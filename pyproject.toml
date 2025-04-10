@@ -1,0 +1,47 @@
+[build-system]
+requires = [
+    "setuptools>=61",
+    "torch==2.3.0"
+]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+# Allow lines to be as long as 80.
+line-length = 80
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-simplify
+    "SIM",
+    # isort
+    # "I",
+    "G",
+]
+ignore = [
+    # star imports
+    "F405", "F403",
+    # unused import
+    "F401",
+    # lambda expression assignment
+    "E731",
+    # Loop control variable not used within loop body
+    "B007",
+    # f-string format
+    "UP032",
+    # Python 3.8 typing
+    "UP006", "UP035",
+    # Can remove once 3.10+ is the minimum Python version
+    "UP007",
+    # Use a context manager for opening files
+    "SIM115",
+    # Unused variable
+    "F841",
+]
