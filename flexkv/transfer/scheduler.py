@@ -1,11 +1,11 @@
-from typing import Dict, List, Set, Tuple
+from typing import OrderedDict, List, Set, Tuple
 from dataclasses import dataclass
 from ..common.transfer import TransferOp, TransferOpGraph
 
 class TransferScheduler:
     def __init__(self):
         # Store all transfer graphs
-        self._transfer_graphs: Dict[int, TransferOpGraph] = {}
+        self._transfer_graphs: OrderedDict[int, TransferOpGraph] = OrderedDict()
     
     def add_transfer_graph(self, graph: TransferOpGraph):
         """Add a new transfer graph to the scheduler"""

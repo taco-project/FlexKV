@@ -1,3 +1,10 @@
+from abc import ABC, abstractmethod
+from typing import List
+import torch
+import queue
+import threading
+from flexkv.common.transfer import TransferOp, TransferType, DeviceType
+from flexkv.common.storage import AccessibleHandle, AccessHandleType
 
 class TransferWorker(ABC):
     def __init__(self, worker_id: int, finished_queue: deque):
@@ -71,37 +78,32 @@ class GPUCPUTransferWorker(TransferWorker):
     def __init__(
         self,
         worker_id: int,
-        gpu_blocks: List[torch.Tensor],
-        cpu_blocks: List[torch.Tensor],
+        gpu_handle: AccessibleHandle,
+        cpu_handle: AccessibleHandle,
         finished_queue: Deque,
         max_batch_size: int = 32,
         gpu_device_id: int = -1,
     ):
-        assert len(gpu_blocks) > 0
-        assert len(gpu_blocks) == len(cpu_blocks)
-        assert gpu_blocks[0].is_cuda
-        assert cpu_blocks[0].is_pinned
-        assert gpu_blocks[0].dtype == cpu_blocks[0].dtype
+        assert gpu_handle.handle_type == AccessHandleType.TENSOR_LIST
+        assert cpu_handle.handle_type == AccessHandleType.TENSOR_LIST
+        
+        assert gpu_handle.dtype == cpu_handle.dtype
 
-        gpu_block_shape = gpu_blocks[0].shape
-        cpu_block_shape = cpu_blocks[0].shape
+        gpu_block_shape = gpu_handle.kv_shape
+        cpu_block_shape = cpu_handle.kv_shape
 
-        assert gpu_block_shape[0] == cpu_block_shape[0] == 2
-        assert gpu_block_shape[2] == cpu_block_shape[2] or (
-            cpu_block_shape[2] == (gpu_block_shape[2] * gpu_block_shape[3] * gpu_block_shape[4])
-        )
+        print("gpu_block_shape", gpu_block_shape)
+        print("cpu_block_shape", cpu_block_shape)
+        
+        #NOTE: this may be different for different frameworks or kvcache layout
+        self.num_layers = gpu_handle.kv_shape[0]
+        self.num_gpu_blocks = gpu_handle.kv_shape[2]
+        self.num_cpu_blocks = cpu_handle.kv_shape[2]
+        self.block_size = cpu_handle.kv_shape[3]
+        self.dtype = gpu_handle.dtype
 
-        self.num_layers = len(gpu_blocks)
-        self.num_gpu_blocks = gpu_block_shape[1]
-        self.num_cpu_blocks = cpu_block_shape[1]
-        self.block_size = cpu_block_shape[2]
-        self.dtype = gpu_blocks[0].dtype
-
-        self.gpu_blocks: List[torch.Tensor] = gpu_blocks
-        self.cpu_blocks: List[torch.Tensor] = cpu_blocks
-
-        self.gpu_layer_ptrs = self._get_layer_ptrs(gpu_blocks)
-        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+        self.gpu_layer_ptrs = gpu_handle.data
+        self.cpu_layer_ptrs = cpu_handle.data
         self.gpu_kv_stride_in_bytes = (
             self.num_gpu_blocks * self.block_size * self.dtype.itemsize
         )
@@ -146,18 +148,17 @@ class GPUCPUTransferWorker(TransferWorker):
 
         if layer_id_list is None:
             layer_id_list = list(range(self.num_layers))
-        #TODO add layer_id_list support
 
         chunk_size_in_bytes = self.block_size * self.dtype.itemsize
 
         if transfer_type == TransferType.H2D:
             transfer_kv_layers(
                 gpu_block_id_list,
-                self.gpu_layer_ptrs,
+                self.gpu_layer_ptrs[layer_id_list],
                 self.gpu_kv_stride_in_bytes,
                 self.gpu_block_stride_in_bytes,
                 cpu_block_id_list,
-                self.cpu_layer_ptrs,
+                self.cpu_layer_ptrs[layer_id_list],
                 self.cpu_kv_stride_in_bytes,
                 self.cpu_block_stride_in_bytes,
                 chunk_size_in_bytes,
@@ -166,11 +167,11 @@ class GPUCPUTransferWorker(TransferWorker):
         elif transfer_type == TransferType.D2H:
             transfer_kv_layers(
                 cpu_block_id_list,
-                self.cpu_layer_ptrs,
+                self.cpu_layer_ptrs[layer_id_list],
                 self.cpu_kv_stride_in_bytes,
                 self.cpu_block_stride_in_bytes,
                 gpu_block_id_list,
-                self.gpu_layer_ptrs,
+                self.gpu_layer_ptrs[layer_id_list],
                 self.gpu_kv_stride_in_bytes,
                 self.gpu_block_stride_in_bytes,
                 chunk_size_in_bytes,
@@ -235,30 +236,27 @@ class CPUSSDDiskTransferWorker(TransferWorker):
     def __init__(
         self,
         worker_id: int,
-        cpu_blocks: List[torch.Tensor],
-        ssd_file: file_storage,
+        cpu_handle: AccessibleHandle,
+        ssd_handle: AccessibleHandle,
         max_batch_size: int = 32,
         finished_queue: Deque = None,
     ):
-        assert len(cpu_blocks) > 0
-        assert len(cpu_blocks) == ssd_file.num_layers
-        assert ssd_file.block_size == cpu_blocks[0].shape[2]
-        assert ssd_file.dtype == cpu_blocks[0].dtype
-        assert cpu_blocks[0].is_pinned
+        cpu_block_shape = cpu_handle.kv_shape
+        ssd_block_shape = ssd_handle.kv_shape
 
-        cpu_block_shape = cpu_blocks[0].shape
+        assert ssd_handle.dtype == cpu_handle.dtype
 
-        self.num_layers = len(cpu_blocks)
-        self.num_cpu_blocks = cpu_block_shape[1]
-        self.num_ssd_blocks = ssd_file.num_blocks
+        #NOTE: this may be different for different frameworks or kvcache layout
+        self.num_layers = cpu_handle.kv_shape[0]
+        self.num_cpu_blocks = cpu_handle.kv_shape[2]
+        self.num_ssd_blocks = ssd_handle.kv_shape[2]
 
-        self.block_size = cpu_block_shape[2]
-        self.dtype = cpu_blocks[0].dtype
+        self.block_size = cpu_handle.kv_shape[3]
+        self.dtype = cpu_handle.dtype
 
-        self.cpu_blocks: List[torch.Tensor] = cpu_blocks
-        self.ssd_file = ssd_file
+        self.cpu_layer_ptrs = cpu_handle.data
+        self.ssd_file = ssd_handle.data
 
-        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.cpu_layer_stride_in_bytes = (
             self.num_cpu_blocks * self.block_size * self.dtype.itemsize * 2
         )
@@ -318,7 +316,8 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         #TODO add layer_id_list support
 
         transfer_kv_blocks_ssd(
-            filename=self.ssd_file.file_path,
+            filename=self.ssd_file,
+            cpu_layer_id_list=layer_id_list,
             cpu_layer_ptrs_tensor=self.cpu_layer_ptrs,
             ssd_block_ids=ssd_block_id_list,
             cpu_block_ids=cpu_block_id_list,
@@ -350,7 +349,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
                 cpu_descriptor,
                 ssd_descriptor,
                 op.transfer_type,
-                layer_id_list=None,
+                layer_id_list=cpu_descriptor.layers,
                 non_blocking=True,
             )
             self.finished_queue.append(op)

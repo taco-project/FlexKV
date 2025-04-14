@@ -59,7 +59,8 @@ void transfer_kv_layers_binding(
 }
 
 void transfer_kv_blocks_ssd(
-    const std::string &filename, const torch::Tensor &cpu_layer_ptrs_tensor,
+    const std::string &filename, const torch::Tensor &cpu_layer_id_list,
+    const torch::Tensor &cpu_layer_ptrs_tensor,
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
@@ -72,8 +73,8 @@ void transfer_kv_blocks_ssd(
               "cpu_block_ids must be int64");
 
   transfer_kv_blocks_ssd_mmap_multi_thread(
-      filename, cpu_layer_ptrs_tensor, ssd_block_ids, cpu_block_ids,
-      cpu_kv_stride_in_bytes, ssd_layer_stride_in_bytes,
+      filename, cpu_layer_id_list, cpu_layer_ptrs_tensor, ssd_block_ids, 
+      cpu_block_ids, cpu_kv_stride_in_bytes, ssd_layer_stride_in_bytes,
       ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, block_size_in_bytes,
       is_read, verbose);
 }
@@ -83,6 +84,7 @@ PYBIND11_MODULE(c_ext, m) {
         "Transfer multi-layer KV-cache between CPU and GPU");
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd,
         "Transfer KV blocks between SSD and CPU memory", py::arg("filename"),
+        py::arg("cpu_layer_id_list"),
         py::arg("cpu_layer_ptrs_tensor"), py::arg("ssd_block_ids"),
         py::arg("cpu_block_ids"), py::arg("cpu_kv_stride_in_bytes"),
         py::arg("ssd_layer_stride_in_bytes"),

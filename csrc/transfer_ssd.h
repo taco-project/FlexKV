@@ -10,7 +10,8 @@
 #include <unistd.h>
 
 void transfer_kv_blocks_ssd_naive(
-    const std::string &filename, const torch::Tensor &cpu_layer_ptrs_tensor,
+    const std::string &filename, const torch::Tensor &cpu_layer_id_list,
+    const torch::Tensor &cpu_layer_ptrs_tensor,
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
@@ -20,7 +21,8 @@ void transfer_kv_blocks_ssd_naive(
   const int64_t *ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
   const int64_t *cpu_block_id_ptr = cpu_block_ids.data_ptr<int64_t>();
 
-  const int num_layers = cpu_layer_ptrs_tensor.size(0);
+  const int32_t *cpu_layer_id_list_ptr = cpu_layer_id_list.data_ptr<int32_t>();
+  const int num_layers = cpu_layer_id_list_ptr.size(0);
   const int num_transfers = ssd_block_ids.size(0);
 
   // open file
@@ -33,7 +35,7 @@ void transfer_kv_blocks_ssd_naive(
   }
 
   for (int i = 0; i < num_layers; i++) {
-    void *layer_ptr = reinterpret_cast<void *>(layer_ptrs[i]);
+    void *layer_ptr = reinterpret_cast<void *>(layer_ptrs[cpu_layer_id_list_ptr[i]]);
 
     void *k_view = layer_ptr;
     void *v_view = layer_ptr + cpu_kv_stride_in_bytes;
@@ -42,7 +44,7 @@ void transfer_kv_blocks_ssd_naive(
       int64_t ssd_block_id = ssd_block_id_ptr[j];
       int64_t cpu_block_id = cpu_block_id_ptr[j];
 
-      int64_t ssd_base_offset = ssd_layer_stride_in_bytes * i +
+      int64_t ssd_base_offset = ssd_layer_stride_in_bytes * cpu_layer_id_list_ptr[i] +
                                 ssd_block_stride_in_bytes * ssd_block_id;
 
       // process K
@@ -104,7 +106,8 @@ void transfer_kv_blocks_ssd_naive(
 // NOTE that we may also use other techniques such as
 // AIO, O_DIRECT, and etc to improve the performance
 void transfer_kv_blocks_ssd_mmap_multi_thread(
-    const std::string &filename, const torch::Tensor &cpu_layer_ptrs_tensor,
+    const std::string &filename, const torch::Tensor &cpu_layer_id_list,
+    const torch::Tensor &cpu_layer_ptrs_tensor,
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
@@ -114,7 +117,9 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
   const int64_t *ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
   const int64_t *cpu_block_id_ptr = cpu_block_ids.data_ptr<int64_t>();
 
-  const int num_layers = cpu_layer_ptrs_tensor.size(0);
+  const int32_t *cpu_layer_id_list_ptr = cpu_layer_id_list.data_ptr<int32_t>();
+
+  const int num_layers = cpu_layer_id_list_ptr.size(0);
   const int num_transfers = ssd_block_ids.size(0);
 
   int64_t file_size = ssd_layer_stride_in_bytes * num_layers;
@@ -149,7 +154,7 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
         }
 
         for (int i = start_layer; i < end_layer; i++) {
-          void *layer_ptr = reinterpret_cast<void *>(layer_ptrs[i]);
+          void *layer_ptr = reinterpret_cast<void *>(layer_ptrs[cpu_layer_id_list_ptr[i]]);
           void *k_view = layer_ptr;
           void *v_view =
               static_cast<char *>(layer_ptr) + cpu_kv_stride_in_bytes;
@@ -158,7 +163,7 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
             int64_t ssd_block_id = ssd_block_id_ptr[j];
             int64_t cpu_block_id = cpu_block_id_ptr[j];
 
-            int64_t ssd_base_offset = ssd_layer_stride_in_bytes * i +
+            int64_t ssd_base_offset = ssd_layer_stride_in_bytes * cpu_layer_id_list_ptr[i] +
                                       ssd_block_stride_in_bytes * ssd_block_id;
 
             // read K block
@@ -251,7 +256,7 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
     auto process_layers = [&](int start_layer, int end_layer) {
       try {
         for (int i = start_layer; i < end_layer; i++) {
-          void *layer_ptr = reinterpret_cast<void *>(layer_ptrs[i]);
+          void *layer_ptr = reinterpret_cast<void *>(layer_ptrs[cpu_layer_id_list_ptr[i]]);
           void *k_view = layer_ptr;
           void *v_view =
               static_cast<char *>(layer_ptr) + cpu_kv_stride_in_bytes;
@@ -260,7 +265,7 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
             int64_t ssd_block_id = ssd_block_id_ptr[j];
             int64_t cpu_block_id = cpu_block_id_ptr[j];
 
-            int64_t ssd_base_offset = ssd_layer_stride_in_bytes * i +
+            int64_t ssd_base_offset = ssd_layer_stride_in_bytes * cpu_layer_id_list_ptr[i] +
                                       ssd_block_stride_in_bytes * ssd_block_id;
 
             // write K block
