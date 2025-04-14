@@ -5,6 +5,7 @@ import queue
 import threading
 from flexkv.common.transfer import TransferOp, TransferType, DeviceType
 from flexkv.common.storage import AccessibleHandle, AccessHandleType
+from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd
 
 class TransferWorker(ABC):
     def __init__(self, worker_id: int, finished_queue: deque):
