@@ -15,7 +15,8 @@ def export_cuda_tensor(tensor: torch.Tensor) -> CUDAIPCHandle:
         raise ValueError("Only CUDA tensors can be shared")
     
     ptr = tensor.data_ptr()
-    handle_data = export_handle(ptr, tensor.numel() * tensor.element_size())
+    handle_data = export_handle(ptr, tensor.numel() * tensor.element_size(), 
+                                device_id=tensor.device.index)
     
     return CUDAIPCHandle(
         handle_data=handle_data,
@@ -27,7 +28,7 @@ def export_cuda_tensor(tensor: torch.Tensor) -> CUDAIPCHandle:
 def import_cuda_tensor(handle: CUDAIPCHandle) -> torch.Tensor:
     """Import a CUDA tensor from a handle"""
     with torch.cuda.device(handle.device_id):
-        ptr = import_handle(handle.handle_data)
+        ptr = import_handle(handle.handle_data, device_id=handle.device_id)
         
         tensor = torch.from_file(
             ptr,

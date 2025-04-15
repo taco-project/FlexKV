@@ -7,6 +7,11 @@ struct MemoryHandle {
     void* ptr;         
     size_t size; 
     CUmemGenericAllocationHandle handle;
+    int device_id;
+};
+
+struct ipc_sharable_cu_handle {
+    int fd = -1;
 };
 
 void check_cu_result(CUresult result, const char* msg) {
@@ -18,7 +23,7 @@ void check_cu_result(CUresult result, const char* msg) {
 }
 
 
-std::vector<uint8_t> export_memory_handle(void* ptr, size_t size) {
+std::vector<uint8_t> export_memory_handle(void* ptr, size_t size, int device_id) {
     CUdeviceptr base_addr = reinterpret_cast<CUdeviceptr>(ptr);
     
     CUmemGenericAllocationHandle handle;
@@ -27,58 +32,45 @@ std::vector<uint8_t> export_memory_handle(void* ptr, size_t size) {
         "Failed to retain allocation handle"
     );
     
-    CUmemAllocationHandleType handle_type = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-    size_t handle_size = 0;
+    ipc_sharable_cu_handle shareable_handle;
     check_cu_result(
         cuMemExportToShareableHandle(
-            nullptr, 
-            handle, 
-            handle_type, 
-            0
-        ),
-        "Failed to get shareable handle size"
-    );
-    
-    std::vector<char> shareable_handle(handle_size);
-    check_cu_result(
-        cuMemExportToShareableHandle(
-            shareable_handle.data(),
+            &shareable_handle.fd,
             handle,
-            handle_type,
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
             0
         ),
         "Failed to export shareable handle"
     );
     
-    MemoryHandle mem_handle = {ptr, size, handle};
+    MemoryHandle mem_handle = {ptr, size, handle, device_id};
     std::vector<uint8_t> serialized_data(
         reinterpret_cast<uint8_t*>(&mem_handle),
         reinterpret_cast<uint8_t*>(&mem_handle) + sizeof(MemoryHandle)
     );
     serialized_data.insert(
         serialized_data.end(),
-        shareable_handle.begin(),
-        shareable_handle.end()
+        reinterpret_cast<uint8_t*>(&shareable_handle),
+        reinterpret_cast<uint8_t*>(&shareable_handle) + sizeof(ipc_sharable_cu_handle)
     );
     
     return serialized_data;
 }
 
 
-void* import_memory_handle(const std::vector<uint8_t>& handle_data) {
+void* import_memory_handle(const std::vector<uint8_t>& handle_data, int device_id) {
     MemoryHandle mem_handle;
     std::memcpy(&mem_handle, handle_data.data(), sizeof(MemoryHandle));
+    assert(mem_handle.device_id == device_id);
     
-    std::vector<char> shareable_handle(
-        handle_data.begin() + sizeof(MemoryHandle),
-        handle_data.end()
-    );
+    ipc_sharable_cu_handle shareable_handle;
+    std::memcpy(&shareable_handle, handle_data.data() + sizeof(MemoryHandle), sizeof(ipc_sharable_cu_handle));
     
     CUmemGenericAllocationHandle imported_handle;
     check_cu_result(
         cuMemImportFromShareableHandle(
             &imported_handle,
-            shareable_handle.data(),
+            (void*)(uintptr_t)shareable_handle.fd,
             CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
         ),
         "Failed to import shareable handle"
@@ -109,7 +101,7 @@ void* import_memory_handle(const std::vector<uint8_t>& handle_data) {
     
     CUmemAccessDesc access_desc = {};
     access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    access_desc.location.id = 0;  // current device
+    access_desc.location.id = device_id;  // current device
     access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     
     check_cu_result(
