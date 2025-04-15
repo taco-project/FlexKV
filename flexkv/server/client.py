@@ -83,8 +83,12 @@ class KVClient:
             self.pending_requests.remove(response.request_id)
             self.completed_results.put(response)
         
-    #this is blocking
     def wait(self, request_ids: List[int]) -> List[torch.Tensor]:
+        """
+        Wait for the server to return the results of the requests
+        Returns a list of masks of those request_ids
+        Note: this is blocking
+        """
         request = ServerRequest(
             client_id=self.client_id,
             request_id=self.request_counter,
@@ -93,17 +97,12 @@ class KVClient:
         )
         self.request_counter += 1
         self.conn.send(request)
-        found_response = []
-        founded_request_num = 0
-        while founded_request_num < len(request_ids):
+        while True:
             self._process_responses()
             while not self.completed_results.empty():
                 response = self.completed_results.get()
-                if response.request_id in request_ids:
-                    found_response.append(response.mask)
-                    founded_request_num += 1
+                if request.request_id == response.request_id:
+                    return response.masks
                 else:
                     self.completed_results.put(response)
-            sleep(0.001)
-            
-        return found_response
+            time.sleep(0.001)
