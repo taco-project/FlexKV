@@ -25,13 +25,12 @@ class ServerResponse:
     error_msg: str = ""
 
 class KVServer(Process):
-    def __init__(self):
+    def __init__(self, cpu_shape: Tuple[int, int, int, int, int, int], dtype: torch.dtype):
         super().__init__()
         self.request_queue = Queue()
         self.client_pipes: Dict[int, Connection] = {}
         self.client_counter = 0
-        self.kvmanager = KVManager() #TODO correct initialization
-        # self.global_to_client_map: Dict[int, Tuple[int, int]] = {}
+        self.kvmanager = KVManager(cpu_shape, dtype) #TODO correct initialization
         self._running = True
         
     def register_client(self) -> Tuple[int, Connection]:
