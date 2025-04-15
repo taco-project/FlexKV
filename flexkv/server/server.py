@@ -20,7 +20,7 @@ class ServerRequest:
 class ServerResponse:
     client_id: int
     request_id: int
-    mask: Optional[List[torch.Tensor]] = None
+    masks: Optional[List[torch.Tensor]] = None
     success: bool = True
     error_msg: str = ""
 
@@ -30,8 +30,8 @@ class KVServer(Process):
         self.request_queue = Queue()
         self.client_pipes: Dict[int, Connection] = {}
         self.client_counter = 0
-        self.kvmanager = KVManager()
-        self.global_to_client_map: Dict[int, Tuple[int, int]] = {}
+        self.kvmanager = KVManager() #TODO correct initialization
+        # self.global_to_client_map: Dict[int, Tuple[int, int]] = {}
         self._running = True
         
     def register_client(self) -> Tuple[int, Connection]:
@@ -89,7 +89,7 @@ class KVServer(Process):
                     
                 elif request.request_type == 'put':
                     self.kvmanager.put_async(
-                        request.client_id, #also device id
+                        request.client_id, # also device id
                         request.request_id,
                         request.token_ids,
                         request.token_mask,
@@ -99,7 +99,7 @@ class KVServer(Process):
                     
                 elif request.request_type == 'get':
                     self.kvmanager.get_async(
-                        request.client_id, #also device id
+                        request.client_id, # also device id
                         request.request_id,
                         request.token_ids,
                         request.token_mask,
@@ -109,7 +109,7 @@ class KVServer(Process):
                 elif request.request_type == 'wait':
                     #Note: to avoid blocking other clients, we use try_wait api here
                     masks = self.kvmanager.try_wait(
-                        request.client_id, #also device id
+                        request.client_id, # also device id
                         request.request_id,
                         request.wait_request_ids
                     )
@@ -118,7 +118,6 @@ class KVServer(Process):
                         self.client_pipes[request.client_id].send(response)
                     else:
                         self.request_queue.put(request)
-                # Send response back to client
 
     def shutdown(self):
         """Shutdown the server"""

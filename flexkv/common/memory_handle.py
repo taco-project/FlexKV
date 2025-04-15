@@ -27,7 +27,7 @@ def export_cuda_tensor(tensor: torch.Tensor) -> CUDAIPCHandle:
 
 def import_cuda_tensor(handle: CUDAIPCHandle) -> torch.Tensor:
     """Import a CUDA tensor from a handle"""
-    with torch.cuda.device(handle.device_id):
+    with torch.cuda.device(handle.device_id): # is this necessary?
         ptr = import_handle(handle.handle_data, device_id=handle.device_id)
         
         tensor = torch.from_file(
