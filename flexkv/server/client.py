@@ -25,11 +25,9 @@ class KVClient:
             if tensor.device.index != device_id:
                 raise ValueError("All tensors must be on the same GPU")
             
-            # 导出CUDA IPC handle
             handle = export_cuda_tensor(tensor)
             handles.append(handle)
         
-        # 发送handles给server
         request = Request(
             client_id=self.client_id,
             request_id=self.request_counter,
