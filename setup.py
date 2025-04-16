@@ -9,6 +9,7 @@ ext_modules = [
             "csrc/bindings.cpp",
             "csrc/transfer.cu",
             "csrc/hash.cpp",
+            "csrc/index.cpp",
         ],
         extra_compile_args={"nvcc": ["-O3"]},
         extra_link_args=["-lcuda", "-lssl", "-lcrypto"],

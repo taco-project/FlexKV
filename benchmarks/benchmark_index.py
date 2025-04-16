@@ -9,7 +9,7 @@ from flexkv.common.block import SequenceMeta
 
 def main(args):
     index = TokenToBlockIndex(tokens_per_block=args.tokens_per_block)
-    token_ids = torch.randint(0, 10000, (args.sequence_length, ))
+    token_ids = torch.randint(0, 10000, (args.sequence_length, ), dtype=torch.int64)
     insert_token_ids = token_ids[:int(args.sequence_length*args.cache_ratio)]
     insert_sequence_meta = SequenceMeta(token_ids=insert_token_ids,
                                         tokens_per_block=args.tokens_per_block)
