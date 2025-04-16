@@ -2,22 +2,24 @@ from typing import Dict, List, Optional
 from queue import Queue
 import threading
 import time
+import torch
 from .scheduler import TransferScheduler
-from .worker import TransferWorker
-from ..common.transfer import TransferOp, TransferOpGraph, DeviceType
+from .worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker
+from ..common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType
+from ..common.storage import AccessibleHandle
 
 class TransferEngine:
     def __init__(self,
-        gpu_blocks: List[List[torch.tensor]],
-        cpu_blocks: List[torch.tensor],
-        ssd_file: Optional[file_storage] = None):
+        gpu_handles: List[AccessibleHandle],
+        cpu_handle: AccessibleHandle,
+        ssd_handle: AccessibleHandle = None):
         """
         Initialize transfer engine
         
         Args:
-            gpu_blocks: List of GPU blocks
-            cpu_blocks: List of CPU blocks
-            ssd_file: Optional SSD file
+            gpu_handles: List of GPU handles
+            cpu_handle: CPU handle
+            ssd_handle: Optional SSD handle
         """
         # Initialize scheduler
         self.scheduler = TransferScheduler()
@@ -33,26 +35,30 @@ class TransferEngine:
         self.gpucpu_workers = [
             GPUCPUTransferWorker(
                 worker_id=i,
-                gpu_blocks=gpu_blocks[i],
-                cpu_blocks=cpu_blocks,
+                gpu_blocks_ptrs=gpu_handles[i].data,
+                cpu_blocks_ptrs=cpu_handle.data,
                 finished_queue=self.finished_ops_queue,
+                gpu_kv_shape=gpu_handles[i].kv_shape,
+                cpu_kv_shape=cpu_handle.kv_shape,
+                dtype=gpu_handles[i].dtype,
                 max_batch_size=self.max_batch_size,
-                gpu_device_id=i,
+                gpu_device_id=i,    
             )
-            for i in range(len(gpu_blocks))
+            for i in range(len(gpu_handles))
         ]
-        if ssd_file is not None:
+        if ssd_handle is not None:
             self.cpussd_worker = CPUSSDDiskTransferWorker(
                 worker_id=0,
-                cpu_blocks=cpu_blocks,
-                ssd_file=ssd_file,
+                cpu_block_ptrs=cpu_handle.data,
+                ssd_file=ssd_handle.data,
+                cpu_kv_shape=cpu_handle.kv_shape,
+                ssd_kv_shape=ssd_handle.kv_shape,
+                dtype=cpu_handle.dtype,
+                max_batch_size=self.max_batch_size,
                 finished_queue=self.finished_ops_queue,
             )
         else:
             self.cpussd_worker = None
-        
-        # Start worker threads
-        self._start_workers()
         
         # Start scheduler thread
         self._running = True
@@ -95,16 +101,16 @@ class TransferEngine:
             TransferType.H2D, 
             TransferType.D2H
         ]:
-           if op.transfer_type == TransferType.H2D:
-            gpu_device_id = op.dst_descriptor.device_id
-           else:
-            gpu_device_id = op.src_descriptor.device_id
-           self.gpucpu_workers[gpu_device_id].add_transfer_op(op)
+            if op.transfer_type == TransferType.H2D:
+                gpu_device_id = op.dst_descriptor.device_id
+            else:
+                gpu_device_id = op.src_descriptor.device_id
+            self.gpucpu_workers[gpu_device_id].submit_transfer(op)
         elif op.transfer_type in [
             TransferType.H2DISK,
             TransferType.DISK2H
         ]:
-            self.cpussd_worker.add_transfer_op(op)
+            self.cpussd_worker.submit_transfer(op)
         else:
             raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
 
@@ -114,10 +120,9 @@ class TransferEngine:
 
     def get_completed_graph(self, timeout: Optional[float] = None) -> Optional[int]:
         """Get ID of a completed transfer graph"""
-        try:
-            return self.completed_queue.get(timeout=timeout)
-        except Queue.Empty:
+        if self.completed_queue.empty():
             return None
+        return self.completed_queue.get(timeout=timeout)
 
     def report_finished_op(self, op: TransferOp, graph_id: int):
         """Report a finished operation"""

@@ -13,7 +13,7 @@ class AccessHandleType(Enum):
 class AccessibleHandle:
     handle_type: AccessHandleType
     # The actual handle data
-    data: Union[List[torch.Tensor], List[List[torch.Tensor]], Path]
+    data: Union[List[torch.Tensor], List[List[torch.Tensor]], str]
     kv_shape: Tuple[int, ...]
     dtype: torch.dtype
     # Optional metadata

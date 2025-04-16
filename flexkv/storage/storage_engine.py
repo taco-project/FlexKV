@@ -1,10 +1,10 @@
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 import torch
 
-from .allocator import CPUAllocator, GPUAllocator, DiskAllocator
-from ..common.storage import AccessibleHandle, HandleType
+from .allocator import CPUAllocator, GPUAllocator, SSDAllocator
+from ..common.storage import AccessibleHandle, AccessHandleType
 from ..common.transfer import DeviceType
 
 class StorageEngine:
@@ -17,7 +17,7 @@ class StorageEngine:
                         tensor_shape: Tuple[int, ...],
                         dtype: torch.dtype,
                         device_id: int = 0,
-                        raw_data: Optional[List[torch.Tensor], Path] = None,
+                        raw_data: Union[List[torch.Tensor], str] = None,
                         **kwargs) -> bool:
         """
         Create and add an allocator for specified device
@@ -90,15 +90,13 @@ class StorageEngine:
     
     def get_allocator_handle(self,
                            device_type: DeviceType,
-                           device_id: int = 0,
-                           block_ids: torch.Tensor) -> Optional[AccessibleHandle]:
+                           device_id: int = 0) -> Optional[AccessibleHandle]:
         """
         Get accessible handle for specified blocks
         
         Args:
             device_type: Type of the device to get handle from
             device_id: Device ID
-            block_ids: Tensor of block IDs to access
         """
         key = (device_type, device_id)
         if key not in self._allocators:

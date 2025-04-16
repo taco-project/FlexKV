@@ -22,15 +22,18 @@ def run_client(client_id: int, client_conn, gpu_device_id: int,
     client.register_device_memory(gpu_blocks)
     
     # Example workload
-    while True:
+    #while True:
         # Send some requests
-        request_id = client.put_async(token_ids, token_mask, gpu_physical_block_ids)
+    request_id1 = client.put_async(token_ids, token_mask, gpu_physical_block_ids)
+    request_id2 = client.put_async(token_ids, token_mask, gpu_physical_block_ids)
+    # Process responses
+    results = client.wait([request_id1, request_id2])
+    print(f"Client {client_id} got result for request {request_id1}")
+    print(f"Client {client_id} got result for request {request_id2}")
+    print(results[0])
+    print(results[1])
         
-        # Process responses
-        results = client.wait([request_id])
-        print(f"Client {client_id} got result for request {request_id}")
-        
-        time.sleep(0.01)  # Avoid busy waiting
+    #    time.sleep(0.01)  # Avoid busy waiting
 
 def main():
     # Create and start server

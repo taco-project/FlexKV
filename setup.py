@@ -9,7 +9,9 @@ ext_modules = [
             "csrc/bindings.cpp",
             "csrc/transfer.cu",
         ],
+        libraries=["cuda"],
         extra_compile_args={"nvcc": ["-O3"]},
+        extra_link_args=["-lcuda"],
     ),
 ]
 
