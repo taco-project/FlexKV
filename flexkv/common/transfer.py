@@ -2,7 +2,9 @@ from enum import Enum, auto
 from typing import List, Optional, Set, Dict
 from dataclasses import dataclass, field
 import torch
-from .block import BlockMeta
+
+from flexkv.common.block import BlockMeta
+
 
 class DeviceType(Enum):
     CPU = 0
@@ -42,34 +44,36 @@ class TransferOpGraph:
     block_meta_to_free: Dict[DeviceType, List[BlockMeta]]
     return_mask: Optional[torch.Tensor]
     _op_map: Dict[int, TransferOp] = field(init=False)
-    
+
     def __init__(self, transfer_graph_id: int):
         self.transfer_graph_id = transfer_graph_id
         self._op_map = {}
-    
+
     def add_transfer_op(self, op: TransferOp):
         op.transfer_graph_id = self.transfer_graph_id
         self._op_map[op.transfer_op_id] = op
-    
+
     def add_dependency(self, op_id: int, dependent_op_id: int):
         """op_id depends on dependent_op_id"""
         if op_id in self._op_map and dependent_op_id in self._op_map:
             self._op_map[op_id].dependencies.add(dependent_op_id)
-    
+
     def is_ready_to_execute(self, op_id: int) -> bool:
-        """check if an op is ready to execute (all its dependencies are completed)"""
+        """check if an op is ready to execute
+        (all its dependencies are completed)"""
         if op_id not in self._op_map:
             return False
         op = self._op_map[op_id]
         if len(op.dependencies) == 0:
             return True
-        return all(self._op_map[dep_id].is_completed for dep_id in op.dependencies)
-    
+        return all(self._op_map[dep_id].is_completed
+                   for dep_id in op.dependencies)
+
     def mark_completed(self, op_id: int):
         """mark an op as completed"""
         if op_id in self._op_map:
             self._op_map[op_id].is_completed = True
-    
+
     def get_ready_ops(self) -> List[int]:
         """get a list of op ids that are ready to execute"""
         return [op.transfer_op_id for op in self._op_map.values() 
