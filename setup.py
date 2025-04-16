@@ -8,10 +8,10 @@ ext_modules = [
         sources=[
             "csrc/bindings.cpp",
             "csrc/transfer.cu",
+            "csrc/hash.cpp",
         ],
-        libraries=["cuda"],
         extra_compile_args={"nvcc": ["-O3"]},
-        extra_link_args=["-lcuda"],
+        extra_link_args=["-lcuda", "-lssl", "-lcrypto"],
     ),
 ]
 
