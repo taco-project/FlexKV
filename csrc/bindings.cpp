@@ -9,9 +9,10 @@
 #include <torch/extension.h>
 #include <unistd.h>
 
+#include "hash.h"
+#include "ipc_memhandle.h"
 #include "transfer.cuh"
 #include "transfer_ssd.h"
-#include "ipc_memhandle.h"
 
 namespace py = pybind11;
 
@@ -74,7 +75,7 @@ void transfer_kv_blocks_ssd(
               "cpu_block_ids must be int64");
 
   transfer_kv_blocks_ssd_mmap_multi_thread(
-      filename, cpu_layer_id_list, cpu_layer_ptrs_tensor, ssd_block_ids, 
+      filename, cpu_layer_id_list, cpu_layer_ptrs_tensor, ssd_block_ids,
       cpu_block_ids, cpu_kv_stride_in_bytes, ssd_layer_stride_in_bytes,
       ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, block_size_in_bytes,
       is_read, verbose);
@@ -85,13 +86,16 @@ PYBIND11_MODULE(c_ext, m) {
         "Transfer multi-layer KV-cache between CPU and GPU");
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd,
         "Transfer KV blocks between SSD and CPU memory", py::arg("filename"),
-        py::arg("cpu_layer_id_list"),
-        py::arg("cpu_layer_ptrs_tensor"), py::arg("ssd_block_ids"),
-        py::arg("cpu_block_ids"), py::arg("cpu_kv_stride_in_bytes"),
-        py::arg("ssd_layer_stride_in_bytes"),
+        py::arg("cpu_layer_id_list"), py::arg("cpu_layer_ptrs_tensor"),
+        py::arg("ssd_block_ids"), py::arg("cpu_block_ids"),
+        py::arg("cpu_kv_stride_in_bytes"), py::arg("ssd_layer_stride_in_bytes"),
         py::arg("ssd_block_stride_in_bytes"), py::arg("ssd_kv_stride_in_bytes"),
         py::arg("block_size_in_bytes"), py::arg("is_read"),
         py::arg("verbose") = false);
   m.def("export_handle", &export_memory_handle);
   m.def("import_handle", &import_memory_handle);
+  m.def("get_hash_size", &flexkv::get_hash_size,
+        "Get the size of the hash result");
+  m.def("hash_tensor", &flexkv::hash_tensor, "Hash a tensor", py::arg("tensor"),
+        py::arg("result"));
 }

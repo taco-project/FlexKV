@@ -5,7 +5,7 @@ import time
 import torch
 
 from flexkv.common.hash_utils import \
-    HashType, hash_ctx_init, hash_ctx_update, hash_ctx_finalize
+    HashType, hash_tensor
 
 class BlockStatus(Enum):
     UNREGISTERED = auto()
@@ -76,8 +76,5 @@ class SequenceMeta:
     def gen_hashes(self) -> None:
         if self.has_hashes:
             return
-        hash_ctx = hash_ctx_init()
         for i in range(self.num_blocks):
-            hash_ctx_update(hash_ctx,
-                            self.token_ids[i*self.tokens_per_block:(i+1)*self.tokens_per_block])
-            self.block_hashes.append(hash_ctx_finalize(hash_ctx))
+            self.block_hashes.append(hash_tensor(self.token_ids[0:(i+1)*self.tokens_per_block]))

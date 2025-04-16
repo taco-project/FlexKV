@@ -17,17 +17,17 @@ def main(args):
                                        tokens_per_block=args.tokens_per_block)
     profiler = cProfile.Profile()
     print("insert sequence of length", insert_sequence_meta.length)
-    profiler.runctx('index.insert(insert_sequence_meta)',
-                    globals(), locals())
+    index.insert(insert_sequence_meta)
     print("match sequence of length", match_sequence_meta.length)
     profiler.runctx('index.match_prefix(match_sequence_meta)',
                     globals(), locals())
     stats = pstats.Stats(profiler)
     stats.sort_stats('cumulative')
     for func in stats.stats:
-        if func[2] in dir(index) and not func[2].startswith('__'):
+        if func[2] in dir(index) and not func[2].startswith('__')\
+            or func[2].startswith('hash'):
             print(f"function: {func[2]:<30} "
-                  f"total time: {stats.stats[func][3]:.4f}s  "
+                  f"total time: {stats.stats[func][3]:.6f}s  "
                   f"total calls: {stats.stats[func][0]}")
 
 if __name__ == "__main__":
@@ -35,9 +35,6 @@ if __name__ == "__main__":
         description='Benchmark the performance of Index.')
     parser.add_argument('--sequence-length', type=int, default=32000)
     parser.add_argument('--tokens-per-block', type=int, default=1)
-    parser.add_argument('--cache-ratio', type=float, default=0.8)
-    parser.add_argument('--enable-prefix-caching',
-                        action='store_true',
-                        help='enable prefix caching')
+    parser.add_argument('--cache-ratio', type=float, default=1)
     args = parser.parse_args()
     main(args)
