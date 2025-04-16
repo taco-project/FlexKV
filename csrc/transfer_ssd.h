@@ -21,8 +21,8 @@ void transfer_kv_blocks_ssd_naive(
   const int64_t *ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
   const int64_t *cpu_block_id_ptr = cpu_block_ids.data_ptr<int64_t>();
 
+  const int num_layers = cpu_layer_id_list.size(0);
   const int32_t *cpu_layer_id_list_ptr = cpu_layer_id_list.data_ptr<int32_t>();
-  const int num_layers = cpu_layer_id_list_ptr.size(0);
   const int num_transfers = ssd_block_ids.size(0);
 
   // open file
@@ -117,9 +117,9 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
   const int64_t *ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
   const int64_t *cpu_block_id_ptr = cpu_block_ids.data_ptr<int64_t>();
 
+  const int num_layers = cpu_layer_id_list.size(0);
   const int32_t *cpu_layer_id_list_ptr = cpu_layer_id_list.data_ptr<int32_t>();
 
-  const int num_layers = cpu_layer_id_list_ptr.size(0);
   const int num_transfers = ssd_block_ids.size(0);
 
   int64_t file_size = ssd_layer_stride_in_bytes * num_layers;

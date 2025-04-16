@@ -1,16 +1,18 @@
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional, Tuple
 import torch
-import queue
+from queue import Queue
 import threading
-from flexkv.common.transfer import TransferOp, TransferType, DeviceType
+from flexkv.common.transfer import TransferOp, TransferType, DeviceType, TransferDescriptor
 from flexkv.common.storage import AccessibleHandle, AccessHandleType
 from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd
+import time
+from threading import Thread
 
 class TransferWorker(ABC):
-    def __init__(self, worker_id: int, finished_queue: deque):
+    def __init__(self, worker_id: int, finished_queue: Queue):
         self.worker_id = worker_id
-        self.transfer_queue = queue.Queue()
+        self.transfer_queue = Queue()
         self.max_batch_size = 32
         self.finished_queue = finished_queue
         self.transfer_thread = threading.Thread(target=self._transfer_worker)
@@ -18,8 +20,7 @@ class TransferWorker(ABC):
     
     def submit_transfer(self, transfer: TransferOp):
         self.transfer_queue.put(transfer)
-
-    @abstractmethod
+    """
     def _get_layer_ptrs(self, layer_blocks: List[torch.Tensor]) -> torch.Tensor:
         layer_ptrs = torch.zeros(
             self.num_layers,
@@ -30,6 +31,7 @@ class TransferWorker(ABC):
         for lay_id in range(self.num_layers):
             layer_ptrs[lay_id] = layer_blocks[lay_id][0].data_ptr()
         return layer_ptrs
+    """
 
     @abstractmethod
     def transfer(self, transfer: TransferOp)->None:
@@ -41,33 +43,33 @@ class TransferWorker(ABC):
 
     def _transfer_worker(self):
         while True:
-            transfers = []
-            write_transfer = None
+            ops = []
+            write_op = None
 
-            request = self.transfer_queue.get()
-            if request is None:
+            op = self.transfer_queue.get()
+            if op is None:
                 break
-            if request.type % 2 == 1: #write request
-                write_transfer = request
-            else: #read request
-                transfers.append(request)
+            if op.transfer_type.value % 2 == 1: #write op
+                write_op = op
+            else: #read op
+                ops.append(op)
 
-            if not write_transfer:
-                while len(transfers) < self.max_batch_size:
+            if not write_op:
+                while len(ops) < self.max_batch_size:
                     try:
-                        request = self.transfer_queue.get_nowait()
-                        if request is None:
+                        op = self.transfer_queue.get_nowait()
+                        if op is None:
                             break
-                        if request.type % 2 == 0:
-                            transfers.append(request)
+                        if op.transfer_type.value % 2 == 0:
+                            ops.append(op)
                         else:
-                            self.transfer_queue.put(request)
+                            self.transfer_queue.put(op)
                             break
                     except Empty:
                         break
 
-            batch = [write_transfer] if write_transfer else transfers
-            debuginfo.info(f"TRANSFER batch {batch[0].type} type - collected")
+            batch = [write_op] if write_op else ops
+            debuginfo.info(f"TRANSFER batch {batch[0].transfer_type.name} type - collected")
             self._process_transfers(batch)
             # time.sleep(0.0001)
 
@@ -79,32 +81,30 @@ class GPUCPUTransferWorker(TransferWorker):
     def __init__(
         self,
         worker_id: int,
-        gpu_handle: AccessibleHandle,
-        cpu_handle: AccessibleHandle,
-        finished_queue: Deque,
+        gpu_blocks_ptrs: torch.Tensor,
+        cpu_blocks_ptrs: torch.Tensor,
+        finished_queue: Queue,
+        gpu_kv_shape: Tuple[int, ...],
+        cpu_kv_shape: Tuple[int, ...],
+        dtype: torch.dtype,
         max_batch_size: int = 32,
         gpu_device_id: int = -1,
     ):
-        assert gpu_handle.handle_type == AccessHandleType.TENSOR_LIST
-        assert cpu_handle.handle_type == AccessHandleType.TENSOR_LIST
-        
-        assert gpu_handle.dtype == cpu_handle.dtype
 
-        gpu_block_shape = gpu_handle.kv_shape
-        cpu_block_shape = cpu_handle.kv_shape
+        print("gpu_block_shape", gpu_kv_shape)
+        print("cpu_block_shape", cpu_kv_shape)
 
-        print("gpu_block_shape", gpu_block_shape)
-        print("cpu_block_shape", cpu_block_shape)
+        assert len(gpu_blocks_ptrs) == len(cpu_blocks_ptrs)
         
         #NOTE: this may be different for different frameworks or kvcache layout
-        self.num_layers = gpu_handle.kv_shape[0]
-        self.num_gpu_blocks = gpu_handle.kv_shape[2]
-        self.num_cpu_blocks = cpu_handle.kv_shape[2]
-        self.block_size = cpu_handle.kv_shape[3]
-        self.dtype = gpu_handle.dtype
+        self.num_layers = len(gpu_blocks_ptrs)
+        self.num_gpu_blocks = gpu_kv_shape[2]
+        self.num_cpu_blocks = cpu_kv_shape[2]
+        self.block_size = cpu_kv_shape[3]
+        self.dtype = dtype
 
-        self.gpu_layer_ptrs = gpu_handle.data
-        self.cpu_layer_ptrs = cpu_handle.data
+        self.gpu_layer_ptrs = gpu_blocks_ptrs
+        self.cpu_layer_ptrs = cpu_blocks_ptrs
         self.gpu_kv_stride_in_bytes = (
             self.num_gpu_blocks * self.block_size * self.dtype.itemsize
         )
@@ -237,26 +237,25 @@ class CPUSSDDiskTransferWorker(TransferWorker):
     def __init__(
         self,
         worker_id: int,
-        cpu_handle: AccessibleHandle,
-        ssd_handle: AccessibleHandle,
+        cpu_block_ptrs: torch.Tensor,
+        ssd_file: str,
+        cpu_kv_shape: Tuple[int, ...],
+        ssd_kv_shape: Tuple[int, ...],
+        dtype: torch.dtype,
         max_batch_size: int = 32,
-        finished_queue: Deque = None,
+        finished_queue: Queue = None,
     ):
-        cpu_block_shape = cpu_handle.kv_shape
-        ssd_block_shape = ssd_handle.kv_shape
-
-        assert ssd_handle.dtype == cpu_handle.dtype
 
         #NOTE: this may be different for different frameworks or kvcache layout
-        self.num_layers = cpu_handle.kv_shape[0]
-        self.num_cpu_blocks = cpu_handle.kv_shape[2]
-        self.num_ssd_blocks = ssd_handle.kv_shape[2]
+        self.num_layers = cpu_kv_shape[0]
+        self.num_cpu_blocks = cpu_kv_shape[2]
+        self.num_ssd_blocks = ssd_kv_shape[2]
 
-        self.block_size = cpu_handle.kv_shape[3]
-        self.dtype = cpu_handle.dtype
+        self.block_size = cpu_kv_shape[3]
+        self.dtype = dtype
 
-        self.cpu_layer_ptrs = cpu_handle.data
-        self.ssd_file = ssd_handle.data
+        self.cpu_layer_ptrs = cpu_block_ptrs
+        self.ssd_file = ssd_file
 
         self.cpu_layer_stride_in_bytes = (
             self.num_cpu_blocks * self.block_size * self.dtype.itemsize * 2

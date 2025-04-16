@@ -11,7 +11,7 @@
 
 #include "transfer.cuh"
 #include "transfer_ssd.h"
-#include "memory_handle.h"
+#include "ipc_memhandle.h"
 
 namespace py = pybind11;
 
@@ -92,6 +92,6 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("ssd_block_stride_in_bytes"), py::arg("ssd_kv_stride_in_bytes"),
         py::arg("block_size_in_bytes"), py::arg("is_read"),
         py::arg("verbose") = false);
-  m.def("export_handle", &export_cuda_handle);
-  m.def("import_handle", &import_cuda_handle);
+  m.def("export_handle", &export_memory_handle);
+  m.def("import_handle", &import_memory_handle);
 }

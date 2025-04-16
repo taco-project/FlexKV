@@ -60,7 +60,7 @@ class GPUAllocator(StorageAllocator):
         for _ in range(self.tensor_shape[0]):
             self.physical_blocks.append(
                 torch.empty(
-                    self.tensor_shape[1:],
+                    size=self.tensor_shape[1:],
                     dtype=self.dtype,
                     device=device,
                 )
@@ -120,7 +120,7 @@ class CPUAllocator(StorageAllocator):
         for _ in range(self.tensor_shape[0]):
             self.physical_blocks.append(
                 torch.empty(
-                    self.tensor_shape[1:],
+                    size=self.tensor_shape[1:],
                     dtype=self.dtype,
                     device="cpu",
                     pin_memory=self.pin_memory,

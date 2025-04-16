@@ -2,7 +2,7 @@ from enum import Enum, auto
 from typing import List, Optional, Set, Dict
 from dataclasses import dataclass, field
 import torch
-
+from .block import BlockMeta
 
 class DeviceType(Enum):
     CPU = 0
@@ -39,7 +39,6 @@ class TransferOp:
 @dataclass
 class TransferOpGraph:
     transfer_graph_id: int
-    transfer_ops: List[TransferOp]
     block_meta_to_free: Dict[DeviceType, List[BlockMeta]]
     return_mask: Optional[torch.Tensor]
     _op_map: Dict[int, TransferOp] = field(init=False)
@@ -73,12 +72,12 @@ class TransferOpGraph:
     
     def get_ready_ops(self) -> List[int]:
         """get a list of op ids that are ready to execute"""
-        return [op.transfer_op_id for op in self.transfer_ops 
+        return [op.transfer_op_id for op in self._op_map.values() 
                 if not op.is_completed and self.is_ready_to_execute(op.transfer_op_id)]
     
     def all_transfer_ops_completed(self) -> bool:
         """check if all transfer ops are completed"""
-        return all(op.is_completed for op in self.transfer_ops)
+        return all(op.is_completed for op in self._op_map.values())
     
     def get_block_meta_to_free(self) -> Dict[DeviceType, List[BlockMeta]]:
         """get a dict of block metas to free"""
