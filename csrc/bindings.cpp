@@ -9,7 +9,7 @@
 #include <torch/extension.h>
 #include <unistd.h>
 
-#include "hash.h"
+#include "cache_utils.h"
 #include "ipc_memhandle.h"
 #include "transfer.cuh"
 #include "transfer_ssd.h"
@@ -98,4 +98,10 @@ PYBIND11_MODULE(c_ext, m) {
         "Get the size of the hash result");
   m.def("hash_tensor", &flexkv::hash_tensor, "Hash a tensor", py::arg("tensor"),
         py::arg("result"));
+  m.def("get_prefix_block_ids", &flexkv::get_prefix_block_ids,
+        "Get prefix block ids", py::arg("last_block_index"),
+        py::arg("last_block_id"), py::arg("prev_block_ids"));
+  m.def("get_block_ids_from_hashes", &flexkv::get_block_ids_from_hashes,
+        "Get block ids from hashes", py::arg("hashes"),
+        py::arg("hash_to_block_id"));
 }
