@@ -66,6 +66,10 @@ class SequenceMeta:
         return len(self.token_ids) // self.tokens_per_block
 
     @property
+    def length(self) -> int:
+        return len(self.token_ids)
+
+    @property
     def has_hashes(self) -> bool:
         return len(self.block_hashes) > 0
 
