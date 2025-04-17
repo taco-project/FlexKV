@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <torch/extension.h>
 #include <unistd.h>
+#include <nvToolsExt.h>
 
 #include "cache_utils.h"
 #include "ipc_memhandle.h"
@@ -46,14 +47,12 @@ void transfer_kv_layers_binding(
   void **src_layer_ptrs = get_tensor_ptr<void **>(src_layer_ptrs_tensor);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
   flexkv::transfer_kv_layers(
       num_blocks, num_layers, dst_block_ids, dst_layer_ptrs,
       dst_kv_stride_in_bytes, dst_chunk_stride_in_bytes, src_block_ids,
       src_layer_ptrs, src_kv_stride_in_bytes, src_chunk_stride_in_bytes,
       chunk_size_in_bytes, stream, transfer_sms, is_host_to_device,
       use_ce_transfer);
-
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(cudaGetErrorString(err));

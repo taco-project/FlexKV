@@ -10,7 +10,7 @@ import time
 from threading import Thread
 import queue
 from flexkv.common.debug import debuginfo
-
+import torch.cuda.nvtx as nvtx
 class TransferWorker(ABC):
     def __init__(self, worker_id: int, finished_queue: Queue):
         self.worker_id = worker_id
@@ -48,13 +48,16 @@ class TransferWorker(ABC):
             ops = []
             write_op = None
 
-            op = self.transfer_queue.get()
-            if op is None:
-                break
-            if op.transfer_type.value % 2 == 1: #write op
-                write_op = op
-            else: #read op
-                ops.append(op)
+            try:
+                op = self.transfer_queue.get(timeout=0.001)
+                if op is None:
+                    break
+                if op.transfer_type.value % 2 == 1:  # write op
+                    write_op = op
+                else:  # read op
+                    ops.append(op)
+            except queue.Empty:
+                continue
 
             if not write_op:
                 while len(ops) < self.max_batch_size:
@@ -72,9 +75,8 @@ class TransferWorker(ABC):
                         break
 
             batch = [write_op] if write_op else ops
-            debuginfo.info(f"TRANSFER batch {batch[0].transfer_type.name} type - collected")
-            self._process_transfers(batch)
-            # time.sleep(0.0001)
+            if batch:
+                self._process_transfers(batch)
 
     def shutdown(self):
         self.transfer_queue.put(None)
@@ -154,7 +156,7 @@ class GPUCPUTransferWorker(TransferWorker):
             layer_id_list = list(range(self.num_layers))
 
         chunk_size_in_bytes = self.block_size * self.dtype.itemsize
-
+        nvtx.range_push("Transfer KV Layers")
         if transfer_type == TransferType.H2D:
             transfer_kv_layers(
                 gpu_block_id_list,
@@ -187,9 +189,9 @@ class GPUCPUTransferWorker(TransferWorker):
             )
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type}")
-
+        nvtx.range_pop()
         # if non_blocking:
-        torch.cuda.synchronize()  # TODO: remove this ?
+        #torch.cuda.synchronize()  # TODO: remove this ?
 
     def _process_transfers(self, transfers):
         if not isinstance(transfers, list):
@@ -207,6 +209,7 @@ class GPUCPUTransferWorker(TransferWorker):
                     gpu_descriptor = op.src_descriptor
                 else:
                     raise ValueError(f"Invalid transfer type: {op.transfer_type}")
+                nvtx.range_push("GPU CPUTransfer")
                 self.transfer(
                     gpu_descriptor,
                     cpu_descriptor,
@@ -214,7 +217,8 @@ class GPUCPUTransferWorker(TransferWorker):
                     layer_id_list=gpu_descriptor.layers,
                     non_blocking=True,
                 )
-                #self.transfer_stream.synchronize()
+                nvtx.range_pop()
+                self.transfer_stream.synchronize()
                 debuginfo.info("TRANSFER stream synchronized")
                 self.finished_queue.put(op)
                 '''
@@ -352,6 +356,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
                 cpu_descriptor = op.src_descriptor
                 ssd_descriptor = op.dst_descriptor
             start_time = time.time()
+            nvtx.range_push("CPU SSD Transfer")
             self.transfer(
                 cpu_descriptor,
                 ssd_descriptor,
@@ -359,6 +364,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
                 layer_id_list=cpu_descriptor.layers,
                 non_blocking=True,
             )
+            nvtx.range_pop()
             self.finished_queue.put(op)
             end_time = time.time()
             ssd_transfer_size = (
