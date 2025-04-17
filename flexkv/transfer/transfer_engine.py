@@ -118,11 +118,31 @@ class TransferEngine:
         """Submit a transfer graph for execution"""
         self.task_queue.put(transfer_graph)
 
-    def get_completed_graph(self, timeout: Optional[float] = None) -> Optional[int]:
-        """Get ID of a completed transfer graph"""
+    def get_completed_graphs(self, timeout: Optional[float] = None) -> List[int]:
+        """Get IDs of all completed transfer graphs at current moment
+        
+        Args:
+            timeout: Optional timeout for the first graph retrieval
+            
+        Returns:
+            List of completed graph IDs. Empty list if no graphs are completed.
+        """
+        completed_graphs = []
+        
         if self.completed_queue.empty():
-            return None
-        return self.completed_queue.get(timeout=timeout)
+            return completed_graphs
+            
+        try:
+            first_graph = self.completed_queue.get(timeout=timeout)
+            completed_graphs.append(first_graph)
+            
+            while not self.completed_queue.empty():
+                completed_graphs.append(self.completed_queue.get_nowait())
+                
+        except Queue.Empty:
+            pass
+            
+        return completed_graphs
 
     def report_finished_op(self, op: TransferOp, graph_id: int):
         """Report a finished operation"""
@@ -133,7 +153,12 @@ class TransferEngine:
         self._running = False
         self._scheduler_thread.join()
         
-        # Shutdown all workers
-        for worker_type in self.workers:
-            for worker in self.workers[worker_type]:
-                worker.shutdown()
+        for worker in self.gpucpu_workers:
+            worker.transfer_queue.put(None) 
+        if self.cpussd_worker is not None:
+            self.cpussd_worker.transfer_queue.put(None)
+            
+        for worker in self.gpucpu_workers:  
+            worker.shutdown()
+        if self.cpussd_worker is not None:
+            self.cpussd_worker.shutdown()
