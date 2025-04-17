@@ -8,6 +8,8 @@ from flexkv.common.storage import AccessibleHandle, AccessHandleType
 from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd
 import time
 from threading import Thread
+import queue
+from flexkv.common.debug import debuginfo
 
 class TransferWorker(ABC):
     def __init__(self, worker_id: int, finished_queue: Queue):
@@ -59,13 +61,14 @@ class TransferWorker(ABC):
                     try:
                         op = self.transfer_queue.get_nowait()
                         if op is None:
+                            self.transfer_queue.put(op)
                             break
                         if op.transfer_type.value % 2 == 0:
                             ops.append(op)
                         else:
                             self.transfer_queue.put(op)
                             break
-                    except Empty:
+                    except queue.Empty:
                         break
 
             batch = [write_op] if write_op else ops
@@ -95,7 +98,7 @@ class GPUCPUTransferWorker(TransferWorker):
         print("cpu_block_shape", cpu_kv_shape)
 
         assert len(gpu_blocks_ptrs) == len(cpu_blocks_ptrs)
-        
+        self.finished_queue = finished_queue
         #NOTE: this may be different for different frameworks or kvcache layout
         self.num_layers = len(gpu_blocks_ptrs)
         self.num_gpu_blocks = gpu_kv_shape[2]
@@ -139,8 +142,8 @@ class GPUCPUTransferWorker(TransferWorker):
         assert gpu_descriptor.device_type == DeviceType.GPU
         assert cpu_descriptor.device_type == DeviceType.CPU
 
-        gpu_block_id_list = gpu_descriptor.physical_block_ids.pin_memory()
-        cpu_block_id_list = cpu_descriptor.physical_block_ids.pin_memory()
+        gpu_block_id_list = gpu_descriptor.physical_block_ids.pin_memory().to(dtype=torch.int64)
+        cpu_block_id_list = cpu_descriptor.physical_block_ids.pin_memory().to(dtype=torch.int64)
 
         assert len(gpu_block_id_list) == len(cpu_block_id_list)
 
@@ -155,28 +158,32 @@ class GPUCPUTransferWorker(TransferWorker):
         if transfer_type == TransferType.H2D:
             transfer_kv_layers(
                 gpu_block_id_list,
-                self.gpu_layer_ptrs[layer_id_list],
+                self.gpu_layer_ptrs[layer_id_list].pin_memory(),
                 self.gpu_kv_stride_in_bytes,
                 self.gpu_block_stride_in_bytes,
                 cpu_block_id_list,
-                self.cpu_layer_ptrs[layer_id_list],
+                self.cpu_layer_ptrs[layer_id_list].pin_memory(),
                 self.cpu_kv_stride_in_bytes,
                 self.cpu_block_stride_in_bytes,
                 chunk_size_in_bytes,
                 self.transfer_sms,
+                True,
+                False,
             )
         elif transfer_type == TransferType.D2H:
             transfer_kv_layers(
                 cpu_block_id_list,
-                self.cpu_layer_ptrs[layer_id_list],
+                self.cpu_layer_ptrs[layer_id_list].pin_memory(),
                 self.cpu_kv_stride_in_bytes,
                 self.cpu_block_stride_in_bytes,
                 gpu_block_id_list,
-                self.gpu_layer_ptrs[layer_id_list],
+                self.gpu_layer_ptrs[layer_id_list].pin_memory(),
                 self.gpu_kv_stride_in_bytes,
                 self.gpu_block_stride_in_bytes,
                 chunk_size_in_bytes,
                 self.transfer_sms,
+                False,
+                False,
             )
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type}")
@@ -209,7 +216,7 @@ class GPUCPUTransferWorker(TransferWorker):
                 )
                 #self.transfer_stream.synchronize()
                 debuginfo.info("TRANSFER stream synchronized")
-                self.finished_queue.append(op)
+                self.finished_queue.put(op)
                 '''
                 if op.transfer_type == TransferType.D2H:
                     add_desc = op.additional_descriptor
@@ -291,13 +298,13 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         non_blocking: bool = False,
     ) -> None:
         debuginfo.info(f"ssd transfer {transfer_type} happens")
-        assert ssd_descriptor.device == DeviceType.SSD
-        assert cpu_descriptor.device == DeviceType.CPU
+        assert ssd_descriptor.device_type == DeviceType.SSD
+        assert cpu_descriptor.device_type == DeviceType.CPU
         # this means partial read hit cpu and other hit ssd
         # or partial write hit ssd and none hit cpu
         debuginfo.info(f"ssd transfer {transfer_type} happens")
-        ssd_block_id_list = ssd_descriptor.physical_block_ids
-        cpu_block_id_list = cpu_descriptor.physical_block_ids
+        ssd_block_id_list = ssd_descriptor.physical_block_ids.pin_memory().to(dtype=torch.int64)
+        cpu_block_id_list = cpu_descriptor.physical_block_ids.pin_memory().to(dtype=torch.int64)
         if len(ssd_block_id_list) != len(cpu_block_id_list):
             assert len(ssd_block_id_list) < len(cpu_block_id_list)
             cpu_block_id_list = cpu_descriptor.physical_block_ids[
@@ -317,7 +324,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
 
         transfer_kv_blocks_ssd(
             filename=self.ssd_file,
-            cpu_layer_id_list=layer_id_list,
+            cpu_layer_id_list=torch.tensor(layer_id_list, dtype=torch.int32),
             cpu_layer_ptrs_tensor=self.cpu_layer_ptrs,
             ssd_block_ids=ssd_block_id_list,
             cpu_block_ids=cpu_block_id_list,
@@ -352,7 +359,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
                 layer_id_list=cpu_descriptor.layers,
                 non_blocking=True,
             )
-            self.finished_queue.append(op)
+            self.finished_queue.put(op)
             end_time = time.time()
             ssd_transfer_size = (
                 len(ssd_descriptor.physical_block_ids)
@@ -362,8 +369,8 @@ class CPUSSDDiskTransferWorker(TransferWorker):
                 * self.num_layers
             )
             debuginfo.info(
-                f"ssd tranfer request: {request.request_id} finished "
-                f"request type is {request.type} "
+                f"ssd tranfer request: {op.transfer_op_id} finished "
+                f"request type is {op.transfer_type} "
                 f"transfer data size is {ssd_transfer_size} bytes "
                 f"transfer time is {end_time - start_time:.4f} s "
                 f"transfer bandwidth is "
