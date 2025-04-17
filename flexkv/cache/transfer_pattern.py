@@ -58,7 +58,7 @@ def create_read_transfer_graph(
             ),
             dst_descriptor = TransferDescriptor(
                 device_type = DeviceType.GPU,
-                physical_block_ids=torch.tensor(gpu_blocks[:len(ssd_blocks)]),
+                physical_block_ids=torch.tensor(gpu_blocks[-len(ssd_blocks):]),
                 device_id = gpu_device_id
             )
         )
