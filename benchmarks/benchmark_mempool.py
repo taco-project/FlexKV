@@ -31,7 +31,7 @@ def main(args):
 if __name__ == "__main__":
     parser = ArgumentParser(
         description='Benchmark the performance of Mempool.')
-    parser.add_argument('--num-total-blocks', type=int, default=10000000)
-    parser.add_argument('--num-alloc-blocks', type=int, default=1000)
+    parser.add_argument('--num-total-blocks', type=int, default=1000000)
+    parser.add_argument('--num-alloc-blocks', type=int, default=32000)
     args = parser.parse_args()
     main(args)
