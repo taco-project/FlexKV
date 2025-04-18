@@ -31,7 +31,7 @@ class CacheEngine:
 
     def take(self, num_required_blocks: int) -> List[int]:
         if num_required_blocks > self.mempool.num_free_blocks:
-            self.mempool.free_blocks(
+            self.mempool.recycle_blocks(
                 self.index.evict(
                     num_required_blocks - self.mempool.num_free_blocks
                 )

@@ -15,7 +15,7 @@ def main(args):
     print(f"allocated {args.num_alloc_blocks} blocks")
     profiler.runctx('print(f"num_free_blocks: {mempool.num_free_blocks}, num_used_blocks: {mempool.num_used_blocks}")',
                     globals(), locals())
-    profiler.runctx('mempool.free_blocks(block_ids)',
+    profiler.runctx('mempool.recycle_blocks(block_ids)',
                     globals(), locals())
     print(f"freed {args.num_alloc_blocks} blocks")
     profiler.runctx('print(f"num_free_blocks: {mempool.num_free_blocks}, num_used_blocks: {mempool.num_used_blocks}")',
