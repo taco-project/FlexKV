@@ -56,9 +56,9 @@ class SequenceMeta:
 
     tokens_per_block: int
 
-    block_hashes: torch.Tensor = field(default_factory=torch.Tensor)
+    block_hashes: List[HashType] = field(default_factory=list)
 
-    _hash_hashes: bool = False
+    _has_hashes: bool = False
 
     def __post_init__(self):
         assert self.token_ids.ndim == 1
@@ -73,17 +73,14 @@ class SequenceMeta:
         return len(self.token_ids)
 
     def has_hashes(self) -> bool:
-        return self._hash_hashes
+        return self._has_hashes
 
     def gen_hashes(self) -> None:
-        if self._hash_hashes:
+        if self._has_hashes:
             return
-        self.block_hashes = torch.zeros((self.num_blocks, get_hash_size()),
-                                        dtype=torch.uint8)
+        self.block_hashes = [None] * self.num_blocks
 
         # TODO: optimize this using C++ extension
         for i in range(self.num_blocks):
-            self.block_hashes[i] = torch.from_numpy(
-                np.frombuffer(hash_tensor(self.token_ids[0:(i+1)*self.tokens_per_block]),
-                              dtype=np.uint8))
-        self._hash_hashes = True
+            self.block_hashes[i] = hash_tensor(self.token_ids[0:(i+1)*self.tokens_per_block])
+        self._has_hashes = True

@@ -8,6 +8,7 @@ from flexkv.common.hash_utils import HashType, hash_tensor
 from flexkv.c_ext import get_hash_size
 from flexkv.c_ext import get_prefix_block_ids
 from flexkv.c_ext import get_block_ids_from_hashes
+from flexkv.c_ext import index_batch_insert
 
 class TokenToBlockIndex:
     def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000):
@@ -19,10 +20,9 @@ class TokenToBlockIndex:
 
         self.max_num_blocks = max_num_blocks
 
-        self._available_block_ids = torch.ones(max_num_blocks, dtype=torch.int32)
-        self._hash_buffer = torch.zeros((max_num_blocks, get_hash_size()), dtype=torch.uint8)
-        self._prev_id = torch.full((max_num_blocks,), -1, dtype=torch.int32)
-        self._physical_block_id = torch.full((max_num_blocks,), -1, dtype=torch.int32)
+        self._available_block_ids = torch.ones(max_num_blocks, dtype=torch.bool)
+        self._prev_id = torch.full((max_num_blocks,), -1, dtype=torch.int64)
+        self._physical_block_id = torch.full((max_num_blocks,), -1, dtype=torch.int64)
         self._last_access_time = torch.zeros(max_num_blocks, dtype=torch.float64)
         self._lock_cnt = torch.zeros(max_num_blocks, dtype=torch.int32)
         self._child_cnt = torch.zeros(max_num_blocks, dtype=torch.int32)
@@ -32,10 +32,9 @@ class TokenToBlockIndex:
         self.index.clear()
         self.leaf_blocks.clear()
 
-        self._available_block_ids = torch.ones(self.max_num_blocks, dtype=torch.int32)
-        self._hash_buffer.zero_()
-        self._prev_id = torch.full((self.max_num_blocks,), -1, dtype=torch.int32)
-        self._physical_block_id = torch.full((self.max_num_blocks,), -1, dtype=torch.int32)
+        self._available_block_ids = torch.ones(self.max_num_blocks, dtype=torch.bool)
+        self._prev_id = torch.full((self.max_num_blocks,), -1, dtype=torch.int64)
+        self._physical_block_id = torch.full((self.max_num_blocks,), -1, dtype=torch.int64)
         self._last_access_time.zero_()
         self._lock_cnt.zero_()
         self._child_cnt.zero_()
@@ -58,8 +57,8 @@ class TokenToBlockIndex:
 
     def match_length(self,
                     sequence: SequenceMeta) -> int:
-        last_block_index, _ = self._search_last_cached_block(sequence)
-        return last_block_index + 1
+        last_index, _ = self._search_last_cached_block(sequence)
+        return last_index + 1
 
     # TODO: optimize this
     def _match_hashes_impl(self, sequence: SequenceMeta) -> torch.Tensor:
@@ -70,69 +69,79 @@ class TokenToBlockIndex:
 
     def _match_token_ids_impl(self,
                               sequence_meta: SequenceMeta) -> torch.Tensor:
-        last_block_index, last_block_id = self._search_last_cached_block(sequence_meta)
-        prefix_block_ids = get_prefix_block_ids(last_block_index, last_block_id, self._prev_id)
+        last_index, last_block_id = self._search_last_cached_block(sequence_meta)
+        prefix_block_ids = get_prefix_block_ids(last_index, last_block_id, self._prev_id)
         return prefix_block_ids
 
-    def insert(self, sequence_meta: SequenceMeta) -> None:
+    def insert(self,
+               sequence_meta: SequenceMeta,
+               match_length: int,
+               physical_block_ids: torch.Tensor) -> None:
+        assert match_length >= 0 and match_length <= sequence_meta.num_blocks
+        assert physical_block_ids.ndim == 1
+        assert len(physical_block_ids) == sequence_meta.num_blocks - match_length
+
+        if match_length == sequence_meta.num_blocks:
+            return
+
         sequence_meta.gen_hashes()
 
-        last_block_index, last_block_id = self._search_last_cached_block(sequence_meta)
+        last_cached_index = match_length - 1
+        first_index = match_length
+        assert sequence_meta.block_hashes[first_index] not in self.index
+        last_cached_block_id = -1
+        if match_length > 0:
+            assert sequence_meta.block_hashes[last_cached_index] in self.index
+            last_cached_block_id = self.index[sequence_meta.block_hashes[last_cached_index]]
+            last_cached_block_hash = sequence_meta.block_hashes[last_cached_index]
+            self.leaf_blocks.pop(last_cached_block_hash, None)
+            self._child_cnt[last_cached_block_id] += 1
 
-        num_inserted_blocks = sequence_meta.num_blocks - last_block_index - 1
+        inserted_block_ids = physical_block_ids
+        assert self._available_block_ids[inserted_block_ids].all()
+        self._available_block_ids[inserted_block_ids] = False
 
-        physical_block_ids = self._available_block_ids.nonzero()[:num_inserted_blocks].type(torch.int32)
-        self._available_block_ids[physical_block_ids] = 0
+        self._prev_id[inserted_block_ids[1:]] = inserted_block_ids[:-1]
 
-        prev_block_id = last_block_id
-        current_time = time.time()
-        for i in range(last_block_index + 1, sequence_meta.num_blocks):
-            hash_tensor = sequence_meta.block_hashes[i]
-            block_hash = hash_tensor.numpy().tobytes()
-            assert block_hash not in self.index
-            physical_block_id = physical_block_ids[i - last_block_index - 1].item()
-            block_id = physical_block_id
-            self.index[block_hash] = block_id
-            self._hash_buffer[block_id] = hash_tensor
-            self._prev_id[block_id] = prev_block_id
-            self._physical_block_id[block_id] = physical_block_id
-            self._last_access_time[block_id] = current_time
-            self._lock_cnt[block_id] = 0
-            self._child_cnt[block_id] = 1
-            self._status[block_id] = 0
-            prev_block_id = block_id
-            if i == sequence_meta.num_blocks - 1:
-                self._child_cnt[block_id] = 0
-                self.leaf_blocks[block_hash] = block_id
+        self._prev_id[inserted_block_ids[0]] = last_cached_block_id
+        self._physical_block_id[inserted_block_ids] = physical_block_ids
+        self._last_access_time[inserted_block_ids] = time.time()
+        self._lock_cnt[inserted_block_ids] = 0
+        self._child_cnt[inserted_block_ids[:-1]] = 1
+        self._child_cnt[inserted_block_ids[-1]] = 0
+        self._status[inserted_block_ids] = 0
 
-        if last_block_index >= 0 and \
-            last_block_index < len(sequence_meta.block_hashes) - 1:
-            last_block_hash = sequence_meta.block_hashes[last_block_index]
-            self.leaf_blocks.pop(last_block_hash, None)
-            self._child_cnt[last_block_id] += 1
+        # self.index.update({
+        #     sequence_meta.block_hashes[i]: inserted_block_ids[i - first_index]
+        #     for i in range(first_index, sequence_meta.num_blocks)
+        # })
+        self._batch_insert(sequence_meta.block_hashes[first_index:],
+                           inserted_block_ids[first_index:])
+
+        self.leaf_blocks[sequence_meta.block_hashes[sequence_meta.num_blocks - 1]] = inserted_block_ids[-1]
 
     def _search_last_cached_block(self,
                                   sequence_meta: SequenceMeta
                                   ) -> Tuple[int, int]:
         left, right = 0, sequence_meta.num_blocks - 1
-        last_block_index = -1
+        last_index = -1
         last_block_id = -1
         while left <= right:
             mid = (left + right) // 2
             hash_key = None
             if sequence_meta.has_hashes():
-                hash_key = sequence_meta.block_hashes[mid].numpy().tobytes()
+                hash_key = sequence_meta.block_hashes[mid]
             else:
                 hash_key = hash_tensor(sequence_meta.token_ids[
                     0:(mid+1)*self.tokens_per_block
                 ])
             if hash_key in self.index:
-                last_block_index = mid
+                last_index = mid
                 last_block_id = self.index[hash_key]
                 left = mid + 1
             else:
                 right = mid - 1
-        return last_block_index, last_block_id
+        return last_index, last_block_id
 
     def evict(self, num_evicted: int) -> List[BlockMeta]:
         candidates = torch.tensor([block_id for block_id in self.leaf_blocks.values() \
@@ -160,6 +169,13 @@ class TokenToBlockIndex:
         return block_meta.status == BlockStatus.AVAILABLE and \
             block_meta.child_cnt == 0
 
+    def _batch_insert(self,
+                      hashes: List[HashType],
+                      block_ids: torch.Tensor) -> None:
+        index_batch_insert(hashes,
+                          block_ids,
+                          self.index)
+
     @property
     def total_cached_blocks(self) -> int:
         return len(self.index)
@@ -175,10 +191,12 @@ if __name__ == "__main__":
     seq1 = SequenceMeta(token_ids=token_ids1, tokens_per_block=tokens_per_block)
     seq2 = SequenceMeta(token_ids=token_ids2, tokens_per_block=tokens_per_block)
 
-    index.insert(seq1)
+    index.insert(seq1, 0, torch.tensor([0, 1, 2, 3], dtype=torch.int64))
     print(f"insert seq1 = {seq1.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks}")
-    index.insert(seq2)
+    seq2_match_length = index.match_length(seq2)
+    assert seq2_match_length == 2
+    index.insert(seq2, seq2_match_length, torch.tensor([8, 9], dtype=torch.int64))
     print(f"insert seq2 = {seq2.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks}")
 

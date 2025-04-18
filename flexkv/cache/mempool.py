@@ -17,7 +17,6 @@ class Mempool:
         self._free_ids = self._free_mask.nonzero()
         self._free_ids_offset = 0
 
-
     def reset(self) -> None:
         self._free_mask.fill_(True)
         self._num_free = self.num_total_blocks
