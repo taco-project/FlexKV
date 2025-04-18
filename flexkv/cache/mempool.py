@@ -27,18 +27,17 @@ class Mempool:
         assert num > 0
         assert num <= self._num_free, "Not enough free blocks"
 
+        if num > len(self._free_ids):
+            self._update_free_ids()
+
         free_ids = self._free_ids[self._free_ids_offset:self._free_ids_offset+num]
         self._free_ids_offset += num
-        if len(free_ids) < num:
-            self._update_free_ids()
-            free_ids = torch.cat([free_ids, self._free_ids[self._free_ids_offset:self._free_ids_offset+num]])
-            self._free_ids_offset += num
 
         self._free_mask[free_ids] = False
         self._num_free -= num
         return free_ids
 
-    def free_blocks(self, block_ids: torch.Tensor) -> None:
+    def recycle_blocks(self, block_ids: torch.Tensor) -> None:
         assert not self._free_mask[block_ids].any()
         self._free_mask[block_ids] = True
         self._num_free += len(block_ids)
