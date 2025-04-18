@@ -16,8 +16,24 @@ def main(args):
     match_sequence_meta = SequenceMeta(token_ids=token_ids,
                                        tokens_per_block=args.tokens_per_block)
     profiler = cProfile.Profile()
+
+    print("\n--------------------------------insert--------------------------------")
     print("insert sequence of length", insert_sequence_meta.length)
-    index.insert(insert_sequence_meta)
+    physical_block_ids = torch.arange(insert_sequence_meta.num_blocks, dtype=torch.int64)
+    insert_sequence_meta.gen_hashes()
+    profiler.runctx('index.insert(insert_sequence_meta, 0, physical_block_ids)',
+                    globals(), locals())
+    stats = pstats.Stats(profiler)
+    stats.sort_stats('cumulative')
+    for func in stats.stats:
+        if func[2] in dir(index) and not func[2].startswith('__')\
+            or func[2].startswith('hash'):
+            print(f"function: {func[2]:<30} "
+                  f"total time: {stats.stats[func][3]:.6f}s  "
+                  f"total calls: {stats.stats[func][0]}")
+
+    print("\n--------------------------------match--------------------------------")
+    profiler.clear()
     print("match sequence of length", match_sequence_meta.length)
     profiler.runctx('index.match_prefix(match_sequence_meta)',
                     globals(), locals())
