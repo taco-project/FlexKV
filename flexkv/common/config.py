@@ -13,13 +13,12 @@ class ModelConfig:
 
 @dataclass
 class CacheConfig:
-    token_per_block: int = 16
+    tokens_per_block: int = 16
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_remote: bool = False
     use_gds: bool = False
     use_pinned_memory: bool = True
-    total_cpu_memory: int = 16 * 1024 * 1024 * 1024  # 16GB
-    total_ssd_memory: int = 32 * 1024 * 1024 * 1024  # 32GB
+    num_cpu_blocks: int = 1000000
+    num_ssd_blocks: int = 10000000
     ssd_cache_path: Optional[str] = None
-    eviction_policy: str = "LRU"
