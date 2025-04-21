@@ -28,6 +28,10 @@ class TransferDescriptor:
     layers: Optional[List[int]] = None
     tp_rank: Optional[int] = None
 
+    def __post_init__(self):
+        assert self.physical_block_ids.ndim == 1
+        assert self.physical_block_ids.dtype == torch.int64
+
 class TransferIDAllocator:
     _op_id_counter = 0
     _graph_id_counter = 0

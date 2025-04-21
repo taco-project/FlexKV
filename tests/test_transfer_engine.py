@@ -4,7 +4,7 @@ from typing import List, Tuple
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.common.transfer import (
-    TransferOp, TransferOpGraph, DeviceType, 
+    TransferOp, TransferOpGraph, DeviceType,
     TransferType, TransferDescriptor
 )
 from flexkv.common.storage import AccessibleHandle, AccessHandleType
@@ -17,9 +17,9 @@ import time
 def create_test_data(layer_num: int, gpu_block_num: int, block_size: int):
     """Create test GPU blocks with known values"""
     gpu_blocks = [
-        torch.randint(0, 100, 
+        torch.randint(0, 100,
                     size=(2, gpu_block_num, block_size),
-                    dtype=torch.float16, 
+                    dtype=torch.float16,
                     device="cuda")
         for _ in range(layer_num)
     ]
@@ -38,7 +38,7 @@ def setup_storage_engine(
 ) -> StorageEngine:
     """Setup storage engine with GPU, CPU and SSD allocators"""
     storage_engine = StorageEngine()
-    
+
     # Create GPU allocator from existing blocks
     gpu_success = storage_engine.create_allocator(
         device_type=DeviceType.GPU,
@@ -48,7 +48,7 @@ def setup_storage_engine(
         raw_data=gpu_blocks
     )
     print(f"GPU allocator creation: {'success' if gpu_success else 'failed'}")
-    
+
     # Create CPU allocator
     cpu_success = storage_engine.create_allocator(
         device_type=DeviceType.CPU,
@@ -57,7 +57,7 @@ def setup_storage_engine(
         pin_memory=True  # Use pinned memory for better transfer performance
     )
     print(f"CPU allocator creation: {'success' if cpu_success else 'failed'}")
-    
+
     # Create SSD allocator
     ssd_success = storage_engine.create_allocator(
         device_type=DeviceType.SSD,
@@ -66,7 +66,7 @@ def setup_storage_engine(
         file_path=ssd_path
     )
     print(f"SSD allocator creation: {'success' if ssd_success else 'failed'}")
-    
+
     return storage_engine
 
 def main():
@@ -81,11 +81,11 @@ def main():
     token_per_block = 16
     head_num = 32
     head_dim = 128
-    
+
     # Create test data
     print("Creating test data...")
-    gpu_blocks = create_test_data(layer_num, 
-                                  gpu_block_num, 
+    gpu_blocks = create_test_data(layer_num,
+                                  gpu_block_num,
                                   token_per_block * head_num * head_dim)
     # Setup storage engine
     print("\nSetting up storage engine...")
@@ -100,7 +100,7 @@ def main():
         ssd_block_num=ssd_block_num,
         ssd_path=ssd_path
     )
-    
+
     # Get handles for transfer engine
     print("\nGetting handles...")
     gpu_handle = storage_engine.get_allocator_handle(
@@ -110,11 +110,11 @@ def main():
     cpu_handle = storage_engine.get_allocator_handle(
         device_type=DeviceType.CPU,
     )
-    
+
     ssd_handle = storage_engine.get_allocator_handle(
         device_type=DeviceType.SSD,
     )
-    
+
     # Setup transfer engine
     print("\nSetting up transfer engine...")
     transfer_engine = TransferEngine(
@@ -122,21 +122,21 @@ def main():
         cpu_handle=cpu_handle,
         ssd_handle=ssd_handle
     )
-    
+
     print("\nCreating transfer graph...")
     tranfer_graph_num = 4
     gpu_transfer_block_num = 16
     assert gpu_transfer_block_num * tranfer_graph_num <= gpu_block_num
     gpu_block_ids = [
-        [i for i in range(2 + gpu_transfer_block_num * j, 2 + gpu_transfer_block_num * (j+1))]
+        torch.tensor([i for i in range(2 + gpu_transfer_block_num * j, 2 + gpu_transfer_block_num * (j+1))])
         for j in range(tranfer_graph_num)
     ]
     cpu_block_ids = [
-        [i for i in range(3 + gpu_transfer_block_num * j, 3 + gpu_transfer_block_num * (j+1))]
+        torch.tensor([i for i in range(3 + gpu_transfer_block_num * j, 3 + gpu_transfer_block_num * (j+1))])
         for j in range(tranfer_graph_num)
     ]
     ssd_block_ids = [
-        [i for i in range(4 + gpu_transfer_block_num * j, 4 + gpu_transfer_block_num * (j+1))]
+        torch.tensor([i for i in range(4 + gpu_transfer_block_num * j, 4 + gpu_transfer_block_num * (j+1))])
         for j in range(tranfer_graph_num)
     ]
     launched_graph_ids = []
@@ -183,7 +183,7 @@ def main():
         launched_graph_ids.append(transfer_graph_read.transfer_graph_id)
     # Wait for completion
     print("Waiting for transfers to complete...")
-    
+
     while True:
         completed_graphs = transfer_engine.get_completed_graphs(timeout=0.001)
         if len(completed_graphs) > 0:
