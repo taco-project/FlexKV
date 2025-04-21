@@ -44,4 +44,6 @@ ignore = [
     "SIM115",
     # Unused variable
     "F841",
+    # Use ternary operator
+    "SIM108",
 ]

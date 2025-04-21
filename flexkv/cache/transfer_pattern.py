@@ -2,11 +2,9 @@ from typing import List
 
 import torch
 
-from flexkv.common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType, TransferDescriptor
+from flexkv.common.transfer import DeviceType, TransferType
+from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferDescriptor, TransferIDAllocator
 
-
-global_transfer_op_id = 0
-global_transfer_graph_id = 0
 
 def create_read_transfer_graph(
     ssd_blocks: List[int],
@@ -15,13 +13,11 @@ def create_read_transfer_graph(
     gpu_device_id: int = 0,
 ) -> TransferOpGraph:
     """Create a transfer graph with SSD->CPU->GPU operations"""
-    global global_transfer_op_id
-    global global_transfer_graph_id
-    graph = TransferOpGraph(global_transfer_graph_id)
+    graph = TransferOpGraph(TransferIDAllocator.allocate_graph_id())
     if len(ssd_blocks) == 0:
         op1 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type = TransferType.H2D,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.CPU,
@@ -34,11 +30,10 @@ def create_read_transfer_graph(
             )
         )
         graph.add_transfer_op(op1)
-        global_transfer_op_id += 1
     elif len(ssd_blocks) < len(cpu_blocks):
         op1 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type = TransferType.DISK2H,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.SSD,
@@ -50,10 +45,9 @@ def create_read_transfer_graph(
             )
         )
         graph.add_transfer_op(op1)
-        global_transfer_op_id += 1
         op2 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type = TransferType.H2D,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.CPU,
@@ -66,10 +60,9 @@ def create_read_transfer_graph(
             )
         )
         graph.add_transfer_op(op2)
-        global_transfer_op_id += 1
         op3 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type = TransferType.H2D,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.CPU,
@@ -82,12 +75,11 @@ def create_read_transfer_graph(
             )
         )
         graph.add_transfer_op(op3)
-        global_transfer_op_id += 1
         graph.add_dependency(op2.transfer_op_id, op1.transfer_op_id)
     else:
         op1 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type=TransferType.DISK2H,
             src_descriptor=TransferDescriptor(
                 device_type=DeviceType.SSD,
@@ -99,10 +91,9 @@ def create_read_transfer_graph(
             )
         )
         graph.add_transfer_op(op1)
-        global_transfer_op_id += 1
         op2 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type=TransferType.H2D,
             src_descriptor=TransferDescriptor(
                 device_type=DeviceType.CPU,
@@ -114,9 +105,7 @@ def create_read_transfer_graph(
             )
         )
         graph.add_transfer_op(op2)
-        global_transfer_op_id += 1
         graph.add_dependency(op2.transfer_op_id, op1.transfer_op_id)
-    global_transfer_graph_id += 1
     return graph
 
 #NOTE write through now
@@ -127,13 +116,11 @@ def create_write_transfer_graph(
     gpu_device_id: int = 0,
 ) -> TransferOpGraph:
     assert len(gpu_blocks) == len(cpu_blocks)
-    global global_transfer_op_id
-    global global_transfer_graph_id
-    graph = TransferOpGraph(global_transfer_graph_id)
+    graph = TransferOpGraph(TransferIDAllocator.allocate_graph_id())
     if len(ssd_blocks) == 0:
         op1 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type = TransferType.D2H,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.GPU,
@@ -146,11 +133,10 @@ def create_write_transfer_graph(
             )
         )
         graph.add_transfer_op(op1)
-        global_transfer_op_id += 1
     elif len(ssd_blocks) < len(cpu_blocks):
         op1 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type = TransferType.D2H,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.GPU,
@@ -163,10 +149,9 @@ def create_write_transfer_graph(
                 )
         )
         graph.add_transfer_op(op1)
-        global_transfer_op_id += 1
         op2 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type = TransferType.H2DISK,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.CPU,
@@ -178,11 +163,10 @@ def create_write_transfer_graph(
             )
         )
         graph.add_transfer_op(op2)
-        global_transfer_op_id += 1
         graph.add_dependency(op2.transfer_op_id, op1.transfer_op_id)
         op3 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type = TransferType.D2H,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.GPU    ,
@@ -195,11 +179,11 @@ def create_write_transfer_graph(
             )
         )
         graph.add_transfer_op(op3)
-        global_transfer_op_id += 1
+        graph.add_dependency(op3.transfer_op_id, op2.transfer_op_id)
     else:
         op1 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type = TransferType.D2H,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.GPU,
@@ -212,10 +196,9 @@ def create_write_transfer_graph(
             )
         )
         graph.add_transfer_op(op1)
-        global_transfer_op_id += 1
         op2 = TransferOp(
-            transfer_op_id = global_transfer_op_id,
-            transfer_graph_id = global_transfer_graph_id,
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
             transfer_type = TransferType.H2DISK,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.CPU,
@@ -227,7 +210,5 @@ def create_write_transfer_graph(
             )
         )
         graph.add_transfer_op(op2)
-        global_transfer_op_id += 1
         graph.add_dependency(op2.transfer_op_id, op1.transfer_op_id)
-    global_transfer_graph_id += 1
     return graph
