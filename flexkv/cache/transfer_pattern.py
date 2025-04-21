@@ -1,6 +1,9 @@
-from flexkv.common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType, TransferDescriptor
 from typing import List
+
 import torch
+
+from flexkv.common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType, TransferDescriptor
+
 
 global_transfer_op_id = 0
 global_transfer_graph_id = 0
@@ -32,7 +35,7 @@ def create_read_transfer_graph(
         )
         graph.add_transfer_op(op1)
         global_transfer_op_id += 1
-    elif len(ssd_blocks) < len(cpu_blocks): 
+    elif len(ssd_blocks) < len(cpu_blocks):
         op1 = TransferOp(
             transfer_op_id = global_transfer_op_id,
             transfer_graph_id = global_transfer_graph_id,
