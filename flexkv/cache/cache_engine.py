@@ -82,7 +82,7 @@ class GlobalCacheEngine:
     def get(self,
             token_ids: torch.Tensor,
             token_mask: torch.Tensor,
-            slot_mapping: torch.Tensor) -> TransferOpGraph:
+            slot_mapping: torch.Tensor) -> Tuple[TransferOpGraph, torch.Tensor]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         # ignore the last incomplete block
@@ -123,7 +123,7 @@ class GlobalCacheEngine:
     def put(self,
             token_ids: torch.Tensor,
             token_mask: torch.Tensor,
-            slot_mapping: torch.Tensor) -> TransferOpGraph:
+            slot_mapping: torch.Tensor) -> Tuple[TransferOpGraph, torch.Tensor]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         # ignore the last incomplete block
