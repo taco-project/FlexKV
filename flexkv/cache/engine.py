@@ -20,6 +20,10 @@ class CacheEngine:
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
+    def reset(self):
+        self.index.reset()
+        self.mempool.reset()
+
     def match(self, sequence_meta: SequenceMeta) -> torch.Tensor:
         physical_block_ids = self.index.match_prefix(sequence_meta,
                                               update_cache_info=True,
@@ -66,6 +70,14 @@ class GlobalCacheEngine:
             self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block)
+
+    def reset(self):
+        if self.cpu_cache_engine:
+            self.cpu_cache_engine.reset()
+        if self.ssd_cache_engine:
+            self.ssd_cache_engine.reset()
+        if self.remote_cache_engine:
+            self.remote_cache_engine.reset()
 
     def get(self,
             token_ids: torch.Tensor,
