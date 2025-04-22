@@ -9,11 +9,11 @@ HashType = NewType('HashType', bytes)
 def get_hash_size() -> int:
     return c_ext.get_hash_size()
 
-def hash_tensor(tensor: torch.Tensor) -> HashType:
+def hash_tensor(tensor: torch.Tensor) -> torch.Tensor:
     assert tensor.ndim == 1
     result = torch.zeros(get_hash_size(), dtype=torch.uint8)
     c_ext.hash_tensor(tensor, result)
-    return result.numpy().tobytes()
+    return result
 
 if __name__ == "__main__":
     import time
