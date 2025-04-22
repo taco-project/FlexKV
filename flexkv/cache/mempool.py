@@ -14,20 +14,20 @@ class Mempool:
 
         self._free_mask = torch.ones(self.num_total_blocks, dtype=torch.bool)
         self._num_free = num_total_blocks
-        self._free_ids = self._free_mask.nonzero()
+        self._free_ids = self._free_mask.nonzero().squeeze(1)
         self._free_ids_offset = 0
 
     def reset(self) -> None:
         self._free_mask.fill_(True)
         self._num_free = self.num_total_blocks
-        self._free_ids = self._free_mask.nonzero()
+        self._free_ids = self._free_mask.nonzero().squeeze(1)
         self._free_ids_offset = 0
 
     def allocate_blocks(self, num: int) -> torch.Tensor:
         assert num > 0
         assert num <= self._num_free, "Not enough free blocks"
 
-        if num > len(self._free_ids):
+        if num > len(self._free_ids) - self._free_ids_offset:
             self._update_free_ids()
 
         free_ids = self._free_ids[self._free_ids_offset:self._free_ids_offset+num]
@@ -43,7 +43,7 @@ class Mempool:
         self._num_free += len(block_ids)
 
     def _update_free_ids(self) -> None:
-        self._free_ids = self._free_mask.nonzero()
+        self._free_ids = self._free_mask.nonzero().squeeze(1)
         self._free_ids_offset = 0
 
     @property

@@ -100,10 +100,18 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("get_prefix_block_ids", &flexkv::get_prefix_block_ids,
         "Get prefix block ids", py::arg("last_block_index"),
         py::arg("last_block_id"), py::arg("prev_block_ids"));
+  m.def("find_n_liner_parents_for_eviction",
+        &flexkv::find_n_liner_parents_for_eviction,
+        "Find n-liner parents for eviction", py::arg("block_id"),
+        py::arg("prev_block_ids"), py::arg("lock_cnt"), py::arg("child_cnt"),
+        py::arg("status"), py::arg("result"));
   m.def("get_block_ids_from_hashes", &flexkv::get_block_ids_from_hashes,
         "Get block ids from hashes", py::arg("hashes"),
         py::arg("hash_to_block_id"));
   m.def("index_batch_insert", &flexkv::index_batch_insert,
         "Batch insert hashes and block ids into a dictionary",
         py::arg("hashes"), py::arg("block_ids"), py::arg("hash_to_block_id"));
+  m.def("index_batch_remove", &flexkv::index_batch_remove,
+        "Batch remove hashes from a dictionary", py::arg("hashes"),
+        py::arg("hash_to_block_id"));
 }

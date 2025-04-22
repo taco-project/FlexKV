@@ -22,11 +22,11 @@ def create_read_transfer_graph(
             transfer_type = TransferType.H2D,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.CPU,
-                physical_block_ids=torch.tensor(cpu_blocks[:]),
+                physical_block_ids=torch.tensor(cpu_blocks),
             ),
             dst_descriptor = TransferDescriptor(
                 device_type = DeviceType.GPU,
-                physical_block_ids=torch.tensor(gpu_blocks[:]),
+                physical_block_ids=torch.tensor(gpu_blocks),
                 device_id = gpu_device_id
             )
         )
@@ -39,7 +39,7 @@ def create_read_transfer_graph(
             transfer_type = TransferType.DISK2H,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.SSD,
-                physical_block_ids=torch.tensor(ssd_blocks[:])
+                physical_block_ids=torch.tensor(ssd_blocks)
             ),
             dst_descriptor = TransferDescriptor(
                 device_type = DeviceType.CPU,
@@ -88,11 +88,11 @@ def create_read_transfer_graph(
             transfer_type=TransferType.DISK2H,
             src_descriptor=TransferDescriptor(
                 device_type=DeviceType.SSD,
-                physical_block_ids=torch.tensor(ssd_blocks[:])
+                physical_block_ids=torch.tensor(ssd_blocks)
             ),
             dst_descriptor=TransferDescriptor(
                 device_type=DeviceType.CPU,
-                physical_block_ids=torch.tensor(cpu_blocks[:])
+                physical_block_ids=torch.tensor(cpu_blocks)
             )
         )
         graph.add_transfer_op(op1)
@@ -103,11 +103,11 @@ def create_read_transfer_graph(
             transfer_type=TransferType.H2D,
             src_descriptor=TransferDescriptor(
                 device_type=DeviceType.CPU,
-                physical_block_ids=torch.tensor(cpu_blocks[:])
+                physical_block_ids=torch.tensor(cpu_blocks)
             ),
             dst_descriptor=TransferDescriptor(
                 device_type=DeviceType.GPU,
-                physical_block_ids=torch.tensor(gpu_blocks[:])
+                physical_block_ids=torch.tensor(gpu_blocks)
             )
         )
         graph.add_transfer_op(op2)
@@ -134,12 +134,12 @@ def create_write_transfer_graph(
             transfer_type = TransferType.D2H,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.GPU,
-                physical_block_ids=torch.tensor(gpu_blocks[:]),
+                physical_block_ids=torch.tensor(gpu_blocks),
                 device_id = gpu_device_id
             ),
             dst_descriptor = TransferDescriptor(
                 device_type = DeviceType.CPU,
-                physical_block_ids=torch.tensor(cpu_blocks[:]),
+                physical_block_ids=torch.tensor(cpu_blocks),
             )
         )
         graph.add_transfer_op(op1)
@@ -171,7 +171,7 @@ def create_write_transfer_graph(
             ),
             dst_descriptor = TransferDescriptor(
                 device_type = DeviceType.SSD,
-                physical_block_ids=torch.tensor(ssd_blocks[:])
+                physical_block_ids=torch.tensor(ssd_blocks)
             )
         )
         graph.add_transfer_op(op2)
@@ -200,12 +200,12 @@ def create_write_transfer_graph(
             transfer_type = TransferType.D2H,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.GPU,
-                physical_block_ids=torch.tensor(gpu_blocks[:]),
+                physical_block_ids=torch.tensor(gpu_blocks),
                 device_id = gpu_device_id
             ),
             dst_descriptor = TransferDescriptor(
                 device_type = DeviceType.CPU,
-                physical_block_ids=torch.tensor(cpu_blocks[:])
+                physical_block_ids=torch.tensor(cpu_blocks)
             )
         )
         graph.add_transfer_op(op1)
@@ -216,11 +216,11 @@ def create_write_transfer_graph(
             transfer_type = TransferType.H2DISK,
             src_descriptor = TransferDescriptor(
                 device_type = DeviceType.CPU,
-                physical_block_ids=torch.tensor(cpu_blocks[:]),
+                physical_block_ids=torch.tensor(cpu_blocks),
             ),
             dst_descriptor = TransferDescriptor(
                 device_type = DeviceType.SSD,
-                physical_block_ids=torch.tensor(ssd_blocks[:])
+                physical_block_ids=torch.tensor(ssd_blocks)
             )
         )
         graph.add_transfer_op(op2)
