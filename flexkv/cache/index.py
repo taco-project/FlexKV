@@ -158,10 +158,14 @@ class TokenToBlockIndex:
     def evict(self, num_evicted: int) -> List[BlockMeta]:
         eviction_granularity = 1000
         assert num_evicted < self.total_cached_blocks
+        leaves = list(self.leaf_blocks.items())
+        _last_access_time = self._last_access_time.numpy()
+        _lock_cnt = self._lock_cnt.numpy()
+        _status = self._status.numpy()
         candidates = [
-            EvictionCandidate(block_hash, block_value, self._last_access_time[block_value])
-            for block_hash, block_value in self.leaf_blocks.items()
-            if self._lock_cnt[block_value] == 0 and self._status[block_value] == 1
+            EvictionCandidate(block_hash, block_value, _last_access_time[block_value])
+            for block_hash, block_value in leaves
+            if _lock_cnt[block_value] == 0 and _status[block_value] == 1
         ]
         heapq.heapify(candidates)
         results = torch.tensor([], dtype=torch.int64)
@@ -171,7 +175,7 @@ class TokenToBlockIndex:
                 break
             candidate = heapq.heappop(candidates)
             candidate_id = candidate.block_id
-            # update the leaf blocks, although in this evcition, 
+            # update the leaf blocks, although in this evcition,
             # we don't need to access the leaf blocks
             if candidate.hash in self.leaf_blocks:
                 self.leaf_blocks.pop(candidate.hash)
@@ -196,11 +200,10 @@ class TokenToBlockIndex:
             parent_block_id = int(self._prev_id[evicted_block_ids[-1]])
             if parent_block_id != -1: # not the root block
                 self._child_cnt[parent_block_id] -= 1
-                if (self._child_cnt[parent_block_id] == 0 and 
-                    self._status[parent_block_id] == 1 and 
-                    self._lock_cnt[parent_block_id] == 0): 
+                if (self._child_cnt[parent_block_id] == 0 and
+                    self._status[parent_block_id] == 1 and
+                    self._lock_cnt[parent_block_id] == 0):
                     # not locked and available, add as new leaf and new candidate
-                    #print(f"add new leaf block: {self._hash_values[parent_block_id]}, {parent_block_id}, {self._last_access_time[parent_block_id]}")
                     hash_key = bytes(self._hash_values[parent_block_id])
                     self.leaf_blocks[hash_key] = parent_block_id
                     heapq.heappush(candidates, EvictionCandidate(hash_key,
@@ -216,7 +219,7 @@ class TokenToBlockIndex:
             #self._child_cnt[evicted_block_ids] = 0
             #self._lock_cnt[evicted_block_ids] = 0
             #self._last_access_time[evicted_block_ids] = 0
-            
+
             if evicted_hashes is None:
                 evicted_hashes = self._hash_values[evicted_block_ids]
                 results = evicted_block_ids
@@ -227,7 +230,7 @@ class TokenToBlockIndex:
         assert len(results) >= num_evicted
         return results
 
-            
+
     def _evictable(self, block_meta: BlockMeta) -> bool:
         return block_meta.status == BlockStatus.AVAILABLE and \
             block_meta.child_cnt == 0
@@ -238,7 +241,7 @@ class TokenToBlockIndex:
         index_batch_insert(hashes,
                           block_ids,
                           self.index)
-    
+
     def _batch_remove(self, hashes: torch.Tensor) -> None:
         index_batch_remove(hashes,
                           self.index)
