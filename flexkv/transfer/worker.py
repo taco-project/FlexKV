@@ -209,6 +209,7 @@ class GPUCPUTransferWorker(TransferWorker):
                     gpu_descriptor = op.src_descriptor
                 else:
                     raise ValueError(f"Invalid transfer type: {op.transfer_type}")
+                start_time = time.time()
                 nvtx.range_push("GPU CPUTransfer")
                 self.transfer(
                     gpu_descriptor,
@@ -221,6 +222,22 @@ class GPUCPUTransferWorker(TransferWorker):
                 self.transfer_stream.synchronize()
                 debuginfo.info("TRANSFER stream synchronized")
                 self.finished_queue.put(op)
+                end_time = time.time()
+                transfer_size = (
+                    len(gpu_descriptor.physical_block_ids)
+                    * self.block_size
+                    * self.dtype.itemsize
+                    * 2
+                    * self.num_layers
+                )
+                debuginfo.info(
+                    f"gpu cpu tranfer request: {op.transfer_op_id} finished "
+                    f"request type is {op.transfer_type} "
+                    f"transfer data size is {transfer_size} bytes "
+                    f"transfer time is {end_time - start_time:.4f} s "
+                    f"transfer bandwidth is "
+                    f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+                )
                 '''
                 if op.transfer_type == TransferType.D2H:
                     add_desc = op.additional_descriptor
@@ -367,7 +384,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
             nvtx.range_pop()
             self.finished_queue.put(op)
             end_time = time.time()
-            ssd_transfer_size = (
+            transfer_size = (
                 len(ssd_descriptor.physical_block_ids)
                 * self.block_size
                 * self.dtype.itemsize
@@ -377,10 +394,10 @@ class CPUSSDDiskTransferWorker(TransferWorker):
             debuginfo.info(
                 f"ssd tranfer request: {op.transfer_op_id} finished "
                 f"request type is {op.transfer_type} "
-                f"transfer data size is {ssd_transfer_size} bytes "
+                f"transfer data size is {transfer_size} bytes "
                 f"transfer time is {end_time - start_time:.4f} s "
                 f"transfer bandwidth is "
-                f"{ssd_transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+                f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
             )
             '''
             if op.transfer_type == TransferType.DISK2H and (
