@@ -35,7 +35,8 @@ void transfer_kv_blocks_ssd_naive(
   }
 
   for (int i = 0; i < num_layers; i++) {
-    void *layer_ptr = reinterpret_cast<void *>(layer_ptrs[cpu_layer_id_list_ptr[i]]);
+    void *layer_ptr =
+        reinterpret_cast<void *>(layer_ptrs[cpu_layer_id_list_ptr[i]]);
 
     void *k_view = layer_ptr;
     void *v_view = layer_ptr + cpu_kv_stride_in_bytes;
@@ -44,8 +45,9 @@ void transfer_kv_blocks_ssd_naive(
       int64_t ssd_block_id = ssd_block_id_ptr[j];
       int64_t cpu_block_id = cpu_block_id_ptr[j];
 
-      int64_t ssd_base_offset = ssd_layer_stride_in_bytes * cpu_layer_id_list_ptr[i] +
-                                ssd_block_stride_in_bytes * ssd_block_id;
+      int64_t ssd_base_offset =
+          ssd_layer_stride_in_bytes * cpu_layer_id_list_ptr[i] +
+          ssd_block_stride_in_bytes * ssd_block_id;
 
       // process K
       void *k_ptr = k_view + cpu_block_id * block_size_in_bytes;
@@ -154,7 +156,8 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
         }
 
         for (int i = start_layer; i < end_layer; i++) {
-          void *layer_ptr = reinterpret_cast<void *>(layer_ptrs[cpu_layer_id_list_ptr[i]]);
+          void *layer_ptr =
+              reinterpret_cast<void *>(layer_ptrs[cpu_layer_id_list_ptr[i]]);
           void *k_view = layer_ptr;
           void *v_view =
               static_cast<char *>(layer_ptr) + cpu_kv_stride_in_bytes;
@@ -163,8 +166,9 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
             int64_t ssd_block_id = ssd_block_id_ptr[j];
             int64_t cpu_block_id = cpu_block_id_ptr[j];
 
-            int64_t ssd_base_offset = ssd_layer_stride_in_bytes * cpu_layer_id_list_ptr[i] +
-                                      ssd_block_stride_in_bytes * ssd_block_id;
+            int64_t ssd_base_offset =
+                ssd_layer_stride_in_bytes * cpu_layer_id_list_ptr[i] +
+                ssd_block_stride_in_bytes * ssd_block_id;
 
             // read K block
             void *k_ptr = static_cast<char *>(k_view) +
@@ -256,7 +260,8 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
     auto process_layers = [&](int start_layer, int end_layer) {
       try {
         for (int i = start_layer; i < end_layer; i++) {
-          void *layer_ptr = reinterpret_cast<void *>(layer_ptrs[cpu_layer_id_list_ptr[i]]);
+          void *layer_ptr =
+              reinterpret_cast<void *>(layer_ptrs[cpu_layer_id_list_ptr[i]]);
           void *k_view = layer_ptr;
           void *v_view =
               static_cast<char *>(layer_ptr) + cpu_kv_stride_in_bytes;
@@ -265,8 +270,9 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
             int64_t ssd_block_id = ssd_block_id_ptr[j];
             int64_t cpu_block_id = cpu_block_id_ptr[j];
 
-            int64_t ssd_base_offset = ssd_layer_stride_in_bytes * cpu_layer_id_list_ptr[i] +
-                                      ssd_block_stride_in_bytes * ssd_block_id;
+            int64_t ssd_base_offset =
+                ssd_layer_stride_in_bytes * cpu_layer_id_list_ptr[i] +
+                ssd_block_stride_in_bytes * ssd_block_id;
 
             // write K block
             void *k_ptr = static_cast<char *>(k_view) +

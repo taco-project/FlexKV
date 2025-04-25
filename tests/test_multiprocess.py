@@ -5,22 +5,22 @@ from flexkv.server.client import KVClient
 from typing import Tuple
 import time
 
-def run_client(client_id: int, client_conn, gpu_device_id: int, 
+def run_client(client_id: int, client_conn, gpu_device_id: int,
                gpu_shape: Tuple[int, int, int, int, int, int]):
     """Client process function"""
     # Initialize client
     client = KVClient(client_conn, client_id)
-    
+
     # Register device memory
     token_ids = torch.randn(64)
     token_mask = torch.ones(64)
     gpu_blocks = [torch.tensor(gpu_shape[1:]).cuda(gpu_device_id)
                     for i in range(gpu_shape[0])]
     gpu_physical_block_ids = torch.tensor([i for i in range(64//gpu_shape[3])]).pin_memory()
-    
+
     # Register with server
     client.register_device_memory(gpu_blocks)
-    
+
     # Example workload
     #while True:
         # Send some requests
@@ -32,7 +32,7 @@ def run_client(client_id: int, client_conn, gpu_device_id: int,
     print(f"Client {client_id} got result for request {request_id2}")
     print(results[0])
     print(results[1])
-        
+
     #    time.sleep(0.01)  # Avoid busy waiting
 
 def main():
@@ -56,7 +56,7 @@ def main():
     for i in range(num_clients):  # Create 2 clients
         # Get connection for new client
         client_id, client_conn = server.register_client()
-        
+
         # Create and start client process
         process = Process(
             target=run_client,
@@ -64,7 +64,7 @@ def main():
         )
         process.start()
         client_processes.append(process)
-    
+
     try:
         # Keep main process running
         while True:
