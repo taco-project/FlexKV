@@ -9,11 +9,12 @@ from flexkv.common.hash_utils import \
     HashType, hash_tensor, get_hash_size
 
 class BlockStatus(Enum):
-    UNREGISTERED = auto()
-    AVAILABLE = auto()
-    LOCKED = auto()
-    IN_GET = auto()
-    IN_PUT = auto()
+    UNREGISTERED = 0
+    AVAILABLE = 1
+    LOCKED = 2
+    IN_GET = 3
+    IN_PUT = 4
+
 
 @dataclass
 class BlockMeta:

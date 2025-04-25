@@ -3,6 +3,8 @@ from queue import Queue as ThreadQueue
 from typing import Dict, List, Optional, Tuple
 import torch
 from .server import ServerRequest, ServerResponse
+import time
+from flexkv.common.memory_handle import export_cuda_tensor
 
 class KVClient:
     def __init__(self, server_connection: Connection, client_id: int):
@@ -11,24 +13,24 @@ class KVClient:
         self.request_counter = 0
         self.pending_requests = ThreadQueue()  # Store pending requests
         self.completed_results = ThreadQueue()  # Store completed results
-        
-    def register_device_memory(self, 
+
+    def register_device_memory(self,
                              gpu_blocks: List[torch.Tensor]):
         """Register device memory with server"""
         if not gpu_blocks or not gpu_blocks[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
-        
+
         device_id = gpu_blocks[0].device.index
         handles = []
-        
+
         for tensor in gpu_blocks:
             if tensor.device.index != device_id:
                 raise ValueError("All tensors must be on the same GPU")
-            
+
             handle = export_cuda_tensor(tensor)
             handles.append(handle)
-        
-        request = Request(
+
+        request = ServerRequest(
             client_id=self.client_id,
             request_id=self.request_counter,
             request_type='register',
@@ -82,7 +84,7 @@ class KVClient:
             #results.append((response.request_id, response.mask))
             self.pending_requests.remove(response.request_id)
             self.completed_results.put(response)
-        
+
     def wait(self, request_ids: List[int]) -> List[torch.Tensor]:
         """
         Wait for the server to return the results of the requests

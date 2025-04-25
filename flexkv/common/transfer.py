@@ -73,8 +73,7 @@ class TransferOp:
 @dataclass
 class TransferOpGraph:
     transfer_graph_id: int
-    block_meta_to_free: Dict[DeviceType, List[BlockMeta]]
-    return_mask: Optional[torch.Tensor]
+    block_meta_to_free: Dict[DeviceType, torch.Tensor]
     _op_map: Dict[int, TransferOp] = field(init=False)
 
     def __init__(self, transfer_graph_id: int):
@@ -120,7 +119,7 @@ class TransferOpGraph:
         """check if all transfer ops are completed"""
         return all(op.status == TransferOpStatus.COMPLETED for op in self._op_map.values())
 
-    def get_block_meta_to_free(self) -> Dict[DeviceType, List[BlockMeta]]:
+    def get_block_meta_to_free(self) -> Dict[DeviceType, torch.Tensor]:
         """get a dict of block metas to free"""
         return self.block_meta_to_free
 

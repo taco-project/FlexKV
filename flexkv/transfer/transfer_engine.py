@@ -15,7 +15,7 @@ class TransferEngine:
         ssd_handle: AccessibleHandle = None):
         """
         Initialize transfer engine
-        
+
         Args:
             gpu_handles: List of GPU handles
             cpu_handle: CPU handle
@@ -23,14 +23,14 @@ class TransferEngine:
         """
         # Initialize scheduler
         self.scheduler = TransferScheduler()
-        
+
         self.max_batch_size = 32
 
         # Initialize queues
         self.task_queue = Queue()  # Queue for new transfer graphs
         self.completed_queue = Queue()  # Queue for completed transfer graphs
         self.finished_ops_queue = Queue()  # Queue for finished operations
-        
+
         # Initialize workers
         self.gpucpu_workers = [
             GPUCPUTransferWorker(
@@ -42,7 +42,7 @@ class TransferEngine:
                 cpu_kv_shape=cpu_handle.kv_shape,
                 dtype=gpu_handles[i].dtype,
                 max_batch_size=self.max_batch_size,
-                gpu_device_id=i,    
+                gpu_device_id=i,
             )
             for i in range(len(gpu_handles))
         ]
@@ -59,7 +59,7 @@ class TransferEngine:
             )
         else:
             self.cpussd_worker = None
-        
+
         # Start scheduler thread
         self._running = True
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
@@ -79,26 +79,26 @@ class TransferEngine:
             while not self.finished_ops_queue.empty():
                 op = self.finished_ops_queue.get()
                 finished_ops.append(op)
-            
+
             if finished_ops or new_graphs_num > 0:
                 # Schedule next operations
                 completed_graphs, next_ops = self.scheduler.schedule(finished_ops)
-                
+
                 # Handle completed graphs
                 for graph in completed_graphs:
-                    self.completed_queue.put(graph)
-                
+                    self.completed_queue.put(graph.transfer_graph_id)
+
                 # Distribute new ops to workers
                 for op in next_ops:
                     self._assign_op_to_worker(op)
-            
+
             time.sleep(0.001)  # Prevent busy waiting
 
     def _assign_op_to_worker(self, op: TransferOp):
         """Assign operation to appropriate worker"""
         # Determine worker type based on transfer type
         if op.transfer_type in [
-            TransferType.H2D, 
+            TransferType.H2D,
             TransferType.D2H
         ]:
             if op.transfer_type == TransferType.H2D:
@@ -120,29 +120,29 @@ class TransferEngine:
 
     def get_completed_graphs(self, timeout: Optional[float] = None) -> List[int]:
         """Get IDs of all completed transfer graphs at current moment
-        
+
         Args:
             timeout: Optional timeout for the first graph retrieval
-            
+
         Returns:
             List of completed graph IDs. Empty list if no graphs are completed.
         """
-        completed_graphs = []
-        
+        completed_graph_ids = []
+
         if self.completed_queue.empty():
-            return completed_graphs
-            
+            return completed_graph_ids
+
         try:
             first_graph = self.completed_queue.get(timeout=timeout)
-            completed_graphs.append(first_graph)
-            
+            completed_graph_ids.append(first_graph)
+
             while not self.completed_queue.empty():
-                completed_graphs.append(self.completed_queue.get_nowait())
-                
+                completed_graph_ids.append(self.completed_queue.get_nowait())
+
         except Queue.Empty:
             pass
-            
-        return completed_graphs
+
+        return completed_graph_ids
 
     def report_finished_op(self, op: TransferOp, graph_id: int):
         """Report a finished operation"""
@@ -152,13 +152,13 @@ class TransferEngine:
         """Shutdown the transfer engine"""
         self._running = False
         self._scheduler_thread.join()
-        
+
         for worker in self.gpucpu_workers:
-            worker.transfer_queue.put(None) 
+            worker.transfer_queue.put(None)
         if self.cpussd_worker is not None:
             self.cpussd_worker.transfer_queue.put(None)
-            
-        for worker in self.gpucpu_workers:  
+
+        for worker in self.gpucpu_workers:
             worker.shutdown()
         if self.cpussd_worker is not None:
             self.cpussd_worker.shutdown()

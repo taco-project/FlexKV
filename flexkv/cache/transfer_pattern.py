@@ -14,6 +14,11 @@ def create_read_transfer_graph(
 ) -> TransferOpGraph:
     """Create a transfer graph with SSD->CPU->GPU operations"""
     graph = TransferOpGraph(TransferIDAllocator.allocate_graph_id())
+    graph.block_meta_to_free = {}
+    if len(cpu_blocks) != 0:
+        graph.block_meta_to_free[DeviceType.CPU] = cpu_blocks
+    if len(ssd_blocks) != 0:
+        graph.block_meta_to_free[DeviceType.SSD] = ssd_blocks
     if len(ssd_blocks) == 0:
         op1 = TransferOp(
             transfer_op_id = TransferIDAllocator.allocate_op_id(),
@@ -117,6 +122,11 @@ def create_write_transfer_graph(
 ) -> TransferOpGraph:
     assert len(gpu_blocks) == len(cpu_blocks)
     graph = TransferOpGraph(TransferIDAllocator.allocate_graph_id())
+    graph.block_meta_to_free = {}
+    if len(ssd_blocks) != 0:
+        graph.block_meta_to_free[DeviceType.SSD] = ssd_blocks
+    if len(cpu_blocks) != 0:
+        graph.block_meta_to_free[DeviceType.CPU] = cpu_blocks
     if len(ssd_blocks) == 0:
         op1 = TransferOp(
             transfer_op_id = TransferIDAllocator.allocate_op_id(),

@@ -19,7 +19,7 @@ class TransferWorker(ABC):
         self.finished_queue = finished_queue
         self.transfer_thread = threading.Thread(target=self._transfer_worker)
         self.transfer_thread.start()
-    
+
     def submit_transfer(self, transfer: TransferOp):
         self.transfer_queue.put(transfer)
     """
@@ -38,7 +38,7 @@ class TransferWorker(ABC):
     @abstractmethod
     def transfer(self, transfer: TransferOp)->None:
         pass
-    
+
     @abstractmethod
     def _process_transfers(self, transfers: List[TransferOp])->None:
         pass

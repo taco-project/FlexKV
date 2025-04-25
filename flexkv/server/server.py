@@ -5,6 +5,7 @@ import torch
 from dataclasses import dataclass
 from ..kvmanager import KVManager
 from ..common.memory_handle import CUDAIPCHandle
+from ..common.memory_handle import import_cuda_tensor
 @dataclass
 class ServerRequest:
     client_id: int
@@ -32,7 +33,7 @@ class KVServer(Process):
         self.client_counter = 0
         self.kvmanager = KVManager(cpu_shape, dtype) #TODO correct initialization
         self._running = True
-        
+
     def register_client(self) -> Tuple[int, Connection]:
         """Register a new client and return client_id and connection"""
         server_conn, client_conn = Pipe()
@@ -55,10 +56,10 @@ class KVServer(Process):
                         print(f"Client {client_id} disconnected")
                         continue
 
-    def _handle_register_request(self, request: Request):
+    def _handle_register_request(self, request: ServerRequest):
         """Handle memory registration request"""
         client_id = request.client_id
-        
+
         shared_tensors = []
         for handle in request.handles:
             tensor = import_cuda_tensor(handle)
@@ -76,7 +77,7 @@ class KVServer(Process):
             # Process pending requests
             while not self.request_queue.empty():
                 request: ServerRequest = self.request_queue.get()
-                
+
                 if request.request_type == 'register':
                     shared_tensors = self._handle_register_request(request)
                     self.kvmanager.register_device_memory(
@@ -85,7 +86,7 @@ class KVServer(Process):
                     ) #this is allowed to be blocking now
                     response = ServerResponse(request.client_id, request.request_id)
                     self.client_pipes[request.client_id].send(response)
-                    
+
                 elif request.request_type == 'put':
                     self.kvmanager.put_async(
                         request.client_id, # also device id
@@ -95,7 +96,7 @@ class KVServer(Process):
                         request.gpu_physical_block_ids
                     )
                     #response = ServerResponse(request.client_id, request.request_id)
-                    
+
                 elif request.request_type == 'get':
                     self.kvmanager.get_async(
                         request.client_id, # also device id

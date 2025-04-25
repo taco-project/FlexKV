@@ -36,6 +36,29 @@ class TokenToBlockIndex:
         self._status = torch.zeros(max_num_blocks, dtype=torch.int32)
         self._hash_values = torch.zeros((max_num_blocks, get_hash_size()), dtype=torch.uint8)
 
+    def set_blocks_as_in_get(self, block_ids: torch.Tensor) -> None:
+        # WARNING should we use thread lock here to avoid race condition?
+        self._status[block_ids] = BlockStatus.IN_GET.value
+        self._lock_cnt[block_ids] += 1
+
+    def set_blocks_as_in_put(self, block_ids: torch.Tensor) -> None:
+        self._status[block_ids] = BlockStatus.IN_PUT.value
+        self._lock_cnt[block_ids] += 1
+
+    #def set_blocks_as_unregistered(self, block_ids: torch.Tensor, decrement_lock_cnt: bool = True) -> None:
+    #    self._status[block_ids] = BlockStatus.UNREGISTERED.value
+    #    if decrement_lock_cnt:
+    #        self._lock_cnt[block_ids] -= 1
+
+    #def set_blocks_as_available(self, block_ids: torch.Tensor, increment_lock_cnt: bool = True) -> None:
+    #    self._status[block_ids] = BlockStatus.AVAILABLE.value
+    #    if increment_lock_cnt:
+    #        self._lock_cnt[block_ids] += 1
+
+    #def set_blocks_as_locked(self, block_ids: torch.Tensor) -> None:
+    #    self._status[block_ids] = BlockStatus.LOCKED.value
+    #    self._lock_cnt[block_ids] += 1
+
     def reset(self)->None:
         self.index.clear()
         self.leaf_blocks.clear()
@@ -51,36 +74,38 @@ class TokenToBlockIndex:
     def match_prefix(self,
                     sequence: SequenceMeta,
                     update_cache_info: bool = True,
-                    lock_blocks: bool = True) -> torch.Tensor:
+                    maximum_status: int = BlockStatus.IN_PUT.value) -> torch.Tensor:
         if sequence.has_hashes():
-            prefix_block_ids = self._match_hashes_impl(sequence)
+            prefix_block_ids = self._match_hashes_impl(sequence, maximum_status)
         else:
-            prefix_block_ids = self._match_token_ids_impl(sequence)
+            prefix_block_ids = self._match_token_ids_impl(sequence, maximum_status)
         if update_cache_info:
             current_time = time.time()
             self._last_access_time[prefix_block_ids] = current_time
-        if lock_blocks:
-            self._lock_cnt[prefix_block_ids] += 1
         return prefix_block_ids
 
     def match_length(self,
-                    sequence: SequenceMeta) -> int:
+                    sequence: SequenceMeta,
+                    maximum_status: int = BlockStatus.IN_PUT.value) -> int:
         """get the length of the longest prefix that is cached"""
-        last_index, _ = self._search_last_cached_block(sequence)
+        last_index, _ = self._search_last_cached_block(sequence, maximum_status)
         return last_index + 1
 
     # TODO: optimize this
-    def _match_hashes_impl(self, sequence: SequenceMeta) -> torch.Tensor:
+    def _match_hashes_impl(self,
+                           sequence: SequenceMeta,
+                           maximum_status: int = BlockStatus.IN_PUT.value) -> torch.Tensor:
         """match the prefix of the sequence with the cached hashes"""
-        cached_prefix_length = self.match_length(sequence)
+        cached_prefix_length = self.match_length(sequence, maximum_status)
         prefix_block_ids = get_block_ids_from_hashes(sequence.block_hashes[:cached_prefix_length],
                                                         self.index)
         return prefix_block_ids
 
     def _match_token_ids_impl(self,
-                              sequence_meta: SequenceMeta) -> torch.Tensor:
+                              sequence_meta: SequenceMeta,
+                              maximum_status: int = BlockStatus.IN_PUT.value) -> torch.Tensor:
         """match the prefix of the sequence with the cached token ids"""
-        last_index, last_block_id = self._search_last_cached_block(sequence_meta)
+        last_index, last_block_id = self._search_last_cached_block(sequence_meta, maximum_status)
         prefix_block_ids = get_prefix_block_ids(last_index, last_block_id, self._prev_id)
         return prefix_block_ids
 
@@ -111,17 +136,17 @@ class TokenToBlockIndex:
         inserted_block_ids = physical_block_ids
         #TODO maintain the available block ids
         # assert self._available_block_ids[inserted_block_ids].all()
-        self._available_block_ids[inserted_block_ids] = False
+        #self._available_block_ids[inserted_block_ids] = False
 
         self._prev_id[inserted_block_ids[1:]] = inserted_block_ids[:-1]
 
         self._prev_id[inserted_block_ids[0]] = last_cached_block_id
         # self._physical_block_id[inserted_block_ids] = physical_block_ids
         self._last_access_time[inserted_block_ids] = time.time()
-        self._lock_cnt[inserted_block_ids] = 0
+        #self._lock_cnt[inserted_block_ids] = 0
         self._child_cnt[inserted_block_ids[:-1]] = 1
         self._child_cnt[inserted_block_ids[-1]] = 0
-        self._status[inserted_block_ids] = 1
+        #self._status[inserted_block_ids] = 1
         self._hash_values[inserted_block_ids] = sequence_meta.block_hashes[first_index:]
 
         # self.index.update({
@@ -130,11 +155,11 @@ class TokenToBlockIndex:
         # })
         self._batch_insert(sequence_meta.block_hashes[first_index:],
                            inserted_block_ids)
-        self.leaf_blocks[bytes(sequence_meta.block_hashes[-1])] = inserted_block_ids[-1]
+        self.leaf_blocks[bytes(sequence_meta.block_hashes[-1])] = inserted_block_ids[-1].item()
 
     def _search_last_cached_block(self,
-                                  sequence_meta: SequenceMeta
-                                  ) -> Tuple[int, int]:
+                                  sequence_meta: SequenceMeta,
+                                  maximum_status: int = BlockStatus.IN_PUT.value) -> Tuple[int, int]:
         left, right = 0, sequence_meta.num_blocks - 1
         last_index = -1
         last_block_id = -1
@@ -147,7 +172,8 @@ class TokenToBlockIndex:
                 hash_key = bytes(hash_tensor(sequence_meta.token_ids[
                     0:(mid+1)*self.tokens_per_block
                 ]))
-            if hash_key in self.index:
+            # TODO:
+            if hash_key in self.index and self._status[self.index[hash_key]] <= maximum_status:
                 last_index = mid
                 last_block_id = self.index[hash_key]
                 left = mid + 1
@@ -155,18 +181,24 @@ class TokenToBlockIndex:
                 right = mid - 1
         return last_index, last_block_id
 
-    def evict(self, num_evicted: int) -> List[BlockMeta]:
+    def evict(self, num_evicted: int, locked_blocks: torch.Tensor) -> torch.Tensor:
         eviction_granularity = 1000
         assert num_evicted < self.total_cached_blocks
         leaves = list(self.leaf_blocks.items())
+        if locked_blocks is not None:
+            self._lock_cnt[locked_blocks] += 1
         _last_access_time = self._last_access_time.numpy()
         _lock_cnt = self._lock_cnt.numpy()
         _status = self._status.numpy()
+        print(f"before eviction, the number of leaves in the cpu index is {len(leaves)}")
         candidates = [
             EvictionCandidate(block_hash, block_value, _last_access_time[block_value])
             for block_hash, block_value in leaves
             if _lock_cnt[block_value] == 0 and _status[block_value] == 1
         ]
+        print(f"and the number of candidates is {len(candidates)}")
+        if len(candidates) == 0:
+            return torch.tensor([], dtype=torch.int64)
         heapq.heapify(candidates)
         results = torch.tensor([], dtype=torch.int64)
         evicted_hashes = None
@@ -226,8 +258,11 @@ class TokenToBlockIndex:
             else:
                 evicted_hashes = torch.cat([evicted_hashes, self._hash_values[evicted_block_ids]])
                 results = torch.cat([results, evicted_block_ids])
+        # print(f"start batched eviction of {len(evicted_hashes)} blocks")
         self._batch_remove(evicted_hashes)
-        assert len(results) >= num_evicted
+        #assert len(results) >= num_evicted
+        if locked_blocks is not None:
+            _lock_cnt[locked_blocks] -= 1
         return results
 
 

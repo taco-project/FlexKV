@@ -4,6 +4,7 @@ import torch
 from typing import Tuple, Optional, List
 import numpy as np
 class StorageAllocator(ABC):
+    @abstractmethod
     def __init__(self):
         pass
 
@@ -41,7 +42,7 @@ class GPUAllocator(StorageAllocator):
         self,
         tensor_shape: Tuple[int, ...],
         dtype: torch.dtype,
-        device_id: Optional[int] = None, 
+        device_id: Optional[int] = None,
     ):
         self.tensor_shape = tensor_shape
         self.dtype = dtype
@@ -69,7 +70,7 @@ class GPUAllocator(StorageAllocator):
     def free(self):
         for block in self.physical_blocks:
             block.free()
-    
+
     def get_accessible_handle(self) -> AccessibleHandle:
         if not self.layer_ptrs:
             self.layer_ptrs = self._get_layer_ptrs(self.physical_blocks)
@@ -82,7 +83,7 @@ class GPUAllocator(StorageAllocator):
         )
 
     @classmethod
-    def from_raw_data(cls, 
+    def from_raw_data(cls,
         data: List[torch.Tensor],
         shape: Tuple[int, ...],
         device_id: Optional[int] = None) -> 'GPUAllocator':
@@ -94,8 +95,8 @@ class GPUAllocator(StorageAllocator):
         allocator.physical_blocks = data
         #allocator.layer_ptrs = allocator._get_layer_ptrs(data)
         return allocator
-        
-    
+
+
 class CPUAllocator(StorageAllocator):
     def __init__(
         self,
@@ -113,7 +114,7 @@ class CPUAllocator(StorageAllocator):
         self.physical_blocks = []
         self.allocate()
         self.layer_ptrs = None
-    
+
     def allocate(self):
         if self.physical_blocks:
             return
@@ -130,7 +131,7 @@ class CPUAllocator(StorageAllocator):
     def free(self):
         for block in self.physical_blocks:
             block.free()
-    
+
     def get_accessible_handle(self) -> AccessibleHandle:
         if not self.layer_ptrs:
             self.layer_ptrs = self._get_layer_ptrs(self.physical_blocks)
@@ -142,7 +143,7 @@ class CPUAllocator(StorageAllocator):
         )
 
     @classmethod
-    def from_raw_data(cls, 
+    def from_raw_data(cls,
         data: List[torch.Tensor],
         shape: Tuple[int, ...],
         pin_memory: bool = False) -> 'CPUAllocator':
