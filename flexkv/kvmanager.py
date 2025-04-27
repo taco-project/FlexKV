@@ -1,5 +1,5 @@
 from queue import Queue
-from typing import List
+from typing import List, Optional, Callable
 import threading
 import time
 
@@ -16,14 +16,10 @@ from flexkv.common.transfer import DeviceType
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 
 @dataclass
-class transferCleanupParams:
-    def __init__(self,
-                 task_id : int,
-                 return_mask : torch.Tensor,
-                 block_meta_to_free : Dict[DeviceType, torch.Tensor]):
-        self.task_id = task_id
-        self.return_mask = return_mask
-        self.block_meta_to_free = block_meta_to_free
+class TaskDescriptor:
+    task_id: int
+    return_mask: torch.Tensor
+    callback: Callable
 
 class KVManager:
     def __init__(self,
@@ -44,7 +40,7 @@ class KVManager:
             ssd_handle = self.storage_engine.get_allocator_handle(DeviceType.SSD) if cache_config.enable_ssd else None
             self.transfer_engine = TransferEngine(self.gpu_handles, cpu_handle, ssd_handle)
 
-        self.transfer_gid_to_cleanups = {}
+        self.transfer_gid_to_task = {}
 
         self._task_id_counter = 0
         self.task_queue = Queue()
@@ -52,6 +48,7 @@ class KVManager:
         self.running = True
         self._worker_thread = threading.Thread(target=self._worker_loop)
         self._worker_thread.start()
+        self.lock = threading.Lock()
 
     # the gpu_blocks of multiple gpus can be added post initialization.
     # the transfer engine will be initialized after we have all the intended gpu handles.
@@ -85,32 +82,33 @@ class KVManager:
                 if request is None:
                     break
                 elif request.request_type == cacheEngineRequestType.GET:
-                    graph, return_mask = self.cache_engine.get(request.token_ids,
-                                                               request.token_mask,
-                                                               request.slot_mapping)
+                    graph, return_mask, callback = self.cache_engine.get(request.token_ids,
+                                                                         request.token_mask,
+                                                                         request.slot_mapping)
                 elif request.request_type == cacheEngineRequestType.PUT:
-                    graph, return_mask = self.cache_engine.put(request.token_ids,
-                                                               request.token_mask,
-                                                               request.slot_mapping)
+                    graph, return_mask, callback = self.cache_engine.put(request.token_ids,
+                                                                         request.token_mask,
+                                                                         request.slot_mapping)
                 else:
                     raise ValueError(f"Unknown request type: {request.request_type}")
                 self.transfer_engine.submit_transfer_graph(graph)
-                self.transfer_gid_to_cleanups[graph.transfer_graph_id] = transferCleanupParams(
-                        request.request_id, return_mask, graph.get_block_meta_to_free())
+                self.transfer_gid_to_task[graph.transfer_graph_id] = TaskDescriptor(
+                        request.request_id, return_mask, callback)
             completed_graph_ids = self.transfer_engine.get_completed_graphs(timeout=0.001)
             for completed_graph_id in completed_graph_ids:
-                cleanup_params = self.transfer_gid_to_cleanups[completed_graph_id]
-                task_id = cleanup_params.task_id
-                self.cache_engine.cleanup_engines(cleanup_params.block_meta_to_free)
+                task_descriptor = self.transfer_gid_to_task[completed_graph_id]
+                task_descriptor.callback()
                 self.finished_queue.put(
-                    (task_id, cleanup_params.return_mask)
+                    (task_descriptor.task_id, task_descriptor.return_mask)
                 )
-                self.transfer_gid_to_cleanups.pop(completed_graph_id)
+                self.transfer_gid_to_task.pop(completed_graph_id)
             time.sleep(0.001)
 
     def _get_task_id(self) -> int:
-        self._task_id_counter += 1
-        return self._task_id_counter
+        with self.lock:
+            old_value = self._task_id_counter
+            self._task_id_counter += 1
+            return old_value
 
     def shutdown(self):
         self.running = False
@@ -121,7 +119,7 @@ class KVManager:
     def get_async(self,
                   token_ids: torch.Tensor,
                   slot_mapping: torch.Tensor,
-                  token_mask: torch.Tensor = None) -> int:
+                  token_mask: Optional[torch.Tensor] = None) -> int:
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
         task_id = self._get_task_id()
@@ -137,7 +135,7 @@ class KVManager:
     def put_async(self,
                   token_ids: torch.Tensor,
                   slot_mapping: torch.Tensor,
-                  token_mask: torch.Tensor = None) -> int:
+                  token_mask: Optional[torch.Tensor] = None) -> int:
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
         task_id = self._get_task_id()

@@ -10,7 +10,6 @@ from flexkv.common.transfer import DeviceType
 class cacheEngineRequestType(Enum):
     GET = "get"
     PUT = "put"
-    CLEANUP = "cleanup"
 
 @dataclass
 class cacheEngineRequest:
