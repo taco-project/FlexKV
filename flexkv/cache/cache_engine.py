@@ -40,13 +40,14 @@ class CacheEngine:
                sequence_meta: SequenceMeta,
                physical_block_ids: torch.Tensor,
                match_length: int = -1,
+               insert_length: int = -1,
                is_ready: bool = True,
                locked: bool = False,
                as_buffer: bool = False) -> None:
         if match_length == -1:
             # in insert, we can use the default maximum_status for match
             match_length = self.index.match_length(sequence_meta=sequence_meta)
-        self.index.insert(sequence_meta, physical_block_ids, match_length, is_ready, locked, as_buffer)
+        self.index.insert(sequence_meta, physical_block_ids, match_length, insert_length, is_ready, locked, as_buffer)
 
     def lock_blocks(self, block_ids: torch.Tensor) -> None:
         self.index.lock(block_ids)
@@ -157,7 +158,8 @@ class GlobalCacheEngine:
             # here we still put the buffer in the cpu index, so no buffer is needed
             self.cpu_cache_engine.insert(sequence_meta,
                                          extra_cpu_blocks,
-                                         len(cpu_matched_blocks) + start_idx,
+                                         match_length=len(cpu_matched_blocks) + start_idx,
+                                         insert_length=len(ssd_matched_blocks),
                                          is_ready=False,
                                          locked=True,
                                          as_buffer=False)
@@ -219,13 +221,13 @@ class GlobalCacheEngine:
 
         self.cpu_cache_engine.insert(sequence_meta,
                                      cpu_blocks_to_transfer,
-                                     len(cpu_matched_blocks) + start_idx,  # start_idx == 0
+                                     match_length=len(cpu_matched_blocks) + start_idx,  # start_idx == 0
                                      is_ready=False,
                                      locked=True,
                                      as_buffer=False)
         self.ssd_cache_engine.insert(sequence_meta,
                                      ssd_blocks_to_transfer,
-                                     len(ssd_matched_blocks) + start_idx,  # start_idx == 0
+                                     match_length=len(ssd_matched_blocks) + start_idx,  # start_idx == 0
                                      is_ready=False,
                                      locked=True,
                                      as_buffer=False)
