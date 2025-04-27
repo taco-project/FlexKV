@@ -87,17 +87,23 @@ class TokenToBlockIndex:
                sequence_meta: SequenceMeta,
                physical_block_ids: torch.Tensor,
                match_length: int,
+               insert_length: int = -1,
                is_ready: bool = True,
                locked: bool = False,
                as_buffer: bool = False) -> None:
         # TODO: support as_buffer=True
         assert not as_buffer
 
-        assert match_length >= 0 and match_length <= sequence_meta.num_blocks
-        assert physical_block_ids.ndim == 1
-        assert len(physical_block_ids) == sequence_meta.num_blocks - match_length
+        if insert_length == -1:
+            insert_length = sequence_meta.num_blocks
+        assert 0 <= match_length <= sequence_meta.num_blocks
+        assert 0 <= insert_length <= sequence_meta.num_blocks
+        assert match_length <= insert_length
 
-        if match_length == sequence_meta.num_blocks:
+        assert physical_block_ids.ndim == 1
+        assert len(physical_block_ids) == insert_length - match_length
+
+        if match_length == insert_length:
             return
 
         sequence_meta.gen_hashes()
@@ -127,15 +133,12 @@ class TokenToBlockIndex:
         self._child_cnt[inserted_block_ids[:-1]] = 1
         self._child_cnt[inserted_block_ids[-1]] = 0
 
-        self._hash_values[inserted_block_ids] = sequence_meta.block_hashes[first_index:]
+        self._hash_values[inserted_block_ids] = sequence_meta.block_hashes[first_index:
+                                                                           first_index+insert_length-match_length]
 
-        # self.index.update({
-        #     sequence_meta.block_hashes[i]: inserted_block_ids[i - first_index]
-        #     for i in range(first_index, sequence_meta.num_blocks)
-        # })
-        self._batch_insert(sequence_meta.block_hashes[first_index:],
+        self._batch_insert(sequence_meta.block_hashes[first_index:first_index+insert_length-match_length],
                            inserted_block_ids)
-        self.leaf_blocks[bytes(sequence_meta.block_hashes[-1])] = inserted_block_ids[-1].item()
+        self.leaf_blocks[bytes(sequence_meta.block_hashes[insert_length-1])] = inserted_block_ids[-1].item()
 
     def _search_last_cached_block(self,
                                   sequence_meta: SequenceMeta) -> Tuple[int, int]:

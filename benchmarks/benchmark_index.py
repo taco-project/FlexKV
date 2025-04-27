@@ -21,7 +21,7 @@ def main(args):
     print("insert sequence of length", insert_sequence_meta.length)
     physical_block_ids = torch.arange(insert_sequence_meta.num_blocks, dtype=torch.int64)
     insert_sequence_meta.gen_hashes()
-    profiler.runctx('index.insert(insert_sequence_meta, 0, physical_block_ids)',
+    profiler.runctx('index.insert(insert_sequence_meta, physical_block_ids, 0)',
                     globals(), locals())
     stats = pstats.Stats(profiler)
     stats.sort_stats('cumulative')

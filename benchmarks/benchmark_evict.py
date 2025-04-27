@@ -49,7 +49,7 @@ def test_eviction_perf():
     history_sequence_meta.append(
         SequenceMeta(torch.randint(0, 256, (inserted_blocks_len*token_per_block,), dtype=torch.uint8), token_per_block)
     )
-    cache_index.insert(history_sequence_meta[0], 0, mempool.allocate_blocks(inserted_blocks_len))
+    cache_index.insert(history_sequence_meta[0], mempool.allocate_blocks(inserted_blocks_len), 0)
     total_evict_time = 0
     total_evict_op_num = 0
 
@@ -77,8 +77,7 @@ def test_eviction_perf():
             total_evict_op_num += 1
             # lock the last block to avoid eviction
             if len(prefix_block_ids) > 0:
-                cache_index._status[prefix_block_ids[-1]] = 2
-                cache_index._lock_cnt[prefix_block_ids[-1]] = 1
+                cache_index.lock(prefix_block_ids[-1])
             local_vars = {
                 'cache_index': cache_index,
                 'mempool': mempool,
@@ -99,12 +98,11 @@ def test_eviction_perf():
                   f"evicted {len(evicted_blocks)} blocks, time: {time_end_evict - time_start_evict:.4f}s")
             mempool.recycle_blocks(evicted_blocks)
             if len(prefix_block_ids) > 0:
-                cache_index._status[prefix_block_ids[-1]] = 0
-                cache_index._lock_cnt[prefix_block_ids[-1]] = 0
+                cache_index.unlock(prefix_block_ids[-1])
 
         new_block_ids = mempool.allocate_blocks(needed_blocks_num)
         assert len(new_block_ids) == needed_blocks_num
-        cache_index.insert(new_sequence_meta, len(prefix_block_ids), new_block_ids)
+        cache_index.insert(new_sequence_meta, new_block_ids, len(prefix_block_ids))
         history_sequence_meta.append(new_sequence_meta)
     time_end = time.time()
     print(f"Time taken for {num_blocks} insertions: {time_end - time_start:.2f}s")
