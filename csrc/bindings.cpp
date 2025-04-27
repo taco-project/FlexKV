@@ -104,7 +104,8 @@ PYBIND11_MODULE(c_ext, m) {
         &flexkv::find_n_liner_parents_for_eviction,
         "Find n-liner parents for eviction", py::arg("block_id"),
         py::arg("prev_block_ids"), py::arg("lock_cnt"), py::arg("child_cnt"),
-        py::arg("status"), py::arg("result"));
+        py::arg("ready"), py::arg("last_access_time"),
+        py::arg("max_last_access_time"), py::arg("max_num_evicted"));
   m.def("get_block_ids_from_hashes", &flexkv::get_block_ids_from_hashes,
         "Get block ids from hashes", py::arg("hashes"),
         py::arg("hash_to_block_id"));

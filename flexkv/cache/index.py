@@ -1,7 +1,10 @@
 import time
 import heapq
-import torch
+from dataclasses import dataclass
 from typing import Dict, List, Union, Tuple
+
+import torch
+
 from flexkv.common.block import BlockMeta, BlockStatus, SequenceMeta
 from flexkv.common.hash_utils import HashType, hash_tensor
 from flexkv.c_ext import get_hash_size
@@ -9,11 +12,11 @@ from flexkv.c_ext import get_prefix_block_ids
 from flexkv.c_ext import get_block_ids_from_hashes
 from flexkv.c_ext import index_batch_insert, find_n_liner_parents_for_eviction, index_batch_remove
 
+@dataclass
 class EvictionCandidate:
-    def __init__(self, hashValue: HashType, block_id: int, last_access_time: float):
-        self.hash = hashValue
-        self.block_id = block_id
-        self.last_access_time = last_access_time
+    hash: HashType
+    block_id: int
+    last_access_time: float
 
     def __lt__(self, other: 'EvictionCandidate') -> bool:
         return self.last_access_time < other.last_access_time
@@ -28,91 +31,63 @@ class TokenToBlockIndex:
 
         self.max_num_blocks = max_num_blocks
 
-        self._available_block_ids = torch.ones(max_num_blocks, dtype=torch.bool)
-        self._prev_id = torch.full((max_num_blocks,), -1, dtype=torch.int64)
-        self._last_access_time = torch.zeros(max_num_blocks, dtype=torch.float64)
-        self._lock_cnt = torch.zeros(max_num_blocks, dtype=torch.int32)
-        self._child_cnt = torch.zeros(max_num_blocks, dtype=torch.int32)
-        self._status = torch.zeros(max_num_blocks, dtype=torch.int32)
-        self._hash_values = torch.zeros((max_num_blocks, get_hash_size()), dtype=torch.uint8)
-
-    def set_blocks_as_in_get(self, block_ids: torch.Tensor) -> None:
-        # WARNING should we use thread lock here to avoid race condition?
-        self._status[block_ids] = BlockStatus.IN_GET.value
-        self._lock_cnt[block_ids] += 1
-
-    def set_blocks_as_in_put(self, block_ids: torch.Tensor) -> None:
-        self._status[block_ids] = BlockStatus.IN_PUT.value
-        self._lock_cnt[block_ids] += 1
-
-    #def set_blocks_as_unregistered(self, block_ids: torch.Tensor, decrement_lock_cnt: bool = True) -> None:
-    #    self._status[block_ids] = BlockStatus.UNREGISTERED.value
-    #    if decrement_lock_cnt:
-    #        self._lock_cnt[block_ids] -= 1
-
-    #def set_blocks_as_available(self, block_ids: torch.Tensor, increment_lock_cnt: bool = True) -> None:
-    #    self._status[block_ids] = BlockStatus.AVAILABLE.value
-    #    if increment_lock_cnt:
-    #        self._lock_cnt[block_ids] += 1
-
-    #def set_blocks_as_locked(self, block_ids: torch.Tensor) -> None:
-    #    self._status[block_ids] = BlockStatus.LOCKED.value
-    #    self._lock_cnt[block_ids] += 1
+        self.reset()
 
     def reset(self)->None:
         self.index.clear()
         self.leaf_blocks.clear()
 
-        self._available_block_ids = torch.ones(self.max_num_blocks, dtype=torch.bool)
-        self._prev_id = torch.full((self.max_num_blocks,), -1, dtype=torch.int64)
-        self._last_access_time.zero_()
-        self._lock_cnt.zero_()
-        self._child_cnt.zero_()
-        self._status.zero_()
-        self._hash_values.zero_()
+        max_num_blocks = self.max_num_blocks
+        self._available_block_ids = torch.ones(max_num_blocks, dtype=torch.bool)
+        self._prev_id = torch.full((max_num_blocks,), -1, dtype=torch.int64)
+        self._last_access_time = torch.zeros(max_num_blocks, dtype=torch.float64)
+        self._lock_cnt = torch.zeros(max_num_blocks, dtype=torch.int32)
+        self._child_cnt = torch.zeros(max_num_blocks, dtype=torch.int32)
+        self._ready = torch.zeros(max_num_blocks, dtype=torch.bool)
+        self._hash_values = torch.zeros((max_num_blocks, get_hash_size()), dtype=torch.uint8)
 
     def match_prefix(self,
                     sequence: SequenceMeta,
-                    update_cache_info: bool = True,
-                    maximum_status: int = BlockStatus.IN_PUT.value) -> torch.Tensor:
+                    update_cache_info: bool = True) -> torch.Tensor:
         if sequence.has_hashes():
-            prefix_block_ids = self._match_hashes_impl(sequence, maximum_status)
+            prefix_block_ids = self._match_hashes_impl(sequence)
         else:
-            prefix_block_ids = self._match_token_ids_impl(sequence, maximum_status)
+            prefix_block_ids = self._match_token_ids_impl(sequence)
+        ready_mask = self._ready[prefix_block_ids]
+        ready_block_ids = prefix_block_ids[ready_mask]
+
         if update_cache_info:
             current_time = time.time()
-            self._last_access_time[prefix_block_ids] = current_time
-        return prefix_block_ids
+            self._last_access_time[ready_block_ids] = current_time
+        return ready_block_ids
 
     def match_length(self,
-                    sequence: SequenceMeta,
-                    maximum_status: int = BlockStatus.IN_PUT.value) -> int:
+                    sequence: SequenceMeta) -> int:
         """get the length of the longest prefix that is cached"""
-        last_index, _ = self._search_last_cached_block(sequence, maximum_status)
+        last_index, _ = self._search_last_cached_block(sequence)
         return last_index + 1
 
     # TODO: optimize this
     def _match_hashes_impl(self,
-                           sequence: SequenceMeta,
-                           maximum_status: int = BlockStatus.IN_PUT.value) -> torch.Tensor:
+                           sequence: SequenceMeta) -> torch.Tensor:
         """match the prefix of the sequence with the cached hashes"""
-        cached_prefix_length = self.match_length(sequence, maximum_status)
+        cached_prefix_length = self.match_length(sequence)
         prefix_block_ids = get_block_ids_from_hashes(sequence.block_hashes[:cached_prefix_length],
                                                         self.index)
         return prefix_block_ids
 
     def _match_token_ids_impl(self,
-                              sequence_meta: SequenceMeta,
-                              maximum_status: int = BlockStatus.IN_PUT.value) -> torch.Tensor:
+                              sequence_meta: SequenceMeta) -> torch.Tensor:
         """match the prefix of the sequence with the cached token ids"""
-        last_index, last_block_id = self._search_last_cached_block(sequence_meta, maximum_status)
+        last_index, last_block_id = self._search_last_cached_block(sequence_meta)
         prefix_block_ids = get_prefix_block_ids(last_index, last_block_id, self._prev_id)
         return prefix_block_ids
 
     def insert(self,
                sequence_meta: SequenceMeta,
                match_length: int,
-               physical_block_ids: torch.Tensor) -> None:
+               physical_block_ids: torch.Tensor,
+               is_ready: bool = True) -> None:
         assert match_length >= 0 and match_length <= sequence_meta.num_blocks
         assert physical_block_ids.ndim == 1
         assert len(physical_block_ids) == sequence_meta.num_blocks - match_length
@@ -135,18 +110,18 @@ class TokenToBlockIndex:
 
         inserted_block_ids = physical_block_ids
         #TODO maintain the available block ids
-        # assert self._available_block_ids[inserted_block_ids].all()
-        #self._available_block_ids[inserted_block_ids] = False
+        assert self._available_block_ids[inserted_block_ids].all()
+        self._available_block_ids[inserted_block_ids] = False
 
         self._prev_id[inserted_block_ids[1:]] = inserted_block_ids[:-1]
-
         self._prev_id[inserted_block_ids[0]] = last_cached_block_id
-        # self._physical_block_id[inserted_block_ids] = physical_block_ids
+
         self._last_access_time[inserted_block_ids] = time.time()
-        #self._lock_cnt[inserted_block_ids] = 0
+        self._lock_cnt[inserted_block_ids] = 0
+        self._ready[inserted_block_ids] = is_ready
         self._child_cnt[inserted_block_ids[:-1]] = 1
         self._child_cnt[inserted_block_ids[-1]] = 0
-        #self._status[inserted_block_ids] = 1
+
         self._hash_values[inserted_block_ids] = sequence_meta.block_hashes[first_index:]
 
         # self.index.update({
@@ -158,8 +133,7 @@ class TokenToBlockIndex:
         self.leaf_blocks[bytes(sequence_meta.block_hashes[-1])] = inserted_block_ids[-1].item()
 
     def _search_last_cached_block(self,
-                                  sequence_meta: SequenceMeta,
-                                  maximum_status: int = BlockStatus.IN_PUT.value) -> Tuple[int, int]:
+                                  sequence_meta: SequenceMeta) -> Tuple[int, int]:
         left, right = 0, sequence_meta.num_blocks - 1
         last_index = -1
         last_block_id = -1
@@ -172,8 +146,7 @@ class TokenToBlockIndex:
                 hash_key = bytes(hash_tensor(sequence_meta.token_ids[
                     0:(mid+1)*self.tokens_per_block
                 ]))
-            # TODO:
-            if hash_key in self.index and self._status[self.index[hash_key]] <= maximum_status:
+            if hash_key in self.index:
                 last_index = mid
                 last_block_id = self.index[hash_key]
                 left = mid + 1
@@ -181,24 +154,16 @@ class TokenToBlockIndex:
                 right = mid - 1
         return last_index, last_block_id
 
-    def evict(self, num_evicted: int, locked_blocks: torch.Tensor) -> torch.Tensor:
-        eviction_granularity = 1000
-        assert num_evicted < self.total_cached_blocks
-        leaves = list(self.leaf_blocks.items())
-        if locked_blocks is not None:
-            self._lock_cnt[locked_blocks] += 1
+    def evict(self, num_evicted: int) -> torch.Tensor:
+        leaves = self.leaf_blocks.items()
         _last_access_time = self._last_access_time.numpy()
         _lock_cnt = self._lock_cnt.numpy()
-        _status = self._status.numpy()
-        print(f"before eviction, the number of leaves in the cpu index is {len(leaves)}")
+        _ready = self._ready.numpy()
         candidates = [
-            EvictionCandidate(block_hash, block_value, _last_access_time[block_value])
-            for block_hash, block_value in leaves
-            if _lock_cnt[block_value] == 0 and _status[block_value] == 1
+            EvictionCandidate(block_hash, block_id, _last_access_time[block_id])
+            for block_hash, block_id in leaves
+            if _lock_cnt[block_id] == 0 and _ready[block_id] == 1
         ]
-        print(f"and the number of candidates is {len(candidates)}")
-        if len(candidates) == 0:
-            return torch.tensor([], dtype=torch.int64)
         heapq.heapify(candidates)
         results = torch.tensor([], dtype=torch.int64)
         evicted_hashes = None
@@ -209,31 +174,30 @@ class TokenToBlockIndex:
             candidate_id = candidate.block_id
             # update the leaf blocks, although in this evcition,
             # we don't need to access the leaf blocks
-            if candidate.hash in self.leaf_blocks:
-                self.leaf_blocks.pop(candidate.hash)
-            else:
-                raise ValueError(f"Candidate {candidate.hash} not in leaf blocks")
-
+            assert candidate.hash in self.leaf_blocks, \
+                f"Candidate {candidate.hash} not in leaf blocks"
+            self.leaf_blocks.pop(candidate.hash)
             # get a chain of parent blocks of the selected block, so that
             # we can evict with larger granularity, and keep the cache
             # more likely to hit
             # preallocate the memory for the evicted block ids
-            evicted_block_ids = torch.empty(size=(eviction_granularity,), dtype=torch.int64)
-            # get parent block with no branches in the radix tree
-            # we can regrad this as "tree node compression"
-            evicted_block_num = find_n_liner_parents_for_eviction(candidate_id,
+            max_last_access_time = float('inf')
+            if len(candidates) > 0:
+                max_last_access_time = candidates[0].last_access_time
+            evicted_block_ids = find_n_liner_parents_for_eviction(candidate_id,
                                                                 self._prev_id,
                                                                 self._lock_cnt,
                                                                 self._child_cnt,
-                                                                self._status,
-                                                                evicted_block_ids)
-            evicted_block_ids = evicted_block_ids[:evicted_block_num]
+                                                                self._ready,
+                                                                self._last_access_time,
+                                                                max_last_access_time,
+                                                                num_evicted - len(results))
             # deal with the parent block of the evicted block
-            parent_block_id = int(self._prev_id[evicted_block_ids[-1]])
+            parent_block_id = self._prev_id[evicted_block_ids[-1]].item()
             if parent_block_id != -1: # not the root block
                 self._child_cnt[parent_block_id] -= 1
                 if (self._child_cnt[parent_block_id] == 0 and
-                    self._status[parent_block_id] == 1 and
+                    self._ready[parent_block_id] and
                     self._lock_cnt[parent_block_id] == 0):
                     # not locked and available, add as new leaf and new candidate
                     hash_key = bytes(self._hash_values[parent_block_id])
@@ -241,34 +205,24 @@ class TokenToBlockIndex:
                     heapq.heappush(candidates, EvictionCandidate(hash_key,
                                                                  parent_block_id,
                                                                  self._last_access_time[parent_block_id]))
-            # update the status of the evicted blocks
-            # Is it necessary to update the status of the evicted blocks?
-            #self._status[evicted_block_ids] = 0
-            #self._prev_id[evicted_block_ids] = -1
-            #self._hash_values[evicted_block_ids] = torch.zeros(
-            #    size=(len(evicted_block_ids), get_hash_size()), dtype=torch.uint8
-            # )
-            #self._child_cnt[evicted_block_ids] = 0
-            #self._lock_cnt[evicted_block_ids] = 0
-            #self._last_access_time[evicted_block_ids] = 0
-
             if evicted_hashes is None:
                 evicted_hashes = self._hash_values[evicted_block_ids]
                 results = evicted_block_ids
             else:
                 evicted_hashes = torch.cat([evicted_hashes, self._hash_values[evicted_block_ids]])
                 results = torch.cat([results, evicted_block_ids])
-        # print(f"start batched eviction of {len(evicted_hashes)} blocks")
         self._batch_remove(evicted_hashes)
-        #assert len(results) >= num_evicted
-        if locked_blocks is not None:
-            _lock_cnt[locked_blocks] -= 1
         return results
+    def lock(self, block_ids: torch.Tensor) -> None:
+        self._lock_cnt[block_ids] += 1
+        assert (self._lock_cnt[block_ids] > 0).all()
 
+    def unlock(self, block_ids: torch.Tensor) -> None:
+        self._lock_cnt[block_ids] -= 1
+        assert (self._lock_cnt[block_ids] >= 0).all()
 
-    def _evictable(self, block_meta: BlockMeta) -> bool:
-        return block_meta.status == BlockStatus.AVAILABLE and \
-            block_meta.child_cnt == 0
+    def set_ready(self, block_ids: torch.Tensor, is_ready: bool = True) -> None:
+        self._ready[block_ids] = is_ready
 
     def _batch_insert(self,
                       hashes: torch.Tensor,
@@ -297,12 +251,12 @@ if __name__ == "__main__":
     seq1 = SequenceMeta(token_ids=token_ids1, tokens_per_block=tokens_per_block)
     seq2 = SequenceMeta(token_ids=token_ids2, tokens_per_block=tokens_per_block)
 
-    index.insert(seq1, 0, torch.tensor([0, 1, 2, 3], dtype=torch.int64))
+    index.insert(seq1, 0, torch.tensor([0, 1, 2, 3], dtype=torch.int64), is_ready=True)
     print(f"insert seq1 = {seq1.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks}")
     seq2_match_length = index.match_length(seq2)
     assert seq2_match_length == 2
-    index.insert(seq2, seq2_match_length, torch.tensor([8, 9], dtype=torch.int64))
+    index.insert(seq2, seq2_match_length, torch.tensor([8, 9], dtype=torch.int64), is_ready=True)
     print(f"insert seq2 = {seq2.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks}")
 
