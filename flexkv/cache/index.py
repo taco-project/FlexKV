@@ -85,9 +85,14 @@ class TokenToBlockIndex:
 
     def insert(self,
                sequence_meta: SequenceMeta,
-               match_length: int,
                physical_block_ids: torch.Tensor,
-               is_ready: bool = True) -> None:
+               match_length: int,
+               is_ready: bool = True,
+               locked: bool = False,
+               as_buffer: bool = False) -> None:
+        # TODO: support as_buffer=True
+        assert not as_buffer
+
         assert match_length >= 0 and match_length <= sequence_meta.num_blocks
         assert physical_block_ids.ndim == 1
         assert len(physical_block_ids) == sequence_meta.num_blocks - match_length
@@ -117,7 +122,7 @@ class TokenToBlockIndex:
         self._prev_id[inserted_block_ids[0]] = last_cached_block_id
 
         self._last_access_time[inserted_block_ids] = time.time()
-        self._lock_cnt[inserted_block_ids] = 0
+        self._lock_cnt[inserted_block_ids] = locked
         self._ready[inserted_block_ids] = is_ready
         self._child_cnt[inserted_block_ids[:-1]] = 1
         self._child_cnt[inserted_block_ids[-1]] = 0
@@ -212,7 +217,9 @@ class TokenToBlockIndex:
                 evicted_hashes = torch.cat([evicted_hashes, self._hash_values[evicted_block_ids]])
                 results = torch.cat([results, evicted_block_ids])
         self._batch_remove(evicted_hashes)
+        self._available_block_ids[results] = True
         return results
+
     def lock(self, block_ids: torch.Tensor) -> None:
         self._lock_cnt[block_ids] += 1
         assert (self._lock_cnt[block_ids] > 0).all()
