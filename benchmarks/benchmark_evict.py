@@ -4,9 +4,7 @@ import pstats
 
 import torch
 from flexkv.cache.index import TokenToBlockIndex
-from flexkv.common.hash_utils import HashType
 from flexkv.cache.mempool import Mempool
-from flexkv.c_ext import get_hash_size
 import random
 import numpy as np
 from flexkv.common.block import SequenceMeta
