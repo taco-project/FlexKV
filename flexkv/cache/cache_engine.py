@@ -42,12 +42,11 @@ class CacheEngine:
                match_length: int = -1,
                insert_length: int = -1,
                is_ready: bool = True,
-               locked: bool = False,
-               as_buffer: bool = False) -> None:
+               locked: bool = False) -> None:
         if match_length == -1:
             # in insert, we can use the default maximum_status for match
             match_length = self.index.match_length(sequence_meta=sequence_meta)
-        self.index.insert(sequence_meta, physical_block_ids, match_length, insert_length, is_ready, locked, as_buffer)
+        self.index.insert(sequence_meta, physical_block_ids, match_length, insert_length, is_ready, locked)
 
     def lock_blocks(self, block_ids: torch.Tensor) -> None:
         self.index.lock(block_ids)
@@ -76,9 +75,8 @@ class CacheEngine:
 
     def cleanup(self, block_ids: torch.Tensor, as_buffer: bool = False) -> None:
         if as_buffer:
-            # TODO: for now we ignore the buffer blocks because we don't have them now
-            # actually we should return those blocks to the mempool
-            raise NotImplementedError("Buffer cleanup is not implemented")
+            # NOTE: blocks as buffer are not inserted into the index, so we don't need to update index
+            self.mempool.recycle_blocks(block_ids)
         else:
             self.set_ready(block_ids)
             self.unlock_blocks(block_ids)
@@ -161,8 +159,7 @@ class GlobalCacheEngine:
                                          match_length=len(cpu_matched_blocks) + start_idx,
                                          insert_length=len(ssd_matched_blocks),
                                          is_ready=False,
-                                         locked=True,
-                                         as_buffer=False)
+                                         locked=True)
 
         # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
         transfer_graph = create_read_transfer_graph(ssd_blocks_to_transfer,
@@ -223,14 +220,12 @@ class GlobalCacheEngine:
                                      cpu_blocks_to_transfer,
                                      match_length=len(cpu_matched_blocks) + start_idx,  # start_idx == 0
                                      is_ready=False,
-                                     locked=True,
-                                     as_buffer=False)
+                                     locked=True)
         self.ssd_cache_engine.insert(sequence_meta,
                                      ssd_blocks_to_transfer,
                                      match_length=len(ssd_matched_blocks) + start_idx,  # start_idx == 0
                                      is_ready=False,
-                                     locked=True,
-                                     as_buffer=False)
+                                     locked=True)
 
         transfer_graph = create_write_transfer_graph(ssd_blocks_to_transfer,
                                                     cpu_blocks_to_transfer,
@@ -246,11 +241,17 @@ class GlobalCacheEngine:
         return transfer_graph, return_mask, callback
 
     def _transfer_callback(self,
-                           block_ids_to_unlock: Dict[DeviceType, torch.Tensor]):
+                           block_ids_to_unlock: Dict[DeviceType, torch.Tensor],
+                           buffer_to_free: Optional[Dict[DeviceType, torch.Tensor]] = None) -> None:
         if DeviceType.CPU in block_ids_to_unlock:
             self.cpu_cache_engine.cleanup(block_ids_to_unlock[DeviceType.CPU], as_buffer=False)
         if DeviceType.SSD in block_ids_to_unlock:
             self.ssd_cache_engine.cleanup(block_ids_to_unlock[DeviceType.SSD], as_buffer=False)
+        if buffer_to_free is not None:
+            if DeviceType.CPU in buffer_to_free:
+                self.cpu_cache_engine.cleanup(buffer_to_free[DeviceType.CPU], as_buffer=True)
+            if DeviceType.SSD in buffer_to_free:
+                self.ssd_cache_engine.cleanup(buffer_to_free[DeviceType.SSD], as_buffer=True)
 
     def match(self, sequence_meta: SequenceMeta,
               start_idx: int,

@@ -89,11 +89,7 @@ class TokenToBlockIndex:
                match_length: int,
                insert_length: int = -1,
                is_ready: bool = True,
-               locked: bool = False,
-               as_buffer: bool = False) -> None:
-        # TODO: support as_buffer=True
-        assert not as_buffer
-
+               locked: bool = False) -> None:
         if insert_length == -1:
             insert_length = sequence_meta.num_blocks
         assert 0 <= match_length <= sequence_meta.num_blocks
