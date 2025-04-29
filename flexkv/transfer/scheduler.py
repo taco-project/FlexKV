@@ -1,6 +1,6 @@
 from typing import OrderedDict, List, Set, Tuple
 from dataclasses import dataclass
-from ..common.transfer import TransferOp, TransferOpGraph
+from ..common.transfer import TransferOp, TransferOpGraph, TransferType
 
 class TransferScheduler:
     def __init__(self):
@@ -31,20 +31,23 @@ class TransferScheduler:
                 self._transfer_graphs[op.transfer_graph_id].mark_completed(op.transfer_op_id)
 
         # Find completed transfer graphs
-        completed_graphs = []
+        completed_graph_ids = []
         for graph_id, graph in self._transfer_graphs.items():
             if graph.all_transfer_ops_completed():
-                completed_graphs.append(graph)
+                completed_graph_ids.append(graph_id)
 
         # Remove completed graphs from scheduler
-        for graph in completed_graphs:
-            self._transfer_graphs.pop(graph.transfer_graph_id)
+        for graph_id in completed_graph_ids:
+            self._transfer_graphs.pop(graph_id)
 
         # Get next batch of executable operations
         next_ops = []
         for graph in self._transfer_graphs.values():
-            ready_op_ids = graph.get_ready_ops()
+            ready_op_ids = graph.take_ready_ops()
             for op_id in ready_op_ids:
-                next_ops.append(graph._op_map[op_id])
+                op = graph._op_map[op_id]
+                if op.transfer_type == TransferType.VIRTUAL:
+                    self._transfer_graphs[op.transfer_graph_id].mark_completed(op_id)
+                next_ops.append(op)
 
-        return completed_graphs, next_ops
+        return completed_graph_ids, next_ops

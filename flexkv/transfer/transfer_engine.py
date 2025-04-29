@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from queue import Queue
 import threading
 import time
@@ -28,7 +28,7 @@ class TransferEngine:
 
         # Initialize queues
         self.task_queue = Queue()  # Queue for new transfer graphs
-        self.completed_queue = Queue()  # Queue for completed transfer graphs
+        self.completed_queue = Queue(maxsize=2048)  # Queue for completed transfer graphs and ops
         self.finished_ops_queue = Queue()  # Queue for finished operations
 
         # Initialize workers
@@ -78,19 +78,23 @@ class TransferEngine:
             finished_ops = []
             while not self.finished_ops_queue.empty():
                 op = self.finished_ops_queue.get()
+                self.completed_queue.put((op.transfer_graph_id, op.transfer_op_id))
                 finished_ops.append(op)
 
             if finished_ops or new_graphs_num > 0:
                 # Schedule next operations
-                completed_graphs, next_ops = self.scheduler.schedule(finished_ops)
+                completed_graph_ids, next_ops = self.scheduler.schedule(finished_ops)
 
                 # Handle completed graphs
-                for graph in completed_graphs:
-                    self.completed_queue.put(graph.transfer_graph_id)
+                for graph_id in completed_graph_ids:
+                    self.completed_queue.put((graph_id, -1))
 
                 # Distribute new ops to workers
                 for op in next_ops:
-                    self._assign_op_to_worker(op)
+                    if op.transfer_type == TransferType.VIRTUAL:
+                        self.completed_queue.put((op.transfer_graph_id, op.transfer_op_id))
+                    else:
+                        self._assign_op_to_worker(op)
 
             time.sleep(0.001)  # Prevent busy waiting
 
@@ -111,6 +115,8 @@ class TransferEngine:
             TransferType.DISK2H
         ]:
             self.cpussd_worker.submit_transfer(op)
+        elif op.transfer_type == TransferType.VIRTUAL:
+            pass
         else:
             raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
 
@@ -118,7 +124,7 @@ class TransferEngine:
         """Submit a transfer graph for execution"""
         self.task_queue.put(transfer_graph)
 
-    def get_completed_graphs(self, timeout: Optional[float] = None) -> List[int]:
+    def get_completed_graphs_and_ops(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
         """Get IDs of all completed transfer graphs at current moment
 
         Args:

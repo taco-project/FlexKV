@@ -30,6 +30,7 @@ class KVManager:
         self.storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
         self.tp_size = model_config.tp_size
         self.gpu_handles = []
+        self._model_config = model_config
         if gpu_blocks is not None:
             assert len(gpu_blocks) == self.tp_size
             self.gpu_handles = [
@@ -41,10 +42,12 @@ class KVManager:
             self.transfer_engine = TransferEngine(self.gpu_handles, cpu_handle, ssd_handle)
 
         self.transfer_gid_to_task = {}
+        self.taskid_to_layerwise_ops = {}
 
         self._task_id_counter = 0
         self.task_queue = Queue()
         self.finished_queue = Queue()
+        self.finished_ops_queue = Queue()
         self.running = True
         self._worker_thread = threading.Thread(target=self._worker_loop)
         self._worker_thread.start()
@@ -82,26 +85,37 @@ class KVManager:
                 if request is None:
                     break
                 elif request.request_type == cacheEngineRequestType.GET:
-                    graph, return_mask, callback = self.cache_engine.get(request.token_ids,
-                                                                         request.token_mask,
-                                                                         request.slot_mapping)
+                    graph, return_mask, callback, finished_ops_ids = self.cache_engine.get(request.token_ids,
+                                                               request.token_mask,
+                                                               request.slot_mapping,
+                                                               self._model_config.num_layers,
+                                                               request.layer_granularity)
+                    if request.layer_granularity != -1:
+                        self.taskid_to_layerwise_ops[request.request_id] = finished_ops_ids
                 elif request.request_type == cacheEngineRequestType.PUT:
                     graph, return_mask, callback = self.cache_engine.put(request.token_ids,
-                                                                         request.token_mask,
-                                                                         request.slot_mapping)
+                                                               request.token_mask,
+                                                               request.slot_mapping,
+                                                               self._model_config.num_layers)
                 else:
                     raise ValueError(f"Unknown request type: {request.request_type}")
                 self.transfer_engine.submit_transfer_graph(graph)
                 self.transfer_gid_to_task[graph.transfer_graph_id] = TaskDescriptor(
                         request.request_id, return_mask, callback)
-            completed_graph_ids = self.transfer_engine.get_completed_graphs(timeout=0.001)
-            for completed_graph_id in completed_graph_ids:
+            results = self.transfer_engine.get_completed_graphs_and_ops(timeout=0.001)
+            for completed_graph_id, completed_op_id in results:
                 task_descriptor = self.transfer_gid_to_task[completed_graph_id]
-                task_descriptor.callback()
-                self.finished_queue.put(
-                    (task_descriptor.task_id, task_descriptor.return_mask)
-                )
-                self.transfer_gid_to_task.pop(completed_graph_id)
+                task_id = task_descriptor.task_id
+                if completed_op_id == -1:
+                    task_descriptor.callback()
+                    self.finished_queue.put( #TODO do not return "return_mask" everytime
+                        (task_id, completed_op_id, task_descriptor.return_mask)
+                    )
+                    self.transfer_gid_to_task.pop(completed_graph_id)
+                else:
+                    self.finished_ops_queue.put(
+                        (task_id, completed_op_id, task_descriptor.return_mask)
+                    )
             time.sleep(0.001)
 
     def _get_task_id(self) -> int:
@@ -119,17 +133,22 @@ class KVManager:
     def get_async(self,
                   token_ids: torch.Tensor,
                   slot_mapping: torch.Tensor,
-                  token_mask: Optional[torch.Tensor] = None) -> int:
+                  token_mask: Optional[torch.Tensor] = None,
+                  layer_granularity: int = -1) -> int:
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
+        if layer_granularity == -1:
+            layer_granularity = self._model_config.num_layers
         task_id = self._get_task_id()
         self.task_queue.put(cacheEngineRequest(
             request_type=cacheEngineRequestType.GET,
             request_id=task_id,
             token_ids=token_ids,
             token_mask=token_mask,
-            slot_mapping=slot_mapping
+            slot_mapping=slot_mapping,
+            layer_granularity=layer_granularity
         ))
+        self.taskid_to_layerwise_ops[task_id] = []
         return task_id
 
     def put_async(self,
@@ -148,15 +167,38 @@ class KVManager:
         ))
         return task_id
 
+    #NOTE the wait() function and wait_at_layer() function should not be called at the same time,
+    # because they clean each other
+    #NOTE every task should be synced in some way, otherwise the queue will be full
     def wait(self, task_ids: List[int]) -> Dict[int, torch.Tensor]:
         num_completed_tasks = 0
         return_masks = {}
         while num_completed_tasks < len(task_ids):
-            completed_task_id, return_mask = self.finished_queue.get()
+            completed_task_id, op_id, return_mask = self.finished_queue.get()
             if completed_task_id in task_ids:
-                num_completed_tasks += 1
-                return_masks[completed_task_id] = return_mask
+                if op_id == -1:
+                    num_completed_tasks += 1
+                    return_masks[completed_task_id] = return_mask
+                    if completed_task_id in self.taskid_to_layerwise_ops:
+                        self.taskid_to_layerwise_ops.pop(completed_task_id)
             else:
-                self.finished_queue.put((completed_task_id, return_mask))
+                self.finished_queue.put((completed_task_id, op_id, return_mask))
             time.sleep(0.001)
         return return_masks
+
+    def wait_at_layer_group(self, task_id: int, layer_group_id: int, last_layer: bool = False):
+        while True:
+            completed_task_id, op_id, return_mask = self.finished_ops_queue.get()
+            if completed_task_id == task_id:
+                if op_id == self.taskid_to_layerwise_ops[task_id][layer_group_id]:
+                    if last_layer:
+                        self.wait([task_id])
+                    return return_mask
+                elif op_id == -1:
+                    raise ValueError("should not happen since we are waiting at some layer")
+                elif op_id < layer_group_id:
+                    continue
+            else:
+                self.finished_ops_queue.put((completed_task_id, op_id, return_mask))
+            time.sleep(0.001)
+

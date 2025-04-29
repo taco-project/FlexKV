@@ -53,6 +53,21 @@ def verify_data(gpu_blocks, gpu_blocks_gt):
 
         assert torch.allclose(gpu_k, gpu_k_gt), f"K mismatch at layer {i}"
         assert torch.allclose(gpu_v, gpu_v_gt), f"V mismatch at layer {i}"
+        '''
+        print("start verify data at layer", i)
+        if not torch.allclose(gpu_k, gpu_k_gt):
+            print("K mismatch at layer", i)
+            k = torch.where(torch.abs(gpu_k - gpu_k_gt) > 1e-3)
+            print(k)
+            print("the actual value of gpu_k[k]", gpu_k[k])
+            print("the actual value of gpu_k_gt[k]", gpu_k_gt[k])
+        if not torch.allclose(gpu_v, gpu_v_gt):
+            print("V mismatch at layer", i)
+            v = torch.where(torch.abs(gpu_v - gpu_v_gt) > 1e-3)
+            print(v)
+            print("the actual value of gpu_v[v]", gpu_v[v])
+            print("the actual value of gpu_v_gt[v]", gpu_v_gt[v])
+        '''
     print("verify done")
 
 def block_ids_2_slot_mapping(block_ids):
@@ -82,22 +97,6 @@ def test_kvmanager():
     kvmanager = KVManager(model_config, cache_config, [gpu_blocks])
 
     request_pairs = [generate_request_pair(i) for i in range(num_requests)]
-    '''
-    write_requests = []
-    for token_ids, block_ids in request_pairs:
-        write_requests.append(kvmanager.put_async(token_ids=token_ids,
-                              slot_mapping=block_ids_2_slot_mapping(block_ids)))
-    print(f"write_requests: {write_requests}")
-    kvmanager.wait(write_requests)
-    print("write done")
-
-    read_requests = []
-    for token_ids, block_ids in request_pairs:
-        read_requests.append(kvmanager.get_async(token_ids=token_ids,
-                             slot_mapping=block_ids_2_slot_mapping(block_ids)))
-    return_masks = kvmanager.wait(read_requests)
-    print("read done")
-    '''
 
     # write initial data
     initial_write_num = num_requests // (
@@ -117,7 +116,7 @@ def test_kvmanager():
     total_data_size = 0
     all_requests = []
     start_time = time.time()
-    print("performing mixed read/write...")
+    print(f"the initial {initial_write_num} write done,performing mixed read/write...")
 
     for i in range(initial_write_num, num_requests):
         print(f"performing mixed read/write {i} / {num_requests} ...")
@@ -128,9 +127,17 @@ def test_kvmanager():
         request = kvmanager.get_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
+            layer_granularity=num_layers // 4,
         )
-        all_requests.append(request)
-
+        #all_requests.append(request)
+        if False:
+            for l in range(4):
+                s_time = time.time()
+                kvmanager.wait_at_layer_group(request, l, last_layer=(l==3))
+                e_time = time.time()
+                print(f"for task {request}, wait at layer {l} done, time: {e_time - s_time} s")
+        else:
+            all_requests.append(request)
 
         # write new data
         token_ids, block_ids = request_pairs[i]
@@ -138,7 +145,6 @@ def test_kvmanager():
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
         )
-
         all_requests.append(request)
         total_data_size += (
             block_per_request * tokens_per_block * num_kv_heads
@@ -149,16 +155,16 @@ def test_kvmanager():
             kvmanager.wait(all_requests)
             all_requests = []
 
-    kvmanager.wait(all_requests)
+    if len(all_requests) > 0:
+        kvmanager.wait(all_requests)
     print("mixed read/write done")
     end_time = time.time()
 
     total_data_size = 2 * total_data_size / (1024 * 1024 * 1024)
     total_time = (
-        end_time - start_time -
-        0.2 * (num_requests - initial_write_num)
+        end_time - start_time
     )
-    #print(f"total time: {total_time} s")
+    print(f"total time: {total_time} s")
     throughput = total_data_size / total_time
 
 

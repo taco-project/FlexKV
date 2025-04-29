@@ -138,7 +138,7 @@ class GPUCPUTransferWorker(TransferWorker):
         gpu_descriptor: TransferDescriptor,
         cpu_descriptor: TransferDescriptor,
         transfer_type: TransferType,
-        layer_id_list: Optional[List[int]] = None,
+        layer_id_list: Optional[torch.Tensor] = None,
         non_blocking: bool = False,
     ) -> None:
         assert gpu_descriptor.device_type == DeviceType.GPU
@@ -153,7 +153,7 @@ class GPUCPUTransferWorker(TransferWorker):
             return
 
         if layer_id_list is None:
-            layer_id_list = list(range(self.num_layers))
+            layer_id_list = torch.arange(self.num_layers, dtype=torch.int32)
 
         chunk_size_in_bytes = self.block_size * self.dtype.itemsize
         nvtx.range_push("Transfer KV Layers")
@@ -211,16 +211,17 @@ class GPUCPUTransferWorker(TransferWorker):
                     raise ValueError(f"Invalid transfer type: {op.transfer_type}")
                 start_time = time.time()
                 nvtx.range_push("GPU CPUTransfer")
+                #print(f"transfer info: gpu_descriptor: {gpu_descriptor}, cpu_descriptor: {cpu_descriptor}, transfer_type: {op.transfer_type}, layer_id_list: {op.layers}")
                 self.transfer(
                     gpu_descriptor,
                     cpu_descriptor,
                     op.transfer_type,
-                    layer_id_list=gpu_descriptor.layers,
+                    layer_id_list=op.layers,
                     non_blocking=True,
                 )
                 nvtx.range_pop()
                 self.transfer_stream.synchronize()
-                debuginfo.info("TRANSFER stream synchronized")
+                # debuginfo.info("TRANSFER stream synchronized")
                 self.finished_queue.put(op)
                 end_time = time.time()
                 transfer_size = (
@@ -228,7 +229,7 @@ class GPUCPUTransferWorker(TransferWorker):
                     * self.block_size
                     * self.dtype.itemsize
                     * 2
-                    * self.num_layers
+                    * len(op.layers)
                 )
                 debuginfo.info(
                     f"gpu cpu tranfer request: {op.transfer_op_id} finished "
@@ -315,7 +316,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         cpu_descriptor: TransferDescriptor,
         ssd_descriptor: TransferDescriptor,
         transfer_type: TransferType,
-        layer_id_list: Optional[List[int]] = None,
+        layer_id_list: Optional[torch.Tensor] = None,
         non_blocking: bool = False,
     ) -> None:
         debuginfo.info(f"ssd transfer {transfer_type} happens")
@@ -340,12 +341,11 @@ class CPUSSDDiskTransferWorker(TransferWorker):
             return
 
         if layer_id_list is None:
-            layer_id_list = list(range(self.num_layers))
-        #TODO add layer_id_list support
+            layer_id_list = torch.arange(self.num_layers, dtype=torch.int32)
 
         transfer_kv_blocks_ssd(
             filename=self.ssd_file,
-            cpu_layer_id_list=torch.tensor(layer_id_list, dtype=torch.int32),
+            cpu_layer_id_list=layer_id_list,
             cpu_layer_ptrs_tensor=self.cpu_layer_ptrs,
             ssd_block_ids=ssd_block_id_list,
             cpu_block_ids=cpu_block_id_list,
@@ -378,7 +378,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
                 cpu_descriptor,
                 ssd_descriptor,
                 op.transfer_type,
-                layer_id_list=cpu_descriptor.layers,
+                layer_id_list=op.layers,
                 non_blocking=True,
             )
             nvtx.range_pop()
