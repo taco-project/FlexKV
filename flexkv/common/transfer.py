@@ -18,15 +18,17 @@ class TransferType(Enum):
     H2DISK = 3  # Host to Disk transfer
     DISK2D = 4  # Disk to Device transfer
     D2DISK = 5  # Device to Disk transfer
+    # if we need to return a results when trasnfer op 1 and op 2 are completed
+    # we can add a virtual transfer op 3 that depends on op 1 and op 2
+    # so that the op 3 will not be executed actually, but can indicate the completion of
+    # a group of transfer ops
+    VIRTUAL = 6 
 
 @dataclass
 class TransferDescriptor:
     device_type: DeviceType = DeviceType.CPU
     device_id: int = 0
     physical_block_ids: torch.Tensor = torch.tensor([], dtype=torch.int64)
-    blockmeta_list: Optional[List[BlockMeta]] = None
-    layers: Optional[List[int]] = None
-    tp_rank: Optional[int] = None
 
     def __post_init__(self):
         assert self.physical_block_ids.ndim == 1
@@ -65,58 +67,81 @@ class TransferOp:
     transfer_op_id: int
     transfer_graph_id: int
     transfer_type: TransferType
-    src_descriptor: TransferDescriptor
-    dst_descriptor: TransferDescriptor
-    dependencies: Set[int] = field(default_factory=set)
+    src_descriptor: TransferDescriptor = None
+    dst_descriptor: TransferDescriptor = None
+    # this will change dynamically as transfer ops executed
+    predecessors: Set[int] = field(default_factory=set)
+    # this will keep the full info
+    successors: Set[int] = field(default_factory=set)
     status: TransferOpStatus = TransferOpStatus.PENDING
+    layers: Optional[torch.Tensor] = None
+    tp_rank: Optional[int] = None
+    tp_world_size: Optional[int] = None
 
 @dataclass
 class TransferOpGraph:
     transfer_graph_id: int
     _op_map: Dict[int, TransferOp] = field(init=False)
+    _current_ops: Set[int]
 
     def __init__(self, transfer_graph_id: int):
         self.transfer_graph_id = transfer_graph_id
         self._op_map = {}
+        self._current_ops = set()
+
+    def add_ready_op_id(self, op_id: int):
+        self._current_ops.add(op_id)
 
     def add_transfer_op(self, op: TransferOp):
         op.transfer_graph_id = self.transfer_graph_id
         self._op_map[op.transfer_op_id] = op
 
-    def add_dependency(self, op_id: int, dependent_op_id: int):
-        """op_id depends on dependent_op_id"""
-        if op_id in self._op_map and dependent_op_id in self._op_map:
-            self._op_map[op_id].dependencies.add(dependent_op_id)
-
-    def is_ready_to_execute(self, op_id: int) -> bool:
-        """check if an op is ready to execute
-        (all its dependencies are completed)"""
-        if op_id not in self._op_map:
-            return False
-        op = self._op_map[op_id]
-        if len(op.dependencies) == 0:
-            return True
-        return all(self._op_map[dep_id].status == TransferOpStatus.COMPLETED
-                   for dep_id in op.dependencies)
-
+    def add_dependency(self, successor_op_id: int, predecessor_op_id: int):
+        """successor_op_id depends on predecessor_op_id"""
+        if successor_op_id in self._op_map and predecessor_op_id in self._op_map:
+            self._op_map[successor_op_id].predecessors.add(predecessor_op_id)
+            self._op_map[predecessor_op_id].successors.add(successor_op_id)
+    
     def mark_completed(self, op_id: int):
         """mark an op as completed"""
         if op_id in self._op_map:
             assert self._op_map[op_id].status == TransferOpStatus.RUNNING
             self._op_map[op_id].status = TransferOpStatus.COMPLETED
+            my_successors = self._op_map[op_id].successors
+            if len(my_successors) == 0:
+                return
+            for successor_id in my_successors:
+                self._op_map[successor_id].predecessors.remove(op_id)
 
-    def get_ready_ops(self) -> List[int]:
+    def take_ready_ops(self) -> List[int]:
         """get a list of op ids that are ready to execute"""
-        ready_ops = [op.transfer_op_id for op in self._op_map.values()
-                if op.status == TransferOpStatus.PENDING and self.is_ready_to_execute(op.transfer_op_id)]
-        for op_id in ready_ops:
-            assert self._op_map[op_id].status == TransferOpStatus.PENDING
-            self._op_map[op_id].status = TransferOpStatus.RUNNING
+        ready_ops = []
+        to_remove = []
+        to_add = []
+        for op_id in self._current_ops:
+            op = self._op_map[op_id]
+            if op.status == TransferOpStatus.COMPLETED:
+                to_remove.append(op_id)
+                for successor_id in op.successors:
+                    if (self._op_map[successor_id].status == TransferOpStatus.PENDING and
+                        len(self._op_map[successor_id].predecessors) == 0):
+                        ready_ops.append(successor_id)
+                        self._op_map[successor_id].status = TransferOpStatus.RUNNING
+                        to_add.append(successor_id)
+            elif op.status == TransferOpStatus.PENDING: # not supposed to happen now
+                ready_ops.append(op_id)
+                self._op_map[op_id].status = TransferOpStatus.RUNNING
+                to_add.append(op_id)
+
+        for op_id in to_remove:
+            self._current_ops.remove(op_id)
+        for op_id in to_add:
+            self._current_ops.add(op_id)
         return ready_ops
 
     def all_transfer_ops_completed(self) -> bool:
         """check if all transfer ops are completed"""
-        return all(op.status == TransferOpStatus.COMPLETED for op in self._op_map.values())
+        return all(op.status == TransferOpStatus.COMPLETED or op.transfer_type == TransferType.VIRTUAL for op in self._op_map.values())
 
     def print_op_map(self):
         """Print transfer op graph in a visual format showing dependencies.
@@ -124,11 +149,11 @@ class TransferOpGraph:
         Example output:
         Transfer Graph 5:
         ├── Op 1 (H2D) [Completed]
-        │   └── No dependencies
+        │   └── No successors
         ├── Op 2 (D2H) [Pending]
-        │   └── Depends on: 1
+        │   └── Followed by: 1
         └── Op 3 (DISK2H) [Pending]
-            └── Depends on: 1, 2
+            └── Followed by: 1, 2
         """
         print(f"Transfer Graph {self.transfer_graph_id}:")
 
@@ -150,11 +175,11 @@ class TransferOpGraph:
 
             # print the dependency info
             dep_prefix = "    " if is_last else "│   "
-            if not op.dependencies:
-                print(f"{dep_prefix}└── No dependencies")
+            if not op.successors:
+                print(f"{dep_prefix}└── No successors")
             else:
-                deps_str = ", ".join(str(dep) for dep in sorted(op.dependencies))
-                print(f"{dep_prefix}└── Depends on: {deps_str}")
+                deps_str = ", ".join(str(dep) for dep in sorted(op.successors))
+                print(f"{dep_prefix}└── Followed by: {deps_str}")
 
             # print the transfer details
             src_info = f"From: {op.src_descriptor.device_type.name}:{op.src_descriptor.device_id}"

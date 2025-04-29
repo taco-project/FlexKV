@@ -19,3 +19,4 @@ class cacheEngineRequest:
     token_mask: torch.Tensor = None
     slot_mapping: torch.Tensor = None
     block_ids_to_unlock: Dict[DeviceType, torch.Tensor] = None
+    layer_granularity: int = -1

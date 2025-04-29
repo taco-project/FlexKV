@@ -118,7 +118,9 @@ class GlobalCacheEngine:
     def get(self,
             token_ids: torch.Tensor,
             token_mask: torch.Tensor,
-            slot_mapping: torch.Tensor) -> Tuple[TransferOpGraph, torch.Tensor]:
+            slot_mapping: torch.Tensor,
+            layer_num: int,
+            layer_granularity: int) -> Tuple[TransferOpGraph, torch.Tensor, List[int]]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         # ignore the last incomplete block
@@ -162,9 +164,12 @@ class GlobalCacheEngine:
                                          locked=True)
 
         # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
-        transfer_graph = create_read_transfer_graph(ssd_blocks_to_transfer,
-                                                    cpu_blocks_to_transfer,
-                                                    gpu_blocks_to_transfer)
+        transfer_graph, finished_ops_ids = create_read_transfer_graph(ssd_blocks=ssd_blocks_to_transfer,
+                                                                  cpu_blocks=cpu_blocks_to_transfer,
+                                                                  gpu_blocks=gpu_blocks_to_transfer,
+                                                                  gpu_device_id=0,
+                                                                  layer_num=layer_num,
+                                                                  layer_granularity=layer_granularity)
 
         return_mask = torch.zeros_like(token_mask)
         return_mask[start_idx* self.tokens_per_block:
@@ -174,12 +179,13 @@ class GlobalCacheEngine:
                            block_ids_to_unlock={DeviceType.CPU: cpu_blocks_to_transfer,
                                                 DeviceType.SSD: ssd_blocks_to_transfer})
 
-        return transfer_graph, return_mask, callback
+        return transfer_graph, return_mask, callback, finished_ops_ids
 
     def put(self,
             token_ids: torch.Tensor,
             token_mask: torch.Tensor,
-            slot_mapping: torch.Tensor) -> Tuple[TransferOpGraph, torch.Tensor]:
+            slot_mapping: torch.Tensor,
+            layer_num : int) -> Tuple[TransferOpGraph, torch.Tensor]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         # ignore the last incomplete block
@@ -229,7 +235,9 @@ class GlobalCacheEngine:
 
         transfer_graph = create_write_transfer_graph(ssd_blocks_to_transfer,
                                                     cpu_blocks_to_transfer,
-                                                    gpu_blocks_to_transfer)
+                                                    gpu_blocks_to_transfer,
+                                                    gpu_device_id = 0,
+                                                    layer_num = layer_num)
 
         return_mask = torch.zeros_like(token_mask)
         return_mask[start_idx* self.tokens_per_block:
