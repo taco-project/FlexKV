@@ -11,8 +11,10 @@ ext_modules = [
             "csrc/hash.cpp",
             "csrc/index.cpp",
         ],
-        extra_compile_args={"nvcc": ["-O3"]},
-        extra_link_args=["-lcuda", "-lssl", "-lcrypto"],
+        library_dirs=["build/lib"],
+        extra_compile_args={"nvcc": ["-O3"], "cxx": ["-std=c++17"]},
+        extra_link_args=["-lcuda", "-lssl", "-lcrypto", "-lxxhash"],
+        include_dirs=["build/include"],
     ),
 ]
 
