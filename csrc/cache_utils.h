@@ -2,7 +2,7 @@
 
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
-
+#include <xxhash.h>
 namespace py = pybind11;
 
 namespace flexkv {
@@ -10,6 +10,18 @@ namespace flexkv {
 int get_hash_size();
 
 void hash_tensor(const torch::Tensor &tensor, torch::Tensor &result);
+
+class Hasher {
+private:
+    XXH64_state_t* xxhasher;
+
+public:
+    Hasher();
+    ~Hasher();
+    void reset();
+    XXH64_hash_t hash(const torch::Tensor &input);
+    void hash_out(const torch::Tensor &input, torch::Tensor &result);
+};
 
 torch::Tensor get_prefix_block_ids(int64_t last_block_index,
                                    int64_t last_block_id,

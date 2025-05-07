@@ -1,12 +1,13 @@
-from enum import Enum, auto
 from dataclasses import dataclass, field
-from typing import NewType, Optional, List
+from enum import Enum, auto
+from typing import List, NewType, Optional
 
-import torch
 import numpy as np
+import torch
 
-from flexkv.common.hash_utils import \
-    HashType, hash_tensor, get_hash_size
+from flexkv.c_ext import Hasher
+from flexkv.common.hash_utils import HashType, get_hash_size, hash_tensor
+
 
 class BlockStatus(Enum):
     UNREGISTERED = 0
@@ -33,7 +34,7 @@ class BlockMeta:
 
     status: BlockStatus = BlockStatus.UNREGISTERED
 
-    def __lt__(self, other: 'BlockMeta') -> bool:
+    def __lt__(self, other: "BlockMeta") -> bool:
         return self.last_access_time < other.last_access_time
 
     def __str__(self):
@@ -49,6 +50,7 @@ class BlockMeta:
 
     def __repr__(self):
         return self.__str__()
+
 
 @dataclass
 class SequenceMeta:
@@ -84,9 +86,16 @@ class SequenceMeta:
         if self._has_hashes:
             return
         assert self.token_ids.ndim == 1
-        self.block_hashes = torch.zeros((self.num_blocks, get_hash_size()), dtype=torch.uint8)
+        self.block_hashes = torch.zeros(
+            (self.num_blocks, get_hash_size()), dtype=torch.uint8
+        )
 
-        # TODO: optimize this using C++ extension
+        hasher = Hasher()
         for i in range(self.num_blocks):
-            self.block_hashes[i] = hash_tensor(self.token_ids[0:(i+1)*self.tokens_per_block])
+            hasher.hash_out(
+                self.token_ids[
+                    i * self.tokens_per_block : (i + 1) * self.tokens_per_block
+                ],
+                self.block_hashes[i],
+            )
         self._has_hashes = True

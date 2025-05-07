@@ -1,16 +1,17 @@
-import time
 import heapq
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Union, Tuple
+from typing import Dict, List, Tuple, Union
 
 import torch
 
+from flexkv.c_ext import (Hasher, find_n_liner_parents_for_eviction,
+                          get_block_ids_from_hashes, get_hash_size,
+                          get_prefix_block_ids, index_batch_insert,
+                          index_batch_remove)
 from flexkv.common.block import BlockMeta, BlockStatus, SequenceMeta
 from flexkv.common.hash_utils import HashType, hash_tensor
-from flexkv.c_ext import get_hash_size
-from flexkv.c_ext import get_prefix_block_ids
-from flexkv.c_ext import get_block_ids_from_hashes
-from flexkv.c_ext import index_batch_insert, find_n_liner_parents_for_eviction, index_batch_remove
+
 
 @dataclass
 class EvictionCandidate:
@@ -141,21 +142,28 @@ class TokenToBlockIndex:
         left, right = 0, sequence_meta.num_blocks - 1
         last_index = -1
         last_block_id = -1
+        hasher = Hasher()
+        hash_res = torch.zeros(get_hash_size(), dtype=torch.uint8)
+        hash_start_pos = 0
         while left <= right:
             mid = (left + right) // 2
             hash_key = None
             if sequence_meta.has_hashes():
                 hash_key = bytes(sequence_meta.block_hashes[mid])
             else:
-                hash_key = bytes(hash_tensor(sequence_meta.token_ids[
-                    0:(mid+1)*self.tokens_per_block
-                ]))
+                hasher.hash_out(sequence_meta.token_ids[
+                    hash_start_pos:(mid+1)*self.tokens_per_block
+                ], hash_res)
+                hash_key = bytes(hash_res)
             if hash_key in self.index:
                 last_index = mid
                 last_block_id = self.index[hash_key]
                 left = mid + 1
+                hash_start_pos = mid + 1
             else:
                 right = mid - 1
+                hasher.reset()
+                hash_start_pos = 0
         return last_index, last_block_id
 
     def evict(self, num_evicted: int) -> torch.Tensor:
