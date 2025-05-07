@@ -115,4 +115,13 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("index_batch_remove", &flexkv::index_batch_remove,
         "Batch remove hashes from a dictionary", py::arg("hashes"),
         py::arg("hash_to_block_id"));
+
+  // Add Hasher class binding
+  py::class_<flexkv::Hasher>(m, "Hasher")
+      .def(py::init<>())
+      .def("reset", &flexkv::Hasher::reset)
+      .def("hash", &flexkv::Hasher::hash, "Hash a tensor and return the hash value", 
+           py::arg("input"))
+      .def("hash_out", &flexkv::Hasher::hash_out, "Hash a tensor and store the result in the output tensor", 
+           py::arg("input"), py::arg("result"));
 }

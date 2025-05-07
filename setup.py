@@ -1,6 +1,7 @@
-from setuptools import setup, find_packages
-from torch.utils import cpp_extension
+import os
 
+from setuptools import find_packages, setup
+from torch.utils import cpp_extension
 
 ext_modules = [
     cpp_extension.CUDAExtension(
@@ -11,10 +12,10 @@ ext_modules = [
             "csrc/hash.cpp",
             "csrc/index.cpp",
         ],
-        library_dirs=["build/lib"],
+        library_dirs=[os.path.abspath("build/lib")],
+        include_dirs=[os.path.abspath("build/include")],
         extra_compile_args={"nvcc": ["-O3"], "cxx": ["-std=c++17"]},
         extra_link_args=["-lcuda", "-lssl", "-lcrypto", "-lxxhash"],
-        include_dirs=["build/include"],
     ),
 ]
 
