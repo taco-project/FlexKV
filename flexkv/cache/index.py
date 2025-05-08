@@ -152,7 +152,7 @@ class TokenToBlockIndex:
                 hash_key = bytes(sequence_meta.block_hashes[mid])
             else:
                 hasher.hash_out(sequence_meta.token_ids[
-                    hash_start_pos:(mid+1)*self.tokens_per_block
+                    hash_start_pos*self.tokens_per_block:(mid+1)*self.tokens_per_block
                 ], hash_res)
                 hash_key = bytes(hash_res)
             if hash_key in self.index:
