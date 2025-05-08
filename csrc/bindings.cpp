@@ -95,8 +95,9 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("import_handle", &import_memory_handle);
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
-  m.def("hash_tensor", &flexkv::hash_tensor, "Hash a tensor", py::arg("tensor"),
-        py::arg("result"));
+  m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
+        py::arg("hasher"), py::arg("token_ids"), py::arg("tokens_per_block"),
+        py::arg("block_hashes"));
   m.def("get_prefix_block_ids", &flexkv::get_prefix_block_ids,
         "Get prefix block ids", py::arg("last_block_index"),
         py::arg("last_block_id"), py::arg("prev_block_ids"));
@@ -120,8 +121,12 @@ PYBIND11_MODULE(c_ext, m) {
   py::class_<flexkv::Hasher>(m, "Hasher")
       .def(py::init<>())
       .def("reset", &flexkv::Hasher::reset)
-      .def("hash", &flexkv::Hasher::hash, "Hash a tensor and return the hash value", 
-           py::arg("input"))
-      .def("hash_out", &flexkv::Hasher::hash_out, "Hash a tensor and store the result in the output tensor", 
-           py::arg("input"), py::arg("result"));
+      .def("update",
+           py::overload_cast<const torch::Tensor &>(&flexkv::Hasher::update),
+           "Update the hasher with a tensor", py::arg("input"))
+      .def("update",
+           py::overload_cast<const void *, size_t>(&flexkv::Hasher::update),
+           "Update the hasher with pointer and size", py::arg("input"),
+           py::arg("size"))
+      .def("digest", &flexkv::Hasher::digest, "Return the hash value");
 }

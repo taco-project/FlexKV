@@ -45,7 +45,7 @@ def test_eviction_perf():
     history_sequence_meta = []
     inserted_blocks_len = random.randint(blocks_num_per_insert//5, blocks_num_per_insert)
     history_sequence_meta.append(
-        SequenceMeta(torch.randint(0, 256, (inserted_blocks_len*token_per_block,), dtype=torch.uint8), token_per_block)
+        SequenceMeta(torch.randint(0, 256, (inserted_blocks_len*token_per_block,), dtype=torch.int64), token_per_block)
     )
     cache_index.insert(history_sequence_meta[0], mempool.allocate_blocks(inserted_blocks_len), 0)
     total_evict_time = 0
@@ -62,13 +62,13 @@ def test_eviction_perf():
                                                         torch.randint(0,
                                                                       256,
                                                                       (inserted_blocks_len*token_per_block,),
-                                                                      dtype=torch.uint8)]),
+                                                                      dtype=torch.int64)]),
                                                         token_per_block)
         else: # in the other half case, generate a new sequence meta
             new_sequence_meta = SequenceMeta(torch.randint(0,
                                                            256,
                                                            (inserted_blocks_len*token_per_block,),
-                                                           dtype=torch.uint8), token_per_block)
+                                                           dtype=torch.int64), token_per_block)
         prefix_block_ids = cache_index.match_prefix(new_sequence_meta)
         needed_blocks_num = new_sequence_meta.num_blocks - len(prefix_block_ids)
         if needed_blocks_num > mempool.num_free_blocks:

@@ -7,21 +7,25 @@ namespace py = pybind11;
 
 namespace flexkv {
 
-int get_hash_size();
+using HashType = XXH64_hash_t;
 
-void hash_tensor(const torch::Tensor &tensor, torch::Tensor &result);
+int get_hash_size();
 
 class Hasher {
 private:
-    XXH64_state_t* xxhasher;
+  XXH64_state_t *xxhasher;
 
 public:
-    Hasher();
-    ~Hasher();
-    void reset();
-    XXH64_hash_t hash(const torch::Tensor &input);
-    void hash_out(const torch::Tensor &input, torch::Tensor &result);
+  Hasher();
+  ~Hasher();
+  void reset();
+  Hasher &update(const torch::Tensor &input);
+  Hasher &update(const void *input, size_t size);
+  HashType digest();
 };
+
+void gen_hashes(Hasher &hasher, const torch::Tensor &token_ids,
+                int tokens_per_block, torch::Tensor &block_hashes);
 
 torch::Tensor get_prefix_block_ids(int64_t last_block_index,
                                    int64_t last_block_id,
