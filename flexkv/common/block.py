@@ -5,8 +5,7 @@ from typing import List, NewType, Optional
 import numpy as np
 import torch
 
-from flexkv.c_ext import Hasher
-from flexkv.common.hash_utils import HashType, get_hash_size, hash_tensor
+from flexkv.common.hash_utils import HashType, gen_hashes, get_hash_size
 
 
 class BlockStatus(Enum):
@@ -59,7 +58,7 @@ class SequenceMeta:
 
     tokens_per_block: int
 
-    block_hashes: torch.Tensor
+    block_hashes: Optional[torch.Tensor] = None
 
     _has_hashes: bool = False
 
@@ -82,20 +81,16 @@ class SequenceMeta:
     def has_hashes(self) -> bool:
         return self._has_hashes
 
+    def get_hash(self, block_id: int) -> HashType:
+        assert self._has_hashes
+        return self.block_hashes[block_id].item()
+
     def gen_hashes(self) -> None:
         if self._has_hashes:
             return
         assert self.token_ids.ndim == 1
-        self.block_hashes = torch.zeros(
-            (self.num_blocks, get_hash_size()), dtype=torch.uint8
-        )
-
-        hasher = Hasher()
-        for i in range(self.num_blocks):
-            hasher.hash_out(
-                self.token_ids[
-                    i * self.tokens_per_block : (i + 1) * self.tokens_per_block
-                ],
-                self.block_hashes[i],
-            )
+        self.block_hashes = gen_hashes(self.token_ids, self.tokens_per_block)
+        assert self.block_hashes.ndim == 1
+        assert self.block_hashes.numel() == self.num_blocks
+        assert self.block_hashes.element_size() == get_hash_size()
         self._has_hashes = True

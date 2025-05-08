@@ -54,20 +54,15 @@ torch::Tensor find_n_liner_parents_for_eviction(
 
 torch::Tensor get_block_ids_from_hashes(const torch::Tensor &hashes,
                                         const py::dict &hash_to_block_id) {
-  assert(hashes.ndim() == 2);
-  assert(hashes.type() == torch::kUInt8);
+  assert(hashes.ndim() == 1);
+  assert(hashes.element_size() == get_hash_size()); // 64bit
 
-  int num_hashes = hashes.size(0);
-  int hash_size = get_hash_size();
-
+  int num_hashes = hashes.numel();
   torch::Tensor result = torch::zeros({num_hashes}, torch::kInt64);
   int64_t *result_ptr = result.data_ptr<int64_t>();
-  uint8_t *hashes_ptr = hashes.data_ptr<uint8_t>();
-
+  HashType *hashes_ptr = reinterpret_cast<HashType *>(hashes.data_ptr());
   for (int i = 0; i < num_hashes; i++) {
-    py::bytes hash_bytes(reinterpret_cast<char *>(hashes_ptr + i * hash_size),
-                         hash_size);
-    result_ptr[i] = hash_to_block_id[hash_bytes].cast<int64_t>();
+    result_ptr[i] = hash_to_block_id[py::int_(hashes_ptr[i])].cast<int64_t>();
   }
 
   return result;
@@ -78,34 +73,26 @@ void index_batch_insert(const torch::Tensor &hashes,
                         py::dict &hash_to_block_id) {
   assert(block_ids.ndim() == 1);
   assert(block_ids.type() == torch::kInt64);
-  assert(hashes.ndim() == 2);
-  assert(hashes.type() == torch::kUInt8);
+  assert(hashes.ndim() == 1);
+  assert(hashes.element_size() == get_hash_size()); // 64bit
 
-  int num_hashes = hashes.size(0);
-  int hash_size = hashes.size(1);
-
+  int num_hashes = hashes.numel();
   int64_t *block_ids_ptr = block_ids.data_ptr<int64_t>();
-  uint8_t *hashes_ptr = hashes.data_ptr<uint8_t>();
+  HashType *hashes_ptr = reinterpret_cast<HashType *>(hashes.data_ptr());
   for (int i = 0; i < num_hashes; i++) {
-    py::bytes hash_bytes(reinterpret_cast<char *>(hashes_ptr + i * hash_size),
-                         hash_size);
-    hash_to_block_id[hash_bytes] = block_ids_ptr[i];
+    hash_to_block_id[py::int_(hashes_ptr[i])] = block_ids_ptr[i];
   }
 }
 
 void index_batch_remove(const torch::Tensor &hashes,
                         py::dict &hash_to_block_id) {
-  assert(hashes.ndim() == 2);
-  assert(hashes.type() == torch::kUInt8);
+  assert(hashes.ndim() == 1);
+  assert(hashes.element_size() == get_hash_size()); // 64bit
 
-  int num_hashes = hashes.size(0);
-  int hash_size = hashes.size(1);
-
-  uint8_t *hashes_ptr = hashes.data_ptr<uint8_t>();
+  int num_hashes = hashes.numel();
+  HashType *hashes_ptr = reinterpret_cast<HashType *>(hashes.data_ptr());
   for (int i = 0; i < num_hashes; i++) {
-    py::bytes hash_bytes(reinterpret_cast<char *>(hashes_ptr + i * hash_size),
-                         hash_size);
-    hash_to_block_id.attr("__delitem__")(hash_bytes);
+    hash_to_block_id.attr("__delitem__")(py::int_(hashes_ptr[i]));
   }
 }
 } // namespace flexkv
