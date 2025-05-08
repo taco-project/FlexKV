@@ -6,10 +6,9 @@ from typing import Dict, List, Tuple, Union
 import torch
 
 from flexkv.c_ext import (find_n_liner_parents_for_eviction,
-                          get_block_ids_from_hashes, get_prefix_block_ids,
-                          index_batch_insert, index_batch_remove)
+                          get_block_ids_from_hashes, get_prefix_block_ids)
 from flexkv.common.block import SequenceMeta
-from flexkv.common.hash_utils import HashType, get_hash_size, Hasher
+from flexkv.common.hash_utils import HashType, Hasher
 
 
 @dataclass
@@ -210,7 +209,7 @@ class TokenToBlockIndex:
                     self._ready[parent_block_id] and
                     self._lock_cnt[parent_block_id] == 0):
                     # not locked and available, add as new leaf and new candidate
-                    self.leaf_blocks[self._hash_values[parent_block_id]] = parent_block_id
+                    self.leaf_blocks[self._hash_values[parent_block_id].to(torch.uint64).item()] = parent_block_id
                     heapq.heappush(candidates, EvictionCandidate(self._hash_values[parent_block_id],
                                                                  parent_block_id,
                                                                  self._last_access_time[parent_block_id]))
@@ -238,13 +237,15 @@ class TokenToBlockIndex:
     def _batch_insert(self,
                       hashes: torch.Tensor,
                       block_ids: torch.Tensor) -> None:
-        index_batch_insert(hashes,
-                          block_ids,
-                          self.index)
+        hash_list = hashes.to(torch.uint64).tolist()
+        block_id_list = block_ids.tolist()
+        for hash, block_id in zip(hash_list, block_id_list):
+            self.index[hash] = block_id
 
     def _batch_remove(self, hashes: torch.Tensor) -> None:
-        index_batch_remove(hashes,
-                          self.index)
+        hash_list = hashes.to(torch.uint64).tolist()
+        for hash in hash_list:
+            self.index.pop(hash)
 
     @property
     def total_cached_blocks(self) -> int:
