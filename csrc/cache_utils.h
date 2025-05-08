@@ -40,11 +40,4 @@ torch::Tensor find_n_liner_parents_for_eviction(
 torch::Tensor get_block_ids_from_hashes(const torch::Tensor &hashes,
                                         const py::dict &hash_to_block_id);
 
-void index_batch_insert(const torch::Tensor &hashes,
-                        const torch::Tensor &block_ids,
-                        py::dict &hash_to_block_id);
-
-void index_batch_remove(const torch::Tensor &hashes,
-                        py::dict &hash_to_block_id);
-
 } // namespace flexkv

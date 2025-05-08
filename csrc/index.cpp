@@ -67,32 +67,4 @@ torch::Tensor get_block_ids_from_hashes(const torch::Tensor &hashes,
 
   return result;
 }
-
-void index_batch_insert(const torch::Tensor &hashes,
-                        const torch::Tensor &block_ids,
-                        py::dict &hash_to_block_id) {
-  assert(block_ids.ndim() == 1);
-  assert(block_ids.type() == torch::kInt64);
-  assert(hashes.ndim() == 1);
-  assert(hashes.element_size() == get_hash_size()); // 64bit
-
-  int num_hashes = hashes.numel();
-  int64_t *block_ids_ptr = block_ids.data_ptr<int64_t>();
-  HashType *hashes_ptr = reinterpret_cast<HashType *>(hashes.data_ptr());
-  for (int i = 0; i < num_hashes; i++) {
-    hash_to_block_id[py::int_(hashes_ptr[i])] = block_ids_ptr[i];
-  }
-}
-
-void index_batch_remove(const torch::Tensor &hashes,
-                        py::dict &hash_to_block_id) {
-  assert(hashes.ndim() == 1);
-  assert(hashes.element_size() == get_hash_size()); // 64bit
-
-  int num_hashes = hashes.numel();
-  HashType *hashes_ptr = reinterpret_cast<HashType *>(hashes.data_ptr());
-  for (int i = 0; i < num_hashes; i++) {
-    hash_to_block_id.attr("__delitem__")(py::int_(hashes_ptr[i]));
-  }
-}
 } // namespace flexkv
