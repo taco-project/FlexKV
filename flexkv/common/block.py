@@ -5,7 +5,7 @@ from typing import List, NewType, Optional
 import numpy as np
 import torch
 
-from flexkv.common.hash_utils import HashType, gen_hashes, get_hash_size
+from flexkv.common.hash_utils import HashType, gen_hashes, get_hash_size, hash_tensor
 
 
 class BlockStatus(Enum):
@@ -81,9 +81,13 @@ class SequenceMeta:
     def has_hashes(self) -> bool:
         return self._has_hashes
 
-    def get_hash(self, block_id: int) -> HashType:
-        assert self._has_hashes
-        return self.block_hashes[block_id].item()
+    def get_hash(self, block_id: int) -> Optional[HashType]:
+        if block_id >= self.num_blocks:
+            return None
+        if self._has_hashes:
+            return self.block_hashes[block_id].item()
+        else:
+            return hash_tensor(self.token_ids[:(block_id+1)*self.tokens_per_block])
 
     def gen_hashes(self) -> None:
         if self._has_hashes:
