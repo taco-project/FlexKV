@@ -8,8 +8,8 @@ from typing import List
 import torch
 
 from flexkv.common.block import SequenceMeta
-from flexkv.cache.index import TokenToBlockIndex
 from flexkv.cache.mempool import Mempool
+from flexkv.cache.radixtree import RadixTreeIndex
 from request_generator import RequestGenerator, KVRequest
 from flexkv.common.debug import debuginfo
 
@@ -35,7 +35,7 @@ def main():
     max_sequence_length = 100 + 10 * (1000 + 1000)
     max_num_blocks = max_sequence_length * 4
     tokens_per_block = 16
-    cache_index = TokenToBlockIndex(tokens_per_block=tokens_per_block, max_num_blocks=max_num_blocks)
+    cache_index = RadixTreeIndex(tokens_per_block=tokens_per_block, max_num_blocks=max_num_blocks)
     mempool = Mempool(num_total_blocks=max_num_blocks)
     profiler = cProfile.Profile()
     num_total_evicted = 0
@@ -48,21 +48,26 @@ def main():
             'req': req,
         }
         sequence_meta = SequenceMeta(token_ids=req.token_ids, tokens_per_block=tokens_per_block)
-        num_matched_blocks = len(cache_index.match_prefix(sequence_meta))
         if req.request_type == "get":
+            num_matched_blocks = 0
             num_total_matched_blocks += num_matched_blocks
             debuginfo.info(f"cache hit ratio: {num_matched_blocks * tokens_per_block / len(req.token_ids)}")
         elif req.request_type == "put":
+            match_result = cache_index.match_prefix(sequence_meta)
+            num_matched_blocks = match_result.num_matched_blocks
+            ret_node = match_result.last_node
             required_blocks_num = sequence_meta.num_blocks - num_matched_blocks
             if required_blocks_num > mempool.num_free_blocks:
+                cache_index.lock(ret_node)
                 local_vars['required_blocks_num'] = required_blocks_num
                 profiler.runctx('evicted_blocks = cache_index.evict(required_blocks_num - mempool.num_free_blocks)',
                                 globals(), local_vars)
                 mempool.recycle_blocks(local_vars['evicted_blocks'])
                 num_total_evicted += len(local_vars['evicted_blocks'])
                 num_eviction += 1
+                cache_index.unlock(ret_node)
             new_block_ids = mempool.allocate_blocks(required_blocks_num)
-            cache_index.insert(sequence_meta, new_block_ids, num_matched_blocks)
+            cache_index.insert(sequence_meta, new_block_ids)
     debuginfo.info(f"Total requests: {len(reqs)}")
     debuginfo.info(f"{num_eviction} eviction happened")
     debuginfo.info(f"Total evicted blocks: {num_total_evicted}")

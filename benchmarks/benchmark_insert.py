@@ -4,12 +4,12 @@ from argparse import ArgumentParser
 
 import torch
 
-from flexkv.cache.index import TokenToBlockIndex
+from flexkv.cache.radixtree import RadixTreeIndex
 from flexkv.common.block import SequenceMeta
 
 
 def main(args):
-    index = TokenToBlockIndex(tokens_per_block=args.tokens_per_block,
+    index = RadixTreeIndex(tokens_per_block=args.tokens_per_block,
                               max_num_blocks=args.max_num_blocks)
     token_ids = torch.randint(0, 10000, (args.sequence_length, ), dtype=torch.int64)
     insert_sequence_meta = SequenceMeta(token_ids=token_ids,
@@ -18,7 +18,7 @@ def main(args):
     profiler = cProfile.Profile()
     print("insert sequence of length", insert_sequence_meta.length)
     physical_block_ids = torch.arange(insert_sequence_meta.num_blocks, dtype=torch.int64)
-    profiler.runctx('index.insert(insert_sequence_meta, physical_block_ids, 0)',
+    profiler.runctx('index.insert(insert_sequence_meta, physical_block_ids)',
                     globals(), locals())
     stats = pstats.Stats(profiler)
     stats.strip_dirs()

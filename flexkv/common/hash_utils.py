@@ -25,7 +25,7 @@ class Hasher:
 def hash_tensor(tensor: torch.Tensor) -> HashType:
     hasher = Hasher()
     hasher.update(tensor)
-    return hasher.digest()
+    return HashType(hasher.digest())
 
 def gen_hashes(token_ids: torch.Tensor, tokens_per_block: int, hasher: Optional[Hasher] = None) -> torch.Tensor:
     block_hashes = torch.zeros(token_ids.numel() // tokens_per_block, dtype=torch.uint64)
