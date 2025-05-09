@@ -26,7 +26,7 @@ class KVManager:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_blocks: List[List[torch.Tensor]] = None):
-        self.cache_engine = GlobalCacheEngine(cache_config)
+        self.cache_engine = GlobalCacheEngine(cache_config, model_config)
         self.storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
         self.tp_size = model_config.tp_size
         self.gpu_handles = []
@@ -201,4 +201,3 @@ class KVManager:
             else:
                 self.finished_ops_queue.put((completed_task_id, op_id, return_mask))
             time.sleep(0.001)
-

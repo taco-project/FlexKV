@@ -48,10 +48,11 @@ class TokenToBlockIndex:
     def match_prefix(self,
                     sequence: SequenceMeta,
                     update_cache_info: bool = True) -> torch.Tensor:
-        if sequence.has_hashes():
-            prefix_block_ids = self._match_hashes_impl(sequence)
-        else:
-            prefix_block_ids = self._match_token_ids_impl(sequence)
+        # if sequence.has_hashes():
+        #     prefix_block_ids = self._match_with_hashes_impl(sequence)
+        # else:
+        #     prefix_block_ids = self._match_with_token_ids_impl(sequence)
+        prefix_block_ids = self._match_with_token_ids_impl(sequence)
         ready_mask = self._ready[prefix_block_ids]
         ready_block_ids = prefix_block_ids[ready_mask]
 
@@ -60,55 +61,54 @@ class TokenToBlockIndex:
             self._last_access_time[ready_block_ids] = current_time
         return ready_block_ids
 
-    def match_length(self,
+    def match_blocks(self,
                     sequence: SequenceMeta) -> int:
         """get the length of the longest prefix that is cached"""
         last_index, _ = self._search_last_cached_block(sequence)
         return last_index + 1
 
-    def _match_hashes_impl(self,
-                           sequence: SequenceMeta) -> torch.Tensor:
+    def _match_with_hashes_impl(self,
+                                sequence: SequenceMeta) -> torch.Tensor:
         """match the prefix of the sequence with the cached hashes"""
-        cached_prefix_length = self.match_length(sequence)
-        prefix_block_ids = get_block_ids_from_hashes(sequence.block_hashes[:cached_prefix_length],
-                                                        self.index)
+        num_matched_blocks = self.match_blocks(sequence)
+        prefix_block_ids = self._hashmap_batch_get(sequence.block_hashes[:num_matched_blocks])
         return prefix_block_ids
 
-    def _match_token_ids_impl(self,
-                              sequence_meta: SequenceMeta) -> torch.Tensor:
+    def _match_with_token_ids_impl(self,
+                                   sequence: SequenceMeta) -> torch.Tensor:
         """match the prefix of the sequence with the cached token ids"""
-        last_index, last_block_id = self._search_last_cached_block(sequence_meta)
+        last_index, last_block_id = self._search_last_cached_block(sequence)
         prefix_block_ids = get_prefix_block_ids(last_index, last_block_id, self._prev_id)
         return prefix_block_ids
 
     def insert(self,
                sequence_meta: SequenceMeta,
                physical_block_ids: torch.Tensor,
-               match_length: int = -1,
-               insert_length: int = -1,
+               num_matched_blocks: int = -1,
+               num_insert_blocks: int = -1,
                is_ready: bool = True,
                locked: bool = False) -> None:
-        if insert_length == -1:
-            insert_length = sequence_meta.num_blocks
-        if match_length == -1:
-            match_length = self.match_length(sequence_meta)
-        assert 0 <= match_length <= sequence_meta.num_blocks
-        assert 0 <= insert_length <= sequence_meta.num_blocks
-        assert match_length <= insert_length
+        if num_insert_blocks == -1:
+            num_insert_blocks = sequence_meta.num_blocks
+        if num_matched_blocks == -1:
+            num_matched_blocks = self.match_blocks(sequence_meta)
+        assert 0 <= num_matched_blocks <= sequence_meta.num_blocks
+        assert 0 <= num_insert_blocks <= sequence_meta.num_blocks
+        assert num_matched_blocks <= num_insert_blocks
 
         assert physical_block_ids.ndim == 1
-        assert len(physical_block_ids) == insert_length - match_length
+        assert len(physical_block_ids) == num_insert_blocks - num_matched_blocks
 
-        if match_length == insert_length:
+        if num_matched_blocks == num_insert_blocks:
             return
 
         sequence_meta.gen_hashes()
 
-        last_cached_index = match_length - 1
-        first_index = match_length
+        last_cached_index = num_matched_blocks - 1
+        first_index = num_matched_blocks
         assert sequence_meta.get_hash(first_index) not in self.index
         last_cached_block_id = -1
-        if match_length > 0:
+        if num_matched_blocks > 0:
             assert sequence_meta.get_hash(last_cached_index) in self.index
             last_cached_block_id = self.index[sequence_meta.get_hash(last_cached_index)]
             self.leaf_blocks.pop(sequence_meta.get_hash(last_cached_index), None)
@@ -129,11 +129,11 @@ class TokenToBlockIndex:
         self._child_cnt[inserted_block_ids[-1]] = 0
 
         self._hash_values[inserted_block_ids] = sequence_meta.block_hashes.to(torch.int64)[first_index:
-                                                                           first_index+insert_length-match_length]
+                                                                           first_index+num_insert_blocks-num_matched_blocks]
 
-        self._batch_insert(sequence_meta.block_hashes[first_index:first_index+insert_length-match_length],
+        self._hashmap_batch_insert(sequence_meta.block_hashes[first_index:first_index+num_insert_blocks-num_matched_blocks],
                            inserted_block_ids)
-        self.leaf_blocks[sequence_meta.get_hash(insert_length-1)] = inserted_block_ids[-1].item()
+        self.leaf_blocks[sequence_meta.get_hash(num_insert_blocks-1)] = inserted_block_ids[-1].item()
 
     def _search_last_cached_block(self,
                                   sequence_meta: SequenceMeta) -> Tuple[int, int]:
@@ -234,18 +234,21 @@ class TokenToBlockIndex:
     def set_ready(self, block_ids: torch.Tensor, is_ready: bool = True) -> None:
         self._ready[block_ids] = is_ready
 
-    def _batch_insert(self,
-                      hashes: torch.Tensor,
-                      block_ids: torch.Tensor) -> None:
+    def _hashmap_batch_insert(self,
+                              hashes: torch.Tensor,
+                              block_ids: torch.Tensor) -> None:
         hash_list = hashes.to(torch.uint64).tolist()
         block_id_list = block_ids.tolist()
         for hash, block_id in zip(hash_list, block_id_list):
             self.index[hash] = block_id
 
-    def _batch_remove(self, hashes: torch.Tensor) -> None:
+    def _hashmap_batch_remove(self, hashes: torch.Tensor) -> None:
         hash_list = hashes.to(torch.uint64).tolist()
         for hash in hash_list:
             self.index.pop(hash)
+
+    def _hashmap_batch_get(self, hashes: torch.Tensor) -> torch.Tensor:
+        return get_block_ids_from_hashes(hashes, self.index)
 
     @property
     def total_cached_blocks(self) -> int:
@@ -266,9 +269,9 @@ if __name__ == "__main__":
     index.insert(seq1, torch.tensor([0, 1, 2, 3], dtype=torch.int64), is_ready=True)
     print(f"insert seq1 = {seq1.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks}")
-    seq2_match_length = index.match_length(seq2)
-    assert seq2_match_length == 2
-    index.insert(seq2, torch.tensor([8, 9], dtype=torch.int64), match_length=2, is_ready=True)
+    seq2_matched_blocks = index.match_blocks(seq2)
+    assert seq2_matched_blocks == 2
+    index.insert(seq2, torch.tensor([8, 9], dtype=torch.int64), num_matched_blocks=2, is_ready=True)
     print(f"insert seq2 = {seq2.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks}")
 

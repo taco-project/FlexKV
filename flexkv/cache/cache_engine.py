@@ -9,7 +9,7 @@ from flexkv.common.transfer import DeviceType, TransferOpGraph
 from flexkv.cache.index import TokenToBlockIndex
 from flexkv.cache.mempool import Mempool
 from flexkv.common.block import BlockMeta, SequenceMeta, BlockStatus
-from flexkv.common.config import CacheConfig
+from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.cache.transfer_pattern import create_read_transfer_graph, create_write_transfer_graph
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 
@@ -33,20 +33,25 @@ class CacheEngine:
                                               update_cache_info=True)
         return physical_block_ids
 
-    def match_length(self, sequence_meta: SequenceMeta) -> int:
-        return self.index.match_length(sequence_meta)
+    def match_blocks(self, sequence_meta: SequenceMeta) -> int:
+        return self.index.match_blocks(sequence_meta)
 
     def insert(self,
                sequence_meta: SequenceMeta,
                physical_block_ids: torch.Tensor,
-               match_length: int = -1,
-               insert_length: int = -1,
+               num_matched_blocks: int = -1,
+               num_insert_blocks: int = -1,
                is_ready: bool = True,
                locked: bool = False) -> None:
-        if match_length == -1:
+        if num_matched_blocks == -1:
             # in insert, we can use the default maximum_status for match
-            match_length = self.index.match_length(sequence_meta=sequence_meta)
-        self.index.insert(sequence_meta, physical_block_ids, match_length, insert_length, is_ready, locked)
+            num_matched_blocks = self.index.match_blocks(sequence_meta=sequence_meta)
+        self.index.insert(sequence_meta,
+                          physical_block_ids,
+                          num_matched_blocks=num_matched_blocks,
+                          num_insert_blocks=num_insert_blocks,
+                          is_ready=is_ready,
+                          locked=locked)
 
     def lock_blocks(self, block_ids: torch.Tensor) -> None:
         self.index.lock(block_ids)
@@ -82,8 +87,9 @@ class CacheEngine:
             self.unlock_blocks(block_ids)
 
 class GlobalCacheEngine:
-    def __init__(self, cache_config: CacheConfig):
+    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig):
         self.cache_config = cache_config
+        self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
 
         self.cpu_cache_engine = None
@@ -119,9 +125,12 @@ class GlobalCacheEngine:
             token_ids: torch.Tensor,
             token_mask: torch.Tensor,
             slot_mapping: torch.Tensor,
-            layer_num: int,
-            layer_granularity: int) -> Tuple[TransferOpGraph, torch.Tensor, List[int]]:
+            layer_num: int = -1,
+            layer_granularity: int = 1) -> Tuple[TransferOpGraph, torch.Tensor, List[int]]:
         self._check_input(token_ids, token_mask, slot_mapping)
+
+        if layer_num == -1:
+            layer_num = self.model_config.num_layers
 
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
@@ -158,8 +167,8 @@ class GlobalCacheEngine:
             # here we still put the buffer in the cpu index, so no buffer is needed
             self.cpu_cache_engine.insert(sequence_meta,
                                          extra_cpu_blocks,
-                                         match_length=len(cpu_matched_blocks) + start_idx,
-                                         insert_length=len(ssd_matched_blocks),
+                                         num_matched_blocks=len(cpu_matched_blocks) + start_idx,
+                                         num_insert_blocks=len(ssd_matched_blocks),
                                          is_ready=False,
                                          locked=True)
 
@@ -185,8 +194,11 @@ class GlobalCacheEngine:
             token_ids: torch.Tensor,
             token_mask: torch.Tensor,
             slot_mapping: torch.Tensor,
-            layer_num : int) -> Tuple[TransferOpGraph, torch.Tensor]:
+            layer_num : int = -1) -> Tuple[TransferOpGraph, torch.Tensor]:
         self._check_input(token_ids, token_mask, slot_mapping)
+
+        if layer_num == -1:
+            layer_num = self.model_config.num_layers
 
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
@@ -224,12 +236,12 @@ class GlobalCacheEngine:
 
         self.cpu_cache_engine.insert(sequence_meta,
                                      cpu_blocks_to_transfer,
-                                     match_length=len(cpu_matched_blocks) + start_idx,  # start_idx == 0
+                                     num_matched_blocks=len(cpu_matched_blocks) + start_idx,  # start_idx == 0
                                      is_ready=False,
                                      locked=True)
         self.ssd_cache_engine.insert(sequence_meta,
                                      ssd_blocks_to_transfer,
-                                     match_length=len(ssd_matched_blocks) + start_idx,  # start_idx == 0
+                                     num_matched_blocks=len(ssd_matched_blocks) + start_idx,  # start_idx == 0
                                      is_ready=False,
                                      locked=True)
 
