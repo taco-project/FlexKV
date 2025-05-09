@@ -219,7 +219,7 @@ class TokenToBlockIndex:
             else:
                 evicted_hashes = torch.cat([evicted_hashes, self._hash_values[evicted_block_ids]])
                 results = torch.cat([results, evicted_block_ids])
-        self._batch_remove(evicted_hashes)
+        self._hashmap_batch_remove(evicted_hashes)
         self._available_block_ids[results] = True
         return results
 
