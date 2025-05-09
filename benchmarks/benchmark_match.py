@@ -7,6 +7,7 @@ import torch
 from flexkv.cache.index import TokenToBlockIndex
 from flexkv.common.block import SequenceMeta
 
+
 def main(args):
     index = TokenToBlockIndex(tokens_per_block=args.tokens_per_block)
     token_ids = torch.randint(0, 10000, (args.sequence_length, ), dtype=torch.int64)
@@ -15,36 +16,21 @@ def main(args):
                                         tokens_per_block=args.tokens_per_block)
     match_sequence_meta = SequenceMeta(token_ids=token_ids,
                                        tokens_per_block=args.tokens_per_block)
-    profiler = cProfile.Profile()
 
-    print("\n--------------------------------insert--------------------------------")
     print("insert sequence of length", insert_sequence_meta.length)
     physical_block_ids = torch.arange(insert_sequence_meta.num_blocks, dtype=torch.int64)
-    insert_sequence_meta.gen_hashes()
-    profiler.runctx('index.insert(insert_sequence_meta, physical_block_ids, 0)',
-                    globals(), locals())
-    stats = pstats.Stats(profiler)
-    stats.sort_stats('cumulative')
-    for func in stats.stats:
-        if func[2] in dir(index) and not func[2].startswith('__')\
-            or func[2].startswith('hash'):
-            print(f"function: {func[2]:<30} "
-                  f"total time: {stats.stats[func][3]:.6f}s  "
-                  f"total calls: {stats.stats[func][0]}")
+    index.insert(insert_sequence_meta, physical_block_ids, 0)
 
-    print("\n--------------------------------match--------------------------------")
-    profiler.clear()
+    profiler = cProfile.Profile()
     print("match sequence of length", match_sequence_meta.length)
-    profiler.runctx('index.match_prefix(match_sequence_meta)',
-                    globals(), locals())
+    for i in range(args.nloops):
+        profiler.runctx('index.match_prefix(match_sequence_meta)',
+                        globals(), locals())
     stats = pstats.Stats(profiler)
+    stats.strip_dirs()
     stats.sort_stats('cumulative')
-    for func in stats.stats:
-        if func[2] in dir(index) and not func[2].startswith('__')\
-            or func[2].startswith('hash'):
-            print(f"function: {func[2]:<30} "
-                  f"total time: {stats.stats[func][3]:.6f}s  "
-                  f"total calls: {stats.stats[func][0]}")
+    stats.print_stats()
+
 
 if __name__ == "__main__":
     parser = ArgumentParser(
@@ -52,5 +38,6 @@ if __name__ == "__main__":
     parser.add_argument('--sequence-length', type=int, default=32000)
     parser.add_argument('--tokens-per-block', type=int, default=1)
     parser.add_argument('--cache-ratio', type=float, default=1)
+    parser.add_argument('--nloops', type=int, default=1000)
     args = parser.parse_args()
     main(args)

@@ -9,7 +9,7 @@ from typing import Optional
 class DebugInfo:
     def __init__(self, debug_level: str = "INFO"):
         self.enabled = False
-        self.logger = logging.getLogger("GlobalKV")
+        self.logger = logging.getLogger("FLEXKV")
 
         formatter = logging.Formatter(
             "%(asctime)s - %(levelname)s - %(message)s"
