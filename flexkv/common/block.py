@@ -58,7 +58,7 @@ class SequenceMeta:
 
     tokens_per_block: int
 
-    block_hashes: Optional[torch.Tensor] = None
+    block_hashes: Optional[np.ndarray] = None
 
     _has_hashes: bool = False
 
@@ -93,8 +93,8 @@ class SequenceMeta:
         if self._has_hashes:
             return
         assert self.token_ids.ndim == 1
-        self.block_hashes = gen_hashes(self.token_ids, self.tokens_per_block)
+        self.block_hashes = gen_hashes(self.token_ids, self.tokens_per_block).numpy()
         assert self.block_hashes.ndim == 1
-        assert self.block_hashes.numel() == self.num_blocks
-        assert self.block_hashes.element_size() == get_hash_size()
+        assert self.block_hashes.size == self.num_blocks
+        assert self.block_hashes.itemsize == get_hash_size()
         self._has_hashes = True

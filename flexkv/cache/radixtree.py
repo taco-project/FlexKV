@@ -129,9 +129,15 @@ class RadixTreeIndex:
             else:
                 if not current_node.is_root():
                     cmp_length = min(current_node.size(), sequence.num_blocks - prefix_blocks_num)
-                    node_hash = current_node.content_hash[:cmp_length]
-                    seq_hash = sequence.block_hashes[prefix_blocks_num:prefix_blocks_num+cmp_length].numpy()
-                    matched_length = (node_hash == seq_hash).sum().item()
+                    left = 0
+                    right = cmp_length
+                    while left < right:
+                        mid = (left + right) // 2
+                        if current_node.content_hash[mid] == sequence.block_hashes[prefix_blocks_num+mid]:
+                            left = mid + 1
+                        else:
+                            right = mid
+                    matched_length = left
                     physical_blocks = np.concatenate([physical_blocks, current_node.content_physical[:matched_length]])
                 else:
                     matched_length = 0
@@ -152,7 +158,8 @@ class RadixTreeIndex:
                sequence_meta: SequenceMeta,
                physical_block_ids: torch.Tensor,
                num_insert_blocks: int = -1,
-               is_ready: bool = True) -> RadixNode:
+               is_ready: bool = True,
+               match_result: Optional[MatchResult] = None) -> RadixNode:
         if num_insert_blocks == -1:
             num_insert_blocks = sequence_meta.num_blocks
         assert 0 <= num_insert_blocks <= sequence_meta.num_blocks
@@ -160,7 +167,8 @@ class RadixTreeIndex:
         assert physical_block_ids.ndim == 1
 
         sequence_meta.gen_hashes()
-        match_result = self.match_prefix(sequence_meta)
+        if match_result is None:
+            match_result = self.match_prefix(sequence_meta)
         num_matched_blocks = match_result.num_matched_blocks
         last_node = match_result.last_node
         last_node_matched_length = match_result.last_node_matched_length
@@ -174,7 +182,7 @@ class RadixTreeIndex:
             return
 
         new_node = RadixNode(
-            content_hash=sequence_meta.block_hashes[num_matched_blocks:num_insert_blocks].numpy(),
+            content_hash=sequence_meta.block_hashes[num_matched_blocks:num_insert_blocks],
             content_physical=physical_block_ids.numpy(),
             is_ready=is_ready,
             lock_cnt=0,
