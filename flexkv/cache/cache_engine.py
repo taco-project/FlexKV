@@ -33,9 +33,6 @@ class CacheEngine:
                                               update_cache_info=True)
         return match_result
 
-    def match_blocks(self, sequence_meta: SequenceMeta) -> int:
-        return self.index.num_matched_blocks(sequence_meta)
-
     def insert(self,
                sequence_meta: SequenceMeta,
                physical_block_ids: torch.Tensor,
@@ -51,11 +48,9 @@ class CacheEngine:
     def lock_node(self, node: RadixNode) -> None:
         self.index.lock(node)
 
-    def unlock_node(self, node: RadixNode) -> None:
+    def cleanup(self, node: RadixNode) -> None:
         self.index.unlock(node)
-
-    def set_ready(self, block_ids: torch.Tensor, is_ready: bool = True) -> None:
-        self.index.set_ready(block_ids, is_ready)
+        self.index.set_ready(node, True)
 
     def take(self,
              num_required_blocks: int,
@@ -70,7 +65,9 @@ class CacheEngine:
             if protected_node is not None:
                 self.index.unlock(protected_node)
         if strict and num_required_blocks > self.mempool.num_free_blocks:
-            raise ValueError("Not enough free blocks to take")
+            raise ValueError(f"Not enough free blocks to take, "
+                             f"required: {num_required_blocks}, "
+                             f"free: {self.mempool.num_free_blocks}")
         return self.mempool.allocate_blocks(num_required_blocks)
 
     def recycle(self, physical_blocks: torch.Tensor) -> None:
@@ -116,11 +113,13 @@ class GlobalCacheEngine:
             token_mask: torch.Tensor,
             slot_mapping: torch.Tensor,
             layer_num: int = -1,
-            layer_granularity: int = 1) -> Tuple[TransferOpGraph, torch.Tensor, List[int]]:
+            layer_granularity: int = -1) -> Tuple[TransferOpGraph, torch.Tensor, List[int]]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         if layer_num == -1:
             layer_num = self.model_config.num_layers
+        if layer_granularity == -1:
+            layer_granularity = layer_num
 
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
@@ -167,14 +166,13 @@ class GlobalCacheEngine:
 
         self.cpu_cache_engine.lock_node(cpu_node_to_unlock)
         self.ssd_cache_engine.lock_node(ssd_node_to_unlock)
-
         # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
         transfer_graph, finished_ops_ids = create_read_transfer_graph(ssd_blocks=ssd_blocks_to_transfer,
-                                                                  cpu_blocks=cpu_blocks_to_transfer,
-                                                                  gpu_blocks=gpu_blocks_to_transfer,
-                                                                  gpu_device_id=0,
-                                                                  layer_num=layer_num,
-                                                                  layer_granularity=layer_granularity)
+                                                                      cpu_blocks=cpu_blocks_to_transfer,
+                                                                      gpu_blocks=gpu_blocks_to_transfer,
+                                                                      gpu_device_id=0,
+                                                                      layer_num=layer_num,
+                                                                      layer_granularity=layer_granularity)
 
         return_mask = torch.zeros_like(token_mask)
         return_mask[start_idx* self.tokens_per_block:
@@ -262,11 +260,9 @@ class GlobalCacheEngine:
                            node_to_unlock: Dict[DeviceType, RadixNode],
                            buffer_to_free: Optional[Dict[DeviceType, torch.Tensor]] = None) -> None:
         if DeviceType.CPU in node_to_unlock:
-            self.cpu_cache_engine.unlock_node(node_to_unlock[DeviceType.CPU])
-            self.cpu_cache_engine.set_ready(node_to_unlock[DeviceType.CPU])
+            self.cpu_cache_engine.cleanup(node_to_unlock[DeviceType.CPU])
         if DeviceType.SSD in node_to_unlock:
-            self.ssd_cache_engine.unlock_node(node_to_unlock[DeviceType.SSD])
-            self.ssd_cache_engine.set_ready(node_to_unlock[DeviceType.SSD])
+            self.ssd_cache_engine.cleanup(node_to_unlock[DeviceType.SSD])
         if buffer_to_free is not None:
             if DeviceType.CPU in buffer_to_free:
                 self.cpu_cache_engine.recycle(buffer_to_free[DeviceType.CPU])

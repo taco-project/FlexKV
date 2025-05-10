@@ -22,7 +22,7 @@ class TransferType(Enum):
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of
     # a group of transfer ops
-    VIRTUAL = 6 
+    VIRTUAL = 6
 
 @dataclass
 class TransferDescriptor:
@@ -74,7 +74,8 @@ class TransferOp:
     # this will keep the full info
     successors: Set[int] = field(default_factory=set)
     status: TransferOpStatus = TransferOpStatus.PENDING
-    layers: Optional[torch.Tensor] = None
+    layer_id: int = -1
+    layer_granularity: int = 1
     tp_rank: Optional[int] = None
     tp_world_size: Optional[int] = None
 
@@ -101,7 +102,7 @@ class TransferOpGraph:
         if successor_op_id in self._op_map and predecessor_op_id in self._op_map:
             self._op_map[successor_op_id].predecessors.add(predecessor_op_id)
             self._op_map[predecessor_op_id].successors.add(successor_op_id)
-    
+
     def mark_completed(self, op_id: int):
         """mark an op as completed"""
         if op_id in self._op_map:
@@ -141,7 +142,9 @@ class TransferOpGraph:
 
     def all_transfer_ops_completed(self) -> bool:
         """check if all transfer ops are completed"""
-        return all(op.status == TransferOpStatus.COMPLETED or op.transfer_type == TransferType.VIRTUAL for op in self._op_map.values())
+        return all(op.status == TransferOpStatus.COMPLETED or
+                   op.transfer_type == TransferType.VIRTUAL
+                   for op in self._op_map.values())
 
     def print_op_map(self):
         """Print transfer op graph in a visual format showing dependencies.

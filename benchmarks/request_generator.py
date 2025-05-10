@@ -123,7 +123,7 @@ class RequestGenerator:
         self.max_parallel_per_device = max_parallel_per_device
 
         self.ready_queues = [asyncio.Queue() for _ in range(self.num_engines)]
-        self.request_queue = asyncio.Queue()
+        self.kvrequest_queue = asyncio.Queue()
         self.request_counter = 0
 
         self.approx_ttft = approx_ttft
@@ -174,7 +174,7 @@ class RequestGenerator:
             sequence = input.clone() if history is None else torch.cat([history, input], dim=0)
             # get before prefill
             for tp_rank in range(self.tp_size):
-                await self.request_queue.put(KVRequest(request_id=await self.inc_request_id(),
+                await self.kvrequest_queue.put(KVRequest(request_id=await self.inc_request_id(),
                                                      device_id=engine_id * self.tp_size + tp_rank,
                                                      tp_rank=tp_rank,
                                                      user_id=user_id,
@@ -187,7 +187,7 @@ class RequestGenerator:
             await asyncio.sleep(self.approx_ttft)
             # put after prefill
             for tp_rank in range(self.tp_size):
-                await self.request_queue.put(KVRequest(request_id=await self.inc_request_id(),
+                await self.kvrequest_queue.put(KVRequest(request_id=await self.inc_request_id(),
                                                      device_id=engine_id * self.tp_size + tp_rank,
                                                      tp_rank=tp_rank,
                                                      user_id=user_id,
@@ -201,7 +201,7 @@ class RequestGenerator:
                 await asyncio.sleep(self.approx_tpot * len(output[i:i+self.put_per_output_tokens]))
                 sequence = torch.cat([sequence, output[i:i+self.put_per_output_tokens]], dim=0)
                 for tp_rank in range(self.tp_size):
-                    await self.request_queue.put(KVRequest(request_id=await self.inc_request_id(),
+                    await self.kvrequest_queue.put(KVRequest(request_id=await self.inc_request_id(),
                                                          device_id=engine_id * self.tp_size + tp_rank,
                                                          tp_rank=tp_rank,
                                                          user_id=user_id,
@@ -250,7 +250,7 @@ class RequestGenerator:
         loop.run_until_complete(request_loop())
         loop.close()
         self.pbar.close()
-        return [self.request_queue.get_nowait() for _ in range(self.request_queue.qsize())]
+        return [self.kvrequest_queue.get_nowait() for _ in range(self.kvrequest_queue.qsize())]
 
 if __name__ == "__main__":
     request_generator = RequestGenerator(dataset="random",
