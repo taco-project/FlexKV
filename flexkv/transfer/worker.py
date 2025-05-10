@@ -138,7 +138,8 @@ class GPUCPUTransferWorker(TransferWorker):
         gpu_descriptor: TransferDescriptor,
         cpu_descriptor: TransferDescriptor,
         transfer_type: TransferType,
-        layer_id_list: Optional[torch.Tensor] = None,
+        layer_id: int = -1,
+        layer_granularity: int = 1,
         non_blocking: bool = False,
     ) -> None:
         assert gpu_descriptor.device_type == DeviceType.GPU
@@ -152,8 +153,10 @@ class GPUCPUTransferWorker(TransferWorker):
         if len(gpu_block_id_list) == 0:
             return
 
-        if layer_id_list is None:
+        if layer_id == -1:
             layer_id_list = torch.arange(self.num_layers, dtype=torch.int32)
+        else:
+            layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
 
         chunk_size_in_bytes = self.block_size * self.dtype.itemsize
         nvtx.range_push("Transfer KV Layers")
@@ -211,12 +214,12 @@ class GPUCPUTransferWorker(TransferWorker):
                     raise ValueError(f"Invalid transfer type: {op.transfer_type}")
                 start_time = time.time()
                 nvtx.range_push("GPU CPUTransfer")
-                #print(f"transfer info: gpu_descriptor: {gpu_descriptor}, cpu_descriptor: {cpu_descriptor}, transfer_type: {op.transfer_type}, layer_id_list: {op.layers}")
                 self.transfer(
                     gpu_descriptor,
                     cpu_descriptor,
                     op.transfer_type,
-                    layer_id_list=op.layers,
+                    layer_id=op.layer_id,
+                    layer_granularity=op.layer_granularity,
                     non_blocking=True,
                 )
                 nvtx.range_pop()

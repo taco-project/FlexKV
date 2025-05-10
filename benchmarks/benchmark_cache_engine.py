@@ -26,7 +26,8 @@ def main(args):
                                          request_rate=1000,
                                          approx_ttft=0.001,
                                          approx_tpot=0.0001,
-                                         put_per_output_tokens=1000)
+                                         put_per_output_tokens=1000,
+                                         random_seed=42)
     reqs: List[KVRequest] = request_generator.generate()
     cache_config = CacheConfig(
         enable_cpu=True,
@@ -91,7 +92,6 @@ def main(args):
             debuginfo.info(f"need put {req.token_mask.sum()} tokens, "
                            f"actual put {return_mask.sum()} tokens")
     debuginfo.info(f"Total requests: {len(reqs)}")
-    debuginfo.info(f"Get requests: {num_get_requests}, Put requests: {num_put_requests}")
     avg_cache_hit_ratio = sum_cache_hit / len(reqs)
     debuginfo.info(f"Avg cache hit ratio: {avg_cache_hit_ratio}, max cache hit ratio: {max_cache_hit_ratio}")
     stats = pstats.Stats(profiler)

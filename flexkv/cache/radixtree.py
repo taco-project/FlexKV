@@ -1,7 +1,7 @@
 import heapq
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Union, Optional
+from typing import Dict, Optional
 
 import torch
 import numpy as np
@@ -45,8 +45,11 @@ class RadixNode:
     def head_hash(self) -> HashType:
         return self.content_hash[0] if self.size() > 0 else None
 
+    def num_children(self) -> int:
+        return len(self.children)
+
     def is_leaf(self) -> bool:
-        return len(self.children) == 0
+        return self.num_children() == 0
 
     def is_root(self) -> bool:
         return self.parent is None
@@ -55,7 +58,7 @@ class RadixNode:
         return not self.is_root() and self.is_leaf() and not self.in_use()
 
     def in_use(self) -> bool:
-        return self.lock_cnt > 0
+        return self.lock_cnt > 0 or not self.is_ready
 
     def split(self, length: int) -> 'RadixNode':
         assert length < self.size()
@@ -81,10 +84,19 @@ class RadixNode:
         assert length > 0
         assert self.is_leaf()
         assert not self.in_use()
-        physical_blocks = self.content_physical[length:]
-        self.content_hash = self.content_hash[:length]
-        self.content_physical = self.content_physical[:length]
+        remaining_length = self.size() - length
+        physical_blocks = self.content_physical[remaining_length:]
+        self.content_hash = self.content_hash[:remaining_length]
+        self.content_physical = self.content_physical[:remaining_length]
         return physical_blocks
+
+    def merge_child(self) -> None:  # ignore status
+        assert self.num_children() == 1
+        child = list(self.children.values())[0]
+        self.content_hash = np.concatenate([self.content_hash, child.content_hash])
+        self.content_physical = np.concatenate([self.content_physical, child.content_physical])
+        self.last_access_time = max(self.last_access_time, child.last_access_time)
+        self.children.clear()
 
 class RadixTreeIndex:
     def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000):
@@ -121,7 +133,7 @@ class RadixTreeIndex:
         while prefix_blocks_num < sequence.num_blocks:
             if update_cache_info:
                 current_node.last_access_time = time.time()
-            child_hash = sequence.get_hash(prefix_blocks_num + current_node.size())  # exceed
+            child_hash = sequence.get_hash(prefix_blocks_num + current_node.size())
             if child_hash in current_node.children:
                 prefix_blocks_num += current_node.size()
                 physical_blocks = np.concatenate([physical_blocks, current_node.content_physical])
@@ -133,7 +145,7 @@ class RadixTreeIndex:
                     right = cmp_length
                     while left < right:
                         mid = (left + right) // 2
-                        if current_node.content_hash[mid] == sequence.block_hashes[prefix_blocks_num+mid]:
+                        if current_node.content_hash[mid] == sequence.get_hash(prefix_blocks_num+mid):
                             left = mid + 1
                         else:
                             right = mid
@@ -172,6 +184,7 @@ class RadixTreeIndex:
         num_matched_blocks = match_result.num_matched_blocks
         last_node = match_result.last_node
         last_node_matched_length = match_result.last_node_matched_length
+        assert last_node_matched_length != 0 or last_node.is_root()
 
         assert len(physical_block_ids) == num_insert_blocks - num_matched_blocks, \
             f"num_insert_blocks = {num_insert_blocks}, " \
@@ -188,17 +201,17 @@ class RadixTreeIndex:
             lock_cnt=0,
             last_access_time=time.time()
         )
-        self.leaf_nodes[new_node.head_hash()] = new_node
-        if last_node.head_hash() in self.leaf_nodes:
-            self.leaf_nodes.pop(last_node.head_hash())
 
-        if last_node_matched_length != last_node.size() and last_node_matched_length != 0:
+        self.leaf_nodes.pop(last_node.head_hash(), None)
+        if last_node_matched_length < last_node.size():
             splited_node = last_node.split(last_node_matched_length)
             if splited_node.is_leaf():
                 self.leaf_nodes[splited_node.head_hash()] = splited_node
 
         new_node.parent = last_node
         last_node.children[new_node.head_hash()] = new_node
+        self.leaf_nodes[new_node.head_hash()] = new_node
+
         return new_node
 
     def evict(self, num_evicted: int) -> torch.Tensor:
@@ -243,6 +256,15 @@ class RadixTreeIndex:
             total_cached_blocks += node.size()
             queue.extend(node.children.values())
         return total_cached_blocks
+
+    def total_node_num(self) -> int:  # include root node
+        total_node_num = 0
+        queue = [self.root_node]
+        while queue:
+            node = queue.pop(0)
+            total_node_num += 1
+            queue.extend(node.children.values())
+        return total_node_num
 
 if __name__ == "__main__":
     tokens_per_block = 2
