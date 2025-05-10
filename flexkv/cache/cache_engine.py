@@ -40,11 +40,13 @@ class CacheEngine:
                sequence_meta: SequenceMeta,
                physical_block_ids: torch.Tensor,
                num_insert_blocks: int = -1,
-               is_ready: bool = True) -> RadixNode:
+               is_ready: bool = True,
+               match_result: Optional[MatchResult] = None) -> RadixNode:
         return self.index.insert(sequence_meta,
                                  physical_block_ids,
                                  num_insert_blocks=num_insert_blocks,
-                                 is_ready=is_ready)
+                                 is_ready=is_ready,
+                                 match_result=match_result)
 
     def lock_node(self, node: RadixNode) -> None:
         self.index.lock(node)
@@ -160,7 +162,8 @@ class GlobalCacheEngine:
             cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                               extra_cpu_blocks,
                                                               num_insert_blocks=len(ssd_physical_blocks),
-                                                              is_ready=False)
+                                                              is_ready=False,
+                                                              match_result=cpu_matched_result)
 
         self.cpu_cache_engine.lock_node(cpu_node_to_unlock)
         self.ssd_cache_engine.lock_node(ssd_node_to_unlock)
@@ -230,10 +233,12 @@ class GlobalCacheEngine:
 
         cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                           cpu_blocks_to_transfer,
-                                                          is_ready=False)
+                                                          is_ready=False,
+                                                          match_result=cpu_matched_result)
         ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
                                                           ssd_blocks_to_transfer,
-                                                          is_ready=False)
+                                                          is_ready=False,
+                                                          match_result=ssd_matched_result)
 
         self.cpu_cache_engine.lock_node(cpu_node_to_unlock)
         self.ssd_cache_engine.lock_node(ssd_node_to_unlock)
@@ -294,8 +299,7 @@ class GlobalCacheEngine:
 
     def _slot_to_block_mapping(self,
                               slot_mapping: torch.Tensor) -> torch.Tensor:
-        block_mapping = slot_mapping // self.tokens_per_block
-        block_mapping = torch.unique(block_mapping)
+        block_mapping = slot_mapping[::self.tokens_per_block] // self.tokens_per_block
         return block_mapping
 
     def _get_block_range(self,

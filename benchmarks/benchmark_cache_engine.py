@@ -1,6 +1,7 @@
 from typing import List
 import cProfile
 import pstats
+from argparse import ArgumentParser
 
 import torch
 
@@ -11,7 +12,7 @@ from flexkv.common.debug import debuginfo
 
 debuginfo.set_level("INFO")
 
-def main():
+def main(args):
     request_generator = RequestGenerator(dataset="random",
                                          dataset_path=None,
                                          num_user_requests=100,
@@ -48,6 +49,8 @@ def main():
     avg_cache_hit_ratio = 0
     max_cache_hit_ratio = 0
     sum_cache_hit = 0
+    num_get_requests = 0
+    num_put_requests = 0
     for req in reqs:
         fake_slot_mapping = torch.arange(req.token_mask[req.token_mask].sum(), dtype=torch.int64)
         local_vars = {
@@ -56,24 +59,39 @@ def main():
             'fake_slot_mapping': fake_slot_mapping,
         }
         if req.request_type == "get":
-            profiler.runctx('graph, return_mask, transfer_call_back, finished_ops_ids = '
-                            'cache_engine.get(req.token_ids, req.token_mask, fake_slot_mapping)',
-                            globals(), local_vars)
-            profiler.runctx('transfer_call_back()', globals(), local_vars)
-            cache_hit_ratio = local_vars['return_mask'].sum() / req.token_mask.sum()
+            num_get_requests += 1
+            if args.profile_get:
+                profiler.runctx('graph, return_mask, transfer_call_back, finished_ops_ids = '
+                                'cache_engine.get(req.token_ids, req.token_mask, fake_slot_mapping)',
+                                globals(), local_vars)
+                profiler.runctx('transfer_call_back()', globals(), local_vars)
+                return_mask = local_vars['return_mask']
+            else:
+                graph, return_mask, transfer_call_back, finished_ops_ids = \
+                    cache_engine.get(req.token_ids, req.token_mask, fake_slot_mapping)
+                transfer_call_back()
+            cache_hit_ratio = return_mask.sum() / req.token_mask.sum()
             sum_cache_hit += cache_hit_ratio
             max_cache_hit_ratio = max(max_cache_hit_ratio, cache_hit_ratio)
             debuginfo.info(f"need get {req.token_mask.sum()} tokens, "
-                           f"actual get {local_vars['return_mask'].sum()} tokens, "
+                           f"actual get {return_mask.sum()} tokens, "
                            f"cache_hit_ratio: {cache_hit_ratio}")
         elif req.request_type == "put":
-            profiler.runctx('graph, return_mask, transfer_call_back = '
-                            'cache_engine.put(req.token_ids, req.token_mask, fake_slot_mapping)',
-                            globals(), local_vars)
-            profiler.runctx('transfer_call_back()', globals(), local_vars)
+            num_put_requests += 1
+            if args.profile_put:
+                profiler.runctx('graph, return_mask, transfer_call_back = '
+                                'cache_engine.put(req.token_ids, req.token_mask, fake_slot_mapping)',
+                                globals(), local_vars)
+                profiler.runctx('transfer_call_back()', globals(), local_vars)
+                return_mask = local_vars['return_mask']
+            else:
+                graph, return_mask, transfer_call_back = \
+                    cache_engine.put(req.token_ids, req.token_mask, fake_slot_mapping)
+                transfer_call_back()
             debuginfo.info(f"need put {req.token_mask.sum()} tokens, "
-                           f"actual put {local_vars['return_mask'].sum()} tokens")
+                           f"actual put {return_mask.sum()} tokens")
     debuginfo.info(f"Total requests: {len(reqs)}")
+    debuginfo.info(f"Get requests: {num_get_requests}, Put requests: {num_put_requests}")
     avg_cache_hit_ratio = sum_cache_hit / len(reqs)
     debuginfo.info(f"Avg cache hit ratio: {avg_cache_hit_ratio}, max cache hit ratio: {max_cache_hit_ratio}")
     stats = pstats.Stats(profiler)
@@ -83,4 +101,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser()
+    parser.add_argument("--profile-get", action="store_true")
+    parser.add_argument("--profile-put", action="store_true")
+    args = parser.parse_args()
+    if not args.profile_get and not args.profile_put:
+        args.profile_get = True
+        args.profile_put = True
+    main(args)
