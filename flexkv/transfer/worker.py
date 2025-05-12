@@ -297,6 +297,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         self.ssd_layer_stride_in_bytes = (
             self.num_ssd_blocks * self.block_size * self.dtype.itemsize * 2
         )
+        print(f"ssd_layer_stride_in_bytes: {self.ssd_layer_stride_in_bytes}, num_ssd_blocks: {self.num_ssd_blocks}, block_size: {self.block_size}, dtype.itemsize: {self.dtype.itemsize}")
         self.cpu_kv_stride_in_bytes = (
             self.num_cpu_blocks * self.block_size * self.dtype.itemsize
         )
@@ -365,6 +366,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
             ssd_block_stride_in_bytes=self.ssd_block_stride_in_bytes,
             ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
             block_size_in_bytes=self.chunk_size_in_bytes,
+            total_layers=self.num_layers,
             is_read=(transfer_type == TransferType.DISK2H),
             verbose=False
         )

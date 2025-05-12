@@ -15,7 +15,7 @@ void transfer_kv_blocks_ssd_naive(
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
-    int64_t block_size_in_bytes, bool is_read, bool verbose = false) {
+    int64_t block_size_in_bytes, int64_t total_layers, bool is_read, bool verbose = false) {
 
   const int64_t *layer_ptrs = cpu_layer_ptrs_tensor.data_ptr<int64_t>();
   const int64_t *ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
@@ -26,7 +26,7 @@ void transfer_kv_blocks_ssd_naive(
   const int num_transfers = ssd_block_ids.size(0);
 
   // open file
-  int flags = is_read ? O_RDONLY : (O_RDWR | O_CREAT);
+  int flags = is_read ? O_RDONLY : O_RDWR;
   int o_direct_flag = block_size_in_bytes % 4096 == 0 ? O_DIRECT : 0;
   int fd = open(filename.c_str(), flags | o_direct_flag, 0644);
   if (fd < 0) {
@@ -113,7 +113,7 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
-    int64_t block_size_in_bytes, bool is_read, bool verbose = false) {
+    int64_t block_size_in_bytes, int64_t total_layers, bool is_read, bool verbose = false) {
 
   const int64_t *layer_ptrs = cpu_layer_ptrs_tensor.data_ptr<int64_t>();
   const int64_t *ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
@@ -124,7 +124,7 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
 
   const int num_transfers = ssd_block_ids.size(0);
 
-  int64_t file_size = ssd_layer_stride_in_bytes * num_layers;
+  int64_t file_size = ssd_layer_stride_in_bytes * total_layers;
 
   int o_direct_flag = block_size_in_bytes % 4096 == 0 ? O_DIRECT : 0;
 
@@ -226,16 +226,10 @@ void transfer_kv_blocks_ssd_mmap_multi_thread(
 
   } else {
     // here we use mmap to write.
-    int fd = open(filename.c_str(), O_RDWR | O_CREAT | o_direct_flag, 0644);
+    int fd = open(filename.c_str(), O_RDWR | o_direct_flag, 0644);
     if (fd < 0) {
       throw std::runtime_error("Failed to open file for writing: " +
                                std::string(strerror(errno)));
-    }
-
-    // resize the file
-    if (ftruncate(fd, file_size) < 0) {
-      close(fd);
-      throw std::runtime_error("Failed to resize file");
     }
 
     // map the whole file

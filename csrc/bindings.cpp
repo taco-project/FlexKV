@@ -65,7 +65,7 @@ void transfer_kv_blocks_ssd(
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
-    int64_t block_size_in_bytes, bool is_read, bool verbose = false) {
+    int64_t block_size_in_bytes, int64_t total_layers, bool is_read, bool verbose = false) {
   TORCH_CHECK(cpu_layer_ptrs_tensor.dtype() == torch::kInt64,
               "cpu_layer_ptrs must be int64");
   TORCH_CHECK(ssd_block_ids.dtype() == torch::kInt64,
@@ -77,7 +77,7 @@ void transfer_kv_blocks_ssd(
       filename, cpu_layer_id_list, cpu_layer_ptrs_tensor, ssd_block_ids,
       cpu_block_ids, cpu_kv_stride_in_bytes, ssd_layer_stride_in_bytes,
       ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, block_size_in_bytes,
-      is_read, verbose);
+      total_layers, is_read, verbose);
 }
 
 PYBIND11_MODULE(c_ext, m) {
@@ -89,7 +89,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("ssd_block_ids"), py::arg("cpu_block_ids"),
         py::arg("cpu_kv_stride_in_bytes"), py::arg("ssd_layer_stride_in_bytes"),
         py::arg("ssd_block_stride_in_bytes"), py::arg("ssd_kv_stride_in_bytes"),
-        py::arg("block_size_in_bytes"), py::arg("is_read"),
+        py::arg("block_size_in_bytes"), py::arg("total_layers"), py::arg("is_read"),
         py::arg("verbose") = false);
   m.def("export_handle", &export_memory_handle);
   m.def("import_handle", &import_memory_handle);
