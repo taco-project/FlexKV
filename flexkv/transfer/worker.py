@@ -12,11 +12,10 @@ import queue
 from flexkv.common.debug import debuginfo
 import torch.cuda.nvtx as nvtx
 class TransferWorker(ABC):
-    def __init__(self, worker_id: int, finished_queue: Queue):
+    def __init__(self, worker_id: int, finished_ops_queue: Queue):
         self.worker_id = worker_id
         self.transfer_queue = Queue()
-        self.max_batch_size = 32
-        self.finished_queue = finished_queue
+        self.finished_ops_queue = finished_ops_queue
         self.transfer_thread = threading.Thread(target=self._transfer_worker)
         self.transfer_thread.start()
 
@@ -36,47 +35,33 @@ class TransferWorker(ABC):
     """
 
     @abstractmethod
-    def transfer(self, transfer: TransferOp)->None:
+    def _transfer_impl(self, transfer: TransferOp)->None:
         pass
 
     @abstractmethod
-    def _process_transfers(self, transfers: List[TransferOp])->None:
+    def launch_transfer(self, transfers: List[TransferOp])->None:
         pass
 
     def _transfer_worker(self):
         while True:
-            ops = []
-            write_op = None
-
+            batch_op = None
             try:
                 op = self.transfer_queue.get(timeout=0.001)
                 if op is None:
                     break
-                if op.transfer_type.value % 2 == 1:  # write op
-                    write_op = op
-                else:  # read op
-                    ops.append(op)
+                batch_op = op
             except queue.Empty:
                 continue
 
-            if not write_op:
-                while len(ops) < self.max_batch_size:
-                    try:
-                        op = self.transfer_queue.get_nowait()
-                        if op is None:
-                            self.transfer_queue.put(op)
-                            break
-                        if op.transfer_type.value % 2 == 0:
-                            ops.append(op)
-                        else:
-                            self.transfer_queue.put(op)
-                            break
-                    except queue.Empty:
-                        break
-
-            batch = [write_op] if write_op else ops
-            if batch:
-                self._process_transfers(batch)
+            # TODO: support batch transfer
+            if batch_op:
+                try:
+                    self.launch_transfer(batch_op)
+                except Exception as e:
+                    debuginfo.error(f"Error launching transfer: {e}\n"
+                                    f"Failed transfer op: {batch_op}")
+                    # self.transfer_queue.put(batch_op)
+                self.finished_ops_queue.put(batch_op)
 
     def shutdown(self):
         self.transfer_queue.put(None)
@@ -88,19 +73,14 @@ class GPUCPUTransferWorker(TransferWorker):
         worker_id: int,
         gpu_blocks_ptrs: torch.Tensor,
         cpu_blocks_ptrs: torch.Tensor,
-        finished_queue: Queue,
+        finished_ops_queue: Queue,
         gpu_kv_shape: Tuple[int, ...],
         cpu_kv_shape: Tuple[int, ...],
         dtype: torch.dtype,
-        max_batch_size: int = 32,
         gpu_device_id: int = -1,
     ):
-
-        print("gpu_block_shape", gpu_kv_shape)
-        print("cpu_block_shape", cpu_kv_shape)
-
         assert len(gpu_blocks_ptrs) == len(cpu_blocks_ptrs)
-        self.finished_queue = finished_queue
+        self.finished_ops_queue = finished_ops_queue
         #NOTE: this may be different for different frameworks or kvcache layout
         self.num_layers = len(gpu_blocks_ptrs)
         self.num_gpu_blocks = gpu_kv_shape[2]
@@ -120,7 +100,6 @@ class GPUCPUTransferWorker(TransferWorker):
         self.cpu_block_stride_in_bytes = self.block_size * self.dtype.itemsize
 
         self.transfer_queue: Queue = Queue()
-        self.max_batch_size = max_batch_size
 
         self.transfer_stream = torch.cuda.Stream()
         self.transfer_sms = 4
@@ -133,7 +112,7 @@ class GPUCPUTransferWorker(TransferWorker):
         self.transfer_thread = Thread(target=self._transfer_worker, daemon=True)
         self.transfer_thread.start()
 
-    def transfer(
+    def _transfer_impl(
         self,
         gpu_descriptor: TransferDescriptor,
         cpu_descriptor: TransferDescriptor,
@@ -198,74 +177,45 @@ class GPUCPUTransferWorker(TransferWorker):
         # if non_blocking:
         #torch.cuda.synchronize()  # TODO: remove this ?
 
-    def _process_transfers(self, transfers):
-        if not isinstance(transfers, list):
-            transfers = [transfers]
-
+    def launch_transfer(self, transfer_op: TransferOp):
         with torch.cuda.stream(self.transfer_stream):
-            # we can implement a tranfer kernel here
-            # to process multiple transfers in parallel
-            for op in transfers:
-                if op.transfer_type == TransferType.H2D:
-                    cpu_descriptor = op.src_descriptor
-                    gpu_descriptor = op.dst_descriptor
-                elif op.transfer_type == TransferType.D2H:
-                    cpu_descriptor = op.dst_descriptor
-                    gpu_descriptor = op.src_descriptor
-                else:
-                    raise ValueError(f"Invalid transfer type: {op.transfer_type}")
-                start_time = time.time()
-                nvtx.range_push("GPU CPUTransfer")
-                self.transfer(
-                    gpu_descriptor,
-                    cpu_descriptor,
-                    op.transfer_type,
-                    layer_id=op.layer_id,
-                    layer_granularity=op.layer_granularity,
-                    non_blocking=True,
-                )
-                nvtx.range_pop()
-                self.transfer_stream.synchronize()
-                # debuginfo.info("TRANSFER stream synchronized")
-                self.finished_queue.put(op)
-                end_time = time.time()
-                transfer_size = (
-                    len(gpu_descriptor.physical_block_ids)
-                    * self.block_size
-                    * self.dtype.itemsize
-                    * 2
-                    * op.layer_granularity
-                )
-                debuginfo.info(
-                    f"gpu cpu tranfer request: {op.transfer_op_id} finished "
-                    f"request type is {op.transfer_type} "
-                    f"transfer data size is {transfer_size} bytes "
-                    f"transfer time is {end_time - start_time:.4f} s "
-                    f"transfer bandwidth is "
-                    f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
-                )
-                '''
-                if op.transfer_type == TransferType.D2H:
-                    add_desc = op.additional_descriptor
-                    if add_desc is not None and (
-                        len(add_desc.physical_block_ids) > 0
-                    ):
-                        self.ssd_transfer.submit_transfer(
-                            request.request_id,
-                            TransferType.H2DISK,
-                            request.dst_descriptor,
-                            request.additional_descriptor,
-                        )
-                    else:
-                        for bm in request.dst_descriptor.blockmeta_list:
-                            bm.status = BlockStatus.AVAILABLE
-                else:
-                    # note: only when the transfer is the end of this
-                    # request, we can release the blocks
-                    # and block_metas always in cpu descriptor
-                    for bm in request.src_descriptor.blockmeta_list:
-                        bm.status = BlockStatus.AVAILABLE
-                '''
+            if transfer_op.transfer_type == TransferType.H2D:
+                cpu_descriptor = transfer_op.src_descriptor
+                gpu_descriptor = transfer_op.dst_descriptor
+            elif transfer_op.transfer_type == TransferType.D2H:
+                cpu_descriptor = transfer_op.dst_descriptor
+                gpu_descriptor = transfer_op.src_descriptor
+            else:
+                raise ValueError(f"Invalid transfer type: {transfer_op.transfer_type}")
+            start_time = time.time()
+            nvtx.range_push("GPU CPUTransfer")
+            self._transfer_impl(
+                gpu_descriptor,
+                cpu_descriptor,
+                transfer_op.transfer_type,
+                layer_id=transfer_op.layer_id,
+                layer_granularity=transfer_op.layer_granularity,
+                non_blocking=True,
+            )
+            nvtx.range_pop()
+            self.transfer_stream.synchronize()
+            # debuginfo.info("TRANSFER stream synchronized")
+            end_time = time.time()
+            transfer_size = (
+                len(gpu_descriptor.physical_block_ids)
+                * self.block_size
+                * self.dtype.itemsize
+                * 2
+                * transfer_op.layer_granularity
+            )
+            debuginfo.info(
+                f"gpu cpu tranfer request: {transfer_op.transfer_op_id} finished "
+                f"request type is {transfer_op.transfer_type} "
+                f"transfer data size is {transfer_size} bytes "
+                f"transfer time is {end_time - start_time:.4f} s "
+                f"transfer bandwidth is "
+                f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+            )
 
 class CPUSSDDiskTransferWorker(TransferWorker):
     def __init__(
@@ -276,8 +226,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         cpu_kv_shape: Tuple[int, ...],
         ssd_kv_shape: Tuple[int, ...],
         dtype: torch.dtype,
-        max_batch_size: int = 32,
-        finished_queue: Queue = None,
+        finished_ops_queue: Queue = None,
     ):
 
         #NOTE: this may be different for different frameworks or kvcache layout
@@ -297,7 +246,6 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         self.ssd_layer_stride_in_bytes = (
             self.num_ssd_blocks * self.block_size * self.dtype.itemsize * 2
         )
-        print(f"ssd_layer_stride_in_bytes: {self.ssd_layer_stride_in_bytes}, num_ssd_blocks: {self.num_ssd_blocks}, block_size: {self.block_size}, dtype.itemsize: {self.dtype.itemsize}")
         self.cpu_kv_stride_in_bytes = (
             self.num_cpu_blocks * self.block_size * self.dtype.itemsize
         )
@@ -310,14 +258,12 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         self.chunk_size_in_bytes = self.block_size * self.dtype.itemsize
 
         self.transfer_queue: Queue = Queue()
-        self.finished_queue = finished_queue
-
-        self.max_batch_size = max_batch_size
+        self.finished_ops_queue = finished_ops_queue
 
         self.transfer_thread = Thread(target=self._transfer_worker, daemon=True)
         self.transfer_thread.start()
 
-    def transfer(
+    def _transfer_impl(
         self,
         cpu_descriptor: TransferDescriptor,
         ssd_descriptor: TransferDescriptor,
@@ -371,64 +317,37 @@ class CPUSSDDiskTransferWorker(TransferWorker):
             verbose=False
         )
 
-    def _process_transfers(self, transfers):
-        if not isinstance(transfers, list):
-            transfers = [transfers]
-        # try:
-        # since we need descriptor slicing,
-        # cannot merge multiple transfers here
-        for op in transfers:
-            if op.transfer_type == TransferType.DISK2H:
-                cpu_descriptor = op.dst_descriptor
-                ssd_descriptor = op.src_descriptor
-            else:
-                cpu_descriptor = op.src_descriptor
-                ssd_descriptor = op.dst_descriptor
-            start_time = time.time()
-            nvtx.range_push("CPU SSD Transfer")
-            self.transfer(
-                cpu_descriptor,
-                ssd_descriptor,
-                op.transfer_type,
-                layer_id=op.layer_id,
-                layer_granularity=op.layer_granularity,
-                non_blocking=True,
-            )
-            nvtx.range_pop()
-            self.finished_queue.put(op)
-            end_time = time.time()
-            transfer_size = (
-                len(ssd_descriptor.physical_block_ids)
-                * self.block_size
-                * self.dtype.itemsize
-                * 2
-                * self.num_layers
-            )
-            debuginfo.info(
-                f"ssd tranfer request: {op.transfer_op_id} finished "
-                f"request type is {op.transfer_type} "
-                f"transfer data size is {transfer_size} bytes "
-                f"transfer time is {end_time - start_time:.4f} s "
-                f"transfer bandwidth is "
-                f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
-            )
-            '''
-            if op.transfer_type == TransferType.DISK2H and (
-                op.additional_descriptor is not None
-            ):
-                self.gpu_transfer.submit_transfer(
-                    request.request_id,
-                    TransferType.H2D,
-                    src_descriptor=request.dst_descriptor,
-                    dst_descriptor=request.additional_descriptor,
-                    return_mask=request.return_mask,
-                    transfer_id=request.transfer_id,
-                )
-            else:
-                # note: only when the transfer is the end of this
-                # request, we can release the blocks
-                # and block_metas always in cpu descriptor
-                for bm in request.src_descriptor.blockmeta_list:
-                    bm.status = BlockStatus.AVAILABLE
-                # self.finished_queue.append(request)
-            '''
+    def launch_transfer(self, transfer_op: TransferOp):
+        if transfer_op.transfer_type == TransferType.DISK2H:
+            cpu_descriptor = transfer_op.dst_descriptor
+            ssd_descriptor = transfer_op.src_descriptor
+        else:
+            cpu_descriptor = transfer_op.src_descriptor
+            ssd_descriptor = transfer_op.dst_descriptor
+        start_time = time.time()
+        nvtx.range_push("CPU SSD Transfer")
+        self._transfer_impl(
+            cpu_descriptor,
+            ssd_descriptor,
+            transfer_op.transfer_type,
+            layer_id=transfer_op.layer_id,
+            layer_granularity=transfer_op.layer_granularity,
+            non_blocking=True,
+        )
+        nvtx.range_pop()
+        end_time = time.time()
+        transfer_size = (
+            len(ssd_descriptor.physical_block_ids)
+            * self.block_size
+            * self.dtype.itemsize
+            * 2
+            * self.num_layers
+        )
+        debuginfo.info(
+            f"ssd tranfer request: {transfer_op.transfer_op_id} finished "
+            f"request type is {transfer_op.transfer_type} "
+            f"transfer data size is {transfer_size} bytes "
+            f"transfer time is {end_time - start_time:.4f} s "
+            f"transfer bandwidth is "
+            f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+        )
