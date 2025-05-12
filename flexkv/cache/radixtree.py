@@ -21,8 +21,8 @@ class MatchResult:
 
 @dataclass
 class RadixNode:
-    content_hash: np.ndarray
-    content_physical: np.ndarray
+    block_hashes: np.ndarray
+    physical_blocks: np.ndarray
 
     is_ready: bool
     lock_cnt: int
@@ -32,18 +32,18 @@ class RadixNode:
     children: Dict[HashType, 'RadixNode'] = field(default_factory=dict)
 
     def __post_init__(self):
-        assert self.content_hash.ndim == 1
-        assert self.content_physical.ndim == 1
-        assert self.content_hash.size == self.content_physical.size
+        assert self.block_hashes.ndim == 1
+        assert self.physical_blocks.ndim == 1
+        assert self.block_hashes.size == self.physical_blocks.size
 
     def __lt__(self, other: 'RadixNode') -> bool:
         return self.last_access_time < other.last_access_time
 
     def size(self) -> int:
-        return self.content_hash.size
+        return self.block_hashes.size
 
     def head_hash(self) -> HashType:
-        return self.content_hash[0] if self.size() > 0 else None
+        return self.block_hashes[0] if self.size() > 0 else None
 
     def num_children(self) -> int:
         return len(self.children)
@@ -65,16 +65,16 @@ class RadixNode:
         assert length > 0
         assert not self.in_use()
         new_node = RadixNode(
-            content_hash=self.content_hash[length:],
-            content_physical=self.content_physical[length:],
+            block_hashes=self.block_hashes[length:],
+            physical_blocks=self.physical_blocks[length:],
             is_ready=self.is_ready,
             lock_cnt=self.lock_cnt,
             last_access_time=self.last_access_time,
             parent=self,
             children=self.children
         )
-        self.content_hash = self.content_hash[:length]
-        self.content_physical = self.content_physical[:length]
+        self.block_hashes = self.block_hashes[:length]
+        self.physical_blocks = self.physical_blocks[:length]
         self.children = {}
         self.children[new_node.head_hash()] = new_node
         return new_node
@@ -85,23 +85,23 @@ class RadixNode:
         assert self.is_leaf()
         assert not self.in_use()
         remaining_length = self.size() - length
-        physical_blocks = self.content_physical[remaining_length:]
-        self.content_hash = self.content_hash[:remaining_length]
-        self.content_physical = self.content_physical[:remaining_length]
+        physical_blocks = self.physical_blocks[remaining_length:]
+        self.block_hashes = self.block_hashes[:remaining_length]
+        self.physical_blocks = self.physical_blocks[:remaining_length]
         return physical_blocks
 
     def merge_child(self) -> None:  # ignore status
         assert self.num_children() == 1
         child = list(self.children.values())[0]
-        self.content_hash = np.concatenate([self.content_hash, child.content_hash])
-        self.content_physical = np.concatenate([self.content_physical, child.content_physical])
+        self.block_hashes = np.concatenate([self.block_hashes, child.block_hashes])
+        self.physical_blocks = np.concatenate([self.physical_blocks, child.physical_blocks])
         self.last_access_time = max(self.last_access_time, child.last_access_time)
         self.children.clear()
 
 class RadixTreeIndex:
     def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000):
-        self.root_node = RadixNode(content_hash=np.array([]),
-                                   content_physical=np.array([]),
+        self.root_node = RadixNode(block_hashes=np.array([]),
+                                   physical_blocks=np.array([]),
                                    is_ready=True,
                                    lock_cnt=0,
                                    last_access_time=time.time())
@@ -115,8 +115,8 @@ class RadixTreeIndex:
         self.reset()
 
     def reset(self)->None:
-        self.root_node = RadixNode(content_hash=np.array([]),
-                                   content_physical=np.array([]),
+        self.root_node = RadixNode(block_hashes=np.array([]),
+                                   physical_blocks=np.array([]),
                                    is_ready=True,
                                    lock_cnt=0,
                                    last_access_time=time.time())
@@ -136,7 +136,7 @@ class RadixTreeIndex:
             child_hash = sequence.get_hash(prefix_blocks_num + current_node.size())
             if child_hash in current_node.children:
                 prefix_blocks_num += current_node.size()
-                physical_blocks = np.concatenate([physical_blocks, current_node.content_physical])
+                physical_blocks = np.concatenate([physical_blocks, current_node.physical_blocks])
                 current_node = current_node.children[child_hash]
             else:
                 if not current_node.is_root():
@@ -145,12 +145,12 @@ class RadixTreeIndex:
                     right = cmp_length
                     while left < right:
                         mid = (left + right) // 2
-                        if current_node.content_hash[mid] == sequence.get_hash(prefix_blocks_num+mid):
+                        if current_node.block_hashes[mid] == sequence.get_hash(prefix_blocks_num+mid):
                             left = mid + 1
                         else:
                             right = mid
                     matched_length = left
-                    physical_blocks = np.concatenate([physical_blocks, current_node.content_physical[:matched_length]])
+                    physical_blocks = np.concatenate([physical_blocks, current_node.physical_blocks[:matched_length]])
                 else:
                     matched_length = 0
                 last_node_matched_length = matched_length
@@ -195,8 +195,8 @@ class RadixTreeIndex:
             return
 
         new_node = RadixNode(
-            content_hash=sequence_meta.block_hashes[num_matched_blocks:num_insert_blocks],
-            content_physical=physical_block_ids.numpy(),
+            block_hashes=sequence_meta.block_hashes[num_matched_blocks:num_insert_blocks],
+            physical_blocks=physical_block_ids.numpy(),
             is_ready=is_ready,
             lock_cnt=0,
             last_access_time=time.time()
@@ -232,7 +232,7 @@ class RadixTreeIndex:
                     self.leaf_nodes[node.parent.head_hash()] = node.parent
                 if node.parent.evictable():
                     heapq.heappush(candidates, node.parent)
-                physical_blocks = node.content_physical
+                physical_blocks = node.physical_blocks
                 del node
             evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
         return torch.as_tensor(evicted_blocks, dtype=torch.int64)
