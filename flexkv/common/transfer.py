@@ -75,7 +75,7 @@ class TransferOp:
     successors: Set[int] = field(default_factory=set)
     status: TransferOpStatus = TransferOpStatus.PENDING
     layer_id: int = -1
-    layer_granularity: int = 1
+    layer_granularity: int = -1
     tp_rank: Optional[int] = None
     tp_world_size: Optional[int] = None
 
