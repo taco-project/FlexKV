@@ -24,8 +24,6 @@ class TransferEngine:
         # Initialize scheduler
         self.scheduler = TransferScheduler()
 
-        self.max_batch_size = 32
-
         # Initialize queues
         self.task_queue = Queue()  # Queue for new transfer graphs
         self.completed_queue = Queue(maxsize=2048)  # Queue for completed transfer graphs and ops
@@ -37,11 +35,10 @@ class TransferEngine:
                 worker_id=i,
                 gpu_blocks_ptrs=gpu_handles[i].data,
                 cpu_blocks_ptrs=cpu_handle.data,
-                finished_queue=self.finished_ops_queue,
+                finished_ops_queue=self.finished_ops_queue,
                 gpu_kv_shape=gpu_handles[i].kv_shape,
                 cpu_kv_shape=cpu_handle.kv_shape,
                 dtype=gpu_handles[i].dtype,
-                max_batch_size=self.max_batch_size,
                 gpu_device_id=i,
             )
             for i in range(len(gpu_handles))
@@ -54,8 +51,7 @@ class TransferEngine:
                 cpu_kv_shape=cpu_handle.kv_shape,
                 ssd_kv_shape=ssd_handle.kv_shape,
                 dtype=cpu_handle.dtype,
-                max_batch_size=self.max_batch_size,
-                finished_queue=self.finished_ops_queue,
+                finished_ops_queue=self.finished_ops_queue,
             )
         else:
             self.cpussd_worker = None
