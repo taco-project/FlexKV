@@ -3,6 +3,9 @@ from flexkv.common.storage import AccessibleHandle, AccessHandleType
 import torch
 from typing import Tuple, Optional, List
 import numpy as np
+import time
+import os
+
 class StorageAllocator(ABC):
     @abstractmethod
     def __init__(self):
@@ -167,11 +170,20 @@ class SSDAllocator(StorageAllocator):
         self.tensor_shape = tensor_shape
         self.dtype = dtype
         self.total_file_size = np.prod(tensor_shape) * dtype.itemsize
+        self.allocate()
 
     def allocate(self):
         self.file = open(self.file_path, "wb+", buffering=0)
-        self.file.write(b"\x00" * self.total_file_size)
-        self.file.close()
+        self._init_file()
+
+    def _init_file(self):
+        try:
+            os.truncate(self.file.fileno(), self.total_file_size)
+        except (IOError, OSError) as e:
+            raise RuntimeError(f"Failed to initialize file: {e}")
+        
+        self.file.flush()
+        os.fsync(self.file.fileno())
 
     def free(self):
         pass
