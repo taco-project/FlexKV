@@ -139,11 +139,16 @@ class GPUCPUTransferWorker(TransferWorker):
         cpu_descriptor: TransferDescriptor,
         transfer_type: TransferType,
         layer_id: int = -1,
-        layer_granularity: int = 1,
+        layer_granularity: int = -1,
         non_blocking: bool = False,
     ) -> None:
         assert gpu_descriptor.device_type == DeviceType.GPU
         assert cpu_descriptor.device_type == DeviceType.CPU
+
+        if layer_id == -1:
+            layer_id = 0
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
 
         gpu_block_id_list = gpu_descriptor.physical_block_ids.pin_memory().to(dtype=torch.int64)
         cpu_block_id_list = cpu_descriptor.physical_block_ids.pin_memory().to(dtype=torch.int64)
@@ -153,10 +158,7 @@ class GPUCPUTransferWorker(TransferWorker):
         if len(gpu_block_id_list) == 0:
             return
 
-        if layer_id == -1:
-            layer_id_list = torch.arange(self.num_layers, dtype=torch.int32)
-        else:
-            layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
+        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
 
         chunk_size_in_bytes = self.block_size * self.dtype.itemsize
         nvtx.range_push("Transfer KV Layers")
@@ -232,7 +234,7 @@ class GPUCPUTransferWorker(TransferWorker):
                     * self.block_size
                     * self.dtype.itemsize
                     * 2
-                    * len(op.layers)
+                    * op.layer_granularity
                 )
                 debuginfo.info(
                     f"gpu cpu tranfer request: {op.transfer_op_id} finished "
@@ -319,12 +321,19 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         cpu_descriptor: TransferDescriptor,
         ssd_descriptor: TransferDescriptor,
         transfer_type: TransferType,
-        layer_id_list: Optional[torch.Tensor] = None,
+        layer_id: int = -1,
+        layer_granularity: int = -1,
         non_blocking: bool = False,
     ) -> None:
         debuginfo.info(f"ssd transfer {transfer_type} happens")
         assert ssd_descriptor.device_type == DeviceType.SSD
         assert cpu_descriptor.device_type == DeviceType.CPU
+
+        if layer_id == -1:
+            layer_id = 0
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
+
         # this means partial read hit cpu and other hit ssd
         # or partial write hit ssd and none hit cpu
         debuginfo.info(f"ssd transfer {transfer_type} happens")
@@ -343,8 +352,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         if len(ssd_block_id_list) == 0:
             return
 
-        if layer_id_list is None:
-            layer_id_list = torch.arange(self.num_layers, dtype=torch.int32)
+        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
 
         transfer_kv_blocks_ssd(
             filename=self.ssd_file,
@@ -360,7 +368,6 @@ class CPUSSDDiskTransferWorker(TransferWorker):
             is_read=(transfer_type == TransferType.DISK2H),
             verbose=False
         )
-
 
     def _process_transfers(self, transfers):
         if not isinstance(transfers, list):
@@ -381,7 +388,8 @@ class CPUSSDDiskTransferWorker(TransferWorker):
                 cpu_descriptor,
                 ssd_descriptor,
                 op.transfer_type,
-                layer_id_list=op.layers,
+                layer_id=op.layer_id,
+                layer_granularity=op.layer_granularity,
                 non_blocking=True,
             )
             nvtx.range_pop()
