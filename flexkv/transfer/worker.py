@@ -120,6 +120,7 @@ class GPUCPUTransferWorker(TransferWorker):
         layer_id: int = -1,
         layer_granularity: int = -1,
         non_blocking: bool = False,
+        use_ce_transfer: bool = False,
     ) -> None:
         assert gpu_descriptor.device_type == DeviceType.GPU
         assert cpu_descriptor.device_type == DeviceType.CPU
@@ -154,7 +155,7 @@ class GPUCPUTransferWorker(TransferWorker):
                 chunk_size_in_bytes,
                 self.transfer_sms,
                 True,
-                False,
+                use_ce_transfer,
             )
         elif transfer_type == TransferType.D2H:
             transfer_kv_layers(
@@ -169,7 +170,7 @@ class GPUCPUTransferWorker(TransferWorker):
                 chunk_size_in_bytes,
                 self.transfer_sms,
                 False,
-                False,
+                use_ce_transfer,
             )
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type}")
@@ -196,6 +197,7 @@ class GPUCPUTransferWorker(TransferWorker):
                 layer_id=transfer_op.layer_id,
                 layer_granularity=transfer_op.layer_granularity,
                 non_blocking=True,
+                use_ce_transfer=False,
             )
             nvtx.range_pop()
             self.transfer_stream.synchronize()
