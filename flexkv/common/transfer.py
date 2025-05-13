@@ -83,25 +83,39 @@ class TransferOp:
 class TransferOpGraph:
     transfer_graph_id: int
     _op_map: Dict[int, TransferOp] = field(init=False)
-    _current_ops: Set[int]
+    _ready_ops: Set[int]
 
     def __init__(self, transfer_graph_id: int):
         self.transfer_graph_id = transfer_graph_id
         self._op_map = {}
-        self._current_ops = set()
+        self._ready_ops = set()
+        self._trigger_ops = set()
 
-    def add_ready_op_id(self, op_id: int):
-        self._current_ops.add(op_id)
+    def add_virtual_op(self, op: TransferOp, need_trigger: bool = False):
+        op.transfer_graph_id = self.transfer_graph_id
+        op.transfer_type = TransferType.VIRTUAL
+        self._op_map[op.transfer_op_id] = op
+        if need_trigger:
+            self._trigger_ops.add(op.transfer_op_id)
+        else:
+            self._ready_ops.add(op.transfer_op_id)
+
+    def trigger_op(self, op_id: int):
+        self._trigger_ops.remove(op_id)
+        self._ready_ops.discard(op_id)
+        self.mark_completed(op_id)
 
     def add_transfer_op(self, op: TransferOp):
         op.transfer_graph_id = self.transfer_graph_id
         self._op_map[op.transfer_op_id] = op
+        self._ready_ops.add(op.transfer_op_id)
 
     def add_dependency(self, successor_op_id: int, predecessor_op_id: int):
         """successor_op_id depends on predecessor_op_id"""
-        if successor_op_id in self._op_map and predecessor_op_id in self._op_map:
-            self._op_map[successor_op_id].predecessors.add(predecessor_op_id)
-            self._op_map[predecessor_op_id].successors.add(successor_op_id)
+        assert successor_op_id in self._op_map and predecessor_op_id in self._op_map
+        self._op_map[successor_op_id].predecessors.add(predecessor_op_id)
+        self._op_map[predecessor_op_id].successors.add(successor_op_id)
+        self._ready_ops.discard(successor_op_id)
 
     def mark_completed(self, op_id: int):
         """mark an op as completed"""
@@ -119,7 +133,7 @@ class TransferOpGraph:
         ready_ops = []
         to_remove = []
         to_add = []
-        for op_id in self._current_ops:
+        for op_id in self._ready_ops:
             op = self._op_map[op_id]
             if op.status == TransferOpStatus.COMPLETED:
                 to_remove.append(op_id)
@@ -134,10 +148,8 @@ class TransferOpGraph:
                 self._op_map[op_id].status = TransferOpStatus.RUNNING
                 to_add.append(op_id)
 
-        for op_id in to_remove:
-            self._current_ops.remove(op_id)
-        for op_id in to_add:
-            self._current_ops.add(op_id)
+        self._ready_ops.difference_update(to_remove)
+        self._ready_ops.update(to_add)
         return ready_ops
 
     def all_transfer_ops_completed(self) -> bool:

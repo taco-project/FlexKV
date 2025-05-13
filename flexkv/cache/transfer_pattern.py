@@ -47,7 +47,6 @@ def create_read_transfer_graph(
             layer_wise_ops.append(op.transfer_op_id)
             if (i > 0):
                 graph.add_dependency(op.transfer_op_id, layer_wise_ops[i - 1])
-        graph.add_ready_op_id(layer_wise_ops[0])
         return graph, layer_wise_ops
     elif len(ssd_blocks) < len(cpu_blocks):
         cpu_layer_wise_ops = []
@@ -123,8 +122,6 @@ def create_read_transfer_graph(
                 graph.add_dependency(op1.transfer_op_id, ssd_layer_wise_ops[i - 1])
                 graph.add_dependency(op2.transfer_op_id, cpu_ssd_depend_ops[i - 1])
                 graph.add_dependency(op3.transfer_op_id, cpu_layer_wise_ops[i - 1])
-        graph.add_ready_op_id(ssd_layer_wise_ops[0])
-        graph.add_ready_op_id(cpu_ssd_depend_ops[0])
         return graph, virtual_ops
     else:
         cpu_layer_wise_op_ids = []
@@ -168,7 +165,6 @@ def create_read_transfer_graph(
             if (i > 0):
                 graph.add_dependency(op2.transfer_op_id, cpu_layer_wise_op_ids[i - 1])
                 graph.add_dependency(op1.transfer_op_id, ssd_layer_wise_op_ids[i - 1])
-        graph.add_ready_op_id(ssd_layer_wise_op_ids[0])
         return graph, cpu_layer_wise_op_ids
 
 # NOTE write through now
@@ -199,7 +195,6 @@ def create_write_transfer_graph(
             layer_id = -1,  # all layers
         )
         graph.add_transfer_op(op1)
-        graph.add_ready_op_id(op1.transfer_op_id)
         return graph
     elif len(ssd_blocks) < len(cpu_blocks):
         op1 = TransferOp(
@@ -250,8 +245,6 @@ def create_write_transfer_graph(
             layer_id = -1,  # all layers
         )
         graph.add_transfer_op(op3)
-        graph.add_ready_op_id(op3.transfer_op_id)
-        graph.add_ready_op_id(op1.transfer_op_id)
         #op4 = TransferOp(
         #    transfer_op_id = TransferIDAllocator.allocate_op_id(),
         #    transfer_graph_id = graph.transfer_graph_id,
@@ -294,5 +287,4 @@ def create_write_transfer_graph(
         )
         graph.add_transfer_op(op2)
         graph.add_dependency(op2.transfer_op_id, op1.transfer_op_id)
-        graph.add_ready_op_id(op1.transfer_op_id)
         return graph
