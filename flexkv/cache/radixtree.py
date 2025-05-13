@@ -19,6 +19,10 @@ class MatchResult:
     last_node_matched_length: int = 0
     physical_blocks: torch.Tensor = torch.empty(0, dtype=torch.int64)
 
+    def __post_init__(self):
+        assert self.physical_blocks.ndim == 1
+        assert self.physical_blocks.dtype == torch.int64
+
 @dataclass
 class RadixNode:
     block_hashes: np.ndarray
@@ -100,11 +104,7 @@ class RadixNode:
 
 class RadixTreeIndex:
     def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000):
-        self.root_node = RadixNode(block_hashes=np.array([]),
-                                   physical_blocks=np.array([]),
-                                   is_ready=True,
-                                   lock_cnt=0,
-                                   last_access_time=time.time())
+        self.root_node = None
 
         self.tokens_per_block = tokens_per_block
 
@@ -115,8 +115,8 @@ class RadixTreeIndex:
         self.reset()
 
     def reset(self)->None:
-        self.root_node = RadixNode(block_hashes=np.array([]),
-                                   physical_blocks=np.array([]),
+        self.root_node = RadixNode(block_hashes=np.array([], dtype=np.int64),
+                                   physical_blocks=np.array([], dtype=np.int64),
                                    is_ready=True,
                                    lock_cnt=0,
                                    last_access_time=time.time())
@@ -159,7 +159,7 @@ class RadixTreeIndex:
         return MatchResult(num_matched_blocks=prefix_blocks_num,
                            last_node=current_node,
                            last_node_matched_length=last_node_matched_length,
-                           physical_blocks=torch.as_tensor(physical_blocks, dtype=torch.int64))
+                           physical_blocks=torch.from_numpy(physical_blocks).to(torch.int64))
 
     def num_matched_blocks(self,
                     sequence: SequenceMeta) -> int:
@@ -177,6 +177,7 @@ class RadixTreeIndex:
         assert 0 <= num_insert_blocks <= sequence_meta.num_blocks
 
         assert physical_block_ids.ndim == 1
+        assert physical_block_ids.dtype == torch.int64
 
         sequence_meta.gen_hashes()
         if match_result is None:
@@ -235,7 +236,7 @@ class RadixTreeIndex:
                 physical_blocks = node.physical_blocks
                 del node
             evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
-        return torch.as_tensor(evicted_blocks, dtype=torch.int64)
+        return torch.from_numpy(evicted_blocks).to(torch.int64)
 
     def lock(self, node: RadixNode) -> None:
         node.lock_cnt += 1
