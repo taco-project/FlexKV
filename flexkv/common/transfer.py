@@ -79,11 +79,7 @@ class TransferOp:
     tp_rank: Optional[int] = None
     tp_world_size: Optional[int] = None
 
-@dataclass
 class TransferOpGraph:
-    transfer_graph_id: int
-    _op_map: Dict[int, TransferOp] = field(init=False)
-    _ready_ops: Set[int]
 
     def __init__(self, transfer_graph_id: int):
         self.transfer_graph_id = transfer_graph_id
