@@ -142,14 +142,16 @@ class GPUCPUTransferWorker(TransferWorker):
 
         chunk_size_in_bytes = self.block_size * self.dtype.itemsize
         nvtx.range_push("Transfer KV Layers")
+        gpu_layer_ptrs = self.gpu_layer_ptrs[layer_id_list].contiguous().pin_memory()
+        cpu_layer_ptrs = self.cpu_layer_ptrs[layer_id_list].contiguous().pin_memory()
         if transfer_type == TransferType.H2D:
             transfer_kv_layers(
                 gpu_block_id_list,
-                self.gpu_layer_ptrs[layer_id_list].pin_memory(),
+                gpu_layer_ptrs,
                 self.gpu_kv_stride_in_bytes,
                 self.gpu_block_stride_in_bytes,
                 cpu_block_id_list,
-                self.cpu_layer_ptrs[layer_id_list].pin_memory(),
+                cpu_layer_ptrs,
                 self.cpu_kv_stride_in_bytes,
                 self.cpu_block_stride_in_bytes,
                 chunk_size_in_bytes,
@@ -160,11 +162,11 @@ class GPUCPUTransferWorker(TransferWorker):
         elif transfer_type == TransferType.D2H:
             transfer_kv_layers(
                 cpu_block_id_list,
-                self.cpu_layer_ptrs[layer_id_list].pin_memory(),
+                cpu_layer_ptrs,
                 self.cpu_kv_stride_in_bytes,
                 self.cpu_block_stride_in_bytes,
                 gpu_block_id_list,
-                self.gpu_layer_ptrs[layer_id_list].pin_memory(),
+                gpu_layer_ptrs,
                 self.gpu_kv_stride_in_bytes,
                 self.gpu_block_stride_in_bytes,
                 chunk_size_in_bytes,
@@ -200,7 +202,6 @@ class GPUCPUTransferWorker(TransferWorker):
                 use_ce_transfer=False,
             )
             nvtx.range_pop()
-            self.transfer_stream.synchronize()
             # debuginfo.info("TRANSFER stream synchronized")
             end_time = time.time()
             transfer_size = (

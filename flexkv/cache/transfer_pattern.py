@@ -174,7 +174,7 @@ def create_write_transfer_graph(
     cpu_blocks: torch.Tensor,
     gpu_blocks: torch.Tensor,
     gpu_device_id: int = 0,
-    layer_num: int = 1,
+    layer_num: int = 1
 ) -> TransferOpGraph:
     assert len(gpu_blocks) == len(cpu_blocks)
     graph = TransferOpGraph(TransferIDAllocator.allocate_graph_id())
@@ -192,7 +192,8 @@ def create_write_transfer_graph(
                 device_type = DeviceType.CPU,
                 physical_block_ids=cpu_blocks,
             ),
-            layer_id = -1,  # all layers
+            layer_id = 0,  # all layers
+            layer_granularity = layer_num
         )
         graph.add_transfer_op(op1)
         return graph
@@ -210,7 +211,8 @@ def create_write_transfer_graph(
                 device_type = DeviceType.CPU,
                 physical_block_ids=cpu_blocks[-len(ssd_blocks):],
             ),
-            layer_id = -1,  # all layers
+            layer_id = 0,  # all layers
+            layer_granularity = layer_num
         )
         graph.add_transfer_op(op1)
         op2 = TransferOp(
@@ -225,7 +227,8 @@ def create_write_transfer_graph(
                 device_type = DeviceType.SSD,
                 physical_block_ids=ssd_blocks,
             ),
-            layer_id = -1,  # all layers
+            layer_id = 0,  # all layers
+            layer_granularity = layer_num
         )
         graph.add_transfer_op(op2)
         graph.add_dependency(op2.transfer_op_id, op1.transfer_op_id)
@@ -242,7 +245,8 @@ def create_write_transfer_graph(
                 device_type = DeviceType.CPU,
                 physical_block_ids=cpu_blocks[:len(cpu_blocks) - len(ssd_blocks)],
             ),
-            layer_id = -1,  # all layers
+            layer_id = 0,  # all layers
+            layer_granularity = layer_num
         )
         graph.add_transfer_op(op3)
         #op4 = TransferOp(
@@ -268,7 +272,8 @@ def create_write_transfer_graph(
                 device_type = DeviceType.CPU,
                 physical_block_ids=cpu_blocks,
             ),
-            layer_id = -1,  # all layers
+            layer_id = 0,  # all layers
+            layer_granularity = layer_num
         )
         graph.add_transfer_op(op1)
         op2 = TransferOp(
@@ -283,7 +288,8 @@ def create_write_transfer_graph(
                 device_type = DeviceType.SSD,
                 physical_block_ids=ssd_blocks,
             ),
-            layer_id = -1,  # all layers
+            layer_id = 0,  # all layers
+            layer_granularity = layer_num
         )
         graph.add_transfer_op(op2)
         graph.add_dependency(op2.transfer_op_id, op1.transfer_op_id)

@@ -30,16 +30,6 @@ class TransferScheduler:
             if op.transfer_graph_id in self._transfer_graphs:
                 self._transfer_graphs[op.transfer_graph_id].mark_completed(op.transfer_op_id)
 
-        # Find completed transfer graphs
-        completed_graph_ids = []
-        for graph_id, graph in self._transfer_graphs.items():
-            if graph.all_transfer_ops_completed():
-                completed_graph_ids.append(graph_id)
-
-        # Remove completed graphs from scheduler
-        for graph_id in completed_graph_ids:
-            self._transfer_graphs.pop(graph_id)
-
         # Get next batch of executable operations
         next_ops = []
         for graph in self._transfer_graphs.values():
@@ -49,5 +39,15 @@ class TransferScheduler:
                 if op.transfer_type == TransferType.VIRTUAL:
                     self._transfer_graphs[op.transfer_graph_id].mark_completed(op_id)
                 next_ops.append(op)
+
+        # Find completed transfer graphs
+        completed_graph_ids = []
+        for graph_id, graph in self._transfer_graphs.items():
+            if graph.all_transfer_ops_completed():
+                completed_graph_ids.append(graph_id)
+
+        # Remove completed graphs from scheduler
+        for graph_id in completed_graph_ids:
+            self._transfer_graphs.pop(graph_id)
 
         return completed_graph_ids, next_ops

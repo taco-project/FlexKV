@@ -17,20 +17,6 @@
 
 namespace py = pybind11;
 
-template <typename ptrType> ptrType get_tensor_ptr(torch::Tensor &tensor) {
-  if (tensor.is_cuda()) {
-    return static_cast<ptrType>(tensor.data_ptr());
-  }
-  if (tensor.is_pinned()) {
-    ptrType host_ptr = static_cast<ptrType>(tensor.data_ptr());
-    ptrType device_ptr;
-    cudaHostGetDevicePointer((void **)&device_ptr,
-                             static_cast<void *>(host_ptr), 0);
-    return device_ptr;
-  }
-  throw std::invalid_argument("Tensor is not pinned or cuda");
-}
-
 void transfer_kv_layers_binding(
     torch::Tensor &dst_block_id_tensor, torch::Tensor &dst_layer_ptrs_tensor,
     int64_t dst_kv_stride_in_bytes, int64_t dst_chunk_stride_in_bytes,
@@ -41,10 +27,10 @@ void transfer_kv_layers_binding(
   int num_blocks = dst_block_id_tensor.numel();
   int num_layers = dst_layer_ptrs_tensor.numel();
 
-  int64_t *dst_block_ids = get_tensor_ptr<int64_t *>(dst_block_id_tensor);
-  void **dst_layer_ptrs = get_tensor_ptr<void **>(dst_layer_ptrs_tensor);
-  int64_t *src_block_ids = get_tensor_ptr<int64_t *>(src_block_id_tensor);
-  void **src_layer_ptrs = get_tensor_ptr<void **>(src_layer_ptrs_tensor);
+  int64_t *dst_block_ids = static_cast<int64_t *>(dst_block_id_tensor.data_ptr());
+  void **dst_layer_ptrs = static_cast<void **>(dst_layer_ptrs_tensor.data_ptr());//must be contiguous
+  int64_t *src_block_ids = static_cast<int64_t *>(src_block_id_tensor.data_ptr());
+  void **src_layer_ptrs = static_cast<void **>(src_layer_ptrs_tensor.data_ptr());
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   flexkv::transfer_kv_layers(
