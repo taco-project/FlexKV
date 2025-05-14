@@ -104,6 +104,7 @@ void transfer_kv_layers(int num_blocks, int num_layers, int64_t *dst_block_ids,
         src_layer_ptrs_int64, src_kv_stride_int64, src_chunk_stride_int64,
         chunk_size_in_int64);
   }
+  cudaStreamSynchronize(stream);
 }
 
 } // namespace flexkv
