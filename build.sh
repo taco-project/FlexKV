@@ -3,6 +3,9 @@ set -e
 
 PROJECT_ROOT=$(pwd)
 
+# 安装submodule
+git submodule update --init --recursive
+
 mkdir -p build
 cd build
 
