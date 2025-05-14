@@ -67,6 +67,8 @@ class TransferOp:
     transfer_op_id: int
     transfer_graph_id: int
     transfer_type: TransferType
+    layer_id: int
+    layer_granularity: int
     src_descriptor: TransferDescriptor = None
     dst_descriptor: TransferDescriptor = None
     # this will change dynamically as transfer ops executed
@@ -74,10 +76,9 @@ class TransferOp:
     # this will keep the full info
     successors: Set[int] = field(default_factory=set)
     status: TransferOpStatus = TransferOpStatus.PENDING
-    layer_id: int = -1
-    layer_granularity: int = -1
     tp_rank: Optional[int] = None
     tp_world_size: Optional[int] = None
+    
 
 class TransferOpGraph:
 
