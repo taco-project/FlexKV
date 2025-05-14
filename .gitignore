@@ -66,4 +66,3 @@ cover/
 # Ruff stuff:
 .ruff_cache/
 .vscode/launch.json
-ssd.cache
