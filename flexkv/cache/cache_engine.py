@@ -55,7 +55,7 @@ class CacheEngine:
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[RadixNode] = None,
-             strict: bool = True) -> List[int]:
+             strict: bool = True) -> torch.Tensor:
         if num_required_blocks > self.mempool.num_free_blocks:
             if protected_node is not None:
                 self.index.lock(protected_node)
