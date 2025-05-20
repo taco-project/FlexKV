@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional, Tuple
 from queue import Queue
 import threading
+import contextlib
 import time
 import torch
 from .scheduler import TransferScheduler
@@ -9,6 +10,7 @@ from ..common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferT
 from ..common.storage import AccessibleHandle
 import multiprocessing as mp
 import copy
+from ..common.debug import debuginfo
 
 class TransferEngine:
     def __init__(self,
@@ -26,7 +28,7 @@ class TransferEngine:
         # Initialize scheduler
         self.scheduler = TransferScheduler()
         self.task_queue = Queue()
-        self.completed_queue = Queue(maxsize=2048) 
+        self.completed_queue = Queue(maxsize=2048)
         self.finished_ops_queue = mp.Queue()
 
         # Initialize workers
@@ -34,7 +36,7 @@ class TransferEngine:
             GPUCPUTransferWorker.create_worker(
                 worker_id=i,
                 gpu_blocks=gpu_handles[i].data,
-                cpu_blocks=cpu_handle.data, 
+                cpu_blocks=cpu_handle.data,
                 finished_ops_queue=self.finished_ops_queue,
                 gpu_kv_shape=gpu_handles[i].kv_shape,
                 cpu_kv_shape=cpu_handle.kv_shape,
@@ -155,7 +157,7 @@ class TransferEngine:
         try:
             self._running = False
             self._scheduler_thread.join(timeout=5)
-            
+
             # shutdown all workers
             for worker in self.gpucpu_workers:
                 worker.shutdown()
@@ -163,18 +165,16 @@ class TransferEngine:
             if self.cpussd_worker is not None:
                 self.cpussd_worker.shutdown()
                 print("clear cpu ssd worker")
-            
+
             # clear finished_ops_queue
-            while not self.finished_ops_queue.empty():
-                try:
+            with contextlib.suppress(Exception):
+                while not self.finished_ops_queue.empty():
                     self.finished_ops_queue.get_nowait()
-                except:
-                    pass
-            
+
             # clear CUDA cache
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            
+
         except Exception as e:
             debuginfo.error(f"Error during shutdown: {e}")
             # terminate all workers
