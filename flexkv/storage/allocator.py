@@ -52,7 +52,7 @@ class GPUAllocator(StorageAllocator):
         self.device_id = device_id
         self.physical_blocks = []
         self.allocate()
-        self.layer_ptrs = None
+        #self.layer_ptrs = None
 
     def allocate(self):
         if self.physical_blocks:
@@ -75,11 +75,11 @@ class GPUAllocator(StorageAllocator):
             block.free()
 
     def get_accessible_handle(self) -> AccessibleHandle:
-        if not self.layer_ptrs:
-            self.layer_ptrs = self._get_layer_ptrs(self.physical_blocks)
+        #if not self.layer_ptrs:
+        #    self.layer_ptrs = self._get_layer_ptrs(self.physical_blocks)
         return AccessibleHandle(
             handle_type=AccessHandleType.TENSOR_LIST,
-            data=self.layer_ptrs,
+            data=self.physical_blocks,
             kv_shape=self.tensor_shape,
             dtype=self.dtype,
             device_id=self.device_id,
@@ -116,7 +116,6 @@ class CPUAllocator(StorageAllocator):
         self.pin_memory = pin_memory
         self.physical_blocks = []
         self.allocate()
-        self.layer_ptrs = None
 
     def allocate(self):
         if self.physical_blocks:
@@ -136,11 +135,9 @@ class CPUAllocator(StorageAllocator):
             block.free()
 
     def get_accessible_handle(self) -> AccessibleHandle:
-        if not self.layer_ptrs:
-            self.layer_ptrs = self._get_layer_ptrs(self.physical_blocks)
         return AccessibleHandle(
             handle_type=AccessHandleType.TENSOR_LIST,
-            data=self.layer_ptrs,
+            data=self.physical_blocks,
             kv_shape=self.tensor_shape,
             dtype=self.dtype,
         )
@@ -156,7 +153,6 @@ class CPUAllocator(StorageAllocator):
             pin_memory=pin_memory,
         )
         allocator.physical_blocks = data
-        #allocator.layer_ptrs = allocator._get_layer_ptrs(data)
         return allocator
 
 class SSDAllocator(StorageAllocator):
