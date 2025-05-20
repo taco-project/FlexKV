@@ -1,14 +1,14 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 import torch
-from queue import Queue
+
 import threading
 from flexkv.common.transfer import TransferOp, TransferType, DeviceType, TransferDescriptor
 from flexkv.common.storage import AccessibleHandle, AccessHandleType
 from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd
 import time
 from threading import Thread
-import queue
+
 from flexkv.common.debug import debuginfo
 import torch.cuda.nvtx as nvtx
 import multiprocessing as mp
