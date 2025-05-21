@@ -60,6 +60,25 @@ class StorageEngine:
                 dtype=torch.float16,
                 file_path=self._cache_config.ssd_cache_path
             )
+        if self._cache_config.enable_remote:
+            if not self._cache_config.remote_kv_layout == "layerwise":
+                raise ValueError("Only layerwise layout is supported for remote")
+            self._remote_layout = KVCacheLayout(
+                type=KVCacheLayoutType(self._cache_config.remote_kv_layout),
+                num_layer=self._model_config.num_layers,
+                num_block=self._cache_config.num_remote_blocks,
+                tokens_per_block=self._cache_config.tokens_per_block,
+                num_head=self._model_config.num_kv_heads,
+                head_size=self._model_config.head_size,
+                is_mla=False
+            )
+            # TODO replace this with real remote file
+            self.allocate(
+                device_type=DeviceType.REMOTE,
+                layout=self._remote_layout,
+                dtype=torch.float16,
+                file_path="fake_remote_file"
+            )
 
     def add_gpu_blocks(self, gpu_blocks: List[torch.Tensor], device_id: int = 0):
         if not self._cache_config.gpu_kv_layout == "layerwise":
@@ -150,6 +169,22 @@ class StorageEngine:
                 if not file_path:
                     raise ValueError("file_path is required for SSD allocator")
                 allocator = SSDAllocator(
+                    layout=layout,
+                    dtype=dtype,
+                    file_path=file_path
+                )
+        elif device_type == DeviceType.REMOTE:
+            #TODO correct this as real remote file
+            file_path = kwargs.get('file_path')
+            if raw_data is not None:
+                allocator = RemoteAllocator.from_raw_data(
+                    data=raw_data,
+                    layout=layout,
+                )
+            else:
+                if not file_path:
+                    raise ValueError("file_path is required for remote allocator")
+                allocator = RemoteAllocator(
                     layout=layout,
                     dtype=dtype,
                     file_path=file_path

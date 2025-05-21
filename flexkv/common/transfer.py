@@ -9,14 +9,17 @@ class DeviceType(Enum):
     CPU = 0
     GPU = 1
     SSD = 2
-
+    REMOTE = 3
+    
 class TransferType(Enum):
-    H2D    = "Host to Device"  # Host to Device transfer
-    D2H    = "Device to Host"  # Device to Host transfer
-    DISK2H = "Disk to Host"  # Disk to Host transfer
-    H2DISK = "Host to Disk"  # Host to Disk transfer
-    DISK2D = "Disk to Device"  # Disk to Device transfer
-    D2DISK = "Device to Disk"  # Device to Disk transfer
+    H2D    = "Host to Device"
+    D2H    = "Device to Host"
+    DISK2H = "Disk to Host"
+    H2DISK = "Host to Disk"
+    DISK2D = "Disk to Device"
+    D2DISK = "Device to Disk"
+    REMOTE2H = "Remote to Host"
+    H2REMOTE = "Host to Remote"
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of

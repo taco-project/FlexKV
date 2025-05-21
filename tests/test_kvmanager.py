@@ -16,7 +16,8 @@ enable_ssd = True
 block_per_request = 16
 num_gpu_blocks = 512
 num_cpu_blocks = 128
-num_ssd_blocks = 1024
+num_ssd_blocks = 256
+num_remote_blocks = 1024
 
 num_requests = num_ssd_blocks // block_per_request
 
@@ -85,12 +86,13 @@ def test_kvmanager():
                                tp_size=tp_size)
     cache_config = CacheConfig(enable_cpu=True,
                                enable_ssd=True,
-                               enable_remote=False,
+                               enable_remote=True,
                                use_gds=False,
                                use_pinned_memory=True,
                                tokens_per_block=tokens_per_block,
                                num_cpu_blocks=num_cpu_blocks,
                                num_ssd_blocks=num_ssd_blocks,
+                               num_remote_blocks=num_remote_blocks,
                                ssd_cache_path=["ssd_cache1"])
     gpu_blocks = [torch.randn(2, num_gpu_blocks, tokens_per_block, num_kv_heads, head_size, dtype=torch.float16).cuda()
                   for _ in range(num_layers)]
@@ -166,7 +168,6 @@ def test_kvmanager():
     )
     print(f"total time: {total_time} s")
     throughput = total_data_size / total_time
-
 
     kvmanager.shutdown()
     verify_data(gpu_blocks, gpu_blocks_gt)

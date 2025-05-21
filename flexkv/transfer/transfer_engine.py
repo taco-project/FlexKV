@@ -21,7 +21,8 @@ class TransferEngine:
     def __init__(self,
         gpu_handles: List[AccessibleHandle],
         cpu_handle: AccessibleHandle,
-        ssd_handle: AccessibleHandle = None):
+        ssd_handle: AccessibleHandle = None,
+        remote_handle: AccessibleHandle = None):
         """
         Initialize transfer engine
 
@@ -29,6 +30,7 @@ class TransferEngine:
             gpu_handles: List of GPU handles
             cpu_handle: CPU handle
             ssd_handle: Optional SSD handle
+            remote_handle: Optional remote handle
         """
         # Initialize scheduler
         self.scheduler = TransferScheduler()
@@ -57,6 +59,7 @@ class TransferEngine:
         # Wait for GPU-CPU workers to initialize
         self.cpussd_read_worker = None
         self.cpussd_write_worker = None
+        self.remotecpu_worker = None
         if ssd_handle is not None:
             self.cpussd_read_worker = CPUSSDDiskTransferWorker.create_worker(
                 worker_id=0,
@@ -76,7 +79,17 @@ class TransferEngine:
                 ssd_kv_layout=ssd_handle.kv_layout,
                 dtype=cpu_handle.dtype,
             )
-
+        # TODO replace with the cpu-remoteFileSystem transfer worker
+        if remote_handle is not None:
+            self.remotecpu_worker = CPUSSDDiskTransferWorker.create_worker(
+                worker_id=0,
+                cpu_blocks=cpu_handle.data,
+                ssd_file=remote_handle.data,
+                finished_ops_queue=self.finished_ops_queue,
+                cpu_kv_layout=cpu_handle.kv_layout,
+                ssd_kv_layout=remote_handle.kv_layout,
+                dtype=cpu_handle.dtype,
+            )
         # Wait for all workers to ready
         for worker in self.gpucpu_workers:
             worker.ready_event.wait(timeout=60)
@@ -84,6 +97,8 @@ class TransferEngine:
             self.cpussd_read_worker.ready_event.wait(timeout=60)
         if self.cpussd_write_worker is not None:
             self.cpussd_write_worker.ready_event.wait(timeout=60)
+        if self.remotecpu_worker is not None:
+            self.remotecpu_worker.ready_event.wait(timeout=60)
 
         # Start scheduler thread
         self._running = True
@@ -156,6 +171,11 @@ class TransferEngine:
                 self.cpussd_write_worker.submit_transfer(op)
             else:
                 self.cpussd_read_worker.submit_transfer(op)
+        elif op.transfer_type in [
+            TransferType.H2REMOTE,
+            TransferType.REMOTE2H
+        ]:
+            self.remotecpu_worker.submit_transfer(copy.deepcopy(op))
         elif op.transfer_type == TransferType.VIRTUAL:
             pass
         else:
@@ -207,6 +227,9 @@ class TransferEngine:
             if self.cpussd_write_worker is not None:
                 self.cpussd_write_worker.shutdown()
                 print("clear cpu ssd write worker")
+            if self.remotecpu_worker is not None:
+                self.remotecpu_worker.shutdown()
+                print("clear cpu remote worker")
 
             # clear finished_ops_queue
             with contextlib.suppress(Exception):
@@ -230,3 +253,6 @@ class TransferEngine:
             if self.cpussd_write_worker is not None and self.cpussd_write_worker.process.is_alive():
                 self.cpussd_write_worker.process.terminate()
                 self.cpussd_write_worker.process.join()
+            if self.remotecpu_worker is not None and self.remotecpu_worker.process.is_alive():
+                self.remotecpu_worker.process.terminate()
+                self.remotecpu_worker.process.join()
