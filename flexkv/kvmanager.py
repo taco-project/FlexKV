@@ -41,7 +41,8 @@ class KVManager:
             ]
             cpu_handle = self.storage_engine.get_allocator_handle(DeviceType.CPU) if cache_config.enable_cpu else None
             ssd_handle = self.storage_engine.get_allocator_handle(DeviceType.SSD) if cache_config.enable_ssd else None
-            self.transfer_engine = TransferEngine(self.gpu_handles, cpu_handle, ssd_handle)
+            remote_handle = self.storage_engine.get_allocator_handle(DeviceType.REMOTE) if cache_config.enable_remote else None
+            self.transfer_engine = TransferEngine(self.gpu_handles, cpu_handle, ssd_handle, remote_handle)
 
         self.transfer_gid_to_task = {}
         self.taskid_to_layerwise_ops = {}
@@ -80,9 +81,15 @@ class KVManager:
                 if self.cache_config.enable_ssd
                 else None
             )
+            remote_handle = (
+                self.storage_engine.get_allocator_handle(DeviceType.REMOTE)
+                if self.cache_config.enable_remote
+                else None   
+            )
             self.transfer_engine = TransferEngine(self.gpu_handles,
                                                   cpu_handle,
-                                                  ssd_handle)
+                                                  ssd_handle,
+                                                  remote_handle)
 
     def _worker_loop(self):
         while self.running:
@@ -104,10 +111,10 @@ class KVManager:
                 elif request.request_type == cacheEngineRequestType.PUT:
                     nvtx.push_range(f"cache_engine.put request_id: {request.request_id}",
                                     color=get_nvtx_default_color())
-                    graph, return_mask, callback = self.cache_engine.put(request.token_ids,
-                                                               request.token_mask,
-                                                               request.slot_mapping,
-                                                               self._model_config.num_layers)
+                    graph, return_mask, callback, finished_ops_ids = self.cache_engine.put(request.token_ids,
+                                                                            request.token_mask,
+                                                                            request.slot_mapping,
+                                                                            self._model_config.num_layers)
 
                 else:
                     raise ValueError(f"Unknown request type: {request.request_type}")

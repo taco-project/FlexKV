@@ -26,4 +26,5 @@ class CacheConfig:
     use_pinned_memory: bool = True
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
+    num_remote_blocks: int = 10000000
     ssd_cache_path: Optional[Union[str, List[str]]] = None
