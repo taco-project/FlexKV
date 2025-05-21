@@ -6,8 +6,6 @@ from typing import Dict, Optional
 import torch
 import numpy as np
 
-from flexkv.c_ext import (find_n_liner_parents_for_eviction,
-                          get_block_ids_from_hashes, get_prefix_block_ids)
 from flexkv.common.block import SequenceMeta
 from flexkv.common.hash_utils import HashType, Hasher
 

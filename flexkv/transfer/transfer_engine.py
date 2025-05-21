@@ -38,10 +38,10 @@ class TransferEngine:
                 gpu_blocks=gpu_handles[i].data,
                 cpu_blocks=cpu_handle.data,
                 finished_ops_queue=self.finished_ops_queue,
-                gpu_kv_shape=gpu_handles[i].kv_shape,
-                cpu_kv_shape=cpu_handle.kv_shape,
+                gpu_kv_layout=gpu_handles[i].kv_layout,
+                cpu_kv_layout=cpu_handle.kv_layout,
                 dtype=gpu_handles[i].dtype,
-                gpu_device_id=i,
+                gpu_device_id=gpu_handles[i].gpu_device_id,
             )
             for i in range(len(gpu_handles))
         ]
@@ -51,8 +51,8 @@ class TransferEngine:
                 cpu_blocks=cpu_handle.data,
                 ssd_file=ssd_handle.data,
                 finished_ops_queue=self.finished_ops_queue,
-                cpu_kv_shape=cpu_handle.kv_shape,
-                ssd_kv_shape=ssd_handle.kv_shape,
+                cpu_kv_layout=cpu_handle.kv_layout,
+                ssd_kv_layout=ssd_handle.kv_layout,
                 dtype=cpu_handle.dtype,
             )
         else:

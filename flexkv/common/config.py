@@ -1,6 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Optional, List, Union
 from enum import Enum
+import torch
 
 @dataclass
 class ModelConfig:
@@ -17,8 +18,12 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_remote: bool = False
+    gpu_kv_layout: str = "layerwise"
+    cpu_kv_layout: str = "layerwise"
+    ssd_kv_layout: str = "layerwise"
+    remote_kv_layout: str = "layerwise"
     use_gds: bool = False
     use_pinned_memory: bool = True
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
-    ssd_cache_path: Optional[str] = None
+    ssd_cache_path: Optional[Union[str, List[str]]] = None

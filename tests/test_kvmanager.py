@@ -90,7 +90,7 @@ def test_kvmanager():
                                tokens_per_block=tokens_per_block,
                                num_cpu_blocks=num_cpu_blocks,
                                num_ssd_blocks=num_ssd_blocks,
-                               ssd_cache_path="ssd_cache")
+                               ssd_cache_path=["ssd_cache1"])
     gpu_blocks = [torch.randn(2, num_gpu_blocks, tokens_per_block, num_kv_heads, head_size, dtype=torch.float16).cuda()
                   for _ in range(num_layers)]
     gpu_blocks_gt = [block.clone() for block in gpu_blocks]
@@ -131,11 +131,11 @@ def test_kvmanager():
         )
         #all_requests.append(request)
         if False:
-            for l in range(4):
+            for layer_id in range(4):
                 s_time = time.time()
-                kvmanager.wait_at_layer_group(request, l, last_layer=(l==3))
+                kvmanager.wait_at_layer_group(request, layer_id, last_layer=(layer_id==3))
                 e_time = time.time()
-                print(f"for task {request}, wait at layer {l} done, time: {e_time - s_time} s")
+                print(f"for task {request}, wait at layer {layer_id} done, time: {e_time - s_time} s")
         else:
             all_requests.append(request)
 
