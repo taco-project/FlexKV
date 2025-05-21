@@ -124,6 +124,10 @@ class KVManager:
             self._task_id_counter += 1
             return old_value
 
+    def __del__(self):
+        if self.running:
+            self.shutdown()
+
     def shutdown(self):
         self.running = False
         self._worker_thread.join()
