@@ -82,7 +82,7 @@ class TransferEngine:
         # TODO replace with the cpu-remoteFileSystem transfer worker
         if remote_handle is not None:
             self.remotecpu_worker = CPUSSDDiskTransferWorker.create_worker(
-                worker_id=0,
+                worker_id=1,
                 cpu_blocks=cpu_handle.data,
                 ssd_file=remote_handle.data,
                 finished_ops_queue=self.finished_ops_queue,

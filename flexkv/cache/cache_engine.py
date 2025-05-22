@@ -10,7 +10,10 @@ from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.mempool import Mempool
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.cache.transfer_pattern import create_read_transfer_graph, create_write_transfer_graph
+from flexkv.cache.transfer_pattern import (
+    create_read_graph_cpu_storage, create_read_graph_cpu_ssd_remote, convert_read_graph_to_layer_wise_graph,
+    create_write_graph_cpu_storage, create_write_graph_cpu_ssd_remote
+)
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 
 class CacheEngine:
@@ -149,15 +152,15 @@ class GlobalCacheEngine:
 
         # tailor the blocks to assure:
         # the blocks are needed by the mask & the blocks are ready
-        cpu_physical_blocks = cpu_matched_result.physical_block_ids[:cpu_matched_result.num_ready_matched_blocks]
+        cpu_physical_blocks = cpu_matched_result.physical_blocks[:cpu_matched_result.num_ready_matched_blocks]
         cpu_physical_blocks = cpu_physical_blocks[start_idx:end_idx]
-        ssd_physical_blocks = ssd_matched_result.physical_block_ids[:ssd_matched_result.num_ready_matched_blocks]
+        ssd_physical_blocks = ssd_matched_result.physical_blocks[:ssd_matched_result.num_ready_matched_blocks]
         ssd_physical_blocks = ssd_physical_blocks[start_idx:end_idx]
         if remote_enabled:
-            remote_physical_blocks = remote_matched_result.physical_block_ids[:remote_matched_result.num_ready_matched_blocks]
+            remote_physical_blocks = remote_matched_result.physical_blocks[:remote_matched_result.num_ready_matched_blocks]
             remote_physical_blocks = remote_physical_blocks[start_idx:end_idx]
             # remote cache has less results than local cache
-            if len(remote_physical_blocks) < len(ssd_physical_blocks):
+            if len(remote_physical_blocks) <= len(ssd_physical_blocks):
                 remote_enabled = False
                 remote_physical_blocks = []
         else:
@@ -165,7 +168,8 @@ class GlobalCacheEngine:
 
         num_transfer_blocks = max(len(cpu_physical_blocks), len(ssd_physical_blocks), len(remote_physical_blocks))
         assert num_transfer_blocks <= len(gpu_block_mapping)
-        
+
+
         gpu_blocks_to_transfer = gpu_block_mapping[:num_transfer_blocks]
         cpu_blocks_to_transfer = cpu_physical_blocks
         ssd_blocks_to_transfer = ssd_physical_blocks[len(cpu_physical_blocks):]
@@ -173,7 +177,11 @@ class GlobalCacheEngine:
 
         cpu_node_to_unlock = cpu_matched_result.last_ready_node
         ssd_node_to_unlock = ssd_matched_result.last_ready_node
-        remote_node_to_unlock = remote_matched_result.last_ready_node if remote_enabled else None
+        if remote_enabled:
+            remote_node_to_unlock = remote_matched_result.last_ready_node
+            self.remote_cache_engine.lock_node(remote_node_to_unlock)
+        else:
+            remote_node_to_unlock = None
 
         # prepare cpu blocks to transfer
         cpu_blocks_to_free = []
@@ -191,7 +199,7 @@ class GlobalCacheEngine:
                 cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
                 cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                                   extra_cpu_blocks,
-                                                                  num_insert_blocks=len(num_transfer_blocks),
+                                                                  num_insert_blocks=num_transfer_blocks,
                                                                   is_ready=False,
                                                                   match_result=cpu_matched_result)
             else:
@@ -199,12 +207,11 @@ class GlobalCacheEngine:
         self.cpu_cache_engine.lock_node(cpu_node_to_unlock)
 
         # prepare ssd blocks to transfer
-        self.ssd_cache_engine.lock_node(ssd_node_to_unlock)
         write_ssd_blocks_from_remote = True # this can be a parameter
         if (remote_enabled and 
             len(ssd_physical_blocks) < num_transfer_blocks and 
             ssd_matched_result.num_ready_matched_blocks >= start_idx and
-            ssd_matched_result.ready_prefix_blocks_num == ssd_matched_result.num_matched_blocks):
+            ssd_matched_result.num_ready_matched_blocks == ssd_matched_result.num_matched_blocks):
             # only when the above all are satisfied, we load data back from cpu to ssd
             write_ssd_blocks_from_remote = True
             extra_ssd_blocks = self.ssd_cache_engine.take(
@@ -213,41 +220,48 @@ class GlobalCacheEngine:
                 strict=True
             )
             ssd_blocks_to_transfer = torch.cat([ssd_blocks_to_transfer, extra_ssd_blocks])
-            ssd_blocks_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
-                                                                extra_ssd_blocks,
-                                                                num_insert_blocks=len(num_transfer_blocks),
-                                                                is_ready=False,
-                                                                match_result=ssd_matched_result)
-                                                            
-        if enable_remote:
+            ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
+                                                            extra_ssd_blocks,
+                                                            num_insert_blocks=num_transfer_blocks,
+                                                            is_ready=False,
+                                                            match_result=ssd_matched_result)
+        self.ssd_cache_engine.lock_node(ssd_node_to_unlock)
+        if remote_enabled and len(remote_blocks_to_transfer) > 0:
             transfer_graph, finished_ops_ids = create_read_graph_cpu_ssd_remote(gpu_blocks=gpu_blocks_to_transfer,
                                                                                 cpu_blocks=cpu_blocks_to_transfer,
-                                                                                storage_blocks=ssd_blocks_to_transfer,
+                                                                                ssd_blocks=ssd_blocks_to_transfer,
                                                                                 remote_blocks=remote_blocks_to_transfer,
                                                                                 gpu_device_id=0,
                                                                                 layer_num=layer_num,
-                                                                                write_ssd_blocks_from_remote=write_ssd_blocks_from_remote)
+                                                                                write_back_to_ssd=write_ssd_blocks_from_remote)
         else:
             transfer_graph, finished_ops_ids = create_read_graph_cpu_storage(gpu_blocks=gpu_blocks_to_transfer,
-                                                            cpu_blocks=cpu_blocks_to_transfer,
-                                                            storage_blocks=ssd_blocks_to_transfer,
-                                                            gpu_device_id=0,
-                                                            layer_num=layer_num)
+                                                                            cpu_blocks=cpu_blocks_to_transfer,
+                                                                            ssd_blocks=ssd_blocks_to_transfer,
+                                                                            gpu_device_id=0,
+                                                                            layer_num=layer_num)
+        
         # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
-        if layer_num // layer_wise_transfer_num != 1:
+        if layer_num // layer_granularity != 1:
             transfer_graph, finished_ops_ids = convert_read_graph_to_layer_wise_graph(transfer_graph=transfer_graph,
                                                                                     finished_ops_ids=finished_ops_ids,
                                                                                     layer_num=layer_num,
                                                                                     layer_granularity=layer_granularity)
+        #print(f"IN GET FUNCTION IN CACHE ENGINE:")
+        #transfer_graph.print_op_map()
         return_mask = torch.zeros_like(token_mask)
         return_mask[start_idx* self.tokens_per_block:
                     (start_idx + len(gpu_blocks_to_transfer)) * self.tokens_per_block] = True
 
+        node_to_unlock = {DeviceType.CPU: cpu_node_to_unlock,
+                          DeviceType.SSD: ssd_node_to_unlock}
+        if remote_enabled:
+            node_to_unlock[DeviceType.REMOTE] = remote_node_to_unlock
+        buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
+    
         callback = partial(self._transfer_callback,
-                           node_to_unlock={DeviceType.CPU: cpu_node_to_unlock,
-                                           DeviceType.SSD: ssd_node_to_unlock,
-                                           DeviceType.REMOTE: remote_node_to_unlock},
-                           buffer_to_free={DeviceType.CPU: cpu_blocks_to_free})
+                           node_to_unlock=node_to_unlock,
+                           buffer_to_free=buffer_to_free)
 
         return transfer_graph, return_mask, callback, finished_ops_ids
 
@@ -337,21 +351,26 @@ class GlobalCacheEngine:
                 extra_cpu_blocks = cpu_matched_result.physical_blocks[-extra_cpu_blocks_num:]
                 cpu_blocks_to_transfer = torch.cat([extra_cpu_blocks, cpu_blocks_to_transfer])
 
-        transfer_graph, finished_ops_ids = create_write_transfer_graph(gpu_blocks=gpu_blocks_to_transfer,
-                                                                      cpu_blocks=cpu_blocks_to_transfer,
-                                                                      storage_blocks=ssd_blocks_to_transfer,
-                                                                      remote_blocks=remote_blocks_to_transfer,
-                                                                      gpu_device_id = 0,
-                                                                      layer_num = layer_num)
+        transfer_graph, finished_ops_ids = create_write_graph_cpu_ssd_remote(gpu_blocks=gpu_blocks_to_transfer,
+                                                                            cpu_blocks=cpu_blocks_to_transfer,
+                                                                            ssd_blocks=ssd_blocks_to_transfer,
+                                                                            remote_blocks=remote_blocks_to_transfer,
+                                                                            gpu_device_id = 0,
+                                                                            layer_num = layer_num)
+        #print(f"IN PUT FUNCTION IN CACHE ENGINE:")
+        #transfer_graph.print_op_map()
 
         return_mask = torch.zeros_like(token_mask)
         return_mask[start_idx* self.tokens_per_block:
                     (start_idx + len(gpu_block_mapping)) * self.tokens_per_block] = True
 
+        node_to_unlock = {DeviceType.CPU: cpu_node_to_unlock,
+                          DeviceType.SSD: ssd_node_to_unlock}
+        if remote_enabled:
+            node_to_unlock[DeviceType.REMOTE] = remote_node_to_unlock
+
         callback = partial(self._transfer_callback,
-                           node_to_unlock={DeviceType.CPU: cpu_node_to_unlock,
-                                           DeviceType.SSD: ssd_node_to_unlock,
-                                           DeviceType.REMOTE: remote_node_to_unlock})
+                           node_to_unlock=node_to_unlock)
         return transfer_graph, return_mask, callback, finished_ops_ids
 
     def _transfer_callback(self,

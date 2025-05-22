@@ -14,12 +14,20 @@ tokens_per_block = 16
 enable_cpu = True
 enable_ssd = True
 block_per_request = 16
-num_gpu_blocks = 512
-num_cpu_blocks = 128
-num_ssd_blocks = 256
-num_remote_blocks = 1024
 
-num_requests = num_ssd_blocks // block_per_request
+#The config that we want to test
+#num_gpu_blocks = 1024
+#num_cpu_blocks = 128
+#num_ssd_blocks = 160
+#num_remote_blocks = 1024
+
+#the config that works
+num_gpu_blocks = 256
+num_cpu_blocks = 60
+num_ssd_blocks = 34
+num_remote_blocks = 256
+
+num_requests = num_gpu_blocks // block_per_request
 
 def generate_request_pair(idx: int):
     """generate a pair of matching token_ids and block_ids"""
@@ -55,7 +63,7 @@ def verify_data(gpu_blocks, gpu_blocks_gt):
 
         assert torch.allclose(gpu_k, gpu_k_gt), f"K mismatch at layer {i}"
         assert torch.allclose(gpu_v, gpu_v_gt), f"V mismatch at layer {i}"
-        '''
+        """
         print("start verify data at layer", i)
         if not torch.allclose(gpu_k, gpu_k_gt):
             print("K mismatch at layer", i)
@@ -69,7 +77,7 @@ def verify_data(gpu_blocks, gpu_blocks_gt):
             print(v)
             print("the actual value of gpu_v[v]", gpu_v[v])
             print("the actual value of gpu_v_gt[v]", gpu_v_gt[v])
-        '''
+        """
     print("verify done")
 
 def block_ids_2_slot_mapping(block_ids):
@@ -103,8 +111,8 @@ def test_kvmanager():
 
     # write initial data
     initial_write_num = num_requests // (
-        num_ssd_blocks // num_cpu_blocks
-    ) - 2
+        num_gpu_blocks // num_cpu_blocks
+    ) - 2 
     write_requests = []
     print("writing initial data...")
     for token_ids, block_ids in request_pairs[:initial_write_num]:

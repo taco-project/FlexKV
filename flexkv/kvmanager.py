@@ -21,6 +21,7 @@ class TaskDescriptor:
     task_id: int
     return_mask: torch.Tensor
     callback: Callable
+    total_ops: int
 
 class KVManager:
     def __init__(self,
@@ -124,9 +125,9 @@ class KVManager:
                                                                             f"request id: {request.request_id}, "
                                                                             f"graph id: {graph.transfer_graph_id}",
                                                                             color=get_nvtx_range_color(graph.transfer_graph_id))
-                self.transfer_engine.submit_transfer_graph(graph)
                 self.transfer_gid_to_task[graph.transfer_graph_id] = TaskDescriptor(
-                        request.request_id, return_mask, callback)
+                        request.request_id, return_mask, callback, graph.num_ops + 1)
+                self.transfer_engine.submit_transfer_graph(graph)
             results = self.transfer_engine.get_completed_graphs_and_ops(timeout=0.001)
             for completed_graph_id, completed_op_id in results:
                 task_descriptor = self.transfer_gid_to_task[completed_graph_id]
@@ -145,6 +146,9 @@ class KVManager:
                     self.finished_ops_queue.put(
                         (task_id, completed_op_id, task_descriptor.return_mask)
                     )
+                self.transfer_gid_to_task[completed_graph_id].total_ops -= 1  # TODO: do we need total_ops?
+                if self.transfer_gid_to_task[completed_graph_id].total_ops == 0:
+                    self.transfer_gid_to_task.pop(completed_graph_id)
             time.sleep(0.001)
 
     def _get_task_id(self) -> int:

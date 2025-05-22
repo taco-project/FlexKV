@@ -153,9 +153,12 @@ class TransferOpGraph:
 
     def all_transfer_ops_completed(self) -> bool:
         """check if all transfer ops are completed"""
-        return all(op.status == TransferOpStatus.COMPLETED or
-                   op.transfer_type == TransferType.VIRTUAL
+        return all(op.status == TransferOpStatus.COMPLETED
                    for op in self._op_map.values())
+
+    @property
+    def num_ops(self) -> int:
+        return len(self._op_map)
 
     def print_op_map(self):
         """Print transfer op graph in a visual format showing dependencies.
@@ -187,6 +190,8 @@ class TransferOpGraph:
             # print the op info
             print(f"{prefix}Op {op_id} ({op.transfer_type.name}) {status}")
 
+            if op.transfer_type == TransferType.VIRTUAL:
+                continue
             # print the dependency info
             dep_prefix = "    " if is_last else "│   "
             if not op.successors:
@@ -199,6 +204,8 @@ class TransferOpGraph:
             src_info = f"From: {op.src_descriptor.device_type.name}:{op.src_descriptor.device_id}"
             dst_info = f"To: {op.dst_descriptor.device_type.name}:{op.dst_descriptor.device_id}"
             print(f"{dep_prefix}    └── {src_info} -> {dst_info}")
+
+            print(f"{dep_prefix}    └── layers: {op.layer_id} - {op.layer_id + op.layer_granularity}")
 
             # if there are physical block ids, also print them
             if len(op.src_descriptor.physical_block_ids) > 0:
