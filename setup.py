@@ -1,13 +1,20 @@
 import os
+import sys
 from setuptools import find_packages, setup
-from Cython.Build import cythonize
 from torch.utils import cpp_extension
+from Cython.Build import cythonize
 
 # Set build directory for all generated files
 build_dir = os.path.abspath("build")
 os.makedirs(build_dir, exist_ok=True)
 
-ext_modules = [
+# Check if we're in debug mode using environment variable
+debug = os.environ.get("FLEXKV_DEBUG") == "1"
+if debug:
+    print("Running in debug mode - Cython compilation disabled")
+
+# Define C++ extensions
+cpp_extensions = [
     cpp_extension.CUDAExtension(
         name="flexkv.c_ext",
         sources=[
@@ -23,21 +30,16 @@ ext_modules = [
     ),
 ]
 
-with open("requirements.txt") as f:
-    install_requires = f.read().splitlines()
+# Initialize ext_modules with C++ extensions
+ext_modules = cpp_extensions
 
-# 使用 cythonize 编译 Python 模块
-# 排除 __init__.py 文件和测试文件
-python_files = ["flexkv/**/*.py"]
-excluded_files = ["flexkv/**/__init__.py", "flexkv/**/test_*.py", "flexkv/**/benchmark_*.py", "flexkv/benchmark/**/*.py"]
-
-setup(
-    name="flexkv",
-    description="A global KV-Cache manager for LLM inference",
-    version="0.1.0",
-    packages=find_packages(exclude=("benchmarks", "csrc", "examples", "tests")),
-    install_requires=install_requires,
-    ext_modules=ext_modules + cythonize(
+# Only use Cython in release mode
+if not debug:
+    # Compile Python modules with cythonize
+    # Exclude __init__.py files and test files
+    python_files = ["flexkv/**/*.py"]
+    excluded_files = ["flexkv/**/__init__.py", "flexkv/**/test_*.py", "flexkv/**/benchmark_*.py", "flexkv/benchmark/**/*.py"]
+    cythonized_modules = cythonize(
         python_files,
         exclude=excluded_files,
         compiler_directives={
@@ -47,7 +49,23 @@ setup(
             "initializedcheck": False,
         },
         build_dir=build_dir,  # Direct Cython to use the build directory
-    ),
+    )
+    # Add Cython modules to ext_modules
+    ext_modules.extend(cythonized_modules)
+    print("Release mode: Including Cython compilation")
+else:
+    print("Debug mode: Skipping Cython compilation")
+
+with open("requirements.txt") as f:
+    install_requires = f.read().splitlines()
+
+setup(
+    name="flexkv",
+    description="A global KV-Cache manager for LLM inference",
+    version="0.1.0",
+    packages=find_packages(exclude=("benchmarks", "csrc", "examples", "tests")),
+    install_requires=install_requires,
+    ext_modules=ext_modules,  # Now contains both C++ and Cython modules as needed
     cmdclass={
         "build_ext": cpp_extension.BuildExtension.with_options(
             no_python_abi_suffix=True,
