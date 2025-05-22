@@ -2,7 +2,7 @@
 set -e
 
 PROJECT_ROOT=$(pwd)
-BUILD_TYPE="release"  # Default to release build
+BUILD_TYPE="debug"  # Default to debug build
 
 # Parse command line arguments
 for arg in "$@"; do
