@@ -177,14 +177,15 @@ class StorageEngine:
             #TODO correct this as real remote file
             file_path = kwargs.get('file_path')
             if raw_data is not None:
-                allocator = RemoteAllocator.from_raw_data(
-                    data=raw_data,
+                allocator = SSDAllocator.from_raw_data(
                     layout=layout,
+                    dtype=dtype,
+                    file_path=raw_data
                 )
             else:
                 if not file_path:
                     raise ValueError("file_path is required for remote allocator")
-                allocator = RemoteAllocator(
+                allocator = SSDAllocator(
                     layout=layout,
                     dtype=dtype,
                     file_path=file_path
