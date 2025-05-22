@@ -7,6 +7,12 @@ FlexKV is a KVCache manager designed for large language model (LLM) inference.
 To install FlexKV, run the following command:
 
 ```bash
+# For debug build (no Cython)
+./build.sh --debug
+
+# For release build (with Cython)
+./build.sh --release
+# or simply
 ./build.sh
 ```
 
