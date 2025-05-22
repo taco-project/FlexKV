@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
-from flexkv.common.storage import AccessibleHandle, AccessHandleType
+from flexkv.common.storage import AccessibleHandle, AccessHandleType, KVCacheLayout
 import torch
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Union
 import numpy as np
 import time
 import os
@@ -12,11 +12,11 @@ class StorageAllocator(ABC):
         pass
 
     @abstractmethod
-    def allocate(self, size: int) -> int:
+    def allocate(self) -> int:
         pass
 
     @abstractmethod
-    def free(self, offset: int):
+    def free(self):
         pass
 
     @abstractmethod
@@ -25,106 +25,113 @@ class StorageAllocator(ABC):
 
     @classmethod
     @abstractmethod
-    def from_raw_data() -> 'StorageAllocator':
+    def from_raw_data(cls) -> 'StorageAllocator':
         pass
-
-    def _get_layer_ptrs(self, layer_blocks: List[torch.Tensor]) -> torch.Tensor:
-        num_layers = len(layer_blocks)
-        layer_ptrs = torch.zeros(
-            num_layers,
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=True,
-        )
-        for lay_id in range(num_layers):
-            layer_ptrs[lay_id] = layer_blocks[lay_id][0].data_ptr()
-        return layer_ptrs
 
 class GPUAllocator(StorageAllocator):
     def __init__(
         self,
-        tensor_shape: Tuple[int, ...],
+        layout: KVCacheLayout,
         dtype: torch.dtype,
-        device_id: Optional[int] = None,
+        device_id: int,
+        num_chunks: int = 1
     ):
-        self.tensor_shape = tensor_shape
+        self.layout = layout
         self.dtype = dtype
         self.device_id = device_id
-        self.physical_blocks = []
-        self.allocate()
-        self.layer_ptrs = None
+        self.num_chunks = num_chunks
+
+        self.physical_chunks = []
+        self._need_free = True
+
+    @property
+    def total_size(self) -> int:
+        return self.layout.get_total_elements()
+
+    @property
+    def total_size_in_bytes(self) -> int:
+        return self.total_size * self.dtype.itemsize
 
     def allocate(self):
-        if self.physical_blocks:
+        if self.physical_chunks:
             return
         if self.device_id is None:
             device = "cuda"
         else:
             device = f"cuda:{self.device_id}"
-        for _ in range(self.tensor_shape[0]):
-            self.physical_blocks.append(
+        total_size_per_chunk = self.total_size // self.num_chunks
+        for _ in range(self.num_chunks):
+            self.physical_chunks.append(
                 torch.empty(
-                    size=self.tensor_shape[1:],
+                    size=(total_size_per_chunk,),
                     dtype=self.dtype,
                     device=device,
                 )
             )
 
     def free(self):
-        for block in self.physical_blocks:
-            block.free()
+        if not self._need_free:
+            return
+        self.physical_chunks.clear()
 
     def get_accessible_handle(self) -> AccessibleHandle:
-        if not self.layer_ptrs:
-            self.layer_ptrs = self._get_layer_ptrs(self.physical_blocks)
+        if not self.physical_chunks:
+            raise RuntimeError(f"Physical blocks are not allocated on GPU {self.device_id}")
         return AccessibleHandle(
-            handle_type=AccessHandleType.TENSOR_LIST,
-            data=self.layer_ptrs,
-            kv_shape=self.tensor_shape,
+            handle_type=AccessHandleType.TENSOR,
+            data=self.physical_chunks,
+            kv_layout=self.layout,
             dtype=self.dtype,
-            device_id=self.device_id,
+            gpu_device_id=self.device_id,
         )
 
     @classmethod
     def from_raw_data(cls,
         data: List[torch.Tensor],
-        shape: Tuple[int, ...],
+        layout: KVCacheLayout,
         device_id: Optional[int] = None) -> 'GPUAllocator':
         allocator = cls(
-            tensor_shape=shape,
+            layout=layout,
             dtype=data[0].dtype,
             device_id=device_id,
+            num_chunks=len(data),
         )
-        allocator.physical_blocks = data
-        #allocator.layer_ptrs = allocator._get_layer_ptrs(data)
+        allocator._need_free = False
+        allocator.physical_chunks = data
         return allocator
-
 
 class CPUAllocator(StorageAllocator):
     def __init__(
         self,
-        tensor_shape: Tuple[int, ...],
+        layout: KVCacheLayout,
         dtype: torch.dtype,
-        pin_memory: bool = False
+        pin_memory: bool = True,
+        num_chunks: int = 1,
     ):
-        assert len(tensor_shape) == 4
-        self.tensor_shape = tensor_shape
-        self.num_layers = tensor_shape[0]
-        self.num_blocks = tensor_shape[2]
-        self.block_size = tensor_shape[3]
+        self.layout = layout
         self.dtype = dtype
         self.pin_memory = pin_memory
-        self.physical_blocks = []
-        self.allocate()
-        self.layer_ptrs = None
+        self.num_chunks = num_chunks
+
+        self.physical_chunks = []
+        self._need_free = True
+
+    @property
+    def total_size(self) -> int:
+        return self.layout.get_total_elements()
+
+    @property
+    def total_size_in_bytes(self) -> int:
+        return self.total_size * self.dtype.itemsize
 
     def allocate(self):
-        if self.physical_blocks:
+        if self.physical_chunks:
             return
-        for _ in range(self.tensor_shape[0]):
-            self.physical_blocks.append(
+        total_size_per_chunk = self.total_size // self.num_chunks
+        for _ in range(self.num_chunks):
+            self.physical_chunks.append(
                 torch.empty(
-                    size=self.tensor_shape[1:],
+                    size=(total_size_per_chunk,),
                     dtype=self.dtype,
                     device="cpu",
                     pin_memory=self.pin_memory,
@@ -132,77 +139,97 @@ class CPUAllocator(StorageAllocator):
             )
 
     def free(self):
-        for block in self.physical_blocks:
-            block.free()
+        if not self._need_free:
+            return
+        self.physical_chunks.clear()
 
     def get_accessible_handle(self) -> AccessibleHandle:
-        if not self.layer_ptrs:
-            self.layer_ptrs = self._get_layer_ptrs(self.physical_blocks)
+        if not self.physical_chunks:
+            raise RuntimeError("Physical blocks are not allocated on CPU")
         return AccessibleHandle(
-            handle_type=AccessHandleType.TENSOR_LIST,
-            data=self.layer_ptrs,
-            kv_shape=self.tensor_shape,
+            handle_type=AccessHandleType.TENSOR,
+            data=self.physical_chunks,
+            kv_layout=self.layout,
             dtype=self.dtype,
         )
 
     @classmethod
     def from_raw_data(cls,
         data: List[torch.Tensor],
-        shape: Tuple[int, ...],
-        pin_memory: bool = False) -> 'CPUAllocator':
+        layout: KVCacheLayout) -> 'CPUAllocator':
         allocator = cls(
-            tensor_shape=shape,
+            layout=layout,
             dtype=data[0].dtype,
-            pin_memory=pin_memory,
+            pin_memory=data[0].is_pinned(),
+            num_chunks=len(data),
         )
-        allocator.physical_blocks = data
-        #allocator.layer_ptrs = allocator._get_layer_ptrs(data)
+        allocator._need_free = False
+        allocator.physical_chunks = data
         return allocator
 
 class SSDAllocator(StorageAllocator):
     def __init__(
         self,
-        tensor_shape: Tuple[int, ...],
-        dtype: torch.dtype = torch.float16,
-        file_path: str = "ssd.cache",
+        layout: KVCacheLayout,
+        dtype: torch.dtype,
+        file_path: Union[str, List[str]],
     ):
+        if isinstance(file_path, str):
+            file_path = [file_path]
         self.file_path = file_path
-        self.tensor_shape = tensor_shape
+        self.layout = layout
         self.dtype = dtype
-        self.total_file_size = np.prod(tensor_shape) * dtype.itemsize
-        self.allocate()
+        self.num_files = len(file_path)
+
+        self._has_allocated = False
+
+    @property
+    def total_size(self) -> int:
+        return self.layout.get_total_elements()
+
+    @property
+    def total_size_in_bytes(self) -> int:
+        return self.total_size * self.dtype.itemsize
 
     def allocate(self):
-        self.file = open(self.file_path, "wb+", buffering=0)
-        self._init_file()
+        if self._has_allocated:
+            return
+        for path in self.file_path:
+            with open(path, "wb+", buffering=0) as file:
+                self._init_file(file)
+        self._has_allocated = True
 
-    def _init_file(self):
+    def _init_file(self, file):
+        file_size = self.total_size_in_bytes // self.num_files
         try:
-            os.truncate(self.file.fileno(), self.total_file_size)
-        except (IOError, OSError) as e:
-            raise RuntimeError(f"Failed to initialize file: {e}")
-        
-        self.file.flush()
-        os.fsync(self.file.fileno())
+            os.truncate(file.fileno(), file_size)
+        except OSError as e:
+            raise RuntimeError(f"Failed to initialize file: {e}") from e
+        file.flush()
+        os.fsync(file.fileno())
 
     def free(self):
         pass
 
     def get_accessible_handle(self) -> AccessibleHandle:
+        if not self._has_allocated:
+            raise RuntimeError("SSD file is not allocated")
         return AccessibleHandle(
             handle_type=AccessHandleType.FILE,
             data=self.file_path,
-            kv_shape=self.tensor_shape,
+            kv_layout=self.layout,
             dtype=self.dtype,
         )
 
     @classmethod
     def from_raw_data(cls,
-        shape: Tuple[int, ...],
-        dtype: torch.dtype = torch.float16,
-        file_path: str = "ssd.cache") -> 'SSDAllocator':
+        layout: KVCacheLayout,
+        dtype: torch.dtype,
+        file_path: Union[str, List[str]]) -> 'SSDAllocator':
         allocator = cls(
-            tensor_shape=shape,
+            layout=layout,
             dtype=dtype,
-            file_path=file_path)
+            file_path=file_path,
+        )
+        allocator._has_allocated = True
         return allocator

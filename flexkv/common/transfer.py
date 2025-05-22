@@ -4,8 +4,6 @@ from dataclasses import dataclass, field
 import torch
 import threading
 
-from flexkv.common.block import BlockMeta
-
 class DeviceType(Enum):
     CPU = 0
     GPU = 1
@@ -78,7 +76,7 @@ class TransferOp:
     status: TransferOpStatus = TransferOpStatus.PENDING
     tp_rank: Optional[int] = None
     tp_world_size: Optional[int] = None
-    
+
 
 class TransferOpGraph:
 

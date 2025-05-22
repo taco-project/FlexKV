@@ -3,11 +3,7 @@ import os
 from typing import List, Tuple
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
-from flexkv.common.transfer import (
-    TransferOp, TransferOpGraph, DeviceType,
-    TransferType, TransferDescriptor
-)
-from flexkv.common.storage import AccessibleHandle, AccessHandleType
+from flexkv.common.transfer import DeviceType
 from flexkv.cache.transfer_pattern import (
     create_read_transfer_graph,
     create_write_transfer_graph
@@ -40,7 +36,7 @@ def setup_storage_engine(
     storage_engine = StorageEngine()
 
     # Create GPU allocator from existing blocks
-    gpu_success = storage_engine.create_allocator(
+    gpu_success = storage_engine.allocate(
         device_type=DeviceType.GPU,
         tensor_shape=(layer_num, 2, gpu_block_num, token_per_block * head_num * head_dim),
         dtype=torch.float16,
@@ -50,7 +46,7 @@ def setup_storage_engine(
     print(f"GPU allocator creation: {'success' if gpu_success else 'failed'}")
 
     # Create CPU allocator
-    cpu_success = storage_engine.create_allocator(
+    cpu_success = storage_engine.allocate(
         device_type=DeviceType.CPU,
         tensor_shape=(layer_num, 2, cpu_block_num, token_per_block * head_num * head_dim),
         dtype=torch.float16,
@@ -59,7 +55,7 @@ def setup_storage_engine(
     print(f"CPU allocator creation: {'success' if cpu_success else 'failed'}")
 
     # Create SSD allocator
-    ssd_success = storage_engine.create_allocator(
+    ssd_success = storage_engine.allocate(
         device_type=DeviceType.SSD,
         tensor_shape=(layer_num, 2, ssd_block_num, token_per_block * head_num * head_dim),
         dtype=torch.float16,
