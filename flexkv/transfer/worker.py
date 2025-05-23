@@ -405,25 +405,6 @@ class CPUSSDDiskTransferWorker(TransferWorker):
 
         self.chunk_size_in_bytes = self.block_size * self.dtype.itemsize
 
-
-    def run(self):
-        """main loop for worker process"""
-        while True:
-            try:
-                op = self.transfer_queue.get(timeout=0.001)
-                if op is None:
-                    del self.cpu_blocks
-                    break
-                try:
-                    self.launch_transfer(op)
-                except Exception as e:
-                    debuginfo.error(f"Error launching transfer: {e}\n"
-                                  f"Failed transfer op: {op}")
-                self.finished_ops_queue.put(op)
-
-            except Empty:
-                continue
-
     def _transfer_impl(
         self,
         cpu_block_ids: np.ndarray,
@@ -472,7 +453,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
             ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
             block_size_in_bytes=self.chunk_size_in_bytes,
             total_layers=self.num_layers,
-            is_read=(transfer_type == TransferType.DISK2H or transfer_type == TransferType.REMOTE2H),  # TODO: fix this
+            is_read=(transfer_type == TransferType.DISK2H),
             verbose=False
         )
 
