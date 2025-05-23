@@ -110,7 +110,9 @@ def create_read_transfer_graph(
             op4 = TransferOp(
                 transfer_op_id = TransferIDAllocator.allocate_op_id(),
                 transfer_graph_id = graph.transfer_graph_id,
-                transfer_type = TransferType.VIRTUAL
+                transfer_type = TransferType.VIRTUAL,
+                layer_id = -1,  # TODO: do we need layer_id for virtual op?
+                layer_granularity = -1
             )
             graph.add_transfer_op(op4)
             virtual_ops.append(op4.transfer_op_id)

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple, Union
+from typing import List, Any
 import torch
 
 import threading
@@ -7,13 +7,17 @@ from flexkv.common.transfer import TransferOp, TransferType, DeviceType, Transfe
 from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd
 import time
 from threading import Thread
+import copy
+import numpy as np
+from dataclasses import dataclass
 
-import torch.cuda.nvtx as nvtx
+import nvtx
 
+from flexkv.common.transfer import get_nvtx_default_color, get_nvtx_range_color
 from flexkv.common.debug import debuginfo
 from flexkv.common.storage import KVCacheLayout
 import multiprocessing as mp
-from multiprocessing import Process, Queue
+from multiprocessing import Queue as MPQueue
 from queue import Empty
 import ctypes
 
@@ -35,10 +39,32 @@ def cudaHostUnregister(tensor):
     size = tensor.numel() * tensor.element_size()
     ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
 
+
+@dataclass
+class WorkerTransferOp:
+    transfer_op_id: int
+    transfer_graph_id: int
+    transfer_type: TransferType
+    src_block_ids: np.ndarray
+    dst_block_ids: np.ndarray
+    layer_id: int
+    layer_granularity: int
+    # successors: List[int]
+
+    def __init__(self, transfer_op: TransferOp):
+        self.transfer_op_id = transfer_op.transfer_op_id
+        self.transfer_graph_id = transfer_op.transfer_graph_id
+        self.transfer_type = transfer_op.transfer_type
+        self.src_block_ids = transfer_op.src_descriptor.physical_block_ids.numpy()
+        self.dst_block_ids = transfer_op.dst_descriptor.physical_block_ids.numpy()
+        self.layer_id = transfer_op.layer_id
+        self.layer_granularity = transfer_op.layer_granularity
+        # self.successors = list(transfer_op.successors)  # for nvtx
+
 class TransferWorker(ABC):
-    def __init__(self, worker_id: int, finished_ops_queue: Queue):
+    def __init__(self, worker_id: int, finished_ops_queue: MPQueue):
         self.worker_id = worker_id
-        self.transfer_queue = Queue()
+        self.transfer_queue = MPQueue()
         self.finished_ops_queue = finished_ops_queue
 
     def _get_layer_ptrs(self, layer_blocks: List[torch.Tensor]) -> torch.Tensor:
@@ -53,21 +79,44 @@ class TransferWorker(ABC):
         return layer_ptrs
 
     @abstractmethod
-    def _transfer_impl(self, transfer: TransferOp)->None:
+    def _transfer_impl(self, **kwargs)->None:
         pass
 
     @abstractmethod
-    def launch_transfer(self, transfers: List[TransferOp])->None:
+    def launch_transfer(self, transfer_op: WorkerTransferOp)->None:
         pass
+
+    def run(self):
+        # Signal initialization complete
+        """main loop for worker process"""
+        while True:
+            try:
+                op = self.transfer_queue.get(timeout=0.001)
+                if op is None:
+                    break
+                try:
+                    nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
+                                        f"graph_id: {op.transfer_graph_id}, "
+                                        # f"successors: {op.successors}",
+                                        , color=get_nvtx_range_color(op.transfer_graph_id))
+                    self.launch_transfer(op)
+                    nvtx.pop_range()
+                except Exception as e:
+                    debuginfo.error(f"Error launching transfer: {e}\n"
+                                  f"Failed transfer op: {op}")
+                self.finished_ops_queue.put(op.transfer_op_id)
+            except Empty:
+                continue
 
 class WorkerHandle:
     """handle for worker process"""
-    def __init__(self, transfer_queue: mp.Queue, process: mp.Process):
+    def __init__(self, transfer_queue: mp.Queue, process: mp.Process, ready_event: Any):
         self.transfer_queue = transfer_queue
         self.process = process
+        self.ready_event = ready_event
 
-    def submit_transfer(self, transfer: TransferOp):
-        self.transfer_queue.put(transfer)
+    def submit_transfer(self, op: TransferOp):
+        self.transfer_queue.put(WorkerTransferOp(op))
 
     def shutdown(self):
         self.transfer_queue.put(None)
@@ -84,53 +133,57 @@ class GPUCPUTransferWorker(TransferWorker):
                      worker_id: int,
                      gpu_blocks: List[torch.Tensor],
                      cpu_blocks: List[torch.Tensor],
-                     finished_ops_queue: mp.Queue,
+                     finished_ops_queue: MPQueue,
                      gpu_kv_layout: KVCacheLayout,
                      cpu_kv_layout: KVCacheLayout,
                      dtype: torch.dtype,
                      gpu_device_id: int = -1):
         transfer_queue = mp.Queue()
+        ready_event = mp.Event()
 
         process = mp.Process(
             target=cls._worker_process,
             args=(worker_id, gpu_blocks, cpu_blocks,
                   transfer_queue, finished_ops_queue,
-                  gpu_kv_layout, cpu_kv_layout, dtype, gpu_device_id),
+                  gpu_kv_layout, cpu_kv_layout, dtype, gpu_device_id, ready_event),
             daemon=True
         )
         process.start()
 
-        return WorkerHandle(transfer_queue, process)
+        return WorkerHandle(transfer_queue, process, ready_event)
 
     @classmethod
     def _worker_process(cls,
                        worker_id: int,
                        gpu_blocks: List[torch.Tensor],
                        cpu_blocks: List[torch.Tensor],
-                       transfer_queue: mp.Queue,
-                       finished_ops_queue: mp.Queue,
+                       transfer_queue: MPQueue,
+                       finished_ops_queue: MPQueue,
                        gpu_kv_layout: KVCacheLayout,
                        cpu_kv_layout: KVCacheLayout,
                        dtype: torch.dtype,
-                       gpu_device_id: int):
+                       gpu_device_id: int,
+                       ready_event: Any):
         # create worker in a new process
         worker = cls(worker_id, gpu_blocks, cpu_blocks,
                     transfer_queue, finished_ops_queue,
-                    gpu_kv_layout, cpu_kv_layout, dtype, gpu_device_id)
+                    gpu_kv_layout, cpu_kv_layout, dtype,
+                    gpu_device_id)
+        ready_event.set()
         worker.run()
 
     def __init__(self,
                  worker_id: int,
                  gpu_blocks: List[torch.Tensor],
                  cpu_blocks: List[torch.Tensor],
-                 transfer_queue: mp.Queue,
-                 finished_ops_queue: mp.Queue,
+                 transfer_queue: MPQueue,
+                 finished_ops_queue: MPQueue,
                  gpu_kv_layout: KVCacheLayout,
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  gpu_device_id: int = -1):
         # initialize worker in a new process
-        self.worker_id = worker_id
+        super().__init__(worker_id, finished_ops_queue)
 
         # Register CPU tensors with CUDA
         for cpu_block in cpu_blocks:
@@ -144,7 +197,6 @@ class GPUCPUTransferWorker(TransferWorker):
         self.cpu_blocks = cpu_blocks
 
         self.transfer_queue = transfer_queue
-        self.finished_ops_queue = finished_ops_queue
 
         self.num_layers = len(self.gpu_blocks_ptrs)
         self.num_gpu_blocks = gpu_kv_layout.num_block
@@ -170,49 +222,23 @@ class GPUCPUTransferWorker(TransferWorker):
         self.transfer_stream = torch.cuda.Stream()
         self.transfer_sms = 4
 
-    def run(self):
-        """main loop for worker process"""
-
-        while True:
-            try:
-                op = self.transfer_queue.get(timeout=0.001)
-                if op is None:
-                    for cpu_block in self.cpu_blocks:
-                        cudaHostUnregister(cpu_block)
-                    del self.cpu_blocks
-                    del self.gpu_blocks
-                    torch.cuda.synchronize()
-                    break
-                try:
-                    self.launch_transfer(op)
-                except Exception as e:
-                    debuginfo.error(f"Error launching transfer: {e}\n"
-                                    f"Failed transfer op: {op}")
-                self.finished_ops_queue.put(op)
-
-            except Empty:
-                continue
-
     def _transfer_impl(
         self,
-        gpu_descriptor: TransferDescriptor,
-        cpu_descriptor: TransferDescriptor,
+        gpu_block_ids: np.ndarray,
+        cpu_block_ids: np.ndarray,
         transfer_type: TransferType,
         layer_id: int = -1,
         layer_granularity: int = -1,
         non_blocking: bool = False,
         use_ce_transfer: bool = False,
     ) -> None:
-        assert gpu_descriptor.device_type == DeviceType.GPU
-        assert cpu_descriptor.device_type == DeviceType.CPU
-
         if layer_id == -1:
             layer_id = 0
         if layer_granularity == -1:
             layer_granularity = self.num_layers
 
-        gpu_block_id_list = gpu_descriptor.physical_block_ids.pin_memory().to(dtype=torch.int64)
-        cpu_block_id_list = cpu_descriptor.physical_block_ids.pin_memory().to(dtype=torch.int64)
+        gpu_block_id_list = torch.from_numpy(gpu_block_ids).to(dtype=torch.int64).pin_memory()
+        cpu_block_id_list = torch.from_numpy(cpu_block_ids).to(dtype=torch.int64).pin_memory()
 
         assert len(gpu_block_id_list) == len(cpu_block_id_list)
 
@@ -222,7 +248,6 @@ class GPUCPUTransferWorker(TransferWorker):
         layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
 
         chunk_size_in_bytes = self.block_size * self.dtype.itemsize
-        nvtx.range_push("Transfer KV Layers")
         gpu_layer_ptrs = self.gpu_layer_ptrs[layer_id_list].contiguous().pin_memory()
         cpu_layer_ptrs = self.cpu_layer_ptrs[layer_id_list].contiguous().pin_memory()
         if transfer_type == TransferType.H2D:
@@ -257,36 +282,33 @@ class GPUCPUTransferWorker(TransferWorker):
             )
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type}")
-        nvtx.range_pop()
         # if non_blocking:
         #torch.cuda.synchronize()  # TODO: remove this ?
 
-    def launch_transfer(self, transfer_op: TransferOp):
+    def launch_transfer(self, transfer_op: WorkerTransferOp):
         with torch.cuda.stream(self.transfer_stream):
             if transfer_op.transfer_type == TransferType.H2D:
-                cpu_descriptor = transfer_op.src_descriptor
-                gpu_descriptor = transfer_op.dst_descriptor
+                cpu_block_ids = transfer_op.src_block_ids
+                gpu_block_ids = transfer_op.dst_block_ids
             elif transfer_op.transfer_type == TransferType.D2H:
-                cpu_descriptor = transfer_op.dst_descriptor
-                gpu_descriptor = transfer_op.src_descriptor
+                cpu_block_ids = transfer_op.dst_block_ids
+                gpu_block_ids = transfer_op.src_block_ids
             else:
                 raise ValueError(f"Invalid transfer type: {transfer_op.transfer_type}")
             start_time = time.time()
-            nvtx.range_push("GPU CPUTransfer")
             self._transfer_impl(
-                gpu_descriptor,
-                cpu_descriptor,
+                gpu_block_ids,
+                cpu_block_ids,
                 transfer_op.transfer_type,
                 layer_id=transfer_op.layer_id,
                 layer_granularity=transfer_op.layer_granularity,
                 non_blocking=True,
                 use_ce_transfer=False,
             )
-            nvtx.range_pop()
             # debuginfo.info("TRANSFER stream synchronized")
             end_time = time.time()
             transfer_size = (
-                len(gpu_descriptor.physical_block_ids)
+                len(gpu_block_ids)
                 * self.block_size
                 * self.dtype.itemsize
                 * 2
@@ -307,52 +329,53 @@ class CPUSSDDiskTransferWorker(TransferWorker):
                      worker_id: int,
                      cpu_blocks: List[torch.Tensor],
                      ssd_file: List[str],
-                     finished_ops_queue: mp.Queue,
+                     finished_ops_queue: MPQueue,
                      cpu_kv_layout: KVCacheLayout,
                      ssd_kv_layout: KVCacheLayout,
                      dtype: torch.dtype):
         transfer_queue = mp.Queue()
+        ready_event = mp.Event()
 
-        #NOTE cpublocks in cpussd worker has not to be pinned
         process = mp.Process(
             target=cls._worker_process,
             args=(worker_id, cpu_blocks, ssd_file,
                   transfer_queue, finished_ops_queue,
-                  cpu_kv_layout, ssd_kv_layout, dtype),
+                  cpu_kv_layout, ssd_kv_layout, dtype, ready_event),
             daemon=True
         )
         process.start()
 
-        return WorkerHandle(transfer_queue, process)
+        return WorkerHandle(transfer_queue, process, ready_event)
 
     @classmethod
     def _worker_process(cls,
                        worker_id: int,
                        cpu_blocks: List[torch.Tensor],
                        ssd_file: List[str],
-                       transfer_queue: mp.Queue,
-                       finished_ops_queue: mp.Queue,
+                       transfer_queue: MPQueue,
+                       finished_ops_queue: MPQueue,
                        cpu_kv_layout: KVCacheLayout,
                        ssd_kv_layout: KVCacheLayout,
-                       dtype: torch.dtype):
+                       dtype: torch.dtype,
+                       ready_event: Any):
         worker = cls(worker_id, cpu_blocks, ssd_file,
                     transfer_queue, finished_ops_queue,
                     cpu_kv_layout, ssd_kv_layout, dtype)
+        ready_event.set()
         worker.run()
 
     def __init__(self,
                  worker_id: int,
                  cpu_blocks: List[torch.Tensor],
                  ssd_file: List[str],
-                 transfer_queue: mp.Queue,
-                 finished_ops_queue: mp.Queue,
+                 transfer_queue: MPQueue,
+                 finished_ops_queue: MPQueue,
                  cpu_kv_layout: KVCacheLayout,
                  ssd_kv_layout: KVCacheLayout,
                  dtype: torch.dtype):
-        self.worker_id = worker_id
+        super().__init__(worker_id, finished_ops_queue)
         self.ssd_file = ssd_file[0]  # TODO: support multiple ssd files
         self.transfer_queue = transfer_queue
-        self.finished_ops_queue = finished_ops_queue
 
         self.num_layers = cpu_kv_layout.num_layer
         self.num_cpu_blocks = cpu_kv_layout.num_block
@@ -382,38 +405,17 @@ class CPUSSDDiskTransferWorker(TransferWorker):
 
         self.chunk_size_in_bytes = self.block_size * self.dtype.itemsize
 
-        #self.transfer_thread = Thread(target=self._transfer_worker, daemon=True)
-        #self.transfer_thread.start()
-
-    def run(self):
-        """main loop for worker process"""
-        while True:
-            try:
-                op = self.transfer_queue.get(timeout=0.001)
-                if op is None:
-                    del self.cpu_blocks
-                    break
-                try:
-                    self.launch_transfer(op)
-                except Exception as e:
-                    debuginfo.error(f"Error launching transfer: {e}\n"
-                                  f"Failed transfer op: {op}")
-                self.finished_ops_queue.put(op)
-
-            except Empty:
-                continue
-
     def _transfer_impl(
         self,
-        cpu_descriptor: TransferDescriptor,
-        ssd_descriptor: TransferDescriptor,
+        cpu_block_ids: np.ndarray,
+        ssd_block_ids: np.ndarray,
         transfer_type: TransferType,
         layer_id: int = -1,
         layer_granularity: int = -1,
         non_blocking: bool = False,
     ) -> None:
-        assert ssd_descriptor.device_type == DeviceType.SSD
-        assert cpu_descriptor.device_type == DeviceType.CPU
+        assert ssd_block_ids.dtype == np.int64
+        assert cpu_block_ids.dtype == np.int64
 
         if layer_id == -1:
             layer_id = 0
@@ -422,11 +424,11 @@ class CPUSSDDiskTransferWorker(TransferWorker):
 
         # this means partial read hit cpu and other hit ssd
         # or partial write hit ssd and none hit cpu
-        ssd_block_id_list = ssd_descriptor.physical_block_ids.pin_memory().to(dtype=torch.int64)
-        cpu_block_id_list = cpu_descriptor.physical_block_ids.pin_memory().to(dtype=torch.int64)
+        ssd_block_id_list = torch.from_numpy(ssd_block_ids).pin_memory().to(dtype=torch.int64)
+        cpu_block_id_list = torch.from_numpy(cpu_block_ids).pin_memory().to(dtype=torch.int64)
         if len(ssd_block_id_list) != len(cpu_block_id_list):
             assert len(ssd_block_id_list) < len(cpu_block_id_list)
-            cpu_block_id_list = cpu_descriptor.physical_block_ids[
+            cpu_block_id_list = cpu_block_ids[
                 -len(ssd_block_id_list) :
             ]
             debuginfo.debug(
@@ -455,27 +457,25 @@ class CPUSSDDiskTransferWorker(TransferWorker):
             verbose=False
         )
 
-    def launch_transfer(self, transfer_op: TransferOp):
+    def launch_transfer(self, transfer_op: WorkerTransferOp):
         if transfer_op.transfer_type == TransferType.DISK2H:
-            cpu_descriptor = transfer_op.dst_descriptor
-            ssd_descriptor = transfer_op.src_descriptor
+            cpu_block_ids = transfer_op.dst_block_ids
+            ssd_block_ids = transfer_op.src_block_ids
         else:
-            cpu_descriptor = transfer_op.src_descriptor
-            ssd_descriptor = transfer_op.dst_descriptor
+            cpu_block_ids = transfer_op.src_block_ids
+            ssd_block_ids = transfer_op.dst_block_ids
         start_time = time.time()
-        nvtx.range_push("CPU SSD Transfer")
         self._transfer_impl(
-            cpu_descriptor,
-            ssd_descriptor,
+            cpu_block_ids,
+            ssd_block_ids,
             transfer_op.transfer_type,
             layer_id=transfer_op.layer_id,
             layer_granularity=transfer_op.layer_granularity,
             non_blocking=True,
         )
-        nvtx.range_pop()
         end_time = time.time()
         transfer_size = (
-            len(ssd_descriptor.physical_block_ids)
+            len(ssd_block_ids)
             * self.block_size
             * self.dtype.itemsize
             * 2

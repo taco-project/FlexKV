@@ -4,6 +4,7 @@ import threading
 import time
 
 import torch
+import nvtx
 
 from dataclasses import dataclass
 from typing import Dict
@@ -12,7 +13,7 @@ from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
-from flexkv.common.transfer import DeviceType
+from flexkv.common.transfer import DeviceType, get_nvtx_range_color, get_nvtx_default_color
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 
 @dataclass
@@ -26,6 +27,7 @@ class KVManager:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_blocks: List[List[torch.Tensor]] = None):
+        nvtx.push_range("KVManager.__init__", color=get_nvtx_default_color())
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
         self.storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
         self.tp_size = model_config.tp_size
@@ -44,6 +46,9 @@ class KVManager:
         self.transfer_gid_to_task = {}
         self.taskid_to_layerwise_ops = {}
 
+        self.taskid_to_nvtx_range = {}
+        self.graphid_to_nvtx_range = {}
+
         self._task_id_counter = 0
         self.task_queue = Queue()
         self.finished_queue = Queue()
@@ -52,6 +57,8 @@ class KVManager:
         self._worker_thread = threading.Thread(target=self._worker_loop)
         self._worker_thread.start()
         self.lock = threading.Lock()
+
+        nvtx.pop_range()
 
     # the gpu_blocks of multiple gpus can be added post initialization.
     # the transfer engine will be initialized after we have all the intended gpu handles.
@@ -85,6 +92,8 @@ class KVManager:
                 if request is None:
                     break
                 elif request.request_type == cacheEngineRequestType.GET:
+                    nvtx.push_range(f"cache_engine.get request_id: {request.request_id}",
+                                    color=get_nvtx_default_color())
                     graph, return_mask, callback, finished_ops_ids = self.cache_engine.get(request.token_ids,
                                                                request.token_mask,
                                                                request.slot_mapping,
@@ -93,12 +102,21 @@ class KVManager:
                     if request.layer_granularity != -1:
                         self.taskid_to_layerwise_ops[request.request_id] = finished_ops_ids
                 elif request.request_type == cacheEngineRequestType.PUT:
+                    nvtx.push_range(f"cache_engine.put request_id: {request.request_id}",
+                                    color=get_nvtx_default_color())
                     graph, return_mask, callback = self.cache_engine.put(request.token_ids,
                                                                request.token_mask,
                                                                request.slot_mapping,
                                                                self._model_config.num_layers)
+
                 else:
                     raise ValueError(f"Unknown request type: {request.request_type}")
+                nvtx.pop_range()
+
+                self.graphid_to_nvtx_range[graph.transfer_graph_id] = nvtx.start_range(
+                                                                            f"request id: {request.request_id}, "
+                                                                            f"graph id: {graph.transfer_graph_id}",
+                                                                            color=get_nvtx_range_color(graph.transfer_graph_id))
                 self.transfer_engine.submit_transfer_graph(graph)
                 self.transfer_gid_to_task[graph.transfer_graph_id] = TaskDescriptor(
                         request.request_id, return_mask, callback)
@@ -108,10 +126,14 @@ class KVManager:
                 task_id = task_descriptor.task_id
                 if completed_op_id == -1:
                     task_descriptor.callback()
+                    nvtx.end_range(self.graphid_to_nvtx_range[completed_graph_id])
+                    self.graphid_to_nvtx_range.pop(completed_graph_id)
                     self.finished_queue.put( #TODO do not return "return_mask" everytime
                         (task_id, completed_op_id, task_descriptor.return_mask)
                     )
                     self.transfer_gid_to_task.pop(completed_graph_id)
+                    nvtx.end_range(self.taskid_to_nvtx_range[task_id])
+                    self.taskid_to_nvtx_range.pop(task_id)
                 else:
                     self.finished_ops_queue.put(
                         (task_id, completed_op_id, task_descriptor.return_mask)
@@ -144,6 +166,8 @@ class KVManager:
         if layer_granularity == -1:
             layer_granularity = self._model_config.num_layers
         task_id = self._get_task_id()
+        self.taskid_to_nvtx_range[task_id] = nvtx.start_range(f"GET request_id: {task_id}",
+                                                              color=get_nvtx_default_color())
         self.task_queue.put(cacheEngineRequest(
             request_type=cacheEngineRequestType.GET,
             request_id=task_id,
@@ -162,6 +186,8 @@ class KVManager:
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
         task_id = self._get_task_id()
+        self.taskid_to_nvtx_range[task_id] = nvtx.start_range(f"PUT request_id: {task_id}",
+                                                              color=get_nvtx_default_color())
         self.task_queue.put(cacheEngineRequest(
             request_type=cacheEngineRequestType.PUT,
             request_id=task_id,

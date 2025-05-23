@@ -3,6 +3,7 @@ from flexkv.kvmanager import KVManager
 from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.debug import debuginfo
 import time
+
 num_layers = 16
 num_kv_heads = 32
 head_size = 128
@@ -117,7 +118,6 @@ def test_kvmanager():
     all_requests = []
     start_time = time.time()
     print(f"the initial {initial_write_num} write done,performing mixed read/write...")
-
     for i in range(initial_write_num, num_requests):
         print(f"performing mixed read/write {i} / {num_requests} ...")
         # read from written data
@@ -127,7 +127,7 @@ def test_kvmanager():
         request = kvmanager.get_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
-            layer_granularity=num_layers // 4,
+            layer_granularity=-1,
         )
         #all_requests.append(request)
         if False:
@@ -170,8 +170,6 @@ def test_kvmanager():
 
     kvmanager.shutdown()
     verify_data(gpu_blocks, gpu_blocks_gt)
-
-
 
 if __name__ == "__main__":
     debuginfo.set_level("INFO")

@@ -55,7 +55,7 @@ class DebugInfo:
             self.logger.critical(msg, *args, **kwargs)
 
 
-debuginfo = DebugInfo(os.getenv("GLOBALKV_DEBUG_LEVEL", "INFO"))
+debuginfo = DebugInfo(os.getenv("FLEXKV_LOG_LEVEL", "INFO"))
 
 
 def debug_timing(name: Optional[str] = None):

@@ -3,12 +3,12 @@ import os
 from typing import List, Tuple
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
-from flexkv.common.transfer import DeviceType
+from flexkv.common.transfer import DeviceType, get_nvtx_default_color
 from flexkv.cache.transfer_pattern import (
     create_read_transfer_graph,
     create_write_transfer_graph
 )
-import torch.cuda.nvtx as nvtx
+import nvtx
 import time
 def create_test_data(layer_num: int, gpu_block_num: int, block_size: int):
     """Create test GPU blocks with known values"""
@@ -141,7 +141,7 @@ def main():
         for i in range(layer_num)
     ]
     # Create and submit write transfer graph, write through ssd
-    nvtx.range_push("Write Transfer Operations")
+    nvtx.push_range("Write Transfer Operations", color=get_nvtx_default_color())
     for i in range(tranfer_graph_num):
         transfer_graph_write = create_write_transfer_graph(
             ssd_blocks=ssd_block_ids[i],
@@ -165,9 +165,9 @@ def main():
             break
         time.sleep(0.001)
 
-    nvtx.range_pop()
+    nvtx.pop_range()
     # Create and submit read transfer graph, ssd partial read
-    nvtx.range_push("Read Transfer Operations")
+    nvtx.push_range("Read Transfer Operations", color=get_nvtx_default_color())
     for i in range(tranfer_graph_num):
         transfer_graph_read = create_read_transfer_graph(
             ssd_blocks=ssd_block_ids[i][:gpu_transfer_block_num//2] if i % 2 == 0 else [],
@@ -190,7 +190,7 @@ def main():
         if len(launched_graph_ids) == 0:
             break
         time.sleep(0.001)
-    nvtx.range_pop()
+    nvtx.pop_range()
     # Verify results
     print("\nVerifying results...")
     #for i in range(layer_num):
