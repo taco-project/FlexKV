@@ -42,7 +42,11 @@ class KVManager:
             ]
             cpu_handle = self.storage_engine.get_allocator_handle(DeviceType.CPU) if cache_config.enable_cpu else None
             ssd_handle = self.storage_engine.get_allocator_handle(DeviceType.SSD) if cache_config.enable_ssd else None
-            remote_handle = self.storage_engine.get_allocator_handle(DeviceType.REMOTE) if cache_config.enable_remote else None
+            remote_handle = (
+                self.storage_engine.get_allocator_handle(DeviceType.REMOTE)
+                if cache_config.enable_remote
+                else None
+            )
             self.transfer_engine = TransferEngine(self.gpu_handles, cpu_handle, ssd_handle, remote_handle)
 
         self.transfer_gid_to_task = {}
@@ -85,7 +89,7 @@ class KVManager:
             remote_handle = (
                 self.storage_engine.get_allocator_handle(DeviceType.REMOTE)
                 if self.cache_config.enable_remote
-                else None   
+                else None
             )
             self.transfer_engine = TransferEngine(self.gpu_handles,
                                                   cpu_handle,
@@ -146,9 +150,9 @@ class KVManager:
                     self.finished_ops_queue.put(
                         (task_id, completed_op_id, task_descriptor.return_mask)
                     )
-                self.transfer_gid_to_task[completed_graph_id].total_ops -= 1  # TODO: do we need total_ops?
-                if self.transfer_gid_to_task[completed_graph_id].total_ops == 0:
-                    self.transfer_gid_to_task.pop(completed_graph_id)
+                # self.transfer_gid_to_task[completed_graph_id].total_ops -= 1  # TODO: do we need total_ops?
+                # if self.transfer_gid_to_task[completed_graph_id].total_ops == 0:
+                #     self.transfer_gid_to_task.pop(completed_graph_id)
             time.sleep(0.001)
 
     def _get_task_id(self) -> int:
