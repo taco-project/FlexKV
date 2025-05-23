@@ -28,3 +28,4 @@ class CacheConfig:
     num_ssd_blocks: int = 10000000
     num_remote_blocks: int = 10000000
     ssd_cache_path: Optional[Union[str, List[str]]] = None
+    remote_cache_path: Optional[Union[str, List[str]]] = None

@@ -472,7 +472,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
             ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
             block_size_in_bytes=self.chunk_size_in_bytes,
             total_layers=self.num_layers,
-            is_read=(transfer_type == TransferType.DISK2H),
+            is_read=(transfer_type == TransferType.DISK2H or transfer_type == TransferType.REMOTE2H),  # TODO: fix this
             verbose=False
         )
 
