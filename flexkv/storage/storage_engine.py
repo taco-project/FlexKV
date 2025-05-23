@@ -77,7 +77,7 @@ class StorageEngine:
                 device_type=DeviceType.REMOTE,
                 layout=self._remote_layout,
                 dtype=torch.float16,
-                file_path="fake_remote_file"
+                file_path=self._cache_config.remote_cache_path
             )
 
     def add_gpu_blocks(self, gpu_blocks: List[torch.Tensor], device_id: int = 0):
