@@ -1,16 +1,21 @@
 from typing import Dict, List, Optional, Tuple
-from queue import Queue
 import threading
 import contextlib
 import time
+from queue import Queue
+import queue
+
 import torch
+import nvtx
 from .scheduler import TransferScheduler
 from .worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker
 from ..common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType
 from ..common.storage import AccessibleHandle
 import multiprocessing as mp
+from multiprocessing import Queue as MPQueue
 import copy
 from ..common.debug import debuginfo
+from ..common.transfer import get_nvtx_range_color, get_nvtx_default_color
 
 class TransferEngine:
     def __init__(self,
@@ -28,8 +33,11 @@ class TransferEngine:
         # Initialize scheduler
         self.scheduler = TransferScheduler()
         self.task_queue = Queue()
-        self.completed_queue = Queue(maxsize=2048)
-        self.finished_ops_queue = mp.Queue()
+        self.completed_queue = Queue()
+        self.finished_ops_queue = MPQueue()
+        self.op_id_to_op = {}
+
+        self.op_id_to_nvtx_range = {}
 
         # Initialize workers
         self.gpucpu_workers = [
@@ -45,8 +53,12 @@ class TransferEngine:
             )
             for i in range(len(gpu_handles))
         ]
+
+        # Wait for GPU-CPU workers to initialize
+        self.cpussd_read_worker = None
+        self.cpussd_write_worker = None
         if ssd_handle is not None:
-            self.cpussd_worker = CPUSSDDiskTransferWorker.create_worker(
+            self.cpussd_read_worker = CPUSSDDiskTransferWorker.create_worker(
                 worker_id=0,
                 cpu_blocks=cpu_handle.data,
                 ssd_file=ssd_handle.data,
@@ -55,8 +67,23 @@ class TransferEngine:
                 ssd_kv_layout=ssd_handle.kv_layout,
                 dtype=cpu_handle.dtype,
             )
-        else:
-            self.cpussd_worker = None
+            self.cpussd_write_worker = CPUSSDDiskTransferWorker.create_worker(
+                worker_id=1,
+                cpu_blocks=cpu_handle.data,
+                ssd_file=ssd_handle.data,
+                finished_ops_queue=self.finished_ops_queue,
+                cpu_kv_layout=cpu_handle.kv_layout,
+                ssd_kv_layout=ssd_handle.kv_layout,
+                dtype=cpu_handle.dtype,
+            )
+
+        # Wait for all workers to ready
+        for worker in self.gpucpu_workers:
+            worker.ready_event.wait(timeout=60)
+        if self.cpussd_read_worker is not None:
+            self.cpussd_read_worker.ready_event.wait(timeout=60)
+        if self.cpussd_write_worker is not None:
+            self.cpussd_write_worker.ready_event.wait(timeout=60)
 
         # Start scheduler thread
         self._running = True
@@ -68,35 +95,48 @@ class TransferEngine:
         while self._running:
             # Process new transfer graphs
             new_graphs_num = 0
-            while not self.task_queue.empty():
-                transfer_graph = self.task_queue.get()
-                self.scheduler.add_transfer_graph(transfer_graph)
-                new_graphs_num += 1
+            while True:
+                try:
+                    transfer_graph = self.task_queue.get_nowait()
+                    self.scheduler.add_transfer_graph(transfer_graph)
+                    new_graphs_num += 1
+                except queue.Empty:
+                    break
             # Collect finished ops
             finished_ops = []
-            while not self.finished_ops_queue.empty():
-                op = self.finished_ops_queue.get()
-                self.completed_queue.put((op.transfer_graph_id, op.transfer_op_id))
-                finished_ops.append(op)
-
+            while True:
+                try:
+                    op_id = self.finished_ops_queue.get_nowait()
+                    op = self.op_id_to_op[op_id]
+                    self.completed_queue.put((op.transfer_graph_id, op.transfer_op_id))
+                    finished_ops.append(op)
+                    del self.op_id_to_op[op_id]
+                except queue.Empty:
+                    break
+            for op in finished_ops:
+                nvtx.end_range(self.op_id_to_nvtx_range[op.transfer_op_id])
+                self.op_id_to_nvtx_range.pop(op.transfer_op_id)
             if finished_ops or new_graphs_num > 0:
                 # Schedule next operations
                 completed_graph_ids, next_ops = self.scheduler.schedule(finished_ops)
-
                 # Handle completed graphs
                 for graph_id in completed_graph_ids:
                     self.completed_queue.put((graph_id, -1))
-
                 # Distribute new ops to workers
                 for op in next_ops:
                     if op.transfer_type == TransferType.VIRTUAL:
                         self.completed_queue.put((op.transfer_graph_id, op.transfer_op_id))
                     else:
+                        self.op_id_to_op[op.transfer_op_id] = op
                         self._assign_op_to_worker(op)
-
             time.sleep(0.001)  # Prevent busy waiting
 
     def _assign_op_to_worker(self, op: TransferOp):
+        self.op_id_to_nvtx_range[op.transfer_op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
+                                                                       f"op_id: {op.transfer_op_id}, "
+                                                                       f"graph_id: {op.transfer_graph_id}, "
+                                                                       f"successors: {op.successors}",
+                                                                       color=get_nvtx_range_color(op.transfer_graph_id))
         """Assign operation to appropriate worker"""
         # Determine worker type based on transfer type
         if op.transfer_type in [
@@ -107,12 +147,15 @@ class TransferEngine:
                 gpu_device_id = op.dst_descriptor.device_id
             else:
                 gpu_device_id = op.src_descriptor.device_id
-            self.gpucpu_workers[gpu_device_id].submit_transfer(copy.deepcopy(op))
+            self.gpucpu_workers[gpu_device_id].submit_transfer(op)
         elif op.transfer_type in [
             TransferType.H2DISK,
             TransferType.DISK2H
         ]:
-            self.cpussd_worker.submit_transfer(copy.deepcopy(op))
+            if op.transfer_type == TransferType.H2DISK:
+                self.cpussd_write_worker.submit_transfer(op)
+            else:
+                self.cpussd_read_worker.submit_transfer(op)
         elif op.transfer_type == TransferType.VIRTUAL:
             pass
         else:
@@ -148,10 +191,6 @@ class TransferEngine:
 
         return completed_graph_ids
 
-    def report_finished_op(self, op: TransferOp, graph_id: int):
-        """Report a finished operation"""
-        self.finished_ops_queue.put((op, graph_id))
-
     def shutdown(self):
         """Shutdown the transfer engine"""
         try:
@@ -162,9 +201,12 @@ class TransferEngine:
             for worker in self.gpucpu_workers:
                 worker.shutdown()
                 print("clear gpu cpu worker")
-            if self.cpussd_worker is not None:
-                self.cpussd_worker.shutdown()
-                print("clear cpu ssd worker")
+            if self.cpussd_read_worker is not None:
+                self.cpussd_read_worker.shutdown()
+                print("clear cpu ssd read worker")
+            if self.cpussd_write_worker is not None:
+                self.cpussd_write_worker.shutdown()
+                print("clear cpu ssd write worker")
 
             # clear finished_ops_queue
             with contextlib.suppress(Exception):
@@ -182,6 +224,9 @@ class TransferEngine:
                 if worker.process.is_alive():
                     worker.process.terminate()
                     worker.process.join()
-            if self.cpussd_worker is not None and self.cpussd_worker.process.is_alive():
-                self.cpussd_worker.process.terminate()
-                self.cpussd_worker.process.join()
+            if self.cpussd_read_worker is not None and self.cpussd_read_worker.process.is_alive():
+                self.cpussd_read_worker.process.terminate()
+                self.cpussd_read_worker.process.join()
+            if self.cpussd_write_worker is not None and self.cpussd_write_worker.process.is_alive():
+                self.cpussd_write_worker.process.terminate()
+                self.cpussd_write_worker.process.join()

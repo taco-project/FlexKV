@@ -1,8 +1,9 @@
 from enum import Enum, auto
-from typing import List, Optional, Set, Dict
+from typing import List, Optional, Set, Dict, Tuple
 from dataclasses import dataclass, field
 import torch
 import threading
+import nvtx
 
 class DeviceType(Enum):
     CPU = 0
@@ -10,17 +11,17 @@ class DeviceType(Enum):
     SSD = 2
 
 class TransferType(Enum):
-    H2D    = 0  # Host to Device transfer
-    D2H    = 1  # Device to Host transfer
-    DISK2H = 2  # Disk to Host transfer
-    H2DISK = 3  # Host to Disk transfer
-    DISK2D = 4  # Disk to Device transfer
-    D2DISK = 5  # Device to Disk transfer
+    H2D    = "Host to Device"  # Host to Device transfer
+    D2H    = "Device to Host"  # Device to Host transfer
+    DISK2H = "Disk to Host"  # Disk to Host transfer
+    H2DISK = "Host to Disk"  # Host to Disk transfer
+    DISK2D = "Disk to Device"  # Disk to Device transfer
+    D2DISK = "Device to Disk"  # Device to Disk transfer
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of
     # a group of transfer ops
-    VIRTUAL = 6
+    VIRTUAL = "Virtual"
 
 @dataclass
 class TransferDescriptor:
@@ -211,3 +212,10 @@ class TransferOpGraph:
                 else:
                     blocks_str = str(blocks)
                 print(f"{dep_prefix}    └── Dst Blocks: {blocks_str}")
+
+def get_nvtx_default_color() -> int:
+    return 0xD3D3D3
+
+def get_nvtx_range_color(number: int) -> int:
+    color = (number * 0x9e3779b1) % 0xffffff
+    return color

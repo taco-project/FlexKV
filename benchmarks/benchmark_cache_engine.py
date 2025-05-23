@@ -63,7 +63,7 @@ def main(args):
             num_get_requests += 1
             if args.profile_get:
                 profiler.runctx('graph, return_mask, transfer_call_back, finished_ops_ids = '
-                                'cache_engine.get(req.token_ids, req.token_mask, fake_slot_mapping)',
+                                'cache_engine.get(req.token_ids, req.token_mask, fake_slot_mapping, -1, -1)',
                                 globals(), local_vars)
                 profiler.runctx('transfer_call_back()', globals(), local_vars)
                 return_mask = local_vars['return_mask']
