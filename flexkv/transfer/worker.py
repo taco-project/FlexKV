@@ -97,8 +97,9 @@ class TransferWorker(ABC):
                 try:
                     nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
                                         f"graph_id: {op.transfer_graph_id}, "
+                                        f"num_blocks: {len(op.src_block_ids)}",
                                         # f"successors: {op.successors}",
-                                        , color=get_nvtx_range_color(op.transfer_graph_id))
+                                        color=get_nvtx_range_color(op.transfer_graph_id))
                     self.launch_transfer(op)
                     nvtx.pop_range()
                 except Exception as e:
