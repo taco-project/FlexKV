@@ -181,6 +181,7 @@ class KVManager:
         if layer_granularity == -1:
             layer_granularity = self._model_config.num_layers
         task_id = self._get_task_id()
+        nvtx.mark(f"GET request_id: {task_id}")
         self.taskid_to_nvtx_range[task_id] = nvtx.start_range(f"GET request_id: {task_id}",
                                                               color=get_nvtx_default_color())
         self.task_queue.put(cacheEngineRequest(
@@ -201,6 +202,7 @@ class KVManager:
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
         task_id = self._get_task_id()
+        nvtx.mark(f"PUT request_id: {task_id}")
         self.taskid_to_nvtx_range[task_id] = nvtx.start_range(f"PUT request_id: {task_id}",
                                                               color=get_nvtx_default_color())
         self.task_queue.put(cacheEngineRequest(
@@ -216,6 +218,7 @@ class KVManager:
     # because they clean each other
     #NOTE every task should be synced in some way, otherwise the queue will be full
     def wait(self, task_ids: List[int]) -> Dict[int, torch.Tensor]:
+        nvtx.mark(f"wait task_ids: {task_ids}")
         num_completed_tasks = 0
         return_masks = {}
         while num_completed_tasks < len(task_ids):
@@ -229,15 +232,18 @@ class KVManager:
             else:
                 self.finished_queue.put((completed_task_id, op_id, return_mask))
             time.sleep(0.001)
+        nvtx.mark(f"wait task_ids: {task_ids} done")
         return return_masks
 
     def wait_at_layer_group(self, task_id: int, layer_group_id: int, last_layer: bool = False):
+        nvtx.mark(f"wait task_id: {task_id}, layer_group_id: {layer_group_id}")
         while True:
             completed_task_id, op_id, return_mask = self.finished_ops_queue.get()
             if completed_task_id == task_id:
                 if op_id == self.taskid_to_layerwise_ops[task_id][layer_group_id]:
                     if last_layer:
                         self.wait([task_id])
+                    nvtx.mark(f"wait_at_layer_group task_id: {task_id}, layer_group_id: {layer_group_id} done")
                     return return_mask
                 elif op_id == -1:
                     raise ValueError("should not happen since we are waiting at some layer")
