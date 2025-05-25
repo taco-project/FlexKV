@@ -14,11 +14,13 @@ tokens_per_block = 16
 enable_cpu = True
 enable_ssd = True
 block_per_request = 16
-num_gpu_blocks = 512
-num_cpu_blocks = 128
-num_ssd_blocks = 1024
 
-num_requests = num_ssd_blocks // block_per_request
+num_gpu_blocks = 256
+num_cpu_blocks = 60
+num_ssd_blocks = 34
+num_remote_blocks = 256
+
+num_requests = num_gpu_blocks // block_per_request
 
 def generate_request_pair(idx: int):
     """generate a pair of matching token_ids and block_ids"""
@@ -52,23 +54,16 @@ def verify_data(gpu_blocks, gpu_blocks_gt):
         gpu_k_gt = gpu_blocks_gt[i][0, :, :, :, :]
         gpu_v_gt = gpu_blocks_gt[i][1, :, :, :, :]
 
+        num_blocks = gpu_k.shape[0]
+        for block_idx in range(num_blocks):
+            if not torch.allclose(gpu_k[block_idx], gpu_k_gt[block_idx]):
+                print(f"K mismatch at layer {i}, block {block_idx} / {num_blocks}")
+        for block_idx in range(num_blocks):
+            if not torch.allclose(gpu_v[block_idx], gpu_v_gt[block_idx]):
+                print(f"V mismatch at layer {i}, block {block_idx} / {num_blocks}")
         assert torch.allclose(gpu_k, gpu_k_gt), f"K mismatch at layer {i}"
         assert torch.allclose(gpu_v, gpu_v_gt), f"V mismatch at layer {i}"
-        '''
-        print("start verify data at layer", i)
-        if not torch.allclose(gpu_k, gpu_k_gt):
-            print("K mismatch at layer", i)
-            k = torch.where(torch.abs(gpu_k - gpu_k_gt) > 1e-3)
-            print(k)
-            print("the actual value of gpu_k[k]", gpu_k[k])
-            print("the actual value of gpu_k_gt[k]", gpu_k_gt[k])
-        if not torch.allclose(gpu_v, gpu_v_gt):
-            print("V mismatch at layer", i)
-            v = torch.where(torch.abs(gpu_v - gpu_v_gt) > 1e-3)
-            print(v)
-            print("the actual value of gpu_v[v]", gpu_v[v])
-            print("the actual value of gpu_v_gt[v]", gpu_v_gt[v])
-        '''
+
     print("verify done")
 
 def block_ids_2_slot_mapping(block_ids):
@@ -85,13 +80,15 @@ def test_kvmanager():
                                tp_size=tp_size)
     cache_config = CacheConfig(enable_cpu=True,
                                enable_ssd=True,
-                               enable_remote=False,
+                               enable_remote=True,
                                use_gds=False,
                                use_pinned_memory=True,
                                tokens_per_block=tokens_per_block,
                                num_cpu_blocks=num_cpu_blocks,
                                num_ssd_blocks=num_ssd_blocks,
-                               ssd_cache_path=["ssd_cache1"])
+                               num_remote_blocks=num_remote_blocks,
+                               ssd_cache_path=["ssd_cache1"],
+                               remote_cache_path=["remote_cache1"])
     gpu_blocks = [torch.randn(2, num_gpu_blocks, tokens_per_block, num_kv_heads, head_size, dtype=torch.float16).cuda()
                   for _ in range(num_layers)]
     gpu_blocks_gt = [block.clone() for block in gpu_blocks]
@@ -101,7 +98,7 @@ def test_kvmanager():
 
     # write initial data
     initial_write_num = num_requests // (
-        num_ssd_blocks // num_cpu_blocks
+        num_gpu_blocks // num_cpu_blocks
     ) - 2
     write_requests = []
     print("writing initial data...")
@@ -123,7 +120,6 @@ def test_kvmanager():
         # read from written data
         read_idx = i - initial_write_num
         token_ids, block_ids = request_pairs[read_idx]
-
         request = kvmanager.get_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
@@ -154,7 +150,6 @@ def test_kvmanager():
         if len(all_requests) >= num_cpu_blocks // block_per_request - 2:
             kvmanager.wait(all_requests)
             all_requests = []
-
     if len(all_requests) > 0:
         kvmanager.wait(all_requests)
     print("mixed read/write done")
@@ -166,7 +161,6 @@ def test_kvmanager():
     )
     print(f"total time: {total_time} s")
     throughput = total_data_size / total_time
-
 
     kvmanager.shutdown()
     verify_data(gpu_blocks, gpu_blocks_gt)

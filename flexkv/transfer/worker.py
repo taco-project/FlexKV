@@ -97,8 +97,9 @@ class TransferWorker(ABC):
                 try:
                     nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
                                         f"graph_id: {op.transfer_graph_id}, "
+                                        f"num_blocks: {len(op.src_block_ids)}",
                                         # f"successors: {op.successors}",
-                                        , color=get_nvtx_range_color(op.transfer_graph_id))
+                                        color=get_nvtx_range_color(op.transfer_graph_id))
                     self.launch_transfer(op)
                     nvtx.pop_range()
                 except Exception as e:
@@ -458,12 +459,15 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp):
-        if transfer_op.transfer_type == TransferType.DISK2H:
+        #TODO remove this when remote worker is ready
+        if transfer_op.transfer_type == TransferType.DISK2H or transfer_op.transfer_type == TransferType.REMOTE2H:
             cpu_block_ids = transfer_op.dst_block_ids
             ssd_block_ids = transfer_op.src_block_ids
+            transfer_op.transfer_type = TransferType.DISK2H
         else:
             cpu_block_ids = transfer_op.src_block_ids
             ssd_block_ids = transfer_op.dst_block_ids
+            transfer_op.transfer_type = TransferType.DISK2D
         start_time = time.time()
         self._transfer_impl(
             cpu_block_ids,

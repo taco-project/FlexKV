@@ -12,7 +12,9 @@ from flexkv.common.hash_utils import HashType, Hasher
 
 @dataclass
 class MatchResult:
+    num_ready_matched_blocks: int = 0
     num_matched_blocks: int = 0
+    last_ready_node: Optional['RadixNode'] = None
     last_node: Optional['RadixNode'] = None
     last_node_matched_length: int = 0
     physical_blocks: torch.Tensor = torch.empty(0, dtype=torch.int64)
@@ -125,7 +127,9 @@ class RadixTreeIndex:
                     update_cache_info: bool = True) -> MatchResult:
         sequence.gen_hashes()
         current_node = self.root_node
+        last_ready_node = self.root_node
         prefix_blocks_num = 0
+        ready_prefix_blocks_num = 0
         last_node_matched_length = 0
         physical_blocks = np.array([], dtype=np.int64)
         while prefix_blocks_num < sequence.num_blocks:
@@ -133,6 +137,9 @@ class RadixTreeIndex:
                 current_node.last_access_time = time.time()
             child_hash = sequence.get_hash(prefix_blocks_num + current_node.size())
             if child_hash in current_node.children:
+                if current_node.is_ready:
+                    last_ready_node = current_node
+                    ready_prefix_blocks_num += current_node.size()
                 prefix_blocks_num += current_node.size()
                 physical_blocks = np.concatenate([physical_blocks, current_node.physical_blocks])
                 current_node = current_node.children[child_hash]
@@ -151,10 +158,15 @@ class RadixTreeIndex:
                     physical_blocks = np.concatenate([physical_blocks, current_node.physical_blocks[:matched_length]])
                 else:
                     matched_length = 0
+                if current_node.is_ready:
+                    last_ready_node = current_node
+                    ready_prefix_blocks_num += matched_length
                 last_node_matched_length = matched_length
                 prefix_blocks_num += matched_length
                 break
         return MatchResult(num_matched_blocks=prefix_blocks_num,
+                           num_ready_matched_blocks=ready_prefix_blocks_num,
+                           last_ready_node=last_ready_node,
                            last_node=current_node,
                            last_node_matched_length=last_node_matched_length,
                            physical_blocks=torch.from_numpy(physical_blocks).to(torch.int64))

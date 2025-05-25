@@ -9,14 +9,17 @@ class DeviceType(Enum):
     CPU = 0
     GPU = 1
     SSD = 2
-
+    REMOTE = 3
+    
 class TransferType(Enum):
-    H2D    = "Host to Device"  # Host to Device transfer
-    D2H    = "Device to Host"  # Device to Host transfer
-    DISK2H = "Disk to Host"  # Disk to Host transfer
-    H2DISK = "Host to Disk"  # Host to Disk transfer
-    DISK2D = "Disk to Device"  # Disk to Device transfer
-    D2DISK = "Device to Disk"  # Device to Disk transfer
+    H2D    = "Host to Device"
+    D2H    = "Device to Host"
+    DISK2H = "Disk to Host"
+    H2DISK = "Host to Disk"
+    DISK2D = "Disk to Device"
+    D2DISK = "Device to Disk"
+    REMOTE2H = "Remote to Host"
+    H2REMOTE = "Host to Remote"
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of
@@ -150,9 +153,12 @@ class TransferOpGraph:
 
     def all_transfer_ops_completed(self) -> bool:
         """check if all transfer ops are completed"""
-        return all(op.status == TransferOpStatus.COMPLETED or
-                   op.transfer_type == TransferType.VIRTUAL
+        return all(op.status == TransferOpStatus.COMPLETED
                    for op in self._op_map.values())
+
+    @property
+    def num_ops(self) -> int:
+        return len(self._op_map)
 
     def print_op_map(self):
         """Print transfer op graph in a visual format showing dependencies.
@@ -184,6 +190,8 @@ class TransferOpGraph:
             # print the op info
             print(f"{prefix}Op {op_id} ({op.transfer_type.name}) {status}")
 
+            if op.transfer_type == TransferType.VIRTUAL:
+                continue
             # print the dependency info
             dep_prefix = "    " if is_last else "│   "
             if not op.successors:
@@ -196,6 +204,8 @@ class TransferOpGraph:
             src_info = f"From: {op.src_descriptor.device_type.name}:{op.src_descriptor.device_id}"
             dst_info = f"To: {op.dst_descriptor.device_type.name}:{op.dst_descriptor.device_id}"
             print(f"{dep_prefix}    └── {src_info} -> {dst_info}")
+
+            print(f"{dep_prefix}    └── layers: {op.layer_id} - {op.layer_id + op.layer_granularity}")
 
             # if there are physical block ids, also print them
             if len(op.src_descriptor.physical_block_ids) > 0:

@@ -10,7 +10,10 @@ from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.mempool import Mempool
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.cache.transfer_pattern import create_read_transfer_graph, create_write_transfer_graph
+from flexkv.cache.transfer_pattern import (
+    create_read_graph_cpu_storage, create_read_graph_cpu_ssd_remote, convert_read_graph_to_layer_wise_graph,
+    create_write_graph_cpu_storage, create_write_graph_cpu_ssd_remote
+)
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 
 class CacheEngine:
@@ -98,7 +101,11 @@ class GlobalCacheEngine:
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block)
         if cache_config.enable_remote:
-            raise NotImplementedError("Remote cache is not implemented")
+            #NOTE here we use ssd to replace the remote file system 
+            # such as CFS for single node test
+            self.remote_cache_engine = CacheEngine(DeviceType.SSD,
+                                                   cache_config.num_remote_blocks,
+                                                   cache_config.tokens_per_block)
 
     def reset(self):
         if self.cpu_cache_engine:
@@ -136,51 +143,125 @@ class GlobalCacheEngine:
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
                                      tokens_per_block=self.cache_config.tokens_per_block)
 
-        # TODO(very important): in some cases, real cpu_matched_blocks < start_idx, this will cause bugs
-        cpu_matched_result, ssd_matched_result, _ = self.match_all(sequence_meta)
-        cpu_physical_blocks = cpu_matched_result.physical_blocks[start_idx:end_idx]
-        ssd_physical_blocks = ssd_matched_result.physical_blocks[start_idx:end_idx]
+        cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
+        remote_enabled = self.need_remote_cache(cpu_matched_result, ssd_matched_result, end_idx - start_idx)
+        if remote_enabled:
+            #TODO: perhaps we need to lock the last node of remote cache engine 
+            # at the same time we match it in real remote cache engine
+            remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
-        num_transfer_blocks = max(len(cpu_physical_blocks), len(ssd_physical_blocks))
+        # tailor the blocks to assure:
+        # the blocks are needed by the mask & the blocks are ready
+        cpu_physical_blocks = cpu_matched_result.physical_blocks[:cpu_matched_result.num_ready_matched_blocks]
+        cpu_physical_blocks = cpu_physical_blocks[start_idx:end_idx]
+        ssd_physical_blocks = ssd_matched_result.physical_blocks[:ssd_matched_result.num_ready_matched_blocks]
+        ssd_physical_blocks = ssd_physical_blocks[start_idx:end_idx]
+        if remote_enabled:
+            remote_physical_blocks = remote_matched_result.physical_blocks[:remote_matched_result.num_ready_matched_blocks]
+            remote_physical_blocks = remote_physical_blocks[start_idx:end_idx]
+            # remote cache has less results than local cache
+            if len(remote_physical_blocks) <= len(ssd_physical_blocks):
+                remote_enabled = False
+                remote_physical_blocks = []
+        else:
+            remote_physical_blocks = []
+
+        num_transfer_blocks = max(len(cpu_physical_blocks), len(ssd_physical_blocks), len(remote_physical_blocks))
         assert num_transfer_blocks <= len(gpu_block_mapping)
+
 
         gpu_blocks_to_transfer = gpu_block_mapping[:num_transfer_blocks]
         cpu_blocks_to_transfer = cpu_physical_blocks
         ssd_blocks_to_transfer = ssd_physical_blocks[len(cpu_physical_blocks):]
+        remote_blocks_to_transfer = remote_physical_blocks[len(ssd_physical_blocks):]
 
-        cpu_node_to_unlock = cpu_matched_result.last_node
-        ssd_node_to_unlock = ssd_matched_result.last_node
+        cpu_node_to_unlock = cpu_matched_result.last_ready_node
+        ssd_node_to_unlock = ssd_matched_result.last_ready_node
+        if remote_enabled:
+            remote_node_to_unlock = remote_matched_result.last_ready_node
+            self.remote_cache_engine.lock_node(remote_node_to_unlock)
+        else:
+            remote_node_to_unlock = None
 
-        if len(cpu_physical_blocks) < len(ssd_physical_blocks):
+        # prepare cpu blocks to transfer
+        cpu_blocks_to_free = []
+        if len(cpu_physical_blocks) < num_transfer_blocks:
             extra_cpu_blocks = self.cpu_cache_engine.take(
-                num_required_blocks=len(ssd_physical_blocks) - len(cpu_physical_blocks),
+                num_required_blocks=num_transfer_blocks - len(cpu_physical_blocks),
                 protected_node=cpu_matched_result.last_node,
                 strict=True
             )
             cpu_blocks_to_transfer = torch.cat([cpu_blocks_to_transfer, extra_cpu_blocks])
-            cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
-                                                              extra_cpu_blocks,
-                                                              num_insert_blocks=len(ssd_physical_blocks),
-                                                              is_ready=False,
-                                                              match_result=cpu_matched_result)
-
+            # we only insert the buffer blocks to cpu cache engine only:
+            # 1. the cpu cache engine satisfies prefix cache after insertion
+            # 2. the sequence is all ready blocks
+            if (cpu_matched_result.num_ready_matched_blocks >= start_idx and 
+                cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
+                cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
+                                                                  extra_cpu_blocks,
+                                                                  num_insert_blocks=num_transfer_blocks,
+                                                                  is_ready=False,
+                                                                  match_result=cpu_matched_result)
+            else:
+                cpu_blocks_to_free = extra_cpu_blocks
         self.cpu_cache_engine.lock_node(cpu_node_to_unlock)
-        self.ssd_cache_engine.lock_node(ssd_node_to_unlock)
-        # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
-        transfer_graph, finished_ops_ids = create_read_transfer_graph(ssd_blocks=ssd_blocks_to_transfer,
-                                                                      cpu_blocks=cpu_blocks_to_transfer,
-                                                                      gpu_blocks=gpu_blocks_to_transfer,
-                                                                      gpu_device_id=0,
-                                                                      layer_num=layer_num,
-                                                                      layer_granularity=layer_granularity)
 
+        # prepare ssd blocks to transfer
+        write_ssd_blocks_from_remote = True # this can be a parameter
+        if (remote_enabled and 
+            len(ssd_physical_blocks) < num_transfer_blocks and 
+            ssd_matched_result.num_ready_matched_blocks >= start_idx and
+            ssd_matched_result.num_ready_matched_blocks == ssd_matched_result.num_matched_blocks):
+            # only when the above all are satisfied, we load data back from cpu to ssd
+            write_ssd_blocks_from_remote = True
+            extra_ssd_blocks = self.ssd_cache_engine.take(
+                num_required_blocks=num_transfer_blocks - len(ssd_physical_blocks),
+                protected_node=ssd_matched_result.last_node,
+                strict=True
+            )
+            ssd_blocks_to_transfer = torch.cat([ssd_blocks_to_transfer, extra_ssd_blocks])
+            ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
+                                                            extra_ssd_blocks,
+                                                            num_insert_blocks=num_transfer_blocks,
+                                                            is_ready=False,
+                                                            match_result=ssd_matched_result)
+        self.ssd_cache_engine.lock_node(ssd_node_to_unlock)
+        if remote_enabled and len(remote_blocks_to_transfer) > 0:
+            transfer_graph, finished_ops_ids = create_read_graph_cpu_ssd_remote(gpu_blocks=gpu_blocks_to_transfer,
+                                                                                cpu_blocks=cpu_blocks_to_transfer,
+                                                                                ssd_blocks=ssd_blocks_to_transfer,
+                                                                                remote_blocks=remote_blocks_to_transfer,
+                                                                                gpu_device_id=0,
+                                                                                layer_num=layer_num,
+                                                                                write_back_to_ssd=write_ssd_blocks_from_remote)
+        else:
+            transfer_graph, finished_ops_ids = create_read_graph_cpu_storage(gpu_blocks=gpu_blocks_to_transfer,
+                                                                            cpu_blocks=cpu_blocks_to_transfer,
+                                                                            ssd_blocks=ssd_blocks_to_transfer,
+                                                                            gpu_device_id=0,
+                                                                            layer_num=layer_num)
+        
+        # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
+        if layer_num // layer_granularity != 1:
+            transfer_graph, finished_ops_ids = convert_read_graph_to_layer_wise_graph(transfer_graph=transfer_graph,
+                                                                                    finished_ops_ids=finished_ops_ids,
+                                                                                    layer_num=layer_num,
+                                                                                    layer_granularity=layer_granularity)
+        #print(f"IN GET FUNCTION IN CACHE ENGINE:")
+        #transfer_graph.print_op_map()
         return_mask = torch.zeros_like(token_mask)
         return_mask[start_idx* self.tokens_per_block:
                     (start_idx + len(gpu_blocks_to_transfer)) * self.tokens_per_block] = True
 
+        node_to_unlock = {DeviceType.CPU: cpu_node_to_unlock,
+                          DeviceType.SSD: ssd_node_to_unlock}
+        if remote_enabled:
+            node_to_unlock[DeviceType.REMOTE] = remote_node_to_unlock
+        buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
+    
         callback = partial(self._transfer_callback,
-                           node_to_unlock={DeviceType.CPU: cpu_node_to_unlock,
-                                           DeviceType.SSD: ssd_node_to_unlock})
+                           node_to_unlock=node_to_unlock,
+                           buffer_to_free=buffer_to_free)
 
         return transfer_graph, return_mask, callback, finished_ops_ids
 
@@ -199,7 +280,6 @@ class GlobalCacheEngine:
         aligned_token_ids = token_ids[:aligned_length]
         # TODO: support put the last incomplete block
         token_mask[aligned_length:] = False
-        # WARNING the start_idx and end_idx is token level, not block level
         start_idx, end_idx = self._get_block_range(token_mask)
 
         # the mask should has a prefix of True
@@ -210,9 +290,20 @@ class GlobalCacheEngine:
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
                                      tokens_per_block=self.cache_config.tokens_per_block)
 
-        cpu_matched_result, ssd_matched_result, _ = self.match_all(sequence_meta)
+        cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[start_idx:end_idx]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[start_idx:end_idx]
+        remote_matched_blocks = []
+        remote_enabled = True # this can be a parameter or based on some cost functions
+        if remote_enabled:
+            #TODO: perhaps we need to lock the last node of remote cache engine 
+            # at the same time we match it in real remote cache engine
+            remote_matched_result = self.remote_cache_engine.match(sequence_meta)
+
+        # in fact, we still face the problem that some of the matched cpu blocks is not ready
+        # but we need to copy them into ssd or remote. We have the assumption that the not ready blocks
+        # will be ready after the copy of new blocks in this put operation from gpu to cpu is done.
+        # this should be good.
 
         # cpu works as a cache for ssd
         assert len(cpu_matched_blocks) <= len(ssd_matched_blocks)
@@ -241,20 +332,46 @@ class GlobalCacheEngine:
         self.cpu_cache_engine.lock_node(cpu_node_to_unlock)
         self.ssd_cache_engine.lock_node(ssd_node_to_unlock)
 
-        transfer_graph = create_write_transfer_graph(ssd_blocks_to_transfer,
-                                                     cpu_blocks_to_transfer,
-                                                     gpu_blocks_to_transfer,
-                                                     gpu_device_id = 0,
-                                                     layer_num = layer_num)
+        # NOTE the take operation and lock operation should be automic with the match operation for real remote engine
+
+        if remote_enabled:
+            remote_blocks_to_transfer = self.remote_cache_engine.take(
+                num_required_blocks=len(gpu_block_mapping) - len(remote_matched_blocks),
+                protected_node = remote_matched_result.last_node,
+                strict=True
+            )
+            remote_node_to_unlock = self.remote_cache_engine.insert(sequence_meta,
+                                                                    remote_blocks_to_transfer,
+                                                                    is_ready=False,
+                                                                    match_result=remote_matched_result)
+            self.remote_cache_engine.lock_node(remote_node_to_unlock)
+            # we need more cpu blocks incase the matched length of remote is less than that of cpu
+            if len(remote_blocks_to_transfer) > len(cpu_blocks_to_transfer):
+                extra_cpu_blocks_num = len(remote_blocks_to_transfer) - len(cpu_blocks_to_transfer)
+                extra_cpu_blocks = cpu_matched_result.physical_blocks[-extra_cpu_blocks_num:]
+                cpu_blocks_to_transfer = torch.cat([extra_cpu_blocks, cpu_blocks_to_transfer])
+
+        transfer_graph, finished_ops_ids = create_write_graph_cpu_ssd_remote(gpu_blocks=gpu_blocks_to_transfer,
+                                                                            cpu_blocks=cpu_blocks_to_transfer,
+                                                                            ssd_blocks=ssd_blocks_to_transfer,
+                                                                            remote_blocks=remote_blocks_to_transfer,
+                                                                            gpu_device_id = 0,
+                                                                            layer_num = layer_num)
+        #print(f"IN PUT FUNCTION IN CACHE ENGINE:")
+        #transfer_graph.print_op_map()
 
         return_mask = torch.zeros_like(token_mask)
         return_mask[start_idx* self.tokens_per_block:
                     (start_idx + len(gpu_block_mapping)) * self.tokens_per_block] = True
 
+        node_to_unlock = {DeviceType.CPU: cpu_node_to_unlock,
+                          DeviceType.SSD: ssd_node_to_unlock}
+        if remote_enabled:
+            node_to_unlock[DeviceType.REMOTE] = remote_node_to_unlock
+
         callback = partial(self._transfer_callback,
-                           node_to_unlock={DeviceType.CPU: cpu_node_to_unlock,
-                                           DeviceType.SSD: ssd_node_to_unlock})
-        return transfer_graph, return_mask, callback
+                           node_to_unlock=node_to_unlock)
+        return transfer_graph, return_mask, callback, finished_ops_ids
 
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, RadixNode],
@@ -263,11 +380,32 @@ class GlobalCacheEngine:
             self.cpu_cache_engine.cleanup(node_to_unlock[DeviceType.CPU])
         if DeviceType.SSD in node_to_unlock:
             self.ssd_cache_engine.cleanup(node_to_unlock[DeviceType.SSD])
+        if DeviceType.REMOTE in node_to_unlock:
+            self.remote_cache_engine.cleanup(node_to_unlock[DeviceType.REMOTE])
         if buffer_to_free is not None:
             if DeviceType.CPU in buffer_to_free:
                 self.cpu_cache_engine.recycle(buffer_to_free[DeviceType.CPU])
             if DeviceType.SSD in buffer_to_free:
                 self.ssd_cache_engine.recycle(buffer_to_free[DeviceType.SSD])
+            if DeviceType.REMOTE in buffer_to_free:
+                self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
+
+    def need_remote_cache(self,
+                          cpu_matched_result: MatchResult,
+                          ssd_matched_result: MatchResult,
+                          num_required_blocks: int) -> bool:
+        #TODO: we need cost function to decide whether to use remote cache
+        return True
+
+    def match_local(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult]:
+        cpu_matched_result = MatchResult()
+        ssd_matched_result = MatchResult()
+        if self.cpu_cache_engine:
+            cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
+        if self.ssd_cache_engine:
+            ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
+
+        return cpu_matched_result, ssd_matched_result
 
     def match_all(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
