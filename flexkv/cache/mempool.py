@@ -38,7 +38,7 @@ class Mempool:
         return free_ids
 
     def recycle_blocks(self, block_ids: torch.Tensor) -> None:
-        #assert block_ids.ndim == 1
+        # assert block_ids.ndim == 1
         assert not self._free_mask[block_ids].any()
         self._free_mask[block_ids] = True
         self._num_free += len(block_ids)

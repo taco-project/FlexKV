@@ -16,7 +16,7 @@ def create_read_graph_cpu_storage(
     """
     Create a read transfer graph with (REMOTE_STORAGE / SSD)->CPU->GPU operations
     ssd_blocks: the blocks of ssd that are used as a lower-level storage backend,
-    including ssd or remote storage. This can be empty, which means cpu-only kvcache. 
+    including ssd or remote storage. This can be empty, which means cpu-only kvcache.
     Returns:
         graph: TransferOpGraph
         ops_to_be_tracked: List[int]: a list of transfer ops that can indicate
@@ -227,7 +227,7 @@ def create_write_graph_cpu_storage(
     """
     Create a write transfer graph with CPU->REMOTE_STORAGE / SSD operations
     ssd_blocks: the blocks of ssd that are used as a lower-level storage backend,
-    including ssd or remote storage. This can be empty, which means cpu-only kvcache. 
+    including ssd or remote storage. This can be empty, which means cpu-only kvcache.
     Write op granularity is larger: gpu->cpu is put into the same op.
     Returns:
         graph: TransferOpGraph
@@ -353,8 +353,8 @@ def convert_read_graph_to_layer_wise_graph(
     layer_granularity: int,
 ) -> Tuple[TransferOpGraph, List[int]]:
     """
-    Convert the input read transfer graph into a layer-wise transfer graph 
-    according to the given granularity. Each op will be split into 
+    Convert the input read transfer graph into a layer-wise transfer graph
+    according to the given granularity. Each op will be split into
     (layer_num // layer_granularity) ops, and the original dependency relationships are preserved.
     """
     assert layer_num % layer_granularity == 0
@@ -384,7 +384,7 @@ def convert_read_graph_to_layer_wise_graph(
             split_op_ids.append(new_op.transfer_op_id)
         opid2splitopids[op_id] = split_op_ids
 
-    #add virtual ops that mark the finish of each layer
+    # add virtual ops that mark the finish of each layer
     if len(finished_ops_ids) > 1:
         for i in range(num_splits):
             op = TransferOp(
@@ -418,4 +418,3 @@ def convert_read_graph_to_layer_wise_graph(
             new_graph.add_dependency(split_op_ids[i], split_op_ids[i - 1])
 
     return new_graph, layer_wise_virtual_op_ids
-
