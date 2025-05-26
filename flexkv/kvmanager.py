@@ -28,7 +28,15 @@ class KVManager:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_blocks: List[List[torch.Tensor]] = None):
-        nvtx.push_range("KVManager.__init__", color=get_nvtx_default_color())
+        nvtx.push_range("Initialize kvmanager", color=get_nvtx_default_color())
+
+        if not cache_config.enable_cpu:
+            raise ValueError("enable_cpu must be True")
+        if cache_config.enable_remote and not cache_config.enable_ssd:
+            raise ValueError("enable_ssd must be True if enable_remote is True")
+        if not cache_config.enable_cpu and not cache_config.use_gds:
+            raise ValueError("use_gds must be True if enable_cpu is False")
+
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
         self.storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
         self.tp_size = model_config.tp_size
@@ -153,7 +161,7 @@ class KVManager:
                 # self.transfer_gid_to_task[completed_graph_id].total_ops -= 1  # TODO: do we need total_ops?
                 # if self.transfer_gid_to_task[completed_graph_id].total_ops == 0:
                 #     self.transfer_gid_to_task.pop(completed_graph_id)
-            time.sleep(0.001)
+            time.sleep(0.0001)
 
     def _get_task_id(self) -> int:
         with self.lock:
@@ -231,7 +239,7 @@ class KVManager:
                         self.taskid_to_layerwise_ops.pop(completed_task_id)
             else:
                 self.finished_queue.put((completed_task_id, op_id, return_mask))
-            time.sleep(0.001)
+            time.sleep(0.0001)
         nvtx.mark(f"wait task_ids: {task_ids} done")
         return return_masks
 
@@ -251,4 +259,4 @@ class KVManager:
                     continue
             else:
                 self.finished_ops_queue.put((completed_task_id, op_id, return_mask))
-            time.sleep(0.001)
+            time.sleep(0.0001)

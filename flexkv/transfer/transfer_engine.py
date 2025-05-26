@@ -20,8 +20,8 @@ class TransferEngine:
     def __init__(self,
         gpu_handles: List[AccessibleHandle],
         cpu_handle: AccessibleHandle,
-        ssd_handle: AccessibleHandle = None,
-        remote_handle: AccessibleHandle = None):
+        ssd_handle: Optional[AccessibleHandle] = None,
+        remote_handle: Optional[AccessibleHandle] = None):
         """
         Initialize transfer engine
 
@@ -58,7 +58,8 @@ class TransferEngine:
         # Wait for GPU-CPU workers to initialize
         self.cpussd_read_worker = None
         self.cpussd_write_worker = None
-        self.remotecpu_worker = None
+        self.remotecpu_read_worker = None
+        self.remotecpu_write_worker = None
         if ssd_handle is not None:
             self.cpussd_read_worker = CPUSSDDiskTransferWorker.create_worker(
                 worker_id=10,
@@ -153,7 +154,7 @@ class TransferEngine:
                     else:
                         self.op_id_to_op[op.transfer_op_id] = op
                         self._assign_op_to_worker(op)
-            time.sleep(0.001)  # Prevent busy waiting
+            time.sleep(0.0001)  # Prevent busy waiting
 
     def _assign_op_to_worker(self, op: TransferOp):
         self.op_id_to_nvtx_range[op.transfer_op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
