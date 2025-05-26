@@ -161,7 +161,7 @@ class KVManager:
                 # self.transfer_gid_to_task[completed_graph_id].total_ops -= 1  # TODO: do we need total_ops?
                 # if self.transfer_gid_to_task[completed_graph_id].total_ops == 0:
                 #     self.transfer_gid_to_task.pop(completed_graph_id)
-            time.sleep(0.001)
+            time.sleep(0.0001)
 
     def _get_task_id(self) -> int:
         with self.lock:
@@ -239,7 +239,7 @@ class KVManager:
                         self.taskid_to_layerwise_ops.pop(completed_task_id)
             else:
                 self.finished_queue.put((completed_task_id, op_id, return_mask))
-            time.sleep(0.001)
+            time.sleep(0.0001)
         nvtx.mark(f"wait task_ids: {task_ids} done")
         return return_masks
 
@@ -259,4 +259,4 @@ class KVManager:
                     continue
             else:
                 self.finished_ops_queue.put((completed_task_id, op_id, return_mask))
-            time.sleep(0.001)
+            time.sleep(0.0001)
