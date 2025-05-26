@@ -154,7 +154,7 @@ class TransferEngine:
                     else:
                         self.op_id_to_op[op.transfer_op_id] = op
                         self._assign_op_to_worker(op)
-            time.sleep(0.001)  # Prevent busy waiting
+            time.sleep(0.0001)  # Prevent busy waiting
 
     def _assign_op_to_worker(self, op: TransferOp):
         self.op_id_to_nvtx_range[op.transfer_op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
