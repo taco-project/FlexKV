@@ -26,7 +26,7 @@ cpp_extensions = [
         library_dirs=[os.path.join(build_dir, "lib")],
         include_dirs=[os.path.join(build_dir, "include")],
         extra_compile_args={"nvcc": ["-O3"], "cxx": ["-std=c++17"]},
-        extra_link_args=["-lcuda", "-lssl", "-lcrypto", "-lxxhash"],
+        extra_link_args=["-lcuda", "-lxxhash"],
     ),
 ]
 
@@ -38,7 +38,11 @@ if not debug:
     # Compile Python modules with cythonize
     # Exclude __init__.py files and test files
     python_files = ["flexkv/**/*.py"]
-    excluded_files = ["flexkv/**/__init__.py", "flexkv/**/test_*.py", "flexkv/**/benchmark_*.py", "flexkv/benchmark/**/*.py"]
+    excluded_files = ["flexkv/**/__init__.py",
+                      "flexkv/**/test_*.py",
+                      "flexkv/**/benchmark_*.py",
+                      "flexkv/benchmark/**/*.py",
+                      "flexkv/benchmark/test_kvmanager.py"]
     cythonized_modules = cythonize(
         python_files,
         exclude=excluded_files,
