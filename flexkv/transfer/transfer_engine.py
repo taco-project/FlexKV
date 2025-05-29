@@ -233,19 +233,19 @@ class TransferEngine:
             # shutdown all workers
             for worker in self.gpucpu_workers:
                 worker.shutdown()
-                print("clear gpu cpu worker")
+                debuginfo.info(f"gpu cpu worker#{worker.worker_id} shutdown")
             if self.cpussd_read_worker is not None:
                 self.cpussd_read_worker.shutdown()
-                print("clear cpu ssd read worker")
+                debuginfo.info(f"cpu ssd read worker#{self.cpussd_read_worker.worker_id} shutdown")
             if self.cpussd_write_worker is not None:
                 self.cpussd_write_worker.shutdown()
-                print("clear cpu ssd write worker")
+                debuginfo.info(f"cpu ssd write worker#{self.cpussd_write_worker.worker_id} shutdown")
             if self.remotecpu_read_worker is not None:
                 self.remotecpu_read_worker.shutdown()
-                print("clear cpu remote read worker")
+                debuginfo.info(f"cpu remote read worker#{self.remotecpu_read_worker.worker_id} shutdown")
             if self.remotecpu_write_worker is not None:
                 self.remotecpu_write_worker.shutdown()
-                print("clear cpu remote write worker")
+                debuginfo.info(f"cpu remote write worker#{self.remotecpu_write_worker.worker_id} shutdown")
 
             # clear finished_ops_queue
             with contextlib.suppress(Exception):

@@ -27,10 +27,14 @@ void transfer_kv_layers_binding(
   int num_blocks = dst_block_id_tensor.numel();
   int num_layers = dst_layer_ptrs_tensor.numel();
 
-  int64_t *dst_block_ids = static_cast<int64_t *>(dst_block_id_tensor.data_ptr());
-  void **dst_layer_ptrs = static_cast<void **>(dst_layer_ptrs_tensor.data_ptr());//must be contiguous
-  int64_t *src_block_ids = static_cast<int64_t *>(src_block_id_tensor.data_ptr());
-  void **src_layer_ptrs = static_cast<void **>(src_layer_ptrs_tensor.data_ptr());
+  int64_t *dst_block_ids =
+      static_cast<int64_t *>(dst_block_id_tensor.data_ptr());
+  void **dst_layer_ptrs = static_cast<void **>(
+      dst_layer_ptrs_tensor.data_ptr()); // must be contiguous
+  int64_t *src_block_ids =
+      static_cast<int64_t *>(src_block_id_tensor.data_ptr());
+  void **src_layer_ptrs =
+      static_cast<void **>(src_layer_ptrs_tensor.data_ptr());
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   flexkv::transfer_kv_layers(
@@ -45,13 +49,14 @@ void transfer_kv_layers_binding(
   }
 }
 
-void transfer_kv_blocks_ssd(
-    const std::string &filename, const torch::Tensor &cpu_layer_id_list,
+void transfer_kv_blocks_ssd_binding(
+    const py::list &filename_list, const torch::Tensor &cpu_layer_id_list,
     const torch::Tensor &cpu_layer_ptrs_tensor,
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
-    int64_t block_size_in_bytes, int64_t total_layers, bool is_read, bool verbose = false) {
+    int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
+    int round_robin, bool use_mmap = false, int num_threads_per_file = 8) {
   TORCH_CHECK(cpu_layer_ptrs_tensor.dtype() == torch::kInt64,
               "cpu_layer_ptrs must be int64");
   TORCH_CHECK(ssd_block_ids.dtype() == torch::kInt64,
@@ -59,24 +64,30 @@ void transfer_kv_blocks_ssd(
   TORCH_CHECK(cpu_block_ids.dtype() == torch::kInt64,
               "cpu_block_ids must be int64");
 
-  transfer_kv_blocks_ssd_mmap_multi_thread(
-      filename, cpu_layer_id_list, cpu_layer_ptrs_tensor, ssd_block_ids,
+  std::vector<std::string> filenames;
+  for (const auto &filename : filename_list) {
+    filenames.push_back(filename.cast<std::string>());
+  }
+  flexkv::transfer_kv_blocks_ssd(
+      filenames, cpu_layer_id_list, cpu_layer_ptrs_tensor, ssd_block_ids,
       cpu_block_ids, cpu_kv_stride_in_bytes, ssd_layer_stride_in_bytes,
       ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, block_size_in_bytes,
-      total_layers, is_read, verbose);
+      total_layers, is_read, round_robin, use_mmap, num_threads_per_file);
 }
 
 PYBIND11_MODULE(c_ext, m) {
   m.def("transfer_kv_layers", &transfer_kv_layers_binding,
         "Transfer multi-layer KV-cache between CPU and GPU");
-  m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd,
-        "Transfer KV blocks between SSD and CPU memory", py::arg("filename"),
-        py::arg("cpu_layer_id_list"), py::arg("cpu_layer_ptrs_tensor"),
-        py::arg("ssd_block_ids"), py::arg("cpu_block_ids"),
-        py::arg("cpu_kv_stride_in_bytes"), py::arg("ssd_layer_stride_in_bytes"),
+  m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
+        "Transfer KV blocks between SSD and CPU memory",
+        py::arg("filename_list"), py::arg("cpu_layer_id_list"),
+        py::arg("cpu_layer_ptrs_tensor"), py::arg("ssd_block_ids"),
+        py::arg("cpu_block_ids"), py::arg("cpu_kv_stride_in_bytes"),
+        py::arg("ssd_layer_stride_in_bytes"),
         py::arg("ssd_block_stride_in_bytes"), py::arg("ssd_kv_stride_in_bytes"),
-        py::arg("block_size_in_bytes"), py::arg("total_layers"), py::arg("is_read"),
-        py::arg("verbose") = false);
+        py::arg("block_size_in_bytes"), py::arg("total_layers"),
+        py::arg("is_read"), py::arg("round_robin"), py::arg("use_mmap") = false,
+        py::arg("num_threads_per_file") = 8);
   m.def("export_handle", &export_memory_handle);
   m.def("import_handle", &import_memory_handle);
   m.def("get_hash_size", &flexkv::get_hash_size,
@@ -84,18 +95,6 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
         py::arg("hasher"), py::arg("token_ids"), py::arg("tokens_per_block"),
         py::arg("block_hashes"));
-  m.def("get_prefix_block_ids", &flexkv::get_prefix_block_ids,
-        "Get prefix block ids", py::arg("last_block_index"),
-        py::arg("last_block_id"), py::arg("prev_block_ids"));
-  m.def("find_n_liner_parents_for_eviction",
-        &flexkv::find_n_liner_parents_for_eviction,
-        "Find n-liner parents for eviction", py::arg("block_id"),
-        py::arg("prev_block_ids"), py::arg("lock_cnt"), py::arg("child_cnt"),
-        py::arg("ready"), py::arg("last_access_time"),
-        py::arg("max_last_access_time"), py::arg("max_num_evicted"));
-  m.def("get_block_ids_from_hashes", &flexkv::get_block_ids_from_hashes,
-        "Get block ids from hashes", py::arg("hashes"),
-        py::arg("hash_to_block_id"));
 
   // Add Hasher class binding
   py::class_<flexkv::Hasher>(m, "Hasher")

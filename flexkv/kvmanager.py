@@ -1,5 +1,5 @@
 from queue import Queue
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Union
 import threading
 import time
 
@@ -225,8 +225,10 @@ class KVManager:
     #NOTE the wait() function and wait_at_layer() function should not be called at the same time,
     # because they clean each other
     #NOTE every task should be synced in some way, otherwise the queue will be full
-    def wait(self, task_ids: List[int]) -> Dict[int, torch.Tensor]:
+    def wait(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
         nvtx.mark(f"wait task_ids: {task_ids}")
+        if isinstance(task_ids, int):
+            task_ids = [task_ids]
         num_completed_tasks = 0
         return_masks = {}
         while num_completed_tasks < len(task_ids):

@@ -21,7 +21,7 @@ cpp_extensions = [
             "csrc/bindings.cpp",
             "csrc/transfer.cu",
             "csrc/hash.cpp",
-            "csrc/index.cpp",
+            "csrc/transfer_ssd.cpp",
         ],
         library_dirs=[os.path.join(build_dir, "lib")],
         include_dirs=[os.path.join(build_dir, "include")],

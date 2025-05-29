@@ -246,8 +246,8 @@ class GlobalCacheEngine:
                                                                                     finished_ops_ids=finished_ops_ids,
                                                                                     layer_num=layer_num,
                                                                                     layer_granularity=layer_granularity)
-        #print(f"IN GET FUNCTION IN CACHE ENGINE:")
-        #transfer_graph.print_op_map()
+        # print(f"IN GET FUNCTION IN CACHE ENGINE:")
+        # transfer_graph.print_op_map()
         return_mask = torch.zeros_like(token_mask)
         return_mask[start_idx* self.tokens_per_block:
                     (start_idx + len(gpu_blocks_to_transfer)) * self.tokens_per_block] = True
@@ -296,8 +296,7 @@ class GlobalCacheEngine:
         cpu_matched_blocks = cpu_matched_result.physical_blocks[start_idx:end_idx]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[start_idx:end_idx]
         remote_matched_blocks = []
-        remote_enabled = True # this can be a parameter or based on some cost functions
-        if remote_enabled:
+        if self.cache_config.enable_remote:
             #TODO: perhaps we need to lock the last node of remote cache engine
             # at the same time we match it in real remote cache engine
             remote_matched_result = self.remote_cache_engine.match(sequence_meta)
@@ -336,7 +335,9 @@ class GlobalCacheEngine:
 
         # NOTE the take operation and lock operation should be automic with the match operation for real remote engine
 
-        if remote_enabled:
+        remote_blocks_to_transfer = torch.tensor([])
+        remote_node_to_unlock = None
+        if self.cache_config.enable_remote:
             remote_blocks_to_transfer = self.remote_cache_engine.take(
                 num_required_blocks=len(gpu_block_mapping) - len(remote_matched_blocks),
                 protected_node = remote_matched_result.last_node,
@@ -360,7 +361,7 @@ class GlobalCacheEngine:
                                                                             gpu_device_id = 0,
                                                                             layer_num = layer_num)
         #print(f"IN PUT FUNCTION IN CACHE ENGINE:")
-        #transfer_graph.print_op_map()
+        # transfer_graph.print_op_map()
 
         return_mask = torch.zeros_like(token_mask)
         return_mask[start_idx* self.tokens_per_block:
@@ -368,7 +369,7 @@ class GlobalCacheEngine:
 
         node_to_unlock = {DeviceType.CPU: cpu_node_to_unlock,
                           DeviceType.SSD: ssd_node_to_unlock}
-        if remote_enabled:
+        if self.cache_config.enable_remote:
             node_to_unlock[DeviceType.REMOTE] = remote_node_to_unlock
 
         callback = partial(self._transfer_callback,
@@ -495,8 +496,8 @@ class GlobalCacheEngine:
                                                                             remote_blocks=torch.tensor([]),
                                                                             gpu_device_id = 0,
                                                                             layer_num = layer_num)
-        #print(f"IN PUT FUNCTION IN CACHE ENGINE:")
-        #transfer_graph.print_op_map()
+        # print(f"IN PUT FUNCTION IN CACHE ENGINE:")
+        # transfer_graph.print_op_map()
 
         return_mask = torch.zeros_like(token_mask)
         return_mask[start_idx* self.tokens_per_block:
@@ -530,7 +531,7 @@ class GlobalCacheEngine:
                           ssd_matched_result: MatchResult,
                           num_required_blocks: int) -> bool:
         #TODO: we need cost function to decide whether to use remote cache
-        return True
+        return self.cache_config.enable_remote
 
     def match_local(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()

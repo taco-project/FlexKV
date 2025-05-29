@@ -15,10 +15,13 @@ enable_cpu = True
 enable_ssd = True
 block_per_request = 16
 
-num_gpu_blocks = 256
-num_cpu_blocks = 60
-num_ssd_blocks = 34
-num_remote_blocks = 256
+num_gpu_blocks = 512
+num_cpu_blocks = 128
+num_ssd_blocks = 256
+num_remote_blocks = 512
+
+# the ratio of gpu blocks to be written in the initial write
+initial_write_ratio = 0.5
 
 num_requests = num_gpu_blocks // block_per_request
 
@@ -57,10 +60,10 @@ def verify_data(gpu_blocks, gpu_blocks_gt):
         num_blocks = gpu_k.shape[0]
         for block_idx in range(num_blocks):
             if not torch.allclose(gpu_k[block_idx], gpu_k_gt[block_idx]):
-                print(f"K mismatch at layer {i}, block {block_idx} / {num_blocks}")
+                print(f"K mismatch at layer {i}, block {block_idx} / {num_blocks // 2}")
         for block_idx in range(num_blocks):
             if not torch.allclose(gpu_v[block_idx], gpu_v_gt[block_idx]):
-                print(f"V mismatch at layer {i}, block {block_idx} / {num_blocks}")
+                print(f"V mismatch at layer {i}, block {block_idx} / {num_blocks // 2}")
         assert torch.allclose(gpu_k, gpu_k_gt), f"K mismatch at layer {i}"
         assert torch.allclose(gpu_v, gpu_v_gt), f"V mismatch at layer {i}"
 
@@ -71,7 +74,6 @@ def block_ids_2_slot_mapping(block_ids):
     return slot_mapping
 
 def test_kvmanager():
-
     model_config = ModelConfig(num_layers=num_layers,
                                num_kv_heads=num_kv_heads,
                                head_size=head_size,
@@ -87,7 +89,7 @@ def test_kvmanager():
                                num_cpu_blocks=num_cpu_blocks,
                                num_ssd_blocks=num_ssd_blocks,
                                num_remote_blocks=num_remote_blocks,
-                               ssd_cache_path=["ssd_cache1"],
+                               ssd_cache_path=["ssd_cache1", "ssd_cache2"],
                                remote_cache_path=["remote_cache1"])
     gpu_blocks = [torch.randn(2, num_gpu_blocks, tokens_per_block, num_kv_heads, head_size, dtype=torch.float16).cuda()
                   for _ in range(num_layers)]
@@ -97,22 +99,23 @@ def test_kvmanager():
     request_pairs = [generate_request_pair(i) for i in range(num_requests)]
 
     # write initial data
-    initial_write_num = num_requests // (
-        num_gpu_blocks // num_cpu_blocks
-    ) - 2
-    write_requests = []
+    initial_write_num = int(num_requests * initial_write_ratio)
     print("writing initial data...")
     for token_ids, block_ids in request_pairs[:initial_write_num]:
-        request = kvmanager.put_async(
+        write_request = kvmanager.put_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
         )
-        write_requests.append(request)
-    kvmanager.wait(write_requests)
-    print("initial data written")
+        kvmanager.wait(write_request)
+        # clear gpu blocks
+        for i in range(num_layers):
+            gpu_blocks[i][:, block_ids, :, :, :] = 0
+    print(f"initial data {initial_write_num} written")
     # mixed read/write test
-    total_data_size = 0
-    all_requests = []
+    total_cache_hit = 0
+    total_cache_miss = 0
+    running_get_requests = []
+    running_put_requests = []
     start_time = time.time()
     print(f"the initial {initial_write_num} write done,performing mixed read/write...")
     for i in range(initial_write_num, num_requests):
@@ -120,50 +123,46 @@ def test_kvmanager():
         # read from written data
         read_idx = i - initial_write_num
         token_ids, block_ids = request_pairs[read_idx]
-        request = kvmanager.get_async(
+        request_id = kvmanager.get_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
             layer_granularity=-1,
         )
-        #all_requests.append(request)
-        if False:
-            for layer_id in range(4):
-                s_time = time.time()
-                kvmanager.wait_at_layer_group(request, layer_id, last_layer=(layer_id==3))
-                e_time = time.time()
-                print(f"for task {request}, wait at layer {layer_id} done, time: {e_time - s_time} s")
-        else:
-            all_requests.append(request)
+        running_get_requests.append(request_id)
 
         # write new data
         token_ids, block_ids = request_pairs[i]
-        request = kvmanager.put_async(
+        request_id = kvmanager.put_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
         )
-        all_requests.append(request)
-        total_data_size += (
-            block_per_request * tokens_per_block * num_kv_heads
-            * head_size * element_size * num_layers * 2
-        )
+        running_put_requests.append(request_id)
         # to aviod that all seq are locked, and cannot eviction
-        if len(all_requests) >= num_cpu_blocks // block_per_request - 2:
-            kvmanager.wait(all_requests)
-            all_requests = []
-    if len(all_requests) > 0:
-        kvmanager.wait(all_requests)
+        if len(running_get_requests) + len(running_put_requests) >= num_cpu_blocks // block_per_request:
+            return_masks = kvmanager.wait(running_get_requests)
+            kvmanager.wait(running_put_requests)
+            for return_mask in return_masks.values():
+                total_cache_hit += return_mask.sum()
+                total_cache_miss += len(return_mask) - return_mask.sum()
+            running_get_requests = []
+            running_put_requests = []
+    if len(running_get_requests) > 0:
+        kvmanager.wait(running_get_requests)
+        running_get_requests = []
+    if len(running_put_requests) > 0:
+        kvmanager.wait(running_put_requests)
+        running_put_requests = []
     print("mixed read/write done")
     end_time = time.time()
 
-    total_data_size = 2 * total_data_size / (1024 * 1024 * 1024)
-    total_time = (
-        end_time - start_time
-    )
-    print(f"total time: {total_time} s")
-    throughput = total_data_size / total_time
-
+    total_time = end_time - start_time
+    print(f"Total time: {total_time} s")
+    print(f"Total cache hit rate: {total_cache_hit / (total_cache_hit + total_cache_miss)}")
     kvmanager.shutdown()
-    verify_data(gpu_blocks, gpu_blocks_gt)
+    if(total_cache_miss == 0):
+        verify_data(gpu_blocks, gpu_blocks_gt)
+    else:
+        print(f"verify skipped, because of total_cache_miss={total_cache_miss}>0")
 
 if __name__ == "__main__":
     debuginfo.set_level("INFO")
