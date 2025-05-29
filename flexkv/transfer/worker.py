@@ -111,7 +111,8 @@ class TransferWorker(ABC):
 
 class WorkerHandle:
     """handle for worker process"""
-    def __init__(self, transfer_queue: mp.Queue, process: mp.Process, ready_event: Any):
+    def __init__(self, worker_id: int, transfer_queue: mp.Queue, process: mp.Process, ready_event: Any):
+        self.worker_id = worker_id
         self.transfer_queue = transfer_queue
         self.process = process
         self.ready_event = ready_event
@@ -151,7 +152,7 @@ class GPUCPUTransferWorker(TransferWorker):
         )
         process.start()
 
-        return WorkerHandle(transfer_queue, process, ready_event)
+        return WorkerHandle(worker_id, transfer_queue, process, ready_event)
 
     @classmethod
     def _worker_process(cls,
@@ -346,7 +347,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         )
         process.start()
 
-        return WorkerHandle(transfer_queue, process, ready_event)
+        return WorkerHandle(worker_id, transfer_queue, process, ready_event)
 
     @classmethod
     def _worker_process(cls,
@@ -375,12 +376,22 @@ class CPUSSDDiskTransferWorker(TransferWorker):
                  ssd_kv_layout: KVCacheLayout,
                  dtype: torch.dtype):
         super().__init__(worker_id, finished_ops_queue)
-        self.ssd_file = ssd_file[0]  # TODO: support multiple ssd files
+        self.ssd_files = ssd_file
+        self.num_ssd_files = len(ssd_file)
         self.transfer_queue = transfer_queue
 
         self.num_layers = cpu_kv_layout.num_layer
         self.num_cpu_blocks = cpu_kv_layout.num_block
         self.num_ssd_blocks = ssd_kv_layout.num_block
+        self.round_robin = 1
+
+        if self.num_ssd_blocks % self.num_ssd_files != 0:
+            raise ValueError(f"num_ssd_blocks {self.num_ssd_blocks} "
+                             f"is not divisible by num_ssd_files {self.num_ssd_files}")
+        self.num_ssd_blocks_per_file = self.num_ssd_blocks // self.num_ssd_files
+        if self.num_ssd_blocks_per_file % self.round_robin != 0:
+            raise ValueError(f"num_ssd_blocks_per_file {self.num_ssd_blocks_per_file} "
+                             f"is not divisible by round_robin {self.round_robin}")
 
         self.block_size = cpu_kv_layout.kv_shape[3:].numel()
         self.dtype = dtype
@@ -395,12 +406,14 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         self.ssd_layer_stride_in_bytes = (
             self.num_ssd_blocks * self.block_size * self.dtype.itemsize * 2
         )
+        self.ssd_layer_stride_in_bytes_per_file = self.ssd_layer_stride_in_bytes // self.num_ssd_files
         self.cpu_kv_stride_in_bytes = (
             self.num_cpu_blocks * self.block_size * self.dtype.itemsize
         )
         self.ssd_kv_stride_in_bytes = (
             self.num_ssd_blocks * self.block_size * self.dtype.itemsize
         )
+        self.ssd_kv_stride_in_bytes_per_file = self.ssd_kv_stride_in_bytes // self.num_ssd_files
         self.ssd_block_stride_in_bytes = self.block_size * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = self.block_size * self.dtype.itemsize
 
@@ -443,19 +456,21 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
 
         transfer_kv_blocks_ssd(
-            filename=self.ssd_file,
+            filename_list=self.ssd_files,
             cpu_layer_id_list=layer_id_list,
             cpu_layer_ptrs_tensor=self.cpu_layer_ptrs,
             ssd_block_ids=ssd_block_id_list,
             cpu_block_ids=cpu_block_id_list,
             cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-            ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
+            ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes_per_file,
             ssd_block_stride_in_bytes=self.ssd_block_stride_in_bytes,
-            ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
+            ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes_per_file,
             block_size_in_bytes=self.chunk_size_in_bytes,
             total_layers=self.num_layers,
             is_read=(transfer_type == TransferType.DISK2H),
-            verbose=False
+            round_robin=self.round_robin,
+            use_mmap=False,  # TODO: fix bug when use mmap
+            num_threads_per_file=16,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp):
@@ -467,7 +482,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         else:
             cpu_block_ids = transfer_op.src_block_ids
             ssd_block_ids = transfer_op.dst_block_ids
-            transfer_op.transfer_type = TransferType.DISK2D
+            transfer_op.transfer_type = TransferType.H2DISK
         start_time = time.time()
         self._transfer_impl(
             cpu_block_ids,
