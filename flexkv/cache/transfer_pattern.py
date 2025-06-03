@@ -5,7 +5,28 @@ import torch
 from flexkv.common.transfer import DeviceType, TransferType
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferDescriptor, TransferIDAllocator
 
+def add_virtal_op_for_mutiple_task_end_ops(
+    graph: TransferOpGraph,
+    finished_ops_ids: List[int]
+)->Tuple[TransferOpGraph, List[int]]:
+    assert len(finished_ops_ids) > 0
+    if len(finished_ops_ids) == 1:
+        return graph, finished_ops_ids
+    else:
+        op = TransferOp(
+            transfer_op_id = TransferIDAllocator.allocate_op_id(),
+            transfer_graph_id = graph.transfer_graph_id,
+            transfer_type = TransferType.VIRTUAL,
+            layer_id = -1,
+            layer_granularity = -1,
+        )
+        graph.add_transfer_op(op)
+        for op_id in finished_ops_ids:
+            graph.add_dependency(op.transfer_op_id, op_id)
+        return graph, [op.transfer_op_id]
+
 def create_read_graph_cpu_storage(
+    graph_id: int,
     gpu_blocks: torch.Tensor,
     cpu_blocks: torch.Tensor,
     ssd_blocks: torch.Tensor,
@@ -24,9 +45,8 @@ def create_read_graph_cpu_storage(
     """
     assert len(gpu_blocks) == len(cpu_blocks)
     if graph is None:
-        graph = TransferOpGraph(TransferIDAllocator.allocate_graph_id())
-    if len(gpu_blocks) == 0:
-        return graph, []
+        graph = TransferOpGraph(graph_id)
+    assert len(gpu_blocks) > 0
     if len(ssd_blocks) == 0:
         op = TransferOp(
             transfer_op_id = TransferIDAllocator.allocate_op_id(),
@@ -47,6 +67,7 @@ def create_read_graph_cpu_storage(
         graph.add_transfer_op(op)
         return graph, [op.transfer_op_id]
     elif len(ssd_blocks) < len(cpu_blocks):
+        task_end_ops_ids = []
         if len(ssd_blocks) > 0:
             op1 = TransferOp(
                 transfer_op_id = TransferIDAllocator.allocate_op_id(),
@@ -82,6 +103,7 @@ def create_read_graph_cpu_storage(
             )
             graph.add_transfer_op(op2)
             graph.add_dependency(op2.transfer_op_id, op1.transfer_op_id)
+            task_end_ops_ids.append(op2.transfer_op_id)
         op3 = TransferOp(
             transfer_op_id = TransferIDAllocator.allocate_op_id(),
             transfer_graph_id = graph.transfer_graph_id,
@@ -99,7 +121,8 @@ def create_read_graph_cpu_storage(
             layer_granularity = layer_num
         )
         graph.add_transfer_op(op3)
-        return graph, [op2.transfer_op_id, op3.transfer_op_id]
+        task_end_ops_ids.append(op3.transfer_op_id)
+        return graph, task_end_ops_ids
     else:
         op1 = TransferOp(
             transfer_op_id = TransferIDAllocator.allocate_op_id(),
@@ -137,6 +160,7 @@ def create_read_graph_cpu_storage(
         return graph, [op2.transfer_op_id]
 
 def create_read_graph_cpu_ssd_remote(
+    graph_id: int,
     gpu_blocks: torch.Tensor,
     cpu_blocks: torch.Tensor,
     ssd_blocks: torch.Tensor,
@@ -152,15 +176,29 @@ def create_read_graph_cpu_ssd_remote(
         finished_ops_ids: List[int]: a list of transfer ops that can indicate
         the completion of each layer or each layer for each tp rank
     """
-    graph = TransferOpGraph(TransferIDAllocator.allocate_graph_id())
-    graph, finished_ops_ids = create_read_graph_cpu_storage(gpu_blocks=gpu_blocks[:-len(remote_blocks)],
-                                                            cpu_blocks=cpu_blocks[:-len(remote_blocks)],
-                                                            ssd_blocks=ssd_blocks[:-len(remote_blocks)],
+    graph = TransferOpGraph(graph_id)
+    finished_ops_ids = []
+    if len(remote_blocks) == 0:
+        graph, finished_ops_ids = create_read_graph_cpu_storage(graph_id=graph_id,
+                                                            gpu_blocks=gpu_blocks,
+                                                            cpu_blocks=cpu_blocks,
+                                                            ssd_blocks=ssd_blocks,
                                                             gpu_device_id=gpu_device_id,
                                                             layer_num=layer_num,
                                                             graph=graph)
-    if len(remote_blocks) == 0:
+        if len(finished_ops_ids) > 0:
+            graph, finished_ops_ids = add_virtal_op_for_mutiple_task_end_ops(graph, finished_ops_ids)
+        assert len(finished_ops_ids) > 0
         return graph, finished_ops_ids
+    else:
+        if len(remote_blocks) < len(gpu_blocks):
+            graph, finished_ops_ids = create_read_graph_cpu_storage(graph_id=graph_id,
+                                                                gpu_blocks=gpu_blocks[:-len(remote_blocks)],
+                                                                cpu_blocks=cpu_blocks[:-len(remote_blocks)],
+                                                                ssd_blocks=ssd_blocks[:-len(remote_blocks)],
+                                                                gpu_device_id=gpu_device_id,
+                                                                layer_num=layer_num,
+                                                                graph=graph)    
     op_r2h = TransferOp(
         transfer_op_id = TransferIDAllocator.allocate_op_id(),
         transfer_graph_id = graph.transfer_graph_id,
@@ -214,9 +252,12 @@ def create_read_graph_cpu_ssd_remote(
         graph.add_transfer_op(op_h2disk)
         graph.add_dependency(op_h2disk.transfer_op_id, op_r2h.transfer_op_id)
     finished_ops_ids.append(op_h2d.transfer_op_id)
+    if len(finished_ops_ids) > 0:
+        graph, finished_ops_ids = add_virtal_op_for_mutiple_task_end_ops(graph, finished_ops_ids)
     return graph, finished_ops_ids
 
 def create_write_graph_cpu_storage(
+    graph_id: int,
     gpu_blocks: torch.Tensor,
     cpu_blocks: torch.Tensor,
     ssd_blocks: torch.Tensor,
@@ -235,7 +276,7 @@ def create_write_graph_cpu_storage(
         the completion of each layer or each layer for each tp rank
     """
     if graph is None:
-        graph = TransferOpGraph(TransferIDAllocator.allocate_graph_id())
+        graph = TransferOpGraph(graph_id)
     op_d2h = TransferOp(
         transfer_op_id = TransferIDAllocator.allocate_op_id(),
         transfer_graph_id = graph.transfer_graph_id,
@@ -273,9 +314,10 @@ def create_write_graph_cpu_storage(
         )
         graph.add_transfer_op(op_h2disk)
         graph.add_dependency(op_h2disk.transfer_op_id, op_d2h.transfer_op_id)
-        return graph, [op_h2disk.transfer_op_id]
+        return graph, [op_d2h.transfer_op_id]
 
 def create_write_graph_cpu_ssd_remote(
+    graph_id: int,
     gpu_blocks: torch.Tensor,
     cpu_blocks: torch.Tensor,
     ssd_blocks: torch.Tensor,
@@ -290,7 +332,7 @@ def create_write_graph_cpu_ssd_remote(
         layer_wise_ops: List[int]: a list of transfer ops that can indicate
         the completion of each layer or each layer for each tp rank
     """
-    graph = TransferOpGraph(TransferIDAllocator.allocate_graph_id())
+    graph = TransferOpGraph(graph_id)
     op_d2h = TransferOp(
         transfer_op_id = TransferIDAllocator.allocate_op_id(),
         transfer_graph_id = graph.transfer_graph_id,
@@ -359,7 +401,8 @@ def convert_read_graph_to_layer_wise_graph(
     """
     assert layer_num % layer_granularity == 0
     num_splits = layer_num // layer_granularity
-    new_graph = TransferOpGraph(TransferIDAllocator.allocate_graph_id())
+    #reuse the graph id to assure that graph <-> request is one-to-one
+    new_graph = TransferOpGraph(transfer_graph.transfer_graph_id)
     # Map from original op id to a list of new op ids (length = num_splits)
     opid2splitopids = {}
     layer_wise_virtual_op_ids = []
@@ -384,24 +427,9 @@ def convert_read_graph_to_layer_wise_graph(
             split_op_ids.append(new_op.transfer_op_id)
         opid2splitopids[op_id] = split_op_ids
 
-    # add virtual ops that mark the finish of each layer
-    if len(finished_ops_ids) > 1:
-        for i in range(num_splits):
-            op = TransferOp(
-                transfer_op_id = TransferIDAllocator.allocate_op_id(),
-                transfer_graph_id = new_graph.transfer_graph_id,
-                transfer_type = TransferType.VIRTUAL,
-                layer_id = i * layer_granularity,
-                layer_granularity = layer_granularity,
-            )
-            new_graph.add_transfer_op(op)
-            layer_wise_virtual_op_ids.append(op.transfer_op_id)
-            # add dependencies between virtual ops and finished ops
-            for h2d_op in finished_ops_ids:
-                new_graph.add_dependency(op.transfer_op_id, opid2splitopids[h2d_op][i])
-    else:
-        for i in range(num_splits):
-            layer_wise_virtual_op_ids.append(opid2splitopids[finished_ops_ids[0]][i])
+    # add splited ops to the finished_ops_ids
+    for i in range(num_splits):
+        layer_wise_virtual_op_ids.append(opid2splitopids[finished_ops_ids[0]][i])
 
     # Copy dependency relationships (preserve original dependencies between ops)
     for op_id, op in transfer_graph._op_map.items():
@@ -414,6 +442,8 @@ def convert_read_graph_to_layer_wise_graph(
 
     # Add dependencies between split ops of the same original op (i.e., i-th depends on (i-1)-th)
     for op_id, split_op_ids in opid2splitopids.items():
+        if transfer_graph._op_map[op_id].transfer_type == TransferType.VIRTUAL:
+            continue
         for i in range(1, num_splits):
             new_graph.add_dependency(split_op_ids[i], split_op_ids[i - 1])
 

@@ -111,13 +111,14 @@ class GlobalCacheEngine:
             self.remote_cache_engine.reset()
 
     def get(self,
+            request_id: int,
             token_ids: torch.Tensor,
             token_mask: torch.Tensor,
             slot_mapping: torch.Tensor,
             layer_num: int = -1,
             layer_granularity: int = -1) -> Tuple[TransferOpGraph, torch.Tensor, Callable, List[int]]:
         if not self.cache_config.enable_remote and not self.cache_config.enable_ssd:
-            return self._get_only_cpu(token_ids, token_mask, slot_mapping, layer_num, layer_granularity)
+            return self._get_only_cpu(request_id, token_ids, token_mask, slot_mapping, layer_num, layer_granularity)
 
         self._check_input(token_ids, token_mask, slot_mapping)
 
@@ -226,20 +227,16 @@ class GlobalCacheEngine:
                                                             is_ready=False,
                                                             match_result=ssd_matched_result)
         self.ssd_cache_engine.lock_node(ssd_node_to_unlock)
-        if remote_enabled and len(remote_blocks_to_transfer) > 0:
-            transfer_graph, finished_ops_ids = create_read_graph_cpu_ssd_remote(gpu_blocks=gpu_blocks_to_transfer,
-                                                                                cpu_blocks=cpu_blocks_to_transfer,
-                                                                                ssd_blocks=ssd_blocks_to_transfer,
-                                                                                remote_blocks=remote_blocks_to_transfer,
-                                                                                gpu_device_id=0,
-                                                                                layer_num=layer_num,
-                                                                                write_back_to_ssd=write_ssd_blocks_from_remote)
-        else:
-            transfer_graph, finished_ops_ids = create_read_graph_cpu_storage(gpu_blocks=gpu_blocks_to_transfer,
+        if not (remote_enabled and len(remote_blocks_to_transfer) > 0):
+            remote_blocks_to_transfer = torch.tensor([])
+        transfer_graph, finished_ops_ids = create_read_graph_cpu_ssd_remote(graph_id=request_id,
+                                                                            gpu_blocks=gpu_blocks_to_transfer,
                                                                             cpu_blocks=cpu_blocks_to_transfer,
                                                                             ssd_blocks=ssd_blocks_to_transfer,
+                                                                            remote_blocks=remote_blocks_to_transfer,
                                                                             gpu_device_id=0,
-                                                                            layer_num=layer_num)
+                                                                            layer_num=layer_num,
+                                                                            write_back_to_ssd=write_ssd_blocks_from_remote)
 
         # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
         if layer_num // layer_granularity != 1:
@@ -266,12 +263,13 @@ class GlobalCacheEngine:
         return transfer_graph, return_mask, callback, finished_ops_ids
 
     def put(self,
+            request_id: int,
             token_ids: torch.Tensor,
             token_mask: torch.Tensor,
             slot_mapping: torch.Tensor,
             layer_num : int = -1) -> Tuple[TransferOpGraph, torch.Tensor, Callable, List[int]]:
         if not self.cache_config.enable_remote and not self.cache_config.enable_ssd:
-            return self._put_only_cpu(token_ids, token_mask, slot_mapping, layer_num)
+            return self._put_only_cpu(request_id, token_ids, token_mask, slot_mapping, layer_num)
 
         self._check_input(token_ids, token_mask, slot_mapping)
 
@@ -355,7 +353,8 @@ class GlobalCacheEngine:
                 extra_cpu_blocks = cpu_matched_result.physical_blocks[-extra_cpu_blocks_num:]
                 cpu_blocks_to_transfer = torch.cat([extra_cpu_blocks, cpu_blocks_to_transfer])
 
-        transfer_graph, finished_ops_ids = create_write_graph_cpu_ssd_remote(gpu_blocks=gpu_blocks_to_transfer,
+        transfer_graph, finished_ops_ids = create_write_graph_cpu_ssd_remote(graph_id=request_id,
+                                                                            gpu_blocks=gpu_blocks_to_transfer,
                                                                             cpu_blocks=cpu_blocks_to_transfer,
                                                                             ssd_blocks=ssd_blocks_to_transfer,
                                                                             remote_blocks=remote_blocks_to_transfer,
@@ -378,6 +377,7 @@ class GlobalCacheEngine:
         return transfer_graph, return_mask, callback, finished_ops_ids
 
     def _get_only_cpu(self,
+                      request_id: int,
                       token_ids: torch.Tensor,
                       token_mask: torch.Tensor,
                       slot_mapping: torch.Tensor,
@@ -424,7 +424,8 @@ class GlobalCacheEngine:
         # prepare cpu blocks to transfer
         self.cpu_cache_engine.lock_node(cpu_node_to_unlock)
 
-        transfer_graph, finished_ops_ids = create_read_graph_cpu_storage(gpu_blocks=gpu_blocks_to_transfer,
+        transfer_graph, finished_ops_ids = create_read_graph_cpu_storage(graph_id=request_id,
+                                                                         gpu_blocks=gpu_blocks_to_transfer,
                                                                          cpu_blocks=cpu_blocks_to_transfer,
                                                                          ssd_blocks=torch.tensor([]),
                                                                          gpu_device_id=0,
@@ -450,6 +451,7 @@ class GlobalCacheEngine:
         return transfer_graph, return_mask, callback, finished_ops_ids
 
     def _put_only_cpu(self,
+                      request_id: int,
                       token_ids: torch.Tensor,
                       token_mask: torch.Tensor,
                       slot_mapping: torch.Tensor,
@@ -491,7 +493,8 @@ class GlobalCacheEngine:
 
         self.cpu_cache_engine.lock_node(cpu_node_to_unlock)
 
-        transfer_graph, finished_ops_ids = create_write_graph_cpu_ssd_remote(gpu_blocks=gpu_blocks_to_transfer,
+        transfer_graph, finished_ops_ids = create_write_graph_cpu_ssd_remote(graph_id=request_id,
+                                                                            gpu_blocks=gpu_blocks_to_transfer,
                                                                             cpu_blocks=cpu_blocks_to_transfer,
                                                                             ssd_blocks=torch.tensor([]),
                                                                             remote_blocks=torch.tensor([]),

@@ -22,7 +22,7 @@ num_ssd_blocks = 256 if enable_remote else 512
 num_remote_blocks = 512
 
 # the ratio of gpu blocks to be written in the initial write
-initial_write_ratio = 0.5
+initial_write_ratio = 0.4
 
 num_requests = num_gpu_blocks // block_per_request
 
@@ -113,7 +113,7 @@ def test_kvmanager():
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
         )
-        kvmanager.wait(write_request)
+        kvmanager.wait_for_task_finished(write_request)
         # clear gpu blocks
         for i in range(num_layers):
             gpu_blocks[i][:, block_ids, :, :, :] = 0
@@ -145,19 +145,21 @@ def test_kvmanager():
         )
         running_put_requests.append(request_id)
         # to aviod that all seq are locked, and cannot eviction
-        if len(running_get_requests) + len(running_put_requests) >= num_cpu_blocks // block_per_request:
-            return_masks = kvmanager.wait(running_get_requests)
-            kvmanager.wait(running_put_requests)
-            for return_mask in return_masks.values():
-                total_cache_hit += return_mask.sum()
-                total_cache_miss += len(return_mask) - return_mask.sum()
+        if len(running_get_requests) + len(running_put_requests) >= num_cpu_blocks // block_per_request - 2:
+            if len(running_put_requests) > 0:
+                kvmanager.wait_for_task_finished(running_put_requests)
+            if len(running_get_requests) > 0:
+                return_masks = kvmanager.wait(running_get_requests)
+                for return_mask in return_masks.values():
+                    total_cache_hit += return_mask.sum()
+                    total_cache_miss += len(return_mask) - return_mask.sum()
             running_get_requests = []
             running_put_requests = []
     if len(running_get_requests) > 0:
         kvmanager.wait(running_get_requests)
         running_get_requests = []
     if len(running_put_requests) > 0:
-        kvmanager.wait(running_put_requests)
+        kvmanager.wait_for_task_finished(running_put_requests)
         running_put_requests = []
     print("mixed read/write done")
     end_time = time.time()
