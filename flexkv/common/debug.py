@@ -57,6 +57,20 @@ class DebugInfo:
 
 debuginfo = DebugInfo(os.getenv("FLEXKV_LOG_LEVEL", "INFO"))
 
+def init_logger(name: str, level = logging.INFO):
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+
+    formatter = logging.Formatter(fmt='[%(levelname)s] [%(asctime)s.%(msecs)03d] [%(filename)s:%(lineno)d] %(message)s',
+                                  datefmt="%m-%d %H:%M:%S")
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(console_handler)
+    return logger
+
 
 def debug_timing(name: Optional[str] = None):
     def decorator(func):

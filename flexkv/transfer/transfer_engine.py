@@ -10,7 +10,8 @@ import nvtx
 from .scheduler import TransferScheduler
 from .worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker
 from ..common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType
-from ..common.storage import AccessibleHandle
+from ..common.storage import AccessibleHandle, KVCacheLayout
+from flexkv.common.memory_handle import KVCacheTensorHandle
 
 from multiprocessing import Queue as MPQueue
 from ..common.debug import debuginfo
@@ -21,7 +22,8 @@ class TransferEngine:
         gpu_handles: List[AccessibleHandle],
         cpu_handle: AccessibleHandle,
         ssd_handle: Optional[AccessibleHandle] = None,
-        remote_handle: Optional[AccessibleHandle] = None):
+        remote_handle: Optional[AccessibleHandle] = None,
+        zmq_gpu_handles: Optional[List[List[KVCacheTensorHandle]]] = None):
         """
         Initialize transfer engine
 
@@ -41,19 +43,36 @@ class TransferEngine:
         self.op_id_to_nvtx_range = {}
 
         # Initialize workers
-        self.gpucpu_workers = [
-            GPUCPUTransferWorker.create_worker(
-                worker_id=i,
-                gpu_blocks=gpu_handles[i].data,
-                cpu_blocks=cpu_handle.data,
-                finished_ops_queue=self.finished_ops_queue,
-                gpu_kv_layout=gpu_handles[i].kv_layout,
-                cpu_kv_layout=cpu_handle.kv_layout,
-                dtype=gpu_handles[i].dtype,
-                gpu_device_id=gpu_handles[i].gpu_device_id,
-            )
-            for i in range(len(gpu_handles))
-        ]
+        # TODO: refactor
+        if zmq_gpu_handles is None:
+            self.gpucpu_workers = [
+                GPUCPUTransferWorker.create_worker(
+                    worker_id=i,
+                    gpu_blocks=gpu_handles[i].data,
+                    cpu_blocks=cpu_handle.data,
+                    finished_ops_queue=self.finished_ops_queue,
+                    gpu_kv_layout=gpu_handles[i].kv_layout,
+                    cpu_kv_layout=cpu_handle.kv_layout,
+                    dtype=gpu_handles[i].dtype,
+                    gpu_device_id=gpu_handles[i].gpu_device_id,
+                )
+                for i in range(len(gpu_handles))
+            ]
+        else:
+            self.gpucpu_workers = [
+                GPUCPUTransferWorker.create_worker(
+                    worker_id=i,
+                    gpu_blocks=None,
+                    cpu_blocks=cpu_handle.data,
+                    finished_ops_queue=self.finished_ops_queue,
+                    gpu_kv_layout=zmq_gpu_handles[i][0].kv_layout,
+                    cpu_kv_layout=cpu_handle.kv_layout,
+                    dtype=zmq_gpu_handles[i][0].dtype,
+                    gpu_device_id=zmq_gpu_handles[i][0].device_id,
+                    zmq_gpu_handle=zmq_gpu_handles[i],
+                )
+                for i in range(len(zmq_gpu_handles))
+            ]
 
         # Wait for GPU-CPU workers to initialize
         self.cpussd_read_worker = None

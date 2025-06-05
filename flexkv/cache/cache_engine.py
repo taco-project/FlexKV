@@ -16,6 +16,7 @@ from flexkv.cache.transfer_pattern import (
 )
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 
+
 class CacheEngine:
     def __init__(self,
                  device_type: DeviceType,

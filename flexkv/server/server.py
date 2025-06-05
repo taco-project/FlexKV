@@ -1,127 +1,287 @@
-from multiprocessing import Process, Queue, Pipe, Connection
-from threading import Thread
-from typing import Dict, List, Optional, Tuple
-import torch
-from dataclasses import dataclass
-from ..kvmanager import KVManager
-from ..common.memory_handle import CUDAIPCHandle
-from ..common.memory_handle import import_cuda_tensor
-@dataclass
-class ServerRequest:
-    client_id: int
-    request_id: int
-    request_type: str  # 'put' or 'get' 'wait' or 'register'
-    token_ids: Optional[torch.Tensor] = None
-    token_mask: Optional[torch.Tensor] = None
-    gpu_blocks: Optional[List[CUDAIPCHandle]] = None
-    gpu_physical_block_ids: Optional[torch.Tensor] = None
-    wait_request_ids: Optional[List[int]] = None
+from collections import deque
+import tempfile
 
-@dataclass
-class ServerResponse:
-    client_id: int
-    request_id: int
-    masks: Optional[List[torch.Tensor]] = None
-    success: bool = True
-    error_msg: str = ""
+import zmq
 
-class KVServer(Process):
-    def __init__(self, cpu_shape: Tuple[int, int, int, int, int, int], dtype: torch.dtype):
-        super().__init__()
-        self.request_queue = Queue()
-        self.client_pipes: Dict[int, Connection] = {}
-        self.client_counter = 0
-        self.kvmanager = KVManager(cpu_shape, dtype) #TODO correct initialization
-        self._running = True
+from flexkv.kvmanager import KVManager
+from flexkv.common.memory_handle import import_layer_tensor_handle
+from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.server.util import get_zmq_socket
+from flexkv.server.request import (
+    RegisterDPClientRequest,
+    RegisterTPClientRequest,
+    PutRequest,
+    GetRequest,
+    WaitRequest,
+    Response
+)
+from flexkv.common.debug import init_logger
 
-    def register_client(self) -> Tuple[int, Connection]:
-        """Register a new client and return client_id and connection"""
-        server_conn, client_conn = Pipe()
-        client_id = self.client_counter
-        self.client_pipes[client_id] = server_conn
-        self.client_counter += 1
-        return client_id, client_conn
+logger = init_logger(__name__)
 
-    def _poll_client_requests(self):
-        """Thread function to poll client connections for requests"""
-        while self._running:
-            # Check each client connection for new requests
-            for client_id, conn in self.client_pipes.items():
-                if conn.poll():  # Check if there's data available
-                    try:
-                        request = conn.recv()
-                        self.request_queue.put(request)
-                    except EOFError:
-                        # Handle client disconnect
-                        print(f"Client {client_id} disconnected")
-                        continue
+class TPClient:
+    def __init__(
+        self,
+        send_to_client: zmq.Socket,
+        tp_rank: int = 0,
+        device_id: int = 0,
+    ):
+        self.tp_rank = tp_rank
+        self.device_id = device_id
+        self.send_to_client = send_to_client
+        
 
-    def _handle_register_request(self, request: ServerRequest):
-        """Handle memory registration request"""
-        client_id = request.client_id
+class DPClient:
+    def __init__(
+        self,
+        client_id: int,
+        send_to_client: zmq.Socket,
+        tp_size: int = 1,
+    ):
+        self.client_id = client_id
+        self.tp_size = tp_size
+        self.tp_client_dict: dict[int, TPClient] = {}
+        
+        self.send_to_client = send_to_client
+        
+        self.is_ready: bool = False
+    
+    def register_tp_client(
+        self,
+        context: zmq.Context,
+        client_recv_port: str,
+        tp_rank: int = 0,
+        device_id: int = 0,
+    ):
+        if tp_rank in self.tp_client_dict:
+            logger.error(f"TP rank: {tp_rank} in DP client: {self.client_id} has already registered.")
+            raise
+        if tp_rank >= self.tp_size:
+            logger.error(f"TP rank: {tp_rank} is larger than TP size of DP client: {self.client_id}.")
+            raise
+        
+        send_to_client = get_zmq_socket(
+            context, zmq.PUSH, client_recv_port, False
+        )
+        
+        self.tp_client_dict[tp_rank] = TPClient(send_to_client, tp_rank, device_id)
 
-        shared_tensors = []
-        for handle in request.handles:
-            tensor = import_cuda_tensor(handle)
-            shared_tensors.append(tensor)
-        return shared_tensors
+        logger.info(f"TP rank: {tp_rank} in DP client: {self.client_id} registered successfully.")
 
+        if len(self.tp_client_dict) == self.tp_size:
+            self.is_ready = True
+            logger.info(f"All the TP clients in DP client: {self.client_id} has registered. "
+                        f"DP client: {self.client_id} is ready!")
+        
+
+class ClientManager:
+    def __init__(
+        self, 
+        max_num_dp_client: int = 1,
+    ):
+        assert max_num_dp_client == 1, f"currently only support dp=1"
+        self.free_client_ids = deque(range(max_num_dp_client))
+        self.client_dict: dict[int, DPClient] = {}
+        
+    def register_dp_client(
+        self,  
+        context: zmq.Context,
+        client_recv_port: str,
+        tp_size: int = 1,
+    ):
+        if len(self.free_client_ids) == 0:
+            logger.error(f"Client full. DP client registration failed.")
+            raise
+        client_id = self.free_client_ids.popleft()
+        send_to_client = get_zmq_socket(
+            context, zmq.PUSH, client_recv_port, False
+        )
+        
+        self.client_dict[client_id] = DPClient(
+            client_id=client_id,
+            tp_size=tp_size,
+            send_to_client=send_to_client,
+        )
+        logger.info(f"DP client {client_id} registered successfully")
+        
+        return client_id
+        
+    def register_tp_client(
+        self,
+        context: zmq.Context,
+        dp_client_id: int,
+        client_recv_port: str,
+        tp_rank: int,
+        device_id: int
+    ):
+        if dp_client_id not in self.client_dict:
+            logger.error(f"DP client: {dp_client_id} has not registered.")
+            raise
+        self.client_dict[dp_client_id].register_tp_client(
+            context, client_recv_port, tp_rank, device_id)
+        
+    def delete_dp_client(self, client_id: int):
+        if client_id not in self.client_dict:
+            logger.error(f"DP client: {client_id} dosen't exist. Delete failed.")
+            raise
+        self.client_dict.pop(client_id)
+        self.free_client_ids.appendleft(client_id)
+        logger.info(f"Delete DP client: {client_id} succeeded.")
+        
+    def get_zmq(self, dp_client_id: int, tp_rank: int = None) -> zmq.Socket:
+        dp_client = self.client_dict[dp_client_id]
+        if tp_rank is None:
+            return dp_client.send_to_client
+        else: 
+            return dp_client.tp_client_dict[tp_rank].send_to_client
+        
+    def is_dp_client_ready(self, dp_client_id: int) -> bool:
+        if dp_client_id in self.client_dict:
+            return self.client_dict[dp_client_id].is_ready
+        return False
+
+
+class KVServer:
+    def __init__(
+        self, 
+        model_config: ModelConfig, 
+        cache_config: CacheConfig,
+        server_recv_port: str = None
+    ):
+        
+        # Init inter-process communication
+        self.context = zmq.Context(2)
+        if server_recv_port == None:
+            server_recv_port = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        self.recv_from_client = get_zmq_socket(
+            self.context, zmq.PULL, server_recv_port, True)
+        
+        self.client_manager = ClientManager()
+        self.kvmanager = KVManager(model_config, cache_config) 
+    
+        self.req_counter = 0
+        
+        logger.info(f"Server Initialized! [Recv Port]: {server_recv_port}")
+        # self._running = True
+
+        
     def run(self):
         """Main server loop"""
-        # Start polling thread
-        polling_thread = Thread(target=self._poll_client_requests)
-        polling_thread.daemon = True  # Thread will exit when main process exits
-        polling_thread.start()
-
-        while self._running:
-            # Process pending requests
-            while not self.request_queue.empty():
-                request: ServerRequest = self.request_queue.get()
-
-                if request.request_type == 'register':
-                    shared_tensors = self._handle_register_request(request)
-                    self.kvmanager.register_device_memory(
-                        request.client_id, #also device id
-                        shared_tensors,
-                    ) #this is allowed to be blocking now
-                    response = ServerResponse(request.client_id, request.request_id)
-                    self.client_pipes[request.client_id].send(response)
-
-                elif request.request_type == 'put':
-                    self.kvmanager.put_async(
-                        request.client_id, # also device id
-                        request.request_id,
-                        request.token_ids,
-                        request.token_mask,
-                        request.gpu_physical_block_ids
+        
+        # TODO: handle error and return error response
+        # TODO: support check finish
+        while True:
+            try:
+                logger.info(f"start wait for req")
+                req = self.recv_from_client.recv_pyobj()
+                logger.info(f"recv req: {type(req)}")
+                
+                # register dp client 
+                if isinstance(req, RegisterDPClientRequest):
+                    self._verify_model_config(req.model_config)
+                    client_id = self.client_manager.register_dp_client(
+                        self.context, 
+                        req.client_recv_port, 
+                        req.model_config.tp_size
                     )
-                    #response = ServerResponse(request.client_id, request.request_id)
-
-                elif request.request_type == 'get':
-                    self.kvmanager.get_async(
-                        request.client_id, # also device id
-                        request.request_id,
-                        request.token_ids,
-                        request.token_mask,
-                        request.gpu_physical_block_ids
+                    response = Response(client_id)
+                    result_zmq = self.client_manager.get_zmq(client_id)
+                    result_zmq.send_pyobj(response)
+                    
+                    
+                elif isinstance(req, RegisterTPClientRequest):
+                    self.client_manager.register_tp_client(
+                        self.context, 
+                        req.dp_client_id, 
+                        req.client_recv_port, 
+                        req.tp_rank,
+                        req.device_id,
                     )
-                    #response = ServerResponse(request.client_id, request.request_id)
-                elif request.request_type == 'wait':
-                    #Note: to avoid blocking other clients, we use try_wait api here
-                    masks = self.kvmanager.try_wait(
-                        request.client_id, # also device id
-                        request.request_id,
-                        request.wait_request_ids
+                    
+                    # register GPU Memory
+                    self.kvmanager.add_single_gpu_blocks(req.handles, req.dp_client_id, req.tp_rank)
+                    
+                    response = Response(req.dp_client_id)
+                    result_zmq = self.client_manager.get_zmq(
+                        req.dp_client_id, req.tp_rank)
+                    result_zmq.send_pyobj(response)
+                    
+                        
+                elif isinstance(req, GetRequest):
+                    assert self.client_manager.is_dp_client_ready(req.dp_client_id)
+                    req_id = self.kvmanager.get_async(
+                        req.token_ids,
+                        req.slot_mapping,
+                        req.token_mask
                     )
-                    if masks is not None:
-                        response = ServerResponse(request.client_id, request.request_id, masks)
-                        self.client_pipes[request.client_id].send(response)
-                    else:
-                        self.request_queue.put(request)
+                    response = Response(req.dp_client_id, req_id)
+                    result_zmq = self.client_manager.get_zmq(
+                        req.dp_client_id)
+                    result_zmq.send_pyobj(response)
 
-    def shutdown(self):
-        """Shutdown the server"""
-        self._running = False
-        # Close all client connections
-        for conn in self.client_pipes.values():
-            conn.close()
+                elif isinstance(req, PutRequest):
+                    assert self.client_manager.is_dp_client_ready(req.dp_client_id)
+                    req_id = self.kvmanager.put_async(
+                        req.token_ids,
+                        req.slot_mapping,
+                        req.token_mask,
+                    )
+                    response = Response(req.dp_client_id, req_id)
+                    result_zmq = self.client_manager.get_zmq(
+                        req.dp_client_id)
+                    result_zmq.send_pyobj(response)
+                    
+                elif isinstance(req, WaitRequest):
+                    # TODO: support TP client wait
+                    # TODO: try_wait api? asyncio?
+                    masks = self.kvmanager.wait(
+                        req.wait_task_ids,
+                    )
+                    response = Response(req.dp_client_id, masks=masks)
+                    result_zmq = self.client_manager.get_zmq(
+                        req.dp_client_id)
+                    result_zmq.send_pyobj(response)
+                
+                else:
+                    raise TypeError(f"Unregonized RequestType: {type(req)}")
+                
+            except zmq.ZMQError as e:
+                logger.error(f"ZMQ Error: {e}", exc_info=True)
+            except Exception as e:
+                logger.error(f"Error: {e}", exc_info=True)
+                
+
+    def _verify_model_config(
+        self, 
+        model_config: ModelConfig) -> bool:
+        # TODO
+        return True
+    
+    def __del__(self):
+        self.kvmanager.shutdown()
+    
+if __name__ == "__main__":
+    num_layers = 32
+    num_kv_heads = 8
+    head_size = 128
+    num_cpu_blocks = 300
+    tp_size = 2
+    tokens_per_block = 4
+
+    model_config = ModelConfig(num_layers=num_layers,
+                                num_kv_heads=num_kv_heads,
+                                head_size=head_size,
+                                element_size=2,
+                                use_mla=False,
+                                tp_size=tp_size)
+
+    cache_config = CacheConfig(enable_cpu=True,
+                                enable_ssd=False,
+                                enable_remote=False,
+                                use_gds=False,
+                                use_pinned_memory=True,
+                                tokens_per_block=tokens_per_block,
+                                num_cpu_blocks=num_cpu_blocks,)
+    
+    kv_server = KVServer(model_config, cache_config)
+    kv_server.run()
