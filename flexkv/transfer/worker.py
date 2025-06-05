@@ -1,10 +1,10 @@
 from abc import ABC, abstractmethod
-from typing import List, Any
+from typing import List, Any, Dict
 import torch
 
 import threading
 from flexkv.common.transfer import TransferOp, TransferType, DeviceType, TransferDescriptor
-from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd
+from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd, transfer_kv_blocks_remote
 import time
 from threading import Thread
 import copy
@@ -21,6 +21,7 @@ import multiprocessing as mp
 from multiprocessing import Queue as MPQueue
 from queue import Empty
 import ctypes
+from flexkv import c_ext
 
 from flexkv.common.debug import init_logger 
 
@@ -489,7 +490,7 @@ class CPUSSDDiskTransferWorker(TransferWorker):
 
     def launch_transfer(self, transfer_op: WorkerTransferOp):
         #TODO remove this when remote worker is ready
-        if transfer_op.transfer_type == TransferType.DISK2H or transfer_op.transfer_type == TransferType.REMOTE2H:
+        if transfer_op.transfer_type == TransferType.DISK2H:
             cpu_block_ids = transfer_op.dst_block_ids
             ssd_block_ids = transfer_op.src_block_ids
             transfer_op.transfer_type = TransferType.DISK2H
@@ -516,6 +517,215 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         )
         debuginfo.info(
             f"ssd tranfer request: {transfer_op.transfer_op_id} finished "
+            f"request type is {transfer_op.transfer_type} "
+            f"transfer data size is {transfer_size} bytes "
+            f"transfer time is {end_time - start_time:.4f} s "
+            f"transfer bandwidth is "
+            f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+        )
+
+
+class CPURemoteTransferWorker(TransferWorker):
+    @classmethod
+    def create_worker(cls,
+                     worker_id: int,
+                     cpu_blocks: List[torch.Tensor],
+                     remote_file: List[str],
+                     finished_ops_queue: MPQueue,
+                     cpu_kv_layout: KVCacheLayout,
+                     remote_kv_layout: KVCacheLayout,
+                     dtype: torch.dtype,
+                     remote_config_custom: Dict[str, Any]):
+        transfer_queue = mp.Queue()
+        ready_event = mp.Event()
+
+        process = mp.Process(
+            target=cls._worker_process,
+            args=(worker_id, cpu_blocks, remote_file,
+                  transfer_queue, finished_ops_queue,
+                  cpu_kv_layout, remote_kv_layout, dtype, ready_event, remote_config_custom),
+            daemon=True
+        )
+        process.start()
+
+        return WorkerHandle(worker_id, transfer_queue, process, ready_event)
+
+    @classmethod
+    def _worker_process(cls,
+                       worker_id: int,
+                       cpu_blocks: List[torch.Tensor],
+                       remote_file: List[str],
+                       transfer_queue: MPQueue,
+                       finished_ops_queue: MPQueue,
+                       cpu_kv_layout: KVCacheLayout,
+                       remote_kv_layout: KVCacheLayout,
+                       dtype: torch.dtype,
+                       ready_event: Any, 
+                       remote_config_custom:  Dict[str, Any]):
+        worker = cls(worker_id, cpu_blocks, remote_file,
+                    transfer_queue, finished_ops_queue,
+                    cpu_kv_layout, remote_kv_layout, dtype, remote_config_custom)
+        ready_event.set()
+        worker.run()
+
+    def __init__(self,
+                 worker_id: int,
+                 cpu_blocks: List[torch.Tensor],
+                 remote_file: List[str],
+                 transfer_queue: MPQueue,
+                 finished_ops_queue: MPQueue,
+                 cpu_kv_layout: KVCacheLayout,
+                 remote_kv_layout: KVCacheLayout,
+                 dtype: torch.dtype,
+                 remote_config_custom: Dict[str, Any]):
+        super().__init__(worker_id, finished_ops_queue)
+        self.remote_files = remote_file
+        self.num_remote_files = len(remote_file)
+        self.transfer_queue = transfer_queue
+
+        self.num_layers = cpu_kv_layout.num_layer
+        self.num_cpu_blocks = cpu_kv_layout.num_block
+        self.num_remote_blocks = remote_kv_layout.num_block
+        self.round_robin = 1
+
+        if self.num_remote_blocks % self.num_remote_files != 0:
+            raise ValueError(f"num_remote_blocks {self.num_remote_blocks} "
+                             f"is not divisible by num_remote_files {self.num_remote_blocks}")
+        self.num_remote_blocks_per_file = self.num_remote_blocks // self.num_remote_files
+        if self.num_remote_blocks_per_file % self.round_robin != 0:
+            raise ValueError(f"num_remote_blocks_per_file {self.num_remote_blocks_per_file} "
+                             f"is not divisible by round_robin {self.round_robin}")
+
+        self.block_size = cpu_kv_layout.kv_shape[3:].numel()
+        self.dtype = dtype
+
+        self.cpu_blocks = cpu_blocks
+
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+
+        self.cpu_layer_stride_in_bytes = (
+            self.num_cpu_blocks * self.block_size * self.dtype.itemsize * 2
+        )
+        self.remote_layer_stride_in_bytes = (
+            self.num_remote_blocks * self.block_size * self.dtype.itemsize * 2
+        )
+        self.remote_layer_stride_in_bytes_per_file = self.remote_layer_stride_in_bytes // self.num_remote_files
+        self.cpu_kv_stride_in_bytes = (
+            self.num_cpu_blocks * self.block_size * self.dtype.itemsize
+        )
+        self.remote_kv_stride_in_bytes = (
+            self.num_remote_blocks * self.block_size * self.dtype.itemsize
+        )
+        self.remote_kv_stride_in_bytes_per_file = self.remote_kv_stride_in_bytes // self.num_remote_files
+        self.remote_block_stride_in_bytes = self.block_size * self.dtype.itemsize
+        self.cpu_block_stride_in_bytes = self.block_size * self.dtype.itemsize
+
+        self.chunk_size_in_bytes = self.block_size * self.dtype.itemsize
+        # 144115188075855883 only use int not c_types.u_int64
+        if not remote_config_custom:
+            raise RuntimeError("remote_config_custom is not provided")
+        pcfs_fsid = remote_config_custom.get("pcfs_fsid")
+        pcfs_port = remote_config_custom.get("pcfs_port")
+        pcfs_ip = remote_config_custom.get("pcfs_ip")
+        pcfs_parent_nodeid = remote_config_custom.get("pcfs_parent_nodeid")
+        if None in (pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid):
+            raise RuntimeError("Some required PCFS config fields are missing")
+        self.pcfs = c_ext.Pcfs(pcfs_fsid, pcfs_port, pcfs_ip, False, pcfs_parent_nodeid)
+        if not self.pcfs.init():
+            raise RuntimeError(f"PCFS init failed: fsid={pcfs_fsid}, ip={pcfs_ip}")
+        self.file_nodeid_list = []
+        for remote_file_single in remote_file:
+            nodeid = self.pcfs.lookup_or_create_file(
+            remote_file_single,
+            (self.remote_layer_stride_in_bytes_per_file * self.num_layers))
+            if nodeid == 0:
+                raise RuntimeError(f"lookup or create file failed for file: {remote_file_single}")
+            self.file_nodeid_list.append(nodeid)
+        
+        c_ext.set_pcfs_instance(self.pcfs)
+
+    def _transfer_impl(
+        self,
+        cpu_block_ids: np.ndarray,
+        remote_block_ids: np.ndarray,
+        transfer_type: TransferType,
+        layer_id: int = -1,
+        layer_granularity: int = -1,
+        non_blocking: bool = False,
+    ) -> None:
+        assert remote_block_ids.dtype == np.int64
+        assert cpu_block_ids.dtype == np.int64
+
+        if layer_id == -1:
+            layer_id = 0
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
+
+        # this means partial read hit cpu and other hit remote
+        # or partial write hit remote and none hit cpu
+        remote_block_id_list = torch.from_numpy(remote_block_ids).pin_memory().to(dtype=torch.int64)
+        cpu_block_id_list = torch.from_numpy(cpu_block_ids).pin_memory().to(dtype=torch.int64)
+        if len(remote_block_id_list) != len(cpu_block_id_list):
+            assert len(remote_block_id_list) < len(cpu_block_id_list)
+            cpu_block_id_list = cpu_block_ids[
+                -len(remote_block_id_list) :
+            ]
+            debuginfo.debug(
+                f"cpu block id num {len(cpu_block_id_list)} "
+                f"remote block id num {len(remote_block_id_list)}"
+            )
+
+        if len(remote_block_id_list) == 0:
+            return
+
+        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
+        transfer_kv_blocks_remote(
+            file_nodeid_list=self.file_nodeid_list,
+            cpu_layer_id_list=layer_id_list,
+            cpu_layer_ptrs_tensor=self.cpu_layer_ptrs,
+            remote_block_ids=remote_block_id_list,
+            cpu_block_ids=cpu_block_id_list,
+            cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
+            remote_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
+            remote_block_stride_in_bytes=self.remote_block_stride_in_bytes,
+            remote_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
+            block_size_in_bytes=self.chunk_size_in_bytes,
+            total_layers=self.num_layers,
+            is_read=(transfer_type == TransferType.REMOTE2H),
+            round_robin=self.round_robin,
+            use_mmap=False,  # TODO: fix bug when use mmap
+            num_threads_per_file=32,
+        )
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp):
+        #TODO remove this when remote worker is ready
+        if transfer_op.transfer_type == TransferType.REMOTE2H:
+            cpu_block_ids = transfer_op.dst_block_ids
+            remote_block_ids = transfer_op.src_block_ids
+            transfer_op.transfer_type = TransferType.REMOTE2H
+        else:
+            cpu_block_ids = transfer_op.src_block_ids
+            remote_block_ids = transfer_op.dst_block_ids
+            transfer_op.transfer_type = TransferType.H2REMOTE
+        start_time = time.time()
+        self._transfer_impl(
+            cpu_block_ids,
+            remote_block_ids,
+            transfer_op.transfer_type,
+            layer_id=transfer_op.layer_id,
+            layer_granularity=transfer_op.layer_granularity,
+            non_blocking=True,
+        )
+        end_time = time.time()
+        transfer_size = (
+            len(remote_block_ids)
+            * self.block_size
+            * self.dtype.itemsize
+            * 2
+            * self.num_layers
+        )
+        debuginfo.info(
+            f"remote tranfer request: {transfer_op.transfer_op_id} finished "
             f"request type is {transfer_op.transfer_type} "
             f"transfer data size is {transfer_size} bytes "
             f"transfer time is {end_time - start_time:.4f} s "

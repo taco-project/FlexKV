@@ -90,7 +90,13 @@ def test_kvmanager():
                                num_ssd_blocks=num_ssd_blocks,
                                num_remote_blocks=num_remote_blocks,
                                ssd_cache_path=["ssd_cache1", "ssd_cache2"],
-                               remote_cache_path=["remote_cache1"])
+                               remote_cache_path=["remote_cache1", "remote_cache2"],
+                               remote_config_custom={
+                                    "pcfs_fsid": "f_l91fz6",
+                                    "pcfs_port": 31,
+                                    "pcfs_ip": "172.21.16.177",
+                                    "pcfs_parent_nodeid": 144115188075855883
+                               })
     gpu_blocks = [torch.randn(2, num_gpu_blocks, tokens_per_block, num_kv_heads, head_size, dtype=torch.float16).cuda()
                   for _ in range(num_layers)]
     gpu_blocks_gt = [block.clone() for block in gpu_blocks]

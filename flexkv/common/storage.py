@@ -1,6 +1,6 @@
 from enum import Enum, auto
 from dataclasses import dataclass
-from typing import Union, List, Optional, Any
+from typing import Union, List, Optional, Any, Dict
 import torch
 from pathlib import Path
 
@@ -73,6 +73,7 @@ class AccessibleHandle:
     dtype: torch.dtype
     # Optional metadata
     gpu_device_id: Optional[int] = None
+    remote_config_custom: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_tensor(cls,
@@ -86,14 +87,16 @@ class AccessibleHandle:
             data=tensor_list,
             kv_layout=kv_layout,
             dtype=tensor_list[0].dtype,
-            gpu_device_id=gpu_device_id
+            gpu_device_id=gpu_device_id,
+            remote_config_custom=None
         )
 
     @classmethod
     def from_file(cls,
                   file_path: Union[str, Path, List[Union[str, Path]]],
                   kv_layout: KVCacheLayout,
-                  dtype: torch.dtype
+                  dtype: torch.dtype,
+                  remote_config_custom: Optional[Dict[str, Any]] = None
                   ) -> 'AccessibleHandle':
         if isinstance(file_path, (str, Path)):
             file_path_list = [str(file_path)]
@@ -104,5 +107,6 @@ class AccessibleHandle:
             data=file_path_list,
             kv_layout=kv_layout,
             dtype=dtype,
-            gpu_device_id=None
+            gpu_device_id=None,
+            remote_config_custom=remote_config_custom
         )

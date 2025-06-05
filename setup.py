@@ -22,11 +22,12 @@ cpp_extensions = [
             "csrc/transfer.cu",
             "csrc/hash.cpp",
             "csrc/transfer_ssd.cpp",
+            "csrc/pcfs/pcfs.cpp",
         ],
         library_dirs=[os.path.join(build_dir, "lib")],
         include_dirs=[os.path.join(build_dir, "include")],
         extra_compile_args={"nvcc": ["-O3"], "cxx": ["-std=c++17"]},
-        extra_link_args=["-lcuda", "-lxxhash"],
+        extra_link_args=["-lcuda", "-lxxhash", "-lhifs_client_sdk", "-lpthread", "-lrt"],
     ),
 ]
 
