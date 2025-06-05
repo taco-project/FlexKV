@@ -4,7 +4,7 @@ import torch
 
 import threading
 from flexkv.common.transfer import TransferOp, TransferType, DeviceType, TransferDescriptor
-from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd
+from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd, TPTransferThreadGroup
 try:
     from flexkv.c_ext import transfer_kv_blocks_remote
 except ImportError:
@@ -344,6 +344,165 @@ class GPUCPUTransferWorker(TransferWorker):
                 f"transfer bandwidth is "
                 f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
             )
+
+class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
+    @classmethod
+    def create_worker(cls,
+                     worker_id: int,
+                     gpu_blocks: List[List[torch.Tensor]],
+                     cpu_blocks: List[torch.Tensor],
+                     finished_ops_queue: MPQueue,
+                     gpu_kv_layout: KVCacheLayout,
+                     cpu_kv_layout: KVCacheLayout,
+                     dtype: torch.dtype,
+                     tp_group_size: int
+                     dp_group_id: int):
+        tranfer_queue = mp.Queue()
+        ready_event = mp.Event()
+
+        process = mp.Process(
+            target=cls._worker_process,
+            args=(worker_id, gpu_blocks, cpu_blocks,
+                  transfer_queue, finished_ops_queue,
+                  gpu_kv_layout, cpu_kv_layout, dtype, 
+                  tp_group_size, dp_group_id, ready_event),
+            daemon=True
+        )
+        process.start()
+
+        return WorkerHandle(worker_id, transfer_queue, process, ready_event)
+    
+    @classmethod
+    def _worker_process(cls,
+                        worker_id: int,
+                        gpu_blocks: List[List[torch.Tensor]],
+                        cpu_blocks: List[torch.Tensor],
+                        transfer_queue: MPQueue,
+                        finished_ops_queue: MPQueue,
+                        gpu_kv_layout: KVCacheLayout,
+                        cpu_kv_layout: KVCacheLayout,
+                        dtype: torch.dtype,
+                        tp_group_size: int,
+                        dp_group_id: int,
+                        ready_event: Any):
+        worker = cls(worker_id, gpu_blocks, cpu_blocks,
+                    transfer_queue, finished_ops_queue,
+                    gpu_kv_layout, cpu_kv_layout, dtype,
+                    tp_group_size, dp_group_id)
+        ready_event.set()
+        worker.run()
+
+    def __init__(self,
+                 worker_id: int,
+                 gpu_blocks: List[List[torch.Tensor]],
+                 cpu_blocks: List[torch.Tensor],
+                 transfer_queue: MPQueue,
+                 finished_ops_queue: MPQueue,
+                 gpu_kv_layout: KVCacheLayout,
+                 cpu_kv_layout: KVCacheLayout,
+                 dtype: torch.dtype, 
+                 tp_group_size: int, 
+                 dp_group_id: int):
+
+        super().__init__(worker_id, finished_ops_queue)
+
+        self.num_gpus = len(gpu_blocks)
+        self.tp_group_size = tp_group_size
+        self.dp_group_id = dp_group_id
+
+        for cpu_block in cpu_blocks:
+            cudaHostRegister(cpu_block)
+
+        self.transfer_queue = transfer_queue
+
+        self.num_layers = gpu_kv_layout.num_layer
+        self.num_gpu_blocks = gpu_kv_layout.num_block
+        self.num_cpu_blocks = cpu_kv_layout.num_block
+
+        self.cpu_block_size = cpu_kv_layout.kv_shape[3:].numel()
+        self.gpu_block_size = gpu_kv_layout.kv_shape[3:].numel()
+
+        #TODO
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+        self.gpu_layer_ptrs = self._get_layer_ptrs(gpu_blocks)
+
+        self.cpu_kv_stride_in_bytes = (
+            self.num_cpu_blocks * self.cpu_block_size * self.dtype.itemsize
+        )
+        self.gpu_kv_stride_in_bytes = (
+            self.num_gpu_blocks * self.gpu_block_size * self.dtype.itemsize
+        )
+        self.gpu_block_stride_in_bytes = self.gpu_block_size * self.dtype.itemsize
+        self.cpu_block_stride_in_bytes = self.cpu_block_size * self.dtype.itemsize
+
+        self.cpu_chunk_size_in_bytes = self.cpu_block_size * self.dtype.itemsize
+        self.gpu_chunk_size_in_bytes = self.gpu_block_size * self.dtype.itemsize
+        
+        self.transfer_sms = 4
+        #TODO
+        self.transfer_stream = torch.cuda.Stream()
+
+        self.tp_group_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, gpu_blocks)
+
+    def _transfer_impl(self,
+                       gpu_block_ids: np.ndarray,
+                       cpu_block_ids: np.ndarray,
+                       transfer_type: TransferType,
+                       layer_id: int = -1,
+                       layer_granularity: int = -1,
+                       non_blocking: bool = False,
+                       use_ce_transfer: bool = False,
+                       )->None:
+        if layer_id == -1:
+            layer_id = 0
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
+            
+        gpu_block_id_list = torch.from_numpy(gpu_block_ids).to(dtype=torch.int64).pin_memory()
+        cpu_block_id_list = torch.from_numpy(cpu_block_ids).to(dtype=torch.int64).pin_memory()
+
+        assert len(gpu_block_id_list) == len(cpu_block_id_list)
+
+        if len(gpu_block_id_list) == 0:
+            return
+
+        #TODO prepare other necessary parameters
+
+        if transfer_type == TransferType.H2D:
+            self.cpp_thread_group.tp_group_transfer(
+                gpu_block_id_list,
+                self.gpu_kv_stride_in_bytes,
+                self.gpu_block_stride_in_bytes,
+                self.gpu_chunk_size_in_bytes,
+                cpu_block_id_list,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.cpu_chunk_size_in_bytes,
+                self.transfer_sms,
+                True,
+                use_ce_transfer,
+                layer_id,
+                layer_granularity,
+            )
+        elif transfer_type == TransferType.D2H:
+            self.cpp_thread_group.tp_group_transfer(
+                cpu_block_id_list,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.cpu_chunk_size_in_bytes,
+                gpu_block_id_list,
+                self.gpu_kv_stride_in_bytes,
+                self.gpu_block_stride_in_bytes,
+                self.gpu_chunk_size_in_bytes,
+                self.transfer_sms,
+                False,
+                use_ce_transfer,
+                layer_id,
+                layer_granularity,
+            )
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_type}")
+
 
 class CPUSSDDiskTransferWorker(TransferWorker):
     @classmethod

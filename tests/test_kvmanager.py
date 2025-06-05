@@ -10,6 +10,7 @@ head_size = 128
 element_size = 2
 use_mla = False
 tp_size = 1
+dp_size = 1
 tokens_per_block = 16
 enable_cpu = True
 enable_ssd = True
@@ -80,7 +81,8 @@ def test_kvmanager():
                                head_size=head_size,
                                element_size=element_size,
                                use_mla=use_mla,
-                               tp_size=tp_size)
+                               tp_size=tp_size,
+                               dp_size=dp_size)
     cache_config = CacheConfig(enable_cpu=True,
                                enable_ssd=True,
                                enable_remote=enable_remote,
@@ -98,10 +100,24 @@ def test_kvmanager():
                                     "pcfs_ip": "172.21.16.177",
                                     "pcfs_parent_nodeid": 144115188075855883
                                })
-    gpu_blocks = [torch.randn(2, num_gpu_blocks, tokens_per_block, num_kv_heads, head_size, dtype=torch.float16).cuda()
+    gpu_blocks = []
+    gpu_blocks_gt = []
+    for gpu_id in range(num_total_gpus):
+        device = torch.device(f"cuda:{gpu_id}")
+        # TODO here we set all the gou blocks as the same shape, need to be fixed as tp-shape
+        my_gpu_blocks = [torch.randn(2, 
+                                     num_gpu_blocks, 
+                                     tokens_per_block, 
+                                     num_kv_heads, 
+                                     head_size, 
+                                     dtype=torch.float16, 
+                                     device=device)
                   for _ in range(num_layers)]
-    gpu_blocks_gt = [block.clone() for block in gpu_blocks]
-    kvmanager = KVManager(model_config, cache_config, [gpu_blocks])
+        my_gpu_blocks_gt = [block.clone() for block in my_gpu_blocks]
+        gpu_blocks.append(my_gpu_blocks)
+        gpu_blocks_gt.append(my_gpu_blocks_gt)
+        
+    kvmanager = KVManager(model_config, cache_config, gpu_blocks)
 
     request_pairs = [generate_request_pair(i) for i in range(num_requests)]
 

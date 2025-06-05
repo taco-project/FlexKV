@@ -11,6 +11,7 @@ class ModelConfig:
     element_size: int
     use_mla: bool = False
     tp_size: int = 1
+    dp_size: int = 1
 
 @dataclass
 class CacheConfig:
