@@ -3,7 +3,7 @@ from enum import Enum
 from dataclasses import dataclass
 import torch
 
-from .allocator import CPUAllocator, GPUAllocator, SSDAllocator, StorageAllocator
+from .allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator, StorageAllocator
 from ..common.storage import AccessibleHandle, KVCacheLayout, KVCacheLayoutType
 from ..common.transfer import DeviceType
 from ..common.config import ModelConfig, CacheConfig
@@ -77,7 +77,8 @@ class StorageEngine:
                 device_type=DeviceType.REMOTE,
                 layout=self._remote_layout,
                 dtype=torch.float16,
-                file_path=self._cache_config.remote_cache_path
+                file_path=self._cache_config.remote_cache_path,
+                remote_config_custom = self._cache_config.remote_config_custom
             )
 
     def add_gpu_blocks(self, gpu_blocks: List[torch.Tensor], device_id: int = 0):
@@ -176,19 +177,22 @@ class StorageEngine:
         elif device_type == DeviceType.REMOTE:
             #TODO correct this as real remote file
             file_path = kwargs.get('file_path')
+            remote_config_custom = kwargs.get('remote_config_custom')
             if raw_data is not None:
-                allocator = SSDAllocator.from_raw_data(
+                allocator = RemoteAllocator.from_raw_data(
                     layout=layout,
                     dtype=dtype,
-                    file_path=raw_data
+                    file_path=raw_data,
+                    remote_config_custom=remote_config_custom
                 )
             else:
                 if not file_path:
                     raise ValueError("file_path is required for remote allocator")
-                allocator = SSDAllocator(
+                allocator = RemoteAllocator(
                     layout=layout,
                     dtype=dtype,
-                    file_path=file_path
+                    file_path=file_path,
+                    remote_config_custom=remote_config_custom
                 )
         else:
             raise ValueError(f"Unsupported device type: {device_type}")

@@ -8,7 +8,7 @@ import queue
 import torch
 import nvtx
 from .scheduler import TransferScheduler
-from .worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker
+from .worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker, CPURemoteTransferWorker
 from ..common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType
 from ..common.storage import AccessibleHandle, KVCacheLayout
 from flexkv.common.memory_handle import KVCacheTensorHandle
@@ -100,23 +100,25 @@ class TransferEngine:
             )
         # TODO replace with the cpu-remoteFileSystem transfer worker
         if remote_handle is not None:
-            self.remotecpu_read_worker = CPUSSDDiskTransferWorker.create_worker(
+            self.remotecpu_read_worker = CPURemoteTransferWorker.create_worker(
                 worker_id=20,
                 cpu_blocks=cpu_handle.data,
-                ssd_file=remote_handle.data,
+                remote_file=remote_handle.data,
                 finished_ops_queue=self.finished_ops_queue,
                 cpu_kv_layout=cpu_handle.kv_layout,
-                ssd_kv_layout=remote_handle.kv_layout,
+                remote_kv_layout=remote_handle.kv_layout,
                 dtype=cpu_handle.dtype,
+                remote_config_custom=remote_handle.remote_config_custom,
             )
-            self.remotecpu_write_worker = CPUSSDDiskTransferWorker.create_worker(
+            self.remotecpu_write_worker = CPURemoteTransferWorker.create_worker(
                 worker_id=21,
                 cpu_blocks=cpu_handle.data,
-                ssd_file=remote_handle.data,
+                remote_file=remote_handle.data,
                 finished_ops_queue=self.finished_ops_queue,
                 cpu_kv_layout=cpu_handle.kv_layout,
-                ssd_kv_layout=remote_handle.kv_layout,
+                remote_kv_layout=remote_handle.kv_layout,
                 dtype=cpu_handle.dtype,
+                remote_config_custom=remote_handle.remote_config_custom,
             )
         # Wait for all workers to ready
         for worker in self.gpucpu_workers:

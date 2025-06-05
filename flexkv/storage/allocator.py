@@ -1,9 +1,8 @@
 from abc import ABC, abstractmethod
 from flexkv.common.storage import AccessibleHandle, AccessHandleType, KVCacheLayout
 import torch
-from typing import Tuple, Optional, List, Union
+from typing import Tuple, Optional, List, Union, Dict, Any
 import numpy as np
-import time
 import os
 
 class StorageAllocator(ABC):
@@ -230,6 +229,70 @@ class SSDAllocator(StorageAllocator):
             layout=layout,
             dtype=dtype,
             file_path=file_path,
+        )
+        allocator._has_allocated = True
+        return allocator
+
+class RemoteAllocator(StorageAllocator):
+    def __init__(
+        self,
+        layout: KVCacheLayout,
+        dtype: torch.dtype,
+        file_path: Union[str, List[str]],
+        remote_config_custom: Dict[str, Any]
+    ):
+        if isinstance(file_path, str):
+            file_path = [file_path]
+        self.file_path = file_path
+        self.layout = layout
+        self.dtype = dtype
+        self.num_files = len(file_path)
+        self.remote_config_custom = remote_config_custom
+
+        self._has_allocated = False
+
+    @property
+    def total_size(self) -> int:
+        return self.layout.get_total_elements()
+
+    @property
+    def total_size_in_bytes(self) -> int:
+        return self.total_size * self.dtype.itemsize
+
+    def allocate(self):
+        if self._has_allocated:
+            return
+
+        self._has_allocated = True
+
+    def _init_file(self, file):
+        pass
+    
+    def free(self):
+        pass
+
+    def get_accessible_handle(self) -> AccessibleHandle:
+        if not self._has_allocated:
+            raise RuntimeError("Remote file is not allocated")
+        return AccessibleHandle(
+            handle_type=AccessHandleType.FILE,
+            data=self.file_path,
+            kv_layout=self.layout,
+            dtype=self.dtype,
+            remote_config_custom = self.remote_config_custom,
+        )
+
+    @classmethod
+    def from_raw_data(cls,
+        layout: KVCacheLayout,
+        dtype: torch.dtype,
+        file_path: Union[str, List[str]],
+        remote_config_custom: Dict[str, Any]) -> 'RemoteAllocator':
+        allocator = cls(
+            layout=layout,
+            dtype=dtype,
+            file_path=file_path,
+            remote_config_custom = remote_config_custom,
         )
         allocator._has_allocated = True
         return allocator

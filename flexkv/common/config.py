@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Dict, Any
 from enum import Enum
 import torch
 
@@ -29,3 +29,4 @@ class CacheConfig:
     num_remote_blocks: int = 10000000
     ssd_cache_path: Optional[Union[str, List[str]]] = None
     remote_cache_path: Optional[Union[str, List[str]]] = None
+    remote_config_custom: Optional[Dict[str, Any]] = None

@@ -14,6 +14,7 @@
 #include "ipc_memhandle.h"
 #include "transfer.cuh"
 #include "transfer_ssd.h"
+#include "pcfs/pcfs.h"
 
 namespace py = pybind11;
 
@@ -75,6 +76,32 @@ void transfer_kv_blocks_ssd_binding(
       total_layers, is_read, round_robin, use_mmap, num_threads_per_file);
 }
 
+void transfer_kv_blocks_remote(
+    const py::list &file_nodeid_list, const torch::Tensor &cpu_layer_id_list,
+    const torch::Tensor &cpu_layer_ptrs_tensor,
+    const torch::Tensor &remote_block_ids, const torch::Tensor &cpu_block_ids,
+    int64_t cpu_kv_stride_in_bytes, int64_t remote_layer_stride_in_bytes,
+    int64_t remote_block_stride_in_bytes, int64_t remote_kv_stride_in_bytes,
+    int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
+    int round_robin, bool use_mmap = false, int num_threads_per_file = 8) {
+  TORCH_CHECK(cpu_layer_ptrs_tensor.dtype() == torch::kInt64,
+              "cpu_layer_ptrs must be int64");
+  TORCH_CHECK(remote_block_ids.dtype() == torch::kInt64,
+              "remote_block_ids must be int64");
+  TORCH_CHECK(cpu_block_ids.dtype() == torch::kInt64,
+              "cpu_block_ids must be int64");
+  std::vector<std::uint64_t> file_nodeids;
+  for (const auto &file_nodeid : file_nodeid_list) {
+    file_nodeids.push_back(file_nodeid.cast<std::uint64_t>());
+  }
+  flexkv::transfer_kv_blocks_cfs_mmap_multi_thread(
+      file_nodeids, cpu_layer_id_list, cpu_layer_ptrs_tensor, remote_block_ids,
+      cpu_block_ids, cpu_kv_stride_in_bytes, remote_layer_stride_in_bytes,
+      remote_block_stride_in_bytes, remote_kv_stride_in_bytes, block_size_in_bytes,
+      total_layers, is_read, round_robin, use_mmap, num_threads_per_file);
+
+}
+
 PYBIND11_MODULE(c_ext, m) {
   m.def("transfer_kv_layers", &transfer_kv_layers_binding,
         "Transfer multi-layer KV-cache between CPU and GPU");
@@ -88,6 +115,15 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("block_size_in_bytes"), py::arg("total_layers"),
         py::arg("is_read"), py::arg("round_robin"), py::arg("use_mmap") = false,
         py::arg("num_threads_per_file") = 8);
+  m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
+        "Transfer KV blocks between remote and CPU memory", py::arg("file_nodeid_list"),
+        py::arg("cpu_layer_id_list"), py::arg("cpu_layer_ptrs_tensor"),
+        py::arg("remote_block_ids"), py::arg("cpu_block_ids"),
+        py::arg("cpu_kv_stride_in_bytes"), py::arg("remote_layer_stride_in_bytes"),
+        py::arg("remote_block_stride_in_bytes"), py::arg("remote_kv_stride_in_bytes"),
+        py::arg("block_size_in_bytes"), py::arg("total_layers"),
+        py::arg("is_read"), py::arg("round_robin"), py::arg("use_mmap") = false,
+        py::arg("num_threads_per_file") = 16);
   m.def("export_handle", &export_memory_handle);
   m.def("import_handle", &import_memory_handle);
   m.def("get_hash_size", &flexkv::get_hash_size,
@@ -108,4 +144,27 @@ PYBIND11_MODULE(c_ext, m) {
            "Update the hasher with pointer and size", py::arg("input"),
            py::arg("size"))
       .def("digest", &flexkv::Hasher::digest, "Return the hash value");
+
+  py::class_<flexkv::Pcfs>(m, "Pcfs")
+      .def(py::init<const std::string&, uint32_t, const std::string&, bool, const uint64_t>())
+      .def("init", &flexkv::Pcfs::init)
+      .def("destroy", &flexkv::Pcfs::destroy)
+      .def("lookup_or_create_file", &flexkv::Pcfs::lookup_or_create_file,py::arg("filename"), py::arg("file_size"),py::call_guard<py::gil_scoped_release>())
+      .def("open", &flexkv::Pcfs::open)
+      .def("close", &flexkv::Pcfs::close)
+      .def("write", &flexkv::Pcfs::write)
+      .def("read", &flexkv::Pcfs::read);
+      // .def("mkdir", &flexkv::Pcfs::mkdir)
+      // .def("lookup", &flexkv::Pcfs::lookup);
+  m.def("set_pcfs_instance", &flexkv::set_pcfs_instance,
+        "Set the global Pcfs instance from a pointer",
+        py::arg("pcfs"));
+
+  m.def("call_pcfs_read", &flexkv::call_pcfs_read,
+        "Call Pcfs::read from C++",
+        py::arg("file_nodeid"), py::arg("offset"), py::arg("buffer"), py::arg("size"), py::arg("thread_id"));
+
+  m.def("call_pcfs_write", &flexkv::call_pcfs_write,
+        "Call Pcfs::write from C++",
+        py::arg("file_nodeid"), py::arg("offset"), py::arg("buffer"), py::arg("size"), py::arg("thread_id"));
 }
