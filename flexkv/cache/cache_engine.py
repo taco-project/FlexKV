@@ -144,6 +144,7 @@ class GlobalCacheEngine:
 
         cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
         remote_enabled = self.need_remote_cache(cpu_matched_result, ssd_matched_result, end_idx - start_idx)
+        remote_enabled = remote_enabled and self.cache_config.enable_remote
         if remote_enabled:
             #TODO: perhaps we need to lock the last node of remote cache engine
             # at the same time we match it in real remote cache engine

@@ -13,7 +13,7 @@ class StorageEngine:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-                 all_gpu_blocks: List[List[torch.Tensor]] = None):
+                 all_gpu_blocks: List[List[torch.Tensor]] = None): # TODO replace this with handles
         """Initialize storage engine"""
         self._allocators: Dict[Tuple[DeviceType, int], StorageAllocator] = {}
         self._model_config = model_config

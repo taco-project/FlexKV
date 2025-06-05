@@ -53,14 +53,19 @@ class KVManager:
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
         self.storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
         self.tp_size = model_config.tp_size
+
         self.gpu_handles = [None] * self.tp_size
         self._model_config = model_config
         self.transfer_engine = None
+        self.dp_size = model_config.tp_size
+        # TODO gpu_blocks need to be replaced with gpu handles
+
         if gpu_blocks is not None:
-            assert len(gpu_blocks) == self.tp_size
+            assert len(gpu_blocks) == self.tp_size * self.dp_size
             self.gpu_handles = [
+                # TODO this need to be adjusted to tp-dp
                 self.storage_engine.get_allocator_handle(DeviceType.GPU, i)
-                for i in range(self.tp_size)
+                for i in range(self.tp_size * self.dp_size)
             ]
             cpu_handle = self.storage_engine.get_allocator_handle(DeviceType.CPU) if cache_config.enable_cpu else None
             ssd_handle = self.storage_engine.get_allocator_handle(DeviceType.SSD) if cache_config.enable_ssd else None
