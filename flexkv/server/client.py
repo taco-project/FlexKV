@@ -1,110 +1,173 @@
-from multiprocessing import Queue, Connection
+from multiprocessing import Queue
+from multiprocessing.connection import Connection
 from queue import Queue as ThreadQueue
 from typing import Dict, List, Optional, Tuple
 import torch
-from .server import ServerRequest, ServerResponse
 import time
-from flexkv.common.memory_handle import export_cuda_tensor
+import tempfile
+import zmq
 
-class KVClient:
-    def __init__(self, server_connection: Connection, client_id: int):
-        self.conn = server_connection
-        self.client_id = client_id
-        self.request_counter = 0
-        self.pending_requests = ThreadQueue()  # Store pending requests
-        self.completed_results = ThreadQueue()  # Store completed results
 
-    def register_device_memory(self,
-                             gpu_blocks: List[torch.Tensor]):
-        """Register device memory with server"""
-        if not gpu_blocks or not gpu_blocks[0].is_cuda:
+from flexkv.common.memory_handle import export_layer_tensor_handle
+from flexkv.common.config import ModelConfig
+from flexkv.common.storage import KVCacheLayout
+from flexkv.server.util import get_zmq_socket
+from flexkv.server.request import (
+    RegisterDPClientRequest,
+    RegisterTPClientRequest,
+    PutRequest,
+    GetRequest,
+    WaitRequest,
+    Response
+)
+from flexkv.common.debug import init_logger
+
+logger = init_logger(__name__)
+
+
+class KVDPClient:
+    def __init__(
+        self,
+        server_recv_port: str,
+        model_config: ModelConfig,
+    ):
+        # Init inter-process communication
+        context = zmq.Context(2)
+        self.send_to_server = get_zmq_socket(
+            context, zmq.PUSH, server_recv_port, False
+        )
+        client_recv_port = f"ipc://{tempfile.NamedTemporaryFile(delete=True).name}"
+        self.recv_from_server = get_zmq_socket(
+            context, zmq.PULL, client_recv_port, True
+        )
+        
+        self.dp_client_id = self.register_to_server(model_config, client_recv_port)
+        
+        logger.info(f"KVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
+    
+    def register_to_server(
+        self,
+        model_config: ModelConfig,
+        client_recv_port: str,
+    ) -> int:
+        register_req = RegisterDPClientRequest(model_config, client_recv_port)
+        
+        self.send_to_server.send_pyobj(register_req)
+        # blocking
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.success:
+            logger.info(f"DP client registered successfully! DP client id: {response.dp_client_id}")
+            return response.dp_client_id
+        else:
+            logger.error(f"DP client registeration fialed: {response.error_msg}")
+            raise
+    
+    def put_async(
+        self,
+        token_ids: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        token_mask: Optional[torch.Tensor],
+    ) -> int:
+        req = PutRequest(self.dp_client_id, token_ids, slot_mapping, token_mask)
+        
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        
+        if response.success:
+            logger.info(f"put_async task: {response.task_id} created.")
+            return response.task_id
+        else:
+            logger.error(f"put_async task in DP {self.dp_client_id} create failed.")
+            return None
+    
+    def get_async(
+        self,
+        token_ids: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        token_mask: Optional[torch.Tensor],
+    ) -> int:
+        req = GetRequest(self.dp_client_id, token_ids, slot_mapping, token_mask)
+        
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        
+        if response.success:
+            logger.info(f"get_async task: {response.task_id} created.")
+            return response.task_id
+        else:
+            logger.error(f"get_async task in DP {self.dp_client_id} create failed.")
+            return None
+        
+    def wait(
+        self,
+        wait_task_ids: List[int],
+    ) -> Dict[int, torch.Tensor]:
+        req = WaitRequest(self.dp_client_id, None, wait_task_ids)
+        
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        
+        if response.success:
+            logger.info(f"wait tasks: {wait_task_ids} finished.")
+            return response.masks
+        else:
+            logger.error(f"wait tasks: {wait_task_ids} in DP {self.dp_client_id} failed.")
+            return None
+
+class KVTPClient:
+    def __init__(
+        self,
+        server_recv_port: str,
+        dp_client_id: int,
+        device_id: int,
+        tp_rank: int,
+    ):
+        # Init inter-process communication
+        context = zmq.Context(2)
+        self.send_to_server = get_zmq_socket(
+            context, zmq.PUSH, server_recv_port, False
+        )
+        self.client_recv_port = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        self.recv_from_server = get_zmq_socket(
+            context, zmq.PULL, self.client_recv_port, True
+        )
+        
+        self.dp_client_id = dp_client_id
+        self.device_id = device_id
+        self.tp_rank = tp_rank
+        
+        logger.info(f"KVTPClient {tp_rank} of KVDPClient {self.dp_client_id} Initialized!")
+    
+    def register_to_server(
+        self,
+        kv_caches: List[torch.Tensor],
+        kv_layout: KVCacheLayout,
+    ):
+        if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
 
-        device_id = gpu_blocks[0].device.index
         handles = []
+        for layer_id, tensor in enumerate(kv_caches):
+            if tensor.device.index != self.device_id:
+                raise ValueError(f"All tensors must be on specified device: {self.device_id}")
 
-        for tensor in gpu_blocks:
-            if tensor.device.index != device_id:
-                raise ValueError("All tensors must be on the same GPU")
-
-            handle = export_cuda_tensor(tensor)
+            handle = export_layer_tensor_handle(tensor, layer_id, kv_layout)
             handles.append(handle)
-
-        request = ServerRequest(
-            client_id=self.client_id,
-            request_id=self.request_counter,
-            request_type='register',
-            handles=handles
+        
+        register_req = RegisterTPClientRequest(
+            self.dp_client_id, 
+            self.tp_rank, 
+            self.device_id, 
+            self.client_recv_port,
+            handles
         )
-        self.request_counter += 1
-        self.conn.send(request)
-        return request.request_id
+        
+        self.send_to_server.send_pyobj(register_req)
+        # blocking
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.success:
+            logger.info(f"TP client of DP client {self.dp_client_id} registered successfully!")
+        else:
+            logger.error(f"TP client of DP client {self.dp_client_id} registeration fialed: {response.error_msg}")
+            raise
 
-
-    def put_async(self,
-                 token_ids: torch.Tensor,
-                 token_mask: Optional[torch.Tensor],
-                 gpu_physical_block_ids: torch.Tensor) -> int:
-        """Send put request to server"""
-        request = ServerRequest(
-            client_id=self.client_id,
-            request_id=self.request_counter,
-            request_type='put',
-            token_ids=token_ids,
-            token_mask=token_mask,
-            gpu_physical_block_ids=gpu_physical_block_ids
-        )
-        self.request_counter += 1
-        self.pending_requests.put(request.request_id)
-        self.conn.send(request)
-        return request.request_id
-
-    def get_async(self,
-                 token_ids: torch.Tensor,
-                 token_mask: Optional[torch.Tensor],
-                 gpu_physical_block_ids: torch.Tensor) -> int:
-        """Send get request to server"""
-        request = ServerRequest(
-            client_id=self.client_id,
-            request_id=self.request_counter,
-            request_type='get',
-            token_ids=token_ids,
-            token_mask=token_mask,
-            gpu_physical_block_ids=gpu_physical_block_ids
-        )
-        self.request_counter += 1
-        self.pending_requests.put(request.request_id)
-        self.conn.send(request)
-        return request.request_id
-
-    def _process_responses(self):
-        """Process any available responses from server"""
-        while self.conn.poll():  # Check if there are any messages
-            response: ServerResponse = self.conn.recv()
-            #results.append((response.request_id, response.mask))
-            self.pending_requests.remove(response.request_id)
-            self.completed_results.put(response)
-
-    def wait(self, request_ids: List[int]) -> List[torch.Tensor]:
-        """
-        Wait for the server to return the results of the requests
-        Returns a list of masks of those request_ids
-        Note: this is blocking
-        """
-        request = ServerRequest(
-            client_id=self.client_id,
-            request_id=self.request_counter,
-            request_type='wait',
-            wait_request_ids=request_ids
-        )
-        self.request_counter += 1
-        self.conn.send(request)
-        while True:
-            self._process_responses()
-            while not self.completed_results.empty():
-                response = self.completed_results.get()
-                if request.request_id == response.request_id:
-                    return response.masks
-                else:
-                    self.completed_results.put(response)
-            time.sleep(0.001)

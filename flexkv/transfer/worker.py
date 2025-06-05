@@ -16,16 +16,21 @@ import nvtx
 from flexkv.common.transfer import get_nvtx_default_color, get_nvtx_range_color
 from flexkv.common.debug import debuginfo
 from flexkv.common.storage import KVCacheLayout
+from flexkv.common.memory_handle import KVCacheTensorHandle, import_layer_tensor_handle
 import multiprocessing as mp
 from multiprocessing import Queue as MPQueue
 from queue import Empty
 import ctypes
 
+from flexkv.common.debug import init_logger 
+
+logger = init_logger(__name__)
+
 cudart = ctypes.CDLL('libcudart.so')
 
 mp.set_start_method('spawn', force=True)
 
-def cudaHostRegister(tensor):
+def cudaHostRegister(tensor: torch.Tensor):
     """Register a CPU tensor with CUDA for pinned memory access"""
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
@@ -33,7 +38,7 @@ def cudaHostRegister(tensor):
     if ret != 0:
         raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
 
-def cudaHostUnregister(tensor):
+def cudaHostUnregister(tensor: torch.Tensor):
     """Unregister a CPU tensor from CUDA for pinned memory access"""
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
@@ -139,7 +144,8 @@ class GPUCPUTransferWorker(TransferWorker):
                      gpu_kv_layout: KVCacheLayout,
                      cpu_kv_layout: KVCacheLayout,
                      dtype: torch.dtype,
-                     gpu_device_id: int = -1):
+                     gpu_device_id: int = -1,
+                     zmq_gpu_handle: list[KVCacheTensorHandle] = None):
         transfer_queue = mp.Queue()
         ready_event = mp.Event()
 
@@ -147,7 +153,8 @@ class GPUCPUTransferWorker(TransferWorker):
             target=cls._worker_process,
             args=(worker_id, gpu_blocks, cpu_blocks,
                   transfer_queue, finished_ops_queue,
-                  gpu_kv_layout, cpu_kv_layout, dtype, gpu_device_id, ready_event),
+                  gpu_kv_layout, cpu_kv_layout, dtype, 
+                  gpu_device_id, ready_event, zmq_gpu_handle),
             daemon=True
         )
         process.start()
@@ -165,14 +172,21 @@ class GPUCPUTransferWorker(TransferWorker):
                        cpu_kv_layout: KVCacheLayout,
                        dtype: torch.dtype,
                        gpu_device_id: int,
-                       ready_event: Any):
+                       ready_event: Any,
+                       zmq_gpu_handle: list[KVCacheTensorHandle]):
         # create worker in a new process
+        if zmq_gpu_handle is not None:
+            gpu_blocks = []
+            for layer_handle in zmq_gpu_handle:
+                tensor, layer_id = import_layer_tensor_handle(layer_handle)
+                gpu_blocks.append(tensor)
         worker = cls(worker_id, gpu_blocks, cpu_blocks,
                     transfer_queue, finished_ops_queue,
                     gpu_kv_layout, cpu_kv_layout, dtype,
                     gpu_device_id)
         ready_event.set()
         worker.run()
+        
 
     def __init__(self,
                  worker_id: int,

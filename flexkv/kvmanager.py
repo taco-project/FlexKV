@@ -10,11 +10,12 @@ from dataclasses import dataclass
 from typing import Dict
 
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.cache.cache_engine import GlobalCacheEngine
+from flexkv.cache.cache_engine import GlobalCacheEngine, TransferOpGraph
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.common.transfer import DeviceType, get_nvtx_range_color, get_nvtx_default_color
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
+from flexkv.common.memory_handle import KVCacheTensorHandle
 
 @dataclass
 class TaskDescriptor:
@@ -37,11 +38,13 @@ class KVManager:
         if not cache_config.enable_cpu and not cache_config.use_gds:
             raise ValueError("use_gds must be True if enable_cpu is False")
 
+        self.cache_config = cache_config
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
         self.storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
         self.tp_size = model_config.tp_size
-        self.gpu_handles = []
+        self.gpu_handles = [None] * self.tp_size
         self._model_config = model_config
+        self.transfer_engine = None
         if gpu_blocks is not None:
             assert len(gpu_blocks) == self.tp_size
             self.gpu_handles = [
@@ -57,14 +60,14 @@ class KVManager:
             )
             self.transfer_engine = TransferEngine(self.gpu_handles, cpu_handle, ssd_handle, remote_handle)
 
-        self.transfer_gid_to_task = {}
-        self.taskid_to_layerwise_ops = {}
+        self.transfer_gid_to_task: dict[int, TaskDescriptor] = {}
+        self.taskid_to_layerwise_ops: dict[int, tuple[TransferOpGraph, torch.Tensor, List[int]]] = {}
 
         self.taskid_to_nvtx_range = {}
         self.graphid_to_nvtx_range = {}
 
         self._task_id_counter = 0
-        self.task_queue = Queue()
+        self.task_queue: Queue[cacheEngineRequest] = Queue()
         self.finished_queue = Queue()
         self.finished_ops_queue = Queue()
         self.running = True
@@ -77,13 +80,16 @@ class KVManager:
     # the gpu_blocks of multiple gpus can be added post initialization.
     # the transfer engine will be initialized after we have all the intended gpu handles.
     # NOTE: this add function must be called in the order of device_id for now
-    def add_single_gpu_blocks(self, gpu_blocks: List[torch.Tensor], device_id: int = 0):
+    def add_single_gpu_blocks(
+        self, 
+        gpu_handle: List[KVCacheTensorHandle], 
+        dp_client_id: int = 0,
+        tp_rank: int = 0,
+    ):
         if self.transfer_engine is not None:
             raise ValueError("we have already get all gpu blocks")
-        self.storage_engine.add_single_gpu_blocks(gpu_blocks, device_id)
-        gpu_handle = self.storage_engine.get_allocator_handle(DeviceType.GPU, device_id)
-        self.gpu_handles.append(gpu_handle)
-        if len(self.gpu_handles) == self.tp_size:
+        self.gpu_handles[tp_rank] = gpu_handle
+        if None not in self.gpu_handles:
             cpu_handle = (
                 self.storage_engine.get_allocator_handle(DeviceType.CPU)
                 if self.cache_config.enable_cpu
@@ -99,14 +105,17 @@ class KVManager:
                 if self.cache_config.enable_remote
                 else None
             )
-            self.transfer_engine = TransferEngine(self.gpu_handles,
+            self.transfer_engine = TransferEngine(None,
                                                   cpu_handle,
                                                   ssd_handle,
-                                                  remote_handle)
+                                                  remote_handle,
+                                                  self.gpu_handles)
 
     def _worker_loop(self):
         while self.running:
             # deal with completed requests from the cache engine
+            while self.transfer_engine == None:
+                time.sleep(1)
             if not self.task_queue.empty():
                 request = self.task_queue.get()
                 if request is None:

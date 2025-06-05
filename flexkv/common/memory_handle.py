@@ -10,34 +10,37 @@ import torch
 import torch.multiprocessing.reductions as reductions
 
 # from flexkv.c_ext import export_handle, import_handle
+from flexkv.common.storage import KVCacheLayout
+from flexkv.common.debug import init_logger
+
+logger = init_logger(__name__)
 
 class KVCacheTensorHandle:
-    def __init__(self, rebuild_func: Callable, rebuild_args: List[Any], device_id: int, layer_id: int):
+    def __init__(
+        self, 
+        rebuild_func: Callable, 
+        rebuild_args: List[Any], 
+        device_id: int, 
+        layer_id: int,
+        dtype: torch.dtype,
+        kv_layout: KVCacheLayout
+    ):
         self.rebuild_func = rebuild_func
         self.rebuild_args = rebuild_args
         self.device_id = device_id
         self.layer_id = layer_id
-
-    def dumps(self) -> bytes:
-        tensor_desc = {
-            "rebuild_func": base64.b64encode(pickle.dumps(self.rebuild_func)).decode("ascii"),
-            "rebuild_args": base64.b64encode(pickle.dumps(self.rebuild_args)).decode("ascii"),
-            "device_id": self.device_id,
-            "layer_id": self.layer_id
-        }
-        return pickle.dumps(tensor_desc)
-
-    @classmethod
-    def loads(cls, tensor_desc_bytes: bytes) -> "KVCacheTensorHandle":
-        tensor_desc = pickle.loads(tensor_desc_bytes)
-        rebuild_func = pickle.loads(base64.b64decode(tensor_desc["rebuild_func"]))
-        rebuild_args = pickle.loads(base64.b64decode(tensor_desc["rebuild_args"]))
-        return KVCacheTensorHandle(rebuild_func, rebuild_args, tensor_desc["device_id"], tensor_desc["layer_id"])
+        self.dtype = dtype
+        self.kv_layout = kv_layout
+        
 
     def rebuild_tensor(self) -> torch.Tensor:
         return self.rebuild_func(*self.rebuild_args)
 
-def export_layer_tensor_handle(tensor: torch.Tensor, layer_id: int) -> bytes:
+def export_layer_tensor_handle(
+    tensor: torch.Tensor, 
+    layer_id: int, 
+    kv_layout: KVCacheLayout = None
+) -> KVCacheTensorHandle:
     if not tensor.is_cuda:
         raise ValueError("Invalid tensor: not a CUDA tensor")
     if not tensor.is_contiguous():
@@ -45,11 +48,11 @@ def export_layer_tensor_handle(tensor: torch.Tensor, layer_id: int) -> bytes:
 
     rebuild_func, rebuild_args = reductions.reduce_tensor(tensor)
 
-    return KVCacheTensorHandle(rebuild_func, rebuild_args, tensor.device.index, layer_id).dumps()
+    return KVCacheTensorHandle(rebuild_func, rebuild_args, tensor.device.index, layer_id, tensor.dtype, kv_layout)
 
-def import_layer_tensor_handle(tensor_desc_bytes: bytes) -> tuple[torch.Tensor, int]:
+def import_layer_tensor_handle(handle: KVCacheTensorHandle) -> tuple[torch.Tensor, int]:
     try:
-        handle = KVCacheTensorHandle.loads(tensor_desc_bytes)
+        # handle = KVCacheTensorHandle.loads(tensor_desc_bytes)
         tensor = handle.rebuild_tensor()
 
         if not tensor.is_cuda:
@@ -58,14 +61,14 @@ def import_layer_tensor_handle(tensor_desc_bytes: bytes) -> tuple[torch.Tensor, 
         return tensor, handle.layer_id
 
     except Exception as e:
-        print("Import tensor handle failed: %s", e)
+        logger.error("Import tensor handle failed: %s", e)
         return None, -1
 
 def _zmq_test_worker():
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
     socket.connect("tcp://127.0.0.1:5555")
-    handle = socket.recv()
+    handle = socket.recv_pyobj()
     tensor, layer_id = import_layer_tensor_handle(handle)
     tensor[:] = 1
     print(f"Process {os.getpid()}: layer {layer_id} tensor modified")
@@ -85,7 +88,7 @@ if __name__ == "__main__":
     process.start()
 
     time.sleep(1)
-    socket.send(handle)
+    socket.send_pyobj(handle)
 
     process.join()
     print(f"Process {os.getpid()}: layer {0}: {layer_tensor}")
