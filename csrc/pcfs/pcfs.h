@@ -18,7 +18,7 @@
 #include <unistd.h>
 
 #include <future>
-
+#ifdef FLEXKV_ENABLE_CFS
 #include "hifs-sdk-ops.h"
 
 namespace flexkv {
@@ -69,7 +69,7 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     int round_robin, bool use_mmap = false, int num_threads_per_file = 8);
 
 }  // namespace flexkv
-
+#endif
 
 
 

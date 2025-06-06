@@ -4,7 +4,12 @@ import torch
 
 import threading
 from flexkv.common.transfer import TransferOp, TransferType, DeviceType, TransferDescriptor
-from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd, transfer_kv_blocks_remote
+from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd
+try:
+    from flexkv.c_ext import transfer_kv_blocks_remote
+except ImportError:
+    transfer_kv_blocks_remote = None
+
 import time
 from threading import Thread
 import copy
@@ -578,6 +583,8 @@ class CPURemoteTransferWorker(TransferWorker):
                  remote_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  remote_config_custom: Dict[str, Any]):
+        if transfer_kv_blocks_remote is None:
+            raise RuntimeError("transfer_kv_blocks_remote not available, please build with FLEXKV_ENABLE_CFS=1")
         super().__init__(worker_id, finished_ops_queue)
         self.remote_files = remote_file
         self.num_remote_files = len(remote_file)

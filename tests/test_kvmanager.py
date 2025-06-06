@@ -14,10 +14,11 @@ tokens_per_block = 16
 enable_cpu = True
 enable_ssd = True
 block_per_request = 16
+enable_remote = False
 
 num_gpu_blocks = 512
 num_cpu_blocks = 128
-num_ssd_blocks = 256
+num_ssd_blocks = 256 if enable_remote else 512
 num_remote_blocks = 512
 
 # the ratio of gpu blocks to be written in the initial write
@@ -82,7 +83,7 @@ def test_kvmanager():
                                tp_size=tp_size)
     cache_config = CacheConfig(enable_cpu=True,
                                enable_ssd=True,
-                               enable_remote=True,
+                               enable_remote=enable_remote,
                                use_gds=False,
                                use_pinned_memory=True,
                                tokens_per_block=tokens_per_block,
