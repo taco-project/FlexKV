@@ -1,6 +1,6 @@
 // Pcfs.cpp
 #include "pcfs.h"
-#include "hifs-sdk-ops.h"  // including hifs headers
+
 #include <fcntl.h>
 #define INIT_IO_SIZE (1024*1024)
 #define MAX_PCFS_LINK_NUM 64 //read + write <= 128, pcfs limits

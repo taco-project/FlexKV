@@ -75,7 +75,7 @@ void transfer_kv_blocks_ssd_binding(
       ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, block_size_in_bytes,
       total_layers, is_read, round_robin, use_mmap, num_threads_per_file);
 }
-
+#ifdef FLEXKV_ENABLE_CFS
 void transfer_kv_blocks_remote(
     const py::list &file_nodeid_list, const torch::Tensor &cpu_layer_id_list,
     const torch::Tensor &cpu_layer_ptrs_tensor,
@@ -99,8 +99,8 @@ void transfer_kv_blocks_remote(
       cpu_block_ids, cpu_kv_stride_in_bytes, remote_layer_stride_in_bytes,
       remote_block_stride_in_bytes, remote_kv_stride_in_bytes, block_size_in_bytes,
       total_layers, is_read, round_robin, use_mmap, num_threads_per_file);
-
 }
+#endif
 
 PYBIND11_MODULE(c_ext, m) {
   m.def("transfer_kv_layers", &transfer_kv_layers_binding,
@@ -115,6 +115,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("block_size_in_bytes"), py::arg("total_layers"),
         py::arg("is_read"), py::arg("round_robin"), py::arg("use_mmap") = false,
         py::arg("num_threads_per_file") = 8);
+#ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
         "Transfer KV blocks between remote and CPU memory", py::arg("file_nodeid_list"),
         py::arg("cpu_layer_id_list"), py::arg("cpu_layer_ptrs_tensor"),
@@ -124,6 +125,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("block_size_in_bytes"), py::arg("total_layers"),
         py::arg("is_read"), py::arg("round_robin"), py::arg("use_mmap") = false,
         py::arg("num_threads_per_file") = 16);
+#endif
   m.def("export_handle", &export_memory_handle);
   m.def("import_handle", &import_memory_handle);
   m.def("get_hash_size", &flexkv::get_hash_size,
@@ -144,7 +146,7 @@ PYBIND11_MODULE(c_ext, m) {
            "Update the hasher with pointer and size", py::arg("input"),
            py::arg("size"))
       .def("digest", &flexkv::Hasher::digest, "Return the hash value");
-
+#ifdef FLEXKV_ENABLE_CFS
   py::class_<flexkv::Pcfs>(m, "Pcfs")
       .def(py::init<const std::string&, uint32_t, const std::string&, bool, const uint64_t>())
       .def("init", &flexkv::Pcfs::init)
@@ -167,4 +169,5 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("call_pcfs_write", &flexkv::call_pcfs_write,
         "Call Pcfs::write from C++",
         py::arg("file_nodeid"), py::arg("offset"), py::arg("buffer"), py::arg("size"), py::arg("thread_id"));
+#endif
 }

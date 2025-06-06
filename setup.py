@@ -13,21 +13,34 @@ debug = os.environ.get("FLEXKV_DEBUG") == "1"
 if debug:
     print("Running in debug mode - Cython compilation disabled")
 
+enable_cfs = os.environ.get("FLEXKV_ENABLE_CFS", "0") == "1"
+
 # Define C++ extensions
+cpp_sources = [
+    "csrc/bindings.cpp",
+    "csrc/transfer.cu",
+    "csrc/hash.cpp",
+    "csrc/transfer_ssd.cpp",
+]
+
+extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt"]
+extra_compile_args = ["-std=c++17"]
+include_dirs = [os.path.join(build_dir, "include")]
+
+if enable_cfs:
+    print("ENABLE_CFS = true: compiling and link cfs related content")
+    cpp_sources.append("csrc/pcfs/pcfs.cpp")
+    extra_link_args.append("-lhifs_client_sdk")
+    extra_compile_args.append("-DFLEXKV_ENABLE_CFS")
+
 cpp_extensions = [
     cpp_extension.CUDAExtension(
         name="flexkv.c_ext",
-        sources=[
-            "csrc/bindings.cpp",
-            "csrc/transfer.cu",
-            "csrc/hash.cpp",
-            "csrc/transfer_ssd.cpp",
-            "csrc/pcfs/pcfs.cpp",
-        ],
+        sources=cpp_sources,
         library_dirs=[os.path.join(build_dir, "lib")],
-        include_dirs=[os.path.join(build_dir, "include")],
-        extra_compile_args={"nvcc": ["-O3"], "cxx": ["-std=c++17"]},
-        extra_link_args=["-lcuda", "-lxxhash", "-lhifs_client_sdk", "-lpthread", "-lrt"],
+        include_dirs=include_dirs,
+        extra_compile_args={"nvcc": ["-O3"], "cxx": extra_compile_args},
+        extra_link_args=extra_link_args,
     ),
 ]
 
