@@ -136,20 +136,21 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("block_hashes"));
 
   py::class_<flexkv::TPTransferThreadGroup>(m, "TPTransferThreadGroup")
-      .def(py::init<int>())
+      .def(py::init<int, const std::vector<std::vector<torch::Tensor>>&, const std::vector<torch::Tensor>&, int>())
       .def("tp_group_transfer", &flexkv::TPTransferThreadGroup::tp_group_transfer,
             py::arg("dst_block_id_tensors"),
-            py::arg("dst_layer_ptrs_tensors"),
             py::arg("dst_kv_stride_in_bytes"),
             py::arg("dst_chunk_stride_in_bytes"),
+            py::arg("dst_chunk_size_in_bytes"),
             py::arg("src_block_id_tensors"),
-            py::arg("src_layer_ptrs_tensors"),
             py::arg("src_kv_stride_in_bytes"),
-            py::arg("src_chunk_stride_in_bytes"),
-            py::arg("chunk_size_in_bytes"),
+            py::arg("src_chunk_stride_in_bytes"), 
+            py::arg("src_chunk_size_in_bytes"),
             py::arg("transfer_sms"),
             py::arg("is_host_to_device"),
-            py::arg("use_ce_transfer"));
+            py::arg("use_ce_transfer"),
+            py::arg("layer_id"),
+            py::arg("layer_granularity"));
 
   // Add Hasher class binding
   py::class_<flexkv::Hasher>(m, "Hasher")

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from flexkv.common.storage import AccessibleHandle, AccessHandleType, KVCacheLayout
+from flexkv.common.storage import AccessibleHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
 import torch
 from typing import Tuple, Optional, List, Union, Dict, Any
 import numpy as np
@@ -86,12 +86,13 @@ class GPUAllocator(StorageAllocator):
 
     @classmethod
     def from_raw_data(cls,
-        data: List[torch.Tensor],
+        data: Union[List[torch.Tensor], List[KVCacheTensorHandle]],
         layout: KVCacheLayout,
+        dtype: torch.dtype,
         device_id: Optional[int] = None) -> 'GPUAllocator':
         allocator = cls(
             layout=layout,
-            dtype=data[0].dtype,
+            dtype=dtype,
             device_id=device_id,
             num_chunks=len(data),
         )

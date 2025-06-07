@@ -420,8 +420,7 @@ def convert_read_graph_to_layer_wise_graph(
                 layer_id=i * layer_granularity,
                 layer_granularity=layer_granularity,
                 # Inherit these fields directly
-                tp_rank=op.tp_rank,
-                tp_world_size=op.tp_world_size,
+                dp_id=op.dp_id,
             )
             new_graph.add_transfer_op(new_op)
             split_op_ids.append(new_op.transfer_op_id)

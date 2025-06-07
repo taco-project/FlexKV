@@ -34,8 +34,6 @@ logger = init_logger(__name__)
 
 cudart = ctypes.CDLL('libcudart.so')
 
-mp.set_start_method('spawn', force=True)
-
 def cudaHostRegister(tensor: torch.Tensor):
     """Register a CPU tensor with CUDA for pinned memory access"""
     ptr = tensor.data_ptr()
@@ -349,14 +347,15 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
     @classmethod
     def create_worker(cls,
                      worker_id: int,
-                     gpu_blocks: List[List[torch.Tensor]],
+                     gpu_blocks: Union[List[List[torch.Tensor]], List[List[KVCacheTensorHandle]]],
                      cpu_blocks: List[torch.Tensor],
                      finished_ops_queue: MPQueue,
                      gpu_kv_layout: KVCacheLayout,
                      cpu_kv_layout: KVCacheLayout,
                      dtype: torch.dtype,
-                     tp_group_size: int
-                     dp_group_id: int):
+                     tp_group_size: int,
+                     dp_group_id: int,
+                     from_raw_gpu_blocks: bool):
         tranfer_queue = mp.Queue()
         ready_event = mp.Event()
 
@@ -365,7 +364,8 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
             args=(worker_id, gpu_blocks, cpu_blocks,
                   transfer_queue, finished_ops_queue,
                   gpu_kv_layout, cpu_kv_layout, dtype, 
-                  tp_group_size, dp_group_id, ready_event),
+                  tp_group_size, dp_group_id, from_raw_gpu_blocks, 
+                  ready_event),
             daemon=True
         )
         process.start()
@@ -375,7 +375,7 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
     @classmethod
     def _worker_process(cls,
                         worker_id: int,
-                        gpu_blocks: List[List[torch.Tensor]],
+                        gpu_blocks: Union[List[List[torch.Tensor]], List[List[KVCacheTensorHandle]]],
                         cpu_blocks: List[torch.Tensor],
                         transfer_queue: MPQueue,
                         finished_ops_queue: MPQueue,
@@ -384,11 +384,26 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                         dtype: torch.dtype,
                         tp_group_size: int,
                         dp_group_id: int,
+                        from_raw_gpu_blocks: bool,
                         ready_event: Any):
-        worker = cls(worker_id, gpu_blocks, cpu_blocks,
+        assert len(gpu_blocks) == tp_group_size
+        # handles exported from other processes
+        if not from_raw_gpu_blocks:
+            imported_gpu_blocks = []
+            for handles_in_one_gpu in gpu_blocks:
+                blocks_in_one_gpu = []
+                for handle in handles_in_one_gpu:
+                    tensor, layer_id = import_layer_tensor_handle(handle)
+                    blocks_in_one_gpu.append(tensor)
+                imported_gpu_blocks.append(blocks_in_one_gpu)
+            gpu_blocks = imported_gpu_blocks
+        else: # raw gpu blocks
+            imported_gpu_blocks = gpu_blocks
+
+        worker = cls(worker_id, imported_gpu_blocks, cpu_blocks,
                     transfer_queue, finished_ops_queue,
                     gpu_kv_layout, cpu_kv_layout, dtype,
-                    tp_group_size, dp_group_id)
+                    tp_group_size, dp_group_id, from_raw_gpu_blocks)
         ready_event.set()
         worker.run()
 
@@ -402,7 +417,8 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype, 
                  tp_group_size: int, 
-                 dp_group_id: int):
+                 dp_group_id: int,
+                 from_raw_gpu_blocks: bool):
 
         super().__init__(worker_id, finished_ops_queue)
 
@@ -422,9 +438,8 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
         self.cpu_block_size = cpu_kv_layout.kv_shape[3:].numel()
         self.gpu_block_size = gpu_kv_layout.kv_shape[3:].numel()
 
-        #TODO
-        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
-        self.gpu_layer_ptrs = self._get_layer_ptrs(gpu_blocks)
+        #self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+        #self.gpu_layer_ptrs = self._get_layer_ptrs(gpu_blocks)
 
         self.cpu_kv_stride_in_bytes = (
             self.num_cpu_blocks * self.cpu_block_size * self.dtype.itemsize
@@ -439,10 +454,8 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
         self.gpu_chunk_size_in_bytes = self.gpu_block_size * self.dtype.itemsize
         
         self.transfer_sms = 4
-        #TODO
-        self.transfer_stream = torch.cuda.Stream()
 
-        self.tp_group_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, gpu_blocks)
+        self.tp_group_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, gpu_blocks, cpu_blocks,dp_group_id)
 
     def _transfer_impl(self,
                        gpu_block_ids: np.ndarray,

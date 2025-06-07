@@ -78,8 +78,7 @@ class TransferOp:
     # this will keep the full info
     successors: Set[int] = field(default_factory=set)
     status: TransferOpStatus = TransferOpStatus.PENDING
-    tp_rank: Optional[int] = None
-    tp_world_size: Optional[int] = None
+    dp_id: Optional[int] = None
 
 
 class TransferOpGraph:
@@ -159,6 +158,10 @@ class TransferOpGraph:
     @property
     def num_ops(self) -> int:
         return len(self._op_map)
+
+    def bind_to_dp_group(self, dp_id: int):
+        for op in self._op_map.values():
+            op.dp_id = dp_id
 
     def print_op_map(self):
         """Print transfer op graph in a visual format showing dependencies.

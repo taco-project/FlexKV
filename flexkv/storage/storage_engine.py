@@ -13,7 +13,7 @@ class StorageEngine:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-                 all_gpu_blocks: List[List[torch.Tensor]] = None): # TODO replace this with handles
+                 all_gpu_blocks: Union[Dict[int, List[torch.Tensor]], Dict[int, List[KVCacheTensorHandle]]] = None):
         """Initialize storage engine"""
         self._allocators: Dict[Tuple[DeviceType, int], StorageAllocator] = {}
         self._model_config = model_config
@@ -24,17 +24,9 @@ class StorageEngine:
             for i in range(len(all_gpu_blocks)):
                 self.add_gpu_blocks(all_gpu_blocks[i], i)
         if self._cache_config.enable_cpu:
-            if not self._cache_config.cpu_kv_layout == "layerwise":
+            if not self._cache_config.cpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
                 raise ValueError("Only layerwise layout is supported for CPU")
-            self._cpu_layout = KVCacheLayout(
-                type=KVCacheLayoutType(self._cache_config.cpu_kv_layout),
-                num_layer=self._model_config.num_layers,
-                num_block=self._cache_config.num_cpu_blocks,
-                tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads,
-                head_size=self._model_config.head_size,
-                is_mla=False
-            )
+            self._cpu_layout = self._cache_config.cpu_kv_layout
             self.allocate(
                 device_type=DeviceType.CPU,
                 layout=self._cpu_layout,
@@ -43,17 +35,9 @@ class StorageEngine:
                 num_chunks=self._model_config.num_layers
             )
         if self._cache_config.enable_ssd:
-            if not self._cache_config.ssd_kv_layout == "layerwise":
+            if not self._cache_config.ssd_kv_layout.type == KVCacheLayoutType.LAYERWISE:
                 raise ValueError("Only layerwise layout is supported for SSD")
-            self._ssd_layout = KVCacheLayout(
-                type=KVCacheLayoutType(self._cache_config.ssd_kv_layout),
-                num_layer=self._model_config.num_layers,
-                num_block=self._cache_config.num_ssd_blocks,
-                tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads,
-                head_size=self._model_config.head_size,
-                is_mla=False
-            )
+            self._ssd_layout = self._cache_config.ssd_kv_layout
             self.allocate(
                 device_type=DeviceType.SSD,
                 layout=self._ssd_layout,
@@ -61,18 +45,9 @@ class StorageEngine:
                 file_path=self._cache_config.ssd_cache_path
             )
         if self._cache_config.enable_remote:
-            if not self._cache_config.remote_kv_layout == "layerwise":
+            if not self._cache_config.remote_kv_layout.type == KVCacheLayoutType.LAYERWISE:
                 raise ValueError("Only layerwise layout is supported for remote")
-            self._remote_layout = KVCacheLayout(
-                type=KVCacheLayoutType(self._cache_config.remote_kv_layout),
-                num_layer=self._model_config.num_layers,
-                num_block=self._cache_config.num_remote_blocks,
-                tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads,
-                head_size=self._model_config.head_size,
-                is_mla=False
-            )
-            # TODO replace this with real remote file
+            self._remote_layout = self._cache_config.remote_kv_layout
             self.allocate(
                 device_type=DeviceType.REMOTE,
                 layout=self._remote_layout,
@@ -81,20 +56,9 @@ class StorageEngine:
                 remote_config_custom = self._cache_config.remote_config_custom
             )
 
-    def add_gpu_blocks(self, gpu_blocks: List[torch.Tensor], device_id: int = 0):
-        if not self._cache_config.gpu_kv_layout == "layerwise":
-            raise ValueError("Only layerwise layout is supported for GPU")
-        self.num_gpu_blocks = gpu_blocks[0].shape[1]
+    def add_gpu_blocks(self, gpu_blocks: Union[List[torch.Tensor], List[KVCacheTensorHandle]], device_id: int = 0):
         if self._gpu_layout is None:
-            self._gpu_layout = KVCacheLayout(
-                type=KVCacheLayoutType(self._cache_config.gpu_kv_layout),
-                num_layer=self._model_config.num_layers,
-                num_block=self.num_gpu_blocks,
-                tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads,
-                head_size=self._model_config.head_size,
-                is_mla=False
-            )
+            self._gpu_layout = self._cache_config.gpu_kv_layout
         self.allocate(
             device_type=DeviceType.GPU,
             layout=self._gpu_layout,
@@ -109,7 +73,7 @@ class StorageEngine:
                  dtype: torch.dtype,
                  num_chunks: int = 1,
                  device_id: int = 0,
-                 raw_data: Union[List[torch.Tensor], str] = None,
+                 raw_data: Union[List[torch.Tensor], List[KVCacheTensorHandle], str] = None,
                  **kwargs) -> bool:
         """
         Create and add an allocator for specified device
@@ -149,6 +113,7 @@ class StorageEngine:
                 allocator = GPUAllocator.from_raw_data(
                     data=raw_data,
                     layout=layout,
+                    dtype=dtype,
                     device_id=device_id
                 )
             else:

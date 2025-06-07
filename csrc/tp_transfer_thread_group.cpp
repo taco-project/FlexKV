@@ -5,7 +5,9 @@
 namespace flexkv {
 
 TPTransferThreadGroup::TPTransferThreadGroup(int num_gpus, 
-                                             const std::vector<std::vector<torch::Tensor>>& gpu_blocks)
+                                             const std::vector<std::vector<torch::Tensor>>& gpu_blocks,
+                                             const std::vector<torch::Tensor>& cpu_blocks,
+                                             int dp_group_id)
 {
     num_gpus_ = num_gpus;
     int num_layers = gpu_blocks[0].size(); 
@@ -15,24 +17,34 @@ TPTransferThreadGroup::TPTransferThreadGroup(int num_gpus,
             gpu_blocks_[i * num_layers + j] = gpu_blocks[i][j].data_ptr();
         }
     }
+    cudaMallocHost((void **)&cpu_blocks_, num_layers * sizeof(void*));
+    for(int j = 0; j < num_layers; ++j) {
+        cpu_blocks_[j] = cpu_blocks[j].data_ptr();
+    }
+    dp_group_id_ = dp_group_id;
+    streams_.resize(num_gpus_);
+    for(int i = 0; i < num_gpus_; i += 1) {
+        cudaSetDevice(dp_group_id * num_gpus_ + i);
+        cudaStreamCreate(&streams_[i]);
+    }
 }
 
 TPTransferThreadGroup::~TPTransferThreadGroup() {}
 
 void TPTransferThreadGroup::tp_group_transfer(
-    const std::vector<torch::Tensor>& dst_block_id_tensors,
-    const std::vector<int64_t>& dst_kv_stride_in_bytes,
-    const std::vector<int64_t>& dst_chunk_stride_in_bytes,
-    const std::vector<int64_t>& dst_chunk_size_in_bytes,
-    const std::vector<torch::Tensor>& src_block_id_tensors,
-    const std::vector<int64_t>& src_kv_stride_in_bytes,
-    const std::vector<int64_t>& src_chunk_stride_in_bytes,
-    const std::vector<int64_t>& src_chunk_size_in_bytes,
-    const std::vector<int>& transfer_sms,
-    const std::vector<bool>& is_host_to_device,
-    const std::vector<bool>& use_ce_transfer,
-    int layer_id,
-    int layer_granularity
+    const torch::Tensor& dst_block_id_tensors,
+    const int64_t dst_kv_stride_in_bytes,
+    const int64_t dst_chunk_stride_in_bytes,
+    const int64_t dst_chunk_size_in_bytes,
+    const torch::Tensor& src_block_id_tensors,
+    const int64_t src_kv_stride_in_bytes,
+    const int64_t src_chunk_stride_in_bytes,
+    const int64_t src_chunk_size_in_bytes,
+    const int transfer_sms,
+    const bool is_host_to_device,
+    const bool use_ce_transfer,
+    const int layer_id,
+    const int layer_granularity
 ) {
 
     std::atomic<bool> failed{false};
@@ -45,24 +57,28 @@ void TPTransferThreadGroup::tp_group_transfer(
             try {
                 int num_blocks = dst_block_id_tensors[i].numel();
                 int num_layers = layer_granularity;
-                // TODO 
+
                 int64_t* dst_block_ids = static_cast<int64_t*>(dst_block_id_tensors[i].data_ptr());
-                void** dst_layer_ptrs = static_cast<void**>(gpu_blocks_ + i * num_layers * sizeof(void*));
                 int64_t* src_block_ids = static_cast<int64_t*>(src_block_id_tensors[i].data_ptr());
-                void** src_layer_ptrs = static_cast<void**>(gpu_blocks_ + i * num_layers * sizeof(void*));
+                void** dst_layer_ptrs;
+                void** src_layer_ptrs;
+                if (is_host_to_device) {
+                    dst_layer_ptrs = static_cast<void**>(gpu_blocks_ + i * num_layers + layer_id);
+                    src_layer_ptrs = static_cast<void**>(cpu_blocks_ + layer_id);
+                } else {
+                    dst_layer_ptrs = static_cast<void**>(cpu_blocks_ + layer_id);
+                    src_layer_ptrs = static_cast<void**>(gpu_blocks_ + i * num_layers + layer_id);
+                }
 
-                // 设置当前线程的CUDA device
-                at::cuda::CUDAGuard device_guard(dst_block_id_tensors[i].device().index());
-
-                cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
+                at::cuda::CUDAGuard device_guard(dp_group_id_ * num_gpus_ + i);
+                // TODO use this just for test
                 flexkv::transfer_kv_layers(
-                    num_blocks, num_layers, dst_block_ids, dst_layer_ptrs,
-                    dst_kv_stride_in_bytes[i], dst_chunk_stride_in_bytes[i],
+                    num_blocks, layer_granularity, dst_block_ids, dst_layer_ptrs,
+                    dst_kv_stride_in_bytes, dst_chunk_stride_in_bytes,
                     src_block_ids, src_layer_ptrs,
-                    src_kv_stride_in_bytes[i], src_chunk_stride_in_bytes[i],
-                    chunk_size_in_bytes[i], stream, transfer_sms[i],
-                    is_host_to_device[i], use_ce_transfer[i]
+                    src_kv_stride_in_bytes, src_chunk_stride_in_bytes,
+                    chunk_size_in_bytes, stream, transfer_sms,
+                    is_host_to_device, use_ce_transfer
                 );
                 cudaError_t err = cudaGetLastError();
                 if (err != cudaSuccess) {
