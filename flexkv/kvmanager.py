@@ -8,6 +8,7 @@ import nvtx
 
 from dataclasses import dataclass
 from typing import Dict
+import multiprocessing as mp
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.cache.cache_engine import GlobalCacheEngine, TransferOpGraph
@@ -39,7 +40,9 @@ class KVManager:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-                 gpu_blocks: List[List[torch.Tensor]] = None):
+                 gpu_blocks: Dict[int, List[torch.Tensor]] = None):
+
+        mp.set_start_method('spawn', force=True)
         nvtx.push_range("Initialize kvmanager", color=get_nvtx_default_color())
 
         if not cache_config.enable_cpu:
@@ -50,32 +53,40 @@ class KVManager:
             raise ValueError("use_gds must be True if enable_cpu is False")
 
         self.cache_config = cache_config
+        self.model_config = model_config
+        self.gpu_num = 0
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
-        self.storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
-        self.tp_size = model_config.tp_size
 
-        self.gpu_handles = [None] * self.tp_size
-        self._model_config = model_config
-        self.transfer_engine = None
-        self.dp_size = model_config.tp_size
-        # TODO gpu_blocks need to be replaced with gpu handles
+        # Two initialization paths:
+        # 1) gpu_blocks are provided 
+        # 2) gpu_handles are provided
+        if gpu_blocks is None:
+            self.gpu_blocks = {}
+            self.transfer_engine = None
+            self.gpu_num = 0
+            return
 
-        if gpu_blocks is not None:
-            assert len(gpu_blocks) == self.tp_size * self.dp_size
-            self.gpu_handles = [
-                # TODO this need to be adjusted to tp-dp
-                self.storage_engine.get_allocator_handle(DeviceType.GPU, i)
-                for i in range(self.tp_size * self.dp_size)
-            ]
-            cpu_handle = self.storage_engine.get_allocator_handle(DeviceType.CPU) if cache_config.enable_cpu else None
-            ssd_handle = self.storage_engine.get_allocator_handle(DeviceType.SSD) if cache_config.enable_ssd else None
-            remote_handle = (
-                self.storage_engine.get_allocator_handle(DeviceType.REMOTE)
-                if cache_config.enable_remote
-                else None
-            )
-            self.transfer_engine = TransferEngine(self.gpu_handles, cpu_handle, ssd_handle, remote_handle)
+        self.gpu_num = len(gpu_blocks)
 
+        self._init_after_gpu_blocks_added(gpu_blocks)
+
+    # Note that for now only after all the gpu blocks are added, we can initialize the transfer engine
+    def _init_after_gpu_blocks_added(self, gpu_blocks: Dict[int, List[torch.Tensor]]):
+
+        assert len(gpu_blocks) == self.model_config.tp_size * self.model_config.dp_size
+        self.storage_engine = StorageEngine(self.model_config, self.cache_config, gpu_blocks)
+        self.gpu_handles = [
+            self.storage_engine.get_allocator_handle(DeviceType.GPU, i)
+            for i in range(self.model_config.tp_size * self.model_config.dp_size)
+        ]
+        cpu_handle = self.storage_engine.get_allocator_handle(DeviceType.CPU) if self.cache_config.enable_cpu else None
+        ssd_handle = self.storage_engine.get_allocator_handle(DeviceType.SSD) if self.cache_config.enable_ssd else None
+        remote_handle = (
+            self.storage_engine.get_allocator_handle(DeviceType.REMOTE)
+            if cache_config.enable_remote
+            else None
+        )
+        self.transfer_engine = TransferEngine(self.gpu_handles, self.cache_config, cpu_handle, ssd_handle, remote_handle)
 
         self.requests_tracker = DoubleBufferExpiringDict(expire_seconds=600)
 
@@ -94,43 +105,22 @@ class KVManager:
 
     # the gpu_blocks of multiple gpus can be added post initialization.
     # the transfer engine will be initialized after we have all the intended gpu handles.
-    # NOTE: this add function must be called in the order of device_id for now
     def add_single_gpu_blocks(
         self, 
-        gpu_handle: List[KVCacheTensorHandle], 
+        gpu_handle: Union[List[KVCacheTensorHandle], List[torch.Tensor]],
         dp_client_id: int = 0,
         tp_rank: int = 0,
     ):
         if self.transfer_engine is not None:
             raise ValueError("we have already get all gpu blocks")
-        self.gpu_handles[tp_rank] = gpu_handle
-        if None not in self.gpu_handles:
-            cpu_handle = (
-                self.storage_engine.get_allocator_handle(DeviceType.CPU)
-                if self.cache_config.enable_cpu
-                else None
-            )
-            ssd_handle = (
-                self.storage_engine.get_allocator_handle(DeviceType.SSD)
-                if self.cache_config.enable_ssd
-                else None
-            )
-            remote_handle = (
-                self.storage_engine.get_allocator_handle(DeviceType.REMOTE)
-                if self.cache_config.enable_remote
-                else None
-            )
-            self.transfer_engine = TransferEngine(None,
-                                                  cpu_handle,
-                                                  ssd_handle,
-                                                  remote_handle,
-                                                  self.gpu_handles)
+        self.gpu_blocks[tp_rank + dp_client_id * self.model_config.tp_size] = gpu_handle
+        self.gpu_num += 1
+        if self.gpu_num == self.model_config.tp_size * self.model_config.dp_size:
+            self._init_after_gpu_blocks_added(self.gpu_blocks)
 
     def _worker_loop(self):
         while self.running:
             # deal with completed requests from the cache engine
-            while self.transfer_engine == None:
-                time.sleep(1)
             if not self.task_queue.empty():
                 request = self.task_queue.get()
                 if request is None:
@@ -142,7 +132,7 @@ class KVManager:
                                                                                             request.token_ids,
                                                                                             request.token_mask,
                                                                                             request.slot_mapping,
-                                                                                            self._model_config.num_layers,
+                                                                                            self.model_config.num_layers,
                                                                                             request.layer_granularity)
                 elif request.request_type == cacheEngineRequestType.PUT:
                     nvtx.push_range(f"cache_engine.put request_id: {request.request_id}",
@@ -151,11 +141,12 @@ class KVManager:
                                                                                         request.token_ids,
                                                                                         request.token_mask,
                                                                                         request.slot_mapping,
-                                                                                        self._model_config.num_layers)
+                                                                                        self.model_config.num_layers)
                 else:
                     raise ValueError(f"Unknown request type: {request.request_type}")
+                graph.bind_to_dp_group(request.dp_id)
                 nvtx.pop_range()
-
+                #TODO deal with empty graphs
                 self.graphid_to_nvtx_range[graph.transfer_graph_id] = nvtx.start_range(
                                                                             f"request id: {request.request_id}, "
                                                                             f"graph id: {graph.transfer_graph_id}",
@@ -203,11 +194,12 @@ class KVManager:
                   token_ids: torch.Tensor,
                   slot_mapping: torch.Tensor,
                   token_mask: Optional[torch.Tensor] = None,
-                  layer_granularity: int = -1) -> int:
+                  layer_granularity: int = -1,
+                  dp_id: int = 0) -> int:
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
         if layer_granularity == -1:
-            layer_granularity = self._model_config.num_layers
+            layer_granularity = self.model_config.num_layers
         task_id = self._get_task_id()
         nvtx.mark(f"GET request_id: {task_id}")
         self.taskid_to_nvtx_range[task_id] = nvtx.start_range(f"GET request_id: {task_id}",
@@ -218,7 +210,8 @@ class KVManager:
             token_ids=token_ids,
             token_mask=token_mask,
             slot_mapping=slot_mapping,
-            layer_granularity=layer_granularity
+            layer_granularity=layer_granularity,
+            dp_id=dp_id
         ))
         self.requests_tracker[task_id] = RequestTracker(task_id=task_id,
                                                         task_type=cacheEngineRequestType.GET,
@@ -232,7 +225,8 @@ class KVManager:
     def put_async(self,
                   token_ids: torch.Tensor,
                   slot_mapping: torch.Tensor,
-                  token_mask: Optional[torch.Tensor] = None) -> int:
+                  token_mask: Optional[torch.Tensor] = None,
+                  dp_id: int = 0) -> int:
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
         task_id = self._get_task_id()
@@ -244,7 +238,8 @@ class KVManager:
             request_id=task_id,
             token_ids=token_ids,
             token_mask=token_mask,
-            slot_mapping=slot_mapping
+            slot_mapping=slot_mapping,
+            dp_id=dp_id
         ))
         self.requests_tracker[task_id] = RequestTracker(task_id=task_id,
                                                         task_type=cacheEngineRequestType.PUT,
