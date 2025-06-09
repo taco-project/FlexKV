@@ -256,8 +256,9 @@ class KVManager:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         num_completed_tasks = 0
+        num_tasks = len(task_ids)
         return_masks = {}
-        while num_completed_tasks < len(task_ids):
+        while num_completed_tasks < num_tasks:
             finished_task_ids = []
             for task_id in task_ids:
                 task_tracker = self.requests_tracker[task_id]
