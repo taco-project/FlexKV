@@ -56,6 +56,7 @@ class KVManager:
         self.model_config = model_config
         self.gpu_num = 0
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
+        self.running = False
 
         # Two initialization paths:
         # 1) gpu_blocks are provided 
@@ -67,7 +68,6 @@ class KVManager:
             return
 
         self.gpu_num = len(gpu_blocks)
-
         self._init_after_gpu_blocks_added(gpu_blocks)
 
     # Note that for now only after all the gpu blocks are added, we can initialize the transfer engine
@@ -83,10 +83,10 @@ class KVManager:
         ssd_handle = self.storage_engine.get_allocator_handle(DeviceType.SSD) if self.cache_config.enable_ssd else None
         remote_handle = (
             self.storage_engine.get_allocator_handle(DeviceType.REMOTE)
-            if cache_config.enable_remote
+            if self.cache_config.enable_remote
             else None
         )
-        self.transfer_engine = TransferEngine(self.gpu_handles, self.cache_config, cpu_handle, ssd_handle, remote_handle)
+        self.transfer_engine = TransferEngine(self.gpu_handles, self.model_config, self.cache_config, cpu_handle, ssd_handle, remote_handle)
 
         self.requests_tracker = DoubleBufferExpiringDict(expire_seconds=600)
 

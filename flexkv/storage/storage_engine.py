@@ -7,6 +7,7 @@ from .allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator
 from ..common.storage import AccessibleHandle, KVCacheLayout, KVCacheLayoutType
 from ..common.transfer import DeviceType
 from ..common.config import ModelConfig, CacheConfig
+from ..common.memory_handle import KVCacheTensorHandle
 
 
 class StorageEngine:

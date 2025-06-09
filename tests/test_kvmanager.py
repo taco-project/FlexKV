@@ -10,8 +10,8 @@ num_kv_heads = 32
 head_size = 128
 element_size = 2
 use_mla = False
-tp_size = 1
-dp_size = 1
+tp_size = 2
+dp_size = 2
 tokens_per_block = 16
 enable_cpu = True
 enable_ssd = True
@@ -29,6 +29,16 @@ default_kv_layout = KVCacheLayout(
     num_block=num_gpu_blocks, 
     tokens_per_block=tokens_per_block, 
     num_head=num_kv_heads, 
+    head_size=head_size,
+    is_mla=False
+)
+
+gpu_kv_layout = KVCacheLayout(
+    type=KVCacheLayoutType.LAYERWISE, 
+    num_layer=num_layers, 
+    num_block=num_gpu_blocks, 
+    tokens_per_block=tokens_per_block, 
+    num_head=num_kv_heads//tp_size, 
     head_size=head_size,
     is_mla=False
 )
@@ -64,6 +74,7 @@ def generate_request_pair(idx: int):
 
 def verify_data(gpu_blocks, dp_wise_gpu_blocks_gt):
     # traverse each dp group
+    head_per_tp = num_kv_heads // tp_size
     for dp_id in range(dp_size):
         gt = dp_wise_gpu_blocks_gt[dp_id]  # the ground truth of the dp group
         for tp_id in range(tp_size):
@@ -71,10 +82,15 @@ def verify_data(gpu_blocks, dp_wise_gpu_blocks_gt):
             gpu_tensors = gpu_blocks[global_gpu_id]
             for layer in range(num_layers):
                 gpu_tensor = gpu_tensors[layer].cpu()
-                gt_tensor = gt[layer]
-                if not torch.allclose(gpu_tensor, gt_tensor):
+                # extract the corresponding slice from ground truth
+                start_head = tp_id * head_per_tp
+                end_head = (tp_id + 1) * head_per_tp
+                gt_tensor_slice = gt[layer][:, :, :, start_head:end_head, :]
+                
+                if not torch.allclose(gpu_tensor, gt_tensor_slice):
                     print(f"Mismatch at dp_id={dp_id}, tp_id={tp_id}, global_gpu_id={global_gpu_id}, layer={layer}")
-                assert torch.allclose(gpu_tensor, gt_tensor), \
+                    print(f"GPU tensor shape: {gpu_tensor.shape}, GT slice shape: {gt_tensor_slice.shape}")
+                assert torch.allclose(gpu_tensor, gt_tensor_slice), \
                     f"Mismatch at dp_id={dp_id}, tp_id={tp_id}, global_gpu_id={global_gpu_id}, layer={layer}"
     print("verify done")
 
@@ -94,7 +110,7 @@ def test_kvmanager():
                                enable_cpu=True,
                                enable_ssd=True,
                                enable_remote=enable_remote,
-                               gpu_kv_layout=default_kv_layout,
+                               gpu_kv_layout=gpu_kv_layout,
                                cpu_kv_layout=default_kv_layout,
                                ssd_kv_layout=default_kv_layout,
                                remote_kv_layout=default_kv_layout,
@@ -115,18 +131,29 @@ def test_kvmanager():
     gpu_blocks = {}
     dp_wise_gpu_blocks_gt = []
     for dp_id in range(dp_size):
-        # generate tp group tensors
-        tp_group_tensors = [
+        # generate ground truth tensors with full head dimension
+        # shape: [2, num_blocks, tokens_per_block, num_head, head_size]
+        tp_group_tensors_gt = [
             torch.randn(size=default_kv_layout.get_kv_shape()[1:], dtype=torch.float16)
             for _ in range(num_layers)
         ]
-        # backup ground truth
-        tp_group_tensors_gt = [t.clone() for t in tp_group_tensors]
+        
+        # split tensors across TP ranks in head dimension
+        head_per_tp = num_kv_heads // tp_size
         for tp_id in range(tp_size):
             global_gpu_id = dp_id * tp_size + tp_id
             device = torch.device(f"cuda:{global_gpu_id}")
-            # put tensor to the corresponding GPU
-            gpu_blocks[global_gpu_id] = [t.to(device) for t in tp_group_tensors]
+            
+            # split each layer tensor in head dimension for this TP rank
+            # each TP rank gets [2, num_blocks, tokens_per_block, num_head//tp_size, head_size]
+            gpu_blocks[global_gpu_id] = []
+            for layer_id in range(num_layers):
+                start_head = tp_id * head_per_tp
+                end_head = (tp_id + 1) * head_per_tp
+                # split in head dimension (dimension 3)
+                tp_tensor = tp_group_tensors_gt[layer_id][:, :, :, start_head:end_head, :].to(device)
+                gpu_blocks[global_gpu_id].append(tp_tensor)
+        
         dp_wise_gpu_blocks_gt.append(tp_group_tensors_gt)
         
     kvmanager = KVManager(model_config, cache_config, gpu_blocks)
@@ -201,7 +228,7 @@ def test_kvmanager():
     print(f"Total cache hit rate: {total_cache_hit / (total_cache_hit + total_cache_miss)}")
     kvmanager.shutdown()
     if(total_cache_miss == 0):
-        verify_data(gpu_blocks, gpu_blocks_gt)
+        verify_data(gpu_blocks, dp_wise_gpu_blocks_gt)
     else:
         print(f"verify skipped, because of total_cache_miss={total_cache_miss}>0")
 

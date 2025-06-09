@@ -8,11 +8,11 @@ import queue
 import torch
 import nvtx
 from .scheduler import TransferScheduler
-from .worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker, CPURemoteTransferWorker
+from .worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker, CPURemoteTransferWorker, tpGPUCPUTransferWorker
 from ..common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType
 from ..common.storage import AccessibleHandle, KVCacheLayout
 from flexkv.common.memory_handle import KVCacheTensorHandle
-from flexkv.common.config import CacheConfig
+from flexkv.common.config import CacheConfig, ModelConfig
 
 from multiprocessing import Queue as MPQueue
 from ..common.debug import debuginfo
@@ -21,6 +21,7 @@ from ..common.transfer import get_nvtx_range_color, get_nvtx_default_color
 class TransferEngine:
     def __init__(self,
         gpu_handles: List[AccessibleHandle],
+        model_config: ModelConfig,
         cache_config: CacheConfig,
         cpu_handle: AccessibleHandle,
         ssd_handle: Optional[AccessibleHandle] = None,
@@ -43,8 +44,8 @@ class TransferEngine:
 
         self.op_id_to_nvtx_range = {}
 
-        self.dp_size = cache_config.dp_size
-        self.tp_size = cache_config.tp_size
+        self.dp_size = model_config.dp_size
+        self.tp_size = model_config.tp_size
 
         assert len(gpu_handles) == self.dp_size * self.tp_size
         
@@ -60,6 +61,7 @@ class TransferEngine:
                     dtype=gpu_handles[0].dtype,
                     gpu_device_id=gpu_handles[0].gpu_device_id,
                 )
+            ]
         else:
             self.gpucpu_workers = [
                 tpGPUCPUTransferWorker.create_worker(
