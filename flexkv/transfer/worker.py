@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Union
 import torch
 
 import threading
@@ -38,7 +38,7 @@ def cudaHostRegister(tensor: torch.Tensor):
     """Register a CPU tensor with CUDA for pinned memory access"""
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 0)
+    ret = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 1) # 1 means cudaHostRegisterPortable
     if ret != 0:
         raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
 
@@ -356,7 +356,7 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                      tp_group_size: int,
                      dp_group_id: int,
                      from_raw_gpu_blocks: bool):
-        tranfer_queue = mp.Queue()
+        transfer_queue = mp.Queue()
         ready_event = mp.Event()
 
         process = mp.Process(
@@ -420,7 +420,10 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                  dp_group_id: int,
                  from_raw_gpu_blocks: bool):
 
-        super().__init__(worker_id, finished_ops_queue)
+        self.worker_id = worker_id
+        self.transfer_queue = MPQueue()
+        self.finished_ops_queue = finished_ops_queue
+        self.dtype = dtype
 
         self.num_gpus = len(gpu_blocks)
         self.tp_group_size = tp_group_size
@@ -455,7 +458,7 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
         
         self.transfer_sms = 4
 
-        self.tp_group_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, gpu_blocks, cpu_blocks,dp_group_id)
+        self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, gpu_blocks, cpu_blocks,dp_group_id)
 
     def _transfer_impl(self,
                        gpu_block_ids: np.ndarray,
@@ -479,10 +482,8 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
         if len(gpu_block_id_list) == 0:
             return
 
-        #TODO prepare other necessary parameters
-
         if transfer_type == TransferType.H2D:
-            self.cpp_thread_group.tp_group_transfer(
+            self.tp_transfer_thread_group.tp_group_transfer(
                 gpu_block_id_list,
                 self.gpu_kv_stride_in_bytes,
                 self.gpu_block_stride_in_bytes,
@@ -498,7 +499,7 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                 layer_granularity,
             )
         elif transfer_type == TransferType.D2H:
-            self.cpp_thread_group.tp_group_transfer(
+            self.tp_transfer_thread_group.tp_group_transfer(
                 cpu_block_id_list,
                 self.cpu_kv_stride_in_bytes,
                 self.cpu_block_stride_in_bytes,
@@ -515,6 +516,43 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
             )
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type}")
+        
+    def launch_transfer(self, transfer_op: WorkerTransferOp):
+        if transfer_op.transfer_type == TransferType.H2D:
+            cpu_block_ids = transfer_op.src_block_ids
+            gpu_block_ids = transfer_op.dst_block_ids
+        elif transfer_op.transfer_type == TransferType.D2H:
+            cpu_block_ids = transfer_op.dst_block_ids
+            gpu_block_ids = transfer_op.src_block_ids
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_op.transfer_type}")
+        start_time = time.time()
+        self._transfer_impl(
+            gpu_block_ids,
+            cpu_block_ids,
+            transfer_op.transfer_type,
+            layer_id=transfer_op.layer_id,
+            layer_granularity=transfer_op.layer_granularity,
+            non_blocking=True,
+            use_ce_transfer=False,
+        )
+        # debuginfo.info("TRANSFER stream synchronized")
+        end_time = time.time()
+        transfer_size = (
+            len(cpu_block_ids)
+            * self.cpu_block_size
+            * self.dtype.itemsize
+            * 2
+            * transfer_op.layer_granularity
+        )
+        debuginfo.info(
+            f"gpu cpu tranfer request: {transfer_op.transfer_op_id} finished "
+            f"request type is {transfer_op.transfer_type} "
+            f"transfer data size is {transfer_size} bytes "
+            f"transfer time is {end_time - start_time:.4f} s "
+            f"transfer bandwidth is "
+            f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+        )
 
 
 class CPUSSDDiskTransferWorker(TransferWorker):

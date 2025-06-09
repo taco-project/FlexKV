@@ -210,9 +210,11 @@ class KVServer:
                 elif isinstance(req, GetRequest):
                     assert self.client_manager.is_dp_client_ready(req.dp_client_id)
                     req_id = self.kvmanager.get_async(
-                        req.token_ids,
-                        req.slot_mapping,
-                        req.token_mask
+                        token_ids=req.token_ids,
+                        slot_mapping=req.slot_mapping,
+                        token_mask=req.token_mask,
+                        layer_granularity=-1,
+                        dp_id=req.dp_client_id,
                     )
                     response = Response(req.dp_client_id, req_id)
                     result_zmq = self.client_manager.get_zmq(
@@ -222,9 +224,10 @@ class KVServer:
                 elif isinstance(req, PutRequest):
                     assert self.client_manager.is_dp_client_ready(req.dp_client_id)
                     req_id = self.kvmanager.put_async(
-                        req.token_ids,
-                        req.slot_mapping,
-                        req.token_mask,
+                        token_ids=req.token_ids,
+                        slot_mapping=req.slot_mapping,
+                        token_mask=req.token_mask,
+                        dp_id=req.dp_client_id,
                     )
                     response = Response(req.dp_client_id, req_id)
                     result_zmq = self.client_manager.get_zmq(

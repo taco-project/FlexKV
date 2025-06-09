@@ -32,11 +32,11 @@ TPTransferThreadGroup::TPTransferThreadGroup(int num_gpus,
 TPTransferThreadGroup::~TPTransferThreadGroup() {}
 
 void TPTransferThreadGroup::tp_group_transfer(
-    const torch::Tensor& dst_block_id_tensors,
+    const torch::Tensor& dst_block_id_tensor,
     const int64_t dst_kv_stride_in_bytes,
     const int64_t dst_chunk_stride_in_bytes,
     const int64_t dst_chunk_size_in_bytes,
-    const torch::Tensor& src_block_id_tensors,
+    const torch::Tensor& src_block_id_tensor,
     const int64_t src_kv_stride_in_bytes,
     const int64_t src_chunk_stride_in_bytes,
     const int64_t src_chunk_size_in_bytes,
@@ -55,29 +55,37 @@ void TPTransferThreadGroup::tp_group_transfer(
     for (int i = 0; i < num_gpus_; ++i) {
         threads_.emplace_back([&, i]() {
             try {
-                int num_blocks = dst_block_id_tensors[i].numel();
+                int num_blocks = dst_block_id_tensor.numel();
                 int num_layers = layer_granularity;
 
-                int64_t* dst_block_ids = static_cast<int64_t*>(dst_block_id_tensors[i].data_ptr());
-                int64_t* src_block_ids = static_cast<int64_t*>(src_block_id_tensors[i].data_ptr());
+                int64_t* dst_block_ids = static_cast<int64_t*>(dst_block_id_tensor.data_ptr());
+                int64_t* src_block_ids = static_cast<int64_t*>(src_block_id_tensor.data_ptr());
                 void** dst_layer_ptrs;
                 void** src_layer_ptrs;
+                int64_t dst_startoff_inside_chunks;
+                int64_t src_startoff_inside_chunks;
+                int64_t copy_size_in_bytes;
                 if (is_host_to_device) {
                     dst_layer_ptrs = static_cast<void**>(gpu_blocks_ + i * num_layers + layer_id);
                     src_layer_ptrs = static_cast<void**>(cpu_blocks_ + layer_id);
+                    dst_startoff_inside_chunks = 0;
+                    src_startoff_inside_chunks = i * dst_chunk_size_in_bytes;
+                    copy_size_in_bytes = dst_chunk_size_in_bytes;
                 } else {
                     dst_layer_ptrs = static_cast<void**>(cpu_blocks_ + layer_id);
                     src_layer_ptrs = static_cast<void**>(gpu_blocks_ + i * num_layers + layer_id);
+                    dst_startoff_inside_chunks = i * src_chunk_size_in_bytes;
+                    src_startoff_inside_chunks = 0;
+                    copy_size_in_bytes = src_chunk_size_in_bytes;
                 }
-
-                at::cuda::CUDAGuard device_guard(dp_group_id_ * num_gpus_ + i);
-                // TODO use this just for test
+                cudaSetDevice(dp_group_id_ * num_gpus_ + i);
                 flexkv::transfer_kv_layers(
                     num_blocks, layer_granularity, dst_block_ids, dst_layer_ptrs,
                     dst_kv_stride_in_bytes, dst_chunk_stride_in_bytes,
-                    src_block_ids, src_layer_ptrs,
+                    dst_startoff_inside_chunks, src_block_ids, src_layer_ptrs,
                     src_kv_stride_in_bytes, src_chunk_stride_in_bytes,
-                    chunk_size_in_bytes, stream, transfer_sms,
+                    src_startoff_inside_chunks,
+                    copy_size_in_bytes, streams_[i], transfer_sms,
                     is_host_to_device, use_ce_transfer
                 );
                 cudaError_t err = cudaGetLastError();

@@ -24,16 +24,30 @@ tokens_per_block = 4
 cpu_shape = (num_layers, 2, num_cpu_blocks, tokens_per_block, num_kv_heads, head_size)
 gpu_shape = (num_layers, 2, num_gpu_blocks, tokens_per_block, num_kv_heads, head_size)
 
+default_kv_layout = KVCacheLayout(
+    type=KVCacheLayoutType.LAYERWISE,
+    num_layer=num_layers,
+    num_block=num_gpu_blocks,
+    tokens_per_block=tokens_per_block,
+    num_head=num_kv_heads,
+    head_size=head_size,
+    is_mla=False,
+)
+
 model_config = ModelConfig(num_layers=num_layers,
                             num_kv_heads=num_kv_heads,
                             head_size=head_size,
                             element_size=2,
                             use_mla=False,
-                            tp_size=tp_size)
+                            tp_size=tp_size, 
+                            dp_size=dp_size)
 
-cache_config = CacheConfig(enable_cpu=True,
+cache_config = CacheConfig(raw_gpu_blocks=False,
+                            enable_cpu=True,
                             enable_ssd=False,
                             enable_remote=False,
+                            gpu_kv_layout=default_kv_layout,
+                            cpu_kv_layout=default_kv_layout,
                             use_gds=False,
                             use_pinned_memory=True,
                             tokens_per_block=tokens_per_block,
@@ -52,7 +66,7 @@ def run_dp_client(server_recv_port):
     for tp_rank in range(model_config.tp_size):
         tp_client_process = Process(
             target=run_tp_client,
-            args=(dp_client.dp_client_id, tp_rank, tp_rank, server_recv_port,),
+            args=(dp_client.dp_client_id, tp_rank, tp_rank + dp_client.dp_client_id * tp_size, server_recv_port,),
             daemon=True,
         )
         tp_client_process.start()
@@ -134,13 +148,13 @@ def main():
 
     for dp_rank in range(dp_size):
         # Create client processes
-        dp_client_precess = Process(
+        dp_client_process = Process(
             target=run_dp_client,
             args=(server_recv_port, ),
         )
-        dp_client_precess.start()
+        dp_client_process.start()
         
-        client_processes.append(dp_client_precess)
+        client_processes.append(dp_client_process)
         
     try:
         # Keep main process running

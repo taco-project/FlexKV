@@ -41,8 +41,8 @@ void transfer_kv_layers_binding(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   flexkv::transfer_kv_layers(
       num_blocks, num_layers, dst_block_ids, dst_layer_ptrs,
-      dst_kv_stride_in_bytes, dst_chunk_stride_in_bytes, src_block_ids,
-      src_layer_ptrs, src_kv_stride_in_bytes, src_chunk_stride_in_bytes,
+      dst_kv_stride_in_bytes, dst_chunk_stride_in_bytes, 0, src_block_ids,
+      src_layer_ptrs, src_kv_stride_in_bytes, src_chunk_stride_in_bytes, 0,
       chunk_size_in_bytes, stream, transfer_sms, is_host_to_device,
       use_ce_transfer);
   cudaError_t err = cudaGetLastError();

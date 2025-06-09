@@ -20,6 +20,7 @@ cpp_sources = [
     "csrc/bindings.cpp",
     "csrc/transfer.cu",
     "csrc/hash.cpp",
+    "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
 ]
 

@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from flexkv.common.storage import AccessibleHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
+from flexkv.common.memory_handle import KVCacheTensorHandle
 import torch
 from typing import Tuple, Optional, List, Union, Dict, Any
 import numpy as np
