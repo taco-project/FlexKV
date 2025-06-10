@@ -79,7 +79,7 @@ class ClientManager:
         self, 
         max_num_dp_client: int = 1,
     ):
-        assert max_num_dp_client == 1, f"currently only support dp=1"
+        #assert max_num_dp_client == 1, f"currently only support dp=1"
         self.free_client_ids = deque(range(max_num_dp_client))
         self.client_dict: dict[int, DPClient] = {}
         
@@ -156,7 +156,7 @@ class KVServer:
         self.recv_from_client = get_zmq_socket(
             self.context, zmq.PULL, server_recv_port, True)
         
-        self.client_manager = ClientManager()
+        self.client_manager = ClientManager(max_num_dp_client=model_config.dp_size)
         self.kvmanager = KVManager(model_config, cache_config) 
     
         self.req_counter = 0
@@ -223,6 +223,7 @@ class KVServer:
 
                 elif isinstance(req, PutRequest):
                     assert self.client_manager.is_dp_client_ready(req.dp_client_id)
+                    #print(f"put request: {req.token_ids} from dp {req.dp_client_id}")
                     req_id = self.kvmanager.put_async(
                         token_ids=req.token_ids,
                         slot_mapping=req.slot_mapping,

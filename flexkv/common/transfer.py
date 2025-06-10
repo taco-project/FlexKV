@@ -89,6 +89,14 @@ class TransferOpGraph:
         self._ready_ops = set()
         self._trigger_ops = set()
 
+    @classmethod
+    def create_empty_graph(cls, transfer_graph_id: int):
+        graph = cls(transfer_graph_id)
+        graph._op_map = {}
+        graph._ready_ops = set()
+        graph._trigger_ops = set()
+        return graph
+
     def add_virtual_op(self, op: TransferOp, need_trigger: bool = False):
         op.transfer_graph_id = self.transfer_graph_id
         op.transfer_type = TransferType.VIRTUAL

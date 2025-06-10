@@ -53,8 +53,7 @@ model_config = ModelConfig(num_layers=num_layers,
                             tp_size=tp_size, 
                             dp_size=dp_size)
 
-cache_config = CacheConfig(raw_gpu_blocks=False,
-                            enable_cpu=True,
+cache_config = CacheConfig( enable_cpu=True,
                             enable_ssd=False,
                             enable_remote=False,
                             gpu_kv_layout=gpu_kv_layout,

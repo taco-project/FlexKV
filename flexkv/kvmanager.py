@@ -151,14 +151,24 @@ class KVManager:
                                                                             f"request id: {request.request_id}, "
                                                                             f"graph id: {graph.transfer_graph_id}",
                                                                             color=get_nvtx_range_color(graph.transfer_graph_id))
-                self.requests_tracker[request.request_id] = RequestTracker(task_id=request.request_id,
+                if graph.num_ops == 0: #early return
+                    layer_op_num = self.model_config.num_layers // request.layer_granularity if request.request_type == cacheEngineRequestType.GET else 1
+                    self.requests_tracker[request.request_id] = RequestTracker(task_id=request.request_id,
                                                                             task_type=request.request_type,
                                                                             return_mask=return_mask,
-                                                                            callback=callback,
-                                                                            task_end_ops_ids=task_end_ops_ids,
-                                                                            task_end_ops_status=len(task_end_ops_ids)*[False],
-                                                                            task_finished=False)
-                self.transfer_engine.submit_transfer_graph(graph)
+                                                                            callback=None,
+                                                                            task_end_ops_ids=[-1]*layer_op_num,
+                                                                            task_end_ops_status=[True]*layer_op_num,
+                                                                            task_finished=True)
+                else:
+                    self.requests_tracker[request.request_id] = RequestTracker(task_id=request.request_id,
+                                                                                task_type=request.request_type,
+                                                                                return_mask=return_mask,
+                                                                                callback=callback,
+                                                                                task_end_ops_ids=task_end_ops_ids,
+                                                                                task_end_ops_status=len(task_end_ops_ids)*[False],
+                                                                                task_finished=False)
+                    self.transfer_engine.submit_transfer_graph(graph)
             results = self.transfer_engine.get_completed_graphs_and_ops(timeout=0.001)
             for completed_graph_id, completed_op_id in results:
                 request_tracker = self.requests_tracker[completed_graph_id]
@@ -275,7 +285,7 @@ class KVManager:
 
     # wait for the whole task to be finished, including the key op and all other ops
     # this function is mainly designed for testing to avoid the frequency of writing is too high to use up memory blocks
-    def wait_for_task_finished(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
+    def wait_for_graph_finished(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
         nvtx.mark(f"wait task_ids: {task_ids}")
         if isinstance(task_ids, int):
             task_ids = [task_ids]

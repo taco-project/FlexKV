@@ -354,8 +354,7 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                      cpu_kv_layout: KVCacheLayout,
                      dtype: torch.dtype,
                      tp_group_size: int,
-                     dp_group_id: int,
-                     from_raw_gpu_blocks: bool):
+                     dp_group_id: int):
         transfer_queue = mp.Queue()
         ready_event = mp.Event()
 
@@ -364,8 +363,7 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
             args=(worker_id, gpu_blocks, cpu_blocks,
                   transfer_queue, finished_ops_queue,
                   gpu_kv_layout, cpu_kv_layout, dtype, 
-                  tp_group_size, dp_group_id, from_raw_gpu_blocks, 
-                  ready_event),
+                  tp_group_size, dp_group_id, ready_event),
             daemon=True
         )
         process.start()
@@ -384,11 +382,10 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                         dtype: torch.dtype,
                         tp_group_size: int,
                         dp_group_id: int,
-                        from_raw_gpu_blocks: bool,
                         ready_event: Any):
         assert len(gpu_blocks) == tp_group_size
         # handles exported from other processes
-        if not from_raw_gpu_blocks:
+        if isinstance(gpu_blocks[0][0], KVCacheTensorHandle):
             imported_gpu_blocks = []
             for handles_in_one_gpu in gpu_blocks:
                 blocks_in_one_gpu = []
@@ -403,7 +400,7 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
         worker = cls(worker_id, imported_gpu_blocks, cpu_blocks,
                     transfer_queue, finished_ops_queue,
                     gpu_kv_layout, cpu_kv_layout, dtype,
-                    tp_group_size, dp_group_id, from_raw_gpu_blocks)
+                    tp_group_size, dp_group_id)
         ready_event.set()
         worker.run()
 
@@ -417,8 +414,7 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype, 
                  tp_group_size: int, 
-                 dp_group_id: int,
-                 from_raw_gpu_blocks: bool):
+                 dp_group_id: int):
 
         self.worker_id = worker_id
         self.transfer_queue = MPQueue()

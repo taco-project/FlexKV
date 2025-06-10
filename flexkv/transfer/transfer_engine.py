@@ -74,7 +74,6 @@ class TransferEngine:
                     dtype=gpu_handles[i].dtype,
                     tp_group_size=self.tp_size,
                     dp_group_id=i,
-                    from_raw_gpu_blocks=cache_config.raw_gpu_blocks,
                 )
                 for i in range(self.dp_size)
             ]
