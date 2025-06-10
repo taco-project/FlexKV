@@ -372,8 +372,8 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
         if(is_read){
           thread_id += num_files * num_threads_per_file;
         }
-        int start_layer = t * layers_per_thread;
-        int end_layer = std::min(start_layer + layers_per_thread, num_layers);
+        int start_layer = cpu_layer_id_list_ptr[0] + t * layers_per_thread;
+        int end_layer = std::min(start_layer + layers_per_thread, cpu_layer_id_list_ptr[0] + num_layers);
         int start_block = 0;
         int end_block = cpu_blocks_partition[f].size();
         if (start_layer < end_layer) {

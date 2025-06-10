@@ -78,8 +78,7 @@ class TransferOp:
     # this will keep the full info
     successors: Set[int] = field(default_factory=set)
     status: TransferOpStatus = TransferOpStatus.PENDING
-    tp_rank: Optional[int] = None
-    tp_world_size: Optional[int] = None
+    dp_id: Optional[int] = None
 
 
 class TransferOpGraph:
@@ -89,6 +88,14 @@ class TransferOpGraph:
         self._op_map = {}
         self._ready_ops = set()
         self._trigger_ops = set()
+
+    @classmethod
+    def create_empty_graph(cls, transfer_graph_id: int):
+        graph = cls(transfer_graph_id)
+        graph._op_map = {}
+        graph._ready_ops = set()
+        graph._trigger_ops = set()
+        return graph
 
     def add_virtual_op(self, op: TransferOp, need_trigger: bool = False):
         op.transfer_graph_id = self.transfer_graph_id
@@ -159,6 +166,10 @@ class TransferOpGraph:
     @property
     def num_ops(self) -> int:
         return len(self._op_map)
+
+    def bind_to_dp_group(self, dp_id: int):
+        for op in self._op_map.values():
+            op.dp_id = dp_id
 
     def print_op_map(self):
         """Print transfer op graph in a visual format showing dependencies.

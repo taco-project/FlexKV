@@ -8,10 +8,11 @@ import queue
 import torch
 import nvtx
 from .scheduler import TransferScheduler
-from .worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker, CPURemoteTransferWorker
+from .worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker, CPURemoteTransferWorker, tpGPUCPUTransferWorker
 from ..common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType
 from ..common.storage import AccessibleHandle, KVCacheLayout
 from flexkv.common.memory_handle import KVCacheTensorHandle
+from flexkv.common.config import CacheConfig, ModelConfig
 
 from multiprocessing import Queue as MPQueue
 from ..common.debug import debuginfo
@@ -20,10 +21,11 @@ from ..common.transfer import get_nvtx_range_color, get_nvtx_default_color
 class TransferEngine:
     def __init__(self,
         gpu_handles: List[AccessibleHandle],
+        model_config: ModelConfig,
+        cache_config: CacheConfig,
         cpu_handle: AccessibleHandle,
         ssd_handle: Optional[AccessibleHandle] = None,
-        remote_handle: Optional[AccessibleHandle] = None,
-        zmq_gpu_handles: Optional[List[List[KVCacheTensorHandle]]] = None):
+        remote_handle: Optional[AccessibleHandle] = None):
         """
         Initialize transfer engine
 
@@ -42,36 +44,38 @@ class TransferEngine:
 
         self.op_id_to_nvtx_range = {}
 
-        # Initialize workers
-        # TODO: refactor
-        if zmq_gpu_handles is None:
+        self.dp_size = model_config.dp_size
+        self.tp_size = model_config.tp_size
+
+        assert len(gpu_handles) == self.dp_size * self.tp_size
+        
+        if self.tp_size == 1 and self.dp_size == 1: #NOTE this is not necessary, just for test
             self.gpucpu_workers = [
                 GPUCPUTransferWorker.create_worker(
+                    worker_id=0,
+                    gpu_blocks=gpu_handles[0].data,
+                    cpu_blocks=cpu_handle.data,
+                    finished_ops_queue=self.finished_ops_queue,
+                    gpu_kv_layout=gpu_handles[0].kv_layout,
+                    cpu_kv_layout=cpu_handle.kv_layout,
+                    dtype=gpu_handles[0].dtype,
+                    gpu_device_id=gpu_handles[0].gpu_device_id,
+                )
+            ]
+        else:
+            self.gpucpu_workers = [
+                tpGPUCPUTransferWorker.create_worker(
                     worker_id=i,
-                    gpu_blocks=gpu_handles[i].data,
+                    gpu_blocks=[gpu_handles[j].data for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
                     cpu_blocks=cpu_handle.data,
                     finished_ops_queue=self.finished_ops_queue,
                     gpu_kv_layout=gpu_handles[i].kv_layout,
                     cpu_kv_layout=cpu_handle.kv_layout,
                     dtype=gpu_handles[i].dtype,
-                    gpu_device_id=gpu_handles[i].gpu_device_id,
+                    tp_group_size=self.tp_size,
+                    dp_group_id=i,
                 )
-                for i in range(len(gpu_handles))
-            ]
-        else:
-            self.gpucpu_workers = [
-                GPUCPUTransferWorker.create_worker(
-                    worker_id=i,
-                    gpu_blocks=None,
-                    cpu_blocks=cpu_handle.data,
-                    finished_ops_queue=self.finished_ops_queue,
-                    gpu_kv_layout=zmq_gpu_handles[i][0].kv_layout,
-                    cpu_kv_layout=cpu_handle.kv_layout,
-                    dtype=zmq_gpu_handles[i][0].dtype,
-                    gpu_device_id=zmq_gpu_handles[i][0].device_id,
-                    zmq_gpu_handle=zmq_gpu_handles[i],
-                )
-                for i in range(len(zmq_gpu_handles))
+                for i in range(self.dp_size)
             ]
 
         # Wait for GPU-CPU workers to initialize
@@ -189,11 +193,7 @@ class TransferEngine:
             TransferType.H2D,
             TransferType.D2H
         ]:
-            if op.transfer_type == TransferType.H2D:
-                gpu_device_id = op.dst_descriptor.device_id
-            else:
-                gpu_device_id = op.src_descriptor.device_id
-            self.gpucpu_workers[gpu_device_id].submit_transfer(op)
+            self.gpucpu_workers[op.dp_id].submit_transfer(op)
         elif op.transfer_type in [
             TransferType.H2DISK,
             TransferType.DISK2H

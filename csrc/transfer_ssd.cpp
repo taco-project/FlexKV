@@ -206,8 +206,8 @@ void transfer_kv_blocks_ssd(
       (num_layers + num_threads_per_file - 1) / num_threads_per_file;
   for (int f = 0; f < num_files; f++) {
     for (int t = 0; t < num_threads_per_file; t++) {
-      int start_layer = t * layers_per_thread;
-      int end_layer = std::min(start_layer + layers_per_thread, num_layers);
+      int start_layer = cpu_layer_id_list_ptr[0] + t * layers_per_thread;
+      int end_layer = cpu_layer_id_list_ptr[0] + std::min(start_layer + layers_per_thread, num_layers);
       int start_block = 0;
       int end_block = cpu_blocks_partition[f].size();
       if (start_layer < end_layer) {

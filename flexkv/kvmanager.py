@@ -8,6 +8,7 @@ import nvtx
 
 from dataclasses import dataclass
 from typing import Dict
+import multiprocessing as mp
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.cache.cache_engine import GlobalCacheEngine, TransferOpGraph
@@ -16,19 +17,32 @@ from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.common.transfer import DeviceType, get_nvtx_range_color, get_nvtx_default_color
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 from flexkv.common.memory_handle import KVCacheTensorHandle
+from flexkv.common.expiring_dict import DoubleBufferExpiringDict
 
 @dataclass
-class TaskDescriptor:
+class RequestTracker:
     task_id: int
+    task_type: cacheEngineRequestType
     return_mask: torch.Tensor
     callback: Callable
-    total_ops: int
+    task_end_ops_ids: List[int]
+    task_end_ops_status: List[bool]
+    task_finished: bool = False
+
+
+    def __post_init__(self):
+        if len(self.task_end_ops_ids) > 0:
+            self.task_end_ops_status = [False] * len(self.task_end_ops_ids)
+        else:
+            self.task_end_ops_status = []
 
 class KVManager:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-                 gpu_blocks: List[List[torch.Tensor]] = None):
+                 gpu_blocks: Dict[int, List[torch.Tensor]] = None):
+
+        mp.set_start_method('spawn', force=True)
         nvtx.push_range("Initialize kvmanager", color=get_nvtx_default_color())
 
         if not cache_config.enable_cpu:
@@ -39,37 +53,49 @@ class KVManager:
             raise ValueError("use_gds must be True if enable_cpu is False")
 
         self.cache_config = cache_config
+        self.model_config = model_config
+        self.gpu_num = 0
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
-        self.storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
-        self.tp_size = model_config.tp_size
-        self.gpu_handles = [None] * self.tp_size
-        self._model_config = model_config
-        self.transfer_engine = None
-        if gpu_blocks is not None:
-            assert len(gpu_blocks) == self.tp_size
-            self.gpu_handles = [
-                self.storage_engine.get_allocator_handle(DeviceType.GPU, i)
-                for i in range(self.tp_size)
-            ]
-            cpu_handle = self.storage_engine.get_allocator_handle(DeviceType.CPU) if cache_config.enable_cpu else None
-            ssd_handle = self.storage_engine.get_allocator_handle(DeviceType.SSD) if cache_config.enable_ssd else None
-            remote_handle = (
-                self.storage_engine.get_allocator_handle(DeviceType.REMOTE)
-                if cache_config.enable_remote
-                else None
-            )
-            self.transfer_engine = TransferEngine(self.gpu_handles, cpu_handle, ssd_handle, remote_handle)
+        self.running = False
 
-        self.transfer_gid_to_task: dict[int, TaskDescriptor] = {}
-        self.taskid_to_layerwise_ops: dict[int, tuple[TransferOpGraph, torch.Tensor, List[int]]] = {}
+        # Two initialization paths:
+        # 1) gpu_blocks are provided 
+        # 2) gpu_handles are provided
+        if gpu_blocks is None:
+            self.gpu_blocks = {}
+            self.transfer_engine = None
+            self.gpu_num = 0
+            return
+
+        self.gpu_num = len(gpu_blocks)
+        self._init_after_gpu_blocks_added(gpu_blocks)
+
+    # Note that for now only after all the gpu blocks are added, we can initialize the transfer engine
+    def _init_after_gpu_blocks_added(self, gpu_blocks: Dict[int, List[torch.Tensor]]):
+
+        assert len(gpu_blocks) == self.model_config.tp_size * self.model_config.dp_size
+        self.storage_engine = StorageEngine(self.model_config, self.cache_config, gpu_blocks)
+        self.gpu_handles = [
+            self.storage_engine.get_allocator_handle(DeviceType.GPU, i)
+            for i in range(self.model_config.tp_size * self.model_config.dp_size)
+        ]
+        cpu_handle = self.storage_engine.get_allocator_handle(DeviceType.CPU) if self.cache_config.enable_cpu else None
+        ssd_handle = self.storage_engine.get_allocator_handle(DeviceType.SSD) if self.cache_config.enable_ssd else None
+        remote_handle = (
+            self.storage_engine.get_allocator_handle(DeviceType.REMOTE)
+            if self.cache_config.enable_remote
+            else None
+        )
+        self.transfer_engine = TransferEngine(self.gpu_handles, self.model_config, self.cache_config, cpu_handle, ssd_handle, remote_handle)
+
+        self.requests_tracker = DoubleBufferExpiringDict(expire_seconds=600)
 
         self.taskid_to_nvtx_range = {}
         self.graphid_to_nvtx_range = {}
 
         self._task_id_counter = 0
         self.task_queue: Queue[cacheEngineRequest] = Queue()
-        self.finished_queue = Queue()
-        self.finished_ops_queue = Queue()
+
         self.running = True
         self._worker_thread = threading.Thread(target=self._worker_loop)
         self._worker_thread.start()
@@ -79,43 +105,22 @@ class KVManager:
 
     # the gpu_blocks of multiple gpus can be added post initialization.
     # the transfer engine will be initialized after we have all the intended gpu handles.
-    # NOTE: this add function must be called in the order of device_id for now
     def add_single_gpu_blocks(
         self, 
-        gpu_handle: List[KVCacheTensorHandle], 
+        gpu_handle: Union[List[KVCacheTensorHandle], List[torch.Tensor]],
         dp_client_id: int = 0,
         tp_rank: int = 0,
     ):
         if self.transfer_engine is not None:
             raise ValueError("we have already get all gpu blocks")
-        self.gpu_handles[tp_rank] = gpu_handle
-        if None not in self.gpu_handles:
-            cpu_handle = (
-                self.storage_engine.get_allocator_handle(DeviceType.CPU)
-                if self.cache_config.enable_cpu
-                else None
-            )
-            ssd_handle = (
-                self.storage_engine.get_allocator_handle(DeviceType.SSD)
-                if self.cache_config.enable_ssd
-                else None
-            )
-            remote_handle = (
-                self.storage_engine.get_allocator_handle(DeviceType.REMOTE)
-                if self.cache_config.enable_remote
-                else None
-            )
-            self.transfer_engine = TransferEngine(None,
-                                                  cpu_handle,
-                                                  ssd_handle,
-                                                  remote_handle,
-                                                  self.gpu_handles)
+        self.gpu_blocks[tp_rank + dp_client_id * self.model_config.tp_size] = gpu_handle
+        self.gpu_num += 1
+        if self.gpu_num == self.model_config.tp_size * self.model_config.dp_size:
+            self._init_after_gpu_blocks_added(self.gpu_blocks)
 
     def _worker_loop(self):
         while self.running:
             # deal with completed requests from the cache engine
-            while self.transfer_engine == None:
-                time.sleep(1)
             if not self.task_queue.empty():
                 request = self.task_queue.get()
                 if request is None:
@@ -123,53 +128,60 @@ class KVManager:
                 elif request.request_type == cacheEngineRequestType.GET:
                     nvtx.push_range(f"cache_engine.get request_id: {request.request_id}",
                                     color=get_nvtx_default_color())
-                    graph, return_mask, callback, finished_ops_ids = self.cache_engine.get(request.token_ids,
-                                                               request.token_mask,
-                                                               request.slot_mapping,
-                                                               self._model_config.num_layers,
-                                                               request.layer_granularity)
-                    if request.layer_granularity != -1:
-                        self.taskid_to_layerwise_ops[request.request_id] = finished_ops_ids
+                    graph, return_mask, callback, task_end_ops_ids = self.cache_engine.get(request.request_id,
+                                                                                            request.token_ids,
+                                                                                            request.token_mask,
+                                                                                            request.slot_mapping,
+                                                                                            self.model_config.num_layers,
+                                                                                            request.layer_granularity)
                 elif request.request_type == cacheEngineRequestType.PUT:
                     nvtx.push_range(f"cache_engine.put request_id: {request.request_id}",
                                     color=get_nvtx_default_color())
-                    graph, return_mask, callback, finished_ops_ids = self.cache_engine.put(request.token_ids,
-                                                                            request.token_mask,
-                                                                            request.slot_mapping,
-                                                                            self._model_config.num_layers)
-
+                    graph, return_mask, callback, task_end_ops_ids = self.cache_engine.put(request.request_id,
+                                                                                        request.token_ids,
+                                                                                        request.token_mask,
+                                                                                        request.slot_mapping,
+                                                                                        self.model_config.num_layers)
                 else:
                     raise ValueError(f"Unknown request type: {request.request_type}")
+                graph.bind_to_dp_group(request.dp_id)
                 nvtx.pop_range()
-
+                #TODO deal with empty graphs
                 self.graphid_to_nvtx_range[graph.transfer_graph_id] = nvtx.start_range(
                                                                             f"request id: {request.request_id}, "
                                                                             f"graph id: {graph.transfer_graph_id}",
                                                                             color=get_nvtx_range_color(graph.transfer_graph_id))
-                self.transfer_gid_to_task[graph.transfer_graph_id] = TaskDescriptor(
-                        request.request_id, return_mask, callback, graph.num_ops + 1)
-                self.transfer_engine.submit_transfer_graph(graph)
+                if graph.num_ops == 0: #early return
+                    layer_op_num = self.model_config.num_layers // request.layer_granularity if request.request_type == cacheEngineRequestType.GET else 1
+                    self.requests_tracker[request.request_id] = RequestTracker(task_id=request.request_id,
+                                                                            task_type=request.request_type,
+                                                                            return_mask=return_mask,
+                                                                            callback=None,
+                                                                            task_end_ops_ids=[-1]*layer_op_num,
+                                                                            task_end_ops_status=[True]*layer_op_num,
+                                                                            task_finished=True)
+                else:
+                    self.requests_tracker[request.request_id] = RequestTracker(task_id=request.request_id,
+                                                                                task_type=request.request_type,
+                                                                                return_mask=return_mask,
+                                                                                callback=callback,
+                                                                                task_end_ops_ids=task_end_ops_ids,
+                                                                                task_end_ops_status=len(task_end_ops_ids)*[False],
+                                                                                task_finished=False)
+                    self.transfer_engine.submit_transfer_graph(graph)
             results = self.transfer_engine.get_completed_graphs_and_ops(timeout=0.001)
             for completed_graph_id, completed_op_id in results:
-                task_descriptor = self.transfer_gid_to_task[completed_graph_id]
-                task_id = task_descriptor.task_id
+                request_tracker = self.requests_tracker[completed_graph_id]
                 if completed_op_id == -1:
-                    task_descriptor.callback()
+                    request_tracker.callback()
                     nvtx.end_range(self.graphid_to_nvtx_range[completed_graph_id])
                     self.graphid_to_nvtx_range.pop(completed_graph_id)
-                    self.finished_queue.put( #TODO do not return "return_mask" everytime
-                        (task_id, completed_op_id, task_descriptor.return_mask)
-                    )
-                    self.transfer_gid_to_task.pop(completed_graph_id)
-                    nvtx.end_range(self.taskid_to_nvtx_range[task_id])
-                    self.taskid_to_nvtx_range.pop(task_id)
-                else:
-                    self.finished_ops_queue.put(
-                        (task_id, completed_op_id, task_descriptor.return_mask)
-                    )
-                # self.transfer_gid_to_task[completed_graph_id].total_ops -= 1  # TODO: do we need total_ops?
-                # if self.transfer_gid_to_task[completed_graph_id].total_ops == 0:
-                #     self.transfer_gid_to_task.pop(completed_graph_id)
+                    nvtx.end_range(self.taskid_to_nvtx_range[request_tracker.task_id])
+                    self.taskid_to_nvtx_range.pop(request_tracker.task_id)
+                    request_tracker.task_finished = True
+                elif completed_op_id in request_tracker.task_end_ops_ids:
+                    request_tracker.task_end_ops_status[request_tracker.task_end_ops_ids.index(completed_op_id)] = True
+                self.requests_tracker[completed_graph_id] = request_tracker
             time.sleep(0.0001)
 
     def _get_task_id(self) -> int:
@@ -192,11 +204,12 @@ class KVManager:
                   token_ids: torch.Tensor,
                   slot_mapping: torch.Tensor,
                   token_mask: Optional[torch.Tensor] = None,
-                  layer_granularity: int = -1) -> int:
+                  layer_granularity: int = -1,
+                  dp_id: int = 0) -> int:
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
         if layer_granularity == -1:
-            layer_granularity = self._model_config.num_layers
+            layer_granularity = self.model_config.num_layers
         task_id = self._get_task_id()
         nvtx.mark(f"GET request_id: {task_id}")
         self.taskid_to_nvtx_range[task_id] = nvtx.start_range(f"GET request_id: {task_id}",
@@ -207,15 +220,23 @@ class KVManager:
             token_ids=token_ids,
             token_mask=token_mask,
             slot_mapping=slot_mapping,
-            layer_granularity=layer_granularity
+            layer_granularity=layer_granularity,
+            dp_id=dp_id
         ))
-        self.taskid_to_layerwise_ops[task_id] = []
+        self.requests_tracker[task_id] = RequestTracker(task_id=task_id,
+                                                        task_type=cacheEngineRequestType.GET,
+                                                        return_mask=None,
+                                                        callback=None,
+                                                        task_end_ops_ids=[],
+                                                        task_end_ops_status=[],
+                                                        task_finished=False)
         return task_id
 
     def put_async(self,
                   token_ids: torch.Tensor,
                   slot_mapping: torch.Tensor,
-                  token_mask: Optional[torch.Tensor] = None) -> int:
+                  token_mask: Optional[torch.Tensor] = None,
+                  dp_id: int = 0) -> int:
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
         task_id = self._get_task_id()
@@ -227,47 +248,89 @@ class KVManager:
             request_id=task_id,
             token_ids=token_ids,
             token_mask=token_mask,
-            slot_mapping=slot_mapping
+            slot_mapping=slot_mapping,
+            dp_id=dp_id
         ))
+        self.requests_tracker[task_id] = RequestTracker(task_id=task_id,
+                                                        task_type=cacheEngineRequestType.PUT,
+                                                        return_mask=None,
+                                                        callback=None,
+                                                        task_end_ops_ids=[],
+                                                        task_end_ops_status=[],
+                                                        task_finished=False)
         return task_id
 
-    #NOTE the wait() function and wait_at_layer() function should not be called at the same time,
-    # because they clean each other
-    #NOTE every task should be synced in some way, otherwise the queue will be full
+    # wait for the key op to be finished
     def wait(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
+        nvtx.mark(f"wait task_ids: {task_ids}")
+        if isinstance(task_ids, int):
+            task_ids = [task_ids]
+        num_completed_tasks = 0
+        num_tasks = len(task_ids)
+        return_masks = {}
+        while num_completed_tasks < num_tasks:
+            finished_task_ids = []
+            for task_id in task_ids:
+                task_tracker = self.requests_tracker[task_id]
+                if len(task_tracker.task_end_ops_ids) == 0: #NOT READY
+                    continue
+                if all(task_tracker.task_end_ops_status):
+                    num_completed_tasks += 1
+                    return_masks[task_id] = task_tracker.return_mask
+                    finished_task_ids.append(task_id)
+            task_ids = [task_id for task_id in task_ids if task_id not in finished_task_ids]
+            time.sleep(0.001)
+        nvtx.mark(f"wait task_ids: {task_ids} done")
+        return return_masks
+
+    # wait for the whole task to be finished, including the key op and all other ops
+    # this function is mainly designed for testing to avoid the frequency of writing is too high to use up memory blocks
+    def wait_for_graph_finished(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
         nvtx.mark(f"wait task_ids: {task_ids}")
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         num_completed_tasks = 0
         return_masks = {}
         while num_completed_tasks < len(task_ids):
-            completed_task_id, op_id, return_mask = self.finished_queue.get()
-            if completed_task_id in task_ids:
-                if op_id == -1:
+            finished_task_ids = []
+            for task_id in task_ids:
+                task_tracker = self.requests_tracker[task_id]
+                if task_tracker.task_finished:
                     num_completed_tasks += 1
-                    return_masks[completed_task_id] = return_mask
-                    if completed_task_id in self.taskid_to_layerwise_ops:
-                        self.taskid_to_layerwise_ops.pop(completed_task_id)
-            else:
-                self.finished_queue.put((completed_task_id, op_id, return_mask))
-            time.sleep(0.0001)
+                    return_masks[task_id] = task_tracker.return_mask
+                    finished_task_ids.append(task_id)
+            task_ids = [task_id for task_id in task_ids if task_id not in finished_task_ids]
+            time.sleep(0.001)
         nvtx.mark(f"wait task_ids: {task_ids} done")
         return return_masks
 
-    def wait_at_layer_group(self, task_id: int, layer_group_id: int, last_layer: bool = False):
+    # the try_wait api is used for server-client mode:
+    # server process running the kvmanager should NOT be blocked by any single client
+    def try_wait(self, task_id: int)->Optional[torch.Tensor]:
+        task_tracker = self.requests_tracker[task_id]
+        if len(task_tracker.task_end_ops_ids) == 0:
+            return None
+        if all(task_tracker.task_end_ops_status):
+            return task_tracker.return_mask
+        return None
+
+    def wait_at_layer_group(self, task_id: int, layer_group_id: int):
         nvtx.mark(f"wait task_id: {task_id}, layer_group_id: {layer_group_id}")
         while True:
-            completed_task_id, op_id, return_mask = self.finished_ops_queue.get()
-            if completed_task_id == task_id:
-                if op_id == self.taskid_to_layerwise_ops[task_id][layer_group_id]:
-                    if last_layer:
-                        self.wait([task_id])
-                    nvtx.mark(f"wait_at_layer_group task_id: {task_id}, layer_group_id: {layer_group_id} done")
-                    return return_mask
-                elif op_id == -1:
-                    raise ValueError("should not happen since we are waiting at some layer")
-                elif op_id < layer_group_id:
-                    continue
-            else:
-                self.finished_ops_queue.put((completed_task_id, op_id, return_mask))
-            time.sleep(0.0001)
+            task_tracker = self.requests_tracker[task_id]
+            if len(task_tracker.task_end_ops_ids) == 0:
+                continue
+            if task_tracker.task_end_ops_status[layer_group_id]:
+                return task_tracker.return_mask
+            time.sleep(0.001)
+
+        nvtx.mark(f"wait_at_layer_group task_id: {task_id}, layer_group_id: {layer_group_id} done")
+        return return_mask
+
+    def try_wait_at_layer_group(self, task_id: int, layer_group_id: int)->Optional[torch.Tensor]:
+        task_tracker = self.requests_tracker[task_id]
+        if len(task_tracker.task_end_ops_ids) == 0:
+            return None
+        if task_tracker.task_end_ops_status[layer_group_id]:
+            return task_tracker.return_mask
+        return None

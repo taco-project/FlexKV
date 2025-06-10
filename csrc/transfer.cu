@@ -10,10 +10,11 @@ namespace flexkv {
 __global__ void transfer_kv_layers_kernel(
     int num_blocks, int num_layers, int64_t *dst_block_ids,
     int64_t **dst_layer_ptrs, int64_t dst_kv_stride, int64_t dst_chunk_stride,
+    int64_t dst_startoff_inside_chunks,
     int64_t *src_block_ids, int64_t **src_layer_ptrs, int64_t src_kv_stride,
-    int64_t src_chunk_stride, int64_t chunk_size) {
+    int64_t src_chunk_stride, int64_t src_startoff_inside_chunks, int64_t copy_size) {
   int num_chunks = num_layers * 2 * num_blocks;
-  int64_t chunk_size_in_float4 = chunk_size * sizeof(int64_t) / sizeof(float4);
+  int64_t copy_size_in_float4 = copy_size * sizeof(int64_t) / sizeof(float4);
 
   for (int chunk_idx = blockIdx.x; chunk_idx < num_chunks;
        chunk_idx += gridDim.x) {
@@ -28,11 +29,11 @@ __global__ void transfer_kv_layers_kernel(
         src_layer_ptrs[lay_idx] + kv_idx * src_kv_stride;
 
     int64_t *dst_chunk_ptr =
-        dst_layer_kv_ptr + dst_block_idx * dst_chunk_stride;
+        dst_layer_kv_ptr + dst_block_idx * dst_chunk_stride + dst_startoff_inside_chunks;
     int64_t *src_chunk_ptr =
-        src_layer_kv_ptr + src_block_idx * src_chunk_stride;
+        src_layer_kv_ptr + src_block_idx * src_chunk_stride + src_startoff_inside_chunks;
 
-    for (int64_t idx = threadIdx.x; idx < chunk_size_in_float4;
+    for (int64_t idx = threadIdx.x; idx < copy_size_in_float4;
          idx += blockDim.x) {
       float4 element = __ldg(&FLOAT4_PTR(src_chunk_ptr)[idx]);
       FLOAT4_PTR(dst_chunk_ptr)[idx] = element;
@@ -43,9 +44,11 @@ __global__ void transfer_kv_layers_kernel(
 void transfer_kv_layers(int num_blocks, int num_layers, int64_t *dst_block_ids,
                         void **dst_layer_ptrs, int64_t dst_kv_stride_in_bytes,
                         int64_t dst_chunk_stride_in_bytes,
+                        int64_t dst_startoff_inside_chunks,
                         int64_t *src_block_ids, void **src_layer_ptrs,
                         int64_t src_kv_stride_in_bytes,
                         int64_t src_chunk_stride_in_bytes,
+                        int64_t src_startoff_inside_chunks,
                         int64_t chunk_size_in_bytes, cudaStream_t stream,
                         int transfer_sms, bool is_host_to_device,
                         bool use_ce_transfer) {
@@ -68,11 +71,14 @@ void transfer_kv_layers(int num_blocks, int num_layers, int64_t *dst_block_ids,
   int64_t src_kv_stride_int64 = src_kv_stride_in_bytes / sizeof(int64_t);
   int64_t dst_chunk_stride_int64 = dst_chunk_stride_in_bytes / sizeof(int64_t);
   int64_t src_chunk_stride_int64 = src_chunk_stride_in_bytes / sizeof(int64_t);
+  int64_t dst_startoff_inside_chunks_int64 = dst_startoff_inside_chunks / sizeof(int64_t);
+  int64_t src_startoff_inside_chunks_int64 = src_startoff_inside_chunks / sizeof(int64_t);
   int64_t chunk_size_in_int64 = chunk_size_in_bytes / sizeof(int64_t);
 
   dim3 blockDim(block_size);
   dim3 gridDim(block_count);
   if (use_ce_transfer) {
+    assert(dst_startoff_inside_chunks == 0 && src_startoff_inside_chunks == 0);
     for (int i = 0; i < num_layers; i++) {
       for (int j = 0; j < 2; j++) {
         for (int k = 0; k < num_blocks; k++) {
@@ -100,9 +106,9 @@ void transfer_kv_layers(int num_blocks, int num_layers, int64_t *dst_block_ids,
   } else {
     transfer_kv_layers_kernel<<<gridDim, blockDim, 0, stream>>>(
         num_blocks, num_layers, dst_block_ids, dst_layer_ptrs_int64,
-        dst_kv_stride_int64, dst_chunk_stride_int64, src_block_ids,
-        src_layer_ptrs_int64, src_kv_stride_int64, src_chunk_stride_int64,
-        chunk_size_in_int64);
+        dst_kv_stride_int64, dst_chunk_stride_int64, dst_startoff_inside_chunks_int64,
+        src_block_ids, src_layer_ptrs_int64, src_kv_stride_int64,
+        src_chunk_stride_int64, src_startoff_inside_chunks_int64, chunk_size_in_int64);
   }
   cudaStreamSynchronize(stream);
 }

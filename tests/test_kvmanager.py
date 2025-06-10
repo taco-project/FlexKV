@@ -1,6 +1,7 @@
 import torch
 from flexkv.kvmanager import KVManager
 from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import debuginfo
 import time
 
@@ -9,7 +10,8 @@ num_kv_heads = 32
 head_size = 128
 element_size = 2
 use_mla = False
-tp_size = 1
+tp_size = 2
+dp_size = 2
 tokens_per_block = 16
 enable_cpu = True
 enable_ssd = True
@@ -21,8 +23,28 @@ num_cpu_blocks = 128
 num_ssd_blocks = 256 if enable_remote else 512
 num_remote_blocks = 512
 
+default_kv_layout = KVCacheLayout(
+    type=KVCacheLayoutType.LAYERWISE, 
+    num_layer=num_layers, 
+    num_block=num_gpu_blocks, 
+    tokens_per_block=tokens_per_block, 
+    num_head=num_kv_heads, 
+    head_size=head_size,
+    is_mla=False
+)
+
+gpu_kv_layout = KVCacheLayout(
+    type=KVCacheLayoutType.LAYERWISE, 
+    num_layer=num_layers, 
+    num_block=num_gpu_blocks, 
+    tokens_per_block=tokens_per_block, 
+    num_head=num_kv_heads//tp_size, 
+    head_size=head_size,
+    is_mla=False
+)
+
 # the ratio of gpu blocks to be written in the initial write
-initial_write_ratio = 0.5
+initial_write_ratio = 0.4
 
 num_requests = num_gpu_blocks // block_per_request
 
@@ -48,26 +70,28 @@ def generate_request_pair(idx: int):
         dtype=torch.int64
     )
 
-    return token_ids, block_ids
+    return token_ids, block_ids, idx % dp_size
 
-def verify_data(gpu_blocks, gpu_blocks_gt):
-    # verify data correctness
-    for i in range(num_layers):
-        gpu_k = gpu_blocks[i][0, :, :, :, :]
-        gpu_v = gpu_blocks[i][1, :, :, :, :]
-        gpu_k_gt = gpu_blocks_gt[i][0, :, :, :, :]
-        gpu_v_gt = gpu_blocks_gt[i][1, :, :, :, :]
-
-        num_blocks = gpu_k.shape[0]
-        for block_idx in range(num_blocks):
-            if not torch.allclose(gpu_k[block_idx], gpu_k_gt[block_idx]):
-                print(f"K mismatch at layer {i}, block {block_idx} / {num_blocks // 2}")
-        for block_idx in range(num_blocks):
-            if not torch.allclose(gpu_v[block_idx], gpu_v_gt[block_idx]):
-                print(f"V mismatch at layer {i}, block {block_idx} / {num_blocks // 2}")
-        assert torch.allclose(gpu_k, gpu_k_gt), f"K mismatch at layer {i}"
-        assert torch.allclose(gpu_v, gpu_v_gt), f"V mismatch at layer {i}"
-
+def verify_data(gpu_blocks, dp_wise_gpu_blocks_gt):
+    # traverse each dp group
+    head_per_tp = num_kv_heads // tp_size
+    for dp_id in range(dp_size):
+        gt = dp_wise_gpu_blocks_gt[dp_id]  # the ground truth of the dp group
+        for tp_id in range(tp_size):
+            global_gpu_id = dp_id * tp_size + tp_id
+            gpu_tensors = gpu_blocks[global_gpu_id]
+            for layer in range(num_layers):
+                gpu_tensor = gpu_tensors[layer].cpu()
+                # extract the corresponding slice from ground truth
+                start_head = tp_id * head_per_tp
+                end_head = (tp_id + 1) * head_per_tp
+                gt_tensor_slice = gt[layer][:, :, :, start_head:end_head, :]
+                
+                if not torch.allclose(gpu_tensor, gt_tensor_slice):
+                    print(f"Mismatch at dp_id={dp_id}, tp_id={tp_id}, global_gpu_id={global_gpu_id}, layer={layer}")
+                    print(f"GPU tensor shape: {gpu_tensor.shape}, GT slice shape: {gt_tensor_slice.shape}")
+                assert torch.allclose(gpu_tensor, gt_tensor_slice), \
+                    f"Mismatch at dp_id={dp_id}, tp_id={tp_id}, global_gpu_id={global_gpu_id}, layer={layer}"
     print("verify done")
 
 def block_ids_2_slot_mapping(block_ids):
@@ -80,10 +104,15 @@ def test_kvmanager():
                                head_size=head_size,
                                element_size=element_size,
                                use_mla=use_mla,
-                               tp_size=tp_size)
+                               tp_size=tp_size,
+                               dp_size=dp_size)
     cache_config = CacheConfig(enable_cpu=True,
                                enable_ssd=True,
                                enable_remote=enable_remote,
+                               gpu_kv_layout=gpu_kv_layout,
+                               cpu_kv_layout=default_kv_layout,
+                               ssd_kv_layout=default_kv_layout,
+                               remote_kv_layout=default_kv_layout,
                                use_gds=False,
                                use_pinned_memory=True,
                                tokens_per_block=tokens_per_block,
@@ -98,25 +127,52 @@ def test_kvmanager():
                                     "pcfs_ip": "172.21.16.177",
                                     "pcfs_parent_nodeid": 144115188075855883
                                })
-    gpu_blocks = [torch.randn(2, num_gpu_blocks, tokens_per_block, num_kv_heads, head_size, dtype=torch.float16).cuda()
-                  for _ in range(num_layers)]
-    gpu_blocks_gt = [block.clone() for block in gpu_blocks]
-    kvmanager = KVManager(model_config, cache_config, [gpu_blocks])
+    gpu_blocks = {}
+    dp_wise_gpu_blocks_gt = []
+    for dp_id in range(dp_size):
+        # generate ground truth tensors with full head dimension
+        # shape: [2, num_blocks, tokens_per_block, num_head, head_size]
+        tp_group_tensors_gt = [
+            torch.randn(size=default_kv_layout.get_kv_shape()[1:], dtype=torch.float16)
+            for _ in range(num_layers)
+        ]
+        
+        # split tensors across TP ranks in head dimension
+        head_per_tp = num_kv_heads // tp_size
+        for tp_id in range(tp_size):
+            global_gpu_id = dp_id * tp_size + tp_id
+            device = torch.device(f"cuda:{global_gpu_id}")
+            
+            # split each layer tensor in head dimension for this TP rank
+            # each TP rank gets [2, num_blocks, tokens_per_block, num_head//tp_size, head_size]
+            gpu_blocks[global_gpu_id] = []
+            for layer_id in range(num_layers):
+                start_head = tp_id * head_per_tp
+                end_head = (tp_id + 1) * head_per_tp
+                # split in head dimension (dimension 3)
+                tp_tensor = tp_group_tensors_gt[layer_id][:, :, :, start_head:end_head, :].to(device)
+                gpu_blocks[global_gpu_id].append(tp_tensor)
+        
+        dp_wise_gpu_blocks_gt.append(tp_group_tensors_gt)
+        
+    kvmanager = KVManager(model_config, cache_config, gpu_blocks)
 
     request_pairs = [generate_request_pair(i) for i in range(num_requests)]
 
     # write initial data
     initial_write_num = int(num_requests * initial_write_ratio)
     print("writing initial data...")
-    for token_ids, block_ids in request_pairs[:initial_write_num]:
+    for token_ids, block_ids, dp_id in request_pairs[:initial_write_num]:
         write_request = kvmanager.put_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
+            dp_id=dp_id,
         )
-        kvmanager.wait(write_request)
+        kvmanager.wait_for_graph_finished(write_request)
         # clear gpu blocks
-        for i in range(num_layers):
-            gpu_blocks[i][:, block_ids, :, :, :] = 0
+        for gpu in range(dp_id * tp_size, (dp_id + 1) * tp_size):
+            for i in range(num_layers):
+                gpu_blocks[gpu][i][:, block_ids, :, :, :] = 0
     print(f"initial data {initial_write_num} written")
     # mixed read/write test
     total_cache_hit = 0
@@ -129,35 +185,39 @@ def test_kvmanager():
         print(f"performing mixed read/write {i} / {num_requests} ...")
         # read from written data
         read_idx = i - initial_write_num
-        token_ids, block_ids = request_pairs[read_idx]
+        token_ids, block_ids, dp_id = request_pairs[read_idx]
         request_id = kvmanager.get_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
             layer_granularity=-1,
+            dp_id=dp_id,
         )
         running_get_requests.append(request_id)
 
         # write new data
-        token_ids, block_ids = request_pairs[i]
+        token_ids, block_ids, dp_id = request_pairs[i]
         request_id = kvmanager.put_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids),
+            dp_id=dp_id,
         )
         running_put_requests.append(request_id)
         # to aviod that all seq are locked, and cannot eviction
-        if len(running_get_requests) + len(running_put_requests) >= num_cpu_blocks // block_per_request:
-            return_masks = kvmanager.wait(running_get_requests)
-            kvmanager.wait(running_put_requests)
-            for return_mask in return_masks.values():
-                total_cache_hit += return_mask.sum()
-                total_cache_miss += len(return_mask) - return_mask.sum()
+        if len(running_get_requests) + len(running_put_requests) >= num_cpu_blocks // block_per_request - 2:
+            if len(running_put_requests) > 0:
+                kvmanager.wait_for_graph_finished(running_put_requests)
+            if len(running_get_requests) > 0:
+                return_masks = kvmanager.wait(running_get_requests)
+                for return_mask in return_masks.values():
+                    total_cache_hit += return_mask.sum()
+                    total_cache_miss += len(return_mask) - return_mask.sum()
             running_get_requests = []
             running_put_requests = []
     if len(running_get_requests) > 0:
         kvmanager.wait(running_get_requests)
         running_get_requests = []
     if len(running_put_requests) > 0:
-        kvmanager.wait(running_put_requests)
+        kvmanager.wait_for_graph_finished(running_put_requests)
         running_put_requests = []
     print("mixed read/write done")
     end_time = time.time()
@@ -167,7 +227,7 @@ def test_kvmanager():
     print(f"Total cache hit rate: {total_cache_hit / (total_cache_hit + total_cache_miss)}")
     kvmanager.shutdown()
     if(total_cache_miss == 0):
-        verify_data(gpu_blocks, gpu_blocks_gt)
+        verify_data(gpu_blocks, dp_wise_gpu_blocks_gt)
     else:
         print(f"verify skipped, because of total_cache_miss={total_cache_miss}>0")
 

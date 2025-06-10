@@ -15,6 +15,7 @@
 #include "transfer.cuh"
 #include "transfer_ssd.h"
 #include "pcfs/pcfs.h"
+#include "tp_transfer_thread_group.h"
 
 namespace py = pybind11;
 
@@ -40,8 +41,8 @@ void transfer_kv_layers_binding(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   flexkv::transfer_kv_layers(
       num_blocks, num_layers, dst_block_ids, dst_layer_ptrs,
-      dst_kv_stride_in_bytes, dst_chunk_stride_in_bytes, src_block_ids,
-      src_layer_ptrs, src_kv_stride_in_bytes, src_chunk_stride_in_bytes,
+      dst_kv_stride_in_bytes, dst_chunk_stride_in_bytes, 0, src_block_ids,
+      src_layer_ptrs, src_kv_stride_in_bytes, src_chunk_stride_in_bytes, 0,
       chunk_size_in_bytes, stream, transfer_sms, is_host_to_device,
       use_ce_transfer);
   cudaError_t err = cudaGetLastError();
@@ -133,6 +134,23 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
         py::arg("hasher"), py::arg("token_ids"), py::arg("tokens_per_block"),
         py::arg("block_hashes"));
+
+  py::class_<flexkv::TPTransferThreadGroup>(m, "TPTransferThreadGroup")
+      .def(py::init<int, const std::vector<std::vector<torch::Tensor>>&, const std::vector<torch::Tensor>&, int>())
+      .def("tp_group_transfer", &flexkv::TPTransferThreadGroup::tp_group_transfer,
+            py::arg("dst_block_id_tensors"),
+            py::arg("dst_kv_stride_in_bytes"),
+            py::arg("dst_chunk_stride_in_bytes"),
+            py::arg("dst_chunk_size_in_bytes"),
+            py::arg("src_block_id_tensors"),
+            py::arg("src_kv_stride_in_bytes"),
+            py::arg("src_chunk_stride_in_bytes"), 
+            py::arg("src_chunk_size_in_bytes"),
+            py::arg("transfer_sms"),
+            py::arg("is_host_to_device"),
+            py::arg("use_ce_transfer"),
+            py::arg("layer_id"),
+            py::arg("layer_granularity"));
 
   // Add Hasher class binding
   py::class_<flexkv::Hasher>(m, "Hasher")
