@@ -106,8 +106,7 @@ def test_kvmanager():
                                use_mla=use_mla,
                                tp_size=tp_size,
                                dp_size=dp_size)
-    cache_config = CacheConfig(raw_gpu_blocks=True,
-                               enable_cpu=True,
+    cache_config = CacheConfig(enable_cpu=True,
                                enable_ssd=True,
                                enable_remote=enable_remote,
                                gpu_kv_layout=gpu_kv_layout,
@@ -169,7 +168,7 @@ def test_kvmanager():
             slot_mapping=block_ids_2_slot_mapping(block_ids),
             dp_id=dp_id,
         )
-        kvmanager.wait_for_task_finished(write_request)
+        kvmanager.wait_for_graph_finished(write_request)
         # clear gpu blocks
         for gpu in range(dp_id * tp_size, (dp_id + 1) * tp_size):
             for i in range(num_layers):
@@ -206,7 +205,7 @@ def test_kvmanager():
         # to aviod that all seq are locked, and cannot eviction
         if len(running_get_requests) + len(running_put_requests) >= num_cpu_blocks // block_per_request - 2:
             if len(running_put_requests) > 0:
-                kvmanager.wait_for_task_finished(running_put_requests)
+                kvmanager.wait_for_graph_finished(running_put_requests)
             if len(running_get_requests) > 0:
                 return_masks = kvmanager.wait(running_get_requests)
                 for return_mask in return_masks.values():
@@ -218,7 +217,7 @@ def test_kvmanager():
         kvmanager.wait(running_get_requests)
         running_get_requests = []
     if len(running_put_requests) > 0:
-        kvmanager.wait_for_task_finished(running_put_requests)
+        kvmanager.wait_for_graph_finished(running_put_requests)
         running_put_requests = []
     print("mixed read/write done")
     end_time = time.time()

@@ -19,7 +19,6 @@ default_kv_layout = KVCacheLayout(type=KVCacheLayoutType.LAYERWISE, num_layer=1,
 @dataclass
 class CacheConfig:
     tokens_per_block: int = 16
-    raw_gpu_blocks: bool = True
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_remote: bool = False

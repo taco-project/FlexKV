@@ -169,6 +169,9 @@ class GlobalCacheEngine:
             remote_physical_blocks = []
 
         num_transfer_blocks = max(len(cpu_physical_blocks), len(ssd_physical_blocks), len(remote_physical_blocks))
+        #early return if no blocks to transfer
+        if num_transfer_blocks == 0:
+            return TransferOpGraph.create_empty_graph(request_id), torch.zeros_like(token_mask), None, []
         assert num_transfer_blocks <= len(gpu_block_mapping)
 
 
@@ -310,6 +313,11 @@ class GlobalCacheEngine:
         assert len(cpu_matched_blocks) <= len(ssd_matched_blocks)
 
         gpu_blocks_to_transfer = gpu_block_mapping[len(cpu_matched_blocks):]
+
+        #early return if no blocks to transfer
+        if len(gpu_blocks_to_transfer) == 0:
+            return TransferOpGraph.create_empty_graph(request_id), torch.ones_like(token_mask), None, []
+
         cpu_blocks_to_transfer = self.cpu_cache_engine.take(
             num_required_blocks=len(gpu_block_mapping) - len(cpu_matched_blocks),
             protected_node = cpu_matched_result.last_node,
@@ -414,6 +422,9 @@ class GlobalCacheEngine:
         cpu_physical_blocks = cpu_physical_blocks[start_idx:end_idx]
 
         num_transfer_blocks = len(cpu_physical_blocks)
+        #early return if no blocks to transfer
+        if num_transfer_blocks == 0:
+            return TransferOpGraph.create_empty_graph(request_id), torch.zeros_like(token_mask), None, []
         assert num_transfer_blocks <= len(gpu_block_mapping)
 
 
@@ -481,6 +492,9 @@ class GlobalCacheEngine:
         cpu_matched_blocks = cpu_matched_result.physical_blocks[start_idx:end_idx]
 
         gpu_blocks_to_transfer = gpu_block_mapping[len(cpu_matched_blocks):]
+        #early return if no blocks to transfer
+        if len(gpu_blocks_to_transfer) == 0:
+            return TransferOpGraph.create_empty_graph(request_id), torch.ones_like(token_mask), None, []
         cpu_blocks_to_transfer = self.cpu_cache_engine.take(
             num_required_blocks=len(gpu_block_mapping) - len(cpu_matched_blocks),
             protected_node = cpu_matched_result.last_node,
