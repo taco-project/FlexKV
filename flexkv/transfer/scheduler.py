@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import OrderedDict, List, Set, Tuple
 
-from ..common.transfer import TransferOp, TransferOpGraph, TransferType
+from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType
 
 
 class TransferScheduler:
