@@ -185,8 +185,8 @@ if __name__ == "__main__":
     model_config = ModelConfig(num_layers=num_layers,
                                 num_kv_heads=num_kv_heads,
                                 head_size=head_size,
-                                element_size=2,
                                 use_mla=False,
-                                tp_size=tp_size)
+                                tp_size=tp_size,
+                                dtype=torch.float16)
     
     dp_client = KVDPClient("ipc:///tmp/tmp6isie_et", model_config)
