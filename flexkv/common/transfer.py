@@ -85,7 +85,7 @@ class TransferOpGraph:
 
     def __init__(self, transfer_graph_id: int):
         self.transfer_graph_id = transfer_graph_id
-        self._op_map = {}
+        self._op_map: dict[int, TransferOp] = {}
         self._ready_ops = set()
         self._trigger_ops = set()
 

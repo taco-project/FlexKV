@@ -40,7 +40,7 @@ class TransferEngine:
         self.task_queue = Queue()
         self.completed_queue = Queue()
         self.finished_ops_queue = MPQueue()
-        self.op_id_to_op = {}
+        self.op_id_to_op: dict[int, TransferOp] = {}
 
         self.op_id_to_nvtx_range = {}
 
@@ -49,34 +49,20 @@ class TransferEngine:
 
         assert len(gpu_handles) == self.dp_size * self.tp_size
         
-        if self.tp_size == 1 and self.dp_size == 1: #NOTE this is not necessary, just for test
-            self.gpucpu_workers = [
-                GPUCPUTransferWorker.create_worker(
-                    worker_id=0,
-                    gpu_blocks=gpu_handles[0].data,
-                    cpu_blocks=cpu_handle.data,
-                    finished_ops_queue=self.finished_ops_queue,
-                    gpu_kv_layout=gpu_handles[0].kv_layout,
-                    cpu_kv_layout=cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    gpu_device_id=gpu_handles[0].gpu_device_id,
-                )
-            ]
-        else:
-            self.gpucpu_workers = [
-                tpGPUCPUTransferWorker.create_worker(
-                    worker_id=i,
-                    gpu_blocks=[gpu_handles[j].data for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
-                    cpu_blocks=cpu_handle.data,
-                    finished_ops_queue=self.finished_ops_queue,
-                    gpu_kv_layout=gpu_handles[i].kv_layout,
-                    cpu_kv_layout=cpu_handle.kv_layout,
-                    dtype=gpu_handles[i].dtype,
-                    tp_group_size=self.tp_size,
-                    dp_group_id=i,
-                )
-                for i in range(self.dp_size)
-            ]
+        self.gpucpu_workers = [
+            tpGPUCPUTransferWorker.create_worker(
+                worker_id=i,
+                gpu_blocks=[gpu_handles[j].data for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                cpu_blocks=cpu_handle.data,
+                finished_ops_queue=self.finished_ops_queue,
+                gpu_kv_layout=gpu_handles[i].kv_layout,
+                cpu_kv_layout=cpu_handle.kv_layout,
+                dtype=gpu_handles[i].dtype,
+                tp_group_size=self.tp_size,
+                dp_group_id=i,
+            )
+            for i in range(self.dp_size)
+        ]
 
         # Wait for GPU-CPU workers to initialize
         self.cpussd_read_worker = None
@@ -153,7 +139,7 @@ class TransferEngine:
                 except queue.Empty:
                     break
             # Collect finished ops
-            finished_ops = []
+            finished_ops: list[TransferOp] = []
             while True:
                 try:
                     op_id = self.finished_ops_queue.get_nowait()

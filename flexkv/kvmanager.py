@@ -7,7 +7,7 @@ import torch
 import nvtx
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Mapping
 import multiprocessing as mp
 
 from flexkv.common.config import CacheConfig, ModelConfig
@@ -18,6 +18,9 @@ from flexkv.common.transfer import DeviceType, get_nvtx_range_color, get_nvtx_de
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 from flexkv.common.memory_handle import KVCacheTensorHandle
 from flexkv.common.expiring_dict import DoubleBufferExpiringDict
+from flexkv.common.debug import init_logger
+
+logger = init_logger(__name__)
 
 @dataclass
 class RequestTracker:
@@ -28,13 +31,7 @@ class RequestTracker:
     task_end_ops_ids: List[int]
     task_end_ops_status: List[bool]
     task_finished: bool = False
-
-
-    def __post_init__(self):
-        if len(self.task_end_ops_ids) > 0:
-            self.task_end_ops_status = [False] * len(self.task_end_ops_ids)
-        else:
-            self.task_end_ops_status = []
+    
 
 class KVManager:
     def __init__(self,
@@ -88,7 +85,7 @@ class KVManager:
         )
         self.transfer_engine = TransferEngine(self.gpu_handles, self.model_config, self.cache_config, cpu_handle, ssd_handle, remote_handle)
 
-        self.requests_tracker = DoubleBufferExpiringDict(expire_seconds=600)
+        self.requests_tracker: Mapping[int, RequestTracker] = DoubleBufferExpiringDict(expire_seconds=600)
 
         self.taskid_to_nvtx_range = {}
         self.graphid_to_nvtx_range = {}
