@@ -51,7 +51,6 @@ gpu_kv_layout = KVCacheLayout(
 model_config = ModelConfig(num_layers=num_layers,
                             num_kv_heads=num_kv_heads,
                             head_size=head_size,
-                            element_size=2,
                             use_mla=False,
                             tp_size=tp_size, 
                             dp_size=dp_size,

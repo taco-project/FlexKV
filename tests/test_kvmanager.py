@@ -11,7 +11,7 @@ from flexkv.kvmanager import KVManager
 num_layers = 16
 num_kv_heads = 32
 head_size = 128
-element_size = 2
+dtype = torch.float16
 use_mla = False
 tp_size = 1
 dp_size = 1
@@ -20,7 +20,6 @@ enable_cpu = True
 enable_ssd = True
 block_per_request = 16
 enable_remote = False
-dtype = torch.float16
 
 num_gpu_blocks = 512
 num_cpu_blocks = 128
@@ -106,7 +105,6 @@ def test_kvmanager():
     model_config = ModelConfig(num_layers=num_layers,
                                num_kv_heads=num_kv_heads,
                                head_size=head_size,
-                               element_size=element_size,
                                use_mla=use_mla,
                                tp_size=tp_size,
                                dp_size=dp_size,

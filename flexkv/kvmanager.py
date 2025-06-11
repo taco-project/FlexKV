@@ -12,7 +12,7 @@ import torch
 from flexkv.cache.cache_engine import GlobalCacheEngine, TransferOpGraph
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import init_logger
-from flexkv.common.expiring_dict import DoubleBufferExpiringDict
+from flexkv.common.expiring_dict import ExpiringDict
 from flexkv.common.memory_handle import KVCacheTensorHandle
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 from flexkv.common.transfer import DeviceType, get_nvtx_range_color, get_nvtx_default_color
@@ -85,7 +85,7 @@ class KVManager:
         )
         self.transfer_engine = TransferEngine(self.gpu_handles, self.model_config, self.cache_config, cpu_handle, ssd_handle, remote_handle)
 
-        self.requests_tracker: Mapping[int, RequestTracker] = DoubleBufferExpiringDict(expire_seconds=600)
+        self.requests_tracker: Mapping[int, RequestTracker] = ExpiringDict(expire_seconds=600)
 
         self.taskid_to_nvtx_range = {}
         self.graphid_to_nvtx_range = {}

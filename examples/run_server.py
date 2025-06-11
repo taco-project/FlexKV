@@ -35,7 +35,6 @@ if __name__ == "__main__":
     num_kv_heads=hf_config.num_key_value_heads
     head_size=(hf_config.head_dim if hasattr(hf_config, 'head_dim') 
                 else hf_config.hidden_size//hf_config.num_attention_heads)
-    element_size=hf_config.torch_dtype.itemsize
     use_mla=hf_config.architectures[0].startswith("Deepseek")
     
     # TODO: different model config may have different attribute name
@@ -43,7 +42,6 @@ if __name__ == "__main__":
         num_layers=num_layers,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
-        element_size=element_size,
         use_mla=use_mla,
         tp_size=args.tp_size,
         dp_size=args.dp_size,
