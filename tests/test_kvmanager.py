@@ -20,6 +20,7 @@ enable_cpu = True
 enable_ssd = True
 block_per_request = 16
 enable_remote = False
+dtype = torch.float16
 
 num_gpu_blocks = 512
 num_cpu_blocks = 128
@@ -108,7 +109,8 @@ def test_kvmanager():
                                element_size=element_size,
                                use_mla=use_mla,
                                tp_size=tp_size,
-                               dp_size=dp_size)
+                               dp_size=dp_size,
+                               dtype=dtype)
     cache_config = CacheConfig(enable_cpu=True,
                                enable_ssd=True,
                                enable_remote=enable_remote,
@@ -136,7 +138,7 @@ def test_kvmanager():
         # generate ground truth tensors with full head dimension
         # shape: [2, num_blocks, tokens_per_block, num_head, head_size]
         tp_group_tensors_gt = [
-            torch.randn(size=default_kv_layout.get_kv_shape()[1:], dtype=torch.float16)
+            torch.randn(size=default_kv_layout.get_kv_shape()[1:], dtype=dtype)
             for _ in range(num_layers)
         ]
         

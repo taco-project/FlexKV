@@ -47,6 +47,7 @@ if __name__ == "__main__":
         use_mla=use_mla,
         tp_size=args.tp_size,
         dp_size=args.dp_size,
+        dtype=hf_config.torch_dtype
     )
     
     cpu_kv_layout = KVCacheLayout(

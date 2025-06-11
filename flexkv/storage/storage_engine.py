@@ -23,7 +23,7 @@ class StorageEngine:
         self._gpu_layout = None
         if all_gpu_blocks:
             for i in range(len(all_gpu_blocks)):
-                self.add_gpu_blocks(all_gpu_blocks[i], i)
+                self.add_gpu_blocks(all_gpu_blocks[i], i, self._model_config.dtype)
         if self._cache_config.enable_cpu:
             if not self._cache_config.cpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
                 raise ValueError("Only layerwise layout is supported for CPU")
@@ -31,7 +31,7 @@ class StorageEngine:
             self.allocate(
                 device_type=DeviceType.CPU,
                 layout=self._cpu_layout,
-                dtype=torch.float16,
+                dtype=self._model_config.dtype,
                 pin_memory=self._cache_config.use_pinned_memory,
                 num_chunks=self._model_config.num_layers
             )
@@ -42,7 +42,7 @@ class StorageEngine:
             self.allocate(
                 device_type=DeviceType.SSD,
                 layout=self._ssd_layout,
-                dtype=torch.float16,
+                dtype=self._model_config.dtype,
                 file_path=self._cache_config.ssd_cache_path
             )
         if self._cache_config.enable_remote:
@@ -52,18 +52,21 @@ class StorageEngine:
             self.allocate(
                 device_type=DeviceType.REMOTE,
                 layout=self._remote_layout,
-                dtype=torch.float16,
+                dtype=self._model_config.dtype,
                 file_path=self._cache_config.remote_cache_path,
                 remote_config_custom = self._cache_config.remote_config_custom
             )
 
-    def add_gpu_blocks(self, gpu_blocks: Union[List[torch.Tensor], List[KVCacheTensorHandle]], device_id: int = 0):
+    def add_gpu_blocks(self, 
+                       gpu_blocks: Union[List[torch.Tensor], List[KVCacheTensorHandle]], 
+                       device_id: int = 0, 
+                       dtype: torch.dtype = torch.float16):
         if self._gpu_layout is None:
             self._gpu_layout = self._cache_config.gpu_kv_layout
         self.allocate(
             device_type=DeviceType.GPU,
             layout=self._gpu_layout,
-            dtype=torch.float16,
+            dtype=dtype,
             device_id=device_id,
             raw_data=gpu_blocks
         )
