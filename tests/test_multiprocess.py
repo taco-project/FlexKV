@@ -1,14 +1,16 @@
-import torch
-from typing import Tuple
 import time
-import tempfile
-
 from multiprocessing import Process
-from flexkv.server.server import KVServer
-from flexkv.server.client import KVDPClient, KVTPClient
+from typing import Tuple
+
+import tempfile
+import torch
+
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import init_logger
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.server.client import KVDPClient, KVTPClient
+from flexkv.server.server import KVServer
+
 
 logger = init_logger(__name__)
 
@@ -20,6 +22,7 @@ num_cpu_blocks = 300
 num_gpu_blocks = 30
 tp_size = 2
 dp_size = 1
+dtype = torch.float16
 tokens_per_block = 8
 cpu_shape = (num_layers, 2, num_cpu_blocks, tokens_per_block, num_kv_heads, head_size)
 gpu_shape = (num_layers, 2, num_gpu_blocks, tokens_per_block, num_kv_heads//tp_size, head_size)
@@ -48,15 +51,16 @@ gpu_kv_layout = KVCacheLayout(
 model_config = ModelConfig(num_layers=num_layers,
                             num_kv_heads=num_kv_heads,
                             head_size=head_size,
-                            element_size=2,
                             use_mla=False,
                             tp_size=tp_size, 
-                            dp_size=dp_size)
+                            dp_size=dp_size,
+                            dtype=dtype)
 
 cache_config = CacheConfig( enable_cpu=True,
                             enable_ssd=False,
                             enable_remote=False,
                             cpu_kv_layout=default_kv_layout,
+                            gpu_kv_layout=gpu_kv_layout,
                             use_gds=False,
                             use_pinned_memory=True,
                             tokens_per_block=tokens_per_block,
@@ -171,7 +175,7 @@ def run_tp_client(dp_client_id, tp_rank, device_id, server_recv_port):
     
     tp_client = KVTPClient(server_recv_port, dp_client_id, device_id, tp_rank)
     
-    gpu_blocks = [torch.rand(size=gpu_shape[1:], dtype=torch.float16).cuda(device_id)
+    gpu_blocks = [torch.rand(size=gpu_shape[1:], dtype=dtype).cuda(device_id)
                     for layer_id in range(gpu_shape[0])]
     gpu_layout = gpu_kv_layout
     

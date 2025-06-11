@@ -1,7 +1,7 @@
-import cProfile
-import pstats
 from argparse import ArgumentParser
 
+import cProfile
+import pstats
 import torch
 
 from flexkv.cache.radixtree import RadixTreeIndex

@@ -1,17 +1,18 @@
-import time
-import cProfile
-import pstats
 import random
-import numpy as np
+import time
+from request_generator import RequestGenerator, KVRequest
 from typing import List
 
+import cProfile
+import numpy as np
+import pstats
 import torch
 
-from flexkv.common.block import SequenceMeta
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex
-from request_generator import RequestGenerator, KVRequest
+from flexkv.common.block import SequenceMeta
 from flexkv.common.debug import debuginfo
+
 
 debuginfo.set_level("INFO")
 

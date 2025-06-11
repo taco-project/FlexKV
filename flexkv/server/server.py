@@ -1,13 +1,16 @@
 from collections import deque
-import tempfile
 
+import tempfile
 import zmq
 
-from flexkv.kvmanager import KVManager
-from flexkv.common.memory_handle import import_layer_tensor_handle
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.server.util import get_zmq_socket
+from flexkv.common.debug import init_logger
+from flexkv.common.memory_handle import import_layer_tensor_handle
+from flexkv.kvmanager import KVManager
 from flexkv.server.request import (
+from flexkv.server.util import get_zmq_socket
+
+
     RegisterDPClientRequest,
     RegisterTPClientRequest,
     PutRequest,
@@ -15,7 +18,6 @@ from flexkv.server.request import (
     WaitRequest,
     Response
 )
-from flexkv.common.debug import init_logger
 
 logger = init_logger(__name__)
 
@@ -275,9 +277,9 @@ if __name__ == "__main__":
     model_config = ModelConfig(num_layers=num_layers,
                                 num_kv_heads=num_kv_heads,
                                 head_size=head_size,
-                                element_size=2,
                                 use_mla=False,
-                                tp_size=tp_size)
+                                tp_size=tp_size,
+                                dtype=torch.float16)
 
     cache_config = CacheConfig(enable_cpu=True,
                                 enable_ssd=False,

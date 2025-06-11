@@ -1,21 +1,23 @@
-from typing import List, Tuple, Optional, Dict, Callable
-from queue import Queue
-import torch
-import time
 import threading
+import time
 from functools import partial
+from queue import Queue
+from typing import List, Tuple, Optional, Dict, Callable
 
-from flexkv.common.transfer import DeviceType, TransferOpGraph
-from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
+import torch
+
 from flexkv.cache.mempool import Mempool
-from flexkv.common.block import SequenceMeta
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.transfer_pattern import (
     create_read_graph_cpu_storage, create_read_graph_cpu_ssd_remote, convert_read_graph_to_layer_wise_graph,
     create_write_graph_cpu_storage, create_write_graph_cpu_ssd_remote
 )
+from flexkv.common.block import SequenceMeta
+from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
+from flexkv.common.transfer import DeviceType, TransferOpGraph
+
 
 class CacheEngine:
     def __init__(self,
@@ -432,7 +434,6 @@ class GlobalCacheEngine:
         # the blocks are needed by the mask & the blocks are ready
         cpu_physical_blocks = cpu_matched_result.physical_blocks[:cpu_matched_result.num_ready_matched_blocks]
         cpu_physical_blocks = cpu_physical_blocks[start_idx:end_idx]
-
         num_transfer_blocks = len(cpu_physical_blocks)
         #early return if no blocks to transfer
         if num_transfer_blocks == 0:

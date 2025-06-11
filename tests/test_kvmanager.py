@@ -1,17 +1,20 @@
-import torch
-from flexkv.kvmanager import KVManager
-from flexkv.common.config import ModelConfig, CacheConfig
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-from flexkv.common.debug import debuginfo
 import time
+
+import torch
+
+from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.debug import debuginfo
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.kvmanager import KVManager
+
 
 num_layers = 16
 num_kv_heads = 32
 head_size = 128
-element_size = 2
+dtype = torch.float16
 use_mla = False
-tp_size = 2
-dp_size = 2
+tp_size = 1
+dp_size = 1
 tokens_per_block = 16
 enable_cpu = True
 enable_ssd = True
@@ -102,12 +105,12 @@ def test_kvmanager():
     model_config = ModelConfig(num_layers=num_layers,
                                num_kv_heads=num_kv_heads,
                                head_size=head_size,
-                               element_size=element_size,
                                use_mla=use_mla,
                                tp_size=tp_size,
-                               dp_size=dp_size)
-    cache_config = CacheConfig(enable_cpu=True,
-                               enable_ssd=True,
+                               dp_size=dp_size,
+                               dtype=dtype)
+    cache_config = CacheConfig(enable_cpu=enable_cpu,
+                               enable_ssd=enable_ssd,
                                enable_remote=enable_remote,
                                gpu_kv_layout=gpu_kv_layout,
                                cpu_kv_layout=default_kv_layout,
@@ -133,7 +136,7 @@ def test_kvmanager():
         # generate ground truth tensors with full head dimension
         # shape: [2, num_blocks, tokens_per_block, num_head, head_size]
         tp_group_tensors_gt = [
-            torch.randn(size=default_kv_layout.get_kv_shape()[1:], dtype=torch.float16)
+            torch.randn(size=default_kv_layout.get_kv_shape()[1:], dtype=dtype)
             for _ in range(num_layers)
         ]
         
@@ -203,7 +206,8 @@ def test_kvmanager():
         )
         running_put_requests.append(request_id)
         # to aviod that all seq are locked, and cannot eviction
-        if len(running_get_requests) + len(running_put_requests) >= num_cpu_blocks // block_per_request - 2:
+        if (i == num_requests - 1 or 
+            len(running_get_requests) + len(running_put_requests) >= num_cpu_blocks // block_per_request - 2):
             if len(running_put_requests) > 0:
                 kvmanager.wait_for_graph_finished(running_put_requests)
             if len(running_get_requests) > 0:

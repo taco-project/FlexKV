@@ -3,8 +3,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-import torch
 import numpy as np
+import torch
 
 from flexkv.common.block import SequenceMeta
 from flexkv.common.hash_utils import HashType, Hasher

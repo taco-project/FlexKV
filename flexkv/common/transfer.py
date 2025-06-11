@@ -1,9 +1,11 @@
+import threading
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Optional, Set, Dict, Tuple
-from dataclasses import dataclass, field
-import torch
-import threading
+
 import nvtx
+import torch
+
 
 class DeviceType(Enum):
     CPU = 0

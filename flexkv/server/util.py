@@ -1,6 +1,5 @@
-import zmq
 import psutil
-
+import zmq
 
 
 def get_zmq_socket(

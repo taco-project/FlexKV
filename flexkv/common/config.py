@@ -1,16 +1,19 @@
 from dataclasses import dataclass
-from typing import Optional, List, Union, Dict, Any
 from enum import Enum
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from typing import Optional, List, Union, Dict, Any
+
 import torch
+
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+
 
 @dataclass
 class ModelConfig:
     num_layers: int
     num_kv_heads: int
     head_size: int
-    element_size: int
     use_mla: bool = False
+    dtype: torch.dtype = torch.float16
     tp_size: int = 1
     dp_size: int = 1
 
