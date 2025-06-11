@@ -2,3 +2,4 @@ setuptools>=61
 torch>=2.3.0
 nvtx==0.2.11
 Cython>=3.0.10
+pytest==8.4.0
