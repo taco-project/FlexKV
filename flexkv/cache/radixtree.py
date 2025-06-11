@@ -8,6 +8,7 @@ import numpy as np
 
 from flexkv.common.block import SequenceMeta
 from flexkv.common.hash_utils import HashType, Hasher
+from flexkv.common.exceptions import LogicError
 
 
 @dataclass
@@ -64,23 +65,26 @@ class RadixNode:
     def in_use(self) -> bool:
         return self.lock_cnt > 0 or not self.is_ready
 
-    def split(self, length: int) -> 'RadixNode':
-        assert length < self.size()
-        assert length > 0
-        assert not self.in_use()
+    def split(self, prefix_length: int) -> 'RadixNode':
+        assert prefix_length < self.size()
+        assert prefix_length > 0
+        assert self.parent is not None
+        # assert not self.in_use()
+        # new_node is parent of self
         new_node = RadixNode(
-            block_hashes=self.block_hashes[length:],
-            physical_blocks=self.physical_blocks[length:],
+            block_hashes=self.block_hashes[:prefix_length],
+            physical_blocks=self.physical_blocks[:prefix_length],
             is_ready=self.is_ready,
-            lock_cnt=self.lock_cnt,
+            lock_cnt=0,  # Note: only lock near-leaf node
             last_access_time=self.last_access_time,
-            parent=self,
-            children=self.children
         )
-        self.block_hashes = self.block_hashes[:length]
-        self.physical_blocks = self.physical_blocks[:length]
-        self.children = {}
-        self.children[new_node.head_hash()] = new_node
+        self.block_hashes = self.block_hashes[prefix_length:]
+        self.physical_blocks = self.physical_blocks[prefix_length:]
+
+        self.parent.children[new_node.head_hash()] = new_node
+        new_node.parent = self.parent
+        self.parent = new_node
+        new_node.children[self.head_hash()] = self
         return new_node
 
     def shrink(self, length: int) -> np.ndarray:
@@ -121,6 +125,9 @@ class RadixTreeIndex:
                                    lock_cnt=0,
                                    last_access_time=time.time())
         self.leaf_nodes.clear()
+
+    def is_empty(self) -> bool:
+        return len(self.leaf_nodes) == 0
 
     def match_prefix(self,
                     sequence: SequenceMeta,
@@ -213,11 +220,9 @@ class RadixTreeIndex:
             last_access_time=time.time()
         )
 
-        self.leaf_nodes.pop(last_node.head_hash(), None)
         if last_node_matched_length < last_node.size():
-            splited_node = last_node.split(last_node_matched_length)
-            if splited_node.is_leaf():
-                self.leaf_nodes[splited_node.head_hash()] = splited_node
+            last_node.split(last_node_matched_length)
+            last_node = last_node.parent
 
         new_node.parent = last_node
         last_node.children[new_node.head_hash()] = new_node
@@ -244,20 +249,31 @@ class RadixTreeIndex:
                 if node.parent.evictable():
                     heapq.heappush(candidates, node.parent)
                 physical_blocks = node.physical_blocks
-                del node
+                node.parent = None
             evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
         return torch.from_numpy(evicted_blocks).to(torch.int64)
 
     def lock(self, node: RadixNode) -> None:
+        if node.lock_cnt < 0:
+            raise LogicError("before lock, lock_cnt < 0")
         node.lock_cnt += 1
-        assert node.lock_cnt > 0
 
     def unlock(self, node: RadixNode) -> None:
+        if node.lock_cnt <= 0:
+            raise LogicError("before unlock, lock_cnt <= 0")
         node.lock_cnt -= 1
-        assert node.lock_cnt >= 0
 
-    def set_ready(self, node: RadixNode, is_ready: bool = True) -> None:
+    def set_ready(self, node: RadixNode, is_ready: bool = True, ready_length: int = -1) -> None:
         node.is_ready = is_ready
+        if ready_length > 0:
+            ready_length -= node.size()
+            num_node = 1
+            while ready_length > 0:
+                node = node.parent
+                ready_length -= node.size()
+                node.is_ready = True
+                num_node += 1
+            assert ready_length == 0
 
     def total_cached_blocks(self) -> int:
         total_cached_blocks = 0
@@ -269,13 +285,26 @@ class RadixTreeIndex:
         return total_cached_blocks
 
     def total_node_num(self) -> int:  # include root node
-        total_node_num = 0
+        total_node_num = -1  # exclude root node
         queue = [self.root_node]
         while queue:
             node = queue.pop(0)
             total_node_num += 1
             queue.extend(node.children.values())
         return total_node_num
+
+    def total_ready_blocks(self) -> int:
+        total_ready_blocks = 0
+        queue = [self.root_node]
+        while queue:
+            node = queue.pop(0)
+            if node.is_ready:
+                total_ready_blocks += node.size()
+            queue.extend(node.children.values())
+        return total_ready_blocks
+
+    def total_unready_blocks(self) -> int:
+        return self.total_cached_blocks() - self.total_ready_blocks()
 
 if __name__ == "__main__":
     tokens_per_block = 2

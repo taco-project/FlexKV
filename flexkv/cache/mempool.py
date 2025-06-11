@@ -3,6 +3,8 @@ from typing import List
 
 import torch
 
+from flexkv.common.exceptions import NotEnoughSpaceError
+
 
 class Mempool:
     def __init__(
@@ -24,8 +26,10 @@ class Mempool:
         self._free_ids_offset = 0
 
     def allocate_blocks(self, num: int) -> torch.Tensor:
-        assert num > 0
-        assert num <= self._num_free, "Not enough free blocks"
+        if num <= 0:
+            raise ValueError(f"num must be greater than 0, but got {num}")
+        if num > self._num_free:
+            raise NotEnoughSpaceError("Not enough free blocks", required=num, available=self._num_free)
 
         if num > len(self._free_ids) - self._free_ids_offset:
             self._update_free_ids()
@@ -38,8 +42,11 @@ class Mempool:
         return free_ids
 
     def recycle_blocks(self, block_ids: torch.Tensor) -> None:
-        # assert block_ids.ndim == 1
-        assert not self._free_mask[block_ids].any()
+        if block_ids.ndim != 1 or block_ids.dtype != torch.int64:
+            raise ValueError("block_ids must be a 1D tensor of int64")
+        if self._free_mask[block_ids].any():
+            free_ids = block_ids[self._free_mask[block_ids]]
+            raise ValueError(f"Cannot recycle free block_ids repeatedly: {free_ids}")
         self._free_mask[block_ids] = True
         self._num_free += len(block_ids)
 

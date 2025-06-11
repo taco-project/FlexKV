@@ -15,18 +15,29 @@ from flexkv.cache.transfer_pattern import (
     create_write_graph_cpu_storage, create_write_graph_cpu_ssd_remote
 )
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
-
+from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
 
 class CacheEngine:
     def __init__(self,
                  device_type: DeviceType,
                  num_total_blocks: int,
                  tokens_per_block: int):
+        if not isinstance(device_type, DeviceType):
+            raise InvalidConfigError(f"Unknown device type: {device_type}")
+        if num_total_blocks <= 0:
+            raise InvalidConfigError(f"Invalid num_total_blocks: {num_total_blocks}")
+        if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
+            raise InvalidConfigError(f"Invalid tokens_per_block: {tokens_per_block}, "
+                              f"tokens_per_block must be a power of 2")
+
         self.device_type = device_type
 
         self.index = RadixTreeIndex(tokens_per_block=tokens_per_block)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
+
+        self.tokens_per_block = tokens_per_block
+        self.num_total_blocks = num_total_blocks
 
     def reset(self):
         self.index.reset()
@@ -52,9 +63,9 @@ class CacheEngine:
     def lock_node(self, node: RadixNode) -> None:
         self.index.lock(node)
 
-    def cleanup(self, node: RadixNode) -> None:
+    def cleanup(self, node: RadixNode, cleanup_length: int) -> None:
         self.index.unlock(node)
-        self.index.set_ready(node, True)
+        self.index.set_ready(node, True, cleanup_length)
 
     def take(self,
              num_required_blocks: int,
@@ -69,10 +80,11 @@ class CacheEngine:
             if protected_node is not None:
                 self.index.unlock(protected_node)
         if strict and num_required_blocks > self.mempool.num_free_blocks:
-            raise ValueError(f"Not enough free blocks to take, "
-                             f"required: {num_required_blocks}, "
-                             f"free: {self.mempool.num_free_blocks}")
-        return self.mempool.allocate_blocks(num_required_blocks)
+            raise NotEnoughSpaceError("Not enough free blocks to take, ",
+                                      required=num_required_blocks,
+                                      available=self.mempool.num_free_blocks)
+        num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
+        return self.mempool.allocate_blocks(num_allocated_blocks)
 
     def recycle(self, physical_blocks: torch.Tensor) -> None:
         self.mempool.recycle_blocks(physical_blocks)
@@ -189,7 +201,7 @@ class GlobalCacheEngine:
             remote_node_to_unlock = None
 
         # prepare cpu blocks to transfer
-        cpu_blocks_to_free = []
+        cpu_blocks_to_free = torch.tensor([], dtype=torch.int64)
         if len(cpu_physical_blocks) < num_transfer_blocks:
             extra_cpu_blocks = self.cpu_cache_engine.take(
                 num_required_blocks=num_transfer_blocks - len(cpu_physical_blocks),
@@ -254,10 +266,10 @@ class GlobalCacheEngine:
         return_mask[start_idx* self.tokens_per_block:
                     (start_idx + len(gpu_blocks_to_transfer)) * self.tokens_per_block] = True
 
-        node_to_unlock = {DeviceType.CPU: cpu_node_to_unlock,
-                          DeviceType.SSD: ssd_node_to_unlock}
+        node_to_unlock = {DeviceType.CPU: (cpu_node_to_unlock, cpu_node_to_unlock.size()),
+                          DeviceType.SSD: (ssd_node_to_unlock, ssd_node_to_unlock.size())}
         if remote_enabled:
-            node_to_unlock[DeviceType.REMOTE] = remote_node_to_unlock
+            node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
 
         callback = partial(self._transfer_callback,
@@ -376,10 +388,10 @@ class GlobalCacheEngine:
         return_mask[start_idx* self.tokens_per_block:
                     (start_idx + len(gpu_block_mapping)) * self.tokens_per_block] = True
 
-        node_to_unlock = {DeviceType.CPU: cpu_node_to_unlock,
-                          DeviceType.SSD: ssd_node_to_unlock}
+        node_to_unlock = {DeviceType.CPU: (cpu_node_to_unlock, cpu_node_to_unlock.size()),
+                          DeviceType.SSD: (ssd_node_to_unlock, ssd_node_to_unlock.size())}
         if self.cache_config.enable_remote:
-            node_to_unlock[DeviceType.REMOTE] = remote_node_to_unlock
+            node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
 
         callback = partial(self._transfer_callback,
                            node_to_unlock=node_to_unlock)
@@ -455,7 +467,7 @@ class GlobalCacheEngine:
         return_mask[start_idx* self.tokens_per_block:
                     (start_idx + len(gpu_blocks_to_transfer)) * self.tokens_per_block] = True
 
-        node_to_unlock = {DeviceType.CPU: cpu_node_to_unlock}
+        node_to_unlock = {DeviceType.CPU: (cpu_node_to_unlock, cpu_node_to_unlock.size())}
 
         callback = partial(self._transfer_callback,
                            node_to_unlock=node_to_unlock)
@@ -522,21 +534,21 @@ class GlobalCacheEngine:
         return_mask[start_idx* self.tokens_per_block:
                     (start_idx + len(gpu_block_mapping)) * self.tokens_per_block] = True
 
-        node_to_unlock = {DeviceType.CPU: cpu_node_to_unlock}
+        node_to_unlock = {DeviceType.CPU: (cpu_node_to_unlock, cpu_node_to_unlock.size())}
 
         callback = partial(self._transfer_callback,
                            node_to_unlock=node_to_unlock)
         return transfer_graph, return_mask, callback, finished_ops_ids
 
     def _transfer_callback(self,
-                           node_to_unlock: Dict[DeviceType, RadixNode],
+                           node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
                            buffer_to_free: Optional[Dict[DeviceType, torch.Tensor]] = None) -> None:
         if DeviceType.CPU in node_to_unlock:
-            self.cpu_cache_engine.cleanup(node_to_unlock[DeviceType.CPU])
+            self.cpu_cache_engine.cleanup(node_to_unlock[DeviceType.CPU][0], node_to_unlock[DeviceType.CPU][1])
         if DeviceType.SSD in node_to_unlock:
-            self.ssd_cache_engine.cleanup(node_to_unlock[DeviceType.SSD])
+            self.ssd_cache_engine.cleanup(node_to_unlock[DeviceType.SSD][0], node_to_unlock[DeviceType.SSD][1])
         if DeviceType.REMOTE in node_to_unlock:
-            self.remote_cache_engine.cleanup(node_to_unlock[DeviceType.REMOTE])
+            self.remote_cache_engine.cleanup(node_to_unlock[DeviceType.REMOTE][0], node_to_unlock[DeviceType.REMOTE][1])
         if buffer_to_free is not None:
             if DeviceType.CPU in buffer_to_free:
                 self.cpu_cache_engine.recycle(buffer_to_free[DeviceType.CPU])
