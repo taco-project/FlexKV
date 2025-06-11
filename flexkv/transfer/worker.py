@@ -87,16 +87,56 @@ class TransferWorker(ABC):
             layer_ptrs[lay_id] = layer_blocks[lay_id][0].data_ptr()
         return layer_ptrs
 
+    @classmethod
+    def create_worker(cls, worker_id: int, finished_ops_queue: MPQueue, *args, **kwargs) -> 'WorkerHandle':
+        """Generic worker creation template method"""
+        transfer_queue = mp.Queue()
+        ready_event = mp.Event()
+
+        process = mp.Process(
+            target=cls._worker_process,
+            args=(worker_id, transfer_queue, finished_ops_queue, ready_event, *args),
+            kwargs=kwargs,
+            daemon=True
+        )
+        process.start()
+
+        return WorkerHandle(worker_id, transfer_queue, process, ready_event)
+
+    @classmethod
+    @abstractmethod
+    def _worker_process(cls, worker_id: int, transfer_queue: MPQueue, finished_ops_queue: MPQueue, 
+                       ready_event: Any, *args, **kwargs):
+        """Template method for worker process creation"""
+        pass
+
     @abstractmethod
     def _transfer_impl(self, **kwargs)->None:
         pass
+
+    def _log_transfer_performance(self, transfer_op: WorkerTransferOp, 
+                                  start_time: float, end_time: float, 
+                                  block_size: int, num_layers: int = None):
+        """Common method to log transfer performance"""
+        if num_layers is None:
+            num_layers = transfer_op.layer_granularity
+        
+        transfer_size = (
+            len(transfer_op.src_block_ids) * block_size * 2 * num_layers
+        )
+        
+        debuginfo.info(
+            f"{transfer_op.transfer_type.name} transfer request: {transfer_op.transfer_op_id} finished "
+            f"transfer data size: {transfer_size} bytes "
+            f"transfer time: {end_time - start_time:.4f} s "
+            f"transfer bandwidth: {transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+        )
 
     @abstractmethod
     def launch_transfer(self, transfer_op: WorkerTransferOp)->None:
         pass
 
     def run(self):
-        # Signal initialization complete
         """main loop for worker process"""
         while True:
             try:
@@ -107,7 +147,6 @@ class TransferWorker(ABC):
                     nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
                                         f"graph_id: {op.transfer_graph_id}, "
                                         f"num_blocks: {len(op.src_block_ids)}",
-                                        # f"successors: {op.successors}",
                                         color=get_nvtx_range_color(op.transfer_graph_id))
                     self.launch_transfer(op)
                     nvtx.pop_range()
@@ -142,62 +181,53 @@ class GPUCPUTransferWorker(TransferWorker):
     @classmethod
     def create_worker(cls,
                      worker_id: int,
+                     finished_ops_queue: MPQueue,
                      gpu_blocks: List[torch.Tensor],
                      cpu_blocks: List[torch.Tensor],
-                     finished_ops_queue: MPQueue,
                      gpu_kv_layout: KVCacheLayout,
                      cpu_kv_layout: KVCacheLayout,
                      dtype: torch.dtype,
                      gpu_device_id: int = -1,
                      zmq_gpu_handle: list[KVCacheTensorHandle] = None):
-        transfer_queue = mp.Queue()
-        ready_event = mp.Event()
-
-        process = mp.Process(
-            target=cls._worker_process,
-            args=(worker_id, gpu_blocks, cpu_blocks,
-                  transfer_queue, finished_ops_queue,
-                  gpu_kv_layout, cpu_kv_layout, dtype, 
-                  gpu_device_id, ready_event, zmq_gpu_handle),
-            daemon=True
+        return super().create_worker(
+            worker_id, finished_ops_queue,
+            gpu_blocks, cpu_blocks, gpu_kv_layout, cpu_kv_layout, dtype, 
+            gpu_device_id, zmq_gpu_handle
         )
-        process.start()
-
-        return WorkerHandle(worker_id, transfer_queue, process, ready_event)
 
     @classmethod
     def _worker_process(cls,
                        worker_id: int,
-                       gpu_blocks: List[torch.Tensor],
-                       cpu_blocks: List[torch.Tensor],
                        transfer_queue: MPQueue,
                        finished_ops_queue: MPQueue,
+                       ready_event: Any,
+                       gpu_blocks: List[torch.Tensor],
+                       cpu_blocks: List[torch.Tensor],
                        gpu_kv_layout: KVCacheLayout,
                        cpu_kv_layout: KVCacheLayout,
                        dtype: torch.dtype,
                        gpu_device_id: int,
-                       ready_event: Any,
                        zmq_gpu_handle: list[KVCacheTensorHandle]):
-        # create worker in a new process
+        # Handle ZMQ tensor imports if needed
         if zmq_gpu_handle is not None:
             gpu_blocks = []
             for layer_handle in zmq_gpu_handle:
                 tensor, layer_id = import_layer_tensor_handle(layer_handle)
                 gpu_blocks.append(tensor)
-        worker = cls(worker_id, gpu_blocks, cpu_blocks,
-                    transfer_queue, finished_ops_queue,
-                    gpu_kv_layout, cpu_kv_layout, dtype,
-                    gpu_device_id)
+        
+        worker = cls(worker_id, transfer_queue, finished_ops_queue,
+                    gpu_blocks, cpu_blocks, gpu_kv_layout, cpu_kv_layout, 
+                    dtype, gpu_device_id)
         ready_event.set()
         worker.run()
         
 
     def __init__(self,
                  worker_id: int,
-                 gpu_blocks: List[torch.Tensor],
-                 cpu_blocks: List[torch.Tensor],
                  transfer_queue: MPQueue,
                  finished_ops_queue: MPQueue,
+                 gpu_blocks: List[torch.Tensor],
+                 cpu_blocks: List[torch.Tensor],
                  gpu_kv_layout: KVCacheLayout,
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
@@ -315,6 +345,7 @@ class GPUCPUTransferWorker(TransferWorker):
                 gpu_block_ids = transfer_op.src_block_ids
             else:
                 raise ValueError(f"Invalid transfer type: {transfer_op.transfer_type}")
+            
             start_time = time.time()
             self._transfer_impl(
                 gpu_block_ids,
@@ -325,66 +356,47 @@ class GPUCPUTransferWorker(TransferWorker):
                 non_blocking=True,
                 use_ce_transfer=False,
             )
-            # debuginfo.info("TRANSFER stream synchronized")
             end_time = time.time()
-            transfer_size = (
-                len(gpu_block_ids)
-                * self.block_size
-                * self.dtype.itemsize
-                * 2
-                * transfer_op.layer_granularity
-            )
-            debuginfo.info(
-                f"gpu cpu tranfer request: {transfer_op.transfer_op_id} finished "
-                f"request type is {transfer_op.transfer_type} "
-                f"transfer data size is {transfer_size} bytes "
-                f"transfer time is {end_time - start_time:.4f} s "
-                f"transfer bandwidth is "
-                f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+            
+            self._log_transfer_performance(
+                transfer_op, start_time, end_time, 
+                self.block_size * self.dtype.itemsize
             )
 
 class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
     @classmethod
     def create_worker(cls,
                      worker_id: int,
+                     finished_ops_queue: MPQueue,
                      gpu_blocks: Union[List[List[torch.Tensor]], List[List[KVCacheTensorHandle]]],
                      cpu_blocks: List[torch.Tensor],
-                     finished_ops_queue: MPQueue,
                      gpu_kv_layout: KVCacheLayout,
                      cpu_kv_layout: KVCacheLayout,
                      dtype: torch.dtype,
                      tp_group_size: int,
                      dp_group_id: int):
-        transfer_queue = mp.Queue()
-        ready_event = mp.Event()
-
-        process = mp.Process(
-            target=cls._worker_process,
-            args=(worker_id, gpu_blocks, cpu_blocks,
-                  transfer_queue, finished_ops_queue,
-                  gpu_kv_layout, cpu_kv_layout, dtype, 
-                  tp_group_size, dp_group_id, ready_event),
-            daemon=True
+        return TransferWorker.create_worker(
+            worker_id, finished_ops_queue,
+            gpu_blocks, cpu_blocks, gpu_kv_layout, cpu_kv_layout, dtype, 
+            tp_group_size, dp_group_id
         )
-        process.start()
-
-        return WorkerHandle(worker_id, transfer_queue, process, ready_event)
     
     @classmethod
     def _worker_process(cls,
                         worker_id: int,
-                        gpu_blocks: Union[List[List[torch.Tensor]], List[List[KVCacheTensorHandle]]],
-                        cpu_blocks: List[torch.Tensor],
                         transfer_queue: MPQueue,
                         finished_ops_queue: MPQueue,
+                        ready_event: Any,
+                        gpu_blocks: Union[List[List[torch.Tensor]], List[List[KVCacheTensorHandle]]],
+                        cpu_blocks: List[torch.Tensor],
                         gpu_kv_layout: KVCacheLayout,
                         cpu_kv_layout: KVCacheLayout,
                         dtype: torch.dtype,
                         tp_group_size: int,
-                        dp_group_id: int,
-                        ready_event: Any):
+                        dp_group_id: int):
         assert len(gpu_blocks) == tp_group_size
-        # handles exported from other processes
+        
+        # Handle tensor import for multi-process case
         if isinstance(gpu_blocks[0][0], KVCacheTensorHandle):
             imported_gpu_blocks = []
             for handles_in_one_gpu in gpu_blocks:
@@ -394,22 +406,19 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                     blocks_in_one_gpu.append(tensor)
                 imported_gpu_blocks.append(blocks_in_one_gpu)
             gpu_blocks = imported_gpu_blocks
-        else: # raw gpu blocks
-            imported_gpu_blocks = gpu_blocks
 
-        worker = cls(worker_id, imported_gpu_blocks, cpu_blocks,
-                    transfer_queue, finished_ops_queue,
-                    gpu_kv_layout, cpu_kv_layout, dtype,
-                    tp_group_size, dp_group_id)
+        worker = cls(worker_id, transfer_queue, finished_ops_queue,
+                    gpu_blocks, cpu_blocks, gpu_kv_layout, cpu_kv_layout, 
+                    dtype, tp_group_size, dp_group_id)
         ready_event.set()
         worker.run()
 
     def __init__(self,
                  worker_id: int,
-                 gpu_blocks: List[List[torch.Tensor]],
-                 cpu_blocks: List[torch.Tensor],
                  transfer_queue: MPQueue,
                  finished_ops_queue: MPQueue,
+                 gpu_blocks: List[List[torch.Tensor]],
+                 cpu_blocks: List[torch.Tensor],
                  gpu_kv_layout: KVCacheLayout,
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype, 
@@ -522,6 +531,7 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
             gpu_block_ids = transfer_op.src_block_ids
         else:
             raise ValueError(f"Invalid transfer type: {transfer_op.transfer_type}")
+        
         start_time = time.time()
         self._transfer_impl(
             gpu_block_ids,
@@ -532,22 +542,11 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
             non_blocking=True,
             use_ce_transfer=False,
         )
-        # debuginfo.info("TRANSFER stream synchronized")
         end_time = time.time()
-        transfer_size = (
-            len(cpu_block_ids)
-            * self.cpu_block_size
-            * self.dtype.itemsize
-            * 2
-            * transfer_op.layer_granularity
-        )
-        debuginfo.info(
-            f"gpu cpu tranfer request: {transfer_op.transfer_op_id} finished "
-            f"request type is {transfer_op.transfer_type} "
-            f"transfer data size is {transfer_size} bytes "
-            f"transfer time is {end_time - start_time:.4f} s "
-            f"transfer bandwidth is "
-            f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+        
+        self._log_transfer_performance(
+            transfer_op, start_time, end_time, 
+            self.cpu_block_size * self.dtype.itemsize
         )
 
 
@@ -555,49 +554,39 @@ class CPUSSDDiskTransferWorker(TransferWorker):
     @classmethod
     def create_worker(cls,
                      worker_id: int,
+                     finished_ops_queue: MPQueue,
                      cpu_blocks: List[torch.Tensor],
                      ssd_file: List[str],
-                     finished_ops_queue: MPQueue,
                      cpu_kv_layout: KVCacheLayout,
                      ssd_kv_layout: KVCacheLayout,
                      dtype: torch.dtype):
-        transfer_queue = mp.Queue()
-        ready_event = mp.Event()
-
-        process = mp.Process(
-            target=cls._worker_process,
-            args=(worker_id, cpu_blocks, ssd_file,
-                  transfer_queue, finished_ops_queue,
-                  cpu_kv_layout, ssd_kv_layout, dtype, ready_event),
-            daemon=True
+        return super().create_worker(
+            worker_id, finished_ops_queue,
+            cpu_blocks, ssd_file, cpu_kv_layout, ssd_kv_layout, dtype
         )
-        process.start()
-
-        return WorkerHandle(worker_id, transfer_queue, process, ready_event)
 
     @classmethod
     def _worker_process(cls,
                        worker_id: int,
-                       cpu_blocks: List[torch.Tensor],
-                       ssd_file: List[str],
                        transfer_queue: MPQueue,
                        finished_ops_queue: MPQueue,
+                       ready_event: Any,
+                       cpu_blocks: List[torch.Tensor],
+                       ssd_file: List[str],
                        cpu_kv_layout: KVCacheLayout,
                        ssd_kv_layout: KVCacheLayout,
-                       dtype: torch.dtype,
-                       ready_event: Any):
-        worker = cls(worker_id, cpu_blocks, ssd_file,
-                    transfer_queue, finished_ops_queue,
-                    cpu_kv_layout, ssd_kv_layout, dtype)
+                       dtype: torch.dtype):
+        worker = cls(worker_id, transfer_queue, finished_ops_queue,
+                    cpu_blocks, ssd_file, cpu_kv_layout, ssd_kv_layout, dtype)
         ready_event.set()
         worker.run()
 
     def __init__(self,
                  worker_id: int,
-                 cpu_blocks: List[torch.Tensor],
-                 ssd_file: List[str],
                  transfer_queue: MPQueue,
                  finished_ops_queue: MPQueue,
+                 cpu_blocks: List[torch.Tensor],
+                 ssd_file: List[str],
                  cpu_kv_layout: KVCacheLayout,
                  ssd_kv_layout: KVCacheLayout,
                  dtype: torch.dtype):
@@ -700,15 +689,13 @@ class CPUSSDDiskTransferWorker(TransferWorker):
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp):
-        #TODO remove this when remote worker is ready
         if transfer_op.transfer_type == TransferType.DISK2H:
             cpu_block_ids = transfer_op.dst_block_ids
             ssd_block_ids = transfer_op.src_block_ids
-            transfer_op.transfer_type = TransferType.DISK2H
         else:
             cpu_block_ids = transfer_op.src_block_ids
             ssd_block_ids = transfer_op.dst_block_ids
-            transfer_op.transfer_type = TransferType.H2DISK
+            
         start_time = time.time()
         self._transfer_impl(
             cpu_block_ids,
@@ -719,20 +706,10 @@ class CPUSSDDiskTransferWorker(TransferWorker):
             non_blocking=True,
         )
         end_time = time.time()
-        transfer_size = (
-            len(ssd_block_ids)
-            * self.block_size
-            * self.dtype.itemsize
-            * 2
-            * self.num_layers
-        )
-        debuginfo.info(
-            f"ssd tranfer request: {transfer_op.transfer_op_id} finished "
-            f"request type is {transfer_op.transfer_type} "
-            f"transfer data size is {transfer_size} bytes "
-            f"transfer time is {end_time - start_time:.4f} s "
-            f"transfer bandwidth is "
-            f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+        
+        self._log_transfer_performance(
+            transfer_op, start_time, end_time, 
+            self.block_size * self.dtype.itemsize, self.num_layers
         )
 
 
@@ -740,51 +717,43 @@ class CPURemoteTransferWorker(TransferWorker):
     @classmethod
     def create_worker(cls,
                      worker_id: int,
+                     finished_ops_queue: MPQueue,
                      cpu_blocks: List[torch.Tensor],
                      remote_file: List[str],
-                     finished_ops_queue: MPQueue,
                      cpu_kv_layout: KVCacheLayout,
                      remote_kv_layout: KVCacheLayout,
                      dtype: torch.dtype,
                      remote_config_custom: Dict[str, Any]):
-        transfer_queue = mp.Queue()
-        ready_event = mp.Event()
-
-        process = mp.Process(
-            target=cls._worker_process,
-            args=(worker_id, cpu_blocks, remote_file,
-                  transfer_queue, finished_ops_queue,
-                  cpu_kv_layout, remote_kv_layout, dtype, ready_event, remote_config_custom),
-            daemon=True
+        return super().create_worker(
+            worker_id, finished_ops_queue,
+            cpu_blocks, remote_file, cpu_kv_layout, remote_kv_layout, 
+            dtype, remote_config_custom
         )
-        process.start()
-
-        return WorkerHandle(worker_id, transfer_queue, process, ready_event)
 
     @classmethod
     def _worker_process(cls,
                        worker_id: int,
-                       cpu_blocks: List[torch.Tensor],
-                       remote_file: List[str],
                        transfer_queue: MPQueue,
                        finished_ops_queue: MPQueue,
+                       ready_event: Any,
+                       cpu_blocks: List[torch.Tensor],
+                       remote_file: List[str],
                        cpu_kv_layout: KVCacheLayout,
                        remote_kv_layout: KVCacheLayout,
                        dtype: torch.dtype,
-                       ready_event: Any, 
-                       remote_config_custom:  Dict[str, Any]):
-        worker = cls(worker_id, cpu_blocks, remote_file,
-                    transfer_queue, finished_ops_queue,
-                    cpu_kv_layout, remote_kv_layout, dtype, remote_config_custom)
+                       remote_config_custom: Dict[str, Any]):
+        worker = cls(worker_id, transfer_queue, finished_ops_queue,
+                    cpu_blocks, remote_file, cpu_kv_layout, remote_kv_layout, 
+                    dtype, remote_config_custom)
         ready_event.set()
         worker.run()
 
     def __init__(self,
                  worker_id: int,
-                 cpu_blocks: List[torch.Tensor],
-                 remote_file: List[str],
                  transfer_queue: MPQueue,
                  finished_ops_queue: MPQueue,
+                 cpu_blocks: List[torch.Tensor],
+                 remote_file: List[str],
                  cpu_kv_layout: KVCacheLayout,
                  remote_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
@@ -911,15 +880,13 @@ class CPURemoteTransferWorker(TransferWorker):
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp):
-        #TODO remove this when remote worker is ready
         if transfer_op.transfer_type == TransferType.REMOTE2H:
             cpu_block_ids = transfer_op.dst_block_ids
             remote_block_ids = transfer_op.src_block_ids
-            transfer_op.transfer_type = TransferType.REMOTE2H
         else:
             cpu_block_ids = transfer_op.src_block_ids
             remote_block_ids = transfer_op.dst_block_ids
-            transfer_op.transfer_type = TransferType.H2REMOTE
+            
         start_time = time.time()
         self._transfer_impl(
             cpu_block_ids,
@@ -930,18 +897,8 @@ class CPURemoteTransferWorker(TransferWorker):
             non_blocking=True,
         )
         end_time = time.time()
-        transfer_size = (
-            len(remote_block_ids)
-            * self.block_size
-            * self.dtype.itemsize
-            * 2
-            * self.num_layers
-        )
-        debuginfo.info(
-            f"remote tranfer request: {transfer_op.transfer_op_id} finished "
-            f"request type is {transfer_op.transfer_type} "
-            f"transfer data size is {transfer_size} bytes "
-            f"transfer time is {end_time - start_time:.4f} s "
-            f"transfer bandwidth is "
-            f"{transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+        
+        self._log_transfer_performance(
+            transfer_op, start_time, end_time, 
+            self.block_size * self.dtype.itemsize, self.num_layers
         )

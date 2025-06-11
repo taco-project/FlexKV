@@ -53,9 +53,9 @@ class TransferEngine:
         self.gpucpu_workers = [
             tpGPUCPUTransferWorker.create_worker(
                 worker_id=i,
+                finished_ops_queue=self.finished_ops_queue,
                 gpu_blocks=[gpu_handles[j].data for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
                 cpu_blocks=cpu_handle.data,
-                finished_ops_queue=self.finished_ops_queue,
                 gpu_kv_layout=gpu_handles[i].kv_layout,
                 cpu_kv_layout=cpu_handle.kv_layout,
                 dtype=gpu_handles[i].dtype,
@@ -73,29 +73,28 @@ class TransferEngine:
         if ssd_handle is not None:
             self.cpussd_read_worker = CPUSSDDiskTransferWorker.create_worker(
                 worker_id=10,
+                finished_ops_queue=self.finished_ops_queue,
                 cpu_blocks=cpu_handle.data,
                 ssd_file=ssd_handle.data,
-                finished_ops_queue=self.finished_ops_queue,
                 cpu_kv_layout=cpu_handle.kv_layout,
                 ssd_kv_layout=ssd_handle.kv_layout,
                 dtype=cpu_handle.dtype,
             )
             self.cpussd_write_worker = CPUSSDDiskTransferWorker.create_worker(
                 worker_id=11,
+                finished_ops_queue=self.finished_ops_queue,
                 cpu_blocks=cpu_handle.data,
                 ssd_file=ssd_handle.data,
-                finished_ops_queue=self.finished_ops_queue,
                 cpu_kv_layout=cpu_handle.kv_layout,
                 ssd_kv_layout=ssd_handle.kv_layout,
                 dtype=cpu_handle.dtype,
             )
-        # TODO replace with the cpu-remoteFileSystem transfer worker
         if remote_handle is not None:
             self.remotecpu_read_worker = CPURemoteTransferWorker.create_worker(
                 worker_id=20,
+                finished_ops_queue=self.finished_ops_queue,
                 cpu_blocks=cpu_handle.data,
                 remote_file=remote_handle.data,
-                finished_ops_queue=self.finished_ops_queue,
                 cpu_kv_layout=cpu_handle.kv_layout,
                 remote_kv_layout=remote_handle.kv_layout,
                 dtype=cpu_handle.dtype,
@@ -103,9 +102,9 @@ class TransferEngine:
             )
             self.remotecpu_write_worker = CPURemoteTransferWorker.create_worker(
                 worker_id=21,
+                finished_ops_queue=self.finished_ops_queue,
                 cpu_blocks=cpu_handle.data,
                 remote_file=remote_handle.data,
-                finished_ops_queue=self.finished_ops_queue,
                 cpu_kv_layout=cpu_handle.kv_layout,
                 remote_kv_layout=remote_handle.kv_layout,
                 dtype=cpu_handle.dtype,
