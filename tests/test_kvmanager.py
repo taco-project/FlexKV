@@ -109,8 +109,8 @@ def test_kvmanager():
                                tp_size=tp_size,
                                dp_size=dp_size,
                                dtype=dtype)
-    cache_config = CacheConfig(enable_cpu=True,
-                               enable_ssd=True,
+    cache_config = CacheConfig(enable_cpu=enable_cpu,
+                               enable_ssd=enable_ssd,
                                enable_remote=enable_remote,
                                gpu_kv_layout=gpu_kv_layout,
                                cpu_kv_layout=default_kv_layout,
@@ -206,7 +206,8 @@ def test_kvmanager():
         )
         running_put_requests.append(request_id)
         # to aviod that all seq are locked, and cannot eviction
-        if len(running_get_requests) + len(running_put_requests) >= num_cpu_blocks // block_per_request - 2:
+        if (i == num_requests - 1 or 
+            len(running_get_requests) + len(running_put_requests) >= num_cpu_blocks // block_per_request - 2):
             if len(running_put_requests) > 0:
                 kvmanager.wait_for_graph_finished(running_put_requests)
             if len(running_get_requests) > 0:

@@ -434,7 +434,6 @@ class GlobalCacheEngine:
         # the blocks are needed by the mask & the blocks are ready
         cpu_physical_blocks = cpu_matched_result.physical_blocks[:cpu_matched_result.num_ready_matched_blocks]
         cpu_physical_blocks = cpu_physical_blocks[start_idx:end_idx]
-
         num_transfer_blocks = len(cpu_physical_blocks)
         #early return if no blocks to transfer
         if num_transfer_blocks == 0:
