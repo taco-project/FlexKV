@@ -287,5 +287,5 @@ if __name__ == "__main__":
                                 tokens_per_block=tokens_per_block,
                                 num_cpu_blocks=num_cpu_blocks,)
     
-    kv_server = KVServer(model_config, cache_config)
+    kv_server = KVServer(model_config, cache_config, "ipc:///tmp/tmp6isie_et")
     kv_server.run()

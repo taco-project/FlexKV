@@ -56,7 +56,6 @@ model_config = ModelConfig(num_layers=num_layers,
 cache_config = CacheConfig( enable_cpu=True,
                             enable_ssd=False,
                             enable_remote=False,
-                            gpu_kv_layout=gpu_kv_layout,
                             cpu_kv_layout=default_kv_layout,
                             use_gds=False,
                             use_pinned_memory=True,
@@ -85,34 +84,85 @@ def run_dp_client(server_recv_port):
     time.sleep(5)
     
     # get/put/wait
+    req1_len = 65
     tokens_per_block = gpu_shape[3]
-    token_ids = torch.randint(0, 1000, (64, ))
-    token_mask = torch.ones(64)
-    gpu_physical_block_ids = torch.tensor([i for i in range(64//tokens_per_block)]).pin_memory()
-    slot_mapping = gpu_physical_block_ids.repeat_interleave(tokens_per_block) * tokens_per_block
+    token_ids = torch.randint(0, 1000, (req1_len, ))
+    token_mask = torch.ones(req1_len, dtype=torch.bool)
+    num_blocks = (req1_len+tokens_per_block-1)//tokens_per_block
+    gpu_physical_block_ids = torch.tensor([i for i in range(num_blocks)]).pin_memory()
+    slot_mapping = gpu_physical_block_ids.repeat_interleave(tokens_per_block)[:req1_len] * tokens_per_block
+    t_start = time.time()
+    request_id0 = dp_client.get_async(token_ids, slot_mapping, token_mask)
+    t_interval = time.time()
+    results = dp_client.wait([request_id0])
+    t_end = time.time()
+    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id0}, "
+                f"time cost: get_async {(t_interval-t_start)*1000:.2f} ms, "
+                f"wait {(t_end-t_interval)*1000:.2f} ms.")
+    logger.info(results)
     
-    # Example workload
-    # Send some requests
+    
+    
+    req1_len = 65
+    tokens_per_block = gpu_shape[3]
+    token_ids = torch.randint(0, 1000, (req1_len, ))
+    token_mask = torch.ones(req1_len, dtype=torch.bool)
+    num_blocks = (req1_len+tokens_per_block-1)//tokens_per_block
+    gpu_physical_block_ids = torch.tensor([i for i in range(num_blocks)]).pin_memory()
+    slot_mapping = gpu_physical_block_ids.repeat_interleave(tokens_per_block)[:req1_len] * tokens_per_block
+    req_1_t_start = time.time()
     request_id1 = dp_client.put_async(token_ids, slot_mapping, token_mask)
+    req_1_t_interval = time.time()
     
-    token_ids = torch.randint(0, 1000, (64, ))
-    token_mask = torch.ones(64)
-    gpu_physical_block_ids = torch.tensor([28-i for i in range(64//tokens_per_block)]).pin_memory()
-    slot_mapping = gpu_physical_block_ids.repeat_interleave(tokens_per_block) * tokens_per_block
+    req2_len = 46
+    token_ids = torch.randint(0, 1000, (req2_len, ))
+    token_mask = torch.ones(req2_len, dtype=torch.bool)
+    num_blocks = (req2_len+tokens_per_block-1)//tokens_per_block
+    gpu_physical_block_ids = torch.tensor([num_gpu_blocks-1-i for i in range(num_blocks)]).pin_memory()
+    slot_mapping = gpu_physical_block_ids.repeat_interleave(tokens_per_block)[:req2_len] * tokens_per_block
+    req_2_t_start = time.time()
     request_id2 = dp_client.put_async(token_ids, slot_mapping, token_mask)
+    req_2_t_interval = time.time()
     # Process responses
     results = dp_client.wait([request_id1, request_id2])
-    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id1}")
-    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id2}")
+    t_end = time.time()
+    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id1}, "
+                f"time cost: put_async {(req_1_t_interval-req_1_t_start)*1000:.2f} ms, "
+                f"wait {(t_end-req_1_t_interval)*1000:.2f} ms.")
+    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id2}, "
+                f"time cost: put_async {(req_2_t_interval-req_2_t_start)*1000:.2f} ms, "
+                f"wait {(t_end-req_2_t_interval)*1000:.2f} ms.")
     logger.info(results)
     
     time.sleep(1)
 
     token_ids[40:] += 1
+    t_start = time.time()
     request_id3 = dp_client.get_async(token_ids, slot_mapping, token_mask)
+    t_interval = time.time()
     results = dp_client.wait([request_id3])
-    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id3}")
+    t_end = time.time()
+    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id3}, "
+                f"time cost: get_async {(t_interval-t_start)*1000:.2f} ms, "
+                f"wait {(t_end-t_interval)*1000:.2f} ms.")
     logger.info(results)
+    
+    
+    token_mask[:20] = False
+    new_slot_mapping = slot_mapping[20:]
+    t_start = time.time()
+    request_id3 = dp_client.get_async(token_ids, new_slot_mapping, token_mask)
+    t_interval = time.time()
+    results = dp_client.wait([request_id3])
+    t_end = time.time()
+    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id3}"
+                f"time cost: get_async {(t_interval-t_start)*1000:.2f} ms, "
+                f"wait {(t_end-t_interval)*1000:.2f} ms.")
+    logger.info(results)
+    logger.info(results[request_id3].sum())
+    logger.info(gpu_physical_block_ids)
+    logger.info(slot_mapping[results[request_id3]][::tokens_per_block]//tokens_per_block)
+    
     
     logger.info(f"dp client tasks finish")
 

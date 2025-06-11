@@ -40,7 +40,6 @@ class KVDPClient:
         self.recv_from_server = get_zmq_socket(
             context, zmq.PULL, client_recv_port, True
         )
-        
         self.dp_client_id = self.register_to_server(model_config, client_recv_port)
         
         logger.info(f"KVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
@@ -171,3 +170,21 @@ class KVTPClient:
             logger.error(f"TP client of DP client {self.dp_client_id} registeration fialed: {response.error_msg}")
             raise
 
+
+
+if __name__ == "__main__":
+    num_layers = 32
+    num_kv_heads = 8
+    head_size = 128
+    num_cpu_blocks = 300
+    tp_size = 2
+    tokens_per_block = 4
+
+    model_config = ModelConfig(num_layers=num_layers,
+                                num_kv_heads=num_kv_heads,
+                                head_size=head_size,
+                                element_size=2,
+                                use_mla=False,
+                                tp_size=tp_size)
+    
+    dp_client = KVDPClient("ipc:///tmp/tmp6isie_et", model_config)

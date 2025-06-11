@@ -583,7 +583,7 @@ class GlobalCacheEngine:
         assert token_ids.ndim == 1
         assert token_mask.ndim == 1
         assert slot_mapping.ndim == 1
-        assert len(token_ids) == len(token_mask)
+        assert len(token_ids) == len(token_mask), f"len(token_ids)={len(token_ids)}, len(token_mask)={len(token_mask)}"
         assert len(slot_mapping) == token_mask.sum().item()
 
     def _slot_to_block_mapping(self,
