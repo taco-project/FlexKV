@@ -1,6 +1,8 @@
-import pytest
 import random
+
+import pytest
 import torch
+
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.cache_engine import CacheEngine
 from flexkv.common.transfer import DeviceType

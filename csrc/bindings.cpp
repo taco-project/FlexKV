@@ -11,7 +11,6 @@
 #include <unistd.h>
 
 #include "cache_utils.h"
-#include "ipc_memhandle.h"
 #include "transfer.cuh"
 #include "transfer_ssd.h"
 #include "pcfs/pcfs.h"
@@ -127,8 +126,6 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("is_read"), py::arg("round_robin"), py::arg("use_mmap") = false,
         py::arg("num_threads_per_file") = 16);
 #endif
-  m.def("export_handle", &export_memory_handle);
-  m.def("import_handle", &import_memory_handle);
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",

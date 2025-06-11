@@ -3,11 +3,12 @@ from enum import Enum
 from typing import Dict, Optional, List, Tuple, Union
 
 import torch
-from ..common.config import ModelConfig, CacheConfig
-from ..common.memory_handle import KVCacheTensorHandle
-from ..common.storage import AccessibleHandle, KVCacheLayout, KVCacheLayoutType
-from ..common.transfer import DeviceType
-from .allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator, StorageAllocator
+
+from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.memory_handle import KVCacheTensorHandle
+from flexkv.common.storage import AccessibleHandle, KVCacheLayout, KVCacheLayoutType
+from flexkv.common.transfer import DeviceType
+from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator, StorageAllocator
 
 
 class StorageEngine:
