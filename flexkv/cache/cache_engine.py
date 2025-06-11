@@ -437,6 +437,9 @@ class GlobalCacheEngine:
         num_transfer_blocks = len(cpu_physical_blocks)
         #early return if no blocks to transfer
         if num_transfer_blocks == 0:
+            print(f"No blocks to transfer in get only cpu, and ",
+                  f"request id is {request_id}, cpu matched result ready len is {cpu_matched_result.num_ready_matched_blocks}, ",
+                  f"cpu matched result num matched block len is {cpu_matched_result.num_matched_blocks}")
             return TransferOpGraph.create_empty_graph(request_id), torch.zeros_like(token_mask), None, []
         assert num_transfer_blocks <= len(gpu_block_mapping)
 

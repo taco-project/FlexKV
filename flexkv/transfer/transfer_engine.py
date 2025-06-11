@@ -8,13 +8,13 @@ from typing import Dict, List, Optional, Tuple
 import contextlib
 import nvtx
 import torch
-from ..common.debug import debuginfo
-from ..common.storage import AccessibleHandle, KVCacheLayout
-from ..common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType
-from ..common.transfer import get_nvtx_range_color, get_nvtx_default_color
-from .scheduler import TransferScheduler
-from .worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker, CPURemoteTransferWorker, tpGPUCPUTransferWorker
 
+from flexkv.common.debug import debuginfo
+from flexkv.common.storage import AccessibleHandle, KVCacheLayout
+from flexkv.common.transfer import TransferOp, TransferOpGraph, DeviceType, TransferType
+from flexkv.common.transfer import get_nvtx_range_color, get_nvtx_default_color
+from flexkv.transfer.scheduler import TransferScheduler
+from flexkv.transfer.worker import TransferWorker, GPUCPUTransferWorker, CPUSSDDiskTransferWorker, CPURemoteTransferWorker, tpGPUCPUTransferWorker
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.memory_handle import KVCacheTensorHandle
 
