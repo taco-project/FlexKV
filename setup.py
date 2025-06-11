@@ -1,10 +1,13 @@
 import os
+import shutil
 import sys
-from setuptools import find_packages, setup
-from torch.utils import cpp_extension
-from Cython.Build import cythonize
 
-# Set build directory for all generated files
+from Cython.Build import cythonize
+from setuptools import find_packages, setup
+from setuptools.command.build_ext import build_ext
+from torch.utils import cpp_extension
+
+
 build_dir = os.path.abspath("build")
 os.makedirs(build_dir, exist_ok=True)
 
@@ -27,6 +30,13 @@ cpp_sources = [
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt"]
 extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.join(build_dir, "include")]
+
+# Add rpath to find libraries at runtime
+lib_dir = os.path.join(build_dir, "lib")
+if os.path.exists(lib_dir):
+    extra_link_args.extend([f"-Wl,-rpath,{lib_dir}", f"-Wl,-rpath,$ORIGIN"])
+    # Also add the current package directory to rpath for installed libraries
+    extra_link_args.append("-Wl,-rpath,$ORIGIN/../lib")
 
 if enable_cfs:
     print("ENABLE_CFS = true: compiling and link cfs related content")
@@ -75,6 +85,32 @@ if not debug:
 else:
     print("Debug mode: Skipping Cython compilation")
 
+class CustomBuildExt(cpp_extension.BuildExtension):
+    def run(self):
+        super().run()
+        # Copy required shared libraries to the package directory after building
+        self.copy_shared_libraries()
+    
+    def copy_shared_libraries(self):
+        """Copy shared libraries to the package lib directory"""
+        source_lib_dir = os.path.join(build_dir, "lib")
+        if not os.path.exists(source_lib_dir):
+            print(f"Warning: Source library directory {source_lib_dir} does not exist")
+            return
+        
+        # Create lib directory in the package
+        package_lib_dir = os.path.join("flexkv", "lib")
+        os.makedirs(package_lib_dir, exist_ok=True)
+        
+        # Copy all .so files
+        for file in os.listdir(source_lib_dir):
+            if file.endswith(".so") or file.endswith(".so.*"):
+                source_file = os.path.join(source_lib_dir, file)
+                dest_file = os.path.join(package_lib_dir, file)
+                if os.path.isfile(source_file):
+                    shutil.copy2(source_file, dest_file)
+                    print(f"Copied {source_file} to {dest_file}")
+
 with open("requirements.txt") as f:
     install_requires = f.read().splitlines()
 
@@ -83,13 +119,16 @@ setup(
     description="A global KV-Cache manager for LLM inference",
     version="0.1.0",
     packages=find_packages(exclude=("benchmarks", "csrc", "examples", "tests")),
+    package_data={
+        "flexkv": ["lib/*.so", "lib/*.so.*"],
+    },
+    include_package_data=True,
     install_requires=install_requires,
     ext_modules=ext_modules,  # Now contains both C++ and Cython modules as needed
     cmdclass={
-        "build_ext": cpp_extension.BuildExtension.with_options(
+        "build_ext": CustomBuildExt.with_options(
             no_python_abi_suffix=True,
             build_temp=os.path.join(build_dir, "temp"),  # Temporary build files
-            build_lib=os.path.join(build_dir, "lib"),    # Output library files
         )
     },
     python_requires=">=3.8",

@@ -1,15 +1,12 @@
-
-from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from flexkv.common.memory_handle import KVCacheTensorHandle
 from flexkv.common.config import ModelConfig
+from flexkv.common.memory_handle import KVCacheTensorHandle
 
 
-  
-    
 @dataclass
 class RegisterDPClientRequest:
     model_config: ModelConfig

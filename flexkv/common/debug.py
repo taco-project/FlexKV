@@ -1,7 +1,7 @@
 import logging
-import time
-import sys
 import os
+import sys
+import time
 from functools import wraps
 from typing import Optional
 

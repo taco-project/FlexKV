@@ -1,10 +1,12 @@
-from enum import Enum, auto
 from dataclasses import dataclass
-from typing import Union, List, Optional, Any, Dict
-import torch
+from enum import Enum, auto
 from pathlib import Path
+from typing import Union, List, Optional, Any, Dict
+
+import torch
 
 from flexkv.common.transfer import DeviceType
+
 
 class AccessHandleType(Enum):
     TENSOR = auto()  # single tensor or tensor list

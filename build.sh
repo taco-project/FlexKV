@@ -47,7 +47,25 @@ else
   FLEXKV_DEBUG=0 pip install --no-build-isolation -e .
 fi
 
+# Set LD_LIBRARY_PATH for immediate use
 export LD_LIBRARY_PATH=$BUILD_LIB_PATH:$LD_LIBRARY_PATH
 echo "Added $BUILD_LIB_PATH to LD_LIBRARY_PATH for current session"
 
+# Copy shared libraries to package directory for permanent access
+echo "=== Copying shared libraries to package directory ==="
+PACKAGE_LIB_DIR="flexkv/lib"
+mkdir -p $PACKAGE_LIB_DIR
+
+if [ -d "$BUILD_LIB_PATH" ]; then
+    for lib_file in $BUILD_LIB_PATH/*.so*; do
+        if [ -f "$lib_file" ]; then
+            cp "$lib_file" "$PACKAGE_LIB_DIR/"
+            echo "Copied $(basename $lib_file) to $PACKAGE_LIB_DIR/"
+        fi
+    done
+else
+    echo "Warning: Build lib directory $BUILD_LIB_PATH not found"
+fi
+
 echo "=== Build and installation completed successfully in ${BUILD_TYPE} mode ==="
+echo "You can now run tests directly without setting LD_LIBRARY_PATH manually"

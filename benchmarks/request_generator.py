@@ -1,11 +1,11 @@
-import random
-from typing import Optional, List, Tuple, Any
-from tqdm import tqdm
 import asyncio
-from dataclasses import dataclass
+import random
 import time
+from dataclasses import dataclass
+from typing import Optional, List, Tuple, Any
 
 import torch
+from tqdm import tqdm
 
 
 @dataclass

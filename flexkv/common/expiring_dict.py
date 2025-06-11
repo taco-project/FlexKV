@@ -1,7 +1,7 @@
 import threading
 import time
-#auto cleaning and thread safe
-#support multiple wait APIs such as wait, wait_tpid_layid.
+
+
 class DoubleBufferExpiringDict:
     def __init__(self, expire_seconds: float = 600):
         self._buffer1 = {}

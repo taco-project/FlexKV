@@ -1,13 +1,13 @@
-from typing import Dict, Optional, List, Tuple, Union
-from enum import Enum
 from dataclasses import dataclass
-import torch
+from enum import Enum
+from typing import Dict, Optional, List, Tuple, Union
 
-from .allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator, StorageAllocator
-from ..common.storage import AccessibleHandle, KVCacheLayout, KVCacheLayoutType
-from ..common.transfer import DeviceType
+import torch
 from ..common.config import ModelConfig, CacheConfig
 from ..common.memory_handle import KVCacheTensorHandle
+from ..common.storage import AccessibleHandle, KVCacheLayout, KVCacheLayoutType
+from ..common.transfer import DeviceType
+from .allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator, StorageAllocator
 
 
 class StorageEngine:

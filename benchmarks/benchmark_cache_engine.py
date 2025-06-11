@@ -1,14 +1,15 @@
+from argparse import ArgumentParser
+from request_generator import RequestGenerator, KVRequest
 from typing import List
+
 import cProfile
 import pstats
-from argparse import ArgumentParser
-
 import torch
 
-from request_generator import RequestGenerator, KVRequest
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import debuginfo
+
 
 debuginfo.set_level("INFO")
 
