@@ -1,11 +1,11 @@
-
-from enum import Enum
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict
 
 import torch
 
 from flexkv.common.transfer import DeviceType
+
 
 class cacheEngineRequestType(Enum):
     GET = "get"

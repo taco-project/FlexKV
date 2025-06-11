@@ -1,14 +1,16 @@
-import torch
-from typing import Tuple
 import time
-import tempfile
-
 from multiprocessing import Process
-from flexkv.server.server import KVServer
-from flexkv.server.client import KVDPClient, KVTPClient
+from typing import Tuple
+
+import tempfile
+import torch
+
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import init_logger
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.server.client import KVDPClient, KVTPClient
+from flexkv.server.server import KVServer
+
 
 logger = init_logger(__name__)
 
@@ -57,6 +59,7 @@ cache_config = CacheConfig( enable_cpu=True,
                             enable_ssd=False,
                             enable_remote=False,
                             cpu_kv_layout=default_kv_layout,
+                            gpu_kv_layout=gpu_kv_layout,
                             use_gds=False,
                             use_pinned_memory=True,
                             tokens_per_block=tokens_per_block,

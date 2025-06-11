@@ -1,6 +1,8 @@
-from typing import OrderedDict, List, Set, Tuple
 from dataclasses import dataclass
+from typing import OrderedDict, List, Set, Tuple
+
 from ..common.transfer import TransferOp, TransferOpGraph, TransferType
+
 
 class TransferScheduler:
     def __init__(self):

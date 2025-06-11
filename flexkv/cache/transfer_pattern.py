@@ -5,6 +5,7 @@ import torch
 from flexkv.common.transfer import DeviceType, TransferType
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferDescriptor, TransferIDAllocator
 
+
 def add_virtal_op_for_mutiple_task_end_ops(
     graph: TransferOpGraph,
     finished_ops_ids: List[int]

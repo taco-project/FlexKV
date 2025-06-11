@@ -1,8 +1,10 @@
+import time
 from typing import NewType, Optional
 
 import torch
 
 from flexkv import c_ext
+
 
 HashType = NewType('HashType', int)
 
@@ -35,7 +37,6 @@ def gen_hashes(token_ids: torch.Tensor, tokens_per_block: int, hasher: Optional[
     return block_hashes
 
 if __name__ == "__main__":
-    import time
     torch.manual_seed(0)
     token_ids = torch.randint(0, 10000, (32000, ), dtype=torch.int64)
     print(f"token ids length: {token_ids.shape[0]}")

@@ -1,17 +1,20 @@
-import torch
-from flexkv.kvmanager import KVManager
-from flexkv.common.config import ModelConfig, CacheConfig
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-from flexkv.common.debug import debuginfo
 import time
+
+import torch
+
+from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.debug import debuginfo
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.kvmanager import KVManager
+
 
 num_layers = 16
 num_kv_heads = 32
-head_size = 128
+head_size = 8
 element_size = 2
 use_mla = False
-tp_size = 2
-dp_size = 2
+tp_size = 1
+dp_size = 1
 tokens_per_block = 16
 enable_cpu = True
 enable_ssd = True
