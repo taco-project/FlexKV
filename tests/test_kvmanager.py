@@ -10,7 +10,7 @@ from flexkv.kvmanager import KVManager
 
 num_layers = 16
 num_kv_heads = 32
-head_size = 8
+head_size = 128
 element_size = 2
 use_mla = False
 tp_size = 1

@@ -363,7 +363,7 @@ class GPUCPUTransferWorker(TransferWorker):
                 self.block_size * self.dtype.itemsize
             )
 
-class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
+class tpGPUCPUTransferWorker(TransferWorker):
     @classmethod
     def create_worker(cls,
                      worker_id: int,
@@ -375,7 +375,7 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                      dtype: torch.dtype,
                      tp_group_size: int,
                      dp_group_id: int):
-        return TransferWorker.create_worker(
+        return super().create_worker(
             worker_id, finished_ops_queue,
             gpu_blocks, cpu_blocks, gpu_kv_layout, cpu_kv_layout, dtype, 
             tp_group_size, dp_group_id
@@ -425,9 +425,8 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
                  tp_group_size: int, 
                  dp_group_id: int):
 
-        self.worker_id = worker_id
-        self.transfer_queue = MPQueue()
-        self.finished_ops_queue = finished_ops_queue
+        super().__init__(worker_id, finished_ops_queue)
+        self.transfer_queue = transfer_queue
         self.dtype = dtype
 
         self.num_gpus = len(gpu_blocks)
@@ -436,8 +435,6 @@ class tpGPUCPUTransferWorker(GPUCPUTransferWorker):
 
         for cpu_block in cpu_blocks:
             cudaHostRegister(cpu_block)
-
-        self.transfer_queue = transfer_queue
 
         self.num_layers = gpu_kv_layout.num_layer
         self.num_gpu_blocks = gpu_kv_layout.num_block
