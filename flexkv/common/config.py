@@ -17,7 +17,12 @@ class ModelConfig:
     tp_size: int = 1
     dp_size: int = 1
 
-default_kv_layout = KVCacheLayout(type=KVCacheLayoutType.LAYERWISE, num_layer=1, num_block=1, tokens_per_block=1, num_head=1, head_size=1)
+default_kv_layout = KVCacheLayout(type=KVCacheLayoutType.LAYERWISE,
+                                  num_layer=1,
+                                  num_block=1,
+                                  tokens_per_block=1,
+                                  num_head=1,
+                                  head_size=1)
 
 @dataclass
 class CacheConfig:

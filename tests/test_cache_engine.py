@@ -61,8 +61,9 @@ def test_mempool():
     mempool.recycle_blocks(block_ids)
     assert mempool.num_free_blocks == 64
 
-    with pytest.raises(ValueError):
-        mempool.allocate_blocks(0)
+    empty_blocks = mempool.allocate_blocks(0)
+    assert empty_blocks.shape == (0, )
+    assert empty_blocks.dtype == torch.int64
     assert mempool.num_free_blocks == 64
 
     with pytest.raises(ValueError):
@@ -156,8 +157,10 @@ def test_take_and_recycle(cache_engine: CacheEngine):
     radixnode = cache_engine.insert(sequence_meta, physical_blocks, is_ready=True)
     assert cache_engine.index.total_cached_blocks() == seq_blocks
 
-    with pytest.raises(ValueError):
-        cache_engine.take(0)
+    empty_blocks = cache_engine.take(0)
+    assert empty_blocks.shape == (0, )
+    assert empty_blocks.dtype == torch.int64
+
     with pytest.raises(ValueError):
         cache_engine.take(-1)
     with pytest.raises(NotEnoughSpaceError):
