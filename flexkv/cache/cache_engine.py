@@ -657,7 +657,7 @@ class GlobalCacheEngine:
         )
         if len(cpu_blocks_to_transfer) < num_cpu_required_blocks:
             self.cpu_cache_engine.recycle(cpu_blocks_to_transfer)
-            return self._empty_return(request_id, block_end_idx - block_start_idx)
+            return self._empty_put_return(request_id, block_end_idx - block_start_idx)
 
         cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                           cpu_blocks_to_transfer,
