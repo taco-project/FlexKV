@@ -50,20 +50,35 @@ class TransferEngine:
 
         assert len(gpu_handles) == self.dp_size * self.tp_size
         
-        self.gpucpu_workers = [
-            tpGPUCPUTransferWorker.create_worker(
-                worker_id=i,
-                finished_ops_queue=self.finished_ops_queue,
-                gpu_blocks=[gpu_handles[j].data for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
-                cpu_blocks=cpu_handle.data,
-                gpu_kv_layout=gpu_handles[i].kv_layout,
-                cpu_kv_layout=cpu_handle.kv_layout,
-                dtype=gpu_handles[i].dtype,
-                tp_group_size=self.tp_size,
-                dp_group_id=i,
-            )
-            for i in range(self.dp_size)
-        ]
+        if self.tp_size == 1:
+            self.gpucpu_workers = [
+                GPUCPUTransferWorker.create_worker(
+                    worker_id=i,
+                    finished_ops_queue=self.finished_ops_queue,
+                    gpu_blocks=gpu_handles[i].data,
+                    cpu_blocks=cpu_handle.data,
+                    gpu_kv_layout=gpu_handles[i].kv_layout,
+                    cpu_kv_layout=cpu_handle.kv_layout,
+                    dtype=gpu_handles[i].dtype,
+                    gpu_device_id=i,
+                )
+                for i in range(self.dp_size)
+            ]
+        else:
+            self.gpucpu_workers = [
+                tpGPUCPUTransferWorker.create_worker(
+                    worker_id=i,
+                    finished_ops_queue=self.finished_ops_queue,
+                    gpu_blocks=[gpu_handles[j].data for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                    cpu_blocks=cpu_handle.data,
+                    gpu_kv_layout=gpu_handles[i].kv_layout,
+                    cpu_kv_layout=cpu_handle.kv_layout,
+                    dtype=gpu_handles[i].dtype,
+                    tp_group_size=self.tp_size,
+                    dp_group_id=i,
+                )
+                for i in range(self.dp_size)
+            ]
 
         # Wait for GPU-CPU workers to initialize
         self.cpussd_read_worker = None
