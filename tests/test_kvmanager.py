@@ -150,9 +150,9 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
     {'use_mla': True},
 ], indirect=True)
 @pytest.mark.parametrize("cache_config", [
-    {'enable_cpu': True, 'enable_ssd': False, 'enable_remote': False},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True},
+    {'enable_cpu': True, 'enable_ssd': False, 'enable_remote': False, 'num_cpu_blocks': 1024},
+    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False,},
+    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True, 'num_ssd_blocks': 256, 'num_remote_blocks': 512},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
@@ -184,12 +184,21 @@ def test_kvmanager(model_config, cache_config, test_config):
         pytest.skip("enable_remote is not supported")
 
     # TODO: config layout by a more flexible way
+    gpu_layout = KVCacheLayout(
+        type=KVCacheLayoutType.LAYERWISE,
+        num_layer=num_layers,
+        num_block=num_gpu_blocks,
+        tokens_per_block=tokens_per_block,
+        num_head=num_kv_heads//tp_size,
+        head_size=head_size,
+        is_mla=False
+    )
     cpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERWISE,
         num_layer=num_layers,
         num_block=num_cpu_blocks,
         tokens_per_block=tokens_per_block,
-        num_head=num_kv_heads//tp_size,
+        num_head=num_kv_heads,
         head_size=head_size,
         is_mla=False
     )
@@ -211,6 +220,7 @@ def test_kvmanager(model_config, cache_config, test_config):
         head_size=head_size,
         is_mla=False
     )
+    cache_config.gpu_kv_layout = gpu_layout
     cache_config.cpu_kv_layout = cpu_layout
     cache_config.ssd_kv_layout = ssd_layout
     cache_config.remote_kv_layout = remote_layout
@@ -256,7 +266,9 @@ def test_kvmanager(model_config, cache_config, test_config):
             dp_id=dp_id,
         )
         running_put_requests.append(request_id)
-        if (i == num_requests - 1 or False):
+        min_block_num = min(num_cpu_blocks, num_gpu_blocks)
+        if (len(running_get_requests) + len(running_put_requests) >= min_block_num // block_per_request - 2 or
+            i == num_requests - 1):
             if len(running_put_requests) > 0:
                 kvmanager.wait_for_graph_finished(running_put_requests)
             if len(running_get_requests) > 0:
@@ -277,6 +289,8 @@ def test_kvmanager(model_config, cache_config, test_config):
     total_time = end_time - start_time
     print(f"Total time: {total_time} s")
     print(f"Total cache hit rate: {total_cache_hit / (total_cache_hit + total_cache_miss)}")
+    if num_cpu_blocks >= num_gpu_blocks:
+        assert total_cache_miss == 0, "total_cache_miss should be 0 if num_cpu_blocks >= num_gpu_blocks"
     kvmanager.shutdown()
     if(total_cache_miss == 0):
         verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers)

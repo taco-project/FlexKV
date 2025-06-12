@@ -182,17 +182,15 @@ class GPUCPUTransferWorker(TransferWorker):
     def create_worker(cls,
                      worker_id: int,
                      finished_ops_queue: MPQueue,
-                     gpu_blocks: List[torch.Tensor],
+                     gpu_blocks: Union[List[torch.Tensor], List[KVCacheTensorHandle]],
                      cpu_blocks: List[torch.Tensor],
                      gpu_kv_layout: KVCacheLayout,
                      cpu_kv_layout: KVCacheLayout,
                      dtype: torch.dtype,
-                     gpu_device_id: int = -1,
-                     zmq_gpu_handle: list[KVCacheTensorHandle] = None):
+                     gpu_device_id: int = -1):
         return super().create_worker(
-            worker_id, finished_ops_queue,
-            gpu_blocks, cpu_blocks, gpu_kv_layout, cpu_kv_layout, dtype, 
-            gpu_device_id, zmq_gpu_handle
+            worker_id, finished_ops_queue, gpu_blocks, 
+            cpu_blocks, gpu_kv_layout, cpu_kv_layout, dtype, gpu_device_id
         )
 
     @classmethod
@@ -201,19 +199,19 @@ class GPUCPUTransferWorker(TransferWorker):
                        transfer_queue: MPQueue,
                        finished_ops_queue: MPQueue,
                        ready_event: Any,
-                       gpu_blocks: List[torch.Tensor],
+                       gpu_blocks: Union[List[torch.Tensor], List[KVCacheTensorHandle]],
                        cpu_blocks: List[torch.Tensor],
                        gpu_kv_layout: KVCacheLayout,
                        cpu_kv_layout: KVCacheLayout,
                        dtype: torch.dtype,
-                       gpu_device_id: int,
-                       zmq_gpu_handle: list[KVCacheTensorHandle]):
+                       gpu_device_id: int):
         # Handle ZMQ tensor imports if needed
-        if zmq_gpu_handle is not None:
-            gpu_blocks = []
-            for layer_handle in zmq_gpu_handle:
+        if isinstance(gpu_blocks[0], KVCacheTensorHandle):
+            imported_gpu_blocks = []
+            for layer_handle in gpu_blocks:
                 tensor, layer_id = import_layer_tensor_handle(layer_handle)
-                gpu_blocks.append(tensor)
+                imported_gpu_blocks.append(tensor)
+            gpu_blocks = imported_gpu_blocks
         
         worker = cls(worker_id, transfer_queue, finished_ops_queue,
                     gpu_blocks, cpu_blocks, gpu_kv_layout, cpu_kv_layout, 
