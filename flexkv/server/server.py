@@ -7,14 +7,15 @@ from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import init_logger
 from flexkv.common.memory_handle import import_layer_tensor_handle
 from flexkv.kvmanager import KVManager
-from flexkv.server.request import (
 from flexkv.server.util import get_zmq_socket
+from flexkv.server.request import (
     RegisterDPClientRequest,
     RegisterTPClientRequest,
     PutRequest,
     GetRequest,
     WaitRequest,
-    Response
+    TryWaitRequest,
+    Response,
 )
 
 
@@ -247,6 +248,16 @@ class KVServer:
                         req.dp_client_id)
                     result_zmq.send_pyobj(response)
                 
+                elif isinstance(req, TryWaitRequest):
+                    # TODO: support TP client try_wait
+                    masks = self.kvmanager.try_wait(
+                        req.try_wait_task_ids,
+                    )
+                    response = Response(req.dp_client_id, masks=masks)
+                    result_zmq = self.client_manager.get_zmq(
+                        req.dp_client_id)
+                    result_zmq.send_pyobj(response)
+
                 else:
                     raise TypeError(f"Unregonized RequestType: {type(req)}")
                 

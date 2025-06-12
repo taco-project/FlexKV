@@ -43,7 +43,14 @@ class WaitRequest:
     dp_client_id: int
     tp_rank: Optional[int]
     wait_task_ids: List[int]
-    
+
+# Used for async put/get 
+@dataclass
+class TryWaitRequest:
+    dp_client_id: int
+    tp_rank: Optional[int]
+    try_wait_task_ids: List[int]
+
 
 @dataclass
 class Response:

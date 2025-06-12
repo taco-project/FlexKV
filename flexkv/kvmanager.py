@@ -310,13 +310,24 @@ class KVManager:
 
     # the try_wait api is used for server-client mode:
     # server process running the kvmanager should NOT be blocked by any single client
-    def try_wait(self, task_id: int)->Optional[torch.Tensor]:
-        task_tracker = self.requests_tracker[task_id]
-        if len(task_tracker.task_end_ops_ids) == 0:
-            return None
-        if all(task_tracker.task_end_ops_status):
-            return task_tracker.return_mask
-        return None
+    def try_wait(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
+        return_masks = {}
+        
+        if isinstance(task_ids, int):
+            task_ids = [task_ids]
+            
+        for task_id in task_ids:
+            task_tracker = self.requests_tracker[task_id]
+            if len(task_tracker.task_end_ops_ids) == 0:
+                mask = None
+            elif all(task_tracker.task_end_ops_status):
+                mask = task_tracker.return_mask
+            else:
+                mask = None
+            
+            return_masks[task_id] = mask
+
+        return return_masks
 
     def wait_at_layer_group(self, task_id: int, layer_group_id: int):
         nvtx.mark(f"wait task_id: {task_id}, layer_group_id: {layer_group_id}")
@@ -331,10 +342,21 @@ class KVManager:
         # nvtx.mark(f"wait_at_layer_group task_id: {task_id}, layer_group_id: {layer_group_id} done")
         # return return_mask
 
-    def try_wait_at_layer_group(self, task_id: int, layer_group_id: int)->Optional[torch.Tensor]:
-        task_tracker = self.requests_tracker[task_id]
-        if len(task_tracker.task_end_ops_ids) == 0:
-            return None
-        if task_tracker.task_end_ops_status[layer_group_id]:
-            return task_tracker.return_mask
-        return None
+    def try_wait_at_layer_group(self, task_ids: Union[int, List[int]], layer_group_id: int)->Dict[int, torch.Tensor]:
+        return_masks = {}
+        
+        if isinstance(task_ids, int):
+            task_ids = [task_ids]
+            
+        for task_id in task_ids:
+            task_tracker = self.requests_tracker[task_id]
+            if len(task_tracker.task_end_ops_ids) == 0:
+                mask = None
+            elif task_tracker.task_end_ops_status[layer_group_id]:
+                mask = task_tracker.return_mask
+            else:
+                mask = None
+            
+            return_masks[task_id] = mask
+
+        return return_masks

@@ -12,13 +12,14 @@ from flexkv.common.config import ModelConfig
 from flexkv.common.debug import init_logger
 from flexkv.common.memory_handle import export_layer_tensor_handle
 from flexkv.common.storage import KVCacheLayout
-from flexkv.server.request import (
 from flexkv.server.util import get_zmq_socket
+from flexkv.server.request import (
     RegisterDPClientRequest,
     RegisterTPClientRequest,
     PutRequest,
     GetRequest,
     WaitRequest,
+    TryWaitRequest,
     Response
 )
 
@@ -114,6 +115,22 @@ class KVDPClient:
             logger.error(f"wait tasks: {wait_task_ids} in DP {self.dp_client_id} failed.")
             return None
 
+    def try_wait(
+        self,
+        try_wait_task_ids: List[int],
+    ) -> Dict[int, torch.Tensor]:
+        req = TryWaitRequest(self.dp_client_id, None, try_wait_task_ids)
+        
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        
+        if response.success:
+            logger.info(f"try_wait tasks: {try_wait_task_ids} finished.")
+            return response.masks
+        else:
+            logger.error(f"try_wait tasks: {try_wait_task_ids} in DP {self.dp_client_id} failed.")
+            return None
+    
 class KVTPClient:
     def __init__(
         self,
