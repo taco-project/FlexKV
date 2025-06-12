@@ -11,7 +11,7 @@ import torch
 
 from flexkv.cache.cache_engine import GlobalCacheEngine, TransferOpGraph
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.common.debug import init_logger
+from flexkv.common.debug import init_logger, debuginfo
 from flexkv.common.expiring_dict import ExpiringDict
 from flexkv.common.memory_handle import KVCacheTensorHandle
 from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
@@ -31,7 +31,7 @@ class RequestTracker:
     task_end_ops_ids: List[int]
     task_end_ops_status: List[bool]
     task_finished: bool = False
-    
+
 
 class KVManager:
     def __init__(self,
@@ -56,7 +56,7 @@ class KVManager:
         self.running = False
 
         # Two initialization paths:
-        # 1) gpu_blocks are provided 
+        # 1) gpu_blocks are provided
         # 2) gpu_handles are provided
         if gpu_blocks is None:
             self.gpu_blocks = {}
@@ -83,7 +83,12 @@ class KVManager:
             if self.cache_config.enable_remote
             else None
         )
-        self.transfer_engine = TransferEngine(self.gpu_handles, self.model_config, self.cache_config, cpu_handle, ssd_handle, remote_handle)
+        self.transfer_engine = TransferEngine(self.gpu_handles,
+                                              self.model_config,
+                                              self.cache_config,
+                                              cpu_handle,
+                                              ssd_handle,
+                                              remote_handle)
 
         self.requests_tracker: Mapping[int, RequestTracker] = ExpiringDict(expire_seconds=600)
 
@@ -103,7 +108,7 @@ class KVManager:
     # the gpu_blocks of multiple gpus can be added post initialization.
     # the transfer engine will be initialized after we have all the intended gpu handles.
     def add_single_gpu_blocks(
-        self, 
+        self,
         gpu_handle: Union[List[KVCacheTensorHandle], List[torch.Tensor]],
         dp_client_id: int = 0,
         tp_rank: int = 0,
@@ -141,15 +146,13 @@ class KVManager:
                                                                                         self.model_config.num_layers)
                 else:
                     raise ValueError(f"Unknown request type: {request.request_type}")
-                graph.bind_to_dp_group(request.dp_id)
+                graph.bind_to_dp_group(request.dp_id)  # TODO: should call this here or in get/put?
                 nvtx.pop_range()
-                #TODO deal with empty graphs
-                self.graphid_to_nvtx_range[graph.transfer_graph_id] = nvtx.start_range(
-                                                                            f"request id: {request.request_id}, "
-                                                                            f"graph id: {graph.transfer_graph_id}",
-                                                                            color=get_nvtx_range_color(graph.transfer_graph_id))
                 if graph.num_ops == 0: #early return
-                    layer_op_num = self.model_config.num_layers // request.layer_granularity if request.request_type == cacheEngineRequestType.GET else 1
+                    debuginfo.info(f"no transfer: "
+                                   f"request_id = {request.request_id}, request_type = {request.request_type}")
+                    layer_op_num = self.model_config.num_layers // request.layer_granularity \
+                        if request.request_type == cacheEngineRequestType.GET else 1
                     self.requests_tracker[request.request_id] = RequestTracker(task_id=request.request_id,
                                                                             task_type=request.request_type,
                                                                             return_mask=return_mask,
@@ -158,6 +161,10 @@ class KVManager:
                                                                             task_end_ops_status=[True]*layer_op_num,
                                                                             task_finished=True)
                 else:
+                    self.graphid_to_nvtx_range[graph.transfer_graph_id] = nvtx.start_range(
+                                                                            f"request id: {request.request_id}, "
+                                                                            f"graph id: {graph.transfer_graph_id}",
+                                                                            color=get_nvtx_range_color(graph.transfer_graph_id))
                     self.requests_tracker[request.request_id] = RequestTracker(task_id=request.request_id,
                                                                                 task_type=request.request_type,
                                                                                 return_mask=return_mask,
@@ -276,7 +283,7 @@ class KVManager:
                     return_masks[task_id] = task_tracker.return_mask
                     finished_task_ids.append(task_id)
             task_ids = [task_id for task_id in task_ids if task_id not in finished_task_ids]
-            time.sleep(0.001)
+            time.sleep(0.0001)
         nvtx.mark(f"wait task_ids: {task_ids} done")
         return return_masks
 
@@ -297,7 +304,7 @@ class KVManager:
                     return_masks[task_id] = task_tracker.return_mask
                     finished_task_ids.append(task_id)
             task_ids = [task_id for task_id in task_ids if task_id not in finished_task_ids]
-            time.sleep(0.001)
+            time.sleep(0.0001)
         nvtx.mark(f"wait task_ids: {task_ids} done")
         return return_masks
 
@@ -319,10 +326,10 @@ class KVManager:
                 continue
             if task_tracker.task_end_ops_status[layer_group_id]:
                 return task_tracker.return_mask
-            time.sleep(0.001)
+            time.sleep(0.0001)
 
-        nvtx.mark(f"wait_at_layer_group task_id: {task_id}, layer_group_id: {layer_group_id} done")
-        return return_mask
+        # nvtx.mark(f"wait_at_layer_group task_id: {task_id}, layer_group_id: {layer_group_id} done")
+        # return return_mask
 
     def try_wait_at_layer_group(self, task_id: int, layer_group_id: int)->Optional[torch.Tensor]:
         task_tracker = self.requests_tracker[task_id]

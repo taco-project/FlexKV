@@ -26,7 +26,7 @@ class Mempool:
         self._free_ids_offset = 0
 
     def allocate_blocks(self, num: int) -> torch.Tensor:
-        if num <= 0:
+        if num < 0:
             raise ValueError(f"num must be greater than 0, but got {num}")
         if num > self._num_free:
             raise NotEnoughSpaceError("Not enough free blocks", required=num, available=self._num_free)
