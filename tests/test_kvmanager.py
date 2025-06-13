@@ -268,6 +268,7 @@ def test_kvmanager(model_config, cache_config, test_config):
         running_put_requests.append(request_id)
         min_block_num = min(num_cpu_blocks, num_gpu_blocks)
         if (len(running_get_requests) + len(running_put_requests) >= min_block_num // block_per_request - 2 or
+            i % initial_write_num == initial_write_num - 1 or
             i == num_requests - 1):
             if len(running_put_requests) > 0:
                 kvmanager.wait_for_graph_finished(running_put_requests)
