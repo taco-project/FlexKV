@@ -78,7 +78,6 @@ void transfer_kv_layers(int num_blocks, int num_layers, int64_t *dst_block_ids,
   dim3 blockDim(block_size);
   dim3 gridDim(block_count);
   if (use_ce_transfer) {
-    assert(dst_startoff_inside_chunks == 0 && src_startoff_inside_chunks == 0);
     for (int i = 0; i < num_layers; i++) {
       for (int j = 0; j < 2; j++) {
         for (int k = 0; k < num_blocks; k++) {
@@ -89,9 +88,9 @@ void transfer_kv_layers(int num_blocks, int num_layers, int64_t *dst_block_ids,
           int64_t dst_block_idx = dst_block_ids[k];
           int64_t src_block_idx = src_block_ids[k];
           int64_t *dst_chunk_ptr =
-              dst_layer_kv_ptr + dst_block_idx * dst_chunk_stride_int64;
+              dst_layer_kv_ptr + dst_block_idx * dst_chunk_stride_int64 + dst_startoff_inside_chunks_int64;
           int64_t *src_chunk_ptr =
-              src_layer_kv_ptr + src_block_idx * src_chunk_stride_int64;
+              src_layer_kv_ptr + src_block_idx * src_chunk_stride_int64 + src_startoff_inside_chunks_int64;
 
           if (is_host_to_device) {
             cudaMemcpyAsync(dst_chunk_ptr, src_chunk_ptr, chunk_size_in_bytes,

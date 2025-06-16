@@ -145,7 +145,8 @@ class KVManager:
                                                                                             request.token_mask,
                                                                                             request.slot_mapping,
                                                                                             self.model_config.num_layers,
-                                                                                            request.layer_granularity)
+                                                                                            request.layer_granularity,
+                                                                                            request.dp_id)
                 elif request.request_type == KVRequestType.PUT:
                     nvtx.push_range(f"cache_engine.put request_id: {request.request_id}",
                                     color=get_nvtx_default_color())
@@ -153,10 +154,10 @@ class KVManager:
                                                                                         request.token_ids,
                                                                                         request.token_mask,
                                                                                         request.slot_mapping,
-                                                                                        self.model_config.num_layers)
+                                                                                        self.model_config.num_layers,
+                                                                                        request.dp_id)
                 else:
                     raise ValueError(f"Unknown request type: {request.request_type}")
-                graph.bind_to_dp_group(request.dp_id)  # TODO: should call this here or in get/put?
                 nvtx.pop_range()
                 if graph.num_ops == 0: #early return
                     flexkv_logger.info(f"no transfer: "
@@ -297,6 +298,8 @@ class KVManager:
         while num_completed_tasks < num_tasks:
             finished_task_ids = []
             for task_id in task_ids:
+                if task_id not in self.requests_tracker:
+                    raise LogicError(f"task_id {task_id} not submitted into flexKV")
                 task_tracker = self.requests_tracker[task_id]
                 if len(task_tracker.return_mask) == 0: #NOT READY
                     continue
@@ -320,6 +323,8 @@ class KVManager:
         while num_completed_tasks < len(task_ids):
             finished_task_ids = []
             for task_id in task_ids:
+                if task_id not in self.requests_tracker:
+                    raise LogicError(f"task_id {task_id} not submitted into flexKV")
                 task_tracker = self.requests_tracker[task_id]
                 if task_tracker.task_finished:
                     num_completed_tasks += 1
@@ -337,6 +342,8 @@ class KVManager:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         for task_id in task_ids:
+            if task_id not in self.requests_tracker:
+                raise LogicError(f"task_id {task_id} not submitted into flexKV")
             task_tracker = self.requests_tracker[task_id]
             if len(task_tracker.task_end_ops_ids) == 0:
                 mask = torch.empty(0)
@@ -350,6 +357,8 @@ class KVManager:
     def wait_at_layer_group(self, task_id: int, layer_group_id: int) -> torch.Tensor:
         nvtx.mark(f"wait task_id: {task_id}, layer_group_id: {layer_group_id}")
         while True:
+            if task_id not in self.requests_tracker:
+                raise LogicError(f"task_id {task_id} not submitted into flexKV")
             task_tracker = self.requests_tracker[task_id]
             if len(task_tracker.task_end_ops_ids) == 0:
                 continue
@@ -367,6 +376,8 @@ class KVManager:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         for task_id in task_ids:
+            if task_id not in self.requests_tracker:
+                raise LogicError(f"task_id {task_id} not submitted into flexKV")
             task_tracker = self.requests_tracker[task_id]
             if len(task_tracker.task_end_ops_ids) == 0:
                 mask = torch.empty(0)
