@@ -6,13 +6,10 @@ import tempfile
 import torch
 
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.common.debug import init_logger
+from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.server.client import KVDPClient, KVTPClient
 from flexkv.server.server import KVServer
-
-
-logger = init_logger(__name__)
 
 
 num_layers = 32
@@ -52,7 +49,7 @@ model_config = ModelConfig(num_layers=num_layers,
                             num_kv_heads=num_kv_heads,
                             head_size=head_size,
                             use_mla=False,
-                            tp_size=tp_size, 
+                            tp_size=tp_size,
                             dp_size=dp_size,
                             dtype=dtype)
 
@@ -69,11 +66,11 @@ cache_config = CacheConfig( enable_cpu=True,
 
 def run_dp_client(server_recv_port):
     """Client process function"""
-    logger.info(f"start dp client process")
+    flexkv_logger.info("start dp client process")
     # Initialize client
     dp_client = KVDPClient(server_recv_port, model_config)
-            
-    logger.info(f"start tp client process")
+
+    flexkv_logger.info("start tp client process")
     tp_client_processes: list[Process] = []
     for tp_rank in range(model_config.tp_size):
         tp_client_process = Process(
@@ -83,10 +80,10 @@ def run_dp_client(server_recv_port):
         )
         tp_client_process.start()
         tp_client_processes.append(tp_client_process)
-        
+
     # wait tp client registered
     time.sleep(5)
-    
+
     # get/put/wait
     req1_len = 65
     tokens_per_block = gpu_shape[3]
@@ -100,13 +97,13 @@ def run_dp_client(server_recv_port):
     t_interval = time.time()
     results = dp_client.wait([request_id0])
     t_end = time.time()
-    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id0}, "
+    flexkv_logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id0}, "
                 f"time cost: get_async {(t_interval-t_start)*1000:.2f} ms, "
                 f"wait {(t_end-t_interval)*1000:.2f} ms.")
-    logger.info(results)
-    
-    
-    
+    flexkv_logger.info(results)
+
+
+
     req1_len = 65
     tokens_per_block = gpu_shape[3]
     token_ids = torch.randint(0, 1000, (req1_len, ))
@@ -117,7 +114,7 @@ def run_dp_client(server_recv_port):
     req_1_t_start = time.time()
     request_id1 = dp_client.put_async(token_ids, slot_mapping, token_mask)
     req_1_t_interval = time.time()
-    
+
     req2_len = 46
     token_ids = torch.randint(0, 1000, (req2_len, ))
     token_mask = torch.ones(req2_len, dtype=torch.bool)
@@ -130,14 +127,14 @@ def run_dp_client(server_recv_port):
     # Process responses
     results = dp_client.wait([request_id1, request_id2])
     t_end = time.time()
-    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id1}, "
+    flexkv_logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id1}, "
                 f"time cost: put_async {(req_1_t_interval-req_1_t_start)*1000:.2f} ms, "
                 f"wait {(t_end-req_1_t_interval)*1000:.2f} ms.")
-    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id2}, "
+    flexkv_logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id2}, "
                 f"time cost: put_async {(req_2_t_interval-req_2_t_start)*1000:.2f} ms, "
                 f"wait {(t_end-req_2_t_interval)*1000:.2f} ms.")
-    logger.info(results)
-    
+    flexkv_logger.info(results)
+
     time.sleep(1)
 
     token_ids[40:] += 1
@@ -146,12 +143,12 @@ def run_dp_client(server_recv_port):
     t_interval = time.time()
     results = dp_client.wait([request_id3])
     t_end = time.time()
-    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id3}, "
+    flexkv_logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id3}, "
                 f"time cost: get_async {(t_interval-t_start)*1000:.2f} ms, "
                 f"wait {(t_end-t_interval)*1000:.2f} ms.")
-    logger.info(results)
-    
-    
+    flexkv_logger.info(results)
+
+
     token_mask[:20] = False
     new_slot_mapping = slot_mapping[20:]
     t_start = time.time()
@@ -159,28 +156,28 @@ def run_dp_client(server_recv_port):
     t_interval = time.time()
     results = dp_client.wait([request_id3])
     t_end = time.time()
-    logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id3}"
+    flexkv_logger.info(f"Client {dp_client.dp_client_id} got result for request {request_id3}"
                 f"time cost: get_async {(t_interval-t_start)*1000:.2f} ms, "
                 f"wait {(t_end-t_interval)*1000:.2f} ms.")
-    logger.info(results)
-    logger.info(results[request_id3].sum())
-    logger.info(gpu_physical_block_ids)
-    logger.info(slot_mapping[results[request_id3]][::tokens_per_block]//tokens_per_block)
-    
-    
-    logger.info(f"dp client tasks finish")
+    flexkv_logger.info(results)
+    flexkv_logger.info(results[request_id3].sum())
+    flexkv_logger.info(gpu_physical_block_ids)
+    flexkv_logger.info(slot_mapping[results[request_id3]][::tokens_per_block]//tokens_per_block)
 
-    
+
+    flexkv_logger.info("dp client tasks finish")
+
+
 def run_tp_client(dp_client_id, tp_rank, device_id, server_recv_port):
-    
+
     tp_client = KVTPClient(server_recv_port, dp_client_id, device_id, tp_rank)
-    
+
     gpu_blocks = [torch.rand(size=gpu_shape[1:], dtype=dtype).cuda(device_id)
                     for layer_id in range(gpu_shape[0])]
     gpu_layout = gpu_kv_layout
-    
+
     tp_client.register_to_server(gpu_blocks, gpu_layout)
-    
+
     while True:
         time.sleep(1)
 
@@ -196,7 +193,7 @@ def main():
         args=(server_recv_port, ),
     )
     server_process.start()
-    
+
     # wait for server start
     time.sleep(5)
 
@@ -209,9 +206,9 @@ def main():
             args=(server_recv_port, ),
         )
         dp_client_process.start()
-        
+
         client_processes.append(dp_client_process)
-        
+
     try:
         # Keep main process running
         while True:
@@ -220,7 +217,7 @@ def main():
         server_process.terminate()
         for dp_process in client_processes:
             dp_process.terminate()
-            
+
 
 if __name__ == "__main__":
     main()

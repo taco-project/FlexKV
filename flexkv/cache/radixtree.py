@@ -20,7 +20,7 @@ class MatchResult:
     last_node_matched_length: int = 0
     physical_blocks: torch.Tensor = torch.empty(0, dtype=torch.int64)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         assert self.physical_blocks.ndim == 1
         assert self.physical_blocks.dtype == torch.int64
 
@@ -34,9 +34,9 @@ class RadixNode:
     last_access_time: float
 
     parent: Optional['RadixNode'] = None
-    children: Dict[HashType, 'RadixNode'] = field(default_factory=dict)
+    children: Dict[Optional[HashType], 'RadixNode'] = field(default_factory=dict)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         assert self.block_hashes.ndim == 1
         assert self.physical_blocks.ndim == 1
         assert self.block_hashes.size == self.physical_blocks.size
@@ -48,7 +48,7 @@ class RadixNode:
         return self.block_hashes.size
 
     def head_hash(self) -> HashType:
-        return self.block_hashes[0] if self.size() > 0 else None
+        return HashType(int(self.block_hashes[0])) if self.size() > 0 else HashType(0)
 
     def num_children(self) -> int:
         return len(self.children)
@@ -108,7 +108,11 @@ class RadixNode:
 
 class RadixTreeIndex:
     def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000):
-        self.root_node = None
+        self.root_node: RadixNode = RadixNode(block_hashes=np.array([], dtype=np.int64),
+                                              physical_blocks=np.array([], dtype=np.int64),
+                                              is_ready=True,
+                                              lock_cnt=0,
+                                              last_access_time=time.time())
 
         self.tokens_per_block = tokens_per_block
 
@@ -116,9 +120,7 @@ class RadixTreeIndex:
 
         self.max_num_blocks = max_num_blocks
 
-        self.reset()
-
-    def reset(self)->None:
+    def reset(self) -> None:
         self.root_node = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                    physical_blocks=np.array([], dtype=np.int64),
                                    is_ready=True,
@@ -188,7 +190,7 @@ class RadixTreeIndex:
                physical_block_ids: torch.Tensor,
                num_insert_blocks: int = -1,
                is_ready: bool = True,
-               match_result: Optional[MatchResult] = None) -> RadixNode:
+               match_result: Optional[MatchResult] = None) -> Optional[RadixNode]:
         if num_insert_blocks == -1:
             num_insert_blocks = sequence_meta.num_blocks
         assert 0 <= num_insert_blocks <= sequence_meta.num_blocks
@@ -201,6 +203,7 @@ class RadixTreeIndex:
             match_result = self.match_prefix(sequence_meta)
         num_matched_blocks = match_result.num_matched_blocks
         last_node = match_result.last_node
+        assert last_node is not None
         last_node_matched_length = match_result.last_node_matched_length
         assert last_node_matched_length != 0 or last_node.is_root()
 
@@ -210,7 +213,8 @@ class RadixTreeIndex:
             f"len(physical_block_ids) = {len(physical_block_ids)}"
 
         if num_matched_blocks >= num_insert_blocks:
-            return
+            # not insert any new blocks
+            return None
 
         new_node = RadixNode(
             block_hashes=sequence_meta.block_hashes[num_matched_blocks:num_insert_blocks],
@@ -223,6 +227,7 @@ class RadixTreeIndex:
         if last_node_matched_length < last_node.size():
             last_node.split(last_node_matched_length)
             last_node = last_node.parent
+            assert last_node is not None
 
         new_node.parent = last_node
         last_node.children[new_node.head_hash()] = new_node
@@ -242,6 +247,7 @@ class RadixTreeIndex:
             if node.size() > num_evicted - len(evicted_blocks):
                 physical_blocks = node.shrink(num_evicted - len(evicted_blocks))
             else:
+                assert node.parent is not None  # node is not root
                 node.parent.children.pop(node.head_hash())
                 self.leaf_nodes.pop(node.head_hash(), None)
                 if node.parent.is_leaf():
@@ -269,7 +275,10 @@ class RadixTreeIndex:
             ready_length -= node.size()
             num_node = 1
             while ready_length > 0:
-                node = node.parent
+                if node.parent is None:
+                    raise LogicError("node is None in set_ready")
+                else:
+                    node = node.parent
                 ready_length -= node.size()
                 node.is_ready = True
                 num_node += 1
@@ -322,7 +331,7 @@ if __name__ == "__main__":
           f"total cached blocks = {index.total_cached_blocks()}")
     seq2_matched_blocks = index.num_matched_blocks(seq2)
     assert seq2_matched_blocks == 2
-    index.insert(seq2, torch.tensor([8, 9], dtype=torch.int64), num_matched_blocks=2, is_ready=True)
+    index.insert(seq2, torch.tensor([8, 9], dtype=torch.int64), is_ready=True)
     print(f"insert seq2 = {seq2.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks()}")
 

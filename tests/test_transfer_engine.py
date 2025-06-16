@@ -28,6 +28,7 @@ import time
 import tempfile
 from typing import List, Dict, Tuple
 import multiprocessing as mp
+from contextlib import suppress
 
 import pytest
 import torch
@@ -53,15 +54,13 @@ def temp_cache_files():
         fd, path = tempfile.mkstemp(suffix=f'_cache_{i}.tmp')
         os.close(fd)
         temp_files.append(path)
-    
+
     yield temp_files
-    
+
     # Cleanup temporary files
     for path in temp_files:
-        try:
+        with suppress(FileNotFoundError):
             os.remove(path)
-        except FileNotFoundError:
-            pass
 
 
 @pytest.fixture
@@ -102,24 +101,26 @@ def cache_config(temp_cache_files):
     )
 
 
-def create_test_gpu_blocks(model_config: ModelConfig, cache_config: CacheConfig, num_gpu_blocks: int) -> Dict[int, List[torch.Tensor]]:
+def create_test_gpu_blocks(model_config: ModelConfig,
+                           cache_config: CacheConfig,
+                           num_gpu_blocks: int) -> Dict[int, List[torch.Tensor]]:
     """Create test GPU block data with random values"""
     gpu_blocks = {}
     for gpu_id in range(model_config.tp_size * model_config.dp_size):
         gpu_blocks[gpu_id] = []
         device_name = f"cuda:{gpu_id}" if gpu_id < torch.cuda.device_count() else "cuda:0"
-        
+
         for layer_id in range(model_config.num_layers):
             # Create KV cache tensor: [2, num_blocks, tokens_per_block, num_heads, head_size]
             kv_tensor = torch.randint(
                 0, 100,
-                size=(2, num_gpu_blocks, cache_config.tokens_per_block, 
+                size=(2, num_gpu_blocks, cache_config.tokens_per_block,
                       model_config.num_kv_heads // model_config.tp_size, model_config.head_size),
                 dtype=model_config.dtype,
                 device=device_name
             )
             gpu_blocks[gpu_id].append(kv_tensor)
-    
+
     return gpu_blocks
 
 
@@ -134,7 +135,7 @@ def setup_kv_layouts(model_config: ModelConfig, cache_config: CacheConfig, num_g
         head_size=model_config.head_size,
         is_mla=model_config.use_mla
     )
-    
+
     cpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERWISE,
         num_layer=model_config.num_layers,
@@ -144,7 +145,7 @@ def setup_kv_layouts(model_config: ModelConfig, cache_config: CacheConfig, num_g
         head_size=model_config.head_size,
         is_mla=model_config.use_mla
     )
-    
+
     ssd_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERWISE,
         num_layer=model_config.num_layers,
@@ -154,7 +155,7 @@ def setup_kv_layouts(model_config: ModelConfig, cache_config: CacheConfig, num_g
         head_size=model_config.head_size,
         is_mla=model_config.use_mla
     )
-    
+
     cache_config.gpu_kv_layout = gpu_layout
     cache_config.cpu_kv_layout = cpu_layout
     cache_config.ssd_kv_layout = ssd_layout
@@ -162,14 +163,14 @@ def setup_kv_layouts(model_config: ModelConfig, cache_config: CacheConfig, num_g
 
 class DataVerifier:
     """Utility class for verifying data transfer correctness"""
-    
+
     @staticmethod
     def verify_gpu_cpu_transfer(
-        gpu_ground_truth: Dict[int, List[torch.Tensor]], 
-        cpu_blocks: List[torch.Tensor], 
-        gpu_block_ids: torch.Tensor, 
-        cpu_block_ids: torch.Tensor, 
-        model_config: ModelConfig, 
+        gpu_ground_truth: Dict[int, List[torch.Tensor]],
+        cpu_blocks: List[torch.Tensor],
+        gpu_block_ids: torch.Tensor,
+        cpu_block_ids: torch.Tensor,
+        model_config: ModelConfig,
         cache_config: CacheConfig,
         start_gpu_id: int,
         gpu_num: int
@@ -179,7 +180,7 @@ class DataVerifier:
         tokens_per_block = cache_config.tokens_per_block
         num_heads = model_config.num_kv_heads
         head_size = model_config.head_size
-        
+
         for gpu_id in range(gpu_num):
             start_head = gpu_id * model_config.num_kv_heads // gpu_num
             end_head = (gpu_id + 1) * model_config.num_kv_heads // gpu_num
@@ -193,8 +194,8 @@ class DataVerifier:
 
     @staticmethod
     def verify_round_trip_consistency(
-        original_data: Dict[int, List[torch.Tensor]], 
-        final_data: Dict[int, List[torch.Tensor]], 
+        original_data: Dict[int, List[torch.Tensor]],
+        final_data: Dict[int, List[torch.Tensor]],
         block_ids: torch.Tensor,
         model_config: ModelConfig,
         gpu_id: int = 0
@@ -205,23 +206,25 @@ class DataVerifier:
                 for block_id in block_ids:
                     original_block = original_data[gpu_id][layer_id][kv_idx, block_id]
                     final_block = final_data[gpu_id][layer_id][kv_idx, block_id]
-                    
+
                     assert torch.allclose(original_block, final_block, rtol=1e-5, atol=1e-6), \
                         f"Round-trip consistency failed at layer {layer_id}, kv {kv_idx}, block {block_id}"
 
 
-def wait_for_transfer_completion(transfer_engine: TransferEngine, expected_graph_ids: List[int], max_wait_time: float = 15.0) -> bool:
+def wait_for_transfer_completion(transfer_engine: TransferEngine,
+                                 expected_graph_ids: List[int],
+                                 max_wait_time: float = 15.0) -> bool:
     """Wait for transfer graphs to complete and return success status"""
     completed_graph_ids = set()
     start_time = time.time()
-    
+
     while len(completed_graph_ids) < len(expected_graph_ids) and (time.time() - start_time) < max_wait_time:
         results = transfer_engine.get_completed_graphs_and_ops(timeout=0.1)
         for graph_id, op_id in results:
             if op_id == -1:  # Graph completion
                 completed_graph_ids.add(graph_id)
         time.sleep(0.001)
-    
+
     return len(completed_graph_ids) == len(expected_graph_ids)
 
 
@@ -231,12 +234,12 @@ def wait_for_transfer_completion(transfer_engine: TransferEngine, expected_graph
 def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gpu_blocks, transfer_block_num):
     """
     Test round-trip data transfers between GPU and CPU
-    
+
     This test validates:
     1. GPU -> CPU transfer correctness
-    2. CPU -> GPU transfer correctness  
+    2. CPU -> GPU transfer correctness
     3. Round-trip data consistency (GPU -> CPU -> GPU)
-    
+
     Parameterized by:
     - tp_size, dp_size: Tensor and data parallelism configurations
     - num_gpu_blocks: Number of GPU blocks to test with
@@ -245,41 +248,43 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
     total_gpus = tp_size * dp_size
     if torch.cuda.device_count() < total_gpus:
         pytest.skip(f"Need at least {total_gpus} CUDA devices")
-    
+
     if transfer_block_num > num_gpu_blocks:
         pytest.skip(f"transfer_block_num ({transfer_block_num}) > num_gpu_blocks ({num_gpu_blocks})")
-    
+
     # Reset ID allocator
     TransferIDAllocator.reset()
-    
+
     # Update model config
     model_config.tp_size = tp_size
     model_config.dp_size = dp_size
-    
+
     # Setup configurations
     cache_config.enable_ssd = False
     setup_kv_layouts(model_config, cache_config, num_gpu_blocks)
-    
+
     # Create GPU blocks and save ground truth
     gpu_blocks = create_test_gpu_blocks(model_config, cache_config, num_gpu_blocks)
-    
+
     # Setup storage engine and transfer engine
-    storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
-    gpu_handles = [storage_engine.get_allocator_handle(DeviceType.GPU, i) for i in range(total_gpus)]
-    cpu_handle = storage_engine.get_allocator_handle(DeviceType.CPU)
-    
+    storage_engine = StorageEngine(model_config, cache_config)
+    for gpu_id, gpu_block in gpu_blocks.items():
+        storage_engine.register_gpu_blocks(gpu_block, device_id=gpu_id, dtype=model_config.dtype)
+    gpu_handles = [storage_engine.get_storage_handle(DeviceType.GPU, i) for i in range(total_gpus)]
+    cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
+
     transfer_engine = TransferEngine(
         gpu_handles=gpu_handles,
         model_config=model_config,
         cache_config=cache_config,
         cpu_handle=cpu_handle
     )
-    
+
     # Test each DP group separately
     for dp_id in range(dp_size):
         gpu_block_ids = torch.arange(0, transfer_block_num, dtype=torch.int64)
         cpu_block_ids = torch.arange(dp_id * transfer_block_num, (dp_id + 1) * transfer_block_num, dtype=torch.int64)
-        
+
         # Step 1: GPU -> CPU transfer
         write_graph, _ = create_write_graph_cpu_storage(
             graph_id=TransferIDAllocator.allocate_graph_id(),
@@ -291,24 +296,24 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
         )
         write_graph.bind_to_dp_group(dp_id)
         transfer_engine.submit_transfer_graph(write_graph)
-        
+
         # Wait for write completion
         assert wait_for_transfer_completion(transfer_engine, [write_graph.transfer_graph_id]), \
             f"GPU->CPU transfer failed for DP group {dp_id}"
-        
+
         # Verify GPU -> CPU transfer
         start_gpu_id= dp_id * tp_size
         DataVerifier.verify_gpu_cpu_transfer(
-            gpu_blocks, cpu_handle.data, gpu_block_ids, cpu_block_ids, 
+            gpu_blocks, cpu_handle.data, gpu_block_ids, cpu_block_ids,
             model_config, cache_config, start_gpu_id, tp_size,
         )
-        
+
         # Clear GPU blocks for read test
         for tp_id in range(tp_size):
             global_gpu_id = dp_id * tp_size + tp_id
             for layer_id in range(model_config.num_layers):
                 gpu_blocks[global_gpu_id][layer_id].zero_()
-        
+
         # Step 2: CPU -> GPU transfer
         read_graph, _ = create_read_graph_cpu_storage(
             graph_id=TransferIDAllocator.allocate_graph_id(),
@@ -320,17 +325,17 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
         )
         read_graph.bind_to_dp_group(dp_id)
         transfer_engine.submit_transfer_graph(read_graph)
-        
+
         # Wait for read completion
         assert wait_for_transfer_completion(transfer_engine, [read_graph.transfer_graph_id]), \
             f"CPU->GPU transfer failed for DP group {dp_id}"
-        
+
         # Verify round-trip consistency
         DataVerifier.verify_gpu_cpu_transfer(
             gpu_blocks, cpu_handle.data, gpu_block_ids, cpu_block_ids,
             model_config, cache_config, start_gpu_id, tp_size,
         )
-    
+
     # Cleanup
     transfer_engine.shutdown()
 
@@ -340,42 +345,44 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
 def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_block_num):
     """
     Test round-trip data transfers involving SSD storage
-    
+
     This test validates:
     1. GPU -> CPU -> SSD transfer chain
     2. SSD -> CPU -> GPU transfer chain
     3. Full round-trip data consistency
-    
+
     Parameterized by:
     - num_gpu_blocks: Number of GPU blocks to test with
     - transfer_block_num: Number of blocks to transfer
     """
     if torch.cuda.device_count() == 0:
         pytest.skip("No CUDA devices available")
-    
+
     if transfer_block_num > num_gpu_blocks:
         pytest.skip(f"transfer_block_num ({transfer_block_num}) > num_gpu_blocks ({num_gpu_blocks})")
-    
+
     # Reset ID allocator
     TransferIDAllocator.reset()
-    
+
     # Setup configurations
     cache_config.enable_ssd = True
     setup_kv_layouts(model_config, cache_config, num_gpu_blocks)
     if (model_config.tp_size * model_config.dp_size) > 1:
         pytest.skip("SSD transfer test is not supported for multi-GPU")
-    
+
     # Create GPU blocks and save ground truth
     gpu_blocks = create_test_gpu_blocks(model_config, cache_config, num_gpu_blocks)
     original_gpu_data = {gpu_id: [layer.clone() for layer in layers] for gpu_id, layers in gpu_blocks.items()}
-    
+
     # Setup storage engine and transfer engine
-    storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
-    gpu_handles = [storage_engine.get_allocator_handle(DeviceType.GPU, i) 
+    storage_engine = StorageEngine(model_config, cache_config)
+    for gpu_id, gpu_block in gpu_blocks.items():
+        storage_engine.register_gpu_blocks(gpu_block, device_id=gpu_id, dtype=model_config.dtype)
+    gpu_handles = [storage_engine.get_storage_handle(DeviceType.GPU, i)
                    for i in range(model_config.tp_size * model_config.dp_size)]
-    cpu_handle = storage_engine.get_allocator_handle(DeviceType.CPU)
-    ssd_handle = storage_engine.get_allocator_handle(DeviceType.SSD)
-    
+    cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
+    ssd_handle = storage_engine.get_storage_handle(DeviceType.SSD)
+
     transfer_engine = TransferEngine(
         gpu_handles=gpu_handles,
         model_config=model_config,
@@ -383,12 +390,12 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
         cpu_handle=cpu_handle,
         ssd_handle=ssd_handle
     )
-    
+
     # Prepare transfer block IDs
     gpu_block_ids = torch.arange(0, transfer_block_num, dtype=torch.int64)
     cpu_block_ids = torch.arange(0, transfer_block_num, dtype=torch.int64)
     ssd_block_ids = torch.arange(0, transfer_block_num, dtype=torch.int64)
-    
+
     # Step 1: GPU -> CPU -> SSD write
     write_graph, _ = create_write_graph_cpu_storage(
         graph_id=TransferIDAllocator.allocate_graph_id(),
@@ -400,16 +407,16 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
     )
     write_graph.bind_to_dp_group(0)
     transfer_engine.submit_transfer_graph(write_graph)
-    
+
     # Wait for write completion
     assert wait_for_transfer_completion(transfer_engine, [write_graph.transfer_graph_id]), \
         "GPU->CPU->SSD write transfer failed"
-    
+
     # Clear GPU blocks for read test
     for gpu_id in range(model_config.tp_size * model_config.dp_size):
         for layer_id in range(model_config.num_layers):
             gpu_blocks[gpu_id][layer_id].zero_()
-    
+
     # Step 2: SSD -> CPU -> GPU read
     read_graph, _ = create_read_graph_cpu_storage(
         graph_id=TransferIDAllocator.allocate_graph_id(),
@@ -421,16 +428,16 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
     )
     read_graph.bind_to_dp_group(0)
     transfer_engine.submit_transfer_graph(read_graph)
-    
+
     # Wait for read completion
     assert wait_for_transfer_completion(transfer_engine, [read_graph.transfer_graph_id]), \
         "SSD->CPU->GPU read transfer failed"
-    
+
     # Verify full round-trip consistency
     DataVerifier.verify_round_trip_consistency(
         original_gpu_data, gpu_blocks, gpu_block_ids, model_config, 0
     )
-    
+
     # Cleanup
     transfer_engine.shutdown()
 
@@ -438,16 +445,20 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
 @pytest.mark.parametrize("num_concurrent_transfers", [4])
 @pytest.mark.parametrize("blocks_per_transfer", [16])
 @pytest.mark.parametrize("include_ssd", [True, False])
-def test_concurrent_mixed_transfers(model_config, cache_config, num_concurrent_transfers, blocks_per_transfer, include_ssd):
+def test_concurrent_mixed_transfers(model_config,
+                                    cache_config,
+                                    num_concurrent_transfers,
+                                    blocks_per_transfer,
+                                    include_ssd):
     """
     Test multiple concurrent read/write transfers
-    
+
     This test validates:
     1. Multiple write transfers running concurrently
     2. Multiple read transfers running concurrently
     3. Mixed read/write transfers running concurrently
     4. Data correctness across all concurrent operations
-    
+
     Parameterized by:
     - num_concurrent_transfers: Number of concurrent transfer graphs
     - blocks_per_transfer: Number of blocks per transfer operation
@@ -457,31 +468,33 @@ def test_concurrent_mixed_transfers(model_config, cache_config, num_concurrent_t
         pytest.skip("No CUDA devices available")
     if (model_config.tp_size * model_config.dp_size) > 1:
         pytest.skip("Concurrent transfer test is not supported for multi-GPU")
-    
+
     total_blocks_needed = num_concurrent_transfers * blocks_per_transfer * 2  # For both read and write
     num_gpu_blocks = max(128, total_blocks_needed)
 
     cache_config.num_cpu_blocks = num_gpu_blocks
     cache_config.num_ssd_blocks = num_gpu_blocks
-    
+
     # Reset ID allocator
     TransferIDAllocator.reset()
-    
+
     # Setup configurations
     cache_config.enable_ssd = include_ssd
     setup_kv_layouts(model_config, cache_config, num_gpu_blocks)
-    
+
     # Create GPU blocks and save ground truth
     gpu_blocks = create_test_gpu_blocks(model_config, cache_config, num_gpu_blocks)
     original_gpu_data = {gpu_id: [layer.clone() for layer in layers] for gpu_id, layers in gpu_blocks.items()}
-    
+
     # Setup storage engine and transfer engine
-    storage_engine = StorageEngine(model_config, cache_config, gpu_blocks)
-    gpu_handles = [storage_engine.get_allocator_handle(DeviceType.GPU, i) 
+    storage_engine = StorageEngine(model_config, cache_config)
+    for gpu_id, gpu_block in gpu_blocks.items():
+        storage_engine.register_gpu_blocks(gpu_block, device_id=gpu_id, dtype=model_config.dtype)
+    gpu_handles = [storage_engine.get_storage_handle(DeviceType.GPU, i)
                    for i in range(model_config.tp_size * model_config.dp_size)]
-    cpu_handle = storage_engine.get_allocator_handle(DeviceType.CPU)
-    ssd_handle = storage_engine.get_allocator_handle(DeviceType.SSD) if include_ssd else None
-    
+    cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
+    ssd_handle = storage_engine.get_storage_handle(DeviceType.SSD) if include_ssd else None
+
     transfer_engine = TransferEngine(
         gpu_handles=gpu_handles,
         model_config=model_config,
@@ -489,19 +502,20 @@ def test_concurrent_mixed_transfers(model_config, cache_config, num_concurrent_t
         cpu_handle=cpu_handle,
         ssd_handle=ssd_handle
     )
-    
+
     # Create concurrent write transfers
     write_graphs = []
-    
+
     for i in range(num_concurrent_transfers):
         start_block = i * blocks_per_transfer
         end_block = start_block + blocks_per_transfer
-        
+
         gpu_block_ids = torch.arange(start_block, end_block, dtype=torch.int64)
         cpu_block_ids = torch.arange(start_block, end_block, dtype=torch.int64)
-        ssd_block_ids = torch.arange(start_block, end_block, dtype=torch.int64) if include_ssd else torch.tensor([], dtype=torch.int64)
-        
-        
+        ssd_block_ids = torch.arange(start_block, end_block, dtype=torch.int64) \
+            if include_ssd else torch.tensor([], dtype=torch.int64)
+
+
         write_graph, _ = create_write_graph_cpu_storage(
             graph_id=TransferIDAllocator.allocate_graph_id(),
             gpu_blocks=gpu_block_ids,
@@ -512,29 +526,30 @@ def test_concurrent_mixed_transfers(model_config, cache_config, num_concurrent_t
         )
         write_graph.bind_to_dp_group(0)
         write_graphs.append(write_graph)
-    
+
     # Submit all write transfers
     for graph in write_graphs:
         transfer_engine.submit_transfer_graph(graph)
-    
+
     # Wait for all writes to complete
     write_graph_ids = [graph.transfer_graph_id for graph in write_graphs]
     assert wait_for_transfer_completion(transfer_engine, write_graph_ids, max_wait_time=20.0), \
         "Concurrent write transfers failed to complete"
-    
+
     # Clear GPU blocks for read test
     for gpu_id in range(model_config.tp_size * model_config.dp_size):
         for layer_id in range(model_config.num_layers):
             gpu_blocks[gpu_id][layer_id].zero_()
-    
+
     # Create concurrent read transfers (using different GPU blocks)
     read_graphs = []
-    
+
     for i in range(num_concurrent_transfers):
         gpu_block_ids = torch.arange(i * blocks_per_transfer, (i + 1) * blocks_per_transfer, dtype=torch.int64)
         cpu_block_ids = torch.arange(i * blocks_per_transfer, (i + 1) * blocks_per_transfer, dtype=torch.int64)
-        ssd_block_ids = torch.arange(i * blocks_per_transfer, (i + 1) * blocks_per_transfer, dtype=torch.int64) if include_ssd else torch.tensor([], dtype=torch.int64)
-        
+        ssd_block_ids = torch.arange(i * blocks_per_transfer, (i + 1) * blocks_per_transfer, dtype=torch.int64) \
+            if include_ssd else torch.tensor([], dtype=torch.int64)
+
         read_graph, _ = create_read_graph_cpu_storage(
             graph_id=TransferIDAllocator.allocate_graph_id(),
             gpu_blocks=gpu_block_ids,
@@ -545,21 +560,21 @@ def test_concurrent_mixed_transfers(model_config, cache_config, num_concurrent_t
         )
         read_graph.bind_to_dp_group(0)
         read_graphs.append(read_graph)
-    
+
     # Submit all read transfers
     for graph in read_graphs:
         transfer_engine.submit_transfer_graph(graph)
-    
+
     # Wait for all reads to complete
     read_graph_ids = [graph.transfer_graph_id for graph in read_graphs]
     assert wait_for_transfer_completion(transfer_engine, read_graph_ids, max_wait_time=20.0), \
         "Concurrent read transfers failed to complete"
-    
+
     # Verify round-trip consistency
     DataVerifier.verify_round_trip_consistency(
         original_gpu_data, gpu_blocks, gpu_block_ids, model_config, 0
     )
-    
+
     # Cleanup
     transfer_engine.shutdown()
 

@@ -66,3 +66,7 @@ cover/
 # Ruff stuff:
 .ruff_cache/
 .vscode/launch.json
+
+
+# mypy
+.mypy_cache/

@@ -8,10 +8,10 @@ import torch
 
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.common.debug import debuginfo
+from flexkv.common.debug import flexkv_logger
 
 
-debuginfo.set_level("INFO")
+flexkv_logger.set_level("INFO")
 
 def main(args):
     request_generator = RequestGenerator(dataset="random",
@@ -75,7 +75,7 @@ def main(args):
             cache_hit_ratio = return_mask.sum() / req.token_mask.sum()
             sum_cache_hit += cache_hit_ratio
             max_cache_hit_ratio = max(max_cache_hit_ratio, cache_hit_ratio)
-            debuginfo.info(f"need get {req.token_mask.sum()} tokens, "
+            flexkv_logger.info(f"need get {req.token_mask.sum()} tokens, "
                            f"actual get {return_mask.sum()} tokens, "
                            f"cache_hit_ratio: {cache_hit_ratio}")
         elif req.request_type == "put":
@@ -90,11 +90,11 @@ def main(args):
                 graph, return_mask, transfer_call_back = \
                     cache_engine.put(req.token_ids, req.token_mask, fake_slot_mapping)
                 transfer_call_back()
-            debuginfo.info(f"need put {req.token_mask.sum()} tokens, "
+            flexkv_logger.info(f"need put {req.token_mask.sum()} tokens, "
                            f"actual put {return_mask.sum()} tokens")
-    debuginfo.info(f"Total requests: {len(reqs)}")
+    flexkv_logger.info(f"Total requests: {len(reqs)}")
     avg_cache_hit_ratio = sum_cache_hit / len(reqs)
-    debuginfo.info(f"Avg cache hit ratio: {avg_cache_hit_ratio}, max cache hit ratio: {max_cache_hit_ratio}")
+    flexkv_logger.info(f"Avg cache hit ratio: {avg_cache_hit_ratio}, max cache hit ratio: {max_cache_hit_ratio}")
     stats = pstats.Stats(profiler)
     stats.strip_dirs()
     stats.sort_stats('cumulative')

@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -33,7 +33,7 @@ def create_read_graph_cpu_storage(
     ssd_blocks: torch.Tensor,
     gpu_device_id: int = 0,
     layer_num: int = 1,
-    graph: TransferOpGraph = None,
+    graph: Optional[TransferOpGraph] = None,
 )->Tuple[TransferOpGraph, List[int]]:
     """
     Create a read transfer graph with (REMOTE_STORAGE / SSD)->CPU->GPU operations
@@ -178,7 +178,7 @@ def create_read_graph_cpu_ssd_remote(
         the completion of each layer or each layer for each tp rank
     """
     graph = TransferOpGraph(graph_id)
-    finished_ops_ids = []
+    finished_ops_ids: List[int] = []
     if len(remote_blocks) == 0:
         graph, finished_ops_ids = create_read_graph_cpu_storage(graph_id=graph_id,
                                                             gpu_blocks=gpu_blocks,
@@ -199,7 +199,7 @@ def create_read_graph_cpu_ssd_remote(
                                                                 ssd_blocks=ssd_blocks[:-len(remote_blocks)],
                                                                 gpu_device_id=gpu_device_id,
                                                                 layer_num=layer_num,
-                                                                graph=graph)    
+                                                                graph=graph)
     op_r2h = TransferOp(
         transfer_op_id = TransferIDAllocator.allocate_op_id(),
         transfer_graph_id = graph.transfer_graph_id,
@@ -264,7 +264,7 @@ def create_write_graph_cpu_storage(
     ssd_blocks: torch.Tensor,
     gpu_device_id: int = 0,
     layer_num: int = 1,
-    graph: TransferOpGraph = None,
+    graph: Optional[TransferOpGraph] = None,
 )->Tuple[TransferOpGraph, List[int]]:
     """
     Create a write transfer graph with CPU->REMOTE_STORAGE / SSD operations

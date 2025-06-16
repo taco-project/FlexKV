@@ -4,7 +4,7 @@ import zmq
 
 def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-):
+) -> zmq.Socket:
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -15,11 +15,11 @@ def get_zmq_socket(
 
     socket: zmq.Socket = context.socket(socket_type)
 
-    def set_send_opt():
+    def set_send_opt() -> None:
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
 
-    def set_recv_opt():
+    def set_recv_opt() -> None:
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
 

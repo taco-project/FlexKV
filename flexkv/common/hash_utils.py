@@ -9,10 +9,10 @@ from flexkv import c_ext
 HashType = NewType('HashType', int)
 
 def get_hash_size() -> int:
-    return c_ext.get_hash_size()
+    return int(c_ext.get_hash_size())
 
 class Hasher:
-    def __init__(self):
+    def __init__(self) -> None:
         self.hasher = c_ext.Hasher()
 
     def reset(self) -> None:
@@ -45,6 +45,6 @@ if __name__ == "__main__":
     end = time.time()
     print(f"tensor hash: {result}, time: {end - start}s")
     start = time.time()
-    result = gen_hashes(token_ids, 16)
+    result2 = gen_hashes(token_ids, 16)
     end = time.time()
-    print(f"block hashes: {result}, time: {end - start}s")
+    print(f"block hashes: {result2}, time: {end - start}s")

@@ -1,23 +1,20 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict
 
 import torch
 
-from flexkv.common.transfer import DeviceType
 
-
-class cacheEngineRequestType(Enum):
+class KVRequestType(Enum):
     GET = "get"
     PUT = "put"
+    SHUTDOWN = "shutdown"
 
 @dataclass
-class cacheEngineRequest:
-    request_type: cacheEngineRequestType = None
-    request_id: int = None
-    token_ids: torch.Tensor = None
-    token_mask: torch.Tensor = None
-    slot_mapping: torch.Tensor = None
-    block_ids_to_unlock: Dict[DeviceType, torch.Tensor] = None
+class KVRequest:
+    request_type: KVRequestType
+    request_id: int
+    token_ids: torch.Tensor
+    token_mask: torch.Tensor
+    slot_mapping: torch.Tensor
     layer_granularity: int = -1
     dp_id: int = 0
