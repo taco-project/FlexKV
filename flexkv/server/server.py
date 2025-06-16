@@ -7,6 +7,7 @@ import zmq
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.kvmanager import KVManager
 from flexkv.server.util import get_zmq_socket
 from flexkv.server.request import (
@@ -147,6 +148,7 @@ class KVServer:
         self,
         model_config: ModelConfig,
         cache_config: CacheConfig,
+        gpu_kv_layout: KVCacheLayout,
         server_recv_port: Optional[str] = None
     ):
 
@@ -158,7 +160,7 @@ class KVServer:
             self.context, zmq.SocketType.PULL, server_recv_port, True)
 
         self.client_manager = ClientManager(max_num_dp_client=model_config.dp_size)
-        self.kvmanager = KVManager(model_config, cache_config)
+        self.kvmanager = KVManager(model_config, cache_config, gpu_kv_layout)
 
         if self.kvmanager.is_ready():
             self.kvmanager.start()
@@ -286,8 +288,19 @@ if __name__ == "__main__":
     num_kv_heads = 8
     head_size = 128
     num_cpu_blocks = 300
+    num_gpu_blocks = 30
     tp_size = 2
     tokens_per_block = 4
+
+    gpu_kv_layout = KVCacheLayout(
+        type=KVCacheLayoutType.LAYERWISE,
+        num_layer=num_layers,
+        num_block=num_gpu_blocks,
+        tokens_per_block=tokens_per_block,
+        num_head=num_kv_heads//tp_size,
+        head_size=head_size,
+        is_mla=False
+    )
 
     model_config = ModelConfig(num_layers=num_layers,
                                 num_kv_heads=num_kv_heads,
@@ -304,5 +317,5 @@ if __name__ == "__main__":
                                 tokens_per_block=tokens_per_block,
                                 num_cpu_blocks=num_cpu_blocks,)
 
-    kv_server = KVServer(model_config, cache_config, "ipc:///tmp/tmp6isie_et")
+    kv_server = KVServer(model_config, cache_config, gpu_kv_layout, "ipc:///tmp/tmp6isie_et")
     kv_server.run()
