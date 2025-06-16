@@ -28,6 +28,18 @@ class KVCacheLayout:
     is_mla: bool = False
     _kv_shape: Optional[torch.Size] = None
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, KVCacheLayout):
+            return NotImplemented
+        return (self.type == other.type and
+                self.num_layer == other.num_layer and
+                self.num_block == other.num_block and
+                self.tokens_per_block == other.tokens_per_block and
+                self.num_head == other.num_head and
+                self.head_size == other.head_size and
+                self.is_mla == other.is_mla and
+                self.kv_shape == other.kv_shape)
+
     @property
     def kv_shape(self) -> torch.Size:
         if self._kv_shape is None:

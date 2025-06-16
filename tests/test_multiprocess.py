@@ -171,7 +171,7 @@ def run_tp_client(dp_client_id, tp_rank, device_id, server_recv_port):
 
 
 def run_server(server_recv_port):
-    kvserver = KVServer(model_config, cache_config, gpu_kv_layout, server_recv_port)
+    kvserver = KVServer(model_config, cache_config, server_recv_port)
     kvserver.run()
 
 def main():

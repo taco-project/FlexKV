@@ -47,6 +47,10 @@ class TransferEngine:
         self.completed_queue: Queue[Tuple[int, int]] = Queue()
         self.finished_ops_queue: MPQueue[int] = MPQueue()
         self.op_id_to_op: Dict[int, TransferOp] = {}
+        self.gpu_handles = gpu_handles
+        self._cpu_handle = cpu_handle
+        self._ssd_handle = ssd_handle
+        self._remote_handle = remote_handle
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
 
@@ -54,20 +58,24 @@ class TransferEngine:
         self.tp_size = model_config.tp_size
 
         assert len(gpu_handles) == self.dp_size * self.tp_size
+        self._running = False
 
+    def _init_workers(self) -> None:
+        if self._running:
+            return
         self._worker_map: Dict[TransferType, Union[WorkerHandle, List[WorkerHandle]]] = {}
 
-        assert cpu_handle is not None
+        assert self._cpu_handle is not None
         if self.tp_size == 1:
-            self.gpucpu_workers = [
+            self.gpucpu_workers: List[WorkerHandle] = [
                 GPUCPUTransferWorker.create_worker(
                     worker_id=i,
                     finished_ops_queue=self.finished_ops_queue,
-                    gpu_blocks=gpu_handles[i].get_tensor_handle_list(),
-                    cpu_blocks=cpu_handle.get_tensor_list(),
-                    gpu_kv_layout=gpu_handles[i].kv_layout,
-                    cpu_kv_layout=cpu_handle.kv_layout,
-                    dtype=gpu_handles[i].dtype,
+                    gpu_blocks=self.gpu_handles[i].get_tensor_handle_list(),
+                    cpu_blocks=self._cpu_handle.get_tensor_list(),
+                    gpu_kv_layout=self.gpu_handles[i].kv_layout,
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    dtype=self.gpu_handles[i].dtype,
                     gpu_device_id=i,
                 )
                 for i in range(self.dp_size)
@@ -77,12 +85,12 @@ class TransferEngine:
                 tpGPUCPUTransferWorker.create_worker(
                     worker_id=i,
                     finished_ops_queue=self.finished_ops_queue,
-                    gpu_blocks=[gpu_handles[j].get_tensor_handle_list() \
+                    gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
                                 for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
-                    cpu_blocks=cpu_handle.get_tensor_list(),
-                    gpu_kv_layout=gpu_handles[i].kv_layout,
-                    cpu_kv_layout=cpu_handle.kv_layout,
-                    dtype=gpu_handles[i].dtype,
+                    cpu_blocks=self._cpu_handle.get_tensor_list(),
+                    gpu_kv_layout=self.gpu_handles[i].kv_layout,
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    dtype=self.gpu_handles[i].dtype,
                     tp_group_size=self.tp_size,
                     dp_group_id=i,
                 )
@@ -91,47 +99,47 @@ class TransferEngine:
         self._worker_map[TransferType.H2D] = self.gpucpu_workers
         self._worker_map[TransferType.D2H] = self.gpucpu_workers
 
-        if ssd_handle is not None and cpu_handle is not None:
-            self.cpussd_read_worker = CPUSSDDiskTransferWorker.create_worker(
+        if self._ssd_handle is not None and self._cpu_handle is not None:
+            self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 worker_id=10,
                 finished_ops_queue=self.finished_ops_queue,
-                cpu_blocks=cpu_handle.get_tensor_list(),
-                ssd_file=ssd_handle.get_file_list(),
-                cpu_kv_layout=cpu_handle.kv_layout,
-                ssd_kv_layout=ssd_handle.kv_layout,
-                dtype=cpu_handle.dtype,
+                cpu_blocks=self._cpu_handle.get_tensor_list(),
+                ssd_file=self._ssd_handle.get_file_list(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                ssd_kv_layout=self._ssd_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
             )
-            self.cpussd_write_worker = CPUSSDDiskTransferWorker.create_worker(
+            self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 worker_id=11,
                 finished_ops_queue=self.finished_ops_queue,
-                cpu_blocks=cpu_handle.get_tensor_list(),
-                ssd_file=ssd_handle.get_file_list(),
-                cpu_kv_layout=cpu_handle.kv_layout,
-                ssd_kv_layout=ssd_handle.kv_layout,
-                dtype=cpu_handle.dtype,
+                cpu_blocks=self._cpu_handle.get_tensor_list(),
+                ssd_file=self._ssd_handle.get_file_list(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                ssd_kv_layout=self._ssd_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
             )
             self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
             self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
-        if remote_handle is not None and cpu_handle is not None:
-            self.remotecpu_read_worker = CPURemoteTransferWorker.create_worker(
+        if self._remote_handle is not None and self._cpu_handle is not None:
+            self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 worker_id=20,
                 finished_ops_queue=self.finished_ops_queue,
-                cpu_blocks=cpu_handle.get_tensor_list(),
-                remote_file=remote_handle.get_file_list(),
-                cpu_kv_layout=cpu_handle.kv_layout,
-                remote_kv_layout=remote_handle.kv_layout,
-                dtype=cpu_handle.dtype,
-                remote_config_custom=remote_handle.remote_config_custom,
+                cpu_blocks=self._cpu_handle.get_tensor_list(),
+                remote_file=self._remote_handle.get_file_list(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                remote_kv_layout=self._remote_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
+                remote_config_custom=self._remote_handle.remote_config_custom,
             )
-            self.remotecpu_write_worker = CPURemoteTransferWorker.create_worker(
+            self.remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 worker_id=21,
                 finished_ops_queue=self.finished_ops_queue,
-                cpu_blocks=cpu_handle.get_tensor_list(),
-                remote_file=remote_handle.get_file_list(),
-                cpu_kv_layout=cpu_handle.kv_layout,
-                remote_kv_layout=remote_handle.kv_layout,
-                dtype=cpu_handle.dtype,
-                remote_config_custom=remote_handle.remote_config_custom,
+                cpu_blocks=self._cpu_handle.get_tensor_list(),
+                remote_file=self._remote_handle.get_file_list(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                remote_kv_layout=self._remote_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
+                remote_config_custom=self._remote_handle.remote_config_custom,
             )
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
@@ -148,6 +156,9 @@ class TransferEngine:
         self._running = True
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
         self._scheduler_thread.start()
+    
+    def start(self) -> None:
+        self._init_workers()
 
     def _scheduler_loop(self) -> None:
         """Main scheduler loop"""

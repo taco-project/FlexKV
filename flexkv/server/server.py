@@ -148,7 +148,6 @@ class KVServer:
         self,
         model_config: ModelConfig,
         cache_config: CacheConfig,
-        gpu_kv_layout: KVCacheLayout,
         server_recv_port: Optional[str] = None
     ):
 
@@ -160,7 +159,7 @@ class KVServer:
             self.context, zmq.SocketType.PULL, server_recv_port, True)
 
         self.client_manager = ClientManager(max_num_dp_client=model_config.dp_size)
-        self.kvmanager = KVManager(model_config, cache_config, gpu_kv_layout)
+        self.kvmanager = KVManager(model_config, cache_config)
 
         if self.kvmanager.is_ready():
             self.kvmanager.start()
@@ -205,7 +204,7 @@ class KVServer:
                     )
 
                     # register GPU Memory
-                    self.kvmanager.register_single_gpu_blocks(req.handles, req.dp_client_id, req.tp_rank)
+                    self.kvmanager.register_single_gpu_blocks(req.handles, req.gpu_layout, req.dp_client_id, req.tp_rank)
 
                     response = Response(req.dp_client_id)
                     result_zmq = self.client_manager.get_zmq(
@@ -317,5 +316,5 @@ if __name__ == "__main__":
                                 tokens_per_block=tokens_per_block,
                                 num_cpu_blocks=num_cpu_blocks,)
 
-    kv_server = KVServer(model_config, cache_config, gpu_kv_layout, "ipc:///tmp/tmp6isie_et")
+    kv_server = KVServer(model_config, cache_config, "ipc:///tmp/tmp6isie_et")
     kv_server.run()
