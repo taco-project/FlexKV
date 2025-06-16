@@ -139,7 +139,8 @@ class GlobalCacheEngine:
             token_mask: torch.Tensor,
             slot_mapping: torch.Tensor,
             layer_num: int = -1,
-            layer_granularity: int = -1) -> Tuple[TransferOpGraph, torch.Tensor, Callable, List[int]]:
+            layer_granularity: int = -1,
+            dp_id: int = 0) -> Tuple[TransferOpGraph, torch.Tensor, Callable, List[int]]:
         self._check_input(token_ids, token_mask, slot_mapping)
         if layer_num == -1:
             layer_num = self.model_config.num_layers
@@ -195,6 +196,7 @@ class GlobalCacheEngine:
                                                                                     finished_ops_ids=finished_ops_ids,
                                                                                     layer_num=layer_num,
                                                                                     layer_granularity=layer_granularity)
+        transfer_graph.bind_to_dp_group(dp_id)
 
         for device_type in node_to_unlock:
             self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
@@ -437,7 +439,8 @@ class GlobalCacheEngine:
             token_ids: torch.Tensor,
             token_mask: torch.Tensor,
             slot_mapping: torch.Tensor,
-            layer_num : int = -1) -> Tuple[TransferOpGraph, torch.Tensor, Callable, List[int]]:
+            layer_num : int = -1,
+            dp_id: int = 0) -> Tuple[TransferOpGraph, torch.Tensor, Callable, List[int]]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         if layer_num == -1:
@@ -493,6 +496,7 @@ class GlobalCacheEngine:
         return_mask = torch.zeros_like(token_mask)
         return_mask[(block_start_idx + skipped_gpu_blocks)* self.tokens_per_block:
                     (block_start_idx + skipped_gpu_blocks + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
+        transfer_graph.bind_to_dp_group(dp_id)
 
         for device_type in node_to_unlock:
             self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
