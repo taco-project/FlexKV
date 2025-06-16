@@ -7,6 +7,7 @@ import zmq
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.kvmanager import KVManager
 from flexkv.server.util import get_zmq_socket
 from flexkv.server.request import (
@@ -203,7 +204,7 @@ class KVServer:
                     )
 
                     # register GPU Memory
-                    self.kvmanager.register_single_gpu_blocks(req.handles, req.dp_client_id, req.tp_rank)
+                    self.kvmanager.register_single_gpu_blocks(req.handles, req.gpu_layout, req.dp_client_id, req.tp_rank)
 
                     response = Response(req.dp_client_id)
                     result_zmq = self.client_manager.get_zmq(
@@ -286,8 +287,19 @@ if __name__ == "__main__":
     num_kv_heads = 8
     head_size = 128
     num_cpu_blocks = 300
+    num_gpu_blocks = 30
     tp_size = 2
     tokens_per_block = 4
+
+    gpu_kv_layout = KVCacheLayout(
+        type=KVCacheLayoutType.LAYERWISE,
+        num_layer=num_layers,
+        num_block=num_gpu_blocks,
+        tokens_per_block=tokens_per_block,
+        num_head=num_kv_heads//tp_size,
+        head_size=head_size,
+        is_mla=False
+    )
 
     model_config = ModelConfig(num_layers=num_layers,
                                 num_kv_heads=num_kv_heads,

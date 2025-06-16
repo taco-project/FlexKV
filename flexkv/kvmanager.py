@@ -15,6 +15,8 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.request import KVRequestType, KVRequest
 from flexkv.common.transfer import DeviceType, get_nvtx_range_color, get_nvtx_default_color
+from flexkv.common.storage import KVCacheLayout
+from flexkv.common.exceptions import LogicError
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 
@@ -34,6 +36,7 @@ class KVManager:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
+                 gpu_layout: Optional[KVCacheLayout] = None,
                  gpu_blocks: Optional[Dict[int, List[TensorSharedHandle]]] = None):
 
         mp.set_start_method('spawn', force=True)
@@ -51,6 +54,7 @@ class KVManager:
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
         self.storage_engine = StorageEngine(self.model_config, self.cache_config)
         self.transfer_engine: Optional[TransferEngine] = None
+        self.gpu_layout: Optional[KVCacheLayout] = gpu_layout
 
         self.running = False
         self.requests_tracker: Dict[int, RequestTracker] = {}
@@ -73,9 +77,10 @@ class KVManager:
 
     # Note that for now only after all the gpu blocks are added, we can initialize the transfer engine
     def _init_transfer_engine(self) -> None:
+        assert self.gpu_layout is not None
         assert len(self.all_gpu_blocks) == self.model_config.tp_size * self.model_config.dp_size
         for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
-            self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper, device_id, dtype=self.model_config.dtype)
+            self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper, self.gpu_layout, device_id, dtype=self.model_config.dtype)
         self.gpu_handles = [
             self.storage_engine.get_storage_handle(DeviceType.GPU, i)
             for i in range(self.model_config.tp_size * self.model_config.dp_size)
@@ -109,6 +114,10 @@ class KVManager:
             return
         if not self.is_ready():
             raise ValueError("transfer engine is not ready, please add all gpu blocks first")
+        if self.transfer_engine is not None:
+            self.transfer_engine.start()
+        else:
+            raise ValueError("transfer engine is not initialized, please call start() after all gpu blocks are added")
         self.running = True
         self._worker_thread = threading.Thread(target=self._worker_loop)
         self._worker_thread.start()
@@ -118,11 +127,16 @@ class KVManager:
     def register_single_gpu_blocks(
         self,
         gpu_handles: List[TensorSharedHandle],
+        gpu_layout: KVCacheLayout,
         dp_client_id: int = 0,
         tp_rank: int = 0,
     ) -> None:
         if self.transfer_engine is not None:
             raise ValueError("we have already get all gpu blocks")
+        if self.gpu_layout is None:
+            self.gpu_layout = gpu_layout
+        else:
+            assert self.gpu_layout == gpu_layout
         self.all_gpu_blocks[tp_rank + dp_client_id * self.model_config.tp_size] = gpu_handles
         self.num_gpus += 1
         if self.num_gpus == self.model_config.tp_size * self.model_config.dp_size:
@@ -145,7 +159,8 @@ class KVManager:
                                                                                             request.token_mask,
                                                                                             request.slot_mapping,
                                                                                             self.model_config.num_layers,
-                                                                                            request.layer_granularity)
+                                                                                            request.layer_granularity,
+                                                                                            request.dp_id)
                 elif request.request_type == KVRequestType.PUT:
                     nvtx.push_range(f"cache_engine.put request_id: {request.request_id}",
                                     color=get_nvtx_default_color())
@@ -153,10 +168,10 @@ class KVManager:
                                                                                         request.token_ids,
                                                                                         request.token_mask,
                                                                                         request.slot_mapping,
-                                                                                        self.model_config.num_layers)
+                                                                                        self.model_config.num_layers,
+                                                                                        request.dp_id)
                 else:
                     raise ValueError(f"Unknown request type: {request.request_type}")
-                graph.bind_to_dp_group(request.dp_id)  # TODO: should call this here or in get/put?
                 nvtx.pop_range()
                 if graph.num_ops == 0: #early return
                     flexkv_logger.info(f"no transfer: "
@@ -297,6 +312,8 @@ class KVManager:
         while num_completed_tasks < num_tasks:
             finished_task_ids = []
             for task_id in task_ids:
+                if task_id not in self.requests_tracker:
+                    raise LogicError(f"task_id {task_id} not submitted into flexKV")
                 task_tracker = self.requests_tracker[task_id]
                 if len(task_tracker.return_mask) == 0: #NOT READY
                     continue
@@ -320,6 +337,8 @@ class KVManager:
         while num_completed_tasks < len(task_ids):
             finished_task_ids = []
             for task_id in task_ids:
+                if task_id not in self.requests_tracker:
+                    raise LogicError(f"task_id {task_id} not submitted into flexKV")
                 task_tracker = self.requests_tracker[task_id]
                 if task_tracker.task_finished:
                     num_completed_tasks += 1
@@ -337,6 +356,8 @@ class KVManager:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         for task_id in task_ids:
+            if task_id not in self.requests_tracker:
+                raise LogicError(f"task_id {task_id} not submitted into flexKV")
             task_tracker = self.requests_tracker[task_id]
             if len(task_tracker.task_end_ops_ids) == 0:
                 mask = torch.empty(0)
@@ -350,6 +371,8 @@ class KVManager:
     def wait_at_layer_group(self, task_id: int, layer_group_id: int) -> torch.Tensor:
         nvtx.mark(f"wait task_id: {task_id}, layer_group_id: {layer_group_id}")
         while True:
+            if task_id not in self.requests_tracker:
+                raise LogicError(f"task_id {task_id} not submitted into flexKV")
             task_tracker = self.requests_tracker[task_id]
             if len(task_tracker.task_end_ops_ids) == 0:
                 continue
@@ -367,6 +390,8 @@ class KVManager:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         for task_id in task_ids:
+            if task_id not in self.requests_tracker:
+                raise LogicError(f"task_id {task_id} not submitted into flexKV")
             task_tracker = self.requests_tracker[task_id]
             if len(task_tracker.task_end_ops_ids) == 0:
                 mask = torch.empty(0)

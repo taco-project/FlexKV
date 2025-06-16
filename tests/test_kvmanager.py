@@ -141,7 +141,7 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
                 tp_tensor = tp_group_tensors_gt[layer_id][:, :, :, start_head:end_head, :].to(device)
                 gpu_blocks[global_gpu_id].append(tp_tensor)
         dp_wise_gpu_blocks_gt.append(tp_group_tensors_gt)
-    return gpu_blocks, dp_wise_gpu_blocks_gt
+    return gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout
 
 @pytest.mark.parametrize("model_config", [
     {'tp_size': 1, 'dp_size': 1},
@@ -186,50 +186,8 @@ def test_kvmanager(model_config, cache_config, test_config):
     if enable_remote:
         pytest.skip("enable_remote is not supported")
 
-    # TODO: config layout by a more flexible way
-    gpu_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
-        num_layer=num_layers,
-        num_block=num_gpu_blocks,
-        tokens_per_block=tokens_per_block,
-        num_head=num_kv_heads//tp_size,
-        head_size=head_size,
-        is_mla=False
-    )
-    cpu_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
-        num_layer=num_layers,
-        num_block=num_cpu_blocks,
-        tokens_per_block=tokens_per_block,
-        num_head=num_kv_heads,
-        head_size=head_size,
-        is_mla=False
-    )
-    ssd_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
-        num_layer=num_layers,
-        num_block=num_ssd_blocks,
-        tokens_per_block=tokens_per_block,
-        num_head=num_kv_heads//tp_size,
-        head_size=head_size,
-        is_mla=False
-    )
-    remote_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
-        num_layer=num_layers,
-        num_block=num_remote_blocks,
-        tokens_per_block=tokens_per_block,
-        num_head=num_kv_heads//tp_size,
-        head_size=head_size,
-        is_mla=False
-    )
-    cache_config.gpu_kv_layout = gpu_layout
-    cache_config.cpu_kv_layout = cpu_layout
-    cache_config.ssd_kv_layout = ssd_layout
-    cache_config.remote_kv_layout = remote_layout
-
-    gpu_blocks, dp_wise_gpu_blocks_gt = generate_gpu_blocks(model_config, cache_config, test_config)
-    kvmanager = KVManager(model_config, cache_config, gpu_blocks)
+    gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = generate_gpu_blocks(model_config, cache_config, test_config)
+    kvmanager = KVManager(model_config, cache_config, gpu_kv_layout, gpu_blocks)
     assert kvmanager.is_ready()
     kvmanager.start()
     request_pairs = [generate_request_pair(i, block_per_request, num_gpu_blocks, tokens_per_block, dp_size)

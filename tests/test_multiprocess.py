@@ -24,16 +24,6 @@ tokens_per_block = 8
 cpu_shape = (num_layers, 2, num_cpu_blocks, tokens_per_block, num_kv_heads, head_size)
 gpu_shape = (num_layers, 2, num_gpu_blocks, tokens_per_block, num_kv_heads//tp_size, head_size)
 
-default_kv_layout = KVCacheLayout(
-    type=KVCacheLayoutType.LAYERWISE,
-    num_layer=num_layers,
-    num_block=num_gpu_blocks,
-    tokens_per_block=tokens_per_block,
-    num_head=num_kv_heads,
-    head_size=head_size,
-    is_mla=False,
-)
-
 gpu_kv_layout = KVCacheLayout(
     type=KVCacheLayoutType.LAYERWISE,
     num_layer=num_layers,
@@ -56,8 +46,6 @@ model_config = ModelConfig(num_layers=num_layers,
 cache_config = CacheConfig( enable_cpu=True,
                             enable_ssd=False,
                             enable_remote=False,
-                            cpu_kv_layout=default_kv_layout,
-                            gpu_kv_layout=gpu_kv_layout,
                             use_gds=False,
                             use_pinned_memory=True,
                             tokens_per_block=tokens_per_block,

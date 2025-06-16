@@ -124,9 +124,9 @@ def create_test_gpu_blocks(model_config: ModelConfig,
     return gpu_blocks
 
 
-def setup_kv_layouts(model_config: ModelConfig, cache_config: CacheConfig, num_gpu_blocks: int):
+def create_gpu_kv_layout(model_config: ModelConfig, cache_config: CacheConfig, num_gpu_blocks: int)->KVCacheLayout:
     """Setup KV cache layouts for different storage tiers"""
-    gpu_layout = KVCacheLayout(
+    return KVCacheLayout(
         type=KVCacheLayoutType.LAYERWISE,
         num_layer=model_config.num_layers,
         num_block=num_gpu_blocks,
@@ -135,31 +135,6 @@ def setup_kv_layouts(model_config: ModelConfig, cache_config: CacheConfig, num_g
         head_size=model_config.head_size,
         is_mla=model_config.use_mla
     )
-
-    cpu_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
-        num_layer=model_config.num_layers,
-        num_block=cache_config.num_cpu_blocks,
-        tokens_per_block=cache_config.tokens_per_block,
-        num_head=model_config.num_kv_heads,
-        head_size=model_config.head_size,
-        is_mla=model_config.use_mla
-    )
-
-    ssd_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
-        num_layer=model_config.num_layers,
-        num_block=cache_config.num_ssd_blocks,
-        tokens_per_block=cache_config.tokens_per_block,
-        num_head=model_config.num_kv_heads,
-        head_size=model_config.head_size,
-        is_mla=model_config.use_mla
-    )
-
-    cache_config.gpu_kv_layout = gpu_layout
-    cache_config.cpu_kv_layout = cpu_layout
-    cache_config.ssd_kv_layout = ssd_layout
-
 
 class DataVerifier:
     """Utility class for verifying data transfer correctness"""
@@ -261,7 +236,7 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
 
     # Setup configurations
     cache_config.enable_ssd = False
-    setup_kv_layouts(model_config, cache_config, num_gpu_blocks)
+    gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
 
     # Create GPU blocks and save ground truth
     gpu_blocks = create_test_gpu_blocks(model_config, cache_config, num_gpu_blocks)
@@ -269,7 +244,7 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
     # Setup storage engine and transfer engine
     storage_engine = StorageEngine(model_config, cache_config)
     for gpu_id, gpu_block in gpu_blocks.items():
-        storage_engine.register_gpu_blocks(gpu_block, device_id=gpu_id, dtype=model_config.dtype)
+        storage_engine.register_gpu_blocks(gpu_block, gpu_kv_layout, device_id=gpu_id, dtype=model_config.dtype)
     gpu_handles = [storage_engine.get_storage_handle(DeviceType.GPU, i) for i in range(total_gpus)]
     cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
 
@@ -279,6 +254,7 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
         cache_config=cache_config,
         cpu_handle=cpu_handle
     )
+    transfer_engine.start()
 
     # Test each DP group separately
     for dp_id in range(dp_size):
@@ -366,7 +342,7 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
 
     # Setup configurations
     cache_config.enable_ssd = True
-    setup_kv_layouts(model_config, cache_config, num_gpu_blocks)
+    gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
     if (model_config.tp_size * model_config.dp_size) > 1:
         pytest.skip("SSD transfer test is not supported for multi-GPU")
 
@@ -377,7 +353,7 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
     # Setup storage engine and transfer engine
     storage_engine = StorageEngine(model_config, cache_config)
     for gpu_id, gpu_block in gpu_blocks.items():
-        storage_engine.register_gpu_blocks(gpu_block, device_id=gpu_id, dtype=model_config.dtype)
+        storage_engine.register_gpu_blocks(gpu_block, gpu_kv_layout, device_id=gpu_id, dtype=model_config.dtype)
     gpu_handles = [storage_engine.get_storage_handle(DeviceType.GPU, i)
                    for i in range(model_config.tp_size * model_config.dp_size)]
     cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
@@ -390,7 +366,7 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
         cpu_handle=cpu_handle,
         ssd_handle=ssd_handle
     )
-
+    transfer_engine.start()
     # Prepare transfer block IDs
     gpu_block_ids = torch.arange(0, transfer_block_num, dtype=torch.int64)
     cpu_block_ids = torch.arange(0, transfer_block_num, dtype=torch.int64)
@@ -480,7 +456,7 @@ def test_concurrent_mixed_transfers(model_config,
 
     # Setup configurations
     cache_config.enable_ssd = include_ssd
-    setup_kv_layouts(model_config, cache_config, num_gpu_blocks)
+    gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
 
     # Create GPU blocks and save ground truth
     gpu_blocks = create_test_gpu_blocks(model_config, cache_config, num_gpu_blocks)
@@ -489,7 +465,7 @@ def test_concurrent_mixed_transfers(model_config,
     # Setup storage engine and transfer engine
     storage_engine = StorageEngine(model_config, cache_config)
     for gpu_id, gpu_block in gpu_blocks.items():
-        storage_engine.register_gpu_blocks(gpu_block, device_id=gpu_id, dtype=model_config.dtype)
+        storage_engine.register_gpu_blocks(gpu_block, gpu_kv_layout, device_id=gpu_id, dtype=model_config.dtype)
     gpu_handles = [storage_engine.get_storage_handle(DeviceType.GPU, i)
                    for i in range(model_config.tp_size * model_config.dp_size)]
     cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
@@ -503,6 +479,7 @@ def test_concurrent_mixed_transfers(model_config,
         ssd_handle=ssd_handle
     )
 
+    transfer_engine.start()
     # Create concurrent write transfers
     write_graphs = []
 

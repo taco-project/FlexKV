@@ -19,11 +19,18 @@ class StorageEngine:
         self._storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
         self._model_config = model_config
         self._cache_config = cache_config
-        self._gpu_layout: Optional[KVCacheLayout] = None
         if self._cache_config.enable_cpu:
-            if not self._cache_config.cpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
+            if not self._cache_config.cpu_kv_layout_type == KVCacheLayoutType.LAYERWISE:
                 raise ValueError("Only layerwise layout is supported for CPU")
-            self._cpu_layout: Optional[KVCacheLayout] = self._cache_config.cpu_kv_layout
+            self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
+                type=self._cache_config.cpu_kv_layout_type,
+                num_layer=self._model_config.num_layers,
+                num_block=self._cache_config.num_cpu_blocks,
+                tokens_per_block=self._cache_config.tokens_per_block,
+                num_head=self._model_config.num_kv_heads,
+                head_size=self._model_config.head_size,
+                is_mla=self._model_config.use_mla
+            )
             self.allocate(
                 device_type=DeviceType.CPU,
                 layout=self._cpu_layout,
@@ -32,9 +39,17 @@ class StorageEngine:
                 num_chunks=self._model_config.num_layers
             )
         if self._cache_config.enable_ssd:
-            if not self._cache_config.ssd_kv_layout.type == KVCacheLayoutType.LAYERWISE:
+            if not self._cache_config.ssd_kv_layout_type == KVCacheLayoutType.LAYERWISE:
                 raise ValueError("Only layerwise layout is supported for SSD")
-            self._ssd_layout: Optional[KVCacheLayout] = self._cache_config.ssd_kv_layout
+            self._ssd_layout: Optional[KVCacheLayout] = KVCacheLayout(
+                type=self._cache_config.ssd_kv_layout_type,
+                num_layer=self._model_config.num_layers,
+                num_block=self._cache_config.num_ssd_blocks,
+                tokens_per_block=self._cache_config.tokens_per_block,
+                num_head=self._model_config.num_kv_heads,
+                head_size=self._model_config.head_size,
+                is_mla=self._model_config.use_mla
+            )
             self.allocate(
                 device_type=DeviceType.SSD,
                 layout=self._ssd_layout,
@@ -42,9 +57,17 @@ class StorageEngine:
                 file_path=self._cache_config.ssd_cache_path
             )
         if self._cache_config.enable_remote:
-            if not self._cache_config.remote_kv_layout.type == KVCacheLayoutType.LAYERWISE:
+            if not self._cache_config.remote_kv_layout_type == KVCacheLayoutType.LAYERWISE:
                 raise ValueError("Only layerwise layout is supported for remote")
-            self._remote_layout: Optional[KVCacheLayout] = self._cache_config.remote_kv_layout
+            self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
+                type=self._cache_config.remote_kv_layout_type,
+                num_layer=self._model_config.num_layers,
+                num_block=self._cache_config.num_remote_blocks,
+                tokens_per_block=self._cache_config.tokens_per_block,
+                num_head=self._model_config.num_kv_heads,
+                head_size=self._model_config.head_size,
+                is_mla=self._model_config.use_mla
+            )
             self.allocate(
                 device_type=DeviceType.REMOTE,
                 layout=self._remote_layout,
@@ -55,13 +78,12 @@ class StorageEngine:
 
     def register_gpu_blocks(self,
                             gpu_blocks: List[TensorSharedHandle],
+                            gpu_layout: KVCacheLayout,
                             device_id: int = 0,
                             dtype: torch.dtype = torch.float16) -> None:
-        if self._gpu_layout is None:
-            self._gpu_layout = self._cache_config.gpu_kv_layout
         self.allocate(
             device_type=DeviceType.GPU,
-            layout=self._gpu_layout,
+            layout=gpu_layout,
             dtype=dtype,
             device_id=device_id,
             raw_data=gpu_blocks

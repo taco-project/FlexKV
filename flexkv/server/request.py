@@ -5,6 +5,7 @@ import torch
 
 from flexkv.common.config import ModelConfig
 from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.storage import KVCacheLayout
 
 
 @dataclass
@@ -20,6 +21,7 @@ class RegisterTPClientRequest:
     device_id: int
     client_recv_port: str
     handles: List[TensorSharedHandle]
+    gpu_layout: KVCacheLayout
 
 
 @dataclass
