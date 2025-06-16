@@ -12,14 +12,16 @@ __global__ void transfer_kv_layers_kernel(
     int64_t **dst_layer_ptrs, int64_t dst_kv_stride, int64_t dst_chunk_stride,
     int64_t dst_startoff_inside_chunks,
     int64_t *src_block_ids, int64_t **src_layer_ptrs, int64_t src_kv_stride,
-    int64_t src_chunk_stride, int64_t src_startoff_inside_chunks, int64_t copy_size) {
-  int num_chunks = num_layers * 2 * num_blocks;
+    int64_t src_chunk_stride, int64_t src_startoff_inside_chunks, 
+    int64_t copy_size, bool is_mla) {
+  int kv_dim = is_mla ? 1 : 2;
+  int num_chunks = num_layers * kv_dim * num_blocks;
   int64_t copy_size_in_float4 = copy_size * sizeof(int64_t) / sizeof(float4);
 
   for (int chunk_idx = blockIdx.x; chunk_idx < num_chunks;
        chunk_idx += gridDim.x) {
-    int lay_idx = chunk_idx / (num_blocks * 2);
-    int kv_idx = (chunk_idx % (num_blocks * 2)) / num_blocks;
+    int lay_idx = chunk_idx / (num_blocks * kv_dim);
+    int kv_idx = (chunk_idx % (num_blocks * kv_dim)) / num_blocks;
     int dst_block_idx = dst_block_ids[chunk_idx % num_blocks];
     int src_block_idx = src_block_ids[chunk_idx % num_blocks];
 
@@ -51,7 +53,7 @@ void transfer_kv_layers(int num_blocks, int num_layers, int64_t *dst_block_ids,
                         int64_t src_startoff_inside_chunks,
                         int64_t chunk_size_in_bytes, cudaStream_t stream,
                         int transfer_sms, bool is_host_to_device,
-                        bool use_ce_transfer) {
+                        bool use_ce_transfer, bool is_mla) {
   int block_size = 128;
   static int max_blocks_per_sm = -1;
   if (max_blocks_per_sm == -1) {
@@ -79,7 +81,8 @@ void transfer_kv_layers(int num_blocks, int num_layers, int64_t *dst_block_ids,
   dim3 gridDim(block_count);
   if (use_ce_transfer) {
     for (int i = 0; i < num_layers; i++) {
-      for (int j = 0; j < 2; j++) {
+      int kv_dim = is_mla ? 1 : 2;
+      for (int j = 0; j < kv_dim; j++) {
         for (int k = 0; k < num_blocks; k++) {
           int64_t *dst_layer_kv_ptr =
               dst_layer_ptrs_int64[i] + j * dst_kv_stride_int64;
@@ -107,7 +110,7 @@ void transfer_kv_layers(int num_blocks, int num_layers, int64_t *dst_block_ids,
         num_blocks, num_layers, dst_block_ids, dst_layer_ptrs_int64,
         dst_kv_stride_int64, dst_chunk_stride_int64, dst_startoff_inside_chunks_int64,
         src_block_ids, src_layer_ptrs_int64, src_kv_stride_int64,
-        src_chunk_stride_int64, src_startoff_inside_chunks_int64, chunk_size_in_int64);
+        src_chunk_stride_int64, src_startoff_inside_chunks_int64, chunk_size_in_int64, is_mla);
   }
   cudaStreamSynchronize(stream);
 }

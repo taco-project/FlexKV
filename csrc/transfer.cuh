@@ -14,6 +14,6 @@ void transfer_kv_layers(int num_blocks, int num_layers, int64_t *dst_block_ids,
                         int64_t src_startoff_inside_chunks,
                         int64_t chunk_size_in_bytes, cudaStream_t stream,
                         int transfer_sms, bool is_host_to_device,
-                        bool use_ce_transfer);
+                        bool use_ce_transfer, bool is_mla);
 
 } // namespace flexkv

@@ -24,7 +24,7 @@ void transfer_kv_layers_binding(
     torch::Tensor &src_block_id_tensor, torch::Tensor &src_layer_ptrs_tensor,
     int64_t src_kv_stride_in_bytes, int64_t src_chunk_stride_in_bytes,
     int64_t chunk_size_in_bytes, int transfer_sms = -1,
-    bool is_host_to_device = true, bool use_ce_transfer = false) {
+    bool is_host_to_device = true, bool use_ce_transfer = false, bool is_mla = false) {
   int num_blocks = dst_block_id_tensor.numel();
   int num_layers = dst_layer_ptrs_tensor.numel();
 
@@ -43,7 +43,7 @@ void transfer_kv_layers_binding(
       dst_kv_stride_in_bytes, dst_chunk_stride_in_bytes, 0, src_block_ids,
       src_layer_ptrs, src_kv_stride_in_bytes, src_chunk_stride_in_bytes, 0,
       chunk_size_in_bytes, stream, transfer_sms, is_host_to_device,
-      use_ce_transfer);
+      use_ce_transfer, is_mla);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(cudaGetErrorString(err));
@@ -57,7 +57,8 @@ void transfer_kv_blocks_ssd_binding(
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
-    int round_robin, bool use_mmap = false, int num_threads_per_file = 8) {
+    int round_robin, bool use_mmap = false, int num_threads_per_file = 8,
+    bool is_mla = false) {
   TORCH_CHECK(cpu_layer_ptrs_tensor.dtype() == torch::kInt64,
               "cpu_layer_ptrs must be int64");
   TORCH_CHECK(ssd_block_ids.dtype() == torch::kInt64,
@@ -73,7 +74,7 @@ void transfer_kv_blocks_ssd_binding(
       filenames, cpu_layer_id_list, cpu_layer_ptrs_tensor, ssd_block_ids,
       cpu_block_ids, cpu_kv_stride_in_bytes, ssd_layer_stride_in_bytes,
       ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, block_size_in_bytes,
-      total_layers, is_read, round_robin, use_mmap, num_threads_per_file);
+      total_layers, is_read, round_robin, use_mmap, num_threads_per_file, is_mla);
 }
 #ifdef FLEXKV_ENABLE_CFS
 void transfer_kv_blocks_remote(
@@ -83,7 +84,8 @@ void transfer_kv_blocks_remote(
     int64_t cpu_kv_stride_in_bytes, int64_t remote_layer_stride_in_bytes,
     int64_t remote_block_stride_in_bytes, int64_t remote_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
-    int round_robin, bool use_mmap = false, int num_threads_per_file = 8) {
+    int round_robin, bool use_mmap = false, int num_threads_per_file = 8,
+    bool is_mla = false) {
   TORCH_CHECK(cpu_layer_ptrs_tensor.dtype() == torch::kInt64,
               "cpu_layer_ptrs must be int64");
   TORCH_CHECK(remote_block_ids.dtype() == torch::kInt64,
@@ -98,7 +100,7 @@ void transfer_kv_blocks_remote(
       file_nodeids, cpu_layer_id_list, cpu_layer_ptrs_tensor, remote_block_ids,
       cpu_block_ids, cpu_kv_stride_in_bytes, remote_layer_stride_in_bytes,
       remote_block_stride_in_bytes, remote_kv_stride_in_bytes, block_size_in_bytes,
-      total_layers, is_read, round_robin, use_mmap, num_threads_per_file);
+      total_layers, is_read, round_robin, use_mmap, num_threads_per_file, is_mla);
 }
 #endif
 
@@ -114,7 +116,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("ssd_block_stride_in_bytes"), py::arg("ssd_kv_stride_in_bytes"),
         py::arg("block_size_in_bytes"), py::arg("total_layers"),
         py::arg("is_read"), py::arg("round_robin"), py::arg("use_mmap") = false,
-        py::arg("num_threads_per_file") = 8);
+        py::arg("num_threads_per_file") = 8, py::arg("is_mla") = false);
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
         "Transfer KV blocks between remote and CPU memory", py::arg("file_nodeid_list"),
@@ -124,7 +126,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("remote_block_stride_in_bytes"), py::arg("remote_kv_stride_in_bytes"),
         py::arg("block_size_in_bytes"), py::arg("total_layers"),
         py::arg("is_read"), py::arg("round_robin"), py::arg("use_mmap") = false,
-        py::arg("num_threads_per_file") = 16);
+        py::arg("num_threads_per_file") = 16, py::arg("is_mla") = false);
 #endif
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
@@ -147,7 +149,8 @@ PYBIND11_MODULE(c_ext, m) {
             py::arg("is_host_to_device"),
             py::arg("use_ce_transfer"),
             py::arg("layer_id"),
-            py::arg("layer_granularity"));
+            py::arg("layer_granularity"),
+            py::arg("is_mla"));
 
   // Add Hasher class binding
   py::class_<flexkv::Hasher>(m, "Hasher")

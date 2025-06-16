@@ -121,7 +121,7 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
         tokens_per_block=tokens_per_block,
         num_head=num_kv_heads//tp_size,
         head_size=head_size,
-        is_mla=False
+        is_mla=model_config.use_mla
     )
     gpu_blocks = {}
     dp_wise_gpu_blocks_gt = []
@@ -181,8 +181,6 @@ def test_kvmanager(model_config, cache_config, test_config):
 
     if tp_size * dp_size > torch.cuda.device_count():
         pytest.skip("tp_size * dp_size > torch.cuda.device_count() is not supported")
-    if use_mla:
-        pytest.skip("mla is not supported")
     if enable_remote:
         pytest.skip("enable_remote is not supported")
 

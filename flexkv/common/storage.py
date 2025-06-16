@@ -55,6 +55,7 @@ class KVCacheLayout:
             if self.type == KVCacheLayoutType.LAYERWISE:
                 if self.is_mla:
                     self._kv_shape = torch.Size([self.num_layer,
+                                                1,
                                                 self.num_block,
                                                 self.tokens_per_block,
                                                 self.num_head,
@@ -70,6 +71,7 @@ class KVCacheLayout:
                 if self.is_mla:
                     self._kv_shape = torch.Size([self.num_block,
                                                 self.num_layer,
+                                                1,
                                                 self.tokens_per_block,
                                                 self.num_head,
                                                 self.head_size])
