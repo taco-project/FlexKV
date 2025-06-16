@@ -14,13 +14,11 @@ from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, R
 class StorageEngine:
     def __init__(self,
                  model_config: ModelConfig,
-                 cache_config: CacheConfig,
-                 gpu_layout: KVCacheLayout):
+                 cache_config: CacheConfig):
         """Initialize storage engine"""
         self._storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
         self._model_config = model_config
         self._cache_config = cache_config
-        self._gpu_layout = gpu_layout
         if self._cache_config.enable_cpu:
             if not self._cache_config.cpu_kv_layout_type == KVCacheLayoutType.LAYERWISE:
                 raise ValueError("Only layerwise layout is supported for CPU")
@@ -80,11 +78,12 @@ class StorageEngine:
 
     def register_gpu_blocks(self,
                             gpu_blocks: List[TensorSharedHandle],
+                            gpu_layout: KVCacheLayout,
                             device_id: int = 0,
                             dtype: torch.dtype = torch.float16) -> None:
         self.allocate(
             device_type=DeviceType.GPU,
-            layout=self._gpu_layout,
+            layout=gpu_layout,
             dtype=dtype,
             device_id=device_id,
             raw_data=gpu_blocks

@@ -242,9 +242,9 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
     gpu_blocks = create_test_gpu_blocks(model_config, cache_config, num_gpu_blocks)
 
     # Setup storage engine and transfer engine
-    storage_engine = StorageEngine(model_config, cache_config, gpu_kv_layout)
+    storage_engine = StorageEngine(model_config, cache_config)
     for gpu_id, gpu_block in gpu_blocks.items():
-        storage_engine.register_gpu_blocks(gpu_block, device_id=gpu_id, dtype=model_config.dtype)
+        storage_engine.register_gpu_blocks(gpu_block, gpu_kv_layout, device_id=gpu_id, dtype=model_config.dtype)
     gpu_handles = [storage_engine.get_storage_handle(DeviceType.GPU, i) for i in range(total_gpus)]
     cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
 
@@ -254,6 +254,7 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
         cache_config=cache_config,
         cpu_handle=cpu_handle
     )
+    transfer_engine.start()
 
     # Test each DP group separately
     for dp_id in range(dp_size):
@@ -350,9 +351,9 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
     original_gpu_data = {gpu_id: [layer.clone() for layer in layers] for gpu_id, layers in gpu_blocks.items()}
 
     # Setup storage engine and transfer engine
-    storage_engine = StorageEngine(model_config, cache_config, gpu_kv_layout)
+    storage_engine = StorageEngine(model_config, cache_config)
     for gpu_id, gpu_block in gpu_blocks.items():
-        storage_engine.register_gpu_blocks(gpu_block, device_id=gpu_id, dtype=model_config.dtype)
+        storage_engine.register_gpu_blocks(gpu_block, gpu_kv_layout, device_id=gpu_id, dtype=model_config.dtype)
     gpu_handles = [storage_engine.get_storage_handle(DeviceType.GPU, i)
                    for i in range(model_config.tp_size * model_config.dp_size)]
     cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
@@ -365,7 +366,7 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
         cpu_handle=cpu_handle,
         ssd_handle=ssd_handle
     )
-
+    transfer_engine.start()
     # Prepare transfer block IDs
     gpu_block_ids = torch.arange(0, transfer_block_num, dtype=torch.int64)
     cpu_block_ids = torch.arange(0, transfer_block_num, dtype=torch.int64)
@@ -462,9 +463,9 @@ def test_concurrent_mixed_transfers(model_config,
     original_gpu_data = {gpu_id: [layer.clone() for layer in layers] for gpu_id, layers in gpu_blocks.items()}
 
     # Setup storage engine and transfer engine
-    storage_engine = StorageEngine(model_config, cache_config, gpu_kv_layout)
+    storage_engine = StorageEngine(model_config, cache_config)
     for gpu_id, gpu_block in gpu_blocks.items():
-        storage_engine.register_gpu_blocks(gpu_block, device_id=gpu_id, dtype=model_config.dtype)
+        storage_engine.register_gpu_blocks(gpu_block, gpu_kv_layout, device_id=gpu_id, dtype=model_config.dtype)
     gpu_handles = [storage_engine.get_storage_handle(DeviceType.GPU, i)
                    for i in range(model_config.tp_size * model_config.dp_size)]
     cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
@@ -478,6 +479,7 @@ def test_concurrent_mixed_transfers(model_config,
         ssd_handle=ssd_handle
     )
 
+    transfer_engine.start()
     # Create concurrent write transfers
     write_graphs = []
 

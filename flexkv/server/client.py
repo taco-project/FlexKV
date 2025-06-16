@@ -171,7 +171,8 @@ class KVTPClient:
             self.tp_rank,
             self.device_id,
             self.client_recv_port,
-            handles
+            handles,
+            kv_layout
         )
 
         self.send_to_server.send_pyobj(register_req)
