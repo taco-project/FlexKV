@@ -117,13 +117,13 @@ class KVManager:
     # the transfer engine will be initialized after we have all the intended gpu handles.
     def register_single_gpu_blocks(
         self,
-        gpu_handle: List[TensorSharedHandle],
+        gpu_handles: List[TensorSharedHandle],
         dp_client_id: int = 0,
         tp_rank: int = 0,
     ) -> None:
         if self.transfer_engine is not None:
             raise ValueError("we have already get all gpu blocks")
-        self.all_gpu_blocks[tp_rank + dp_client_id * self.model_config.tp_size] = gpu_handle
+        self.all_gpu_blocks[tp_rank + dp_client_id * self.model_config.tp_size] = gpu_handles
         self.num_gpus += 1
         if self.num_gpus == self.model_config.tp_size * self.model_config.dp_size:
             self._init_transfer_engine()

@@ -5,7 +5,7 @@ from typing import Union, List, Optional, Any, Dict
 
 import torch
 
-from flexkv.common.memory_handle import KVCacheTensorHandle, TensorSharedHandle
+from flexkv.common.memory_handle import TensorSharedHandle
 
 
 class AccessHandleType(Enum):
@@ -108,7 +108,7 @@ class StorageHandle:
         else:
             raise ValueError(f"Invalid data type: {type(self.data)}, expected list of strings")
 
-    def get_tensor_handle_list(self) -> List[KVCacheTensorHandle]:
+    def get_tensor_handle_list(self) -> List[TensorSharedHandle]:
         assert isinstance(self.data, list) and \
                 (all(isinstance(x, torch.Tensor) for x in self.data) or \
                 all(isinstance(x, TensorSharedHandle) for x in self.data)), \

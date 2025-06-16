@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from flexkv.common.config import ModelConfig
-from flexkv.common.memory_handle import KVCacheTensorHandle
+from flexkv.common.memory_handle import TensorSharedHandle
 
 
 @dataclass
@@ -19,7 +19,7 @@ class RegisterTPClientRequest:
     tp_rank: int
     device_id: int
     client_recv_port: str
-    handles: List[KVCacheTensorHandle]
+    handles: List[TensorSharedHandle]
 
 
 @dataclass
