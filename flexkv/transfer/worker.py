@@ -229,6 +229,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         self.gpu_block_stride_in_bytes = self.block_size * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = self.block_size * self.dtype.itemsize
 
+        self.is_mla = gpu_kv_layout.is_mla
+
         # set GPU device
         if gpu_device_id != -1:
             torch.cuda.set_device(gpu_device_id)
@@ -286,6 +288,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 self.transfer_sms,
                 True,
                 use_ce_transfer,
+                self.is_mla,
             )
         elif transfer_type == TransferType.D2H:
             transfer_kv_layers(
@@ -301,6 +304,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 self.transfer_sms,
                 False,
                 use_ce_transfer,
+                self.is_mla,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
@@ -383,6 +387,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.gpu_chunk_size_in_bytes = self.gpu_block_size * self.dtype.itemsize
 
         self.transfer_sms = 4
+        self.is_mla = gpu_kv_layout.is_mla
 
         self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks,dp_group_id)
 
@@ -432,6 +437,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 use_ce_transfer,
                 layer_id,
                 layer_granularity,
+                self.is_mla,
             )
         elif transfer_type == TransferType.D2H:
             self.tp_transfer_thread_group.tp_group_transfer(
@@ -448,6 +454,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 use_ce_transfer,
                 layer_id,
                 layer_granularity,
+                self.is_mla,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
@@ -509,11 +516,14 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
 
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
 
+        self.is_mla = cpu_kv_layout.is_mla
+        kv_dim = 2 if not self.is_mla else 1
+
         self.cpu_layer_stride_in_bytes = (
-            self.num_cpu_blocks * self.block_size * self.dtype.itemsize * 2
+            self.num_cpu_blocks * self.block_size * self.dtype.itemsize * kv_dim
         )
         self.ssd_layer_stride_in_bytes = (
-            self.num_ssd_blocks * self.block_size * self.dtype.itemsize * 2
+            self.num_ssd_blocks * self.block_size * self.dtype.itemsize * kv_dim
         )
         self.ssd_layer_stride_in_bytes_per_file = self.ssd_layer_stride_in_bytes // self.num_ssd_files
         self.cpu_kv_stride_in_bytes = (
@@ -573,6 +583,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             round_robin=self.round_robin,
             use_mmap=False,  # TODO: fix bug when use mmap
             num_threads_per_file=16,
+            is_mla=self.is_mla,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
@@ -631,15 +642,18 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         self.block_size = cpu_kv_layout.kv_shape[3:].numel()
         self.dtype = dtype
 
+        self.is_mla = cpu_kv_layout.is_mla
+        kv_dim = 2 if not self.is_mla else 1
+
         self.cpu_blocks = cpu_blocks
 
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
 
         self.cpu_layer_stride_in_bytes = (
-            self.num_cpu_blocks * self.block_size * self.dtype.itemsize * 2
+            self.num_cpu_blocks * self.block_size * self.dtype.itemsize * kv_dim
         )
         self.remote_layer_stride_in_bytes = (
-            self.num_remote_blocks * self.block_size * self.dtype.itemsize * 2
+            self.num_remote_blocks * self.block_size * self.dtype.itemsize * kv_dim
         )
         self.remote_layer_stride_in_bytes_per_file = self.remote_layer_stride_in_bytes // self.num_remote_files
         self.cpu_kv_stride_in_bytes = (
@@ -718,6 +732,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             round_robin=self.round_robin,
             use_mmap=False,  # TODO: fix bug when use mmap
             num_threads_per_file=32,
+            is_mla=self.is_mla,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:

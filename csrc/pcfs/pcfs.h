@@ -66,7 +66,8 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     int64_t cpu_kv_stride_in_bytes, int64_t cfs_layer_stride_in_bytes,
     int64_t cfs_block_stride_in_bytes, int64_t cfs_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
-    int round_robin, bool use_mmap = false, int num_threads_per_file = 8);
+    int round_robin, bool use_mmap = false, int num_threads_per_file = 8,
+    bool is_mla = false);
 
 }  // namespace flexkv
 #endif
