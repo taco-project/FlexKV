@@ -1,10 +1,12 @@
+from typing import Optional
+
 class FlexKVError(Exception):
-    def __init__(self, message: str = "", error_type: str = None):
+    def __init__(self, message: str = "", error_type: Optional[str] = None):
         self.message = message
         self.error_type = error_type
         super().__init__(self.__str__())
 
-    def __str__(self):
+    def __str__(self) -> str:
         if self.error_type is not None:
             return f"[{self.error_type}] {self.message}"
         return self.message
@@ -18,7 +20,7 @@ class LogicError(FlexKVError):
         super().__init__(message, "Logic error")
 
 class TransferError(FlexKVError):
-    def __init__(self, message: str = "", src: str = None, dst: str = None):
+    def __init__(self, message: str = "", src: Optional[str] = None, dst: Optional[str] = None):
         self.src = src
         self.dst = dst
         if src or dst:
@@ -26,7 +28,7 @@ class TransferError(FlexKVError):
         super().__init__(message, "Transfer failed")
 
 class NotEnoughSpaceError(FlexKVError):
-    def __init__(self, message: str = "", required: int = None, available: int = None):
+    def __init__(self, message: str = "", required: Optional[int] = None, available: Optional[int] = None):
         self.required = required
         self.available = available
         if required is not None and available is not None:
@@ -34,7 +36,7 @@ class NotEnoughSpaceError(FlexKVError):
         super().__init__(message, "Not enough space")
 
 class TimeOutError(FlexKVError):
-    def __init__(self, message: str = "", timeout: int = None):
+    def __init__(self, message: str = "", timeout: Optional[int] = None):
         self.timeout = timeout
         if timeout is not None:
             message = f"{message} (Timeout: {timeout})"

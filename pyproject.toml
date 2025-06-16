@@ -46,4 +46,28 @@ ignore = [
     "F841",
     # Use ternary operator
     "SIM108",
+    # Logging statement uses f-string
+    "G004",
 ]
+
+[tool.mypy]
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+warn_no_return = true
+warn_unreachable = false
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = "nvtx.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "flexkv.c_ext.*"
+ignore_missing_imports = true

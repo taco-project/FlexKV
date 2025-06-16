@@ -1,303 +1,228 @@
 import os
 from abc import ABC, abstractmethod
-from typing import Tuple, Optional, List, Union, Dict, Any
+from typing import Tuple, Optional, List, Union, Dict, Any, BinaryIO
 
 import numpy as np
 import torch
 
-from flexkv.common.memory_handle import KVCacheTensorHandle
-from flexkv.common.storage import AccessibleHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
+from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
 
 
-class StorageAllocator(ABC):
+class BaseStorageAllocator(ABC):
+    @classmethod
     @abstractmethod
-    def __init__(self):
-        pass
-
-    @abstractmethod
-    def allocate(self) -> int:
-        pass
-
-    @abstractmethod
-    def free(self):
-        pass
-
-    @abstractmethod
-    def get_accessible_handle(self) -> AccessibleHandle:
+    def allocate(self,
+                 layout: KVCacheLayout,
+                 dtype: torch.dtype,
+                 num_chunks: int = 1,
+                 **kwargs: Any
+                 ) -> StorageHandle:
         pass
 
     @classmethod
     @abstractmethod
-    def from_raw_data(cls) -> 'StorageAllocator':
+    def free(cls, accessible_handle: StorageHandle) -> None:
         pass
 
-class GPUAllocator(StorageAllocator):
-    def __init__(
-        self,
+    @classmethod
+    @abstractmethod
+    def from_raw_data(cls,
+        data: Any,
         layout: KVCacheLayout,
         dtype: torch.dtype,
-        device_id: int,
-        num_chunks: int = 1
-    ):
-        self.layout = layout
-        self.dtype = dtype
-        self.device_id = device_id
-        self.num_chunks = num_chunks
+        **kwargs: Any) -> StorageHandle:
+        pass
 
-        self.physical_chunks = []
-        self._need_free = True
+class GPUAllocator(BaseStorageAllocator):
+    @classmethod
+    def allocate(cls,
+                 layout: KVCacheLayout,
+                 dtype: torch.dtype,
+                 num_chunks: int = 1,
+                 **kwargs: Any) -> StorageHandle:
+        device_id = kwargs.get("device_id", torch.cuda.current_device())
+        device = f"cuda:{device_id}"
 
-    @property
-    def total_size(self) -> int:
-        return self.layout.get_total_elements()
-
-    @property
-    def total_size_in_bytes(self) -> int:
-        return self.total_size * self.dtype.itemsize
-
-    def allocate(self):
-        if self.physical_chunks:
-            return
-        if self.device_id is None:
-            device = "cuda"
-        else:
-            device = f"cuda:{self.device_id}"
-        total_size_per_chunk = self.total_size // self.num_chunks
-        for _ in range(self.num_chunks):
-            self.physical_chunks.append(
+        total_size = layout.get_total_elements()
+        total_size_per_chunk = total_size // num_chunks
+        physical_chunks = []
+        for _ in range(num_chunks):
+            physical_chunks.append(
                 torch.empty(
                     size=(total_size_per_chunk,),
-                    dtype=self.dtype,
+                    dtype=dtype,
                     device=device,
                 )
             )
-
-    def free(self):
-        if not self._need_free:
-            return
-        self.physical_chunks.clear()
-
-    def get_accessible_handle(self) -> AccessibleHandle:
-        if not self.physical_chunks:
-            raise RuntimeError(f"Physical blocks are not allocated on GPU {self.device_id}")
-        return AccessibleHandle(
+        return StorageHandle(
             handle_type=AccessHandleType.TENSOR,
-            data=self.physical_chunks,
-            kv_layout=self.layout,
-            dtype=self.dtype,
-            gpu_device_id=self.device_id,
+            data=physical_chunks,
+            kv_layout=layout,
+            dtype=dtype,
+            gpu_device_id=device_id,
         )
 
     @classmethod
+    def free(cls, accessible_handle: StorageHandle) -> None:
+        pass
+
+    @classmethod
     def from_raw_data(cls,
-        data: Union[List[torch.Tensor], List[KVCacheTensorHandle]],
+        data: Union[List[TensorSharedHandle], List[torch.Tensor]],  # type: ignore
         layout: KVCacheLayout,
         dtype: torch.dtype,
-        device_id: Optional[int] = None) -> 'GPUAllocator':
-        allocator = cls(
-            layout=layout,
+        **kwargs: Any) -> StorageHandle:
+        device_id = kwargs.get("device_id")
+        if device_id is None:
+            raise ValueError("device_id is required for GPU allocator")
+        return StorageHandle(
+            handle_type=AccessHandleType.TENSOR \
+                if isinstance(data[0], torch.Tensor) else AccessHandleType.TENSOR_HANDLE,
+            data=data,
+            kv_layout=layout,
             dtype=dtype,
-            device_id=device_id,
-            num_chunks=len(data),
+            gpu_device_id=device_id,
         )
-        allocator._need_free = False
-        allocator.physical_chunks = data
-        return allocator
 
-class CPUAllocator(StorageAllocator):
-    def __init__(
-        self,
-        layout: KVCacheLayout,
-        dtype: torch.dtype,
-        pin_memory: bool = True,
-        num_chunks: int = 1,
-    ):
-        self.layout = layout
-        self.dtype = dtype
-        self.pin_memory = pin_memory
-        self.num_chunks = num_chunks
-
-        self.physical_chunks = []
-        self._need_free = True
-
-    @property
-    def total_size(self) -> int:
-        return self.layout.get_total_elements()
-
-    @property
-    def total_size_in_bytes(self) -> int:
-        return self.total_size * self.dtype.itemsize
-
-    def allocate(self):
-        if self.physical_chunks:
-            return
-        total_size_per_chunk = self.total_size // self.num_chunks
-        for _ in range(self.num_chunks):
-            self.physical_chunks.append(
+class CPUAllocator(BaseStorageAllocator):
+    @classmethod
+    def allocate(cls,
+                 layout: KVCacheLayout,
+                 dtype: torch.dtype,
+                 num_chunks: int = 1,
+                 **kwargs: Any) -> StorageHandle:
+        pin_memory = kwargs.get("pin_memory", True)
+        total_size = layout.get_total_elements()
+        total_size_per_chunk = total_size // num_chunks
+        physical_chunks = []
+        for _ in range(num_chunks):
+            physical_chunks.append(
                 torch.empty(
                     size=(total_size_per_chunk,),
-                    dtype=self.dtype,
+                    dtype=dtype,
                     device="cpu",
-                    pin_memory=self.pin_memory,
+                    pin_memory=pin_memory,
                 )
             )
-
-    def free(self):
-        if not self._need_free:
-            return
-        self.physical_chunks.clear()
-
-    def get_accessible_handle(self) -> AccessibleHandle:
-        if not self.physical_chunks:
-            raise RuntimeError("Physical blocks are not allocated on CPU")
-        return AccessibleHandle(
+        return StorageHandle(
             handle_type=AccessHandleType.TENSOR,
-            data=self.physical_chunks,
-            kv_layout=self.layout,
-            dtype=self.dtype,
+            data=physical_chunks,
+            kv_layout=layout,
+            dtype=dtype,
         )
 
     @classmethod
-    def from_raw_data(cls,
-        data: List[torch.Tensor],
-        layout: KVCacheLayout) -> 'CPUAllocator':
-        allocator = cls(
-            layout=layout,
-            dtype=data[0].dtype,
-            pin_memory=data[0].is_pinned(),
-            num_chunks=len(data),
-        )
-        allocator._need_free = False
-        allocator.physical_chunks = data
-        return allocator
+    def free(cls, accessible_handle: StorageHandle) -> None:
+        pass
 
-class SSDAllocator(StorageAllocator):
-    def __init__(
-        self,
-        layout: KVCacheLayout,
-        dtype: torch.dtype,
-        file_path: Union[str, List[str]],
-    ):
+    @classmethod
+    def from_raw_data(cls,
+                      data: List[torch.Tensor],  # type: ignore
+                      layout: KVCacheLayout,
+                      dtype: torch.dtype,
+                      **kwargs: Any) -> StorageHandle:
+        return StorageHandle(
+            handle_type=AccessHandleType.TENSOR,
+            data=data,
+            kv_layout=layout,
+            dtype=dtype,
+        )
+
+class SSDAllocator(BaseStorageAllocator):
+    @classmethod
+    def allocate(cls,
+                 layout: KVCacheLayout,
+                 dtype: torch.dtype,
+                 num_chunks: int = 1,
+                 **kwargs: Any) -> StorageHandle:
+        file_path = kwargs.get("file_path")
+        if file_path is None:
+            raise ValueError("file_path is required for SSD allocator")
+
         if isinstance(file_path, str):
             file_path = [file_path]
-        self.file_path = file_path
-        self.layout = layout
-        self.dtype = dtype
-        self.num_files = len(file_path)
-
-        self._has_allocated = False
-
-    @property
-    def total_size(self) -> int:
-        return self.layout.get_total_elements()
-
-    @property
-    def total_size_in_bytes(self) -> int:
-        return self.total_size * self.dtype.itemsize
-
-    def allocate(self):
-        if self._has_allocated:
-            return
-        for path in self.file_path:
+        total_size = layout.get_total_elements()
+        total_size_per_file = total_size // len(file_path)
+        for path in file_path:
             with open(path, "wb+", buffering=0) as file:
-                self._init_file(file)
-        self._has_allocated = True
+                cls._init_file(file, total_size_per_file)
 
-    def _init_file(self, file):
-        file_size = self.total_size_in_bytes // self.num_files
+        return StorageHandle(
+            handle_type=AccessHandleType.FILE,
+            data=file_path,
+            kv_layout=layout,
+            dtype=dtype,
+        )
+
+    @classmethod
+    def _init_file(cls, file: BinaryIO, total_size_per_file: int) -> None:
         try:
-            os.truncate(file.fileno(), file_size)
+            os.truncate(file.fileno(), total_size_per_file)
         except OSError as e:
             raise RuntimeError(f"Failed to initialize file: {e}") from e
         file.flush()
         os.fsync(file.fileno())
 
-    def free(self):
-        pass
-
-    def get_accessible_handle(self) -> AccessibleHandle:
-        if not self._has_allocated:
-            raise RuntimeError("SSD file is not allocated")
-        return AccessibleHandle(
-            handle_type=AccessHandleType.FILE,
-            data=self.file_path,
-            kv_layout=self.layout,
-            dtype=self.dtype,
-        )
-
     @classmethod
     def from_raw_data(cls,
-        layout: KVCacheLayout,
-        dtype: torch.dtype,
-        file_path: Union[str, List[str]]) -> 'SSDAllocator':
-        allocator = cls(
-            layout=layout,
+                      data: Union[str, List[str]],  # type: ignore
+                      layout: KVCacheLayout,
+                      dtype: torch.dtype,
+                      **kwargs: Any) -> StorageHandle:
+        if isinstance(data, str):
+            data = [data]
+        return StorageHandle(
+            handle_type=AccessHandleType.FILE,
+            data=data,
+            kv_layout=layout,
             dtype=dtype,
-            file_path=file_path,
         )
-        allocator._has_allocated = True
-        return allocator
 
-class RemoteAllocator(StorageAllocator):
-    def __init__(
-        self,
-        layout: KVCacheLayout,
-        dtype: torch.dtype,
-        file_path: Union[str, List[str]],
-        remote_config_custom: Dict[str, Any]
-    ):
+class RemoteAllocator(BaseStorageAllocator):
+    @classmethod
+    def allocate(cls,
+                 layout: KVCacheLayout,
+                 dtype: torch.dtype,
+                 num_chunks: int = 1,
+                 **kwargs: Any) -> StorageHandle:
+        file_path = kwargs.get("file_path")
+        if file_path is None:
+            raise ValueError("file_path is required for Remote allocator")
+        remote_config_custom = kwargs.get("remote_config_custom")
+        if remote_config_custom is None:
+            raise ValueError("remote_config_custom is required for Remote allocator")
         if isinstance(file_path, str):
             file_path = [file_path]
-        self.file_path = file_path
-        self.layout = layout
-        self.dtype = dtype
-        self.num_files = len(file_path)
-        self.remote_config_custom = remote_config_custom
 
-        self._has_allocated = False
-
-    @property
-    def total_size(self) -> int:
-        return self.layout.get_total_elements()
-
-    @property
-    def total_size_in_bytes(self) -> int:
-        return self.total_size * self.dtype.itemsize
-
-    def allocate(self):
-        if self._has_allocated:
-            return
-
-        self._has_allocated = True
-
-    def _init_file(self, file):
-        pass
-    
-    def free(self):
-        pass
-
-    def get_accessible_handle(self) -> AccessibleHandle:
-        if not self._has_allocated:
-            raise RuntimeError("Remote file is not allocated")
-        return AccessibleHandle(
+        return StorageHandle(
             handle_type=AccessHandleType.FILE,
-            data=self.file_path,
-            kv_layout=self.layout,
-            dtype=self.dtype,
-            remote_config_custom = self.remote_config_custom,
+            data=file_path,
+            kv_layout=layout,
+            dtype=dtype,
+            remote_config_custom = remote_config_custom,
         )
 
     @classmethod
+    def free(cls, accessible_handle: StorageHandle) -> None:
+        pass
+
+    @classmethod
     def from_raw_data(cls,
-        layout: KVCacheLayout,
-        dtype: torch.dtype,
-        file_path: Union[str, List[str]],
-        remote_config_custom: Dict[str, Any]) -> 'RemoteAllocator':
-        allocator = cls(
-            layout=layout,
+                      data: Union[str, List[str]],  # type: ignore
+                      layout: KVCacheLayout,
+                      dtype: torch.dtype,
+                      **kwargs: Any) -> StorageHandle:
+        remote_config_custom = kwargs.get("remote_config_custom")
+        if remote_config_custom is None:
+            raise ValueError("remote_config_custom is required for Remote allocator")
+        if isinstance(data, str):
+            data = [data]
+
+        return StorageHandle(
+            handle_type=AccessHandleType.FILE,
+            data=data,
+            kv_layout=layout,
             dtype=dtype,
-            file_path=file_path,
             remote_config_custom = remote_config_custom,
         )
-        allocator._has_allocated = True
-        return allocator

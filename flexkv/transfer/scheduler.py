@@ -5,17 +5,17 @@ from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType
 
 
 class TransferScheduler:
-    def __init__(self):
+    def __init__(self) -> None:
         # Store all transfer graphs
         self._transfer_graphs: OrderedDict[int, TransferOpGraph] = OrderedDict()
 
-    def add_transfer_graph(self, graph: TransferOpGraph):
+    def add_transfer_graph(self, graph: TransferOpGraph) -> None:
         """Add a new transfer graph to the scheduler"""
         self._transfer_graphs[graph.transfer_graph_id] = graph
 
     def schedule(self,
                 finished_ops: List[TransferOp]
-               ) -> Tuple[List[TransferOpGraph], List[TransferOp]]:
+               ) -> Tuple[List[int], List[TransferOp]]:
         """
         Schedule transfer operations
 

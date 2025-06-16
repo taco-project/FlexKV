@@ -11,10 +11,10 @@ import torch
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex
 from flexkv.common.block import SequenceMeta
-from flexkv.common.debug import debuginfo
+from flexkv.common.debug import flexkv_logger
 
 
-debuginfo.set_level("INFO")
+flexkv_logger.set_level("INFO")
 
 def main():
     request_generator = RequestGenerator(dataset="random",
@@ -52,7 +52,7 @@ def main():
         if req.request_type == "get":
             num_matched_blocks = 0
             num_total_matched_blocks += num_matched_blocks
-            debuginfo.info(f"cache hit ratio: {num_matched_blocks * tokens_per_block / len(req.token_ids)}")
+            flexkv_logger.info(f"cache hit ratio: {num_matched_blocks * tokens_per_block / len(req.token_ids)}")
         elif req.request_type == "put":
             match_result = cache_index.match_prefix(sequence_meta)
             num_matched_blocks = match_result.num_matched_blocks
@@ -69,17 +69,17 @@ def main():
                 cache_index.unlock(ret_node)
             new_block_ids = mempool.allocate_blocks(required_blocks_num)
             cache_index.insert(sequence_meta, new_block_ids)
-    debuginfo.info(f"Total requests: {len(reqs)}")
-    debuginfo.info(f"{num_eviction} eviction happened")
-    debuginfo.info(f"Total evicted blocks: {num_total_evicted}")
-    debuginfo.info(f"Total matched blocks: {num_total_matched_blocks}")
+    flexkv_logger.info(f"Total requests: {len(reqs)}")
+    flexkv_logger.info(f"{num_eviction} eviction happened")
+    flexkv_logger.info(f"Total evicted blocks: {num_total_evicted}")
+    flexkv_logger.info(f"Total matched blocks: {num_total_matched_blocks}")
     if num_total_evicted > 0:
         stats = pstats.Stats(profiler)
         stats.strip_dirs()
         stats.sort_stats('cumulative')
         stats.print_stats()
     else:
-        debuginfo.info("No evictions")
+        flexkv_logger.info("No evictions")
 
 if __name__ == "__main__":
     main()

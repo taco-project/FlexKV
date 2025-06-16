@@ -14,7 +14,6 @@ from flexkv.cache.transfer_pattern import (
 )
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.common.request import cacheEngineRequestType, cacheEngineRequest
 from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
 from flexkv.common.transfer import DeviceType, TransferOpGraph
 
@@ -41,7 +40,7 @@ class CacheEngine:
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
 
-    def reset(self):
+    def reset(self) -> None:
         self.index.reset()
         self.mempool.reset()
 
@@ -55,7 +54,7 @@ class CacheEngine:
                physical_block_ids: torch.Tensor,
                num_insert_blocks: int = -1,
                is_ready: bool = True,
-               match_result: Optional[MatchResult] = None) -> RadixNode:
+               match_result: Optional[MatchResult] = None) -> Optional[RadixNode]:
         return self.index.insert(sequence_meta,
                                  physical_block_ids,
                                  num_insert_blocks=num_insert_blocks,
@@ -121,11 +120,12 @@ class GlobalCacheEngine:
                                                    cache_config.tokens_per_block)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
-        self._empty_get_return = lambda request_id: (TransferOpGraph.create_empty_graph(request_id), [], {}, {}, 0)
-        self._empty_put_return = lambda request_id, skip_gpu_blocks_in_mask=0:  \
-            (TransferOpGraph.create_empty_graph(request_id), [], {}, {}, 0, skip_gpu_blocks_in_mask)
+        self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, int]] = \
+            lambda request_id: (TransferOpGraph.create_empty_graph(request_id), [], {}, {}, 0)
+        self._empty_put_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, int, int]] = \
+            lambda request_id: (TransferOpGraph.create_empty_graph(request_id), [], {}, {}, 0, 0)
 
-    def reset(self):
+    def reset(self) -> None:
         if self.cpu_cache_engine:
             self.cpu_cache_engine.reset()
         if self.ssd_cache_engine:
@@ -211,8 +211,11 @@ class GlobalCacheEngine:
             block_start_idx: int,
             block_end_idx: int,
             gpu_block_mapping: torch.Tensor,
-            layer_num: int = -1) -> Tuple[TransferOpGraph, List[int], Callable, int]:
+            layer_num: int = -1) -> Tuple[TransferOpGraph, List[int], Dict, Dict, int]:
         assert self.cache_config.enable_cpu and self.cache_config.enable_ssd and self.cache_config.enable_remote
+        assert self.cpu_cache_engine is not None
+        assert self.ssd_cache_engine is not None
+        assert self.remote_cache_engine is not None
 
         cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
         remote_matched_result = self.remote_cache_engine.match(sequence_meta)
@@ -296,10 +299,14 @@ class GlobalCacheEngine:
                                                                             gpu_device_id=0,
                                                                             layer_num=layer_num,
                                                                             write_back_to_ssd=write_ssd_blocks_from_remote)
+        node_to_unlock = {}
+        if cpu_node_to_unlock is not None:
+            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+        if ssd_node_to_unlock is not None:
+            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+        if remote_node_to_unlock is not None:
+            node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
 
-        node_to_unlock = {DeviceType.CPU: (cpu_node_to_unlock, cpu_node_to_unlock.size()),
-                          DeviceType.SSD: (ssd_node_to_unlock, ssd_node_to_unlock.size()),
-                          DeviceType.REMOTE: (remote_node_to_unlock, remote_node_to_unlock.size())}
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
 
         # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
@@ -311,8 +318,10 @@ class GlobalCacheEngine:
                         block_start_idx: int,
                         block_end_idx: int,
                         gpu_block_mapping: torch.Tensor,
-                        layer_num: int = -1) -> Tuple[TransferOpGraph, List[int], Callable, int]:
+                        layer_num: int = -1) -> Tuple[TransferOpGraph, List[int], Dict, Dict, int]:
         assert self.cache_config.enable_cpu and self.cache_config.enable_ssd
+        assert self.cpu_cache_engine is not None
+        assert self.ssd_cache_engine is not None
 
         cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
 
@@ -370,12 +379,15 @@ class GlobalCacheEngine:
                                                                             gpu_blocks=gpu_blocks_to_transfer,
                                                                             cpu_blocks=cpu_blocks_to_transfer,
                                                                             ssd_blocks=ssd_blocks_to_transfer,
-                                                                            remote_blocks=[],
+                                                                            remote_blocks=torch.tensor([]),
                                                                             gpu_device_id=0,
                                                                             layer_num=layer_num,
                                                                             write_back_to_ssd=write_ssd_blocks_from_remote)
-        node_to_unlock = {DeviceType.CPU: (cpu_node_to_unlock, cpu_node_to_unlock.size()),
-                          DeviceType.SSD: (ssd_node_to_unlock, ssd_node_to_unlock.size())}
+        node_to_unlock = {}
+        if cpu_node_to_unlock is not None:
+            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+        if ssd_node_to_unlock is not None:
+            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
 
         return transfer_graph, finished_ops_ids, node_to_unlock, buffer_to_free, len(gpu_blocks_to_transfer)
@@ -388,6 +400,7 @@ class GlobalCacheEngine:
                            gpu_block_mapping: torch.Tensor,
                            layer_num: int = -1) -> Tuple[TransferOpGraph, List[int], Dict, Dict, int]:
         assert self.cache_config.enable_cpu
+        assert self.cpu_cache_engine is not None
 
         cpu_matched_result, _ = self.match_local(sequence_meta)
 
@@ -413,7 +426,9 @@ class GlobalCacheEngine:
                                                                          gpu_device_id=0,
                                                                          layer_num=layer_num)
 
-        node_to_unlock = {DeviceType.CPU: (cpu_node_to_unlock, cpu_node_to_unlock.size())}
+        node_to_unlock = {}
+        if cpu_node_to_unlock is not None:
+            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
 
         return transfer_graph, finished_ops_ids, node_to_unlock, {}, len(gpu_blocks_to_transfer)
 
@@ -443,7 +458,8 @@ class GlobalCacheEngine:
                                      tokens_per_block=self.cache_config.tokens_per_block)
 
         if not self.cache_config.enable_ssd and not self.cache_config.enable_remote:
-            transfer_graph, finished_ops_ids, node_to_unlock, buffer_to_free, num_gpu_blocks_to_transfer, skip_gpu_blocks_in_mask = \
+            (transfer_graph, finished_ops_ids, node_to_unlock,
+             buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
                 self._put_impl_cpu_only(
                     request_id,
                     sequence_meta,
@@ -453,7 +469,8 @@ class GlobalCacheEngine:
                     layer_num
                 )
         elif not self.cache_config.enable_remote:
-            transfer_graph, finished_ops_ids, node_to_unlock, buffer_to_free, num_gpu_blocks_to_transfer, skip_gpu_blocks_in_mask = \
+            (transfer_graph, finished_ops_ids, node_to_unlock,
+             buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
                 self._put_impl_local(
                     request_id,
                     sequence_meta,
@@ -463,7 +480,8 @@ class GlobalCacheEngine:
                     layer_num
                 )
         else:
-            transfer_graph, finished_ops_ids, node_to_unlock, buffer_to_free, num_gpu_blocks_to_transfer, skip_gpu_blocks_in_mask = \
+            (transfer_graph, finished_ops_ids, node_to_unlock,
+             buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
                 self._put_impl_global(
                     request_id,
                     sequence_meta,
@@ -473,8 +491,8 @@ class GlobalCacheEngine:
                     layer_num
                 )
         return_mask = torch.zeros_like(token_mask)
-        return_mask[(block_start_idx + skip_gpu_blocks_in_mask)* self.tokens_per_block:
-                    (block_start_idx + skip_gpu_blocks_in_mask + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
+        return_mask[(block_start_idx + skipped_gpu_blocks)* self.tokens_per_block:
+                    (block_start_idx + skipped_gpu_blocks + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 
         for device_type in node_to_unlock:
             self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
@@ -491,16 +509,21 @@ class GlobalCacheEngine:
             block_start_idx: int,
             block_end_idx: int,
             gpu_block_mapping: torch.Tensor,
-            layer_num : int = -1) -> Tuple[TransferOpGraph, List[int], Callable, int]:
+            layer_num : int = -1) -> Tuple[TransferOpGraph, List[int], Dict, Dict, int, int]:
         assert self.cache_config.enable_cpu and self.cache_config.enable_ssd and self.cache_config.enable_remote
+        assert self.cpu_cache_engine is not None
+        assert self.ssd_cache_engine is not None
+        assert self.remote_cache_engine is not None
 
         cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_ready_matched_blocks][block_start_idx:block_end_idx]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_ready_matched_blocks][block_start_idx:block_end_idx]
-        remote_matched_blocks = []
+
         remote_matched_result = self.remote_cache_engine.match(sequence_meta)
+        remote_matched_blocks = remote_matched_result.physical_blocks[
+            :remote_matched_result.num_ready_matched_blocks][block_start_idx:block_end_idx]
 
         # cpu works as a cache for ssd
         assert len(cpu_matched_blocks) <= len(ssd_matched_blocks)
@@ -509,7 +532,7 @@ class GlobalCacheEngine:
 
         #early return if no blocks to transfer
         if len(gpu_blocks_to_transfer) == 0:
-            return self._empty_put_return(request_id, len(cpu_matched_blocks))
+            return self._empty_put_return(request_id)
 
         num_cpu_required_blocks = len(gpu_block_mapping) - len(cpu_matched_blocks)
         num_ssd_required_blocks = len(gpu_block_mapping) - len(ssd_matched_blocks)
@@ -535,7 +558,7 @@ class GlobalCacheEngine:
             self.cpu_cache_engine.recycle(cpu_blocks_to_transfer)
             self.ssd_cache_engine.recycle(ssd_blocks_to_transfer)
             self.remote_cache_engine.recycle(remote_blocks_to_transfer)
-            return self._empty_put_return(request_id, block_end_idx - block_start_idx)
+            return self._empty_put_return(request_id)
 
         cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                           cpu_blocks_to_transfer,
@@ -562,11 +585,16 @@ class GlobalCacheEngine:
                                                                             remote_blocks=remote_blocks_to_transfer,
                                                                             gpu_device_id = 0,
                                                                             layer_num = layer_num)
-        node_to_unlock = {DeviceType.CPU: (cpu_node_to_unlock, cpu_node_to_unlock.size()),
-                          DeviceType.SSD: (ssd_node_to_unlock, ssd_node_to_unlock.size()),
-                          DeviceType.REMOTE: (remote_node_to_unlock, remote_node_to_unlock.size())}
+        node_to_unlock = {}
+        if cpu_node_to_unlock is not None:
+            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+        if ssd_node_to_unlock is not None:
+            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+        if remote_node_to_unlock is not None:
+            node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
 
-        return transfer_graph, finished_ops_ids, node_to_unlock, {}, len(gpu_blocks_to_transfer), len(cpu_matched_blocks)
+        skipped_gpu_blocks = len(cpu_matched_blocks)
+        return transfer_graph, finished_ops_ids, node_to_unlock, {}, len(gpu_blocks_to_transfer), skipped_gpu_blocks
 
     def _put_impl_local(self,
             request_id: int,
@@ -574,8 +602,11 @@ class GlobalCacheEngine:
             block_start_idx: int,
             block_end_idx: int,
             gpu_block_mapping: torch.Tensor,
-            layer_num : int = -1) -> Tuple[TransferOpGraph, List[int], Callable, int]:
+            layer_num : int = -1) -> Tuple[TransferOpGraph, List[int], Dict, Dict, int, int]:
         assert self.cache_config.enable_cpu and self.cache_config.enable_ssd
+        assert self.cpu_cache_engine is not None
+        assert self.ssd_cache_engine is not None
+
         cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_ready_matched_blocks][block_start_idx:block_end_idx]
@@ -589,7 +620,7 @@ class GlobalCacheEngine:
 
         #early return if no blocks to transfer
         if len(gpu_blocks_to_transfer) == 0:
-            return self._empty_put_return(request_id, len(cpu_matched_blocks))
+            return self._empty_put_return(request_id)
 
         num_cpu_required_blocks = len(gpu_block_mapping) - len(cpu_matched_blocks)
         num_ssd_required_blocks = len(gpu_block_mapping) - len(ssd_matched_blocks)
@@ -607,7 +638,7 @@ class GlobalCacheEngine:
             len(ssd_blocks_to_transfer) < num_ssd_required_blocks:
             self.cpu_cache_engine.recycle(cpu_blocks_to_transfer)
             self.ssd_cache_engine.recycle(ssd_blocks_to_transfer)
-            return self._empty_put_return(request_id, block_end_idx - block_start_idx)
+            return self._empty_put_return(request_id)
 
         cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                           cpu_blocks_to_transfer,
@@ -622,14 +653,18 @@ class GlobalCacheEngine:
                                                                             gpu_blocks=gpu_blocks_to_transfer,
                                                                             cpu_blocks=cpu_blocks_to_transfer,
                                                                             ssd_blocks=ssd_blocks_to_transfer,
-                                                                            remote_blocks=[],
+                                                                            remote_blocks=torch.tensor([]),
                                                                             gpu_device_id = 0,
                                                                             layer_num = layer_num)
 
-        node_to_unlock = {DeviceType.CPU: (cpu_node_to_unlock, cpu_node_to_unlock.size()),
-                          DeviceType.SSD: (ssd_node_to_unlock, ssd_node_to_unlock.size())}
+        node_to_unlock = {}
+        if cpu_node_to_unlock is not None:
+            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+        if ssd_node_to_unlock is not None:
+            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
 
-        return transfer_graph, finished_ops_ids, node_to_unlock, {}, len(gpu_blocks_to_transfer), len(cpu_matched_blocks)
+        skipped_gpu_blocks = len(cpu_matched_blocks)
+        return transfer_graph, finished_ops_ids, node_to_unlock, {}, len(gpu_blocks_to_transfer), skipped_gpu_blocks
 
     def _put_impl_cpu_only(self,
                            request_id: int,
@@ -637,8 +672,9 @@ class GlobalCacheEngine:
                            block_start_idx: int,
                            block_end_idx: int,
                            gpu_block_mapping: torch.Tensor,
-                           layer_num: int = -1) -> Tuple[TransferOpGraph, List[int], Callable, int]:
+                           layer_num: int = -1) -> Tuple[TransferOpGraph, List[int], Dict, Dict, int, int]:
         assert self.cache_config.enable_cpu
+        assert self.cpu_cache_engine is not None
 
         cpu_matched_result, _ = self.match_local(sequence_meta)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
@@ -647,7 +683,7 @@ class GlobalCacheEngine:
         gpu_blocks_to_transfer = gpu_block_mapping[len(cpu_matched_blocks):]
         #early return if no blocks to transfer
         if len(gpu_blocks_to_transfer) == 0:
-            return self._empty_put_return(request_id, len(cpu_matched_blocks))
+            return self._empty_put_return(request_id)
 
         num_cpu_required_blocks = len(gpu_block_mapping) - len(cpu_matched_blocks)
         cpu_blocks_to_transfer = self.cpu_cache_engine.take(
@@ -657,7 +693,7 @@ class GlobalCacheEngine:
         )
         if len(cpu_blocks_to_transfer) < num_cpu_required_blocks:
             self.cpu_cache_engine.recycle(cpu_blocks_to_transfer)
-            return self._empty_put_return(request_id, block_end_idx - block_start_idx)
+            return self._empty_put_return(request_id)
 
         cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                           cpu_blocks_to_transfer,
@@ -671,26 +707,34 @@ class GlobalCacheEngine:
                                                                             remote_blocks=torch.tensor([]),
                                                                             gpu_device_id = 0,
                                                                             layer_num = layer_num)
+        node_to_unlock = {}
+        if cpu_node_to_unlock is not None:
+            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
 
-        node_to_unlock = {DeviceType.CPU: (cpu_node_to_unlock, cpu_node_to_unlock.size())}
-
-        return transfer_graph, finished_ops_ids, node_to_unlock, {}, len(gpu_blocks_to_transfer), len(cpu_matched_blocks)
+        skipped_gpu_blocks = len(cpu_matched_blocks)
+        return transfer_graph, finished_ops_ids, node_to_unlock, {}, len(gpu_blocks_to_transfer), skipped_gpu_blocks
 
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
                            buffer_to_free: Optional[Dict[DeviceType, torch.Tensor]] = None) -> None:
         if DeviceType.CPU in node_to_unlock:
+            assert self.cpu_cache_engine is not None
             self.cpu_cache_engine.cleanup(node_to_unlock[DeviceType.CPU][0], node_to_unlock[DeviceType.CPU][1])
         if DeviceType.SSD in node_to_unlock:
+            assert self.ssd_cache_engine is not None
             self.ssd_cache_engine.cleanup(node_to_unlock[DeviceType.SSD][0], node_to_unlock[DeviceType.SSD][1])
         if DeviceType.REMOTE in node_to_unlock:
+            assert self.remote_cache_engine is not None
             self.remote_cache_engine.cleanup(node_to_unlock[DeviceType.REMOTE][0], node_to_unlock[DeviceType.REMOTE][1])
         if buffer_to_free is not None:
             if DeviceType.CPU in buffer_to_free:
+                assert self.cpu_cache_engine is not None
                 self.cpu_cache_engine.recycle(buffer_to_free[DeviceType.CPU])
             if DeviceType.SSD in buffer_to_free:
+                assert self.ssd_cache_engine is not None
                 self.ssd_cache_engine.recycle(buffer_to_free[DeviceType.SSD])
             if DeviceType.REMOTE in buffer_to_free:
+                assert self.remote_cache_engine is not None
                 self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
 
     def match_local(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult]:
@@ -729,12 +773,12 @@ class GlobalCacheEngine:
 
     def _slot_to_block_mapping(self,
                               slot_mapping: torch.Tensor) -> torch.Tensor:
-        block_mapping = slot_mapping[::self.tokens_per_block] // self.tokens_per_block
+        block_mapping: torch.Tensor = slot_mapping[::self.tokens_per_block] // self.tokens_per_block
         return block_mapping
 
     def _get_block_range(self,
                          token_mask: torch.Tensor) -> Tuple[int, int]:
         mask_idx = torch.where(token_mask)[0]
-        start_idx = mask_idx[0].item() // self.tokens_per_block
-        end_idx = mask_idx[-1].item() // self.tokens_per_block
+        start_idx = int(mask_idx[0].item() // self.tokens_per_block)
+        end_idx = int(mask_idx[-1].item() // self.tokens_per_block)
         return start_idx, end_idx + 1

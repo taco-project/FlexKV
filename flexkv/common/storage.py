@@ -5,12 +5,13 @@ from typing import Union, List, Optional, Any, Dict
 
 import torch
 
-from flexkv.common.transfer import DeviceType
+from flexkv.common.memory_handle import KVCacheTensorHandle, TensorSharedHandle
 
 
 class AccessHandleType(Enum):
     TENSOR = auto()  # single tensor or tensor list
     FILE = auto()  # single file or file list
+    TENSOR_HANDLE = auto()  # single tensor handle or tensor handle list
 
 class KVCacheLayoutType(Enum):
     LAYERWISE = "layerwise"
@@ -25,19 +26,29 @@ class KVCacheLayout:
     num_head: int
     head_size: int
     is_mla: bool = False
-    kv_shape: torch.Size = None
+    _kv_shape: Optional[torch.Size] = None
 
-    def __post_init__(self):
-        if self.kv_shape is None:
+    @property
+    def kv_shape(self) -> torch.Size:
+        if self._kv_shape is None:
+            self._compute_kv_shape()
+        assert self._kv_shape is not None
+        return self._kv_shape
+
+    def __post_init__(self) -> None:
+        self._compute_kv_shape()
+
+    def _compute_kv_shape(self) -> None:
+        if self._kv_shape is None:
             if self.type == KVCacheLayoutType.LAYERWISE:
                 if self.is_mla:
-                    self.kv_shape = torch.Size([self.num_layer,
+                    self._kv_shape = torch.Size([self.num_layer,
                                                 self.num_block,
                                                 self.tokens_per_block,
                                                 self.num_head,
                                                 self.head_size])
                 else:
-                    self.kv_shape = torch.Size([self.num_layer,
+                    self._kv_shape = torch.Size([self.num_layer,
                                                 2,
                                                 self.num_block,
                                                 self.tokens_per_block,
@@ -45,13 +56,13 @@ class KVCacheLayout:
                                                 self.head_size])
             elif self.type == KVCacheLayoutType.BLOCKWISE:
                 if self.is_mla:
-                    self.kv_shape = torch.Size([self.num_block,
+                    self._kv_shape = torch.Size([self.num_block,
                                                 self.num_layer,
                                                 self.tokens_per_block,
                                                 self.num_head,
                                                 self.head_size])
                 else:
-                    self.kv_shape = torch.Size([self.num_block,
+                    self._kv_shape = torch.Size([self.num_block,
                                                 self.num_layer,
                                                 2,
                                                 self.tokens_per_block,
@@ -60,55 +71,55 @@ class KVCacheLayout:
             else:
                 raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
 
-    def get_kv_shape(self) -> torch.Size:
-        return self.kv_shape
-
     def get_total_elements(self) -> int:
         return self.kv_shape.numel()
 
 @dataclass
-class AccessibleHandle:
+class StorageHandle:
     handle_type: AccessHandleType
     # The actual handle data
-    data: Union[List[torch.Tensor], List[List[torch.Tensor]], str]
+    data: Union[List[torch.Tensor], List[str], List[TensorSharedHandle]]
     kv_layout: KVCacheLayout
     dtype: torch.dtype
     # Optional metadata
     gpu_device_id: Optional[int] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
 
-    @classmethod
-    def from_tensor(cls,
-                    tensor: Union[torch.Tensor, List[torch.Tensor]],
-                    kv_layout: KVCacheLayout,
-                    gpu_device_id: Optional[int] = None) -> 'AccessibleHandle':
-        if isinstance(tensor, torch.Tensor):
-            tensor_list = [tensor]
-        return cls(
-            handle_type=AccessHandleType.TENSOR,
-            data=tensor_list,
-            kv_layout=kv_layout,
-            dtype=tensor_list[0].dtype,
-            gpu_device_id=gpu_device_id,
-            remote_config_custom=None
-        )
+    def get_tensor_list(self) -> List[torch.Tensor]:
+        assert isinstance(self.data, list) and \
+                (all(isinstance(x, torch.Tensor) for x in self.data) or \
+                all(isinstance(x, TensorSharedHandle) for x in self.data)), \
+                "handle data must be List[Tensor] or List[TensorWrapper]"
+        if self.handle_type == AccessHandleType.TENSOR:
+            return self.data  # type: ignore
+        elif self.handle_type == AccessHandleType.TENSOR_HANDLE:
+            assert all(isinstance(x, TensorSharedHandle) for x in self.data), \
+                "All elements must be TensorSharedHandle for TENSOR_HANDLE type"
+            return [x.get_tensor() for x in self.data]  # type: ignore
+        else:
+            raise ValueError(f"Invalid data type: {type(self.data)}, expected list of tensors")
 
-    @classmethod
-    def from_file(cls,
-                  file_path: Union[str, Path, List[Union[str, Path]]],
-                  kv_layout: KVCacheLayout,
-                  dtype: torch.dtype,
-                  remote_config_custom: Optional[Dict[str, Any]] = None
-                  ) -> 'AccessibleHandle':
-        if isinstance(file_path, (str, Path)):
-            file_path_list = [str(file_path)]
-        if isinstance(file_path[0], Path):
-            file_path_list = [str(fp) for fp in file_path]
-        return cls(
-            handle_type=AccessHandleType.FILE,
-            data=file_path_list,
-            kv_layout=kv_layout,
-            dtype=dtype,
-            gpu_device_id=None,
-            remote_config_custom=remote_config_custom
-        )
+    def get_file_list(self) -> List[str]:
+        if self.handle_type == AccessHandleType.FILE:
+            assert isinstance(self.data, list) and \
+                all(isinstance(x, str) for x in self.data), \
+                "handle data must be List[str]"
+            return self.data  # type: ignore
+        else:
+            raise ValueError(f"Invalid data type: {type(self.data)}, expected list of strings")
+
+    def get_tensor_handle_list(self) -> List[KVCacheTensorHandle]:
+        assert isinstance(self.data, list) and \
+                (all(isinstance(x, torch.Tensor) for x in self.data) or \
+                all(isinstance(x, TensorSharedHandle) for x in self.data)), \
+                "handle data must be List[Tensor] or List[TensorWrapper]"
+        if self.handle_type == AccessHandleType.TENSOR_HANDLE:
+            assert all(isinstance(x, TensorSharedHandle) for x in self.data), \
+                "All elements must be TensorSharedHandle for TENSOR_HANDLE type"
+            return self.data  # type: ignore
+        elif self.handle_type == AccessHandleType.TENSOR:
+            assert all(isinstance(x, torch.Tensor) for x in self.data), \
+                "All elements must be torch.Tensor for TENSOR type"
+            return [TensorSharedHandle(x) for x in self.data]  # type: ignore
+        else:
+            raise ValueError(f"Invalid data type: {type(self.data)}, expected list of tensors")

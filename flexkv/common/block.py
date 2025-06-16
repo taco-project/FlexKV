@@ -22,7 +22,7 @@ class SequenceMeta:
 
     tokens_per_block: int
 
-    block_hashes: Optional[np.ndarray] = None
+    block_hashes: np.ndarray = np.array([], dtype=np.int64)
 
     _has_hashes: bool = False
 
@@ -30,7 +30,7 @@ class SequenceMeta:
         self.token_ids = token_ids
         self.tokens_per_block = tokens_per_block
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         assert self.token_ids.ndim == 1
         assert self.tokens_per_block > 0
 
@@ -49,7 +49,7 @@ class SequenceMeta:
         if block_id >= self.num_blocks:
             return None
         if self._has_hashes:
-            return self.block_hashes[block_id].item()
+            return HashType(int(self.block_hashes[block_id].item()))
         else:
             return hash_tensor(self.token_ids[:(block_id+1)*self.tokens_per_block])
 

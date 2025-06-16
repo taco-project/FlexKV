@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from flexkv.common.config import ModelConfig, CacheConfig
-from flexkv.common.debug import debuginfo
+from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.kvmanager import KVManager
 
@@ -127,7 +127,7 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
     dp_wise_gpu_blocks_gt = []
     for dp_id in range(dp_size):
         tp_group_tensors_gt = [
-            torch.randn(size=gpu_kv_layout.get_kv_shape()[1:], dtype=dtype)
+            torch.randn(size=gpu_kv_layout.kv_shape[1:], dtype=dtype)
             for _ in range(num_layers)
         ]
         head_per_tp = num_kv_heads // tp_size
@@ -169,6 +169,9 @@ def test_kvmanager(model_config, cache_config, test_config):
     num_cpu_blocks = cache_config.num_cpu_blocks
     num_ssd_blocks = cache_config.num_ssd_blocks
     num_remote_blocks = cache_config.num_remote_blocks
+    enable_cpu = cache_config.enable_cpu
+    enable_ssd = cache_config.enable_ssd
+    enable_remote = cache_config.enable_remote
 
     num_gpu_blocks = test_config["num_gpu_blocks"]
     block_per_request = test_config['requests_per_block']
@@ -180,7 +183,7 @@ def test_kvmanager(model_config, cache_config, test_config):
         pytest.skip("tp_size * dp_size > torch.cuda.device_count() is not supported")
     if use_mla:
         pytest.skip("mla is not supported")
-    if cache_config.enable_remote:
+    if enable_remote:
         pytest.skip("enable_remote is not supported")
 
     # TODO: config layout by a more flexible way
@@ -227,6 +230,8 @@ def test_kvmanager(model_config, cache_config, test_config):
 
     gpu_blocks, dp_wise_gpu_blocks_gt = generate_gpu_blocks(model_config, cache_config, test_config)
     kvmanager = KVManager(model_config, cache_config, gpu_blocks)
+    assert kvmanager.is_ready()
+    kvmanager.start()
     request_pairs = [generate_request_pair(i, block_per_request, num_gpu_blocks, tokens_per_block, dp_size)
                      for i in range(num_requests)]
     initial_write_num = int(num_requests * initial_write_ratio)
@@ -290,10 +295,12 @@ def test_kvmanager(model_config, cache_config, test_config):
     total_time = end_time - start_time
     print(f"Total time: {total_time} s")
     print(f"Total cache hit rate: {total_cache_hit / (total_cache_hit + total_cache_miss)}")
-    if num_cpu_blocks >= num_gpu_blocks:
-        assert total_cache_miss == 0, "total_cache_miss should be 0 if num_cpu_blocks >= num_gpu_blocks"
+    if enable_cpu and num_cpu_blocks >= num_gpu_blocks or \
+        enable_ssd and num_ssd_blocks >= num_gpu_blocks or \
+        enable_remote and num_remote_blocks >= num_gpu_blocks:
+        assert total_cache_miss == 0
     kvmanager.shutdown()
-    if(total_cache_miss == 0):
+    if total_cache_miss == 0:
         verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers)
     else:
         print(f"verify skipped, because of total_cache_miss={total_cache_miss}>0")
