@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, List, Tuple, Union
 import torch
 
 from flexkv.common.config import ModelConfig, CacheConfig
-from flexkv.common.memory_handle import KVCacheTensorHandle, TensorSharedHandle
+from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
 from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator
