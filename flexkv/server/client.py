@@ -11,6 +11,7 @@ import zmq
 from flexkv.common.config import ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.storage import KVCacheLayout
 from flexkv.server.util import get_zmq_socket
 from flexkv.server.request import (
     RegisterDPClientRequest,
@@ -154,6 +155,7 @@ class KVTPClient:
     def register_to_server(
         self,
         kv_caches: List[torch.Tensor],
+        kv_layout: KVCacheLayout,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
