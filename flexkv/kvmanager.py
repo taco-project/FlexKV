@@ -15,6 +15,8 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.request import KVRequestType, KVRequest
 from flexkv.common.transfer import DeviceType, get_nvtx_range_color, get_nvtx_default_color
+from flexkv.common.storage import KVCacheLayout
+from flexkv.common.exceptions import LogicError
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 
@@ -34,6 +36,7 @@ class KVManager:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
+                 gpu_layout: KVCacheLayout,
                  gpu_blocks: Optional[Dict[int, List[TensorSharedHandle]]] = None):
 
         mp.set_start_method('spawn', force=True)
@@ -49,7 +52,7 @@ class KVManager:
         self.cache_config = cache_config
         self.model_config = model_config
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
-        self.storage_engine = StorageEngine(self.model_config, self.cache_config)
+        self.storage_engine = StorageEngine(self.model_config, self.cache_config, gpu_layout)
         self.transfer_engine: Optional[TransferEngine] = None
 
         self.running = False

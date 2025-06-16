@@ -17,23 +17,16 @@ class ModelConfig:
     tp_size: int = 1
     dp_size: int = 1
 
-default_kv_layout = KVCacheLayout(type=KVCacheLayoutType.LAYERWISE,
-                                  num_layer=1,
-                                  num_block=1,
-                                  tokens_per_block=1,
-                                  num_head=1,
-                                  head_size=1)
-
 @dataclass
 class CacheConfig:
     tokens_per_block: int = 16
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_remote: bool = False
-    gpu_kv_layout: KVCacheLayout = default_kv_layout
-    cpu_kv_layout: KVCacheLayout = default_kv_layout
-    ssd_kv_layout: KVCacheLayout = default_kv_layout
-    remote_kv_layout: KVCacheLayout = default_kv_layout
+    gpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
+    cpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
+    ssd_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
+    remote_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
     use_gds: bool = False
     use_pinned_memory: bool = True
     num_cpu_blocks: int = 1000000
