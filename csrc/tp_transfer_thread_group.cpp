@@ -44,7 +44,8 @@ void TPTransferThreadGroup::tp_group_transfer(
     const bool is_host_to_device,
     const bool use_ce_transfer,
     const int layer_id,
-    const int layer_granularity
+    const int layer_granularity,
+    const bool is_mla
 ) {
 
     std::atomic<bool> failed{false};
@@ -86,7 +87,7 @@ void TPTransferThreadGroup::tp_group_transfer(
                     src_kv_stride_in_bytes, src_chunk_stride_in_bytes,
                     src_startoff_inside_chunks,
                     copy_size_in_bytes, streams_[i], transfer_sms,
-                    is_host_to_device, use_ce_transfer
+                    is_host_to_device, use_ce_transfer, is_mla
                 );
                 cudaError_t err = cudaGetLastError();
                 if (err != cudaSuccess) {

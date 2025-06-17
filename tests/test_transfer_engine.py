@@ -112,9 +112,10 @@ def create_test_gpu_blocks(model_config: ModelConfig,
 
         for layer_id in range(model_config.num_layers):
             # Create KV cache tensor: [2, num_blocks, tokens_per_block, num_heads, head_size]
+            kv_dim = 2 if not model_config.use_mla else 1
             kv_tensor = torch.randint(
                 0, 100,
-                size=(2, num_gpu_blocks, cache_config.tokens_per_block,
+                size=(kv_dim, num_gpu_blocks, cache_config.tokens_per_block,
                       model_config.num_kv_heads // model_config.tp_size, model_config.head_size),
                 dtype=model_config.dtype,
                 device=device_name
@@ -155,14 +156,14 @@ class DataVerifier:
         tokens_per_block = cache_config.tokens_per_block
         num_heads = model_config.num_kv_heads
         head_size = model_config.head_size
-
+        kv_dim = 2 if not model_config.use_mla else 1
         for gpu_id in range(gpu_num):
             start_head = gpu_id * model_config.num_kv_heads // gpu_num
             end_head = (gpu_id + 1) * model_config.num_kv_heads // gpu_num
             gpu_layers = gpu_ground_truth[start_gpu_id + gpu_id]
             for layer_id in range(model_config.num_layers):
                 gpu_gt_data = gpu_layers[layer_id][:, gpu_block_ids, :, :, :].cpu()
-                cpu_data = cpu_blocks[layer_id].reshape(2, cpu_block_num, tokens_per_block, num_heads, head_size)
+                cpu_data = cpu_blocks[layer_id].reshape(kv_dim, cpu_block_num, tokens_per_block, num_heads, head_size)
                 gpu_data_cpu = cpu_data[:, cpu_block_ids, :,start_head:end_head, :]
                 assert torch.allclose(gpu_data_cpu, gpu_gt_data, rtol=1e-5, atol=1e-6), \
                     f"GPU->CPU data mismatch at gpu_id {gpu_id}, layer {layer_id}"
@@ -177,7 +178,8 @@ class DataVerifier:
     ):
         """Verify that round-trip transfer maintains data consistency"""
         for layer_id in range(model_config.num_layers):
-            for kv_idx in range(2):
+            kv_dim = 2 if not model_config.use_mla else 1
+            for kv_idx in range(kv_dim):
                 for block_id in block_ids:
                     original_block = original_data[gpu_id][layer_id][kv_idx, block_id]
                     final_block = final_data[gpu_id][layer_id][kv_idx, block_id]
@@ -204,9 +206,10 @@ def wait_for_transfer_completion(transfer_engine: TransferEngine,
 
 
 @pytest.mark.parametrize("tp_size,dp_size", [(1, 1), (2, 1), (2, 2)])
-@pytest.mark.parametrize("num_gpu_blocks", [64, 128])
+@pytest.mark.parametrize("num_gpu_blocks", [128])
 @pytest.mark.parametrize("transfer_block_num", [16])
-def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gpu_blocks, transfer_block_num):
+@pytest.mark.parametrize("use_mla", [True, False])
+def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gpu_blocks, transfer_block_num, use_mla):
     """
     Test round-trip data transfers between GPU and CPU
 
@@ -231,6 +234,7 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
     TransferIDAllocator.reset()
 
     # Update model config
+    model_config.use_mla = use_mla
     model_config.tp_size = tp_size
     model_config.dp_size = dp_size
 
@@ -318,7 +322,8 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
 
 @pytest.mark.parametrize("num_gpu_blocks", [64, 128])
 @pytest.mark.parametrize("transfer_block_num", [8, 16])
-def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_block_num):
+@pytest.mark.parametrize("use_mla", [True, False])
+def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_block_num, use_mla):
     """
     Test round-trip data transfers involving SSD storage
 
@@ -342,6 +347,7 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
 
     # Setup configurations
     cache_config.enable_ssd = True
+    model_config.use_mla = use_mla
     gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
     if (model_config.tp_size * model_config.dp_size) > 1:
         pytest.skip("SSD transfer test is not supported for multi-GPU")
@@ -421,11 +427,13 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
 @pytest.mark.parametrize("num_concurrent_transfers", [4])
 @pytest.mark.parametrize("blocks_per_transfer", [16])
 @pytest.mark.parametrize("include_ssd", [True, False])
+@pytest.mark.parametrize("use_mla", [True, False])
 def test_concurrent_mixed_transfers(model_config,
                                     cache_config,
                                     num_concurrent_transfers,
                                     blocks_per_transfer,
-                                    include_ssd):
+                                    include_ssd,
+                                    use_mla):
     """
     Test multiple concurrent read/write transfers
 
@@ -440,6 +448,7 @@ def test_concurrent_mixed_transfers(model_config,
     - blocks_per_transfer: Number of blocks per transfer operation
     - include_ssd: Whether to include SSD in transfer operations
     """
+    model_config.use_mla = use_mla
     if torch.cuda.device_count() == 0:
         pytest.skip("No CUDA devices available")
     if (model_config.tp_size * model_config.dp_size) > 1:

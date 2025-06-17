@@ -36,7 +36,8 @@ static void _transfer_single_thread_impl(
     const std::vector<int> &ssd_block_ids, int start_layer, int end_layer,
     int start_block, int end_block, const int64_t *cpu_layer_ptrs,
     int64_t ssd_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
-    int64_t ssd_kv_stride_in_bytes, int64_t block_size_in_bytes, bool is_read) {
+    int64_t ssd_kv_stride_in_bytes, int64_t block_size_in_bytes,
+    bool is_read, bool is_mla) {
   int num_blocks = end_block - start_block;
   if (num_blocks == 0) {
     return;
@@ -67,6 +68,9 @@ static void _transfer_single_thread_impl(
       if (bytes_transfer != block_size_in_bytes) {
         throw std::runtime_error("Failed to transfer K block");
       }
+      if (is_mla) {
+        continue;
+      }
       // read V block
       void *cpu_v_block_ptr = static_cast<char *>(cpu_v_layer_ptr) +
                               cpu_block_id * block_size_in_bytes;
@@ -91,7 +95,8 @@ static void _transfer_single_thread_mmap_impl(
     const std::vector<int> &ssd_blocks_ids, int start_layer, int end_layer,
     int start_block, int end_block, const int64_t *cpu_layer_ptrs,
     int64_t ssd_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
-    int64_t ssd_kv_stride_in_bytes, int64_t block_size_in_bytes, bool is_read) {
+    int64_t ssd_kv_stride_in_bytes, int64_t block_size_in_bytes,
+    bool is_read, bool is_mla) {
   int num_blocks = end_block - start_block;
   if (num_blocks == 0) {
     return;
@@ -117,6 +122,9 @@ static void _transfer_single_thread_mmap_impl(
       } else {
         memcpy(cpu_k_block_ptr, mmap_k_block_ptr, block_size_in_bytes);
       }
+      if (is_mla) {
+        continue;
+      }
       void *cpu_v_block_ptr = static_cast<char *>(cpu_v_layer_ptr) +
                               cpu_block_id * block_size_in_bytes;
       void *mmap_v_block_ptr =
@@ -140,7 +148,8 @@ void transfer_kv_blocks_ssd(
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
-    int round_robin, bool use_mmap, int num_threads_per_file) {
+    int round_robin, bool use_mmap, int num_threads_per_file,
+    bool is_mla) {
   int num_files = filenames.size();
   int file_size = ssd_layer_stride_in_bytes * total_layers;
   const int64_t *cpu_layer_ptrs = cpu_layer_ptrs_tensor.data_ptr<int64_t>();
@@ -218,7 +227,7 @@ void transfer_kv_blocks_ssd(
              &ssd_blocks_partition, start_layer, end_layer, start_block,
              end_block, &cpu_layer_ptrs, ssd_layer_stride_in_bytes,
              cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
-             block_size_in_bytes, is_read, prom = std::move(prom)]() mutable {
+             block_size_in_bytes, is_read, is_mla,prom = std::move(prom)]() mutable {
               try {
                 if (use_mmap) {
                   _transfer_single_thread_mmap_impl(
@@ -226,14 +235,14 @@ void transfer_kv_blocks_ssd(
                       ssd_blocks_partition[f], start_layer, end_layer,
                       start_block, end_block, cpu_layer_ptrs,
                       ssd_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
-                      ssd_kv_stride_in_bytes, block_size_in_bytes, is_read);
+                      ssd_kv_stride_in_bytes, block_size_in_bytes, is_read, is_mla);
                 } else {
                   _transfer_single_thread_impl(
                       fds[f], cpu_blocks_partition[f], ssd_blocks_partition[f],
                       start_layer, end_layer, start_block, end_block,
                       cpu_layer_ptrs, ssd_layer_stride_in_bytes,
                       cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
-                      block_size_in_bytes, is_read);
+                      block_size_in_bytes, is_read, is_mla);
                 }
                 prom.set_value(nullptr);
               } catch (...) {
