@@ -58,6 +58,7 @@ class KVManager:
 
         self.running = False
         self.requests_tracker: Dict[int, RequestTracker] = {}
+        self.graph_to_request: Dict[int, int] = {}
         self.taskid_to_nvtx_range: Dict[int, Any] = {}
         self.graphid_to_nvtx_range: Dict[int, Any] = {}
 
@@ -186,10 +187,11 @@ class KVManager:
                                                                             task_end_ops_status=[True]*layer_op_num,
                                                                             task_finished=True)
                 else:
-                    self.graphid_to_nvtx_range[graph.transfer_graph_id] = nvtx.start_range(
+                    self.graph_to_request[graph.graph_id] = request.request_id
+                    self.graphid_to_nvtx_range[graph.graph_id] = nvtx.start_range(
                                                                             f"request id: {request.request_id}, "
-                                                                            f"graph id: {graph.transfer_graph_id}",
-                                                                            color=get_nvtx_range_color(graph.transfer_graph_id))
+                                                                            f"graph id: {graph.graph_id}",
+                                                                            color=get_nvtx_range_color(graph.graph_id))
                     self.requests_tracker[request.request_id] = RequestTracker(task_id=request.request_id,
                                                                                 task_type=request.request_type,
                                                                                 return_mask=return_mask,
@@ -200,18 +202,20 @@ class KVManager:
                     self.transfer_engine.submit_transfer_graph(graph)
             results = self.transfer_engine.get_completed_graphs_and_ops(timeout=0.001)
             for completed_graph_id, completed_op_id in results:
-                request_tracker = self.requests_tracker[completed_graph_id]
+                request_id = self.graph_to_request[completed_graph_id]
+                request_tracker = self.requests_tracker[request_id]
                 if completed_op_id == -1:
                     if request_tracker.callback:
                         request_tracker.callback()
                     nvtx.end_range(self.graphid_to_nvtx_range[completed_graph_id])
                     self.graphid_to_nvtx_range.pop(completed_graph_id)
+                    self.graph_to_request.pop(completed_graph_id)
                     nvtx.end_range(self.taskid_to_nvtx_range[request_tracker.task_id])
                     self.taskid_to_nvtx_range.pop(request_tracker.task_id)
                     request_tracker.task_finished = True
                 elif completed_op_id in request_tracker.task_end_ops_ids:
                     request_tracker.task_end_ops_status[request_tracker.task_end_ops_ids.index(completed_op_id)] = True
-                self.requests_tracker[completed_graph_id] = request_tracker
+                self.requests_tracker[request_id] = request_tracker
             time.sleep(0.0001)
 
     def _get_task_id(self) -> int:
@@ -226,14 +230,15 @@ class KVManager:
 
     def shutdown(self) -> None:
         self.running = False
-        self._worker_thread.join()
+        flexkv_logger.info("kvmanager shutdown")
         self.task_queue.put(KVRequest(
             request_type=KVRequestType.SHUTDOWN,
-            request_id=0,
+            request_id=-1,
             token_ids=torch.empty(0),
             token_mask=torch.empty(0),
             slot_mapping=torch.empty(0),
         ))
+        self._worker_thread.join()
         if self.transfer_engine is not None:
             self.transfer_engine.shutdown()
 

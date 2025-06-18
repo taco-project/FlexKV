@@ -58,8 +58,8 @@ class WorkerTransferOp:
     # successors: List[int]
 
     def __init__(self, transfer_op: TransferOp):
-        self.transfer_op_id = transfer_op.transfer_op_id
-        self.transfer_graph_id = transfer_op.transfer_graph_id
+        self.transfer_op_id = transfer_op.op_id
+        self.transfer_graph_id = transfer_op.graph_id
         self.transfer_type = transfer_op.transfer_type
         self.src_block_ids = transfer_op.src_descriptor.physical_block_ids.numpy()
         self.dst_block_ids = transfer_op.dst_descriptor.physical_block_ids.numpy()

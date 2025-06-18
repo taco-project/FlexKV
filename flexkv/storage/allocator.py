@@ -142,7 +142,7 @@ class SSDAllocator(BaseStorageAllocator):
 
         if isinstance(file_path, str):
             file_path = [file_path]
-        total_size = layout.get_total_elements()
+        total_size = layout.get_total_elements() * dtype.itemsize
         total_size_per_file = total_size // len(file_path)
         for path in file_path:
             with open(path, "wb+", buffering=0) as file:
