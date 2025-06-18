@@ -11,7 +11,7 @@ class TransferScheduler:
 
     def add_transfer_graph(self, graph: TransferOpGraph) -> None:
         """Add a new transfer graph to the scheduler"""
-        self._transfer_graphs[graph.transfer_graph_id] = graph
+        self._transfer_graphs[graph.graph_id] = graph
 
     def schedule(self,
                 finished_ops: List[TransferOp]
@@ -29,8 +29,8 @@ class TransferScheduler:
         """
         # Mark completed operations
         for op in finished_ops:
-            if op.transfer_graph_id in self._transfer_graphs:
-                self._transfer_graphs[op.transfer_graph_id].mark_completed(op.transfer_op_id)
+            if op.graph_id in self._transfer_graphs:
+                self._transfer_graphs[op.graph_id].mark_completed(op.op_id)
 
         # Get next batch of executable operations
         next_ops = []
@@ -39,7 +39,7 @@ class TransferScheduler:
             for op_id in ready_op_ids:
                 op = graph._op_map[op_id]
                 if op.transfer_type == TransferType.VIRTUAL:
-                    self._transfer_graphs[op.transfer_graph_id].mark_completed(op_id)
+                    self._transfer_graphs[op.graph_id].mark_completed(op_id)
                 next_ops.append(op)
 
         # Find completed transfer graphs

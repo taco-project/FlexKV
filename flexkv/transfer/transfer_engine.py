@@ -178,35 +178,35 @@ class TransferEngine:
                 try:
                     op_id = self.finished_ops_queue.get_nowait()
                     op = self.op_id_to_op[op_id]
-                    self.completed_queue.put((op.transfer_graph_id, op.transfer_op_id))
+                    self.completed_queue.put((op.graph_id, op.op_id))
                     finished_ops.append(op)
                     del self.op_id_to_op[op_id]
                 except queue.Empty:
                     break
             for op in finished_ops:
-                nvtx.end_range(self.op_id_to_nvtx_range[op.transfer_op_id])
-                self.op_id_to_nvtx_range.pop(op.transfer_op_id)
+                nvtx.end_range(self.op_id_to_nvtx_range[op.op_id])
+                self.op_id_to_nvtx_range.pop(op.op_id)
             if finished_ops or new_graphs_num > 0:
                 # Schedule next operations
                 completed_graph_ids, next_ops = self.scheduler.schedule(finished_ops)
-                # Handle completed graphs
-                for graph_id in completed_graph_ids:
-                    self.completed_queue.put((graph_id, -1))
                 # Distribute new ops to workers
                 for op in next_ops:
                     if op.transfer_type == TransferType.VIRTUAL:
-                        self.completed_queue.put((op.transfer_graph_id, op.transfer_op_id))
+                        self.completed_queue.put((op.graph_id, op.op_id))
                     else:
-                        self.op_id_to_op[op.transfer_op_id] = op
+                        self.op_id_to_op[op.op_id] = op
                         self._assign_op_to_worker(op)
+                # Handle completed graphs
+                for graph_id in completed_graph_ids:
+                    self.completed_queue.put((graph_id, -1))
             time.sleep(0.0001)  # Prevent busy waiting
 
     def _assign_op_to_worker(self, op: TransferOp) -> None:
-        self.op_id_to_nvtx_range[op.transfer_op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
-                                                                       f"op_id: {op.transfer_op_id}, "
-                                                                       f"graph_id: {op.transfer_graph_id}, "
+        self.op_id_to_nvtx_range[op.op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
+                                                                       f"op_id: {op.op_id}, "
+                                                                       f"graph_id: {op.graph_id}, "
                                                                        f"successors: {op.successors}",
-                                                                       color=get_nvtx_range_color(op.transfer_graph_id))
+                                                                       color=get_nvtx_range_color(op.graph_id))
         """Assign operation to appropriate worker"""
         if op.transfer_type == TransferType.VIRTUAL:
             return

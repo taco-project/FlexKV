@@ -1,7 +1,7 @@
 import threading
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import List, Optional, Set, Dict, Tuple
+from enum import Enum
+from typing import ClassVar, List, Set, Dict
 
 import torch
 
@@ -37,29 +37,6 @@ class TransferDescriptor:
         assert self.physical_block_ids.ndim == 1
         assert self.physical_block_ids.dtype == torch.int64
 
-class TransferIDAllocator:
-    _op_id_counter = 0
-    _graph_id_counter = 0
-    _lock = threading.Lock()
-
-    @staticmethod
-    def reset() -> None:
-        with TransferIDAllocator._lock:
-            TransferIDAllocator._op_id_counter = 0
-            TransferIDAllocator._graph_id_counter = 0
-
-    @staticmethod
-    def allocate_op_id() -> int:
-        with TransferIDAllocator._lock:
-            TransferIDAllocator._op_id_counter += 1
-            return TransferIDAllocator._op_id_counter
-
-    @staticmethod
-    def allocate_graph_id() -> int:
-        with TransferIDAllocator._lock:
-            TransferIDAllocator._graph_id_counter += 1
-            return TransferIDAllocator._graph_id_counter
-
 class TransferOpStatus(Enum):
     PENDING = 0
     RUNNING = 1
@@ -67,8 +44,11 @@ class TransferOpStatus(Enum):
 
 @dataclass
 class TransferOp:
-    transfer_op_id: int
-    transfer_graph_id: int
+    _next_op_id: ClassVar[int] = 0
+    _lock: ClassVar[threading.Lock] = threading.Lock()
+
+    op_id: int = field(init=False)
+    graph_id: int
     transfer_type: TransferType
     layer_id: int
     layer_granularity: int
@@ -81,31 +61,47 @@ class TransferOp:
     status: TransferOpStatus = TransferOpStatus.PENDING
     dp_id: int = 0
 
+    def __post_init__(self) -> None:
+        if self.transfer_type != TransferType.VIRTUAL and \
+            len(self.src_descriptor.physical_block_ids) != len(self.dst_descriptor.physical_block_ids):
+            raise ValueError("src_descriptor and dst_descriptor must have the same number of physical blocks")
+        with TransferOp._lock:
+            self.op_id = TransferOp._next_op_id
+            TransferOp._next_op_id += 1
+
 
 class TransferOpGraph:
+    _next_graph_id = 0
+    _lock = threading.Lock()
 
-    def __init__(self, transfer_graph_id: int):
-        self.transfer_graph_id = transfer_graph_id
+    def __init__(self) -> None:
+        self.graph_id = self._get_next_graph_id()
         self._op_map: Dict[int, TransferOp] = {}
         self._ready_ops: Set[int] = set()
         self._trigger_ops: Set[int] = set()
 
     @classmethod
-    def create_empty_graph(cls, transfer_graph_id: int) -> "TransferOpGraph":
-        graph = cls(transfer_graph_id)
-        graph._op_map = {}
-        graph._ready_ops = set()
-        graph._trigger_ops = set()
-        return graph
+    def _get_next_graph_id(cls) -> int:
+        with cls._lock:
+            graph_id = cls._next_graph_id
+            cls._next_graph_id += 1
+            return graph_id
+
+    def set_graph_id(self, graph_id: int) -> None:
+        self.graph_id = graph_id
+
+    @classmethod
+    def create_empty_graph(cls) -> "TransferOpGraph":
+        return cls()
 
     def add_virtual_op(self, op: TransferOp, need_trigger: bool = False) -> None:
-        op.transfer_graph_id = self.transfer_graph_id
+        op.graph_id = self.graph_id
         op.transfer_type = TransferType.VIRTUAL
-        self._op_map[op.transfer_op_id] = op
+        self._op_map[op.op_id] = op
         if need_trigger:
-            self._trigger_ops.add(op.transfer_op_id)
+            self._trigger_ops.add(op.op_id)
         else:
-            self._ready_ops.add(op.transfer_op_id)
+            self._ready_ops.add(op.op_id)
 
     def trigger_op(self, op_id: int) -> None:
         self._trigger_ops.remove(op_id)
@@ -113,9 +109,9 @@ class TransferOpGraph:
         self.mark_completed(op_id)
 
     def add_transfer_op(self, op: TransferOp) -> None:
-        op.transfer_graph_id = self.transfer_graph_id
-        self._op_map[op.transfer_op_id] = op
-        self._ready_ops.add(op.transfer_op_id)
+        op.graph_id = self.graph_id
+        self._op_map[op.op_id] = op
+        self._ready_ops.add(op.op_id)
 
     def add_dependency(self, successor_op_id: int, predecessor_op_id: int) -> None:
         """successor_op_id depends on predecessor_op_id"""
@@ -184,7 +180,7 @@ class TransferOpGraph:
         └── Op 3 (DISK2H) [Pending]
             └── Followed by: 1, 2
         """
-        print(f"Transfer Graph {self.transfer_graph_id}:")
+        print(f"Transfer Graph {self.graph_id}:")
 
         # get all op ids and sort them
         op_ids = sorted(self._op_map.keys())
