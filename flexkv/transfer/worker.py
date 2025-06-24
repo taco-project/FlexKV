@@ -20,7 +20,7 @@ from flexkv.c_ext import transfer_kv_layers, transfer_kv_blocks_ssd, TPTransferT
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
-from flexkv.common.transfer import TransferOp, TransferType
+from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
 from flexkv.common.transfer import get_nvtx_range_color
 
 try:
@@ -680,10 +680,11 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         if not self.pcfs.init():
             raise RuntimeError(f"PCFS init failed: fsid={pcfs_fsid}, ip={pcfs_ip}")
         self.file_nodeid_list = []
+        need_create = False
         for remote_file_single in remote_file:
             nodeid = self.pcfs.lookup_or_create_file(
             remote_file_single,
-            (self.remote_layer_stride_in_bytes_per_file * self.num_layers))
+            (self.remote_layer_stride_in_bytes_per_file * self.num_layers), need_create)
             if nodeid == 0:
                 raise RuntimeError(f"lookup or create file failed for file: {remote_file_single}")
             self.file_nodeid_list.append(nodeid)
@@ -710,8 +711,16 @@ class CPURemoteTransferWorker(TransferWorkerBase):
 
         # this means partial read hit cpu and other hit remote
         # or partial write hit remote and none hit cpu
-        remote_block_ids = dst_block_ids
-        cpu_block_ids = src_block_ids
+        
+        if transfer_type == TransferType.H2REMOTE:
+            remote_block_ids = dst_block_ids
+            cpu_block_ids = src_block_ids
+        elif transfer_type == TransferType.REMOTE2H:
+            remote_block_ids = src_block_ids
+            cpu_block_ids = dst_block_ids
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_type} for CPUSSDDiskTransferWorker")
+                
         remote_block_id_list = torch.from_numpy(remote_block_ids).pin_memory().to(dtype=torch.int64)
         cpu_block_id_list = torch.from_numpy(cpu_block_ids).pin_memory().to(dtype=torch.int64)
 
@@ -729,7 +738,9 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             block_size_in_bytes=self.chunk_size_in_bytes,
             total_layers=self.num_layers,
             is_read=(transfer_type == TransferType.REMOTE2H),
+            partition_block_type=PartitionBlockType.SEQUENTIAL.value, # use sequential
             round_robin=self.round_robin,
+            num_remote_blocks_per_file=self.num_remote_blocks_per_file,
             use_mmap=False,  # TODO: fix bug when use mmap
             num_threads_per_file=32,
             is_mla=self.is_mla,

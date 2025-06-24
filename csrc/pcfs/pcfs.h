@@ -31,7 +31,7 @@ public:
     bool init();
     void destroy();
 
-    uint64_t lookup_or_create_file(const std::string& filename, const uint64_t& file_size);
+    uint64_t lookup_or_create_file(const std::string& filename, const uint64_t& file_size, const bool& need_create);
     bool open(uint64_t file_nodeid, uint32_t flags, int thread_id);
     bool close(uint64_t file_nodeid, int thread_id);
     bool write(uint64_t file_nodeid, uint64_t offset, char* buffer, size_t size, int thread_id);
@@ -66,8 +66,7 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     int64_t cpu_kv_stride_in_bytes, int64_t cfs_layer_stride_in_bytes,
     int64_t cfs_block_stride_in_bytes, int64_t cfs_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
-    int round_robin, bool use_mmap = false, int num_threads_per_file = 8,
-    bool is_mla = false);
+    int partition_block_type, int round_robin, int64_t num_remote_blocks_per_file, bool use_mmap = false, int num_threads_per_file = 8, bool is_mla = false);
 
 }  // namespace flexkv
 #endif

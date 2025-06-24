@@ -29,9 +29,14 @@ class CacheConfig:
     remote_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
     use_gds: bool = False
     use_pinned_memory: bool = True
+    # remote_cache_size_mode including file_size & block_num
+    remote_cache_size_mode: str = "file_size"
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
-    num_remote_blocks: int = 10000000
+    num_remote_blocks: Optional[int] = None
+    remote_file_size: Optional[int] = None 
+    remote_file_num: Optional[int] = None 
+    remote_file_prefix: Optional[str] = None
     ssd_cache_path: Optional[Union[str, List[str]]] = None
     remote_cache_path: Optional[Union[str, List[str]]] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
