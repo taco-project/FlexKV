@@ -1,6 +1,5 @@
 // Pcfs.cpp
 #include "pcfs.h"
-
 #include <fcntl.h>
 #define INIT_IO_SIZE (1024*1024)
 #define MAX_PCFS_LINK_NUM 64 //read + write <= 128, pcfs limits
@@ -29,7 +28,7 @@ void flexkv::Pcfs::destroy() {
 }
 
 
-uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string& filename, const uint64_t& file_size) {
+uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string& filename, const uint64_t& file_size, const bool& need_create) {
     uint64_t file_nodeid = 0;
     hifs_lookup_req_t lkreq;
     lkreq.parent_nodeid = parent_nodeid;
@@ -42,7 +41,10 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string& filename, const 
     // do nothing
     if (hifs_lookup(fsctx, &lkreq, &lkreply) != 0 || lkreply.error != 0) {}
     file_nodeid = lkreply.nodeid;
-    if (file_nodeid == 0) {       
+    if (file_nodeid == 0) {
+        if (!need_create) {
+          return 0;
+        }       
         hifs_create_req_t crreq = {0};
         hifs_create_reply_t crreply = {0};
         crreq.parent_nodeid = parent_nodeid; 
@@ -67,38 +69,50 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string& filename, const 
             fprintf(stderr, "embedded open file data pnodeid:%lu file %s fail\n", parent_nodeid, filename.c_str());
             return 0;
         }
-        // init with 0x00
-        char *buffer = static_cast<char*>(malloc(INIT_IO_SIZE));
-        if (!buffer) {
-            return false;
-        }
-        memset(buffer, 0, INIT_IO_SIZE);
+        hifs_truncate_req_t truncate_req = {0};
+        hifs_truncate_reply_t truncate_reply = {0};
+        truncate_req.nodeid = crreply.nodeid;
+        truncate_req.uid = 0;
+        truncate_req.gid = 0;
+        truncate_req.unique = 1000;
+        truncate_req.size = file_size;
+        if (hifs_truncate(fsctx, &truncate_req, &truncate_reply) != 0 || truncate_reply.error != 0) {
+            fprintf(stderr, "embedded truncate file data pnodeid:%lu file %s to size %lu fail\n", parent_nodeid, filename.c_str(), file_size);
+            return 0;
+        }        
 
-        size_t remaining = file_size;
-        size_t offset = 0;
-        for (offset = 0; remaining > 0; offset += INIT_IO_SIZE) {
-            size_t write_size = (remaining > INIT_IO_SIZE) ? INIT_IO_SIZE : remaining;
-            hifs_write_req_t wrreq = {0};
-            hifs_write_reply_t wrreply = {0};
-            wrreq.fh = open_reply.fh;
-            wrreq.offset = offset;
-            wrreq.size = write_size;
-            wrreq.buf = buffer;
-            wrreq.uid = 0;
-            wrreq.gid = 0;
-            wrreq.unique= 1000;
-            if (hifs_write(fsctx, &wrreq, &wrreply) != 0 || wrreply.error != 0) {
-                fprintf(stderr, "embedded write file data pnodeid:%lu file %s fail\n", open_reply.fh, filename.c_str());
-                free(buffer);
-                return 0;
-            }
+        // init with 0x00
+        // char *buffer = static_cast<char*>(malloc(INIT_IO_SIZE));
+        // if (!buffer) {
+        //     return false;
+        // }
+        // memset(buffer, 0, INIT_IO_SIZE);
+
+        // size_t remaining = file_size;
+        // size_t offset = 0;
+        // for (offset = 0; remaining > 0; offset += INIT_IO_SIZE) {
+        //     size_t write_size = (remaining > INIT_IO_SIZE) ? INIT_IO_SIZE : remaining;
+        //     hifs_write_req_t wrreq = {0};
+        //     hifs_write_reply_t wrreply = {0};
+        //     wrreq.fh = open_reply.fh;
+        //     wrreq.offset = offset;
+        //     wrreq.size = write_size;
+        //     wrreq.buf = buffer;
+        //     wrreq.uid = 0;
+        //     wrreq.gid = 0;
+        //     wrreq.unique= 1000;
+        //     if (hifs_write(fsctx, &wrreq, &wrreply) != 0 || wrreply.error != 0) {
+        //         fprintf(stderr, "embedded write file data pnodeid:%lu file %s fail\n", open_reply.fh, filename.c_str());
+        //         free(buffer);
+        //         return 0;
+        //     }
             
-            remaining -= write_size;
-        }
-        free(buffer);
+        //     remaining -= write_size;
+        // }
+        // free(buffer);
     } else {
         // return 0 if the size is smaller than file_size
-        int64_t exist_file_size = lkreply.attr.size;
+        uint64_t exist_file_size = lkreply.attr.size;
         if(exist_file_size < file_size) {
           fprintf(stderr, "file exists and its size smaller than allocate: %lu file %s fail\n", parent_nodeid, filename.c_str());
           return 0;
@@ -250,23 +264,31 @@ extern "C" {
 
 static void partition_and_remap_blocks_by_file(
     const int64_t *cpu_block_ids, const int64_t *cfs_block_ids, int num_blocks,
-    int num_files, int round_robin,
+    int num_files, int partition_block_type, int round_robin, int64_t num_remote_blocks_per_file,
     std::vector<std::vector<int>> &cpu_blocks_partition,
     std::vector<std::vector<int>> &cfs_blocks_partition) {
+
     for (int i = 0; i < num_blocks; i++) {
       int64_t cfs_block_id = cfs_block_ids[i];
       int64_t cpu_block_id = cpu_block_ids[i];
-      int file_id = (cfs_block_id / round_robin) % num_files;
-      int block_id_in_file =
+      int file_id, block_id_in_file;
+      if (partition_block_type == 1) { //sequential
+        file_id = cfs_block_id / num_remote_blocks_per_file;
+        block_id_in_file = cfs_block_id % num_remote_blocks_per_file;
+      } else { //round_robin
+        file_id = (cfs_block_id / round_robin) % num_files;
+        block_id_in_file =
           ((cfs_block_id / round_robin) / num_files) * round_robin +
           (cfs_block_id % round_robin);
+      }
       cfs_blocks_partition[file_id].push_back(block_id_in_file);
       cpu_blocks_partition[file_id].push_back(cpu_block_id);
       }
-    }
+}
+
 
 static void _transfer_single_thread_impl(
-    int file_nodeid, const std::vector<int> &cpu_block_ids,
+    uint64_t file_nodeid, const std::vector<int> &cpu_block_ids,
     const std::vector<int> &cfs_block_ids, int start_layer, int end_layer,
     int start_block, int end_block, const int64_t *cpu_layer_ptrs,
     int64_t cfs_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
@@ -332,7 +354,10 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     int64_t cpu_kv_stride_in_bytes, int64_t cfs_layer_stride_in_bytes,
     int64_t cfs_block_stride_in_bytes, int64_t cfs_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
-    int round_robin, bool use_mmap, int num_threads_per_file, bool is_mla) {
+    int partition_block_type, int round_robin, int64_t num_remote_blocks_per_file,
+    bool use_mmap, int num_threads_per_file, bool is_mla) {
+    
+
     int num_files = file_nodeids.size();
     //int file_size = cfs_layer_stride_in_bytes * total_layers;
     const int64_t *cpu_layer_ptrs = cpu_layer_ptrs_tensor.data_ptr<int64_t>();
@@ -349,7 +374,7 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
                                                      std::vector<int>());
     partition_and_remap_blocks_by_file(
         cpu_block_id_ptr, cfs_block_id_ptr, num_blocks, file_nodeids.size(),
-        round_robin, cpu_blocks_partition, cfs_blocks_partition);
+        partition_block_type, round_robin, num_remote_blocks_per_file, cpu_blocks_partition, cfs_blocks_partition);
 
 
   // create multiple threads to handle different layers
@@ -361,6 +386,7 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     if (num_threads_per_file > MAX_PCFS_LINK_NUM / num_files) {
       num_threads_per_file = MAX_PCFS_LINK_NUM / num_files;
     }
+
     if (num_threads_per_file <= 0) {
       throw std::runtime_error("num_threads_per_file must be greater than 0");
     }

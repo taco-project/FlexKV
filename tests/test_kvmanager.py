@@ -25,6 +25,10 @@ DEFAULT_CACHE_CONFIG = {
     'num_cpu_blocks': 128,
     'num_ssd_blocks': 512,
     'num_remote_blocks': 512,
+    'remote_cache_size_mode': "block_num",
+    'remote_file_size': (1024*1024*1024),
+    'remote_file_num': 16,
+    'remote_file_prefix': "remote_cache",
     'use_gds': False,
     'use_pinned_memory': True,
     'ssd_cache_path': ["ssd_cache1", "ssd_cache2"],
@@ -33,7 +37,7 @@ DEFAULT_CACHE_CONFIG = {
         "pcfs_fsid": "f_l91fz6",
         "pcfs_port": 31,
         "pcfs_ip": "172.21.16.177",
-        "pcfs_parent_nodeid": 144115188075855883
+        "pcfs_parent_nodeid": 1
     }
 }
 
@@ -168,7 +172,7 @@ def test_kvmanager(model_config, cache_config, test_config):
     tokens_per_block = cache_config.tokens_per_block
     num_cpu_blocks = cache_config.num_cpu_blocks
     num_ssd_blocks = cache_config.num_ssd_blocks
-    num_remote_blocks = cache_config.num_remote_blocks
+
     enable_cpu = cache_config.enable_cpu
     enable_ssd = cache_config.enable_ssd
     enable_remote = cache_config.enable_remote
@@ -186,6 +190,8 @@ def test_kvmanager(model_config, cache_config, test_config):
 
     gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = generate_gpu_blocks(model_config, cache_config, test_config)
     kvmanager = KVManager(model_config, cache_config, gpu_kv_layout, gpu_blocks)
+    # put this after KVManager()
+    num_remote_blocks = cache_config.num_remote_blocks
     assert kvmanager.is_ready()
     kvmanager.start()
     request_pairs = [generate_request_pair(i, block_per_request, num_gpu_blocks, tokens_per_block, dp_size)

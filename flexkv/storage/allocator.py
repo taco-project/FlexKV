@@ -1,6 +1,10 @@
 import os
 from abc import ABC, abstractmethod
 from typing import Tuple, Optional, List, Union, Dict, Any, BinaryIO
+try:
+    from flexkv.c_ext import Pcfs
+except ImportError:
+    Pcfs = None
 
 import numpy as np
 import torch
@@ -195,6 +199,32 @@ class RemoteAllocator(BaseStorageAllocator):
         if isinstance(file_path, str):
             file_path = [file_path]
 
+        if not remote_config_custom:
+            raise RuntimeError("remote_config_custom is not provided")
+        pcfs_fsid = remote_config_custom.get("pcfs_fsid")
+        pcfs_port = remote_config_custom.get("pcfs_port")
+        pcfs_ip = remote_config_custom.get("pcfs_ip")
+        pcfs_parent_nodeid = remote_config_custom.get("pcfs_parent_nodeid")
+        if None in (pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid):
+            raise RuntimeError("Some required PCFS config fields are missing")
+        if Pcfs is None:
+            raise RuntimeError("Pcfs class not available. Please build with FLEXKV_ENABLE_CFS=1")
+        pcfs = Pcfs(pcfs_fsid, pcfs_port, pcfs_ip, False, pcfs_parent_nodeid)
+        if not pcfs.init():
+            raise RuntimeError(f"PCFS init failed: fsid={pcfs_fsid}, ip={pcfs_ip}")
+        for file in file_path:
+            total_size = layout.get_total_elements() * dtype.itemsize
+            file_size = total_size // len(file_path)
+            need_create = True
+            print(f"file_size in init:{file_size}")
+            nodeid = pcfs.lookup_or_create_file(file, file_size, need_create)
+            if nodeid == 0:
+                raise RuntimeError(f"lookup or create file failed for file: {file}")
+        
+            # destroy pcfs & close file, not used
+            close_res = pcfs.close(nodeid, 1000)
+            if not close_res:
+                raise RuntimeError(f"close file failed for file: {file}")
         return StorageHandle(
             handle_type=AccessHandleType.FILE,
             data=file_path,

@@ -27,6 +27,10 @@ class TransferType(Enum):
     # a group of transfer ops
     VIRTUAL = "Virtual"
 
+class PartitionBlockType(Enum):
+    ROUND_ROBIN = 0
+    SEQUENTIAL = 1
+    
 @dataclass
 class TransferDescriptor:
     device_type: DeviceType = DeviceType.CPU

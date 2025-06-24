@@ -114,9 +114,7 @@ class GlobalCacheEngine:
                                                 cache_config.tokens_per_block)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
-            #NOTE here we use ssd to replace the remote file system
-            # such as CFS for single node test
-            self.remote_cache_engine = CacheEngine(DeviceType.SSD,
+            self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine

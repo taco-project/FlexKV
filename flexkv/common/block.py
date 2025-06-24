@@ -22,7 +22,7 @@ class SequenceMeta:
 
     tokens_per_block: int
 
-    block_hashes: np.ndarray = np.array([], dtype=np.int64)
+    block_hashes: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
 
     _has_hashes: bool = False
 
