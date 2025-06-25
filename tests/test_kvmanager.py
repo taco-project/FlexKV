@@ -123,7 +123,7 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
         num_layer=num_layers,
         num_block=num_gpu_blocks,
         tokens_per_block=tokens_per_block,
-        num_head=num_kv_heads//tp_size,
+        num_head=num_kv_heads//tp_size if not use_mla else num_kv_heads,
         head_size=head_size,
         is_mla=model_config.use_mla
     )
