@@ -70,12 +70,12 @@ void TPTransferThreadGroup::tp_group_transfer(
                     dst_layer_ptrs = static_cast<void**>(gpu_blocks_ + i * num_layers + layer_id);
                     src_layer_ptrs = static_cast<void**>(cpu_blocks_ + layer_id);
                     dst_startoff_inside_chunks = 0;
-                    src_startoff_inside_chunks = i * dst_chunk_size_in_bytes;
+                    src_startoff_inside_chunks = is_mla ? 0 : i * dst_chunk_size_in_bytes;
                     copy_size_in_bytes = dst_chunk_size_in_bytes;
                 } else {
                     dst_layer_ptrs = static_cast<void**>(cpu_blocks_ + layer_id);
                     src_layer_ptrs = static_cast<void**>(gpu_blocks_ + i * num_layers + layer_id);
-                    dst_startoff_inside_chunks = i * src_chunk_size_in_bytes;
+                    dst_startoff_inside_chunks = is_mla ? 0 : i * src_chunk_size_in_bytes;
                     src_startoff_inside_chunks = 0;
                     copy_size_in_bytes = src_chunk_size_in_bytes;
                 }
