@@ -15,19 +15,20 @@ class TPTransferThreadGroup {
 public:
     TPTransferThreadGroup(int num_gpus, 
                          const std::vector<std::vector<torch::Tensor>>& gpu_blocks,
-                         const std::vector<torch::Tensor>& cpu_blocks,
+                         torch::Tensor& cpu_blocks,
                          int dp_group_id);
     ~TPTransferThreadGroup();
 
     void tp_group_transfer(
-        const torch::Tensor& dst_block_id_tensors,
-        const int64_t dst_kv_stride_in_bytes,
-        const int64_t dst_chunk_stride_in_bytes,
-        const int64_t dst_chunk_size_in_bytes,
-        const torch::Tensor& src_block_id_tensors,
-        const int64_t src_kv_stride_in_bytes,
-        const int64_t src_chunk_stride_in_bytes,
-        const int64_t src_chunk_size_in_bytes,
+        const torch::Tensor& gpu_block_id_tensor,
+        const int64_t gpu_kv_stride_in_bytes,
+        const int64_t gpu_block_stride_in_bytes,
+        const int64_t gpu_chunk_size_in_bytes,
+        const torch::Tensor& cpu_block_id_tensor,
+        const int64_t cpu_kv_stride_in_bytes,
+        const int64_t cpu_layer_stride_in_bytes,
+        const int64_t cpu_block_stride_in_bytes,
+        const int64_t cpu_chunk_size_in_bytes,
         const int transfer_sms,
         const bool is_host_to_device,
         const bool use_ce_transfer,
@@ -40,7 +41,7 @@ private:
     int num_gpus_;
     int dp_group_id_;
     void** gpu_blocks_;
-    void** cpu_blocks_;
+    void* cpu_blocks_;
     std::vector<std::thread> threads_;
     std::vector<cudaStream_t> streams_;
 };

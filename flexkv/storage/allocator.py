@@ -16,10 +16,9 @@ from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout
 class BaseStorageAllocator(ABC):
     @classmethod
     @abstractmethod
-    def allocate(self,
-                 layout: KVCacheLayout,
+    def allocate(cls,
+                 layout: KVCacheLayout,  # TODO: do we need to pass layout/dtype here?
                  dtype: torch.dtype,
-                 num_chunks: int = 1,
                  **kwargs: Any
                  ) -> StorageHandle:
         pass
@@ -43,10 +42,10 @@ class GPUAllocator(BaseStorageAllocator):
     def allocate(cls,
                  layout: KVCacheLayout,
                  dtype: torch.dtype,
-                 num_chunks: int = 1,
                  **kwargs: Any) -> StorageHandle:
         device_id = kwargs.get("device_id", torch.cuda.current_device())
         device = f"cuda:{device_id}"
+        num_chunks = kwargs.get("num_chunks", 1)
 
         total_size = layout.get_total_elements()
         total_size_per_chunk = total_size // num_chunks
@@ -94,24 +93,19 @@ class CPUAllocator(BaseStorageAllocator):
     def allocate(cls,
                  layout: KVCacheLayout,
                  dtype: torch.dtype,
-                 num_chunks: int = 1,
                  **kwargs: Any) -> StorageHandle:
         pin_memory = kwargs.get("pin_memory", True)
         total_size = layout.get_total_elements()
-        total_size_per_chunk = total_size // num_chunks
-        physical_chunks = []
-        for _ in range(num_chunks):
-            physical_chunks.append(
-                torch.empty(
-                    size=(total_size_per_chunk,),
-                    dtype=dtype,
-                    device="cpu",
-                    pin_memory=pin_memory,
-                )
-            )
+        # although the kv layout may have multiple dimensions, we only have one-dim CPU tensor
+        physical_tensor = torch.empty(
+                            size=(total_size,),
+                            dtype=dtype,
+                            device="cpu",
+                            pin_memory=pin_memory,
+                        )
         return StorageHandle(
             handle_type=AccessHandleType.TENSOR,
-            data=physical_chunks,
+            data=physical_tensor,
             kv_layout=layout,
             dtype=dtype,
         )
@@ -122,7 +116,7 @@ class CPUAllocator(BaseStorageAllocator):
 
     @classmethod
     def from_raw_data(cls,
-                      data: List[torch.Tensor],  # type: ignore
+                      data: torch.Tensor,  # type: ignore
                       layout: KVCacheLayout,
                       dtype: torch.dtype,
                       **kwargs: Any) -> StorageHandle:
@@ -138,29 +132,55 @@ class SSDAllocator(BaseStorageAllocator):
     def allocate(cls,
                  layout: KVCacheLayout,
                  dtype: torch.dtype,
-                 num_chunks: int = 1,
                  **kwargs: Any) -> StorageHandle:
-        file_path = kwargs.get("file_path")
-        if file_path is None:
-            raise ValueError("file_path is required for SSD allocator")
+        cache_dir = kwargs.get("cache_dir")
+        file_prefix = kwargs.get("file_prefix", "flexkv_ssd_cache")
+        if cache_dir is None:
+            raise ValueError("cache_dir is required for SSD allocator")
+        if isinstance(cache_dir, str):
+            cache_dir = [cache_dir]
+        for dir in cache_dir:
+            if not os.path.exists(dir):
+                os.makedirs(dir)
+            if not os.path.isdir(dir):
+                raise ValueError("cache_dir must be a directory")
+        if not isinstance(file_prefix, str):
+            raise ValueError("file_prefix must be a string")
 
-        if isinstance(file_path, str):
-            file_path = [file_path]
-        total_size = layout.get_total_elements() * dtype.itemsize
-        total_size_per_file = total_size // len(file_path)
-        for path in file_path:
-            with open(path, "wb+", buffering=0) as file:
-                cls._init_file(file, total_size_per_file)
+        num_ssd_devices = len(cache_dir)
+        if layout.num_block % num_ssd_devices != 0:
+            raise ValueError(f"num_ssd_blocks ({layout.num_block}) must be a multiple of "
+                             f"num_ssd_devices ({num_ssd_devices})")
+
+        total_blocks_per_device = layout.num_block // num_ssd_devices
+        block_size = layout.get_elements_per_block() * dtype.itemsize
+        max_blocks_per_file = cls.get_file_size_limit(cache_dir[0]) // block_size
+
+        # TODO: we can use a better strategy to determine the number of blocks per file
+        num_blocks_per_file = min(max_blocks_per_file, 32 * 1024)
+
+        num_files_per_device = (total_blocks_per_device + num_blocks_per_file - 1) // num_blocks_per_file
+        real_file_size = num_blocks_per_file * block_size
+
+        ssd_files: Dict[int, List[str]] = {}
+        for i in range(num_ssd_devices):
+            ssd_files[i] = []
+            for j in range(num_files_per_device):
+                file_path = os.path.join(cache_dir[i], f"{file_prefix}_{i}_{j}.bin")
+                with open(file_path, "wb+", buffering=0) as file:
+                    cls._create_file(file, real_file_size)
+                ssd_files[i].append(file_path)
 
         return StorageHandle(
             handle_type=AccessHandleType.FILE,
-            data=file_path,
+            data=ssd_files,
             kv_layout=layout,
             dtype=dtype,
+            num_blocks_per_file=num_blocks_per_file,
         )
 
     @classmethod
-    def _init_file(cls, file: BinaryIO, total_size_per_file: int) -> None:
+    def _create_file(cls, file: BinaryIO, total_size_per_file: int) -> None:
         try:
             os.truncate(file.fileno(), total_size_per_file)
         except OSError as e:
@@ -174,21 +194,18 @@ class SSDAllocator(BaseStorageAllocator):
                       layout: KVCacheLayout,
                       dtype: torch.dtype,
                       **kwargs: Any) -> StorageHandle:
-        if isinstance(data, str):
-            data = [data]
-        return StorageHandle(
-            handle_type=AccessHandleType.FILE,
-            data=data,
-            kv_layout=layout,
-            dtype=dtype,
-        )
+        raise NotImplementedError
+
+    @staticmethod
+    def get_file_size_limit(file_path: str) -> int:
+        st = os.statvfs(file_path)
+        return st.f_frsize * st.f_bavail
 
 class RemoteAllocator(BaseStorageAllocator):
     @classmethod
     def allocate(cls,
                  layout: KVCacheLayout,
                  dtype: torch.dtype,
-                 num_chunks: int = 1,
                  **kwargs: Any) -> StorageHandle:
         file_path = kwargs.get("file_path")
         if file_path is None:

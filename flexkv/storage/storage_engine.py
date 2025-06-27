@@ -19,9 +19,9 @@ class StorageEngine:
         self._storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
         self._model_config = model_config
         self._cache_config = cache_config
+        if not self._cache_config.gpu_kv_layout_type == KVCacheLayoutType.LAYERWISE:
+            raise ValueError("Only layerwise layout is supported for GPU")
         if self._cache_config.enable_cpu:
-            if not self._cache_config.cpu_kv_layout_type == KVCacheLayoutType.LAYERWISE:
-                raise ValueError("Only layerwise layout is supported for CPU")
             self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=self._cache_config.cpu_kv_layout_type,
                 num_layer=self._model_config.num_layers,
@@ -36,11 +36,10 @@ class StorageEngine:
                 layout=self._cpu_layout,
                 dtype=self._model_config.dtype,
                 pin_memory=self._cache_config.use_pinned_memory,
-                num_chunks=self._model_config.num_layers
             )
         if self._cache_config.enable_ssd:
-            if not self._cache_config.ssd_kv_layout_type == KVCacheLayoutType.LAYERWISE:
-                raise ValueError("Only layerwise layout is supported for SSD")
+            if not self._cache_config.ssd_kv_layout_type == self._cpu_layout.type:
+                raise ValueError(f"SSD layout type must be the same as CPU layout type: {self._cpu_layout.type}")
             self._ssd_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=self._cache_config.ssd_kv_layout_type,
                 num_layer=self._model_config.num_layers,
@@ -54,11 +53,11 @@ class StorageEngine:
                 device_type=DeviceType.SSD,
                 layout=self._ssd_layout,
                 dtype=self._model_config.dtype,
-                file_path=self._cache_config.ssd_cache_path
+                cache_dir=self._cache_config.ssd_cache_dir
             )
         if self._cache_config.enable_remote:
-            if not self._cache_config.remote_kv_layout_type == KVCacheLayoutType.LAYERWISE:
-                raise ValueError("Only layerwise layout is supported for remote")
+            if not self._cache_config.remote_kv_layout_type == self._cpu_layout.type:
+                raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
             self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=self._cache_config.remote_kv_layout_type,
                 num_layer=self._model_config.num_layers,
@@ -93,7 +92,6 @@ class StorageEngine:
                  device_type: DeviceType,
                  layout: KVCacheLayout,
                  dtype: torch.dtype,
-                 num_chunks: int = 1,
                  device_id: int = 0,
                  raw_data: Optional[Union[List[TensorSharedHandle], List[str], str]] = None,
                  **kwargs: Any) -> bool:
@@ -120,24 +118,22 @@ class StorageEngine:
         if device_type == DeviceType.CPU:
             pin_memory = kwargs.get('pin_memory', False)
             if raw_data is not None:
-                assert isinstance(raw_data, list) and \
-                    all(isinstance(x, torch.Tensor) for x in raw_data), \
-                    "raw_data for CPUAllocator must be List[Tensor]"
+                assert isinstance(raw_data, torch.Tensor), \
+                    "raw_data for CPUAllocator must be Tensor"
                 storage_handle = CPUAllocator.from_raw_data(
                     data=raw_data,  # type: ignore
                     layout=layout,
                     dtype=dtype,
-                    num_chunks=num_chunks,
                     pin_memory=pin_memory
                 )
             else:
                 storage_handle = CPUAllocator.allocate(
                     layout=layout,
                     dtype=dtype,
-                    num_chunks=num_chunks,
                     pin_memory=pin_memory
                 )
         elif device_type == DeviceType.GPU:
+            num_chunks = kwargs.get('num_chunks', 1)
             if raw_data is not None:
                 assert isinstance(raw_data, list) and \
                     (all(isinstance(x, TensorSharedHandle) for x in raw_data) or \
@@ -147,7 +143,6 @@ class StorageEngine:
                     data=raw_data,  # type: ignore
                     layout=layout,
                     dtype=dtype,
-                    num_chunks=num_chunks,
                     device_id=device_id
                 )
             else:
@@ -158,7 +153,7 @@ class StorageEngine:
                     device_id=device_id
                 )
         elif device_type == DeviceType.SSD:
-            file_path = kwargs.get('file_path')
+            cache_dir = kwargs.get('cache_dir')
             if raw_data is not None:
                 assert isinstance(raw_data, str) or \
                     (isinstance(raw_data, list) and all(isinstance(x, str) for x in raw_data)), \
@@ -166,15 +161,16 @@ class StorageEngine:
                 storage_handle = SSDAllocator.from_raw_data(
                     data=raw_data,  # type: ignore
                     layout=layout,
-                    dtype=dtype
+                    dtype=dtype,
                 )
             else:
-                if not file_path:
-                    raise ValueError("file_path is required for SSD allocator")
+                if not cache_dir:
+                    raise ValueError("cache_dir is required for SSD allocator")
                 storage_handle = SSDAllocator.allocate(
                     layout=layout,
                     dtype=dtype,
-                    file_path=file_path
+                    cache_dir=cache_dir,
+                    file_prefix="flexkv_ssd_cache"
                 )
         elif device_type == DeviceType.REMOTE:
             file_path = kwargs.get('file_path')

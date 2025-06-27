@@ -499,7 +499,8 @@ class GlobalCacheEngine:
                 cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
                 cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                                   fragment2_cpu_blocks,
-                                                                  num_insert_blocks=fragment12_num_blocks,
+                                                                  num_insert_blocks=fragment12_num_blocks + \
+                                                                    block_mask_start,
                                                                   is_ready=False,
                                                                   match_result=cpu_matched_result)
             else:

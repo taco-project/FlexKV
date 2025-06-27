@@ -1,14 +1,16 @@
 import time
+import os
+import shutil
+
 import pytest
 import torch
 
 from flexkv.common.config import ModelConfig, CacheConfig
-from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.kvmanager import KVManager
 
 DEFAULT_MODEL_CONFIG = {
-    'num_layers': 16,
+    'num_layers': 4,
     'num_kv_heads': 32,
     'head_size': 128,
     'dtype': torch.float16,
@@ -31,7 +33,7 @@ DEFAULT_CACHE_CONFIG = {
     'remote_file_prefix': "remote_cache",
     'use_gds': False,
     'use_pinned_memory': True,
-    'ssd_cache_path': ["ssd_cache1", "ssd_cache2"],
+    'ssd_cache_dir': ["./ssd_cache1/", "./ssd_cache2/"],
     'remote_cache_path': ["remote_cache1", "remote_cache2"],
     'remote_config_custom': {
         "pcfs_fsid": "f_l91fz6",
@@ -66,7 +68,7 @@ def generate_request_pair(idx: int, block_per_request, num_gpu_blocks, tokens_pe
     )
     return token_ids, block_ids, idx % dp_size
 
-def verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers):
+def verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers, use_mla):
     head_per_tp = num_kv_heads // tp_size
     for dp_id in range(dp_size):
         gt = dp_wise_gpu_blocks_gt[dp_id]
@@ -75,8 +77,12 @@ def verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_siz
             gpu_tensors = gpu_blocks[global_gpu_id]
             for layer in range(num_layers):
                 gpu_tensor = gpu_tensors[layer].cpu()
-                start_head = tp_id * head_per_tp
-                end_head = (tp_id + 1) * head_per_tp
+                if not use_mla:
+                    start_head = tp_id * head_per_tp
+                    end_head = (tp_id + 1) * head_per_tp
+                else:
+                    start_head = 0
+                    end_head = num_kv_heads
                 gt_tensor_slice = gt[layer][:, :, :, start_head:end_head, :]
                 if not torch.allclose(gpu_tensor, gt_tensor_slice):
                     print(f"Mismatch at dp_id={dp_id}, tp_id={tp_id}, global_gpu_id={global_gpu_id}, layer={layer}")
@@ -118,12 +124,12 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
     tokens_per_block = cache_config.tokens_per_block
     num_gpu_blocks = test_config["num_gpu_blocks"]
 
-    gpu_kv_layout = KVCacheLayout(
+    tpgroup_gpu_kv_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERWISE,
         num_layer=num_layers,
         num_block=num_gpu_blocks,
         tokens_per_block=tokens_per_block,
-        num_head=num_kv_heads//tp_size if not use_mla else num_kv_heads,
+        num_head=num_kv_heads,
         head_size=head_size,
         is_mla=model_config.use_mla
     )
@@ -131,7 +137,7 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
     dp_wise_gpu_blocks_gt = []
     for dp_id in range(dp_size):
         tp_group_tensors_gt = [
-            torch.randn(size=gpu_kv_layout.kv_shape[1:], dtype=dtype)
+            torch.randn(size=tpgroup_gpu_kv_layout.kv_shape[1:], dtype=dtype)
             for _ in range(num_layers)
         ]
         head_per_tp = num_kv_heads // tp_size
@@ -140,11 +146,16 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
             device = torch.device(f"cuda:{global_gpu_id}")
             gpu_blocks[global_gpu_id] = []
             for layer_id in range(num_layers):
-                start_head = tp_id * head_per_tp
-                end_head = (tp_id + 1) * head_per_tp
+                if not use_mla:
+                    start_head = tp_id * head_per_tp
+                    end_head = (tp_id + 1) * head_per_tp
+                else:
+                    start_head = 0
+                    end_head = num_kv_heads
                 tp_tensor = tp_group_tensors_gt[layer_id][:, :, :, start_head:end_head, :].to(device)
                 gpu_blocks[global_gpu_id].append(tp_tensor)
         dp_wise_gpu_blocks_gt.append(tp_group_tensors_gt)
+    gpu_kv_layout = tpgroup_gpu_kv_layout.div_head(tp_size) if not use_mla else tpgroup_gpu_kv_layout
     return gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout
 
 @pytest.mark.parametrize("model_config", [
@@ -152,6 +163,7 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
     {'tp_size': 2, 'dp_size': 2},
     {'dtype': torch.float32},
     {'use_mla': True},
+    {'tp_size': 4, 'dp_size': 1, 'use_mla': True},
 ], indirect=True)
 @pytest.mark.parametrize("cache_config", [
     {'enable_cpu': True, 'enable_ssd': False, 'enable_remote': False, 'num_cpu_blocks': 1024},
@@ -161,7 +173,11 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
 ], indirect=True)
-def test_kvmanager(model_config, cache_config, test_config):
+@pytest.mark.parametrize("flex_kv_layout_type", [
+    KVCacheLayoutType.LAYERWISE,
+    KVCacheLayoutType.BLOCKWISE,
+])
+def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type):
     num_layers = model_config.num_layers
     num_kv_heads = model_config.num_kv_heads
     head_size = model_config.head_size
@@ -177,6 +193,10 @@ def test_kvmanager(model_config, cache_config, test_config):
     enable_ssd = cache_config.enable_ssd
     enable_remote = cache_config.enable_remote
 
+    cache_config.cpu_kv_layout_type = flex_kv_layout_type
+    cache_config.ssd_kv_layout_type = flex_kv_layout_type
+    cache_config.remote_kv_layout_type = flex_kv_layout_type
+
     num_gpu_blocks = test_config["num_gpu_blocks"]
     block_per_request = test_config['requests_per_block']
     initial_write_ratio = test_config['initial_write_ratio']
@@ -184,9 +204,9 @@ def test_kvmanager(model_config, cache_config, test_config):
     num_requests = num_gpu_blocks // block_per_request
 
     if tp_size * dp_size > torch.cuda.device_count():
-        pytest.skip("tp_size * dp_size > torch.cuda.device_count() is not supported")
+        pytest.skip("skip because tp_size * dp_size > torch.cuda.device_count()")
     if enable_remote:
-        pytest.skip("enable_remote is not supported")
+        pytest.skip("skip because enable_remote is not supported")
 
     gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = generate_gpu_blocks(model_config, cache_config, test_config)
     kvmanager = KVManager(model_config, cache_config, gpu_kv_layout, gpu_blocks)
@@ -262,7 +282,11 @@ def test_kvmanager(model_config, cache_config, test_config):
         enable_remote and num_remote_blocks >= num_gpu_blocks:
         assert total_cache_miss == 0
     kvmanager.shutdown()
+    if enable_ssd:
+        for dir in cache_config.ssd_cache_dir:
+            if os.path.exists(dir):
+                shutil.rmtree(dir)
     if total_cache_miss == 0:
-        verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers)
+        verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers, use_mla)
     else:
         print(f"verify skipped, because of total_cache_miss={total_cache_miss}>0")
