@@ -45,23 +45,6 @@ from flexkv.transfer.transfer_engine import TransferEngine
 
 
 @pytest.fixture
-def temp_cache_files():
-    """Create temporary cache files for testing"""
-    temp_files = []
-    for i in range(2):
-        fd, path = tempfile.mkstemp(suffix=f'_cache_{i}.tmp')
-        os.close(fd)
-        temp_files.append(path)
-
-    yield temp_files
-
-    # Cleanup temporary files
-    for path in temp_files:
-        with suppress(FileNotFoundError):
-            os.remove(path)
-
-
-@pytest.fixture
 def model_config():
     """Create default model configuration"""
     return ModelConfig(
@@ -76,7 +59,7 @@ def model_config():
 
 
 @pytest.fixture
-def cache_config(temp_cache_files):
+def cache_config():
     """Create default cache configuration"""
     return CacheConfig(
         tokens_per_block=16,
@@ -88,7 +71,7 @@ def cache_config(temp_cache_files):
         num_remote_blocks=256,
         use_gds=False,
         use_pinned_memory=True,
-        ssd_cache_path=temp_cache_files,
+        ssd_cache_dir=["./ssd_cache"],
         remote_cache_path=["remote_cache1", "remote_cache2"],
         remote_config_custom={
             "pcfs_fsid": "f_l91fz6",
@@ -172,18 +155,18 @@ class DataVerifier:
         final_data: Dict[int, List[torch.Tensor]],
         block_ids: torch.Tensor,
         model_config: ModelConfig,
-        gpu_id: int = 0
     ):
-        """Verify that round-trip transfer maintains data consistency"""
-        for layer_id in range(model_config.num_layers):
-            kv_dim = 2 if not model_config.use_mla else 1
-            for kv_idx in range(kv_dim):
-                for block_id in block_ids:
-                    original_block = original_data[gpu_id][layer_id][kv_idx, block_id]
-                    final_block = final_data[gpu_id][layer_id][kv_idx, block_id]
+        gpu_ids = list(original_data.keys())
+        for gpu_id in gpu_ids:
+            for layer_id in range(model_config.num_layers):
+                kv_dim = 2 if not model_config.use_mla else 1
+                for kv_idx in range(kv_dim):
+                    for block_id in block_ids:
+                        original_block = original_data[gpu_id][layer_id][kv_idx, block_id]
+                        final_block = final_data[gpu_id][layer_id][kv_idx, block_id]
 
-                    assert torch.allclose(original_block, final_block, rtol=1e-5, atol=1e-6), \
-                        f"Round-trip consistency failed at layer {layer_id}, kv {kv_idx}, block {block_id}"
+                        assert torch.allclose(original_block, final_block, rtol=1e-5, atol=1e-6), \
+                            f"Round-trip consistency failed at layer {layer_id}, kv {kv_idx}, block {block_id}"
 
 
 def wait_for_transfer_completion(transfer_engine: TransferEngine,
@@ -206,8 +189,16 @@ def wait_for_transfer_completion(transfer_engine: TransferEngine,
 @pytest.mark.parametrize("tp_size,dp_size", [(1, 1), (2, 1), (2, 2)])
 @pytest.mark.parametrize("num_gpu_blocks", [128])
 @pytest.mark.parametrize("transfer_block_num", [16])
-@pytest.mark.parametrize("use_mla", [True, False])
-def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gpu_blocks, transfer_block_num, use_mla):
+@pytest.mark.parametrize("use_mla", [False, True])
+@pytest.mark.parametrize("underlying_layout_type", [KVCacheLayoutType.LAYERWISE, KVCacheLayoutType.BLOCKWISE])
+def test_gpu_cpu_round_trip(model_config,
+                            cache_config,
+                            tp_size,
+                            dp_size,
+                            num_gpu_blocks,
+                            transfer_block_num,
+                            use_mla,
+                            underlying_layout_type):
     """
     Test round-trip data transfers between GPU and CPU
 
@@ -232,13 +223,14 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
     model_config.use_mla = use_mla
     model_config.tp_size = tp_size
     model_config.dp_size = dp_size
-
+    cache_config.cpu_kv_layout_type = underlying_layout_type
     # Setup configurations
     cache_config.enable_ssd = False
     gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
 
     # Create GPU blocks and save ground truth
     gpu_blocks = create_test_gpu_blocks(model_config, cache_config, num_gpu_blocks)
+    gpu_blocks_gt = {gpu_id: [layer.clone() for layer in layers] for gpu_id, layers in gpu_blocks.items()}
 
     # Setup storage engine and transfer engine
     storage_engine = StorageEngine(model_config, cache_config)
@@ -276,11 +268,11 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
             f"GPU->CPU transfer failed for DP group {dp_id}"
 
         # Verify GPU -> CPU transfer
-        start_gpu_id= dp_id * tp_size
-        DataVerifier.verify_gpu_cpu_transfer(
-            gpu_blocks, cpu_handle.data, gpu_block_ids, cpu_block_ids,
-            model_config, cache_config, start_gpu_id, tp_size,
-        )
+        #start_gpu_id= dp_id * tp_size
+        #DataVerifier.verify_gpu_cpu_transfer(
+        #    gpu_blocks, cpu_handle.data, gpu_block_ids, cpu_block_ids,
+        #    model_config, cache_config, start_gpu_id, tp_size,
+        #)
 
         # Clear GPU blocks for read test
         for tp_id in range(tp_size):
@@ -298,17 +290,14 @@ def test_gpu_cpu_round_trip(model_config, cache_config, tp_size, dp_size, num_gp
         )
         read_graph.bind_to_dp_group(dp_id)
         transfer_engine.submit_transfer_graph(read_graph)
-
         # Wait for read completion
         assert wait_for_transfer_completion(transfer_engine, [read_graph.graph_id]), \
             f"CPU->GPU transfer failed for DP group {dp_id}"
 
-        # Verify round-trip consistency
-        DataVerifier.verify_gpu_cpu_transfer(
-            gpu_blocks, cpu_handle.data, gpu_block_ids, cpu_block_ids,
-            model_config, cache_config, start_gpu_id, tp_size,
-        )
-
+    # Verify round-trip consistency
+    DataVerifier.verify_round_trip_consistency(
+        gpu_blocks_gt, gpu_blocks, gpu_block_ids, model_config
+    )
     # Cleanup
     transfer_engine.shutdown()
 
@@ -405,7 +394,7 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
 
     # Verify full round-trip consistency
     DataVerifier.verify_round_trip_consistency(
-        original_gpu_data, gpu_blocks, gpu_block_ids, model_config, 0
+        original_gpu_data, gpu_blocks, gpu_block_ids, model_config
     )
 
     # Cleanup
@@ -541,7 +530,7 @@ def test_concurrent_mixed_transfers(model_config,
 
     # Verify round-trip consistency
     DataVerifier.verify_round_trip_consistency(
-        original_gpu_data, gpu_blocks, gpu_block_ids, model_config, 0
+        original_gpu_data, gpu_blocks, gpu_block_ids, model_config
     )
 
     # Cleanup

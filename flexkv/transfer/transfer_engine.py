@@ -13,6 +13,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import StorageHandle
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType
 from flexkv.common.transfer import get_nvtx_range_color
+from flexkv.common.storage import KVCacheLayoutType
 from flexkv.transfer.scheduler import TransferScheduler
 from flexkv.transfer.worker import (
     WorkerHandle,
@@ -72,7 +73,7 @@ class TransferEngine:
                     worker_id=i,
                     finished_ops_queue=self.finished_ops_queue,
                     gpu_blocks=self.gpu_handles[i].get_tensor_handle_list(),
-                    cpu_blocks=self._cpu_handle.get_tensor_list(),
+                    cpu_blocks=self._cpu_handle.get_tensor(),
                     gpu_kv_layout=self.gpu_handles[i].kv_layout,
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=self.gpu_handles[i].dtype,
@@ -87,7 +88,7 @@ class TransferEngine:
                     finished_ops_queue=self.finished_ops_queue,
                     gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
                                 for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
-                    cpu_blocks=self._cpu_handle.get_tensor_list(),
+                    cpu_blocks=self._cpu_handle.get_tensor(),
                     gpu_kv_layout=self.gpu_handles[i].kv_layout,
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=self.gpu_handles[i].dtype,
@@ -103,20 +104,22 @@ class TransferEngine:
             self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 worker_id=10,
                 finished_ops_queue=self.finished_ops_queue,
-                cpu_blocks=self._cpu_handle.get_tensor_list(),
-                ssd_file=self._ssd_handle.get_file_list(),
+                cpu_blocks=self._cpu_handle.get_tensor(),
+                ssd_files=self._ssd_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
                 ssd_kv_layout=self._ssd_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
+                num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
             )
             self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 worker_id=11,
                 finished_ops_queue=self.finished_ops_queue,
-                cpu_blocks=self._cpu_handle.get_tensor_list(),
-                ssd_file=self._ssd_handle.get_file_list(),
+                cpu_blocks=self._cpu_handle.get_tensor(),
+                ssd_files=self._ssd_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
                 ssd_kv_layout=self._ssd_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
+                num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
             )
             self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
             self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
@@ -124,7 +127,7 @@ class TransferEngine:
             self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 worker_id=20,
                 finished_ops_queue=self.finished_ops_queue,
-                cpu_blocks=self._cpu_handle.get_tensor_list(),
+                cpu_blocks=self._cpu_handle.get_tensor(),
                 remote_file=self._remote_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
                 remote_kv_layout=self._remote_handle.kv_layout,
@@ -134,7 +137,7 @@ class TransferEngine:
             self.remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 worker_id=21,
                 finished_ops_queue=self.finished_ops_queue,
-                cpu_blocks=self._cpu_handle.get_tensor_list(),
+                cpu_blocks=self._cpu_handle.get_tensor(),
                 remote_file=self._remote_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
                 remote_kv_layout=self._remote_handle.kv_layout,
@@ -151,12 +154,13 @@ class TransferEngine:
                 for w in worker:
                     w.ready_event.wait(timeout=60)
             else:
+                print(f"waiting for worker {worker} to ready")
                 worker.ready_event.wait(timeout=60)
         # Start scheduler thread
         self._running = True
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
         self._scheduler_thread.start()
-    
+
     def start(self) -> None:
         self._init_workers()
 

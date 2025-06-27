@@ -14,17 +14,17 @@
 
 namespace flexkv {
 
-static void partition_and_remap_blocks_by_file(
+static void partition_and_remap_blocks_by_device(
     const int64_t *cpu_block_ids, const int64_t *ssd_block_ids, int num_blocks,
-    int num_files, int round_robin,
+    int num_devices, int round_robin,
     std::vector<std::vector<int>> &cpu_blocks_partition,
     std::vector<std::vector<int>> &ssd_blocks_partition) {
   for (int i = 0; i < num_blocks; i++) {
     int64_t ssd_block_id = ssd_block_ids[i];
     int64_t cpu_block_id = cpu_block_ids[i];
-    int file_id = (ssd_block_id / round_robin) % num_files;
+    int file_id = (ssd_block_id / round_robin) % num_devices;
     int block_id_in_file =
-        ((ssd_block_id / round_robin) / num_files) * round_robin +
+        ((ssd_block_id / round_robin) / num_devices) * round_robin +
         (ssd_block_id % round_robin);
     ssd_blocks_partition[file_id].push_back(block_id_in_file);
     cpu_blocks_partition[file_id].push_back(cpu_block_id);
@@ -32,127 +32,80 @@ static void partition_and_remap_blocks_by_file(
 }
 
 static void _transfer_single_thread_impl(
-    int fd, const std::vector<int> &cpu_block_ids,
-    const std::vector<int> &ssd_block_ids, int start_layer, int end_layer,
-    int start_block, int end_block, const int64_t *cpu_layer_ptrs,
-    int64_t ssd_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
-    int64_t ssd_kv_stride_in_bytes, int64_t block_size_in_bytes,
-    bool is_read, bool is_mla) {
+    const std::vector<int> &fd_list, const std::vector<int> &cpu_block_ids,
+    const std::vector<int> &ssd_block_ids_in_device, int start_layer,
+    int end_layer, int start_block, int end_block, int64_t cpu_tensor_ptr,
+    int64_t cpu_layer_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
+    int64_t cpu_kv_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
+    int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes,
+    int num_blocks_per_file, bool is_read, bool is_mla) {
   int num_blocks = end_block - start_block;
   if (num_blocks == 0) {
     return;
   }
-  for (int i = start_layer; i < end_layer; i++) {
-    void *cpu_k_layer_ptr = reinterpret_cast<void *>(cpu_layer_ptrs[i]);
-    void *cpu_v_layer_ptr =
-        static_cast<char *>(cpu_k_layer_ptr) + cpu_kv_stride_in_bytes;
-    int64_t ssd_layer_offset = ssd_layer_stride_in_bytes * i;
-    for (int j = start_block; j < end_block; j++) {
-      int ssd_block_id = ssd_block_ids[j];
-      int cpu_block_id = cpu_block_ids[j];
+  for (int bid = start_block; bid < end_block; bid++) {
+    int cpu_block_id = cpu_block_ids[bid];
+    int ssd_block_id = ssd_block_ids_in_device[bid];
+    int fd = fd_list[ssd_block_id / num_blocks_per_file];
+    ssd_block_id %= num_blocks_per_file; // block id in single file
 
-      int64_t ssd_k_block_offset =
-          ssd_layer_offset + ssd_block_id * block_size_in_bytes;
+    for (int lid = start_layer; lid < end_layer; lid++) {
+      int64_t ssd_k_block_offset = ssd_block_id * block_stride_in_bytes +
+                                   lid * ssd_layer_stride_in_bytes;
+      int64_t ssd_v_block_offset = ssd_k_block_offset + ssd_kv_stride_in_bytes;
+      int64_t cpu_k_block_offset = cpu_block_id * block_stride_in_bytes +
+                                   lid * cpu_layer_stride_in_bytes;
+      int64_t cpu_v_block_offset = cpu_k_block_offset + cpu_kv_stride_in_bytes;
 
-      // read K block
-      void *cpu_k_block_ptr = static_cast<char *>(cpu_k_layer_ptr) +
-                              cpu_block_id * block_size_in_bytes;
+      void *cpu_k_block_ptr =
+          reinterpret_cast<char *>(cpu_tensor_ptr) + cpu_k_block_offset;
+      void *cpu_v_block_ptr =
+          reinterpret_cast<char *>(cpu_tensor_ptr) + cpu_v_block_offset;
       ssize_t bytes_transfer = 0;
       if (is_read) {
         bytes_transfer =
-            pread(fd, cpu_k_block_ptr, block_size_in_bytes, ssd_k_block_offset);
+            pread(fd, cpu_k_block_ptr, chunk_size_in_bytes, ssd_k_block_offset);
       } else {
-        bytes_transfer = pwrite(fd, cpu_k_block_ptr, block_size_in_bytes,
+        bytes_transfer = pwrite(fd, cpu_k_block_ptr, chunk_size_in_bytes,
                                 ssd_k_block_offset);
       }
-      if (bytes_transfer != block_size_in_bytes) {
+      if (bytes_transfer != chunk_size_in_bytes) {
         throw std::runtime_error("Failed to transfer K block");
       }
       if (is_mla) {
         continue;
       }
-      // read V block
-      void *cpu_v_block_ptr = static_cast<char *>(cpu_v_layer_ptr) +
-                              cpu_block_id * block_size_in_bytes;
-      int64_t ssd_v_block_offset = ssd_k_block_offset + ssd_kv_stride_in_bytes;
       bytes_transfer = 0;
       if (is_read) {
         bytes_transfer =
-            pread(fd, cpu_v_block_ptr, block_size_in_bytes, ssd_v_block_offset);
+            pread(fd, cpu_v_block_ptr, chunk_size_in_bytes, ssd_v_block_offset);
       } else {
-        bytes_transfer = pwrite(fd, cpu_v_block_ptr, block_size_in_bytes,
+        bytes_transfer = pwrite(fd, cpu_v_block_ptr, chunk_size_in_bytes,
                                 ssd_v_block_offset);
       }
-      if (bytes_transfer != block_size_in_bytes) {
+      if (bytes_transfer != chunk_size_in_bytes) {
         throw std::runtime_error("Failed to transfer V block");
       }
-    } // end block loop
-  } // end layer loop
-}
 
-static void _transfer_single_thread_mmap_impl(
-    void *mmap_ptr, const std::vector<int> &cpu_block_ids,
-    const std::vector<int> &ssd_blocks_ids, int start_layer, int end_layer,
-    int start_block, int end_block, const int64_t *cpu_layer_ptrs,
-    int64_t ssd_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
-    int64_t ssd_kv_stride_in_bytes, int64_t block_size_in_bytes,
-    bool is_read, bool is_mla) {
-  int num_blocks = end_block - start_block;
-  if (num_blocks == 0) {
-    return;
-  }
-  for (int i = start_layer; i < end_layer; i++) {
-    void *cpu_k_layer_ptr = reinterpret_cast<void *>(cpu_layer_ptrs[i]);
-    void *cpu_v_layer_ptr =
-        static_cast<char *>(cpu_k_layer_ptr) + cpu_kv_stride_in_bytes;
-    int64_t ssd_layer_offset = ssd_layer_stride_in_bytes * i;
-    for (int j = start_block; j < end_block; j++) {
-      int ssd_block_id = ssd_blocks_ids[j];
-      int cpu_block_id = cpu_block_ids[j];
-
-      int64_t ssd_k_block_offset =
-          ssd_layer_offset + ssd_block_id * block_size_in_bytes;
-
-      void *cpu_k_block_ptr = static_cast<char *>(cpu_k_layer_ptr) +
-                              cpu_block_id * block_size_in_bytes;
-      void *mmap_k_block_ptr =
-          static_cast<char *>(mmap_ptr) + ssd_k_block_offset;
-      if (is_read) {
-        memcpy(mmap_k_block_ptr, cpu_k_block_ptr, block_size_in_bytes);
-      } else {
-        memcpy(cpu_k_block_ptr, mmap_k_block_ptr, block_size_in_bytes);
-      }
-      if (is_mla) {
-        continue;
-      }
-      void *cpu_v_block_ptr = static_cast<char *>(cpu_v_layer_ptr) +
-                              cpu_block_id * block_size_in_bytes;
-      void *mmap_v_block_ptr =
-          static_cast<char *>(mmap_k_block_ptr) + ssd_kv_stride_in_bytes;
-      if (is_read) {
-        memcpy(mmap_v_block_ptr, cpu_v_block_ptr, block_size_in_bytes);
-      } else {
-        memcpy(cpu_v_block_ptr, mmap_v_block_ptr, block_size_in_bytes);
-      }
-    } // end block loop
-  } // end layer loop
+    } // end layer loop
+  } // end block loop
 }
 
 // NOTE that we may also use other techniques such as
 // AIO, O_DIRECT, and etc to improve the performance
 void transfer_kv_blocks_ssd(
-    const std::vector<std::string> &filenames,
-    const torch::Tensor &cpu_layer_id_list,
-    const torch::Tensor &cpu_layer_ptrs_tensor,
+    const std::vector<std::vector<std::string>> &filepaths,
+    const torch::Tensor &cpu_layer_id_list, int64_t cpu_tensor_ptr,
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
-    int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
-    int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
-    int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
-    int round_robin, bool use_mmap, int num_threads_per_file,
+    int64_t cpu_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
+    int64_t ssd_layer_stride_in_bytes, // in single file
+    int64_t ssd_kv_stride_in_bytes,    // in single file
+    int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes, bool is_read,
+    int num_blocks_per_file, int round_robin, int num_threads_per_device,
     bool is_mla) {
-  int num_files = filenames.size();
-  int file_size = ssd_layer_stride_in_bytes * total_layers;
-  const int64_t *cpu_layer_ptrs = cpu_layer_ptrs_tensor.data_ptr<int64_t>();
+  const int num_devices = filepaths.size();
+  const int num_files_per_device = filepaths[0].size();
+
   const int64_t *ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
   const int64_t *cpu_block_id_ptr = cpu_block_ids.data_ptr<int64_t>();
 
@@ -160,90 +113,65 @@ void transfer_kv_blocks_ssd(
   const int num_layers = cpu_layer_id_list.size(0);
   const int32_t *cpu_layer_id_list_ptr = cpu_layer_id_list.data_ptr<int32_t>();
 
-  int o_direct_flag = block_size_in_bytes % 4096 == 0 ? O_DIRECT : 0;
-  int fds[num_files];
-  for (int i = 0; i < num_files; i++) {
-    if (is_read) {
-      fds[i] = open(filenames[i].c_str(), O_RDONLY | o_direct_flag);
-    } else {
-      fds[i] = open(filenames[i].c_str(), O_RDWR | o_direct_flag);
-    }
-    if (fds[i] < 0) {
-      throw std::runtime_error("Thread failed to open file: " +
-                               std::string(strerror(errno)));
-    }
-    posix_fadvise(fds[i], 0, 0, POSIX_FADV_SEQUENTIAL | POSIX_FADV_WILLNEED);
-  }
-
-  std::vector<std::vector<int>> cpu_blocks_partition(num_files,
-                                                     std::vector<int>());
-  std::vector<std::vector<int>> ssd_blocks_partition(num_files,
-                                                     std::vector<int>());
-  partition_and_remap_blocks_by_file(
-      cpu_block_id_ptr, ssd_block_id_ptr, num_blocks, filenames.size(),
-      round_robin, cpu_blocks_partition, ssd_blocks_partition);
-
-  std::vector<void *> mmap_ptrs;
-  // mmap the files
-  if (use_mmap) {
-    for (int i = 0; i < num_files; i++) {
-      int fd = fds[i];
-      int prot = is_read ? PROT_READ : PROT_WRITE;
-      void *mmap_ptr = mmap(nullptr, file_size, prot, MAP_SHARED, fd, 0);
-      if (mmap_ptr == MAP_FAILED) {
-        close(fd);
-        throw std::runtime_error("Failed to mmap file: " +
+  const int o_direct_flag = chunk_size_in_bytes % 4096 == 0 ? O_DIRECT : 0;
+  std::vector<std::vector<int>> fds(num_devices, std::vector<int>());
+  for (int i = 0; i < num_devices; i++) {
+    for (int j = 0; j < num_files_per_device; j++) {
+      int fd = -1;
+      if (is_read) {
+        fd = open(filepaths[i][j].c_str(), O_RDONLY | o_direct_flag);
+      } else {
+        fd = open(filepaths[i][j].c_str(), O_RDWR | o_direct_flag);
+      }
+      if (fd < 0) {
+        throw std::runtime_error("Thread failed to open file: " +
                                  std::string(strerror(errno)));
       }
-      madvise(mmap_ptr, file_size, MADV_SEQUENTIAL | MADV_DONTNEED);
-      mmap_ptrs.push_back(mmap_ptr);
+      posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL | POSIX_FADV_WILLNEED);
+      fds[i].push_back(fd);
     }
   }
 
-  // create multiple threads to handle different layers
-  // limit the max number of threads
-  if (num_threads_per_file > num_layers) {
-    num_threads_per_file = num_layers;
-  }
-  if (num_threads_per_file <= 0) {
-    throw std::runtime_error("num_threads_per_file must be greater than 0");
-  }
+  std::vector<std::vector<int>> cpu_blocks_partition(num_devices,
+                                                     std::vector<int>());
+  std::vector<std::vector<int>> ssd_blocks_partition(num_devices,
+                                                     std::vector<int>());
+  partition_and_remap_blocks_by_device(
+      cpu_block_id_ptr, ssd_block_id_ptr, num_blocks, num_devices, round_robin,
+      cpu_blocks_partition, ssd_blocks_partition);
+
   std::vector<std::thread> threads;
   std::vector<std::future<std::exception_ptr>> futures;
-  // assign layers to each thread
-  int layers_per_thread =
-      (num_layers + num_threads_per_file - 1) / num_threads_per_file;
-  for (int f = 0; f < num_files; f++) {
-    for (int t = 0; t < num_threads_per_file; t++) {
-      int start_layer = cpu_layer_id_list_ptr[0] + t * layers_per_thread;
-      int end_layer = cpu_layer_id_list_ptr[0] + std::min(start_layer + layers_per_thread, num_layers);
-      int start_block = 0;
-      int end_block = cpu_blocks_partition[f].size();
-      if (start_layer < end_layer) {
+  for (int d = 0; d < num_devices; d++) {
+    for (int t = 0; t < num_threads_per_device; t++) {
+      int start_layer = cpu_layer_id_list_ptr[0];
+      int end_layer = cpu_layer_id_list_ptr[0] + num_layers;
+      int num_transfer_blocks = cpu_blocks_partition[d].size();
+      int num_blocks_per_thread =
+          (num_transfer_blocks + num_threads_per_device - 1) /
+          num_threads_per_device;
+      int start_block = t * num_blocks_per_thread;
+      int end_block =
+          std::min(start_block + num_blocks_per_thread, num_transfer_blocks);
+      if (start_block < end_block) {
         std::promise<std::exception_ptr> prom;
         futures.push_back(prom.get_future());
         threads.emplace_back(
-            [f, use_mmap, &mmap_ptrs, &fds, &cpu_blocks_partition,
-             &ssd_blocks_partition, start_layer, end_layer, start_block,
-             end_block, &cpu_layer_ptrs, ssd_layer_stride_in_bytes,
+            [d, &fds, &cpu_blocks_partition, &ssd_blocks_partition, start_layer,
+             end_layer, start_block, end_block, cpu_tensor_ptr,
+             cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
              cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
-             block_size_in_bytes, is_read, is_mla,prom = std::move(prom)]() mutable {
+             chunk_size_in_bytes, block_stride_in_bytes, num_blocks_per_file,
+             is_read, is_mla, prom = std::move(prom)]() mutable {
               try {
-                if (use_mmap) {
-                  _transfer_single_thread_mmap_impl(
-                      mmap_ptrs[f], cpu_blocks_partition[f],
-                      ssd_blocks_partition[f], start_layer, end_layer,
-                      start_block, end_block, cpu_layer_ptrs,
-                      ssd_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
-                      ssd_kv_stride_in_bytes, block_size_in_bytes, is_read, is_mla);
-                } else {
-                  _transfer_single_thread_impl(
-                      fds[f], cpu_blocks_partition[f], ssd_blocks_partition[f],
-                      start_layer, end_layer, start_block, end_block,
-                      cpu_layer_ptrs, ssd_layer_stride_in_bytes,
-                      cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
-                      block_size_in_bytes, is_read, is_mla);
-                }
+                _transfer_single_thread_impl(
+                    fds[d], cpu_blocks_partition[d], ssd_blocks_partition[d],
+                    start_layer, end_layer, start_block, end_block,
+                    cpu_tensor_ptr, cpu_layer_stride_in_bytes,
+                    ssd_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
+                    ssd_kv_stride_in_bytes, chunk_size_in_bytes,
+                    block_stride_in_bytes, num_blocks_per_file, is_read,
+                    is_mla);
                 prom.set_value(nullptr);
               } catch (...) {
                 prom.set_value(std::current_exception());
@@ -251,20 +179,16 @@ void transfer_kv_blocks_ssd(
             });
       }
     } // end thread loop
-  } // end file loop
+  } // end device loop
 
   // wait for all threads to finish
   for (auto &thread : threads) {
     thread.join();
   }
-  if (use_mmap) {
-    for (auto &mmap_ptr : mmap_ptrs) {
-      msync(mmap_ptr, file_size, MS_SYNC);
-      munmap(mmap_ptr, file_size);
+  for (const auto &fd_list : fds) {
+    for (const auto &fd : fd_list) {
+      close(fd);
     }
-  }
-  for (const auto &fd : fds) {
-    close(fd);
   }
   // check if any error occurs
   for (auto &fut : futures) {

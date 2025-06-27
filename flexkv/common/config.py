@@ -34,9 +34,9 @@ class CacheConfig:
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
     num_remote_blocks: Optional[int] = None
-    remote_file_size: Optional[int] = None 
-    remote_file_num: Optional[int] = None 
+    remote_file_size: Optional[int] = None
+    remote_file_num: Optional[int] = None
     remote_file_prefix: Optional[str] = None
-    ssd_cache_path: Optional[Union[str, List[str]]] = None
+    ssd_cache_dir: Optional[Union[str, List[str]]] = None
     remote_cache_path: Optional[Union[str, List[str]]] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
