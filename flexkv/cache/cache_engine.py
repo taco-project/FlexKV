@@ -951,6 +951,8 @@ class GlobalCacheEngine:
     def _get_block_range(self,
                          token_mask: torch.Tensor) -> Tuple[int, int]:
         mask_idx = torch.where(token_mask)[0]
+        if len(mask_idx) == 0:
+            return 0, 0
         start_idx = int(mask_idx[0].item() // self.tokens_per_block)
         end_idx = int(mask_idx[-1].item() // self.tokens_per_block)
         return start_idx, end_idx + 1

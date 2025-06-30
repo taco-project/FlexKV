@@ -91,9 +91,11 @@ def verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_siz
                     f"Mismatch at dp_id={dp_id}, tp_id={tp_id}, global_gpu_id={global_gpu_id}, layer={layer}"
     print("verify done")
 
-def block_ids_2_slot_mapping(block_ids, tokens_per_block):
+def block_ids_2_slot_mapping(block_ids, tokens_per_block, actual_length=-1):
     slot_mapping = block_ids.repeat_interleave(tokens_per_block) * tokens_per_block
-    return slot_mapping
+    if actual_length == -1:
+        actual_length = len(block_ids) * tokens_per_block
+    return slot_mapping[:actual_length]
 
 @pytest.fixture
 def model_config(request: pytest.FixtureRequest):
@@ -228,6 +230,25 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
         for gpu in range(dp_id * tp_size, (dp_id + 1) * tp_size):
             for i in range(num_layers):
                 gpu_blocks[gpu][i][:, block_ids, :, :, :] = 0
+
+    #corner case: input token length for put is less than tokens_per_block
+    write_request = kvmanager.put_async(
+        token_ids=torch.randint(0, 100, size=(8,), dtype=torch.int64),
+        slot_mapping=block_ids_2_slot_mapping(torch.arange(0,1, dtype=torch.int64), tokens_per_block, actual_length=8),
+        dp_id=0,
+    )
+    kvmanager.wait_for_graph_finished(write_request)
+    #corner case: input token length is long enough, but the mask is less than tokens_per_block
+    my_mask = torch.zeros(16, dtype=torch.bool)
+    my_mask[0:8] = True
+    write_request = kvmanager.put_async(
+        token_ids=torch.randint(0, 100, size=(16,), dtype=torch.int64),
+        slot_mapping=block_ids_2_slot_mapping(torch.arange(0,1, dtype=torch.int64), tokens_per_block, actual_length=8),
+        token_mask=my_mask,
+        dp_id=0,
+    )
+    kvmanager.wait_for_graph_finished(write_request)
+
     print(f"initial data {initial_write_num} written")
     total_cache_hit = 0
     total_cache_miss = 0
