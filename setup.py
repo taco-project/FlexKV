@@ -35,7 +35,7 @@ hpp_sources = [
     "csrc/radix_tree.h",
 ]
 
-extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
+extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring", "-lcufile"] #"-lssl", "-lcrypto"
 extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.join(build_dir, "include")]
 
@@ -60,7 +60,7 @@ cpp_extensions = [
         library_dirs=[os.path.join(build_dir, "lib")],
         include_dirs=include_dirs,
         depends=hpp_sources,
-        extra_compile_args={"nvcc": ["-O3"], "cxx": extra_compile_args},
+        extra_compile_args={"nvcc": ["-O3", "-DENABLE_GDS"], "cxx": extra_compile_args},
         extra_link_args=extra_link_args,
     ),
 ]
