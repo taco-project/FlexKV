@@ -626,11 +626,11 @@ class GlobalCacheEngine:
 
         cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
-            :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
+            :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
-            :ssd_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
+            :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         remote_matched_blocks = remote_matched_result.physical_blocks[
-            :remote_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
+            :remote_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_mapping) - num_skipped_blocks
@@ -792,9 +792,9 @@ class GlobalCacheEngine:
 
         cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
-            :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
+            :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
-            :ssd_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
+            :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_mapping) - num_skipped_blocks
