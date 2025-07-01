@@ -488,12 +488,14 @@ int GDSManager::batch_synchronize(int batch_id) {
     
     // Wait for batch to complete
     unsigned int num_completed = 0;
-    unsigned int nr_completed = 0;
+    unsigned int nr = 0;
     std::vector<CUfileIOEvents_t> io_events(batch_info.batch_size);
     CUfileError_t status;
     
     while (num_completed != batch_info.batch_size) {
-        status = cuFileBatchIOGetStatus(batch_handle, batch_info.batch_size, &nr_completed, io_events.data(), NULL);	
+        memset(io_events, 0, sizeof(*io_events));
+        nr = batch_info.batch_size;
+        status = cuFileBatchIOGetStatus(batch_handle, batch_info.batch_size, &nr, io_events.data(), NULL);	
         if (status.err !=0) {
             set_error("cuFileBatchIOGetStatus failed");
             // Clean up the batch handle even if status check failed
@@ -502,7 +504,7 @@ int GDSManager::batch_synchronize(int batch_id) {
             return -1;
         }
 
-        num_completed += nr_completed;
+        num_completed += nr;
     } 
     // Destroy the batch
     cuFileBatchIODestroy(batch_handle);
