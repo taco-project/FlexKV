@@ -305,7 +305,8 @@ def test_gpu_cpu_round_trip(model_config,
 @pytest.mark.parametrize("num_gpu_blocks", [64, 128])
 @pytest.mark.parametrize("transfer_block_num", [8, 16])
 @pytest.mark.parametrize("use_mla", [True, False])
-def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_block_num, use_mla):
+@pytest.mark.parametrize("iouring_entries", [0, 512])
+def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_block_num, use_mla, iouring_entries):
     """
     Test round-trip data transfers involving SSD storage
 
@@ -326,6 +327,7 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
 
     # Setup configurations
     cache_config.enable_ssd = True
+    cache_config.ssd_cache_iouring_entries = iouring_entries;
     model_config.use_mla = use_mla
     gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
     if (model_config.tp_size * model_config.dp_size) > 1:
@@ -405,12 +407,14 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
 @pytest.mark.parametrize("blocks_per_transfer", [16])
 @pytest.mark.parametrize("include_ssd", [True, False])
 @pytest.mark.parametrize("use_mla", [True, False])
+@pytest.mark.parametrize("iouring_entries", [0, 512])
 def test_concurrent_mixed_transfers(model_config,
                                     cache_config,
                                     num_concurrent_transfers,
                                     blocks_per_transfer,
                                     include_ssd,
-                                    use_mla):
+                                    use_mla,
+                                    iouring_entries):
     """
     Test multiple concurrent read/write transfers
 
@@ -436,6 +440,7 @@ def test_concurrent_mixed_transfers(model_config,
 
     cache_config.num_cpu_blocks = num_gpu_blocks
     cache_config.num_ssd_blocks = num_gpu_blocks
+    cache_config.ssd_cache_iouring_entries = iouring_entries
 
     # Setup configurations
     cache_config.enable_ssd = include_ssd

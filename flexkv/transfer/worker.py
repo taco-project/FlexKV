@@ -22,6 +22,7 @@ from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
 from flexkv.common.transfer import get_nvtx_range_color
+from flexkv.common.config import CacheConfig
 
 try:
     from flexkv.c_ext import transfer_kv_blocks_remote
@@ -450,7 +451,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  cpu_kv_layout: KVCacheLayout,
                  ssd_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
-                 num_blocks_per_file: int):
+                 num_blocks_per_file: int,
+                 cache_config: CacheConfig):
         super().__init__(worker_id, transfer_queue, finished_ops_queue)
         self.ssd_files = ssd_files
         self.num_blocks_per_file = num_blocks_per_file
@@ -478,6 +480,12 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+
+        if cache_config.use_pinned_memory:
+            iouring_entries = cache_config.ssd_cache_iouring_entries
+        else:
+            iouring_entries = 0
+        self.iouring = c_ext.IOUring(iouring_entries, cache_config.ssd_cache_iouring_flags)
 
     def _transfer_impl(
         self,
@@ -509,6 +517,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
 
         transfer_kv_blocks_ssd(
+            iouring=self.iouring,
             filename_list=self.ssd_files,
             cpu_layer_id_list=layer_id_list,
             cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),

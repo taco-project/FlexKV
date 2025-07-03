@@ -27,7 +27,7 @@ cpp_sources = [
     "csrc/transfer_ssd.cpp",
 ]
 
-extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt"]
+extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
 extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.join(build_dir, "include")]
 

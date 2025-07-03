@@ -38,5 +38,7 @@ class CacheConfig:
     remote_file_num: Optional[int] = None
     remote_file_prefix: Optional[str] = None
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
+    ssd_cache_iouring_entries: int = 0
+    ssd_cache_iouring_flags: int = 0
     remote_cache_path: Optional[Union[str, List[str]]] = None
     remote_config_custom: Optional[Dict[str, Any]] = None

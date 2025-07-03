@@ -34,6 +34,7 @@ DEFAULT_CACHE_CONFIG = {
     'use_gds': False,
     'use_pinned_memory': True,
     'ssd_cache_dir': ["./ssd_cache1/", "./ssd_cache2/"],
+    'ssd_cache_iouring_entries': 0,
     'remote_cache_path': ["remote_cache1", "remote_cache2"],
     'remote_config_custom': {
         "pcfs_fsid": "f_l91fz6",
@@ -170,7 +171,9 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
 @pytest.mark.parametrize("cache_config", [
     {'enable_cpu': True, 'enable_ssd': False, 'enable_remote': False, 'num_cpu_blocks': 1024},
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False,},
+    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False, 'ssd_cache_iouring_entries': 512},
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True, 'num_ssd_blocks': 256, 'num_remote_blocks': 512},
+    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True, 'num_ssd_blocks': 256, 'num_remote_blocks': 512, 'ssd_cache_iouring_entries': 512},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
