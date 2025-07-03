@@ -52,6 +52,7 @@ class TransferEngine:
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
+        self._cache_config = cache_config
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
 
@@ -110,6 +111,7 @@ class TransferEngine:
                 ssd_kv_layout=self._ssd_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
                 num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                cache_config=self._cache_config,
             )
             self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 worker_id=11,
@@ -120,6 +122,7 @@ class TransferEngine:
                 ssd_kv_layout=self._ssd_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
                 num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                cache_config=self._cache_config,
             )
             self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
             self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
