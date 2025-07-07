@@ -17,6 +17,7 @@ from flexkv.common.request import KVRequestType, KVRequest
 from flexkv.common.transfer import DeviceType, get_nvtx_range_color, get_nvtx_default_color
 from flexkv.common.storage import KVCacheLayout
 from flexkv.common.exceptions import LogicError
+from flexkv.common.tracer import FlexKVTracer
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 
@@ -54,6 +55,15 @@ class KVManager:
         self._verify_Model_Cache_config(model_config, cache_config)
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
         self.storage_engine = StorageEngine(self.model_config, self.cache_config)
+        
+        # Initialize tracer
+        self.tracer = FlexKVTracer(cache_config)
+        
+        # Record configuration in tracer
+        if gpu_layout is not None:
+            self.tracer.trace_config(model_config, cache_config, gpu_layout)
+        
+        
         self.transfer_engine: Optional[TransferEngine] = None
         self.gpu_layout: Optional[KVCacheLayout] = gpu_layout
 
@@ -137,6 +147,7 @@ class KVManager:
             raise ValueError("we have already get all gpu blocks")
         if self.gpu_layout is None:
             self.gpu_layout = gpu_layout
+            self.tracer.trace_config(self.model_config, self.cache_config, self.gpu_layout)
         else:
             assert self.gpu_layout == gpu_layout
         self.all_gpu_blocks[tp_rank + dp_client_id * self.model_config.tp_size] = gpu_handles
@@ -226,11 +237,16 @@ class KVManager:
             return old_value
 
     def __del__(self) -> None:
+        if hasattr(self, 'tracer'):
+            self.tracer.flush()
         if self.running:
             self.shutdown()
 
     def shutdown(self) -> None:
         self.running = False
+        # Flush tracer before shutdown
+        if hasattr(self, 'tracer'):
+            self.tracer.flush()
         flexkv_logger.info("kvmanager shutdown")
         self.task_queue.put(KVRequest(
             request_type=KVRequestType.SHUTDOWN,
@@ -256,6 +272,16 @@ class KVManager:
         if layer_granularity == -1:
             layer_granularity = self.model_config.num_layers
         task_id = self._get_task_id()
+        # Trace the request
+        self.tracer.trace_request(
+            request_type="GET",
+            request_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask,
+            layer_granularity=layer_granularity,
+            dp_id=dp_id
+        )
         nvtx.mark(f"GET request_id: {task_id}")
         self.taskid_to_nvtx_range[task_id] = nvtx.start_range(f"GET request_id: {task_id}",
                                                               color=get_nvtx_default_color())
@@ -287,6 +313,15 @@ class KVManager:
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
         task_id = self._get_task_id()
+        # Trace the request
+        self.tracer.trace_request(
+            request_type="PUT",
+            request_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask,
+            dp_id=dp_id
+        )
         nvtx.mark(f"PUT request_id: {task_id}")
         self.taskid_to_nvtx_range[task_id] = nvtx.start_range(f"PUT request_id: {task_id}",
                                                               color=get_nvtx_default_color())
@@ -309,6 +344,11 @@ class KVManager:
 
     # wait for the key op to be finished
     def wait(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
+        # Trace the wait request
+        self.tracer.trace_wait_request(
+            wait_type="wait",
+            task_ids=task_ids,
+        )
         nvtx.mark(f"wait task_ids: {task_ids}")
         if isinstance(task_ids, int):
             task_ids = [task_ids]
@@ -335,6 +375,11 @@ class KVManager:
     # wait for the whole task to be finished, including the key op and all other ops
     # this function is mainly designed for testing to avoid the frequency of writing is too high to use up memory blocks
     def wait_for_graph_finished(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
+         # Trace the wait request
+        self.tracer.trace_wait_request(
+            wait_type="wait_for_graph_finished",
+            task_ids=task_ids,
+        )
         nvtx.mark(f"wait task_ids: {task_ids}")
         if isinstance(task_ids, int):
             task_ids = [task_ids]
@@ -358,6 +403,11 @@ class KVManager:
     # the try_wait api is used for server-client mode:
     # server process running the kvmanager should NOT be blocked by any single client
     def try_wait(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
+        # Trace the wait request
+        self.tracer.trace_wait_request(
+            wait_type="try_wait",
+            task_ids=task_ids,
+        )
         return_masks: Dict[int, torch.Tensor] = {}
         if isinstance(task_ids, int):
             task_ids = [task_ids]
@@ -375,6 +425,12 @@ class KVManager:
         return return_masks
 
     def wait_at_layer_group(self, task_id: int, layer_group_id: int) -> torch.Tensor:
+        # Trace the wait request
+        self.tracer.trace_wait_request(
+            wait_type="wait_at_layer_group",
+            task_ids=task_id,
+            layer_group_id=layer_group_id
+        )
         nvtx.mark(f"wait task_id: {task_id}, layer_group_id: {layer_group_id}")
         while True:
             if task_id not in self.requests_tracker:
@@ -392,6 +448,12 @@ class KVManager:
     def try_wait_at_layer_group(self,
                                 task_ids: Union[int, List[int]],
                                 layer_group_id: int) -> Dict[int, torch.Tensor]:
+        # Trace the wait request
+        self.tracer.trace_wait_request(
+            wait_type="try_wait_at_layer_group",
+            task_ids=task_ids,
+            layer_group_id=layer_group_id,
+        )
         return_masks: Dict[int, torch.Tensor] = {}
         if isinstance(task_ids, int):
             task_ids = [task_ids]
