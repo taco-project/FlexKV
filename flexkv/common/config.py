@@ -42,3 +42,10 @@ class CacheConfig:
     ssd_cache_iouring_flags: int = 0
     remote_cache_path: Optional[Union[str, List[str]]] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
+    
+    # Trace configs
+    enable_trace: bool = True
+    trace_file_path: str = "./flexkv_trace.log"
+    trace_max_file_size_mb: int = 100
+    trace_max_files: int = 5
+    trace_flush_interval_ms: int = 1000
