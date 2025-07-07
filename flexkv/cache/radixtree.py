@@ -224,9 +224,15 @@ class RadixTreeIndex:
             last_access_time=time.time()
         )
 
+        last_node_leaf = last_node.is_leaf() and not last_node.is_root()
+        if last_node_leaf:
+            self.leaf_nodes.pop(last_node.head_hash(), None)
+
         if last_node_matched_length < last_node.size():
             last_node.split(last_node_matched_length)
             last_node = last_node.parent
+            if last_node_leaf:
+                self.leaf_nodes[last_node.head_hash()] = last_node
             assert last_node is not None
 
         new_node.parent = last_node
