@@ -95,11 +95,11 @@ class FlexKVReplayEngine:
         self.model_config = ModelConfig(
             num_layers=model_config_data['num_layers'],
             num_kv_heads=model_config_data['num_kv_heads'],
-            head_size=model_config_data['head_size'],
+            head_size=8,#model_config_data['head_size'], # for local test
             use_mla=model_config_data['use_mla'],
             dtype=dtype,
-            tp_size=model_config_data['tp_size'],
-            dp_size=model_config_data['dp_size'],
+            tp_size=1,#model_config_data['tp_size'], # for local test
+            dp_size=1,#model_config_data['dp_size'], # for local test
         )
         
         # Recreate cache_config (with trace disabled for replay)
@@ -113,7 +113,7 @@ class FlexKVReplayEngine:
             ssd_kv_layout_type=self._parse_layout_type(cache_config_data['ssd_kv_layout_type']),
             remote_kv_layout_type=self._parse_layout_type(cache_config_data['remote_kv_layout_type']),
             use_gds=cache_config_data['use_gds'],
-            use_pinned_memory=cache_config_data['use_pinned_memory'],
+            use_pinned_memory=False,#cache_config_data['use_pinned_memory'], # for local test
             remote_cache_size_mode=cache_config_data['remote_cache_size_mode'],
             num_cpu_blocks=cache_config_data['num_cpu_blocks'],
             num_ssd_blocks=cache_config_data['num_ssd_blocks'],
@@ -137,10 +137,12 @@ class FlexKVReplayEngine:
                 num_block=gpu_layout_data['num_block'],
                 tokens_per_block=gpu_layout_data['tokens_per_block'],
                 num_head=gpu_layout_data['num_head'],
-                head_size=gpu_layout_data['head_size'],
+                head_size=8,#gpu_layout_data['head_size'], #for local test
                 is_mla=gpu_layout_data['is_mla'],
             )
         
+        self.gpu_blocks_num = self.gpu_layout.num_block
+
         self.log(f"Model config: {self.model_config}")
         self.log(f"Cache config loaded {self.cache_config}")
         if self.gpu_layout:
@@ -231,7 +233,8 @@ class FlexKVReplayEngine:
         self.log(f"Replaying {request_type} request with {len(token_ids)} tokens")
         
         if request_type == "GET":
-            print(f"GET token_ids: {token_ids[:4]}")
+            print(f"🔍🔍🔍GET token_ids: {token_ids[:128]}")
+            print(f"request_id: {data['request_id']}, request_type: {request_type}, input length: {len(token_ids)}, true in mask: {token_mask.sum()}")
             task_id = self.kvmanager.get_async(
                 token_ids=token_ids,
                 slot_mapping=slot_mapping,
@@ -240,7 +243,8 @@ class FlexKVReplayEngine:
                 dp_id=dp_id
             )
         elif request_type == "PUT":
-            print(f"PUT token_ids: {token_ids[:4]}")
+            print(f"✅✅✅PUT token_ids: {token_ids[:128]}")
+            print(f"request_id: {data['request_id']}, request_type: {request_type}, input length: {len(token_ids)}, true in mask: {token_mask.sum()}")
             task_id = self.kvmanager.put_async(
                 token_ids=token_ids,
                 slot_mapping=slot_mapping,
@@ -259,7 +263,7 @@ class FlexKVReplayEngine:
         task_ids = data['task_ids']
         layer_group_id = data.get('layer_group_id')
         
-        self.log(f"Replaying {wait_type} for task_ids: {task_ids}")
+        self.log(f"⏰⏰⏰Replaying {wait_type} for task_ids: {task_ids}")
         
         try:
             if wait_type == "wait":
@@ -274,7 +278,10 @@ class FlexKVReplayEngine:
                 result = self.kvmanager.try_wait_at_layer_group(task_ids, layer_group_id)
             else:
                 raise ValueError(f"Unknown wait type: {wait_type}")
-            
+            successed_elements = []
+            for task_id in task_ids:
+                successed_elements.append(result[task_id].sum().item())
+            print(f"wait result: task ids: {task_ids}, successed elements num: {successed_elements}")
             self.log(f"Wait completed successfully for {wait_type}")
             return result
             
@@ -307,7 +314,7 @@ class FlexKVReplayEngine:
         other_events.sort(key=lambda e: e['timestamp'])
         
         request_id_mapping = {}  # Map original request_id to replayed task_id
-        
+        replayed_event_num = 0
         for event in other_events:
             event_type = event['event_type']
             
@@ -330,10 +337,14 @@ class FlexKVReplayEngine:
                 
                 # Update event data with mapped task_ids
                 event['data']['task_ids'] = mapped_task_ids
-                self.replay_wait_event(event)
+                results = self.replay_wait_event(event)
+                print(f"wait request done")
             
             # Small delay between events to simulate real timing
             time.sleep(0.001)
+            replayed_event_num += 1
+            #if replayed_event_num == 200:
+            #    break
         
         self.log("Event replay completed successfully!")
     

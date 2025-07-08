@@ -230,9 +230,9 @@ class RadixTreeIndex:
 
         if last_node_matched_length < last_node.size():
             last_node.split(last_node_matched_length)
-            last_node = last_node.parent
             if last_node_leaf:
                 self.leaf_nodes[last_node.head_hash()] = last_node
+            last_node = last_node.parent
             assert last_node is not None
 
         new_node.parent = last_node
