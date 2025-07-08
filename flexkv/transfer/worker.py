@@ -577,6 +577,8 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         if transfer_kv_blocks_remote is None:
             raise RuntimeError("transfer_kv_blocks_remote not available, please build with FLEXKV_ENABLE_CFS=1")
         super().__init__(worker_id, transfer_queue, finished_ops_queue)
+        
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.remote_files = remote_file
         self.num_remote_files = len(remote_file)
 
@@ -682,9 +684,10 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         transfer_kv_blocks_remote(
             file_nodeid_list=self.file_nodeid_list,
             cpu_layer_id_list=layer_id_list,
-            cpu_layer_ptrs_tensor=self.cpu_layer_ptrs,
+            cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
             remote_block_ids=remote_block_id_list,
             cpu_block_ids=cpu_block_id_list,
+            cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
             cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
             remote_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
             remote_block_stride_in_bytes=self.remote_block_stride_in_bytes,

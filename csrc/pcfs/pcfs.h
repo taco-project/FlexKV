@@ -61,8 +61,9 @@ extern "C" {
 // AIO, O_DIRECT, and etc to improve the performance
 void transfer_kv_blocks_cfs_mmap_multi_thread(
     const std::vector<std::uint64_t> &file_nodeids, const torch::Tensor &cpu_layer_id_list,
-    const torch::Tensor &cpu_layer_ptrs_tensor,
+    int64_t cpu_tensor_ptr,
     const torch::Tensor &cfs_block_ids, const torch::Tensor &cpu_block_ids,
+    int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t cfs_layer_stride_in_bytes,
     int64_t cfs_block_stride_in_bytes, int64_t cfs_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t total_layers, bool is_read,

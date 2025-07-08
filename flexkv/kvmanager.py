@@ -473,30 +473,31 @@ class KVManager:
     def _verify_Model_Cache_config(self, 
                                    model_config: ModelConfig,
                                    cache_config: CacheConfig):
-        if cache_config.remote_cache_path is None:
+        if cache_config.enable_remote:
+            if cache_config.remote_cache_path is None:
 
-            if cache_config.remote_file_prefix is None:
-                raise ValueError("remote_file_prefix must be provided when remote_cache_path is None")
+                if cache_config.remote_file_prefix is None:
+                    raise ValueError("remote_file_prefix must be provided when remote_cache_path is None")
 
-            if cache_config.remote_file_num is None or cache_config.remote_file_num <= 0:
-                raise ValueError("remote_file_num must be a positive integer")
+                if cache_config.remote_file_num is None or cache_config.remote_file_num <= 0:
+                    raise ValueError("remote_file_num must be a positive integer")
 
-            cache_config.remote_cache_path = [
-                f"{cache_config.remote_file_prefix}_{i}"
-                for i in range(cache_config.remote_file_num)
-            ]
+                cache_config.remote_cache_path = [
+                    f"{cache_config.remote_file_prefix}_{i}"
+                    for i in range(cache_config.remote_file_num)
+                ]
 
-        if cache_config.remote_cache_size_mode == "block_num":
-            if cache_config.num_remote_blocks is None:
-                raise ValueError("num_remote_blocks must not None if use block_num model")
-        elif cache_config.remote_cache_size_mode == "file_size":
-            if cache_config.remote_file_size is None:
-                raise ValueError("remote_file_size must not None if use file_size model")
-            if model_config.use_mla:
-                kv_size = model_config.num_layers * cache_config.tokens_per_block * model_config.num_kv_heads * model_config.head_size * model_config.dtype.itemsize
-            else:
-                kv_size = model_config.num_layers * 2 * cache_config.tokens_per_block * model_config.num_kv_heads * model_config.head_size * model_config.dtype.itemsize
-            cache_config.num_remote_blocks = cache_config.remote_file_size // kv_size * cache_config.remote_file_num
+            if cache_config.remote_cache_size_mode == "block_num":
+                if cache_config.num_remote_blocks is None:
+                    raise ValueError("num_remote_blocks must not None if use block_num model")
+            elif cache_config.remote_cache_size_mode == "file_size":
+                if cache_config.remote_file_size is None:
+                    raise ValueError("remote_file_size must not None if use file_size model")
+                if model_config.use_mla:
+                    kv_size = model_config.num_layers * cache_config.tokens_per_block * model_config.num_kv_heads * model_config.head_size * model_config.dtype.itemsize
+                else:
+                    kv_size = model_config.num_layers * 2 * cache_config.tokens_per_block * model_config.num_kv_heads * model_config.head_size * model_config.dtype.itemsize
+                cache_config.num_remote_blocks = cache_config.remote_file_size // kv_size * cache_config.remote_file_num
             
-        else:
-            raise ValueError("remote_cache_size_mode must block_num or file_size model")
+            else:
+                raise ValueError("remote_cache_size_mode must block_num or file_size model")

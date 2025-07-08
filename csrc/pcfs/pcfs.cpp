@@ -290,7 +290,7 @@ static void partition_and_remap_blocks_by_file(
 static void _transfer_single_thread_impl(
     uint64_t file_nodeid, const std::vector<int> &cpu_block_ids,
     const std::vector<int> &cfs_block_ids, int start_layer, int end_layer,
-    int start_block, int end_block, const int64_t *cpu_layer_ptrs,
+    int start_block, int end_block, int64_t cpu_tensor_ptr, int64_t cpu_layer_stride_in_bytes,
     int64_t cfs_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
     int64_t cfs_kv_stride_in_bytes, int64_t block_size_in_bytes, 
     bool is_read, int thread_id, bool is_mla) {
@@ -299,7 +299,7 @@ static void _transfer_single_thread_impl(
       return;
     }
     for (int i = start_layer; i < end_layer; i++) {
-      void *cpu_k_layer_ptr = reinterpret_cast<void *>(cpu_layer_ptrs[i]);
+      void *cpu_k_layer_ptr = i * cpu_layer_stride_in_bytes + reinterpret_cast<char *>(cpu_tensor_ptr);
       void *cpu_v_layer_ptr =static_cast<char *>(cpu_k_layer_ptr) + cpu_kv_stride_in_bytes;
       int64_t cfs_layer_offset = cfs_layer_stride_in_bytes * i;
       for (int j = start_block; j < end_block; j++) {
@@ -349,8 +349,9 @@ static void _transfer_single_thread_impl(
 void transfer_kv_blocks_cfs_mmap_multi_thread(
     const std::vector<std::uint64_t> &file_nodeids,
     const torch::Tensor &cpu_layer_id_list,
-    const torch::Tensor &cpu_layer_ptrs_tensor,
+    int64_t cpu_tensor_ptr,
     const torch::Tensor &cfs_block_ids, const torch::Tensor &cpu_block_ids,
+    int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t cfs_layer_stride_in_bytes,
     int64_t cfs_block_stride_in_bytes, int64_t cfs_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
@@ -360,7 +361,6 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
 
     int num_files = file_nodeids.size();
     //int file_size = cfs_layer_stride_in_bytes * total_layers;
-    const int64_t *cpu_layer_ptrs = cpu_layer_ptrs_tensor.data_ptr<int64_t>();
     const int64_t *cfs_block_id_ptr = cfs_block_ids.data_ptr<int64_t>();
     const int64_t *cpu_block_id_ptr = cpu_block_ids.data_ptr<int64_t>();
 
@@ -412,14 +412,14 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
           threads.emplace_back(
               [f, &file_nodeids, &cpu_blocks_partition,
               &cfs_blocks_partition, start_layer, end_layer, start_block,
-              end_block, &cpu_layer_ptrs, cfs_layer_stride_in_bytes,
+              end_block, cpu_tensor_ptr, cpu_layer_stride_in_bytes, cfs_layer_stride_in_bytes,
               cpu_kv_stride_in_bytes, cfs_kv_stride_in_bytes,
               block_size_in_bytes, is_read, is_mla, prom = std::move(prom), thread_id]() mutable {
                 try {
                   _transfer_single_thread_impl(
                       file_nodeids[f], cpu_blocks_partition[f], cfs_blocks_partition[f],
                       start_layer, end_layer, start_block, end_block,
-                      cpu_layer_ptrs, cfs_layer_stride_in_bytes,
+                      cpu_tensor_ptr, cpu_layer_stride_in_bytes, cfs_layer_stride_in_bytes,
                       cpu_kv_stride_in_bytes, cfs_kv_stride_in_bytes,
                       block_size_in_bytes, is_read, thread_id, is_mla);
                   prom.set_value(nullptr);
