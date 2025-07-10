@@ -22,7 +22,7 @@ set(XXHASH_SOURCES
     third_party/xxHash/xxhash.c
 )
 add_library(xxhash SHARED ${XXHASH_SOURCES})
-target_include_directories(xxhash PUBLIC 
+target_include_directories(xxhash PUBLIC
     third_party/xxHash
     ${CMAKE_INSTALL_INCLUDEDIR}
 )
@@ -30,4 +30,4 @@ target_include_directories(xxhash PUBLIC
 install(FILES ${XXHASH_HEADERS} DESTINATION include)
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "C++ compiler: ${CMAKE_CXX_COMPILER}") 
+message(STATUS "C++ compiler: ${CMAKE_CXX_COMPILER}")

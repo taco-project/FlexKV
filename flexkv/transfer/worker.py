@@ -577,7 +577,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         if transfer_kv_blocks_remote is None:
             raise RuntimeError("transfer_kv_blocks_remote not available, please build with FLEXKV_ENABLE_CFS=1")
         super().__init__(worker_id, transfer_queue, finished_ops_queue)
-        
+
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.remote_files = remote_file
         self.num_remote_files = len(remote_file)
@@ -667,7 +667,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
 
         # this means partial read hit cpu and other hit remote
         # or partial write hit remote and none hit cpu
-        
+
         if transfer_type == TransferType.H2REMOTE:
             remote_block_ids = dst_block_ids
             cpu_block_ids = src_block_ids
@@ -676,7 +676,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             cpu_block_ids = dst_block_ids
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for CPUSSDDiskTransferWorker")
-                
+
         remote_block_id_list = torch.from_numpy(remote_block_ids).pin_memory().to(dtype=torch.int64)
         cpu_block_id_list = torch.from_numpy(cpu_block_ids).pin_memory().to(dtype=torch.int64)
 
