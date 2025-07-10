@@ -419,12 +419,13 @@ class KVManager:
                 raise LogicError(f"task_id {task_id} not submitted into flexKV")
             task_tracker = self.requests_tracker[task_id]
             if len(task_tracker.task_end_ops_ids) == 0:
-                mask = torch.empty(0)
+                mask = None
             elif all(task_tracker.task_end_ops_status):
                 mask = task_tracker.return_mask
+                return_masks[task_id] = mask
             else:
-                mask = torch.empty(0)
-            return_masks[task_id] = mask
+                mask = None
+            
         return return_masks
 
     def wait_at_layer_group(self, task_id: int, layer_group_id: int) -> torch.Tensor:
