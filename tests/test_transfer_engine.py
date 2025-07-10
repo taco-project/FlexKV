@@ -327,7 +327,7 @@ def test_ssd_round_trip(model_config, cache_config, num_gpu_blocks, transfer_blo
 
     # Setup configurations
     cache_config.enable_ssd = True
-    cache_config.ssd_cache_iouring_entries = iouring_entries;
+    cache_config.ssd_cache_iouring_entries = iouring_entries
     model_config.use_mla = use_mla
     gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
     if (model_config.tp_size * model_config.dp_size) > 1:

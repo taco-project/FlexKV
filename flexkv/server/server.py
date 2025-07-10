@@ -204,7 +204,10 @@ class KVServer:
                     )
 
                     # register GPU Memory
-                    self.kvmanager.register_single_gpu_blocks(req.handles, req.gpu_layout, req.dp_client_id, req.tp_rank)
+                    self.kvmanager.register_single_gpu_blocks(req.handles,
+                                                            req.gpu_layout,
+                                                            req.dp_client_id,
+                                                            req.tp_rank)
 
                     response = Response(req.dp_client_id)
                     result_zmq = self.client_manager.get_zmq(

@@ -237,7 +237,7 @@ class RemoteAllocator(BaseStorageAllocator):
             nodeid = pcfs.lookup_or_create_file(file, file_size, need_create)
             if nodeid == 0:
                 raise RuntimeError(f"lookup or create file failed for file: {file}")
-        
+
             # destroy pcfs & close file, not used
             close_res = pcfs.close(nodeid, 1000)
             if not close_res:

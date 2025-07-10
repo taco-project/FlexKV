@@ -40,7 +40,7 @@ include_dirs = [os.path.join(build_dir, "include")]
 # Add rpath to find libraries at runtime
 lib_dir = os.path.join(build_dir, "lib")
 if os.path.exists(lib_dir):
-    extra_link_args.extend([f"-Wl,-rpath,{lib_dir}", f"-Wl,-rpath,$ORIGIN"])
+    extra_link_args.extend([f"-Wl,-rpath,{lib_dir}", "-Wl,-rpath,$ORIGIN"])
     # Also add the current package directory to rpath for installed libraries
     extra_link_args.append("-Wl,-rpath,$ORIGIN/../lib")
 
@@ -98,18 +98,18 @@ class CustomBuildExt(cpp_extension.BuildExtension):
         super().run()
         # Copy required shared libraries to the package directory after building
         self.copy_shared_libraries()
-    
+
     def copy_shared_libraries(self):
         """Copy shared libraries to the package lib directory"""
         source_lib_dir = os.path.join(build_dir, "lib")
         if not os.path.exists(source_lib_dir):
             print(f"Warning: Source library directory {source_lib_dir} does not exist")
             return
-        
+
         # Create lib directory in the package
         package_lib_dir = os.path.join("flexkv", "lib")
         os.makedirs(package_lib_dir, exist_ok=True)
-        
+
         # Copy all .so files
         for file in os.listdir(source_lib_dir):
             if file.endswith(".so") or file.endswith(".so.*"):

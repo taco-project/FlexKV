@@ -51,19 +51,19 @@ class KVManager:
             raise ValueError("use_gds must be True if enable_cpu is False")
         self.cache_config = cache_config
         self.model_config = model_config
-   
+
         self._verify_Model_Cache_config(model_config, cache_config)
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
         self.storage_engine = StorageEngine(self.model_config, self.cache_config)
-        
+
         # Initialize tracer
         self.tracer = FlexKVTracer(cache_config)
-        
+
         # Record configuration in tracer
         if gpu_layout is not None:
             self.tracer.trace_config(model_config, cache_config, gpu_layout)
-        
-        
+
+
         self.transfer_engine: Optional[TransferEngine] = None
         self.gpu_layout: Optional[KVCacheLayout] = gpu_layout
 
@@ -92,7 +92,10 @@ class KVManager:
         assert self.gpu_layout is not None
         assert len(self.all_gpu_blocks) == self.model_config.tp_size * self.model_config.dp_size
         for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
-            self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper, self.gpu_layout, device_id, dtype=self.model_config.dtype)
+            self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper,
+                                                    self.gpu_layout,
+                                                    device_id,
+                                                    dtype=self.model_config.dtype)
         self.gpu_handles = [
             self.storage_engine.get_storage_handle(DeviceType.GPU, i)
             for i in range(self.model_config.tp_size * self.model_config.dp_size)
@@ -469,8 +472,8 @@ class KVManager:
                 mask = torch.empty(0)
             return_masks[task_id] = mask
         return return_masks
-            
-    def _verify_Model_Cache_config(self, 
+
+    def _verify_Model_Cache_config(self,
                                    model_config: ModelConfig,
                                    cache_config: CacheConfig):
         if cache_config.enable_remote:
@@ -494,10 +497,23 @@ class KVManager:
                 if cache_config.remote_file_size is None:
                     raise ValueError("remote_file_size must not None if use file_size model")
                 if model_config.use_mla:
-                    kv_size = model_config.num_layers * cache_config.tokens_per_block * model_config.num_kv_heads * model_config.head_size * model_config.dtype.itemsize
+                    kv_size = (
+                        model_config.num_layers
+                        * cache_config.tokens_per_block
+                        * model_config.num_kv_heads
+                        * model_config.head_size
+                        * model_config.dtype.itemsize
+                    )
                 else:
-                    kv_size = model_config.num_layers * 2 * cache_config.tokens_per_block * model_config.num_kv_heads * model_config.head_size * model_config.dtype.itemsize
+                    kv_size = (
+                        model_config.num_layers
+                        * 2
+                        * cache_config.tokens_per_block
+                        * model_config.num_kv_heads
+                        * model_config.head_size
+                        * model_config.dtype.itemsize
+                    )
                 cache_config.num_remote_blocks = cache_config.remote_file_size // kv_size * cache_config.remote_file_num
-            
+
             else:
                 raise ValueError("remote_cache_size_mode must block_num or file_size model")

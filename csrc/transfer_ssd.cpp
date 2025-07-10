@@ -32,86 +32,90 @@ static void partition_and_remap_blocks_by_device(
 }
 
 static void _transfer_iouring_impl(
-    IOUring &iouring,
-    const std::vector<int> &fd_list, const std::vector<int> &cpu_block_ids,
+    IOUring &iouring, const std::vector<int> &fd_list,
+    const std::vector<int> &cpu_block_ids,
     const std::vector<int> &ssd_block_ids_in_device, int start_layer,
     int end_layer, int start_block, int end_block, int64_t cpu_tensor_ptr,
     int64_t cpu_layer_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes,
     int num_blocks_per_file, bool is_read, bool is_mla) {
-    int num_blocks = end_block - start_block;
-    int num_layers = end_layer - start_layer;
-    int rc;
+  int num_blocks = end_block - start_block;
+  int num_layers = end_layer - start_layer;
+  int rc;
 
-    if (num_blocks == 0) {
-        return;
-    }
+  if (num_blocks == 0) {
+    return;
+  }
 
-    for (int bid = start_block; bid < end_block; bid++) {
-        int cpu_block_id = cpu_block_ids[bid];
-        int ssd_block_id = ssd_block_ids_in_device[bid];
-        int fd = fd_list[ssd_block_id / num_blocks_per_file];
-        ssd_block_id %= num_blocks_per_file; // block id in single file
+  for (int bid = start_block; bid < end_block; bid++) {
+    int cpu_block_id = cpu_block_ids[bid];
+    int ssd_block_id = ssd_block_ids_in_device[bid];
+    int fd = fd_list[ssd_block_id / num_blocks_per_file];
+    ssd_block_id %= num_blocks_per_file; // block id in single file
 
-        for (int lid = start_layer; lid < end_layer; lid++) {
-            int64_t ssd_k_block_offset = ssd_block_id * block_stride_in_bytes +
+    for (int lid = start_layer; lid < end_layer; lid++) {
+      int64_t ssd_k_block_offset = ssd_block_id * block_stride_in_bytes +
                                    lid * ssd_layer_stride_in_bytes;
-            int64_t ssd_v_block_offset = ssd_k_block_offset + ssd_kv_stride_in_bytes;
-            int64_t cpu_k_block_offset = cpu_block_id * block_stride_in_bytes +
+      int64_t ssd_v_block_offset = ssd_k_block_offset + ssd_kv_stride_in_bytes;
+      int64_t cpu_k_block_offset = cpu_block_id * block_stride_in_bytes +
                                    lid * cpu_layer_stride_in_bytes;
-            int64_t cpu_v_block_offset = cpu_k_block_offset + cpu_kv_stride_in_bytes;
+      int64_t cpu_v_block_offset = cpu_k_block_offset + cpu_kv_stride_in_bytes;
 
-            void *cpu_k_block_ptr =
-                         reinterpret_cast<char *>(cpu_tensor_ptr) + cpu_k_block_offset;
-            void *cpu_v_block_ptr =
-                         reinterpret_cast<char *>(cpu_tensor_ptr) + cpu_v_block_offset;
-            ssize_t bytes_transfer = 0;
+      void *cpu_k_block_ptr =
+          reinterpret_cast<char *>(cpu_tensor_ptr) + cpu_k_block_offset;
+      void *cpu_v_block_ptr =
+          reinterpret_cast<char *>(cpu_tensor_ptr) + cpu_v_block_offset;
+      ssize_t bytes_transfer = 0;
 
-            if (is_read) {
-		rc = iouring.prep_read(fd, cpu_k_block_ptr, chunk_size_in_bytes, ssd_k_block_offset);
-		if (rc < 0) {
-                    bytes_transfer =
-                        pread(fd, cpu_k_block_ptr, chunk_size_in_bytes, ssd_k_block_offset);
-		}
-            } else {
-		rc = iouring.prep_write(fd, cpu_k_block_ptr, chunk_size_in_bytes, ssd_k_block_offset);
-		if (rc < 0) {
-                    bytes_transfer = pwrite(fd, cpu_k_block_ptr, chunk_size_in_bytes,
+      if (is_read) {
+        rc = iouring.prep_read(fd, cpu_k_block_ptr, chunk_size_in_bytes,
+                               ssd_k_block_offset);
+        if (rc < 0) {
+          bytes_transfer = pread(fd, cpu_k_block_ptr, chunk_size_in_bytes,
+                                 ssd_k_block_offset);
+        }
+      } else {
+        rc = iouring.prep_write(fd, cpu_k_block_ptr, chunk_size_in_bytes,
                                 ssd_k_block_offset);
-		}
-            }
+        if (rc < 0) {
+          bytes_transfer = pwrite(fd, cpu_k_block_ptr, chunk_size_in_bytes,
+                                  ssd_k_block_offset);
+        }
+      }
 
-            if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
-                throw std::runtime_error("Failed to transfer K block");
-            }
+      if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
+        throw std::runtime_error("Failed to transfer K block");
+      }
 
-            if (is_mla) {
-                continue;
-            }
+      if (is_mla) {
+        continue;
+      }
 
-            bytes_transfer = 0;
-            if (is_read) {
-		rc = iouring.prep_read(fd, cpu_v_block_ptr, chunk_size_in_bytes, ssd_v_block_offset);
-		if (rc < 0) {
-                    bytes_transfer =
-                        pread(fd, cpu_v_block_ptr, chunk_size_in_bytes, ssd_v_block_offset);
-		}
-            } else {
-		rc = iouring.prep_write(fd, cpu_v_block_ptr, chunk_size_in_bytes, ssd_v_block_offset);
-		if (rc < 0) {
-                    bytes_transfer = pwrite(fd, cpu_v_block_ptr, chunk_size_in_bytes,
+      bytes_transfer = 0;
+      if (is_read) {
+        rc = iouring.prep_read(fd, cpu_v_block_ptr, chunk_size_in_bytes,
+                               ssd_v_block_offset);
+        if (rc < 0) {
+          bytes_transfer = pread(fd, cpu_v_block_ptr, chunk_size_in_bytes,
+                                 ssd_v_block_offset);
+        }
+      } else {
+        rc = iouring.prep_write(fd, cpu_v_block_ptr, chunk_size_in_bytes,
                                 ssd_v_block_offset);
-		}
-            }
+        if (rc < 0) {
+          bytes_transfer = pwrite(fd, cpu_v_block_ptr, chunk_size_in_bytes,
+                                  ssd_v_block_offset);
+        }
+      }
 
-            if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
-                throw std::runtime_error("Failed to transfer V block");
-            }
-        } // end layer loop
-    } // end block loop
+      if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
+        throw std::runtime_error("Failed to transfer V block");
+      }
+    } // end layer loop
+  } // end block loop
 
-    iouring.submit();
+  iouring.submit();
 }
 
 static void _transfer_single_thread_impl(
@@ -177,8 +181,7 @@ static void _transfer_single_thread_impl(
 // NOTE that we may also use other techniques such as
 // AIO, O_DIRECT, and etc to improve the performance
 void transfer_kv_blocks_ssd(
-    IOUring &iouring,
-    const std::vector<std::vector<std::string>> &filepaths,
+    IOUring &iouring, const std::vector<std::vector<std::string>> &filepaths,
     const torch::Tensor &cpu_layer_id_list, int64_t cpu_tensor_ptr,
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
@@ -238,18 +241,16 @@ void transfer_kv_blocks_ssd(
       int end_block =
           std::min(start_block + num_blocks_per_thread, num_transfer_blocks);
       if (start_block < end_block) {
-	if (iouring.enabled()) {
+        if (iouring.enabled()) {
           _transfer_iouring_impl(
-              iouring,
-	      fds[d], cpu_blocks_partition[d], ssd_blocks_partition[d],
-              start_layer, end_layer, start_block, end_block,
-              cpu_tensor_ptr, cpu_layer_stride_in_bytes,
-              ssd_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
-              ssd_kv_stride_in_bytes, chunk_size_in_bytes,
-              block_stride_in_bytes, num_blocks_per_file, is_read,
-              is_mla);
-              continue;
-	}
+              iouring, fds[d], cpu_blocks_partition[d], ssd_blocks_partition[d],
+              start_layer, end_layer, start_block, end_block, cpu_tensor_ptr,
+              cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
+              cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
+              chunk_size_in_bytes, block_stride_in_bytes, num_blocks_per_file,
+              is_read, is_mla);
+          continue;
+        }
 
         std::promise<std::exception_ptr> prom;
         futures.push_back(prom.get_future());
