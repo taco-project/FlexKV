@@ -27,6 +27,12 @@ cpp_sources = [
     "csrc/transfer_ssd.cpp",
 ]
 
+hpp_sources = [
+    "csrc/cache_utils.h",
+    "csrc/tp_transfer_thread_group.h",
+    "csrc/transfer_ssd.h",
+]
+
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
 extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.join(build_dir, "include")]
@@ -41,6 +47,7 @@ if os.path.exists(lib_dir):
 if enable_cfs:
     print("ENABLE_CFS = true: compiling and link cfs related content")
     cpp_sources.append("csrc/pcfs/pcfs.cpp")
+    hpp_sources.append("csrc/pcfs/pcfs.h")
     extra_link_args.append("-lhifs_client_sdk")
     extra_compile_args.append("-DFLEXKV_ENABLE_CFS")
 
@@ -50,6 +57,7 @@ cpp_extensions = [
         sources=cpp_sources,
         library_dirs=[os.path.join(build_dir, "lib")],
         include_dirs=include_dirs,
+        depends=hpp_sources,
         extra_compile_args={"nvcc": ["-O3"], "cxx": extra_compile_args},
         extra_link_args=extra_link_args,
     ),
