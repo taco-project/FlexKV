@@ -214,7 +214,11 @@ void transfer_kv_blocks_ssd(
         throw std::runtime_error("Thread failed to open file: " +
                                  std::string(strerror(errno)));
       }
-      posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL | POSIX_FADV_WILLNEED);
+
+      if (!o_direct_flag) {
+          posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+          posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+      }
       fds[i].push_back(fd);
     }
   }
