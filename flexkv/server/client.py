@@ -66,7 +66,7 @@ class KVDPClient:
         slot_mapping: torch.Tensor,
         token_mask: Optional[torch.Tensor],
     ) -> Optional[int]:
-        req = PutRequest(self.dp_client_id, token_ids, slot_mapping, token_mask)
+        req = PutRequest(self.dp_client_id, token_ids.numpy(), slot_mapping.numpy(), token_mask.numpy() if token_mask is not None else None)
 
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
@@ -84,7 +84,7 @@ class KVDPClient:
         slot_mapping: torch.Tensor,
         token_mask: Optional[torch.Tensor],
     ) -> Optional[int]:
-        req = GetRequest(self.dp_client_id, token_ids, slot_mapping, token_mask)
+        req = GetRequest(self.dp_client_id, token_ids.numpy(), slot_mapping.numpy(), token_mask.numpy() if token_mask is not None else None)
 
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
@@ -104,7 +104,8 @@ class KVDPClient:
 
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
-
+        if response.masks is not None:
+            response.masks = {k: torch.from_numpy(v) for k, v in response.masks.items()}
         if response.success:
             flexkv_logger.info(f"wait tasks: {wait_task_ids} finished.")
             return response.masks
@@ -120,7 +121,8 @@ class KVDPClient:
 
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
-
+        if response.masks is not None:
+            response.masks = {k: torch.from_numpy(v) for k, v in response.masks.items()}
         if response.success:
             flexkv_logger.info(f"try_wait tasks: {try_wait_task_ids} finished.")
             return response.masks

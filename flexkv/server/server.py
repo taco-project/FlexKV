@@ -3,6 +3,7 @@ from typing import Optional, Dict
 
 import tempfile
 import zmq
+import torch
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
@@ -220,9 +221,9 @@ class KVServer:
                 elif isinstance(req, GetRequest):
                     assert self.client_manager.is_dp_client_ready(req.dp_client_id)
                     req_id = self.kvmanager.get_async(
-                        token_ids=req.token_ids,
-                        slot_mapping=req.slot_mapping,
-                        token_mask=req.token_mask,
+                        token_ids=torch.from_numpy(req.token_ids),
+                        slot_mapping=torch.from_numpy(req.slot_mapping),
+                        token_mask=torch.from_numpy(req.token_mask) if req.token_mask is not None else None,
                         layer_granularity=-1,
                         dp_id=req.dp_client_id,
                     )
@@ -235,9 +236,9 @@ class KVServer:
                     assert self.client_manager.is_dp_client_ready(req.dp_client_id)
                     #print(f"put request: {req.token_ids} from dp {req.dp_client_id}")
                     req_id = self.kvmanager.put_async(
-                        token_ids=req.token_ids,
-                        slot_mapping=req.slot_mapping,
-                        token_mask=req.token_mask,
+                        token_ids=torch.from_numpy(req.token_ids),
+                        slot_mapping=torch.from_numpy(req.slot_mapping),
+                        token_mask=torch.from_numpy(req.token_mask) if req.token_mask is not None else None,
                         dp_id=req.dp_client_id,
                     )
                     response = Response(req.dp_client_id, req_id)
@@ -251,6 +252,9 @@ class KVServer:
                     masks = self.kvmanager.wait(
                         req.wait_task_ids,
                     )
+                    if masks is not None:
+                        # Convert to numpy arrays for serialization
+                        masks = {k: v.numpy() if isinstance(v, torch.Tensor) else v for k, v in masks.items()}
                     response = Response(req.dp_client_id, masks=masks)
                     result_zmq = self.client_manager.get_zmq(
                         req.dp_client_id)
@@ -261,6 +265,9 @@ class KVServer:
                     masks = self.kvmanager.try_wait(
                         req.try_wait_task_ids,
                     )
+                    if masks is not None:
+                        # Convert to numpy arrays for serialization
+                        masks = {k: v.numpy() if isinstance(v, torch.Tensor) else v for k, v in masks.items()}
                     response = Response(req.dp_client_id, masks=masks)
                     result_zmq = self.client_manager.get_zmq(
                         req.dp_client_id)
