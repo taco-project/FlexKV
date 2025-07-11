@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from flexkv.common.config import ModelConfig
@@ -27,17 +28,17 @@ class RegisterTPClientRequest:
 @dataclass
 class PutRequest:
     dp_client_id: int
-    token_ids: torch.Tensor
-    slot_mapping: torch.Tensor
-    token_mask: Optional[torch.Tensor]
+    token_ids: np.ndarray
+    slot_mapping: np.ndarray
+    token_mask: Optional[np.ndarray]
 
 
 @dataclass
 class GetRequest:
     dp_client_id: int
-    token_ids: torch.Tensor
-    slot_mapping: torch.Tensor
-    token_mask: Optional[torch.Tensor]
+    token_ids: np.ndarray
+    slot_mapping: np.ndarray
+    token_mask: Optional[np.ndarray]
 
 
 @dataclass
@@ -58,6 +59,6 @@ class TryWaitRequest:
 class Response:
     dp_client_id: int
     task_id: Optional[int] = None
-    masks: Optional[Dict[int, torch.Tensor]] = None
+    masks: Optional[Dict[int, np.ndarray]] = None
     success: bool = True
     error_msg: str = ""
