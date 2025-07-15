@@ -22,12 +22,12 @@ static void partition_and_remap_blocks_by_device(
   for (int i = 0; i < num_blocks; i++) {
     int64_t ssd_block_id = ssd_block_ids[i];
     int64_t cpu_block_id = cpu_block_ids[i];
-    int file_id = (ssd_block_id / round_robin) % num_devices;
-    int block_id_in_file =
+    int device_id = (ssd_block_id / round_robin) % num_devices;
+    int block_id_in_device =
         ((ssd_block_id / round_robin) / num_devices) * round_robin +
         (ssd_block_id % round_robin);
-    ssd_blocks_partition[file_id].push_back(block_id_in_file);
-    cpu_blocks_partition[file_id].push_back(cpu_block_id);
+    ssd_blocks_partition[device_id].push_back(block_id_in_device);
+    cpu_blocks_partition[device_id].push_back(cpu_block_id);
   }
 }
 
