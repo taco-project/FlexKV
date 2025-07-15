@@ -1,5 +1,5 @@
 import time
-from multiprocessing import Queue
+from multiprocessing import Lock, Queue
 from multiprocessing.connection import Connection
 from queue import Queue as ThreadQueue
 from typing import Dict, List, Optional, Tuple
@@ -40,8 +40,15 @@ class KVDPClient:
             context, zmq.SocketType.PULL, client_recv_port, True
         )
         self.dp_client_id = self.register_to_server(model_config, client_recv_port)
-
+        self._task_id_counter = (self.dp_client_id + 1) * 10000000
+        self._task_id_lock = Lock()
         flexkv_logger.info(f"KVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
+    
+    def _get_task_id(self) -> int:
+        with self._task_id_lock:
+            old_value = self._task_id_counter
+            self._task_id_counter += 1
+            return old_value
 
     def register_to_server(
         self,
@@ -66,17 +73,23 @@ class KVDPClient:
         slot_mapping: torch.Tensor,
         token_mask: Optional[torch.Tensor],
     ) -> Optional[int]:
-        req = PutRequest(self.dp_client_id, token_ids.numpy(), slot_mapping.numpy(), token_mask.numpy() if token_mask is not None else None)
-
+        start_time = time.time()
+        req = PutRequest(self.dp_client_id, 
+                         token_ids.numpy(), 
+                         slot_mapping.numpy(), 
+                         token_mask.numpy() if token_mask is not None else None,
+                         self._get_task_id())
         self.send_to_server.send_pyobj(req)
-        response: Response = self.recv_from_server.recv_pyobj()
-
-        if response.success:
-            flexkv_logger.info(f"put_async task: {response.task_id} created.")
-            return response.task_id
-        else:
-            flexkv_logger.error(f"put_async task in DP {self.dp_client_id} create failed.")
-            return None
+        response: Response = Response(self.dp_client_id, req.task_id)
+        end_time = time.time()
+        print(f"[dpclient] put_async task: {req.task_id} created. time: {(end_time - start_time)*1000:.2f}ms")
+        return req.task_id
+       #if response.success:
+        #    flexkv_logger.info(f"put_async task: {response.task_id} created.")
+        #    return response.task_id
+        #else:
+        #    flexkv_logger.error(f"put_async task in DP {self.dp_client_id} create failed.")
+        #    return None
 
     def get_async(
         self,
@@ -84,17 +97,24 @@ class KVDPClient:
         slot_mapping: torch.Tensor,
         token_mask: Optional[torch.Tensor],
     ) -> Optional[int]:
-        req = GetRequest(self.dp_client_id, token_ids.numpy(), slot_mapping.numpy(), token_mask.numpy() if token_mask is not None else None)
+        start_time = time.time()
+        req = GetRequest(self.dp_client_id, 
+                         token_ids.numpy(), 
+                         slot_mapping.numpy(), 
+                         token_mask.numpy() if token_mask is not None else None,
+                         self._get_task_id())
 
         self.send_to_server.send_pyobj(req)
-        response: Response = self.recv_from_server.recv_pyobj()
-
-        if response.success:
-            flexkv_logger.info(f"get_async task: {response.task_id} created.")
-            return response.task_id
-        else:
-            flexkv_logger.error(f"get_async task in DP {self.dp_client_id} create failed.")
-            return None
+        response: Response = Response(self.dp_client_id, req.task_id)
+        end_time = time.time()
+        print(f"[dpclient] get_async task: {req.task_id} created. time: {(end_time - start_time)*1000:.2f}ms")
+        return req.task_id
+        #if response.success:
+        #    flexkv_logger.info(f"get_async task: {response.task_id} created.")
+        #    return response.task_id
+        #else:
+        #    flexkv_logger.error(f"get_async task in DP {self.dp_client_id} create failed.")
+        #    return None
 
     def wait(
         self,
