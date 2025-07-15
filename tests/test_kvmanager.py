@@ -42,7 +42,11 @@ DEFAULT_CACHE_CONFIG = {
         "pcfs_port": 31,
         "pcfs_ip": "172.21.16.177",
         "pcfs_parent_nodeid": 1
-    }
+    },
+    'use_ce_transfer_h2d': False,
+    'use_ce_transfer_d2h': True,
+    'transfer_sms_h2d': 4,
+    'transfer_sms_d2h': 4,
 }
 
 DEFAULT_TEST_CONFIG = {

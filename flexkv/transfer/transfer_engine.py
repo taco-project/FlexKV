@@ -42,6 +42,9 @@ class TransferEngine:
             ssd_handle: Optional SSD handle
             remote_handle: Optional remote handle
         """
+        self.model_config: ModelConfig = model_config
+        self.cache_config: CacheConfig = cache_config
+
         # Initialize scheduler
         self.scheduler = TransferScheduler()
         self.task_queue: Queue[TransferOpGraph] = Queue()
@@ -79,6 +82,10 @@ class TransferEngine:
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=self.gpu_handles[i].dtype,
                     gpu_device_id=i,
+                    use_ce_transfer_h2d=self.cache_config.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=self.cache_config.use_ce_transfer_d2h,
+                    transfer_sms_h2d=self.cache_config.transfer_sms_h2d,
+                    transfer_sms_d2h=self.cache_config.transfer_sms_d2h,
                 )
                 for i in range(self.dp_size)
             ]
@@ -95,6 +102,10 @@ class TransferEngine:
                     dtype=self.gpu_handles[i].dtype,
                     tp_group_size=self.tp_size,
                     dp_group_id=i,
+                    use_ce_transfer_h2d=self.cache_config.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=self.cache_config.use_ce_transfer_d2h,
+                    transfer_sms_h2d=self.cache_config.transfer_sms_h2d,
+                    transfer_sms_d2h=self.cache_config.transfer_sms_d2h,
                 )
                 for i in range(self.dp_size)
             ]
@@ -157,7 +168,7 @@ class TransferEngine:
                 for w in worker:
                     w.ready_event.wait(timeout=60)
             else:
-                print(f"waiting for worker {worker} to ready")
+                flexkv_logger.info(f"waiting for worker {worker} to ready")
                 worker.ready_event.wait(timeout=60)
         # Start scheduler thread
         self._running = True
