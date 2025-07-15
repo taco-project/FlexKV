@@ -267,14 +267,16 @@ class KVManager:
                   slot_mapping: torch.Tensor,
                   token_mask: Optional[torch.Tensor] = None,
                   layer_granularity: int = -1,
-                  dp_id: int = 0) -> int:
+                  dp_id: int = 0,
+                  task_id: int = -1) -> int:
         if not self.running:
             raise ValueError("kvmanager is not running, please call start() first")
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
         if layer_granularity == -1:
             layer_granularity = self.model_config.num_layers
-        task_id = self._get_task_id()
+        if task_id == -1:
+            task_id = self._get_task_id()
         # Trace the request
         self.tracer.trace_request(
             request_type="GET",
@@ -310,12 +312,14 @@ class KVManager:
                   token_ids: torch.Tensor,
                   slot_mapping: torch.Tensor,
                   token_mask: Optional[torch.Tensor] = None,
-                  dp_id: int = 0) -> int:
+                  dp_id: int = 0,
+                  task_id: int = -1) -> int:
         if not self.running:
             raise ValueError("kvmanager is not running, please call start() first")
         if token_mask is None:
             token_mask = torch.ones_like(token_ids)
-        task_id = self._get_task_id()
+        if task_id == -1:
+            task_id = self._get_task_id()
         # Trace the request
         self.tracer.trace_request(
             request_type="PUT",

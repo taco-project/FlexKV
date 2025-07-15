@@ -17,7 +17,7 @@ num_kv_heads = 8
 head_size = 128
 num_cpu_blocks = 300
 num_gpu_blocks = 30
-tp_size = 2
+tp_size = 1
 dp_size = 1
 dtype = torch.float16
 tokens_per_block = 8
@@ -47,7 +47,7 @@ cache_config = CacheConfig( enable_cpu=True,
                             enable_ssd=False,
                             enable_remote=False,
                             use_gds=False,
-                            use_pinned_memory=True,
+                            use_pinned_memory=False,
                             tokens_per_block=tokens_per_block,
                             num_cpu_blocks=num_cpu_blocks,)
 

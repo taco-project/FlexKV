@@ -226,11 +226,13 @@ class KVServer:
                         token_mask=torch.from_numpy(req.token_mask) if req.token_mask is not None else None,
                         layer_granularity=-1,
                         dp_id=req.dp_client_id,
+                        task_id=req.task_id,
                     )
-                    response = Response(req.dp_client_id, req_id)
-                    result_zmq = self.client_manager.get_zmq(
-                        req.dp_client_id)
-                    result_zmq.send_pyobj(response)
+                    if req.task_id == -1:
+                        response = Response(req.dp_client_id, req_id)
+                        result_zmq = self.client_manager.get_zmq(
+                            req.dp_client_id)
+                        result_zmq.send_pyobj(response)
 
                 elif isinstance(req, PutRequest):
                     assert self.client_manager.is_dp_client_ready(req.dp_client_id)
@@ -240,11 +242,13 @@ class KVServer:
                         slot_mapping=torch.from_numpy(req.slot_mapping),
                         token_mask=torch.from_numpy(req.token_mask) if req.token_mask is not None else None,
                         dp_id=req.dp_client_id,
+                        task_id=req.task_id,
                     )
-                    response = Response(req.dp_client_id, req_id)
-                    result_zmq = self.client_manager.get_zmq(
-                        req.dp_client_id)
-                    result_zmq.send_pyobj(response)
+                    if req.task_id == -1:
+                        response = Response(req.dp_client_id, req_id)
+                        result_zmq = self.client_manager.get_zmq(
+                            req.dp_client_id)
+                        result_zmq.send_pyobj(response)
 
                 elif isinstance(req, WaitRequest):
                     # TODO: support TP client wait

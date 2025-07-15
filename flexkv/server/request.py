@@ -31,6 +31,7 @@ class PutRequest:
     token_ids: np.ndarray
     slot_mapping: np.ndarray
     token_mask: Optional[np.ndarray]
+    task_id: int = -1
 
 
 @dataclass
@@ -39,7 +40,7 @@ class GetRequest:
     token_ids: np.ndarray
     slot_mapping: np.ndarray
     token_mask: Optional[np.ndarray]
-
+    task_id: int = -1
 
 @dataclass
 class WaitRequest:
