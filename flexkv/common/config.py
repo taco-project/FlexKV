@@ -49,3 +49,12 @@ class CacheConfig:
     trace_max_file_size_mb: int = 100
     trace_max_files: int = 5
     trace_flush_interval_ms: int = 1000
+
+    # for CPU-GPU transfer
+    use_ce_transfer_h2d: bool = False
+    use_ce_transfer_d2h: bool = False
+    transfer_sms_h2d: int = 8
+    transfer_sms_d2h: int = 8
+
+    # for ssd allocation
+    max_blocks_per_file: int = 32000  # -1 means no limit

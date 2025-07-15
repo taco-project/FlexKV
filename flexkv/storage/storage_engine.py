@@ -53,7 +53,8 @@ class StorageEngine:
                 device_type=DeviceType.SSD,
                 layout=self._ssd_layout,
                 dtype=self._model_config.dtype,
-                cache_dir=self._cache_config.ssd_cache_dir
+                cache_dir=self._cache_config.ssd_cache_dir,
+                max_blocks_per_file=self._cache_config.max_blocks_per_file
             )
         if self._cache_config.enable_remote:
             if not self._cache_config.remote_kv_layout_type == self._cpu_layout.type:
@@ -154,6 +155,7 @@ class StorageEngine:
                 )
         elif device_type == DeviceType.SSD:
             cache_dir = kwargs.get('cache_dir')
+            max_blocks_per_file = kwargs.get('max_blocks_per_file', -1)
             if raw_data is not None:
                 assert isinstance(raw_data, str) or \
                     (isinstance(raw_data, list) and all(isinstance(x, str) for x in raw_data)), \
@@ -170,7 +172,8 @@ class StorageEngine:
                     layout=layout,
                     dtype=dtype,
                     cache_dir=cache_dir,
-                    file_prefix="flexkv_ssd_cache"
+                    file_prefix="flexkv_ssd_cache",
+                    max_blocks_per_file=max_blocks_per_file
                 )
         elif device_type == DeviceType.REMOTE:
             file_path = kwargs.get('file_path')

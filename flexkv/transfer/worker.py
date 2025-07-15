@@ -192,7 +192,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  gpu_kv_layout: KVCacheLayout,
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
-                 gpu_device_id: int) -> None:
+                 gpu_device_id: int,
+                 use_ce_transfer_h2d: bool = False,
+                 use_ce_transfer_d2h: bool = False,
+                 transfer_sms_h2d: int = 8,
+                 transfer_sms_d2h: int = 8) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_queue, finished_ops_queue)
         # Register CPU tensors with CUDA
@@ -225,7 +229,10 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         if gpu_device_id != -1:
             torch.cuda.set_device(gpu_device_id)
         self.transfer_stream = torch.cuda.Stream()
-        self.transfer_sms = 8
+        self.transfer_sms_h2d = transfer_sms_h2d
+        self.transfer_sms_d2h = transfer_sms_d2h
+        self.use_ce_transfer_h2d = use_ce_transfer_h2d
+        self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
     def _transfer_impl(
         self,
@@ -240,14 +247,16 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         assert dst_block_ids.dtype == np.int64
         assert len(src_block_ids) == len(dst_block_ids)
 
-        use_ce_transfer = kwargs.get("use_ce_transfer", False)
-
         if transfer_type == TransferType.H2D:
             gpu_block_ids = dst_block_ids
             cpu_block_ids = src_block_ids
+            use_ce_transfer = self.use_ce_transfer_h2d
+            transfer_sms = self.transfer_sms_h2d
         elif transfer_type == TransferType.D2H:
             gpu_block_ids = src_block_ids
             cpu_block_ids = dst_block_ids
+            use_ce_transfer = self.use_ce_transfer_d2h
+            transfer_sms = self.transfer_sms_d2h
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for GPUCPUTransferWorker")
 
@@ -275,7 +284,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_block_stride_in_bytes,
             self.chunk_size_in_bytes,
             layer_id,
-            self.transfer_sms,
+            transfer_sms,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
             self.is_mla,
@@ -297,7 +306,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 transfer_op.transfer_type,
                 layer_id,
                 layer_granularity,
-                use_ce_transfer=False,
             )
             end_time = time.time()
 
@@ -322,7 +330,11 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  tp_group_size: int,
-                 dp_group_id: int):
+                 dp_group_id: int,
+                 use_ce_transfer_h2d: bool = False,
+                 use_ce_transfer_d2h: bool = False,
+                 transfer_sms_h2d: int = 8,
+                 transfer_sms_d2h: int = 8):
 
         super().__init__(worker_id, transfer_queue, finished_ops_queue)
         assert len(gpu_blocks) == tp_group_size
@@ -358,7 +370,10 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         if not gpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
             raise ValueError("Only layerwise layout is supported for GPU")
 
-        self.transfer_sms = 8
+        self.transfer_sms_h2d = transfer_sms_h2d
+        self.transfer_sms_d2h = transfer_sms_d2h
+        self.use_ce_transfer_h2d = use_ce_transfer_h2d
+        self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
         self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id)
 
@@ -374,14 +389,16 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         assert dst_block_ids.dtype == np.int64
         assert len(src_block_ids) == len(dst_block_ids)
 
-        use_ce_transfer = kwargs.get("use_ce_transfer", False)
-
         if transfer_type == TransferType.H2D:
             gpu_block_ids = dst_block_ids
             cpu_block_ids = src_block_ids
+            use_ce_transfer = self.use_ce_transfer_h2d
+            transfer_sms = self.transfer_sms_h2d
         elif transfer_type == TransferType.D2H:
             gpu_block_ids = src_block_ids
             cpu_block_ids = dst_block_ids
+            use_ce_transfer = self.use_ce_transfer_d2h
+            transfer_sms = self.transfer_sms_d2h
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for tpGPUCPUTransferWorker")
 
@@ -403,7 +420,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.cpu_chunk_size_in_bytes,
-            self.transfer_sms,
+            transfer_sms,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
             layer_id,
@@ -427,7 +444,6 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             transfer_op.transfer_type,
             layer_id,
             layer_granularity,
-            use_ce_transfer=False,
         )
         end_time = time.time()
 
@@ -472,7 +488,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
 
-        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files)
+        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files)  # TODO: padding
 
         self.chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
         self.block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
