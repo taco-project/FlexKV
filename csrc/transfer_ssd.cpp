@@ -39,7 +39,7 @@ static void _transfer_iouring_impl(
     int64_t cpu_layer_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes,
-    int num_blocks_per_file, bool is_read, bool is_mla) {
+    int num_files_per_device, bool is_read, bool is_mla) {
   int num_blocks = end_block - start_block;
   int num_layers = end_layer - start_layer;
   int rc;
@@ -51,8 +51,8 @@ static void _transfer_iouring_impl(
   for (int bid = start_block; bid < end_block; bid++) {
     int cpu_block_id = cpu_block_ids[bid];
     int ssd_block_id = ssd_block_ids_in_device[bid];
-    int fd = fd_list[ssd_block_id / num_blocks_per_file];
-    ssd_block_id %= num_blocks_per_file; // block id in single file
+    int fd = fd_list[ssd_block_id % num_files_per_device];
+    ssd_block_id /= num_files_per_device; // block id in single file
 
     for (int lid = start_layer; lid < end_layer; lid++) {
       int64_t ssd_k_block_offset = ssd_block_id * block_stride_in_bytes +
@@ -125,7 +125,7 @@ static void _transfer_single_thread_impl(
     int64_t cpu_layer_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes,
-    int num_blocks_per_file, bool is_read, bool is_mla) {
+    int num_files_per_device, bool is_read, bool is_mla) {
   int num_blocks = end_block - start_block;
   if (num_blocks == 0) {
     return;
@@ -133,8 +133,8 @@ static void _transfer_single_thread_impl(
   for (int bid = start_block; bid < end_block; bid++) {
     int cpu_block_id = cpu_block_ids[bid];
     int ssd_block_id = ssd_block_ids_in_device[bid];
-    int fd = fd_list[ssd_block_id / num_blocks_per_file];
-    ssd_block_id %= num_blocks_per_file; // block id in single file
+    int fd = fd_list[ssd_block_id % num_files_per_device];
+    ssd_block_id /= num_files_per_device; // block id in single file
 
     for (int lid = start_layer; lid < end_layer; lid++) {
       int64_t ssd_k_block_offset = ssd_block_id * block_stride_in_bytes +
@@ -251,7 +251,7 @@ void transfer_kv_blocks_ssd(
               start_layer, end_layer, start_block, end_block, cpu_tensor_ptr,
               cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
               cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
-              chunk_size_in_bytes, block_stride_in_bytes, num_blocks_per_file,
+              chunk_size_in_bytes, block_stride_in_bytes, num_files_per_device,
               is_read, is_mla);
           continue;
         }
@@ -263,7 +263,7 @@ void transfer_kv_blocks_ssd(
              end_layer, start_block, end_block, cpu_tensor_ptr,
              cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
              cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
-             chunk_size_in_bytes, block_stride_in_bytes, num_blocks_per_file,
+             chunk_size_in_bytes, block_stride_in_bytes, num_files_per_device,
              is_read, is_mla, prom = std::move(prom)]() mutable {
               try {
                 _transfer_single_thread_impl(
@@ -272,7 +272,7 @@ void transfer_kv_blocks_ssd(
                     cpu_tensor_ptr, cpu_layer_stride_in_bytes,
                     ssd_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
                     ssd_kv_stride_in_bytes, chunk_size_in_bytes,
-                    block_stride_in_bytes, num_blocks_per_file, is_read,
+                    block_stride_in_bytes, num_files_per_device, is_read,
                     is_mla);
                 prom.set_value(nullptr);
               } catch (...) {
