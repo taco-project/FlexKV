@@ -8,7 +8,7 @@ from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
-from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator
+from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator, GDSAllocator
 
 
 class StorageEngine:
@@ -74,6 +74,22 @@ class StorageEngine:
                 dtype=self._model_config.dtype,
                 file_path=self._cache_config.remote_cache_path,
                 remote_config_custom = self._cache_config.remote_config_custom
+            )
+        if getattr(self._cache_config, 'use_gds', False):
+            self._gds_layout: Optional[KVCacheLayout] = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERWISE,  # GDS uses layerwise layout
+                num_layer=self._model_config.num_layers,
+                num_block=getattr(self._cache_config, 'num_gds_blocks', self._cache_config.num_ssd_blocks),
+                tokens_per_block=self._cache_config.tokens_per_block,
+                num_head=self._model_config.num_kv_heads,
+                head_size=self._model_config.head_size,
+                is_mla=self._model_config.use_mla
+            )
+            self.allocate(
+                device_type=DeviceType.GDS,
+                layout=self._gds_layout,
+                dtype=self._model_config.dtype,
+                gds_cache_dirs=getattr(self._cache_config, 'gds_cache_dirs', None)
             )
 
     def register_gpu_blocks(self,
@@ -202,6 +218,17 @@ class StorageEngine:
                     file_path=file_path,
                     remote_config_custom=remote_config_custom
                 )
+        elif device_type == DeviceType.GDS:
+            gds_cache_dirs = kwargs.get('gds_cache_dirs')
+            max_blocks_per_file = kwargs.get('max_blocks_per_file', -1)
+            
+            allocator = GDSAllocator(
+                layout=layout,
+                dtype=dtype,
+                gds_cache_dirs=gds_cache_dirs,
+                max_blocks_per_file=max_blocks_per_file
+            )
+            storage_handle = allocator.get_accessible_handle()
         else:
             raise ValueError(f"Unsupported device type: {device_type}")
         self._storage_handles[key] = storage_handle

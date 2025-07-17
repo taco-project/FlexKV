@@ -7,6 +7,7 @@
 #include <vector>
 #include <initializer_list>
 #include <atomic>
+#include <torch/extension.h>
 
 #ifdef ENABLE_GDS
 #include <cuda_runtime.h>
@@ -102,11 +103,13 @@ public:
      */
     void synchronize();
     
+#ifdef ENABLE_GDS
     /**
      * Get the internal CUDA stream (uses first available stream)
      * @return CUDA stream handle
      */
     cudaStream_t get_stream() const;
+#endif
     
     /**
      * Get number of files currently managed
@@ -244,3 +247,44 @@ struct BatchReadOp {
     size_t file_offset;           // Offset in file from where to read
     ssize_t* result;              // Output: bytes read or -1 on error
 }; 
+
+/**
+ * High-level transfer function for KV blocks between GPU and GDS
+ * Similar to transfer_kv_blocks_ssd but for GPU-GDS transfers
+ * 
+ * @param gds_manager GDS manager instance to use for operations
+ * @param gds_filepaths List of GDS file paths
+ * @param gpu_layer_id_list Tensor of layer IDs to process
+ * @param gpu_layer_ptrs_tensor Tensor containing GPU layer pointers
+ * @param gds_block_ids Tensor of GDS block IDs
+ * @param gpu_block_ids Tensor of GPU block IDs  
+ * @param gpu_kv_stride_in_bytes Stride between K and V in GPU memory
+ * @param gds_layer_stride_in_bytes Stride between layers in GDS file
+ * @param gds_block_stride_in_bytes Stride between blocks in GDS file
+ * @param gds_kv_stride_in_bytes Stride between K and V in GDS file
+ * @param block_size_in_bytes Size of each block in bytes
+ * @param gds_copy_off_inside_chunks Copy offset inside each chunk in GDS file
+ * @param num_blocks_per_file Number of blocks per file
+ * @param total_layers Total number of layers
+ * @param is_read true for GDS->GPU, false for GPU->GDS
+ * @param verbose Enable verbose logging
+ */
+void transfer_kv_blocks_gds(
+    GDSManager& gds_manager,
+    const std::vector<std::string>& gds_filepaths,
+    const torch::Tensor& gpu_layer_id_list,
+    const torch::Tensor& gpu_layer_ptrs_tensor,
+    const torch::Tensor& gds_block_ids,
+    const torch::Tensor& gpu_block_ids,
+    int64_t gpu_kv_stride_in_bytes,
+    int64_t gds_layer_stride_in_bytes,
+    int64_t gds_block_stride_in_bytes,
+    int64_t gds_kv_stride_in_bytes,
+    int64_t block_size_in_bytes,
+    int64_t gds_copy_off_inside_chunks,
+    int num_blocks_per_file,
+    int64_t total_layers,
+    bool is_read,
+    bool verbose = false,
+    bool is_mla = false
+); 

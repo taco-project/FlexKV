@@ -12,6 +12,7 @@ class AccessHandleType(Enum):
     TENSOR = auto()  # single tensor or tensor list
     FILE = auto()  # single file or file list
     TENSOR_HANDLE = auto()  # single tensor handle or tensor handle list
+    GDS_MANAGER = auto()
 
 # NOTE: currently, we assume that the layout type of GPU should always be layerwise
 # and the layout type of CPU, SSD, remote should be the same, either laywise or blockwise

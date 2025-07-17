@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional, Literal, List
 from enum import Enum
 from typing import Optional, List, Union, Dict, Any
 
@@ -44,6 +45,7 @@ class CacheConfig:
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
+    num_gds_blocks: int = 10000000
     num_remote_blocks: Optional[int] = None
 
     # CPU-GPU transfer configs
@@ -57,6 +59,9 @@ class CacheConfig:
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
     ssd_cache_iouring_entries: int = 0
     ssd_cache_iouring_flags: int = 0
+
+    # gds cache configs
+    gds_cache_dir: Optional[List[str]] = None
 
     # remote cache configs
     remote_cache_size_mode: str = "file_size"  # file_size or block_num

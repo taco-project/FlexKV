@@ -11,6 +11,7 @@ class DeviceType(Enum):
     GPU = 1
     SSD = 2
     REMOTE = 3
+    GDS = 4
 
 class TransferType(Enum):
     H2D    = "H2D"
@@ -21,6 +22,8 @@ class TransferType(Enum):
     D2DISK = "D2DISK"
     REMOTE2H = "REMOTE2H"
     H2REMOTE = "H2REMOTE"
+    GDS2D  = "GDS2D"
+    D2GDS  = "D2GDS"
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of

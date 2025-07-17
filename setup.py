@@ -24,20 +24,24 @@ cpp_sources = [
     "csrc/transfer.cu",
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
+    "csrc/gds/tp_gds_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/gds/gds_manager.cpp"
 ]
 
 hpp_sources = [
     "csrc/cache_utils.h",
     "csrc/tp_transfer_thread_group.h",
+    "csrc/gds/tp_gds_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
+    "csrc/gds/gds_manager.h",
 ]
 
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring", "-lcufile"] #"-lssl", "-lcrypto"
-extra_compile_args = ["-std=c++17"]
-include_dirs = [os.path.join(build_dir, "include")]
+extra_compile_args = ["-std=c++17", "-DENABLE_GDS"]
+include_dirs = [os.path.join(build_dir, "include"), "csrc"]
 
 # Add rpath to find libraries at runtime
 lib_dir = os.path.join(build_dir, "lib")
@@ -147,3 +151,4 @@ setup(
     },
     python_requires=">=3.8",
 )
+

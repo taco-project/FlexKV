@@ -274,13 +274,11 @@ void GDSManager::synchronize() {
 #endif
 }
 
-cudaStream_t GDSManager::get_stream() const {
 #ifdef ENABLE_GDS
+cudaStream_t GDSManager::get_stream() const {
     return is_ready_ ? shared_stream_ : nullptr;
-#else
-    return nullptr;
-#endif
 }
+#endif
 
 ssize_t GDSManager::write(const char* filename, const void* gpu_data, size_t size, size_t file_offset) {
     if (!is_ready_) {
@@ -492,9 +490,9 @@ int GDSManager::batch_synchronize(int batch_id) {
     std::vector<CUfileIOEvents_t> io_events(batch_info.batch_size);
     CUfileError_t status;
     
-    while (num_completed != batch_info.batch_size) {
-        memset(io_events, 0, sizeof(*io_events));
-        nr = batch_info.batch_size;
+    while (num_completed != static_cast<unsigned int>(batch_info.batch_size)) {
+        memset(io_events.data(), 0, io_events.size() * sizeof(CUfileIOEvents_t));
+        nr = static_cast<unsigned int>(batch_info.batch_size);
         status = cuFileBatchIOGetStatus(batch_handle, batch_info.batch_size, &nr, io_events.data(), NULL);	
         if (status.err !=0) {
             set_error("cuFileBatchIOGetStatus failed");
@@ -583,4 +581,134 @@ int GDSManager::batch_read(const struct BatchReadOp* operations, int batch_size)
     set_error("GDS not available");
     return -1;
 #endif
+}
+
+void transfer_kv_blocks_gds(
+    GDSManager& gds_manager,
+    const std::vector<std::string>& gds_filepaths,
+    const torch::Tensor& gpu_layer_id_list,
+    const torch::Tensor& gpu_layer_ptrs_tensor,
+    const torch::Tensor& gds_block_ids,
+    const torch::Tensor& gpu_block_ids,
+    int64_t gpu_kv_stride_in_bytes,
+    int64_t gds_layer_stride_in_bytes,
+    int64_t gds_block_stride_in_bytes,
+    int64_t gds_kv_stride_in_bytes,
+    int64_t block_size_in_bytes,
+    int64_t gds_copy_off_inside_chunks,
+    int num_blocks_per_file,
+    int64_t total_layers,
+    bool is_read,
+    bool verbose,
+    bool is_mla
+) {
+    if (!gds_manager.is_ready()) {
+        throw std::runtime_error("GDS Manager not ready: " + gds_manager.get_last_error());
+    }
+    
+    if (gds_filepaths.empty()) {
+        throw std::runtime_error("No GDS file paths provided");
+    }
+    
+    // Get tensor data pointers
+    const int64_t* layer_ptrs = gpu_layer_ptrs_tensor.data_ptr<int64_t>();
+    const int64_t* gds_block_id_ptr = gds_block_ids.data_ptr<int64_t>();
+    const int64_t* gpu_block_id_ptr = gpu_block_ids.data_ptr<int64_t>();
+    
+    const int num_layers = gpu_layer_id_list.size(0);
+    const int32_t* gpu_layer_id_list_ptr = gpu_layer_id_list.data_ptr<int32_t>();
+    const int num_transfers = gds_block_ids.size(0);
+    const int num_files = gds_filepaths.size();
+    
+    // Process each layer
+    for (int i = 0; i < num_layers; i++) {
+        int32_t layer_idx = gpu_layer_id_list_ptr[i];
+        void* layer_ptr = reinterpret_cast<void*>(layer_ptrs[layer_idx]);
+        
+        // Calculate K and V base pointers for this layer
+        void* k_view = layer_ptr;
+        void* v_view = static_cast<char*>(layer_ptr) + gpu_kv_stride_in_bytes;
+        
+        // Process each block transfer for this layer
+        for (int j = 0; j < num_transfers; j++) {
+            int64_t gds_block_id = gds_block_id_ptr[j];
+            int64_t gpu_block_id = gpu_block_id_ptr[j];
+            
+            // Multi-file support: determine which file and block within file
+            // Similar to SSD transfer logic
+            int file_idx = gds_block_id / num_blocks_per_file;
+            int64_t block_id_in_file = gds_block_id % num_blocks_per_file;
+            
+            // Ensure file index is valid
+            if (file_idx >= num_files) {
+                throw std::runtime_error("GDS block ID " + std::to_string(gds_block_id) + 
+                                       " exceeds available files (file_idx=" + std::to_string(file_idx) + 
+                                       ", num_files=" + std::to_string(num_files) + ")");
+            }
+            
+            const std::string& filename = gds_filepaths[file_idx];
+            
+            // Calculate GDS file offsets using block_id_in_file
+            int64_t gds_base_offset = 
+                gds_layer_stride_in_bytes * layer_idx +
+                gds_block_stride_in_bytes * block_id_in_file;
+            
+            int64_t gds_k_offset = gds_base_offset + gds_copy_off_inside_chunks;
+            int64_t gds_v_offset = gds_k_offset + gds_kv_stride_in_bytes;
+            
+            // Calculate GPU memory pointers
+            void* k_ptr = static_cast<char*>(k_view) + gpu_block_id * block_size_in_bytes;
+            void* v_ptr = static_cast<char*>(v_view) + gpu_block_id * block_size_in_bytes;
+            
+            // Perform K block transfer
+            ssize_t k_result;
+            if (is_read) {
+                // GDS -> GPU (read from GDS file to GPU memory)
+                k_result = gds_manager.read(filename.c_str(), k_ptr, block_size_in_bytes, gds_k_offset);
+            } else {
+                // GPU -> GDS (write from GPU memory to GDS file) 
+                k_result = gds_manager.write(filename.c_str(), k_ptr, block_size_in_bytes, gds_k_offset);
+            }
+            
+            if (k_result != block_size_in_bytes) {
+                throw std::runtime_error("Failed to transfer K block for layer " + 
+                                       std::to_string(layer_idx) + ", block " + std::to_string(j) +
+                                       ", file " + filename + ": " + gds_manager.get_last_error());
+            }
+            
+            if (is_mla) {
+                continue;
+            }
+
+            // Perform V block transfer
+            ssize_t v_result;
+            if (is_read) {
+                // GDS -> GPU (read from GDS file to GPU memory)
+                v_result = gds_manager.read(filename.c_str(), v_ptr, block_size_in_bytes, gds_v_offset);
+            } else {
+                // GPU -> GDS (write from GPU memory to GDS file)
+                v_result = gds_manager.write(filename.c_str(), v_ptr, block_size_in_bytes, gds_v_offset);
+            }
+            
+            if (v_result != block_size_in_bytes) {
+                throw std::runtime_error("Failed to transfer V block for layer " + 
+                                       std::to_string(layer_idx) + ", block " + std::to_string(j) +
+                                       ", file " + filename + ": " + gds_manager.get_last_error());
+            }
+            
+            if (verbose) {
+                std::cerr << "Layer " << layer_idx << " Block " << j
+                          << " Operation: " << (is_read ? "Read" : "Write")
+                          << " GDS Block ID: " << gds_block_id << " (file " << file_idx 
+                          << ", block_in_file " << block_id_in_file << ")"
+                          << " GPU Block ID: " << gpu_block_id 
+                          << " File: " << filename
+                          << " K bytes: " << k_result
+                          << " V bytes: " << v_result << std::endl;
+            }
+        }
+    }
+    
+    // Synchronize to ensure all operations complete
+    gds_manager.synchronize();
 }

@@ -102,7 +102,7 @@ class CPUAllocator(BaseStorageAllocator):
         physical_tensor = torch.empty(
                             size=(total_size,),
                             dtype=dtype,
-                            device="cpu",
+                    device="cpu",
                             pin_memory=pin_memory,
                         )
         return StorageHandle(
@@ -277,3 +277,136 @@ class RemoteAllocator(BaseStorageAllocator):
             dtype=dtype,
             remote_config_custom = remote_config_custom,
         )
+        return allocator
+
+
+class GDSAllocator(BaseStorageAllocator):
+    def __init__(
+        self,
+        layout: KVCacheLayout,
+        dtype: torch.dtype,
+        gds_cache_dirs: Optional[List[str]] = None,
+        **kwargs: Any,
+    ):
+        """
+        Initialize GDS Allocator
+        
+        Args:
+            layout: KV cache layout information
+            dtype: Data type of tensors 
+            gds_cache_dirs: List of directories to create GDS files in
+        """
+        self.layout = layout 
+        self.dtype = dtype
+        self.total_file_size = layout.get_total_elements() * dtype.itemsize
+        print(f"[GDSAllocator] total_file_size: {self.total_file_size}")
+        
+        # Use provided directories or default
+        if gds_cache_dirs is None or len(gds_cache_dirs) == 0:
+            self.gds_cache_dirs = ["./flexkv_gds"]
+        else:
+            self.gds_cache_dirs = gds_cache_dirs
+            
+        # Configuration for file size limits  
+        self.max_blocks_per_file = kwargs.get("max_blocks_per_file", -1)
+        if self.max_blocks_per_file == -1:
+            self.max_blocks_per_file = int(1e9)  # Very large number as default
+        
+        self.file_paths = []
+        self.gds_manager = None
+        self.allocate()
+
+    def allocate(self):
+        """Allocate GDS files and initialize GDS manager"""
+        from flexkv import c_ext
+        
+        # Create GDS files based on directories and layout
+        self.file_paths = self._create_gds_files()
+        
+        # Initialize GDS manager with files
+        self.gds_manager = c_ext.GDSManager(self.file_paths)
+        
+        if not self.gds_manager.is_ready():
+            raise RuntimeError(f"Failed to initialize GDS Manager: {self.gds_manager.get_last_error()}")
+
+    def _create_gds_files(self) -> List[str]:
+        """Create GDS files based on directories and layout, similar to SSDAllocator logic"""
+        from flexkv import c_ext
+        
+        # Ensure directories exist
+        for dir_path in self.gds_cache_dirs:
+            os.makedirs(dir_path, exist_ok=True)
+            if not os.path.isdir(dir_path):
+                raise ValueError(f"gds_cache_dir must be a directory: {dir_path}")
+        
+        num_gds_devices = len(self.gds_cache_dirs)
+        
+        # Check if total blocks can be evenly distributed across devices
+        if self.layout.num_block % num_gds_devices != 0:
+            raise ValueError(f"num_gds_blocks ({self.layout.num_block}) must be a multiple of "
+                             f"num_gds_devices ({num_gds_devices})")
+        
+        total_blocks_per_device = self.layout.num_block // num_gds_devices
+        block_size = self.layout.get_elements_per_block() * self.dtype.itemsize
+        
+        # Calculate file size limits (use filesystem limit or default)
+        try:
+            fsys_max_blocks_per_file = self._get_file_size_limit(self.gds_cache_dirs[0]) // block_size
+        except (OSError, AttributeError):
+            # Use 4GB as default if we can't get filesystem limit
+            fsys_max_blocks_per_file = (4 * 1024 * 1024 * 1024) // block_size
+        
+        num_blocks_per_file = min(fsys_max_blocks_per_file, self.max_blocks_per_file)
+        num_files_per_device = (total_blocks_per_device + num_blocks_per_file - 1) // num_blocks_per_file
+        real_file_size = num_blocks_per_file * block_size
+        self.num_blocks_per_file = num_blocks_per_file
+        
+        # Create a temporary GDS manager for file creation
+        temp_gds_manager = c_ext.GDSManager([])
+        file_paths = []
+        
+        # Create files for each device/directory
+        for device_idx in range(num_gds_devices):
+            dir_path = self.gds_cache_dirs[device_idx]
+            for file_idx in range(num_files_per_device):
+                file_path = os.path.join(dir_path, f"gds_cache_{device_idx}_{file_idx}.dat")
+                file_paths.append(file_path)
+                
+                # Use GDS Manager to create the file properly (with O_DIRECT and cuFile registration)
+                if not temp_gds_manager.create_gds_file(file_path, real_file_size):
+                    raise RuntimeError(f"Failed to create GDS file {file_path}: {temp_gds_manager.get_last_error()}")
+                
+                # Remove from temp manager since we'll add it to the real manager later
+                temp_gds_manager.remove_file(file_path)
+        
+        return file_paths
+    
+    def _get_file_size_limit(self, file_path: str) -> int:
+        """Get file size limit for the filesystem, similar to SSDAllocator"""
+        st = os.statvfs(file_path)
+        return st.f_frsize * st.f_bavail
+
+    def free(self):
+        """Free GDS resources"""
+        if self.gds_manager:
+            # GDS manager destructor will handle cleanup
+            self.gds_manager = None
+
+    def get_accessible_handle(self) -> StorageHandle:
+        """Get accessible handle for GDS storage"""
+        # Return file paths instead of GDSManager to avoid multiprocessing serialization issues
+        # The worker will recreate GDSManager from these paths
+        return StorageHandle(
+            handle_type=AccessHandleType.FILE,  # Use FILE type for file paths
+            data=self.file_paths,  # Pass file paths instead of GDSManager
+            kv_layout=self.layout,
+            dtype=self.dtype,
+            num_blocks_per_file=self.num_blocks_per_file,
+        )
+    
+    def from_raw_data(cls,
+                      data: Union[str, List[str]],  # type: ignore
+                      layout: KVCacheLayout,
+                      dtype: torch.dtype,
+                      **kwargs: Any) -> StorageHandle:
+        raise NotImplementedError
