@@ -8,6 +8,7 @@ from flexkv.cache.cache_engine import CacheEngine
 from flexkv.common.transfer import DeviceType
 from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
 from flexkv.common.block import SequenceMeta
+from tests.test_utils import skip_if_no_cuda
 
 @pytest.fixture
 def cache_engine(request: pytest.FixtureRequest) -> CacheEngine:
