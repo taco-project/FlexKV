@@ -316,8 +316,7 @@ class FlexKVReplayEngine:
         other_events.sort(key=lambda e: e['timestamp'])
 
         request_id_mapping = {}  # Map original request_id to replayed task_id
-        replayed_event_num = 0
-        for event in other_events:
+        for replayed_event_num, event in enumerate(other_events):
             event_type = event['event_type']
 
             if event_type == 'request':
@@ -344,7 +343,6 @@ class FlexKVReplayEngine:
 
             # Small delay between events to simulate real timing
             time.sleep(0.001)
-            replayed_event_num += 1
             #if replayed_event_num == 200:
             #    break
 

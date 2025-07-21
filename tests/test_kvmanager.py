@@ -12,7 +12,6 @@ from flexkv.kvmanager import KVManager
 # Import utilities from test_utils
 from tests.test_utils import (
     DEFAULT_MODEL_CONFIG, DEFAULT_CACHE_CONFIG, DEFAULT_TEST_CONFIG,
-    model_config, cache_config, test_config,
     generate_request_pair, verify_data, block_ids_2_slot_mapping,
     generate_gpu_blocks_with_ground_truth, skip_if_insufficient_gpus,
     create_kvmanager_with_mode, create_gpu_kv_layout

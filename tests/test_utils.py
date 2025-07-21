@@ -37,7 +37,7 @@ DEFAULT_CACHE_CONFIG = {
     'use_gds': False,
     'enable_trace': False,
     'use_pinned_memory': False,
-    'ssd_cache_dir': ["./ssd_cache", "./ssd_cache2/"],  # Simplified to single directory for transfer engine compatibility
+    'ssd_cache_dir': ["./ssd_cache", "./ssd_cache2/"],
     'ssd_cache_iouring_entries': 0,
     'remote_cache_path': ["remote_cache1", "remote_cache2"],
     'remote_config_custom': {
@@ -56,7 +56,7 @@ DEFAULT_TEST_CONFIG = {
     'num_gpu_blocks': 512,
     'requests_per_block': 16,
     'initial_write_ratio': 0.4,
-    'use_server_client': False, 
+    'use_server_client': False,
 }
 
 # Fixtures
@@ -80,7 +80,7 @@ def test_config(request: pytest.FixtureRequest):
     param = request.param if hasattr(request, 'param') else {}
     cfg = dict(DEFAULT_TEST_CONFIG, **param)
     return cfg
-    
+
 # Utility functions
 def generate_request_pair(idx: int, block_per_request, num_gpu_blocks, tokens_per_block, dp_size):
     """Generate a request pair with token_ids, block_ids, and dp_id"""
@@ -117,7 +117,7 @@ def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks):
     use_mla = model_config.use_mla
     tp_size = model_config.tp_size
     tokens_per_block = cache_config.tokens_per_block
-    
+
     tpgroup_gpu_kv_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERWISE,
         num_layer=num_layers,
@@ -161,7 +161,10 @@ def generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_confi
         head_per_tp = num_kv_heads // tp_size
         for tp_id in range(tp_size):
             global_gpu_id = dp_id * tp_size + tp_id
-            device = torch.device(f"cuda:{global_gpu_id}") if global_gpu_id < torch.cuda.device_count() else torch.device("cuda:0")
+            device = (
+                torch.device(f"cuda:{global_gpu_id}")
+                if global_gpu_id < torch.cuda.device_count() else torch.device("cuda:0")
+            )
             gpu_blocks[global_gpu_id] = []
             for layer_id in range(num_layers):
                 if not use_mla:
@@ -234,21 +237,20 @@ def skip_if_no_cuda():
 # Server-Client mode support functions
 class KVManagerServerClient:
     """Server-Client wrapper for KVManager that manages server, tp_client, and dp_client processes"""
-    
+
     def __init__(self, model_config, cache_config, gpu_kv_layout, gpu_blocks):
         import tempfile
-        from multiprocessing import Process
         from flexkv.server.client import KVDPClient, KVTPClient
         from flexkv.server.server import KVServer
-        
+
         self.model_config = model_config
         self.cache_config = cache_config
         self.gpu_kv_layout = gpu_kv_layout
         self.gpu_blocks = gpu_blocks
-        
+
         # Create temporary IPC port for communication
         self.server_recv_port = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        
+
         # Extract basic config parameters for server process
         server_config = {
             'num_layers': model_config.num_layers,
@@ -266,7 +268,7 @@ class KVManagerServerClient:
             'num_ssd_blocks': cache_config.num_ssd_blocks,
             'ssd_cache_dir': cache_config.ssd_cache_dir if hasattr(cache_config, 'ssd_cache_dir') else ["./ssd_cache"],
         }
-        
+
         # Start server process
         self.server_process = Process(
             target=self._run_server,
@@ -274,14 +276,14 @@ class KVManagerServerClient:
             daemon=False
         )
         self.server_process.start()
-        
+
         # Wait for server to start
         time.sleep(5)
-        
+
         # Initialize dp_client
         self.dp_client = KVDPClient(self.server_recv_port, model_config)
-        print(f"dp_client started")
-        
+        print("dp_client started")
+
         # Start tp_client processes
         self.tp_client_processes = []
         for tp_rank in range(model_config.tp_size):
@@ -289,23 +291,23 @@ class KVManagerServerClient:
             # Extract only the necessary basic types for tp_client
             tp_client_process = Process(
                 target=KVManagerServerClient._run_tp_client,
-                args=(self.dp_client.dp_client_id, tp_rank, device_id, self.server_recv_port, 
+                args=(self.dp_client.dp_client_id, tp_rank, device_id, self.server_recv_port,
                       model_config.num_layers, str(model_config.dtype), list(gpu_kv_layout.kv_shape[1:])),
                 daemon=True
             )
             tp_client_process.start()
             self.tp_client_processes.append(tp_client_process)
-        
+
         # Wait for tp clients to register
         time.sleep(5)
-        
+
         self._server_client_mode = True
-        
+
     def _run_server(self, server_recv_port, server_config):
         """Run server process"""
         from flexkv.server.server import KVServer
         from flexkv.common.config import ModelConfig, CacheConfig
-        
+
         # Recreate config objects from basic parameters
         model_config = ModelConfig(
             num_layers=server_config['num_layers'],
@@ -316,7 +318,7 @@ class KVManagerServerClient:
             dp_size=server_config['dp_size'],
             dtype=torch.float16 if server_config['dtype'] == 'torch.float16' else torch.float32
         )
-        
+
         cache_config = CacheConfig(
             tokens_per_block=server_config['tokens_per_block'],
             enable_cpu=server_config['enable_cpu'],
@@ -326,17 +328,17 @@ class KVManagerServerClient:
             num_ssd_blocks=server_config['num_ssd_blocks'],
             ssd_cache_dir=server_config['ssd_cache_dir']
         )
-        print(f"starting server ... ...")
+        print("starting server ... ...")
         kvserver = KVServer(model_config, cache_config, server_recv_port)
         kvserver.run()
-        print(f"server started")
-        
+        print("server started")
+
     @staticmethod
     def _run_tp_client(dp_client_id, tp_rank, device_id, server_recv_port, num_layers, dtype_str, kv_shape):
         """Run tp_client process"""
         from flexkv.server.client import KVTPClient
         from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-        
+
         tp_client = KVTPClient(server_recv_port, dp_client_id, device_id, tp_rank)
         # Convert dtype string back to torch dtype
         if dtype_str == "torch.float16":
@@ -345,14 +347,14 @@ class KVManagerServerClient:
             dtype = torch.float32
         else:
             dtype = torch.float16  # default
-        
+
         # Create GPU blocks for this tp_rank in the tp_client process
         gpu_blocks_for_tp = []
         for layer_id in range(num_layers):
             gpu_blocks_for_tp.append(
                 torch.rand(size=tuple(kv_shape), dtype=dtype).cuda(device_id)
             )
-        
+
         # Create a simple layout for registration
         gpu_kv_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERWISE,
@@ -363,17 +365,17 @@ class KVManagerServerClient:
             head_size=kv_shape[4],  # Assuming this is the head_size dimension
             is_mla=False
         )
-        print(f"registering to server ... ...")
+        print("registering to server ... ...")
         tp_client.register_to_server(gpu_blocks_for_tp, gpu_kv_layout)
-        print(f"registered to server")
+        print("registered to server")
         # Keep the process running
         while True:
             time.sleep(1)
-        
+
     def is_ready(self):
         """Check if the server-client system is ready"""
         return self.server_process.is_alive() and all(p.is_alive() for p in self.tp_client_processes)
-    
+
     def start(self):
         """Start the server-client system (already started in __init__)"""
         return True
@@ -385,22 +387,22 @@ class KVManagerServerClient:
     def get_async(self, token_ids, slot_mapping, layer_granularity, dp_id):
         """Get data from the server-client system"""
         return self.dp_client.get_async(token_ids, slot_mapping, token_mask=None)
-    
+
     def wait_for_graph_finished(self, request):
         """Wait for graph to finish"""
         masks = self.dp_client.wait(request)
         time.sleep(0.2)
         return masks
-    
+
     def wait(self, request_ids):
         """Wait for requests to complete"""
         masks = self.dp_client.wait(request_ids)
         return masks
-    
+
     def shutdown(self):
         """Shutdown all processes"""
         print("Shutting down KVManagerServerClient...")
-        
+
         # First, try to gracefully shutdown the server by sending a shutdown signal
         try:
             # Send a shutdown request to the server
@@ -408,12 +410,12 @@ class KVManagerServerClient:
             shutdown_request = ShutdownRequest(dp_client_id=self.dp_client.dp_client_id)
             self.dp_client.send_to_server.send_pyobj(shutdown_request)
             print("Sent shutdown request to server")
-            
+
             # Wait a bit for graceful shutdown
             time.sleep(3)
         except Exception as e:
             print(f"Error sending shutdown request: {e}")
-        
+
         # Terminate tp_client processes
         print("Terminating tp_client processes...")
         for tp_process in self.tp_client_processes:
@@ -424,7 +426,7 @@ class KVManagerServerClient:
                     print(f"Force killing tp_client process {tp_process.pid}")
                     tp_process.kill()
                     tp_process.join(timeout=2)
-        
+
         # Terminate server process
         print("Terminating server process...")
         if self.server_process.is_alive():
@@ -434,7 +436,7 @@ class KVManagerServerClient:
                 print(f"Force killing server process {self.server_process.pid}")
                 self.server_process.kill()
                 self.server_process.join(timeout=5)
-        
+
         # Clean up temporary file
         import os
         if hasattr(self, 'server_recv_port') and self.server_recv_port.startswith('ipc://'):
@@ -445,7 +447,7 @@ class KVManagerServerClient:
                     print(f"Cleaned up temporary file: {temp_file}")
             except Exception as e:
                 print(f"Error cleaning up temporary file: {e}")
-        
+
         print("KVManagerServerClient shutdown complete")
 
 def create_kvmanager_with_mode(model_config, cache_config, gpu_kv_layout, gpu_blocks, use_server_client=False):

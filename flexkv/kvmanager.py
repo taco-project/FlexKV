@@ -429,7 +429,7 @@ class KVManager:
                 return_masks[task_id] = mask
             else:
                 mask = None
-            
+
         return return_masks
 
     def wait_at_layer_group(self, task_id: int, layer_group_id: int) -> torch.Tensor:
