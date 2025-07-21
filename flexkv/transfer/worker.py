@@ -500,12 +500,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
-
-        if cache_config.use_pinned_memory:
-            iouring_entries = cache_config.ssd_cache_iouring_entries
-        else:
-            iouring_entries = 0
-        self.iouring = c_ext.IOUring(iouring_entries, cache_config.ssd_cache_iouring_flags)
+        self.iouring = c_ext.IOUring(cache_config.ssd_cache_iouring_entries, cache_config.ssd_cache_iouring_flags)
 
     def _transfer_impl(
         self,
