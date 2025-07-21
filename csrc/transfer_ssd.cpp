@@ -216,8 +216,8 @@ void transfer_kv_blocks_ssd(
       }
 
       if (!o_direct_flag) {
-          posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-          posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
       }
       fds[i].push_back(fd);
     }

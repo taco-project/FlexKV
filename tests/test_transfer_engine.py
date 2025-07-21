@@ -45,9 +45,6 @@ from flexkv.transfer.transfer_engine import TransferEngine
 
 # Import utilities from test_utils
 from tests.test_utils import (
-    model_config,
-    cache_config,
-    test_config,
     wait_for_transfer_completion,
     skip_if_no_cuda,
     skip_if_insufficient_gpus,
@@ -92,12 +89,17 @@ def test_gpu_cpu_round_trip(model_config,
     model_config.use_mla = use_mla
     model_config.tp_size = tp_size
     model_config.dp_size = dp_size
-    test_config['num_gpu_blocks'] = num_gpu_blocks
+
+    # Create a copy of test_config to avoid modifying the fixture
+    test_config_copy = test_config.copy()
+    test_config_copy['num_gpu_blocks'] = num_gpu_blocks
+
     cache_config.cpu_kv_layout_type = underlying_layout_type
     # Setup configurations
     cache_config.enable_ssd = False
 
-    gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_config)
+    gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = \
+        generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_config_copy)
     # Setup storage engine and transfer engine
     storage_engine = StorageEngine(model_config, cache_config)
     for gpu_id, gpu_block in gpu_blocks.items():
@@ -153,7 +155,7 @@ def test_gpu_cpu_round_trip(model_config,
         assert wait_for_transfer_completion(transfer_engine, [read_graph.graph_id]), \
             f"CPU->GPU transfer failed for DP group {dp_id}"
 
-    verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, model_config.num_kv_heads, 
+    verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, model_config.num_kv_heads,
                 model_config.tp_size, model_config.dp_size, model_config.num_layers, model_config.use_mla)
     # Cleanup
     transfer_engine.shutdown()
@@ -163,7 +165,13 @@ def test_gpu_cpu_round_trip(model_config,
 @pytest.mark.parametrize("transfer_block_num", [8, 16])
 @pytest.mark.parametrize("use_mla", [True, False])
 @pytest.mark.parametrize("iouring_entries", [0, 512])
-def test_ssd_round_trip(model_config, cache_config, test_config, num_gpu_blocks, transfer_block_num, use_mla, iouring_entries):
+def test_ssd_round_trip(model_config,
+                        cache_config,
+                        test_config,
+                        num_gpu_blocks,
+                        transfer_block_num,
+                        use_mla,
+                        iouring_entries):
     """
     Test round-trip data transfers involving SSD storage
 
@@ -185,8 +193,13 @@ def test_ssd_round_trip(model_config, cache_config, test_config, num_gpu_blocks,
     cache_config.enable_ssd = True
     cache_config.ssd_cache_iouring_entries = iouring_entries
     model_config.use_mla = use_mla
-    test_config['num_gpu_blocks'] = num_gpu_blocks
-    gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_config)
+
+    # Create a copy of test_config to avoid modifying the fixture
+    test_config_copy = test_config.copy()
+    test_config_copy['num_gpu_blocks'] = num_gpu_blocks
+
+    gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = \
+        generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_config_copy)
     if (model_config.tp_size * model_config.dp_size) > 1:
         pytest.skip("SSD transfer test is not supported for multi-GPU")
 
@@ -247,7 +260,7 @@ def test_ssd_round_trip(model_config, cache_config, test_config, num_gpu_blocks,
     assert wait_for_transfer_completion(transfer_engine, [read_graph.graph_id]), \
         "SSD->CPU->GPU read transfer failed"
 
-    verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, model_config.num_kv_heads, 
+    verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, model_config.num_kv_heads,
                 model_config.tp_size, model_config.dp_size, model_config.num_layers, model_config.use_mla)
 
     # Cleanup
@@ -283,7 +296,7 @@ def test_concurrent_mixed_transfers(model_config,
     """
     model_config.use_mla = use_mla
     skip_if_no_cuda()
-    
+
     if (model_config.tp_size * model_config.dp_size) > 1:
         pytest.skip("Concurrent transfer test is not supported for multi-GPU")
 
@@ -296,8 +309,13 @@ def test_concurrent_mixed_transfers(model_config,
 
     # Setup configurations
     cache_config.enable_ssd = include_ssd
-    
-    gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_config)
+
+    # Create a copy of test_config to avoid modifying the fixture
+    test_config_copy = test_config.copy()
+    test_config_copy['num_gpu_blocks'] = num_gpu_blocks
+
+    gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = \
+        generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_config_copy)
 
     # Setup storage engine and transfer engine
     storage_engine = StorageEngine(model_config, cache_config)
@@ -383,7 +401,7 @@ def test_concurrent_mixed_transfers(model_config,
     assert wait_for_transfer_completion(transfer_engine, read_graph_ids, max_wait_time=20.0), \
         "Concurrent read transfers failed to complete"
 
-    verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, model_config.num_kv_heads, 
+    verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, model_config.num_kv_heads,
                 model_config.tp_size, model_config.dp_size, model_config.num_layers, model_config.use_mla)
 
     # Cleanup

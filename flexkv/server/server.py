@@ -296,7 +296,7 @@ class KVServer:
                 flexkv_logger.error(f"ZMQ Error: {e}", exc_info=True)
             except Exception as e:
                 flexkv_logger.error(f"Error: {e}", exc_info=True)
-        
+
         # Cleanup after shutdown
         flexkv_logger.info("Server shutting down, cleaning up...")
         if hasattr(self, 'kvmanager'):

@@ -64,7 +64,7 @@ class FlexKVTracer:
 
     def _convert_tensor_to_list(self, obj: Any) -> Any:
         """Convert torch tensors and numpy arrays to lists for JSON serialization"""
-        if isinstance(obj, torch.Tensor) or isinstance(obj, np.ndarray):
+        if isinstance(obj, (torch.Tensor, np.ndarray)):
             return obj.tolist()
         elif isinstance(obj, dict):
             return {k: self._convert_tensor_to_list(v) for k, v in obj.items()}
@@ -264,7 +264,6 @@ class FlexKVTracer:
 
     def __del__(self):
         """Ensure all records are flushed when tracer is destroyed"""
-        try:
+        from contextlib import suppress
+        with suppress(Exception):
             self.flush()
-        except:
-            pass
