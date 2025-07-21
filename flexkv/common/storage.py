@@ -75,13 +75,17 @@ class KVCacheLayout:
             else:
                 raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
 
-    def div_block(self, num_chunks: int) -> 'KVCacheLayout':
-        assert self.num_block % num_chunks == 0, \
-            f"num_block {self.num_block} must be divisible by num_chunks {num_chunks}"
+    def div_block(self, num_chunks: int, padding: bool = False) -> 'KVCacheLayout':
+        if padding:
+            num_blocks = (self.num_block + num_chunks - 1) // num_chunks * num_chunks
+        else:
+            assert self.num_block % num_chunks == 0, \
+                f"num_block {self.num_block} must be divisible by num_chunks {num_chunks}"
+            num_blocks = self.num_block // num_chunks
         new_layout = KVCacheLayout(
             type=self.type,
             num_layer=self.num_layer,
-            num_block=self.num_block // num_chunks,
+            num_block=num_blocks,
             tokens_per_block=self.tokens_per_block,
             num_head=self.num_head,
             head_size=self.head_size,

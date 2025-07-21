@@ -43,7 +43,7 @@ def main(args):
         num_layers=32,
         num_kv_heads=32,
         head_size=4096,
-        element_size=4,
+        dtype=torch.bfloat16,
         use_mla=False
     )
     cache_engine = GlobalCacheEngine(cache_config, model_config)

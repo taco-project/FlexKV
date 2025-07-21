@@ -14,9 +14,11 @@ from tests.test_utils import (
     DEFAULT_MODEL_CONFIG, DEFAULT_CACHE_CONFIG, DEFAULT_TEST_CONFIG,
     model_config, cache_config, test_config,
     generate_request_pair, verify_data, block_ids_2_slot_mapping,
-    generate_gpu_blocks_with_ground_truth, cleanup_ssd_cache_dirs, skip_if_insufficient_gpus,
+    generate_gpu_blocks_with_ground_truth, skip_if_insufficient_gpus,
     create_kvmanager_with_mode, create_gpu_kv_layout
 )
+
+
 @pytest.mark.parametrize("model_config", [
     {'tp_size': 1, 'dp_size': 1},
     {'tp_size': 2, 'dp_size': 2},
@@ -29,7 +31,8 @@ from tests.test_utils import (
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False,},
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False, 'ssd_cache_iouring_entries': 512},
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True, 'num_ssd_blocks': 256, 'num_remote_blocks': 512},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True, 'num_ssd_blocks': 256, 'num_remote_blocks': 512, 'ssd_cache_iouring_entries': 512},
+    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True,
+     'num_ssd_blocks': 256, 'num_remote_blocks': 512, 'ssd_cache_iouring_entries': 512},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4, 'use_server_client': False},
@@ -68,10 +71,10 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
 
     # Skip tests based on GPU availability and configuration
     skip_if_insufficient_gpus(tp_size * dp_size)
-    
+
     if enable_remote:
         pytest.skip("skip because enable_remote is not supported")
-    
+
     if use_server_client and dp_size > 1:
         pytest.skip("skip because server-client mode is not supported for dp_size > 1 IN THIS TEST SCRIPT now")
 
@@ -83,10 +86,11 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
         dp_wise_gpu_blocks_gt = None  # Not used in server-client mode
     else:
         # In direct mode, create GPU blocks in current process
-        gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_config)
-    
+        gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = \
+            generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_config)
+
     kvmanager = create_kvmanager_with_mode(model_config, cache_config, gpu_kv_layout, gpu_blocks, use_server_client)
-    
+
     # put this after KVManager()
     num_remote_blocks = cache_config.num_remote_blocks
     assert kvmanager.is_ready()
@@ -180,10 +184,7 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
         enable_remote and num_remote_blocks >= num_gpu_blocks:
         assert total_cache_miss == 0
     kvmanager.shutdown()
-    
-    # Cleanup SSD cache directories
-    cleanup_ssd_cache_dirs(cache_config)
-    
+
     if total_cache_miss == 0 and not use_server_client:
         # Only verify data in direct mode
         verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers, use_mla)
