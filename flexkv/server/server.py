@@ -19,6 +19,7 @@ from flexkv.server.request import (
     WaitRequest,
     TryWaitRequest,
     Response,
+    ShutdownRequest,
 )
 
 
@@ -176,7 +177,8 @@ class KVServer:
 
         # TODO: handle error and return error response
         # TODO: support check finish
-        while True:
+        self._running = True
+        while self._running:
             try:
                 flexkv_logger.info("start wait for req")
                 req = self.recv_from_client.recv_pyobj()
@@ -277,6 +279,16 @@ class KVServer:
                         req.dp_client_id)
                     result_zmq.send_pyobj(response)
 
+                elif isinstance(req, ShutdownRequest):
+                    flexkv_logger.info(f"Received shutdown request from DP client {req.dp_client_id}")
+                    # Gracefully shutdown the server
+                    self._running = False
+                    # Send response back to client
+                    response = Response(req.dp_client_id, success=True)
+                    result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+                    result_zmq.send_pyobj(response)
+                    break
+
                 else:
                     raise TypeError(f"Unregonized RequestType: {type(req)}")
 
@@ -284,6 +296,12 @@ class KVServer:
                 flexkv_logger.error(f"ZMQ Error: {e}", exc_info=True)
             except Exception as e:
                 flexkv_logger.error(f"Error: {e}", exc_info=True)
+        
+        # Cleanup after shutdown
+        flexkv_logger.info("Server shutting down, cleaning up...")
+        if hasattr(self, 'kvmanager'):
+            self.kvmanager.shutdown()
+        flexkv_logger.info("Server shutdown complete")
 
 
     def _verify_model_config(

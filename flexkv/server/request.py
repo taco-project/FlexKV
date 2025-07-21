@@ -63,3 +63,8 @@ class Response:
     masks: Optional[Dict[int, np.ndarray]] = None
     success: bool = True
     error_msg: str = ""
+
+
+@dataclass
+class ShutdownRequest:
+    dp_client_id: int

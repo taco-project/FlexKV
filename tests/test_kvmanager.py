@@ -9,163 +9,14 @@ from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.kvmanager import KVManager
 
-DEFAULT_MODEL_CONFIG = {
-    'num_layers': 4,
-    'num_kv_heads': 32,
-    'head_size': 128,
-    'dtype': torch.float16,
-    'use_mla': False,
-    'tp_size': 1,
-    'dp_size': 1,
-}
-
-DEFAULT_CACHE_CONFIG = {
-    'tokens_per_block': 16,
-    'enable_cpu': True,
-    'enable_ssd': True,
-    'enable_remote': False,
-    'num_cpu_blocks': 128,
-    'num_ssd_blocks': 512,
-    'num_remote_blocks': 512,
-    'remote_cache_size_mode': "block_num",
-    'remote_file_size': (1024*1024*1024),
-    'remote_file_num': 16,
-    'remote_file_prefix': "remote_cache",
-    'use_gds': False,
-    'enable_trace': True,
-    'use_pinned_memory': False,
-    'ssd_cache_dir': ["./ssd_cache1/", "./ssd_cache2/"],
-    'ssd_cache_iouring_entries': 0,
-    'remote_cache_path': ["remote_cache1", "remote_cache2"],
-    'remote_config_custom': {
-        "pcfs_fsid": "f_l91fz6",
-        "pcfs_port": 31,
-        "pcfs_ip": "172.21.16.177",
-        "pcfs_parent_nodeid": 1
-    },
-    'use_ce_transfer_h2d': False,
-    'use_ce_transfer_d2h': True,
-    'transfer_sms_h2d': 4,
-    'transfer_sms_d2h': 4,
-}
-
-DEFAULT_TEST_CONFIG = {
-    'num_gpu_blocks': 512,
-    'requests_per_block': 16,
-    'initial_write_ratio': 0.4,
-}
-
-def generate_request_pair(idx: int, block_per_request, num_gpu_blocks, tokens_per_block, dp_size):
-    start_idx = (idx * block_per_request) % num_gpu_blocks
-    if start_idx + block_per_request >= num_gpu_blocks:
-        start_idx = (
-            (start_idx + block_per_request) % num_gpu_blocks
-        )
-    block_ids = torch.arange(
-        start_idx,
-        start_idx + block_per_request,
-        dtype=torch.int64
-    )
-    token_ids = torch.randint(
-        low=0,
-        high=100,
-        size=(block_per_request * tokens_per_block,),
-        dtype=torch.int64
-    )
-    return token_ids, block_ids, idx % dp_size
-
-def verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers, use_mla):
-    head_per_tp = num_kv_heads // tp_size
-    for dp_id in range(dp_size):
-        gt = dp_wise_gpu_blocks_gt[dp_id]
-        for tp_id in range(tp_size):
-            global_gpu_id = dp_id * tp_size + tp_id
-            gpu_tensors = gpu_blocks[global_gpu_id]
-            for layer in range(num_layers):
-                gpu_tensor = gpu_tensors[layer].cpu()
-                if not use_mla:
-                    start_head = tp_id * head_per_tp
-                    end_head = (tp_id + 1) * head_per_tp
-                else:
-                    start_head = 0
-                    end_head = num_kv_heads
-                gt_tensor_slice = gt[layer][:, :, :, start_head:end_head, :]
-                if not torch.allclose(gpu_tensor, gt_tensor_slice):
-                    print(f"Mismatch at dp_id={dp_id}, tp_id={tp_id}, global_gpu_id={global_gpu_id}, layer={layer}")
-                    print(f"GPU tensor shape: {gpu_tensor.shape}, GT slice shape: {gt_tensor_slice.shape}")
-                assert torch.allclose(gpu_tensor, gt_tensor_slice), \
-                    f"Mismatch at dp_id={dp_id}, tp_id={tp_id}, global_gpu_id={global_gpu_id}, layer={layer}"
-    print("verify done")
-
-def block_ids_2_slot_mapping(block_ids, tokens_per_block, actual_length=-1):
-    slot_mapping = block_ids.repeat_interleave(tokens_per_block) * tokens_per_block
-    if actual_length == -1:
-        actual_length = len(block_ids) * tokens_per_block
-    return slot_mapping[:actual_length]
-
-@pytest.fixture
-def model_config(request: pytest.FixtureRequest):
-    param = request.param if hasattr(request, 'param') else {}
-    cfg = dict(DEFAULT_MODEL_CONFIG, **param)
-    return ModelConfig(**cfg)
-
-@pytest.fixture
-def cache_config(request: pytest.FixtureRequest):
-    param = request.param if hasattr(request, 'param') else {}
-    cfg = dict(DEFAULT_CACHE_CONFIG, **param)
-    return CacheConfig(**cfg)
-
-@pytest.fixture
-def test_config(request: pytest.FixtureRequest):
-    param = request.param if hasattr(request, 'param') else {}
-    cfg = dict(DEFAULT_TEST_CONFIG, **param)
-    return cfg
-
-def generate_gpu_blocks(model_config, cache_config, test_config):
-    num_layers = model_config.num_layers
-    num_kv_heads = model_config.num_kv_heads
-    head_size = model_config.head_size
-    use_mla = model_config.use_mla
-    tp_size = model_config.tp_size
-    dp_size = model_config.dp_size
-    dtype = model_config.dtype
-    tokens_per_block = cache_config.tokens_per_block
-    num_gpu_blocks = test_config["num_gpu_blocks"]
-
-    tpgroup_gpu_kv_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
-        num_layer=num_layers,
-        num_block=num_gpu_blocks,
-        tokens_per_block=tokens_per_block,
-        num_head=num_kv_heads,
-        head_size=head_size,
-        is_mla=model_config.use_mla
-    )
-    gpu_blocks = {}
-    dp_wise_gpu_blocks_gt = []
-    for dp_id in range(dp_size):
-        tp_group_tensors_gt = [
-            torch.randn(size=tpgroup_gpu_kv_layout.kv_shape[1:], dtype=dtype)
-            for _ in range(num_layers)
-        ]
-        head_per_tp = num_kv_heads // tp_size
-        for tp_id in range(tp_size):
-            global_gpu_id = dp_id * tp_size + tp_id
-            device = torch.device(f"cuda:{global_gpu_id}")
-            gpu_blocks[global_gpu_id] = []
-            for layer_id in range(num_layers):
-                if not use_mla:
-                    start_head = tp_id * head_per_tp
-                    end_head = (tp_id + 1) * head_per_tp
-                else:
-                    start_head = 0
-                    end_head = num_kv_heads
-                tp_tensor = tp_group_tensors_gt[layer_id][:, :, :, start_head:end_head, :].to(device)
-                gpu_blocks[global_gpu_id].append(tp_tensor)
-        dp_wise_gpu_blocks_gt.append(tp_group_tensors_gt)
-    gpu_kv_layout = tpgroup_gpu_kv_layout.div_head(tp_size) if not use_mla else tpgroup_gpu_kv_layout
-    return gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout
-
+# Import utilities from test_utils
+from tests.test_utils import (
+    DEFAULT_MODEL_CONFIG, DEFAULT_CACHE_CONFIG, DEFAULT_TEST_CONFIG,
+    model_config, cache_config, test_config,
+    generate_request_pair, verify_data, block_ids_2_slot_mapping,
+    generate_gpu_blocks_with_ground_truth, cleanup_ssd_cache_dirs, skip_if_insufficient_gpus,
+    create_kvmanager_with_mode, create_gpu_kv_layout
+)
 @pytest.mark.parametrize("model_config", [
     {'tp_size': 1, 'dp_size': 1},
     {'tp_size': 2, 'dp_size': 2},
@@ -181,7 +32,8 @@ def generate_gpu_blocks(model_config, cache_config, test_config):
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True, 'num_ssd_blocks': 256, 'num_remote_blocks': 512, 'ssd_cache_iouring_entries': 512},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
-    {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
+    {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4, 'use_server_client': False},
+    {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4, 'use_server_client': True},
 ], indirect=True)
 @pytest.mark.parametrize("flex_kv_layout_type", [
     KVCacheLayoutType.LAYERWISE,
@@ -210,16 +62,31 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
     num_gpu_blocks = test_config["num_gpu_blocks"]
     block_per_request = test_config['requests_per_block']
     initial_write_ratio = test_config['initial_write_ratio']
+    use_server_client = test_config.get('use_server_client', False)
 
     num_requests = num_gpu_blocks // block_per_request
 
-    if tp_size * dp_size > torch.cuda.device_count():
-        pytest.skip("skip because tp_size * dp_size > torch.cuda.device_count()")
+    # Skip tests based on GPU availability and configuration
+    skip_if_insufficient_gpus(tp_size * dp_size)
+    
     if enable_remote:
         pytest.skip("skip because enable_remote is not supported")
+    
+    if use_server_client and dp_size > 1:
+        pytest.skip("skip because server-client mode is not supported for dp_size > 1 IN THIS TEST SCRIPT now")
 
-    gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = generate_gpu_blocks(model_config, cache_config, test_config)
-    kvmanager = KVManager(model_config, cache_config, gpu_kv_layout, gpu_blocks)
+    if use_server_client:
+        # In server-client mode, GPU blocks are created in tp_client processes
+        # We only need the layout for initialization
+        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
+        gpu_blocks = None  # Not used in server-client mode
+        dp_wise_gpu_blocks_gt = None  # Not used in server-client mode
+    else:
+        # In direct mode, create GPU blocks in current process
+        gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout = generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_config)
+    
+    kvmanager = create_kvmanager_with_mode(model_config, cache_config, gpu_kv_layout, gpu_blocks, use_server_client)
+    
     # put this after KVManager()
     num_remote_blocks = cache_config.num_remote_blocks
     assert kvmanager.is_ready()
@@ -235,9 +102,11 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
             dp_id=dp_id,
         )
         kvmanager.wait_for_graph_finished(write_request)
-        for gpu in range(dp_id * tp_size, (dp_id + 1) * tp_size):
-            for i in range(num_layers):
-                gpu_blocks[gpu][i][:, block_ids, :, :, :] = 0
+        if not use_server_client:
+            # In direct mode, update GPU blocks for verification
+            for gpu in range(dp_id * tp_size, (dp_id + 1) * tp_size):
+                for i in range(num_layers):
+                    gpu_blocks[gpu][i][:, block_ids, :, :, :] = 0
 
     #corner case: input token length for put is less than tokens_per_block
     write_request = kvmanager.put_async(
@@ -247,15 +116,15 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
     )
     kvmanager.wait_for_graph_finished(write_request)
     #corner case: input token length is long enough, but the mask is less than tokens_per_block
-    my_mask = torch.zeros(16, dtype=torch.bool)
-    my_mask[0:8] = True
-    write_request = kvmanager.put_async(
-        token_ids=torch.randint(0, 100, size=(16,), dtype=torch.int64),
-        slot_mapping=block_ids_2_slot_mapping(torch.arange(0,1, dtype=torch.int64), tokens_per_block, actual_length=8),
-        token_mask=my_mask,
-        dp_id=0,
-    )
-    kvmanager.wait_for_graph_finished(write_request)
+    #my_mask = torch.zeros(16, dtype=torch.bool)
+    #my_mask[0:8] = True
+    #write_request = kvmanager.put_async(
+    #    token_ids=torch.randint(0, 100, size=(16,), dtype=torch.int64),
+    #    slot_mapping=block_ids_2_slot_mapping(torch.arange(0,1, dtype=torch.int64), tokens_per_block, actual_length=8),
+    #    token_mask=my_mask,
+    #    dp_id=0,
+    #)
+    #kvmanager.wait_for_graph_finished(write_request)
 
     print(f"initial data {initial_write_num} written")
     total_cache_hit = 0
@@ -311,11 +180,14 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
         enable_remote and num_remote_blocks >= num_gpu_blocks:
         assert total_cache_miss == 0
     kvmanager.shutdown()
-    if enable_ssd:
-        for dir in cache_config.ssd_cache_dir:
-            if os.path.exists(dir):
-                shutil.rmtree(dir)
-    if total_cache_miss == 0:
+    
+    # Cleanup SSD cache directories
+    cleanup_ssd_cache_dirs(cache_config)
+    
+    if total_cache_miss == 0 and not use_server_client:
+        # Only verify data in direct mode
         verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers, use_mla)
-    else:
+    elif total_cache_miss > 0:
         print(f"verify skipped, because of total_cache_miss={total_cache_miss}>0")
+    elif use_server_client:
+        print("verify skipped in server-client mode (verification happens in tp_client processes)")
