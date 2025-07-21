@@ -208,7 +208,7 @@ void transfer_kv_blocks_ssd(
       if (is_read) {
         fd = open(filepaths[i][j].c_str(), O_RDONLY | o_direct_flag);
       } else {
-        fd = open(filepaths[i][j].c_str(), O_RDWR | o_direct_flag);
+        fd = open(filepaths[i][j].c_str(), O_RDWR);
       }
       if (fd < 0) {
         throw std::runtime_error("Thread failed to open file: " +
