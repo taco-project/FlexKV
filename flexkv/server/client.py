@@ -43,7 +43,7 @@ class KVDPClient:
         self._task_id_counter = (self.dp_client_id + 1) * 10000000
         self._task_id_lock = Lock()
         flexkv_logger.info(f"KVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
-    
+
     def _get_task_id(self) -> int:
         with self._task_id_lock:
             old_value = self._task_id_counter
@@ -74,9 +74,9 @@ class KVDPClient:
         token_mask: Optional[torch.Tensor],
     ) -> Optional[int]:
         start_time = time.time()
-        req = PutRequest(self.dp_client_id, 
-                         token_ids.numpy(), 
-                         slot_mapping.numpy(), 
+        req = PutRequest(self.dp_client_id,
+                         token_ids.numpy(),
+                         slot_mapping.numpy(),
                          token_mask.numpy() if token_mask is not None else None,
                          self._get_task_id())
         self.send_to_server.send_pyobj(req)
@@ -98,9 +98,9 @@ class KVDPClient:
         token_mask: Optional[torch.Tensor],
     ) -> Optional[int]:
         start_time = time.time()
-        req = GetRequest(self.dp_client_id, 
-                         token_ids.numpy(), 
-                         slot_mapping.numpy(), 
+        req = GetRequest(self.dp_client_id,
+                         token_ids.numpy(),
+                         slot_mapping.numpy(),
                          token_mask.numpy() if token_mask is not None else None,
                          self._get_task_id())
 
