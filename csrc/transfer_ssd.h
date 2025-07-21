@@ -24,7 +24,7 @@ public:
       } else {
         fprintf(stderr,
                 "IOUring(%p) init failed, entries(%d), flags(%d), errno(%d)\n",
-                this, entries, flags, errno);
+                this, _entries, flags, errno);
       }
     }
   }
