@@ -132,7 +132,7 @@ class TransferWorkerBase(ABC):
         """Common method to log transfer performance"""
         flexkv_logger.info(
             f"{transfer_op.transfer_type.name} transfer request: {transfer_op.transfer_op_id} finished "
-            f"transfer data size: {transfer_size} bytes "
+            f"transfer data size: {transfer_size / (1024 * 1024 * 1024)} GB "
             f"transfer time: {end_time - start_time:.4f} s "
             f"transfer bandwidth: {transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
         )
@@ -181,6 +181,10 @@ class WorkerHandle:
             print("force terminate the worker process")
             self.process.terminate()
             self.process.join()
+
+    def __del__(self) -> None:
+        if self.process.is_alive():
+            self.shutdown()
 
 class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non-tp and non-dp case
     def __init__(self,
@@ -488,7 +492,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
 
-        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files)  # TODO: padding
+        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
 
         self.chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
         self.block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize

@@ -13,14 +13,14 @@ class DeviceType(Enum):
     REMOTE = 3
 
 class TransferType(Enum):
-    H2D    = "Host to Device"
-    D2H    = "Device to Host"
-    DISK2H = "Disk to Host"
-    H2DISK = "Host to Disk"
-    DISK2D = "Disk to Device"
-    D2DISK = "Device to Disk"
-    REMOTE2H = "Remote to Host"
-    H2REMOTE = "Host to Remote"
+    H2D    = "H2D"
+    D2H    = "D2H"
+    DISK2H = "DISK2H"
+    H2DISK = "H2DISK"
+    DISK2D = "DISK2D"
+    D2DISK = "D2DISK"
+    REMOTE2H = "REMOTE2H"
+    H2REMOTE = "H2REMOTE"
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of
