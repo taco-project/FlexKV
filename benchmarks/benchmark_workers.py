@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Tuple
 from argparse import ArgumentParser
 from tqdm import tqdm
+import copy
 
 import torch
 
@@ -160,9 +161,7 @@ def create_cpu_ssd_worker(
                 ssd_kv_layout=ssd_handle.kv_layout,
                 dtype=model_config.dtype,
                 num_blocks_per_file=ssd_handle.num_blocks_per_file,
-                cache_config=CacheConfig(
-                    use_pinned_memory=False,
-                ),
+                cache_config=cache_config
             )
     return (
         worker_handle,
@@ -205,27 +204,31 @@ def bench_worker(args):
                          f"{TransferType.H2DISK.name}, {TransferType.DISK2H.name}")
 
     if shuffle_ids:
-        src_block_ids = torch.randperm(num_blocks_to_transfer)
-        dst_block_ids = torch.randperm(num_blocks_to_transfer)
+        block_ids = torch.randperm(num_blocks_to_transfer)
     else:
-        src_block_ids = torch.arange(num_blocks_to_transfer)
-        dst_block_ids = torch.arange(num_blocks_to_transfer)
+        block_ids = torch.arange(num_blocks_to_transfer)
 
     transfer_op = TransferOp(
         transfer_type=transfer_type,
         layer_id=0,
         layer_granularity=num_layers_to_transfer,
         src_descriptor=TransferDescriptor(
-            physical_block_ids=src_block_ids,
+            physical_block_ids=block_ids,
         ),
         dst_descriptor=TransferDescriptor(
-            physical_block_ids=dst_block_ids,
+            physical_block_ids=block_ids,
         ),
         graph_id=0,
         dp_id=0,
         successors=[],
         predecessors=[],
     )
+    if transfer_type == TransferType.DISK2H:
+        tmp_op = copy.deepcopy(transfer_op)
+        tmp_op.transfer_type = TransferType.H2DISK
+        tmp_op.src_descriptor = transfer_op.dst_descriptor
+        tmp_op.dst_descriptor = transfer_op.src_descriptor
+        launch_transfer(worker_handle, finished_ops_queue, tmp_op)
     for _ in range(warmup_round):
         launch_transfer(worker_handle, finished_ops_queue, transfer_op)
     pbar = tqdm(total=benchmark_round, desc="Benchmarking")

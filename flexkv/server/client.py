@@ -12,7 +12,7 @@ from flexkv.common.config import ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
-from flexkv.server.util import get_zmq_socket
+from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import (
     RegisterDPClientRequest,
     RegisterTPClientRequest,

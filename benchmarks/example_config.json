@@ -9,6 +9,9 @@
         "dp_size": 1
     },
     "CacheConfig": {
+        "enable_cpu": true,
+        "enable_ssd": true,
+        "enable_remote": false,
         "tokens_per_block": 16,
         "use_gds": false,
         "use_pinned_memory": true,
@@ -25,7 +28,7 @@
         "transfer_sms_d2h": 8,
         "max_blocks_per_file": 32000,
         "ssd_cache_dir": "./ssd_cache1/",
-        "ssd_cache_iouring_entries": 0,
+        "ssd_cache_iouring_entries": 512,
         "ssd_cache_iouring_flags": 0,
         "remote_cache_size_mode": "file_size",
         "remote_file_size": null,
