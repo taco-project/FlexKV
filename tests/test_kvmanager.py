@@ -10,7 +10,7 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.kvmanager import KVManager
 
 # Import utilities from test_utils
-from tests.test_utils import (
+from test_utils import (
     DEFAULT_MODEL_CONFIG, DEFAULT_CACHE_CONFIG, DEFAULT_TEST_CONFIG,
     generate_request_pair, verify_data, block_ids_2_slot_mapping,
     generate_gpu_blocks_with_ground_truth, skip_if_insufficient_gpus,

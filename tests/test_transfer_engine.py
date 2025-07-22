@@ -44,7 +44,7 @@ from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 
 # Import utilities from test_utils
-from tests.test_utils import (
+from test_utils import (
     wait_for_transfer_completion,
     skip_if_no_cuda,
     skip_if_insufficient_gpus,
