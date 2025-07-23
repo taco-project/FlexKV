@@ -171,8 +171,88 @@ private:
   uint64_t total_cqe_err;
 };
 
+class SSDIOCTX {
+public:
+  SSDIOCTX(std::map<int, std::vector<std::string>>& ssd_files,
+           int num_devices, int iouring_entries, int iouring_flags)
+           : iouring(iouring_entries, iouring_flags),
+           fds_buffer_io(num_devices),
+	   fds_direct_io(num_devices) {
+
+    int i, j, fd_buffer_io, fd_direct_io;
+
+    this->num_devices = num_devices;
+    this->num_files_per_device = ssd_files[0].size();
+
+    for (i = 0; i < num_devices; i++) {
+      for (j = 0; j < num_files_per_device; j++) {
+        fd_buffer_io = open(ssd_files[i][j].c_str(), O_RDWR);
+        fd_direct_io = open(ssd_files[i][j].c_str(), O_RDWR | O_DIRECT);
+
+        if (fd_buffer_io < 0 || fd_direct_io < 0) {
+          std::cerr << "open file failed, path = " << ssd_files[i][j] << std::endl;
+          throw std::runtime_error("Failed to open file");
+        } else {
+          posix_fadvise(fd_buffer_io, 0, 0, POSIX_FADV_SEQUENTIAL);
+          posix_fadvise(fd_buffer_io, 0, 0, POSIX_FADV_WILLNEED);
+        }
+
+        fds_buffer_io[i].push_back(fd_buffer_io);
+        fds_direct_io[i].push_back(fd_direct_io);
+      }
+    }
+  }
+
+  ~SSDIOCTX() {
+    for (const auto &fd_list : fds_buffer_io) {
+      for (const auto &fd : fd_list) {
+        if (fd >= 0) {
+          close(fd);
+        }
+      }
+    }
+
+    for (const auto &fd_list : fds_direct_io) {
+      for (const auto &fd : fd_list) {
+        if (fd >= 0) {
+          close(fd);
+        }
+      }
+    }
+  }
+
+  int get_num_devices() {
+    return num_devices;
+  }
+
+  int get_num_files_per_device() {
+    return num_files_per_device;
+  }
+
+  IOUring &get_iouring() {
+    return iouring;
+  }
+
+  std::vector<std::vector<int>> &get_fds_buffer_io() {
+    return fds_buffer_io;
+  }
+
+  std::vector<std::vector<int>> &get_fds_direct_io() {
+    return fds_direct_io;
+  }
+
+private:
+  int num_devices;
+  int num_files_per_device;
+
+  IOUring iouring;
+  std::vector<std::vector<int>> fds_buffer_io;
+  std::vector<std::vector<int>> fds_direct_io;
+};
+
+
 void transfer_kv_blocks_ssd(
-    IOUring &iouring, const std::vector<std::vector<std::string>> &filepaths,
+    SSDIOCTX &ioctx,
     const torch::Tensor &cpu_layer_id_list, int64_t cpu_tensor_ptr,
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,

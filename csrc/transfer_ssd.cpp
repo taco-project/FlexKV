@@ -41,7 +41,6 @@ static void _transfer_iouring_impl(
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes,
     int num_files_per_device, bool is_read, bool is_mla) {
   int num_blocks = end_block - start_block;
-  int num_layers = end_layer - start_layer;
   int rc;
 
   if (num_blocks == 0) {
@@ -66,51 +65,37 @@ static void _transfer_iouring_impl(
           reinterpret_cast<char *>(cpu_tensor_ptr) + cpu_k_block_offset;
       void *cpu_v_block_ptr =
           reinterpret_cast<char *>(cpu_tensor_ptr) + cpu_v_block_offset;
-      ssize_t bytes_transfer = 0;
 
       if (is_read) {
         rc = iouring.prep_read(fd, cpu_k_block_ptr, chunk_size_in_bytes,
                                ssd_k_block_offset);
         if (rc < 0) {
-          bytes_transfer = pread(fd, cpu_k_block_ptr, chunk_size_in_bytes,
-                                 ssd_k_block_offset);
+          throw std::runtime_error("Failed to transfer K block");
         }
       } else {
         rc = iouring.prep_write(fd, cpu_k_block_ptr, chunk_size_in_bytes,
                                 ssd_k_block_offset);
         if (rc < 0) {
-          bytes_transfer = pwrite(fd, cpu_k_block_ptr, chunk_size_in_bytes,
-                                  ssd_k_block_offset);
+          throw std::runtime_error("Failed to transfer K block");
         }
-      }
-
-      if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
-        throw std::runtime_error("Failed to transfer K block");
       }
 
       if (is_mla) {
         continue;
       }
 
-      bytes_transfer = 0;
       if (is_read) {
         rc = iouring.prep_read(fd, cpu_v_block_ptr, chunk_size_in_bytes,
                                ssd_v_block_offset);
         if (rc < 0) {
-          bytes_transfer = pread(fd, cpu_v_block_ptr, chunk_size_in_bytes,
-                                 ssd_v_block_offset);
+          throw std::runtime_error("Failed to transfer V block");
         }
       } else {
         rc = iouring.prep_write(fd, cpu_v_block_ptr, chunk_size_in_bytes,
                                 ssd_v_block_offset);
         if (rc < 0) {
-          bytes_transfer = pwrite(fd, cpu_v_block_ptr, chunk_size_in_bytes,
-                                  ssd_v_block_offset);
+          throw std::runtime_error("Failed to transfer V block");
         }
-      }
-
-      if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
-        throw std::runtime_error("Failed to transfer V block");
       }
     } // end layer loop
   } // end block loop
@@ -134,6 +119,7 @@ static void _transfer_single_thread_impl(
     int cpu_block_id = cpu_block_ids[bid];
     int ssd_block_id = ssd_block_ids_in_device[bid];
     int fd = fd_list[ssd_block_id % num_files_per_device];
+
     ssd_block_id /= num_files_per_device; // block id in single file
 
     for (int lid = start_layer; lid < end_layer; lid++) {
@@ -181,7 +167,7 @@ static void _transfer_single_thread_impl(
 // NOTE that we may also use other techniques such as
 // AIO, O_DIRECT, and etc to improve the performance
 void transfer_kv_blocks_ssd(
-    IOUring &iouring, const std::vector<std::vector<std::string>> &filepaths,
+    SSDIOCTX &ioctx,
     const torch::Tensor &cpu_layer_id_list, int64_t cpu_tensor_ptr,
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
@@ -190,8 +176,8 @@ void transfer_kv_blocks_ssd(
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes, bool is_read,
     int num_blocks_per_file, int round_robin, int num_threads_per_device,
     bool is_mla) {
-  const int num_devices = filepaths.size();
-  const int num_files_per_device = filepaths[0].size();
+  const int num_devices = ioctx.get_num_devices();
+  const int num_files_per_device = ioctx.get_num_files_per_device();
 
   const int64_t *ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
   const int64_t *cpu_block_id_ptr = cpu_block_ids.data_ptr<int64_t>();
@@ -199,29 +185,10 @@ void transfer_kv_blocks_ssd(
   const int num_blocks = ssd_block_ids.size(0);
   const int num_layers = cpu_layer_id_list.size(0);
   const int32_t *cpu_layer_id_list_ptr = cpu_layer_id_list.data_ptr<int32_t>();
+  bool is_direct = chunk_size_in_bytes % 4096 == 0;
 
-  const int o_direct_flag = chunk_size_in_bytes % 4096 == 0 ? O_DIRECT : 0;
-  std::vector<std::vector<int>> fds(num_devices, std::vector<int>());
-  for (int i = 0; i < num_devices; i++) {
-    for (int j = 0; j < num_files_per_device; j++) {
-      int fd = -1;
-      if (is_read) {
-        fd = open(filepaths[i][j].c_str(), O_RDONLY | o_direct_flag);
-      } else {
-        fd = open(filepaths[i][j].c_str(), O_RDWR);
-      }
-      if (fd < 0) {
-        throw std::runtime_error("Thread failed to open file: " +
-                                 std::string(strerror(errno)));
-      }
-
-      if (!o_direct_flag) {
-        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-        posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
-      }
-      fds[i].push_back(fd);
-    }
-  }
+  IOUring &iouring = ioctx.get_iouring();
+  std::vector<std::vector<int>> &fds = ioctx.get_fds_direct_io();
 
   std::vector<std::vector<int>> cpu_blocks_partition(num_devices,
                                                      std::vector<int>());
@@ -230,6 +197,10 @@ void transfer_kv_blocks_ssd(
   partition_and_remap_blocks_by_device(
       cpu_block_id_ptr, ssd_block_id_ptr, num_blocks, num_devices, round_robin,
       cpu_blocks_partition, ssd_blocks_partition);
+
+  if (is_read && is_direct) {
+      fds = ioctx.get_fds_buffer_io();
+  }
 
   std::vector<std::thread> threads;
   std::vector<std::future<std::exception_ptr>> futures;
@@ -247,7 +218,8 @@ void transfer_kv_blocks_ssd(
       if (start_block < end_block) {
         if (iouring.enabled()) {
           _transfer_iouring_impl(
-              iouring, fds[d], cpu_blocks_partition[d], ssd_blocks_partition[d],
+              iouring, fds[d],
+              cpu_blocks_partition[d], ssd_blocks_partition[d],
               start_layer, end_layer, start_block, end_block, cpu_tensor_ptr,
               cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
               cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
@@ -298,12 +270,6 @@ void transfer_kv_blocks_ssd(
       if (auto eptr = fut.get()) {
         std::rethrow_exception(eptr);
       }
-    }
-  }
-
-  for (const auto &fd_list : fds) {
-    for (const auto &fd : fd_list) {
-      close(fd);
     }
   }
 }

@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
+#include <map>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
@@ -54,7 +55,7 @@ void transfer_kv_blocks_binding(
 }
 
 void transfer_kv_blocks_ssd_binding(
-    flexkv::IOUring &iouring, const py::dict &filepath_py_dict,
+    flexkv::SSDIOCTX &ioctx,
     const torch::Tensor &cpu_layer_id_list, int64_t cpu_tensor_ptr,
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
@@ -67,19 +68,8 @@ void transfer_kv_blocks_ssd_binding(
   TORCH_CHECK(cpu_block_ids.dtype() == torch::kInt64,
               "cpu_block_ids must be int64");
 
-  std::vector<std::vector<std::string>>
-      filepaths; // num_devices * num_files_per_device
-  for (const auto &item : filepath_py_dict) {
-    std::vector<std::string> filepath_tmp;
-    py::list filepath_py_list = item.second.cast<py::list>();
-    for (const auto &filepath_py : filepath_py_list) {
-      filepath_tmp.push_back(filepath_py.cast<std::string>());
-    }
-    filepaths.emplace_back(filepath_tmp);
-  }
-
   flexkv::transfer_kv_blocks_ssd(
-      iouring, filepaths, cpu_layer_id_list, cpu_tensor_ptr, ssd_block_ids,
+      ioctx, cpu_layer_id_list, cpu_tensor_ptr, ssd_block_ids,
       cpu_block_ids, cpu_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
       ssd_layer_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size_in_bytes,
       block_stride_in_bytes, is_read, num_blocks_per_file, round_robin,
@@ -118,8 +108,8 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("transfer_kv_blocks", &transfer_kv_blocks_binding,
         "Transfer multi-layer KV-cache between CPU and GPU");
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
-        "Transfer KV blocks between SSD and CPU memory", py::arg("iouring"),
-        py::arg("filename_list"), py::arg("cpu_layer_id_list"),
+        "Transfer KV blocks between SSD and CPU memory",
+        py::arg("ioctx"), py::arg("cpu_layer_id_list"),
         py::arg("cpu_tensor_ptr"), py::arg("ssd_block_ids"),
         py::arg("cpu_block_ids"), py::arg("cpu_layer_stride_in_bytes"),
         py::arg("cpu_kv_stride_in_bytes"), py::arg("ssd_layer_stride_in_bytes"),
@@ -148,7 +138,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("hasher"), py::arg("token_ids"), py::arg("tokens_per_block"),
         py::arg("block_hashes"));
 
-  py::class_<flexkv::IOUring>(m, "IOUring").def(py::init<int, int>());
+  py::class_<flexkv::SSDIOCTX>(m, "SSDIOCTX")
+      .def(py::init<std::map<int, std::vector<std::string>> &, int, int, int>());
 
   py::class_<flexkv::TPTransferThreadGroup>(m, "TPTransferThreadGroup")
       .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
