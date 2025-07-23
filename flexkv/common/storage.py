@@ -77,7 +77,7 @@ class KVCacheLayout:
 
     def div_block(self, num_chunks: int, padding: bool = False) -> 'KVCacheLayout':
         if padding:
-            num_blocks = (self.num_block + num_chunks - 1) // num_chunks * num_chunks
+            num_blocks = (self.num_block + num_chunks - 1) // num_chunks
         else:
             assert self.num_block % num_chunks == 0, \
                 f"num_block {self.num_block} must be divisible by num_chunks {num_chunks}"
