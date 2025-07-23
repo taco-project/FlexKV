@@ -500,7 +500,13 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
-        self.iouring = c_ext.IOUring(cache_config.ssd_cache_iouring_entries, cache_config.ssd_cache_iouring_flags)
+
+        try:
+            self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), cache_config.ssd_cache_iouring_entries,
+                cache_config.ssd_cache_iouring_flags)
+        except Exception as e:
+            flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
+            raise RuntimeError("SSD Worker init failed")
 
     def _transfer_impl(
         self,
@@ -532,8 +538,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
 
         transfer_kv_blocks_ssd(
-            iouring=self.iouring,
-            filename_list=self.ssd_files,
+            ioctx=self.ioctx,
             cpu_layer_id_list=layer_id_list,
             cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
             ssd_block_ids=ssd_block_id_list,
