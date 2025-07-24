@@ -190,8 +190,8 @@ def parse_args():
     parser.add_argument("--config", type=str, default="benchmarks/example_config.json")
     # benchmark config
     parser.add_argument("--num_layers", type=int, default=-1)
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--sequence_length", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--sequence_length", type=int, default=1024)
     parser.add_argument("--cache_ratio", type=float, default=1)
     return parser.parse_args()
 
