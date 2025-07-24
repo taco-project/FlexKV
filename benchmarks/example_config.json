@@ -36,7 +36,7 @@
         "remote_file_prefix": null,
         "remote_cache_path": null,
         "remote_config_custom": null,
-        "enable_trace": true,
+        "enable_trace": false,
         "trace_file_path": "./flexkv_trace.log",
         "trace_max_file_size_mb": 100,
         "trace_max_files": 5,

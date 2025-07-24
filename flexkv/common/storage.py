@@ -16,8 +16,8 @@ class AccessHandleType(Enum):
 # NOTE: currently, we assume that the layout type of GPU should always be layerwise
 # and the layout type of CPU, SSD, remote should be the same, either laywise or blockwise
 class KVCacheLayoutType(Enum):
-    LAYERWISE = "layerwise"
-    BLOCKWISE = "blockwise"
+    LAYERWISE = "LAYERWISE"
+    BLOCKWISE = "BLOCKWISE"
 
 @dataclass
 class KVCacheLayout:

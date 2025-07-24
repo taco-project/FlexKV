@@ -1,4 +1,5 @@
 import asyncio
+import json
 import random
 import time
 from dataclasses import dataclass, field
@@ -6,6 +7,9 @@ from typing import Optional, List, Tuple, Any
 
 import torch
 from tqdm import tqdm
+
+from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.storage import KVCacheLayoutType
 
 
 @dataclass
@@ -81,3 +85,30 @@ def generate_random_multiturn(num_user_requests: int,
             token_mask=torch.ones_like(torch.cat([request["input"], request["output"]], dim=0)),
         ))
     return kv_requests
+
+def load_config(config_path: str) -> Tuple[ModelConfig, CacheConfig]:
+    with open(config_path) as f:
+        config = json.load(f)
+        if "ModelConfig" not in config:
+            print("ModelConfig not found in config, using default values")
+            config["ModelConfig"] = {}
+        if "CacheConfig" not in config:
+            print("CacheConfig not found in config, using default values")
+            config["CacheConfig"] = {}
+        if "dtype" in config["ModelConfig"]:
+            config["ModelConfig"]["dtype"] = eval(f"torch.{config['ModelConfig']['dtype']}")
+        if "gpu_kv_layout_type" in config["CacheConfig"]:
+            config["CacheConfig"]["gpu_kv_layout_type"] = \
+                KVCacheLayoutType(config["CacheConfig"]["gpu_kv_layout_type"])
+        if "cpu_kv_layout_type" in config["CacheConfig"]:
+            config["CacheConfig"]["cpu_kv_layout_type"] = \
+                KVCacheLayoutType(config["CacheConfig"]["cpu_kv_layout_type"])
+        if "ssd_kv_layout_type" in config["CacheConfig"]:
+            config["CacheConfig"]["ssd_kv_layout_type"] = \
+                KVCacheLayoutType(config["CacheConfig"]["ssd_kv_layout_type"])
+        if "remote_kv_layout_type" in config["CacheConfig"]:
+            config["CacheConfig"]["remote_kv_layout_type"] = \
+                KVCacheLayoutType(config["CacheConfig"]["remote_kv_layout_type"])
+        model_config = ModelConfig(**config["ModelConfig"])
+        cache_config = CacheConfig(**config["CacheConfig"])
+        return model_config, cache_config

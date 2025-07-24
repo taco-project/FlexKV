@@ -8,7 +8,7 @@ import torch
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
-from utils import generate_random_multiturn
+from utils import generate_random_multiturn, load_config
 
 flexkv_logger.set_level("OFF")
 
@@ -19,11 +19,7 @@ def main(args):
                                      input_length=args.input_length,
                                      output_length=args.output_length)
     config_file = args.config
-    with open(config_file) as f:
-        config = json.load(f)
-    cache_config = CacheConfig(**config["CacheConfig"])
-    model_config = ModelConfig(**config["ModelConfig"])
-    model_config.dtype = eval(f"torch.{model_config.dtype}")
+    model_config, cache_config = load_config(config_file)
 
     print(f"model_config: {model_config}")
     print(f"cache_config: {cache_config}")

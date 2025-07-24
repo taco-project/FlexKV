@@ -170,6 +170,7 @@ class TransferEngine:
             else:
                 flexkv_logger.info(f"waiting for worker {worker} to ready")
                 worker.ready_event.wait(timeout=60)
+                flexkv_logger.info(f"worker {worker} is ready")
         # Start scheduler thread
         self._running = True
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)

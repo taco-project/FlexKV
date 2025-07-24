@@ -40,6 +40,8 @@ class KVManager:
                  gpu_layout: Optional[KVCacheLayout] = None,
                  gpu_blocks: Optional[Dict[int, List[TensorSharedHandle]]] = None):
 
+        flexkv_logger.info(f"Initializing kvmanager...\nmodel_config: {model_config}\ncache_config: {cache_config}")
+
         mp.set_start_method('spawn', force=True)
         self.init_nvtx_range = nvtx.push_range("Initialize kvmanager", color=get_nvtx_default_color())
 

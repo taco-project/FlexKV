@@ -82,7 +82,8 @@ class KVDPClient:
         self.send_to_server.send_pyobj(req)
         response: Response = Response(self.dp_client_id, req.task_id)
         end_time = time.time()
-        print(f"[dpclient] put_async task: {req.task_id} created. time: {(end_time - start_time)*1000:.2f}ms")
+        flexkv_logger.info(f"[dpclient] put_async task: {req.task_id} created. "
+                           f"time: {(end_time - start_time)*1000:.2f}ms")
         return req.task_id
        #if response.success:
         #    flexkv_logger.info(f"put_async task: {response.task_id} created.")
@@ -107,7 +108,8 @@ class KVDPClient:
         self.send_to_server.send_pyobj(req)
         response: Response = Response(self.dp_client_id, req.task_id)
         end_time = time.time()
-        print(f"[dpclient] get_async task: {req.task_id} created. time: {(end_time - start_time)*1000:.2f}ms")
+        flexkv_logger.info(f"[dpclient] get_async task: {req.task_id} created. "
+                           f"time: {(end_time - start_time)*1000:.2f}ms")
         return req.task_id
         #if response.success:
         #    flexkv_logger.info(f"get_async task: {response.task_id} created.")
