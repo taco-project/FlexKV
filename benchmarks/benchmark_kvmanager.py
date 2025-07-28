@@ -1,3 +1,4 @@
+import os
 import tempfile
 from multiprocessing import Process
 import argparse
@@ -8,7 +9,7 @@ from dataclasses import dataclass
 import torch
 
 from flexkv.server.client import KVDPClient, KVTPClient
-from flexkv.server.server import KVServer
+from flexkv.server.server import KVServer, SchedulerServer
 from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.storage import KVCacheLayoutType, KVCacheLayout
 from flexkv.common.debug import flexkv_logger
@@ -58,20 +59,7 @@ def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_c
     while True:
         time.sleep(1)
 
-def shutdown(server_process, dp_client, tp_client_processes, server_recv_port):
-    """Shutdown all processes"""
-    try:
-        # Send a shutdown request to the server
-        from flexkv.server.request import ShutdownRequest
-        shutdown_request = ShutdownRequest(dp_client_id=dp_client.dp_client_id)
-        dp_client.send_to_server.send_pyobj(shutdown_request)
-
-        # Wait a bit for graceful shutdown
-        time.sleep(3)
-    except Exception as e:
-        print(f"Error sending shutdown request: {e}")
-
-    # Terminate tp_client processes
+def shutdown_tp_client(tp_client_processes):
     for tp_process in tp_client_processes:
         if tp_process.is_alive():
             tp_process.terminate()
@@ -81,24 +69,95 @@ def shutdown(server_process, dp_client, tp_client_processes, server_recv_port):
                 tp_process.kill()
                 tp_process.join(timeout=2)
 
-    # Terminate server process
-    if server_process.is_alive():
-        server_process.terminate()
-        server_process.join(timeout=10)
-        if server_process.is_alive():
-            print(f"Force killing server process {server_process.pid}")
-            server_process.kill()
-            server_process.join(timeout=5)
+class FlexkvWrapper:
+    def __init__(self, model_config, cache_config, server_recv_port):
+        self.model_config = model_config
+        self.cache_config = cache_config
+        self.server_recv_port = server_recv_port
 
-    # Clean up temporary file
-    import os
-    if server_recv_port.startswith('ipc://'):
-        temp_file = server_recv_port[6:]  # Remove 'ipc://' prefix
-        try:
-            if os.path.exists(temp_file):
-                os.unlink(temp_file)
-        except Exception as e:
-            print(f"Error cleaning up temporary file: {e}")
+        self.use_scheduler_server = model_config.dp_size == 1
+        if self.use_scheduler_server:
+            self.launch_scheduler_server()
+        else:
+            self.launch_server()
+
+    def launch_server(self):
+        def server_process():
+            kvserver = KVServer(self.model_config, self.cache_config, self.server_recv_port)
+            kvserver.run()
+            time.sleep(10)
+        self.server_process = Process(
+            target=server_process,
+            daemon=False
+        )
+        self.server_process.start()
+        time.sleep(5)
+        self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
+
+    def launch_scheduler_server(self):
+        self.scheduler_server = SchedulerServer(self.model_config, self.cache_config, self.server_recv_port)
+        self.scheduler_server.start_server_thread()
+        time.sleep(10)
+
+    @property
+    def dp_client_id(self):
+        if self.use_scheduler_server:
+            return 0
+        else:
+            return self.dp_client.dp_client_id
+
+    def put_async(self, token_ids, slot_mapping, token_mask=None):
+        if self.use_scheduler_server:
+            return self.scheduler_server.put_async(token_ids, slot_mapping, token_mask)
+        else:
+            return self.dp_client.put_async(token_ids, slot_mapping, token_mask)
+
+    def get_async(self, token_ids, slot_mapping, token_mask=None):
+        if self.use_scheduler_server:
+            return self.scheduler_server.get_async(token_ids, slot_mapping, token_mask)
+        else:
+            return self.dp_client.get_async(token_ids, slot_mapping, token_mask)
+
+    def wait(self, request_ids):
+        if self.use_scheduler_server:
+            return self.scheduler_server.wait(request_ids)
+        else:
+            return self.dp_client.wait(request_ids)
+
+    def try_wait(self, request_ids):
+        if self.use_scheduler_server:
+            return self.scheduler_server.try_wait(request_ids)
+        else:
+            return self.dp_client.try_wait(request_ids)
+
+    def shutdown(self):
+        if not self.use_scheduler_server:
+            try:
+                # Send a shutdown request to the server
+                from flexkv.server.request import ShutdownRequest
+                shutdown_request = ShutdownRequest(dp_client_id=self.dp_client_id)
+                self.dp_client.send_to_server.send_pyobj(shutdown_request)
+
+                # Wait a bit for graceful shutdown
+                time.sleep(3)
+            except Exception as e:
+                print(f"Error sending shutdown request: {e}")
+            if self.server_process.is_alive():
+                self.server_process.terminate()
+                self.server_process.join(timeout=10)
+                if self.server_process.is_alive():
+                    print(f"Force killing server process {self.server_process.pid}")
+                    self.server_process.kill()
+                    self.server_process.join(timeout=5)
+            if self.server_recv_port.startswith('ipc://'):
+                temp_file = self.server_recv_port[6:]  # Remove 'ipc://' prefix
+                try:
+                    if os.path.exists(temp_file):
+                        os.unlink(temp_file)
+                except Exception as e:
+                    print(f"Error cleaning up temporary file: {e}")
+        else:
+            self.scheduler_server.shutdown()
 
 def benchmark_kvmanager(model_config, cache_config, benchmark_config, server_recv_port):
     if model_config.tp_size * model_config.dp_size > torch.cuda.device_count():
@@ -107,14 +166,8 @@ def benchmark_kvmanager(model_config, cache_config, benchmark_config, server_rec
     print(f"{model_config = }")
     print(f"{cache_config = }")
     print(f"{benchmark_config = }")
-    server_process = Process(
-        target=run_server,
-        args=(model_config, cache_config, server_recv_port),
-        daemon=False
-    )
-    server_process.start()
-    time.sleep(5)
-    dp_client = KVDPClient(server_recv_port, model_config)
+    flexkv_wrapper = FlexkvWrapper(model_config, cache_config, server_recv_port)
+
     tp_client_processes = []
 
     sequence_length = benchmark_config.sequence_length
@@ -125,7 +178,7 @@ def benchmark_kvmanager(model_config, cache_config, benchmark_config, server_rec
     for tp_rank in range(model_config.tp_size):
         tp_client_process = Process(
             target=run_tp_client,
-            args=(dp_client.dp_client_id, tp_rank, server_recv_port,
+            args=(flexkv_wrapper.dp_client_id, tp_rank, server_recv_port,
                     model_config, cache_config),
             daemon=True
         )
@@ -147,10 +200,10 @@ def benchmark_kvmanager(model_config, cache_config, benchmark_config, server_rec
     put_ids = []
     if benchmark_config.cache_ratio > 0:
         for i in range(batch_size):
-            put_ids.append(dp_client.put_async(batch_sequence_tensor[i][:cache_length],
+            put_ids.append(flexkv_wrapper.put_async(batch_sequence_tensor[i][:cache_length],
                                             batch_slot_mapping[i][:cache_length],
                                             token_mask=None))
-    put_result = dp_client.wait(put_ids)
+    put_result = flexkv_wrapper.wait(put_ids)
     end_time = time.time()
     time.sleep(1)
     elapsed_time_put = end_time - start_time
@@ -166,10 +219,10 @@ def benchmark_kvmanager(model_config, cache_config, benchmark_config, server_rec
     start_time = time.time()
     get_ids = []
     for i in range(batch_size):
-        get_ids.append(dp_client.get_async(batch_sequence_tensor[i],
+        get_ids.append(flexkv_wrapper.get_async(batch_sequence_tensor[i],
                                            batch_slot_mapping[i],
                                            token_mask=None))
-    get_result = dp_client.wait(get_ids)
+    get_result = flexkv_wrapper.wait(get_ids)
     end_time = time.time()
     elapsed_time_get = end_time - start_time
     cached_tokens = 0
@@ -183,16 +236,18 @@ def benchmark_kvmanager(model_config, cache_config, benchmark_config, server_rec
           f"cache_ratio: {cached_tokens * 100 / all_tokens:.2f}%, "
           f"time: {elapsed_time_get*1000:.2f}ms, bandwidth: {transfer_bandwidth_get:.2f} GB/s")
 
-    shutdown(server_process, dp_client, tp_client_processes, server_recv_port)
+    shutdown_tp_client(tp_client_processes)
+    flexkv_wrapper.shutdown()
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="benchmarks/example_config.json")
     # benchmark config
-    parser.add_argument("--num_layers", type=int, default=-1)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--sequence_length", type=int, default=1024)
-    parser.add_argument("--cache_ratio", type=float, default=1)
+    parser.add_argument("--num-layers", type=int, default=-1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--sequence-length", type=int, default=1024)
+    parser.add_argument("--cache-ratio", type=float, default=1)
     return parser.parse_args()
 
 if __name__ == "__main__":
