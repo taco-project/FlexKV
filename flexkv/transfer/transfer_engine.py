@@ -218,7 +218,7 @@ class TransferEngine:
                 # Handle completed graphs
                 for graph_id in completed_graph_ids:
                     self.completed_queue.put((graph_id, -1))
-            time.sleep(0.0001)  # Prevent busy waiting
+            time.sleep(0.001)  # Prevent busy waiting
 
     def _assign_op_to_worker(self, op: TransferOp) -> None:
         self.op_id_to_nvtx_range[op.op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
