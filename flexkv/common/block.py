@@ -8,13 +8,6 @@ import torch
 from flexkv.common.hash_utils import HashType, gen_hashes, get_hash_size, hash_tensor
 
 
-class BlockStatus(Enum):
-    UNREGISTERED = 0
-    AVAILABLE = 1
-    LOCKED = 2
-    IN_GET = 3
-    IN_PUT = 4
-
 @dataclass
 class SequenceMeta:
 

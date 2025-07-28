@@ -8,6 +8,7 @@ from typing import List, Callable, Union
 
 import nvtx
 import torch
+from expiring_dict import ExpiringDict
 
 from flexkv.cache.cache_engine import GlobalCacheEngine, TransferOpGraph
 from flexkv.common.config import CacheConfig, ModelConfig
@@ -70,7 +71,7 @@ class KVManager:
         self.gpu_layout: Optional[KVCacheLayout] = gpu_layout
 
         self.running = False
-        self.requests_tracker: Dict[int, RequestTracker] = {}
+        self.requests_tracker: ExpiringDict[int, RequestTracker] = ExpiringDict(600) # 10 minutes
         self.graph_to_request: Dict[int, int] = {}
         self.taskid_to_nvtx_range: Dict[int, Any] = {}
         self.graphid_to_nvtx_range: Dict[int, Any] = {}
@@ -173,21 +174,21 @@ class KVManager:
                     nvtx.push_range(f"cache_engine.get request_id: {request.request_id}",
                                     color=get_nvtx_default_color())
                     graph, return_mask, callback, task_end_ops_ids = self.cache_engine.get(request.request_id,
-                                                                                            request.token_ids,
-                                                                                            request.token_mask,
-                                                                                            request.slot_mapping,
-                                                                                            self.model_config.num_layers,
-                                                                                            request.layer_granularity,
-                                                                                            request.dp_id)
+                                                                                           request.token_ids,
+                                                                                           request.token_mask,
+                                                                                           request.slot_mapping,
+                                                                                           self.model_config.num_layers,
+                                                                                           request.layer_granularity,
+                                                                                           request.dp_id)
                 elif request.request_type == KVRequestType.PUT:
                     nvtx.push_range(f"cache_engine.put request_id: {request.request_id}",
                                     color=get_nvtx_default_color())
                     graph, return_mask, callback, task_end_ops_ids = self.cache_engine.put(request.request_id,
-                                                                                        request.token_ids,
-                                                                                        request.token_mask,
-                                                                                        request.slot_mapping,
-                                                                                        self.model_config.num_layers,
-                                                                                        request.dp_id)
+                                                                                           request.token_ids,
+                                                                                           request.token_mask,
+                                                                                           request.slot_mapping,
+                                                                                           self.model_config.num_layers,
+                                                                                           request.dp_id)
                 else:
                     raise ValueError(f"Unknown request type: {request.request_type}")
                 nvtx.pop_range()
@@ -197,12 +198,12 @@ class KVManager:
                     layer_op_num = self.model_config.num_layers // request.layer_granularity \
                         if request.request_type == KVRequestType.GET else 1
                     self.requests_tracker[request.request_id] = RequestTracker(task_id=request.request_id,
-                                                                            task_type=request.request_type,
-                                                                            return_mask=return_mask,
-                                                                            callback=None,
-                                                                            task_end_ops_ids=[-1]*layer_op_num,
-                                                                            task_end_ops_status=[True]*layer_op_num,
-                                                                            task_finished=True)
+                                                                               task_type=request.request_type,
+                                                                               return_mask=return_mask,
+                                                                               callback=None,
+                                                                               task_end_ops_ids=[-1]*layer_op_num,
+                                                                               task_end_ops_status=[True]*layer_op_num,
+                                                                               task_finished=True)
                 else:
                     self.graph_to_request[graph.graph_id] = request.request_id
                     self.graphid_to_nvtx_range[graph.graph_id] = nvtx.start_range(
@@ -210,12 +211,12 @@ class KVManager:
                                                                             f"graph id: {graph.graph_id}",
                                                                             color=get_nvtx_range_color(graph.graph_id))
                     self.requests_tracker[request.request_id] = RequestTracker(task_id=request.request_id,
-                                                                                task_type=request.request_type,
-                                                                                return_mask=return_mask,
-                                                                                callback=callback,
-                                                                                task_end_ops_ids=task_end_ops_ids,
-                                                                                task_end_ops_status=len(task_end_ops_ids)*[False],
-                                                                                task_finished=False)
+                                                                               task_type=request.request_type,
+                                                                               return_mask=return_mask,
+                                                                               callback=callback,
+                                                                               task_end_ops_ids=task_end_ops_ids,
+                                                                               task_end_ops_status=len(task_end_ops_ids)*[False],
+                                                                               task_finished=False)
                     self.transfer_engine.submit_transfer_graph(graph)
             results = self.transfer_engine.get_completed_graphs_and_ops(timeout=0.001)
             for completed_graph_id, completed_op_id in results:
