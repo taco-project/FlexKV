@@ -233,12 +233,12 @@ public:
     return iouring;
   }
 
-  std::vector<std::vector<int>> &get_fds_buffer_io() {
-    return fds_buffer_io;
-  }
-
-  std::vector<std::vector<int>> &get_fds_direct_io() {
-    return fds_direct_io;
+  std::vector<std::vector<int>> &get_fds(bool is_read, bool is_direct) {
+    if (is_read && is_direct) {
+      return fds_direct_io;
+    } else {
+      return fds_buffer_io;
+    }
   }
 
 private:
