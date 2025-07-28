@@ -188,7 +188,7 @@ void transfer_kv_blocks_ssd(
   bool is_direct = chunk_size_in_bytes % 4096 == 0;
 
   IOUring &iouring = ioctx.get_iouring();
-  std::vector<std::vector<int>> &fds = ioctx.get_fds_direct_io();
+  std::vector<std::vector<int>> &fds = ioctx.get_fds(is_read, is_direct);
 
   std::vector<std::vector<int>> cpu_blocks_partition(num_devices,
                                                      std::vector<int>());
@@ -197,10 +197,6 @@ void transfer_kv_blocks_ssd(
   partition_and_remap_blocks_by_device(
       cpu_block_id_ptr, ssd_block_id_ptr, num_blocks, num_devices, round_robin,
       cpu_blocks_partition, ssd_blocks_partition);
-
-  if (is_read && is_direct) {
-      fds = ioctx.get_fds_buffer_io();
-  }
 
   std::vector<std::thread> threads;
   std::vector<std::future<std::exception_ptr>> futures;
