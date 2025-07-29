@@ -40,7 +40,9 @@ class KVDPClient:
             context, zmq.SocketType.PULL, client_recv_port, True
         )
         self.dp_client_id = self.register_to_server(model_config, client_recv_port)
-        self._task_id_counter = (self.dp_client_id + 1) * 10000000
+
+        self._task_id_range = (self.dp_client_id * 10000000, (self.dp_client_id + 1) * 10000000)
+        self._task_id_counter = self._task_id_range[0]
         self._task_id_lock = Lock()
         flexkv_logger.info(f"KVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
 
@@ -48,6 +50,8 @@ class KVDPClient:
         with self._task_id_lock:
             old_value = self._task_id_counter
             self._task_id_counter += 1
+            if self._task_id_counter >= self._task_id_range[1]:
+                self._task_id_counter = self._task_id_range[0]
             return old_value
 
     def register_to_server(
