@@ -65,37 +65,51 @@ static void _transfer_iouring_impl(
           reinterpret_cast<char *>(cpu_tensor_ptr) + cpu_k_block_offset;
       void *cpu_v_block_ptr =
           reinterpret_cast<char *>(cpu_tensor_ptr) + cpu_v_block_offset;
+      ssize_t bytes_transfer = 0;
 
       if (is_read) {
         rc = iouring.prep_read(fd, cpu_k_block_ptr, chunk_size_in_bytes,
                                ssd_k_block_offset);
         if (rc < 0) {
-          throw std::runtime_error("Failed to transfer K block");
+	  bytes_transfer = pread(fd, cpu_k_block_ptr, chunk_size_in_bytes,
+			       ssd_k_block_offset);
         }
       } else {
         rc = iouring.prep_write(fd, cpu_k_block_ptr, chunk_size_in_bytes,
                                 ssd_k_block_offset);
         if (rc < 0) {
-          throw std::runtime_error("Failed to transfer K block");
+	  bytes_transfer = pwrite(fd, cpu_k_block_ptr, chunk_size_in_bytes,
+			        ssd_k_block_offset);
         }
+      }
+
+      if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
+        throw std::runtime_error("Failed to transfer K block");
       }
 
       if (is_mla) {
         continue;
       }
 
+      bytes_transfer = 0;
       if (is_read) {
         rc = iouring.prep_read(fd, cpu_v_block_ptr, chunk_size_in_bytes,
                                ssd_v_block_offset);
         if (rc < 0) {
-          throw std::runtime_error("Failed to transfer V block");
+	  bytes_transfer = pread(fd, cpu_v_block_ptr, chunk_size_in_bytes,
+			       ssd_v_block_offset);
         }
       } else {
         rc = iouring.prep_write(fd, cpu_v_block_ptr, chunk_size_in_bytes,
                                 ssd_v_block_offset);
         if (rc < 0) {
-          throw std::runtime_error("Failed to transfer V block");
+	  bytes_transfer = pwrite(fd, cpu_v_block_ptr, chunk_size_in_bytes,
+			        ssd_v_block_offset);
         }
+      }
+
+      if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
+         throw std::runtime_error("Failed to transfer K block");
       }
     } // end layer loop
   } // end block loop
