@@ -4,8 +4,8 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from multiprocessing import Queue as MPQueue
-from queue import Empty
+from multiprocessing import Queue as MPQueue, Pipe as MPPipe
+from multiprocessing.connection import Connection
 from threading import Thread
 from typing import List, Any, Dict, Union, Optional
 
@@ -70,10 +70,10 @@ class WorkerTransferOp:
 class TransferWorkerBase(ABC):
     def __init__(self,
                  worker_id: int,
-                 transfer_queue: MPQueue,
+                 transfer_conn: Connection,  # receive end of pipe
                  finished_ops_queue: MPQueue):
         self.worker_id = worker_id
-        self.transfer_queue: MPQueue[WorkerTransferOp] = transfer_queue
+        self.transfer_conn = transfer_conn  # receive end of pipe
         self.finished_ops_queue: MPQueue[int] = finished_ops_queue
 
     def _get_layer_ptrs(self, layer_blocks: Union[List[torch.Tensor], torch.Tensor]) -> torch.Tensor:
@@ -92,23 +92,23 @@ class TransferWorkerBase(ABC):
     @classmethod
     def create_worker(cls, worker_id: int, finished_ops_queue: MPQueue, *args: Any, **kwargs: Any) -> 'WorkerHandle':
         """Generic worker creation template method"""
-        transfer_queue: mp.Queue[WorkerTransferOp] = mp.Queue()
+        parent_conn, child_conn = MPPipe()  # create pipe
         ready_event = mp.Event()
 
         process = mp.Process(
             target=cls._worker_process,
-            args=(worker_id, transfer_queue, finished_ops_queue, ready_event, *args),
+            args=(worker_id, child_conn, finished_ops_queue, ready_event, *args),
             kwargs=kwargs,
             daemon=True
         )
         process.start()
 
-        return WorkerHandle(worker_id, transfer_queue, process, ready_event)
+        return WorkerHandle(worker_id, parent_conn, process, ready_event)
 
     @classmethod
-    def _worker_process(cls, worker_id: int, transfer_queue: MPQueue, finished_ops_queue: MPQueue,
+    def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
                        ready_event: Any, *args: Any, **kwargs: Any) -> None:
-        worker = cls(worker_id, transfer_queue, finished_ops_queue, *args, **kwargs)
+        worker = cls(worker_id, transfer_conn, finished_ops_queue, *args, **kwargs)
         ready_event.set()
         worker.run()
 
@@ -145,36 +145,48 @@ class TransferWorkerBase(ABC):
         """main loop for worker process"""
         while True:
             try:
-                op = self.transfer_queue.get(timeout=0.001)
-                if op is None:
-                    break
-                try:
-                    nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
-                                        f"graph_id: {op.transfer_graph_id}, "
-                                        f"num_blocks: {len(op.src_block_ids)}",
-                                        color=get_nvtx_range_color(op.transfer_graph_id))
-                    self.launch_transfer(op)
-                    nvtx.pop_range()
-                except Exception as e:
-                    flexkv_logger.error(f"Error launching transfer: {e}\n"
-                                  f"Failed transfer op: {op}")
-                self.finished_ops_queue.put(op.transfer_op_id)
-            except Empty:
+                if self.transfer_conn.poll(timeout=0.001):  # check if data available
+                    op = self.transfer_conn.recv()
+                    if op is None:
+                        break
+                    try:
+                        nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
+                                            f"graph_id: {op.transfer_graph_id}, "
+                                            f"num_blocks: {len(op.src_block_ids)}",
+                                            color=get_nvtx_range_color(op.transfer_graph_id))
+                        self.launch_transfer(op)
+                        nvtx.pop_range()
+                    except Exception as e:
+                        flexkv_logger.error(f"Error launching transfer: {e}\n"
+                                      f"Failed transfer op: {op}")
+                    self.finished_ops_queue.put(op.transfer_op_id)
+                else:
+                    continue
+                time.sleep(0.001)
+            except EOFError:
+                # Connection closed
+                break
+            except Exception as e:
+                flexkv_logger.error(f"Error in worker run loop: {e}")
                 continue
 
 class WorkerHandle:
     """handle for worker process"""
-    def __init__(self, worker_id: int, transfer_queue: mp.Queue, process: mp.Process, ready_event: Any):
+    def __init__(self, worker_id: int, transfer_conn: Connection, process: mp.Process, ready_event: Any):
         self.worker_id = worker_id
-        self.transfer_queue = transfer_queue
+        self.transfer_conn = transfer_conn  # send end of pipe
         self.process = process
         self.ready_event = ready_event
 
     def submit_transfer(self, op: TransferOp) -> None:
-        self.transfer_queue.put(WorkerTransferOp(op))
+        self.transfer_conn.send(WorkerTransferOp(op))
 
     def shutdown(self) -> None:
-        self.transfer_queue.put(None)
+        try:
+            self.transfer_conn.send(None)
+            self.transfer_conn.close()
+        except (BrokenPipeError, OSError):
+            pass  # Pipe already closed
         # set timeout to 5 seconds
         self.process.join(timeout=5)
         if self.process.is_alive():
@@ -189,7 +201,7 @@ class WorkerHandle:
 class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non-tp and non-dp case
     def __init__(self,
                  worker_id: int,
-                 transfer_queue: MPQueue,
+                 transfer_conn: Connection,
                  finished_ops_queue: MPQueue,
                  gpu_blocks: List[TensorSharedHandle],
                  cpu_blocks: torch.Tensor,
@@ -202,7 +214,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  transfer_sms_h2d: int = 8,
                  transfer_sms_d2h: int = 8) -> None:
         # initialize worker in a new process
-        super().__init__(worker_id, transfer_queue, finished_ops_queue)
+        super().__init__(worker_id, transfer_conn, finished_ops_queue)
         # Register CPU tensors with CUDA
         cudaHostRegister(cpu_blocks)
         self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
@@ -326,7 +338,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 class tpGPUCPUTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
-                 transfer_queue: MPQueue,
+                 transfer_conn: Connection,
                  finished_ops_queue: MPQueue,
                  gpu_blocks: List[List[TensorSharedHandle]],
                  cpu_blocks: torch.Tensor,
@@ -340,7 +352,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  transfer_sms_h2d: int = 8,
                  transfer_sms_d2h: int = 8):
 
-        super().__init__(worker_id, transfer_queue, finished_ops_queue)
+        super().__init__(worker_id, transfer_conn, finished_ops_queue)
         assert len(gpu_blocks) == tp_group_size
         # Handle tensor import for multi-process case
         imported_gpu_blocks = []
@@ -464,7 +476,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 class CPUSSDDiskTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
-                 transfer_queue: MPQueue,
+                 transfer_conn: Connection,
                  finished_ops_queue: MPQueue,
                  cpu_blocks: torch.Tensor,
                  ssd_files: Dict[int, List[str]],  # ssd_device_id -> file_paths
@@ -473,7 +485,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  dtype: torch.dtype,
                  num_blocks_per_file: int,
                  cache_config: CacheConfig):
-        super().__init__(worker_id, transfer_queue, finished_ops_queue)
+        super().__init__(worker_id, transfer_conn, finished_ops_queue)
         self.ssd_files = ssd_files
         self.num_blocks_per_file = num_blocks_per_file
         self.num_files = sum(len(file_list) for file_list in ssd_files.values())
@@ -586,7 +598,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
 class CPURemoteTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
-                 transfer_queue: MPQueue,
+                 transfer_conn: Connection,
                  finished_ops_queue: MPQueue,
                  cpu_blocks: List[torch.Tensor],
                  remote_file: List[str],
@@ -596,7 +608,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
                  remote_config_custom: Dict[str, Any]):
         if transfer_kv_blocks_remote is None:
             raise RuntimeError("transfer_kv_blocks_remote not available, please build with FLEXKV_ENABLE_CFS=1")
-        super().__init__(worker_id, transfer_queue, finished_ops_queue)
+        super().__init__(worker_id, transfer_conn, finished_ops_queue)
 
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.remote_files = remote_file
