@@ -145,24 +145,30 @@ class TransferWorkerBase(ABC):
         """main loop for worker process"""
         while True:
             try:
-                if self.transfer_conn.poll(timeout=0.001):  # check if data available
+                if self.transfer_conn.poll(timeout=0.0001):  # check if data available
                     op = self.transfer_conn.recv()
                     if op is None:
                         break
-                    try:
-                        nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
-                                            f"graph_id: {op.transfer_graph_id}, "
-                                            f"num_blocks: {len(op.src_block_ids)}",
-                                            color=get_nvtx_range_color(op.transfer_graph_id))
-                        self.launch_transfer(op)
-                        nvtx.pop_range()
-                    except Exception as e:
-                        flexkv_logger.error(f"Error launching transfer: {e}\n"
-                                      f"Failed transfer op: {op}")
-                    self.finished_ops_queue.put(op.transfer_op_id)
+                    batch_ops = [op]
+                    while self.transfer_conn.poll(timeout=0):
+                        op = self.transfer_conn.recv()
+                        if op is None:
+                            break
+                        batch_ops.append(op)
+                    for op in batch_ops:
+                        try:
+                            nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
+                                                f"graph_id: {op.transfer_graph_id}, "
+                                                f"num_blocks: {len(op.src_block_ids)}",
+                                                color=get_nvtx_range_color(op.transfer_graph_id))
+                            self.launch_transfer(op)
+                            nvtx.pop_range()
+                        except Exception as e:
+                            flexkv_logger.error(f"Error launching transfer: {e}\n"
+                                        f"Failed transfer op: {op}")
+                        self.finished_ops_queue.put(op.transfer_op_id)
                 else:
                     continue
-                time.sleep(0.001)
             except EOFError:
                 # Connection closed
                 break
@@ -518,7 +524,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 cache_config.ssd_cache_iouring_flags)
         except Exception as e:
             flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
-            raise RuntimeError("SSD Worker init failed")
+            raise RuntimeError("SSD Worker init failed") from e
 
     def _transfer_impl(
         self,
