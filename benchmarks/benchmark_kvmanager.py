@@ -130,14 +130,17 @@ class FlexkvWrapper:
         else:
             return self.dp_client.try_wait(request_ids)
 
+    def check_running(self):
+        if self.use_scheduler_server:
+            return self.scheduler_server.check_running()
+        else:
+            return self.dp_client.check_running()
+
     def shutdown(self):
         if not self.use_scheduler_server:
             try:
                 # Send a shutdown request to the server
-                from flexkv.server.request import ShutdownRequest
-                shutdown_request = ShutdownRequest(dp_client_id=self.dp_client_id)
-                self.dp_client.send_to_server.send_pyobj(shutdown_request)
-
+                self.dp_client.shutdown()
                 # Wait a bit for graceful shutdown
                 time.sleep(3)
             except Exception as e:
@@ -195,6 +198,9 @@ def benchmark_kvmanager(model_config, cache_config, benchmark_config, server_rec
         batch_sequence_tensor.append(torch.randint(0, 100000, (sequence_length, ), dtype=torch.int64))
         batch_slot_mapping.append(torch.arange(i * sequence_length, (i+1) * sequence_length, dtype=torch.int64))
 
+    while not flexkv_wrapper.check_running():
+        time.sleep(0.1)
+        print("waiting for flexkv wrapper to be ready")
     # benchmark put
     start_time = time.time()
     put_ids = []
@@ -259,6 +265,7 @@ if __name__ == "__main__":
         cache_ratio=args.cache_ratio
     )
     model_config, cache_config = load_config(args.config)
+    #cache_config.num_cpu_blocks = 8192 - 2048
     # pad sequence length to divisible by tokens_per_block
     benchmark_config.sequence_length = \
         ((benchmark_config.sequence_length - 1) // cache_config.tokens_per_block + 1) * cache_config.tokens_per_block

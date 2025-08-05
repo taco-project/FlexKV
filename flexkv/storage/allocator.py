@@ -11,6 +11,7 @@ import torch
 
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
+from flexkv.common.debug import flexkv_logger
 
 
 class BaseStorageAllocator(ABC):
@@ -97,6 +98,7 @@ class CPUAllocator(BaseStorageAllocator):
         pin_memory = kwargs.get("pin_memory", True)
         total_size = layout.get_total_elements()
         # although the kv layout may have multiple dimensions, we only have one-dim CPU tensor
+        flexkv_logger.info(f"CPU allocate total_size: {2 * total_size/1024/1024/1024} GB")
         physical_tensor = torch.empty(
                             size=(total_size,),
                             dtype=dtype,

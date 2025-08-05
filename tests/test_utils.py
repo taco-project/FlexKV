@@ -406,9 +406,7 @@ class KVManagerServerClient:
         # First, try to gracefully shutdown the server by sending a shutdown signal
         try:
             # Send a shutdown request to the server
-            from flexkv.server.request import ShutdownRequest
-            shutdown_request = ShutdownRequest(dp_client_id=self.dp_client.dp_client_id)
-            self.dp_client.send_to_server.send_pyobj(shutdown_request)
+            self.dp_client.shutdown()
             print("Sent shutdown request to server")
 
             # Wait a bit for graceful shutdown

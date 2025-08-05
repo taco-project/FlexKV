@@ -20,6 +20,8 @@ from flexkv.server.request import (
     GetRequest,
     WaitRequest,
     TryWaitRequest,
+    CheckRunningRequest,
+    ShutdownRequest,
     Response
 )
 
@@ -84,17 +86,10 @@ class KVDPClient:
                          token_mask.numpy() if token_mask is not None else None,
                          self._get_task_id())
         self.send_to_server.send_pyobj(req)
-        response: Response = Response(self.dp_client_id, req.task_id)
         end_time = time.time()
         flexkv_logger.info(f"[dpclient] put_async task: {req.task_id} created. "
                            f"time: {(end_time - start_time)*1000:.2f}ms")
         return req.task_id
-       #if response.success:
-        #    flexkv_logger.info(f"put_async task: {response.task_id} created.")
-        #    return response.task_id
-        #else:
-        #    flexkv_logger.error(f"put_async task in DP {self.dp_client_id} create failed.")
-        #    return None
 
     def get_async(
         self,
@@ -110,23 +105,17 @@ class KVDPClient:
                          self._get_task_id())
 
         self.send_to_server.send_pyobj(req)
-        response: Response = Response(self.dp_client_id, req.task_id)
         end_time = time.time()
         flexkv_logger.info(f"[dpclient] get_async task: {req.task_id} created. "
                            f"time: {(end_time - start_time)*1000:.2f}ms")
         return req.task_id
-        #if response.success:
-        #    flexkv_logger.info(f"get_async task: {response.task_id} created.")
-        #    return response.task_id
-        #else:
-        #    flexkv_logger.error(f"get_async task in DP {self.dp_client_id} create failed.")
-        #    return None
 
     def wait(
         self,
         wait_task_ids: List[int],
+        wait_timeout: float = 20.0,
     ) -> Optional[Dict[int, torch.Tensor]]:
-        req = WaitRequest(self.dp_client_id, None, wait_task_ids)
+        req = WaitRequest(self.dp_client_id, None, wait_task_ids, wait_timeout)
 
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
@@ -155,6 +144,22 @@ class KVDPClient:
         else:
             flexkv_logger.error(f"try_wait tasks: {try_wait_task_ids} in DP {self.dp_client_id} failed.")
             return None
+
+    def check_running(self) -> bool:
+        req = CheckRunningRequest(self.dp_client_id)
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        return response.running
+
+    def shutdown(self) -> None:
+        req = ShutdownRequest(self.dp_client_id)
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.success:
+            flexkv_logger.info(f"DP client {self.dp_client_id} shutdown successfully.")
+        else:
+            flexkv_logger.error(f"DP client {self.dp_client_id} shutdown failed.")
+            raise
 
 class KVTPClient:
     def __init__(

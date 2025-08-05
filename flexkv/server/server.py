@@ -23,6 +23,7 @@ from flexkv.server.request import (
     TryWaitRequest,
     Response,
     ShutdownRequest,
+    CheckRunningRequest,
 )
 import contextlib
 
@@ -154,7 +155,8 @@ class KVServer:
         self,
         model_config: ModelConfig,
         cache_config: CacheConfig,
-        server_recv_port: Optional[str] = None
+        server_recv_port: Optional[str] = None,
+        worker_init_timeout_minutes: int = None,
     ):
 
         # Init inter-process communication
@@ -166,9 +168,11 @@ class KVServer:
 
         self.client_manager = ClientManager(max_num_dp_client=model_config.dp_size)
         self.kvmanager = KVManager(model_config, cache_config)
+        self.worker_init_timeout_minutes = worker_init_timeout_minutes
 
         if self.kvmanager.is_ready():
-            self.kvmanager.start()
+            flexkv_logger.info("KVManager is ready, starting with worker initialization...")
+            self.kvmanager.start(worker_init_timeout_minutes=worker_init_timeout_minutes)
 
         self.req_counter = 0
 
@@ -222,7 +226,8 @@ class KVServer:
                     result_zmq.send_pyobj(response)
 
                     if self.kvmanager.is_ready():
-                        self.kvmanager.start()
+                        flexkv_logger.info("All TP clients registered, starting KVManager...")
+                        self.kvmanager.start(worker_init_timeout_minutes=self.worker_init_timeout_minutes)
 
                 elif isinstance(req, GetRequest):
                     assert self.client_manager.is_dp_client_ready(req.dp_client_id)
@@ -242,7 +247,6 @@ class KVServer:
 
                 elif isinstance(req, PutRequest):
                     assert self.client_manager.is_dp_client_ready(req.dp_client_id)
-                    #print(f"put request: {req.token_ids} from dp {req.dp_client_id}")
                     req_id = self.kvmanager.put_async(
                         token_ids=torch.from_numpy(req.token_ids),
                         slot_mapping=torch.from_numpy(req.slot_mapping),
@@ -258,9 +262,9 @@ class KVServer:
 
                 elif isinstance(req, WaitRequest):
                     # TODO: support TP client wait
-                    # TODO: try_wait api? asyncio?
                     masks = self.kvmanager.wait(
                         req.wait_task_ids,
+                        timeout=req.wait_timeout,
                     )
                     if masks is not None:
                         # Convert to numpy arrays for serialization
@@ -292,6 +296,11 @@ class KVServer:
                     result_zmq = self.client_manager.get_zmq(req.dp_client_id)
                     result_zmq.send_pyobj(response)
                     break
+
+                elif isinstance(req, CheckRunningRequest):
+                    response = Response(req.dp_client_id, success=True, running=self.kvmanager.is_running())
+                    result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+                    result_zmq.send_pyobj(response)
 
                 else:
                     raise TypeError(f"Unregonized RequestType: {type(req)}")
@@ -333,10 +342,12 @@ class SchedulerServer:
         self,
         model_config: ModelConfig,
         cache_config: CacheConfig,
-        server_recv_port: Optional[str] = None
+        server_recv_port: Optional[str] = None,
+        worker_init_timeout_minutes: int = None
     ):
         self.model_config = model_config
         self.cache_config = cache_config
+        self.worker_init_timeout_minutes = worker_init_timeout_minutes
 
         # Initialize KVManager (similar to KVServer)
         self.kvmanager = KVManager(model_config, cache_config)
@@ -344,7 +355,7 @@ class SchedulerServer:
         # Start KVManager if it's ready (e.g., when no TP clients are needed)
         if self.kvmanager.is_ready():
             try:
-                self.kvmanager.start()
+                self.kvmanager.start(worker_init_timeout_minutes=worker_init_timeout_minutes)
                 flexkv_logger.info("KVManager started during initialization")
             except Exception as e:
                 flexkv_logger.warning(f"KVManager start failed during initialization: {e}")
@@ -365,7 +376,8 @@ class SchedulerServer:
 
         # DP client related
         self.dp_client_id = 0  # Fixed to 0 because we merged scheduler and server
-        self._task_id_counter = (self.dp_client_id + 1) * 10000000
+        self._task_id_range = (self.dp_client_id * 10000000, (self.dp_client_id + 1) * 10000000)
+        self._task_id_counter = self._task_id_range[0]
         self._task_id_lock = Lock()
 
         # Server thread control
@@ -379,6 +391,8 @@ class SchedulerServer:
         with self._task_id_lock:
             old_value = self._task_id_counter
             self._task_id_counter += 1
+            if self._task_id_counter >= self._task_id_range[1]:
+                self._task_id_counter = self._task_id_range[0]
             return old_value
 
     def start_server_thread(self) -> None:
@@ -412,6 +426,7 @@ class SchedulerServer:
                     response = Response(req.dp_client_id, success=True)
                     # Since we don't know which TP client sent the shutdown request,
                     # we send response to all registered TP clients
+                    self._running = False
                     for tp_client in self.tp_client_dict.values():
                         tp_client.send_to_client.send_pyobj(response)
                     break
@@ -424,6 +439,7 @@ class SchedulerServer:
                 flexkv_logger.error(f"ZMQ Error in SchedulerServer: {e}", exc_info=True)
             except Exception as e:
                 flexkv_logger.error(f"Error in SchedulerServer: {e}", exc_info=True)
+            time.sleep(0.0001)
 
         flexkv_logger.info("SchedulerServer background thread stopped")
 
@@ -463,7 +479,8 @@ class SchedulerServer:
                     self.is_ready = True
                     # Always start kvmanager when all TP clients are registered
                     try:
-                        self.kvmanager.start()
+                        flexkv_logger.info("All TP clients registered, starting KVManager...")
+                        self.kvmanager.start(worker_init_timeout_minutes=self.worker_init_timeout_minutes)
                         flexkv_logger.info("KVManager started successfully")
                     except Exception as e:
                         flexkv_logger.warning(f"KVManager start failed or already started: {e}")
@@ -567,6 +584,7 @@ class SchedulerServer:
     def wait(
         self,
         wait_task_ids: List[int],
+        wait_timeout: float = 20.0,
     ) -> Optional[Dict[int, torch.Tensor]]:
         """
         Wait for specified tasks to complete, directly calling KVManager (no network communication required)
@@ -578,7 +596,7 @@ class SchedulerServer:
             Dictionary mapping task IDs to result masks, None if failed
         """
         try:
-            masks = self.kvmanager.wait(wait_task_ids)
+            masks = self.kvmanager.wait(wait_task_ids, timeout=wait_timeout)
             flexkv_logger.info(f"[SchedulerServer] wait tasks: {wait_task_ids} finished.")
             return masks
 
@@ -608,6 +626,9 @@ class SchedulerServer:
         except Exception as e:
             flexkv_logger.error(f"try_wait failed: {e}")
             return None
+
+    def check_running(self) -> bool:
+        return self.kvmanager.is_running()
 
     def shutdown(self) -> None:
         """Shutdown SchedulerServer"""

@@ -71,7 +71,7 @@ class KVManager:
         self.gpu_layout: Optional[KVCacheLayout] = gpu_layout
 
         self.running = False
-        self.requests_tracker: ExpiringDict[int, RequestTracker] = ExpiringDict(600) # 10 minutes
+        self.requests_tracker: ExpiringDict[int, RequestTracker] = ExpiringDict(1800) # 30 minutes
         self.graph_to_request: Dict[int, int] = {}
         self.taskid_to_nvtx_range: Dict[int, Any] = {}
         self.graphid_to_nvtx_range: Dict[int, Any] = {}
@@ -126,19 +126,28 @@ class KVManager:
     def is_running(self) -> bool:
         return self.running
 
-    def start(self) -> None:
+    def start(self, worker_init_timeout_minutes: int = None) -> None:
+        """
+        start KVManager 
+        
+        Args:
+            worker_init_timeout_minutes: worker initialization timeout minutes, if None, will be calculated based on CPU tensor size
+                                         for large memory scenario, suggest setting to 15-20 minutes
+        """
         if self.running:
             flexkv_logger.warning("kvmanager is already running")
             return
         if not self.is_ready():
             raise ValueError("transfer engine is not ready, please add all gpu blocks first")
         if self.transfer_engine is not None:
-            self.transfer_engine.start()
+            self.transfer_engine.start(worker_init_timeout_minutes=worker_init_timeout_minutes)
+            self.running = True
         else:
             raise ValueError("transfer engine is not initialized, please call start() after all gpu blocks are added")
-        self.running = True
+
         self._worker_thread = threading.Thread(target=self._worker_loop)
         self._worker_thread.start()
+        flexkv_logger.info(f"KVManager fully started and running")
 
     # the gpu_blocks of multiple gpus can be added post initialization.
     # the transfer engine will be initialized after we have all the intended gpu handles.
@@ -353,7 +362,7 @@ class KVManager:
         return task_id
 
     # wait for the key op to be finished
-    def wait(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
+    def wait(self, task_ids: Union[int, List[int]], timeout: float = 20.0) -> Dict[int, torch.Tensor]:
         # Trace the wait request
         self.tracer.trace_wait_request(
             wait_type="wait",
@@ -365,11 +374,16 @@ class KVManager:
         num_completed_tasks = 0
         num_tasks = len(task_ids)
         return_masks = {}
+        start_time = time.time()
         while num_completed_tasks < num_tasks:
             finished_task_ids = []
             for task_id in task_ids:
                 if task_id not in self.requests_tracker:
-                    raise LogicError(f"task_id {task_id} not submitted into flexKV")
+                    flexkv_logger.error(f"task_id {task_id} not submitted into flexKV")
+                    return_masks[task_id] = torch.empty(0) #if not found in tracker, the return mask is an empty tensor
+                    num_completed_tasks += 1
+                    finished_task_ids.append(task_id)
+                    continue
                 task_tracker = self.requests_tracker[task_id]
                 if len(task_tracker.return_mask) == 0: #NOT READY
                     continue
@@ -378,13 +392,19 @@ class KVManager:
                     return_masks[task_id] = task_tracker.return_mask
                     finished_task_ids.append(task_id)
             task_ids = [task_id for task_id in task_ids if task_id not in finished_task_ids]
+            if time.time() - start_time > timeout:
+                flexkv_logger.warning(f"wait task_ids: {task_ids} timeout, has to return now")
+                for task_id in task_ids:
+                    return_masks[task_id] = torch.empty(0) # return mask of timeout task is also an empty tensor
+                nvtx.mark(f"wait task_ids: {task_ids} timeout")
+                return return_masks
             time.sleep(0.0001)
         nvtx.mark(f"wait task_ids: {task_ids} done")
         return return_masks
 
     # wait for the whole task to be finished, including the key op and all other ops
     # this function is mainly designed for testing to avoid the frequency of writing is too high to use up memory blocks
-    def wait_for_graph_finished(self, task_ids: Union[int, List[int]]) -> Dict[int, torch.Tensor]:
+    def wait_for_graph_finished(self, task_ids: Union[int, List[int]], timeout: float = 20.0) -> Dict[int, torch.Tensor]:
          # Trace the wait request
         self.tracer.trace_wait_request(
             wait_type="wait_for_graph_finished",
@@ -395,17 +415,28 @@ class KVManager:
             task_ids = [task_ids]
         num_completed_tasks = 0
         return_masks = {}
+        start_time = time.time()
         while num_completed_tasks < len(task_ids):
             finished_task_ids = []
             for task_id in task_ids:
                 if task_id not in self.requests_tracker:
-                    raise LogicError(f"task_id {task_id} not submitted into flexKV")
+                    flexkv_logger.error(f"task_id {task_id} not submitted into flexKV")
+                    return_masks[task_id] = torch.empty(0) #if not found in tracker, the return mask is an empty tensor
+                    num_completed_tasks += 1
+                    finished_task_ids.append(task_id)
+                    continue
                 task_tracker = self.requests_tracker[task_id]
                 if task_tracker.task_finished:
                     num_completed_tasks += 1
                     return_masks[task_id] = task_tracker.return_mask
                     finished_task_ids.append(task_id)
             task_ids = [task_id for task_id in task_ids if task_id not in finished_task_ids]
+            if time.time() - start_time > timeout:
+                flexkv_logger.warning(f"wait task_ids: {task_ids} timeout, has to return now")
+                for task_id in task_ids:
+                    return_masks[task_id] = torch.empty(0) # return mask of timeout task is also an empty tensor
+                nvtx.mark(f"wait task_ids: {task_ids} timeout")
+                return return_masks
             time.sleep(0.0001)
         nvtx.mark(f"wait task_ids: {task_ids} done")
         return return_masks
@@ -423,7 +454,9 @@ class KVManager:
             task_ids = [task_ids]
         for task_id in task_ids:
             if task_id not in self.requests_tracker:
-                raise LogicError(f"task_id {task_id} not submitted into flexKV")
+                flexkv_logger.error(f"task_id {task_id} not submitted into flexKV")
+                return_masks[task_id] = torch.empty(0) #if not found in tracker, the return mask is an empty tensor
+                continue
             task_tracker = self.requests_tracker[task_id]
             if len(task_tracker.task_end_ops_ids) == 0:
                 mask = None
@@ -435,7 +468,7 @@ class KVManager:
 
         return return_masks
 
-    def wait_at_layer_group(self, task_id: int, layer_group_id: int) -> torch.Tensor:
+    def wait_at_layer_group(self, task_id: int, layer_group_id: int, timeout: float = 20.0) -> torch.Tensor:
         # Trace the wait request
         self.tracer.trace_wait_request(
             wait_type="wait_at_layer_group",
@@ -443,14 +476,19 @@ class KVManager:
             layer_group_id=layer_group_id
         )
         nvtx.mark(f"wait task_id: {task_id}, layer_group_id: {layer_group_id}")
+        start_time = time.time()
         while True:
             if task_id not in self.requests_tracker:
-                raise LogicError(f"task_id {task_id} not submitted into flexKV")
+                flexkv_logger.error(f"task_id {task_id} not submitted into flexKV")
+                return torch.empty(0) #if not found in tracker, the return mask is an empty tensor
             task_tracker = self.requests_tracker[task_id]
             if len(task_tracker.task_end_ops_ids) == 0:
                 continue
             if task_tracker.task_end_ops_status[layer_group_id]:
                 return task_tracker.return_mask
+            if time.time() - start_time > timeout:
+                flexkv_logger.warning(f"wait task_id: {task_id}, layer_group_id: {layer_group_id} timeout, has to return now")
+                return torch.empty(0) # return mask of timeout task is an empty tensor
             time.sleep(0.0001)
 
         # nvtx.mark(f"wait_at_layer_group task_id: {task_id}, layer_group_id: {layer_group_id} done")
@@ -470,7 +508,9 @@ class KVManager:
             task_ids = [task_ids]
         for task_id in task_ids:
             if task_id not in self.requests_tracker:
-                raise LogicError(f"task_id {task_id} not submitted into flexKV")
+                flexkv_logger.error(f"task_id {task_id} not submitted into flexKV")
+                return_masks[task_id] = torch.empty(0) #if not found in tracker, the return mask is an empty tensor
+                continue
             task_tracker = self.requests_tracker[task_id]
             if len(task_tracker.task_end_ops_ids) == 0:
                 mask = torch.empty(0)
