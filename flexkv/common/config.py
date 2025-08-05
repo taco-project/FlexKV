@@ -31,7 +31,7 @@ class CacheConfig:
     enable_ssd: bool = False
     enable_remote: bool = False
     use_gds: bool = False
-    use_pinned_memory: bool = True
+    use_pinned_memory: bool = False
 
     # kv cache layout configs
     gpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE

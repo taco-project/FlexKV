@@ -47,6 +47,7 @@ class WaitRequest:
     dp_client_id: int
     tp_rank: Optional[int]
     wait_task_ids: List[int]
+    wait_timeout: float = 20.0
 
 # Used for async put/get
 @dataclass
@@ -62,9 +63,15 @@ class Response:
     task_id: Optional[int] = None
     masks: Optional[Dict[int, np.ndarray]] = None
     success: bool = True
+    running: bool = False
     error_msg: str = ""
 
 
 @dataclass
 class ShutdownRequest:
+    dp_client_id: int
+
+
+@dataclass
+class CheckRunningRequest:
     dp_client_id: int

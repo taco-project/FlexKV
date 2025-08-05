@@ -65,7 +65,7 @@ class TransferEngine:
         assert len(gpu_handles) == self.dp_size * self.tp_size
         self._running = False
 
-    def _init_workers(self) -> None:
+    def _init_workers(self, worker_init_timeout_minutes: int = None) -> None:
         if self._running:
             return
         self._worker_map: Dict[TransferType, Union[WorkerHandle, List[WorkerHandle]]] = {}
@@ -163,21 +163,84 @@ class TransferEngine:
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
         # Wait for all workers to ready
-        for worker in self._worker_map.values():
-            if isinstance(worker, List):
-                for w in worker:
-                    w.ready_event.wait(timeout=60)
-            else:
-                flexkv_logger.info(f"waiting for worker {worker} to ready")
-                worker.ready_event.wait(timeout=60)
-                flexkv_logger.info(f"worker {worker} is ready")
+        self.wait_all_workers_ready(timeout_minutes=worker_init_timeout_minutes)
         # Start scheduler thread
         self._running = True
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
         self._scheduler_thread.start()
 
-    def start(self) -> None:
-        self._init_workers()
+    def start(self, worker_init_timeout_minutes: int = None) -> None:
+        self._init_workers(worker_init_timeout_minutes)
+    
+    def wait_all_workers_ready(self, timeout_minutes: int = None) -> bool:
+        """
+        wait for all workers ready
+        
+        Args:
+            timeout_minutes: timeout minutes, if None, will be calculated based on CPU tensor size
+        """
+        if not hasattr(self, '_worker_map') or not self._worker_map:
+            return False
+        
+        # calculate timeout minutes
+        if timeout_minutes is None:
+            # estimate timeout minutes based on CPU tensor size
+            cpu_tensor_size_gb = 0
+            if self._cpu_handle is not None:
+                cpu_tensor = self._cpu_handle.get_tensor()
+                cpu_tensor_size_gb = cpu_tensor.numel() * cpu_tensor.element_size() / (1024**3)
+            
+            # base time 3 minutes + 0.1 seconds per GB, min 5 minutes, max 20 minutes
+            estimated_minutes = max(5, min(20, 3 + cpu_tensor_size_gb * 0.1))
+            timeout_minutes = int(estimated_minutes)
+            
+        flexkv_logger.info(f"Starting waiting for worker initialization with {timeout_minutes} minutes timeout "
+                          f"(CPU tensor: {cpu_tensor_size_gb:.1f}GB)")
+        
+        try:
+            total_workers = sum(len(w) if isinstance(w, list) else 1 for w in self._worker_map.values())
+            ready_workers = 0
+            
+            for worker_type, worker in self._worker_map.items():
+                if isinstance(worker, List):
+                    for i, w in enumerate(worker):
+                        flexkv_logger.info(f"[{ready_workers+1}/{total_workers}] Waiting for {worker_type} worker[{i}]...")
+                        
+                        if not self._wait_worker_with_progress(w, f"{worker_type}[{i}]", timeout_minutes):
+                            return False
+                        
+                        ready_workers += 1
+                else:
+                    flexkv_logger.info(f"[{ready_workers+1}/{total_workers}] Waiting for {worker_type} worker...")
+                    
+                    if not self._wait_worker_with_progress(worker, worker_type, timeout_minutes):
+                        return False
+                    
+                    ready_workers += 1
+            
+            flexkv_logger.info(f"All {total_workers} transfer engine workers are ready!")
+            return True
+            
+        except Exception as e:
+            flexkv_logger.error(f"Error waiting for workers ready: {e}")
+            return False
+    
+    def _wait_worker_with_progress(self, worker, worker_name: str, timeout_minutes: int) -> bool:
+        import time
+        
+        timeout_seconds = timeout_minutes * 60
+        check_interval = 1
+        start_time = time.time()
+
+        while True:
+            if worker.ready_event.wait(timeout=check_interval):
+                return True
+            #check timeout
+            elapsed = time.time() - start_time
+            if elapsed >= timeout_seconds:
+                flexkv_logger.error(f"❌ {worker_name} worker failed to ready within {timeout_minutes} minutes")
+                return False
+        return False
 
     def _scheduler_loop(self) -> None:
         """Main scheduler loop"""
