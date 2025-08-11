@@ -156,7 +156,6 @@ class KVServer:
         model_config: ModelConfig,
         cache_config: CacheConfig,
         server_recv_port: Optional[str] = None,
-        worker_init_timeout_minutes: int = None,
     ):
 
         # Init inter-process communication
@@ -168,11 +167,10 @@ class KVServer:
 
         self.client_manager = ClientManager(max_num_dp_client=model_config.dp_size)
         self.kvmanager = KVManager(model_config, cache_config)
-        self.worker_init_timeout_minutes = worker_init_timeout_minutes
 
         if self.kvmanager.is_ready():
             flexkv_logger.info("KVManager is ready, starting with worker initialization...")
-            self.kvmanager.start(worker_init_timeout_minutes=worker_init_timeout_minutes)
+            self.kvmanager.start()
 
         self.req_counter = 0
 
@@ -227,7 +225,7 @@ class KVServer:
 
                     if self.kvmanager.is_ready():
                         flexkv_logger.info("All TP clients registered, starting KVManager...")
-                        self.kvmanager.start(worker_init_timeout_minutes=self.worker_init_timeout_minutes)
+                        self.kvmanager.start()
 
                 elif isinstance(req, GetRequest):
                     assert self.client_manager.is_dp_client_ready(req.dp_client_id)
@@ -343,11 +341,9 @@ class SchedulerServer:
         model_config: ModelConfig,
         cache_config: CacheConfig,
         server_recv_port: Optional[str] = None,
-        worker_init_timeout_minutes: int = None
     ):
         self.model_config = model_config
         self.cache_config = cache_config
-        self.worker_init_timeout_minutes = worker_init_timeout_minutes
 
         # Initialize KVManager (similar to KVServer)
         self.kvmanager = KVManager(model_config, cache_config)
@@ -355,7 +351,7 @@ class SchedulerServer:
         # Start KVManager if it's ready (e.g., when no TP clients are needed)
         if self.kvmanager.is_ready():
             try:
-                self.kvmanager.start(worker_init_timeout_minutes=worker_init_timeout_minutes)
+                self.kvmanager.start()
                 flexkv_logger.info("KVManager started during initialization")
             except Exception as e:
                 flexkv_logger.warning(f"KVManager start failed during initialization: {e}")
@@ -480,7 +476,7 @@ class SchedulerServer:
                     # Always start kvmanager when all TP clients are registered
                     try:
                         flexkv_logger.info("All TP clients registered, starting KVManager...")
-                        self.kvmanager.start(worker_init_timeout_minutes=self.worker_init_timeout_minutes)
+                        self.kvmanager.start()
                         flexkv_logger.info("KVManager started successfully")
                     except Exception as e:
                         flexkv_logger.warning(f"KVManager start failed or already started: {e}")

@@ -126,28 +126,21 @@ class KVManager:
     def is_running(self) -> bool:
         return self.running
 
-    def start(self, worker_init_timeout_minutes: int = None) -> None:
-        """
-        start KVManager 
-        
-        Args:
-            worker_init_timeout_minutes: worker initialization timeout minutes, if None, will be calculated based on CPU tensor size
-                                         for large memory scenario, suggest setting to 15-20 minutes
-        """
+    def start(self) -> None:
         if self.running:
             flexkv_logger.warning("kvmanager is already running")
             return
         if not self.is_ready():
             raise ValueError("transfer engine is not ready, please add all gpu blocks first")
         if self.transfer_engine is not None:
-            self.transfer_engine.start(worker_init_timeout_minutes=worker_init_timeout_minutes)
+            self.transfer_engine.start()
             self.running = True
         else:
             raise ValueError("transfer engine is not initialized, please call start() after all gpu blocks are added")
 
         self._worker_thread = threading.Thread(target=self._worker_loop)
         self._worker_thread.start()
-        flexkv_logger.info(f"KVManager fully started and running")
+        flexkv_logger.info("KVManager fully started and running")
 
     # the gpu_blocks of multiple gpus can be added post initialization.
     # the transfer engine will be initialized after we have all the intended gpu handles.
@@ -404,7 +397,9 @@ class KVManager:
 
     # wait for the whole task to be finished, including the key op and all other ops
     # this function is mainly designed for testing to avoid the frequency of writing is too high to use up memory blocks
-    def wait_for_graph_finished(self, task_ids: Union[int, List[int]], timeout: float = 20.0) -> Dict[int, torch.Tensor]:
+    def wait_for_graph_finished(self,
+                                task_ids: Union[int, List[int]],
+                                timeout: float = 20.0) -> Dict[int, torch.Tensor]:
          # Trace the wait request
         self.tracer.trace_wait_request(
             wait_type="wait_for_graph_finished",
@@ -487,7 +482,8 @@ class KVManager:
             if task_tracker.task_end_ops_status[layer_group_id]:
                 return task_tracker.return_mask
             if time.time() - start_time > timeout:
-                flexkv_logger.warning(f"wait task_id: {task_id}, layer_group_id: {layer_group_id} timeout, has to return now")
+                flexkv_logger.warning(f"wait task_id: {task_id}, layer_group_id: {layer_group_id} "
+                                      f"timeout, has to return now")
                 return torch.empty(0) # return mask of timeout task is an empty tensor
             time.sleep(0.0001)
 
