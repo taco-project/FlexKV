@@ -292,7 +292,8 @@ class KVManagerServerClient:
             tp_client_process = Process(
                 target=KVManagerServerClient._run_tp_client,
                 args=(self.dp_client.dp_client_id, tp_rank, device_id, self.server_recv_port,
-                      model_config.num_layers, str(model_config.dtype), list(gpu_kv_layout.kv_shape[1:])),
+                      model_config.num_layers, str(model_config.dtype), 
+                      list(gpu_kv_layout.kv_shape[1:]), model_config.use_mla),
                 daemon=True
             )
             tp_client_process.start()
@@ -334,7 +335,7 @@ class KVManagerServerClient:
         print("server started")
 
     @staticmethod
-    def _run_tp_client(dp_client_id, tp_rank, device_id, server_recv_port, num_layers, dtype_str, kv_shape):
+    def _run_tp_client(dp_client_id, tp_rank, device_id, server_recv_port, num_layers, dtype_str, kv_shape, is_mla):
         """Run tp_client process"""
         from flexkv.server.client import KVTPClient
         from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -363,7 +364,7 @@ class KVManagerServerClient:
             tokens_per_block=kv_shape[2],  # Assuming this is the tokens_per_block dimension
             num_head=kv_shape[3],  # Assuming this is the num_head dimension
             head_size=kv_shape[4],  # Assuming this is the head_size dimension
-            is_mla=False
+            is_mla=is_mla
         )
         print("registering to server ... ...")
         tp_client.register_to_server(gpu_blocks_for_tp, gpu_kv_layout)
