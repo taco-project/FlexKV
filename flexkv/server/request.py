@@ -24,6 +24,9 @@ class RegisterTPClientRequest:
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
 
+@dataclass
+class IsReadyRequest:
+    dp_client_id: int
 
 @dataclass
 class PutRequest:
@@ -65,6 +68,7 @@ class Response:
     success: bool = True
     running: bool = False
     error_msg: str = ""
+    is_ready: bool = False
 
 
 @dataclass

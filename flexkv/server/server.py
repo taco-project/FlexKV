@@ -17,6 +17,7 @@ from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import (
     RegisterDPClientRequest,
     RegisterTPClientRequest,
+    IsReadyRequest,
     PutRequest,
     GetRequest,
     WaitRequest,
@@ -226,6 +227,13 @@ class KVServer:
                     if self.kvmanager.is_ready():
                         flexkv_logger.info("All TP clients registered, starting KVManager...")
                         self.kvmanager.start()
+
+                elif isinstance(req, IsReadyRequest):
+                    is_ready = self.kvmanager.is_ready()
+                    response = Response(req.dp_client_id, is_ready=is_ready)
+                    result_zmq = self.client_manager.get_zmq(
+                        req.dp_client_id)
+                    result_zmq.send_pyobj(response)
 
                 elif isinstance(req, GetRequest):
                     assert self.client_manager.is_dp_client_ready(req.dp_client_id)

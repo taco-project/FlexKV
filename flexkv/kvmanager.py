@@ -373,7 +373,7 @@ class KVManager:
             for task_id in task_ids:
                 if task_id not in self.requests_tracker:
                     flexkv_logger.error(f"task_id {task_id} not submitted into flexKV")
-                    return_masks[task_id] = torch.empty(0) #if not found in tracker, the return mask is an empty tensor
+                    return_masks[task_id] = torch.empty(0, dtype=torch.bool) #if not found in tracker, the return mask is an empty tensor
                     num_completed_tasks += 1
                     finished_task_ids.append(task_id)
                     continue
@@ -388,7 +388,7 @@ class KVManager:
             if time.time() - start_time > timeout:
                 flexkv_logger.warning(f"wait task_ids: {task_ids} timeout, has to return now")
                 for task_id in task_ids:
-                    return_masks[task_id] = torch.empty(0) # return mask of timeout task is also an empty tensor
+                    return_masks[task_id] = torch.empty(0, dtype=torch.bool) # return mask of timeout task is also an empty tensor
                 nvtx.mark(f"wait task_ids: {task_ids} timeout")
                 return return_masks
             time.sleep(0.0001)
