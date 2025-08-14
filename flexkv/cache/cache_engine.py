@@ -941,7 +941,7 @@ class GlobalCacheEngine:
         assert token_mask.ndim == 1
         assert slot_mapping.ndim == 1
         assert len(token_ids) == len(token_mask), f"len(token_ids)={len(token_ids)}, len(token_mask)={len(token_mask)}"
-        assert len(slot_mapping) == token_mask.sum().item()
+        assert len(slot_mapping) == token_mask.sum().item(), f"len(slot_mapping)={len(slot_mapping)}, token_mask.sum().item()={token_mask.sum().item()}"
 
     def _slot_to_block_mapping(self,
                               slot_mapping: torch.Tensor) -> torch.Tensor:
