@@ -18,8 +18,10 @@ import time
 from functools import partial
 from queue import Queue
 from typing import List, Tuple, Optional, Dict, Callable
+from dataclasses import dataclass
 
 import torch
+from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
@@ -33,6 +35,108 @@ from flexkv.common.transfer import (
     DeviceType, TransferOpGraph, TransferOp, TransferType, TransferDescriptor
 )
 
+@dataclass
+class MatchResultAccel:
+    num_ready_matched_blocks: int = 0
+    num_matched_blocks: int = 0
+    last_ready_node: Optional['CRadixNode'] = None
+    last_node: Optional['CRadixNode'] = None
+    last_node_matched_length: int = 0
+    physical_blocks: torch.Tensor = torch.empty(0, dtype=torch.int64)
+
+    def __post_init__(self) -> None:
+        assert self.physical_blocks.ndim == 1
+        assert self.physical_blocks.dtype == torch.int64
+
+class CacheEngineAccel:
+    def __init__(self,
+                 device_type: DeviceType,
+                 num_total_blocks: int,
+                 tokens_per_block: int):
+        if not isinstance(device_type, DeviceType):
+            raise InvalidConfigError(f"Unknown device type: {device_type}")
+        if num_total_blocks <= 0:
+            raise InvalidConfigError(f"Invalid num_total_blocks: {num_total_blocks}")
+        if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
+            raise InvalidConfigError(f"Invalid tokens_per_block: {tokens_per_block}, "
+                              f"tokens_per_block must be a power of 2")
+
+        self.device_type = device_type
+
+        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks)
+
+        self.mempool = Mempool(num_total_blocks=num_total_blocks)
+
+        self.tokens_per_block = tokens_per_block
+        self.num_total_blocks = num_total_blocks
+
+    def reset(self) -> None:
+        self.index.reset()
+        self.mempool.reset()
+
+    def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
+        sequence_meta.gen_hashes()
+        match_result = self.index.match_prefix(torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
+                                              sequence_meta.num_blocks, True)
+        return MatchResultAccel(match_result.num_ready_matched_blocks, match_result.num_matched_blocks,
+                            match_result.last_ready_node, match_result.last_node,
+                            match_result.last_node_matched_length,
+                            torch.tensor(match_result.physical_blocks, dtype=torch.int64))
+
+    def insert(self,
+               sequence_meta: SequenceMeta,
+               physical_block_ids: torch.Tensor,
+               num_insert_blocks: int = -1,
+               is_ready: bool = True,
+               match_result: Optional[MatchResultAccel] = None) -> Optional[CRadixNode]:
+        sequence_meta.gen_hashes()
+        if match_result is None:
+          return self.index.insert(physical_block_ids,
+                                 torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
+                                 sequence_meta.num_blocks,
+                                 num_insert_blocks,
+                                 is_ready)
+        else:
+          return self.index.insert(physical_block_ids,
+                                 torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
+                                 sequence_meta.num_blocks,
+                                 num_insert_blocks,
+                                 is_ready,
+                                 match_result.last_node,
+                                 match_result.num_matched_blocks,
+                                 match_result.last_node_matched_length)
+
+    def lock_node(self, node: CRadixNode) -> None:
+        self.index.lock(node)
+
+    def cleanup(self, node: CRadixNode, cleanup_length: int) -> None:
+        self.index.unlock(node)
+        self.index.set_ready(node, True, cleanup_length)
+
+    def take(self,
+             num_required_blocks: int,
+             protected_node: Optional[CRadixNode] = None,
+             strict: bool = True) -> torch.Tensor:
+        if num_required_blocks > self.mempool.num_free_blocks:
+            if protected_node is not None:
+                self.index.lock(protected_node)
+            target_blocks = torch.zeros(num_required_blocks - self.mempool.num_free_blocks, dtype=torch.int64)
+            num_evicted = self.index.evict(target_blocks, num_required_blocks - self.mempool.num_free_blocks)
+            if num_evicted != num_required_blocks - self.mempool.num_free_blocks:
+                target_blocks.resize_(num_evicted)
+            self.mempool.recycle_blocks(target_blocks)
+
+            if protected_node is not None:
+                self.index.unlock(protected_node)
+        if strict and num_required_blocks > self.mempool.num_free_blocks:
+            raise NotEnoughSpaceError("Not enough free blocks to take, ",
+                                      required=num_required_blocks,
+                                      available=self.mempool.num_free_blocks)
+        num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
+        return self.mempool.allocate_blocks(num_allocated_blocks)
+
+    def recycle(self, physical_blocks: torch.Tensor) -> None:
+        self.mempool.recycle_blocks(physical_blocks)
 
 class CacheEngine:
     def __init__(self,
@@ -119,17 +223,32 @@ class GlobalCacheEngine:
         self.cache_engines = {}
 
         if cache_config.enable_cpu:
-            self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
+            if cache_config.index_accel:
+                self.cpu_cache_engine = CacheEngineAccel(DeviceType.CPU,
+                                                cache_config.num_cpu_blocks,
+                                                cache_config.tokens_per_block)
+            else:
+                self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
-            self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
+            if cache_config.index_accel:
+                self.ssd_cache_engine = CacheEngineAccel(DeviceType.SSD,
+                                                cache_config.num_ssd_blocks,
+                                                cache_config.tokens_per_block)
+            else:
+                self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
-            self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
+            if cache_config.index_accel:
+                self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
+                                                   cache_config.num_remote_blocks,
+                                                   cache_config.tokens_per_block)
+            else:
+                self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
@@ -429,7 +548,10 @@ class GlobalCacheEngine:
         assert self.cache_config.enable_cpu
         assert self.cpu_cache_engine is not None
 
-        cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
+        if self.cache_config.index_accel:
+            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta)
+        else:
+            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
 
         # tailor the blocks to assure:
         # the blocks are needed by the mask & the blocks are ready
@@ -639,7 +761,10 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
         assert self.remote_cache_engine is not None
 
-        cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
+        if self.cache_config.index_accel:
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
+        else:
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
@@ -805,7 +930,10 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
         # assert self.ssd_cache_engine is not None
 
-        cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
+        if  self.cache_config.index_accel:
+            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta)
+        else:
+            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
@@ -924,6 +1052,16 @@ class GlobalCacheEngine:
                 assert self.remote_cache_engine is not None
                 self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
 
+    def match_local_accel(self, sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel]:
+        cpu_matched_result = MatchResultAccel()
+        ssd_matched_result = MatchResultAccel()
+        if self.cpu_cache_engine:
+            cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
+        if self.ssd_cache_engine:
+            ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
+
+        return cpu_matched_result, ssd_matched_result
+
     def match_local(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
@@ -933,6 +1071,20 @@ class GlobalCacheEngine:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
+
+    def match_all_accel(self, sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:
+        cpu_matched_result = MatchResultAccel()
+        ssd_matched_result = MatchResultAccel()
+        remote_matched_result = MatchResultAccel()
+        # TODO: avoid redundant match?
+        if self.cpu_cache_engine:
+            cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
+        if self.ssd_cache_engine:
+            ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
+        if self.remote_cache_engine:
+            remote_matched_result = self.remote_cache_engine.match(sequence_meta)
+
+        return cpu_matched_result, ssd_matched_result, remote_matched_result
 
     def match_all(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
