@@ -19,6 +19,7 @@
 #include "tp_transfer_thread_group.h"
 #include "transfer.cuh"
 #include "transfer_ssd.h"
+#include "radix_tree.h"
 
 namespace py = pybind11;
 
@@ -195,4 +196,36 @@ PYBIND11_MODULE(c_ext, m) {
         "Call Pcfs::write from C++", py::arg("file_nodeid"), py::arg("offset"),
         py::arg("buffer"), py::arg("size"), py::arg("thread_id"));
 #endif
+
+  py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
+      .def(py::init<int, int>())
+      .def("is_empty", &flexkv::CRadixTreeIndex::is_empty)
+      .def("reset", &flexkv::CRadixTreeIndex::reset)
+      .def("lock", &flexkv::CRadixTreeIndex::lock, py::arg("node"))
+      .def("unlock", &flexkv::CRadixTreeIndex::unlock, py::arg("node"))
+      .def("set_ready", &flexkv::CRadixTreeIndex::set_ready,
+           py::arg("node"), py::arg("ready"), py::arg("ready_length"))
+      .def("insert", &flexkv::CRadixTreeIndex::insert, py::return_value_policy::reference,
+          py::arg("physical_block_ids"), py::arg("block_hashes"), py::arg("num_blocks"),
+          py::arg("num_insert_blocks"), py::arg("ready") = true, py::arg("node") = nullptr,
+          py::arg("num_matched_blocks") = -1, py::arg("last_node_matched_length") = -1)
+      .def("evict", &flexkv::CRadixTreeIndex::evict, py::arg("evicted_blocks"), py::arg("num_evicted"))
+      .def("total_cached_blocks", &flexkv::CRadixTreeIndex::total_cached_blocks)
+      .def("total_unready_blocks", &flexkv::CRadixTreeIndex::total_unready_blocks)
+      .def("total_ready_blocks", &flexkv::CRadixTreeIndex::total_ready_blocks)
+      .def("match_prefix", &flexkv::CRadixTreeIndex::match_prefix,
+           py::arg("block_hashes"), py::arg("num_blocks"), py::arg("update_cache_info"));
+
+  py::class_<flexkv::CRadixNode>(m, "CRadixNode")
+      .def(py::init<flexkv::CRadixTreeIndex *, bool, int>())
+      .def("size", &flexkv::CRadixNode::size);
+
+  py::class_<flexkv::CMatchResult, std::shared_ptr<flexkv::CMatchResult>>(m, "CMatchResult")
+      .def(py::init<int, int, int, flexkv::CRadixNode *, flexkv::CRadixNode *, std::vector<int64_t> *>())
+      .def_readonly("last_ready_node", &flexkv::CMatchResult::last_ready_node)
+      .def_readonly("last_node", &flexkv::CMatchResult::last_node)
+      .def_readonly("physical_blocks", &flexkv::CMatchResult::physical_blocks)
+      .def_readonly("num_ready_matched_blocks", &flexkv::CMatchResult::num_ready_matched_blocks)
+      .def_readonly("num_matched_blocks", &flexkv::CMatchResult::num_matched_blocks)
+      .def_readonly("last_node_matched_length", &flexkv::CMatchResult::last_node_matched_length);
 }

@@ -32,6 +32,7 @@ class CacheConfig:
     enable_remote: bool = False
     use_gds: bool = False
     use_pinned_memory: bool = False
+    index_accel: bool = False
 
     # kv cache layout configs
     gpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE

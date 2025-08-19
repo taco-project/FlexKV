@@ -25,12 +25,14 @@ cpp_sources = [
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
+    "csrc/radix_tree.cpp",
 ]
 
 hpp_sources = [
     "csrc/cache_utils.h",
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
+    "csrc/radix_tree.h",
 ]
 
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
