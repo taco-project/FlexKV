@@ -8,9 +8,11 @@
 #include <thread>
 #include <torch/extension.h>
 #include <vector>
-
+#include <condition_variable>
+#include <queue>
+#include <functional>
+#include <future>
 namespace flexkv {
-
 class TPTransferThreadGroup {
 public:
   TPTransferThreadGroup(
@@ -32,12 +34,20 @@ public:
                          const int layer_granularity, const bool is_mla);
 
 private:
+  using Task = std::function<void()>;
+  std::future<void> enqueue_for_gpu(int gpu_idx, Task task);
+
   int num_gpus_;
   int dp_group_id_;
   void **gpu_blocks_;
   void *cpu_blocks_;
   std::vector<std::thread> threads_;
   std::vector<cudaStream_t> streams_;
+
+  std::vector<std::queue<Task>> queues_;
+  std::vector<std::mutex> mtxs_;
+  std::vector<std::condition_variable> cvs_;
+  std::atomic<bool> stop_pool_;
 };
 
 } // namespace flexkv
