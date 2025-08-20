@@ -24,6 +24,11 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
     torch::Tensor &cpu_blocks, int dp_group_id) {
   num_gpus_ = num_gpus;
+
+  queues_.resize(num_gpus_);
+  mtxs_   = std::vector<std::mutex>(num_gpus_);
+  cvs_    = std::vector<std::condition_variable>(num_gpus_);
+
   int num_layers = gpu_blocks[0].size();
   cudaMallocHost((void **)&gpu_blocks_,
                  num_gpus_ * num_layers * sizeof(void *));
@@ -41,9 +46,46 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     cudaSetDevice(dp_group_id * num_gpus_ + i);
     cudaStreamCreate(&streams_[i]);
   }
+  // create the thread pool
+  stop_pool_=false;
+  for (int i = 0; i < num_gpus_; ++i) {
+    threads_.emplace_back([this, i]() {
+      int device_id = dp_group_id_ * num_gpus_ + i;
+      cudaSetDevice(device_id);  // only once
+
+      while (true) {
+        Task task;
+        {
+          std::unique_lock<std::mutex> lk(mtxs_[i]);
+          cvs_[i].wait(lk, [&]{ return stop_pool_ || !queues_[i].empty(); });
+          if (stop_pool_ && queues_[i].empty()) return;
+
+          task = std::move(queues_[i].front());
+          queues_[i].pop();
+        }
+        task();  // 
+      }
+    });
+  }
+
 }
 
-TPTransferThreadGroup::~TPTransferThreadGroup() {}
+TPTransferThreadGroup::~TPTransferThreadGroup() {
+  stop_pool_ = true;
+  for (auto& cv : cvs_) cv.notify_all();
+  for (auto& t : threads_) if (t.joinable()) t.join();
+}
+
+std::future<void> TPTransferThreadGroup::enqueue_for_gpu(int gpu_idx, Task task) {
+  auto pkg = std::make_shared<std::packaged_task<void()>>(std::move(task));
+  auto fut = pkg->get_future();
+  {
+      std::lock_guard<std::mutex> lk(mtxs_[gpu_idx]);
+      queues_[gpu_idx].emplace([pkg]{ (*pkg)(); });
+  }
+  cvs_[gpu_idx].notify_one();
+  return fut;
+}
 
 void TPTransferThreadGroup::tp_group_transfer(
     const torch::Tensor &gpu_block_id_tensor,
@@ -60,11 +102,15 @@ void TPTransferThreadGroup::tp_group_transfer(
 
   std::atomic<bool> failed{false};
   std::string error_msg;
-  threads_.clear();
-  threads_.reserve(num_gpus_);
+  // threads_.clear();
+  // threads_.reserve(num_gpus_);
 
-  for (int i = 0; i < num_gpus_; ++i) {
-    threads_.emplace_back([&, i]() {
+  // Barrier sync_point(num_gpus_);
+  std::vector<std::future<void>> futures;
+  futures.reserve(num_gpus_);
+
+  for (int i=0; i<num_gpus_; ++i){
+    futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
         int num_blocks = gpu_block_id_tensor.numel();
         int num_layers = layer_granularity;
@@ -78,14 +124,16 @@ void TPTransferThreadGroup::tp_group_transfer(
         void *cpu_ptr = cpu_blocks_;
         int64_t cpu_startoff_inside_chunks =
             is_mla ? 0 : i * gpu_chunk_size_in_bytes;
-        cudaSetDevice(dp_group_id_ * num_gpus_ + i);
+      
         flexkv::transfer_kv_blocks(
-            num_blocks, layer_id, layer_granularity, gpu_block_ids,
-            gpu_layer_ptrs, gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes,
-            cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
-            cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-            cpu_startoff_inside_chunks, gpu_chunk_size_in_bytes, streams_[i],
-            transfer_sms, is_host_to_device, use_ce_transfer, is_mla);
+          num_blocks, layer_id, layer_granularity, gpu_block_ids,
+          gpu_layer_ptrs, gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes,
+          cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
+          cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+          cpu_startoff_inside_chunks, gpu_chunk_size_in_bytes, streams_[i],
+          transfer_sms, is_host_to_device, use_ce_transfer, is_mla
+        );
+
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
           failed = true;
@@ -95,12 +143,12 @@ void TPTransferThreadGroup::tp_group_transfer(
         failed = true;
         error_msg = e.what();
       }
-    });
+
+    }));
   }
 
-  for (auto &t : threads_) {
-    if (t.joinable())
-      t.join();
+  for (auto &f : futures){
+    f.get();
   }
 
   if (failed) {
