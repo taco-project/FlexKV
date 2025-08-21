@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import ClassVar, List, Set, Dict
 
-import torch
+import numpy as np
 
 
 class DeviceType(Enum):
@@ -31,16 +31,6 @@ class PartitionBlockType(Enum):
     ROUND_ROBIN = 0
     SEQUENTIAL = 1
 
-@dataclass
-class TransferDescriptor:
-    device_type: DeviceType = DeviceType.CPU
-    device_id: int = 0
-    physical_block_ids: torch.Tensor = torch.tensor([], dtype=torch.int64)
-
-    def __post_init__(self) -> None:
-        assert self.physical_block_ids.ndim == 1
-        assert self.physical_block_ids.dtype == torch.int64
-
 class TransferOpStatus(Enum):
     PENDING = 0
     RUNNING = 1
@@ -54,10 +44,10 @@ class TransferOp:
     op_id: int = field(init=False)
     graph_id: int
     transfer_type: TransferType
-    layer_id: int
-    layer_granularity: int
-    src_descriptor: TransferDescriptor = field(default_factory=TransferDescriptor)
-    dst_descriptor: TransferDescriptor = field(default_factory=TransferDescriptor)
+    src_block_ids: np.ndarray
+    dst_block_ids: np.ndarray
+    layer_id: int = 0
+    layer_granularity: int = -1
     # this will change dynamically as transfer ops executed
     predecessors: Set[int] = field(default_factory=set)
     # this will keep the full info
@@ -67,8 +57,8 @@ class TransferOp:
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
-            len(self.src_descriptor.physical_block_ids) != len(self.dst_descriptor.physical_block_ids):
-            raise ValueError("src_descriptor and dst_descriptor must have the same number of physical blocks")
+            self.src_block_ids.size != self.dst_block_ids.size:
+            raise ValueError("src_block_ids and dst_block_ids must have the same number of physical blocks")
         with TransferOp._lock:
             self.op_id = TransferOp._next_op_id
             TransferOp._next_op_id += 1
@@ -79,13 +69,14 @@ class TransferOpGraph:
     _lock = threading.Lock()
 
     def __init__(self) -> None:
-        self.graph_id = self._get_next_graph_id()
+        self.graph_id = self._get_graph_id()
         self._op_map: Dict[int, TransferOp] = {}
         self._ready_ops: Set[int] = set()
         self._trigger_ops: Set[int] = set()
+        self._gpu_transfer_op_id: int = -1
 
     @classmethod
-    def _get_next_graph_id(cls) -> int:
+    def _get_graph_id(cls) -> int:
         with cls._lock:
             graph_id = cls._next_graph_id
             cls._next_graph_id += 1
@@ -115,6 +106,14 @@ class TransferOpGraph:
     def add_transfer_op(self, op: TransferOp) -> None:
         op.graph_id = self.graph_id
         self._op_map[op.op_id] = op
+        if op.transfer_type == TransferType.H2D or \
+            op.transfer_type == TransferType.D2H or \
+            op.transfer_type == TransferType.D2DISK or \
+            op.transfer_type == TransferType.DISK2D:
+            if self._gpu_transfer_op_id == -1:
+                self._gpu_transfer_op_id = op.op_id
+            else:
+                raise ValueError("Only one GPU transfer op is allowed")
         self._ready_ops.add(op.op_id)
 
     def add_dependency(self, successor_op_id: int, predecessor_op_id: int) -> None:
@@ -130,8 +129,6 @@ class TransferOpGraph:
             assert self._op_map[op_id].status == TransferOpStatus.RUNNING
             self._op_map[op_id].status = TransferOpStatus.COMPLETED
             my_successors = self._op_map[op_id].successors
-            if len(my_successors) == 0:
-                return
             for successor_id in my_successors:
                 self._op_map[successor_id].predecessors.remove(op_id)
 
@@ -164,6 +161,16 @@ class TransferOpGraph:
         return all(op.status == TransferOpStatus.COMPLETED
                    for op in self._op_map.values())
 
+    def set_gpu_blocks(self, gpu_blocks: np.ndarray) -> None:
+        transfer_type = self._op_map[self._gpu_transfer_op_id].transfer_type
+        op = self._op_map[self._gpu_transfer_op_id]
+        if transfer_type.name.endswith("2D"):
+            op.dst_block_ids = gpu_blocks
+        else:
+            op.src_block_ids = gpu_blocks
+        assert op.src_block_ids.size == op.dst_block_ids.size, \
+            f"src_block_ids.size={op.src_block_ids.size}, dst_block_ids.size={op.dst_block_ids.size}"
+
     @property
     def num_ops(self) -> int:
         return len(self._op_map)
@@ -171,69 +178,6 @@ class TransferOpGraph:
     def bind_to_dp_group(self, dp_id: int) -> None:
         for op in self._op_map.values():
             op.dp_id = dp_id
-
-    def print_op_map(self) -> None:
-        """Print transfer op graph in a visual format showing dependencies.
-
-        Example output:
-        Transfer Graph 5:
-        ├── Op 1 (H2D) [Completed]
-        │   └── No successors
-        ├── Op 2 (D2H) [Pending]
-        │   └── Followed by: 1
-        └── Op 3 (DISK2H) [Pending]
-            └── Followed by: 1, 2
-        """
-        print(f"Transfer Graph {self.graph_id}:")
-
-        # get all op ids and sort them
-        op_ids = sorted(self._op_map.keys())
-
-        for i, op_id in enumerate(op_ids):
-            op = self._op_map[op_id]
-            is_last = (i == len(op_ids) - 1)
-
-            # draw the tree structure branch
-            prefix = "└── " if is_last else "├── "
-
-            # get the op status
-            status = "[Completed]" if op.status == TransferOpStatus.COMPLETED else "[Pending]"
-
-            # print the op info
-            print(f"{prefix}Op {op_id} ({op.transfer_type.name}) {status}")
-
-            if op.transfer_type == TransferType.VIRTUAL:
-                continue
-            # print the dependency info
-            dep_prefix = "    " if is_last else "│   "
-            if not op.successors:
-                print(f"{dep_prefix}└── No successors")
-            else:
-                deps_str = ", ".join(str(dep) for dep in sorted(op.successors))
-                print(f"{dep_prefix}└── Followed by: {deps_str}")
-
-            # print the transfer details
-            src_info = f"From: {op.src_descriptor.device_type.name}:{op.src_descriptor.device_id}"
-            dst_info = f"To: {op.dst_descriptor.device_type.name}:{op.dst_descriptor.device_id}"
-            print(f"{dep_prefix}    └── {src_info} -> {dst_info}")
-
-            print(f"{dep_prefix}    └── layers: {op.layer_id} - {op.layer_id + op.layer_granularity}")
-
-            # if there are physical block ids, also print them
-            if len(op.src_descriptor.physical_block_ids) > 0:
-                blocks = op.src_descriptor.physical_block_ids.tolist()
-                if len(blocks) > 3:
-                    blocks_str = f"{blocks[:3]}... ({len(blocks)} blocks)"
-                else:
-                    blocks_str = str(blocks)
-                print(f"{dep_prefix}    └── Src Blocks: {blocks_str}")
-            if len(op.dst_descriptor.physical_block_ids) > 0:
-                blocks = op.dst_descriptor.physical_block_ids.tolist()
-                if len(blocks) > 3:
-                    blocks_str = f"{blocks[:3]}... ({len(blocks)} blocks)"
-                else:
-                    blocks_str = str(blocks)
-                print(f"{dep_prefix}    └── Dst Blocks: {blocks_str}")
 
 def get_nvtx_default_color() -> int:
     return 0xD3D3D3

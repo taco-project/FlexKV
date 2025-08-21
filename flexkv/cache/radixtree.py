@@ -18,11 +18,14 @@ class MatchResult:
     last_ready_node: Optional['RadixNode'] = None
     last_node: Optional['RadixNode'] = None
     last_node_matched_length: int = 0
-    physical_blocks: torch.Tensor = torch.empty(0, dtype=torch.int64)
+    physical_blocks: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
 
     def __post_init__(self) -> None:
         assert self.physical_blocks.ndim == 1
-        assert self.physical_blocks.dtype == torch.int64
+        assert self.physical_blocks.dtype == np.int64
+
+    def is_empty(self) -> bool:
+        return self.num_matched_blocks == 0
 
 @dataclass
 class RadixNode:
@@ -178,7 +181,7 @@ class RadixTreeIndex:
                            last_ready_node=last_ready_node,
                            last_node=current_node,
                            last_node_matched_length=last_node_matched_length,
-                           physical_blocks=torch.from_numpy(physical_blocks).to(torch.int64))
+                           physical_blocks=physical_blocks)
 
     def num_matched_blocks(self,
                     sequence: SequenceMeta) -> int:
@@ -187,7 +190,7 @@ class RadixTreeIndex:
 
     def insert(self,
                sequence_meta: SequenceMeta,
-               physical_block_ids: torch.Tensor,
+               physical_block_ids: np.ndarray,
                num_insert_blocks: int = -1,
                is_ready: bool = True,
                match_result: Optional[MatchResult] = None) -> Optional[RadixNode]:
@@ -196,7 +199,7 @@ class RadixTreeIndex:
         assert 0 <= num_insert_blocks <= sequence_meta.num_blocks
 
         assert physical_block_ids.ndim == 1
-        assert physical_block_ids.dtype == torch.int64
+        assert physical_block_ids.dtype == np.int64
 
         sequence_meta.gen_hashes()
         if match_result is None:
@@ -218,7 +221,7 @@ class RadixTreeIndex:
 
         new_node = RadixNode(
             block_hashes=sequence_meta.block_hashes[num_matched_blocks:num_insert_blocks],
-            physical_blocks=physical_block_ids.numpy(),
+            physical_blocks=physical_block_ids,
             is_ready=is_ready,
             lock_cnt=0,
             last_access_time=time.time()
@@ -241,7 +244,7 @@ class RadixTreeIndex:
 
         return new_node
 
-    def evict(self, num_evicted: int) -> torch.Tensor:
+    def evict(self, num_evicted: int) -> np.ndarray:
         candidates = []
         for node in self.leaf_nodes.values():
             if node.evictable():
@@ -263,7 +266,7 @@ class RadixTreeIndex:
                 physical_blocks = node.physical_blocks
                 node.parent = None
             evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
-        return torch.from_numpy(evicted_blocks).to(torch.int64)
+        return evicted_blocks
 
     def lock(self, node: RadixNode) -> None:
         if node.lock_cnt < 0:
@@ -326,22 +329,22 @@ if __name__ == "__main__":
     index = RadixTreeIndex(tokens_per_block=tokens_per_block)
     print(f"init index, tokens_per_block = {tokens_per_block}")
 
-    token_ids1 = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
-    token_ids2 = torch.tensor([1, 2, 3, 4, 15, 16, 17, 18])
+    token_ids1 = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.int64)
+    token_ids2 = np.array([1, 2, 3, 4, 15, 16, 17, 18], dtype=np.int64)
 
     seq1 = SequenceMeta(token_ids=token_ids1, tokens_per_block=tokens_per_block)
     seq2 = SequenceMeta(token_ids=token_ids2, tokens_per_block=tokens_per_block)
 
-    index.insert(seq1, torch.tensor([0, 1, 2, 3], dtype=torch.int64), is_ready=True)
+    index.insert(seq1, np.array([0, 1, 2, 3], dtype=np.int64), is_ready=True)
     print(f"insert seq1 = {seq1.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks()}")
     seq2_matched_blocks = index.num_matched_blocks(seq2)
     assert seq2_matched_blocks == 2
-    index.insert(seq2, torch.tensor([8, 9], dtype=torch.int64), is_ready=True)
+    index.insert(seq2, np.array([8, 9], dtype=np.int64), is_ready=True)
     print(f"insert seq2 = {seq2.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks()}")
 
-    seq3 = SequenceMeta(token_ids=torch.tensor([1,2,3,4,0,0]),
+    seq3 = SequenceMeta(token_ids=np.array([1,2,3,4,0,0], dtype=np.int64),
                         tokens_per_block=tokens_per_block)
     match_result = index.num_matched_blocks(seq3)
     print(f"match {seq3.token_ids}, num cached blocks: {match_result}")

@@ -74,7 +74,6 @@ class TransferEngine:
         if self.tp_size == 1:
             self.gpucpu_workers: List[WorkerHandle] = [
                 GPUCPUTransferWorker.create_worker(
-                    worker_id=i,
                     finished_ops_queue=self.finished_ops_queue,
                     gpu_blocks=self.gpu_handles[i].get_tensor_handle_list(),
                     cpu_blocks=self._cpu_handle.get_tensor(),
@@ -92,7 +91,6 @@ class TransferEngine:
         else:
             self.gpucpu_workers = [
                 tpGPUCPUTransferWorker.create_worker(
-                    worker_id=i,
                     finished_ops_queue=self.finished_ops_queue,
                     gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
                                 for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
@@ -114,7 +112,6 @@ class TransferEngine:
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
             self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
-                worker_id=10,
                 finished_ops_queue=self.finished_ops_queue,
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 ssd_files=self._ssd_handle.get_file_list(),
@@ -125,7 +122,6 @@ class TransferEngine:
                 cache_config=self._cache_config,
             )
             self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
-                worker_id=11,
                 finished_ops_queue=self.finished_ops_queue,
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 ssd_files=self._ssd_handle.get_file_list(),
@@ -139,7 +135,6 @@ class TransferEngine:
             self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
         if self._remote_handle is not None and self._cpu_handle is not None:
             self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
-                worker_id=20,
                 finished_ops_queue=self.finished_ops_queue,
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 remote_file=self._remote_handle.get_file_list(),
@@ -149,7 +144,6 @@ class TransferEngine:
                 remote_config_custom=self._remote_handle.remote_config_custom,
             )
             self.remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
-                worker_id=21,
                 finished_ops_queue=self.finished_ops_queue,
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 remote_file=self._remote_handle.get_file_list(),
@@ -163,18 +157,19 @@ class TransferEngine:
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
         # Wait for all workers to ready
-        for worker in self._worker_map.values():
+        for transfer_type, worker in self._worker_map.items():
             if isinstance(worker, List):
                 for w in worker:
-                    w.ready_event.wait(timeout=60)
+                    flexkv_logger.info(f"waiting for {transfer_type.name} worker {w.worker_id} to ready")
+                    w.ready_event.wait()
+                    flexkv_logger.info(f"{transfer_type.name} worker {w.worker_id} is ready")
             else:
-                flexkv_logger.info(f"waiting for worker {worker} to ready")
-                worker.ready_event.wait(timeout=60)
-                flexkv_logger.info(f"worker {worker} is ready")
+                flexkv_logger.info(f"waiting for {transfer_type.name} worker {worker.worker_id} to ready")
+                worker.ready_event.wait()
+                flexkv_logger.info(f"{transfer_type.name} worker {worker.worker_id} is ready")
         # Start scheduler thread
         self._running = True
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
-        flexkv_logger.info("TransferEngine initialized and running")
         self._scheduler_thread.start()
 
     def start(self) -> None:
@@ -272,6 +267,8 @@ class TransferEngine:
     def shutdown(self) -> None:
         """Shutdown the transfer engine"""
         try:
+            if not self._running:
+                return
             self._running = False
             self._scheduler_thread.join(timeout=5)
 
