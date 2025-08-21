@@ -134,6 +134,7 @@ class FlexKVTracer:
             "ssd_cache_iouring_flags": cache_config.ssd_cache_iouring_flags,
             "remote_cache_path": cache_config.remote_cache_path,
             "remote_config_custom": cache_config.remote_config_custom,
+            "evict_ratio": cache_config.evict_ratio,
         }
 
         # Convert gpu_layout to dict if provided
