@@ -51,7 +51,8 @@ class CacheEngineAccel:
     def __init__(self,
                  device_type: DeviceType,
                  num_total_blocks: int,
-                 tokens_per_block: int):
+                 tokens_per_block: int,
+                 evict_ratio: float):
         if not isinstance(device_type, DeviceType):
             raise InvalidConfigError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -68,6 +69,7 @@ class CacheEngineAccel:
 
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
+        self.evict_ratio = evict_ratio
 
     def reset(self) -> None:
         self.index.reset()
@@ -119,9 +121,10 @@ class CacheEngineAccel:
         if num_required_blocks > self.mempool.num_free_blocks:
             if protected_node is not None:
                 self.index.lock(protected_node)
-            target_blocks = torch.zeros(num_required_blocks - self.mempool.num_free_blocks, dtype=torch.int64)
-            num_evicted = self.index.evict(target_blocks, num_required_blocks - self.mempool.num_free_blocks)
-            if num_evicted != num_required_blocks - self.mempool.num_free_blocks:
+            evict_block_num = max(num_required_blocks - self.mempool.num_free_blocks, int(self.mempool.num_total_blocks * self.evict_ratio))
+            target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
+            num_evicted = self.index.evict(target_blocks, evict_block_num)
+            if num_evicted != evict_block_num:
                 target_blocks.resize_(num_evicted)
             self.mempool.recycle_blocks(target_blocks)
 
@@ -141,7 +144,8 @@ class CacheEngine:
     def __init__(self,
                  device_type: DeviceType,
                  num_total_blocks: int,
-                 tokens_per_block: int):
+                 tokens_per_block: int,
+                 evict_ratio: float):
         if not isinstance(device_type, DeviceType):
             raise InvalidConfigError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -158,6 +162,7 @@ class CacheEngine:
 
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
+        self.evict_ratio = evict_ratio
 
     def reset(self) -> None:
         self.index.reset()
@@ -194,8 +199,9 @@ class CacheEngine:
         if num_required_blocks > self.mempool.num_free_blocks:
             if protected_node is not None:
                 self.index.lock(protected_node)
+            evict_block_num = max(num_required_blocks - self.mempool.num_free_blocks, int(self.mempool.num_total_blocks * self.evict_ratio))
             self.mempool.recycle_blocks(
-                self.index.evict(num_required_blocks - self.mempool.num_free_blocks)
+                self.index.evict(evict_block_num)
             )
             if protected_node is not None:
                 self.index.unlock(protected_node)
@@ -225,31 +231,37 @@ class GlobalCacheEngine:
             if cache_config.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
-                                                cache_config.tokens_per_block)
+                                                cache_config.tokens_per_block,
+                                                cache_config.evict_ratio)
             else:
                 self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
-                                                cache_config.tokens_per_block)
+                                                cache_config.tokens_per_block,
+                                                cache_config.evict_ratio)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
-                                                cache_config.tokens_per_block)
+                                                cache_config.tokens_per_block,
+                                                cache_config.evict_ratio)
             else:
                 self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
-                                                cache_config.tokens_per_block)
+                                                cache_config.tokens_per_block,
+                                                cache_config.evict_ratio)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
             if cache_config.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
-                                                   cache_config.tokens_per_block)
+                                                   cache_config.tokens_per_block,
+                                                   cache_config.evict_ratio)
             else:
                 self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
-                                                   cache_config.tokens_per_block)
+                                                   cache_config.tokens_per_block,
+                                                   cache_config.evict_ratio)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
         self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, int]] = \

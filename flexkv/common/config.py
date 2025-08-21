@@ -71,3 +71,6 @@ class CacheConfig:
     trace_max_file_size_mb: int = 100
     trace_max_files: int = 5
     trace_flush_interval_ms: int = 1000
+    
+    #evict ratio
+    evict_ratio: float = 0.0
