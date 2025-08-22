@@ -86,6 +86,7 @@ if not debug:
             "boundscheck": False,
             "wraparound": False,
             "initializedcheck": False,
+            "profile": True,
         },
         build_dir=build_dir,  # Direct Cython to use the build directory
     )
