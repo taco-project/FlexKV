@@ -177,7 +177,7 @@ class KVTaskManager:
             callback=callback)
         self.graph_to_task[graph.graph_id] = task_id
 
-    def launch_task(self, task_id: int) -> None:
+    def _launch_task(self, task_id: int) -> None:
         task = self.tasks[task_id]
         if task.is_completed():
             return
@@ -188,7 +188,7 @@ class KVTaskManager:
         if transfer_graph.num_ops > 0:
             self.transfer_handle.submit(transfer_graph)
 
-    def update_tasks(self, timeout: float = 0.001) -> None:
+    def _update_tasks(self, timeout: float = 0.001) -> None:
         completed_ops = self._get_completed_ops(timeout)
         for completed_graph_id, completed_op_id in completed_ops:
             if completed_graph_id not in self.graph_to_task:
@@ -200,7 +200,7 @@ class KVTaskManager:
             elif completed_op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
 
-    def cancel_task(self, task_id: int) -> None:
+    def _cancel_task(self, task_id: int) -> None:
         task = self.tasks[task_id]
         if task.is_completed():
             flexkv_logger.warning(f"Task {task_id} is already completed, cannot cancel")
@@ -328,7 +328,7 @@ class KVTaskEngine(KVTaskManager):
                                                     layer_granularity=layer_granularity,
                                                     dp_id=dp_id,
                                                     task_id=task_id)
-        self.launch_task(task_id)
+        self._launch_task(task_id)
         return task_id, return_mask
 
     def put_async(self,
@@ -343,7 +343,7 @@ class KVTaskEngine(KVTaskManager):
                                                     token_mask=token_mask,
                                                     dp_id=dp_id,
                                                     task_id=task_id)
-        self.launch_task(task_id)
+        self._launch_task(task_id)
         return task_id, return_mask
 
     def _wait_impl(self,
@@ -354,7 +354,7 @@ class KVTaskEngine(KVTaskManager):
         start_time = time.time()
         is_timeout = timeout == 0.0
 
-        self.update_tasks(timeout=0)
+        self._update_tasks(timeout=0)
 
         for task_id in task_ids:
             while True:
@@ -393,7 +393,7 @@ class KVTaskEngine(KVTaskManager):
                     if time.time() - start_time > timeout:
                         is_timeout = True
                         break
-                    self.update_tasks(timeout=0.001)
+                    self._update_tasks(timeout=0.001)
         return return_responses
 
     def try_wait(self, task_ids: Union[int, List[int]]) -> Dict[int, KVResponse]:
@@ -489,16 +489,16 @@ class KVTaskEngine(KVTaskManager):
         self._process_empty_graph(task_id)
         return task_id, self.tasks[task_id].return_mask
 
-    def launch_transfer(self,
+    def launch_tasks(self,
                         task_ids: List[int],
                         slot_mappings: List[np.ndarray]) -> None:
         assert isinstance(slot_mappings[0], np.ndarray)
         self.set_slot_mappings(task_ids, slot_mappings)
         for task_id in task_ids:
-            self.launch_task(task_id)
+            self._launch_task(task_id)
 
-    def cancel(self, task_ids: Union[int, List[int]]) -> None:
+    def cancel_tasks(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         for task_id in task_ids:
-            self.cancel_task(task_id)
+            self._cancel_task(task_id)
