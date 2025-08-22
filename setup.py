@@ -8,7 +8,7 @@ from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
 
 
-build_dir = os.path.abspath("build")
+build_dir = "build"
 os.makedirs(build_dir, exist_ok=True)
 
 # Check if we're in debug mode using environment variable
@@ -130,13 +130,14 @@ setup(
     version="0.1.0",
     packages=find_packages(exclude=("benchmarks", "csrc", "examples", "tests")),
     package_data={
-        "flexkv": ["lib/*.so", "lib/*.so.*"],
+        "flexkv": ["*.so", "lib/*.so", "lib/*.so.*"],
     },
     include_package_data=True,
     install_requires=install_requires,
     ext_modules=ext_modules,  # Now contains both C++ and Cython modules as needed
     cmdclass={
         "build_ext": CustomBuildExt.with_options(
+            include_dirs=os.path.join(build_dir, "include"),  # Include directory for xxhash
             no_python_abi_suffix=True,
             build_temp=os.path.join(build_dir, "temp"),  # Temporary build files
         )

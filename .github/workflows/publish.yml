@@ -1,0 +1,73 @@
+# This workflow will upload a Python Package to Release asset
+# For more information see: https://help.github.com/en/actions/language-and-framework-guides/using-python-with-github-actions
+# Copied from vLLM github actions https://github.com/vllm-project/vllm/blob/main/.github/workflows/publish.yml
+name: flexkv ci
+
+on:
+  pull_request:
+    branches: [ "main", "feat/lilgao/ci"]
+  push:
+    branches: [ "main", "feat/lilgao/ci"]
+
+# Needed to create wheel and upload assets
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Wheel
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+          os: ['ubuntu-22.04']
+          python-version: ['3.10']
+          pytorch-version: ['2.6.0']
+          cuda-version: ['12.4']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Linux Env
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          bash -x .github/workflows/scripts/env.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+            python-version: ${{ matrix.python-version }}
+            cache: 'pip'
+
+      - name: Install CUDA ${{ matrix.cuda-version }}
+        run: |
+          bash -x .github/workflows/scripts/cuda-install.sh ${{ matrix.cuda-version }} ${{ matrix.os }}
+
+      - name: Install PyTorch ${{ matrix.pytorch-version }} with CUDA ${{ matrix.cuda-version }}
+        run: |
+          bash -x .github/workflows/scripts/pytorch-install.sh ${{ matrix.python-version }} ${{ matrix.pytorch-version }} ${{ matrix.cuda-version }}
+
+      - name: Build wheel
+        shell: bash
+        env:
+          TORCH_CUDA_ARCH_LIST: "8.9 9.0+PTX"
+          MAX_JOBS: 4
+        run: |
+          ./build.sh --release
+
+      - name: Get Date and Time
+        run: |
+          echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+          echo "time=$(date +'%H-%M-%S')" >> $GITHUB_ENV
+
+      - name: Upload to cos
+        uses: shallwefootball/s3-upload-action@master
+        with:
+          aws_key_id: ${{ secrets.COS_SECRET_ID }}
+          aws_secret_access_key: ${{ secrets.COS_SECRET_KEY }}
+          aws_bucket: ${{ secrets.COS_BUCKET }}
+          endpoint: ${{ secrets.COS_ENDPOINT }}
+          source_dir: dist
+          destination_dir: flexkv/${{ env.date }}/${{ env.time }}

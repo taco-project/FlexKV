@@ -40,13 +40,6 @@ echo "=== Setting BUILD_LIB_PATH to $BUILD_LIB_PATH ==="
 
 cd ..
 
-echo "=== Installing package with pip ==="
-if [ "$BUILD_TYPE" = "debug" ]; then
-  FLEXKV_DEBUG=1 pip install --no-build-isolation -e .
-else
-  FLEXKV_DEBUG=0 pip install --no-build-isolation -e .
-fi
-
 # Set LD_LIBRARY_PATH for immediate use
 export LD_LIBRARY_PATH=$BUILD_LIB_PATH:$LD_LIBRARY_PATH
 echo "Added $BUILD_LIB_PATH to LD_LIBRARY_PATH for current session"
@@ -69,3 +62,11 @@ fi
 
 echo "=== Build and installation completed successfully in ${BUILD_TYPE} mode ==="
 echo "You can now run tests directly without setting LD_LIBRARY_PATH manually"
+
+if [ "$BUILD_TYPE" = "debug" ]; then
+  FLEXKV_DEBUG=1 pip install --no-build-isolation -e .
+elif [ "$BUILD_TYPE" = "release" ]; then
+  FLEXKV_DEBUG=0 python setup.py bdist_wheel -v
+else
+  FLEXKV_DEBUG=0 pip install --no-build-isolation -e .
+fi
