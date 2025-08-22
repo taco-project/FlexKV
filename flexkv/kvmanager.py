@@ -168,20 +168,17 @@ class KVManager:
         if isinstance(slot_mappings[0], torch.Tensor):
             slot_mappings = [slot_mapping.numpy() for slot_mapping in slot_mappings]
         if self.server_client_mode:
-            for task_id in task_ids:
-                self.dp_client.launch_task(task_id, slot_mappings)
+            self.dp_client.launch_tasks(task_ids, slot_mappings)
         else:
-            self.kv_task_engine.launch_transfer(task_ids, slot_mappings)
+            self.kv_task_engine.launch_tasks(task_ids, slot_mappings)
 
-    def cancel_task(self, task_ids: Union[int, List[int]]) -> None:
+    def cancel(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         if self.server_client_mode:
-            for task_id in task_ids:
-                self.dp_client.cancel_task(task_id)
+            self.dp_client.cancel_tasks(task_ids)
         else:
-            for task_id in task_ids:
-                self.kv_task_engine.cancel_task(task_id)
+            self.kv_task_engine.cancel_tasks(task_ids)
 
     def wait(self,
              task_ids: Union[int, List[int]],
