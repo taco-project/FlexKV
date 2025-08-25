@@ -2,13 +2,13 @@ import os
 import shutil
 import sys
 
-from Cython.Build import cythonize
+
 from setuptools import find_packages, setup
 from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
 
 
-build_dir = os.path.abspath("build")
+build_dir = "build"
 os.makedirs(build_dir, exist_ok=True)
 
 # Check if we're in debug mode using environment variable
@@ -78,6 +78,8 @@ if not debug:
                       "flexkv/**/benchmark_*.py",
                       "flexkv/benchmark/**/*.py",
                       "flexkv/benchmark/test_kvmanager.py"]
+    # Import cython when debug is turned off.
+    from Cython.Build import cythonize
     cythonized_modules = cythonize(
         python_files,
         exclude=excluded_files,
