@@ -3,7 +3,7 @@ import time
 from functools import partial
 from queue import Queue
 from typing import List, Tuple, Optional, Dict, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -26,11 +26,10 @@ class MatchResultAccel:
     last_ready_node: Optional['CRadixNode'] = None
     last_node: Optional['CRadixNode'] = None
     last_node_matched_length: int = 0
-    physical_blocks: torch.Tensor = torch.empty(0, dtype=torch.int64)
+    physical_blocks: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
 
     def __post_init__(self) -> None:
         assert self.physical_blocks.ndim == 1
-        assert self.physical_blocks.dtype == torch.int64
 
 class CacheEngineAccel:
     def __init__(self,
@@ -67,7 +66,7 @@ class CacheEngineAccel:
         return MatchResultAccel(match_result.num_ready_matched_blocks, match_result.num_matched_blocks,
                             match_result.last_ready_node, match_result.last_node,
                             match_result.last_node_matched_length,
-                            torch.tensor(match_result.physical_blocks, dtype=torch.int64))
+                            torch.tensor(match_result.physical_blocks, dtype=torch.int64).numpy())
 
     def insert(self,
                sequence_meta: SequenceMeta,
@@ -77,13 +76,13 @@ class CacheEngineAccel:
                match_result: Optional[MatchResultAccel] = None) -> Optional[CRadixNode]:
         sequence_meta.gen_hashes()
         if match_result is None:
-          return self.index.insert(physical_block_ids,
+          return self.index.insert(torch.from_numpy(physical_block_ids).to(torch.int64),
                                  torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
                                  sequence_meta.num_blocks,
                                  num_insert_blocks,
                                  is_ready)
         else:
-          return self.index.insert(physical_block_ids,
+          return self.index.insert(torch.from_numpy(physical_block_ids).to(torch.int64),
                                  torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
                                  sequence_meta.num_blocks,
                                  num_insert_blocks,
@@ -111,7 +110,7 @@ class CacheEngineAccel:
             num_evicted = self.index.evict(target_blocks, evict_block_num)
             if num_evicted != evict_block_num:
                 target_blocks.resize_(num_evicted)
-            self.mempool.recycle_blocks(target_blocks)
+            self.mempool.recycle_blocks(target_blocks.numpy())
 
             if protected_node is not None:
                 self.index.unlock(protected_node)
@@ -122,7 +121,7 @@ class CacheEngineAccel:
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         return self.mempool.allocate_blocks(num_allocated_blocks)
 
-    def recycle(self, physical_blocks: torch.Tensor) -> None:
+    def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
 
 class CacheEngine:
