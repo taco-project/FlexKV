@@ -234,7 +234,6 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
         read_idx = i - initial_write_num
         token_ids, block_ids, dp_id = request_pairs[read_idx]
         slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
-        print(f"token_ids: {token_ids}, block_ids: {block_ids}, dp_id: {dp_id}, slot_mapping: {slot_mapping}")
         request_id, _ = kvmanager.get_match(
             token_ids=token_ids,
             layer_granularity=-1,

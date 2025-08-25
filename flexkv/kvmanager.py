@@ -198,3 +198,11 @@ class KVManager:
             return self.dp_client.try_wait(task_ids)
         else:
             return self.kv_task_engine.try_wait(task_ids)
+
+    # Only for testing
+    def _clear_cpu_cache(self) -> None:
+        if self.server_client_mode:
+            flexkv_logger.error("clear_cache is not supported in server client mode")
+            return
+        else:
+            self.kv_task_engine._clear_cpu_cache()
