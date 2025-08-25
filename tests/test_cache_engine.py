@@ -16,6 +16,7 @@ def cache_engine(request: pytest.FixtureRequest) -> CacheEngine:
         'device_type': DeviceType.CPU,
         'num_total_blocks': 64,
         'tokens_per_block': 4,
+        'evict_ratio': 0.05,
     }
     default_config_kwargs.update(param)
     return CacheEngine(**default_config_kwargs)
@@ -23,11 +24,11 @@ def cache_engine(request: pytest.FixtureRequest) -> CacheEngine:
 @pytest.mark.parametrize(
     "config, should_raise",
     [
-        ({'num_total_blocks': 64, 'tokens_per_block': 4, 'device_type': DeviceType.CPU}, False),
-        ({'num_total_blocks': 0, 'tokens_per_block': 4, 'device_type': DeviceType.GPU}, True),
-        ({'num_total_blocks': 64, 'tokens_per_block': 0, 'device_type': DeviceType.SSD}, True),
-        ({'num_total_blocks': 64, 'tokens_per_block': 4, 'device_type': 'Unknown'}, True),
-        ({'num_total_blocks': 64, 'tokens_per_block': 3, 'device_type': DeviceType.CPU}, True),
+        ({'evict_ratio': 0.05, 'num_total_blocks': 64, 'tokens_per_block': 4, 'device_type': DeviceType.CPU}, False),
+        ({'evict_ratio': 0.05, 'num_total_blocks': 0, 'tokens_per_block': 4, 'device_type': DeviceType.GPU}, True),
+        ({'evict_ratio': 0.05, 'num_total_blocks': 64, 'tokens_per_block': 0, 'device_type': DeviceType.SSD}, True),
+        ({'evict_ratio': 0.05, 'num_total_blocks': 64, 'tokens_per_block': 4, 'device_type': 'Unknown'}, True),
+        ({'evict_ratio': 0.05, 'num_total_blocks': 64, 'tokens_per_block': 3, 'device_type': DeviceType.CPU}, True),
     ]
 )
 def test_config_init(config: dict, should_raise: bool):
