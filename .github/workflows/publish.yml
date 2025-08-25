@@ -5,9 +5,9 @@ name: flexkv ci
 
 on:
   pull_request:
-    branches: [ "main", "feat/lilgao/ci"]
+    branches: [ "main", "dev"]
   push:
-    branches: [ "main", "feat/lilgao/ci"]
+    branches: [ "main", "dev"]
 
 # Needed to create wheel and upload assets
 permissions:
