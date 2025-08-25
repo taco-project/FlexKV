@@ -8,7 +8,7 @@ from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
 
 
-build_dir = "build"
+build_dir = os.path.abspath("build")
 os.makedirs(build_dir, exist_ok=True)
 
 # Check if we're in debug mode using environment variable

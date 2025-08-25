@@ -17,7 +17,7 @@ from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.debug import flexkv_logger
 
 
-flexkv_logger.set_level("OFF")
+# flexkv_logger.set_level("OFF")
 
 @dataclass
 class BenchmarkConfig:
@@ -50,11 +50,10 @@ def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]
 
 def create_cpu_gpu_worker(
                   model_config: ModelConfig,
-                  cache_config: CacheConfig,
-                  bench_config: BenchmarkConfig) -> Tuple[WorkerHandle, mp.Queue]:
+                  cache_config: CacheConfig) -> Tuple[WorkerHandle, mp.Queue]:
     mp.set_start_method('spawn', force=True)
     cpu_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
+        type=KVCacheLayoutType(cache_config.cpu_kv_layout_type),
         num_layer=model_config.num_layers,
         num_block=cache_config.num_cpu_blocks,
         tokens_per_block=cache_config.tokens_per_block,
@@ -85,7 +84,6 @@ def create_cpu_gpu_worker(
     finished_ops_queue = mp.Queue()
     if model_config.tp_size == 1:
         worker_handle = GPUCPUTransferWorker.create_worker(
-            worker_id=0,
             finished_ops_queue=finished_ops_queue,
             gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
             cpu_blocks=cpu_handle.get_tensor(),
@@ -100,7 +98,6 @@ def create_cpu_gpu_worker(
         )
     else:
         worker_handle = tpGPUCPUTransferWorker.create_worker(
-            worker_id=0,
             finished_ops_queue=finished_ops_queue,
             gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
             cpu_blocks=cpu_handle.get_tensor(),
@@ -121,11 +118,10 @@ def create_cpu_gpu_worker(
 
 def create_cpu_ssd_worker(
                   model_config: ModelConfig,
-                  cache_config: CacheConfig,
-                  bench_config: BenchmarkConfig) -> Tuple[WorkerHandle, mp.Queue]:
+                  cache_config: CacheConfig) -> Tuple[WorkerHandle, mp.Queue]:
     mp.set_start_method('spawn', force=True)
     cpu_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
+        type=KVCacheLayoutType(cache_config.cpu_kv_layout_type),
         num_layer=model_config.num_layers,
         num_block=cache_config.num_cpu_blocks,
         tokens_per_block=cache_config.tokens_per_block,
@@ -133,7 +129,7 @@ def create_cpu_ssd_worker(
         head_size=model_config.head_size,
     )
     ssd_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
+        type=KVCacheLayoutType(cache_config.ssd_kv_layout_type),
         num_layer=model_config.num_layers,
         num_block=cache_config.num_ssd_blocks,
         tokens_per_block=cache_config.tokens_per_block,
@@ -153,7 +149,6 @@ def create_cpu_ssd_worker(
     )
     finished_ops_queue = mp.Queue()
     worker_handle = CPUSSDDiskTransferWorker.create_worker(
-                worker_id=10,
                 finished_ops_queue=finished_ops_queue,
                 cpu_blocks=cpu_handle.get_tensor(),
                 ssd_files=ssd_handle.get_file_list(),
@@ -195,18 +190,18 @@ def bench_worker(args):
     shuffle_ids = bench_config.shuffle_ids
 
     if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
-        worker_handle, finished_ops_queue = create_cpu_gpu_worker(model_config, cache_config, bench_config)
+        worker_handle, finished_ops_queue = create_cpu_gpu_worker(model_config, cache_config)
     elif transfer_type == TransferType.H2DISK or transfer_type == TransferType.DISK2H:
-        worker_handle, finished_ops_queue = create_cpu_ssd_worker(model_config, cache_config, bench_config)
+        worker_handle, finished_ops_queue = create_cpu_ssd_worker(model_config, cache_config)
     else:
         raise ValueError(f"Unsupported transfer type: {transfer_type} for benchmark, "
                          f"currently only support {TransferType.H2D.name}, {TransferType.D2H.name}, "
                          f"{TransferType.H2DISK.name}, {TransferType.DISK2H.name}")
 
     if shuffle_ids:
-        block_ids = torch.randperm(num_blocks_to_transfer)
+        block_ids = torch.randperm(num_blocks_to_transfer).numpy()
     else:
-        block_ids = torch.arange(num_blocks_to_transfer)
+        block_ids = torch.arange(num_blocks_to_transfer).numpy()
 
     transfer_op = TransferOp(
         transfer_type=transfer_type,

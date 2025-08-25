@@ -49,9 +49,9 @@ DEFAULT_CACHE_CONFIG = {
         "pcfs_parent_nodeid": 144115188075855883  # Using transfer engine value for consistency
     },
     'use_ce_transfer_h2d': False,
-    'use_ce_transfer_d2h': True,
-    'transfer_sms_h2d': 4,
-    'transfer_sms_d2h': 4,
+    'use_ce_transfer_d2h': False,
+    'transfer_sms_h2d': 8,
+    'transfer_sms_d2h': 8,
 }
 
 DEFAULT_TEST_CONFIG = {
