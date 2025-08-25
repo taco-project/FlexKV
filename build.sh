@@ -64,9 +64,9 @@ echo "=== Build and installation completed successfully in ${BUILD_TYPE} mode ==
 echo "You can now run tests directly without setting LD_LIBRARY_PATH manually"
 
 if [ "$BUILD_TYPE" = "debug" ]; then
-  FLEXKV_DEBUG=1 pip install --no-build-isolation -e .
+  FLEXKV_DEBUG=1 pip install -v --no-build-isolation -e .
 elif [ "$BUILD_TYPE" = "release" ]; then
   FLEXKV_DEBUG=0 python setup.py bdist_wheel -v
 else
-  FLEXKV_DEBUG=0 pip install --no-build-isolation -e .
+  FLEXKV_DEBUG=0 pip install -v --no-build-isolation -e .
 fi
