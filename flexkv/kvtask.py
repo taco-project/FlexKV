@@ -13,7 +13,7 @@ import numpy as np
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.transfer import TransferOpGraph
+from flexkv.common.transfer import TransferOpGraph, get_nvtx_default_color
 from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.transfer_manager import TransferManagerHandle
@@ -60,12 +60,14 @@ class KVTask:
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
 
-def task_status_to_response_status(task_status: TaskStatus) -> KVResponseStatus:
-    return {
-        TaskStatus.COMPLETED: KVResponseStatus.SUCCESS,
-        TaskStatus.CANCELLED: KVResponseStatus.CANCELLED,
-        TaskStatus.FAILED: KVResponseStatus.FAILED,
-    }[task_status]
+TASK_STATUS_TO_RESPONSE_STATUS = {
+    TaskStatus.COMPLETED: KVResponseStatus.SUCCESS,
+    TaskStatus.CANCELLED: KVResponseStatus.CANCELLED,
+    TaskStatus.FAILED: KVResponseStatus.FAILED,
+}
+
+def convert_to_response_status(task_status: TaskStatus) -> KVResponseStatus:
+    return TASK_STATUS_TO_RESPONSE_STATUS[task_status]
 
 class KVTaskManager:
     def __init__(self,
@@ -97,8 +99,9 @@ class KVTaskManager:
         self.graph_to_task: Dict[int, int] = {}
 
         self.task_id_counter = 0
-
         self.task_id_lock = threading.Lock()
+
+        self.running_tasks: int = 0
 
     def start(self) -> None:
         self.transfer_handle.start()
@@ -185,6 +188,7 @@ class KVTaskManager:
             raise ValueError(f"Task {task_id} status is {task.status}, cannot launch")
         transfer_graph = task.graph
         task.status = TaskStatus.RUNNING
+        nvtx.mark(f"launch task: task_id={task_id}, graph_id={transfer_graph.graph_id}")
         if transfer_graph.num_ops > 0:
             self.transfer_handle.submit(transfer_graph)
 
@@ -377,7 +381,7 @@ class KVTaskEngine(KVTaskManager):
                 elif self.check_completed(task_id, completely=completely):
                     self.tasks[task_id].status = TaskStatus.COMPLETED # TODO is this correct?
                     return_responses[task_id] = KVResponse(
-                        status=task_status_to_response_status(self.tasks[task_id].status),
+                        status=convert_to_response_status(self.tasks[task_id].status),
                         task_id=task_id,
                         return_mask=self.tasks[task_id].return_mask
                     )
@@ -399,6 +403,7 @@ class KVTaskEngine(KVTaskManager):
     def try_wait(self, task_ids: Union[int, List[int]]) -> Dict[int, KVResponse]:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
+        nvtx.mark(f"try_wait task_ids: {task_ids}")
         return_responses = self._wait_impl(task_ids,
                                        timeout=0.0,
                                        completely=False)
@@ -408,11 +413,11 @@ class KVTaskEngine(KVTaskManager):
              task_ids: Union[int, List[int]],
              timeout: float = 20.0,
              completely: bool = False) -> Dict[int, KVResponse]:
-        nvtx.mark(f"wait task_ids: {task_ids}")
         if isinstance(task_ids, int):
             task_ids = [task_ids]
+        nvtx.push_range(f"wait task_ids: {task_ids}", color=get_nvtx_default_color())
         return_responses = self._wait_impl(task_ids, timeout, completely=completely)
-        nvtx.mark(f"wait task_ids: {task_ids} done")
+        nvtx.pop_range()
         return return_responses
 
     def get_match(self,
@@ -444,7 +449,7 @@ class KVTaskEngine(KVTaskManager):
             layer_granularity = self.model_config.num_layers
         if task_id == -1:
             task_id = self._gen_task_id()
-        nvtx.mark(f"GET task_id: {task_id}")
+        nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
         self.create_get_task(task_id,
                              token_ids,
                              slot_mapping,
@@ -453,6 +458,7 @@ class KVTaskEngine(KVTaskManager):
                              dp_id,
                              is_fake_slot_mapping=is_fake_slot_mapping)
         self._process_empty_graph(task_id)
+        nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
 
     def put_match(self,
@@ -479,7 +485,7 @@ class KVTaskEngine(KVTaskManager):
             token_mask = np.ones_like(token_ids)
         if task_id == -1:
             task_id = self._gen_task_id()
-        nvtx.mark(f"PUT task_id: {task_id}")
+        nvtx.push_range(f"put match: task_id={task_id}", color=get_nvtx_default_color())
         self.create_put_task(task_id,
                              token_ids,
                              slot_mapping,
@@ -487,6 +493,7 @@ class KVTaskEngine(KVTaskManager):
                              dp_id,
                              is_fake_slot_mapping=is_fake_slot_mapping)
         self._process_empty_graph(task_id)
+        nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
 
     def launch_tasks(self,
@@ -502,3 +509,6 @@ class KVTaskEngine(KVTaskManager):
             task_ids = [task_ids]
         for task_id in task_ids:
             self._cancel_task(task_id)
+
+    def _clear_cpu_cache(self) -> None:
+        self.cache_engine.cpu_cache_engine.reset()

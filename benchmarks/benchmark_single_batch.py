@@ -9,6 +9,7 @@ import torch
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.config import ModelConfig, CacheConfig
 from utils import load_config
 from flexkv.kvmanager import KVManager
 from flexkv.kvtask import KVResponseStatus
@@ -22,6 +23,7 @@ class BenchmarkConfig:
     batch_size: int
     sequence_length: int
     cache_ratio: float
+    clear_cpu_cache: bool
 
 def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_config):
     """Run tp_client process"""
@@ -61,7 +63,11 @@ def shutdown_tp_client(tp_client_processes):
                 tp_process.kill()
                 tp_process.join(timeout=2)
 
-def benchmark_flexkv(model_config, cache_config, benchmark_config, gpu_register_port, server_recv_port):
+def benchmark_flexkv(model_config: ModelConfig,
+                     cache_config: CacheConfig,
+                     benchmark_config: BenchmarkConfig,
+                     gpu_register_port: str,
+                     server_recv_port: str):
     if model_config.tp_size * model_config.dp_size > torch.cuda.device_count():
         raise ValueError(f"tp_size {model_config.tp_size} * dp_size {model_config.dp_size} is greater than "
                          f"the number of available GPUs {torch.cuda.device_count()}")
@@ -111,6 +117,9 @@ def benchmark_flexkv(model_config, cache_config, benchmark_config, gpu_register_
     put_result = kvmanager.wait(batch_put_ids, completely=True)
     end_time = time.time()
 
+    if benchmark_config.clear_cpu_cache:
+        kvmanager._clear_cpu_cache()
+
     elapsed_time_put = end_time - start_time
     put_tokens = 0
     for _, response in put_result.items():
@@ -157,6 +166,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=1024)
     parser.add_argument("--cache-ratio", type=float, default=1)
+    parser.add_argument("--clear-cpu-cache", action="store_true")
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -165,7 +175,8 @@ if __name__ == "__main__":
         num_layers_to_transfer=args.num_layers,
         batch_size=args.batch_size,
         sequence_length=args.sequence_length,
-        cache_ratio=args.cache_ratio
+        cache_ratio=args.cache_ratio,
+        clear_cpu_cache=args.clear_cpu_cache
     )
     model_config, cache_config = load_config(args.config)
     #cache_config.num_cpu_blocks = 8192 - 2048

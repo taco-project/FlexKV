@@ -62,6 +62,8 @@ class TransferOp:
         with TransferOp._lock:
             self.op_id = TransferOp._next_op_id
             TransferOp._next_op_id += 1
+        assert self.src_block_ids.dtype == np.int64
+        assert self.dst_block_ids.dtype == np.int64
 
 
 class TransferOpGraph:
