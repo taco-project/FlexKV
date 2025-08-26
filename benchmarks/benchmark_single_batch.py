@@ -93,8 +93,9 @@ def benchmark_flexkv(model_config: ModelConfig,
         tp_client_processes.append(tp_client_process)
 
     while not kvmanager.is_ready():
-        time.sleep(1)
+        time.sleep(3)
         flexkv_logger.info("waiting for flexkv to be ready")
+    flexkv_logger.info("flexkv is ready")
 
     batch_sequence_tensor = []
     batch_slot_mapping = []

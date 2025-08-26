@@ -41,6 +41,7 @@
         "trace_max_file_size_mb": 100,
         "trace_max_files": 5,
         "trace_flush_interval_ms": 1000,
-        "evict_ratio": 0.05
+        "evict_ratio": 0.05,
+        "index_accel": true
     }
 }
