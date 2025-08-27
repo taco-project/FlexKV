@@ -14,6 +14,7 @@ class ModelConfig:
     head_size: int
     use_mla: bool = False
     dtype: torch.dtype = torch.bfloat16
+    max_req_tokens = 163840
 
     # parallel configs
     tp_size: int = 1
