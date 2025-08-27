@@ -37,6 +37,7 @@ from flexkv.transfer.worker import (
     tpGPUCPUTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.ring_buffer import PinnedMemoryRing
 
 
 class TransferEngine:
@@ -70,6 +71,8 @@ class TransferEngine:
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
         self._cache_config = cache_config
+
+        self.pin_buffer = PinnedMemoryRing(500, self.model_config.max_req_tokens // self.cache_config.tokens_per_block)
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
 
@@ -114,6 +117,8 @@ class TransferEngine:
                     dtype=self.gpu_handles[i].dtype,
                     tp_group_size=self.tp_size,
                     dp_group_id=i,
+                    src_buffer_tensor = self.pin_buffer.get_src_buffer(),
+                    dst_buffer_tensor = self.pin_buffer.get_dst_buffer(),
                     use_ce_transfer_h2d=self.cache_config.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=self.cache_config.use_ce_transfer_d2h,
                     transfer_sms_h2d=self.cache_config.transfer_sms_h2d,
@@ -206,6 +211,7 @@ class TransferEngine:
             while True:
                 try:
                     op_id = self.finished_ops_queue.get_nowait()
+                    self.pin_buffer.mark_free(op_id) ## release the slot for ring buffer
                     op = self.op_id_to_op[op_id]
                     self.completed_queue.put((op.graph_id, op.op_id))
                     finished_ops.append(op)
@@ -224,6 +230,9 @@ class TransferEngine:
                         self.completed_queue.put((op.graph_id, op.op_id))
                     else:
                         self.op_id_to_op[op.op_id] = op
+                        slot, valid_block_num = self.pin_buffer.allocate_and_write(op.op_id, op)
+                        op.slot_id = slot
+                        op.valid_block_num = valid_block_num
                         self._assign_op_to_worker(op)
                 # Handle completed graphs
                 for graph_id in completed_graph_ids:

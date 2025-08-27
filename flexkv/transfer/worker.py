@@ -1,5 +1,5 @@
 import copy
-import multiprocessing as mp
+import torch.multiprocessing as mp
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -55,6 +55,8 @@ class WorkerTransferOp:
     dst_block_ids: np.ndarray
     layer_id: int
     layer_granularity: int
+    slot_id: int
+    valid_block_num: int
     # successors: List[int]
 
     def __init__(self, transfer_op: TransferOp):
@@ -65,6 +67,8 @@ class WorkerTransferOp:
         self.dst_block_ids = transfer_op.dst_block_ids
         self.layer_id = transfer_op.layer_id
         self.layer_granularity = transfer_op.layer_granularity
+        self.slot_id = transfer_op.slot_id
+        self.valid_block_num = transfer_op.valid_block_num
         # self.successors = list(transfer_op.successors)  # for nvtx
 
 class TransferWorkerBase(ABC):
@@ -364,6 +368,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  dtype: torch.dtype,
                  tp_group_size: int,
                  dp_group_id: int,
+                 src_buffer_tensor: torch.Tensor,
+                 dst_buffer_tensor: torch.Tensor,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_sms_h2d: int = 8,
@@ -410,33 +416,42 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id)
 
+        # get and pin the shared tensor for better transfer
+        flexkv_logger.info(f"[worker] src data ptr: {src_buffer_tensor.data_ptr()}")
+        flexkv_logger.info(f"[worker] dst data ptr: {dst_buffer_tensor.data_ptr()}")
+        self.src_pin_tensor = src_buffer_tensor
+        self.dst_pin_tensor = dst_buffer_tensor
+        
+        cudaHostRegister(self.src_pin_tensor)
+        cudaHostRegister(self.dst_pin_tensor)
+
     def _transfer_impl(self,
-                       src_block_ids: np.ndarray,
-                       dst_block_ids: np.ndarray,
+                       src_block_ids: torch.Tensor,
+                       dst_block_ids: torch.Tensor,
                        transfer_type: TransferType,
                        layer_id: int,
                        layer_granularity: int,
                        **kwargs: Any,
                        )->None:
-        assert src_block_ids.dtype == np.int64
-        assert dst_block_ids.dtype == np.int64
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
 
         if transfer_type == TransferType.H2D:
-            gpu_block_ids = dst_block_ids
-            cpu_block_ids = src_block_ids
+            gpu_block_id_list = dst_block_ids
+            cpu_block_id_list = src_block_ids
             use_ce_transfer = self.use_ce_transfer_h2d
             transfer_sms = self.transfer_sms_h2d
         elif transfer_type == TransferType.D2H:
-            gpu_block_ids = src_block_ids
-            cpu_block_ids = dst_block_ids
+            gpu_block_id_list = src_block_ids
+            cpu_block_id_list = dst_block_ids
             use_ce_transfer = self.use_ce_transfer_d2h
             transfer_sms = self.transfer_sms_d2h
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for tpGPUCPUTransferWorker")
 
-        gpu_block_id_list = torch.from_numpy(gpu_block_ids).to(dtype=torch.int64).pin_memory()
-        cpu_block_id_list = torch.from_numpy(cpu_block_ids).to(dtype=torch.int64).pin_memory()
+        # gpu_block_id_list = torch.from_numpy(gpu_block_ids).to(dtype=torch.int64).pin_memory()
+        # cpu_block_id_list = torch.from_numpy(cpu_block_ids).to(dtype=torch.int64).pin_memory()
 
         assert len(gpu_block_id_list) == len(cpu_block_id_list)
 
@@ -470,10 +485,13 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         if layer_granularity == -1:
             layer_granularity = self.num_layers
 
+        slot_id = transfer_op.slot_id
+        valid_block_num = transfer_op.valid_block_num
+
         start_time = time.time()
         self._transfer_impl(
-            transfer_op.src_block_ids,
-            transfer_op.dst_block_ids,
+            self.src_pin_tensor[slot_id, :valid_block_num],
+            self.dst_pin_tensor[slot_id, :valid_block_num],
             transfer_op.transfer_type,
             layer_id,
             layer_granularity,

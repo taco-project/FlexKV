@@ -21,6 +21,7 @@ from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field
 
 import numpy as np
+import nvtx
 import torch
 from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
 
@@ -991,6 +992,7 @@ class GlobalCacheEngine:
                 assert self.remote_cache_engine is not None
                 self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
 
+    @nvtx.annotate("Match Prefix Accel", color="yellow")
     def match_local_accel(self, sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel]:
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
@@ -1000,7 +1002,8 @@ class GlobalCacheEngine:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
-
+    
+    @nvtx.annotate("Match Prefix", color="yellow")
     def match_local(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
@@ -1010,7 +1013,8 @@ class GlobalCacheEngine:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
-
+    
+    @nvtx.annotate("Match All Prefix accel", color="yellow")
     def match_all_accel(self,
                         sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:
         cpu_matched_result = MatchResultAccel()
@@ -1025,7 +1029,8 @@ class GlobalCacheEngine:
             remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result
-
+    
+    @nvtx.annotate("Match All Prefix", color="yellow")
     def match_all(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
