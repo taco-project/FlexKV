@@ -54,7 +54,10 @@ class TransferOp:
     successors: Set[int] = field(default_factory=set)
     status: TransferOpStatus = TransferOpStatus.PENDING
     dp_id: int = 0
-
+    # used for get block ids inner worker process
+    slot_id: int = -1
+    valid_block_num: int =0
+    
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
             self.src_block_ids.size != self.dst_block_ids.size:
