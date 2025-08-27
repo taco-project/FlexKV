@@ -5,13 +5,13 @@ from typing import List, NewType, Optional
 import numpy as np
 import torch
 
-from flexkv.common.hash_utils import HashType, gen_hashes, get_hash_size, hash_tensor
+from flexkv.common.hash_utils import HashType, gen_hashes, get_hash_size, hash_array
 
 
 @dataclass
 class SequenceMeta:
 
-    token_ids: torch.Tensor
+    token_ids: np.ndarray
 
     tokens_per_block: int
 
@@ -19,7 +19,7 @@ class SequenceMeta:
 
     _has_hashes: bool = False
 
-    def __init__(self, token_ids: torch.Tensor, tokens_per_block: int):
+    def __init__(self, token_ids: np.ndarray, tokens_per_block: int):
         self.token_ids = token_ids
         self.tokens_per_block = tokens_per_block
 
@@ -44,13 +44,13 @@ class SequenceMeta:
         if self._has_hashes:
             return HashType(int(self.block_hashes[block_id].item()))
         else:
-            return hash_tensor(self.token_ids[:(block_id+1)*self.tokens_per_block])
+            return hash_array(self.token_ids[:(block_id+1)*self.tokens_per_block])
 
     def gen_hashes(self) -> None:
         if self._has_hashes:
             return
         assert self.token_ids.ndim == 1
-        self.block_hashes = gen_hashes(self.token_ids, self.tokens_per_block).numpy()
+        self.block_hashes = gen_hashes(self.token_ids, self.tokens_per_block)
         assert self.block_hashes.ndim == 1
         assert self.block_hashes.size == self.num_blocks
         assert self.block_hashes.itemsize == get_hash_size()

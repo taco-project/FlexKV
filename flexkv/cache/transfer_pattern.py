@@ -1,28 +1,33 @@
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 
-from flexkv.common.transfer import DeviceType, TransferType
-from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferDescriptor
+from flexkv.common.transfer import TransferType
+from flexkv.common.transfer import TransferOp, TransferOpGraph
 
 
 def add_virtal_op_for_mutiple_finished_ops(
     graph: TransferOpGraph,
     finished_ops_ids: List[int]
-)->Tuple[TransferOpGraph, List[int]]:
-    if len(finished_ops_ids) <= 1:
-        return graph, finished_ops_ids
+)->Tuple[TransferOpGraph, int]:
+    if len(finished_ops_ids) == 0:
+        return graph, -1
+    elif len(finished_ops_ids) == 1:
+        return graph, finished_ops_ids[0]
     else:
         op = TransferOp(
             graph_id = graph.graph_id,
             transfer_type = TransferType.VIRTUAL,
+            src_block_ids = np.array([], dtype=np.int64),
+            dst_block_ids = np.array([], dtype=np.int64),
             layer_id = -1,
             layer_granularity = -1,
         )
         graph.add_transfer_op(op)
         for op_id in finished_ops_ids:
             graph.add_dependency(op.op_id, op_id)
-        return graph, [op.op_id]
+        return graph, op.op_id
 
 def create_read_graph_cpu_storage(
     gpu_blocks: torch.Tensor,
@@ -49,15 +54,8 @@ def create_read_graph_cpu_storage(
         op = TransferOp(
             graph_id = graph.graph_id,
             transfer_type = TransferType.H2D,
-            src_descriptor = TransferDescriptor(
-                device_type = DeviceType.CPU,
-                physical_block_ids=cpu_blocks,
-            ),
-            dst_descriptor = TransferDescriptor(
-                device_type = DeviceType.GPU,
-                physical_block_ids=gpu_blocks,
-                device_id = gpu_device_id
-            ),
+            src_block_ids = cpu_blocks,
+            dst_block_ids = gpu_blocks,
             layer_id = 0,
             layer_granularity = layer_num,
         )
@@ -69,14 +67,8 @@ def create_read_graph_cpu_storage(
             op1 = TransferOp(
                 graph_id = graph.graph_id,
                 transfer_type = TransferType.DISK2H,
-                src_descriptor = TransferDescriptor(
-                    device_type = DeviceType.SSD,
-                    physical_block_ids=ssd_blocks,
-                ),
-                dst_descriptor = TransferDescriptor(
-                    device_type = DeviceType.CPU,
-                    physical_block_ids=cpu_blocks[-len(ssd_blocks):]
-                ),
+                src_block_ids = ssd_blocks,
+                dst_block_ids = cpu_blocks[-len(ssd_blocks):],
                 layer_id = 0,
                 layer_granularity = layer_num
             )
@@ -84,15 +76,8 @@ def create_read_graph_cpu_storage(
             op2 = TransferOp(
                 graph_id = graph.graph_id,
                 transfer_type = TransferType.H2D,
-                src_descriptor = TransferDescriptor(
-                    device_type = DeviceType.CPU,
-                    physical_block_ids=cpu_blocks[-len(ssd_blocks):]
-                ),
-                dst_descriptor = TransferDescriptor(
-                    device_type = DeviceType.GPU,
-                    physical_block_ids=gpu_blocks[-len(ssd_blocks):],
-                    device_id = gpu_device_id
-                ),
+                src_block_ids = cpu_blocks[-len(ssd_blocks):],
+                dst_block_ids = gpu_blocks[-len(ssd_blocks):],
                 layer_id = 0,
                 layer_granularity = layer_num
             )
@@ -102,15 +87,8 @@ def create_read_graph_cpu_storage(
         op3 = TransferOp(
             graph_id = graph.graph_id,
             transfer_type = TransferType.H2D,
-            src_descriptor = TransferDescriptor(
-                device_type = DeviceType.CPU,
-                physical_block_ids=cpu_blocks[:len(cpu_blocks) - len(ssd_blocks)]
-            ),
-            dst_descriptor = TransferDescriptor(
-                device_type = DeviceType.GPU,
-                physical_block_ids=gpu_blocks[:len(cpu_blocks) - len(ssd_blocks)],
-                device_id = gpu_device_id
-            ),
+            src_block_ids = cpu_blocks[:len(cpu_blocks) - len(ssd_blocks)],
+            dst_block_ids = gpu_blocks[:len(cpu_blocks) - len(ssd_blocks)],
             layer_id = 0,
             layer_granularity = layer_num
         )
@@ -121,14 +99,8 @@ def create_read_graph_cpu_storage(
         op1 = TransferOp(
             graph_id = graph.graph_id,
             transfer_type=TransferType.DISK2H,
-            src_descriptor=TransferDescriptor(
-                device_type=DeviceType.SSD,
-                physical_block_ids=ssd_blocks,
-            ),
-            dst_descriptor=TransferDescriptor(
-                device_type=DeviceType.CPU,
-                physical_block_ids=cpu_blocks,
-            ),
+            src_block_ids=ssd_blocks,
+            dst_block_ids=cpu_blocks,
             layer_id = 0,
             layer_granularity = layer_num
         )
@@ -136,14 +108,8 @@ def create_read_graph_cpu_storage(
         op2 = TransferOp(
             graph_id = graph.graph_id,
             transfer_type=TransferType.H2D,
-            src_descriptor=TransferDescriptor(
-                device_type=DeviceType.CPU,
-                physical_block_ids=cpu_blocks,
-            ),
-            dst_descriptor=TransferDescriptor(
-                device_type=DeviceType.GPU,
-                physical_block_ids=gpu_blocks,
-            ),
+            src_block_ids=cpu_blocks,
+            dst_block_ids=gpu_blocks,
             layer_id = 0,
             layer_granularity = layer_num
         )
@@ -191,14 +157,8 @@ def create_read_graph_cpu_ssd_remote(
     op_r2h = TransferOp(
         graph_id = graph.graph_id,
         transfer_type = TransferType.REMOTE2H,
-        src_descriptor = TransferDescriptor(
-            device_type = DeviceType.REMOTE,
-            physical_block_ids=remote_blocks,
-        ),
-        dst_descriptor = TransferDescriptor(
-            device_type = DeviceType.CPU,
-            physical_block_ids=cpu_blocks[-len(remote_blocks):],
-        ),
+        src_block_ids = remote_blocks,
+        dst_block_ids = cpu_blocks[-len(remote_blocks):],
         layer_id = 0,
         layer_granularity = layer_num
     )
@@ -206,15 +166,8 @@ def create_read_graph_cpu_ssd_remote(
     op_h2d = TransferOp(
         graph_id = graph.graph_id,
         transfer_type = TransferType.H2D,
-        src_descriptor = TransferDescriptor(
-            device_type = DeviceType.CPU,
-            physical_block_ids=cpu_blocks[-len(remote_blocks):],
-        ),
-        dst_descriptor = TransferDescriptor(
-            device_type = DeviceType.GPU,
-            physical_block_ids=gpu_blocks[-len(remote_blocks):],
-            device_id = gpu_device_id
-        ),
+        src_block_ids = cpu_blocks[-len(remote_blocks):],
+        dst_block_ids = gpu_blocks[-len(remote_blocks):],
         layer_id = 0,
         layer_granularity = layer_num
     )
@@ -224,14 +177,8 @@ def create_read_graph_cpu_ssd_remote(
         op_h2disk = TransferOp(
             graph_id = graph.graph_id,
             transfer_type = TransferType.H2DISK,
-            src_descriptor = TransferDescriptor(
-                device_type = DeviceType.CPU,
-                physical_block_ids=cpu_blocks[-len(remote_blocks):],
-            ),
-            dst_descriptor = TransferDescriptor(
-                device_type = DeviceType.SSD,
-                physical_block_ids=ssd_blocks[-len(remote_blocks):],
-            ),
+            src_block_ids = cpu_blocks[-len(remote_blocks):],
+            dst_block_ids = ssd_blocks[-len(remote_blocks):],
             layer_id = 0,
             layer_granularity = layer_num
         )
@@ -265,15 +212,8 @@ def create_write_graph_cpu_storage(
     op_d2h = TransferOp(
         graph_id = graph.graph_id,
         transfer_type = TransferType.D2H,
-        src_descriptor = TransferDescriptor(
-            device_type = DeviceType.GPU,
-            physical_block_ids=gpu_blocks,
-            device_id = gpu_device_id
-        ),
-        dst_descriptor = TransferDescriptor(
-            device_type = DeviceType.CPU,
-            physical_block_ids=cpu_blocks[-len(gpu_blocks):],
-        ),
+        src_block_ids = gpu_blocks,
+        dst_block_ids = cpu_blocks[-len(gpu_blocks):],
         layer_id = 0,
         layer_granularity = layer_num
     )
@@ -284,14 +224,8 @@ def create_write_graph_cpu_storage(
         op_h2disk = TransferOp(
             graph_id = graph.graph_id,
             transfer_type = TransferType.H2DISK,
-            src_descriptor = TransferDescriptor(
-                device_type = DeviceType.CPU,
-                physical_block_ids=cpu_blocks[-len(ssd_blocks):],
-            ),
-            dst_descriptor = TransferDescriptor(
-                device_type = DeviceType.SSD,
-                physical_block_ids=ssd_blocks,
-            ),
+            src_block_ids = cpu_blocks[-len(ssd_blocks):],
+            dst_block_ids = ssd_blocks,
             layer_id = 0,
             layer_granularity = layer_num
         )
@@ -318,15 +252,8 @@ def create_write_graph_cpu_ssd_remote(
     op_d2h = TransferOp(
         graph_id = graph.graph_id,
         transfer_type = TransferType.D2H,
-        src_descriptor = TransferDescriptor(
-            device_type = DeviceType.GPU,
-            physical_block_ids=gpu_blocks,
-            device_id = gpu_device_id
-        ),
-        dst_descriptor = TransferDescriptor(
-            device_type = DeviceType.CPU,
-            physical_block_ids=cpu_blocks[-len(gpu_blocks):],
-        ),
+        src_block_ids = gpu_blocks,
+        dst_block_ids = cpu_blocks[-len(gpu_blocks):],
         layer_id = 0,
         layer_granularity = layer_num
     )
@@ -335,14 +262,8 @@ def create_write_graph_cpu_ssd_remote(
         op_h2disk = TransferOp(
             graph_id = graph.graph_id,
             transfer_type = TransferType.H2DISK,
-            src_descriptor = TransferDescriptor(
-                device_type = DeviceType.CPU,
-                physical_block_ids=cpu_blocks[-len(gpu_blocks):],
-            ),
-            dst_descriptor = TransferDescriptor(
-                device_type = DeviceType.SSD,
-                physical_block_ids=ssd_blocks,
-            ),
+            src_block_ids = cpu_blocks[-len(gpu_blocks):],
+            dst_block_ids = ssd_blocks,
             layer_id = 0,
             layer_granularity = layer_num
         )
@@ -352,14 +273,8 @@ def create_write_graph_cpu_ssd_remote(
         op_h2remote = TransferOp(
             graph_id = graph.graph_id,
             transfer_type = TransferType.H2REMOTE,
-            src_descriptor = TransferDescriptor(
-                device_type = DeviceType.CPU,
-                physical_block_ids=cpu_blocks[-len(remote_blocks):],
-            ),
-            dst_descriptor = TransferDescriptor(
-                device_type = DeviceType.REMOTE,
-                physical_block_ids=remote_blocks,
-            ),
+            src_block_ids = cpu_blocks[-len(remote_blocks):],
+            dst_block_ids = remote_blocks,
             layer_id = 0,
             layer_granularity = layer_num
         )
@@ -394,8 +309,8 @@ def convert_read_graph_to_layer_wise_graph(
             new_op = TransferOp(
                 graph_id=new_graph.graph_id,
                 transfer_type=op.transfer_type,
-                src_descriptor=op.src_descriptor,
-                dst_descriptor=op.dst_descriptor,
+                src_block_ids=op.src_block_ids,
+                dst_block_ids=op.dst_block_ids,
                 layer_id=i * layer_granularity,
                 layer_granularity=layer_granularity,
                 # Inherit these fields directly

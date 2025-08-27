@@ -9,7 +9,7 @@ import copy
 
 import torch
 
-from flexkv.common.transfer import TransferOp, TransferType, TransferDescriptor
+from flexkv.common.transfer import TransferOp, TransferType
 from flexkv.transfer.worker import GPUCPUTransferWorker, CPUSSDDiskTransferWorker, WorkerHandle, tpGPUCPUTransferWorker
 from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator
 from flexkv.common.storage import KVCacheLayoutType, KVCacheLayout
@@ -212,12 +212,8 @@ def bench_worker(args):
         transfer_type=transfer_type,
         layer_id=0,
         layer_granularity=num_layers_to_transfer,
-        src_descriptor=TransferDescriptor(
-            physical_block_ids=block_ids,
-        ),
-        dst_descriptor=TransferDescriptor(
-            physical_block_ids=block_ids,
-        ),
+        src_block_ids=block_ids,
+        dst_block_ids=block_ids,
         graph_id=0,
         dp_id=0,
         successors=[],
@@ -226,8 +222,8 @@ def bench_worker(args):
     if transfer_type == TransferType.DISK2H:
         tmp_op = copy.deepcopy(transfer_op)
         tmp_op.transfer_type = TransferType.H2DISK
-        tmp_op.src_descriptor = transfer_op.dst_descriptor
-        tmp_op.dst_descriptor = transfer_op.src_descriptor
+        tmp_op.src_block_ids = transfer_op.dst_block_ids
+        tmp_op.dst_block_ids = transfer_op.src_block_ids
         launch_transfer(worker_handle, finished_ops_queue, tmp_op)
     for _ in range(warmup_round):
         launch_transfer(worker_handle, finished_ops_queue, transfer_op)
