@@ -24,7 +24,7 @@ import torch
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.memory_handle import TensorSharedHandle
-from flexkv.kvmanager import KVManager
+from flexkv.kvtask import KVTaskEngine
 
 
 class FlexKVReplayEngine:
@@ -204,7 +204,7 @@ class FlexKVReplayEngine:
             )
 
         # Create KVManager
-        self.kvmanager = KVManager(
+        self.kvmanager = KVTaskEngine(
             model_config=self.model_config,
             cache_config=self.cache_config,
             gpu_layout=self.gpu_layout,
@@ -274,10 +274,6 @@ class FlexKVReplayEngine:
                 result = self.kvmanager.wait_for_graph_finished(task_ids)
             elif wait_type == "try_wait":
                 result = self.kvmanager.try_wait(task_ids)
-            elif wait_type == "wait_at_layer_group":
-                result = self.kvmanager.wait_at_layer_group(task_ids[0], layer_group_id)
-            elif wait_type == "try_wait_at_layer_group":
-                result = self.kvmanager.try_wait_at_layer_group(task_ids, layer_group_id)
             else:
                 raise ValueError(f"Unknown wait type: {wait_type}")
             successed_elements = []

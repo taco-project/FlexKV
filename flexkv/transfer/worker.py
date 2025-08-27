@@ -61,13 +61,16 @@ class WorkerTransferOp:
         self.transfer_op_id = transfer_op.op_id
         self.transfer_graph_id = transfer_op.graph_id
         self.transfer_type = transfer_op.transfer_type
-        self.src_block_ids = transfer_op.src_descriptor.physical_block_ids.numpy()
-        self.dst_block_ids = transfer_op.dst_descriptor.physical_block_ids.numpy()
+        self.src_block_ids = transfer_op.src_block_ids
+        self.dst_block_ids = transfer_op.dst_block_ids
         self.layer_id = transfer_op.layer_id
         self.layer_granularity = transfer_op.layer_granularity
         # self.successors = list(transfer_op.successors)  # for nvtx
 
 class TransferWorkerBase(ABC):
+    _worker_id_counter = 0
+    _worker_id_lock = threading.Lock()
+
     def __init__(self,
                  worker_id: int,
                  transfer_conn: Connection,  # receive end of pipe
@@ -75,6 +78,13 @@ class TransferWorkerBase(ABC):
         self.worker_id = worker_id
         self.transfer_conn = transfer_conn  # receive end of pipe
         self.finished_ops_queue: MPQueue[int] = finished_ops_queue
+
+    @classmethod
+    def _get_worker_id(cls) -> int:
+        with cls._worker_id_lock:
+            worker_id = cls._worker_id_counter
+            cls._worker_id_counter += 1
+            return worker_id
 
     def _get_layer_ptrs(self, layer_blocks: Union[List[torch.Tensor], torch.Tensor]) -> torch.Tensor:
         if isinstance(layer_blocks, torch.Tensor):
@@ -90,10 +100,11 @@ class TransferWorkerBase(ABC):
         return layer_ptrs
 
     @classmethod
-    def create_worker(cls, worker_id: int, finished_ops_queue: MPQueue, *args: Any, **kwargs: Any) -> 'WorkerHandle':
+    def create_worker(cls, finished_ops_queue: MPQueue, *args: Any, **kwargs: Any) -> 'WorkerHandle':
         """Generic worker creation template method"""
         parent_conn, child_conn = MPPipe()  # create pipe
         ready_event = mp.Event()
+        worker_id = cls._get_worker_id()
 
         process = mp.Process(
             target=cls._worker_process,
@@ -180,7 +191,7 @@ class WorkerHandle:
     """handle for worker process"""
     def __init__(self, worker_id: int, transfer_conn: Connection, process: mp.Process, ready_event: Any):
         self.worker_id = worker_id
-        self.transfer_conn = transfer_conn  # send end of pipe
+        self.transfer_conn = transfer_conn
         self.process = process
         self.ready_event = ready_event
 

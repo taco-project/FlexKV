@@ -2,16 +2,18 @@ import time
 from multiprocessing import Lock, Queue
 from multiprocessing.connection import Connection
 from queue import Queue as ThreadQueue
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 
 import tempfile
 import torch
 import zmq
+import numpy as np
 
-from flexkv.common.config import ModelConfig
+from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
+from flexkv.common.request import KVResponseStatus, KVResponse
 from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import (
     RegisterDPClientRequest,
@@ -19,13 +21,16 @@ from flexkv.server.request import (
     IsReadyRequest,
     PutRequest,
     GetRequest,
+    PutMatchRequest,
+    GetMatchRequest,
+    LaunchTaskRequest,
+    CancelTaskRequest,
     WaitRequest,
     TryWaitRequest,
     CheckRunningRequest,
     ShutdownRequest,
     Response
 )
-
 
 class KVDPClient:
     def __init__(
@@ -38,6 +43,7 @@ class KVDPClient:
         self.send_to_server = get_zmq_socket(
             context, zmq.SocketType.PUSH, server_recv_port, False
         )
+        # is this ok when there are multiple dp clients?
         client_recv_port = f"ipc://{tempfile.NamedTemporaryFile(delete=True).name}"
         self.recv_from_server = get_zmq_socket(
             context, zmq.SocketType.PULL, client_recv_port, True
@@ -67,7 +73,7 @@ class KVDPClient:
         self.send_to_server.send_pyobj(register_req)
         # blocking
         response: Response = self.recv_from_server.recv_pyobj()
-        if response.success:
+        if response.error_msg is None:
             flexkv_logger.info(f"DP client registered successfully! DP client id: {response.dp_client_id}")
             return response.dp_client_id
         else:
@@ -80,36 +86,47 @@ class KVDPClient:
         req = IsReadyRequest(self.dp_client_id)
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
-        if response.success:
-            return response.is_ready
-        else:
-            flexkv_logger.error(f"is_ready failed: {response.error_msg}")
-            raise
-        
+        return response.is_ready
+
     def put_async(
         self,
         token_ids: torch.Tensor,
         slot_mapping: torch.Tensor,
         token_mask: Optional[torch.Tensor],
-    ) -> Optional[int]:
-        # start_time = time.time()
+    ) -> int:
         req = PutRequest(self.dp_client_id,
                          token_ids.numpy(),
                          slot_mapping.numpy(),
                          token_mask.numpy() if token_mask is not None else None,
                          self._get_task_id())
         self.send_to_server.send_pyobj(req)
-        # end_time = time.time()
-        # print(f"[dpclient] put_async task: {req.task_id} created. time: {(end_time - start_time)*1000:.2f}ms")
         return req.task_id
+
+    def put_match(
+        self,
+        token_ids: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        token_mask: Optional[torch.Tensor],
+    ) -> Optional[Tuple[int, np.ndarray]]:
+        req = PutMatchRequest(self.dp_client_id,
+                              token_ids.numpy(),
+                              slot_mapping.numpy(),
+                              token_mask.numpy() if token_mask is not None else None,
+                              self._get_task_id())
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.error_msg is None:
+            return response.task_id, response.mask
+        else:
+            flexkv_logger.error(f"put_match failed, error_msg: {response.error_msg}")
+            return None
 
     def get_async(
         self,
         token_ids: torch.Tensor,
         slot_mapping: torch.Tensor,
         token_mask: Optional[torch.Tensor],
-    ) -> Optional[int]:
-        # start_time = time.time()
+    ) -> int:
         req = GetRequest(self.dp_client_id,
                          token_ids.numpy(),
                          slot_mapping.numpy(),
@@ -117,24 +134,56 @@ class KVDPClient:
                          self._get_task_id())
 
         self.send_to_server.send_pyobj(req)
-        # end_time = time.time()
-        # print(f"[dpclient] get_async task: {req.task_id} created. time: {(end_time - start_time)*1000:.2f}ms")
         return req.task_id
+
+    def get_match(
+        self,
+        token_ids: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        token_mask: Optional[torch.Tensor],
+    ) -> Optional[Tuple[int, np.ndarray]]:
+        req = GetMatchRequest(self.dp_client_id,
+                              token_ids.numpy(),
+                              slot_mapping.numpy(),
+                              token_mask.numpy() if token_mask is not None else None,
+                              self._get_task_id())
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.error_msg is None:
+            return req.task_id, response.mask
+        else:
+            flexkv_logger.error(f"get_match failed, error_msg: {response.error_msg}")
+            return None
+
+    def launch_task(
+        self,
+        task_ids: List[int],
+    ) -> None:
+        req = LaunchTaskRequest(self.dp_client_id, task_ids)
+        self.send_to_server.send_pyobj(req)
+
+    def cancel_task(
+        self,
+        task_ids: List[int],
+    ) -> None:
+        req = CancelTaskRequest(self.dp_client_id, task_ids)
+        self.send_to_server.send_pyobj(req)
 
     def wait(
         self,
         wait_task_ids: List[int],
         wait_timeout: float = 20.0,
-    ) -> Optional[Dict[int, torch.Tensor]]:
-        req = WaitRequest(self.dp_client_id, None, wait_task_ids, wait_timeout)
+        completely: bool = False,
+    ) -> Optional[Dict[int, KVResponse]]:
+        req = WaitRequest(self.dp_client_id, None, wait_task_ids, wait_timeout, completely)
 
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
-        if response.masks is not None:
-            response.masks = {k: torch.from_numpy(v) for k, v in response.masks.items()}
-        if response.success:
-        #   flexkv_logger.info(f"wait tasks: {wait_task_ids} finished.")
-            return response.masks
+        if response.status is not None:
+            for k, v in response.status.items():
+                if v.status != KVResponseStatus.SUCCESS:
+                    flexkv_logger.error(f"wait task {k} failed: {v.status}")
+            return response.status
         else:
             flexkv_logger.error(f"wait tasks: {wait_task_ids} in DP {self.dp_client_id} failed.")
             return None
@@ -142,26 +191,26 @@ class KVDPClient:
     def try_wait(
         self,
         try_wait_task_ids: List[int],
-    ) -> Optional[Dict[int, torch.Tensor]]:
+    ) -> Optional[Dict[int, KVResponse]]:
         req = TryWaitRequest(self.dp_client_id, None, try_wait_task_ids)
 
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
         if response.masks is not None:
-            response.masks = {k: torch.from_numpy(v) for k, v in response.masks.items()}
-        if response.success:
-        #    flexkv_logger.info(f"try_wait tasks: {try_wait_task_ids} finished.")
+            for k, v in response.masks.items():
+                if v.status != KVResponseStatus.SUCCESS:
+                    flexkv_logger.error(f"try_wait task {k} failed: {v.status}")
             return response.masks
         else:
             flexkv_logger.error(f"try_wait tasks: {try_wait_task_ids} in DP {self.dp_client_id} failed.")
             return None
-
+    """
     def check_running(self) -> bool:
         req = CheckRunningRequest(self.dp_client_id)
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
         return response.running
-
+    """
     def shutdown(self) -> None:
         req = ShutdownRequest(self.dp_client_id)
         self.send_to_server.send_pyobj(req)
@@ -224,15 +273,13 @@ class KVTPClient:
         self.send_to_server.send_pyobj(register_req)
         # blocking
         response: Response = self.recv_from_server.recv_pyobj()
-        if response.success:
+        if response.error_msg is None:
             flexkv_logger.info(f"TP client of DP client {self.dp_client_id} registered successfully!")
         else:
             flexkv_logger.error(
                 f"TP client of DP client {self.dp_client_id} registeration fialed: {response.error_msg}"
             )
             raise
-
-
 
 if __name__ == "__main__":
     num_layers = 32
