@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 
 from flexkv.common.config import ModelConfig
 from flexkv.common.memory_handle import TensorSharedHandle
