@@ -13,7 +13,7 @@ class PinnedMemoryRing:
         self.max_task_num = max_task_num
         self.max_block_num = max_block_num
         self.dtype = dtype
-        self.time_out = 1  ## waiting time for get free slot (1s)
+        self.time_out = 0.001  ## waiting time for get free slot (1 ms)
         # create the buffer tensor
         self.src_buffer_o = torch.empty((self.max_task_num, self.max_block_num), dtype = torch.int64)
         self.dst_buffer_o = torch.empty((self.max_task_num, self.max_block_num), dtype = torch.int64)
@@ -21,8 +21,8 @@ class PinnedMemoryRing:
         self.src_buffer = self.src_buffer_o.share_memory_()
         self.dst_buffer = self.dst_buffer_o.share_memory_()
         
-        flexkv_logger.info(f"[PinnedMemoryRing] block ids src_buffer data_ptr: {self.src_buffer.data_ptr()}")
-        flexkv_logger.info(f"[PinnedMemoryRing] block ids dst_buffer data_ptr: {self.dst_buffer.data_ptr()}")
+        flexkv_logger.info(f"[PinnedMemoryRing] block ids src_buffer data_ptr: {self.src_buffer.storage().data_ptr()}")
+        flexkv_logger.info(f"[PinnedMemoryRing] block ids dst_buffer data_ptr: {self.dst_buffer.storage().data_ptr()}")
 
         self.op_slot_map = OrderedDict() ## {op_id : ring buffer slot}
         self.slot_in_use = [False]*max_task_num
@@ -44,38 +44,42 @@ class PinnedMemoryRing:
             num_blocks: the valid number of blocks in the current op
         """
         # firstly, determine whether the length of block ids exceeds the limit
-        num_blocks = op.src_descriptor.physical_block_ids.size(0)
+        num_blocks = len(op.src_block_ids)
         if num_blocks > self.max_block_num:
             raise ValueError(f"block_ids too large: {num_blocks} > {self.max_block_num}")
         
-        assert op.src_descriptor.physical_block_ids.size(0) == op.dst_descriptor.physical_block_ids.size(0), \
-            f"the number of src block ids ({op.src_descriptor.physical_block_ids.size(0)}) is not eaqual to" \
-            f"the number of dst block ids ({op.dst_descriptor.physical_block_ids.size(0)})"
+        assert len(op.src_block_ids) == len(op.dst_block_ids), \
+            f"the number of src block ids ({len(op.src_block_ids)}) is not eaqual to" \
+            f"the number of dst block ids ({len(op.dst_block_ids)})"
 
         # get the slot of empty buffer
         with self.condition:
             while not self.free_slots:
                 if not self.condition.wait(timeout=self.time_out):
-                    raise TimeoutError("Timeout waiting for a free slot in the ring buffer")
-
+                    flexkv_logger.info("No empty slot in PinnedMemoryRing, transfer the block ids")
+                    op.slot_id = -1
+                    op.valid_block_num = num_blocks
+                    return -1, num_blocks
+                
             slot = self.free_slots.popleft()  # O(1) 
           
         # update status managers
         self.slot_in_use[slot] = True
         self.op_slot_map[op_id] = slot
         self.valid_length[slot] = num_blocks
-        # print("----> ring buffer src blocks: ", op.src_descriptor.physical_block_ids)
-        # print("----> ring buffer dst blocks: ", op.dst_descriptor.physical_block_ids)
-        
+
         # do copy
-        self.src_buffer[slot, :num_blocks] = op.src_descriptor.physical_block_ids
-        self.dst_buffer[slot, :num_blocks] = op.dst_descriptor.physical_block_ids
+        self.src_buffer[slot, :num_blocks] = torch.from_numpy(op.src_block_ids).to(torch.int64)
+        self.dst_buffer[slot, :num_blocks] = torch.from_numpy(op.dst_block_ids).to(torch.int64)
         
         # set the rest value of this buffer to -1
         if num_blocks < self.max_block_num:
             self.src_buffer[slot, num_blocks:] = -1  # 
             self.dst_buffer[slot, num_blocks:] = -1  # 
 
+        # update slot id and valid_block_num of current op
+        op.slot_id = slot
+        op.valid_block_num = num_blocks
         return slot, num_blocks
     
     def mark_free(self, op_id: int):
