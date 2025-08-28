@@ -23,7 +23,7 @@ from flexkv.transfer.worker import (
     tpGPUCPUTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.common.ring_buffer import PinnedMemoryRing
+from flexkv.common.ring_buffer import SharedMemoryRing
 
 
 class TransferEngine:
@@ -58,7 +58,7 @@ class TransferEngine:
         self._remote_handle = remote_handle
         self._cache_config = cache_config
 
-        self.pin_buffer = PinnedMemoryRing(500, self.model_config.max_req_tokens // self.cache_config.tokens_per_block)
+        self.pin_buffer = SharedMemoryRing(500, self.model_config.max_req_tokens // self.cache_config.tokens_per_block)
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
 
