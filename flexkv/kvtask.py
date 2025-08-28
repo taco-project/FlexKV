@@ -235,7 +235,7 @@ class KVTaskManager:
         task = self.tasks[task_id]
         if task.status != TaskStatus.UNREADY:
             return
-        graph_ids = self.cache_engine.slot_mapping_to_block_ids(slot_mapping[task.return_mask.astype(np.bool_)],
+        graph_ids = self.cache_engine.slot_mapping_to_block_ids(slot_mapping,
                                                                 self.cache_config.tokens_per_block)
         task.graph.set_gpu_blocks(graph_ids)
         task.status = TaskStatus.READY
@@ -353,7 +353,9 @@ class KVTaskEngine(KVTaskManager):
     def _wait_impl(self,
                    task_ids: List[int],
                    timeout: float = 20.0,
-                   completely: bool = False) -> Dict[int, KVResponse]:
+                   completely: bool = False,
+                   only_return_finished: bool = False,
+                   ) -> Dict[int, KVResponse]:
         return_responses = {}
         start_time = time.time()
         is_timeout = timeout == 0.0
@@ -386,18 +388,18 @@ class KVTaskEngine(KVTaskManager):
                         return_mask=self.tasks[task_id].return_mask
                     )
                     break
-                elif is_timeout:
+                elif only_return_finished:
+                    break
+                elif time.time() - start_time > timeout:
+                    is_timeout = True
+                if is_timeout:
                     return_responses[task_id] = KVResponse(
                         status=KVResponseStatus.TIMEOUT,
                         task_id=task_id,
                         return_mask=None
                     )
                     break
-                else:
-                    if time.time() - start_time > timeout:
-                        is_timeout = True
-                        break
-                    self._update_tasks(timeout=0.001)
+                self._update_tasks(timeout=0.001)
         return return_responses
 
     def try_wait(self, task_ids: Union[int, List[int]]) -> Dict[int, KVResponse]:
@@ -405,8 +407,8 @@ class KVTaskEngine(KVTaskManager):
             task_ids = [task_ids]
         nvtx.mark(f"try_wait task_ids: {task_ids}")
         return_responses = self._wait_impl(task_ids,
-                                       timeout=0.0,
-                                       completely=False)
+                                           completely=False,
+                                           only_return_finished=True)
         return return_responses
 
     def wait(self,
@@ -426,7 +428,9 @@ class KVTaskEngine(KVTaskManager):
                   layer_granularity: int = -1,
                   dp_id: int = 0,
                   task_id: int = -1) -> Tuple[int, np.ndarray]:
-        fake_slot_mapping = np.zeros_like(token_ids)
+        if token_mask is None:
+            token_mask = np.ones_like(token_ids, dtype=bool)
+        fake_slot_mapping = np.zeros_like(token_ids[token_mask])
         return self._get_match_impl(token_ids,
                                     fake_slot_mapping,
                                     is_fake_slot_mapping=True,
