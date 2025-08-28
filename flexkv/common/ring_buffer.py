@@ -8,7 +8,7 @@ import numpy as np
 from flexkv.common.transfer import TransferOp
 from flexkv.common.debug import flexkv_logger
 
-class PinnedMemoryRing:
+class SharedMemoryRing:
     def __init__(self, max_task_num: int, max_block_num: int, dtype = np.int64):
         self.max_task_num = max_task_num
         self.max_block_num = max_block_num
@@ -21,8 +21,8 @@ class PinnedMemoryRing:
         self.src_buffer = self.src_buffer_o.share_memory_()
         self.dst_buffer = self.dst_buffer_o.share_memory_()
         
-        flexkv_logger.info(f"[PinnedMemoryRing] block ids src_buffer data_ptr: {self.src_buffer.storage().data_ptr()}")
-        flexkv_logger.info(f"[PinnedMemoryRing] block ids dst_buffer data_ptr: {self.dst_buffer.storage().data_ptr()}")
+        flexkv_logger.info(f"[SharedMemoryRing] block ids src_buffer data_ptr: {self.src_buffer.storage().data_ptr()}")
+        flexkv_logger.info(f"[SharedMemoryRing] block ids dst_buffer data_ptr: {self.dst_buffer.storage().data_ptr()}")
 
         self.op_slot_map = OrderedDict() ## {op_id : ring buffer slot}
         self.slot_in_use = [False]*max_task_num
@@ -56,7 +56,7 @@ class PinnedMemoryRing:
         with self.condition:
             while not self.free_slots:
                 if not self.condition.wait(timeout=self.time_out):
-                    flexkv_logger.info("No empty slot in PinnedMemoryRing, transfer the block ids")
+                    flexkv_logger.info("No empty slot in SharedMemoryRing, transfer the block ids")
                     op.slot_id = -1
                     op.valid_block_num = num_blocks
                     return -1, num_blocks
@@ -150,7 +150,7 @@ def producer(manager, task_id, data):
         print(f"Producer {task_id} encountered an error: {e}")
 
 if __name__ == "__main__":
-    manager = PinnedMemoryRing(4, 10)
+    manager = SharedMemoryRing(4, 10)
     
 
  
