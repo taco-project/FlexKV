@@ -20,15 +20,17 @@ class Hasher:
         self.hasher.reset()
 
     def update(self, array: np.ndarray) -> None:
-        self.hasher.update(array)
+        self.hasher.update(torch.from_numpy(array))
 
     def digest(self) -> HashType:
         return HashType(self.hasher.digest())
 
+_HASHER = Hasher()
+
 def hash_array(array: np.ndarray) -> HashType:
-    hasher = Hasher()
-    hasher.update(array)
-    return HashType(hasher.digest())
+    _HASHER.reset()
+    _HASHER.update(array)
+    return HashType(_HASHER.digest())
 
 def gen_hashes(token_ids: np.ndarray, tokens_per_block: int, hasher: Optional[Hasher] = None) -> np.ndarray:
     block_hashes = np.zeros(token_ids.size // tokens_per_block, dtype=np.uint64)
@@ -39,13 +41,15 @@ def gen_hashes(token_ids: np.ndarray, tokens_per_block: int, hasher: Optional[Ha
 
 if __name__ == "__main__":
     np.random.seed(0)
-    token_ids = np.random.randint(0, 10000, (32000, ), dtype=np.int64)
+    token_ids = np.random.randint(0, 10000, (1000, ), dtype=np.int64)
     print(f"token ids length: {token_ids.shape[0]}")
-    start = time.time()
     result = hash_array(token_ids)
-    end = time.time()
-    print(f"array hash: {result}, time: {end - start}s")
     start = time.time()
-    result2 = gen_hashes(token_ids, 16)
+    for i in range(1):
+        result = hash_array(token_ids)
     end = time.time()
-    print(f"block hashes: {result2}, time: {end - start}s")
+    print(f"array hash: {result}, average time: {(end - start)*1000/5}ms")
+    # start = time.time()
+    # result2 = gen_hashes(token_ids, 16)
+    # end = time.time()
+    # print(f"block hashes: {result2}, time: {(end - start)*1000}ms")
