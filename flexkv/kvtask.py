@@ -381,7 +381,6 @@ class KVTaskEngine(KVTaskManager):
                     )
                     break
                 elif self.check_completed(task_id, completely=completely):
-                    self.tasks[task_id].status = TaskStatus.COMPLETED # TODO is this correct?
                     return_responses[task_id] = KVResponse(
                         status=convert_to_response_status(self.tasks[task_id].status),
                         task_id=task_id,
