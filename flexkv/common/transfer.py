@@ -55,9 +55,10 @@ class TransferOp:
     status: TransferOpStatus = TransferOpStatus.PENDING
     dp_id: int = 0
     # used for get block ids inner worker process
-    slot_id: int = -1
-    valid_block_num: int =0
-    
+    src_slot_id: int = -1
+    dst_slot_id: int = -1
+    valid_block_num: int = 0
+
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
             self.src_block_ids.size != self.dst_block_ids.size:
@@ -67,6 +68,7 @@ class TransferOp:
             TransferOp._next_op_id += 1
         assert self.src_block_ids.dtype == np.int64
         assert self.dst_block_ids.dtype == np.int64
+        self.valid_block_num = self.src_block_ids.size
 
 
 class TransferOpGraph:
