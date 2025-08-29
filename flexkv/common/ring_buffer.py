@@ -7,84 +7,69 @@ from collections import OrderedDict,deque
 import numpy as np
 from flexkv.common.transfer import TransferOp
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.hash_utils import hash_array
 
-class SharedMemoryRing:
-    def __init__(self, max_task_num: int, max_block_num: int, dtype = np.int64):
-        self.max_task_num = max_task_num
+
+class SharedOpPool:
+    def __init__(self, max_op_num: int, max_block_num: int, dtype = np.int64):
+        self.max_op_num = max_op_num
         self.max_block_num = max_block_num
         self.dtype = dtype
-        self.time_out = 0.001  ## waiting time for get free slot (1 ms)
         # create the buffer tensor
-        self.src_buffer_o = torch.empty((self.max_task_num, self.max_block_num), dtype = torch.int64)
-        self.dst_buffer_o = torch.empty((self.max_task_num, self.max_block_num), dtype = torch.int64)
+        self.buffer_o = torch.empty((self.max_op_num, self.max_block_num), dtype = torch.int64)
         # move tensor to share memory
-        self.src_buffer = self.src_buffer_o.share_memory_()
-        self.dst_buffer = self.dst_buffer_o.share_memory_()
+        self.buffer = self.buffer_o.share_memory_()
 
-        flexkv_logger.info(f"[SharedMemoryRing] block ids src_buffer data_ptr: {self.src_buffer.storage().data_ptr()}")
-        flexkv_logger.info(f"[SharedMemoryRing] block ids dst_buffer data_ptr: {self.dst_buffer.storage().data_ptr()}")
+        flexkv_logger.info(f"[SharedOpPool] block ids buffer data_ptr: {self.buffer.storage().data_ptr()}")
 
-        self.op_slot_map = OrderedDict() ## {op_id : ring buffer slot}
-        self.slot_in_use = [False]*max_task_num
-        self.free_slots = deque(range(max_task_num))
+        self.free_slots = deque(range(max_op_num))
+        self.slot_map = dict() # {slot_hash: slot_id}
 
-        self.valid_length = [0]*max_task_num
+        self.slot_ref_count = np.zeros(max_op_num, dtype=np.int32)
+        self.slot_hashes = [0]*max_op_num
 
         self.lock = threading.Lock()
-        self.condition = threading.Condition(self.lock)
 
-    def allocate_and_write(self, op_id: int, op: TransferOp):
+    def allocate_slot(self, block_ids: np.ndarray):
         """
-        Allocating a slot for the op and copy src block ids and dst block ids to the buffer.
+        Allocating a slot for the given block ids
         Params:
-            op_id: the id index of the op
-            op: the actual op object, which contains the block ids
+            block_ids: the block ids of src address or dst address
         Returns:
-            slot: the slot which is assigned to the current op
-            num_blocks: the valid number of blocks in the current op
+            slot_id: the slot which is assigned to the given block ids, -1 if failed
         """
         # firstly, determine whether the length of block ids exceeds the limit
-        num_blocks = len(op.src_block_ids)
-        if num_blocks > self.max_block_num:
-            flexkv_logger.warning(f"block_ids too large: {num_blocks} > {self.max_block_num}, "
-                                f"please increase the max_block_num")
-            return -1, num_blocks
+        num_blocks = block_ids.size
+        if num_blocks > self.max_block_num or num_blocks == 0:
+            return -1
 
-        assert len(op.src_block_ids) == len(op.dst_block_ids), \
-            f"the number of src block ids ({len(op.src_block_ids)}) is not eaqual to" \
-            f"the number of dst block ids ({len(op.dst_block_ids)})"
+        slot_hash = hash_array(block_ids)
+        reuse = False
 
         # get the slot of empty buffer
-        with self.condition:
-            while not self.free_slots:
-                if not self.condition.wait(timeout=self.time_out):
-                    flexkv_logger.info("No empty slot in SharedMemoryRing, transfer the block ids")
-                    op.slot_id = -1
-                    op.valid_block_num = num_blocks
-                    return -1, num_blocks
+        with self.lock:
+            if slot_hash in self.slot_map:
+                slot_id = self.slot_map[slot_hash]
+                reuse = True
+            else:
+                if not self.free_slots:
+                    flexkv_logger.info("No empty slot in SharedOpPool")
+                    return -1
 
-            slot = self.free_slots.popleft()  # O(1)
+                slot_id = self.free_slots.popleft()
+                self.slot_map[slot_hash] = slot_id
 
         # update status managers
-        self.slot_in_use[slot] = True
-        self.op_slot_map[op_id] = slot
-        self.valid_length[slot] = num_blocks
+        self.slot_ref_count[slot_id] += 1
+        self.slot_hashes[slot_id] = slot_hash
 
         # do copy
-        self.src_buffer[slot, :num_blocks] = torch.from_numpy(op.src_block_ids).to(torch.int64)
-        self.dst_buffer[slot, :num_blocks] = torch.from_numpy(op.dst_block_ids).to(torch.int64)
+        if not reuse:
+            self.buffer[slot_id, :num_blocks] = torch.from_numpy(block_ids).to(torch.int64)
 
-        # set the rest value of this buffer to -1
-        if num_blocks < self.max_block_num:
-            self.src_buffer[slot, num_blocks:] = -1  #
-            self.dst_buffer[slot, num_blocks:] = -1  #
+        return slot_id
 
-        # update slot id and valid_block_num of current op
-        op.slot_id = slot
-        op.valid_block_num = num_blocks
-        return slot, num_blocks
-
-    def mark_free(self, op_id: int):
+    def free_slot(self, slot_id: int):
         """
         Free the relevant resources of corresponding op, called when op transfer completed.
         Input:
@@ -92,64 +77,33 @@ class SharedMemoryRing:
         Output:
             None
         """
-        with self.condition:
-            if op_id not in self.op_slot_map:
-                raise KeyError(f"Task {op_id} not found in buffer")
+        with self.lock:
+            slot_hash = self.slot_hashes[slot_id]
+            if slot_hash not in self.slot_map:
+                raise RuntimeError(f"Slot {slot_id} is not in use, double free detected!")
+            self.slot_ref_count[slot_id] -= 1
+            assert self.slot_ref_count[slot_id] >= 0, f"Slot {slot_id} ref count is negative"
+            if self.slot_ref_count[slot_id] == 0:
+                self.free_slots.append(slot_id)
+                del self.slot_map[slot_hash]
 
-            slot = self.op_slot_map[op_id]
-            if not self.slot_in_use[slot]:
-                raise RuntimeError(f"Slot {slot} is already free, double free detected!")
-
-            self.slot_in_use[slot] = False
-            self.valid_length[slot] = 0
-            self.free_slots.append(slot)
-            del self.op_slot_map[op_id]
-
-            self.condition.notify()
-
-    def get_src_block_ids(self, slot: int):
-        if slot < 0 or slot >= self.max_task_num:
-            raise IndexError(f"Invalid slot index {slot}")
-        return self.src_buffer[slot, :self.valid_length[slot]]
-
-    def get_dst_block_ids(self, slot: int):
-        if slot < 0 or slot >= self.max_task_num:
-            raise IndexError(f"Invalid slot index {slot}")
-        return self.dst_buffer[slot, :self.valid_length[slot]]
-
-    def get_src_buffer(self):
-        return self.src_buffer
-
-    def get_dst_buffer(self):
-        return self.dst_buffer
+    def get_buffer(self):
+        return self.buffer
 
     def get_buffer_size(self):
-        return self.max_task_num, self.max_block_num
+        return self.max_op_num, self.max_block_num
 
     def status(self):
         """
         Current status logger
         """
         with self.lock:
-            used = sum(self.slot_in_use)
-            free = self.max_task_num - used
+            used = len(self.slot_map)
+            free = self.max_op_num - used
             return {"used_slots": used,
                     "free_slots": free,
-                    "capacity": self.max_task_num}
+                    "capacity": self.max_op_num}
 
-
-def producer(manager, task_id, data):
-    try:
-        print(f"Producer {task_id} trying to allocate...")
-        slot = manager.allocate_and_write(task_id, data)
-        print(f"Producer {task_id} got slot {slot}")
-
-        time.sleep(random.uniform(0.1, 2.0))
-
-        manager.mark_free(task_id)
-        print(f"Producer {task_id} released slot {slot}")
-    except Exception as e:
-        print(f"Producer {task_id} encountered an error: {e}")
 
 if __name__ == "__main__":
-    manager = SharedMemoryRing(4, 10)
+    manager = SharedOpPool(4, 10)

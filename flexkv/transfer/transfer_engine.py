@@ -37,8 +37,18 @@ from flexkv.transfer.worker import (
     tpGPUCPUTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig
-from flexkv.common.ring_buffer import SharedMemoryRing
+from flexkv.common.ring_buffer import SharedOpPool
 
+
+def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
+    op.src_slot_id = pin_buffer.allocate_slot(op.src_block_ids)
+    op.dst_slot_id = pin_buffer.allocate_slot(op.dst_block_ids)
+
+def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
+    if op.src_slot_id != -1:
+        pin_buffer.free_slot(op.src_slot_id)
+    if op.dst_slot_id != -1:
+        pin_buffer.free_slot(op.dst_slot_id)
 
 class TransferEngine:
     def __init__(self,
@@ -72,7 +82,7 @@ class TransferEngine:
         self._remote_handle = remote_handle
         self._cache_config = cache_config
 
-        self.pin_buffer = SharedMemoryRing(500, self.model_config.max_req_tokens // self.cache_config.tokens_per_block)
+        self.pin_buffer = SharedOpPool(2048, self.model_config.max_req_tokens // self.cache_config.tokens_per_block)
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
 
@@ -92,8 +102,7 @@ class TransferEngine:
             self.gpucpu_workers: List[WorkerHandle] = [
                 GPUCPUTransferWorker.create_worker(
                     finished_ops_queue=self.finished_ops_queue,
-                    src_buffer_tensor = self.pin_buffer.get_src_buffer(),
-                    dst_buffer_tensor = self.pin_buffer.get_dst_buffer(),
+                    op_buffer_tensor = self.pin_buffer.get_buffer(),
                     gpu_blocks=self.gpu_handles[i].get_tensor_handle_list(),
                     cpu_blocks=self._cpu_handle.get_tensor(),
                     gpu_kv_layout=self.gpu_handles[i].kv_layout,
@@ -111,8 +120,7 @@ class TransferEngine:
             self.gpucpu_workers = [
                 tpGPUCPUTransferWorker.create_worker(
                     finished_ops_queue=self.finished_ops_queue,
-                    src_buffer_tensor = self.pin_buffer.get_src_buffer(),
-                    dst_buffer_tensor = self.pin_buffer.get_dst_buffer(),
+                    op_buffer_tensor = self.pin_buffer.get_buffer(),
                     gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
                                 for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
                     cpu_blocks=self._cpu_handle.get_tensor(),
@@ -134,8 +142,7 @@ class TransferEngine:
         if self._ssd_handle is not None and self._cpu_handle is not None:
             self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 finished_ops_queue=self.finished_ops_queue,
-                src_buffer_tensor = self.pin_buffer.get_src_buffer(),
-                dst_buffer_tensor = self.pin_buffer.get_dst_buffer(),
+                op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 ssd_files=self._ssd_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
@@ -146,8 +153,7 @@ class TransferEngine:
             )
             self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 finished_ops_queue=self.finished_ops_queue,
-                src_buffer_tensor = self.pin_buffer.get_src_buffer(),
-                dst_buffer_tensor = self.pin_buffer.get_dst_buffer(),
+                op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 ssd_files=self._ssd_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
@@ -161,8 +167,7 @@ class TransferEngine:
         if self._remote_handle is not None and self._cpu_handle is not None:
             self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 finished_ops_queue=self.finished_ops_queue,
-                src_buffer_tensor = self.pin_buffer.get_src_buffer(),
-                dst_buffer_tensor = self.pin_buffer.get_dst_buffer(),
+                op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 remote_file=self._remote_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
@@ -172,8 +177,7 @@ class TransferEngine:
             )
             self.remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 finished_ops_queue=self.finished_ops_queue,
-                src_buffer_tensor = self.pin_buffer.get_src_buffer(),
-                dst_buffer_tensor = self.pin_buffer.get_dst_buffer(),
+                op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 remote_file=self._remote_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
@@ -222,9 +226,7 @@ class TransferEngine:
                 try:
                     op_id = self.finished_ops_queue.get_nowait()
                     op = self.op_id_to_op[op_id]
-                    # release the slot for ring buffer, only when slot_id not equal to -1
-                    if op.slot_id != -1:
-                        self.pin_buffer.mark_free(op_id) 
+                    free_op_from_buffer(op, self.pin_buffer)
                     self.completed_queue.put((op.graph_id, op.op_id))
                     finished_ops.append(op)
                     del self.op_id_to_op[op_id]
@@ -243,7 +245,7 @@ class TransferEngine:
                     else:
                         self.op_id_to_op[op.op_id] = op
                         # copy block ids into buffer and update slot id info
-                        self.pin_buffer.allocate_and_write(op.op_id, op)
+                        register_op_to_buffer(op, self.pin_buffer)
                         self._assign_op_to_worker(op)
                 # Handle completed graphs
                 for graph_id in completed_graph_ids:
