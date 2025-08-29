@@ -20,7 +20,7 @@ class SharedMemoryRing:
         # move tensor to share memory
         self.src_buffer = self.src_buffer_o.share_memory_()
         self.dst_buffer = self.dst_buffer_o.share_memory_()
-        
+
         flexkv_logger.info(f"[SharedMemoryRing] block ids src_buffer data_ptr: {self.src_buffer.storage().data_ptr()}")
         flexkv_logger.info(f"[SharedMemoryRing] block ids dst_buffer data_ptr: {self.dst_buffer.storage().data_ptr()}")
 
@@ -29,10 +29,10 @@ class SharedMemoryRing:
         self.free_slots = deque(range(max_task_num))
 
         self.valid_length = [0]*max_task_num
-        
+
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
-        
+
     def allocate_and_write(self, op_id: int, op: TransferOp):
         """
         Allocating a slot for the op and copy src block ids and dst block ids to the buffer.
@@ -46,8 +46,10 @@ class SharedMemoryRing:
         # firstly, determine whether the length of block ids exceeds the limit
         num_blocks = len(op.src_block_ids)
         if num_blocks > self.max_block_num:
-            raise ValueError(f"block_ids too large: {num_blocks} > {self.max_block_num}")
-        
+            flexkv_logger.warning(f"block_ids too large: {num_blocks} > {self.max_block_num}, "
+                                f"please increase the max_block_num")
+            return -1, num_blocks
+
         assert len(op.src_block_ids) == len(op.dst_block_ids), \
             f"the number of src block ids ({len(op.src_block_ids)}) is not eaqual to" \
             f"the number of dst block ids ({len(op.dst_block_ids)})"
@@ -60,9 +62,9 @@ class SharedMemoryRing:
                     op.slot_id = -1
                     op.valid_block_num = num_blocks
                     return -1, num_blocks
-                
-            slot = self.free_slots.popleft()  # O(1) 
-          
+
+            slot = self.free_slots.popleft()  # O(1)
+
         # update status managers
         self.slot_in_use[slot] = True
         self.op_slot_map[op_id] = slot
@@ -71,21 +73,21 @@ class SharedMemoryRing:
         # do copy
         self.src_buffer[slot, :num_blocks] = torch.from_numpy(op.src_block_ids).to(torch.int64)
         self.dst_buffer[slot, :num_blocks] = torch.from_numpy(op.dst_block_ids).to(torch.int64)
-        
+
         # set the rest value of this buffer to -1
         if num_blocks < self.max_block_num:
-            self.src_buffer[slot, num_blocks:] = -1  # 
-            self.dst_buffer[slot, num_blocks:] = -1  # 
+            self.src_buffer[slot, num_blocks:] = -1  #
+            self.dst_buffer[slot, num_blocks:] = -1  #
 
         # update slot id and valid_block_num of current op
         op.slot_id = slot
         op.valid_block_num = num_blocks
         return slot, num_blocks
-    
+
     def mark_free(self, op_id: int):
         """
         Free the relevant resources of corresponding op, called when op transfer completed.
-        Input: 
+        Input:
             op_id: the index of current op
         Output:
             None
@@ -93,37 +95,37 @@ class SharedMemoryRing:
         with self.condition:
             if op_id not in self.op_slot_map:
                 raise KeyError(f"Task {op_id} not found in buffer")
-            
+
             slot = self.op_slot_map[op_id]
             if not self.slot_in_use[slot]:
                 raise RuntimeError(f"Slot {slot} is already free, double free detected!")
-           
+
             self.slot_in_use[slot] = False
             self.valid_length[slot] = 0
             self.free_slots.append(slot)
             del self.op_slot_map[op_id]
-            
+
             self.condition.notify()
-    
+
     def get_src_block_ids(self, slot: int):
         if slot < 0 or slot >= self.max_task_num:
             raise IndexError(f"Invalid slot index {slot}")
-        return self.src_buffer[slot, :self.valid_length[slot]]    
-    
+        return self.src_buffer[slot, :self.valid_length[slot]]
+
     def get_dst_block_ids(self, slot: int):
         if slot < 0 or slot >= self.max_task_num:
             raise IndexError(f"Invalid slot index {slot}")
-        return self.dst_buffer[slot, :self.valid_length[slot]]    
+        return self.dst_buffer[slot, :self.valid_length[slot]]
 
     def get_src_buffer(self):
         return self.src_buffer
-    
+
     def get_dst_buffer(self):
         return self.dst_buffer
-    
+
     def get_buffer_size(self):
         return self.max_task_num, self.max_block_num
-    
+
     def status(self):
         """
         Current status logger
@@ -151,6 +153,3 @@ def producer(manager, task_id, data):
 
 if __name__ == "__main__":
     manager = SharedMemoryRing(4, 10)
-    
-
- 
