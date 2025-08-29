@@ -26,6 +26,7 @@ class KVManager:
         self.server_client_mode = model_config.dp_size > 1 # True #just for test
         flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
         if self.server_client_mode:
+            # TODO: server should only be created once but kvmanager will init in every dp rank.
             self.server_handle = KVServer.create_server(model_config, cache_config, gpu_register_port, server_recv_port)
             self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
         else:
@@ -37,6 +38,13 @@ class KVManager:
     #    self.server.run()
     #    time.sleep(10)
     #    self.dp_client = DPClient(self.server_recv_port, self.model_config)
+    
+    @property
+    def dp_client_id(self) -> int:
+        if self.server_client_mode:
+            return self.dp_client.dp_client_id
+        else:
+            return 0
 
     def start(self) -> None:
         if not self.server_client_mode:
@@ -106,7 +114,6 @@ class KVManager:
                                                           token_mask,
                                                           layer_granularity,
                                                           dp_id)
-        mask = torch.from_numpy(mask) if mask is not None else None
         return task_id, mask
 
     def put_async(self,
@@ -140,12 +147,11 @@ class KVManager:
             task_id, mask = self.dp_client.put_match(token_ids, token_mask, dp_id)
         else:
             task_id, mask = self.kv_task_engine.put_match(token_ids, token_mask, dp_id)
-        mask = torch.from_numpy(mask) if mask is not None else None
         return task_id, mask
 
     def launch(self,
                task_ids: Union[int, List[int]],
-               slot_mappings: Union[np.ndarray, List[np.ndarray]]) -> None:
+               slot_mappings: Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]]) -> None:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         if not isinstance(slot_mappings, List):

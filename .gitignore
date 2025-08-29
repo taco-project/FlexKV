@@ -70,3 +70,6 @@ cover/
 
 # mypy
 .mypy_cache/
+
+# VSCode
+.vscode/
