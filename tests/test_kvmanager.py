@@ -137,7 +137,7 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
 
         tp_client_process = Process(
             target=run_tp_client,
-            args=(0, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks, child_conn),
+            args=(0, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks + tp_rank, child_conn),
             daemon=True
         )
         tp_client_processes.append(tp_client_process)
