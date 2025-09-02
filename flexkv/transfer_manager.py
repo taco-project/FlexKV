@@ -31,7 +31,7 @@ class TransferManager:
         self.cache_config = cache_config
         self.gpu_register_port = gpu_register_port
 
-        self.gpu_layout: Optional[KVCacheLayout] = None
+        self.all_gpu_layouts: Dict[int, KVCacheLayout] = {}
         self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks
 
         self.context = zmq.Context(2)
@@ -64,13 +64,7 @@ class TransferManager:
                 self.client_dict[device_id] = send_to_client
 
                 self.all_gpu_blocks[device_id] = req.handles
-                if self.gpu_layout is None:
-                    self.gpu_layout = req.gpu_layout
-                elif self.gpu_layout != req.gpu_layout:
-                    flexkv_logger.error(f"GPU {device_id} has different GPU layout: "
-                                        f"{self.gpu_layout} != {req.gpu_layout}")
-                    raise ValueError(f"GPU {device_id} has different GPU layout: "
-                                     f"{self.gpu_layout} != {req.gpu_layout}")
+                self.all_gpu_layouts[device_id] = req.gpu_layout
                 flexkv_logger.info(f"GPU {device_id} registered successfully")
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
@@ -113,11 +107,11 @@ class TransferManager:
     def initialize_transfer_engine(self) -> None:
         self._register_gpu_blocks_via_socket()
 
-        assert self.gpu_layout is not None
+        assert len(self.all_gpu_layouts) == self.model_config.tp_size * self.model_config.dp_size
         assert len(self.all_gpu_blocks) == self.model_config.tp_size * self.model_config.dp_size
         for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
             self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper,
-                                                    self.gpu_layout,
+                                                    self.all_gpu_layouts[device_id],
                                                     device_id,
                                                     dtype=self.model_config.dtype)
         self.gpu_handles = [
