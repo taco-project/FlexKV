@@ -18,9 +18,7 @@ class RegisterDPClientRequest:
 @dataclass
 class RegisterTPClientRequest:
     dp_client_id: int
-    tp_rank: int
     device_id: int
-    client_recv_port: str
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
 

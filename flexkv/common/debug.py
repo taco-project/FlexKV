@@ -6,13 +6,19 @@ from functools import wraps
 from typing import Optional, Callable, Any
 
 
+FLEXKV_LOGGING_PREFIX = os.getenv("FLEXKV_LOGGING_PREFIX", "FLEXKV")
+_FORMAT = (f"[{FLEXKV_LOGGING_PREFIX}] %(levelname)s %(asctime)s.%(msecs)03d "
+           " %(message)s")
+_DATE_FORMAT = "%m-%d %H:%M:%S"
+
 class FlexkvLogger:
     def __init__(self, debug_level: str = "INFO"):
         self.enabled = False
         self.logger = logging.getLogger("FLEXKV")
 
         formatter = logging.Formatter(
-            "%(asctime)s - %(levelname)s - %(message)s"
+            fmt=_FORMAT,
+            datefmt=_DATE_FORMAT,
         )
 
         console_handler = logging.StreamHandler(sys.stdout)

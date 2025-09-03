@@ -227,23 +227,17 @@ class KVTPClient:
         server_recv_port: str,
         dp_client_id: int,
         device_id: int,
-        tp_rank: int,
     ):
         # Init inter-process communication
         context = zmq.Context(2)
         self.send_to_server = get_zmq_socket(
             context, zmq.SocketType.PUSH, server_recv_port, False
         )
-        self.client_recv_port = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        self.recv_from_server = get_zmq_socket(
-            context, zmq.SocketType.PULL, self.client_recv_port, True
-        )
 
         self.dp_client_id = dp_client_id
         self.device_id = device_id
-        self.tp_rank = tp_rank
 
-        flexkv_logger.info(f"KVTPClient {tp_rank} of KVDPClient {self.dp_client_id} Initialized!")
+        flexkv_logger.info(f"KVTPClient {device_id} of KVDPClient {self.dp_client_id} Initialized!")
 
     def register_to_server(
         self,
@@ -263,23 +257,13 @@ class KVTPClient:
 
         register_req = RegisterTPClientRequest(
             self.dp_client_id,
-            self.tp_rank,
             self.device_id,
-            self.client_recv_port,
             handles,
             kv_layout
         )
 
-        self.send_to_server.send_pyobj(register_req)
-        # blocking
-        response: Response = self.recv_from_server.recv_pyobj()
-        if response.error_msg is None:
-            flexkv_logger.info(f"TP client of DP client {self.dp_client_id} registered successfully!")
-        else:
-            flexkv_logger.error(
-                f"TP client of DP client {self.dp_client_id} registeration fialed: {response.error_msg}"
-            )
-            raise
+        self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
+
 
 if __name__ == "__main__":
     num_layers = 32
