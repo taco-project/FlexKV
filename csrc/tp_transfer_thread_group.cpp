@@ -28,9 +28,20 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     torch::Tensor &gpu_chunk_sizes_tensor) {
 
   num_gpus_ = num_gpus;
-  gpu_kv_strides_in_bytes_ = static_cast<int64_t *>(gpu_kv_strides_tensor.data_ptr());
-  gpu_block_strides_in_bytes_ = static_cast<int64_t *>(gpu_block_strides_tensor.data_ptr());
-  gpu_chunk_sizes_in_bytes_ = static_cast<int64_t *>(gpu_chunk_sizes_tensor.data_ptr());
+  
+  gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
+  gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
+  gpu_chunk_sizes_in_bytes_ = new int64_t[num_gpus];
+  
+  int64_t* kv_strides_ptr = gpu_kv_strides_tensor.data_ptr<int64_t>();
+  int64_t* block_strides_ptr = gpu_block_strides_tensor.data_ptr<int64_t>();
+  int64_t* chunk_sizes_ptr = gpu_chunk_sizes_tensor.data_ptr<int64_t>();
+  
+  for (int i = 0; i < num_gpus; i++) {
+    gpu_kv_strides_in_bytes_[i] = kv_strides_ptr[i];
+    gpu_block_strides_in_bytes_[i] = block_strides_ptr[i];
+    gpu_chunk_sizes_in_bytes_[i] = chunk_sizes_ptr[i];
+  }
 
   queues_.resize(num_gpus_);
   mtxs_   = std::vector<std::mutex>(num_gpus_);
@@ -81,6 +92,10 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
   stop_pool_ = true;
   for (auto& cv : cvs_) cv.notify_all();
   for (auto& t : threads_) if (t.joinable()) t.join();
+  
+  delete[] gpu_kv_strides_in_bytes_;
+  delete[] gpu_block_strides_in_bytes_;
+  delete[] gpu_chunk_sizes_in_bytes_;
 }
 
 std::future<void> TPTransferThreadGroup::enqueue_for_gpu(int gpu_idx, Task task) {
