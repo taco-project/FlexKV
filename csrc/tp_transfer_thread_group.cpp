@@ -22,8 +22,15 @@ namespace flexkv {
 
 TPTransferThreadGroup::TPTransferThreadGroup(
     int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-    torch::Tensor &cpu_blocks, int dp_group_id) {
+    torch::Tensor &cpu_blocks, int dp_group_id,
+    torch::Tensor &gpu_kv_strides_tensor,
+    torch::Tensor &gpu_block_strides_tensor,
+    torch::Tensor &gpu_chunk_sizes_tensor) {
+
   num_gpus_ = num_gpus;
+  gpu_kv_strides_in_bytes_ = static_cast<int64_t *>(gpu_kv_strides_tensor.data_ptr());
+  gpu_block_strides_in_bytes_ = static_cast<int64_t *>(gpu_block_strides_tensor.data_ptr());
+  gpu_chunk_sizes_in_bytes_ = static_cast<int64_t *>(gpu_chunk_sizes_tensor.data_ptr());
 
   queues_.resize(num_gpus_);
   mtxs_   = std::vector<std::mutex>(num_gpus_);
@@ -89,9 +96,6 @@ std::future<void> TPTransferThreadGroup::enqueue_for_gpu(int gpu_idx, Task task)
 
 void TPTransferThreadGroup::tp_group_transfer(
     const torch::Tensor &gpu_block_id_tensor,
-    const int64_t gpu_kv_stride_in_bytes,
-    const int64_t gpu_block_stride_in_bytes,
-    const int64_t gpu_chunk_size_in_bytes,
     const torch::Tensor &cpu_block_id_tensor,
     const int64_t cpu_kv_stride_in_bytes,
     const int64_t cpu_layer_stride_in_bytes,
@@ -123,14 +127,14 @@ void TPTransferThreadGroup::tp_group_transfer(
             static_cast<void **>(gpu_blocks_ + i * num_layers + layer_id);
         void *cpu_ptr = cpu_blocks_;
         int64_t cpu_startoff_inside_chunks =
-            is_mla ? 0 : i * gpu_chunk_size_in_bytes;
+            is_mla ? 0 : i * gpu_chunk_sizes_in_bytes_[i];
       
         flexkv::transfer_kv_blocks(
           num_blocks, layer_id, layer_granularity, gpu_block_ids,
-          gpu_layer_ptrs, gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes,
+          gpu_layer_ptrs, gpu_kv_strides_in_bytes_[i], gpu_block_strides_in_bytes_[i],
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
           cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-          cpu_startoff_inside_chunks, gpu_chunk_size_in_bytes, streams_[i],
+          cpu_startoff_inside_chunks, gpu_chunk_sizes_in_bytes_[i], streams_[i],
           transfer_sms, is_host_to_device, use_ce_transfer, is_mla
         );
 
