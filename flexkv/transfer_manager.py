@@ -37,7 +37,6 @@ class TransferManager:
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
             self.context, zmq.SocketType.PULL, gpu_register_port, True)
-        self.client_dict: Dict[int, zmq.Socket] = {}
 
         self.transfer_engine: Optional[TransferEngine] = None
         self.storage_engine = StorageEngine(self.model_config, self.cache_config)
@@ -47,32 +46,18 @@ class TransferManager:
 
         if device_id in self.all_gpu_blocks:
             flexkv_logger.error(f"GPU {device_id} has already registered.")
-            response = Response(req.dp_client_id, success=False,
-                              error_msg=f"GPU {device_id} already registered")
         elif device_id >= self.model_config.tp_size * self.model_config.dp_size:
             flexkv_logger.error(f"GPU {device_id} is larger than TP size: "
                                 f"{self.model_config.tp_size * self.model_config.dp_size}.")
-            response = Response(req.dp_client_id, success=False,
-                              error_msg=f"GPU {device_id} exceeds TP size "
-                                        f"{self.model_config.tp_size * self.model_config.dp_size}")
         else:
             try:
-                response = Response(req.dp_client_id)
-                send_to_client = get_zmq_socket(
-                    self.context, zmq.SocketType.PUSH, req.client_recv_port, False)
-                send_to_client.send_pyobj(response)
-                self.client_dict[device_id] = send_to_client
 
                 self.all_gpu_blocks[device_id] = req.handles
                 self.all_gpu_layouts[device_id] = req.gpu_layout
                 flexkv_logger.info(f"GPU {device_id} registered successfully")
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
-                response = Response(req.dp_client_id, success=False,
-                                  error_msg=f"Failed to register GPU {device_id}: {e}")
 
-        if device_id in self.client_dict:
-            self.client_dict[device_id].send_pyobj(response)
 
     def _register_gpu_blocks_via_socket(self) -> None:
         try:
