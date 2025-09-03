@@ -144,12 +144,10 @@ PYBIND11_MODULE(c_ext, m) {
 
   py::class_<flexkv::TPTransferThreadGroup>(m, "TPTransferThreadGroup")
       .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
-                    torch::Tensor &, int>())
+                    torch::Tensor &, int, torch::Tensor &, torch::Tensor &, torch::Tensor &>())
       .def("tp_group_transfer",
            &flexkv::TPTransferThreadGroup::tp_group_transfer,
-           py::arg("gpu_block_id_tensor"), py::arg("gpu_kv_stride_in_bytes"),
-           py::arg("gpu_block_stride_in_bytes"),
-           py::arg("gpu_chunk_size_in_bytes"), py::arg("cpu_block_id_tensor"),
+           py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),
            py::arg("cpu_kv_stride_in_bytes"),
            py::arg("cpu_layer_stride_in_bytes"),
            py::arg("cpu_block_stride_in_bytes"),
