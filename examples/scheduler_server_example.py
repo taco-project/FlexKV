@@ -28,7 +28,7 @@ def run_tp_client_process(dp_client_id, tp_rank, device_id, server_recv_port, mo
             # Clear cache
             torch.cuda.empty_cache()
             
-        tp_client = KVTPClient(server_recv_port, dp_client_id, device_id, tp_rank)
+        tp_client = KVTPClient(server_recv_port, dp_client_id, device_id)
 
         # Create GPU blocks for this TP client
         gpu_blocks = []

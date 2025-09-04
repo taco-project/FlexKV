@@ -51,7 +51,6 @@ class TransferManager:
                                 f"{self.model_config.tp_size * self.model_config.dp_size}.")
         else:
             try:
-
                 self.all_gpu_blocks[device_id] = req.handles
                 self.all_gpu_layouts[device_id] = req.gpu_layout
                 flexkv_logger.info(f"GPU {device_id} registered successfully")

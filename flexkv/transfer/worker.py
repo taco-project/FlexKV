@@ -90,7 +90,6 @@ class TransferWorkerBase(ABC):
         self.transfer_conn = transfer_conn  # receive end of pipe
         self.finished_ops_queue: MPQueue[int] = finished_ops_queue
 
-        flexkv_logger.info(f"[TransferWorkerBase] op buffer data ptr: {op_buffer_tensor.storage().data_ptr()}")
         self.op_buffer_tensor = op_buffer_tensor
         cudaHostRegister(self.op_buffer_tensor)
 
