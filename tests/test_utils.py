@@ -342,7 +342,7 @@ class KVManagerServerClient:
         from flexkv.server.client import KVTPClient
         from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
-        tp_client = KVTPClient(server_recv_port, dp_client_id, device_id, tp_rank)
+        tp_client = KVTPClient(server_recv_port, dp_client_id, device_id)
         # Convert dtype string back to torch dtype
         if dtype_str == "torch.float16":
             dtype = torch.float16

@@ -92,6 +92,8 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
   stop_pool_ = true;
   for (auto& cv : cvs_) cv.notify_all();
   for (auto& t : threads_) if (t.joinable()) t.join();
+
+  cudaFreeHost(gpu_blocks_);
   
   delete[] gpu_kv_strides_in_bytes_;
   delete[] gpu_block_strides_in_bytes_;
