@@ -14,23 +14,9 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 ./build.sh
 ```
 
-### Use FlexKV with vLLM (v0.8.4)
+### Use FlexKV with vLLM
 
-Apply the patch `examples/vllm_adaption/flexkv_vllm_0_8_4.patch` to vLLM 0.8.4, then start FlexKV, vLLM, and the benchmark script:
-
-```bash
-# Start FlexKV as server
-bash benchmarks/flexkv_benchmark/run_flexkv_server.sh
-
-# Start vLLM as client
-bash benchmarks/flexkv_benchmark/serving_vllm.sh
-
-# Start benchmark
-bash benchmarks/flexkv_benchmark/multiturn_benchmark.sh
-```
-Apply the patch `examples/vllm_adaption/flexkv_vllm_0_10_0.patch` to vLLM 0.10.0, and use the same testing method as above.
-
-> **Note**: The current script is only compatible with the `main` branch. Support for the latest features in the `dev` branch is under development.
+See [docs/vllm_adapter/README_en.md](docs/vllm_adapter/README_en.md)
 
 ## Design Architecture
 

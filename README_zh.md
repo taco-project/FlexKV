@@ -16,21 +16,7 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 ### 以 vLLM 为例使用 FlexKV
 
-在 vLLM 0.8.4 版本中应用patch `examples/vllm_adaption/flexkv_vllm_0_8_4.patch`，分别启动 FlexKV、vLLM 和测试脚本：
-
-```bash
-# 启动 FlexKV 作为服务端
-bash benchmarks/flexkv_benchmark/run_flexkv_server.sh
-
-# 启动 vLLM 作为客户端
-bash benchmarks/flexkv_benchmark/serving_vllm.sh
-
-# 启动性能测试
-bash benchmarks/flexkv_benchmark/multiturn_benchmark.sh
-```
-在 vLLM 0.10.0 版本中应用patch `examples/vllm_adaption/flexkv_vllm_0_10_0.patch`，测试方法同上。
-
-> **注意**：当前脚本仅适配 `main` 分支。`dev` 分支的最新特性支持脚本正在开发中。
+见[docs/vllm_adapter/README_zh.md](docs/vllm_adapter/README_zh.md)
 
 ## 设计框架
 
