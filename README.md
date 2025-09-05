@@ -74,6 +74,7 @@ FlexKV performs:
 - The main branch is the stable branch, which maintains already tested commits. Please pull from main branch if you need stable code.
 - The dev branch is the development branch, which contains newer features. Please branch from and merge into dev if you need new features or are developing new functionality.
 - The bugfix branch is for bug fixes, maintaining urgent bugs that need immediate resolution or documentation that requires prompt updates. If you need to fix a bug or update documentation urgently, please branch from and merge into the bugfix branch.
+- The stable branch refers to the previous main branch state, intended only for rollback or extremely conservative use cases (e.g., production deployment). Its use is discouraged.
 
 ## Roadmap
 
