@@ -79,7 +79,7 @@ def shutdown_tp_client(tp_client_processes):
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False, 'ssd_cache_iouring_entries': 512},
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True, 'num_ssd_blocks': 256, 'num_remote_blocks': 512},
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True,
-     'num_ssd_blocks': 256, 'num_remote_blocks': 512, 'ssd_cache_iouring_entries': 512},
+    'num_ssd_blocks': 256, 'num_remote_blocks': 512, 'ssd_cache_iouring_entries': 512},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
