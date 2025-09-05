@@ -31,54 +31,52 @@ class KVManager:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
-                 server_recv_port: Optional[str] = None):
+                 server_recv_port: Optional[str] = None,
+                 dp_client_id: int = 0):
         flexkv_logger.info(f"{model_config = }")
         flexkv_logger.info(f"{cache_config = }")
         self.model_config = model_config
         self.cache_config = cache_config
         self.gpu_register_port = gpu_register_port
         self.server_recv_port = server_recv_port
-        self.server_client_mode = model_config.dp_size > 1 # True #just for test
+        self.server_client_mode = model_config.dp_size > 1
+        self.dp_client_id = dp_client_id
         flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
         if self.server_client_mode:
-            # TODO: server should only be created once but kvmanager will init in every dp rank.
-            self.server_handle = KVServer.create_server(model_config, cache_config, gpu_register_port, server_recv_port)
-            self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
+            # server should only be created once but kvmanager will init in every dp rank.
+            if dp_client_id == 0:
+                self.server_handle = KVServer.create_server(model_config,
+                                                            cache_config,
+                                                            gpu_register_port,
+                                                            server_recv_port)
+                                                            
+            else:
+                self.server_handle = None
+            self.dp_client = KVDPClient(self.server_recv_port, self.model_config, dp_client_id)
         else:
             self.server_handle = None
             self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port)
-
-    #def _launch_server(self) -> None:
-    #    self.server = KVServer(self.model_config, self.cache_config, self.server_recv_port)
-    #    self.server.run()
-    #    time.sleep(10)
-    #    self.dp_client = DPClient(self.server_recv_port, self.model_config)
     
     @property
-    def dp_client_id(self) -> int:
-        if self.server_client_mode:
-            return self.dp_client.dp_client_id
-        else:
-            return 0
+    def dpclient_id(self) -> int:
+        return self.dp_client_id
 
     def start(self) -> None:
         if not self.server_client_mode:
             self.kv_task_engine.start()
-        # for server client mode, we need to do nothing, because the start is actually called
-        # when the server is created
+        else:
+            # send the start request to the server
+            self.dp_client.start_server_and_register()
 
     def is_ready(self) -> bool:
         if self.server_client_mode:
-            return self.server_handle is not None and self.server_handle.ready_event.is_set()
+            return self.dp_client.is_ready()
         else:
             return self.kv_task_engine.is_ready()
 
     def shutdown(self) -> None:
         if self.server_client_mode:
-            if self.server_handle is not None:
-                self.server_handle.shutdown()
-            else:
-                flexkv_logger.error("Shutdown server failed, server is not created")
+            self.dp_client.shutdown()
         else:
             self.kv_task_engine.shutdown()
 
@@ -97,10 +95,9 @@ class KVManager:
             token_mask = token_mask.numpy()
         if self.server_client_mode:
             task_id = self.dp_client.get_async(token_ids,
-                                            slot_mapping,
-                                            token_mask,
-                                            layer_granularity,
-                                            dp_id)
+                                               slot_mapping,
+                                               token_mask,
+                                               layer_granularity)
         else:
             task_id, _ = self.kv_task_engine.get_async(token_ids,
                                                        slot_mapping,
@@ -122,8 +119,7 @@ class KVManager:
         if self.server_client_mode:
             task_id, mask = self.dp_client.get_match(token_ids,
                                                      token_mask,
-                                                     layer_granularity,
-                                                     dp_id)
+                                                     layer_granularity)
         else:
             task_id, mask = self.kv_task_engine.get_match(token_ids,
                                                           token_mask,
@@ -144,7 +140,7 @@ class KVManager:
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask, dp_id)
+            task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask)
         else:
             task_id, _ = self.kv_task_engine.put_async(token_ids, slot_mapping, token_mask, dp_id)
         return task_id
@@ -159,7 +155,7 @@ class KVManager:
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id, mask = self.dp_client.put_match(token_ids, token_mask, dp_id)
+            task_id, mask = self.dp_client.put_match(token_ids, token_mask)
         else:
             task_id, mask = self.kv_task_engine.put_match(token_ids, token_mask, dp_id)
         return task_id, mask

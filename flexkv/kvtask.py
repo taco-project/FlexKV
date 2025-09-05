@@ -64,6 +64,7 @@ TASK_STATUS_TO_RESPONSE_STATUS = {
     TaskStatus.COMPLETED: KVResponseStatus.SUCCESS,
     TaskStatus.CANCELLED: KVResponseStatus.CANCELLED,
     TaskStatus.FAILED: KVResponseStatus.FAILED,
+    TaskStatus.RUNNING: KVResponseStatus.SUCCESS, # for early return: still running, but success
 }
 
 def convert_to_response_status(task_status: TaskStatus) -> KVResponseStatus:
