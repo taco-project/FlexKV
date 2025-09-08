@@ -222,7 +222,7 @@ class FlexKVSchedulerConnector:
                             the task_id and number of new matched tokens.
         """
         match_start_time = time.perf_counter()
-        num_tokens_to_get = (cdiv(request.num_prompt_tokens, self.block_size)-1)*self.block_size
+        num_tokens_to_get = (cdiv(request.num_prompt_tokens+1, self.block_size)-1)*self.block_size
         token_ids = request.prompt_token_ids[:num_tokens_to_get]
         
         assert num_computed_tokens <= num_tokens_to_get
@@ -368,7 +368,7 @@ class FlexKVSchedulerConnector:
                             the task_id, number of matched tokens and number of unmatched tokens.
         """
         match_start_time = time.perf_counter()
-        num_tokens_to_put = (cdiv(request.num_tokens, self.block_size)-1)*self.block_size
+        num_tokens_to_put = (cdiv(request.num_tokens+1, self.block_size)-1)*self.block_size
         token_ids = request.all_token_ids[:num_tokens_to_put]
 
         if num_tokens_to_put == 0:
