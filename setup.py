@@ -37,7 +37,7 @@ hpp_sources = [
 
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
 extra_compile_args = ["-std=c++17"]
-include_dirs = [os.path.join(build_dir, "include")]
+include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
 
 # Add rpath to find libraries at runtime
 lib_dir = os.path.join(build_dir, "lib")
