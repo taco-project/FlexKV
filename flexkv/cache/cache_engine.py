@@ -1068,7 +1068,7 @@ class GlobalCacheEngine:
                          token_mask: np.ndarray) -> Tuple[int, int]:
         mask_idx = np.where(token_mask)[0]
         if len(mask_idx) == 0:
-            return len(token_mask), len(token_mask)
+            return len(token_mask)//self.tokens_per_block, len(token_mask)//self.tokens_per_block
         start_idx = mask_idx[0].item() // self.tokens_per_block
         end_idx = mask_idx[-1].item() // self.tokens_per_block
         return start_idx, end_idx + 1
