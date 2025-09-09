@@ -320,7 +320,7 @@ class GlobalCacheEngine:
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
         aligned_token_ids = token_ids[:aligned_length]
-        token_mask[aligned_length:] = False
+        token_mask = token_mask[:aligned_length]
 
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
         assert block_end_idx == aligned_length // self.tokens_per_block
@@ -678,7 +678,7 @@ class GlobalCacheEngine:
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
         aligned_token_ids = token_ids[:aligned_length]
-        token_mask[aligned_length:] = False
+        token_mask = token_mask[:aligned_length]
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
 
         # the mask should has a prefix of True
@@ -1101,7 +1101,7 @@ class GlobalCacheEngine:
                          token_mask: np.ndarray) -> Tuple[int, int]:
         mask_idx = np.where(token_mask)[0]
         if len(mask_idx) == 0:
-            return 0, 0
+            return len(token_mask), len(token_mask)
         start_idx = mask_idx[0].item() // self.tokens_per_block
         end_idx = mask_idx[-1].item() // self.tokens_per_block
         return start_idx, end_idx + 1

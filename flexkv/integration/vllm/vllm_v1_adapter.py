@@ -194,11 +194,11 @@ class FlexKVSchedulerConnector:
         """
         task_id, num_new_matched_tokens = self._get_match(request=request,
                                                           num_computed_tokens=num_computed_tokens)
-        self.flexkv_stats.record_get(num_prompt_tokens=request.num_prompt_tokens,
+        self.flexkv_stats.record_get(num_prompt_tokens=request.num_tokens,
                                      num_gpu_matched_tokens=num_computed_tokens,
                                      num_flexkv_matched_tokens=num_new_matched_tokens)
 
-        if not self._need_to_get(num_prompt_tokens=request.num_prompt_tokens,
+        if not self._need_to_get(num_prompt_tokens=request.num_tokens,
                                    num_computed_tokens=num_computed_tokens,
                                    num_new_matched_tokens=num_new_matched_tokens):
             return 0, False
@@ -222,10 +222,11 @@ class FlexKVSchedulerConnector:
                             the task_id and number of new matched tokens.
         """
         match_start_time = time.perf_counter()
-        num_tokens_to_get = (cdiv(request.num_prompt_tokens+1, self.block_size)-1)*self.block_size
-        token_ids = request.prompt_token_ids[:num_tokens_to_get]
+        num_tokens_to_get = (request.num_tokens//self.block_size)*self.block_size
+        token_ids = request.all_token_ids[:num_tokens_to_get]
 
-        assert num_computed_tokens <= num_tokens_to_get
+        assert num_computed_tokens <= num_tokens_to_get, (
+            f"{num_computed_tokens=} must less equal to {num_tokens_to_get=}")
         assert num_computed_tokens % self.block_size == 0
 
         if num_tokens_to_get == num_computed_tokens:
