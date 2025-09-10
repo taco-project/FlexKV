@@ -33,14 +33,13 @@ class CacheConfig:
     enable_remote: bool = False
     enable_kv_sharing: bool = False
     use_gds: bool = False
-    use_pinned_memory: bool = False
     index_accel: bool = False
 
     # kv cache layout configs
     gpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
-    cpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
-    ssd_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
-    remote_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
+    cpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
+    ssd_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
+    remote_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
@@ -87,6 +86,6 @@ class CacheConfig:
     trace_max_file_size_mb: int = 100
     trace_max_files: int = 5
     trace_flush_interval_ms: int = 1000
-    
+
     #evict ratio
     evict_ratio: float = 0.0
