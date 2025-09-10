@@ -41,7 +41,6 @@ cat <<EOF > ./flexkv_config.json
     "cache_config": {
           "enable_cpu": true,
           "num_cpu_blocks": 10240,
-          "use_pinned_memory": true
     },
     "num_log_interval_requests": 200
 }
