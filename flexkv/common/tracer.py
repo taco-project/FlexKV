@@ -117,6 +117,7 @@ class FlexKVTracer:
             "enable_ssd": cache_config.enable_ssd,
             "enable_remote": cache_config.enable_remote,
             "enable_gds": cache_config.enable_gds,
+            "remote_cache_size_mode": cache_config.remote_cache_size_mode,
             "num_cpu_blocks": cache_config.num_cpu_blocks,
             "num_ssd_blocks": cache_config.num_ssd_blocks,
             "num_gds_blocks": cache_config.num_gds_blocks,
