@@ -32,6 +32,12 @@ DEFAULT_CACHE_CONFIG = {
     'num_cpu_blocks': 128,
     'num_ssd_blocks': 512,
     'enable_gds': False,
+    'num_remote_blocks': 512,  # Aligned with ssd_blocks
+    'remote_cache_size_mode': "block_num",
+    'remote_file_size': (1024*1024*1024),
+    'remote_file_num': 16,
+    'remote_file_prefix': "remote_cache",
+    'enable_trace': False,
     'ssd_cache_dir': ["./ssd_cache", "./ssd_cache2/"],
 }
 
