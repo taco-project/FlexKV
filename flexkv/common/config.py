@@ -74,3 +74,14 @@ class CacheConfig:
 
     #evict ratio
     evict_ratio: float = 0.0
+
+    def __post_init__(self):
+        layout_fields = ['gpu_kv_layout_type', 
+                         'cpu_kv_layout_type', 
+                         'ssd_kv_layout_type', 
+                         'remote_kv_layout_type']
+        for field in layout_fields:
+            value = getattr(self, field)
+            if isinstance(value, str):
+                setattr(self, field, KVCacheLayoutType[value.upper()])
+        
