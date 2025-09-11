@@ -2,13 +2,16 @@ import os
 import shutil
 import sys
 
-from Cython.Build import cythonize
+
 from setuptools import find_packages, setup
 from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
 
+def get_version():
+    with open(os.path.join(os.path.dirname(__file__), "VERSION")) as f:
+        return f.read().strip()
 
-build_dir = os.path.abspath("build")
+build_dir = "build"
 os.makedirs(build_dir, exist_ok=True)
 
 # Check if we're in debug mode using environment variable
@@ -25,17 +28,19 @@ cpp_sources = [
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
+    "csrc/radix_tree.cpp",
 ]
 
 hpp_sources = [
     "csrc/cache_utils.h",
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
+    "csrc/radix_tree.h",
 ]
 
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
 extra_compile_args = ["-std=c++17"]
-include_dirs = [os.path.join(build_dir, "include")]
+include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
 
 # Add rpath to find libraries at runtime
 lib_dir = os.path.join(build_dir, "lib")
@@ -76,6 +81,8 @@ if not debug:
                       "flexkv/**/benchmark_*.py",
                       "flexkv/benchmark/**/*.py",
                       "flexkv/benchmark/test_kvmanager.py"]
+    # Import cython when debug is turned off.
+    from Cython.Build import cythonize
     cythonized_modules = cythonize(
         python_files,
         exclude=excluded_files,
@@ -84,6 +91,7 @@ if not debug:
             "boundscheck": False,
             "wraparound": False,
             "initializedcheck": False,
+            "profile": True,
         },
         build_dir=build_dir,  # Direct Cython to use the build directory
     )
@@ -125,16 +133,17 @@ with open("requirements.txt") as f:
 setup(
     name="flexkv",
     description="A global KV-Cache manager for LLM inference",
-    version="0.1.0",
+    version=get_version(),
     packages=find_packages(exclude=("benchmarks", "csrc", "examples", "tests")),
     package_data={
-        "flexkv": ["lib/*.so", "lib/*.so.*"],
+        "flexkv": ["*.so", "lib/*.so", "lib/*.so.*"],
     },
     include_package_data=True,
     install_requires=install_requires,
     ext_modules=ext_modules,  # Now contains both C++ and Cython modules as needed
     cmdclass={
         "build_ext": CustomBuildExt.with_options(
+            include_dirs=os.path.join(build_dir, "include"),  # Include directory for xxhash
             no_python_abi_suffix=True,
             build_temp=os.path.join(build_dir, "temp"),  # Temporary build files
         )

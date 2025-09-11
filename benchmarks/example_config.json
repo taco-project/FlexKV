@@ -14,11 +14,10 @@
         "enable_remote": false,
         "tokens_per_block": 16,
         "use_gds": false,
-        "use_pinned_memory": true,
         "gpu_kv_layout_type": "LAYERWISE",
-        "cpu_kv_layout_type": "LAYERWISE",
-        "ssd_kv_layout_type": "LAYERWISE",
-        "remote_kv_layout_type": "LAYERWISE",
+        "cpu_kv_layout_type": "BLOCKWISE",
+        "ssd_kv_layout_type": "BLOCKWISE",
+        "remote_kv_layout_type": "BLOCKWISE",
         "num_cpu_blocks": 2048,
         "num_ssd_blocks": 4096,
         "num_remote_blocks": null,
@@ -28,7 +27,7 @@
         "transfer_sms_d2h": 8,
         "max_blocks_per_file": 32000,
         "ssd_cache_dir": "./ssd_cache1/",
-        "ssd_cache_iouring_entries": 512,
+        "ssd_cache_iouring_entries": 32,
         "ssd_cache_iouring_flags": 0,
         "remote_cache_size_mode": "file_size",
         "remote_file_size": null,
@@ -40,6 +39,8 @@
         "trace_file_path": "./flexkv_trace.log",
         "trace_max_file_size_mb": 100,
         "trace_max_files": 5,
-        "trace_flush_interval_ms": 1000
+        "trace_flush_interval_ms": 1000,
+        "evict_ratio": 0.05,
+        "index_accel": true
     }
 }

@@ -173,11 +173,10 @@ private:
 
 class SSDIOCTX {
 public:
-  SSDIOCTX(std::map<int, std::vector<std::string>>& ssd_files,
-           int num_devices, int iouring_entries, int iouring_flags)
-           : iouring(iouring_entries, iouring_flags),
-           fds_buffer_io(num_devices),
-	   fds_direct_io(num_devices) {
+  SSDIOCTX(std::map<int, std::vector<std::string>> &ssd_files, int num_devices,
+           int iouring_entries, int iouring_flags)
+      : iouring(iouring_entries, iouring_flags), fds_buffer_io(num_devices),
+        fds_direct_io(num_devices) {
 
     int i, j, fd_buffer_io, fd_direct_io;
 
@@ -190,7 +189,8 @@ public:
         fd_direct_io = open(ssd_files[i][j].c_str(), O_RDWR | O_DIRECT);
 
         if (fd_buffer_io < 0 || fd_direct_io < 0) {
-          std::cerr << "open file failed, path = " << ssd_files[i][j] << std::endl;
+          std::cerr << "open file failed, path = " << ssd_files[i][j]
+                    << std::endl;
           throw std::runtime_error("Failed to open file");
         } else {
           posix_fadvise(fd_buffer_io, 0, 0, POSIX_FADV_SEQUENTIAL);
@@ -221,20 +221,14 @@ public:
     }
   }
 
-  int get_num_devices() {
-    return num_devices;
-  }
+  int get_num_devices() { return num_devices; }
 
-  int get_num_files_per_device() {
-    return num_files_per_device;
-  }
+  int get_num_files_per_device() { return num_files_per_device; }
 
-  IOUring &get_iouring() {
-    return iouring;
-  }
+  IOUring &get_iouring() { return iouring; }
 
   std::vector<std::vector<int>> &get_fds(bool is_read, bool is_direct) {
-    if (is_read && is_direct) {
+    if (is_direct) {
       return fds_direct_io;
     } else {
       return fds_buffer_io;
@@ -250,15 +244,13 @@ private:
   std::vector<std::vector<int>> fds_direct_io;
 };
 
-
 void transfer_kv_blocks_ssd(
-    SSDIOCTX &ioctx,
-    const torch::Tensor &cpu_layer_id_list, int64_t cpu_tensor_ptr,
-    const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids,
-    int64_t cpu_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
-    int64_t ssd_layer_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
-    int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes, bool is_read,
-    int num_blocks_per_file, int round_robin = 1,
-    int num_threads_per_device = 16, bool is_mla = false);
+    SSDIOCTX &ioctx, const torch::Tensor &cpu_layer_id_list,
+    int64_t cpu_tensor_ptr, const torch::Tensor &ssd_block_ids,
+    const torch::Tensor &cpu_block_ids, int64_t cpu_layer_stride_in_bytes,
+    int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
+    int64_t ssd_kv_stride_in_bytes, int64_t chunk_size_in_bytes,
+    int64_t block_stride_in_bytes, bool is_read, int num_blocks_per_file,
+    int round_robin = 1, int num_threads_per_device = 16, bool is_mla = false);
 
 } // namespace flexkv
