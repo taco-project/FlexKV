@@ -14,22 +14,9 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 ./build.sh
 ```
 
-### Use FlexKV with vLLM (v0.8.4)
+### Use FlexKV with vLLM
 
-Apply the patch `examples/vllm_adaption/flexkv_vllm_0_8_4.patch` to vLLM 0.8.4, then start FlexKV, vLLM, and the benchmark script:
-
-```bash
-# Start FlexKV as server
-bash benchmarks/flexkv_benchmark/run_flexkv_server.sh
-
-# Start vLLM as client
-bash benchmarks/flexkv_benchmark/serving_vllm.sh
-
-# Start benchmark
-bash benchmarks/flexkv_benchmark/multiturn_benchmark.sh
-```
-
-> **Note**: The current script is only compatible with the `main` branch. Support for the latest features in the `dev` branch is under development.
+See [docs/vllm_adapter/README_en.md](docs/vllm_adapter/README_en.md)
 
 ## Design Architecture
 
@@ -84,8 +71,10 @@ FlexKV performs:
 - *put* requests can be called asynchronously; the time to copy data from GPU to CPU memory can overlap with subsequent computation. Data transfers between CPU memory, SSD, and scalable storage are fully handled asynchronously by the TransferEngine and transparent to the main process.
 
 ## Branch
-- main is the stable branch, maintaining commits that have been tested.
-- dev is the development branch, maintaining newer features.
+- The main branch is the stable branch, which maintains already tested commits. Please pull from main branch if you need stable code.
+- The dev branch is the development branch, which contains newer features. Please branch from and merge into dev if you need new features or are developing new functionality.
+- The bugfix branch is for bug fixes, maintaining urgent bugs that need immediate resolution or documentation that requires prompt updates. If you need to fix a bug or update documentation urgently, please branch from and merge into the bugfix branch.
+- The stable branch refers to the previous main branch state, intended only for rollback or extremely conservative use cases (e.g., production deployment). Its use is discouraged.
 
 ## Roadmap
 

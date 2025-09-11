@@ -3,7 +3,7 @@ import multiprocessing as mp
 import os
 import pickle
 import time
-from typing import List, Callable, Any, Optional, Tuple, Union
+from typing import Callable, Any, Optional, Tuple, Union
 from dataclasses import dataclass
 
 import torch
@@ -16,7 +16,7 @@ from flexkv.common.debug import flexkv_logger
 @dataclass
 class TensorSharedHandle:
     rebuild_func: Callable
-    rebuild_args: List[Any]
+    rebuild_args: Tuple[Any]
     device: torch.device
 
     def __init__(self, tensor: torch.Tensor):
@@ -29,7 +29,7 @@ class TensorSharedHandle:
         return tensor
 
     @staticmethod
-    def _export_tensor_handle(tensor: torch.Tensor) -> Tuple[Callable, List[Any], torch.device]:
+    def _export_tensor_handle(tensor: torch.Tensor) -> Tuple[Callable, Tuple[Any], torch.device]:
 
         device = tensor.device
         rebuild_func, rebuild_args = reductions.reduce_tensor(tensor)
@@ -37,7 +37,7 @@ class TensorSharedHandle:
         return rebuild_func, rebuild_args, device
 
     @staticmethod
-    def _import_tensor_handle(rebuild_func: Callable, rebuild_args: List[Any], device: torch.device) -> torch.Tensor:
+    def _import_tensor_handle(rebuild_func: Callable, rebuild_args: Tuple[Any], device: torch.device) -> torch.Tensor:
         try:
             tensor = rebuild_func(*rebuild_args)
 
