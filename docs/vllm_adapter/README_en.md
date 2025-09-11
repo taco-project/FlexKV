@@ -6,15 +6,15 @@ In commit [`0290841dce65ae9b036a23d733cf94e47e814934`](https://github.com/taco-p
 
 This change involves significant API adjustments. Therefore, please note:
 
-- **Version >= `0.0.2`**: Use the **current version API**; the vLLM patch is located in `examples/vllm_adaption/`.
-- **Version == `0.0.1`**: Supports the **legacy version API**; the vLLM patch is located in `examples/vllm_adaption_legacy/`.
+- **Version >= `1.0.0`**: Use the **current version API**; the vLLM patch is located in `examples/vllm_adaption/`.
+- **Version == `0.1.0`**: Supports the **legacy version API**; the vLLM patch is located in `examples/vllm_adaption_legacy/`.
 
 ---
 
-## Current Version (>= 0.0.2)
+## Current Version (>= 1.0.0)
 
 ### Supported Versions
-- FlexKV >= `0.0.2`
+- FlexKV >= `1.0.0`
 - vLLM versions >= `0.8.5` can generally follow this version for adaptation
 
 ### Example
@@ -63,10 +63,10 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
 
 ```
 
-## Legacy Version (<= 0.0.1) – Not Recommended for Current Use
+## Legacy Version (<= 0.1.0) – Not Recommended for Current Use
 
 ### Supported Versions
-- FlexKV <= `0.0.1`
+- FlexKV <= `0.1.0`
 
 ### Example
 Apply the patch `examples/vllm_adaption_legacy/flexkv_vllm_0_8_4.patch` to vLLM 0.8.4, then start FlexKV, vLLM, and the benchmark script:
