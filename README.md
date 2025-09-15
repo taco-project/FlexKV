@@ -8,10 +8,18 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 
 ## How to Use
 
+### Install Dependencies
+
+```bash
+apt install liburing-dev
+apt install libxxhash-dev 
+```
+
 ### Build FlexKV
 
 ```bash
 ./build.sh
+#./build.sh --release for cython package
 ```
 
 ### Use FlexKV with vLLM
