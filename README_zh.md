@@ -8,10 +8,18 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 ## 如何使用
 
+### 安装依赖
+
+```bash
+apt install liburing-dev
+apt install libxxhash-dev 
+```
+
 ### 编译 FlexKV
 
 ```bash
 ./build.sh
+#./build.sh --release for cython package
 ```
 
 ### 以 vLLM 为例使用 FlexKV

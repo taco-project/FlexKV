@@ -62,6 +62,8 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
 
 ```
 
+> 注：`flexkv_config.json`配置仅为简单示例，选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
+
 ## Legacy版本（<= 0.1.0）,目前的版本尽量不要使用
 
 ### 适用版本
