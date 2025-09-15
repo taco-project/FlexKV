@@ -111,9 +111,11 @@ class CacheEngineAccel:
     def lock_node(self, node: CRadixNode) -> None:
         self.index.lock(node)
 
-    def cleanup(self, node: CRadixNode, cleanup_length: int) -> None:
+    def unlock(self, node: CRadixNode) -> None:
         self.index.unlock(node)
-        self.index.set_ready(node, True, cleanup_length)
+
+    def set_ready(self, node: CRadixNode, ready: bool, ready_length: int) -> None:
+        self.index.set_ready(node, ready, ready_length)
 
     def take(self,
              num_required_blocks: int,
@@ -122,7 +124,10 @@ class CacheEngineAccel:
         if num_required_blocks > self.mempool.num_free_blocks:
             if protected_node is not None:
                 self.index.lock(protected_node)
-            evict_block_num = max(num_required_blocks - self.mempool.num_free_blocks, int(self.mempool.num_total_blocks * self.evict_ratio))
+            evict_block_num = max(
+                num_required_blocks - self.mempool.num_free_blocks,
+                int(self.mempool.num_total_blocks * self.evict_ratio)
+            )
             target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
             num_evicted = self.index.evict(target_blocks, evict_block_num)
             if num_evicted != evict_block_num:
@@ -189,9 +194,11 @@ class CacheEngine:
     def lock_node(self, node: RadixNode) -> None:
         self.index.lock(node)
 
-    def cleanup(self, node: RadixNode, cleanup_length: int) -> None:
+    def unlock(self, node: RadixNode) -> None:
         self.index.unlock(node)
-        self.index.set_ready(node, True, cleanup_length)
+
+    def set_ready(self, node: RadixNode, ready: bool, ready_length: int) -> None:
+        self.index.set_ready(node, ready, ready_length)
 
     def take(self,
              num_required_blocks: int,
@@ -200,7 +207,10 @@ class CacheEngine:
         if num_required_blocks > self.mempool.num_free_blocks:
             if protected_node is not None:
                 self.index.lock(protected_node)
-            evict_block_num = max(num_required_blocks - self.mempool.num_free_blocks, int(self.mempool.num_total_blocks * self.evict_ratio))
+            evict_block_num = max(
+                num_required_blocks - self.mempool.num_free_blocks,
+                int(self.mempool.num_total_blocks * self.evict_ratio)
+            )
             self.mempool.recycle_blocks(
                 self.index.evict(evict_block_num)
             )
@@ -283,10 +293,10 @@ class GlobalCacheEngine:
                                                    cache_config.evict_ratio)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
-        self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, int]] = \
-            lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, 0)
-        self._empty_put_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, int, int]] = \
-            lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, 0, 0)
+        self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]] = \
+            lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0)
+        self._empty_put_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]] = \
+            lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0, 0)
 
     def reset(self) -> None:
         if self.cpu_cache_engine:
@@ -303,7 +313,7 @@ class GlobalCacheEngine:
             slot_mapping: np.ndarray,
             layer_num: int = -1,
             layer_granularity: int = -1,
-            dp_id: int = 0) -> Tuple[TransferOpGraph, np.ndarray, Callable, int]:
+            dp_id: int = 0) -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         if layer_num == -1:
@@ -320,7 +330,7 @@ class GlobalCacheEngine:
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
         aligned_token_ids = token_ids[:aligned_length]
-        token_mask = token_mask[:aligned_length]
+        token_mask[aligned_length:] = False
 
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
         assert block_end_idx == aligned_length // self.tokens_per_block
@@ -331,25 +341,27 @@ class GlobalCacheEngine:
                                      tokens_per_block=self.cache_config.tokens_per_block)
 
         if not self.cache_config.enable_remote:
-            transfer_graph, finished_ops_ids, node_to_unlock, buffer_to_free, num_gpu_blocks_to_transfer = \
+            (transfer_graph, finished_ops_ids, node_to_unlock,
+             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
                 self._get_impl_local(
-                request_id,
-                sequence_meta,
-                block_start_idx,
-                block_end_idx,
-                gpu_block_ids,
-                layer_num
-            )
+                    request_id,
+                    sequence_meta,
+                    block_start_idx,
+                    block_end_idx,
+                    gpu_block_ids,
+                    layer_num
+                )
         else:
-            transfer_graph, finished_ops_ids, node_to_unlock, buffer_to_free, num_gpu_blocks_to_transfer = \
+            (transfer_graph, finished_ops_ids, node_to_unlock,
+             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
                 self._get_impl_global(
-                request_id,
-                sequence_meta,
-                block_start_idx,
-                block_end_idx,
-                gpu_block_ids,
-                layer_num
-            )
+                    request_id,
+                    sequence_meta,
+                    block_start_idx,
+                    block_end_idx,
+                    gpu_block_ids,
+                    layer_num
+                )
 
         transfer_graph, task_end_op_id = add_virtal_op_for_mutiple_finished_ops(
             transfer_graph,
@@ -374,7 +386,13 @@ class GlobalCacheEngine:
                            node_to_unlock=node_to_unlock,
                            buffer_to_free=buffer_to_free)
 
-        return transfer_graph, return_mask, callback, task_end_op_id
+        op_callback_dict = {} # dict, op_id -> callback
+        for op_id in op_node_to_ready:
+            op_callback_dict[op_id] = partial(self._op_callback,
+                                              device_type=op_node_to_ready[op_id][0],
+                                              node_to_ready=op_node_to_ready[op_id][1],
+                                              ready_length=op_node_to_ready[op_id][2])
+        return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
     def _get_impl_global(self,
             request_id: int,
@@ -382,7 +400,7 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num: int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, int]:
+            layer_num: int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
         """
         transfer pattern:
 
@@ -547,7 +565,10 @@ class GlobalCacheEngine:
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
 
         # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
-        return transfer_graph, finished_ops_ids, node_to_unlock, buffer_to_free, len(fragment123_gpu_blocks)
+        return (
+            transfer_graph, finished_ops_ids, node_to_unlock, {}, buffer_to_free,
+            len(fragment123_gpu_blocks)  # op_node_to_ready: {}
+        )
 
     def _get_impl_local(self,
                         request_id: int,
@@ -555,7 +576,7 @@ class GlobalCacheEngine:
                         block_mask_start: int,
                         block_mask_end: int,
                         gpu_block_ids: np.ndarray,
-                        layer_num: int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, int]:
+                        layer_num: int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
         """
         transfer pattern:
 
@@ -592,6 +613,7 @@ class GlobalCacheEngine:
 
         transfer_graph = TransferOpGraph()
         finished_ops_ids = []
+        op_node_to_ready = {}
 
         fragment12_gpu_blocks = gpu_block_ids[:fragment12_num_blocks]
         fragment2_ssd_blocks = ssd_matched_blocks[-fragment2_num_blocks:]
@@ -636,6 +658,7 @@ class GlobalCacheEngine:
                                                                     block_mask_start,
                                                                   is_ready=False,
                                                                   match_result=cpu_matched_result)
+                op_node_to_ready[op_disk2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
             else:
                 cpu_blocks_to_free = fragment2_cpu_blocks
         if fragment2_cpu_blocks is not None:
@@ -662,7 +685,10 @@ class GlobalCacheEngine:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
 
-        return transfer_graph, finished_ops_ids, node_to_unlock, buffer_to_free, len(fragment12_gpu_blocks)
+        return (
+            transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
+            buffer_to_free, len(fragment12_gpu_blocks)
+        )
 
     def put(self,
             request_id: int,
@@ -670,7 +696,7 @@ class GlobalCacheEngine:
             token_mask: np.ndarray,
             slot_mapping: np.ndarray,
             layer_num : int = -1,
-            dp_id: int = 0) -> Tuple[TransferOpGraph, np.ndarray, Callable, int]:
+            dp_id: int = 0) -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         if layer_num == -1:
@@ -678,7 +704,7 @@ class GlobalCacheEngine:
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
         aligned_token_ids = token_ids[:aligned_length]
-        token_mask = token_mask[:aligned_length]
+        token_mask[aligned_length:] = False
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
 
         # the mask should has a prefix of True
@@ -691,7 +717,7 @@ class GlobalCacheEngine:
                                      tokens_per_block=self.cache_config.tokens_per_block)
 
         if not self.cache_config.enable_remote:
-            (transfer_graph, finished_ops_ids, node_to_unlock,
+            (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
              buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
                 self._put_impl_local(
                     request_id,
@@ -702,7 +728,7 @@ class GlobalCacheEngine:
                     layer_num
                 )
         else:
-            (transfer_graph, finished_ops_ids, node_to_unlock,
+            (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
              buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
                 self._put_impl_global(
                     request_id,
@@ -730,7 +756,14 @@ class GlobalCacheEngine:
                            node_to_unlock=node_to_unlock,
                            buffer_to_free=buffer_to_free)
 
-        return transfer_graph, return_mask, callback, task_end_op_id
+        op_callback_dict = {}
+        for op_id in op_node_to_ready:
+            op_callback_dict[op_id] = partial(self._op_callback,
+                                              device_type=op_node_to_ready[op_id][0],
+                                              node_to_ready=op_node_to_ready[op_id][1],
+                                              ready_length=op_node_to_ready[op_id][2])
+
+        return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
     def _put_impl_global(self,
             request_id: int,
@@ -738,7 +771,7 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num : int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, int, int]:
+            layer_num : int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
         """
         transfer pattern:
 
@@ -885,7 +918,10 @@ class GlobalCacheEngine:
             node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
 
         skipped_gpu_blocks = len(cpu_matched_blocks)
-        return transfer_graph, finished_ops_ids, node_to_unlock, {}, len(fragment12_gpu_blocks), skipped_gpu_blocks
+        return (
+            transfer_graph, finished_ops_ids, node_to_unlock, {}, {},
+            len(fragment12_gpu_blocks), skipped_gpu_blocks  # op_node_to_ready: {}
+        )
 
     def _put_impl_local(self,
             request_id: int,
@@ -893,7 +929,7 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num : int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, int, int]:
+            layer_num : int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
         """
         transfer pattern:
 
@@ -949,6 +985,7 @@ class GlobalCacheEngine:
 
         transfer_graph = TransferOpGraph()
         finished_ops_ids = []
+        op_node_to_ready = {}
 
         op_d2h = TransferOp(
             graph_id = transfer_graph.graph_id,
@@ -980,12 +1017,14 @@ class GlobalCacheEngine:
                                                           fragment12_cpu_blocks,
                                                           is_ready=False,
                                                           match_result=cpu_matched_result)
+        op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         ssd_node_to_unlock = None
         if len(fragment2_ssd_blocks) > 0:
             ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
                                                             fragment2_ssd_blocks,
                                                             is_ready=False,
                                                             match_result=ssd_matched_result)
+            op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
@@ -993,20 +1032,28 @@ class GlobalCacheEngine:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
 
         skipped_gpu_blocks = len(cpu_matched_blocks)
-        return transfer_graph, finished_ops_ids, node_to_unlock, {}, len(fragment12_gpu_blocks), skipped_gpu_blocks
+        return (
+            transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready, {},
+            len(fragment12_gpu_blocks), skipped_gpu_blocks
+        )
 
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
                            buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None) -> None:
         if DeviceType.CPU in node_to_unlock:
             assert self.cpu_cache_engine is not None
-            self.cpu_cache_engine.cleanup(node_to_unlock[DeviceType.CPU][0], node_to_unlock[DeviceType.CPU][1])
+            self.cpu_cache_engine.unlock(node_to_unlock[DeviceType.CPU][0])
+            self.cpu_cache_engine.set_ready(node_to_unlock[DeviceType.CPU][0], True, node_to_unlock[DeviceType.CPU][1])
         if DeviceType.SSD in node_to_unlock:
             assert self.ssd_cache_engine is not None
-            self.ssd_cache_engine.cleanup(node_to_unlock[DeviceType.SSD][0], node_to_unlock[DeviceType.SSD][1])
+            self.ssd_cache_engine.unlock(node_to_unlock[DeviceType.SSD][0])
+            self.ssd_cache_engine.set_ready(node_to_unlock[DeviceType.SSD][0], True, node_to_unlock[DeviceType.SSD][1])
         if DeviceType.REMOTE in node_to_unlock:
             assert self.remote_cache_engine is not None
-            self.remote_cache_engine.cleanup(node_to_unlock[DeviceType.REMOTE][0], node_to_unlock[DeviceType.REMOTE][1])
+            self.remote_cache_engine.unlock(node_to_unlock[DeviceType.REMOTE][0])
+            self.remote_cache_engine.set_ready(
+                node_to_unlock[DeviceType.REMOTE][0], True, node_to_unlock[DeviceType.REMOTE][1]
+            )
         if buffer_to_free is not None:
             if DeviceType.CPU in buffer_to_free:
                 assert self.cpu_cache_engine is not None
@@ -1018,6 +1065,17 @@ class GlobalCacheEngine:
                 assert self.remote_cache_engine is not None
                 self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
 
+    def _op_callback(self, device_type: DeviceType, node_to_ready: RadixNode, ready_length: int) -> None:
+        if device_type == DeviceType.CPU:
+            assert self.cpu_cache_engine is not None
+            self.cpu_cache_engine.set_ready(node_to_ready, True, ready_length)
+        elif device_type == DeviceType.SSD:
+            assert self.ssd_cache_engine is not None
+            self.ssd_cache_engine.set_ready(node_to_ready, True, ready_length)
+        elif device_type == DeviceType.REMOTE:
+            assert self.remote_cache_engine is not None
+            self.remote_cache_engine.set_ready(node_to_ready, True, ready_length)
+
     @nvtx.annotate("Match Prefix Accel", color="yellow")
     def match_local_accel(self, sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel]:
         cpu_matched_result = MatchResultAccel()
@@ -1028,7 +1086,7 @@ class GlobalCacheEngine:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
-    
+
     @nvtx.annotate("Match Prefix", color="yellow")
     def match_local(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
@@ -1039,7 +1097,7 @@ class GlobalCacheEngine:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
-    
+
     @nvtx.annotate("Match All Prefix accel", color="yellow")
     def match_all_accel(self,
                         sequence_meta: SequenceMeta,
@@ -1062,7 +1120,7 @@ class GlobalCacheEngine:
                 remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result
-    
+
     @nvtx.annotate("Match All Prefix", color="yellow")
     def match_all(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
@@ -1101,7 +1159,7 @@ class GlobalCacheEngine:
                          token_mask: np.ndarray) -> Tuple[int, int]:
         mask_idx = np.where(token_mask)[0]
         if len(mask_idx) == 0:
-            return len(token_mask)//self.tokens_per_block, len(token_mask)//self.tokens_per_block
+            return 0, 0
         start_idx = mask_idx[0].item() // self.tokens_per_block
         end_idx = mask_idx[-1].item() // self.tokens_per_block
         return start_idx, end_idx + 1
