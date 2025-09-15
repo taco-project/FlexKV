@@ -1,4 +1,4 @@
-# Contributing to Mooncake
+# Contributing to FlexKV
 
 Thank you for your interest in contributing to FlexKV!
 
