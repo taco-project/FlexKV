@@ -17,7 +17,7 @@ docker pull nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.4.1
 ### FlexKV Code Preparation
 
 ```bash
-git clone -b dev https://github.com/taco-project/FlexKV
+git clone https://github.com/taco-project/FlexKV
 ```
 
 ### Install FlexKV
@@ -31,8 +31,10 @@ cd FlexKV && ./build.sh
 ### vLLM Apply Patch
 
 ```bash
-# Navigate to FlexKV directory
-git apply examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
+# Navigate to vLLM directory
+cd /opt/vllm 
+# apply patch
+git apply /your/path/to/FlexKV/examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
 ```
 
 ### FlexKV Verification
