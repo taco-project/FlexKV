@@ -18,6 +18,10 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 
 See [docs/vllm_adapter/README_en.md](docs/vllm_adapter/README_en.md)
 
+### FlexKV Integration with Dynamo
+
+See [docs/dynamo_integration/README_en.md](docs/dynamo_integration/README_en.md)
+
 ## Design Architecture
 
 <div align="center">

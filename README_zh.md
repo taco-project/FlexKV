@@ -18,6 +18,10 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 见[docs/vllm_adapter/README_zh.md](docs/vllm_adapter/README_zh.md)
 
+### FlexKV和Dynamo框架的集成
+
+见[docs/dynamo_integration/README_zh.md](docs/dynamo_integration/README_zh.md)
+
 ## 设计框架
 
 <div align="center">
