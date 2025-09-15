@@ -86,6 +86,7 @@ class TransferEngine:
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
         self._cache_config = cache_config
+        self._enable_pcfs_sharing = cache_config.index_accel and cache_config.enable_kv_sharing
 
         self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 
@@ -185,6 +186,7 @@ class TransferEngine:
                 remote_kv_layout=self._remote_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
                 remote_config_custom=self._remote_handle.remote_config_custom,
+                enable_pcfs_sharing=self._enable_pcfs_sharing,
             )
             self.remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,

@@ -372,6 +372,66 @@ static void _transfer_single_thread_impl(
   } // end layer loop
 }
 
+static void _shared_transfer_single_thread_impl(
+    uint64_t file_nodeid, const std::vector<int64_t> &cfs_block_ids,
+    const std::vector<int64_t> &cpu_block_ids, int start_layer, int end_layer,
+    int64_t cpu_tensor_ptr, int64_t cpu_layer_stride_in_bytes,
+    int64_t cfs_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
+    int64_t cfs_kv_stride_in_bytes, int64_t block_size_in_bytes,
+    int thread_id, bool is_mla) {
+  
+  int num_blocks = cfs_block_ids.size();
+  if (num_blocks == 0) {
+    return;
+  }
+  
+  for (int i = start_layer; i < end_layer; i++) {
+    void *cpu_k_layer_ptr = i * cpu_layer_stride_in_bytes +
+                            reinterpret_cast<char *>(cpu_tensor_ptr);
+    void *cpu_v_layer_ptr =
+        static_cast<char *>(cpu_k_layer_ptr) + cpu_kv_stride_in_bytes;
+    int64_t cfs_layer_offset = cfs_layer_stride_in_bytes * i;
+    
+    for (int j = 0; j < num_blocks; j++) {
+      int64_t cfs_block_id = cfs_block_ids[j];
+      int64_t cpu_block_id = cpu_block_ids[j];
+
+      int64_t cfs_k_block_offset =
+          cfs_layer_offset + cfs_block_id * block_size_in_bytes;
+
+      // read K block
+      char *cpu_k_block_ptr = static_cast<char *>(cpu_k_layer_ptr) +
+                              cpu_block_id * block_size_in_bytes;
+      bool transfer_ret = false;
+      
+      transfer_ret = flexkv::call_pcfs_read(file_nodeid, cfs_k_block_offset,
+                                            cpu_k_block_ptr,
+                                            block_size_in_bytes, thread_id);
+      
+      if (!transfer_ret) {
+        throw std::runtime_error("Failed to transfer K block");
+      }
+      
+      if (is_mla) {
+        continue;
+      }
+      
+      // read V block
+      char *cpu_v_block_ptr = static_cast<char *>(cpu_v_layer_ptr) +
+                              cpu_block_id * block_size_in_bytes;
+      int64_t cfs_v_block_offset = cfs_k_block_offset + cfs_kv_stride_in_bytes;
+      
+      transfer_ret = flexkv::call_pcfs_read(file_nodeid, cfs_v_block_offset,
+                                            cpu_v_block_ptr,
+                                            block_size_in_bytes, thread_id);
+      
+      if (!transfer_ret) {
+        throw std::runtime_error("Failed to transfer V block");
+      }
+    } // end block loop
+  } // end layer loop
+}
+
 // NOTE that we may also use other techniques such as
 // AIO, O_DIRECT, and etc to improve the performance
 void transfer_kv_blocks_cfs_mmap_multi_thread(
@@ -471,4 +531,112 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     }
   }
 }
+
+void shared_transfer_kv_blocks_remote_read(
+  const std::vector<std::uint64_t> &file_nodeids,
+  const std::vector<std::vector<int64_t>> &cfs_blocks_partition,
+  const std::vector<std::vector<int64_t>> &cpu_blocks_partition,
+  const torch::Tensor &cpu_layer_id_list,
+  int64_t cpu_tensor_ptr,
+  int64_t cpu_layer_stride_in_bytes,
+  int64_t cpu_kv_stride_in_bytes,
+  int64_t cfs_layer_stride_in_bytes,
+  int64_t cfs_block_stride_in_bytes,
+  int64_t cfs_kv_stride_in_bytes,
+  int64_t block_size_in_bytes,
+  int64_t total_layers,
+  bool is_mla,
+  int num_threads_per_file) {
+  
+  int num_files = file_nodeids.size();
+  const int num_layers = cpu_layer_id_list.size(0);
+  const int32_t *cpu_layer_id_list_ptr = cpu_layer_id_list.data_ptr<int32_t>();
+  
+  // 验证参数
+  if (cfs_blocks_partition.size() != num_files) {
+      throw std::runtime_error("cfs_blocks_partition size must match file_nodeids size");
+  }
+  if (cpu_blocks_partition.size() != num_files) {
+      throw std::runtime_error("cpu_blocks_partition size must match file_nodeids size");
+  }
+  
+  // 限制线程数量
+  if (num_threads_per_file > num_layers) {
+      num_threads_per_file = num_layers;
+  }
+  if (num_threads_per_file > MAX_PCFS_LINK_NUM / num_files) {
+      num_threads_per_file = MAX_PCFS_LINK_NUM / num_files;
+  }
+  if (num_threads_per_file <= 0) {
+      throw std::runtime_error("num_threads_per_file must be greater than 0");
+  }
+  
+  std::vector<std::thread> threads;
+  std::vector<std::future<std::exception_ptr>> futures;
+  
+  // 为每个文件分配线程
+  int layers_per_thread = (num_layers + num_threads_per_file - 1) / num_threads_per_file;
+  
+  for (int f = 0; f < num_files; f++) {
+      // 跳过没有块的文件
+      if (cfs_blocks_partition[f].empty()) {
+          continue;
+      }
+      
+      for (int t = 0; t < num_threads_per_file; t++) {
+          // 计算线程 ID（为每个文件分配唯一的线程 ID）
+          int thread_id = f * num_threads_per_file + t;
+          thread_id += num_files * num_threads_per_file; // 读操作的偏移
+          
+          // 计算该线程处理的层范围
+          int start_layer = cpu_layer_id_list_ptr[0] + t * layers_per_thread;
+          int end_layer = std::min(start_layer + layers_per_thread,
+                                 cpu_layer_id_list_ptr[0] + num_layers);
+          
+          if (start_layer < end_layer) {
+              std::promise<std::exception_ptr> prom;
+              futures.push_back(prom.get_future());
+              
+              threads.emplace_back(
+                  [f, &file_nodeids, &cfs_blocks_partition, &cpu_blocks_partition,
+                   start_layer, end_layer, cpu_tensor_ptr,
+                   cpu_layer_stride_in_bytes, cfs_layer_stride_in_bytes,
+                   cpu_kv_stride_in_bytes, cfs_kv_stride_in_bytes,
+                   block_size_in_bytes, thread_id, is_mla, prom = std::move(prom)]() mutable {
+                      try {
+                          _shared_transfer_single_thread_impl(
+                              file_nodeids[f],
+                              cfs_blocks_partition[f],
+                              cpu_blocks_partition[f],
+                              start_layer, end_layer,
+                              cpu_tensor_ptr,
+                              cpu_layer_stride_in_bytes,
+                              cfs_layer_stride_in_bytes,
+                              cpu_kv_stride_in_bytes,
+                              cfs_kv_stride_in_bytes,
+                              block_size_in_bytes,
+                              thread_id,
+                              is_mla);
+                          prom.set_value(nullptr);
+                      } catch (...) {
+                          prom.set_value(std::current_exception());
+                      }
+                  });
+          }
+      }
+  }
+  
+  // 等待所有线程完成
+  for (auto &thread : threads) {
+      thread.join();
+  }
+  
+  // 检查是否有错误
+  for (auto &fut : futures) {
+      if (auto eptr = fut.get()) {
+          std::rethrow_exception(eptr);
+      }
+  }
+}
+
 } // namespace flexkv
