@@ -77,6 +77,23 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     int round_robin, int64_t num_remote_blocks_per_file, bool use_mmap = false,
     int num_threads_per_file = 8, bool is_mla = false);
 
+// New function for shared PCFS read operations
+void shared_transfer_kv_blocks_remote_read(
+  const std::vector<std::uint64_t> &file_nodeids,
+  const std::vector<std::vector<int64_t>> &cfs_blocks_partition,
+  const std::vector<std::vector<int64_t>> &cpu_blocks_partition,
+  const torch::Tensor &cpu_layer_id_list,
+  int64_t cpu_tensor_ptr,
+  int64_t cpu_layer_stride_in_bytes,
+  int64_t cpu_kv_stride_in_bytes,
+  int64_t cfs_layer_stride_in_bytes,
+  int64_t cfs_block_stride_in_bytes,
+  int64_t cfs_kv_stride_in_bytes,
+  int64_t block_size_in_bytes,
+  int64_t total_layers,
+  bool is_mla = false,
+  int num_threads_per_file = 8);
+
 } // namespace flexkv
 #endif
 
