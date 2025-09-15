@@ -33,7 +33,8 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_remote: bool = False
-    enable_gds: bool = False  # Requires enable_ssd=True
+    enable_gds: bool = False # Requires enable_ssd=True
+    enable_kv_sharing: bool = False
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
@@ -50,6 +51,30 @@ class CacheConfig:
     remote_file_prefix: Optional[str] = None
     remote_cache_path: Optional[Union[str, List[str]]] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
+
+    # KV sharing / distributed radix tree tunables
+    lt_pool_initial_capacity: int = 10000000
+    refresh_batch_size: int = 128
+    rebuild_interval_ms: int = 1000
+    idle_sleep_ms: int = 10
+    lease_ttl_ms: int = 100000
+    renew_lease_ms: int = 0
+
+    # Redis configs (for KV sharing / metadata)
+    redis_host: str = "127.0.0.1"
+    redis_port: int = 6379
+    local_ip: str = "127.0.0.1"
+    redis_password: Optional[str] = None
+
+    # Trace configs
+    enable_trace: bool = True
+    trace_file_path: str = "./flexkv_trace.log"
+    trace_max_file_size_mb: int = 100
+    trace_max_files: int = 5
+    trace_flush_interval_ms: int = 1000
+    
+    #evict ratio
+    evict_ratio: float = 0.0
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration

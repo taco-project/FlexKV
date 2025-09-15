@@ -25,6 +25,8 @@ import numpy as np
 import nvtx
 import torch
 from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
+from flexkv.cache.pcfs_cache_engine import PCFSCacheEngine
+from flexkv.cache.redis_meta import RedisMeta
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
@@ -35,17 +37,7 @@ from flexkv.common.transfer import (
     DeviceType, TransferOpGraph, TransferOp, TransferType
 )
 from flexkv.common.debug import flexkv_logger
-@dataclass
-class MatchResultAccel:
-    num_ready_matched_blocks: int = 0
-    num_matched_blocks: int = 0
-    last_ready_node: Optional['CRadixNode'] = None
-    last_node: Optional['CRadixNode'] = None
-    last_node_matched_length: int = 0
-    physical_blocks: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
-
-    def __post_init__(self) -> None:
-        assert self.physical_blocks.ndim == 1
+from flexkv.common.type import MatchResultAccel
 
 class CacheEngineAccel:
     def __init__(self,
@@ -80,10 +72,19 @@ class CacheEngineAccel:
         sequence_meta.gen_hashes()
         match_result = self.index.match_prefix(torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
                                               sequence_meta.num_blocks, True)
+        # physical blocks
+        phys = torch.tensor(match_result.physical_blocks, dtype=torch.int64).numpy()
+        # optional block_node_ids
+        try:
+            bnis = getattr(match_result, "block_node_ids")
+            bnids_np = torch.tensor(bnis, dtype=torch.uint32).numpy() if bnis is not None else None
+        except Exception:
+            bnids_np = None
         return MatchResultAccel(match_result.num_ready_matched_blocks, match_result.num_matched_blocks,
                             match_result.last_ready_node, match_result.last_node,
                             match_result.last_node_matched_length,
-                            torch.tensor(match_result.physical_blocks, dtype=torch.int64).numpy())
+                            phys,
+                            bnids_np)
 
     def insert(self,
                sequence_meta: SequenceMeta,
@@ -251,7 +252,23 @@ class GlobalCacheEngine:
         self.remote_cache_engine = None
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
+        if cache_config.enable_kv_sharing:
+            self.redis_meta = RedisMeta(
+                cache_config.redis_host,
+                cache_config.redis_port,
+                cache_config.redis_password,
+                cache_config.local_ip,
+            )
+            self.redis_meta.init_meta()
+            self.node_id = self.redis_meta.get_node_id()
+            self.enable_kv_sharing = True
+        else:
+            self.enable_kv_sharing = False
         self.cache_engines = {}
+        if cache_config.index_accel:
+            self.index_accel = True
+        else:
+            self.index_accel = False
 
         self.evict_ratio = GLOBAL_CONFIG_FROM_ENV.evict_ratio
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
@@ -285,7 +302,10 @@ class GlobalCacheEngine:
                                                 self.hit_reward_seconds)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
-            if self.index_accel:
+            if cache_config.enable_kv_sharing:
+                # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine)
+                self.remote_cache_engine = PCFSCacheEngine.from_cache_config(cache_config, self.node_id, meta=self.redis_meta)
+            elif cache_config.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
@@ -435,16 +455,20 @@ class GlobalCacheEngine:
         assert enable_cpu and enable_remote
         assert self.cpu_cache_engine is not None
         assert self.remote_cache_engine is not None
-
-        cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
-
+        if self.index_accel:
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
+        else:
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         remote_matched_blocks = remote_matched_result.physical_blocks[
             :remote_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-
+        shared_pcfs_read = self.cache_config.enable_kv_sharing and self.index_accel
+        remote_file_nodeids = None
+        if shared_pcfs_read:
+            remote_file_nodeids = remote_matched_result.block_node_ids
         fragment123_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks), len(remote_matched_blocks))
         #early return if no blocks to transfer
         if fragment123_num_blocks == 0:
@@ -464,7 +488,9 @@ class GlobalCacheEngine:
         fragment123_cpu_blocks = cpu_matched_blocks
         fragment2_ssd_blocks = ssd_matched_blocks[-fragment2_num_blocks:]
         fragment3_remote_blocks = remote_matched_blocks[-fragment3_num_blocks:]
-
+        fragment3_remote_file_nodeids = None
+        if shared_pcfs_read:
+            fragment3_remote_file_nodeids = remote_file_nodeids[-fragment3_num_blocks:]
         cpu_node_to_unlock = cpu_matched_result.last_ready_node
         ssd_node_to_unlock = ssd_matched_result.last_ready_node
         remote_node_to_unlock = remote_matched_result.last_ready_node
@@ -514,7 +540,8 @@ class GlobalCacheEngine:
                 src_block_ids = fragment3_remote_blocks,
                 dst_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
                 layer_id = 0,
-                layer_granularity = layer_num
+                layer_granularity = layer_num,
+                src_block_node_ids = fragment3_remote_file_nodeids
             )
             transfer_graph.add_transfer_op(op_remote2h)
 
@@ -846,7 +873,8 @@ class GlobalCacheEngine:
 
         if self.index_accel:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta,
-                                                                                               temp_cache_strategy=temp_cache_strategy)
+                                                                                               temp_cache_strategy=temp_cache_strategy,
+                                                                                               is_get=False)
         else:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta,
                                                                                            temp_cache_strategy=temp_cache_strategy)
@@ -1187,7 +1215,8 @@ class GlobalCacheEngine:
     @nvtx.annotate("Match All Prefix accel", color="yellow")
     def match_all_accel(self,
                         sequence_meta: SequenceMeta,
-                        temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                        temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
+                        is_get: bool = True) \
                             -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
@@ -1198,7 +1227,13 @@ class GlobalCacheEngine:
         if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
         if self.remote_cache_engine and not temp_cache_strategy.ignore_remote:
-            remote_matched_result = self.remote_cache_engine.match(sequence_meta)
+            if self.enable_kv_sharing:
+                if is_get:
+                    remote_matched_result = self.remote_cache_engine.match_all(sequence_meta)
+                else:
+                    remote_matched_result = self.remote_cache_engine.match_local(sequence_meta)
+            else:
+                remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result
     @nvtx.annotate("Match All Prefix", color="yellow")
