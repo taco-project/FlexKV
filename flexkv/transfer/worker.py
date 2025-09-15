@@ -16,7 +16,7 @@ import torch
 
 from flexkv import c_ext
 
-from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
+from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup, shared_transfer_kv_blocks_remote_read
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -58,6 +58,7 @@ class WorkerTransferOp:
     valid_block_num: int
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
+    src_block_node_ids: Optional[np.ndarray]
     # successors: List[int]
 
     def __init__(self, transfer_op: TransferOp):
@@ -69,6 +70,9 @@ class WorkerTransferOp:
         self.src_slot_id = transfer_op.src_slot_id
         self.dst_slot_id = transfer_op.dst_slot_id
         self.valid_block_num = transfer_op.valid_block_num
+        # Always preserve optional src_block_node_ids from TransferOp
+        self.src_block_node_ids = transfer_op.src_block_node_ids
+
         if self.src_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
             self.dst_block_ids = transfer_op.dst_block_ids
@@ -676,7 +680,8 @@ class CPURemoteTransferWorker(TransferWorkerBase):
                  cpu_kv_layout: KVCacheLayout,
                  remote_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
-                 remote_config_custom: Dict[str, Any]):
+                 remote_config_custom: Dict[str, Any],
+                 enable_pcfs_sharing: bool = False):
         if transfer_kv_blocks_remote is None:
             raise RuntimeError("transfer_kv_blocks_remote not available, please build with FLEXKV_ENABLE_CFS=1")
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
@@ -689,6 +694,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         self.num_cpu_blocks = cpu_kv_layout.num_block
         self.num_remote_blocks = remote_kv_layout.num_block
         self.round_robin = 1
+        self.enable_pcfs_sharing = enable_pcfs_sharing
 
         if self.num_remote_blocks % self.num_remote_files != 0:
             raise ValueError(f"num_remote_blocks {self.num_remote_blocks} "
@@ -781,27 +787,82 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             raise ValueError(f"Invalid transfer type: {transfer_type} for CPUSSDDiskTransferWorker")
 
         layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
-        transfer_kv_blocks_remote(
-            file_nodeid_list=self.file_nodeid_list,
-            cpu_layer_id_list=layer_id_list,
-            cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
-            remote_block_ids=remote_block_id_list,
-            cpu_block_ids=cpu_block_id_list,
-            cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-            cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-            remote_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
-            remote_block_stride_in_bytes=self.remote_block_stride_in_bytes,
-            remote_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
-            block_size_in_bytes=self.chunk_size_in_bytes,
-            total_layers=self.num_layers,
-            is_read=(transfer_type == TransferType.REMOTE2H),
-            partition_block_type=PartitionBlockType.SEQUENTIAL.value, # use sequential
-            round_robin=self.round_robin,
-            num_remote_blocks_per_file=self.num_remote_blocks_per_file,
-            use_mmap=False,  # TODO: fix bug when use mmap
-            num_threads_per_file=32,
-            is_mla=self.is_mla,
-        )
+                # Use PCFS shared transfer for read operations when PCFS sharing is enabled
+        if self.enable_pcfs_sharing and transfer_type == TransferType.REMOTE2H:
+            # For PCFS sharing, we need to construct cfs_blocks_partition and cpu_blocks_partition
+            # based on the file_nodeids from the transfer operation
+            # Optional: per-source-block node ids for remote routing (numpy.ndarray)
+            src_block_node_ids = kwargs.get("src_block_node_ids")
+            if src_block_node_ids is not None and not isinstance(src_block_node_ids, np.ndarray):
+                raise TypeError("src_block_node_ids must be a numpy.ndarray if provided")
+            
+            assert len(src_block_node_ids) == len(remote_block_id_list)
+            
+            # Construct cfs_blocks_partition and cpu_blocks_partition
+            # This is a simplified implementation - in practice, you might need more sophisticated logic
+            
+            # Group blocks by file_nodeid (simplified grouping logic)
+            files_set = set(src_block_node_ids)
+            file_nodeids_list = list(files_set)
+            
+            # Initialize partitions with proper size
+            cfs_blocks_partition = [[] for _ in range(len(file_nodeids_list))]
+            cpu_blocks_partition = [[] for _ in range(len(file_nodeids_list))]
+            
+            # Create mapping from file_nodeid to partition index
+            file2fid_dict = {file_nodeid: fid for fid, file_nodeid in enumerate(file_nodeids_list)}
+            #因为每个flexkv的文件数量是相同的，所以total_file_num是相同的，后面用全局block_id计算block_id_in_file时，需要除以total_file_num
+            total_file_num = len(self.file_nodeid_list)
+            for i in range(len(remote_block_id_list)):
+                file_nodeid = src_block_node_ids[i]
+                fid = file2fid_dict[file_nodeid]
+                
+                # Calculate block_id_in_file using the same logic as C++
+                # This should match the C++ implementation in pcfs.cpp
+                block_id_in_file = int(((remote_block_id_list[i] / self.round_robin) / total_file_num) * self.round_robin + (remote_block_id_list[i] % self.round_robin))
+                
+                cfs_blocks_partition[fid].append(block_id_in_file)
+                cpu_blocks_partition[fid].append(cpu_block_id_list[i].item())
+            
+            # Use the new shared transfer function
+            shared_transfer_kv_blocks_remote_read(
+                file_nodeid_list=file_nodeids_list,
+                cfs_blocks_partition_list=cfs_blocks_partition,
+                cpu_blocks_partition_list=cpu_blocks_partition,
+                cpu_layer_id_list=layer_id_list,
+                cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
+                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
+                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
+                cfs_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
+                cfs_block_stride_in_bytes=self.remote_block_stride_in_bytes,
+                cfs_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
+                block_size_in_bytes=self.chunk_size_in_bytes,
+                total_layers=self.num_layers,
+                is_mla=self.is_mla,
+                num_threads_per_file=32,
+            )
+        else:
+            transfer_kv_blocks_remote(
+                file_nodeid_list=self.file_nodeid_list,
+                cpu_layer_id_list=layer_id_list,
+                cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
+                remote_block_ids=remote_block_id_list,
+                cpu_block_ids=cpu_block_id_list,
+                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
+                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
+                remote_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
+                remote_block_stride_in_bytes=self.remote_block_stride_in_bytes,
+                remote_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
+                block_size_in_bytes=self.chunk_size_in_bytes,
+                total_layers=self.num_layers,
+                is_read=(transfer_type == TransferType.REMOTE2H),
+                partition_block_type=PartitionBlockType.SEQUENTIAL.value, # use sequential
+                round_robin=self.round_robin,
+                num_remote_blocks_per_file=self.num_remote_blocks_per_file,
+                use_mmap=False,  # TODO: fix bug when use mmap
+                num_threads_per_file=32,
+                is_mla=self.is_mla,
+            )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
         layer_id = transfer_op.layer_id
@@ -820,6 +881,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             transfer_op.transfer_type,
             transfer_op.layer_id,
             transfer_op.layer_granularity,
+            src_block_node_ids=transfer_op.src_block_node_ids,
         )
         end_time = time.time()
 

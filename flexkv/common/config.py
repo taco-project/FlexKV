@@ -31,6 +31,7 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_remote: bool = False
+    enable_kv_sharing: bool = False
     use_gds: bool = False
     use_pinned_memory: bool = False
     index_accel: bool = False
@@ -65,6 +66,20 @@ class CacheConfig:
     remote_file_prefix: Optional[str] = None
     remote_cache_path: Optional[Union[str, List[str]]] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
+
+    # KV sharing / distributed radix tree tunables
+    lt_pool_initial_capacity: int = 10000000
+    refresh_batch_size: int = 128
+    rebuild_interval_ms: int = 1000
+    idle_sleep_ms: int = 10
+    lease_ttl_ms: int = 100000
+    renew_lease_ms: int = 0
+
+    # Redis configs (for KV sharing / metadata)
+    redis_host: str = "127.0.0.1"
+    redis_port: int = 6379
+    local_ip: str = "127.0.0.1"
+    redis_password: Optional[str] = None
 
     # Trace configs
     enable_trace: bool = True

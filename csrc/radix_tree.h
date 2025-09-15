@@ -6,6 +6,7 @@
 #include <execinfo.h>
 
 #include "cache_utils.h"
+#include "lease_meta_mempool.h"  // for flexkv::LeaseMeta
 
 namespace flexkv {
 
@@ -20,13 +21,16 @@ private:
 
   std::deque<int64_t> block_hashes;
   std::deque<int64_t> physical_blocks;
+  std::deque<uint32_t>* block_node_ids;
+  LeaseMeta* lease_meta;
   std::map<HashType, CRadixNode *> children;
 
   CRadixTreeIndex *index;
   CRadixNode *parent;
 
 public:
-  CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt);
+  CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt,
+     bool enable_block_node_ids = false);
   ~CRadixNode();
 
   struct Compare {
@@ -37,6 +41,28 @@ public:
 
   bool get_leaf_state() {
     return on_leaf;
+  }
+
+  LeaseMeta* get_lease_meta() {
+    return lease_meta;
+  }
+
+  void set_lease_meta(LeaseMeta* lease_meta) {
+    this->lease_meta = lease_meta;
+  }
+
+  void for_each_child(std::function<void(HashType, CRadixNode*)> func) {
+    for (auto& child : children) {
+      func(child.first, child.second);
+    }
+  }
+  
+  std::deque<uint32_t>* get_block_node_ids() {
+    return block_node_ids;
+  }
+
+  bool has_block_node_ids() {
+    return block_node_ids != nullptr;
   }
 
   void set_leaf_state(bool on_leaf) {
@@ -122,6 +148,13 @@ public:
     children.erase(hash);
   }
 
+  template<typename Fn>
+  void for_each_child(Fn&& fn) {
+    for (auto &kv : children) {
+      fn(kv.first, kv.second);
+    }
+  }
+
   bool is_leaf() {
     return get_num_children() == 0;
   }
@@ -166,21 +199,25 @@ public:
   CRadixNode *last_ready_node;
   CRadixNode *last_node;
   std::vector<int64_t> *physical_blocks;
+  std::vector<uint32_t> *block_node_ids;
 
   CMatchResult(int _num_ready_matched_blocks, int _num_matched_blocks, int _last_node_matched_length,
-    CRadixNode *_last_ready_node, CRadixNode *_last_node, std::vector<int64_t> *blocks)
+    CRadixNode *_last_ready_node, CRadixNode *_last_node, std::vector<int64_t> *blocks, std::vector<uint32_t> *block_node_ids = nullptr)
     : num_ready_matched_blocks(_num_ready_matched_blocks), num_matched_blocks(_num_matched_blocks),
       last_node_matched_length(_last_node_matched_length), last_ready_node(_last_ready_node),
-      last_node(_last_node), physical_blocks(blocks) {
+      last_node(_last_node), physical_blocks(blocks), block_node_ids(block_node_ids) {
   }
 
   ~CMatchResult() {
     delete physical_blocks;
+    if (block_node_ids) {
+      delete block_node_ids;
+    }
   };
 };
 
 class CRadixTreeIndex {
-private:
+protected:
   CRadixNode *root;
   std::list<CRadixNode *> node_list;
   std::list<CRadixNode *> leaf_list;
@@ -199,7 +236,7 @@ public:
     node_list.push_back(root);
   }
 
-  ~CRadixTreeIndex() {
+  virtual ~CRadixTreeIndex() {
     leaf_list.clear();
 
     while (node_list.size()) {
@@ -274,15 +311,15 @@ public:
     node->set_leaf_state(true);
   }
 
-  void lock(CRadixNode *node) {
+  virtual void lock(CRadixNode *node) {
     node->lock();
   }
 
-  void unlock(CRadixNode *node) {
+  virtual void unlock(CRadixNode *node) {
     node->unlock();
   }
 
-  bool is_empty() {
+  virtual bool is_empty() {
     return node_list.size() == 1;
   }
 
@@ -294,7 +331,7 @@ public:
     node_count--;
   }
 
-  void set_ready(CRadixNode *node, bool ready = true, int ready_length = -1) {
+  virtual void set_ready(CRadixNode *node, bool ready = true, int ready_length = -1) {
     node->set_ready(ready);
     if (ready_length > 0) {
       ready_length -= node->size();
@@ -335,10 +372,10 @@ public:
     return total_cached_blocks() - total_ready_blocks();
   }
 
-  int evict(torch::Tensor &evicted_blocks, int num_evicted);
-  std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,
+  virtual int evict(torch::Tensor &evicted_blocks, int num_evicted);
+  virtual std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,
     int num_blocks, bool update_cache_info = true);
-  CRadixNode *insert(torch::Tensor &physical_block_ids, torch::Tensor &block_hashes, int num_blocks,
+  virtual CRadixNode *insert(torch::Tensor &physical_block_ids, torch::Tensor &block_hashes, int num_blocks,
     int num_insert_blocks, bool ready = true, CRadixNode *node = nullptr, int num_matched_blocks = -1,
     int last_node_matched_length = -1);
 };
