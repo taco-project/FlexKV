@@ -172,7 +172,6 @@ def test_take_and_recycle(cache_engine: CacheEngineAccel):
     cache_engine.lock_node(radixnode)
     with pytest.raises(NotEnoughSpaceError):
         cache_engine.take(num_total_blocks, protected_node=radixnode, strict=True)
-
     cache_engine.unlock(radixnode)
     cache_engine.set_ready(radixnode, True, radixnode.size())
 
