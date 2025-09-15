@@ -39,7 +39,7 @@ git apply /your/path/to/FlexKV/examples/vllm_adaption/vllm_0_10_1_1-flexkv-conne
 
 ### FlexKV Verification
 
-Please refer to the test scripts in [vLLM online serving](https://github.com/taco-project/FlexKV/blob/dev/docs/vllm_adapter/README_zh.md#%E7%A4%BA%E4%BE%8B).
+Please refer to the test scripts in [vLLM online serving](../../docs/vllm_adapter/README_zh.md#%E7%A4%BA%E4%BE%8B).
 
 ## 2. Dynamo Modifications
 
@@ -122,6 +122,8 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
     fi
 done
 ```
+
+> Note: The `flexkv_config.json` configuration is provided as a simple example only. For full parameter options, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md)
 
 ### Verification
 

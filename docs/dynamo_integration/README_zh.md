@@ -39,7 +39,7 @@ git apply /your/path/to/FlexKV/examples/vllm_adaption/vllm_0_10_1_1-flexkv-conne
 
 ### FlexKV 验证
 
-请参考[vLLM online serving](https://github.com/taco-project/FlexKV/blob/dev/docs/vllm_adapter/README_zh.md#%E7%A4%BA%E4%BE%8B)里的测试脚本。
+请参考[vLLM online serving](../../docs/vllm_adapter/README_zh.md#%E7%A4%BA%E4%BE%8B)里的测试脚本。
 
 
 ## 2. Dynamo 配置修改
@@ -123,6 +123,8 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
     fi
 done
 ```
+
+> 注：`flexkv_config.json`配置仅为简单示例，选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
 
 ### 验证
 
