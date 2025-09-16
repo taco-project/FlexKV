@@ -10,7 +10,7 @@
 
 namespace flexkv {
 
-CRadixNode::CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt) {
+CRadixNode::CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt, bool enable_block_node_ids) {
   assert(index != nullptr);
 
   this->on_leaf = false;
@@ -18,11 +18,16 @@ CRadixNode::CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt) {
   this->index = index;
   this->ready = ready;
   this->lock_cnt = lock_cnt;
+  this->lease_meta = nullptr;
+  this->block_node_ids = nullptr;
 
   struct timeval now;
   gettimeofday(&now, nullptr);
   last_access_time = now.tv_sec * 1000 + now.tv_usec / 10000;
-
+  if (enable_block_node_ids) {
+    this->block_node_ids = new std::deque<uint32_t>();
+    assert(this->block_node_ids != nullptr);
+  }
   index->inc_node_count();
 }
 
@@ -32,7 +37,13 @@ CRadixNode::~CRadixNode() {
   block_hashes.clear();
   physical_blocks.clear();
   children.clear();
-
+  if (block_node_ids != nullptr) {
+    delete block_node_ids;
+  }
+  if (lease_meta != nullptr) {
+    LeaseMetaMemPool::release(lease_meta);
+    lease_meta = nullptr;
+  }
   index->dec_node_count();
 }
 
@@ -40,8 +51,8 @@ CRadixNode *CRadixNode::split(int prefix_length) {
   assert(prefix_length < size());
   assert(prefix_length > 0);
   assert(parent != nullptr);
-
-  auto new_node = new CRadixNode(index, is_ready(), 0);
+  bool enable_block_node_ids = (block_node_ids != nullptr);
+  auto new_node = new CRadixNode(index, is_ready(), 0, enable_block_node_ids);
   new_node->set_time(get_time());
   new_node->set_parent(parent);
   get_index()->add_node(new_node);
@@ -51,6 +62,13 @@ CRadixNode *CRadixNode::split(int prefix_length) {
 
   new_block_hashes.insert(new_block_hashes.end(), block_hashes.cbegin(), block_hashes.cbegin() + prefix_length);
   new_physical_blocks.insert(new_physical_blocks.end(), physical_blocks.cbegin(), physical_blocks.cbegin() + prefix_length);
+  if (enable_block_node_ids) {
+    auto old_ids = get_block_node_ids();
+    auto new_ids = new_node->get_block_node_ids();
+    new_ids->insert(new_ids->end(), old_ids->cbegin(), old_ids->cbegin() + prefix_length);
+    // Erase the moved range from the original deque
+    old_ids->erase(old_ids->begin(), old_ids->begin() + prefix_length);
+  }
 
   block_hashes.erase(block_hashes.begin(), block_hashes.begin() + prefix_length);
   physical_blocks.erase(physical_blocks.begin(), physical_blocks.begin() + prefix_length);
@@ -75,6 +93,17 @@ void CRadixNode::merge_child() {
             child->get_physical_blocks().cend());
 
   set_time(std::max(get_time(), child->get_time()));
+  if (block_node_ids != nullptr) {
+    block_node_ids->insert(block_node_ids->end(), child->get_block_node_ids()->cbegin(),
+           child->get_block_node_ids()->cend());
+  }
+  if (lease_meta != nullptr) {
+    auto child_lm = child->get_lease_meta();
+    if (child_lm != nullptr) {
+      lease_meta->state = child_lm->state;
+      lease_meta->lease_time = std::min(lease_meta->lease_time, child_lm->lease_time);
+    }
+  }
   children.clear();
 
   child->clear_parent();
@@ -95,6 +124,9 @@ std::deque<int64_t> *CRadixNode::shrink(int length) {
 
   block_hashes.erase(block_hashes.begin() + remaining_length, block_hashes.end());
   physical_blocks.erase(physical_blocks.begin() + remaining_length, physical_blocks.end());
+  if (block_node_ids != nullptr) {
+    block_node_ids->erase(block_node_ids->begin() + remaining_length, block_node_ids->end());
+  }
 
   return shrink_blocks;
 }
