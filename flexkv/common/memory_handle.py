@@ -19,10 +19,17 @@ class TensorSharedHandle:
     rebuild_args: Tuple[Any]
     device: torch.device
 
-    def __init__(self, tensor: torch.Tensor):
+    def __init__(self, tensor: torch.Tensor, device_id: int = -1):
         if not tensor.is_cuda:
             raise ValueError("Only support CUDA tensor sharing")
-        self.rebuild_func, self.rebuild_args, self.device = self._export_tensor_handle(tensor)
+        self.rebuild_func, self.rebuild_args, tensor_device_id = self._export_tensor_handle(tensor)
+        if device_id == -1:
+            self.device = tensor_device_id
+        else:
+            self.device = torch.device(f"cuda:{device_id}")
+            tmp_list = list(self.rebuild_args)
+            tmp_list[6] = device_id
+            self.rebuild_args = tuple(tmp_list)
 
     def get_tensor(self) -> torch.Tensor:
         tensor = self._import_tensor_handle(self.rebuild_func, self.rebuild_args, self.device)
@@ -40,10 +47,10 @@ class TensorSharedHandle:
     def _import_tensor_handle(rebuild_func: Callable, rebuild_args: Tuple[Any], device: torch.device) -> torch.Tensor:
         try:
             tensor = rebuild_func(*rebuild_args)
-
             assert isinstance(tensor, torch.Tensor)
 
             if tensor.device != device:
+                flexkv_logger.warning(f"Tensor device {tensor.device} is not the same as the target device {device}")
                 tensor = tensor.to(device)
 
             return tensor
