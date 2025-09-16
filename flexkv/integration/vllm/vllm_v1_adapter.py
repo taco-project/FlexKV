@@ -115,12 +115,14 @@ class FlexKVPutTask(FlexKVTask):
 class FlexKVSchedulerConnector:
     def __init__(
         self,
-        flexkv_config: FlexKVConfig
+        flexkv_config: FlexKVConfig,
+        dp_rank: int = 0,
     ):
         logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
         self.flexkv_config = flexkv_config
         self.server_recv_port = flexkv_config.server_recv_port
         self.tp_size = flexkv_config.tp_size
+        self.dp_size = flexkv_config.dp_size
         self.block_size = flexkv_config.block_size
         self.model_config = ModelConfig(
             num_layers=flexkv_config.num_layers,
@@ -129,6 +131,7 @@ class FlexKVSchedulerConnector:
             use_mla=flexkv_config.use_mla,
             dtype=flexkv_config.dtype,
             tp_size=flexkv_config.tp_size,
+            dp_size=flexkv_config.dp_size,
         )
         if "tokens_per_block" in flexkv_config.cache_config:
             assert flexkv_config.cache_config.pop("tokens_per_block") == flexkv_config.block_size
@@ -138,7 +141,8 @@ class FlexKVSchedulerConnector:
         )
         self.flexkv_manager = KVManager(model_config=self.model_config,
                                         cache_config=self.cache_config,
-                                        gpu_register_port=flexkv_config.server_recv_port)
+                                        gpu_register_port=flexkv_config.server_recv_port,
+                                        dp_client_id=dp_rank)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
 
@@ -526,11 +530,12 @@ class FlexKVWorkerConnector:
     def __init__(
         self,
         flexkv_config: FlexKVConfig,
+        dp_client_id: int,
     ):
-        current_device_id = torch.cuda.current_device()
+        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.tp_size
         self.flexkv_config = flexkv_config
-        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.server_recv_port}")
-        self.tp_client = KVTPClient(flexkv_config.server_recv_port, 0, current_device_id)
+        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.server_recv_port}, dp_client_id: {dp_client_id}")
+        self.tp_client = KVTPClient(flexkv_config.server_recv_port, dp_client_id, current_device_id)
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
@@ -569,11 +574,12 @@ class FlexKVConnectorV1Impl:
         self.role = role
         flexkv_config = FlexKVConfig.from_env()
         flexkv_config.post_init_from_vllm_config(vllm_config)
+        dp_rank = vllm_config.parallel_config.data_parallel_rank
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector = FlexKVSchedulerConnector(flexkv_config)
+            self.connector = FlexKVSchedulerConnector(flexkv_config, dp_rank)
         elif role == KVConnectorRole.WORKER:
-            self.connector = FlexKVWorkerConnector(flexkv_config)
+            self.connector = FlexKVWorkerConnector(flexkv_config, dp_rank)
         else:
             raise ValueError(f"Unrecognized KVConnectorRole: {role}.")
 

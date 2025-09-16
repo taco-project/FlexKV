@@ -236,10 +236,7 @@ class KVTPClient:
 
         handles = []
         for _, tensor in enumerate(kv_caches):
-            if tensor.device.index != self.device_id:
-                raise ValueError(f"All tensors must be on specified device: {self.device_id}")
-
-            handle = TensorSharedHandle(tensor)
+            handle = TensorSharedHandle(tensor, self.device_id)
             handles.append(handle)
 
         register_req = RegisterTPClientRequest(

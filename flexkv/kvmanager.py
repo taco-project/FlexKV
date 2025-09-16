@@ -37,18 +37,22 @@ class KVManager:
         flexkv_logger.info(f"{cache_config = }")
         self.model_config = model_config
         self.cache_config = cache_config
-        self.gpu_register_port = gpu_register_port
-        self.server_recv_port = server_recv_port
+        self.gpu_register_port = gpu_register_port if gpu_register_port is not None else "ipc:///tmp/flexkv_test_gpu_register"
+        self.server_recv_port = server_recv_port if server_recv_port is not None else "ipc:///tmp/flexkv_test_server"
         self.server_client_mode = model_config.dp_size > 1
         self.dp_client_id = dp_client_id
         flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
         if self.server_client_mode:
             # server should only be created once but kvmanager will init in every dp rank.
             if dp_client_id == 0:
-                self.server_handle = KVServer.create_server(model_config,
-                                                            cache_config,
-                                                            gpu_register_port,
-                                                            server_recv_port)
+                # You can control child process environment variables here
+                # Example: child_env = {"CUDA_VISIBLE_DEVICES": "0"}
+                # Example: inherit_env = False  # to not inherit parent env
+                self.server_handle = KVServer.create_server(model_config=model_config,
+                                                            cache_config=cache_config,
+                                                            gpu_register_port=gpu_register_port,
+                                                            server_recv_port=self.server_recv_port,
+                                                            inherit_env=False)
                                                             
             else:
                 self.server_handle = None
