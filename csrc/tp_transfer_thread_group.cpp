@@ -143,15 +143,26 @@ void TPTransferThreadGroup::tp_group_transfer(
         void **gpu_layer_ptrs =
             static_cast<void **>(gpu_blocks_ + i * num_layers + layer_id);
         void *cpu_ptr = cpu_blocks_;
-        int64_t cpu_startoff_inside_chunks =
-            is_mla ? 0 : i * gpu_chunk_sizes_in_bytes_[i];
+        int64_t cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i];
+        if (is_mla && !is_host_to_device) {
+          cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
+        } else if (is_mla && is_host_to_device) {
+          cpu_startoff_inside_chunks = 0;
+        }
+        int64_t gpu_startoff_inside_chunks = 
+            is_mla && !is_host_to_device ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_ : 0;
+        // we assume that the chunk size is the same for all gpus,
+        // even if they have different number of gpu_blocks
+        int64_t chunk_size = is_mla && !is_host_to_device ? 
+            gpu_chunk_sizes_in_bytes_[i] / num_gpus_ : gpu_chunk_sizes_in_bytes_[i];
       
         flexkv::transfer_kv_blocks(
           num_blocks, layer_id, layer_granularity, gpu_block_ids,
           gpu_layer_ptrs, gpu_kv_strides_in_bytes_[i], gpu_block_strides_in_bytes_[i],
+          gpu_startoff_inside_chunks,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
           cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-          cpu_startoff_inside_chunks, gpu_chunk_sizes_in_bytes_[i], streams_[i],
+          cpu_startoff_inside_chunks, chunk_size, streams_[i],
           transfer_sms, is_host_to_device, use_ce_transfer, is_mla
         );
 
