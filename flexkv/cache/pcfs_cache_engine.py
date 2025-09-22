@@ -22,18 +22,19 @@ class HierarchyLRCacheEngine:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 device_type: DeviceType,
-                 # Optional runtime wiring for remote/local trees
-                 local_max_num_blocks: Optional[int] = 0,
-                 local_lease_ttl_ms: int = 100000,
+                device_type: DeviceType,
+                # Optional runtime wiring for remote/local trees
+                local_max_num_blocks: Optional[int] = 0,
+                local_lease_ttl_ms: int = 100000,
                  local_renew_lease_ms: int = 10000,
                  local_refresh_batch_size: int = 1000,
                  local_idle_sleep_ms: int = 10,
                  remote_max_num_blocks: int = 4000000,
                  redis_node_id: int = 0,
                  remote_refresh_batch_size: int = 1000,
-                 remote_rebuild_interval_ms: int = 1000,
+                 remote_rebuild_interval_ms: int = 10000,
                  remote_idle_sleep_ms: int = 10,
+                 evict_start_threshold: float = 1.0,
                  meta: Optional[RedisMeta] = None) -> None:
         if num_total_blocks <= 0:
             raise InvalidConfigError(f"Invalid num_total_blocks: {num_total_blocks}")
@@ -81,6 +82,7 @@ class HierarchyLRCacheEngine:
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
+        self.evict_start_threshold = evict_start_threshold
 
     def start(self) -> None:
         if self._meta is None:
@@ -138,8 +140,7 @@ class HierarchyLRCacheEngine:
         # Query both local and remote
         mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
         mr_remote = self.remote_index.match_prefix(block_hashes_t, int(num_blocks), True)
-        print(f"the local match result: {mr_local.num_matched_blocks}, {mr_local.num_ready_matched_blocks }")
-        print(f"the remote match result: {mr_remote.num_matched_blocks}, {mr_remote.num_ready_matched_blocks}")
+        print(f"[MATCH {self.device_type.name}] local: {mr_local.num_matched_blocks}/{mr_local.num_ready_matched_blocks}, remote: {mr_remote.num_matched_blocks}/{mr_remote.num_ready_matched_blocks}")
         # For simplicy, we choose the one with the larger matched length; tie-break on ready length
         # We should allow to combine the two results in the future.
         local_key = (int(mr_local.num_matched_blocks), int(mr_local.num_ready_matched_blocks))
@@ -165,10 +166,11 @@ class HierarchyLRCacheEngine:
                 else:
                     # For P2P mode, use node_ids directly
                     bnids_np = nids.cpu().numpy().astype(np.uint32)
+                    #print(f"[REMOTE_MATCH {self.device_type.name}] Using remote data: block_ids={nps.cpu().numpy()[:min(4, len(nps))]}, node_ids={bnids_np[:min(4, len(bnids_np))]}")
             else:
                 bnids_np = None
                 if mr_remote.num_matched_blocks > 0:
-                    print("[DEBUG] Warning: remote matched but block_node_ids is empty, falling back to local")
+                    #print(f"[REMOTE_MATCH {self.device_type.name}] Warning: remote matched but block_node_ids is empty, falling back to local")
                     chosen = mr_local
         phys_np = chosen.physical_blocks.cpu().numpy()
         if self.device_type == DeviceType.CPU and matched_pos == "remote" and mr_local.num_matched_blocks > 0:
@@ -262,14 +264,17 @@ class HierarchyLRCacheEngine:
         phys_t = torch.from_numpy(physical_block_ids).to(torch.int64) if isinstance(physical_block_ids, np.ndarray) else physical_block_ids.to(torch.int64)
         hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
         if match_result is None:
-            return self.local_index.insert(
+            node = self.local_index.insert(
                 phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks), bool(is_ready)
             )
         else:
-            return self.local_index.insert(
+            node = self.local_index.insert(
                 phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks), bool(is_ready),
                 match_result.last_node, int(match_result.num_matched_blocks), int(match_result.last_node_matched_length)
             )
+        # NOTE: Do NOT lock the node here, because the caller (put() method) will lock it
+        # The node will be unlocked in _transfer_callback after data transfer completes
+        return node
 
     def lock_node(self, node: CRadixNode) -> None:
         if node is None:
@@ -289,6 +294,18 @@ class HierarchyLRCacheEngine:
         Args:
             node: The radix node to unlock
         """
+        if node is None:
+            return
+        try:
+            is_remote_node = bool(node.has_block_node_ids())
+        except Exception:
+            is_remote_node = False
+        if is_remote_node:
+            self.remote_index.unlock(node)
+        else:
+            self.local_index.unlock(node)
+
+    def cleanup(self, node: CRadixNode, cleanup_length: int) -> None:
         if node is None:
             return
         try:
@@ -327,25 +344,45 @@ class HierarchyLRCacheEngine:
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
              strict: bool = True) -> torch.Tensor:
-        if num_required_blocks > self.mempool.num_free_blocks:
+        # Calculate current utilization
+        utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
+        
+        # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
+        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
+        
+        if should_evict:
             if protected_node is not None:
                 self.local_index.lock(protected_node)
+            
+            # Calculate how many blocks to evict
+            # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
+            target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
+            evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
+            
             evict_block_num = max(
-                num_required_blocks - self.mempool.num_free_blocks,
-                int(self.mempool.num_total_blocks * self.evict_ratio),
+                num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
+                evict_to_reach_target,                               # Or reach target free ratio
+                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
             )
-            target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
-            num_evicted = self.local_index.evict(target_blocks, evict_block_num)
-            if num_evicted != evict_block_num:
-                target_blocks.resize_(num_evicted)
-            self.mempool.recycle_blocks(target_blocks.numpy())
+            
+            if evict_block_num > 0:
+                target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
+                num_evicted = self.local_index.evict(target_blocks, evict_block_num)
+                if num_evicted != evict_block_num:
+                    target_blocks.resize_(num_evicted)
+                self.mempool.recycle_blocks(target_blocks.numpy())
+            
             if protected_node is not None:
                 self.local_index.unlock(protected_node)
+        
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise NotEnoughSpaceError(
                 "Not enough free blocks to take, ", required=num_required_blocks, available=self.mempool.num_free_blocks
             )
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
+        #print(f"[TAKE STATISTICS] device type: {self.device_type.name}, utilization: {utilization}, ",
+        #      f"should_evict: {should_evict}, num_required_blocks: {num_required_blocks}, ",
+        #      f"num_allocated_blocks: {num_allocated_blocks}, num_free_blocks: {self.mempool.num_free_blocks}")
         return self.mempool.allocate_blocks(num_allocated_blocks)
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
@@ -353,7 +390,7 @@ class HierarchyLRCacheEngine:
 
 
     @classmethod
-    def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "PCFSCacheEngine":
+    def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
         """Create a PCFSCacheEngine from CacheConfig.
 
         This replaces RemotePCFSCacheEngine. It wires both local and remote
@@ -438,12 +475,20 @@ class HierarchyLRCacheEngine:
         if device_type == DeviceType.REMOTE:
             return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta)
         else:
+            # 根据device_type选择正确的blocks配置
+            if device_type == DeviceType.CPU:
+                local_max_num_blocks = int(cache_config.num_cpu_blocks)
+            elif device_type == DeviceType.SSD:
+                local_max_num_blocks = int(cache_config.num_ssd_blocks)
+            else:
+                local_max_num_blocks = int(cache_config.num_local_blocks or 0)
+            
             return cls(
                 num_total_blocks=int(cache_config.num_remote_blocks or 0),
                 tokens_per_block=int(cache_config.tokens_per_block),
                 evict_ratio=float(cache_config.evict_ratio),
                 device_type=device_type,
-                local_max_num_blocks=int(cache_config.num_local_blocks or 0),
+                local_max_num_blocks=local_max_num_blocks,
                 local_lease_ttl_ms=int(getattr(cache_config, "lease_ttl_ms", 100000)),
                 local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 0)),
                 local_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
@@ -454,8 +499,9 @@ class HierarchyLRCacheEngine:
                 # remote_node_id=int(node_id),
                 # remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
                 remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 128)),
-                remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 1000)),
+                remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 10000)),
                 remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
+                evict_start_threshold=float(cache_config.evict_start_threshold),
                 meta=meta,
             )
             raise InvalidConfigError("Invalid device type: {cache_config.device_type}")

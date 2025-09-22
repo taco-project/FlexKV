@@ -87,7 +87,7 @@ cpp_extensions = [
         library_dirs=[os.path.join(build_dir, "lib")],
         include_dirs=include_dirs,
         depends=hpp_sources,
-        extra_compile_args={"nvcc": nvcc_compile_args, "cxx": extra_compile_args},
+        extra_compile_args={"nvcc": ["-O3"], "cxx": extra_compile_args},
         extra_link_args=extra_link_args,
     ),
 ]

@@ -23,6 +23,7 @@ static inline uint64_t get_now_ms() {
 LocalRadixTree::LocalRadixTree(int tokens_per_block, int max_num_blocks, uint32_t ttl_ms, uint32_t renew_ms, uint32_t batch_sz, uint32_t idle_sleep_ms)
   : CRadixTreeIndex(tokens_per_block, max_num_blocks), channel(nullptr), node_id(0), lease_ttl_ms(ttl_ms), refresh_batch_size(batch_sz), lease_pool(max_num_blocks) {
   this->idle_sleep_ms = idle_sleep_ms;
+  
   if (renew_ms == 0) {
     renew_lease_ms = (uint32_t)(ttl_ms * 2 / 10);
     if (renew_lease_ms == 0) {
@@ -120,10 +121,7 @@ size_t LocalRadixTree::local_block_report(size_t max_batch) {
   NewBlockMeta* node_ptr = nullptr;
   // 1) publish new block metas
   while (processed < max_batch && new_block_queue.pop(node_ptr)) {
-    printf("[DEBUG] LocalRadixTree: publishing node with %zu blocks to Redis (node_id=%u)\n", 
-           node_ptr ? node_ptr->block_hashes.size() : 0, node_id);
     publish_node_blocks(node_ptr);
-    printf("[DEBUG] LocalRadixTree: published one node successfully\n");
     delete node_ptr; // release the temporary copied node
     processed++;
   }
@@ -178,13 +176,10 @@ void LocalRadixTree::insert_and_publish(const CRadixNode *node) {
   dst_hashes.insert(dst_hashes.end(), src_hashes.begin(), src_hashes.end());
   dst_phys.insert(dst_phys.end(), src_phys.begin(), src_phys.end());
   // Lease meta is optional for publishing; keep nullptr so publisher treats as defaults
-  printf("[DEBUG] LocalRadixTree::insert_and_publish: queued node with %zu blocks (node_id=%u, parent_hash=%ld)\n", 
-         dst_hashes.size(), node_id, cp->parent_hash);
   // DEBUG: Print block hashes being published
-  printf("[DEBUG] Block hashes being published:\n");
-  for (size_t i = 0; i < std::min(dst_hashes.size(), size_t(10)); ++i) {
+  /*for (size_t i = 0; i < std::min(dst_hashes.size(), size_t(10)); ++i) {
     printf("  [%zu] hash=%ld, pb=%ld\n", i, dst_hashes[i], dst_phys[i]);
-  }
+  }*/
   new_block_queue.push(cp);
 }
 
@@ -231,8 +226,8 @@ bool LocalRadixTree::start(RedisMetaChannel *ch) {
 void LocalRadixTree::renew_relese_time() {
   // compute new lease expiry (ms)
   struct timeval tv; gettimeofday(&tv, nullptr);
-  uint32_t now_ms = (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
-  uint32_t new_lt = now_ms + lease_ttl_ms;
+  uint64_t now_ms = (uint64_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+  uint64_t new_lt = now_ms + lease_ttl_ms;
   // update in-memory metas 
   lease_pool.for_each_allocated_item([&](LeaseMeta* m){
     if (m != nullptr && m->state == NODE_STATE_NORMAL) {
@@ -261,7 +256,6 @@ void LocalRadixTree::publish_node_blocks(NewBlockMeta *node) {
   if (n == 0) return;
   std::vector<BlockMeta> metas;
   metas.reserve(n);
-  printf("we have get prepared to publish one node, the size of the node is %zu\n", n);
   for (size_t i = 0; i < n; ++i) {
     BlockMeta meta;
     if (i == 0) {
@@ -277,7 +271,7 @@ void LocalRadixTree::publish_node_blocks(NewBlockMeta *node) {
     metas.push_back(meta);
   }
   channel->publish(metas);
-  printf("we have published one node in publish_node_blocks\n");
+  //printf("we have published one node in publish_node_blocks, and the node size is %zu, the node hash is %ld\n", n, hashes[0]);
 }
 
 int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
@@ -293,13 +287,44 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   uint64_t now_ms = (uint64_t)now_tv.tv_sec * 1000 + (uint64_t)(now_tv.tv_usec / 1000);
 
   // Partition leaf candidates by lease expiry
+  int evictable_count = 0;
+  int not_evictable_count = 0;
+  int locked_count = 0;
+  int not_ready_count = 0;
+  int expired_count = 0;
+  int fresh_count = 0;
+  int about_to_evict_count = 0;
+  
   for (auto it = leaf_list.begin(); it != leaf_list.end(); ++it) {
     CRadixNode *node = *it;
-    if (!node->evictable()) continue;
+    if (!node->evictable()) {
+      not_evictable_count++;
+      // Check why not evictable
+      if (node->get_lock_cnt() > 0) locked_count++;
+      if (!node->is_ready()) not_ready_count++;
+      continue;
+    }
+    evictable_count++;
     LeaseMeta *lm = node->get_lease_meta();
     bool expired = (lm == nullptr) || ((uint64_t)lm->lease_time <= now_ms);
-    if (expired) expired_q.push(node); else fresh_q.push(node);
+    if (expired) {
+      expired_q.push(node);
+      expired_count++;
+    } else {
+      // 只有NORMAL状态的节点才加入fresh_q，跳过ABOUT_TO_EVICT
+      if (lm && lm->state == NODE_STATE_NORMAL) {
+        fresh_q.push(node);
+        fresh_count++;
+      } else {
+        about_to_evict_count++;
+      }
+    }
   }
+  
+  // Log eviction状态 when eviction is attempted
+  /*printf("[EVICT] need=%d, leaf_list=%zu, evictable=%d (expired=%d, fresh_normal=%d, about_to_evict=%d), not_evictable=%d (locked=%d, not_ready=%d)\n",
+         num_evicted, leaf_list.size(), evictable_count, expired_count, fresh_count, 
+         about_to_evict_count, not_evictable_count, locked_count, not_ready_count);*/
 
   auto push_parent_if_candidate = [&](CRadixNode *parent){
     if (parent->is_leaf() && !is_root(parent)) {
@@ -368,29 +393,27 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
           // Attach LeaseMeta if missing and mark ABOUT_TO_EVICT
           LeaseMeta *newlm = lease_pool.alloc();
           assert(newlm != nullptr);
-          // get current lease meta
+          // get current lease meta (fresh_q中已经只包含NORMAL节点)
           LeaseMeta *slm = node->get_lease_meta();
           assert(slm != nullptr);
+          assert(slm->state == NODE_STATE_NORMAL);
           // set new lease meta
           subset->set_lease_meta(newlm);
           newlm->state = slm->state;
           newlm->lease_time = slm->lease_time;
-          if (slm->state == NODE_STATE_NORMAL) {
-            slm->state = NODE_STATE_ABOUT_TO_EVICT;
-            auto hashs = subset->get_block_hashes();
-            about_to_evict_q->insert(about_to_evict_q->end(), hashs.begin(), hashs.end());
-          }
+          slm->state = NODE_STATE_ABOUT_TO_EVICT;
+          auto hashs = subset->get_block_hashes();
+          about_to_evict_q->insert(about_to_evict_q->end(), hashs.begin(), hashs.end());
           remaining -= subset->size(); // should equal 'remaining'
         }
       } else {
-        // Mark whole node
+        // Mark whole node (fresh_q中已经只包含NORMAL节点)
         LeaseMeta *lm = node->get_lease_meta();
         assert(lm != nullptr);
-        if (lm->state == NODE_STATE_NORMAL) {
-          lm->state = NODE_STATE_ABOUT_TO_EVICT;
-          auto hashs = node->get_block_hashes();
-          about_to_evict_q->insert(about_to_evict_q->end(), hashs.begin(), hashs.end());
-        }
+        assert(lm->state == NODE_STATE_NORMAL);
+        lm->state = NODE_STATE_ABOUT_TO_EVICT;
+        auto hashs = node->get_block_hashes();
+        about_to_evict_q->insert(about_to_evict_q->end(), hashs.begin(), hashs.end());
         remaining -= node_sz;
       }
     }
@@ -401,6 +424,7 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   if (about_to_evict_q && about_to_evict_q->size() > 0) {
     about_to_evict_blocks_queue.push(about_to_evict_q);
   }
+  
   return has_evicted;
 }
 
@@ -408,24 +432,16 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
 std::shared_ptr<CMatchResult> LocalRadixTree::match_prefix(torch::Tensor &block_hashes,
   int num_blocks, bool update_cache_info) {
   // DEBUG: Print matching attempt info for local tree
-  printf("[DEBUG] LocalRadixTree::match_prefix called with %d blocks\n", num_blocks);
-  if (num_blocks > 0 && block_hashes.numel() >= num_blocks) {
+  /*if (num_blocks > 0 && block_hashes.numel() >= num_blocks) {
     auto *hashes_ptr = block_hashes.data_ptr<int64_t>();
-    printf("[DEBUG] Local query hashes: [");
     for (int i = 0; i < std::min(num_blocks, 10); ++i) {
       printf("%ld%s", hashes_ptr[i], (i < num_blocks - 1 && i < 9) ? ", " : "");
     }
     printf("]\n");
-  }
-  
-  auto root = this->get_root();
-  printf("[DEBUG] Local index: root has %d children, is_empty=%s\n", 
-         root->get_num_children(), this->is_empty() ? "true" : "false");
+  }*/
   
   auto result = CRadixTreeIndex::match_prefix(block_hashes, num_blocks, update_cache_info);
   
-  printf("[DEBUG] Local match result: matched=%d blocks, ready=%d blocks\n", 
-         result->num_matched_blocks, result->num_ready_matched_blocks);
   
   return result;
 }

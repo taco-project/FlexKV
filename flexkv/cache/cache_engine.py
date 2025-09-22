@@ -46,7 +46,8 @@ class CacheEngineAccel:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 hit_reward_seconds: int = 0):
+                 hit_reward_seconds: int = 0,
+                 evict_start_threshold: float = 1.0):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -64,6 +65,7 @@ class CacheEngineAccel:
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
+        self.evict_start_threshold = evict_start_threshold
 
     def reset(self) -> None:
         self.index.reset()
@@ -126,21 +128,37 @@ class CacheEngineAccel:
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
              strict: bool = True) -> torch.Tensor:
-        if num_required_blocks > self.mempool.num_free_blocks:
+        # Calculate current utilization
+        utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
+        
+        # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
+        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
+        
+        if should_evict:
             if protected_node is not None:
                 self.index.lock(protected_node)
+            
+            # Calculate how many blocks to evict
+            # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
+            target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
+            evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
+            
             evict_block_num = max(
-                num_required_blocks - self.mempool.num_free_blocks,
-                int(self.mempool.num_total_blocks * self.evict_ratio)
+                num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
+                evict_to_reach_target,                               # Or reach target free ratio
+                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
             )
-            target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
-            num_evicted = self.index.evict(target_blocks, evict_block_num)
-            if num_evicted != evict_block_num:
-                target_blocks.resize_(num_evicted)
-            self.mempool.recycle_blocks(target_blocks.numpy())
-
+            
+            if evict_block_num > 0:
+                target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
+                num_evicted = self.index.evict(target_blocks, evict_block_num)
+                if num_evicted != evict_block_num:
+                    target_blocks.resize_(num_evicted)
+                self.mempool.recycle_blocks(target_blocks.numpy())
+            
             if protected_node is not None:
                 self.index.unlock(protected_node)
+        
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise RuntimeError(f"Not enough free blocks to take, "
                                f"required: {num_required_blocks}, "
@@ -157,7 +175,8 @@ class CacheEngine:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 hit_reward_seconds: int = 0):
+                 hit_reward_seconds: int = 0,
+                 evict_start_threshold: float = 1.0):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -175,6 +194,7 @@ class CacheEngine:
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
+        self.evict_start_threshold = evict_start_threshold
 
     def reset(self) -> None:
         self.index.reset()
@@ -210,18 +230,35 @@ class CacheEngine:
              num_required_blocks: int,
              protected_node: Optional[RadixNode] = None,
              strict: bool = True) -> np.ndarray:
-        if num_required_blocks > self.mempool.num_free_blocks:
+        # Calculate current utilization
+        utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
+        
+        # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
+        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
+        
+        if should_evict:
             if protected_node is not None:
                 self.index.lock(protected_node)
+            
+            # Calculate how many blocks to evict
+            # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
+            target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
+            evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
+            
             evict_block_num = max(
-                num_required_blocks - self.mempool.num_free_blocks,
-                int(self.mempool.num_total_blocks * self.evict_ratio)
+                num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
+                evict_to_reach_target,                               # Or reach target free ratio
+                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
             )
-            self.mempool.recycle_blocks(
-                self.index.evict(evict_block_num)
-            )
+            
+            if evict_block_num > 0:
+                self.mempool.recycle_blocks(
+                    self.index.evict(evict_block_num)
+                )
+            
             if protected_node is not None:
                 self.index.unlock(protected_node)
+        
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise RuntimeError("Not enough free blocks to take, ",
                                f"required: {num_required_blocks}, "
@@ -270,6 +307,7 @@ class GlobalCacheEngine:
             self.index_accel = False
 
         self.evict_ratio = GLOBAL_CONFIG_FROM_ENV.evict_ratio
+        self.evict_start_threshold = GLOBAL_CONFIG_FROM_ENV.evict_start_threshold
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
 
         if cache_config.enable_cpu:
@@ -280,13 +318,15 @@ class GlobalCacheEngine:
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.evict_start_threshold)
             else:
                 self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.evict_start_threshold)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
@@ -296,13 +336,15 @@ class GlobalCacheEngine:
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.evict_start_threshold)
             else:
                 self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.evict_start_threshold)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
@@ -313,13 +355,15 @@ class GlobalCacheEngine:
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
                                                    self.evict_ratio,
-                                                   self.hit_reward_seconds)
+                                                   self.hit_reward_seconds,
+                                                   self.evict_start_threshold)
             else:
                 self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
                                                    self.evict_ratio,
-                                                   self.hit_reward_seconds)
+                                                   self.hit_reward_seconds,
+                                                   self.evict_start_threshold)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
         #TODO move this to kvmanager.start()
@@ -658,6 +702,10 @@ class GlobalCacheEngine:
             cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta, temp_cache_strategy)
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
+
+        # DEBUG: Log GET operation with hash info
+        #if len(sequence_meta.block_hashes) > 0:
+        #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
 
         # tailor the blocks to assure:
         # the blocks are needed by the mask & the blocks are ready
@@ -1111,6 +1159,10 @@ class GlobalCacheEngine:
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
+        
+        # DEBUG: Log PUT operation with hash info
+        #if len(sequence_meta.block_hashes) > 0:
+        #    print(f"[PUT {request_id}] hash[0]={sequence_meta.block_hashes[0]}, CPU_match={cpu_matched_result.num_matched_blocks}, SSD_match={ssd_matched_result.num_matched_blocks}")
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
@@ -1139,6 +1191,7 @@ class GlobalCacheEngine:
 
         if len(fragment12_cpu_blocks) < fragment12_num_blocks or \
             len(fragment2_ssd_blocks) < fragment2_num_blocks:
+            print(f"[WARNING] PUT request {request_id} FAILED: CPU={len(fragment12_cpu_blocks)}/{fragment12_num_blocks}, SSD={len(fragment2_ssd_blocks)}/{fragment2_num_blocks}")
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
             if enable_ssd:
                 self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
@@ -1213,15 +1266,17 @@ class GlobalCacheEngine:
                            is_put: bool = False) -> None:
         if DeviceType.CPU in node_to_unlock:
             assert self.cpu_cache_engine is not None
-            self.cpu_cache_engine.unlock(node_to_unlock[DeviceType.CPU][0])
-            self.cpu_cache_engine.set_ready(node_to_unlock[DeviceType.CPU][0], True, node_to_unlock[DeviceType.CPU][1])
+            cpu_node = node_to_unlock[DeviceType.CPU][0]
+            self.cpu_cache_engine.unlock(cpu_node)
+            self.cpu_cache_engine.set_ready(cpu_node, True, node_to_unlock[DeviceType.CPU][1])
             if is_put and self.enable_kv_sharing:
                 if self.cache_config.enable_p2p_cpu:
-                    self.cpu_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.CPU][0])
+                    self.cpu_cache_engine.local_index.insert_and_publish(cpu_node)
         if DeviceType.SSD in node_to_unlock:
             assert self.ssd_cache_engine is not None
-            self.ssd_cache_engine.unlock(node_to_unlock[DeviceType.SSD][0])
-            self.ssd_cache_engine.set_ready(node_to_unlock[DeviceType.SSD][0], True, node_to_unlock[DeviceType.SSD][1])
+            ssd_node = node_to_unlock[DeviceType.SSD][0]
+            self.ssd_cache_engine.unlock(ssd_node)
+            self.ssd_cache_engine.set_ready(ssd_node, True, node_to_unlock[DeviceType.SSD][1])
             if is_put and self.enable_kv_sharing:
                 if self.cache_config.enable_p2p_ssd:
                     self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
@@ -1311,7 +1366,7 @@ class GlobalCacheEngine:
                 remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result
-        
+
     @nvtx.annotate("Match All Prefix", color="yellow")
     def match_all(self,
                   sequence_meta: SequenceMeta,

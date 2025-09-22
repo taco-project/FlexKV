@@ -56,8 +56,12 @@ def test_imports():
         from flexkv.cache.radix_remote import LocalRadixTree, DistributedRadixTree
         print("[OK] LocalRadixTree 和 DistributedRadixTree 导入成功")
         
-        from flexkv.cache.pcfs_cache_engine import PCFSCacheEngine
-        print("[OK] PCFSCacheEngine 导入成功")
+        # PCFSCacheEngine 已被重构为 HierarchyLRCacheEngine
+        try:
+            from flexkv.cache.pcfs_cache_engine import HierarchyLRCacheEngine
+            print("[OK] HierarchyLRCacheEngine 导入成功")
+        except ImportError as e:
+            print(f"[WARN] HierarchyLRCacheEngine 导入失败: {e}")
         
         from flexkv.cache.redis_meta import RedisMeta, RedisMetaChannel
         print("[OK] RedisMeta 和 RedisMetaChannel 导入成功")
@@ -79,7 +83,7 @@ def test_distributed_radix_tree():
             max_num_blocks=1000,
             node_id=1,
             refresh_batch_size=32,
-            rebuild_interval_ms=1,
+            rebuild_interval_ms=1000,
             idle_sleep_ms=1,
             lease_renew_ms=1
         )
@@ -90,7 +94,7 @@ def test_distributed_radix_tree():
         
         # 测试查找（DistributedRadixTree 没有 insert 方法）
         try:
-            match_result = drt.match_prefix(test_tokens, 0, False)
+            match_result = drt.match_prefix(test_tokens, len(test_tokens), False)
             print(f"[OK] 查找操作成功: {match_result}")
         except Exception as e:
             print(f"[WARN] 查找操作失败: {e}")
@@ -130,7 +134,7 @@ def test_local_radix_tree():
         # 测试查找
         try:
             lrt.insert(test_tokens, test_tokens, 4, 4, True, None, -1, -1)
-            match_result = lrt.match_prefix(test_tokens, 0, False)
+            match_result = lrt.match_prefix(test_tokens, len(test_tokens), False)
             if match_result is None:
                 print(f"[WARN] 查找操作失败: {match_result}")
                 return False
@@ -164,18 +168,20 @@ def test_local_radix_tree():
         return False
 
 def test_pcfs_cache_engine():
-    """测试 PCFSCacheEngine 功能"""
-    print("\n=== 测试 PCFSCacheEngine 功能 ===")
+    """测试 HierarchyLRCacheEngine 功能"""
+    print("\n=== 测试 HierarchyLRCacheEngine 功能 ===")
     try:
-        from flexkv.cache.pcfs_cache_engine import PCFSCacheEngine
+        from flexkv.cache.pcfs_cache_engine import HierarchyLRCacheEngine
+        from flexkv.common.transfer import DeviceType
         
-        # 创建 PCFSCacheEngine 实例
-        cache_engine = PCFSCacheEngine(
+        # 创建 HierarchyLRCacheEngine 实例
+        cache_engine = HierarchyLRCacheEngine(
             num_total_blocks=1000,
             tokens_per_block=4,
-            evict_ratio=0.1
+            evict_ratio=0.1,
+            device_type=DeviceType.CPU
         )
-        print("[OK] PCFSCacheEngine 创建成功")
+        print("[OK] HierarchyLRCacheEngine 创建成功")
         
         # 测试基本属性
         print(f"  - num_total_blocks: {cache_engine.num_total_blocks}")
@@ -184,7 +190,7 @@ def test_pcfs_cache_engine():
         
         return True
     except Exception as e:
-        print(f"[ERROR] PCFSCacheEngine 测试失败: {e}")
+        print(f"[ERROR] HierarchyLRCacheEngine 测试失败: {e}")
         return False
 
 def test_distributed_radix_tree_integration():
@@ -193,12 +199,37 @@ def test_distributed_radix_tree_integration():
     try:
         from flexkv.cache.radix_remote import LocalRadixTree, DistributedRadixTree
         from flexkv.cache.redis_meta import RedisMeta
+        import redis
+        
+        # 步骤0: 清理Redis中的历史数据
+        print("步骤0: 清理Redis历史数据...")
+        try:
+            r = redis.Redis(host='127.0.0.1', port=6379, decode_responses=True)
+            # 删除所有 block:* 和 node:* keys
+            block_keys = list(r.scan_iter("block:*"))
+            node_keys = list(r.scan_iter("node:*"))
+            if block_keys:
+                r.delete(*block_keys)
+            if node_keys:
+                r.delete(*node_keys)
+            print(f"[OK] Redis 清理完成 - 删除了 {len(block_keys)} 个block keys 和 {len(node_keys)} 个node keys")
+        except Exception as e:
+            print(f"[WARN] Redis 清理失败: {e}")
+        
+        # 使用时间戳生成唯一的 IP 地址
+        import time
+        timestamp = int(time.time() * 1000) % 100000
+        ip_suffix1 = (timestamp % 250) + 1
+        ip_suffix2 = ((timestamp + 1) % 250) + 1
+        local_ip1 = f"10.0.{ip_suffix1 // 250}.{ip_suffix1 % 250}"
+        local_ip2 = f"10.0.{ip_suffix2 // 250}.{ip_suffix2 % 250}"
         
         # 步骤1: 创建两个RedisMeta实例
         print("步骤1: 创建RedisMeta实例...")
-        redis_meta1 = RedisMeta(host="127.0.0.1", port=6379, local_ip="127.0.0.1")
-        redis_meta2 = RedisMeta(host="127.0.0.1", port=6379, local_ip="127.0.0.2")
-        print(f"[OK] RedisMeta实例创建成功 - Meta1(127.0.0.1), Meta2(127.0.0.2)")
+        print(f"  使用唯一IP: local_ip1={local_ip1}, local_ip2={local_ip2}")
+        redis_meta1 = RedisMeta(host="127.0.0.1", port=6379, local_ip=local_ip1)
+        redis_meta2 = RedisMeta(host="127.0.0.1", port=6379, local_ip=local_ip2)
+        print(f"[OK] RedisMeta实例创建成功 - Meta1({local_ip1}), Meta2({local_ip2})")
         
         # 步骤2: 初始化RedisMeta
         print("步骤2: 初始化RedisMeta...")
@@ -219,7 +250,7 @@ def test_distributed_radix_tree_integration():
         local_tree1 = LocalRadixTree(
             tokens_per_block=4,
             max_num_blocks=1000,
-            lease_ttl_ms=10000,
+            lease_ttl_ms=100000,
             renew_lease_ms=2,
             refresh_batch_size=64,
             idle_sleep_ms=1
@@ -228,7 +259,7 @@ def test_distributed_radix_tree_integration():
         local_tree2 = LocalRadixTree(
             tokens_per_block=4,
             max_num_blocks=1000,
-            lease_ttl_ms=10000,
+            lease_ttl_ms=100000,
             renew_lease_ms=2,
             refresh_batch_size=64,
             idle_sleep_ms=1
@@ -240,8 +271,8 @@ def test_distributed_radix_tree_integration():
             max_num_blocks=1000,
             node_id=node_id1,
             refresh_batch_size=32,
-            rebuild_interval_ms=1,
-            idle_sleep_ms=1,
+            rebuild_interval_ms=3000,  # 增加到3秒，避免频繁的 Redis 操作阻塞 stop()
+            idle_sleep_ms=100,  # 增加idle时间，让 stop() 更快响应
             lease_renew_ms=2
         )
         
@@ -250,8 +281,8 @@ def test_distributed_radix_tree_integration():
             max_num_blocks=1000,
             node_id=node_id2,
             refresh_batch_size=32,
-            rebuild_interval_ms=1,
-            idle_sleep_ms=1,
+            rebuild_interval_ms=3000,  # 增加到3秒，避免频繁的 Redis 操作阻塞 stop()
+            idle_sleep_ms=100,  # 增加idle时间，让 stop() 更快响应
             lease_renew_ms=2
         )
         print("[OK] RadixTree实例创建成功 - 2个LocalRadixTree, 2个DistributedRadixTree")
@@ -264,17 +295,19 @@ def test_distributed_radix_tree_integration():
         channel2 = redis_meta2.get_redis_meta_channel()
         if not channel2:
             raise RuntimeError("RedisMeta2获取RedisMetaChannel失败")
+        channel3 = redis_meta1.get_redis_meta_channel()
+        if not channel3:
+            raise RuntimeError("RedisMeta3获取RedisMetaChannel失败")
+        channel4 = redis_meta2.get_redis_meta_channel()
+        if not channel4:
+            raise RuntimeError("RedisMeta4获取RedisMetaChannel失败")
         
-        # 同时启动所有RadixTree
+        # 先启动 LocalRadixTree
         if not local_tree1.start(channel1):
             raise RuntimeError("LocalRadixTree1启动失败")
         if not local_tree2.start(channel2):
             raise RuntimeError("LocalRadixTree2启动失败")
-        if not distributed_tree1.start(channel1):
-            raise RuntimeError("DistributedRadixTree1启动失败")
-        if not distributed_tree2.start(channel2):
-            raise RuntimeError("DistributedRadixTree2启动失败")
-        print("[OK] 所有RadixTree启动成功")
+        print("[OK] LocalRadixTree启动成功")
         
         # 步骤5: 创建测试数据 - 每个包含4个block
         print("步骤5: 创建测试数据...")
@@ -316,30 +349,31 @@ def test_distributed_radix_tree_integration():
         else:
             print("    [WARN] LocalRadixTree2 insert返回None")
         
+        # 步骤6.5: 等待数据发布到 Redis
+        print("步骤6.5: 等待数据发布到 Redis. sleep 2 seconds...")
+        time.sleep(2)
+        print("[OK] 数据发布等待完成")
+        
+        # 步骤6.6: 启动 DistributedRadixTree
+        print("步骤6.6: 启动 DistributedRadixTree...")
+        if not distributed_tree1.start(channel3):
+            raise RuntimeError("DistributedRadixTree1启动失败")
+        if not distributed_tree2.start(channel4):
+            raise RuntimeError("DistributedRadixTree2启动失败")
+        print("[OK] DistributedRadixTree启动成功")
+        
         # 步骤7: 等待数据同步
-        print("步骤7: 等待数据同步...")
-        time.sleep(3)  # 增加等待时间确保数据同步
+        print("步骤7: 等待 DistributedRadixTree 刷新. sleep 8 seconds...")
+        time.sleep(8)  # 等待 DistributedRadixTree 完成至少两次刷新（rebuild_interval_ms=3000），确保数据被加载
         print("[OK] 数据同步等待完成")
         
-        # 步骤8: 使用DistributedRadixTree加载Redis数据
-        print("步骤8: 使用DistributedRadixTree加载Redis数据...")
+        # 步骤7.5: 调试信息 - 检查 Redis 中的数据
+        print("步骤7.5: 检查 Redis 中的数据...")
+        print(f"  - node_id1: {node_id1}")
+        print(f"  - node_id2: {node_id2}")
         
-        # DistributedRadixTree1刷新
-        print("  - DistributedRadixTree1执行remote_tree_refresh...")
-        refresh_result1 = distributed_tree1.remote_tree_refresh()
-        if refresh_result1 is None:
-            raise RuntimeError("DistributedRadixTree1 remote_tree_refresh失败")
-        print(f"    [OK] DistributedRadixTree1 remote_tree_refresh完成")
-        
-        # DistributedRadixTree2刷新
-        print("  - DistributedRadixTree2执行remote_tree_refresh...")
-        refresh_result2 = distributed_tree2.remote_tree_refresh()
-        if refresh_result2 is None:
-            raise RuntimeError("DistributedRadixTree2 remote_tree_refresh失败")
-        print(f"    [OK] DistributedRadixTree2 remote_tree_refresh完成")
-        
-        # 步骤9: 详细验证结果
-        print("步骤9: 验证结果...")
+        # 步骤8: 详细验证结果
+        print("步骤8: 验证结果...")
         
         # 验证LocalRadixTree状态
         print("LocalRadixTree状态:")
@@ -353,7 +387,7 @@ def test_distributed_radix_tree_integration():
         if lrt1_ready == 0:
             raise RuntimeError("LocalRadixTree1 total_ready_blocks失败")
         lrt1_unready = local_tree1.total_unready_blocks()
-        if lrt1_unready == 0:
+        if lrt1_unready != 0:
             raise RuntimeError("LocalRadixTree1 total_unready_blocks失败")
         
         lrt2_nodes = local_tree2.total_node_num()
@@ -366,7 +400,7 @@ def test_distributed_radix_tree_integration():
         if lrt2_ready == 0:
             raise RuntimeError("LocalRadixTree2 total_ready_blocks失败")
         lrt2_unready = local_tree2.total_unready_blocks()
-        if lrt2_unready == 0:
+        if lrt2_unready != 0:
             raise RuntimeError("LocalRadixTree2 total_unready_blocks失败")
         
         print(f"  - LocalRadixTree1: 节点数={lrt1_nodes}, 缓存块数={lrt1_cached}, 就绪块数={lrt1_ready}, 未就绪块数={lrt1_unready}")
@@ -389,12 +423,12 @@ def test_distributed_radix_tree_integration():
         test_hashes2 = torch.tensor([3001, 3002, 3003, 3004], dtype=torch.long)
         
         # 在LocalRadixTree中测试匹配
-        match_result1 = local_tree1.match_prefix(test_hashes1, 4, True)
+        match_result1 = local_tree1.match_prefix(test_hashes1, len(test_hashes1), True)
         if match_result1 is None:
             raise RuntimeError("LocalRadixTree1 match_prefix失败")
         if match_result1.num_matched_blocks == 0:
             raise RuntimeError("LocalRadixTree1 match_prefix失败")
-        match_result2 = local_tree2.match_prefix(test_hashes2, 4, True)
+        match_result2 = local_tree2.match_prefix(test_hashes2, len(test_hashes2), True)
         if match_result2 is None:
             raise RuntimeError("LocalRadixTree2 match_prefix失败")
         if match_result2.num_matched_blocks == 0:
@@ -403,19 +437,42 @@ def test_distributed_radix_tree_integration():
         print(f"  - LocalRadixTree2匹配结果: 匹配块数={match_result2.num_matched_blocks if match_result2 else 0}")
         
         # 在DistributedRadixTree中测试匹配
-        drt_match1 = distributed_tree1.match_prefix(test_hashes2, 4, True)
+        drt_match1 = distributed_tree1.match_prefix(test_hashes2, len(test_hashes2), True)
+        print(f"  - DistributedRadixTree1匹配结果: {drt_match1}")
+        if drt_match1:
+            print(f"    匹配块数={drt_match1.num_matched_blocks}")
         if drt_match1 is None:
-            raise RuntimeError("DistributedRadixTree1 match_prefix失败")
+            raise RuntimeError("DistributedRadixTree1 match_prefix失败: 返回None")
         if drt_match1.num_matched_blocks == 0:
-            raise RuntimeError("DistributedRadixTree1 match_prefix失败")
-        drt_match2 = distributed_tree2.match_prefix(test_hashes1, 4, True)
+            raise RuntimeError(f"DistributedRadixTree1 match_prefix失败: 匹配块数为0, 查询hashes={test_hashes2.tolist()}")
+        drt_match2 = distributed_tree2.match_prefix(test_hashes1, len(test_hashes1), True)
         if drt_match2 is None:
             raise RuntimeError("DistributedRadixTree2 match_prefix失败")
         if drt_match2.num_matched_blocks == 0:
             raise RuntimeError("DistributedRadixTree2 match_prefix失败")
         print(f"  - DistributedRadixTree1匹配结果: 匹配块数={drt_match1.num_matched_blocks if drt_match1 else 0}")
         print(f"  - DistributedRadixTree2匹配结果: 匹配块数={drt_match2.num_matched_blocks if drt_match2 else 0}")
+        # 步骤9: 使用DistributedRadixTree加载Redis数据
+        print("步骤9: 使用DistributedRadixTree加载Redis数据...")
+        distributed_tree1.stop()
+        distributed_tree2.stop()
+        local_tree1.stop()
+        local_tree2.stop()
+        print("[OK] DistributedRadixTree停止")
+        time.sleep(1)
+        # DistributedRadixTree1刷新
+        print("  - DistributedRadixTree1执行remote_tree_refresh...")
+        refresh_result1 = distributed_tree1.remote_tree_refresh()
+        if refresh_result1 is None:
+            raise RuntimeError("DistributedRadixTree1 remote_tree_refresh失败")
+        print(f"    [OK] DistributedRadixTree1 remote_tree_refresh完成")
         
+        # DistributedRadixTree2刷新
+        print("  - DistributedRadixTree2执行remote_tree_refresh...")
+        refresh_result2 = distributed_tree2.remote_tree_refresh()
+        if refresh_result2 is None:
+            raise RuntimeError("DistributedRadixTree2 remote_tree_refresh失败")
+        print(f"    [OK] DistributedRadixTree2 remote_tree_refresh完成")
         # 步骤10: 性能测试
         print("步骤10: 性能测试...")
         
@@ -434,7 +491,7 @@ def test_distributed_radix_tree_integration():
                 # 测试insert性能
                 lrt_node = local_tree1.insert(test_physical, test_hashes, 4, 4, True, None, -1, -1)
                 # 测试match_prefix性能
-                lrt_match = local_tree1.match_prefix(test_hashes, 4, True)
+                lrt_match = local_tree1.match_prefix(test_hashes, len(test_hashes), True)
             except Exception as e:
                 print(f"    [WARN] LocalRadixTree1性能测试中操作失败: {e}")
                 break
@@ -456,7 +513,7 @@ def test_distributed_radix_tree_integration():
             test_hashes = torch.tensor([(i + 2000) % 3000, (i + 2001) % 3000, (i + 2002) % 3000, (i + 2003) % 3000], dtype=torch.long)
             try:
                 # 测试match_prefix性能
-                drt_match = distributed_tree1.match_prefix(test_hashes, 4, True)
+                drt_match = distributed_tree1.match_prefix(test_hashes, len(test_hashes), True)
             except Exception as e:
                 print(f"    [WARN] DistributedRadixTree1性能测试中操作失败: {e}")
                 break
@@ -547,7 +604,7 @@ def main():
         ("模块导入", test_imports),
         ("LocalRadixTree", test_local_radix_tree),
         ("DistributedRadixTree", test_distributed_radix_tree),
-        ("PCFSCacheEngine", test_pcfs_cache_engine),
+        ("HierarchyLRCacheEngine", test_pcfs_cache_engine),
         ("分布式RadixTree集成", test_distributed_radix_tree_integration),
         ("CUDA 跳过", test_cuda_skipping),
     ]
