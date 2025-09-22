@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include "radix_tree.h" // for NodeState
+#include "lease_meta_mempool.h" // for NODE_STATE_* macros
 
 namespace flexkv {
 
@@ -12,7 +12,7 @@ struct BlockMeta {
   uint32_t nid;      // node id
   int64_t hash;      // current block hash
   uint32_t lt;       // lease time
-  NodeState state;   // lease state
+  int state;         // lease state
 };
 
 } // namespace flexkv

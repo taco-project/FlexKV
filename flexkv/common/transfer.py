@@ -1,7 +1,7 @@
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, List, Set, Dict
+from typing import ClassVar, List, Set, Dict, Optional
 
 import numpy as np
 
@@ -48,6 +48,7 @@ class TransferOp:
     dst_block_ids: np.ndarray
     layer_id: int = 0
     layer_granularity: int = -1
+    src_block_node_ids: Optional[np.ndarray] = None
     # this will change dynamically as transfer ops executed
     predecessors: Set[int] = field(default_factory=set)
     # this will keep the full info

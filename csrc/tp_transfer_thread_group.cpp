@@ -15,7 +15,9 @@
  * limitations under the License.
  */
 #include "tp_transfer_thread_group.h"
+#ifdef CUDA_AVAILABLE
 #include "transfer.cuh"
+#endif
 #include <stdexcept>
 
 namespace flexkv {
@@ -218,11 +220,13 @@ void TPTransferThreadGroup::tp_group_transfer(
             break;
         }
 
+#ifdef CUDA_AVAILABLE
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
           failed = true;
           error_msg = cudaGetErrorString(err);
         }
+#endif
       } catch (const std::exception &e) {
         failed = true;
         error_msg = e.what();

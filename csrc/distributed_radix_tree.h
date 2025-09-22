@@ -28,7 +28,8 @@ class RedisMetaChannel; // forward declaration
 
 class RefRadixTree : public CRadixTreeIndex {
 public:
-  RefRadixTree(int tokens_per_block, int max_num_blocks = 1000000);
+  RefRadixTree(int tokens_per_block, int max_num_blocks = 1000000, uint32_t lease_renew_ms = 5000,
+     LockFreeQueue<CRadixNode*> *renew_lease_queue = nullptr, LeaseMetaMemPool* lt_pool = nullptr);
   ~RefRadixTree();
   // Decrement reference count; when it reaches zero, delete this instance
   void dec_ref_cnt();
@@ -50,7 +51,9 @@ private:
 
   int evict(torch::Tensor &evicted_blocks, int num_evicted) override;
   std::atomic<uint32_t> ref_cnt;
-
+  uint32_t lease_renew_ms_;
+  LockFreeQueue<CRadixNode*> *renew_lease_queue_;
+  LeaseMetaMemPool* lt_pool_;
 };
 
 struct RefCntGuard {
@@ -76,7 +79,7 @@ private:
   size_t refresh_batch_size_ = 128;
   uint32_t rebuild_interval_ms_ = 1000;
   uint32_t idle_sleep_ms_ = 10;
-  uint32_t renew_threshold_ms_ = 5000; // 5 seconds before expiry to renew lease
+  uint32_t lease_renew_ms_ = 5000;
   LockFreeQueue<CRadixNode*> renew_lease_queue;
   bool refresh_started = false;
   volatile bool refresh_should_stop = false;
@@ -90,16 +93,16 @@ private:
 public:
   DistributedRadixTree(int tokens_per_block, int max_num_blocks,
                   uint32_t node_id,
-                  size_t lt_pool_initial_capacity = 0,
                   size_t refresh_batch_size = 128,
                   uint32_t rebuild_interval_ms = 1000,
-                  uint32_t idle_sleep_ms = 10);
+                  uint32_t idle_sleep_ms = 10,
+                  uint32_t lease_renew_ms = 5000);
   ~DistributedRadixTree();
 
   void set_meta_channel(RedisMetaChannel *ch) { channel = ch; }
   void set_node_id(uint32_t nid) { node_id = nid; }
 
-  void start(RedisMetaChannel *channel);
+  bool start(RedisMetaChannel *channel);
   void stop();
   RefRadixTree* remote_tree_refresh();
   std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,

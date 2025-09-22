@@ -81,7 +81,7 @@ void LeaseMetaMemPool::free(LeaseMeta *ptr) {
     std::lock_guard<std::mutex> lk(allocated_mu);
     auto it = allocated_set.find(ptr);
     if (it == allocated_set.end()) {
-      // not allocated from this pool or double free, ignore safely
+      // not allocated from this pool or already freed: ignore safely (idempotent)
       return;
     }
     allocated_set.erase(it);

@@ -20,8 +20,8 @@ static inline uint64_t get_now_ms() {
   return (uint64_t)now.tv_sec * 1000 + (uint64_t)(now.tv_usec / 1000);
 }
 
-LocalRadixTree::LocalRadixTree(int tokens_per_block, int max_num_blocks, uint32_t ttl_ms, uint32_t renew_ms, uint32_t batch_sz, uint32_t idle_sleep_ms, size_t lt_pool_initial_capacity)
-  : CRadixTreeIndex(tokens_per_block, max_num_blocks), channel(nullptr), node_id(0), lease_ttl_ms(ttl_ms), refresh_batch_size(batch_sz), lease_pool(lt_pool_initial_capacity) {
+LocalRadixTree::LocalRadixTree(int tokens_per_block, int max_num_blocks, uint32_t ttl_ms, uint32_t renew_ms, uint32_t batch_sz, uint32_t idle_sleep_ms)
+  : CRadixTreeIndex(tokens_per_block, max_num_blocks), channel(nullptr), node_id(0), lease_ttl_ms(ttl_ms), refresh_batch_size(batch_sz), lease_pool(max_num_blocks) {
   this->idle_sleep_ms = idle_sleep_ms;
   if (renew_ms == 0) {
     renew_lease_ms = (uint32_t)(ttl_ms * 2 / 10);
@@ -31,6 +31,11 @@ LocalRadixTree::LocalRadixTree(int tokens_per_block, int max_num_blocks, uint32_
   } else {
     renew_lease_ms = renew_ms;
   }
+}
+
+LocalRadixTree::~LocalRadixTree() {
+  // Ensure background worker is stopped before nodes/lease pool destruction
+  stop();
 }
 
 CRadixNode *LocalRadixTree::insert(torch::Tensor &physical_block_ids,
@@ -199,14 +204,19 @@ void LocalRadixTree::refresh_worker() {
   }
 }
 
-void LocalRadixTree::start(RedisMetaChannel *ch) {
-  if (refresh_started) return;
+bool LocalRadixTree::start(RedisMetaChannel *ch) {
+  if (refresh_started) return true;
   // Initialize channel and node_id from ch
   set_meta_channel(ch);
-  if (channel == nullptr) return;
+  if (channel == nullptr) return false;
   refresh_should_stop = false;
   refresh_started = true;
-  pthread_create(&refresh_tid, nullptr, &LocalRadixTree::refresh_worker_trampoline, this);
+  int result = pthread_create(&refresh_tid, nullptr, &LocalRadixTree::refresh_worker_trampoline, this);
+  if (result != 0) {
+    refresh_started = false;
+    return false;
+  }
+  return true;
 }
 void LocalRadixTree::renew_relese_time() {
   // compute new lease expiry (ms)
@@ -394,7 +404,13 @@ int LocalRadixTree::total_cached_blocks() { return CRadixTreeIndex::total_cached
 int LocalRadixTree::total_node_num() { return CRadixTreeIndex::total_node_num(); }
 void LocalRadixTree::reset() { CRadixTreeIndex::reset(); }
 bool LocalRadixTree::is_root(CRadixNode *node) { return CRadixTreeIndex::is_root(node); }
-void LocalRadixTree::remove_node(CRadixNode *node) { CRadixTreeIndex::remove_node(node); }
+void LocalRadixTree::remove_node(CRadixNode *node) {
+  auto lm = node->get_lease_meta();
+  if (lm != nullptr) {
+    lease_pool.free(lm);
+  }
+  CRadixTreeIndex::remove_node(node); 
+}
 void LocalRadixTree::remove_leaf(CRadixNode *node) { CRadixTreeIndex::remove_leaf(node); }
 void LocalRadixTree::add_node(CRadixNode *node) { CRadixTreeIndex::add_node(node); }
 void LocalRadixTree::add_leaf(CRadixNode *node) { CRadixTreeIndex::add_leaf(node); }

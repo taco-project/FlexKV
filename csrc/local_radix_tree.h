@@ -44,7 +44,7 @@ private:
   void refresh_worker();
   static void* refresh_worker_trampoline(void* arg);
 
-  void publish_node_blocks(CRadixNode *node);
+  void publish_node_blocks(NewBlockMeta *node);
   // Pop at most max_batch nodes from new_block_queue and publish their BlockMeta to Redis.
   // Returns number of nodes published.
   size_t local_block_report(size_t max_batch = 1024);
@@ -56,8 +56,8 @@ public:
                  uint32_t lease_ttl_ms = 100000,
                  uint32_t renew_lease_ms = 0,
                  uint32_t refresh_batch_size = 256,
-                 uint32_t idle_sleep_ms = 10,
-                 size_t lt_pool_initial_capacity = 0);
+                 uint32_t idle_sleep_ms = 10);
+  ~LocalRadixTree();
 
   void set_meta_channel(RedisMetaChannel *ch);
 
@@ -65,7 +65,7 @@ public:
   void insert_and_publish(const CRadixNode *node);
 
   // Start background thread; initialize channel and node_id from ch first
-  void start(RedisMetaChannel *ch);
+  bool start(RedisMetaChannel *ch);
   // Stop background thread gracefully
   void stop();
 

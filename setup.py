@@ -25,13 +25,17 @@ enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
 # Define C++ extensions
 cpp_sources = [
     "csrc/bindings.cpp",
-    "csrc/transfer.cu",
+    # "csrc/transfer.cu",  # Skip CUDA file for now
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/gds/tp_gds_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
     "csrc/gds/gds_manager.cpp"
+    "csrc/distributed_radix_tree.cpp",
+    "csrc/local_radix_tree.cpp",
+    "csrc/redis_meta_channel.cpp",
+    "csrc/lease_meta_mempool.cpp",
 ]
 
 hpp_sources = [
@@ -43,7 +47,8 @@ hpp_sources = [
     "csrc/gds/gds_manager.h",
 ]
 
-extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
+#extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
+extra_link_args = ["-lxxhash", "-lpthread", "-lrt", "-luring", "-lhiredis"]
 extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
 
@@ -160,6 +165,7 @@ setup(
             build_temp=os.path.join(build_dir, "temp"),  # Temporary build files
         )
     },
-    python_requires=">=3.8",
+    #python_requires=">=3.8",
+    python_requires=">=3.6",
 )
 
