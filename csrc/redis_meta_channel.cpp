@@ -9,6 +9,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <iostream>
 
 namespace flexkv {
 
@@ -318,7 +319,7 @@ size_t RedisMetaChannel::load(std::vector<BlockMeta> &out, size_t max_items) {
   return out.size();
 }
 
-bool RedisMetaChannel::renew_node_leases(uint32_t node_id, uint32_t new_lt, size_t batch_size) {
+bool RedisMetaChannel::renew_node_leases(uint32_t node_id, uint64_t new_lt, size_t batch_size) {
   // Discover keys for this node and update lt via pipeline
   std::vector<std::string> keys;
   if (!list_block_keys(node_id, keys)) return false;
@@ -346,6 +347,8 @@ uint32_t RedisMetaChannel::get_node_id() const {
 bool RedisMetaChannel::list_keys(const std::string &pattern, std::vector<std::string> &keys) {
   keys.clear();
   std::string cursor = "0";
+  size_t iter_safety = 0;
+  const size_t kMaxScanIterations = 100000; // hard safety cap to prevent infinite loops
   
   do {
     // Use raw command to get proper SCAN response parsing
@@ -381,19 +384,30 @@ bool RedisMetaChannel::list_keys(const std::string &pattern, std::vector<std::st
       
       // Second element is array of keys
       if (reply->element[1]->type == REDIS_REPLY_ARRAY) {
+        size_t added = 0;
         for (size_t i = 0; i < reply->element[1]->elements; ++i) {
           if (reply->element[1]->element[i]->type == REDIS_REPLY_STRING) {
             keys.push_back(std::string(reply->element[1]->element[i]->str, 
                                       reply->element[1]->element[i]->len));
+            ++added;
           }
         }
+        //std::cerr << "[FlexKV][RedisMeta] SCAN got " << added << " keys, new cursor=" << cursor << std::endl;
       }
+    } else {
+      std::cerr << "[FlexKV][RedisMeta] SCAN unexpected reply type; breaking" << std::endl;
+      freeReplyObject(reply);
+      return false;
     }
     
     freeReplyObject(reply);
+    if (++iter_safety > kMaxScanIterations) {
+      std::cerr << "[FlexKV][RedisMeta] SCAN exceeded safety iteration cap; breaking" << std::endl;
+      return false;
+    }
     
   } while (cursor != "0");
-  
+  //std::cerr << "[FlexKV][RedisMeta] SCAN got " << keys.size() << " keys" << std::endl;
   return true;
 }
 

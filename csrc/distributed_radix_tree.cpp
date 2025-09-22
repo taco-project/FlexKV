@@ -9,6 +9,7 @@
 #include <sys/time.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <iostream>
 
 namespace flexkv {
 DistributedRadixTree::DistributedRadixTree(int tokens_per_block, int max_num_blocks,
@@ -58,8 +59,6 @@ void* DistributedRadixTree::refresh_worker_trampoline(void* arg) {
 bool DistributedRadixTree::start(RedisMetaChannel *ch) {
   if (refresh_started) return true;
   channel = ch;
-  printf("[DEBUG] DistributedRadixTree::start() called, channel=%p, ch->node_id=%u, this->node_id=%u\n", 
-         ch, ch ? ch->get_node_id() : 0, node_id);
   refresh_should_stop = false;
   refresh_started = true;
   int result = pthread_create(&refresh_tid, nullptr, &DistributedRadixTree::refresh_worker_trampoline, this);
@@ -85,7 +84,6 @@ void DistributedRadixTree::refresh_worker() {
   struct timeval tv_start; gettimeofday(&tv_start, nullptr);
   uint64_t last_rebuild_ms = (uint64_t)tv_start.tv_sec * 1000 + (uint64_t)(tv_start.tv_usec / 1000);
   while (!refresh_should_stop) {
-    printf("[DEBUG] refresh_worker loop iteration start, channel=%p\n", channel);
     std::vector<CRadixNode*> batch;
     batch.reserve(batch_size);
     CRadixNode* node = nullptr;
@@ -106,9 +104,7 @@ void DistributedRadixTree::refresh_worker() {
       RefRadixTree* new_idx = remote_tree_refresh();
       printf("we have got the new index from the remote tree refresh\n");
       if (new_idx != nullptr) {
-        printf("[DEBUG] Switching index: new=%p, old=%p\n", new_idx, c_index.load());
         RefRadixTree* old_idx = c_index.exchange(new_idx, std::memory_order_acq_rel);
-        printf("[DEBUG] Index switched successfully\n");
         RefRadixTree* old_idx2 = old_index.exchange(old_idx, std::memory_order_acq_rel);
         if (old_idx2 != nullptr) {
           old_idx2->dec_ref_cnt();
@@ -146,7 +142,7 @@ void DistributedRadixTree::refresh_nodes_lease_from_redis(const std::vector<CRad
     auto *lm = n->get_lease_meta();
     if (lm == nullptr) continue;
     auto &hashes = n->get_block_hashes();
-    uint32_t min_lt = UINT32_MAX;
+    uint64_t min_lt = UINT64_MAX;
     for (size_t i = 0; i < hashes.size(); ++i, ++idx) {
       if (idx >= lt_state.size()) break;
       const std::string &lt_s = lt_state[idx].first;
@@ -155,7 +151,7 @@ void DistributedRadixTree::refresh_nodes_lease_from_redis(const std::vector<CRad
       try {
         int st = std::stoi(st_s);
         if (st == (int)NODE_STATE_NORMAL) {
-          uint32_t lt = (uint32_t)std::stoul(lt_s);
+          uint64_t lt = (uint64_t)std::stoull(lt_s);
           if (lt < min_lt) min_lt = lt;
         }
       } catch (const std::exception&) {
@@ -163,8 +159,8 @@ void DistributedRadixTree::refresh_nodes_lease_from_redis(const std::vector<CRad
         continue;
       }
     }
-    if (min_lt != UINT32_MAX) {
-      lm->lease_time = min_lt == UINT32_MAX ? 0 : min_lt;
+    if (min_lt != UINT64_MAX) {
+      lm->lease_time = min_lt == UINT64_MAX ? 0 : min_lt;
     }
   }
 }
@@ -175,19 +171,26 @@ struct NodeInfo {
 };
 
 RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
-  printf("we are starting to refresh the remote tree\n");
-  if (channel == nullptr) return nullptr;
+  if (channel == nullptr) {
+    std::cerr << "[ERROR] remote_tree_refresh: channel is nullptr" << std::endl;
+    return nullptr;
+  }
   // 1) list node:* keys
   std::vector<std::string> node_keys;
-  if (!channel->list_node_keys(node_keys)) return nullptr;
-  if (node_keys.empty()) return nullptr;
+  if (!channel->list_node_keys(node_keys)) {
+    std::cerr << "[ERROR] remote_tree_refresh: list_node_keys failed" << std::endl;
+    return nullptr;
+  }
+  if (node_keys.empty()) {
+    std::cerr << "[ERROR] remote_tree_refresh: node_keys is empty" << std::endl;
+    return nullptr;
+  }
+
   // Extract node ids from keys (format: node:<id>)
-  printf("[DEBUG] local_ip=%s, node_id=%u\n", channel->get_local_ip().c_str(), node_id);
   std::vector<NodeInfo> nodes;
   nodes.reserve(node_keys.size());
   std::vector<std::string> ips;
   ips.reserve(node_keys.size());
-  printf("[DEBUG] found %zu node keys\n", node_keys.size());
   for (const auto& k : node_keys) {
     printf("[debug] node key: %s\n", k.c_str());
   }
@@ -208,80 +211,57 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
     } catch (const std::exception&) {
       continue;
     }
-    printf("[DEBUG] Parsing node key %s -> nid=%u, self node_id=%u\n", k.c_str(), nid, node_id);
-    if (nid == node_id) {
-      printf("[DEBUG] Skipping self node %u\n", nid);
-      continue; // skip self
-    }
+    if (nid == node_id) continue; // skip self
     std::string ip = ips[i];
-    printf("[DEBUG] Node %u IP: %s, self_ip: %s\n", nid, ip.c_str(), self_ip.c_str());
     uint32_t dst = compute_ip_distance(ip, self_ip);
-    printf("[DEBUG] Node %u distance: %u\n", nid, dst);
     nodes.push_back(NodeInfo{nid, dst});
   }
 
   // 3) sort by numeric distance ascending
   std::sort(nodes.begin(), nodes.end(), [](const NodeInfo &a, const NodeInfo &b){ return a.dst < b.dst; });
   
-  printf("[DEBUG] After filtering, will process %zu remote nodes\n", nodes.size());
   for (const auto &nfo : nodes) {
-    printf("[DEBUG] Remote node: nid=%u, distance=%u\n", nfo.nid, nfo.dst);
   }
 
   // 4) iterate nodes and load their block metas
   RefRadixTree* new_index = new RefRadixTree(tokens_per_block, max_num_blocks, lease_renew_ms_,
      &renew_lease_queue, &lt_pool);
-  int total_blocks_loaded = 0;
   for (const auto &nfo : nodes) {
-    printf("[DEBUG] === Loading node %u (distance=%u) ===\n", nfo.nid, nfo.dst);
     // list keys block:<nid>:*
     std::vector<std::string> bkeys;
     //std::string pat = std::string("block:") + std::to_string(nfo.nid) + ":*";
     if (!channel->list_block_keys(nfo.nid, bkeys)) {
-      printf("[DEBUG] list_block_keys FAILED for node %u\n", nfo.nid);
+      std::cerr << "[ERROR] remote_tree_refresh: list_block_keys failed for node_id=" << nfo.nid << std::endl;
       continue;
     }
-    printf("[DEBUG] Node %u has %zu block keys\n", nfo.nid, bkeys.size());
     if (bkeys.empty()) {
-      printf("[DEBUG] Node %u: empty block keys, skipping\n", nfo.nid);
+      std::cerr << "[ERROR] remote_tree_refresh: no block keys for node_id=" << nfo.nid << std::endl;
       continue;
     }
 
     std::vector<BlockMeta> metas;
     channel->load_metas_by_keys(bkeys, metas);
-    printf("[DEBUG] Node %u: loaded %zu metas from Redis\n", nfo.nid, metas.size());
     if (metas.empty()) {
-      printf("[DEBUG] Node %u: metas empty after load, skipping\n", nfo.nid);
+      std::cerr << "[ERROR] remote_tree_refresh: no metas loaded for node_id=" << nfo.nid << " (had " << bkeys.size() << " keys)" << std::endl;
       continue;
-    }
-    // DEBUG: Print first few block hashes
-    printf("[DEBUG] Node %u: First block hashes from Redis:\n", nfo.nid);
-    for (size_t i = 0; i < std::min(metas.size(), size_t(10)); ++i) {
-      printf("  [%zu] hash=%ld, ph=%ld, pb=%ld, state=%d\n", 
-             i, metas[i].hash, metas[i].ph, metas[i].pb, metas[i].state);
     }
     // Merge into new_index via DFS+merge helpers
     if (!metas.empty()) {
       std::unordered_map<int64_t, std::vector<BlockMeta*>> parent_to_children;
-      int normal_state_count = 0;
-      for (int i = 0; i < metas.size(); ++i) {
+      for (size_t i = 0; i < metas.size(); ++i) {
         if (metas[i].state != NODE_STATE_NORMAL) continue;
-        normal_state_count++;
         parent_to_children[metas[i].ph].push_back(&metas[i]);
       }
-      printf("[DEBUG] Node %u: %d metas with NODE_STATE_NORMAL\n", nfo.nid, normal_state_count);
-      printf("[DEBUG] Node %u: parent_to_children has %zu unique parents\n", nfo.nid, parent_to_children.size());
-      printf("[DEBUG] Node %u: root children count = %zu\n", nfo.nid, parent_to_children[0].size());
-      
       std::unordered_set<int64_t> processed_hashes;
       std::vector<CRadixNode*> temp_root_children;
       for (const auto& root_child_ptr : parent_to_children[0]) {
         if (processed_hashes.find(root_child_ptr->hash) != processed_hashes.end()) continue;
         CRadixNode* temp_root_child = dfs_build_subtree_from_meta(root_child_ptr, new_index, nullptr,
                                    parent_to_children, processed_hashes, lt_pool, true);
-        temp_root_children.push_back(temp_root_child);
+        if (temp_root_child != nullptr) {
+          temp_root_children.push_back(temp_root_child);
+        }
       }
-      printf("[DEBUG] Node %u: built %zu temp_root_children\n", nfo.nid, temp_root_children.size());
       
       int merged_count = 0;
       for (auto root_child : temp_root_children) {
@@ -289,16 +269,12 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
         attach_and_merge_root_child(new_index, root_child, new_index->get_root(), lt_pool);
         merged_count++;
       }
-      printf("[DEBUG] Node %u: merged %d subtrees into new_index\n", nfo.nid, merged_count);
-      total_blocks_loaded += normal_state_count;
     }
   }
-  printf("[DEBUG] remote_tree_refresh END: total_blocks=%d, processed %zu nodes\n", total_blocks_loaded, nodes.size());
   
   // DEBUG: Print statistics about the newly built tree
   if (new_index != nullptr) {
     auto root = new_index->get_root();
-    printf("[DEBUG] New remote tree stats:\n");
     printf("  - Root has %d children\n", root->get_num_children());
     printf("  - Tree is_empty: %s\n", new_index->is_empty() ? "true" : "false");
     // Print first few root children hashes
@@ -318,34 +294,23 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
 std::shared_ptr<CMatchResult> DistributedRadixTree::match_prefix(
   torch::Tensor &block_hashes, int num_blocks, bool update_cache_info) {
   RefRadixTree *idx = c_index.load(std::memory_order_acquire);
-  
-  // DEBUG: Print matching attempt info
-  printf("[DEBUG] DistributedRadixTree::match_prefix called with %d blocks\n", num_blocks);
-  if (num_blocks > 0 && block_hashes.numel() >= num_blocks) {
-    auto *hashes_ptr = block_hashes.data_ptr<int64_t>();
-    printf("[DEBUG] Query hashes: [");
-    for (int i = 0; i < std::min(num_blocks, 10); ++i) {
-      printf("%ld%s", hashes_ptr[i], (i < num_blocks - 1 && i < 9) ? ", " : "");
-    }
-    printf("]\n");
+  if (idx == nullptr) {
+    auto empty_i64 = torch::empty({0}, torch::dtype(torch::kInt64));
+    auto empty_u32 = torch::empty({0}, torch::dtype(torch::kInt32));
+    return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
   }
   
   if (idx == nullptr) {
-    printf("[DEBUG] Remote index is NULL, returning empty match result\n");
     auto empty_i64 = torch::empty({0}, torch::dtype(torch::kInt64));
     auto empty_u32 = torch::empty({0}, torch::dtype(torch::kInt32));
     return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
   }
   
   auto root = idx->get_root();
-  printf("[DEBUG] Remote index exists, root has %d children, is_empty=%s\n", 
-         root->get_num_children(), idx->is_empty() ? "true" : "false");
   
   RefCntGuard guard{idx};
   auto result = idx->match_prefix(block_hashes, num_blocks, update_cache_info);
   
-  printf("[DEBUG] Match result: matched=%d blocks, ready=%d blocks\n", 
-         result->num_matched_blocks, result->num_ready_matched_blocks);
   
   return result;
 }
@@ -484,6 +449,7 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   uint64_t now_ms = (uint64_t)now_tv.tv_sec * 1000 + (uint64_t)(now_tv.tv_usec / 1000);
 
   while (prefix_blocks_num < num_blocks) {
+    
     if (update_cache_info) {
       current_node->update_time();
     }
@@ -491,59 +457,97 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
     // DEBUG: Print matching loop state
     bool is_root_node = (current_node->get_parent() == nullptr);
     HashType next_child_hash = HashType(block_hashes_ptr[prefix_blocks_num + current_node->size()]);
-    printf("[DEBUG] RefRadixTree match loop: prefix_blocks_num=%d, current_node_size=%d, is_root=%s, next_child_hash=%ld, has_children=%d\n",
-           prefix_blocks_num, current_node->size(), is_root_node ? "true" : "false", 
-           next_child_hash, current_node->get_num_children());
     
     // DEBUG: Print all children hashes if root
     if (is_root_node && current_node->get_num_children() > 0) {
-      printf("[DEBUG] RefRadixTree root children hashes: ");
       current_node->for_each_child([](HashType h, CRadixNode* c) {
         printf("%ld ", h);
       });
       printf("\n");
     }
 
-    // Lease checks on current node before descending further
+    // For non-root nodes, first verify blocks match, then check lease validity before copying
     if (!is_root(current_node)) {
-      LeaseMeta* lm = current_node->get_lease_meta();
-      uint64_t lt = (lm != nullptr) ? (uint64_t)lm->lease_time : 0;
-      if (lt > 0) {
-        if ((int64_t)lt - (int64_t)now_ms <= 0) {
-          // expired: stop matching and return what we have so far
+      // First, verify that this node's blocks match the query
+      auto node_size = current_node->size();
+      auto remaining_query_blocks = num_blocks - prefix_blocks_num;
+      auto blocks_to_check = std::min(node_size, remaining_query_blocks);
+      
+      // Find how many blocks match
+      int matched = 0;
+      for (int i = 0; i < blocks_to_check; ++i) {
+        if (current_node->get_hash(i) == HashType(block_hashes_ptr[prefix_blocks_num + i])) {
+          matched++;
+        } else {
           break;
         }
-        if ((int64_t)lt - (int64_t)now_ms <= (int64_t)lease_renew_ms_) {
-          if (renew_lease_queue_ != nullptr) {
-            renew_lease_queue_->push(current_node);
+      }
+      
+      // Only check lease validity if we have matched blocks
+      if (matched > 0) {
+        // Get lease meta
+        LeaseMeta* lm = current_node->get_lease_meta();
+        if (lm == nullptr) {
+          std::cerr << "[ERROR] lease_meta is nullptr for node at " << current_node 
+                    << ", is_root=" << is_root(current_node)
+                    << ", size=" << current_node->size() << std::endl;
+          break;
+        }
+        
+        // Check if lease is valid
+        uint64_t lt = (uint64_t)lm->lease_time;
+        if (lt > 0) {
+          if ((int64_t)lt - (int64_t)now_ms <= 0) {
+            // Lease expired: stop matching and return what we have so far
+            // Do NOT add this node's blocks to the result
+            break;
+          }
+          // Check if lease needs renewal
+          if ((int64_t)lt - (int64_t)now_ms <= (int64_t)lease_renew_ms_) {
+            if (renew_lease_queue_ != nullptr) {
+              renew_lease_queue_->push(current_node);
+            }
           }
         }
+        
+        // Lease is valid - copy the matched blocks
+        auto pbs = current_node->get_physical_blocks();
+        auto bnis = current_node->get_block_node_ids();
+        
+        if (bnis == nullptr) {
+          std::cerr << "[ERROR] block_node_ids is nullptr for non-root node at " << current_node << std::endl;
+          break;
+        }
+        
+        for (int i = 0; i < matched; ++i) {
+          pb_out[pb_write++] = pbs[i];
+          ni_out[ni_write++] = (*bnis)[i];
+        }
+        
+        if (current_node->is_ready()) {
+          last_ready_node = current_node;
+          ready_prefix_blocks_num += matched;
+        }
+        
+        prefix_blocks_num += matched;
+      }
+      
+      // If we didn't match all blocks in this node, we're done
+      if (matched < node_size) {
+        last_node_matched_length = matched;
+        break;
+      }
+      
+      // If we've consumed all query blocks, we're done
+      if (prefix_blocks_num >= num_blocks) {
+        break;
       }
     }
 
-    child_hash = HashType(block_hashes_ptr[prefix_blocks_num + current_node->size()]);
+    // Look for the next child node (note: for non-root nodes, we've already consumed their blocks above)
+    child_hash = HashType(block_hashes_ptr[prefix_blocks_num]);
     if (current_node->lookup_child(child_hash)) {
-      printf("[DEBUG] RefRadixTree: Found child with hash %ld\n", child_hash);
-      
-      // First, collect current node's blocks
-      if (current_node->is_ready()) {
-        last_ready_node = current_node;
-        ready_prefix_blocks_num += current_node->size();
-      }
-      prefix_blocks_num += current_node->size();
-      for (auto v : current_node->get_physical_blocks()) {
-        pb_out[pb_write++] = v;
-      }
-      auto bnis = current_node->get_block_node_ids();
-      if (bnis != nullptr) {
-        for (auto v : *bnis) {
-          ni_out[ni_write++] = v;
-        }
-      } else {
-        std::cerr << "block_node_ids is nullptr" << std::endl;
-      }
-      
-      // Move to child node
+      // Simply move to the child node; we'll process its blocks in the next iteration
       current_node = current_node->get_child(child_hash);
       
       // CRITICAL: For compressed nodes with multiple blocks, verify all blocks match
@@ -554,19 +558,15 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
         int remaining = num_blocks - prefix_blocks_num;
         int to_check = std::min(child_size, remaining);
         
-        printf("[DEBUG] RefRadixTree: Verifying child node with %d blocks (checking %d)\n", child_size, to_check);
         
         for (int i = 0; i < to_check; i++) {
           if (current_node->get_hash(i) == HashType(block_hashes_ptr[prefix_blocks_num + i])) {
             child_matched++;
           } else {
-            printf("[DEBUG] RefRadixTree: Mismatch at block %d: node_hash=%ld, query_hash=%ld\n", 
-                   i, current_node->get_hash(i), HashType(block_hashes_ptr[prefix_blocks_num + i]));
             break;
           }
         }
         
-        printf("[DEBUG] RefRadixTree: Child node matched %d/%d blocks\n", child_matched, to_check);
         
         // If not all blocks match, we have a partial match - collect what matches and stop
         if (child_matched < to_check) {
@@ -612,61 +612,15 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
         }
       }
     } else {
-      printf("[DEBUG] RefRadixTree: Child NOT found for hash %ld, checking partial match\n", child_hash);
-      auto matched_length = 0;
-      if (is_root(current_node) == false) {
-        auto cmp_length = std::min(current_node->size(), num_blocks - prefix_blocks_num);
-        auto left = 0;
-        auto right = cmp_length;
-
-        while (left < right) {
-          auto mid = (left + right) / 2;
-          if (current_node->get_hash(mid) == HashType(block_hashes_ptr[prefix_blocks_num+mid])) {
-            left = mid + 1;
-          } else {
-            right = mid;
-          }
-        }
-        matched_length = left;
-        auto &dq = current_node->get_physical_blocks();
-        for (int i = 0; i < matched_length; ++i) {
-          pb_out[pb_write++] = dq[i];
-        }
-        auto bnis = current_node->get_block_node_ids();
-        if (bnis != nullptr) {
-          for (auto v : *bnis) {
-            ni_out[ni_write++] = v;
-          }
-        } else {
-          std::cerr << "block_node_ids is nullptr" << std::endl;
-        }
-      } else {
-        matched_length = 0;
-      }
-
-      if (current_node->is_ready()) {
-        last_ready_node = current_node;
-        ready_prefix_blocks_num += matched_length;
-      }
-
-      last_node_matched_length = matched_length;
-      prefix_blocks_num += matched_length;
+      // No child found - we've matched as far as possible
+      // For non-root nodes, we've already processed their blocks in the loop above
+      // For root nodes, there's nothing to match
       break;
     }
   }
 
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
   auto node_ids = node_ids_tensor.narrow(0, 0, ni_write);
-  
-  printf("[DEBUG] RefRadixTree match complete: pb_write=%d, ni_write=%d\n", (int)pb_write, (int)ni_write);
-  if (ni_write > 0) {
-    printf("[DEBUG] First few node_ids: ");
-    for (int i = 0; i < std::min(ni_write, (int32_t)4); i++) {
-      printf("%d ", ni_out[i]);
-    }
-    printf("\n");
-  }
-  
   return std::make_shared<CMatchResult>(prefix_blocks_num, ready_prefix_blocks_num, last_node_matched_length,
     last_ready_node, current_node, physical_blocks, node_ids);
 }
@@ -689,6 +643,7 @@ CRadixNode* dfs_build_subtree_from_meta(const BlockMeta* current_meta,
   // Create a child node and try to compress a linear chain into it
   auto* child_node = new CRadixNode(index, is_ready, 0, true);
   if (child_node == nullptr) return nullptr;
+  
   LeaseMeta *lm = lt_pool.alloc();
   if (lm == nullptr) return nullptr;
   child_node->set_lease_meta(lm);
@@ -697,6 +652,8 @@ CRadixNode* dfs_build_subtree_from_meta(const BlockMeta* current_meta,
   if (parent_node != nullptr) {
     child_node->set_parent(parent_node);
     parent_node->set_child(static_cast<HashType>(current_meta->hash), child_node);
+    // Add node to the index's node_list (must be after setting parent)
+    index->add_node(child_node);
   }
 
   auto& cbh = child_node->get_block_hashes();
@@ -707,7 +664,7 @@ CRadixNode* dfs_build_subtree_from_meta(const BlockMeta* current_meta,
   // Seed with the current meta
   cbh.push_back(current_meta->hash);
   cpb.push_back(current_meta->pb);
-  bni->push_back(current_meta->nid);  // Add node_id for the first block
+  bni->push_back(current_meta->nid);  // IMPORTANT: Add node_id for the first block!
   processed_hashes.insert(current_meta->hash);
 
   // Track minimal lease time across merged chain
@@ -789,8 +746,6 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
       root_child->set_parent(current_root);
       // Register all nodes in the subtree to the tree's node_list
       register_subtree_nodes(temp_tree, root_child);
-      printf("[DEBUG] Attached root_child (hash=%ld, size=%zu) to empty root and registered nodes\n", 
-             head_hash, src_size);
       return;  // Don't delete root_child
     } else {
       // Child with same head hash already exists, merge into it
@@ -834,6 +789,14 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
       } else if (i == src_hashes.size()) {// matched all block_hashes within root_child
         matched_root_child = root_child;
       }
+  } else {
+      // current_root is empty (like the tree root), attach root_child as a child
+      HashType head_hash = root_child->get_head_hash();
+      current_root->set_child(head_hash, root_child);
+      root_child->set_parent(current_root);
+      // Add to node_list after setting parent (required by add_node assertion)
+      temp_tree->add_node(root_child);
+      return;
   }
 
   // 2) Merge children: for each child of root_child, keep current_root child if head collision; otherwise attach

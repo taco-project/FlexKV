@@ -78,7 +78,7 @@ private:
   // refresh worker tunables
   size_t refresh_batch_size_ = 128;
   uint32_t rebuild_interval_ms_ = 1000;
-  uint32_t idle_sleep_ms_ = 1000;
+  uint32_t idle_sleep_ms_ = 10;
   uint32_t lease_renew_ms_ = 5000;
   LockFreeQueue<CRadixNode*> renew_lease_queue;
   bool refresh_started = false;

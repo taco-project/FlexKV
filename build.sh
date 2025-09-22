@@ -1,25 +1,43 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-PROJECT_ROOT=$(pwd)
-BUILD_TYPE="debug"  # Default to debug build
+usage() {
+  echo "Usage: $0 [--cuda|--no-cuda] [install|build|develop]"
+  echo "  --cuda       Build with CUDA (default)"
+  echo "  --no-cuda    Build without CUDA"
+  echo "  install      pip install -v . (default)"
+  echo "  build        python -m build"
+  echo "  develop      pip install -v -e ."
+}
 
-# Parse command line arguments
+WITH_CUDA=1
+ACTION="install"
+BUILD_TYPE="debug"
+
 for arg in "$@"; do
-  case $arg in
-    --debug)
-      BUILD_TYPE="debug"
-      shift
-      ;;
-    --release)
-      BUILD_TYPE="release"
-      shift
-      ;;
-    *)
-      # Unknown option
-      ;;
+  case "$arg" in
+    --cuda) WITH_CUDA=1 ;;
+    --no-cuda) WITH_CUDA=0 ;;
+    --debug) BUILD_TYPE="debug" ;;
+    --release) BUILD_TYPE="release" ;;
+    install|build|develop) ACTION="$arg" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $arg"; usage; exit 1 ;;
   esac
 done
+
+export FLEXKV_WITH_CUDA="${WITH_CUDA}"
+
+if [[ "${WITH_CUDA}" == "1" ]]; then
+  echo "[INFO] Building WITH CUDA"
+  if ! command -v nvcc >/dev/null 2>&1; then
+    echo "[WARN] nvcc not found in PATH; ensure CUDA toolkit is available"
+  fi
+else
+  echo "[INFO] Building WITHOUT CUDA"
+fi
+
+# Defer Python build/install to the end to ensure env vars are set and isolation is disabled
 
 echo "=== Building in ${BUILD_TYPE} mode ==="
 
@@ -50,23 +68,23 @@ PACKAGE_LIB_DIR="flexkv/lib"
 mkdir -p $PACKAGE_LIB_DIR
 
 if [ -d "$BUILD_LIB_PATH" ]; then
-    for lib_file in $BUILD_LIB_PATH/*.so*; do
-        if [ -f "$lib_file" ]; then
-            cp "$lib_file" "$PACKAGE_LIB_DIR/"
-            echo "Copied $(basename $lib_file) to $PACKAGE_LIB_DIR/"
-        fi
-    done
+  for lib_file in "$BUILD_LIB_PATH"/*.so*; do
+    if [ -f "$lib_file" ]; then
+      cp "$lib_file" "$PACKAGE_LIB_DIR/"
+      echo "Copied $(basename "$lib_file") to $PACKAGE_LIB_DIR/"
+    fi
+  done
 else
-    echo "Warning: Build lib directory $BUILD_LIB_PATH not found"
+  echo "Warning: Build lib directory $BUILD_LIB_PATH not found"
 fi
 
-echo "=== Build and installation completed successfully in ${BUILD_TYPE} mode ==="
-echo "You can now run tests directly without setting LD_LIBRARY_PATH manually"
-
-if [ "$BUILD_TYPE" = "debug" ]; then
-  FLEXKV_DEBUG=1 pip install -v --no-build-isolation -e .
-elif [ "$BUILD_TYPE" = "release" ]; then
-  FLEXKV_DEBUG=0 python setup.py bdist_wheel -v
+# Drive Python build/install
+if [[ "$ACTION" == "install" ]]; then
+  FLEXKV_DEBUG=$([[ "$BUILD_TYPE" == "debug" ]] && echo 1 || echo 0) pip install -v --no-build-isolation .
+elif [[ "$ACTION" == "build" ]]; then
+  python -m build
+elif [[ "$ACTION" == "develop" ]]; then
+  FLEXKV_DEBUG=$([[ "$BUILD_TYPE" == "debug" ]] && echo 1 || echo 0) pip install -v --no-build-isolation -e .
 else
-  FLEXKV_DEBUG=0 pip install -v --no-build-isolation -e .
+  usage; exit 1
 fi

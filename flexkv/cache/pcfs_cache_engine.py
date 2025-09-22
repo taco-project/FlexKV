@@ -22,17 +22,17 @@ class HierarchyLRCacheEngine:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 device_type: DeviceType,
-                 # Optional runtime wiring for remote/local trees
-                 local_max_num_blocks: Optional[int] = 0,
-                 local_lease_ttl_ms: int = 100000,
+                device_type: DeviceType,
+                # Optional runtime wiring for remote/local trees
+                local_max_num_blocks: Optional[int] = 0,
+                local_lease_ttl_ms: int = 100000,
                  local_renew_lease_ms: int = 10000,
                  local_refresh_batch_size: int = 1000,
                  local_idle_sleep_ms: int = 10,
                  remote_max_num_blocks: int = 4000000,
                  redis_node_id: int = 0,
                  remote_refresh_batch_size: int = 1000,
-                 remote_rebuild_interval_ms: int = 1000,
+                 remote_rebuild_interval_ms: int = 10000,
                  remote_idle_sleep_ms: int = 10,
                  meta: Optional[RedisMeta] = None) -> None:
         if num_total_blocks <= 0:
@@ -289,6 +289,9 @@ class HierarchyLRCacheEngine:
         Args:
             node: The radix node to unlock
         """
+        pass
+
+    def cleanup(self, node: CRadixNode, cleanup_length: int) -> None:
         if node is None:
             return
         try:
@@ -353,7 +356,7 @@ class HierarchyLRCacheEngine:
 
 
     @classmethod
-    def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "PCFSCacheEngine":
+    def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
         """Create a PCFSCacheEngine from CacheConfig.
 
         This replaces RemotePCFSCacheEngine. It wires both local and remote
@@ -454,7 +457,7 @@ class HierarchyLRCacheEngine:
                 # remote_node_id=int(node_id),
                 # remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
                 remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 128)),
-                remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 1000)),
+                remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 10000)),
                 remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
                 meta=meta,
             )

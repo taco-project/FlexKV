@@ -235,7 +235,7 @@ class RedisNodeInfo:
             node_key = f"node:{node_id}"
             self._client.hset(node_key, mapping={
                 "node_id": str(node_id),
-                "ip": self.local_ip,
+                "local_ip": self.local_ip,
                 "uuid": self.uuid,
                 "status": "active",
                 "timestamp": str(int(time.time()))
@@ -557,7 +557,7 @@ class RedisMeta:
         data = r.hgetall(key)
         if not data:
             return {}
-        out: dict[str, int | str] = {}
+        out: Dict[str, Union[int, str]] = {}
         nid = data.get("node_id")
         out["node_id"] = int(nid) if nid is not None and nid != "" else int(node_id)
         out["addr"] = data.get("addr", "")

@@ -4,8 +4,11 @@
 #include <vector>
 #include <map>
 
+#ifdef CUDA_AVAILABLE
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include "transfer.cuh"
+#endif
 #include <fcntl.h>
 #include <nvtx3/nvToolsExt.h>
 #include <pybind11/pybind11.h>
@@ -27,6 +30,7 @@
 #include "distributed_radix_tree.h"
 #include "redis_meta_channel.h"
 #include "block_meta.h"
+#include "lock_free_q.h"
 #include <deque>
 
 namespace py = pybind11;
@@ -641,6 +645,18 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readwrite("hash", &flexkv::BlockMeta::hash)
       .def_readwrite("lt", &flexkv::BlockMeta::lt)
       .def_readwrite("state", &flexkv::BlockMeta::state);
+
+  // Expose a simple LockFreeQueue<int> to Python as IntQueue
+  py::class_<flexkv::LockFreeQueue<int>>(m, "IntQueue")
+      .def(py::init<>())
+      .def("push", [](flexkv::LockFreeQueue<int> &q, int value) {
+        q.push(value);
+      }, py::arg("value"))
+      .def("pop", [](flexkv::LockFreeQueue<int> &q) {
+        int value = 0;
+        bool ok = q.pop(value);
+        return py::make_tuple(ok, value);
+      });
 
   // RedisMetaChannel binding
   py::class_<flexkv::RedisMetaChannel>(m, "RedisMetaChannel")

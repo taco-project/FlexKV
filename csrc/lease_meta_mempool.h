@@ -17,7 +17,7 @@ namespace flexkv {
 
 struct LeaseMeta {
   volatile int state;
-  volatile uint32_t lease_time;
+  volatile uint64_t lease_time;
   LeaseMeta() : state(NODE_STATE_NORMAL), lease_time(0) {
   }
 };
