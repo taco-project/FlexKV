@@ -72,12 +72,15 @@ class CacheEngineAccel:
         sequence_meta.gen_hashes()
         match_result = self.index.match_prefix(torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
                                               sequence_meta.num_blocks, True)
-        # physical blocks
-        phys = torch.tensor(match_result.physical_blocks, dtype=torch.int64).numpy()
+        # physical blocks (torch.Tensor -> numpy, zero-copy on CPU)
+        phys = match_result.physical_blocks.cpu().numpy()
         # optional block_node_ids
         try:
-            bnis = getattr(match_result, "block_node_ids")
-            bnids_np = torch.tensor(bnis, dtype=torch.uint32).numpy() if bnis is not None else None
+            bnis = getattr(match_result, "block_node_ids", None)
+            if isinstance(bnis, torch.Tensor) and bnis.numel() > 0:
+                bnids_np = bnis.cpu().numpy()
+            else:
+                bnids_np = None
         except Exception:
             bnids_np = None
         return MatchResultAccel(match_result.num_ready_matched_blocks, match_result.num_matched_blocks,
@@ -246,8 +249,10 @@ class GlobalCacheEngine:
                 cache_config.redis_password,
                 cache_config.local_ip,
             )
-            self.redis_meta.init_meta()
-            self.node_id = self.redis_meta.get_node_id()
+            node_id = self.redis_meta.init_meta()
+            if node_id is None:
+                raise RuntimeError("Failed to initialize Redis metadata")
+            self.node_id = node_id
             self.enable_kv_sharing = True
         else:
             self.enable_kv_sharing = False
@@ -791,7 +796,8 @@ class GlobalCacheEngine:
 
         callback = partial(self._transfer_callback,
                            node_to_unlock=node_to_unlock,
-                           buffer_to_free=buffer_to_free)
+                           buffer_to_free=buffer_to_free,
+                           is_put=True)
 
         op_callback_dict = {}
         for op_id in op_node_to_ready:
@@ -1085,7 +1091,8 @@ class GlobalCacheEngine:
 
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
-                           buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None) -> None:
+                           buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
+                           is_put: bool = False) -> None:
         if DeviceType.CPU in node_to_unlock:
             assert self.cpu_cache_engine is not None
             self.cpu_cache_engine.unlock(node_to_unlock[DeviceType.CPU][0])
@@ -1100,6 +1107,8 @@ class GlobalCacheEngine:
             self.remote_cache_engine.set_ready(
                 node_to_unlock[DeviceType.REMOTE][0], True, node_to_unlock[DeviceType.REMOTE][1]
             )
+            if is_put and self.enable_kv_sharing:
+                self.remote_cache_engine.insert_and_publish(node_to_unlock[DeviceType.REMOTE][0])
         if buffer_to_free is not None:
             if DeviceType.CPU in buffer_to_free:
                 assert self.cpu_cache_engine is not None
