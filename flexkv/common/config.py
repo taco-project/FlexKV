@@ -67,7 +67,6 @@ class CacheConfig:
     remote_config_custom: Optional[Dict[str, Any]] = None
 
     # KV sharing / distributed radix tree tunables
-    lt_pool_initial_capacity: int = 10000000
     refresh_batch_size: int = 128
     rebuild_interval_ms: int = 1000
     idle_sleep_ms: int = 10

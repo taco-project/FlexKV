@@ -15,7 +15,9 @@
  * limitations under the License.
  */
 #include "tp_transfer_thread_group.h"
+#ifdef CUDA_AVAILABLE
 #include "transfer.cuh"
+#endif
 #include <stdexcept>
 
 namespace flexkv {
@@ -146,6 +148,7 @@ void TPTransferThreadGroup::tp_group_transfer(
         int64_t cpu_startoff_inside_chunks =
             is_mla ? 0 : i * gpu_chunk_sizes_in_bytes_[i];
       
+#ifdef CUDA_AVAILABLE
         flexkv::transfer_kv_blocks(
           num_blocks, layer_id, layer_granularity, gpu_block_ids,
           gpu_layer_ptrs, gpu_kv_strides_in_bytes_[i], gpu_block_strides_in_bytes_[i],
@@ -154,12 +157,18 @@ void TPTransferThreadGroup::tp_group_transfer(
           cpu_startoff_inside_chunks, gpu_chunk_sizes_in_bytes_[i], streams_[i],
           transfer_sms, is_host_to_device, use_ce_transfer, is_mla
         );
+#else
+        // CUDA not available, skip transfer
+        throw std::runtime_error("CUDA not available, cannot perform transfer");
+#endif
 
+#ifdef CUDA_AVAILABLE
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
           failed = true;
           error_msg = cudaGetErrorString(err);
         }
+#endif
       } catch (const std::exception &e) {
         failed = true;
         error_msg = e.what();

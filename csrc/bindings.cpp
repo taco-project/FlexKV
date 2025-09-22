@@ -29,6 +29,7 @@
 
 namespace py = pybind11;
 
+#ifdef CUDA_AVAILABLE
 void transfer_kv_blocks_binding(
     torch::Tensor &gpu_block_id_tensor, torch::Tensor &gpu_layer_ptrs_tensor,
     int64_t gpu_kv_stride_in_bytes, int64_t gpu_block_stride_in_bytes,
@@ -60,7 +61,9 @@ void transfer_kv_blocks_binding(
     throw std::runtime_error(cudaGetErrorString(err));
   }
 }
+#endif
 
+#ifdef CUDA_AVAILABLE
 void transfer_kv_blocks_ssd_binding(
     flexkv::SSDIOCTX &ioctx,
     const torch::Tensor &cpu_layer_id_list, int64_t cpu_tensor_ptr,
@@ -82,6 +85,7 @@ void transfer_kv_blocks_ssd_binding(
       block_stride_in_bytes, is_read, num_blocks_per_file, round_robin,
       num_threads_per_device, is_mla);
 }
+#endif
 #ifdef FLEXKV_ENABLE_CFS
 void transfer_kv_blocks_remote(
     const py::list &file_nodeid_list, const torch::Tensor &cpu_layer_id_list,
@@ -162,6 +166,7 @@ void shared_transfer_kv_blocks_remote_read_binding(
 #endif
 
 PYBIND11_MODULE(c_ext, m) {
+#ifdef CUDA_AVAILABLE
   m.def("transfer_kv_blocks", &transfer_kv_blocks_binding,
         "Transfer multi-layer KV-cache between CPU and GPU");
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
@@ -174,6 +179,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("block_stride_in_bytes"), py::arg("is_read"),
         py::arg("num_blocks_per_file"), py::arg("round_robin") = 1,
         py::arg("num_threads_per_device") = 16, py::arg("is_mla") = false);
+#endif
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
         "Transfer KV blocks between remote and CPU memory",
@@ -249,6 +255,7 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("call_pcfs_write", &flexkv::call_pcfs_write,
         "Call Pcfs::write from C++", py::arg("file_nodeid"), py::arg("offset"),
         py::arg("buffer"), py::arg("size"), py::arg("thread_id"));
+#ifdef CUDA_AVAILABLE
   m.def("shared_transfer_kv_blocks_remote_read", 
         &shared_transfer_kv_blocks_remote_read_binding,
         "Shared transfer KV blocks from remote PCFS to CPU memory",
@@ -266,6 +273,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("total_layers"),
         py::arg("is_mla") = false,
         py::arg("num_threads_per_file") = 8);
+#endif
 #endif
 
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
@@ -297,7 +305,7 @@ PYBIND11_MODULE(c_ext, m) {
       .def("has_block_node_ids", &flexkv::CRadixNode::has_block_node_ids);
 
   py::class_<flexkv::CMatchResult, std::shared_ptr<flexkv::CMatchResult>>(m, "CMatchResult")
-      .def(py::init<int, int, int, flexkv::CRadixNode *, flexkv::CRadixNode *, std::vector<int64_t> *>())
+      .def(py::init<int, int, int, flexkv::CRadixNode *, flexkv::CRadixNode *, torch::Tensor, torch::Tensor>())
       .def_readonly("last_ready_node", &flexkv::CMatchResult::last_ready_node)
       .def_readonly("last_node", &flexkv::CMatchResult::last_node)
       .def_readonly("physical_blocks", &flexkv::CMatchResult::physical_blocks)
@@ -318,14 +326,14 @@ PYBIND11_MODULE(c_ext, m) {
 
   // RedisMetaChannel binding
   py::class_<flexkv::RedisMetaChannel>(m, "RedisMetaChannel")
-      .def(py::init<const std::string&, int, uint32_t, const std::string&, const std::string&>(),
-           py::arg("host"), py::arg("port"), py::arg("node_id"), py::arg("local_ip"), py::arg("blocks_key") = std::string("blocks"))
+      .def(py::init<const std::string&, int, uint32_t, const std::string&, const std::string&, const std::string&>(),
+           py::arg("host"), py::arg("port"), py::arg("node_id"), py::arg("local_ip"), py::arg("blocks_key") = std::string("blocks"), py::arg("password") = std::string(""))
       .def("connect", &flexkv::RedisMetaChannel::connect)
       .def("get_node_id", &flexkv::RedisMetaChannel::get_node_id)
       .def("get_local_ip", &flexkv::RedisMetaChannel::get_local_ip)
       .def("make_block_key", &flexkv::RedisMetaChannel::make_block_key, py::arg("node_id"), py::arg("hash"))
-      .def("publish_one", [](flexkv::RedisMetaChannel &ch, const flexkv::BlockMeta &m){ ch.publish(m); })
-      .def("publish_batch", [](flexkv::RedisMetaChannel &ch, const std::vector<flexkv::BlockMeta> &metas, size_t batch_size){ ch.publish(metas, batch_size); }, py::arg("metas"), py::arg("batch_size")=100)
+      .def("publish_one", [](flexkv::RedisMetaChannel &ch, const flexkv::BlockMeta &m){ return ch.publish(m); })
+      .def("publish_batch", [](flexkv::RedisMetaChannel &ch, const std::vector<flexkv::BlockMeta> &metas, size_t batch_size){ return ch.publish(metas, batch_size); }, py::arg("metas"), py::arg("batch_size")=100)
       .def("load", [](flexkv::RedisMetaChannel &ch, size_t max_items){ std::vector<flexkv::BlockMeta> out; ch.load(out, max_items); return out; }, py::arg("max_items"))
       .def("renew_node_leases", &flexkv::RedisMetaChannel::renew_node_leases, py::arg("node_id"), py::arg("new_lt"), py::arg("batch_size")=200)
       .def("list_keys", [](flexkv::RedisMetaChannel &ch, const std::string &pattern){ std::vector<std::string> keys; ch.list_keys(pattern, keys); return keys; }, py::arg("pattern"))
@@ -334,19 +342,18 @@ PYBIND11_MODULE(c_ext, m) {
       .def("hmget_field_for_keys", [](flexkv::RedisMetaChannel &ch, const std::vector<std::string> &keys, const std::string &field){ std::vector<std::string> values; ch.hmget_field_for_keys(keys, field, values); return values; }, py::arg("keys"), py::arg("field"))
       .def("hmget_two_fields_for_keys", [](flexkv::RedisMetaChannel &ch, const std::vector<std::string> &keys, const std::string &f1, const std::string &f2){ std::vector<std::pair<std::string,std::string>> out; ch.hmget_two_fields_for_keys(keys, f1, f2, out); return out; }, py::arg("keys"), py::arg("field1"), py::arg("field2"))
       .def("load_metas_by_keys", [](flexkv::RedisMetaChannel &ch, const std::vector<std::string> &keys){ std::vector<flexkv::BlockMeta> out; ch.load_metas_by_keys(keys, out); return out; }, py::arg("keys"))
-      .def("update_block_state_batch", [](flexkv::RedisMetaChannel &ch, uint32_t node_id, const std::vector<int64_t> &hashes, flexkv::NodeState state, size_t batch_size){ std::deque<int64_t> dq(hashes.begin(), hashes.end()); ch.update_block_state_batch(node_id, &dq, state, batch_size); }, py::arg("node_id"), py::arg("hashes"), py::arg("state"), py::arg("batch_size")=200)
-      .def("delete_blockmeta_batch", [](flexkv::RedisMetaChannel &ch, uint32_t node_id, const std::vector<int64_t> &hashes, size_t batch_size){ std::deque<int64_t> dq(hashes.begin(), hashes.end()); ch.delete_blockmeta_batch(node_id, &dq, batch_size); }, py::arg("node_id"), py::arg("hashes"), py::arg("batch_size")=200);
+      .def("update_block_state_batch", [](flexkv::RedisMetaChannel &ch, uint32_t node_id, const std::vector<int64_t> &hashes, int state, size_t batch_size){ std::deque<int64_t> dq(hashes.begin(), hashes.end()); return ch.update_block_state_batch(node_id, &dq, state, batch_size); }, py::arg("node_id"), py::arg("hashes"), py::arg("state"), py::arg("batch_size")=200)
+      .def("delete_blockmeta_batch", [](flexkv::RedisMetaChannel &ch, uint32_t node_id, const std::vector<int64_t> &hashes, size_t batch_size){ std::deque<int64_t> dq(hashes.begin(), hashes.end()); return ch.delete_blockmeta_batch(node_id, &dq, batch_size); }, py::arg("node_id"), py::arg("hashes"), py::arg("batch_size")=200);
 
   // LocalRadixTree bindings (derived from CRadixTreeIndex)
   py::class_<flexkv::LocalRadixTree, flexkv::CRadixTreeIndex>(m, "LocalRadixTree")
-      .def(py::init<int, int, uint32_t, uint32_t, uint32_t, uint32_t, size_t>(),
+      .def(py::init<int, int, uint32_t, uint32_t, uint32_t, uint32_t>(),
            py::arg("tokens_per_block"),
            py::arg("max_num_blocks") = 1000000,
            py::arg("lease_ttl_ms") = 100000,
            py::arg("renew_lease_ms") = 0,
            py::arg("refresh_batch_size") = 256,
-           py::arg("idle_sleep_ms") = 10,
-           py::arg("lt_pool_initial_capacity") = 0)
+           py::arg("idle_sleep_ms") = 10)
       .def("set_meta_channel", &flexkv::LocalRadixTree::set_meta_channel, py::arg("channel"))
       .def("start", &flexkv::LocalRadixTree::start, py::arg("channel"))
       .def("stop", &flexkv::LocalRadixTree::stop)
@@ -374,14 +381,14 @@ PYBIND11_MODULE(c_ext, m) {
 
   // DistributedRadixTree bindings (remote reference tree manager)
   py::class_<flexkv::DistributedRadixTree>(m, "DistributedRadixTree")
-      .def(py::init<int, int, uint32_t, size_t, size_t, uint32_t, uint32_t>(),
+      .def(py::init<int, int, uint32_t, size_t, uint32_t, uint32_t, uint32_t>(),
            py::arg("tokens_per_block"),
            py::arg("max_num_blocks"),
            py::arg("node_id"),
-           py::arg("lt_pool_initial_capacity") = 0,
            py::arg("refresh_batch_size") = 128,
            py::arg("rebuild_interval_ms") = 1000,
-           py::arg("idle_sleep_ms") = 10)
+           py::arg("idle_sleep_ms") = 10,
+           py::arg("lease_renew_ms") = 5000)
       .def("start", &flexkv::DistributedRadixTree::start, py::arg("channel"))
       .def("stop", &flexkv::DistributedRadixTree::stop)
       .def("remote_tree_refresh", &flexkv::DistributedRadixTree::remote_tree_refresh, py::return_value_policy::reference)
@@ -392,4 +399,14 @@ PYBIND11_MODULE(c_ext, m) {
       .def("unlock", &flexkv::DistributedRadixTree::unlock, py::arg("node"))
       .def("is_empty", &flexkv::DistributedRadixTree::is_empty)
       .def("set_ready", &flexkv::DistributedRadixTree::set_ready, py::arg("node"), py::arg("ready") = true, py::arg("ready_length") = -1);
+
+  // RefRadixTree bindings (for type information)
+  py::class_<flexkv::RefRadixTree, flexkv::CRadixTreeIndex>(m, "RefRadixTree")
+      .def(py::init<int, int, uint32_t, flexkv::LockFreeQueue<flexkv::CRadixNode*>*>(),
+           py::arg("tokens_per_block"),
+           py::arg("max_num_blocks") = 1000000,
+           py::arg("lease_renew_ms") = 5000,
+           py::arg("renew_lease_queue") = nullptr)
+      .def("dec_ref_cnt", &flexkv::RefRadixTree::dec_ref_cnt)
+      .def("inc_ref_cnt", &flexkv::RefRadixTree::inc_ref_cnt);
 }

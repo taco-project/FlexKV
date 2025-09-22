@@ -10,14 +10,13 @@
 #include <deque>
 
 namespace flexkv {
-enum NodeState {
-  NODE_STATE_NORMAL,
-  NODE_STATE_ABOUT_TO_EVICT,
-  NODE_STATE_EVICTED,
-};
+
+#define NODE_STATE_NORMAL 0
+#define NODE_STATE_ABOUT_TO_EVICT 1
+#define NODE_STATE_EVICTED 2
 
 struct LeaseMeta {
-  volatile NodeState state;
+  volatile int state;
   volatile uint32_t lease_time;
   LeaseMeta() : state(NODE_STATE_NORMAL), lease_time(0) {
   }
