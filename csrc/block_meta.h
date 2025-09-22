@@ -11,7 +11,7 @@ struct BlockMeta {
   int64_t pb;        // physical block id
   uint32_t nid;      // node id
   int64_t hash;      // current block hash
-  uint32_t lt;       // lease time
+  uint64_t lt;       // lease time
   int state;         // lease state
 };
 

@@ -62,11 +62,12 @@ class DistributedRadixTree:
     def remote_tree_refresh(self) -> Optional["RefRadixTree"]:
         """Refresh the remote tree by loading block metadata from Redis.
         
+        This method can be called at any time to manually refresh the remote tree,
+        regardless of whether the background refresh thread is running.
+        
         Returns:
             Optional[RefRadixTree]: The refreshed reference tree, or None if refresh fails
         """
-        if not self._started:
-            raise RuntimeError("DistributedRadixTree must be started before calling remote_tree_refresh")
         return self._c.remote_tree_refresh()
 
     def match_prefix(self, block_hashes: torch.Tensor, num_blocks: int, update_cache_info: bool = True):

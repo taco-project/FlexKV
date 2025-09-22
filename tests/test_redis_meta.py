@@ -202,7 +202,9 @@ def test_redis_meta_channel():
         # 测试 publish_one 方法（需要连接）
         try:
             meta = BlockMeta(ph=1, pb=2, nid=1, hash=12345, lt=1000000, state=NodeState.NODE_STATE_NORMAL)
-            channel.publish_one(meta)
+            if not channel.publish_one(meta):
+                print("[ERROR] publish_one 失败")
+                return False
             print("[OK] publish_one 成功")
         except Exception as e:
             print(f"[WARN] publish_one 失败: {e}")
@@ -213,15 +215,22 @@ def test_redis_meta_channel():
                 BlockMeta(ph=1, pb=2, nid=1, hash=12345, lt=1000000, state=NodeState.NODE_STATE_NORMAL),
                 BlockMeta(ph=2, pb=3, nid=1, hash=12346, lt=1000001, state=NodeState.NODE_STATE_NORMAL)
             ]
-            channel.publish_batch(metas, batch_size=10)
+            if not channel.publish_batch(metas, batch_size=10):
+                print("[ERROR] publish_batch 失败")
+                return False
             print("[OK] publish_batch 成功")
         except Exception as e:
             print(f"[WARN] publish_batch 失败: {e}")
         
         # 测试 list_keys 方法
         try:
-            keys = channel.list_keys("*")
+            keys = channel.list_keys("flexkv_test_blocks:*")
+            if len(keys) == 0:
+                print("[ERROR] list_keys 失败")
+                return False
             print(f"[OK] list_keys 成功，找到 {len(keys)} 个键")
+            for key in keys:
+                print(f"    键: {key}")
         except Exception as e:
             print(f"[WARN] list_keys 失败: {e}")
         
@@ -261,7 +270,7 @@ def test_redis_meta_channel():
         try:
             # 准备测试哈希值
             test_hashes = [50000 + i for i in range(5)]
-            result = channel.update_block_state_batch(1, test_hashes, NodeState.NODE_STATE_ABOUT_TO_EVICT, batch_size=10)
+            result = channel.update_block_state_batch(1, test_hashes, 1, batch_size=10)
             print(f"[OK] update_block_state_batch 成功，结果: {result}")
             
             # 验证状态是否更新成功
@@ -324,6 +333,9 @@ def test_redis_meta():
             
             # 测试 get_redis_meta_channel
             channel = redis_meta.get_redis_meta_channel("flexkv_test_blocks")
+            if channel is None:
+                print("[ERROR] get_redis_meta_channel 失败")
+                return False
             print("[OK] get_redis_meta_channel 成功")
             
             # 测试 unregister_node
