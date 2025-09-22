@@ -30,10 +30,14 @@ class CacheConfig:
     tokens_per_block: int = 16
     enable_cpu: bool = True
     enable_ssd: bool = False
-    enable_remote: bool = False
-    enable_kv_sharing: bool = False
+    enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
+                                # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
+    enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
+    enable_p2p_cpu: bool = False
+    enable_p2p_ssd: bool = False
+    enable_3rd_remote: bool = False
     use_gds: bool = False
-    index_accel: bool = False
+    index_accel: bool = False # have to be True when (enable_p2p_cpu or enable_p2p_ssd) is True
 
     # kv cache layout configs
     gpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
@@ -98,4 +102,9 @@ class CacheConfig:
             value = getattr(self, field)
             if isinstance(value, str):
                 setattr(self, field, KVCacheLayoutType[value.upper()])
+        
+        self.enable_kv_sharing = self.enable_p2p_cpu or \
+            self.enable_p2p_ssd or self.enable_3rd_remote
+        self.enable_remote = self.enable_3rd_remote
+        self.index_accel = self.enable_p2p_cpu or self.enable_p2p_ssd or self.index_accel
         

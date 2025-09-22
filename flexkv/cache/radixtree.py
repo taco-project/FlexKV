@@ -23,12 +23,14 @@ import torch
 from flexkv.common.block import SequenceMeta
 from flexkv.common.hash_utils import HashType, Hasher
 from flexkv.common.exceptions import LogicError
+from flexkv.common.transfer import DeviceType
 
 
 @dataclass
 class MatchResult:
     num_ready_matched_blocks: int = 0
     num_matched_blocks: int = 0
+    matched_pos: str = "local"
     last_ready_node: Optional['RadixNode'] = None
     last_node: Optional['RadixNode'] = None
     last_node_matched_length: int = 0

@@ -24,7 +24,7 @@ import numpy as np
 import nvtx
 import torch
 from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
-from flexkv.cache.pcfs_cache_engine import PCFSCacheEngine
+from flexkv.cache.pcfs_cache_engine import HierarchyLRCacheEngine
 from flexkv.cache.redis_meta import RedisMeta
 
 from flexkv.cache.mempool import Mempool
@@ -259,7 +259,9 @@ class GlobalCacheEngine:
             self.index_accel = False
 
         if cache_config.enable_cpu:
-            if cache_config.index_accel:
+            if cache_config.enable_p2p_cpu:
+                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
+            elif cache_config.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
@@ -271,7 +273,9 @@ class GlobalCacheEngine:
                                                 cache_config.evict_ratio)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
-            if cache_config.index_accel:
+            if cache_config.enable_p2p_ssd:
+                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
+            elif cache_config.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
@@ -284,8 +288,8 @@ class GlobalCacheEngine:
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
-                # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine)
-                self.remote_cache_engine = PCFSCacheEngine.from_cache_config(cache_config, self.node_id, meta=self.redis_meta)
+                # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
+                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
             elif cache_config.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
@@ -298,10 +302,21 @@ class GlobalCacheEngine:
                                                    cache_config.evict_ratio)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
+        #TODO move this to kvmanager.start()
+        self.start()
+
         self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]] = \
             lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0)
         self._empty_put_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]] = \
             lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0, 0)
+
+    def start(self) -> None:
+        if self.cpu_cache_engine and self.cache_config.enable_p2p_cpu:
+            self.cpu_cache_engine.start()
+        if self.ssd_cache_engine and self.cache_config.enable_p2p_ssd:
+            self.ssd_cache_engine.start()
+        if self.remote_cache_engine and self.cache_config.enable_3rd_remote:
+            self.remote_cache_engine.start()
 
     def reset(self) -> None:
         if self.cpu_cache_engine:
@@ -346,6 +361,7 @@ class GlobalCacheEngine:
                                      tokens_per_block=self.cache_config.tokens_per_block)
 
         if not self.cache_config.enable_remote:
+            # from this entrance, we will also handle the case of peer_cpu and peer_ssd
             (transfer_graph, finished_ops_ids, node_to_unlock,
              op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
                 self._get_impl_local(
@@ -357,8 +373,9 @@ class GlobalCacheEngine:
                     layer_num
                 )
         else:
+            #TODO pcfs will be supported later
             (transfer_graph, finished_ops_ids, node_to_unlock,
-             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
+             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \ 
                 self._get_impl_global(
                     request_id,
                     sequence_meta,
@@ -585,11 +602,11 @@ class GlobalCacheEngine:
         """
         transfer pattern:
 
-        GPU: (gpu cached) | fragment1 | fragment2      | (need compute)
+        GPU          : (gpu cached) | fragment1 | fragment2      | (need compute)
                                ↑          ↑
-        CPU:     ...      | fragment1 | fragment2(new) | (uncached)
+        CPU(+peerCPU):     ...      | fragment1 | fragment2(new) | (uncached)
                                           ↑
-        SSD:     ...      | fragment1 | fragment2      | (uncached)
+        SSD(+peerSSD):     ...      | fragment1 | fragment2      | (uncached)
 
         """
         assert self.cache_config.enable_cpu
@@ -607,6 +624,10 @@ class GlobalCacheEngine:
         # if ssd disabled, len(ssd_physical_blocks) is 0
         ssd_matched_blocks = ssd_matched_result.physical_blocks[:ssd_matched_result.num_ready_matched_blocks]
         ssd_matched_blocks = ssd_matched_blocks[block_mask_start:block_mask_end]
+
+        # TODO: is this possible?
+        if len(cpu_matched_blocks) > len(ssd_matched_blocks):
+            ssd_matched_blocks = np.array([], dtype=np.int64)
 
         fragment12_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks))
         fragment1_num_blocks = len(cpu_matched_blocks)
@@ -631,31 +652,65 @@ class GlobalCacheEngine:
         cpu_blocks_to_free = np.array([], dtype=np.int64)
         op_disk2h = None
         fragment2_cpu_blocks = None
-        if fragment2_num_blocks > 0:
-            fragment2_cpu_blocks = self.cpu_cache_engine.take(
-                num_required_blocks=fragment2_num_blocks,
-                protected_node=cpu_matched_result.last_node,
-                strict=False
+
+        #allocated new cpu blocks for this request
+        allocated_cpu_block_num = fragment2_num_blocks
+        if cpu_matched_result.matched_pos == "remote" and cpu_matched_result.insert_to_local_cpu_index:
+            allocated_cpu_blocks += fragment1_num_blocks
+        allocated_cpu_blocks = self.cpu_cache_engine.take(
+            num_required_blocks=allocated_cpu_block_num,
+            protected_node=cpu_matched_result.last_node,
+            strict=False
+        )
+        # NOTE: not enough space to allocate, skip the request
+        # there might be a better way to handle this
+        if len(allocated_cpu_blocks) < allocated_cpu_block_num:
+            self.cpu_cache_engine.recycle(allocated_cpu_blocks)
+            return self._empty_get_return(request_id)
+
+        if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
+            fragment1_cpu_blocks_local = allocated_cpu_blocks[-fragment1_num_blocks:]
+            op_peerh2h = TransferOp(
+                graph_id = transfer_graph.graph_id,
+                transfer_type = TransferType.PEERH2H,
+                src_block_ids = fragment1_cpu_blocks,
+                dst_block_ids = fragment1_cpu_blocks_local,
+                layer_id = 0,
+                layer_granularity = layer_num,
+                remote_node_ids = cpu_matched_result.matched_node_ids
             )
-            if len(fragment2_cpu_blocks) < fragment2_num_blocks:
-                # NOTE: not enough space to allocate, skip the request
-                # there might be a better way to handle this
-                self.cpu_cache_engine.recycle(fragment2_cpu_blocks)
-                return self._empty_get_return(request_id)
+            transfer_graph.add_transfer_op(op_peerh2h)
+            #TODO here we dont combine peer cpu or local cpu match results, so we can safely add remote results to local cpu
+            #TODO here assume all matched blocks are ready blocks for peer cpu
+            if (cpu_matched_result.insert_to_local_cpu_index and 
+                cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
+                cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
+                cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
+                                                                  fragment1_cpu_blocks_local,
+                                                                  is_ready=False)
+                op_node_to_ready[op_peerh2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+            else:
+                cpu_blocks_to_free.extend(fragment1_cpu_blocks_local)
+
+        if fragment2_num_blocks > 0:
+            fragment2_cpu_blocks = allocated_cpu_blocks[:fragment2_num_blocks]
 
             op_disk2h = TransferOp(
                 graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.DISK2H,
+                transfer_type = TransferType.PEERSSD2H if ssd_matched_result.matched_pos == "remote" else TransferType.DISK2H,
                 src_block_ids = fragment2_ssd_blocks,
                 dst_block_ids = fragment2_cpu_blocks,
                 layer_id = 0,
-                layer_granularity = layer_num
+                layer_granularity = layer_num,
+                remote_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None
             )
             transfer_graph.add_transfer_op(op_disk2h)
             # we only insert the buffer blocks to cpu cache engine only:
             # 1. the cpu cache engine satisfies prefix cache after insertion
             # 2. the sequence is all ready blocks
-            if (cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
+            # TODO: for simplicity, if we use peer cpu results, we dont insert the buffer ssd blocks to local cpu any more
+            if (cpu_matched_result.matched_pos == "local" and
+                cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
                 cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
                 cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                                   fragment2_cpu_blocks,
@@ -665,7 +720,11 @@ class GlobalCacheEngine:
                                                                   match_result=cpu_matched_result)
                 op_node_to_ready[op_disk2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
             else:
-                cpu_blocks_to_free = fragment2_cpu_blocks
+                cpu_blocks_to_free.extend(fragment2_cpu_blocks)
+
+        if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
+            fragment1_cpu_blocks = fragment1_cpu_blocks_local
+
         if fragment2_cpu_blocks is not None:
             fragment12_cpu_blocks = np.concatenate([fragment1_cpu_blocks, fragment2_cpu_blocks])
         else:
@@ -681,6 +740,8 @@ class GlobalCacheEngine:
         transfer_graph.add_transfer_op(op_h2d)
         if op_disk2h is not None:
             transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
+        if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
+            transfer_graph.add_dependency(op_h2d.op_id, op_peerh2h.op_id)
         finished_ops_ids.append(op_h2d.op_id)
 
         node_to_unlock = {}
@@ -1089,11 +1150,14 @@ class GlobalCacheEngine:
     def match_local_accel(self, sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel]:
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
-        if self.cpu_cache_engine:
+        if self.cpu_cache_engine and not self.cache_config.enable_p2p_cpu:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
-        if self.ssd_cache_engine:
+        else:
+            cpu_matched_result = self.cpu_cache_engine.match_local(sequence_meta)
+        if self.ssd_cache_engine and not self.cache_config.enable_p2p_ssd:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
-
+        else:
+            ssd_matched_result = self.ssd_cache_engine.match_local(sequence_meta)
         return cpu_matched_result, ssd_matched_result
 
     @nvtx.annotate("Match Prefix", color="yellow")
@@ -1114,7 +1178,6 @@ class GlobalCacheEngine:
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
         remote_matched_result = MatchResultAccel()
-        # TODO: avoid redundant match?
         if self.cpu_cache_engine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
         if self.ssd_cache_engine:
@@ -1135,7 +1198,6 @@ class GlobalCacheEngine:
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
         remote_matched_result = MatchResult()
-        # TODO: avoid redundant match?
         if self.cpu_cache_engine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
         if self.ssd_cache_engine:
