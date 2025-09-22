@@ -11,6 +11,12 @@ class DeviceType(Enum):
     GPU = 1
     SSD = 2
     REMOTE = 3
+<<<<<<< HEAD
+=======
+    GDS = 4
+    PEERCPU = 5
+    PEERSSD = 6
+>>>>>>> 719e921 (build transfer graphs based on the cache engine match results)
 
 class TransferType(Enum):
     H2D    = "H2D"
@@ -21,6 +27,15 @@ class TransferType(Enum):
     D2DISK = "D2DISK"
     REMOTE2H = "REMOTE2H"
     H2REMOTE = "H2REMOTE"
+<<<<<<< HEAD
+=======
+    GDS2D  = "GDS2D"
+    D2GDS  = "D2GDS"
+    PEERH2H = "PEERH2H"
+    H2PEERH = "H2PEERH"
+    PEERSSD2H = "PEERSSD2H"
+    H2PEERSSD = "H2PEERSSD"
+>>>>>>> 719e921 (build transfer graphs based on the cache engine match results)
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of
@@ -43,7 +58,7 @@ class TransferOp:
 
     op_id: int = field(init=False)
     graph_id: int
-    transfer_type: TransferType
+    transfer_type: TransferType 
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
     layer_id: int = 0
@@ -59,6 +74,7 @@ class TransferOp:
     src_slot_id: int = -1
     dst_slot_id: int = -1
     valid_block_num: int = 0
+    remote_node_ids: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \

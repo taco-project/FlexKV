@@ -17,11 +17,12 @@ from flexkv.common.transfer import DeviceType
 from flexkv.common.type import MatchResultAccel
 
 
-class PCFSCacheEngine:
+class HierarchyLRCacheEngine:
     def __init__(self,
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
+                 device_type: DeviceType,
                  *,
                  # Optional runtime wiring for remote/local trees
                  local_lease_ttl_ms: int = 100000,
@@ -41,9 +42,11 @@ class PCFSCacheEngine:
                 f"Invalid tokens_per_block: {tokens_per_block}, tokens_per_block must be a power of 2"
             )
 
-        # PCFS cache engine is always REMOTE device type
-        self.device_type = DeviceType.REMOTE
-        self._meta: Optional[RedisMeta] = meta
+        self.device_type = device_type
+        self._meta: Optional[RedisMeta] = meta # todo: define storage type in meta
+
+
+        # belows are only for 3rd-party remote storage (like pcfs)
         # Mapping: node_id -> list of PCFS file_nodeids
         self.nid_to_file_nodeids: Dict[int, List[int]] = {}
         # Partition parameter used for mapping block_id to file index
@@ -73,7 +76,7 @@ class PCFSCacheEngine:
         # defer channel start to start(meta)
 
         # Local memory pool for physical blocks on this device
-        self.mempool = Mempool(num_total_blocks=num_total_blocks)
+        self.mempool = Mempool(num_total_blocks=int(local_max_num_blocks or num_total_blocks))
 
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
@@ -82,13 +85,26 @@ class PCFSCacheEngine:
     def start(self) -> None:
         if self._meta is None:
             raise InvalidConfigError("RedisMeta is not provided; ensure from_cache_config stores it or pass it to start().")
-        self.remote_ch = self._meta.get_redis_meta_channel("RPCFSB")
-        self.local_ch = self._meta.get_redis_meta_channel("PCFSB")
+        #TODO can we use like this to distinguish the different tree pairs?
+        if self.device_type == DeviceType.REMOTE:
+            local_ch_block_key = "PCFSB"
+            remote_ch_block_key = "PCFSB"
+        elif self.device_type == DeviceType.CPU:
+            local_ch_block_key = "CPUB"
+            remote_ch_block_key = "CPUB"
+        elif self.device_type == DeviceType.SSD:
+            local_ch_block_key = "SSDB"
+            remote_ch_block_key = "SSDB"
+        else:
+            raise InvalidConfigError(f"Invalid device type: {self.device_type}")
+        self.remote_ch = self._meta.get_redis_meta_channel(remote_ch_block_key)
+        self.local_ch = self._meta.get_redis_meta_channel(local_ch_block_key)
                 # Load and store mapping of node_id -> file_nodeids from Redis
-        try:
-            self.nid_to_file_nodeids = self._meta.load_pcfs_file_nodeids()
-        except Exception:
-            raise InvalidConfigError("Failed to load PCFS file nodeids from Redis")
+        if self.device_type == DeviceType.REMOTE:
+            try:
+                self.nid_to_file_nodeids = self._meta.load_pcfs_file_nodeids()
+            except Exception:
+                raise InvalidConfigError("Failed to load PCFS file nodeids from Redis")
         self.local_index.start(self.local_ch)
         self.remote_index.start(self.remote_ch)
 
@@ -123,9 +139,11 @@ class PCFSCacheEngine:
         mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
         mr_remote = self.remote_index.match_prefix(block_hashes_t, int(num_blocks), True)
 
-        # Choose the one with the larger matched length; tie-break on ready length
+        # For simplicy, we choose the one with the larger matched length; tie-break on ready length
+        # We should allow to combine the two results in the future.
         local_key = (int(mr_local.num_matched_blocks), int(mr_local.num_ready_matched_blocks))
         remote_key = (int(mr_remote.num_matched_blocks), int(mr_remote.num_ready_matched_blocks))
+        matched_pos = "local" if local_key >= remote_key else "remote"
         chosen = mr_local if local_key >= remote_key else mr_remote
 
         # physical blocks
@@ -143,6 +161,11 @@ class PCFSCacheEngine:
             if bnids_np is None:
                 chosen = mr_local
         phys_np = chosen.physical_blocks.cpu().numpy()
+        if self.device_type == DeviceType.CPU and matched_pos == "remote" and mr_local.num_matched_blocks > 0:
+            insert_to_local_cpu_index = False
+        else:
+            insert_to_local_cpu_index = True
+        #TODO A big question is how to get the node id for peer_cpu and peer_ssd?
         return MatchResultAccel(
             num_ready_matched_blocks=int(chosen.num_ready_matched_blocks),
             num_matched_blocks=int(chosen.num_matched_blocks),
@@ -151,6 +174,8 @@ class PCFSCacheEngine:
             last_node_matched_length=int(chosen.last_node_matched_length),
             physical_blocks=phys_np,
             block_node_ids=bnids_np,
+            matched_pos=matched_pos,
+            insert_to_local_cpu=insert_to_local_cpu_index,
         )
 
     def nodeids_to_file_nodeids(self,
@@ -211,6 +236,7 @@ class PCFSCacheEngine:
             last_node_matched_length=int(mr_local.last_node_matched_length),
             physical_blocks=phys_np,
             block_node_ids=None,
+            matched_pos="local",
         )
 
     def insert(self,
@@ -240,7 +266,7 @@ class PCFSCacheEngine:
         except Exception:
             is_remote_node = False
         if is_remote_node:
-            self.remote_index.lock(node)
+            self.remote_index.lock(node) #TODO why do we need to lock the remote node?
         else:
             self.local_index.lock(node)
 
@@ -281,18 +307,8 @@ class PCFSCacheEngine:
             self.local_index.set_ready(node, ready, ready_length)
 
     def cleanup(self, node: CRadixNode, cleanup_length: int) -> None:
-        if node is None:
-            return
-        try:
-            is_remote_node = bool(node.has_block_node_ids())
-        except Exception:
-            is_remote_node = False
-        if is_remote_node:
-            self.remote_index.unlock(node)
-            self.remote_index.set_ready(node, True, int(cleanup_length))
-        else:
-            self.local_index.unlock(node)
-            self.local_index.set_ready(node, True, int(cleanup_length))
+        unlock(node)
+        set_ready(node, ready, ready_length)
 
     def take(self,
              num_required_blocks: int,
@@ -324,7 +340,7 @@ class PCFSCacheEngine:
 
 
     @classmethod
-    def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "PCFSCacheEngine":
+    def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "PCFSCacheEngine":
         """Create a PCFSCacheEngine from CacheConfig.
 
         This replaces RemotePCFSCacheEngine. It wires both local and remote
@@ -390,6 +406,7 @@ class PCFSCacheEngine:
             num_total_blocks=num_blocks,
             tokens_per_block=int(cache_config.tokens_per_block),
             evict_ratio=float(cache_config.evict_ratio),
+            device_type=DeviceType.REMOTE,
             local_lease_ttl_ms=int(getattr(cache_config, "lease_ttl_ms", 100000)),
             local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 10)),
             local_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
@@ -401,4 +418,31 @@ class PCFSCacheEngine:
             remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
             meta=meta,
         )
+
+    #TODO is this enough for peercpu and peerssd?
+    @classmethod
+    def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, device_type: DeviceType, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
+        if device_type == DeviceType.REMOTE:
+            return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta)
+        else:
+            return cls(
+                num_total_blocks=int(cache_config.num_remote_blocks or 0),
+                tokens_per_block=int(cache_config.tokens_per_block),
+                evict_ratio=float(cache_config.evict_ratio),
+                device_type=device_type,
+                local_max_num_blocks=int(cache_config.num_local_blocks or 0),
+                local_lease_ttl_ms=int(getattr(cache_config, "lease_ttl_ms", 100000)),
+                local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 0)),
+                local_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
+                local_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
+                local_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
+                remote_max_num_blocks=int(cache_config.num_remote_blocks or 0),
+                remote_node_id=int(node_id),
+                remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
+                remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 128)),
+                remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 1000)),
+                remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
+                meta=meta,
+            )
+            raise InvalidConfigError("Invalid device type: {cache_config.device_type}")
 
