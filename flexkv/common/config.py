@@ -76,7 +76,7 @@ class CacheConfig:
 
     # KV sharing / distributed radix tree tunables
     refresh_batch_size: int = 128
-    rebuild_interval_ms: int = 1000
+    rebuild_interval_ms: int = 10000
     idle_sleep_ms: int = 10
     lease_ttl_ms: int = 100000
     renew_lease_ms: int = 0

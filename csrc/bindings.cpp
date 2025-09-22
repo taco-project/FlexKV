@@ -4,10 +4,15 @@
 #include <vector>
 #include <map>
 
+#ifdef CUDA_AVAILABLE
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include "transfer.cuh"
+#endif
 #include <fcntl.h>
+#ifdef CUDA_AVAILABLE
 #include <nvToolsExt.h>
+#endif
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <sys/mman.h>
@@ -18,13 +23,13 @@
 #include "cache_utils.h"
 #include "pcfs/pcfs.h"
 #include "tp_transfer_thread_group.h"
-#include "transfer.cuh"
 #include "transfer_ssd.h"
 #include "radix_tree.h"
 #include "local_radix_tree.h"
 #include "distributed_radix_tree.h"
 #include "redis_meta_channel.h"
 #include "block_meta.h"
+#include "lock_free_q.h"
 #include <deque>
 
 namespace py = pybind11;
@@ -323,6 +328,18 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readwrite("hash", &flexkv::BlockMeta::hash)
       .def_readwrite("lt", &flexkv::BlockMeta::lt)
       .def_readwrite("state", &flexkv::BlockMeta::state);
+
+  // Expose a simple LockFreeQueue<int> to Python as IntQueue
+  py::class_<flexkv::LockFreeQueue<int>>(m, "IntQueue")
+      .def(py::init<>())
+      .def("push", [](flexkv::LockFreeQueue<int> &q, int value) {
+        q.push(value);
+      }, py::arg("value"))
+      .def("pop", [](flexkv::LockFreeQueue<int> &q) {
+        int value = 0;
+        bool ok = q.pop(value);
+        return py::make_tuple(ok, value);
+      });
 
   // RedisMetaChannel binding
   py::class_<flexkv::RedisMetaChannel>(m, "RedisMetaChannel")

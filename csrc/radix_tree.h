@@ -51,7 +51,7 @@ public:
     this->lease_meta = lease_meta;
   }
   
-  void set_lease_time(uint32_t lease_time) {
+  void set_lease_time(uint64_t lease_time) {
     if (this->lease_meta != nullptr) {
       this->lease_meta->lease_time = lease_time;
     }
