@@ -74,7 +74,7 @@ CRadixNode::~CRadixNode() {
     delete block_node_ids;
   }
   if (lease_meta != nullptr) {
-    LeaseMetaMemPool::release(lease_meta);
+    // Avoid returning to pool during teardown to prevent double-free on shutdown
     lease_meta = nullptr;
   }
   index->dec_node_count();
@@ -292,7 +292,10 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
   auto prefix_blocks_num = 0;
   auto ready_prefix_blocks_num = 0;
   auto last_node_matched_length = 0;
-  auto physical_blocks = new std::vector<int64_t>();
+  // Preallocate tensor for up to num_blocks entries and fill directly to avoid extra copy
+  auto physical_blocks_tensor = torch::empty({num_blocks}, torch::dtype(torch::kInt64));
+  auto *pb_out = physical_blocks_tensor.data_ptr<int64_t>();
+  int64_t pb_write = 0;
   auto block_hashes_ptr = block_hashes.data_ptr<int64_t>();
   HashType child_hash;
   
@@ -368,9 +371,9 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
     }
   }
 
-  return std::make_shared<CMatchResult>(
-      ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
-      last_ready_node, current_node, physical_blocks);
+  auto empty_uint32 = torch::Tensor();
+  return std::make_shared<CMatchResult>(ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
+    last_ready_node, current_node, physical_blocks, empty_uint32);
 }
 
 } //  namespace flexkv

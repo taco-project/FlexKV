@@ -32,9 +32,19 @@ class CacheConfig:
     tokens_per_block: int = 16
     enable_cpu: bool = True
     enable_ssd: bool = False
+<<<<<<< HEAD
     enable_remote: bool = False
     enable_gds: bool = False # Requires enable_ssd=True
     enable_kv_sharing: bool = False
+=======
+    enable_gds: bool = False
+    enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
+                                # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
+    enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
+    enable_p2p_cpu: bool = False
+    enable_p2p_ssd: bool = False
+    enable_3rd_remote: bool = False
+>>>>>>> 719e921 (build transfer graphs based on the cache engine match results)
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
@@ -57,6 +67,12 @@ class CacheConfig:
     redis_port: int = 6379
     local_ip: str = "127.0.0.1"
     redis_password: Optional[str] = None
+
+    def __post_init__(self):
+        self.enable_kv_sharing = self.enable_p2p_cpu or \
+            self.enable_p2p_ssd or self.enable_3rd_remote
+        self.enable_remote = self.enable_3rd_remote
+        self.index_accel = self.enable_p2p_cpu or self.enable_p2p_ssd or self.index_accel
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration

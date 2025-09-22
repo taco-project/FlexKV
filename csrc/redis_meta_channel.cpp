@@ -1,252 +1,210 @@
 #include "redis_meta_channel.h"
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <string.h>
-
+#include <hiredis/hiredis.h>
 #include <sstream>
 #include <mutex>
 #include <iomanip>
+#include <cstring>
+#include <cerrno>
+#include <thread>
+#include <chrono>
+#include <algorithm>
 
 namespace flexkv {
 
-static std::string resp_bulk(const std::string &s) {
-  std::ostringstream oss;
-  oss << "$" << s.size() << "\r\n" << s << "\r\n";
-  return oss.str();
+RedisHiredisClient::RedisHiredisClient() : context_(nullptr), port_(0), timeout_ms_(3000), password_("") {}
+
+RedisHiredisClient::~RedisHiredisClient() { 
+  close(); 
 }
 
-static std::string resp_array(const std::vector<std::string> &argv) {
-  std::ostringstream oss;
-  oss << "*" << argv.size() << "\r\n";
-  for (auto &a : argv) {
-    oss << resp_bulk(a);
-  }
-  return oss.str();
-}
-
-RedisTCPClient::RedisTCPClient() : sockfd(-1), port(0), timeout_ms(3000) {}
-
-RedisTCPClient::~RedisTCPClient() { close(); }
-
-bool RedisTCPClient::connect(const std::string &h, int p, int t_ms) {
-  host = h; port = p; timeout_ms = t_ms;
-  sockfd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (sockfd < 0) return false;
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) return false;
-  if (::connect(sockfd, (sockaddr*)&addr, sizeof(addr)) < 0) return false;
-  return true;
-}
-
-void RedisTCPClient::close() {
-  if (sockfd >= 0) {
-    ::shutdown(sockfd, SHUT_RDWR);
-    ::close(sockfd);
-  }
-  sockfd = -1;
-}
-
-bool RedisTCPClient::send_all(const std::string &buf) {
-  size_t sent = 0;
-  while (sent < buf.size()) {
-    ssize_t n = ::send(sockfd, buf.data() + sent, buf.size() - sent, 0);
-    if (n <= 0) return false;
-    sent += (size_t)n;
-  }
-  return true;
-}
-
-bool RedisTCPClient::recv_line(std::string &line) {
-  line.clear();
-  char c;
-  while (true) {
-    ssize_t n = ::recv(sockfd, &c, 1, 0);
-    if (n <= 0) return false;
-    if (c == '\r') {
-      char lf;
-      if (::recv(sockfd, &lf, 1, 0) <= 0) return false;
-      if (lf != '\n') return false;
-      break;
+bool RedisHiredisClient::connect(const std::string &host, int port, int timeout_ms, const std::string &password) {
+  host_ = host;
+  port_ = port;
+  timeout_ms_ = timeout_ms;
+  password_ = password;
+  
+  // Create connection with timeout
+  struct timeval timeout = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+  context_ = redisConnectWithTimeout(host.c_str(), port, timeout);
+  
+  if (context_ == nullptr || context_->err) {
+    if (context_) {
+      redisFree(context_);
+      context_ = nullptr;
     }
-    line.push_back(c);
+    return false;
   }
-  return true;
-}
-
-bool RedisTCPClient::recv_nbytes(size_t n, std::string &out) {
-  out.resize(n);
-  size_t got = 0;
-  while (got < n) {
-    ssize_t r = ::recv(sockfd, &out[got], n - got, 0);
-    if (r <= 0) return false;
-    got += (size_t)r;
-  }
-  // consume CRLF
-  char crlf[2];
-  if (::recv(sockfd, crlf, 2, 0) != 2) return false;
-  return true;
-}
-
-bool RedisTCPClient::command(const std::vector<std::string> &argv, std::vector<std::string> &out) {
-  out.clear();
-  std::string req = resp_array(argv);
-  if (!send_all(req)) return false;
-  std::string line;
-  if (!recv_line(line)) return false;
-  if (line.empty()) return false;
-  if (line[0] == '+') { // simple string
-    out.push_back(line.substr(1));
-    return true;
-  } else if (line[0] == ':') { // integer
-    out.push_back(line.substr(1));
-    return true;
-  } else if (line[0] == '$') { // bulk string
-    int len = std::stoi(line.substr(1));
-    if (len < 0) return true; // nil
-    std::string bulk;
-    if (!recv_nbytes((size_t)len, bulk)) return false;
-    out.push_back(bulk);
-    return true;
-  } else if (line[0] == '*') { // array
-    int cnt = std::stoi(line.substr(1));
-    for (int i = 0; i < cnt; ++i) {
-      if (!recv_line(line)) return false;
-      if (line.empty() || line[0] != '$') return false;
-      int len = std::stoi(line.substr(1));
-      if (len < 0) { out.emplace_back(); continue; }
-      std::string bulk;
-      if (!recv_nbytes((size_t)len, bulk)) return false;
-      out.push_back(bulk);
-    }
-    return true;
-  }
-  return false;
-}
-
-bool RedisTCPClient::pipeline(const std::vector<std::vector<std::string>> &batch,
-                              std::vector<std::vector<std::string>> &replies) {
-  replies.clear();
-  if (batch.empty()) return true;
-  // Build one big request
-  std::ostringstream req;
-  for (const auto &argv : batch) req << resp_array(argv);
-  std::string payload = req.str();
-  if (!send_all(payload)) return false;
-
-  // Receive replies sequentially
-  replies.reserve(batch.size());
-  for (size_t i = 0; i < batch.size(); ++i) {
-    std::vector<std::string> one;
-    // Parse a single reply using same logic as command()
-    std::string line;
-    if (!recv_line(line)) return false;
-    if (line.empty()) return false;
-    if (line[0] == '+') {
-      one.push_back(line.substr(1));
-    } else if (line[0] == ':') {
-      one.push_back(line.substr(1));
-    } else if (line[0] == '$') {
-      int len = std::stoi(line.substr(1));
-      if (len >= 0) {
-        std::string bulk;
-        if (!recv_nbytes((size_t)len, bulk)) return false;
-        one.push_back(bulk);
-      } else {
-        one.emplace_back();
-      }
-    } else if (line[0] == '*') {
-      int cnt = std::stoi(line.substr(1));
-      for (int j = 0; j < cnt; ++j) {
-        if (!recv_line(line)) return false;
-        if (line.empty() || line[0] != '$') return false;
-        int len = std::stoi(line.substr(1));
-        if (len < 0) { one.emplace_back(); continue; }
-        std::string bulk;
-        if (!recv_nbytes((size_t)len, bulk)) return false;
-        one.push_back(bulk);
-      }
-    } else {
+  
+  // Authenticate if password is provided
+  if (!password_.empty()) {
+    redisReply* reply = (redisReply*)redisCommand(context_, "AUTH %s", password_.c_str());
+    if (!reply) {
+      redisFree(context_);
+      context_ = nullptr;
       return false;
     }
-    replies.push_back(std::move(one));
+    
+    bool auth_success = (reply->type == REDIS_REPLY_STATUS && 
+                        strcmp(reply->str, "OK") == 0);
+    freeReplyObject(reply);
+    
+    if (!auth_success) {
+      redisFree(context_);
+      context_ = nullptr;
+      return false;
+    }
   }
+  
   return true;
 }
-bool RedisMetaChannel::hmget_two_fields_for_keys(const std::vector<std::string> &keys,
-                                                 const std::string &field1,
-                                                 const std::string &field2,
-                                                 std::vector<std::pair<std::string, std::string>> &out) {
-  out.clear();
-  if (keys.empty()) return true;
-  std::vector<std::vector<std::string>> batch;
-  batch.reserve(keys.size());
-  for (const auto &k : keys) batch.push_back({"HMGET", k, field1, field2});
-  std::vector<std::vector<std::string>> replies;
-  if (!client.pipeline(batch, replies)) return false;
-  out.reserve(replies.size());
-  for (const auto &r : replies) {
-    if (r.size() >= 2) out.emplace_back(r[0], r[1]);
-    else if (r.size() == 1) out.emplace_back(r[0], std::string());
-    else out.emplace_back(std::string(), std::string());
+
+void RedisHiredisClient::close() {
+  if (context_) {
+    redisFree(context_);
+    context_ = nullptr;
   }
-  return out.size() == keys.size();
 }
 
-static std::string to_hex_u64(uint64_t value) {
-  std::ostringstream oss;
-  oss << std::hex << std::nouppercase << value;
-  return oss.str();
+bool RedisHiredisClient::command(const std::vector<std::string> &argv, std::vector<std::string> &out) {
+  if (!context_) return false;
+  
+  // Convert vector<string> to char* array
+  std::vector<const char*> args;
+  std::vector<size_t> arglens;
+  
+  for (const auto& arg : argv) {
+    args.push_back(arg.c_str());
+    arglens.push_back(arg.length());
+  }
+  
+  redisReply* reply = (redisReply*)redisCommandArgv(context_, args.size(), args.data(), arglens.data());
+  if (!reply) {
+    return false;
+  }
+  
+  bool result = parse_reply(reply, out);
+  freeReplyObject(reply);
+  return result;
 }
+
+bool RedisHiredisClient::pipeline(const std::vector<std::vector<std::string>> &batch,
+                                  std::vector<std::vector<std::string>> &replies) {
+  if (!context_ || batch.empty()) return false;
+  
+  replies.clear();
+  replies.reserve(batch.size());
+  
+  // Append all commands to pipeline
+  for (const auto& cmd : batch) {
+    std::vector<const char*> args;
+    std::vector<size_t> arglens;
+    
+    for (const auto& arg : cmd) {
+      args.push_back(arg.c_str());
+      arglens.push_back(arg.length());
+    }
+    
+    int ret = redisAppendCommandArgv(context_, args.size(), args.data(), arglens.data());
+    if (ret != REDIS_OK) {
+      return false;
+    }
+  }
+  
+  // Get all replies
+  for (size_t i = 0; i < batch.size(); ++i) {
+    redisReply* reply = nullptr;
+    int ret = redisGetReply(context_, (void**)&reply);
+    if (ret != REDIS_OK || !reply) {
+      if (reply) freeReplyObject(reply);
+      return false;
+    }
+    
+    std::vector<std::string> reply_vec;
+    bool success = parse_reply(reply, reply_vec);
+    freeReplyObject(reply);
+    
+    if (!success) {
+      return false;
+    }
+    
+    replies.push_back(std::move(reply_vec));
+  }
+  
+  return true;
+}
+
+redisContext* RedisHiredisClient::get_context() const {
+  return context_;
+}
+
+bool RedisHiredisClient::parse_reply(redisReply* reply, std::vector<std::string> &out) {
+  if (!reply) return false;
+  
+  out.clear();
+  
+  switch (reply->type) {
+    case REDIS_REPLY_STRING:
+    case REDIS_REPLY_STATUS:
+      out.push_back(std::string(reply->str, reply->len));
+      break;
+      
+    case REDIS_REPLY_INTEGER:
+      out.push_back(std::to_string(reply->integer));
+      break;
+      
+    case REDIS_REPLY_ARRAY:
+      for (size_t i = 0; i < reply->elements; ++i) {
+        if (reply->element[i]->type == REDIS_REPLY_STRING) {
+          out.push_back(std::string(reply->element[i]->str, reply->element[i]->len));
+        } else if (reply->element[i]->type == REDIS_REPLY_NIL) {
+          out.push_back(""); // Empty string for NIL
+        } else {
+          // For other types, convert to string representation
+          out.push_back(std::to_string(reply->element[i]->integer));
+        }
+      }
+      break;
+      
+    case REDIS_REPLY_NIL:
+      out.push_back(""); // Empty string for NIL
+      break;
+      
+    case REDIS_REPLY_ERROR:
+      return false; // Error reply
+      
+    default:
+      return false;
+  }
+  
+  return true;
+}
+
+
+
 
 RedisMetaChannel::RedisMetaChannel(const std::string &h, int p, uint32_t node_id,
                                    const std::string &lip,
-                                   const std::string &bk)
-  : host(h), port(p), node_id(node_id), blocks_key(bk), local_ip(lip) {
+                                   const std::string &bk,
+                                   const std::string &pwd)
+  : host(h), port(p), node_id(node_id), blocks_key(bk), local_ip(lip), password(pwd) {
 }
 
 bool RedisMetaChannel::connect() {
-  return client.connect(host, port, 3000);
+  return client.connect(host, port, 3000, password);
 }
+
 std::string RedisMetaChannel::make_block_key(uint32_t node_id, uint64_t hash) const {
   std::ostringstream oss;
   oss << blocks_key << ":block:" << node_id << ":" << std::hex << std::nouppercase << hash;
   return oss.str();
 }
 
-
-// register_node removed; node id is now set via constructor
-
-std::string RedisMetaChannel::to_string(const BlockMeta &m) {
-  // ph|pb|nid|hash|lt|state
-  std::ostringstream oss;
-  oss << m.ph << '|' << m.pb << '|' << m.nid << '|' << m.hash << '|' << m.lt << '|' << (int)m.state;
-  return oss.str();
-}
-
-bool RedisMetaChannel::from_string(const std::string &s, BlockMeta &m) {
-  std::istringstream iss(s);
-  std::string tok;
-  if (!std::getline(iss, tok, '|')) return false; m.ph = std::stoll(tok);
-  if (!std::getline(iss, tok, '|')) return false; m.pb = std::stoll(tok);
-  if (!std::getline(iss, tok, '|')) return false; m.nid = (uint32_t)std::stoul(tok);
-  if (!std::getline(iss, tok, '|')) return false; m.hash = std::stoll(tok);
-  if (!std::getline(iss, tok, '|')) return false; m.lt = (uint32_t)std::stoul(tok);
-  if (!std::getline(iss, tok, '|')) return false; m.state = (NodeState)std::stoi(tok);
-  return true;
-}
-
-void RedisMetaChannel::publish(const BlockMeta &meta) {
+bool RedisMetaChannel::publish(const BlockMeta &meta) {
   std::vector<std::string> resp;
   // Key format: <blocks_key>:block:<nid>:<hash_hex>
   std::string key = make_block_key(meta.nid, (uint64_t)meta.hash);
-  client.command({
+  bool ret = client.command({
       "HSET", key,
       "ph", std::to_string(meta.ph),
       "pb", std::to_string(meta.pb),
@@ -255,10 +213,11 @@ void RedisMetaChannel::publish(const BlockMeta &meta) {
       "lt", std::to_string(meta.lt),
       "state", std::to_string((int)meta.state)
   }, resp);
+  return ret;
 }
 
-void RedisMetaChannel::publish(const std::vector<BlockMeta> &metas, size_t batch_size) {
-  if (metas.empty()) return;
+bool RedisMetaChannel::publish(const std::vector<BlockMeta> &metas, size_t batch_size) {
+  if (metas.empty()) return true;
   if (batch_size == 0) batch_size = 100;
 
   size_t total = metas.size();
@@ -282,59 +241,88 @@ void RedisMetaChannel::publish(const std::vector<BlockMeta> &metas, size_t batch
       });
     }
     std::vector<std::vector<std::string>> replies;
-    client.pipeline(batch, replies);
+    bool ret = client.pipeline(batch, replies);
+    if (!ret) {
+      return false;
+    }
     idx = end;
   }
+  return true;
 }
 
 size_t RedisMetaChannel::load(std::vector<BlockMeta> &out, size_t max_items) {
   out.clear();
   if (max_items == 0) return 0;
 
-  // Fetch keys: KEYS <blocks_key>:block:*
+  // Use SCAN instead of KEYS to avoid blocking
   std::vector<std::string> keys;
-  if (!client.command({"KEYS", blocks_key + ":block:*"}, keys)) return 0;
+  std::string pattern = blocks_key + ":block:*";
+  std::string cursor = "0";
+  
+  do {
+    std::vector<std::string> scan_result;
+    if (!client.command({"SCAN", cursor, "MATCH", pattern, "COUNT", "100"}, scan_result)) {
+      return 0;
+    }
+    
+    if (scan_result.size() >= 2) {
+      cursor = scan_result[0];
+      // scan_result[1] contains the array of keys
+      // Parse the array response
+      for (size_t i = 1; i < scan_result.size(); ++i) {
+        keys.push_back(scan_result[i]);
+        if (keys.size() >= max_items) break;
+      }
+    } else {
+      break;
+    }
+  } while (cursor != "0" && keys.size() < max_items);
+  
   if (keys.empty()) return 0;
 
-  size_t total = std::min(keys.size(), max_items);
-  out.reserve(total);
-
-  const size_t batch_size = 100;
-  size_t idx = 0;
-  while (idx < total) {
-    size_t end = std::min(idx + batch_size, total);
-    std::vector<std::vector<std::string>> batch;
-    batch.reserve(end - idx);
-    for (size_t i = idx; i < end; ++i) {
-      batch.push_back({"HMGET", keys[i], "ph", "pb", "nid", "hash", "lt", "state"});
-    }
-    std::vector<std::vector<std::string>> replies;
-    if (!client.pipeline(batch, replies)) break;
-    for (const auto &fields : replies) {
-      if (fields.size() != 6) continue;
-      BlockMeta m{};
-      if (!fields[0].empty()) m.ph = std::stoll(fields[0]); else m.ph = 0;
-      if (!fields[1].empty()) m.pb = std::stoll(fields[1]); else m.pb = 0;
-      if (!fields[2].empty()) m.nid = (uint32_t)std::stoul(fields[2]); else m.nid = 0;
-      if (!fields[3].empty()) m.hash = std::stoll(fields[3]); else m.hash = 0;
-      if (!fields[4].empty()) m.lt = (uint32_t)std::stoul(fields[4]); else m.lt = 0;
-      if (!fields[5].empty()) m.state = (NodeState)std::stoi(fields[5]); else m.state = (NodeState)0;
-      out.push_back(m);
-    }
-    idx = end;
+  // Batch HMGET for all fields
+  std::vector<std::vector<std::string>> batch;
+  batch.reserve(keys.size());
+  
+  for (const auto& key : keys) {
+    batch.push_back({"HMGET", key, "ph", "pb", "nid", "hash", "lt", "state"});
   }
+  
+  std::vector<std::vector<std::string>> replies;
+  if (!client.pipeline(batch, replies)) return 0;
+  
+  // Parse replies into BlockMeta objects
+  for (size_t i = 0; i < replies.size() && i < keys.size(); ++i) {
+    const auto& reply = replies[i];
+    if (reply.size() == 6) {
+      BlockMeta meta;
+      if (reply[0].empty() || reply[1].empty() || reply[2].empty() 
+      || reply[3].empty() || reply[4].empty() || reply[5].empty()) {
+        meta.state = NODE_STATE_EVICTED;
+      } else {
+        meta.ph = std::stoll(reply[0]);
+        meta.pb = std::stoll(reply[1]);
+        meta.nid = std::stoul(reply[2]);
+        meta.hash = std::stoll(reply[3]);
+        meta.lt = std::stoul(reply[4]);
+        meta.state = std::stoi(reply[5]);
+      }
+      out.push_back(meta);
+    } else {
+      BlockMeta meta;
+      meta.state = NODE_STATE_EVICTED;
+      out.push_back(meta);
+    }
+  }
+  
   return out.size();
 }
 
-uint32_t RedisMetaChannel::get_node_id() const {
-  return node_id;
-}
-
-void RedisMetaChannel::renew_node_leases(uint32_t node_id, uint32_t new_lt, size_t batch_size) {
+bool RedisMetaChannel::renew_node_leases(uint32_t node_id, uint32_t new_lt, size_t batch_size) {
   // Discover keys for this node and update lt via pipeline
   std::vector<std::string> keys;
-  if (!list_block_keys(node_id, keys)) return;
-  if (keys.empty()) return;
+  if (!list_block_keys(node_id, keys)) return false;
+  if (keys.empty()) return true;
   if (batch_size == 0) batch_size = 200;
   size_t idx = 0, total = keys.size();
   while (idx < total) {
@@ -345,72 +333,180 @@ void RedisMetaChannel::renew_node_leases(uint32_t node_id, uint32_t new_lt, size
       batch.push_back({"HSET", keys[i], "lt", std::to_string(new_lt)});
     }
     std::vector<std::vector<std::string>> replies;
-    client.pipeline(batch, replies);
+    if (!client.pipeline(batch, replies)) return false;
     idx = end;
   }
+  return true;
+}
+
+uint32_t RedisMetaChannel::get_node_id() const {
+  return node_id;
 }
 
 bool RedisMetaChannel::list_keys(const std::string &pattern, std::vector<std::string> &keys) {
   keys.clear();
-  return client.command({"KEYS", pattern}, keys);
+  std::string cursor = "0";
+  
+  do {
+    // Use raw command to get proper SCAN response parsing
+    std::vector<std::string> scan_cmd = {"SCAN", cursor, "MATCH", pattern, "COUNT", "100"};
+    
+    // Get raw response from Redis
+    redisContext* context = client.get_context();
+    if (!context) return false;
+    
+    // Prepare command arguments
+    std::vector<const char*> argv;
+    std::vector<size_t> arglen;
+    for (const auto& arg : scan_cmd) {
+      argv.push_back(arg.c_str());
+      arglen.push_back(arg.length());
+    }
+    
+    redisReply* reply = nullptr;
+    int result = redisAppendCommandArgv(context, argv.size(), argv.data(), arglen.data());
+    if (result != REDIS_OK) return false;
+    
+    result = redisGetReply(context, (void**)&reply);
+    if (result != REDIS_OK || !reply) return false;
+    
+    // Parse SCAN response: [cursor, [keys...]]
+    if (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 2) {
+      // First element is cursor
+      if (reply->element[0]->type == REDIS_REPLY_STRING) {
+        cursor = std::string(reply->element[0]->str, reply->element[0]->len);
+      } else if (reply->element[0]->type == REDIS_REPLY_INTEGER) {
+        cursor = std::to_string(reply->element[0]->integer);
+      }
+      
+      // Second element is array of keys
+      if (reply->element[1]->type == REDIS_REPLY_ARRAY) {
+        for (size_t i = 0; i < reply->element[1]->elements; ++i) {
+          if (reply->element[1]->element[i]->type == REDIS_REPLY_STRING) {
+            keys.push_back(std::string(reply->element[1]->element[i]->str, 
+                                      reply->element[1]->element[i]->len));
+          }
+        }
+      }
+    }
+    
+    freeReplyObject(reply);
+    
+  } while (cursor != "0");
+  
+  return true;
 }
 
 bool RedisMetaChannel::list_node_keys(std::vector<std::string> &keys) {
-  keys.clear();
-  return client.command({"KEYS", "node:*"}, keys);
+  return list_keys("node:*", keys);
 }
 
 bool RedisMetaChannel::list_block_keys(uint32_t node_id, std::vector<std::string> &keys) {
-  keys.clear();
   std::string pattern = blocks_key + ":block:" + std::to_string(node_id) + ":*";
-  return client.command({"KEYS", pattern}, keys);
+  return list_keys(pattern, keys);
 }
 
 bool RedisMetaChannel::hmget_field_for_keys(const std::vector<std::string> &keys,
                                             const std::string &field,
                                             std::vector<std::string> &values) {
-  values.clear();
   if (keys.empty()) return true;
+  
+  values.clear();
+  values.reserve(keys.size());
+  
+  // Batch HMGET for single field
   std::vector<std::vector<std::string>> batch;
   batch.reserve(keys.size());
-  for (const auto &k : keys) batch.push_back({"HMGET", k, field});
+  
+  for (const auto& key : keys) {
+    batch.push_back({"HMGET", key, field});
+  }
+  
   std::vector<std::vector<std::string>> replies;
   if (!client.pipeline(batch, replies)) return false;
-  values.reserve(replies.size());
-  for (const auto &r : replies) {
-    if (!r.empty()) values.push_back(r[0]); else values.emplace_back();
+  
+  for (const auto& reply : replies) {
+    if (!reply.empty()) {
+      values.push_back(reply[0]);
+    } else {
+      values.push_back("");
+    }
   }
-  return values.size() == keys.size();
+  
+  return true;
+}
+
+bool RedisMetaChannel::hmget_two_fields_for_keys(const std::vector<std::string> &keys,
+                                                 const std::string &field1,
+                                                 const std::string &field2,
+                                                 std::vector<std::pair<std::string, std::string>> &out) {
+  if (keys.empty()) return true;
+  
+  out.clear();
+  out.reserve(keys.size());
+  
+  // Batch HMGET for two fields
+  std::vector<std::vector<std::string>> batch;
+  batch.reserve(keys.size());
+  
+  for (const auto& key : keys) {
+    batch.push_back({"HMGET", key, field1, field2});
+  }
+  
+  std::vector<std::vector<std::string>> replies;
+  if (!client.pipeline(batch, replies)) return false;
+  
+  for (const auto& reply : replies) {
+    if (reply.size() >= 2) {
+      out.emplace_back(reply[0], reply[1]);
+    } else {
+      out.emplace_back("", "");
+    }
+  }
+  
+  return true;
 }
 
 size_t RedisMetaChannel::load_metas_by_keys(const std::vector<std::string> &keys,
                                             std::vector<BlockMeta> &out) {
   out.clear();
   if (keys.empty()) return 0;
-  const size_t batch_size = 100;
-  size_t idx = 0, total = keys.size();
-  while (idx < total) {
-    size_t end = std::min(idx + batch_size, total);
-    std::vector<std::vector<std::string>> batch;
-    batch.reserve(end - idx);
-    for (size_t i = idx; i < end; ++i) {
-      batch.push_back({"HMGET", keys[i], "ph", "pb", "nid", "hash", "lt", "state"});
-    }
-    std::vector<std::vector<std::string>> replies;
-    if (!client.pipeline(batch, replies)) break;
-    for (const auto &fields : replies) {
-      if (fields.size() != 6) continue;
-      BlockMeta m{};
-      if (!fields[0].empty()) m.ph = std::stoll(fields[0]); else m.ph = 0;
-      if (!fields[1].empty()) m.pb = std::stoll(fields[1]); else m.pb = 0;
-      if (!fields[2].empty()) m.nid = (uint32_t)std::stoul(fields[2]); else m.nid = 0;
-      if (!fields[3].empty()) m.hash = std::stoll(fields[3]); else m.hash = 0;
-      if (!fields[4].empty()) m.lt = (uint32_t)std::stoul(fields[4]); else m.lt = 0;
-      if (!fields[5].empty()) m.state = (NodeState)std::stoi(fields[5]); else m.state = (NodeState)0;
-      out.push_back(m);
-    }
-    idx = end;
+  
+  // Batch HMGET for all fields
+  std::vector<std::vector<std::string>> batch;
+  batch.reserve(keys.size());
+  
+  for (const auto& key : keys) {
+    batch.push_back({"HMGET", key, "ph", "pb", "nid", "hash", "lt", "state"});
   }
+  
+  std::vector<std::vector<std::string>> replies;
+  if (!client.pipeline(batch, replies)) return 0;
+  
+  // Parse replies into BlockMeta objects
+  for (size_t i = 0; i < replies.size() && i < keys.size(); ++i) {
+    const auto& reply = replies[i];
+    if (reply.size() == 6) {
+      BlockMeta meta;
+      if (reply[0].empty() || reply[1].empty() || reply[2].empty() 
+      || reply[3].empty() || reply[4].empty() || reply[5].empty()) {
+        meta.state = NODE_STATE_EVICTED;
+      } else {
+        meta.ph = std::stoll(reply[0]);
+        meta.pb = std::stoll(reply[1]);
+        meta.nid = std::stoul(reply[2]);
+        meta.hash = std::stoll(reply[3]);
+        meta.lt = std::stoul(reply[4]);
+        meta.state = std::stoi(reply[5]);
+      }
+      out.push_back(meta);
+    } else {
+      BlockMeta meta;
+      meta.state = NODE_STATE_EVICTED;
+      out.push_back(meta);
+    }
+  }
+  
   return out.size();
 }
 
@@ -418,11 +514,11 @@ static std::string key_for_block(RedisMetaChannel* ch, uint32_t node_id, int64_t
   return ch->make_block_key(node_id, (uint64_t)hash);
 }
 
-void RedisMetaChannel::update_block_state_batch(uint32_t node_id,
+bool RedisMetaChannel::update_block_state_batch(uint32_t node_id,
                                                 std::deque<int64_t> *hashes,
-                                                NodeState state,
+                                                int state,
                                                 size_t batch_size) {
-  if (hashes == nullptr || hashes->empty()) return;
+  if (hashes == nullptr || hashes->empty()) return true;
   if (batch_size == 0) batch_size = 200;
   size_t idx = 0, total = hashes->size();
   while (idx < total) {
@@ -434,15 +530,16 @@ void RedisMetaChannel::update_block_state_batch(uint32_t node_id,
       batch.push_back({"HSET", key, "state", std::to_string((int)state)});
     }
     std::vector<std::vector<std::string>> replies;
-    client.pipeline(batch, replies);
+    if (!client.pipeline(batch, replies)) return false;
     idx = end;
   }
+  return true;
 }
 
-void RedisMetaChannel::delete_blockmeta_batch(uint32_t node_id,
+bool RedisMetaChannel::delete_blockmeta_batch(uint32_t node_id,
                                               std::deque<int64_t> *hashes,
                                               size_t batch_size) {
-  if (hashes == nullptr || hashes->empty()) return;
+  if (hashes == nullptr || hashes->empty()) return true;
   if (batch_size == 0) batch_size = 200;
   size_t idx = 0, total = hashes->size();
   while (idx < total) {
@@ -454,11 +551,10 @@ void RedisMetaChannel::delete_blockmeta_batch(uint32_t node_id,
       batch.push_back({"DEL", key});
     }
     std::vector<std::vector<std::string>> replies;
-    client.pipeline(batch, replies);
+    if (!client.pipeline(batch, replies)) return false;
     idx = end;
   }
+  return true;
 }
 
 } // namespace flexkv
-
-

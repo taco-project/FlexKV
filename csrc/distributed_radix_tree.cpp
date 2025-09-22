@@ -12,13 +12,14 @@
 
 namespace flexkv {
 DistributedRadixTree::DistributedRadixTree(int tokens_per_block, int max_num_blocks,
-                  uint32_t nid, size_t lt_pool_initial_capacity,
-                  size_t refresh_batch_size, uint32_t rebuild_interval_ms, uint32_t idle_sleep_ms)
+                  uint32_t nid,
+                  size_t refresh_batch_size, uint32_t rebuild_interval_ms, uint32_t idle_sleep_ms,
+                  uint32_t lease_renew_ms)
   : channel(nullptr), node_id(nid), tokens_per_block(tokens_per_block), max_num_blocks(max_num_blocks),
-    lt_pool(lt_pool_initial_capacity) {
+    lt_pool(max_num_blocks) {
   refresh_batch_size_ = refresh_batch_size;
   rebuild_interval_ms_ = rebuild_interval_ms;
-  idle_sleep_ms_ = idle_sleep_ms;
+  lease_renew_ms_ = lease_renew_ms;
   old_index.store(nullptr, std::memory_order_relaxed);
   c_index.store(nullptr, std::memory_order_relaxed);
 }
@@ -54,12 +55,17 @@ void* DistributedRadixTree::refresh_worker_trampoline(void* arg) {
   return nullptr;
 }
 
-void DistributedRadixTree::start(RedisMetaChannel *ch) {
-  if (refresh_started) return;
+bool DistributedRadixTree::start(RedisMetaChannel *ch) {
+  if (refresh_started) return true;
   channel = ch;
   refresh_should_stop = false;
   refresh_started = true;
-  pthread_create(&refresh_tid, nullptr, &DistributedRadixTree::refresh_worker_trampoline, this);
+  int result = pthread_create(&refresh_tid, nullptr, &DistributedRadixTree::refresh_worker_trampoline, this);
+  if (result != 0) {
+    refresh_started = false;
+    return false;
+  }
+  return true;
 }
 
 void DistributedRadixTree::stop() {
@@ -134,14 +140,19 @@ void DistributedRadixTree::refresh_nodes_lease_from_redis(const std::vector<CRad
       const std::string &lt_s = lt_state[idx].first;
       const std::string &st_s = lt_state[idx].second;
       if (lt_s.empty() || st_s.empty()) continue;
-      int st = std::stoi(st_s);
-      if (st == (int)NODE_STATE_NORMAL) {
-        uint32_t lt = (uint32_t)std::stoul(lt_s);
-        if (lt < min_lt) min_lt = lt;
+      try {
+        int st = std::stoi(st_s);
+        if (st == (int)NODE_STATE_NORMAL) {
+          uint32_t lt = (uint32_t)std::stoul(lt_s);
+          if (lt < min_lt) min_lt = lt;
+        }
+      } catch (const std::exception&) {
+        // skip unparsable entries
+        continue;
       }
     }
     if (min_lt != UINT32_MAX) {
-      lm->lease_time = min_lt;
+      lm->lease_time = min_lt == UINT32_MAX ? 0 : min_lt;
     }
   }
 }
@@ -175,7 +186,12 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
     if (k.size() <= 5) continue;
     if (ips.size() <= i) continue;
     // parse nid
-    uint32_t nid = (uint32_t)std::stoul(k.substr(5));
+    uint32_t nid = 0;
+    try {
+      nid = (uint32_t)std::stoul(k.substr(5));
+    } catch (const std::exception&) {
+      continue;
+    }
     if (nid == node_id) continue; // skip self
     std::string ip = ips[i];
     uint32_t dst = compute_ip_distance(ip, self_ip);
@@ -186,7 +202,8 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
   std::sort(nodes.begin(), nodes.end(), [](const NodeInfo &a, const NodeInfo &b){ return a.dst < b.dst; });
 
   // 4) iterate nodes and load their block metas
-  RefRadixTree* new_index = new RefRadixTree(tokens_per_block, max_num_blocks);
+  RefRadixTree* new_index = new RefRadixTree(tokens_per_block, max_num_blocks, lease_renew_ms_,
+     &renew_lease_queue, &lt_pool);
   for (const auto &nfo : nodes) {
     // list keys block:<nid>:*
     std::vector<std::string> bkeys;
@@ -200,7 +217,10 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
     // Merge into new_index via DFS+merge helpers
     if (!metas.empty()) {
       std::unordered_map<int64_t, std::vector<BlockMeta*>> parent_to_children;
-      for (const auto& meta : metas) parent_to_children[meta.ph].push_back(&meta);
+      for (int i = 0; i < metas.size(); ++i) {
+        if (metas[i].state != NODE_STATE_NORMAL) continue;
+        parent_to_children[metas[i].ph].push_back(&metas[i]);
+      }
       std::unordered_set<int64_t> processed_hashes;
       std::vector<CRadixNode*> temp_root_children;
       for (const auto& root_child_ptr : parent_to_children[0]) {
@@ -222,7 +242,9 @@ std::shared_ptr<CMatchResult> DistributedRadixTree::match_prefix(
   torch::Tensor &block_hashes, int num_blocks, bool update_cache_info) {
   RefRadixTree *idx = c_index.load(std::memory_order_acquire);
   if (idx == nullptr) {
-    return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, new std::vector<int64_t>());
+    auto empty_i64 = torch::empty({0}, torch::dtype(torch::kInt64));
+    auto empty_u32 = torch::empty({0}, torch::dtype(torch::kInt32));
+    return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
   }
   RefCntGuard guard{idx};
   return idx->match_prefix(block_hashes, num_blocks, update_cache_info);
@@ -274,13 +296,23 @@ void DistributedRadixTree::set_ready(CRadixNode *node, bool ready, int ready_len
   idx->set_ready(node, ready, ready_length);
 }
 
-RefRadixTree::RefRadixTree(int tokens_per_block, int max_num_blocks)
+RefRadixTree::RefRadixTree(int tokens_per_block, int max_num_blocks, uint32_t lease_renew_ms,
+   LockFreeQueue<CRadixNode*> *renew_lease_queue, LeaseMetaMemPool* lt_pool)
   : CRadixTreeIndex(tokens_per_block, max_num_blocks) {
+  lease_renew_ms_ = lease_renew_ms;
+  renew_lease_queue_ = renew_lease_queue;
+  lt_pool_ = lt_pool;
   ref_cnt.store(1);
 }
 
 RefRadixTree::~RefRadixTree() {
-  // No special cleanup beyond base class for now
+  while (node_list.size()) {
+    auto node = node_list.front();
+    auto lm = node->get_lease_meta();
+    if (lm != nullptr) {
+      lt_pool_->free(lm);
+    }
+  }
 }
 
 void RefRadixTree::dec_ref_cnt() {
@@ -337,9 +369,15 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   auto prefix_blocks_num = 0;
   auto ready_prefix_blocks_num = 0;
   auto last_node_matched_length = 0;
-  auto physical_blocks = new std::vector<int64_t>();
+  auto physical_blocks_tensor = torch::empty({num_blocks}, torch::dtype(torch::kInt64));
+  auto *pb_out = physical_blocks_tensor.data_ptr<int64_t>();
+  int64_t pb_write = 0;
   auto block_hashes_ptr = block_hashes.data_ptr<int64_t>();
   HashType child_hash;
+  // node ids stored as int32 tensor (PyTorch lacks uint32 dtype)
+  auto node_ids_tensor = torch::empty({num_blocks}, torch::dtype(torch::kInt32));
+  auto *ni_out = node_ids_tensor.data_ptr<int32_t>();
+  int32_t ni_write = 0;
 
   // now in ms
   struct timeval now_tv; gettimeofday(&now_tv, nullptr);
@@ -359,8 +397,10 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
           // expired: stop matching and return what we have so far
           break;
         }
-        if ((int64_t)lt - (int64_t)now_ms <= (int64_t)renew_threshold_ms_) {
-          renew_lease_queue.push(current_node);
+        if ((int64_t)lt - (int64_t)now_ms <= (int64_t)lease_renew_ms_) {
+          if (renew_lease_queue_ != nullptr) {
+            renew_lease_queue_->push(current_node);
+          }
         }
       }
     }
@@ -372,8 +412,17 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
         ready_prefix_blocks_num += current_node->size();
       }
       prefix_blocks_num += current_node->size();
-      physical_blocks->insert(physical_blocks->end(), current_node->get_physical_blocks().begin(),
-        current_node->get_physical_blocks().end());
+      for (auto v : current_node->get_physical_blocks()) {
+        pb_out[pb_write++] = v;
+      }
+      auto bnis = current_node->get_block_node_ids();
+      if (bnis != nullptr) {
+        for (auto v : *bnis) {
+          ni_out[ni_write++] = v;
+        }
+      } else {
+        std::cerr << "block_node_ids is nullptr" << std::endl;
+      }
       current_node = current_node->get_child(child_hash);
     } else {
       auto matched_length = 0;
@@ -391,8 +440,18 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
           }
         }
         matched_length = left;
-        physical_blocks->insert(physical_blocks->end(), current_node->get_physical_blocks().begin(),
-          current_node->get_physical_blocks().begin() + matched_length);
+        auto &dq = current_node->get_physical_blocks();
+        for (int i = 0; i < matched_length; ++i) {
+          pb_out[pb_write++] = dq[i];
+        }
+        auto bnis = current_node->get_block_node_ids();
+        if (bnis != nullptr) {
+          for (auto v : *bnis) {
+            ni_out[ni_write++] = v;
+          }
+        } else {
+          std::cerr << "block_node_ids is nullptr" << std::endl;
+        }
       } else {
         matched_length = 0;
       }
@@ -408,8 +467,10 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
     }
   }
 
+  auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
+  auto node_ids = node_ids_tensor.narrow(0, 0, ni_write);
   return std::make_shared<CMatchResult>(prefix_blocks_num, ready_prefix_blocks_num, last_node_matched_length,
-    last_ready_node, current_node, physical_blocks);
+    last_ready_node, current_node, physical_blocks, node_ids);
 }
 
 // DFS function to build subtree from BlockMeta with chain compression
@@ -442,7 +503,7 @@ CRadixNode* dfs_build_subtree_from_meta(const BlockMeta* current_meta,
 
   auto& cbh = child_node->get_block_hashes();
   auto& cpb = child_node->get_physical_blocks();
-  auto& bni = child_node->get_block_node_ids();
+  auto bni = child_node->get_block_node_ids();
   if (bni == nullptr) return nullptr;
 
   // Seed with the current meta
