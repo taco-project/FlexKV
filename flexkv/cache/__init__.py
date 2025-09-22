@@ -1,9 +1,15 @@
-from .redis_meta import RedisMetaChannel, BlockMeta
+# Ensure C++ extensions are loaded first
+import flexkv.c_ext
+
+# Import other modules
 from .radix_remote import DistributedRadixTree, LocalRadixTree
+from .redis_meta import RedisMetaChannel, BlockMeta, RedisNodeInfo
 
 __all__ = [
+    "RedisMeta",
     "RedisMetaChannel",
-    "BlockMeta",
+    "RedisNodeInfo",
+    "BlockMeta", 
     "DistributedRadixTree",
     "LocalRadixTree",
 ]

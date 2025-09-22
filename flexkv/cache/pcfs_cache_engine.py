@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from typing import Optional, Tuple, TYPE_CHECKING, List, Dict
 
 import numpy as np
@@ -26,16 +24,13 @@ class PCFSCacheEngine:
                  evict_ratio: float,
                  *,
                  # Optional runtime wiring for remote/local trees
-                 local_max_num_blocks: Optional[int] = None,
                  local_lease_ttl_ms: int = 100000,
-                 local_renew_lease_ms: int = 0,
-                 local_refresh_batch_size: int = 256,
+                 local_renew_lease_ms: int = 10000,
+                 local_refresh_batch_size: int = 1000,
                  local_idle_sleep_ms: int = 10,
-                 local_lt_pool_initial_capacity: int = 0,
-                 remote_max_num_blocks: Optional[int] = None,
-                 remote_node_id: int = 0,
-                 remote_lt_pool_initial_capacity: int = 0,
-                 remote_refresh_batch_size: int = 128,
+                 remote_max_num_blocks: int = 4000000,
+                 redis_node_id: int = 0,
+                 remote_refresh_batch_size: int = 1000,
                  remote_rebuild_interval_ms: int = 1000,
                  remote_idle_sleep_ms: int = 10,
                  meta: Optional[RedisMeta] = None) -> None:
@@ -57,24 +52,23 @@ class PCFSCacheEngine:
         # Local index (authoritative for mutations)
         self.local_index = LocalRadixTree(
             tokens_per_block=tokens_per_block,
-            max_num_blocks=int(local_max_num_blocks or num_total_blocks),
+            max_num_blocks=int(num_total_blocks),
             lease_ttl_ms=int(local_lease_ttl_ms),
             renew_lease_ms=int(local_renew_lease_ms),
             refresh_batch_size=int(local_refresh_batch_size),
             idle_sleep_ms=int(local_idle_sleep_ms),
-            lt_pool_initial_capacity=int(local_lt_pool_initial_capacity),
         )
 
 
         # Remote reference index (read-only, built from Redis)
         self.remote_index = DistributedRadixTree(
             tokens_per_block=tokens_per_block,
-            max_num_blocks=int(remote_max_num_blocks or num_total_blocks),
-            node_id=int(remote_node_id),
-            lt_pool_initial_capacity=int(remote_lt_pool_initial_capacity),
+            max_num_blocks=int(remote_max_num_blocks or (num_total_blocks * 10)),
+            node_id=int(redis_node_id),
             refresh_batch_size=int(remote_refresh_batch_size),
             rebuild_interval_ms=int(remote_rebuild_interval_ms),
             idle_sleep_ms=int(remote_idle_sleep_ms),
+            lease_renew_ms=int(local_renew_lease_ms),
         )
         # defer channel start to start(meta)
 
@@ -106,6 +100,20 @@ class PCFSCacheEngine:
         self.local_index.reset()
         self.mempool.reset()
 
+    def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
+        """Match a sequence against the cache index.
+        
+        This method provides a simple interface similar to CacheEngine.match(),
+        delegating to match_all() for consistency.
+        
+        Args:
+            sequence_meta: The sequence metadata to match
+            
+        Returns:
+            MatchResultAccel: The match result
+        """
+        return self.match_all(sequence_meta)
+
     def match_all(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
         sequence_meta.gen_hashes()
         block_hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
@@ -121,20 +129,20 @@ class PCFSCacheEngine:
         chosen = mr_local if local_key >= remote_key else mr_remote
 
         # physical blocks
-        phys_np = torch.tensor(chosen.physical_blocks, dtype=torch.int64).numpy()
-        #block_node_ids = torch.tensor(chosen.block_node_ids, dtype=torch.uint32).numpy() if chosen.block_node_ids is not None else None
-        # optional block_node_ids
         bnids_np = None
         if chosen is mr_remote:
-            block_node_ids = torch.tensor(chosen.block_node_ids, dtype=torch.uint32).numpy() if chosen.block_node_ids is not None else None
-            if block_node_ids is None:
-                raise Exception("Failed to get block_node_ids")
-            bnids_np = self.nodeids_to_file_nodeids(block_node_ids, phys_np)
+            #尝试使用DistributedRadixTree的block_node_ids
+            #如果检查失败，则使用LocalRadixTree的匹配结果
+            nids = chosen.block_node_ids
+            nps = chosen.physical_blocks
+            # Convert tensors to numpy views (CPU) if present
+            if isinstance(nids, torch.Tensor) and nids.numel() > 0:
+                bnids_np = self.nodeids_to_file_nodeids(nids.cpu().numpy(), nps.cpu().numpy())
+            else:
+                bnids_np = None
             if bnids_np is None:
-                raise Exception("Failed to get file_nodeids")
-            bnids_len = bnids_np.shape[0]
-            if bnids_len != phys_np.shape[0]:
-                raise Exception("bnids_len != phys_np.shape[0]")
+                chosen = mr_local
+        phys_np = chosen.physical_blocks.cpu().numpy()
         return MatchResultAccel(
             num_ready_matched_blocks=int(chosen.num_ready_matched_blocks),
             num_matched_blocks=int(chosen.num_matched_blocks),
@@ -146,38 +154,44 @@ class PCFSCacheEngine:
         )
 
     def nodeids_to_file_nodeids(self,
-                                 block_node_ids: np.ndarray,
-                                 physical_blocks: np.ndarray) -> Optional[np.ndarray]:
+                                 bnids_np: np.ndarray,
+                                 phys: np.ndarray) -> Optional[np.ndarray]:
         """Convert per-block node ids to per-block PCFS file_nodeids.
 
-        For each i:
-          nid = block_node_ids[i]
-          file_nodeids_list = self.nid_to_file_nodeids[nid]
-          remote_file_num = len(file_nodeids_list)
-          block_id = physical_blocks[i]
-          f_idx = (block_id // self.round_robin) % remote_file_num
-          out[i] = file_nodeids_list[f_idx]
+        Args:
+            bnids_np: block_node_ids from MatchResultAccel.block_node_ids
+            phys: physical_blocks from MatchResultAccel.physical_blocks
+
+        Returns:
+            file_nodeids array with dtype=uint32, or None if conversion fails
         """
+        if bnids_np is None or phys is None:
+            return None
         try:
-            bnids_np = np.asarray(block_node_ids, dtype=np.uint32)
-            phys_np = np.asarray(physical_blocks, dtype=np.int64)
+            bnids_np = np.asarray(bnids_np, dtype=np.uint32)
+            phys_np = np.asarray(phys, dtype=np.int64)
         except Exception:
             return None
         if bnids_np.shape[0] != phys_np.shape[0]:
-            raise Exception("block_node_ids and physical_blocks must have the same length")
-        out = np.full(phys_np.shape, fill_value=-1, dtype=np.int64)
+            return None
+        out = np.full(phys_np.shape, fill_value=0, dtype=np.uint32)
         rr = max(1, int(self.round_robin))
+        
         for i in range(bnids_np.shape[0]):
             nid = int(bnids_np[i])
+            #检查节点是否活跃
+            if not self._meta.is_node_active(nid):
+                return None
             file_list = self.nid_to_file_nodeids.get(nid)
+            #检查文件列表是否为空
             if not file_list:
-                break
+                return None
             remote_file_num = len(file_list)
             if remote_file_num <= 0:
-                break
+                return None
             block_id = int(phys_np[i])
             f_idx = (block_id // rr) % remote_file_num
-            out[i] = int(file_list[f_idx])
+            out[i] = np.uint32(file_list[f_idx])
         return out
 
     def match_local(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
@@ -187,7 +201,7 @@ class PCFSCacheEngine:
 
         mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
 
-        phys_np = torch.tensor(mr_local.physical_blocks, dtype=torch.int64).numpy()
+        phys_np = mr_local.physical_blocks.cpu().numpy()
 
         return MatchResultAccel(
             num_ready_matched_blocks=int(mr_local.num_ready_matched_blocks),
@@ -229,6 +243,42 @@ class PCFSCacheEngine:
             self.remote_index.lock(node)
         else:
             self.local_index.lock(node)
+
+    def unlock(self, node: CRadixNode) -> None:
+        """Unlock a node in the appropriate index (local or remote).
+        
+        Args:
+            node: The radix node to unlock
+        """
+        if node is None:
+            return
+        try:
+            is_remote_node = bool(node.has_block_node_ids())
+        except Exception:
+            is_remote_node = False
+        if is_remote_node:
+            self.remote_index.unlock(node)
+        else:
+            self.local_index.unlock(node)
+
+    def set_ready(self, node: CRadixNode, ready: bool = True, ready_length: int = -1) -> None:
+        """Set the ready state of a node in the appropriate index (local or remote).
+        
+        Args:
+            node: The radix node to set ready state
+            ready: Whether the node is ready (default: True)
+            ready_length: The ready length (default: -1, meaning use node's current length)
+        """
+        if node is None:
+            return
+        try:
+            is_remote_node = bool(node.has_block_node_ids())
+        except Exception:
+            is_remote_node = False
+        if is_remote_node:
+            self.remote_index.set_ready(node, ready, ready_length)
+        else:
+            self.local_index.set_ready(node, ready, ready_length)
 
     def cleanup(self, node: CRadixNode, cleanup_length: int) -> None:
         if node is None:
@@ -340,16 +390,13 @@ class PCFSCacheEngine:
             num_total_blocks=num_blocks,
             tokens_per_block=int(cache_config.tokens_per_block),
             evict_ratio=float(cache_config.evict_ratio),
-            local_max_num_blocks=num_blocks,
             local_lease_ttl_ms=int(getattr(cache_config, "lease_ttl_ms", 100000)),
-            local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 0)),
+            local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 10)),
             local_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
             local_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
-            local_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
             remote_max_num_blocks=num_blocks,
-            remote_node_id=int(node_id),
-            remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
-            remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 128)),
+            redis_node_id=int(node_id),
+            remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
             remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 1000)),
             remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
             meta=meta,

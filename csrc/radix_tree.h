@@ -51,6 +51,12 @@ public:
   void set_lease_meta(LeaseMeta* lease_meta) {
     this->lease_meta = lease_meta;
   }
+  
+  void set_lease_time(uint32_t lease_time) {
+    if (this->lease_meta != nullptr) {
+      this->lease_meta->lease_time = lease_time;
+    }
+  }
 
   void for_each_child(std::function<void(HashType, CRadixNode*)> func) {
     for (auto& child : children) {
@@ -206,22 +212,17 @@ public:
 
   CRadixNode *last_ready_node;
   CRadixNode *last_node;
-  std::vector<int64_t> *physical_blocks;
-  std::vector<uint32_t> *block_node_ids;
+  torch::Tensor physical_blocks;
+  torch::Tensor block_node_ids;
 
   CMatchResult(int _num_ready_matched_blocks, int _num_matched_blocks, int _last_node_matched_length,
-    CRadixNode *_last_ready_node, CRadixNode *_last_node, std::vector<int64_t> *blocks, std::vector<uint32_t> *block_node_ids = nullptr)
+    CRadixNode *_last_ready_node, CRadixNode *_last_node, torch::Tensor blocks, torch::Tensor block_node_ids = torch::Tensor())
     : num_ready_matched_blocks(_num_ready_matched_blocks), num_matched_blocks(_num_matched_blocks),
       last_node_matched_length(_last_node_matched_length), last_ready_node(_last_ready_node),
       last_node(_last_node), physical_blocks(blocks), block_node_ids(block_node_ids) {
   }
 
-  ~CMatchResult() {
-    delete physical_blocks;
-    if (block_node_ids) {
-      delete block_node_ids;
-    }
-  };
+  ~CMatchResult() {}
 };
 
 class CRadixTreeIndex {

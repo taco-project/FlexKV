@@ -1,7 +1,7 @@
-setuptools>=61
-torch>=2.3.0
-nvtx==0.2.11
+setuptools>=40.0.0
+torch>=1.10.0
+# nvtx==0.2.11  # Skip nvtx for now due to compatibility issues
 Cython>=3.0.10
-pytest==8.4.0
-pytest-benchmark==5.1.0
+pytest>=6.0.0
+pytest-benchmark>=3.0.0
 expiring-dict==1.1.2
