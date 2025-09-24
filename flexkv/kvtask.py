@@ -18,6 +18,7 @@ from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.transfer_manager import TransferManagerHandle
 from flexkv.common.request import KVResponseStatus, KVResponse
+from flexkv.cache.redis_meta import RedisMeta
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -77,6 +78,7 @@ class KVTaskManager:
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
                  use_separate_process: bool = True,
+                 redis_meta: RedisMeta = None
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
@@ -88,7 +90,7 @@ class KVTaskManager:
         self.model_config = model_config
         self._check_config(model_config, cache_config)
 
-        self.cache_engine = GlobalCacheEngine(cache_config, model_config)
+        self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta)
 
         self.transfer_handle = TransferManagerHandle(
             self.model_config,
@@ -320,8 +322,9 @@ class KVTaskEngine(KVTaskManager):
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
                  use_separate_process: bool = True,
+                 redis_meta: Optional[RedisMeta] = None
                  ):
-        super().__init__(model_config, cache_config, gpu_register_port, use_separate_process)
+        super().__init__(model_config, cache_config, gpu_register_port, use_separate_process, redis_meta)
         self.tracer = FlexKVTracer(cache_config)
 
     def get_async(self,

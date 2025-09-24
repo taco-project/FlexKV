@@ -1,3 +1,5 @@
+import os
+import json
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, List, Union, Dict, Any
@@ -38,6 +40,7 @@ class CacheConfig:
     enable_3rd_remote: bool = False
     use_gds: bool = False
     index_accel: bool = False # have to be True when (enable_p2p_cpu or enable_p2p_ssd) is True
+    distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
 
     # kv cache layout configs
     gpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
@@ -77,12 +80,16 @@ class CacheConfig:
     lease_ttl_ms: int = 100000
     renew_lease_ms: int = 0
 
+    # distributed zmq configs
+    local_zmq_ip: str = "127.0.0.1"
+    local_zmq_port: int = 5555
+
     # Redis configs (for KV sharing / metadata)
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
     local_ip: str = "127.0.0.1"
     redis_password: Optional[str] = None
-
+    
     # Trace configs
     enable_trace: bool = True
     trace_file_path: str = "./flexkv_trace.log"
@@ -108,3 +115,51 @@ class CacheConfig:
         self.enable_remote = self.enable_3rd_remote
         self.index_accel = self.enable_p2p_cpu or self.enable_p2p_ssd or self.index_accel
         
+@dataclass
+class MooncakeTransferEngineConfig:
+    engine_ip: str
+    engine_port: int
+    metadata_backend: Union[str, None]
+    metadata_server: str
+    metadata_server_auth: str
+    protocol: str
+    device_name: str
+    # redis_server: str
+    # redis_db: int
+    # redis_auth: str
+
+
+    @staticmethod
+    def from_file(file_path: str) -> "MooncakeTransferEngineConfig":
+        """Load the config from a JSON file."""
+        with open(file_path) as fin:
+            config = json.load(fin)
+        return MooncakeTransferEngineConfig.from_dict(config)
+
+
+    @staticmethod
+    def load_from_env(env_name: str) -> "MooncakeTransferEngineConfig":
+        """Load config from a file specified in the environment variable."""
+        config_file_path = os.getenv(env_name)
+        if config_file_path is None:
+            raise ValueError(
+                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
+            )
+        return MooncakeTransferEngineConfig.from_file(config_file_path)
+
+
+    @staticmethod
+    def from_dict(config: dict) -> "MooncakeTransferEngineConfig":
+        """Load the config from a JSON file."""
+        return MooncakeTransferEngineConfig(
+            engine_ip=config.get("engine_ip", "127.0.0.1"),
+            engine_port=config.get("engine_port", 5555),
+            metadata_backend=config.get("metadata_backend", "redis"),
+            metadata_server=config.get("metadata_server", "redis://127.0.0.1:6380"),
+            metadata_server_auth=config.get("metadata_server_auth", "yourpass"),
+            protocol=config.get("protocol", "rdma"),
+            device_name=config.get("device_name", ""),
+            # redis_server=config.get("redis_server", "redis://127.0.0.1:6379"),
+            # redis_db=config.get("redis_db", 0),
+            # redis_auth=config.get("redis_auth", "yourpass"),
+        )
