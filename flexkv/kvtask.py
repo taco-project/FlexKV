@@ -20,6 +20,7 @@ from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
 from flexkv.transfer_manager import get_master_host_and_ports_from_env
+from flexkv.cache.redis_meta import RedisMeta
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -78,6 +79,7 @@ class KVTaskManager:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
+                 redis_meta: RedisMeta = None
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
@@ -100,7 +102,7 @@ class KVTaskManager:
             self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
             self.is_multinode_tp = True
 
-        self.cache_engine = GlobalCacheEngine(cache_config, model_config)
+        self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta)
 
         model_config_for_transfer = copy.deepcopy(self.model_config)
         if self.is_multinode_tp:
@@ -399,10 +401,10 @@ class KVTaskEngine(KVTaskManager):
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
+                 redis_meta: Optional[RedisMeta] = None
                  ):
-        super().__init__(model_config, cache_config, gpu_register_port)
+        super().__init__(model_config, cache_config, gpu_register_port, redis_meta)
         self.tracer = FlexKVTracer()
-        # trace config
         self.tracer.trace_config(model_config, cache_config, gpu_layout=None)
 
     def get_async(self,

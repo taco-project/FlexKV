@@ -37,6 +37,7 @@ from flexkv.transfer.worker import (
     tpGPUCPUTransferWorker,
     GDSTransferWorker,
     tpGDSTransferWorker,
+    RemoteCPU2CPUTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
@@ -240,6 +241,21 @@ class TransferEngine:
             # GDS workers handle DISK2D/D2DISK operations using the GDS transfer path
             self._worker_map[TransferType.DISK2D] = self.gds_workers
             self._worker_map[TransferType.D2DISK] = self.gds_workers
+            
+        if self._cpu_handle is not None and self.cache_config.enable_kv_sharing:
+            flexkv_logger.info(f"[transfer_engine] initializing the RemoteCPU2CPUTransferWorker!")
+            self.cpu_remote_cpu_worker: WorkerHandle = RemoteCPU2CPUTransferWorker.create_worker(
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor = self.pin_buffer.get_buffer(),
+                cpu_blocks=self._cpu_handle.get_tensor(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                # TODO: get remote kv_layout, assuming that remote kv layout is same as current node
+                remote_kv_layout=self._cpu_handle.kv_layout, 
+                dtype=self._cpu_handle.dtype,
+                cache_config = self.cache_config
+            )
+            self._worker_map[TransferType.DIST2H] = self.cpu_remote_cpu_worker
+            
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
         # Wait for all workers to ready

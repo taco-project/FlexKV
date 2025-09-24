@@ -38,6 +38,7 @@ from flexkv.common.transfer import (
 )
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.type import MatchResultAccel
+from flexkv.cache.redis_meta import RedisMeta
 
 class CacheEngineAccel:
     def __init__(self,
@@ -232,7 +233,7 @@ class CacheEngine:
         self.mempool.recycle_blocks(physical_blocks)
 
 class GlobalCacheEngine:
-    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig):
+    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None):
         self.cache_config = cache_config
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
@@ -243,16 +244,9 @@ class GlobalCacheEngine:
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
         if cache_config.enable_kv_sharing:
-            self.redis_meta = RedisMeta(
-                cache_config.redis_host,
-                cache_config.redis_port,
-                cache_config.redis_password,
-                cache_config.local_ip,
-            )
-            node_id = self.redis_meta.init_meta()
-            if node_id is None:
-                raise RuntimeError("Failed to initialize Redis metadata")
-            self.node_id = node_id
+            assert redis_meta != None
+            self.redis_meta = redis_meta
+            self.node_id = self.redis_meta.get_node_id()
             self.enable_kv_sharing = True
         else:
             self.enable_kv_sharing = False
