@@ -1,3 +1,5 @@
+import os
+import json
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, List, Union, Dict, Any
@@ -32,24 +34,22 @@ class CacheConfig:
     tokens_per_block: int = 16
     enable_cpu: bool = True
     enable_ssd: bool = False
-<<<<<<< HEAD
-    enable_remote: bool = False
     enable_gds: bool = False # Requires enable_ssd=True
-    enable_kv_sharing: bool = False
-=======
-    enable_gds: bool = False
     enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
                                 # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
     enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
->>>>>>> 719e921 (build transfer graphs based on the cache engine match results)
+
+    distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
+
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
     num_remote_blocks: Optional[int] = None
+    num_local_blocks: int = 1000000
 
     # ssd cache configs
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
@@ -62,6 +62,9 @@ class CacheConfig:
     remote_cache_path: Optional[Union[str, List[str]]] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
 
+    # distributed zmq configs
+    local_zmq_ip: str = "127.0.0.1"
+    local_zmq_port: int = 5555
     # Redis configs (for KV sharing / metadata)
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
@@ -230,3 +233,52 @@ def update_default_config_from_user_config(model_config: ModelConfig,
             else:
                 raise ValueError(f"Unknown config name: {global_attr_name} in config file, "
                                  f"available config names: {global_config_attrs}")
+        
+@dataclass
+class MooncakeTransferEngineConfig:
+    engine_ip: str
+    engine_port: int
+    metadata_backend: Union[str, None]
+    metadata_server: str
+    metadata_server_auth: str
+    protocol: str
+    device_name: str
+    # redis_server: str
+    # redis_db: int
+    # redis_auth: str
+
+
+    @staticmethod
+    def from_file(file_path: str) -> "MooncakeTransferEngineConfig":
+        """Load the config from a JSON file."""
+        with open(file_path) as fin:
+            config = json.load(fin)
+        return MooncakeTransferEngineConfig.from_dict(config)
+
+
+    @staticmethod
+    def load_from_env(env_name: str) -> "MooncakeTransferEngineConfig":
+        """Load config from a file specified in the environment variable."""
+        config_file_path = os.getenv(env_name)
+        if config_file_path is None:
+            raise ValueError(
+                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
+            )
+        return MooncakeTransferEngineConfig.from_file(config_file_path)
+
+
+    @staticmethod
+    def from_dict(config: dict) -> "MooncakeTransferEngineConfig":
+        """Load the config from a JSON file."""
+        return MooncakeTransferEngineConfig(
+            engine_ip=config.get("engine_ip", "127.0.0.1"),
+            engine_port=config.get("engine_port", 5555),
+            metadata_backend=config.get("metadata_backend", "redis"),
+            metadata_server=config.get("metadata_server", "redis://127.0.0.1:6380"),
+            metadata_server_auth=config.get("metadata_server_auth", "yourpass"),
+            protocol=config.get("protocol", "rdma"),
+            device_name=config.get("device_name", ""),
+            # redis_server=config.get("redis_server", "redis://127.0.0.1:6379"),
+            # redis_db=config.get("redis_db", 0),
+            # redis_auth=config.get("redis_auth", "yourpass"),
+        )

@@ -24,6 +24,7 @@ from flexkv.transfer_manager import (
     get_trtllm_subprocess_host_and_ports_from_env
 )
 from flexkv.common.hash_utils import hash_array
+from flexkv.cache.redis_meta import RedisMeta
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -84,6 +85,7 @@ class KVTaskManager:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
+                 redis_meta: RedisMeta = None
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
@@ -93,6 +95,8 @@ class KVTaskManager:
             raise ValueError("enable_gds must be True if enable_cpu is False")
         if cache_config.enable_gds and not cache_config.enable_ssd:
             raise ValueError("enable_ssd must be True if enable_gds is True")
+        if cache_config.enable_kv_sharing and cache_config.enable_gds:
+            raise ValueError("enable_kv_sharing and enable_gds cannot be used at the same time")
         self.cache_config = cache_config
         self.model_config = model_config
         self._check_config(model_config, cache_config)
@@ -106,7 +110,7 @@ class KVTaskManager:
             self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
             self.is_multinode_tp = True
 
-        self.cache_engine = GlobalCacheEngine(cache_config, model_config)
+        self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta)
 
         model_config_for_transfer = copy.deepcopy(self.model_config)
         if self.is_multinode_tp:
@@ -455,10 +459,10 @@ class KVTaskEngine(KVTaskManager):
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
+                 redis_meta: Optional[RedisMeta] = None
                  ):
-        super().__init__(model_config, cache_config, gpu_register_port)
+        super().__init__(model_config, cache_config, gpu_register_port, redis_meta)
         self.tracer = FlexKVTracer()
-        # trace config
         self.tracer.trace_config(model_config, cache_config, gpu_layout=None)
 
     def get_async(self,

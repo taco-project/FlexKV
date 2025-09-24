@@ -23,8 +23,8 @@ class HierarchyLRCacheEngine:
                  tokens_per_block: int,
                  evict_ratio: float,
                  device_type: DeviceType,
-                 *,
                  # Optional runtime wiring for remote/local trees
+                 local_max_num_blocks: Optional[int] = 0,
                  local_lease_ttl_ms: int = 100000,
                  local_renew_lease_ms: int = 10000,
                  local_refresh_batch_size: int = 1000,
@@ -138,7 +138,8 @@ class HierarchyLRCacheEngine:
         # Query both local and remote
         mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
         mr_remote = self.remote_index.match_prefix(block_hashes_t, int(num_blocks), True)
-
+        print(f"the local match result: {mr_local.num_matched_blocks}, {mr_local.num_ready_matched_blocks }")
+        print(f"the remote match result: {mr_remote.num_matched_blocks}, {mr_remote.num_ready_matched_blocks}")
         # For simplicy, we choose the one with the larger matched length; tie-break on ready length
         # We should allow to combine the two results in the future.
         local_key = (int(mr_local.num_matched_blocks), int(mr_local.num_ready_matched_blocks))
@@ -155,11 +156,20 @@ class HierarchyLRCacheEngine:
             nps = chosen.physical_blocks
             # Convert tensors to numpy views (CPU) if present
             if isinstance(nids, torch.Tensor) and nids.numel() > 0:
-                bnids_np = self.nodeids_to_file_nodeids(nids.cpu().numpy(), nps.cpu().numpy())
+                # For P2P mode (CPU/SSD), no PCFS conversion is needed
+                # Only convert to PCFS file_nodeids if device_type is REMOTE
+                if self.device_type == DeviceType.REMOTE:
+                    bnids_np = self.nodeids_to_file_nodeids(nids.cpu().numpy(), nps.cpu().numpy())
+                    if bnids_np is None:
+                        chosen = mr_local
+                else:
+                    # For P2P mode, use node_ids directly
+                    bnids_np = nids.cpu().numpy().astype(np.uint32)
             else:
                 bnids_np = None
-            if bnids_np is None:
-                chosen = mr_local
+                if mr_remote.num_matched_blocks > 0:
+                    print("[DEBUG] Warning: remote matched but block_node_ids is empty, falling back to local")
+                    chosen = mr_local
         phys_np = chosen.physical_blocks.cpu().numpy()
         if self.device_type == DeviceType.CPU and matched_pos == "remote" and mr_local.num_matched_blocks > 0:
             insert_to_local_cpu_index = False
@@ -175,7 +185,8 @@ class HierarchyLRCacheEngine:
             physical_blocks=phys_np,
             block_node_ids=bnids_np,
             matched_pos=matched_pos,
-            insert_to_local_cpu=insert_to_local_cpu_index,
+            matched_node_ids=bnids_np,  # Set matched_node_ids for P2P transfer
+            insert_to_local_cpu_index=insert_to_local_cpu_index,
         )
 
     def nodeids_to_file_nodeids(self,
@@ -205,7 +216,9 @@ class HierarchyLRCacheEngine:
         for i in range(bnids_np.shape[0]):
             nid = int(bnids_np[i])
             #检查节点是否活跃
-            if not self._meta.is_node_active(nid):
+            is_active = self._meta.is_node_active(nid)
+            if not is_active:
+                print(f"[DEBUG] Node {nid} is not active, returning None")
                 return None
             file_list = self.nid_to_file_nodeids.get(nid)
             #检查文件列表是否为空
@@ -435,10 +448,11 @@ class HierarchyLRCacheEngine:
                 local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 0)),
                 local_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
                 local_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
-                local_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
+                # local_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
                 remote_max_num_blocks=int(cache_config.num_remote_blocks or 0),
-                remote_node_id=int(node_id),
-                remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
+                redis_node_id=int(node_id),
+                # remote_node_id=int(node_id),
+                # remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
                 remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 128)),
                 remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 1000)),
                 remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),

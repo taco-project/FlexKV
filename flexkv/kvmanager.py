@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional, Tuple, List, Dict, Union, Iterable
 import time
 
@@ -22,8 +23,9 @@ import torch
 from flexkv.server.client import KVDPClient
 from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
-from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
 from flexkv.common.debug import flexkv_logger
+from flexkv.cache.redis_meta import RedisMeta
 
 
 class KVManager:
@@ -60,6 +62,22 @@ class KVManager:
         self.global_client_id = self.instance_id * model_config.dp_size + dp_client_id
         
         flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
+        
+        if self.cache_config.enable_kv_sharing:
+            flexkv_logger.info(f"[kv manager] initializing RedisMeta and connection to \
+                        {self.cache_config.redis_host}:{self.cache_config.redis_port}")
+            # initialize redis Meta obj 
+            self.redis_meta_client = RedisMeta(
+                self.cache_config.redis_host,
+                self.cache_config.redis_port,
+                self.cache_config.redis_password,
+                self.cache_config.local_ip,
+            )
+            self.redis_meta_client.init_meta()
+            # update distributed_node_id
+            self.cache_config.distributed_node_id = self.redis_meta_client.get_node_id() # update distributed_node_id of current node
+            
+
         if self.server_client_mode:
             # Server should only be created once across all instances and dp ranks
             if self.instance_id == 0 and dp_client_id == 0:
@@ -76,7 +94,8 @@ class KVManager:
             self.dp_client = KVDPClient(self.server_recv_port, self.model_config, self.global_client_id)
         else:
             self.server_handle = None
-            self.kv_task_engine = KVTaskEngine(model_config, cache_config, self.gpu_register_port)
+            self.kv_task_engine = KVTaskEngine(self.model_config, self.cache_config, self.gpu_register_port, redis_meta=self.redis_meta_client)
+    
     @property
     def dpclient_id(self) -> int:
         return self.dp_client_id

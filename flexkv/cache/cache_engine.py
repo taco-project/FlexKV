@@ -38,6 +38,7 @@ from flexkv.common.transfer import (
 )
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.type import MatchResultAccel
+from flexkv.cache.redis_meta import RedisMeta
 
 class CacheEngineAccel:
     def __init__(self,
@@ -245,7 +246,7 @@ class CacheStrategy:
 DEFAULT_CACHE_STRATEGY = CacheStrategy()
 
 class GlobalCacheEngine:
-    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig):
+    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None):
         self.cache_config = cache_config
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
@@ -256,16 +257,9 @@ class GlobalCacheEngine:
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
         if cache_config.enable_kv_sharing:
-            self.redis_meta = RedisMeta(
-                cache_config.redis_host,
-                cache_config.redis_port,
-                cache_config.redis_password,
-                cache_config.local_ip,
-            )
-            node_id = self.redis_meta.init_meta()
-            if node_id is None:
-                raise RuntimeError("Failed to initialize Redis metadata")
-            self.node_id = node_id
+            assert redis_meta != None
+            self.redis_meta = redis_meta
+            self.node_id = self.redis_meta.get_node_id()
             self.enable_kv_sharing = True
         else:
             self.enable_kv_sharing = False
@@ -1201,7 +1195,6 @@ class GlobalCacheEngine:
                                                             is_ready=False,
                                                             match_result=ssd_matched_result)
             op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
-
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
@@ -1222,10 +1215,16 @@ class GlobalCacheEngine:
             assert self.cpu_cache_engine is not None
             self.cpu_cache_engine.unlock(node_to_unlock[DeviceType.CPU][0])
             self.cpu_cache_engine.set_ready(node_to_unlock[DeviceType.CPU][0], True, node_to_unlock[DeviceType.CPU][1])
+            if is_put and self.enable_kv_sharing:
+                if self.cache_config.enable_p2p_cpu:
+                    self.cpu_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.CPU][0])
         if DeviceType.SSD in node_to_unlock:
             assert self.ssd_cache_engine is not None
             self.ssd_cache_engine.unlock(node_to_unlock[DeviceType.SSD][0])
             self.ssd_cache_engine.set_ready(node_to_unlock[DeviceType.SSD][0], True, node_to_unlock[DeviceType.SSD][1])
+            if is_put and self.enable_kv_sharing:
+                if self.cache_config.enable_p2p_ssd:
+                    self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
         if DeviceType.REMOTE in node_to_unlock:
             assert self.remote_cache_engine is not None
             self.remote_cache_engine.unlock(node_to_unlock[DeviceType.REMOTE][0])
@@ -1312,6 +1311,7 @@ class GlobalCacheEngine:
                 remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result
+        
     @nvtx.annotate("Match All Prefix", color="yellow")
     def match_all(self,
                   sequence_meta: SequenceMeta,

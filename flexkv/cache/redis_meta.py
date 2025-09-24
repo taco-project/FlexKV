@@ -235,7 +235,7 @@ class RedisNodeInfo:
             node_key = f"node:{node_id}"
             self._client.hset(node_key, mapping={
                 "node_id": str(node_id),
-                "local_ip": self.local_ip,
+                "ip": self.local_ip,
                 "uuid": self.uuid,
                 "status": "active",
                 "timestamp": str(int(time.time()))
@@ -529,7 +529,7 @@ class RedisMeta:
             return True
         return False
 
-    def regist_node_meta(self, node_id: int, addr: str, cpu_buffer_ptr: int, ssd_buffer_ptr: int) -> None:
+    def regist_node_meta(self, node_id: int, addr: str, zmq_addr: str, cpu_buffer_ptr: int, ssd_buffer_ptr: int) -> None:
         """Register node meta information as a Redis hash.
 
         Key: meta:<node_id>
@@ -540,6 +540,7 @@ class RedisMeta:
         r.hset(key, mapping={
             "node_id": int(node_id),
             "addr": str(addr),
+            "zmq_addr": str(zmq_addr),
             "cpu_buffer_ptr": int(cpu_buffer_ptr),
             "ssd_buffer_ptr": int(ssd_buffer_ptr),
         })
@@ -556,10 +557,11 @@ class RedisMeta:
         data = r.hgetall(key)
         if not data:
             return {}
-        out: Dict[str, Union[int, str]] = {}
+        out: dict[str, int | str] = {}
         nid = data.get("node_id")
         out["node_id"] = int(nid) if nid is not None and nid != "" else int(node_id)
         out["addr"] = data.get("addr", "")
+        out["zmq_addr"] = data.get("zmq_addr", "")
         cb = data.get("cpu_buffer_ptr")
         sb = data.get("ssd_buffer_ptr")
         out["cpu_buffer_ptr"] = int(cb) if cb is not None and cb != "" else 0
@@ -572,6 +574,9 @@ class RedisMeta:
         key = f"meta:{int(node_id)}"
         return bool(r.delete(key))
 
+
+    def set_node_id(self, node_id: int):
+        self._node_id = int(node_id)
 
     def load_pcfs_file_nodeids(self) -> Dict[int, List[int]]:
         """Load all PCFS file node IDs grouped by node id from Redis.
