@@ -52,6 +52,7 @@ class CacheConfig:
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
     num_remote_blocks: Optional[int] = None
+    num_local_blocks: int = 1000000
 
     # CPU-GPU transfer configs
     use_ce_transfer_h2d: bool = False

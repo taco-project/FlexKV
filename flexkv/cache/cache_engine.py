@@ -650,7 +650,7 @@ class GlobalCacheEngine:
         #allocated new cpu blocks for this request
         allocated_cpu_block_num = fragment2_num_blocks
         if cpu_matched_result.matched_pos == "remote" and cpu_matched_result.insert_to_local_cpu_index:
-            allocated_cpu_blocks += fragment1_num_blocks
+            allocated_cpu_block_num += fragment1_num_blocks ## NOTE: fix bug?
         allocated_cpu_blocks = self.cpu_cache_engine.take(
             num_required_blocks=allocated_cpu_block_num,
             protected_node=cpu_matched_result.last_node,
