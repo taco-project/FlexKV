@@ -23,8 +23,8 @@ class HierarchyLRCacheEngine:
                  tokens_per_block: int,
                  evict_ratio: float,
                  device_type: DeviceType,
-                 *,
                  # Optional runtime wiring for remote/local trees
+                 local_max_num_blocks: Optional[int] = 0,
                  local_lease_ttl_ms: int = 100000,
                  local_renew_lease_ms: int = 10000,
                  local_refresh_batch_size: int = 1000,
