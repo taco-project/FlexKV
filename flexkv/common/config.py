@@ -49,6 +49,7 @@ class CacheConfig:
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
     num_remote_blocks: Optional[int] = None
+    num_local_blocks: int = 1000000
 
     # ssd cache configs
     ssd_cache_dir: Optional[Union[str, List[str]]] = None

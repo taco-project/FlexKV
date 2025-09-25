@@ -13,11 +13,12 @@ from urllib.parse import urlparse
 
 class RDMATaskInfo:
     def __init__(
-        self, task_id: int, peer_engine_addr: str, peer_zmq_addr: str, src_ptr: int, dst_ptr: int, 
+        self, task_id: int, local_engine_addr: str, peer_engine_addr: str, peer_zmq_addr: str, src_ptr: int, dst_ptr: int, 
         src_block_ids: int, dst_block_ids: int, data_size: int
     ):
         self.task_id = task_id
-        self.peer_engine_addr = peer_engine_addr
+        self.local_engine_addr = local_engine_addr ## the mooncake engine address of local node
+        self.peer_engine_addr = peer_engine_addr ## thre mooncake engine address of remote node
         self.src_ptr = src_ptr
         self.dst_ptr = dst_ptr
         self.peer_zmq_addr = peer_zmq_addr
@@ -28,7 +29,8 @@ class RDMATaskInfo:
     def to_dict(self) -> dict:
         return {
             "task_id": self.task_id,
-            "peer_engine_addr": self.peer_engine_addr,
+            "local_engine_addr": self.local_engine_addr,  
+            "peer_engine_addr": self.peer_engine_addr, 
             "peer_zmq_addr": self.peer_zmq_addr,
             "src_ptr": self.src_ptr,
             "dst_ptr": self.dst_ptr,
@@ -40,6 +42,7 @@ class RDMATaskInfo:
     def from_dict(self, data: dict) -> "RDMATaskInfo":
         return RDMATaskInfo(
             task_id = data.get("task_id", 0),
+            local_engine_addr=data.get("local_engine_addr", ""),
             peer_engine_addr=data.get("peer_engine_addr", ""),
             peer_zmq_addr = data.get("peer_zmq_addr", ""),
             src_ptr=int(data.get("src_ptr", 0)),
