@@ -28,16 +28,15 @@ class TransferType(Enum):
     PEERSSD2H = "PEERSSD2H"
     H2PEERSSD = "H2PEERSSD"
 
-    DIST2H = "DIST2H"
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of
     # a group of transfer ops
     VIRTUAL = "Virtual"
 
-class DistType(Enum):
-    DISTH = "DISTH"
-    DISTSSD = "DISTSSD"
+# class DistType(Enum):
+#     DISTH = "DISTH"
+#     DISTSSD = "DISTSSD"
 
 class PartitionBlockType(Enum):
     ROUND_ROBIN = 0
@@ -74,7 +73,6 @@ class TransferOp:
     remote_node_ids: Optional[np.ndarray] = None
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
-    dist_type: Optional[DistType] = None
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \

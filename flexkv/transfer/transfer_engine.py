@@ -39,7 +39,7 @@ from flexkv.transfer.worker import (
     tpGPUCPUTransferWorker,
     GDSTransferWorker,
     tpGDSTransferWorker,
-    RemoteCPU2CPUTransferWorker,
+    PEER2CPUTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
@@ -249,19 +249,31 @@ class TransferEngine:
             self._worker_map[TransferType.DISK2D] = self.gds_workers
             self._worker_map[TransferType.D2DISK] = self.gds_workers
             
-        if self._cpu_handle is not None and self.cache_config.enable_kv_sharing:
-            flexkv_logger.info(f"[transfer_engine] initializing the RemoteCPU2CPUTransferWorker!")
-            self.cpu_remote_cpu_worker: WorkerHandle = RemoteCPU2CPUTransferWorker.create_worker(
+        if self._cpu_handle is not None and self.cache_config.enable_kv_sharing and self.cache_config.enable_p2p_cpu:
+            ## NOTE:if we have the cpu handle and enable p2p cpu transfer we need this worker 
+            ## (currently we inplement cpu and ssd distributed transfer in one worker)
+            if self.cache_config.enable_p2p_ssd and not self.cache_config.enable_p2p_cpu:
+                raise ValueError("enable_p2p_ssd requires enable_p2p_cpu to be True")
+            flexkv_logger.info(f"[transfer_engine] initializing the PEER2CPUTransferWorker!")
+            self.cpu_remote_cpu_worker: WorkerHandle = PEER2CPUTransferWorker.create_worker(
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
-                # TODO: get remote kv_layout, assuming that remote kv layout is same as current node
+                ssd_kv_layout = self._ssd_handle.kv_layout,
+                # TODO: get remote kv_layout, now we can assume that remote kv layout is same as current node
                 remote_kv_layout=self._cpu_handle.kv_layout, 
                 dtype=self._cpu_handle.dtype,
-                cache_config = self.cache_config
+                cache_config = self.cache_config,
+                ssd_files = self._ssd_handle.get_file_list(),
+                num_blocks_per_file = self._ssd_handle.num_blocks_per_file
             )
-            self._worker_map[TransferType.DIST2H] = self.cpu_remote_cpu_worker
+            # NOTE: now peerH2H and peerSSD2H op use the same worker
+            if self.cache_config.enable_p2p_cpu:
+                self._worker_map[TransferType.PEERH2H] = self.cpu_remote_cpu_worker
+            if self.cache_config.enable_p2p_ssd:
+                self._worker_map[TransferType.PEERSSD2H] = self.cpu_remote_cpu_worker
+
             
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from torch.multiprocessing import Queue as MPQueue, Pipe as MPPipe
 from multiprocessing.connection import Connection
 from threading import Thread
-from typing import List, Any, Dict, Union, Optional
+from typing import List, Any, Dict, Union, Optional, Tuple
 
 import ctypes
 import numpy as np
@@ -918,7 +918,13 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             end_time,
         )
 
+<<<<<<< HEAD
 class GDSTransferWorker(TransferWorkerBase):
+=======
+
+
+
+>>>>>>> 23e9178 (modify dist worker name and params of some function in worker and mooncakeEngineWrapper, and complete the test demo)
     def __init__(
         self,
         worker_id: int,
@@ -1266,7 +1272,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
             start_time,
             end_time,
         )
-class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
+
+class PEER2CPUTransferWorker(TransferWorkerBase):
     def __init__(self,
         worker_id: int,
         transfer_conn: Connection,
@@ -1278,8 +1285,8 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
         remote_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         cache_config: CacheConfig,
-        ssd_files: Dict[int, List[str]],  # ssd_device_id -> file_paths
-        num_blocks_per_file: int,
+        ssd_files: Dict[int, List[str]] = None,  # ssd_device_id -> file_paths
+        num_blocks_per_file: int = 0,
     ):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
@@ -1298,8 +1305,8 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
         self.dst_buffer_ptr = self.cpu_blocks.data_ptr()
 
         self.mooncake_transfer_engine = None
-
-        self.zmq_listen_addr = f"tcp://{cache_config.local_zmq_ip}:{cache_config.local_zmq_port}"
+        self.zmq_listen_addr = ""
+        
         ## initialize distributed environment
         if self.cache_config.enable_kv_sharing:
             # step1: initialize the redis meta clent for node info
@@ -1316,50 +1323,58 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
             mooncake_config_path = os.environ["MOONCAKE_CONFIG_PATH"]
             self.mooncake_config = MooncakeTransferEngineConfig.from_file(mooncake_config_path)
             self.mooncake_transfer_engine = MoonCakeTransferEngineWrapper(self.mooncake_config, self.redis_meta_client)        
-            assert self.mooncake_transfer_engine!=None, "RemoteCPU2CPUTransferWorker: initilaize mooncake transfer engine failed"
+            assert self.mooncake_transfer_engine!=None, "PEER2CPUTransferWorker: initilaize mooncake transfer engine failed"
             
             # step3: register local cpu buffer to mooncake transfer engine
-            total_cpu_buffer_size = self.cpu_blocks.numel() * self.cpu_blocks.element_size()
-            regist_buffer_status = self.mooncake_transfer_engine.regist_buffer(self.cpu_blocks.data_ptr(), total_cpu_buffer_size)
-            assert regist_buffer_status == 0, "RemoteCPU2CPUTransferWorker: regist cpu buffer to mooncake transfer engine"
+            total_cpu_blocks_size = self.cpu_blocks.numel() * self.cpu_blocks.element_size()
+            regist_buffer_status = self.mooncake_transfer_engine.regist_buffer(self.cpu_blocks.data_ptr(), total_cpu_blocks_size)
+            assert regist_buffer_status == 0, "PEER2CPUTransferWorker: regist cpu buffer to mooncake transfer engine"
 
             # step4: regist node info into redis server
-            
             self.mooncake_transfer_engine.regist_node_meta(self.cpu_blocks.data_ptr(), self.cpu_blocks.data_ptr())
+        
+        ## when enable p2p ssd, we need start a zmq server to recive the meta info from remote node, and allocate a cpu buffer for 
+        ## ssd to cpu copy
+        if self.cache_config.enable_p2p_ssd:
             
-        self.zmq_context = zmq.Context()
-        self.listen_socket = self.zmq_context.socket(zmq.ROUTER)
-        self.listen_socket.bind(self.zmq_listen_addr)
-        self.runing = True
-        self.start_meta_info_reciver()
-        
-        ## init the cpu buffer for ssd to cpu copy
-        # NOTE: now we allocate 500 blocks for test
-        self.cpu_buffer_layout = KVCacheLayout(
-            self.cpu_kv_layout.type,
-            self.cpu_kv_layout.num_layer,
-            500,
-            self.cpu_kv_layout.tokens_per_block,
-            self.cpu_kv_layout.num_head,
-            self.cpu_kv_layout.head_size,
-            self.cpu_kv_layout.is_mla,
-            self.cpu_kv_layout._kv_shape
-        )
-        self.cpu_buffer = torch.empty(self.cpu_buffer_layout.get_total_elements(), dtype=self.dtype, 
-                                      device='cpu', pin_memory=True)
+            ## init the cpu buffer for ssd to cpu copy
+            # NOTE: now we allocate 500 blocks for test
+            self.tmp_cpu_buffer_layout = KVCacheLayout(
+                self.cpu_kv_layout.type,
+                self.cpu_kv_layout.num_layer,
+                500,
+                self.cpu_kv_layout.tokens_per_block,
+                self.cpu_kv_layout.num_head,
+                self.cpu_kv_layout.head_size,
+                self.cpu_kv_layout.is_mla,
+                self.cpu_kv_layout._kv_shape
+            )
+            self.tmp_cpu_buffer = torch.empty(self.tmp_cpu_buffer_layout.get_total_elements(), dtype=self.dtype, 
+                                        device='cpu', pin_memory=True)
 
+            self.mooncake_transfer_engine.regist_buffer(self.tmp_cpu_buffer.data_ptr(), self.tmp_cpu_buffer.numel() * self.tmp_cpu_buffer.element_size())
+
+            ## start the zmq server
+            self.zmq_listen_addr = f"tcp://{cache_config.local_zmq_ip}:{cache_config.local_zmq_port}"
+            
+            self.zmq_context = zmq.Context()
+            self.listen_socket = self.zmq_context.socket(zmq.ROUTER)
+            self.listen_socket.bind(self.zmq_listen_addr)
+            self.runing = True
+            self.start_meta_info_reciver()
+            
         
-        ## ssd copy to cpu buffer related
+        ## ssd copy to temp cpu buffer related
         self.ssd_files = ssd_files
         self.num_blocks_per_file = num_blocks_per_file
         self.num_files = sum(len(file_list) for file_list in ssd_files.values())
 
         ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
 
-        self.chunk_size_in_bytes = self.cpu_buffer_layout.get_chunk_size() * self.dtype.itemsize
-        self.block_stride_in_bytes = self.cpu_buffer_layout.get_block_stride() * self.dtype.itemsize
-        self.cpu_kv_stride_in_bytes = self.cpu_buffer_layout.get_kv_stride() * self.dtype.itemsize
-        self.cpu_layer_stride_in_bytes = self.cpu_buffer_layout.get_layer_stride() * self.dtype.itemsize
+        self.chunk_size_in_bytes = self.tmp_cpu_buffer_layout.get_chunk_size() * self.dtype.itemsize
+        self.block_stride_in_bytes = self.tmp_cpu_buffer_layout.get_block_stride() * self.dtype.itemsize
+        self.cpu_kv_stride_in_bytes = self.tmp_cpu_buffer_layout.get_kv_stride() * self.dtype.itemsize
+        self.cpu_layer_stride_in_bytes = self.tmp_cpu_buffer_layout.get_layer_stride() * self.dtype.itemsize
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
 
@@ -1372,7 +1387,8 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
             raise RuntimeError("SSD Worker init failed") from e
         
-        self.remote_ssd_task_id_counter = 0 # unique task id counter for remote ssd to cpu transfer task
+        ## unique task id counter for remote ssd to cpu transfer task
+        self.remote_ssd_task_id_counter = 0 
         self.task_id_lock = threading.Lock()
 
     ############### common part ###############
@@ -1404,11 +1420,9 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
         transfered_size = 0
         
         for task_info in task_info_list:
-            flexkv_logger.info(f"RDMA read data from remote peer: {task_info.peer_engine_addr}")
             self._transfer_impl(
                 task_info,
                 transfer_op.transfer_type,
-                transfer_op.dist_type,
                 layer_id,
                 layer_granularity,
             )
@@ -1432,29 +1446,23 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
         self,
         task_info: RDMATaskInfo,
         transfer_type: TransferType,
-        dist_type: DistType,
         layer_id: int,
         layer_granularity: int,
         **kwargs,
-    ):
-        ##NOTE: currently, only support REMOTEH2H transfer type
-        assert (
-            transfer_type == TransferType.DIST2H
-        ), f"Only REMOTEH2H transfer type is supported, but got {transfer_type}"
-        if dist_type == DistType.DISTH:
+    ):       
+        if transfer_type == TransferType.PEERH2H:
             # remote cpu to local cpu transfer by one-side rdma read
             ret = self.mooncake_transfer_engine.transfer_sync_impl(task_info)
             if ret != 0:
                 flexkv_logger.error(f"RDMA transfer failed with error code: {ret}")
-        elif dist_type == DistType.DISTSSD:
+        elif transfer_type == TransferType.PEERSSD2H:
             # remote ssd to local cpu transfer by two side zmq and one side rdma write
-            remote_ssd_task_id  = self.gen_task_id() 
             # step1: construct the meta info 
             remote_ssd_to_cpu_meta = RemoteSSD2HMetaInfo(
-                task_id = remote_ssd_task_id,
+                task_id = task_info.task_id,
                 cpu_block_ids=task_info.dst_block_ids,
                 ssd_block_ids =task_info.src_block_ids,
-                peer_engine_addr=task_info.peer_engine_addr,
+                peer_engine_addr=task_info.local_engine_addr,
                 peer_cpu_base_ptr=self.dst_buffer_ptr,
                 data_size = task_info.data_size,
                 layer_id=layer_id,
@@ -1465,17 +1473,18 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
                 raise RuntimeError(f"Send remote ssd to cpu meta info to {task_info.peer_zmq_addr} failed")   
 
             ## step3: wait for remote node to send data transfer complete notify
-            ret = self.mooncake_transfer_engine.wait_notify(task_info.peer_engine_addr, remote_ssd_task_id)
+            ret = self.mooncake_transfer_engine.wait_notify(task_info.peer_engine_addr, task_info.task_id)
             if ret != 0:
-                flexkv_logger.error(f"Wait remote ssd to cpu transfer notify failed with error code: {ret}")
+                flexkv_logger.error(f"Wait remote ssd to cpu transfer task {task_info.task_id} notify from {task_info.peer_engine_addr} failed with error code: {ret}")
                 raise RuntimeError(f"Wait remote ssd to cpu transfer notify failed with error code: {ret}")   
-                   
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_type} for PEER2CPUTransferWorker")
+        
     def op_parser(
         self, transfer_op: WorkerTransferOp, layer_id: int, layer_granularity: int
     ) -> List[RDMATaskInfo]:
         """
         parse the transfer op to a list of RDMATaskInfo
-        only support DIST2H transfer type
         1. group the blocks by remote node id, each segment is a list of continuous blocks (segment is the smallest transmission unit)
         2. using corresponding distributed op parser to parse the op and create RDMATaskInfo for each segment
         5. return the list of RDMATaskInfo
@@ -1484,8 +1493,8 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
         Returns:
             List[RDMATaskInfo]: the list of RDMATaskInfo
         """
-        assert transfer_op.transfer_type == TransferType.DIST2H, \
-                f"RemoteCPU2CPUTransferWorker only support TransferType.DIST2H, but get {transfer_op.transfer_type}"
+        assert transfer_op.transfer_type == TransferType.PEERH2H or transfer_op.transfer_type == TransferType.PEERSSD2H, \
+                f"PEER2CPUTransferWorker only support PEERH2H or PEERSSD2H, but get {transfer_op.transfer_type}"
         
         src_block_ids, dst_block_ids =self.get_transfer_block_ids(transfer_op, False)
         
@@ -1494,7 +1503,7 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
         src_block_node_ids = transfer_op.src_block_node_ids
 
         # step1: group the blocks by remote node id and remote block source type, each segment is a list of continuous blocks
-        flexkv_logger.info(f"[RemoteCPU2CPUTransferWorker] src_block_ids: {src_block_ids} \n \
+        flexkv_logger.info(f"[PEER2CPUTransferWorker] src_block_ids: {src_block_ids} \n \
                                 dst_block_ids: {dst_block_ids} \n \
                                 src_block_node_ids: {src_block_node_ids} \n")
         groups = group_blocks_by_node_and_segment(
@@ -1502,12 +1511,12 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
         )
         task_info_list = []
 
-        if  transfer_op.dist_type == DistType.DISTH:
-            task_info_list = self._dist_cpu_op_parser(groups, layer_id, layer_granularity, transfer_op.dist_type)
-        elif transfer_op.dist_type == DistType.DISTSSD:
-            task_info_list = self._dist_ssd_op_parser(groups, transfer_op.dist_type)
+        if  transfer_op.transfer_type == TransferType.PEERH2H:
+            task_info_list = self._dist_cpu_op_parser(groups, layer_id, layer_granularity)
+        elif transfer_op.transfer_type == TransferType.PEERSSD2H:
+            task_info_list = self._dist_ssd_op_parser(groups)
         else:
-            raise RuntimeError(f"Unsurpported DistType: {transfer_op.dist_type}")  
+            raise RuntimeError(f"Unsurpported transfer_type {transfer_op.transfer_type} in PEER2CPUTransferWorker")  
 
         return task_info_list
 
@@ -1527,7 +1536,7 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
 
         except zmq.Again:
             #timeout
-            flexkv_logger.error(f"Failed to send meta info to {peer_zmq_addr}: timeout after {timeout_ms} ms")
+            flexkv_logger.error(f"Failed to send meta info to {peer_zmq_addr}: timeout after {1000} ms")
             req_socket.close()
             return False
 
@@ -1537,27 +1546,26 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.error(f"Error sending meta info to {peer_zmq_addr}: {e}")
             return False
 
-    def _dist_ssd_op_parser(self, groups: Dict[int, List[Dict[str, List[int]]]], 
-                            dist_type: DistType):
+    def _dist_ssd_op_parser(self, groups: Dict[int, List[Dict[str, List[int]]]]):
         """
         Distributed ssd op parser
         1. for each segment, get the remote ssd blocks and local cpu blocks
         2. create RDMATaskInfo for each segment
         Args:
             groups (Dict[int, List[Dict[str, List[int]]]]): the grouped blocks
-            dist_type (DistType): the distributed type, only support DISTSSD
 
         Returns:
             task_info_list: the list of RDMATaskInfo, each task refers to one data transfer operation
         """
         ## parse ssd
         #TODO: now we only support blockwise layout, need support layerwise layout
-        assert dist_type == DistType.DISTSSD
         
         task_info_list = []
         
         for node_id, segments in groups.items():
-            peer_zmq_addr = self.redis_meta_client.get_node_meta(node_id).get("zmq_addr")
+            peer_node_info = self.mooncake_transfer_engine.get_node_meta(node_id)
+            peer_zmq_addr = peer_node_info.zmq_addr
+            peer_engine_addr = peer_node_info.engine_addr
             assert peer_zmq_addr != "", f"Node {node_id} zmq addr not found in redis server"
             for seg in segments:
                 src_blocks = seg["src"]
@@ -1565,9 +1573,12 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
                 assert len(src_blocks) == len(dst_blocks)
                 ## NOTE: src_blocks and dst_blocks are continuous, so we transfer all blocks in one rdma task
                 data_size = self.cpu_kv_layout.get_block_stride() * self.dtype.itemsize * src_blocks
+                ssd_task_id = self.gen_task_id()
                 task_info_list.append(
                     RDMATaskInfo(
+                        ssd_task_id,
                         self.mooncake_transfer_engine.get_engine_addr(), ## for ssd transfer, peer engine addr refers to local mooncake engien
+                        peer_engine_addr,
                         peer_zmq_addr,
                         None,
                         None,
@@ -1649,7 +1660,7 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
 
     def write_data_back_to_peer(self, local_cpu_block_ids, recv_meta: RemoteSSD2HMetaInfo, layer_id: int, layer_granularity: int):
         
-        src_ptrs, src_block_size = self.get_cpu_buffer_block_start_ptr(local_cpu_block_ids, self.cpu_buffer.data_ptr(), 
+        src_ptrs, src_block_size = self.get_cpu_buffer_block_start_ptr(local_cpu_block_ids, self.tmp_cpu_buffer.data_ptr(), 
                                                             layer_id, layer_granularity)
         
         dst_ptrs, dst_block_size = self.get_cpu_buffer_block_start_ptr(recv_meta.cpu_block_ids, recv_meta.peer_engine_addr,
@@ -1661,6 +1672,7 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
         if isinstance(src_ptrs, int):
             rdma_task_info = RDMATaskInfo(
                 task_id = recv_meta.task_id, 
+                local_engine_addr= "",
                 peer_engine_addr= recv_meta.peer_engine_addr,
                 peer_zmq_addr="",
                 src_ptr = src_ptrs,
@@ -1675,6 +1687,7 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
             for i in range(len(src_ptrs)-1):
                 rdma_task_info = RDMATaskInfo(
                     task_id = recv_meta.task_id,
+                    local_engine_addr= "",
                     peer_engine_addr= recv_meta.peer_engine_addr,
                     peer_zmq_addr="",
                     src_ptr = src_ptrs[i],
@@ -1690,6 +1703,7 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
             # last block with notify
             rdma_task_info = RDMATaskInfo(
                 task_id = recv_meta.task_id, 
+                local_engine_addr="",
                 peer_engine_addr= recv_meta.peer_engine_addr,
                 peer_zmq_addr="",
                 src_ptr = src_ptrs[-1],
@@ -1707,8 +1721,7 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
     
     def _dist_cpu_op_parser(self, groups: Dict[int, List[Dict[str, List[int]]]], 
                             layer_id: int,
-                            layer_granularity: int,
-                            dist_type: DistType):
+                            layer_granularity: int):
         """
         Distributed cpu op parser
         1. for each segment, get the remote cpu ptrs and local cpu ptrs
@@ -1718,19 +1731,17 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
             groups (Dict[int, List[Dict[str, List[int]]]]): the grouped blocks
             layer_id (int): start layer id
             layer_granularity (int): number of layers to be transferred
-            dist_type (DistType): the distributed type, only support DISTH
 
         Returns:
             task_info_list: the list of RDMATaskInfo, each task refers to one data transfer operation
         """
-        assert dist_type == DistType.DISTH
         
         task_info_list = []
 
         for node_id, segments in groups.items():
             # step1: get the remote meta info
             src_meta = self.mooncake_transfer_engine.get_node_meta(node_id)
-            src_engine_addr = src_meta.engine_addr
+            peer_engine_addr = src_meta.engine_addr
             for seg in segments:
                 src_blocks = seg["src"]
                 dst_blocks = seg["dst"]
@@ -1742,7 +1753,7 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
                     layer_id, 
                     layer_granularity
                 )
-                flexkv_logger.info(f"[RemoteCPU2CPUTransferWorker]: remote cpu op parser src_block_start_ptrs: {src_block_start_ptrs} ")
+                flexkv_logger.info(f"[PEER2CPUTransferWorker]: remote cpu op parser src_block_start_ptrs: {src_block_start_ptrs} ")
                 
                 dst_block_start_ptrs, dst_data_size_per_block = self.get_cpu_buffer_block_start_ptr(
                     dst_blocks,
@@ -1750,16 +1761,21 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
                     layer_id,
                     layer_granularity,
                 )
-                flexkv_logger.info(f"[RemoteCPU2CPUTransferWorker]: remote cpu op parser dst_block_start_ptrs: {dst_block_start_ptrs} ")
+                flexkv_logger.info(f"[PEER2CPUTransferWorker]: remote cpu op parser dst_block_start_ptrs: {dst_block_start_ptrs} ")
                 
                 assert src_data_size_per_block == dst_data_size_per_block, "src and dst blocks have different layout"
-
+                
+                # step3: create RDMATaskInfo for each segment
+                # NOTE: block wise layout: only one start ptr for each segment
+                #       layer wise layout: multiple start ptrs for each segment, the number of start ptrs equals to layer_granularity * kv_dim
                 if isinstance(src_block_start_ptrs, int):
                     # the blocks is continuous only one start ptr, crossponding the block_wise layout
                     data_size = src_data_size_per_block * len(src_blocks) ## total data_size of current blocks
                     task_info_list.append(
                         RDMATaskInfo(
-                            src_engine_addr,
+                            0,
+                            "",
+                            peer_engine_addr,
                             "",
                             src_block_start_ptrs,
                             dst_block_start_ptrs,
@@ -1770,15 +1786,14 @@ class RemoteCPU2CPUTransferWorker(TransferWorkerBase):
                     )
                 elif isinstance(src_block_start_ptrs, list):
                     assert len(src_block_start_ptrs) == len(dst_block_start_ptrs)
-                    
-                    # step3: create RDMATaskInfo for each segment
-                    # NOTE: block wise layout: only one start ptr for each segment
-                    #       layer wise layout: multiple start ptrs for each segment, the number of start ptrs equals to layer_granularity * kv_dim
+                    #  start ptr is a list, crossponding the layer_wise layout
                     for i in range(len(src_block_start_ptrs)):
                         data_size = src_data_size_per_block * len(src_blocks) ## total data_size of current blocks
                         task_info_list.append(
                             RDMATaskInfo(
-                                src_engine_addr,
+                                0,
+                                "",
+                                peer_engine_addr,
                                 "",
                                 src_block_start_ptrs[i],
                                 dst_block_start_ptrs[i],
