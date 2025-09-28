@@ -30,7 +30,7 @@ from flexkv.common.transfer import get_nvtx_range_color
 from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
 from flexkv.mooncakeEngineWrapper import RDMATaskInfo, MoonCakeTransferEngineWrapper
 from flexkv.cache.redis_meta import RedisMeta
-from flexkv.transfer.utils import group_blocks_by_node_and_segment, RemoteSSD2HMetaInfo
+from flexkv.transfer.utils import group_blocks_by_node_and_segment, RemoteSSD2HMetaInfo, NodeMetaInfo, RDMATaskInfo
 try:
     from flexkv.c_ext import (
         transfer_kv_blocks_remote,
@@ -1318,6 +1318,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             )
             self.redis_meta_client.set_node_id(self.cache_config.distributed_node_id)
 
+            # Persistent NodeMetaInfo Pool for skip redis operation when getting 
+            # NodeMetaInfo according to node_id
+            # assuming that every flexkv progress has unique node id
+            self.node_metas: Dict[int, NodeMetaInfo] = {}
+            assert self.redis_meta_client != None
+
             # step2: initialize mooncake transfer engine for the whole flexkv
             # NOTE:now we read the config file by env paras
             mooncake_config_path = os.environ["MOONCAKE_CONFIG_PATH"]
@@ -1325,7 +1331,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 mooncake_config_path
             )
             self.mooncake_transfer_engine = MoonCakeTransferEngineWrapper(
-                self.mooncake_config, self.redis_meta_client
+                self.mooncake_config
             )
             assert (
                 self.mooncake_transfer_engine != None
@@ -1343,7 +1349,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             ), "PEER2CPUTransferWorker: regist cpu buffer to mooncake transfer engine"
 
             # step4: regist node info into redis server
-            self.mooncake_transfer_engine.regist_node_meta(
+            self.regist_node_meta(
                 self.cpu_blocks.data_ptr(),
                 self.cpu_blocks.data_ptr(),
                 self.zmq_listen_addr,
@@ -1510,7 +1516,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             )
             # print(f"---> remote_ssd_to_cpu_meta: {remote_ssd_to_cpu_meta.task_id}, cpu_block_ids: {remote_ssd_to_cpu_meta.cpu_block_ids}, \
             #     peer_addr: {remote_ssd_to_cpu_meta.peer_engine_addr}")
-            print("DEBUG send type:",  type(json.dumps(remote_ssd_to_cpu_meta.to_dict())))  # 只打印前200字符避免太长
 
             ## step2: send the meta info to remote node
             if not self.send_meta_info(remote_ssd_to_cpu_meta, task_info.peer_zmq_addr):
@@ -1628,7 +1633,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         task_info_list = []
 
         for node_id, segments in groups.items():
-            peer_node_info = self.mooncake_transfer_engine.get_node_meta(node_id)
+            peer_node_info = self.get_node_meta(node_id)
             peer_zmq_addr = peer_node_info.zmq_addr
             peer_engine_addr = peer_node_info.engine_addr
             assert (
@@ -1869,9 +1874,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         for node_id, segments in groups.items():
             # step1: get the remote meta info
-            src_meta = self.mooncake_transfer_engine.get_node_meta(node_id)
+            src_meta = self.get_node_meta(node_id)
             peer_engine_addr = src_meta.engine_addr
-            print("---->peer_meta", src_meta.to_dict())
             for seg in segments:
                 src_blocks = seg["src"]
                 dst_blocks = seg["dst"]
@@ -2001,14 +2005,42 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             src_block_ptrs.append(cpu_base_ptr + element_offset)
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.cpu_kv_layout.type}")
-<<<<<<< HEAD
         data_size_per_block = self.cpu_kv_layout.get_block_stride() * self.dtype.itemsize
-        return src_block_ptrs[0] if len(src_block_ptrs) == 1 else src_block_ptrs, data_size_per_block
-=======
-        data_size_per_block = (
-            self.cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+        
+        return  src_block_ptrs, data_size_per_block
+
+    ### redis client helper functions
+    def regist_node_meta(self, cpu_buffer_base_ptr: int, ssd_buffer_base_ptr: int, zmq_addr: str):
+        self.redis_meta_client.regist_node_meta(self.redis_meta_client.get_node_id(), self.mooncake_transfer_engine.get_engine_addr(), 
+                                                zmq_addr, cpu_buffer_base_ptr, ssd_buffer_base_ptr)
+        #NOTE: maybe useless
+        node_meta_info = NodeMetaInfo(
+            self.redis_meta_client.get_node_id(),
+            self.mooncake_transfer_engine.get_engine_addr(),
+            zmq_addr,
+            cpu_buffer_base_ptr,
+            ssd_buffer_base_ptr
         )
-        return (
-            src_block_ptrs[0] if len(src_block_ptrs) == 1 else src_block_ptrs
-        ), data_size_per_block
->>>>>>> 218e505 (fix implement bugs and update test_dist transfer demo)
+        self.node_metas[self.redis_meta_client.get_node_id()] = node_meta_info
+        flexkv_logger.info(f"Registered node {self.redis_meta_client.get_node_id()} to Redis.")
+    
+    def unregist_node_meta(self, node_id: int = None) -> None:
+        self.redis_meta_client.unregist_node_meta(self.redis_meta_client.get_node_id())
+        flexkv_logger.info(f"Unregistered node {self.redis_meta_client.get_node_id()} from Redis.")
+
+    def get_node_meta(self, node_id: int) -> Optional[NodeMetaInfo]:
+        # TODO: how to remove the invalid node meta info in node_metas
+        """Get the node meta info by node id."""
+        if not node_id in self.node_metas:
+            ## fetch from redis
+            node_redis_data = self.redis_meta_client.get_node_meta(node_id)
+            if not node_redis_data:
+                flexkv_logger.error(f"Node {node_id} meta not found in Redis.")
+                return None
+
+            node_meta = NodeMetaInfo.from_dict(node_redis_data)
+
+            self.node_metas[node_id] = node_meta
+            flexkv_logger.info(f"Fetched node {node_id} meta from Redis.")
+
+        return self.node_metas[node_id]
