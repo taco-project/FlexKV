@@ -24,11 +24,18 @@ def test_worker():
     cache_config = CacheConfig(
         tokens_per_block=64,
         enable_cpu=True,
+        enable_ssd=True,
         enable_kv_sharing=True,
-        enable_p2p_cpu=True
+        enable_p2p_cpu=True,
+        enable_p2p_ssd=True,
+        redis_host = "172.16.0.18",
+        redis_port = 6379,
+        redis_password = "yourpass",
+        local_zmq_ip = "172.16.0.23",
+        local_zmq_port = 5555,
     )
     redis_meta = RedisMeta(
-        "172.160.18",
+        "172.16.0.18",
         6379,
         "yourpass",
         "127.0.0.1"
@@ -55,7 +62,7 @@ def test_worker():
     physical_tensor = torch.arange(
         start=0,
         end=total_size,
-        dtype=torch.bfloat16,       # 或者使用 torch.long
+        dtype=torch.int32,       # 或者使用 torch.long
         device="cpu",
         pin_memory=False,
     )
@@ -64,7 +71,7 @@ def test_worker():
             handle_type=AccessHandleType.TENSOR,
             data=physical_tensor,
             kv_layout=cpu_layout,
-            dtype=torch.bfloat16,
+            dtype=torch.int32,
         )    
     pin_buffer = SharedOpPool(2048, 100)
     ssd_layout = KVCacheLayout(
@@ -76,14 +83,14 @@ def test_worker():
         head_size = 32,
         is_mla=True
     )
-    ssd_files = {0:"/data0/flexkv_ssd_cache_0_0.bin"}
+    ssd_files = {0:["/data0/flexkv_ssd_cache_0_0.bin"]}
 
     worker = PEER2CPUTransferWorker(
         worker_id=0,
         transfer_conn= child_conn,
         finished_ops_queue = finished_ops_queue,
         op_buffer_tensor = pin_buffer.get_buffer(),
-        cpu_blocks = cpu_handle.get_tensor(),
+        cpu_blocks = physical_tensor,
         cpu_kv_layout=cpu_handle.kv_layout,
         ssd_kv_layout=ssd_layout,
         remote_kv_layout=cpu_handle.kv_layout, # TODO: get remote kv_layout
