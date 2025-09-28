@@ -2,13 +2,11 @@ import torch
 from torch.multiprocessing import Queue as MPQueue, Pipe as MPPipe
 import numpy as np
 import os
-from flexkv.transfer.utils import group_blocks_by_node_and_type
 from flexkv.transfer.worker import PEER2CPUTransferWorker, WorkerTransferOp
-from flexkv.mooncakeEngineWrapper import RDMATaskInfo, MoonCakeTransferEngineWrapper
 
 from flexkv.common.ring_buffer import SharedOpPool
 from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
-from flexkv.common.config import MooncakeTransferEngineConfig, CacheConfig
+from flexkv.common.config import CacheConfig
 from flexkv.common.transfer import TransferOp, TransferType
 from flexkv.cache.redis_meta import RedisMeta
 
@@ -156,7 +154,7 @@ if __name__ == "__main__":
     os.environ["MOONCAKE_CONFIG_PATH"] = "./mooncake_config_l.json"
     ret_tensor, block_stride = test_worker()
     print(block_stride)
-    blocks = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12]
+    blocks = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13]
     # blocks = [0, 1, 2, 3, 4, 6, 7, 8, 9]
 
     for i in blocks:
