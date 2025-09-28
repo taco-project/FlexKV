@@ -21,13 +21,20 @@ def test_worker():
     cache_config = CacheConfig(
         tokens_per_block=64,
         enable_cpu=True,
+        enable_ssd=True,
         enable_kv_sharing=True,
-        enable_p2p_cpu=True
+        enable_p2p_cpu=True,
+        enable_p2p_ssd=True,
+        redis_host = "172.16.0.18",
+        redis_port = 6379,
+        redis_password = "yourpass",
+        local_zmq_ip = "172.16.0.18",
+        local_zmq_port = 5555,
     )
     
     ## step1: initialize the redis meta
     redis_meta = RedisMeta(
-        "172.160.18",
+        "172.16.0.18",
         6379,
         "yourpass",
         "127.0.0.1"
@@ -52,7 +59,7 @@ def test_worker():
     ## initial physical tensor and regist it to mooncake engine
     physical_tensor = torch.zeros(
                     size=(total_size,),
-                    dtype=torch.uint32,
+                    dtype=torch.int32,
                     device="cpu",
                     pin_memory=False,
                 )
@@ -62,7 +69,7 @@ def test_worker():
             handle_type=AccessHandleType.TENSOR,
             data=physical_tensor,
             kv_layout=cpu_layout,
-            dtype=torch.bfloat16,
+            dtype=torch.int32,
         )    
     
     ## initialize SharedOpPool
@@ -78,7 +85,7 @@ def test_worker():
         is_mla=True
     )
 
-    ssd_files = {0:"/data0/flexkv_ssd_cache_0_0.bin"}
+    ssd_files = {0:["/data0/flexkv_ssd_cache_0_0.bin"]}
 
     ## step 6: initialize PEER2CPUTransferWorker
     worker = PEER2CPUTransferWorker(
@@ -86,7 +93,7 @@ def test_worker():
         transfer_conn= child_conn,
         finished_ops_queue = finished_ops_queue,
         op_buffer_tensor = pin_buffer.get_buffer(),
-        cpu_blocks = cpu_handle.get_tensor(),
+        cpu_blocks = physical_tensor,
         cpu_kv_layout=cpu_handle.kv_layout,
         ssd_kv_layout=ssd_layout,
         remote_kv_layout=cpu_handle.kv_layout, # TODO: get remote kv_layout
@@ -122,10 +129,13 @@ def test_worker():
     
     
     #### test remote ssd 2 cpu
+    print("="*30)
+    # ssd_src_block_ids = np.array([0, 1, 2])
+    # ssd_dst_block_ids = np.array([7, 8, 9])
+    # remote_block_node_ids = np.array([1, 1, 1])
     ssd_src_block_ids = np.array([0, 1, 2, 4, 5, 6])
     ssd_dst_block_ids = np.array([7, 8, 9, 10, 11, 12])
     remote_block_node_ids = np.array([1, 1, 1, 1, 1, 1])
-    
     transfer_op = TransferOp(
         graph_id = 1,
         transfer_type = TransferType.PEERSSD2H,
@@ -144,9 +154,10 @@ def test_worker():
 if __name__ == "__main__":
     os.environ["MC_REDIS_PASSWORD"] = "yourpass"
     os.environ["MOONCAKE_CONFIG_PATH"] = "./mooncake_config_l.json"
-    test_worker()
     ret_tensor, block_stride = test_worker()
     print(block_stride)
     blocks = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12]
+    # blocks = [0, 1, 2, 3, 4, 6, 7, 8, 9]
+
     for i in blocks:
         print(ret_tensor[i*block_stride:(i+1)*block_stride])

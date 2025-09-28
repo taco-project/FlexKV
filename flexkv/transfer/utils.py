@@ -92,8 +92,8 @@ def group_blocks_by_node_and_segment(
 
 class RemoteSSD2HMetaInfo:
     task_id: int
-    cpu_block_ids: np.ndarray
-    ssd_block_ids: np.ndarray
+    cpu_block_ids: List[int]
+    ssd_block_ids: List[int]
     peer_engine_addr: str # the mooncake engine address of the node that initiates the transfer, used for write data back to the node.
     peer_cpu_base_ptr: int # the cpu buffer base ptr of the peer node, used for calculating the dst ptrs.
     data_size: int
@@ -109,8 +109,9 @@ class RemoteSSD2HMetaInfo:
         self.data_size = data_size
         self.layer_id = layer_id
         self.layer_granularity = layer_granularity
-    
-    def from_dict(self, data) -> "RemoteSSD2HMetaInfo":
+
+    @classmethod
+    def from_dict(self, data: dict) -> "RemoteSSD2HMetaInfo":
         return RemoteSSD2HMetaInfo(
             task_id = data.get("task_id"),
             cpu_block_ids=data.get("cpu_block_ids"),
@@ -121,4 +122,14 @@ class RemoteSSD2HMetaInfo:
             layer_id = data.get("layer_id"),
             layer_granularity = data.get("layer_granularity")
         )
-        
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "cpu_block_ids": self.cpu_block_ids,
+            "ssd_block_ids": self.ssd_block_ids,
+            "peer_engine_addr": self.peer_engine_addr,
+            "peer_cpu_base_ptr": self.peer_cpu_base_ptr,
+            "data_size": self.data_size,
+            "layer_id": self.layer_id,
+            "layer_granularity": self.layer_granularity,
+        }

@@ -5,6 +5,7 @@ import json
 import time
 from typing import Optional, Union, List, Dict, Tuple, Any
 
+import engine
 from engine import TransferEngine
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import MooncakeTransferEngineConfig
@@ -14,7 +15,7 @@ from urllib.parse import urlparse
 class RDMATaskInfo:
     def __init__(
         self, task_id: int, local_engine_addr: str, peer_engine_addr: str, peer_zmq_addr: str, src_ptr: int, dst_ptr: int, 
-        src_block_ids: int, dst_block_ids: int, data_size: int
+        src_block_ids: List[int], dst_block_ids: List[int], data_size: int
     ):
         self.task_id = task_id
         self.local_engine_addr = local_engine_addr ## the mooncake engine address of local node
@@ -45,8 +46,8 @@ class RDMATaskInfo:
             local_engine_addr=data.get("local_engine_addr", ""),
             peer_engine_addr=data.get("peer_engine_addr", ""),
             peer_zmq_addr = data.get("peer_zmq_addr", ""),
-            src_ptr=int(data.get("src_ptr", 0)),
-            dst_ptr=int(data.get("dst_ptr", 0)),
+            src_ptr=data.get("src_ptr", []),
+            dst_ptr=data.get("dst_ptr", []),
             src_block_ids=data.get("src_block_ids"),
             dst_block_ids=data.get("dst_block_ids"),
             data_size=int(data.get("data_size", 0)),
@@ -73,10 +74,10 @@ class NodeMetaInfo:
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "node_id": self.node_id,
-            "engine_addr": self.engine_addr,
+            "addr": self.engine_addr,
             "zmq_addr": self.zmq_addr,
-            "cpu_bufer_base_ptr": self.cpu_bufer_base_ptr,
-            "ssd_bufer_base_ptr": self.ssd_bufer_base_ptr,
+            "cpu_buffer_ptr": self.cpu_bufer_base_ptr,
+            "ssd_buffer_ptr": self.ssd_bufer_base_ptr,
         }
         return result
 
@@ -84,10 +85,10 @@ class NodeMetaInfo:
     def from_dict(cls, data: Dict[str, Any]) -> "NodeMetaInfo":
         return cls(
             node_id=data.get("node_id"),
-            engine_addr=data.get("engine_addr"),
+            engine_addr=data.get("addr"),
             zmq_addr=data.get("zmq_addr"),
-            cpu_bufer_base_ptr=data.get("cpu_bufer_base_ptr"),
-            ssd_bufer_base_ptr=data.get("ssd_bufer_base_ptr"),
+            cpu_bufer_base_ptr=data.get("cpu_buffer_ptr"),
+            ssd_bufer_base_ptr=data.get("ssd_buffer_ptr"),
         )
 
 
@@ -204,14 +205,9 @@ class MoonCakeTransferEngineWrapper:
         return ret if ret == 0 else -1
     
     def transfer_sync_write_with_notify(self, task: RDMATaskInfo, notify_name: str, notify_msg: str):
-        ret = self.engine.transfer_sync_write_with_notify(
-            task.peer_engine_addr,
-            task.src_ptr,
-            task.dst_ptr,
-            task.data_size,
-            notify_name,
-            notify_msg
-        )
+        notify = engine.TransferNotify(notify_name, notify_msg)
+        ret = self.engine.transfer_sync(
+            task.peer_engine_addr, task.src_ptr, task.dst_ptr, task.data_size, engine.TransferOpcode.Write, notify)
         return ret if ret == 0 else -1
     
     def wait_notify(self, peer_addr: str, task_id: int):
@@ -232,11 +228,17 @@ class MoonCakeTransferEngineWrapper:
         timeout = 5.0 # timeout after 5 seconds
         start_time = time.time()
         while True:
+            found = False
             notifies = self.engine.get_notifies()
             if notifies:
-                if notifies.name == peer_addr and notifies.msg == str(task_id):
-                    flexkv_logger.info(f"Received notify: {notifies.name}, {notifies.msg}")
-                    return True
+                for notify in notifies:
+                    if notify.name == peer_addr or notify.msg == str(task_id):
+                        flexkv_logger.info(f"Received notify: {notify.name}, {notify.msg}")
+                        found= True
+                        break
+            if found:
+                break
+                    
             if time.time() - start_time > timeout:
                 #TODO: how to cancle the transfer task
                 flexkv_logger.warning(f"Timeout waiting for notify: {peer_addr}, task={task_id}")
@@ -244,6 +246,8 @@ class MoonCakeTransferEngineWrapper:
         
             time.sleep(0.01) # sleep for 10 ms to avoid busy waiting
             
+        return True
+    
     # helper function
     def get_engine_addr(self):
         return self.mooncake_addr
