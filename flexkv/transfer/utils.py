@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional, Any
 import torch
 import numpy as np
 
@@ -133,3 +133,81 @@ class RemoteSSD2HMetaInfo:
             "layer_id": self.layer_id,
             "layer_granularity": self.layer_granularity,
         }
+        
+class NodeMetaInfo:
+    """Node information for flexkv sub-nodes"""
+
+    def __init__(
+        self,
+        node_id: int,
+        engine_addr: Optional[str] = None,
+        zmq_addr: Optional[str] = None,
+        cpu_bufer_base_ptr: Optional[int] = None,
+        ssd_bufer_base_ptr: Optional[int] = None,
+    ):
+        self.node_id = node_id
+        self.engine_addr = engine_addr
+        self.zmq_addr = zmq_addr
+        self.cpu_bufer_base_ptr = cpu_bufer_base_ptr
+        self.ssd_bufer_base_ptr = ssd_bufer_base_ptr
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_id": self.node_id,
+            "addr": self.engine_addr,
+            "zmq_addr": self.zmq_addr,
+            "cpu_buffer_ptr": self.cpu_bufer_base_ptr,
+            "ssd_buffer_ptr": self.ssd_bufer_base_ptr,
+        }
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "NodeMetaInfo":
+        return cls(
+            node_id=data.get("node_id"),
+            engine_addr=data.get("addr"),
+            zmq_addr=data.get("zmq_addr"),
+            cpu_bufer_base_ptr=data.get("cpu_buffer_ptr"),
+            ssd_bufer_base_ptr=data.get("ssd_buffer_ptr"),
+        )
+        
+class RDMATaskInfo:
+    def __init__(
+        self, task_id: int, local_engine_addr: str, peer_engine_addr: str, peer_zmq_addr: str, src_ptr: int, dst_ptr: int, 
+        src_block_ids: List[int], dst_block_ids: List[int], data_size: int
+    ):
+        self.task_id = task_id
+        self.local_engine_addr = local_engine_addr ## the mooncake engine address of local node
+        self.peer_engine_addr = peer_engine_addr ## thre mooncake engine address of remote node
+        self.src_ptr = src_ptr
+        self.dst_ptr = dst_ptr
+        self.peer_zmq_addr = peer_zmq_addr
+        self.src_block_ids = src_block_ids
+        self.dst_block_ids = dst_block_ids
+        self.data_size = data_size
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "local_engine_addr": self.local_engine_addr,  
+            "peer_engine_addr": self.peer_engine_addr, 
+            "peer_zmq_addr": self.peer_zmq_addr,
+            "src_ptr": self.src_ptr,
+            "dst_ptr": self.dst_ptr,
+            "src_block_ids": self.src_block_ids,
+            "dst_block_ids": self.dst_block_ids,
+            "data_size": self.data_size,
+        }
+
+    def from_dict(self, data: dict) -> "RDMATaskInfo":
+        return RDMATaskInfo(
+            task_id = data.get("task_id", 0),
+            local_engine_addr=data.get("local_engine_addr", ""),
+            peer_engine_addr=data.get("peer_engine_addr", ""),
+            peer_zmq_addr = data.get("peer_zmq_addr", ""),
+            src_ptr=data.get("src_ptr", []),
+            dst_ptr=data.get("dst_ptr", []),
+            src_block_ids=data.get("src_block_ids"),
+            dst_block_ids=data.get("dst_block_ids"),
+            data_size=int(data.get("data_size", 0)),
+        )
