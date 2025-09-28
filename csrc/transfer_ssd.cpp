@@ -156,6 +156,11 @@ static void _transfer_single_thread_impl(
         bytes_transfer = pwrite(fd, cpu_k_block_ptr, chunk_size_in_bytes,
                                 ssd_k_block_offset);
       }
+      
+      if (bytes_transfer == -1){
+        perror("pread failed");
+      }
+
       if (bytes_transfer != chunk_size_in_bytes) {
         throw std::runtime_error("Failed to transfer K block");
       }

@@ -24,7 +24,7 @@ enable_cfs = os.environ.get("FLEXKV_ENABLE_CFS", "0") == "1"
 # Define C++ extensions
 cpp_sources = [
     "csrc/bindings.cpp",
-    # "csrc/transfer.cu",  # Skip CUDA file for now
+    "csrc/transfer.cu",  # Skip CUDA file for now
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
@@ -43,7 +43,7 @@ hpp_sources = [
 ]
 
 #extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
-extra_link_args = ["-lxxhash", "-lpthread", "-lrt", "-luring", "-lhiredis"]
+extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring", "-lhiredis"]
 extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
 
@@ -60,6 +60,7 @@ if enable_cfs:
     hpp_sources.append("csrc/pcfs/pcfs.h")
     extra_link_args.append("-lhifs_client_sdk")
     extra_compile_args.append("-DFLEXKV_ENABLE_CFS")
+extra_compile_args.append("-DCUDA_AVAILABLE")
 
 cpp_extensions = [
     cpp_extension.CUDAExtension(
