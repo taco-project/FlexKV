@@ -15,7 +15,7 @@ from flexkv.cache.redis_meta import RedisMeta
 def test_worker():
     finished_ops_queue: MPQueue[int] = MPQueue()
     parent_conn, child_conn = MPPipe()  # create pipe
-    
+    # config set
     cache_config = CacheConfig(
         tokens_per_block=64,
         enable_cpu=True,
@@ -30,7 +30,7 @@ def test_worker():
         local_zmq_port = 5555,
     )
     
-    ## step1: initialize the redis meta
+    ## step1: initialize the redis meta and regist to redis server
     redis_meta = RedisMeta(
         "172.16.0.18",
         6379,
@@ -42,6 +42,7 @@ def test_worker():
     print(f"[Node A] node id: {node_id}")
 
     cache_config.distributed_node_id = node_id
+    
     ## step2: define the kv cache layout and allocate the physical buffer
     cpu_layout = KVCacheLayout(
         KVCacheLayoutType.BLOCKWISE,  ## test block wise layout
@@ -62,7 +63,7 @@ def test_worker():
                     pin_memory=False,
                 )
     
-    ## step5: initialize other obj that used in worker
+    ## step3: initialize StorageHandle and SharedOpPool obj that used in worker
     cpu_handle = StorageHandle(
             handle_type=AccessHandleType.TENSOR,
             data=physical_tensor,
@@ -73,6 +74,7 @@ def test_worker():
     ## initialize SharedOpPool
     pin_buffer = SharedOpPool(2048, 100)
 
+    ## step4: initialize ssd layout and ssd files
     ssd_layout = KVCacheLayout(
         KVCacheLayoutType.BLOCKWISE,  ## test block wise layout
         num_layer = 20,
@@ -85,7 +87,7 @@ def test_worker():
 
     ssd_files = {0:["/data0/flexkv_ssd_cache_0_0.bin"]}
 
-    ## step 6: initialize PEER2CPUTransferWorker
+    ## step 5: initialize PEER2CPUTransferWorker
     worker = PEER2CPUTransferWorker(
         worker_id=0,
         transfer_conn= child_conn,
@@ -101,7 +103,7 @@ def test_worker():
         num_blocks_per_file=1000
     )
     
-    ## test remote cpu to local cpu
+    ### test remote cpu to local cpu
     cpu_src_block_ids = np.array([0, 1, 10, 11, 12, 13])
     cpu_dst_block_ids = np.array([0, 1, 2, 3, 4, 6])
     remote_block_node_ids = np.array([1, 1, 1, 1, 1, 1])
@@ -122,7 +124,6 @@ def test_worker():
     ## initialize worker transfer_op
     worker_transfer_op_cpu = WorkerTransferOp(transfer_op)
     
-    ## step8: read data from remote node
     worker.launch_transfer(worker_transfer_op_cpu)
     
     
@@ -150,12 +151,10 @@ def test_worker():
     return physical_tensor, block_stride
     
 if __name__ == "__main__":
-    os.environ["MC_REDIS_PASSWORD"] = "yourpass"
-    os.environ["MOONCAKE_CONFIG_PATH"] = "./mooncake_config_l.json"
+    os.environ["MC_REDIS_PASSWORD"] = "yourpass"                    ## set mooncake metaserver password
+    os.environ["MOONCAKE_CONFIG_PATH"] = "./mooncake_config_l.json" ## set mooncake config json
     ret_tensor, block_stride = test_worker()
-    print(block_stride)
     blocks = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13]
-    # blocks = [0, 1, 2, 3, 4, 6, 7, 8, 9]
 
     for i in blocks:
         print(ret_tensor[i*block_stride:(i+1)*block_stride])
