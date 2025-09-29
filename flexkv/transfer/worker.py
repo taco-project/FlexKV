@@ -218,6 +218,12 @@ class TransferWorkerBase(ABC):
                 if self.transfer_conn.poll(timeout=0.0001):  # check if data available
                     op = self.transfer_conn.recv()
                     if op is None:
+                        # shut down zmq listening server of peer2cpuTransferWorker
+                        if hasattr(self, "shutdown") and callable(getattr(self, "shutdown")):
+                            try:
+                                self.shutdown()
+                            except Exception as e:
+                                flexkv_logger.error(f"Error when shut down worker: {e}")
                         break
                     batch_ops = [op]
                     while self.transfer_conn.poll(timeout=0):
@@ -1028,7 +1034,9 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             self.zmq_context = zmq.Context()
             self.listen_socket = self.zmq_context.socket(zmq.REP)
             self.listen_socket.bind(self.zmq_listen_addr)
-            self.runing = True
+
+            self.shutdown_event = threading.Event()
+            self.zmq_thread = threading.Thread(target=self.ssd_handle_loop, daemon=True)
             self.start_meta_info_reciver()
 
             ## ssd copy to temp cpu buffer related
@@ -1089,8 +1097,23 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             return old_value
 
     def start_meta_info_reciver(self):
-        threading.Thread(target=self.ssd_handle_loop, daemon=True).start()
+        self.zmq_thread.start()
 
+    def shutdown(self):
+        self.shutdown_event.set()
+        try:
+            self.listen_socket.close(0)
+            self.zmq_context.term()
+        except Exception as e:
+            flexkv_logger.error(f"Error when closing ZMQ: {e}")
+        self.zmq_thread.join()
+        # unregist buffer in mooncake engine
+        self.mooncake_transfer_engine.unregist_buffer(self.cpu_blocks.data_ptr())
+        if self.cache_config.enable_p2p_ssd:
+            self.mooncake_transfer_engine.unregist_buffer(self.tmp_cpu_buffer.data_ptr())
+        # unregist node info from redis server
+        self.unregist_node_meta()
+    
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
@@ -1310,7 +1333,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         flexkv_logger.info(
             f"Node {self.cache_config.distributed_node_id} Listening on {self.zmq_listen_addr}"
         )
-        while self.runing:
+        while not self.shutdown_event.is_set():
             try:
                 ## step1: parsing the message into meta info
                 try:
