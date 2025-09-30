@@ -26,7 +26,7 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
 from flexkv.common.transfer import get_nvtx_range_color
 from flexkv.common.config import CacheConfig, MooncakeTransferEngineConfig
-from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
+from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper, MooncakeNotifyMsg, NotifyStatus
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.transfer.utils import group_blocks_by_node_and_segment, RemoteSSD2HMetaInfo, NodeMetaInfo, RDMATaskInfo
 try:
@@ -208,7 +208,7 @@ class TransferWorkerBase(ABC):
         )
 
     @abstractmethod
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         pass
 
     def run(self) -> None:
@@ -237,12 +237,14 @@ class TransferWorkerBase(ABC):
                                                 f"graph_id: {op.transfer_graph_id}, "
                                                 f"num_blocks: {op.valid_block_num}",
                                                 color=get_nvtx_range_color(op.transfer_graph_id))
-                            self.launch_transfer(op)
+                            transfer_status = self.launch_transfer(op)
                             nvtx.pop_range()
                         except Exception as e:
                             flexkv_logger.error(f"Error launching transfer: {e}\n"
                                         f"Failed transfer op: {op}")
-                        self.finished_ops_queue.put(op.transfer_op_id)
+                        if transfer_status:
+                            ## only put the op when transfer success
+                            self.finished_ops_queue.put(op.transfer_op_id)                
                 else:
                     continue
             except EOFError:
@@ -386,7 +388,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.is_mla,
         )
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
         if layer_id == -1:
@@ -416,7 +418,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 start_time,
                 end_time,
             )
-
+        return True
+        
 class tpGPUCPUTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
@@ -532,7 +535,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         )
 
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
         if layer_id == -1:
@@ -561,6 +564,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             start_time,
             end_time,
         )
+        return True
 
 class CPUSSDDiskTransferWorker(TransferWorkerBase):
     def __init__(self,
@@ -654,7 +658,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             is_mla=self.is_mla,
         )
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
         if layer_id == -1:
@@ -684,6 +688,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             end_time,
         )
 
+        return True
+    
 class CPURemoteTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
@@ -879,7 +885,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
                 is_mla=self.is_mla,
             )
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
         if layer_id == -1:
@@ -909,7 +915,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             start_time,
             end_time,
         )
-
+        return True
 
 
 class PEER2CPUTransferWorker(TransferWorkerBase):
@@ -967,6 +973,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             # assuming that every flexkv progress has unique node id
             self.node_metas: Dict[int, NodeMetaInfo] = {}
             assert self.redis_meta_client != None
+
 
             # step2: initialize mooncake transfer engine for the whole flexkv
             # NOTE:now we read the config file by env paras
@@ -1034,7 +1041,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             self.zmq_context = zmq.Context()
             self.listen_socket = self.zmq_context.socket(zmq.REP)
             self.listen_socket.bind(self.zmq_listen_addr)
-
+            
             self.shutdown_event = threading.Event()
             self.zmq_thread = threading.Thread(target=self.ssd_handle_loop, daemon=True)
             self.start_meta_info_reciver()
@@ -1064,6 +1071,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             self.ssd_layer_stride_in_bytes = (
                 ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
             )
+            
         # print(f"---> chunk_size_in_bytes: {self.chunk_size_in_bytes}, block_stride_in_bytes: {self.block_stride_in_bytes}, \
         #         cpu_kv_stride_in_bytes: {self.cpu_kv_stride_in_bytes}, cpu_layer_stride_in_bytes: {self.cpu_layer_stride_in_bytes}, \
         #         ssd_kv_stride_in_bytes: {self.ssd_kv_stride_in_bytes}, ssd_layer_stride_in_bytes: {self.ssd_layer_stride_in_bytes}")
@@ -1113,8 +1121,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             self.mooncake_transfer_engine.unregist_buffer(self.tmp_cpu_buffer.data_ptr())
         # unregist node info from redis server
         self.unregist_node_meta()
-    
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
         if layer_id == -1:
@@ -1126,14 +1134,17 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         start_time = time.time()
         transfered_size = 0
-
+        transfer_finished = True
         for task_info in task_info_list:
-            self._transfer_impl(
+            ret = self._transfer_impl(
                 task_info,
                 transfer_op.transfer_type,
                 layer_id,
                 layer_granularity,
             )
+            if not ret:
+                transfer_finished = False
+                break
             # transfered_size += task_info.data_size
 
         end_time = time.time()
@@ -1149,7 +1160,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             start_time,
             end_time,
         )
-
+        return transfer_finished
+    
     def _transfer_impl(
         self,
         task_info: RDMATaskInfo,
@@ -1160,9 +1172,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
     ):
         if transfer_type == TransferType.PEERH2H:
             # remote cpu to local cpu transfer by one-side rdma read
-            ret = self.mooncake_transfer_engine.transfer_sync_impl(task_info)
+            ret = self.mooncake_transfer_engine.transfer_sync_read(task_info)
             if ret != 0:
+                #TODO：deal with send meta failure
                 flexkv_logger.error(f"RDMA transfer failed with error code: {ret}")
+                return False
         elif transfer_type == TransferType.PEERSSD2H:
             # remote ssd to local cpu transfer by two side zmq and one side rdma write
             # step1: construct the meta info
@@ -1176,31 +1190,33 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 layer_id=layer_id,
                 layer_granularity=layer_granularity,
             )
-            # print(f"---> remote_ssd_to_cpu_meta: {remote_ssd_to_cpu_meta.task_id}, cpu_block_ids: {remote_ssd_to_cpu_meta.cpu_block_ids}, \
-            #     peer_addr: {remote_ssd_to_cpu_meta.peer_engine_addr}")
 
             ## step2: send the meta info to remote node
             if not self.send_meta_info(remote_ssd_to_cpu_meta, task_info.peer_zmq_addr):
-                raise RuntimeError(
+                #TODO：deal with send meta failure
+                flexkv_logger.error(
                     f"Send remote ssd to cpu meta info to {task_info.peer_zmq_addr} failed"
                 )
+                return False
 
             ## step3: wait for remote node to send data transfer complete notify
             ret = self.mooncake_transfer_engine.wait_notify(
                 task_info.peer_engine_addr, task_info.task_id
             )
             if not ret:
+                #TODO：deal with transfer failure
                 flexkv_logger.error(
                     f"Wait remote ssd to cpu transfer task {task_info.task_id} notify from {task_info.peer_engine_addr} failed with error code: {ret}"
                 )
-                raise RuntimeError(
-                    f"Wait remote ssd to cpu transfer notify failed with error code: {ret}"
-                )
+                return False
+
         else:
             raise ValueError(
                 f"Invalid transfer type: {transfer_type} for PEER2CPUTransferWorker"
             )
 
+        return True
+    
     def op_parser(
         self, transfer_op: WorkerTransferOp, layer_id: int, layer_granularity: int
     ) -> List[RDMATaskInfo]:
@@ -1259,7 +1275,10 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         try:
             req_socket.connect(peer_zmq_addr)
             req_socket.send(json.dumps(meta_info.to_dict()).encode("utf-8"))
-            reply = req_socket.recv()  # 必须等待回复
+            reply = req_socket.recv()  
+            
+            if reply != b"OK":
+                return False
             flexkv_logger.info(f"Meta info sent to {peer_zmq_addr}")
             req_socket.close()
             return True
@@ -1341,19 +1360,20 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 except zmq.Again:
                     time.sleep(0.001)
                     continue
-
+                #TODO：if recieve empty message or message is demaged, we must handle this error
                 if not message:
-                    flexkv_logger.warning("Received empty message, skipping...")
+                    self.listen_socket.send(b"ERROR")  
                     continue
-                self.listen_socket.send(b"OK")  # 必须回复
 
                 # step1: 解析 meta info
                 recv_meta = self.meta_info_parser(message)
-                # print(f"--->recv_meta, task_id: {recv_meta.task_id}, cpu_block_ids: {recv_meta.cpu_block_ids}, \
-                #         ssd_block_ids: {recv_meta.ssd_block_ids}, peer_engine_addr: {recv_meta.peer_engine_addr}, \
-                #         peer_cpu_base_ptr: {recv_meta.peer_cpu_base_ptr}, data_size {recv_meta.data_size}, \
-                #         layer_id: {recv_meta.layer_id}, layer_granularity: {recv_meta.layer_granularity}")
-                
+                if not recv_meta:
+                    self.listen_socket.send(b"ERROR")  
+                    flexkv_logger.warning("Can not parse RemoteSSD2HMetaInfo using recieved message")
+
+                self.listen_socket.send(b"OK")  
+
+                failure_msg = MooncakeNotifyMsg(task_id=recv_meta.task_id, status = NotifyStatus.FAIL) ## used when transfer fails
                 ## step2: do mem copy
                 
                 ssd_block_ids = torch.tensor(recv_meta.ssd_block_ids, dtype=torch.int64)
@@ -1361,8 +1381,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     flexkv_logger.warning(
                         "Received meta info with empty ssd_block_ids, skipping..."
                     )
-                    continue
+                    self.mooncake_transfer_engine.transfer_failure_notify(recv_meta.peer_engine_addr, 
+                                                            self.tmp_cpu_buffer.data_ptr(), recv_meta.peer_cpu_base_ptr, 
+                                                            self.mooncake_transfer_engine.get_engine_addr(),failure_msg)
 
+                    continue
+                
                 # NOTE: every time we reuse the local cpu buffer, so the local cpu buffer block ids alway start from 0
                 local_cpu_buffer_block_ids = torch.arange(
                     0, len(ssd_block_ids), dtype=torch.int64
@@ -1373,9 +1397,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 layer_id_list = torch.arange(
                     layer_id, layer_id + layer_granularity, dtype=torch.int32
                 )
-                self.copy_ssd_data_to_dram(
+                if not self.copy_ssd_data_to_dram(
                     layer_id_list, ssd_block_ids, local_cpu_buffer_block_ids
-                )
+                ):
+                    #TODO: mark as failed
+                    self.mooncake_transfer_engine.transfer_failure_notify(recv_meta.peer_engine_addr, 
+                                                                          self.tmp_cpu_buffer.data_ptr(), recv_meta.peer_cpu_base_ptr, 
+                                                                          self.mooncake_transfer_engine.get_engine_addr(),failure_msg)
+                
 
                 ## step3: do rdma transfer and send notify
                 if (
@@ -1388,7 +1417,9 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     != 0
                 ):
                     flexkv_logger.error(f"Failed to write data back to peer")
-                    ## TODO: send error notify to peer
+                    self.mooncake_transfer_engine.transfer_failure_notify(recv_meta.peer_engine_addr, 
+                                                                          self.tmp_cpu_buffer.data_ptr(), recv_meta.peer_cpu_base_ptr, 
+                                                                          self.mooncake_transfer_engine.get_engine_addr(),failure_msg)
                     continue
 
             except Exception as e:
@@ -1400,24 +1431,30 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
     ):  
         assert len(ssd_block_id_list) == len(cpu_block_id_list)
         flexkv_logger.info(f"copy ssd blocks:{ssd_block_id_list} to cpu blocks: {cpu_block_id_list}" )
-        transfer_kv_blocks_ssd(
-            ioctx=self.ioctx,
-            cpu_layer_id_list=layer_id_list,
-            cpu_tensor_ptr=self.tmp_cpu_buffer.data_ptr(),  ## copy ssd data to tmp cpu buffer
-            ssd_block_ids=ssd_block_id_list,
-            cpu_block_ids=cpu_block_id_list,
-            cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-            cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-            ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
-            ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
-            chunk_size_in_bytes=self.chunk_size_in_bytes,
-            block_stride_in_bytes=self.block_stride_in_bytes,
-            is_read=True,
-            num_blocks_per_file=self.num_blocks_per_file,
-            round_robin=self.round_robin,
-            num_threads_per_device=32,
-            is_mla=self.is_mla,
-        )
+        try:
+            transfer_kv_blocks_ssd(
+                ioctx=self.ioctx,
+                cpu_layer_id_list=layer_id_list,
+                cpu_tensor_ptr=self.tmp_cpu_buffer.data_ptr(),  ## copy ssd data to tmp cpu buffer
+                ssd_block_ids=ssd_block_id_list,
+                cpu_block_ids=cpu_block_id_list,
+                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
+                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
+                ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
+                ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
+                chunk_size_in_bytes=self.chunk_size_in_bytes,
+                block_stride_in_bytes=self.block_stride_in_bytes,
+                is_read=True,
+                num_blocks_per_file=self.num_blocks_per_file,
+                round_robin=self.round_robin,
+                num_threads_per_device=32,
+                is_mla=self.is_mla,
+            )
+        except Exception as e:
+            flexkv_logger.error(f"Copy data from ssd to cpu failed: {e}")
+            return False
+
+        return True
         
 
     def write_data_back_to_peer(
@@ -1462,7 +1499,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             ret = self.mooncake_transfer_engine.transfer_sync_write_with_notify(
                 rdma_task_info,
                 self.mooncake_transfer_engine.get_engine_addr(),
-                str(recv_meta.task_id),
+                MooncakeNotifyMsg(recv_meta.task_id, NotifyStatus.SUCCESS) # success do rdma write
             )
             return ret
         elif isinstance(src_ptrs, List):
@@ -1505,7 +1542,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             ret = self.mooncake_transfer_engine.transfer_sync_write_with_notify(
                 rdma_task_info,
                 self.mooncake_transfer_engine.get_engine_addr(),
-                recv_meta.task_id,
+                MooncakeNotifyMsg(recv_meta.task_id, NotifyStatus.FAIL) # success do rdma write
             )
 
             return ret
