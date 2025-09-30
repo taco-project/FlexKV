@@ -1,12 +1,36 @@
 import os
 import time
 from typing import List
+import json
+from enum import Enum
 
 import engine
 from engine import TransferEngine
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import MooncakeTransferEngineConfig
 from flexkv.transfer.utils import RDMATaskInfo
+
+class NotifyStatus(Enum):
+    SUCCESS = 0
+    FAIL = 1
+
+class MooncakeNotifyMsg:
+    task_id: int
+    status: NotifyStatus
+    def __init__(self, task_id: int, status: NotifyStatus):
+        self.task_id = task_id
+        self.status = status
+        
+    def to_string(self):
+        return json.dumps({
+            "task_id": self.task_id,
+            "status": self.status
+        })
+    @classmethod
+    def from_string(cls, s):
+        data = json.loads(s)
+        return cls(task_id = data["task_id"], status = data["status"])
+
 
 class MoonCakeTransferEngineWrapper:
     def __init__(
@@ -52,7 +76,7 @@ class MoonCakeTransferEngineWrapper:
         ret = self.engine.unregister_memory(buffer_ptr)
         return ret if ret == 0 else -1
 
-    def transfer_sync_impl(self, task: RDMATaskInfo) -> int:
+    def transfer_sync_read(self, task: RDMATaskInfo) -> int:
         """Transfer the data synchronously."""
 
         ret = self.engine.transfer_sync_read(
@@ -66,12 +90,18 @@ class MoonCakeTransferEngineWrapper:
         )
         return ret if ret == 0 else -1
     
-    def transfer_sync_write_with_notify(self, task: RDMATaskInfo, notify_name: str, notify_msg: str):
-        notify = engine.TransferNotify(notify_name, notify_msg)
+    def transfer_sync_write_with_notify(self, task: RDMATaskInfo, notify_name: str, msg : MooncakeNotifyMsg):
+        notify = engine.TransferNotify(notify_name, msg.to_string())
         ret = self.engine.transfer_sync(
             task.peer_engine_addr, task.src_ptr, task.dst_ptr, task.data_size, engine.TransferOpcode.Write, notify)
         return ret if ret == 0 else -1
     
+    def transfer_failure_notify(self, peer_engine_addr, src_ptr, dst_ptr, notify_name, notify_msg):
+        notify = engine.TransferNotify(notify_name, notify_msg)
+        ret = self.engine.transfer_sync(
+           peer_engine_addr, src_ptr, dst_ptr, 0, engine.TransferOpcode.Write, notify)
+        return ret if ret == 0 else -1
+
     def wait_notify(self, peer_addr: str, task_id: int):
         """
         Wait for the notify from the remote peer. Currently, this operation will block the main thread.
@@ -89,13 +119,17 @@ class MoonCakeTransferEngineWrapper:
         # TODO: modify the implementation to support parallel tasks.
         timeout = 5.0 # timeout after 5 seconds
         start_time = time.time()
+        transfer_status = False
         while True:
             found = False
             notifies = self.engine.get_notifies()
             if notifies:
                 for notify in notifies:
-                    if notify.name == peer_addr or notify.msg == str(task_id):
+                    msg = MooncakeNotifyMsg.from_string(notify.msg)
+                    if notify.name == peer_addr and msg.task_id == task_id:
                         flexkv_logger.info(f"Received notify: {notify.name}, {notify.msg}")
+                        if msg.status == NotifyStatus.SUCCESS:
+                            transfer_status = True
                         found= True
                         break
             if found:
@@ -108,7 +142,7 @@ class MoonCakeTransferEngineWrapper:
         
             time.sleep(0.01) # sleep for 10 ms to avoid busy waiting
             
-        return True
+        return transfer_status
     
     # helper function
     def get_engine_addr(self):
