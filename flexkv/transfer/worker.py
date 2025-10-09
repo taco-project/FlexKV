@@ -104,7 +104,7 @@ class TransferWorkerBase(ABC):
         self.finished_ops_queue: MPQueue[int] = finished_ops_queue
 
         self.op_buffer_tensor = op_buffer_tensor
-        # cudaHostRegister(self.op_buffer_tensor) ## TODO: fix this bug
+        cudaHostRegister(self.op_buffer_tensor) 
 
     @classmethod
     def _get_worker_id(cls) -> int:
