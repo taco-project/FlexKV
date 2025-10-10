@@ -1,7 +1,6 @@
 from collections import defaultdict
 from typing import Tuple, List, Dict, Optional, Any
 import torch
-import numpy as np
 
 def group_blocks_by_node_and_type(
     src_block_ids: torch.Tensor,
@@ -96,16 +95,18 @@ class RemoteSSD2HMetaInfo:
     ssd_block_ids: List[int]
     peer_engine_addr: str # the mooncake engine address of the node that initiates the transfer, used for write data back to the node.
     peer_cpu_base_ptr: int # the cpu buffer base ptr of the peer node, used for calculating the dst ptrs.
+    peer_zmq_status_addr: str
     data_size: int
     layer_id: int
     layer_granularity: int
     
-    def __init__(self, task_id, cpu_block_ids, ssd_block_ids, peer_engine_addr, peer_cpu_base_ptr, data_size, layer_id, layer_granularity):
+    def __init__(self, task_id, cpu_block_ids, ssd_block_ids, peer_engine_addr, peer_cpu_base_ptr, peer_zmq_status_addr, data_size, layer_id, layer_granularity):
         self.task_id = task_id
         self.cpu_block_ids = cpu_block_ids
         self.ssd_block_ids = ssd_block_ids
         self.peer_engine_addr = peer_engine_addr
         self.peer_cpu_base_ptr = peer_cpu_base_ptr
+        self.peer_zmq_status_addr = peer_zmq_status_addr
         self.data_size = data_size
         self.layer_id = layer_id
         self.layer_granularity = layer_granularity
@@ -118,6 +119,7 @@ class RemoteSSD2HMetaInfo:
             ssd_block_ids=data.get("ssd_block_ids"),
             peer_engine_addr=data.get("peer_engine_addr"),
             peer_cpu_base_ptr = data.get("peer_cpu_base_ptr"),
+            peer_zmq_status_addr = data.get("peer_zmq_status_addr"),
             data_size=data.get("data_size"),
             layer_id = data.get("layer_id"),
             layer_granularity = data.get("layer_granularity")
@@ -129,6 +131,7 @@ class RemoteSSD2HMetaInfo:
             "ssd_block_ids": self.ssd_block_ids,
             "peer_engine_addr": self.peer_engine_addr,
             "peer_cpu_base_ptr": self.peer_cpu_base_ptr,
+            "peer_zmq_status_addr": self.peer_zmq_status_addr,
             "data_size": self.data_size,
             "layer_id": self.layer_id,
             "layer_granularity": self.layer_granularity,
