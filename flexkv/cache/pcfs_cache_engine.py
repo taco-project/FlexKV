@@ -175,7 +175,7 @@ class HierarchyLRCacheEngine:
             physical_blocks=phys_np,
             block_node_ids=bnids_np,
             matched_pos=matched_pos,
-            insert_to_local_cpu=insert_to_local_cpu_index,
+            insert_to_local_cpu_index=insert_to_local_cpu_index,
         )
 
     def nodeids_to_file_nodeids(self,
@@ -435,10 +435,10 @@ class HierarchyLRCacheEngine:
                 local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 0)),
                 local_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
                 local_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
-                local_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
+                # local_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
                 remote_max_num_blocks=int(cache_config.num_remote_blocks or 0),
-                remote_node_id=int(node_id),
-                remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
+                # remote_node_id=int(node_id),
+                # remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
                 remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 128)),
                 remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 1000)),
                 remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
