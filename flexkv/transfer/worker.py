@@ -1291,10 +1291,10 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         op_buffer_tensor: torch.Tensor,
         cpu_blocks: torch.Tensor,
         cpu_kv_layout: KVCacheLayout,
-        ssd_kv_layout: KVCacheLayout,
         remote_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         cache_config: CacheConfig,
+        ssd_kv_layout: KVCacheLayout = None,
         ssd_files: Dict[int, List[str]] = None,  # ssd_device_id -> file_paths
         num_blocks_per_file: int = 0,
     ):
@@ -1373,7 +1373,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         ## when enable p2p ssd, we need start a zmq server to recive the meta info from remote node, and allocate a cpu buffer for
         ## ssd to cpu copy
         if self.cache_config.enable_p2p_ssd:
-
+            assert ssd_kv_layout is not None, "Invalid ssd kv layout!"
             ## init the cpu buffer for ssd to cpu copy
             # NOTE: now we allocate 500 blocks for test
             self.tmp_cpu_buffer_layout = KVCacheLayout(
@@ -1397,21 +1397,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.tmp_cpu_buffer.numel() * self.tmp_cpu_buffer.element_size(),
             )
 
-            ## start the zmq server
-            # self.zmq_context = zmq.Context()
-            # ## used for listening the meta info
-            # self.zmq_listen_addr = f"tcp://{cache_config.local_zmq_ip}:{cache_config.local_zmq_port}"
-            # self.listen_socket = self.zmq_context.socket(zmq.REP)
-            # self.listen_socket.bind(self.zmq_listen_addr)
-            
-            # ## used for listening the transfer status
-            # self.zmq_status_addr = f"tcp://{cache_config.local_zmq_ip}:{cache_config.local_zmq_port+1}"
-            # self.status_socket = self.zmq_context.socket(zmq.PULL)
-            # self.status_socket.bind(self.zmq_status_addr)
-            
-            # self.shutdown_event = threading.Event()
-            # self.zmq_thread = threading.Thread(target=self.ssd_handle_loop, daemon=True)
-            # self.start_meta_info_reciver()
+            ## start the zmq server and client
             self.zmq_server = SSDZMQServer(cache_config.local_zmq_ip, cache_config.local_zmq_port, self.ssd_handle_loop)
             self.zmq_client = SSDZMQClient(cache_config.local_zmq_ip, cache_config.local_zmq_port+1)
             
@@ -1442,18 +1428,18 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             )
             
        
-        self.round_robin = 1
-        # initialize ssd ioctx
-        try:
-            self.ioctx = c_ext.SSDIOCTX(
-                ssd_files,
-                len(ssd_files),
-                cache_config.ssd_cache_iouring_entries,
-                cache_config.ssd_cache_iouring_flags,
-            )
-        except Exception as e:
-            flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
-            raise RuntimeError("SSD Worker init failed") from e
+            self.round_robin = 1
+            # initialize ssd ioctx
+            try:
+                self.ioctx = c_ext.SSDIOCTX(
+                    ssd_files,
+                    len(ssd_files),
+                    cache_config.ssd_cache_iouring_entries,
+                    cache_config.ssd_cache_iouring_flags,
+                )
+            except Exception as e:
+                flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
+                raise RuntimeError("SSD Worker init failed") from e
 
         ## unique task id counter for remote ssd to cpu transfer task
         self.remote_ssd_task_id_counter = 0
@@ -1471,18 +1457,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             self.remote_ssd_task_id_counter += 1
             return old_value
 
-    def start_meta_info_reciver(self):
-        self.zmq_thread.start()
-
     def shutdown(self):
-        # self.shutdown_event.set()
-        # try:
-        #     self.listen_socket.close(0)
-        #     self.status_socket.close(0)
-        #     self.zmq_context.term()
-        # except Exception as e:
-        #     flexkv_logger.error(f"Error when closing ZMQ: {e}")
-        # self.zmq_thread.join()
         self.zmq_server.shutdown()
         self.zmq_client.shutdown()
         # unregist buffer in mooncake engine
