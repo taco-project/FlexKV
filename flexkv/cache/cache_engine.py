@@ -369,7 +369,7 @@ class GlobalCacheEngine:
         else:
             #TODO pcfs will be supported later
             (transfer_graph, finished_ops_ids, node_to_unlock,
-             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \ 
+             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
                 self._get_impl_global(
                     request_id,
                     sequence_meta,
@@ -671,7 +671,8 @@ class GlobalCacheEngine:
                 dst_block_ids = fragment1_cpu_blocks_local,
                 layer_id = 0,
                 layer_granularity = layer_num,
-                remote_node_ids = cpu_matched_result.matched_node_ids
+                remote_node_ids = cpu_matched_result.matched_node_ids,
+                src_block_node_ids = cpu_matched_result.matched_node_ids  # Add this for worker
             )
             transfer_graph.add_transfer_op(op_peerh2h)
             #TODO here we dont combine peer cpu or local cpu match results, so we can safely add remote results to local cpu
@@ -696,7 +697,8 @@ class GlobalCacheEngine:
                 dst_block_ids = fragment2_cpu_blocks,
                 layer_id = 0,
                 layer_granularity = layer_num,
-                remote_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None
+                remote_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None,
+                src_block_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None
             )
             transfer_graph.add_transfer_op(op_disk2h)
             # we only insert the buffer blocks to cpu cache engine only:
@@ -1106,10 +1108,14 @@ class GlobalCacheEngine:
             assert self.cpu_cache_engine is not None
             self.cpu_cache_engine.unlock(node_to_unlock[DeviceType.CPU][0])
             self.cpu_cache_engine.set_ready(node_to_unlock[DeviceType.CPU][0], True, node_to_unlock[DeviceType.CPU][1])
+            if is_put and self.enable_kv_sharing:
+                self.cpu_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.CPU][0])
         if DeviceType.SSD in node_to_unlock:
             assert self.ssd_cache_engine is not None
             self.ssd_cache_engine.unlock(node_to_unlock[DeviceType.SSD][0])
             self.ssd_cache_engine.set_ready(node_to_unlock[DeviceType.SSD][0], True, node_to_unlock[DeviceType.SSD][1])
+            if is_put and self.enable_kv_sharing:
+                self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
         if DeviceType.REMOTE in node_to_unlock:
             assert self.remote_cache_engine is not None
             self.remote_cache_engine.unlock(node_to_unlock[DeviceType.REMOTE][0])

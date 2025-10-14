@@ -254,6 +254,21 @@ std::shared_ptr<CMatchResult> CRadixTreeIndex::match_prefix(
     }
 
     child_hash = HashType(block_hashes_ptr[prefix_blocks_num + current_node->size()]);
+    // DEBUG: Print matching attempt
+    bool is_root_node = (current_node->get_parent() == nullptr);
+    printf("[DEBUG] Match loop: prefix_blocks_num=%d, current_node_size=%d, is_root=%s, child_hash=%ld, has_children=%d\n",
+           prefix_blocks_num, current_node->size(), is_root_node ? "true" : "false", 
+           child_hash, current_node->get_num_children());
+    
+    // DEBUG: Print all children hashes if root
+    if (is_root_node && current_node->get_num_children() > 0) {
+      printf("[DEBUG] Root children hashes: ");
+      current_node->for_each_child([](HashType h, CRadixNode* c) {
+        printf("%ld ", h);
+      });
+      printf("\n");
+    }
+    
     if (current_node->lookup_child(child_hash)) {
       if (current_node->is_ready()) {
         last_ready_node = current_node;

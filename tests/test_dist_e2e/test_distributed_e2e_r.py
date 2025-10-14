@@ -22,11 +22,12 @@ def put_into_flexKV():
     cache_config.enable_p2p_cpu = True
     cache_config.enable_p2p_ssd = True
     # cache_config.index_accel = True
-    cache_config.redis_host = "172.16.0.18"
+    cache_config.redis_host = "10.6.131.10"
     cache_config.redis_port = 6379
-    cache_config.redis_password = "yourpass"
-    cache_config.local_zmq_ip = "172.16.0.29"
+    cache_config.redis_password = "redis-serving-passwd"
+    cache_config.local_zmq_ip = "10.6.131.9"
     cache_config.local_zmq_port = 5555
+    cache_config.local_ip = "10.6.131.9"
     cache_config.num_cpu_blocks = 100
     cache_config.num_ssd_blocks = 1000
     cache_config.num_remote_blocks = 2000
