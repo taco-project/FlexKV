@@ -249,11 +249,11 @@ class TransferEngine:
             self._worker_map[TransferType.DISK2D] = self.gds_workers
             self._worker_map[TransferType.D2DISK] = self.gds_workers
             
-        if self._cpu_handle is not None and self.cache_config.enable_kv_sharing and self.cache_config.enable_p2p_cpu:
+        if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
+            or (self._ssd_handle and self.cache_config.enable_p2p_ssd)):
             ## NOTE:if we have the cpu handle and enable p2p cpu transfer we need this worker 
             ## (currently we inplement cpu and ssd distributed transfer in one worker)
-            if self.cache_config.enable_p2p_ssd and not self.cache_config.enable_p2p_cpu:
-                raise ValueError("enable_p2p_ssd requires enable_p2p_cpu to be True")
+
             flexkv_logger.info(f"[transfer_engine] initializing the PEER2CPUTransferWorker!")
             self.cpu_remote_cpu_worker: WorkerHandle = PEER2CPUTransferWorker.create_worker(
                 finished_ops_queue=self.finished_ops_queue,
