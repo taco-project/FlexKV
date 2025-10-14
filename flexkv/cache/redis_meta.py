@@ -235,7 +235,7 @@ class RedisNodeInfo:
             node_key = f"node:{node_id}"
             self._client.hset(node_key, mapping={
                 "node_id": str(node_id),
-                "local_ip": self.local_ip,
+                "ip": self.local_ip,
                 "uuid": self.uuid,
                 "status": "active",
                 "timestamp": str(int(time.time()))

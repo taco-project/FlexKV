@@ -1153,10 +1153,14 @@ class GlobalCacheEngine:
             assert self.cpu_cache_engine is not None
             self.cpu_cache_engine.unlock(node_to_unlock[DeviceType.CPU][0])
             self.cpu_cache_engine.set_ready(node_to_unlock[DeviceType.CPU][0], True, node_to_unlock[DeviceType.CPU][1])
+            if is_put and self.enable_kv_sharing:
+                self.cpu_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.CPU][0])
         if DeviceType.SSD in node_to_unlock:
             assert self.ssd_cache_engine is not None
             self.ssd_cache_engine.unlock(node_to_unlock[DeviceType.SSD][0])
             self.ssd_cache_engine.set_ready(node_to_unlock[DeviceType.SSD][0], True, node_to_unlock[DeviceType.SSD][1])
+            if is_put and self.enable_kv_sharing:
+                self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
         if DeviceType.REMOTE in node_to_unlock:
             assert self.remote_cache_engine is not None
             self.remote_cache_engine.unlock(node_to_unlock[DeviceType.REMOTE][0])
