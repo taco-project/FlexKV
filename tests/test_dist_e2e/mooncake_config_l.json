@@ -1,9 +1,9 @@
 {
-    "engine_ip": "172.16.0.18",
+    "engine_ip": "10.6.131.10",
     "engine_port": 12345,
     "metadata_backend": "redis",
-    "metadata_server": "redis://172.16.0.18:6380",
-    "metadata_server_auth": "yourpass",
+    "metadata_server": "redis://10.6.131.10:6380",
+    "metadata_server_auth": "redis-serving-passwd",
     "protocol": "rdma",
     "device_name": ""
 }
