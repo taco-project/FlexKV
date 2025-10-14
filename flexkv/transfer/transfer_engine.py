@@ -202,13 +202,13 @@ class TransferEngine:
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
-                ssd_kv_layout = self._ssd_handle.kv_layout,
                 # TODO: get remote kv_layout, now we can assume that remote kv layout is same as current node
                 remote_kv_layout=self._cpu_handle.kv_layout, 
                 dtype=self._cpu_handle.dtype,
                 cache_config = self.cache_config,
-                ssd_files = self._ssd_handle.get_file_list(),
-                num_blocks_per_file = self._ssd_handle.num_blocks_per_file
+                ssd_kv_layout = self._ssd_handle.kv_layout if self._ssd_handle else None,
+                ssd_files = self._ssd_handle.get_file_list() if self._ssd_handle else None,
+                num_blocks_per_file = self._ssd_handle.num_blocks_per_file if self._ssd_handle else None
             )
             # NOTE: now peerH2H and peerSSD2H op use the same worker
             if self.cache_config.enable_p2p_cpu:
