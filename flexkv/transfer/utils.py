@@ -2,33 +2,39 @@ from collections import defaultdict
 from typing import Tuple, List, Dict, Optional, Any
 import torch
 
-def group_blocks_by_node_and_type(
+
+def group_blocks_by_node(
     src_block_ids: torch.Tensor,
     dst_block_ids: torch.Tensor,
-    remote_block_node_ids: List[int],
+    remote_block_node_ids: List[int]
 ) -> Dict[int, Dict[str, List[int]]]:
-    '''
-    group the blocks by remote node id and remote block source type
-    Parameters:
-        src_block_ids (torch.Tensor): the source block ids on remote node
-        dst_block_ids (torch.Tensor): the destination block ids on local node
-        remote_block_node_ids (List[int]): the remote node ids for each block
-        remote_block_src_types (List[int]): the remote block source types for each block
-    Returns:
-        Dict[Tuple[int, int], Dict[str, List[int]]]: the grouped blocks
-        1st key: (node_id, src_type)
-        2nd key: "src" or "dst"
-        value: List of block ids
-    '''
     groups = defaultdict(lambda: {"src": [], "dst": []})
-
-    for src, dst, node_id in zip(
-        src_block_ids, dst_block_ids, remote_block_node_ids
-    ):
+    for src, dst, node_id in zip(src_block_ids.tolist(), dst_block_ids.tolist(), remote_block_node_ids):
         groups[node_id]["src"].append(src)
         groups[node_id]["dst"].append(dst)
-
     return dict(groups)
+
+def split_contiguous_blocks(
+    src_list: List[int], dst_list: List[int]
+)-> List[Dict[str, List[int]]]:
+    if not src_list:
+        return []
+
+    result = []
+    current_src = [src_list[0]]
+    current_dst = [dst_list[0]]
+
+    for i in range(1, len(src_list)):
+        if src_list[i] == src_list[i - 1] + 1:
+            current_src.append(src_list[i])
+            current_dst.append(dst_list[i])
+        else:
+            result.append({"src": current_src, "dst": current_dst})
+            current_src = [src_list[i]]
+            current_dst = [dst_list[i]]
+
+    result.append({"src": current_src, "dst": current_dst})
+    return result
 
 def group_blocks_by_node_and_segment(
     src_block_ids: torch.Tensor,
