@@ -834,8 +834,9 @@ class GDSTransferWorker(TransferWorkerBase):
     def __init__(
         self,
         worker_id: int,
-        transfer_queue: MPQueue,
+        transfer_conn: Connection,
         finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
         gpu_blocks: List[TensorSharedHandle],
         gds_file_paths: List[str],  # File paths instead of GDS Manager
         num_blocks_per_file: int,
@@ -860,7 +861,7 @@ class GDSTransferWorker(TransferWorkerBase):
             gpu_device_id: GPU device ID
         """
         # Initialize base class first
-        super().__init__(worker_id, transfer_queue, finished_ops_queue)
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         
         self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
@@ -899,16 +900,16 @@ class GDSTransferWorker(TransferWorkerBase):
 
     def _transfer_impl(
         self,
-        src_block_ids: np.ndarray,
-        dst_block_ids: np.ndarray,
+        src_block_ids: torch.Tensor,
+        dst_block_ids: torch.Tensor,
         transfer_type: TransferType,
         layer_id: int,
         layer_granularity: int,
         **kwargs: Any,
     ) -> None:
         """Implement actual transfer between GPU and GDS"""
-        assert src_block_ids.dtype == np.int64
-        assert dst_block_ids.dtype == np.int64
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
 
         if layer_id == -1:
@@ -919,12 +920,12 @@ class GDSTransferWorker(TransferWorkerBase):
         # Convert to tensors
         if transfer_type == TransferType.GDS2D:
             # GDS to GPU: src=GDS, dst=GPU
-            gds_block_id_list = torch.from_numpy(src_block_ids).to(dtype=torch.int64).pin_memory()
-            gpu_block_id_list = torch.from_numpy(dst_block_ids).to(dtype=torch.int64).pin_memory()
+            gds_block_id_list = src_block_ids
+            gpu_block_id_list = dst_block_ids
         elif transfer_type == TransferType.D2GDS:
             # GPU to GDS: src=GPU, dst=GDS
-            gpu_block_id_list = torch.from_numpy(src_block_ids).to(dtype=torch.int64).pin_memory()
-            gds_block_id_list = torch.from_numpy(dst_block_ids).to(dtype=torch.int64).pin_memory()
+            gpu_block_id_list = src_block_ids
+            gds_block_id_list = dst_block_ids
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for GDSTransferWorker")
 
@@ -976,11 +977,13 @@ class GDSTransferWorker(TransferWorkerBase):
         if layer_granularity == -1:
             layer_granularity = self.num_layers
 
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+
         with torch.cuda.stream(self.transfer_stream):
             start_time = time.time()
             self._transfer_impl(
-                transfer_op.src_block_ids,
-                transfer_op.dst_block_ids,
+                src_block_ids,
+                dst_block_ids,
                 transfer_op.transfer_type,
                 layer_id,
                 layer_granularity,
@@ -988,7 +991,7 @@ class GDSTransferWorker(TransferWorkerBase):
             end_time = time.time()
 
             kv_dim = 2 if not self.is_mla else 1
-            transfer_size = self.chunk_size_in_bytes * layer_granularity * len(transfer_op.src_block_ids) * kv_dim
+            transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
 
             self._log_transfer_performance(
                 transfer_op,
@@ -1002,8 +1005,9 @@ class tpGDSTransferWorker(TransferWorkerBase):
     def __init__(
         self,
         worker_id: int,
-        transfer_queue: MPQueue,
+        transfer_conn: Connection,
         finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
         gpu_blocks: List[List[TensorSharedHandle]],
         gds_file_paths: List[str],
         num_blocks_per_file: int,
@@ -1030,7 +1034,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             dp_group_id: Data parallel group ID
         """
         # Initialize base class first
-        super().__init__(worker_id, transfer_queue, finished_ops_queue)
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         
         assert len(gpu_blocks) == tp_group_size
         # Handle tensor import for multi-process case
@@ -1075,15 +1079,15 @@ class tpGDSTransferWorker(TransferWorkerBase):
             self.num_gpus, self.gpu_blocks, gds_file_paths, dp_group_id)
 
     def _transfer_impl(self,
-                       src_block_ids: np.ndarray,
-                       dst_block_ids: np.ndarray,
+                       src_block_ids: torch.Tensor,
+                       dst_block_ids: torch.Tensor,
                        transfer_type: TransferType,
                        layer_id: int,
                        layer_granularity: int,
                        **kwargs: Any,
                        ) -> None:
-        assert src_block_ids.dtype == np.int64
-        assert dst_block_ids.dtype == np.int64
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
 
         if transfer_type == TransferType.D2GDS:
@@ -1097,8 +1101,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for tpGDSTransferWorker")
 
-        gpu_block_id_list = torch.from_numpy(gpu_block_ids).to(dtype=torch.int64).pin_memory()
-        gds_block_id_list = torch.from_numpy(gds_block_ids).to(dtype=torch.int64).pin_memory()
+        gpu_block_id_list = gpu_block_ids
+        gds_block_id_list = gds_block_ids
 
         assert len(gpu_block_id_list) == len(gds_block_id_list)
 
@@ -1131,10 +1135,12 @@ class tpGDSTransferWorker(TransferWorkerBase):
         if layer_granularity == -1:
             layer_granularity = self.num_layers
 
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+
         start_time = time.time()
         self._transfer_impl(
-            transfer_op.src_block_ids,
-            transfer_op.dst_block_ids,
+            src_block_ids,
+            dst_block_ids,
             transfer_op.transfer_type,
             layer_id,
             layer_granularity,
@@ -1142,7 +1148,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
         end_time = time.time()
 
         kv_dim = 2 if not self.is_mla else 1
-        transfer_size = self.gds_chunk_size_in_bytes * layer_granularity * len(transfer_op.src_block_ids) * kv_dim
+        transfer_size = self.gds_chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
 
         self._log_transfer_performance(
             transfer_op,

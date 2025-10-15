@@ -133,11 +133,14 @@ class TransferManager:
             if self.cache_config.enable_remote \
             else None
         )
+        gds_handle = self.storage_engine.get_storage_handle(DeviceType.GDS) \
+            if self.cache_config.enable_gds else None
         self.transfer_engine = TransferEngine(gpu_handles=self.gpu_handles,
                                               model_config=self.model_config,
                                               cache_config=self.cache_config,
                                               cpu_handle=cpu_handle,
                                               ssd_handle=ssd_handle,
+                                              gds_handle=gds_handle,
                                               remote_handle=remote_handle)
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:

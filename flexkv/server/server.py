@@ -434,7 +434,7 @@ if __name__ == "__main__":
     cache_config = CacheConfig(enable_cpu=True,
                                 enable_ssd=False,
                                 enable_remote=False,
-                                use_gds=False,
+                                enable_gds=False,
                                 use_pinned_memory=True,
                                 tokens_per_block=tokens_per_block,
                                 num_cpu_blocks=num_cpu_blocks,)

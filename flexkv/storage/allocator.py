@@ -285,7 +285,7 @@ class GDSAllocator(BaseStorageAllocator):
         self,
         layout: KVCacheLayout,
         dtype: torch.dtype,
-        gds_cache_dirs: Optional[List[str]] = None,
+        gds_cache_dir: Optional[Union[str, List[str]]] = None,
         **kwargs: Any,
     ):
         """
@@ -294,7 +294,7 @@ class GDSAllocator(BaseStorageAllocator):
         Args:
             layout: KV cache layout information
             dtype: Data type of tensors 
-            gds_cache_dirs: List of directories to create GDS files in
+            gds_cache_dir: List of directories to create GDS files in
         """
         self.layout = layout 
         self.dtype = dtype
@@ -302,10 +302,14 @@ class GDSAllocator(BaseStorageAllocator):
         print(f"[GDSAllocator] total_file_size: {self.total_file_size}")
         
         # Use provided directories or default
-        if gds_cache_dirs is None or len(gds_cache_dirs) == 0:
-            self.gds_cache_dirs = ["./flexkv_gds"]
+        if gds_cache_dir is None:
+            self.gds_cache_dir = ["./flexkv_gds"]
         else:
-            self.gds_cache_dirs = gds_cache_dirs
+            # Convert to list if it's a string
+            if isinstance(gds_cache_dir, str):
+                self.gds_cache_dir = [gds_cache_dir]
+            else:
+                self.gds_cache_dir = gds_cache_dir
             
         # Configuration for file size limits  
         self.max_blocks_per_file = kwargs.get("max_blocks_per_file", -1)
@@ -334,12 +338,12 @@ class GDSAllocator(BaseStorageAllocator):
         from flexkv import c_ext
         
         # Ensure directories exist
-        for dir_path in self.gds_cache_dirs:
+        for dir_path in self.gds_cache_dir:
             os.makedirs(dir_path, exist_ok=True)
             if not os.path.isdir(dir_path):
                 raise ValueError(f"gds_cache_dir must be a directory: {dir_path}")
         
-        num_gds_devices = len(self.gds_cache_dirs)
+        num_gds_devices = len(self.gds_cache_dir)
         
         # Check if total blocks can be evenly distributed across devices
         if self.layout.num_block % num_gds_devices != 0:
@@ -351,7 +355,7 @@ class GDSAllocator(BaseStorageAllocator):
         
         # Calculate file size limits (use filesystem limit or default)
         try:
-            fsys_max_blocks_per_file = self._get_file_size_limit(self.gds_cache_dirs[0]) // block_size
+            fsys_max_blocks_per_file = self._get_file_size_limit(self.gds_cache_dir[0]) // block_size
         except (OSError, AttributeError):
             # Use 4GB as default if we can't get filesystem limit
             fsys_max_blocks_per_file = (4 * 1024 * 1024 * 1024) // block_size
@@ -367,7 +371,7 @@ class GDSAllocator(BaseStorageAllocator):
         
         # Create files for each device/directory
         for device_idx in range(num_gds_devices):
-            dir_path = self.gds_cache_dirs[device_idx]
+            dir_path = self.gds_cache_dir[device_idx]
             for file_idx in range(num_files_per_device):
                 file_path = os.path.join(dir_path, f"gds_cache_{device_idx}_{file_idx}.dat")
                 file_paths.append(file_path)

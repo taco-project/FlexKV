@@ -59,7 +59,7 @@ if __name__ == "__main__":
         enable_ssd=False,
         enable_remote=False,
         cpu_kv_layout=cpu_kv_layout,
-        use_gds=False,
+        enable_gds=False,
         use_pinned_memory=True,
         tokens_per_block=args.block_size,
         num_cpu_blocks=args.num_cpu_blocks,

@@ -32,7 +32,7 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_remote: bool = False
-    use_gds: bool = False
+    enable_gds: bool = False
     use_pinned_memory: bool = False
     index_accel: bool = False
 
@@ -41,6 +41,7 @@ class CacheConfig:
     cpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
     ssd_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
     remote_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
+    gds_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
@@ -61,7 +62,7 @@ class CacheConfig:
     ssd_cache_iouring_flags: int = 0
 
     # gds cache configs
-    gds_cache_dir: Optional[List[str]] = None
+    gds_cache_dir: Optional[Union[str, List[str]]] = None
 
     # remote cache configs
     remote_cache_size_mode: str = "file_size"  # file_size or block_num

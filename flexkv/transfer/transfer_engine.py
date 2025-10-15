@@ -182,8 +182,8 @@ class TransferEngine:
             if self.tp_size == 1:
                 self.gds_workers = [
                     GDSTransferWorker.create_worker(
-                        worker_id=30 + i,  # Unique worker IDs for GDS workers
                         finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
                         gpu_blocks=self.gpu_handles[i].get_tensor_handle_list(),
                         gds_file_paths=self._gds_handle.data,  # Pass file paths instead of GDSManager
                         num_blocks_per_file=self._gds_handle.num_blocks_per_file,
@@ -197,8 +197,8 @@ class TransferEngine:
             else:
                 self.gds_workers = [
                     tpGDSTransferWorker.create_worker(
-                        worker_id=40 + i,  # Unique worker IDs for TP GDS workers
                         finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
                         gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
                                     for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
                         gds_file_paths=self._gds_handle.data,  # Pass file paths instead of GDSManager
