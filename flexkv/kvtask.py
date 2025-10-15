@@ -16,7 +16,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import TransferOpGraph, get_nvtx_default_color
 from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import GlobalCacheEngine
-from flexkv.transfer_manager import TransferManagerHandle
+from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
 
 class TaskStatus(Enum):
@@ -76,7 +76,6 @@ class KVTaskManager:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
-                 use_separate_process: bool = True,
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
@@ -88,17 +87,66 @@ class KVTaskManager:
         self.model_config = model_config
         self._check_config(model_config, cache_config)
 
-        self.cache_engine = GlobalCacheEngine(cache_config, model_config)
+        self.is_multinode_tp = False
 
-        self.transfer_handle = TransferManagerHandle(
-            self.model_config,
-            self.cache_config,
-            use_separate_process=use_separate_process,
-            gpu_register_port=gpu_register_port
+        if self.model_config.tp_size > torch.cuda.device_count():
+            if self.model_config.tp_size != torch.cuda.device_count() * 2:
+                raise ValueError("Only support 2 nodes TP")
+            if self.model_config.dp_size != 1:
+                raise ValueError("Only support dp_size=1 for multi-node TP")
+            self.is_multinode_tp = True
+
+        self.cache_engine = GlobalCacheEngine(cache_config, model_config)
+        """
+        多节点TP 单机测试：
+        1. 禁用本地的transfer manager，使用远程的transfer manager
+        """
+        # self.transfer_handles = [TransferManagerHandle(
+        #     self.model_config,
+        #     self.cache_config,
+        #     mode="process",
+        #     gpu_register_port=gpu_register_port
+        # )]
+        # if self.is_multinode_tp:
+        #     self.transfer_handles.append(TransferManagerHandle(
+        #         self.model_config,
+        #         self.cache_config,
+        #         mode="remote",
+        #         gpu_register_port=gpu_register_port,
+        #         master_host="tcp://localhost",
+        #         master_ports=("5556", "5557", "5558")
+        #     ))
+
+        """
+        2. 节点A启动handle，连接节点B的TransferManager进程
+        """
+        self.transfer_handles = [TransferManagerHandle(
+                self.model_config,
+                self.cache_config,
+                mode="remote",
+                gpu_register_port=gpu_register_port,
+                master_host="tcp://localhost",
+                master_ports=("5556", "5557", "5558")
+            )
+        ]
+
+        """
+        3. 模拟节点B的TransferManager进程，实际场景中由vllm worker启动
+        """
+        self.remote_process = TransferManagerOnRemote.create_process(
+            model_config=self.model_config,
+            cache_config=self.cache_config,
+            gpu_register_port=gpu_register_port,
+            master_host="tcp://localhost",
+            master_ports=("5556", "5557", "5558")
         )
 
         self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
         self.graph_to_task: Dict[int, int] = {}
+
+        self.uncompleted_ops: Dict[int, int] = {}  # op_id -> completed_count
+        self.uncompleted_graphs: Dict[int, int] = {}  # graph_id -> completed_count
+        self.required_completed_count: int = len(self.transfer_handles)
 
         self.task_id_counter = 0
         self.task_id_lock = threading.Lock()
@@ -106,16 +154,21 @@ class KVTaskManager:
         self.running_tasks: int = 0
 
     def start(self) -> None:
-        self.transfer_handle.start()
+        for transfer_handle in self.transfer_handles:
+            transfer_handle.start()
 
     def is_ready(self) -> bool:
-        return self.transfer_handle.is_ready()
+        return all(transfer_handle.is_ready() for transfer_handle in self.transfer_handles)
 
     def __del__(self) -> None:
         self.shutdown()
 
     def shutdown(self) -> None:
-        self.transfer_handle.shutdown()
+        for transfer_handle in self.transfer_handles:
+            transfer_handle.shutdown()
+
+        self.remote_process.terminate()
+        self.remote_process.join()
 
     def create_get_task(self,
                         task_id: int,
@@ -194,7 +247,8 @@ class KVTaskManager:
         task.status = TaskStatus.RUNNING
         nvtx.mark(f"launch task: task_id={task_id}, graph_id={transfer_graph.graph_id}")
         if transfer_graph.num_ops > 0:
-            self.transfer_handle.submit(transfer_graph)
+            for transfer_handle in self.transfer_handles:
+                transfer_handle.submit(transfer_graph)
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
         completed_ops = self._get_completed_ops(timeout)
@@ -268,7 +322,26 @@ class KVTaskManager:
             self._mark_completed(task_id)
 
     def _get_completed_ops(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
-        return self.transfer_handle.wait(timeout)
+        results = []
+        for transfer_handle in self.transfer_handles:
+            completed_ops = transfer_handle.wait(timeout)
+            for op_id, graph_id in completed_ops:
+                flexkv_logger.info(f"Completed op_id: {op_id}, graph_id: {graph_id}")
+                if op_id == -1:
+                    completed_count = self.uncompleted_graphs.get(graph_id, 0) + 1
+                    if completed_count == self.required_completed_count:
+                        results.append((-1, graph_id))
+                        self.uncompleted_graphs.pop(graph_id, None)
+                    else:
+                        self.uncompleted_graphs[graph_id] = completed_count
+                else:
+                    completed_count = self.uncompleted_ops.get(op_id, 0) + 1
+                    if completed_count == self.required_completed_count:
+                        results.append((op_id, graph_id))
+                        self.uncompleted_ops.pop(op_id, None)
+                    else:
+                        self.uncompleted_ops[op_id] = completed_count
+        return results
 
     def _check_config(self, model_config: ModelConfig, cache_config: CacheConfig) -> None:
         if cache_config.enable_remote:
@@ -313,15 +386,13 @@ class KVTaskManager:
             else:
                 raise ValueError("remote_cache_size_mode must block_num or file_size model")
 
-
 class KVTaskEngine(KVTaskManager):
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
-                 use_separate_process: bool = True,
                  ):
-        super().__init__(model_config, cache_config, gpu_register_port, use_separate_process)
+        super().__init__(model_config, cache_config, gpu_register_port)
         self.tracer = FlexKVTracer(cache_config)
 
     def get_async(self,
