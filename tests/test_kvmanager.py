@@ -52,6 +52,9 @@ def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_c
         while True:
             time.sleep(1)
     except Exception as e:
+        print(f"[TP Client {tp_rank}] Exception occurred: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         if child_conn is not None:
             child_conn.send(None)
             child_conn.close()
@@ -127,14 +130,15 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
     kvmanager.start()
 
     # Create pipes for each tp_client to send GPU blocks back
+    mp_ctx = mp.get_context('spawn')
     pipe_connections = []
     tp_client_processes = []
 
     for tp_rank in range(tp_size):
-        parent_conn, child_conn = Pipe()
+        parent_conn, child_conn = mp_ctx.Pipe()
         pipe_connections.append(parent_conn)
 
-        tp_client_process = Process(
+        tp_client_process = mp_ctx.Process(
             target=run_tp_client,
             args=(0, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks + tp_rank, child_conn),
             daemon=True

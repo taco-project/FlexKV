@@ -4,7 +4,7 @@ import threading
 from enum import Enum
 from dataclasses import dataclass
 from typing import Callable
-
+import multiprocessing as mp
 
 from expiring_dict import ExpiringDict
 import nvtx
@@ -326,7 +326,6 @@ class KVTaskManager:
         for transfer_handle in self.transfer_handles:
             completed_ops = transfer_handle.wait(timeout)
             for op_id, graph_id in completed_ops:
-                flexkv_logger.info(f"Completed op_id: {op_id}, graph_id: {graph_id}")
                 if op_id == -1:
                     completed_count = self.uncompleted_graphs.get(graph_id, 0) + 1
                     if completed_count == self.required_completed_count:

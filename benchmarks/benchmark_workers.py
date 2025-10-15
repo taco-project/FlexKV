@@ -84,6 +84,7 @@ def create_cpu_gpu_worker(
     finished_ops_queue = mp.Queue()
     if model_config.tp_size == 1:
         worker_handle = GPUCPUTransferWorker.create_worker(
+            mp_ctx=mp.get_context('spawn'),
             finished_ops_queue=finished_ops_queue,
             gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
             cpu_blocks=cpu_handle.get_tensor(),
@@ -98,6 +99,7 @@ def create_cpu_gpu_worker(
         )
     else:
         worker_handle = tpGPUCPUTransferWorker.create_worker(
+            mp_ctx=mp.get_context('spawn'),
             finished_ops_queue=finished_ops_queue,
             gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
             cpu_blocks=cpu_handle.get_tensor(),
@@ -149,6 +151,7 @@ def create_cpu_ssd_worker(
     )
     finished_ops_queue = mp.Queue()
     worker_handle = CPUSSDDiskTransferWorker.create_worker(
+                mp_ctx=mp.get_context('spawn'),
                 finished_ops_queue=finished_ops_queue,
                 cpu_blocks=cpu_handle.get_tensor(),
                 ssd_files=ssd_handle.get_file_list(),

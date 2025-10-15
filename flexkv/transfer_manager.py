@@ -362,17 +362,17 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: str):
-        mp.set_start_method('spawn', force=True)
+        self.mp_ctx = mp.get_context('spawn')
 
         self.model_config = model_config
         self.cache_config = cache_config
         self.gpu_register_port = gpu_register_port
 
-        self.command_parent_conn, self.command_child_conn = Pipe()
-        self.result_parent_conn, self.result_child_conn = Pipe()
+        self.command_parent_conn, self.command_child_conn = self.mp_ctx.Pipe()
+        self.result_parent_conn, self.result_child_conn = self.mp_ctx.Pipe()
 
         self.process: Optional[Process] = None
-        self.ready_event = Event()
+        self.ready_event = self.mp_ctx.Event()
 
         self._completed_results: List[Tuple[int, int]] = []
 
@@ -380,7 +380,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         if self.process is not None and self.process.is_alive():
             return
 
-        self.process = Process(
+        self.process = self.mp_ctx.Process(
             target=self._process_worker,
             args=(self.model_config,
                   self.cache_config,

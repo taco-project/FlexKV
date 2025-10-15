@@ -115,15 +115,16 @@ class TransferWorkerBase(ABC):
 
     @classmethod
     def create_worker(cls,
+                      mp_ctx: Any,
                       finished_ops_queue: MPQueue,
                       op_buffer_tensor: torch.Tensor,
                       *args: Any, **kwargs: Any) -> 'WorkerHandle':
         """Generic worker creation template method"""
-        parent_conn, child_conn = MPPipe()  # create pipe
-        ready_event = mp.Event()
+        parent_conn, child_conn = mp_ctx.Pipe()  # create pipe
+        ready_event = mp_ctx.Event()
         worker_id = cls._get_worker_id()
 
-        process = mp.Process(
+        process = mp_ctx.Process(
             target=cls._worker_process,
             args=(worker_id, child_conn, finished_ops_queue, op_buffer_tensor, ready_event, *args),
             kwargs=kwargs,
@@ -463,7 +464,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
 
         self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
-                                                              gpu_kv_strides_tensor, gpu_block_strides_tensor, gpu_chunk_sizes_tensor)
+                                                              gpu_kv_strides_tensor, gpu_block_strides_tensor,
+                                                              gpu_chunk_sizes_tensor)
 
 
     def _transfer_impl(self,
@@ -496,7 +498,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         if len(gpu_block_id_list) == 0:
             return
-        
+
         self.tp_transfer_thread_group.tp_group_transfer(
             gpu_block_id_list,
             cpu_block_id_list,
