@@ -130,12 +130,22 @@ class TransferEngine:
         self._worker_map[TransferType.H2D] = self.gpucpu_workers
         self._worker_map[TransferType.D2H] = self.gpucpu_workers
 
+        self._ssd_handle = self._gds_handle if self._ssd_handle is None else self._ssd_handle
         if self._ssd_handle is not None and self._cpu_handle is not None:
+        # Initialize disk workers for either SSD or GDS
+        # When GDS is enabled, we use CPU->GDS two-step transfer instead of GPU->GDS direct transfer
+        # to free GPU memory early
+            file_list = self._ssd_handle.get_file_list()
+            if isinstance(file_list, list) and not isinstance(file_list, dict):
+                ssd_files = {0: file_list}
+            else:
+                ssd_files = file_list
+
             self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
-                ssd_files=self._ssd_handle.get_file_list(),
+                ssd_files=ssd_files,
                 cpu_kv_layout=self._cpu_handle.kv_layout,
                 ssd_kv_layout=self._ssd_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
@@ -146,7 +156,7 @@ class TransferEngine:
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
-                ssd_files=self._ssd_handle.get_file_list(),
+                ssd_files=ssd_files,
                 cpu_kv_layout=self._cpu_handle.kv_layout,
                 ssd_kv_layout=self._ssd_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,

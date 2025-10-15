@@ -928,7 +928,7 @@ class GlobalCacheEngine:
             disk_cache_engine = self.gds_cache_engine
         elif self.cache_config.enable_ssd:
             disk_cache_engine = self.ssd_cache_engine
-            
+
         if disk_cache_engine is not None:
             fragment2_ssd_blocks = disk_cache_engine.take(
                 num_required_blocks=fragment2_num_blocks,
@@ -961,21 +961,17 @@ class GlobalCacheEngine:
 
         if fragment2_num_blocks > 0:
             fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
-            # Use D2GDS for GDS, H2DISK for SSD
-            transfer_type = TransferType.D2GDS if self.cache_config.enable_gds else TransferType.H2DISK
-            op_disk_transfer = TransferOp(
+            op_h2disk = TransferOp(
                 graph_id = transfer_graph.graph_id,
-                transfer_type = transfer_type,
-                src_block_ids = fragment2_cpu_blocks if not self.cache_config.enable_gds else fragment12_gpu_blocks[-fragment2_num_blocks:],
+                transfer_type = TransferType.H2DISK,
+                src_block_ids = fragment2_cpu_blocks,
                 dst_block_ids = fragment2_ssd_blocks,
                 layer_id = 0,
                 layer_granularity = layer_num
             )
-            transfer_graph.add_transfer_op(op_disk_transfer)
-            if self.cache_config.enable_gds:
-                finished_ops_ids.append(op_disk_transfer.op_id)
-            else:
-                transfer_graph.add_dependency(op_disk_transfer.op_id, op_d2h.op_id)
+            transfer_graph.add_transfer_op(op_h2disk)
+
+            transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
 
         """insert and lock"""
         cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
@@ -984,7 +980,6 @@ class GlobalCacheEngine:
                                                           match_result=cpu_matched_result)
         disk_node_to_unlock = None
         if len(fragment2_ssd_blocks) > 0:
-            disk_cache_engine = self.gds_cache_engine if self.cache_config.enable_gds else self.ssd_cache_engine
             disk_node_to_unlock = disk_cache_engine.insert(sequence_meta,
                                                             fragment2_ssd_blocks,
                                                             is_ready=False,
