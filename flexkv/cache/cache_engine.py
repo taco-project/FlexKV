@@ -685,7 +685,7 @@ class GlobalCacheEngine:
                                                                   is_ready=False)
                 op_node_to_ready[op_peerh2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
             else:
-                cpu_blocks_to_free.extend(fragment1_cpu_blocks_local)
+                cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment1_cpu_blocks_local])
 
         if fragment2_num_blocks > 0:
             fragment2_cpu_blocks = allocated_cpu_blocks[:fragment2_num_blocks]

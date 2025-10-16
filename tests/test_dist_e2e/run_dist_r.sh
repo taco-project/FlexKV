@@ -9,3 +9,4 @@ export PYTHONPATH=$so_dir:$PYTHONPATH
 export MC_REDIS_PASSWORD="redis-serving-passwd"
 strings $so_dir/engine.cpython-310-x86_64-linux-gnu.so | grep Version
 python test_distributed_e2e_r.py
+#python test_distributed_p2p_interleaved_a.py
