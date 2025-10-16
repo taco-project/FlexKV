@@ -154,6 +154,10 @@ public:
     children.erase(hash);
   }
 
+  void clear_children() {
+    children.clear();
+  }
+
   template<typename Fn>
   void for_each_child(Fn&& fn) {
     for (auto &kv : children) {
