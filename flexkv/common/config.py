@@ -41,6 +41,7 @@ class CacheConfig:
     use_gds: bool = False
     index_accel: bool = False # have to be True when (enable_p2p_cpu or enable_p2p_ssd) is True
     distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
+    num_tmp_cpu_blocks: int = 500 # only used when distributed ssd p2p, it controls the number blocks of temp cpu buffer which used for copy data from ssd to cpu
 
     # kv cache layout configs
     gpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
