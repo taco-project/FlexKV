@@ -43,6 +43,7 @@ class CacheConfig:
     enable_3rd_remote: bool = False
 
     distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
+    num_tmp_cpu_blocks: int = 500 # only used when distributed ssd p2p, it controls the number blocks of temp cpu buffer which used for copy data from ssd to cpu
 
 
     # mempool capacity configs

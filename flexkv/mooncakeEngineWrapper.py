@@ -8,6 +8,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import MooncakeTransferEngineConfig
 from flexkv.transfer.utils import RDMATaskInfo
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus
+from typing import List
 
 
 class MoonCakeTransferEngineWrapper:
@@ -54,24 +55,32 @@ class MoonCakeTransferEngineWrapper:
         ret = self.engine.unregister_memory(buffer_ptr)
         return ret if ret == 0 else -1
 
-    def transfer_sync_read(self, task: RDMATaskInfo) -> int:
+    def transfer_sync_read(self, peer_engine_addr: str, src_ptr: int, dst_ptr: int, data_size: int) -> int:
         """Transfer the data synchronously."""
 
         ret = self.engine.transfer_sync_read(
-            task.peer_engine_addr, task.dst_ptr, task.src_ptr, task.data_size
+            peer_engine_addr, dst_ptr, src_ptr, data_size
         )
         return ret if ret == 0 else -1
     
-    def transfer_sync_write(self, task: RDMATaskInfo):
+    def transfer_sync_write(self, peer_engine_addr: int, src_ptr: int, dst_ptr: int, data_size: int) -> int:
         ret = self.engine.transfer_sync_write(
-            task.peer_engine_addr, task.src_ptr, task.dst_ptr, task.data_size
+            peer_engine_addr, src_ptr, dst_ptr, data_size
         )
         return ret if ret == 0 else -1
     
-    def transfer_sync_write_with_notify(self, task: RDMATaskInfo, notify_name: str, msg : NotifyMsg):
+    def batch_transfer_sync_read(self, peer_engine_addr: str, src_ptr_list: List[int], dst_ptr_list: List[int], data_size_list: List[int])-> int:
+        ret = self.engine.batch_transfer_sync_read(peer_engine_addr, dst_ptr_list, src_ptr_list, data_size_list)
+        return ret if ret == 0 else -1
+    
+    def batch_transfer_sync_write(self, peer_engine_addr: str, src_ptr_list: List[int], dst_ptr_list: List[int], data_size_list: List[int])-> int:
+        ret = self.engine.batch_transfer_sync_write(peer_engine_addr, src_ptr_list, dst_ptr_list, data_size_list)
+        return ret if ret == 0 else -1
+    
+    def transfer_sync_write_with_notify(self, peer_engine_addr: str, src_ptr: int, dst_ptr: int, data_size: int, notify_name: str, msg : NotifyMsg):
         notify = engine.TransferNotify(notify_name, msg.to_string())
         ret = self.engine.transfer_sync(
-            task.peer_engine_addr, task.src_ptr, task.dst_ptr, task.data_size, engine.TransferOpcode.Write, notify)
+            peer_engine_addr, src_ptr, dst_ptr, data_size, engine.TransferOpcode.Write, notify)
         return ret if ret == 0 else -1
     
     def transfer_failure_notify(self, peer_engine_addr: str, src_ptr: int, dst_ptr: int, notify_name: str, notify_msg: NotifyMsg):
