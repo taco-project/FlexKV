@@ -186,8 +186,8 @@ def try_get_from_flexKV():
     
     time.sleep(20)
     
-    block_ids = torch.arange(0, 4, dtype=torch.int64)
-    token_ids = torch.arange(0, 16, dtype=torch.int64)
+    block_ids = torch.arange(0, 2, dtype=torch.int64)
+    token_ids = torch.arange(0, 8, dtype=torch.int64)
     slot_mapping = block_ids_2_slot_mapping(block_ids, cache_config.tokens_per_block)
     request_id, _ = kvmanager.get_match(
         token_ids=token_ids,
