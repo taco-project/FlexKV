@@ -182,29 +182,30 @@ class NodeMetaInfo:
         
 class RDMATaskInfo:
     def __init__(
-        self, task_id: int, local_engine_addr: str, peer_engine_addr: str, peer_zmq_addr: str, src_ptr: int, dst_ptr: int, 
-        src_block_ids: List[int], dst_block_ids: List[int], data_size: int
+        self, task_id: int, local_engine_addr: str, peer_engine_addr: str, peer_zmq_addr: str, src_ptrs: List[int], dst_ptrs: List[int], 
+        src_block_ids: List[int], dst_block_ids: List[int], data_lens: List[int], data_size: int
     ):
         self.task_id = task_id
         self.local_engine_addr = local_engine_addr ## the mooncake engine address of local node
         self.peer_engine_addr = peer_engine_addr ## thre mooncake engine address of remote node
-        self.src_ptr = src_ptr
-        self.dst_ptr = dst_ptr
+        self.src_ptrs = src_ptrs
+        self.dst_ptrs = dst_ptrs
         self.peer_zmq_addr = peer_zmq_addr
         self.src_block_ids = src_block_ids
         self.dst_block_ids = dst_block_ids
         self.data_size = data_size
-
+        self.data_lens = data_lens
     def to_dict(self) -> dict:
         return {
             "task_id": self.task_id,
             "local_engine_addr": self.local_engine_addr,  
             "peer_engine_addr": self.peer_engine_addr, 
             "peer_zmq_addr": self.peer_zmq_addr,
-            "src_ptr": self.src_ptr,
-            "dst_ptr": self.dst_ptr,
+            "src_ptrs": self.src_ptrs,
+            "dst_ptrs": self.dst_ptrs,
             "src_block_ids": self.src_block_ids,
             "dst_block_ids": self.dst_block_ids,
+            "data_lens": self.data_lens,
             "data_size": self.data_size,
         }
 
@@ -218,5 +219,6 @@ class RDMATaskInfo:
             dst_ptr=data.get("dst_ptr", []),
             src_block_ids=data.get("src_block_ids"),
             dst_block_ids=data.get("dst_block_ids"),
+            data_lens = data.get("data_lens", []),
             data_size=int(data.get("data_size", 0)),
         )
