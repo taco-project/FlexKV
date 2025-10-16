@@ -1205,10 +1205,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
     ):
         if transfer_type == TransferType.PEERH2H:
             # remote cpu to local cpu transfer by one-side rdma read
-            ret = self.mooncake_transfer_engine.transfer_sync_read(task_info)
-            if ret != 0:
-                flexkv_logger.error(f"RDMA transfer failed with error code: {ret}")
-                return False
+            for i in range(len(task_info.src_ptrs)):
+                ret = self.mooncake_transfer_engine.transfer_sync_read(task_info.peer_zmq_addr, task_info.src_ptrs[i], 
+                                                                       task_info.dst_ptrs[i], task_info.data_lens[i])
+                if ret != 0:
+                    flexkv_logger.error(f"transfer_sync_write failed with error code: {ret}")
+                    return False
         elif transfer_type == TransferType.PEERSSD2H:
             # remote ssd to local cpu transfer by two side zmq and one side rdma write
             # step1: construct the meta info
