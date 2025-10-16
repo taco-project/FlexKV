@@ -117,7 +117,7 @@ void DistributedRadixTree::refresh_worker() {
     if (batch.empty()) {
       usleep(1000 * idle_sleep_ms_);
     }
-    printf("we have slept for %d ms\n", idle_sleep_ms_);
+    //printf("we have slept for %d ms\n", idle_sleep_ms_);
   }
   printf("the refresh_worker loop iteration end\n");
 }
@@ -219,9 +219,6 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
 
   // 3) sort by numeric distance ascending
   std::sort(nodes.begin(), nodes.end(), [](const NodeInfo &a, const NodeInfo &b){ return a.dst < b.dst; });
-  
-  for (const auto &nfo : nodes) {
-  }
 
   // 4) iterate nodes and load their block metas
   RefRadixTree* new_index = new RefRadixTree(tokens_per_block, max_num_blocks, lease_renew_ms_,
@@ -256,9 +253,12 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
       std::vector<CRadixNode*> temp_root_children;
       for (const auto& root_child_ptr : parent_to_children[0]) {
         if (processed_hashes.find(root_child_ptr->hash) != processed_hashes.end()) continue;
+        // Note: pass nullptr as parent for root children - they will be attached to tree root later
         CRadixNode* temp_root_child = dfs_build_subtree_from_meta(root_child_ptr, new_index, nullptr,
                                    parent_to_children, processed_hashes, lt_pool, true);
         if (temp_root_child != nullptr) {
+          // Root children are not added to node_list in dfs_build because parent is nullptr
+          // They will be properly added when attached to the tree root
           temp_root_children.push_back(temp_root_child);
         }
       }
@@ -300,17 +300,8 @@ std::shared_ptr<CMatchResult> DistributedRadixTree::match_prefix(
     return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
   }
   
-  if (idx == nullptr) {
-    auto empty_i64 = torch::empty({0}, torch::dtype(torch::kInt64));
-    auto empty_u32 = torch::empty({0}, torch::dtype(torch::kInt32));
-    return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
-  }
-  
-  auto root = idx->get_root();
-  
   RefCntGuard guard{idx};
   auto result = idx->match_prefix(block_hashes, num_blocks, update_cache_info);
-  
   
   return result;
 }
@@ -593,22 +584,29 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
         }
         
         // All blocks matched, collect them and continue
-        if (current_node->is_ready()) {
+        // But only collect up to what we need (remaining blocks in query)
+        int blocks_to_collect = std::min(child_size, remaining);
+        if (current_node->is_ready() && child_matched == child_size) {
           last_ready_node = current_node;
-          ready_prefix_blocks_num += child_size;
+          ready_prefix_blocks_num += blocks_to_collect;
         }
-        prefix_blocks_num += child_size;
+        prefix_blocks_num += blocks_to_collect;
         auto &cpb = current_node->get_physical_blocks();
-        for (auto v : cpb) {
-          pb_out[pb_write++] = v;
+        for (int i = 0; i < blocks_to_collect; i++) {
+          pb_out[pb_write++] = cpb[i];
         }
         auto cbnis = current_node->get_block_node_ids();
         if (cbnis != nullptr) {
-          for (auto v : *cbnis) {
-            ni_out[ni_write++] = v;
+          for (int i = 0; i < blocks_to_collect; i++) {
+            ni_out[ni_write++] = (*cbnis)[i];
           }
         } else {
           std::cerr << "child block_node_ids is nullptr" << std::endl;
+        }
+        
+        // If we've collected all requested blocks, stop here
+        if (prefix_blocks_num >= num_blocks) {
+          break;
         }
       }
     } else {
@@ -745,12 +743,14 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
       current_root->set_child(head_hash, root_child);
       root_child->set_parent(current_root);
       // Register all nodes in the subtree to the tree's node_list
+      // This recursively adds root_child and all its descendants
       register_subtree_nodes(temp_tree, root_child);
-      return;  // Don't delete root_child
+      return;  // Don't delete root_child - it's now part of the tree
     } else {
       // Child with same head hash already exists, merge into it
       CRadixNode* existing_child = current_root->get_child(head_hash);
       attach_and_merge_root_child(temp_tree, root_child, existing_child, lt_pool);
+      // Note: root_child will be deleted in the recursive call after merging
       return;
     }
   }
@@ -812,7 +812,13 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
     }
   });
 
+  // Clear children map before deletion to avoid double-reference issues
+  // The children have been re-parented to current_root or recursively merged
+  matched_root_child->clear_children();
+  
   // matched_root_child node data has been merged or its children re-attached; clear its
+  // Must set parent to nullptr before deletion (required by destructor assertion)
+  matched_root_child->set_parent(nullptr);
   delete matched_root_child;
 }
 
