@@ -71,7 +71,7 @@ class FlexKVConfig:
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
-
+        
         self.__post_init__()
 
     def post_init_from_sglang_config(
