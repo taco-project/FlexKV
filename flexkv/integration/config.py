@@ -61,7 +61,7 @@ class FlexKVConfig:
         ):
         self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.block_size = vllm_config.cache_config.block_size
-        self.num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
+        self.num_kv_heads = vllm_config.model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.head_size = vllm_config.model_config.get_head_size()
         self.dtype = vllm_config.model_config.dtype
         self.use_mla = vllm_config.model_config.is_deepseek_mla
