@@ -191,9 +191,6 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
   nodes.reserve(node_keys.size());
   std::vector<std::string> ips;
   ips.reserve(node_keys.size());
-  for (const auto& k : node_keys) {
-    printf("[debug] node key: %s\n", k.c_str());
-  }
   // 2) fetch ip for each node
   if (!channel->hmget_field_for_keys(node_keys, "ip", ips)) return nullptr;
 
@@ -246,7 +243,9 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
     if (!metas.empty()) {
       std::unordered_map<int64_t, std::vector<BlockMeta*>> parent_to_children;
       for (size_t i = 0; i < metas.size(); ++i) {
-        if (metas[i].state != NODE_STATE_NORMAL) continue;
+        // Include both NORMAL and ABOUT_TO_EVICT nodes in remote index
+        // ABOUT_TO_EVICT nodes are still valid and queryable, just marked for future eviction
+        if (metas[i].state != NODE_STATE_NORMAL && metas[i].state != NODE_STATE_ABOUT_TO_EVICT) continue;
         parent_to_children[metas[i].ph].push_back(&metas[i]);
       }
       std::unordered_set<int64_t> processed_hashes;
@@ -270,22 +269,6 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
         merged_count++;
       }
     }
-  }
-  
-  // DEBUG: Print statistics about the newly built tree
-  if (new_index != nullptr) {
-    auto root = new_index->get_root();
-    printf("  - Root has %d children\n", root->get_num_children());
-    printf("  - Tree is_empty: %s\n", new_index->is_empty() ? "true" : "false");
-    // Print first few root children hashes
-    int child_count = 0;
-    root->for_each_child([&](int64_t hash, CRadixNode* child) {
-      if (child_count < 5) {
-        printf("  - Root child[%d]: hash=%ld, size=%d, ready=%s\n", 
-               child_count, hash, child->size(), child->is_ready() ? "true" : "false");
-        child_count++;
-      }
-    });
   }
   
   return new_index;
@@ -445,18 +428,6 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
       current_node->update_time();
     }
     
-    // DEBUG: Print matching loop state
-    bool is_root_node = (current_node->get_parent() == nullptr);
-    HashType next_child_hash = HashType(block_hashes_ptr[prefix_blocks_num + current_node->size()]);
-    
-    // DEBUG: Print all children hashes if root
-    if (is_root_node && current_node->get_num_children() > 0) {
-      current_node->for_each_child([](HashType h, CRadixNode* c) {
-        printf("%ld ", h);
-      });
-      printf("\n");
-    }
-
     // For non-root nodes, first verify blocks match, then check lease validity before copying
     if (!is_root(current_node)) {
       // First, verify that this node's blocks match the query
