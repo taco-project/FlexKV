@@ -23,6 +23,7 @@ static inline uint64_t get_now_ms() {
 LocalRadixTree::LocalRadixTree(int tokens_per_block, int max_num_blocks, uint32_t ttl_ms, uint32_t renew_ms, uint32_t batch_sz, uint32_t idle_sleep_ms)
   : CRadixTreeIndex(tokens_per_block, max_num_blocks), channel(nullptr), node_id(0), lease_ttl_ms(ttl_ms), refresh_batch_size(batch_sz), lease_pool(max_num_blocks) {
   this->idle_sleep_ms = idle_sleep_ms;
+  
   if (renew_ms == 0) {
     renew_lease_ms = (uint32_t)(ttl_ms * 2 / 10);
     if (renew_lease_ms == 0) {
@@ -176,9 +177,9 @@ void LocalRadixTree::insert_and_publish(const CRadixNode *node) {
   dst_phys.insert(dst_phys.end(), src_phys.begin(), src_phys.end());
   // Lease meta is optional for publishing; keep nullptr so publisher treats as defaults
   // DEBUG: Print block hashes being published
-  for (size_t i = 0; i < std::min(dst_hashes.size(), size_t(10)); ++i) {
+  /*for (size_t i = 0; i < std::min(dst_hashes.size(), size_t(10)); ++i) {
     printf("  [%zu] hash=%ld, pb=%ld\n", i, dst_hashes[i], dst_phys[i]);
-  }
+  }*/
   new_block_queue.push(cp);
 }
 
@@ -287,13 +288,44 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   uint64_t now_ms = (uint64_t)now_tv.tv_sec * 1000 + (uint64_t)(now_tv.tv_usec / 1000);
 
   // Partition leaf candidates by lease expiry
+  int evictable_count = 0;
+  int not_evictable_count = 0;
+  int locked_count = 0;
+  int not_ready_count = 0;
+  int expired_count = 0;
+  int fresh_count = 0;
+  int about_to_evict_count = 0;
+  
   for (auto it = leaf_list.begin(); it != leaf_list.end(); ++it) {
     CRadixNode *node = *it;
-    if (!node->evictable()) continue;
+    if (!node->evictable()) {
+      not_evictable_count++;
+      // Check why not evictable
+      if (node->get_lock_cnt() > 0) locked_count++;
+      if (!node->is_ready()) not_ready_count++;
+      continue;
+    }
+    evictable_count++;
     LeaseMeta *lm = node->get_lease_meta();
     bool expired = (lm == nullptr) || ((uint64_t)lm->lease_time <= now_ms);
-    if (expired) expired_q.push(node); else fresh_q.push(node);
+    if (expired) {
+      expired_q.push(node);
+      expired_count++;
+    } else {
+      // 只有NORMAL状态的节点才加入fresh_q，跳过ABOUT_TO_EVICT
+      if (lm && lm->state == NODE_STATE_NORMAL) {
+        fresh_q.push(node);
+        fresh_count++;
+      } else {
+        about_to_evict_count++;
+      }
+    }
   }
+  
+  // Log eviction状态 when eviction is attempted
+  /*printf("[EVICT] need=%d, leaf_list=%zu, evictable=%d (expired=%d, fresh_normal=%d, about_to_evict=%d), not_evictable=%d (locked=%d, not_ready=%d)\n",
+         num_evicted, leaf_list.size(), evictable_count, expired_count, fresh_count, 
+         about_to_evict_count, not_evictable_count, locked_count, not_ready_count);*/
 
   auto push_parent_if_candidate = [&](CRadixNode *parent){
     if (parent->is_leaf() && !is_root(parent)) {
@@ -362,29 +394,27 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
           // Attach LeaseMeta if missing and mark ABOUT_TO_EVICT
           LeaseMeta *newlm = lease_pool.alloc();
           assert(newlm != nullptr);
-          // get current lease meta
+          // get current lease meta (fresh_q中已经只包含NORMAL节点)
           LeaseMeta *slm = node->get_lease_meta();
           assert(slm != nullptr);
+          assert(slm->state == NODE_STATE_NORMAL);
           // set new lease meta
           subset->set_lease_meta(newlm);
           newlm->state = slm->state;
           newlm->lease_time = slm->lease_time;
-          if (slm->state == NODE_STATE_NORMAL) {
-            slm->state = NODE_STATE_ABOUT_TO_EVICT;
-            auto hashs = subset->get_block_hashes();
-            about_to_evict_q->insert(about_to_evict_q->end(), hashs.begin(), hashs.end());
-          }
+          slm->state = NODE_STATE_ABOUT_TO_EVICT;
+          auto hashs = subset->get_block_hashes();
+          about_to_evict_q->insert(about_to_evict_q->end(), hashs.begin(), hashs.end());
           remaining -= subset->size(); // should equal 'remaining'
         }
       } else {
-        // Mark whole node
+        // Mark whole node (fresh_q中已经只包含NORMAL节点)
         LeaseMeta *lm = node->get_lease_meta();
         assert(lm != nullptr);
-        if (lm->state == NODE_STATE_NORMAL) {
-          lm->state = NODE_STATE_ABOUT_TO_EVICT;
-          auto hashs = node->get_block_hashes();
-          about_to_evict_q->insert(about_to_evict_q->end(), hashs.begin(), hashs.end());
-        }
+        assert(lm->state == NODE_STATE_NORMAL);
+        lm->state = NODE_STATE_ABOUT_TO_EVICT;
+        auto hashs = node->get_block_hashes();
+        about_to_evict_q->insert(about_to_evict_q->end(), hashs.begin(), hashs.end());
         remaining -= node_sz;
       }
     }
@@ -395,6 +425,7 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   if (about_to_evict_q && about_to_evict_q->size() > 0) {
     about_to_evict_blocks_queue.push(about_to_evict_q);
   }
+  
   return has_evicted;
 }
 
@@ -409,8 +440,6 @@ std::shared_ptr<CMatchResult> LocalRadixTree::match_prefix(torch::Tensor &block_
     }
     printf("]\n");
   }
-  
-  auto root = this->get_root();
   
   auto result = CRadixTreeIndex::match_prefix(block_hashes, num_blocks, update_cache_info);
   

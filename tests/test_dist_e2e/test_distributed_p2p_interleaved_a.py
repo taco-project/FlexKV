@@ -117,7 +117,7 @@ def test_node_a():
     model_config = ModelConfig(**DEFAULT_MODEL_CONFIG)
     model_config.tp_size = 1
     cache_config = CacheConfig(**DEFAULT_CACHE_CONFIG)
-    num_total_request = 10
+    num_total_request = 40
     cache_config.tokens_per_block = 4
     cache_config.enable_ssd = True
     cache_config.enable_kv_sharing = True
@@ -129,9 +129,15 @@ def test_node_a():
     cache_config.local_zmq_ip = "10.6.131.9"
     cache_config.local_zmq_port = 5555
     cache_config.local_ip = "10.6.131.9"
-    cache_config.num_cpu_blocks = 200  # Enough for 100 requests * 16 blocks
+    cache_config.num_cpu_blocks = 60
     cache_config.num_ssd_blocks = 1000
     cache_config.ssd_cache_dir = "/data/flexkv_ssd/"
+    cache_config.lease_ttl_ms = 2000          # 1秒租约（加快驱逐速度）
+    cache_config.renew_lease_ms = 100         # 100ms续约（只续约NORMAL节点，ABOUT_TO_EVICT不续约）
+    
+    # 主动式驱逐策略：提前预留buffer空间
+    cache_config.evict_start_threshold = 0.8  # CPU使用率达80%就开始驱逐
+    cache_config.evict_ratio = 0.15            # 每次至少驱逐15%的blocks
     
     num_gpu_blocks = 512
     tokens_per_block = cache_config.tokens_per_block
@@ -227,7 +233,7 @@ def test_node_a():
             dp_id=0,
         )
         kvmanager.wait([write_request], completely=True)
-        
+        time.sleep(0.5)
         if (req_id + 1) % 10 == 0:
             print(f"  Written {len([x for x in my_write_ids if x <= req_id])}/{len(my_write_ids)} requests")
     
@@ -277,7 +283,10 @@ def test_node_a():
         
         # Verify
         kvresponse = return_results[request_id]
-        assert kvresponse.status == KVResponseStatus.SUCCESS, f"Request {req_id} failed"
+        if kvresponse.status != KVResponseStatus.SUCCESS:
+            verification_failed += 1
+            print(f"  ❌ Request {req_id}: {kvresponse.status}")
+            continue
         
         valid_fetched_tokens = kvresponse.return_mask.sum().item() // tokens_per_block * tokens_per_block
         
@@ -302,7 +311,7 @@ def test_node_a():
             verification_failed += 1
             print(f"  ❌ Request {req_id}: Only {valid_fetched_tokens}/{len(token_ids)} tokens fetched")
         
-        
+        time.sleep(0.5)
         if (req_id + 1) % 10 == 0:
             print(f"  Read {req_id + 1}/{len(my_read_ids)} requests")
     

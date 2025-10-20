@@ -5,5 +5,5 @@
     "metadata_server": "redis://10.6.131.10:6380",
     "metadata_server_auth": "redis-serving-passwd",
     "protocol": "rdma",
-    "device_name": ""
+    "device_name": "mlx5_7"
 }
