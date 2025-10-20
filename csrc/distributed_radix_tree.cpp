@@ -459,16 +459,19 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
         // Check if lease is valid
         uint64_t lt = (uint64_t)lm->lease_time;
         if (lt > 0) {
-          if ((int64_t)lt - (int64_t)now_ms <= 0) {
+          //if ((int64_t)lt - (int64_t)now_ms <= 0) {
             // Lease expired: stop matching and return what we have so far
             // Do NOT add this node's blocks to the result
-            break;
-          }
+          //  break;
+          //}
           // Check if lease needs renewal
-          if ((int64_t)lt - (int64_t)now_ms <= (int64_t)lease_renew_ms_) {
+          // if the lease time is less than 1s, we don't use it
+          // this is important, and we hard-coded this as 1 s for now.
+          if ((int64_t)lt - (int64_t)now_ms <= 1000) {
             if (renew_lease_queue_ != nullptr) {
               renew_lease_queue_->push(current_node);
             }
+            break;
           }
         }
         
