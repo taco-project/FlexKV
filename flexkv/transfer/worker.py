@@ -1535,6 +1535,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 layer_id=layer_id,
                 layer_granularity=layer_granularity,
             )
+            #flexkv_logger.info(
+            #    f"[PEERSSD2H] Sending meta: task_id={task_info.task_id}, "
+            #    f"ssd_block_ids={task_info.src_block_ids}, cpu_block_ids={task_info.dst_block_ids}, "
+            #    f"peer_engine_addr={task_info.local_engine_addr}, peer_zmq_addr={task_info.peer_zmq_addr}"
+            #)
             ## step2: send the meta info to remote node
             if not self.zmq_client.send_meta_info(remote_ssd_to_cpu_meta, task_info.peer_zmq_addr):
                 flexkv_logger.error(
@@ -1587,6 +1592,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 layer_id=layer_id,
                 layer_granularity=layer_granularity,
             )
+            flexkv_logger.info(
+                f"[_transfer_impl] Sending task_id={task_info.task_id}, "
+                f"ssd_block_ids={task_info.src_block_ids}, "
+                f"cpu_block_ids={task_info.dst_block_ids} to {task_info.peer_zmq_addr}"
+            )
             ## step2: send the meta info to remote node
             if not self.zmq_client.send_meta_info(remote_ssd_to_cpu_meta, task_info.peer_zmq_addr):
                 flexkv_logger.error(
@@ -1636,11 +1646,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         src_block_node_ids = transfer_op.src_block_node_ids
 
         # step1: group the blocks by remote node id and remote block source type, each segment is a list of continuous blocks
-        flexkv_logger.info(
-            f"[PEER2CPUTransferWorker] src_block_ids: {src_block_ids} \n \
-                                dst_block_ids: {dst_block_ids} \n \
-                                src_block_node_ids: {src_block_node_ids} \n"
-        )
+        #flexkv_logger.info(
+        #    f"[PEER2CPUTransferWorker] src_block_ids: {src_block_ids} \n \
+        #                        dst_block_ids: {dst_block_ids} \n \
+        #                        src_block_node_ids: {src_block_node_ids} \n"
+        #)
         task_info_list = []
 
         if transfer_op.transfer_type == TransferType.PEERH2H:
@@ -1742,6 +1752,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     flexkv_logger.warning("Can not parse RemoteSSD2HMetaInfo using recieved message")
                     continue
                 
+                flexkv_logger.info(
+                    f"[ssd_handle_loop] Received task_id={recv_meta.task_id}, "
+                    f"ssd_block_ids={recv_meta.ssd_block_ids}, "
+                    f"cpu_block_ids={recv_meta.cpu_block_ids}"
+                )
+                
                 self.zmq_server.listen_socket.send(b"OK")  
                 
                 failure_msg = NotifyMsg(mooncake_engine_addr=self.mooncake_transfer_engine.get_engine_addr(),
@@ -1806,24 +1822,46 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                         all_copy_complete = False
                         break
 
-                    src_ptrs, src_block_size = self.get_cpu_buffer_block_start_ptr(
-                        local_cpu_buffer_block_ids_per_seg,
-                        self.tmp_cpu_buffer.data_ptr(),
-                        layer_id,
-                        layer_granularity,
+                    # Further split based on dst_cpu_block_ids contiguity
+                    # because get_cpu_buffer_block_start_ptr assumes blocks are contiguous
+                    dst_cpu_list = dst_cpu_block_ids_per_seg.tolist()
+                    local_cpu_list = local_cpu_buffer_block_ids_per_seg.tolist()
+                    
+                    # Split based on dst_cpu_list contiguity
+                    dst_segments = split_contiguous_blocks(dst_cpu_list, local_cpu_list)
+                    
+                    flexkv_logger.info(
+                        f"[ssd_handle_loop] dst_cpu_list={dst_cpu_list}, local_cpu_list={local_cpu_list}, "
+                        f"dst_segments={dst_segments}"
                     )
+                    
+                    for seg in dst_segments:
+                        seg_dst_blocks = seg["src"]  # contiguous dst CPU block IDs on peer
+                        seg_local_blocks = seg["dst"]  # corresponding local CPU buffer block IDs
+                        
+                        # Note: seg_local_blocks should also be contiguous since they correspond to 
+                        # contiguous dst blocks and were allocated sequentially
+                        src_ptrs, src_block_size = self.get_cpu_buffer_block_start_ptr(
+                            seg_local_blocks,
+                            self.tmp_cpu_buffer.data_ptr(),
+                            layer_id,
+                            layer_granularity,
+                        )
 
-                    dst_ptrs, dst_block_size = self.get_cpu_buffer_block_start_ptr(
-                        dst_cpu_block_ids_per_seg,
-                        recv_meta.peer_cpu_base_ptr,
-                        layer_id,
-                        layer_granularity,
-                    )
-                    for _ in range(len(src_ptrs)):
-                        data_size_list.append(src_block_size * len(local_cpu_buffer_block_ids_per_seg))
-                    src_ptr_list.extend(src_ptrs)
-                    dst_ptr_list.extend(dst_ptrs)
-                    assert len(src_ptr_list) == len(data_size_list) and len(dst_ptr_list) == len(data_size_list)
+                        dst_ptrs, dst_block_size = self.get_cpu_buffer_block_start_ptr(
+                            seg_dst_blocks,
+                            recv_meta.peer_cpu_base_ptr,
+                            layer_id,
+                            layer_granularity,
+                        )
+                        
+                        assert src_block_size == dst_block_size, "Block size mismatch between src and dst"
+                        
+                        for _ in range(len(src_ptrs)):
+                            data_size_list.append(src_block_size * len(seg_local_blocks))
+                        src_ptr_list.extend(src_ptrs)
+                        dst_ptr_list.extend(dst_ptrs)
+                        assert len(src_ptr_list) == len(data_size_list) and len(dst_ptr_list) == len(data_size_list)
 
                 ## step4: do rdma transfer and send notify
                 if not all_copy_complete:
@@ -1919,37 +1957,70 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 src_blocks = seg["src"]
                 dst_blocks = seg["dst"]
 
-                # step2: calculate the src and dst block start ptrs
-                src_block_start_ptrs, src_data_size_per_block = (
-                    self.get_cpu_buffer_block_start_ptr(
-                        src_blocks,
-                        src_meta.cpu_bufer_base_ptr,  # the cpu buffer ptr on remote machine
-                        layer_id,
-                        layer_granularity,
-                    )
-                )
-
-
-                dst_block_start_ptrs, dst_data_size_per_block = (
-                    self.get_cpu_buffer_block_start_ptr(
-                        dst_blocks,
-                        self.dst_buffer_ptr,  # the cpu buffer ptr on local machine
-                        layer_id,
-                        layer_granularity,
-                    )
-                )
- 
-                assert (
-                    src_data_size_per_block == dst_data_size_per_block
-                ), "src and dst blocks have different layout"
+                # step2: Both src_blocks and dst_blocks must be contiguous for get_cpu_buffer_block_start_ptr
+                # We need to split where EITHER src or dst becomes non-contiguous
+                # Strategy: find all breakpoints where src OR dst is non-contiguous
                 
+                # Split based on both src and dst contiguity simultaneously
+                final_segments = []
+                i = 0
+                while i < len(src_blocks):
+                    current_src = [src_blocks[i]]
+                    current_dst = [dst_blocks[i]]
+                    j = i + 1
+                    
+                    # Continue while BOTH src and dst are contiguous
+                    while j < len(src_blocks):
+                        if (src_blocks[j] == src_blocks[j-1] + 1 and 
+                            dst_blocks[j] == dst_blocks[j-1] + 1):
+                            current_src.append(src_blocks[j])
+                            current_dst.append(dst_blocks[j])
+                            j += 1
+                        else:
+                            break
+                    
+                    final_segments.append({"src": current_src, "dst": current_dst})
+                    i = j
                 
-                for _ in range(len(src_block_start_ptrs)):
-                    data_size = src_data_size_per_block * len(src_blocks)
-                    data_size_list.append(data_size)
-                src_ptr_list.extend(src_block_start_ptrs)
-                dst_ptr_list.extend(dst_block_start_ptrs)
-                assert len(data_size_list) == len(src_ptr_list) and len(data_size_list) == len(dst_ptr_list)
+                flexkv_logger.info(
+                    f"[_dist_cpu_op_parser] src_blocks={src_blocks}, dst_blocks={dst_blocks}, "
+                    f"final_segments={final_segments}"
+                )
+                
+                # Now process each segment where both src and dst are contiguous
+                for final_seg in final_segments:
+                    sub_src_blocks = final_seg["src"]  # contiguous src blocks
+                    sub_dst_blocks = final_seg["dst"]  # contiguous dst blocks
+                    
+                    # step3: Now both sub_src_blocks and sub_dst_blocks are contiguous
+                    src_block_start_ptrs, src_data_size_per_block = (
+                        self.get_cpu_buffer_block_start_ptr(
+                            sub_src_blocks,
+                            src_meta.cpu_bufer_base_ptr,  # the cpu buffer ptr on remote machine
+                            layer_id,
+                            layer_granularity,
+                        )
+                    )
+
+                    dst_block_start_ptrs, dst_data_size_per_block = (
+                        self.get_cpu_buffer_block_start_ptr(
+                            sub_dst_blocks,
+                            self.dst_buffer_ptr,  # the cpu buffer ptr on local machine
+                            layer_id,
+                            layer_granularity,
+                        )
+                    )
+
+                    assert (
+                        src_data_size_per_block == dst_data_size_per_block
+                    ), "src and dst blocks have different layout"
+                    
+                    for _ in range(len(src_block_start_ptrs)):
+                        data_size = src_data_size_per_block * len(sub_src_blocks)
+                        data_size_list.append(data_size)
+                    src_ptr_list.extend(src_block_start_ptrs)
+                    dst_ptr_list.extend(dst_block_start_ptrs)
+                    assert len(data_size_list) == len(src_ptr_list) and len(data_size_list) == len(dst_ptr_list)
                 
             flexkv_logger.info(
                 f"[PEER2CPUTransferWorker]: remote cpu op parser src_ptr_list: {src_ptr_list}, dst_ptr_list: {dst_ptr_list} "
@@ -2004,15 +2075,27 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         # assuming that remote cpu buffer layout is the same as local cpu buffer layout
         assert self.cpu_kv_layout.type == self.remote_kv_layout.type
         src_block_ptrs = []
-        block_id = cpu_blocks[0]  # we only need the start ptr of the first block, because the blocks are continuous
+        
+        # Get the first block ID and handle different input types
+        if isinstance(cpu_blocks, torch.Tensor):
+            block_id_int = int(cpu_blocks[0].item())
+        elif isinstance(cpu_blocks, list):
+            first_elem = cpu_blocks[0]
+            if isinstance(first_elem, torch.Tensor):
+                block_id_int = int(first_elem.item())
+            else:
+                block_id_int = int(first_elem)
+        else:
+            raise ValueError(f"Invalid cpu_blocks type: {type(cpu_blocks)}")
+        
         if self.cpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
-            for layer_id in range(layer_start_id, layer_granularity):
+            for layer_id in range(layer_start_id, layer_start_id + layer_granularity):
                 for kv_id in range(self.kv_dim):
                     element_offset = (
                         (
                             ((layer_id * self.kv_dim) + kv_id)
                             * self.cpu_kv_layout.num_block
-                            + (block_id.item())
+                            + block_id_int
                         )
                         * self.cpu_kv_layout.get_block_stride()
                         * self.dtype.itemsize
@@ -2021,7 +2104,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         elif self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKWISE:
             block_volume = self.cpu_kv_layout.get_block_stride()
-            element_offset = int(block_id.item()) * block_volume * self.dtype.itemsize
+            element_offset = block_id_int * block_volume * self.dtype.itemsize
             src_block_ptrs.append(cpu_base_ptr + element_offset)
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.cpu_kv_layout.type}")

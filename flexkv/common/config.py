@@ -99,6 +99,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     max_file_size_gb=float(os.getenv('FLEXKV_MAX_FILE_SIZE_GB', -1)),  # -1 means no limit
 
     evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.05)),
+    evict_start_threshold=float(os.getenv('FLEXKV_EVICT_START_THRESHOLD', 1.0)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
 
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
