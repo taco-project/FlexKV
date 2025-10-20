@@ -1,3 +1,19 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #pragma once
 
 #include <atomic>
@@ -17,13 +33,13 @@ class TPTransferThreadGroup {
 public:
   TPTransferThreadGroup(
       int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-      torch::Tensor &cpu_blocks, int dp_group_id);
+      torch::Tensor &cpu_blocks, int dp_group_id,
+      torch::Tensor &gpu_kv_strides_tensor,
+      torch::Tensor &gpu_block_strides_tensor,
+      torch::Tensor &gpu_chunk_sizes_tensor);
   ~TPTransferThreadGroup();
 
   void tp_group_transfer(const torch::Tensor &gpu_block_id_tensor,
-                         const int64_t gpu_kv_stride_in_bytes,
-                         const int64_t gpu_block_stride_in_bytes,
-                         const int64_t gpu_chunk_size_in_bytes,
                          const torch::Tensor &cpu_block_id_tensor,
                          const int64_t cpu_kv_stride_in_bytes,
                          const int64_t cpu_layer_stride_in_bytes,
@@ -41,6 +57,11 @@ private:
   int dp_group_id_;
   void **gpu_blocks_;
   void *cpu_blocks_;
+
+  int64_t *gpu_kv_strides_in_bytes_;
+  int64_t *gpu_block_strides_in_bytes_;
+  int64_t *gpu_chunk_sizes_in_bytes_;
+
   std::vector<std::thread> threads_;
   std::vector<cudaStream_t> streams_;
 

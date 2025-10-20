@@ -1,0 +1,1141 @@
+diff --git a/benchmarks/backend_request_func.py b/benchmarks/backend_request_func.py
+index 287d500a8..7e87f0446 100644
+--- a/benchmarks/backend_request_func.py
++++ b/benchmarks/backend_request_func.py
+@@ -7,6 +7,7 @@ import time
+ import traceback
+ from dataclasses import dataclass, field
+ from typing import Optional, Union
++import asyncio
+ 
+ import aiohttp
+ import huggingface_hub.constants
+@@ -22,10 +23,10 @@ AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+ 
+ @dataclass
+ class RequestFuncInput:
+-    prompt: str
++    prompt: Union[str, list[str]]
+     api_url: str
+-    prompt_len: int
+-    output_len: int
++    prompt_len: Union[int, list[int]]
++    output_len: Union[int, list[int]]
+     model: str
+     model_name: Optional[str] = None
+     logprobs: Optional[int] = None
+@@ -436,6 +437,109 @@ async def async_request_openai_chat_completions(
+     return output
+ 
+ 
++async def async_request_openai_chat_completions_multiturns(
++    request_func_input: RequestFuncInput,
++    pbar: Optional[tqdm] = None,
++    turn_interval_time: float = 3.0,
++) -> RequestFuncOutput:
++    api_url = request_func_input.api_url
++    assert api_url.endswith(
++        ("chat/completions", "profile")
++    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
++    assert isinstance(request_func_input.prompt, list)
++    assert isinstance(request_func_input.prompt_len, list)
++    assert isinstance(request_func_input.output_len, list)
++
++    async with aiohttp.ClientSession(trust_env=True,
++                                     timeout=AIOHTTP_TIMEOUT) as session:
++        payload = {
++            "model": request_func_input.model_name \
++                if request_func_input.model_name else request_func_input.model,
++            "messages": [
++            ],
++            "temperature": 0.0,
++            "stream": True,
++            "stream_options": {
++                "include_usage": True,
++            },
++        }
++        payload["ignore_eos"] = request_func_input.ignore_eos
++        if request_func_input.extra_body:
++            payload.update(request_func_input.extra_body)
++        headers = {
++            "Content-Type": "application/json",
++            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
++        }
++
++        output_list = []
++        for turn_id, prompt in enumerate(request_func_input.prompt):
++            output = RequestFuncOutput()
++            output.prompt_len = request_func_input.prompt_len[turn_id]
++            
++            payload["messages"].append({"role": "user", "content": prompt})
++            payload["max_tokens"] = request_func_input.output_len[turn_id]
++
++            generated_text = ""
++            ttft = 0.0
++            st = time.perf_counter()
++            most_recent_timestamp = st
++            try:
++                async with session.post(url=api_url, json=payload,
++                                        headers=headers) as response:
++                    if response.status == 200:
++                        async for chunk_bytes in response.content:
++                            chunk_bytes = chunk_bytes.strip()
++                            if not chunk_bytes:
++                                continue
++
++                            chunk = chunk_bytes.decode("utf-8").removeprefix(
++                                "data: ")
++                            if chunk != "[DONE]":
++                                timestamp = time.perf_counter()
++                                data = json.loads(chunk)
++
++                                if choices := data.get("choices"):
++                                    content = choices[0]["delta"].get("content")
++                                    # First token
++                                    if ttft == 0.0:
++                                        ttft = timestamp - st
++                                        output.ttft = ttft
++
++                                    # Decoding phase
++                                    else:
++                                        output.itl.append(timestamp -
++                                                        most_recent_timestamp)
++
++                                    generated_text += content or ""
++                                elif usage := data.get("usage"):
++                                    output.output_tokens = usage.get(
++                                        "completion_tokens")
++
++                                most_recent_timestamp = timestamp
++
++                        output.generated_text = generated_text
++                        output.success = True
++                        output.latency = most_recent_timestamp - st
++                    else:
++                        output.error = response.reason or ""
++                        output.success = False
++                        break
++            except Exception:
++                output.success = False
++                exc_info = sys.exc_info()
++                output.error = "".join(traceback.format_exception(*exc_info))
++                break
++            payload["messages"].append({"role": "assistant", "content": generated_text})
++            
++            output_list.append(output)
++            if turn_id != len(request_func_input.prompt) - 1:
++                await asyncio.sleep(turn_interval_time)
++            
++    if pbar:
++        pbar.update(1)
++    return output_list
++
++
+ def get_model(pretrained_model_name_or_path: str) -> str:
+     if os.getenv('VLLM_USE_MODELSCOPE', 'False').lower() == 'true':
+         from modelscope import snapshot_download
+@@ -496,6 +600,7 @@ ASYNC_REQUEST_FUNCS = {
+     "tensorrt-llm": async_request_trt_llm,
+     "scalellm": async_request_openai_completions,
+     "sglang": async_request_openai_completions,
++    "openai-chat-multiturns": async_request_openai_chat_completions_multiturns,
+ }
+ 
+ OPENAI_COMPATIBLE_BACKENDS = [
+diff --git a/benchmarks/benchmark_dataset.py b/benchmarks/benchmark_dataset.py
+index 63f174275..561a40421 100644
+--- a/benchmarks/benchmark_dataset.py
++++ b/benchmarks/benchmark_dataset.py
+@@ -50,9 +50,9 @@ class SampleRequest:
+     Represents a single inference request for benchmarking.
+     """
+ 
+-    prompt: Union[str, Any]
+-    prompt_len: int
+-    expected_output_len: int
++    prompt: Union[str, list[str], Any]
++    prompt_len: Union[int, list[int]]
++    expected_output_len: Union[int, list[int]]
+     multi_modal_data: Optional[Union[MultiModalDataDict, dict]] = None
+     lora_request: Optional[LoRARequest] = None
+ 
+@@ -507,6 +507,108 @@ class SonnetDataset(BenchmarkDataset):
+                     ))
+         return samples
+ 
++    
++# -----------------------------------------------------------------------------
++# ShareGPT Multiturn Dataset Implementation
++# -----------------------------------------------------------------------------
++    
++    
++class ShareGPTMultiTurnsDataset(BenchmarkDataset):
++    def __init__(self, min_num_turns: int = 2, **kwargs) -> None:
++        super().__init__(**kwargs)
++        self.load_data(min_num_turns)
++
++    def load_data(self, min_num_turns: int) -> None:
++        if self.dataset_path is None:
++            raise ValueError("dataset_path must be provided for loading data.")
++
++        with open(self.dataset_path, encoding="utf-8") as f:
++            self.data = json.load(f)
++        # Filter entries with at least two conversation turns.
++        new_data = []
++        for entry in self.data:
++            if "conversations" in entry:
++                while len(entry["conversations"]) > 0 and entry["conversations"][0]['from'] != 'human':
++                    entry["conversations"].pop(0)
++                if len(entry["conversations"]) % 2 != 0:
++                    entry["conversations"].pop(-1)
++                if len(entry["conversations"]) >= 2 * min_num_turns:
++                    new_data.append(entry)
++        self.data = new_data
++        random.seed(self.random_seed)
++        random.shuffle(self.data)
++    
++    def sample(
++        self,
++        tokenizer: PreTrainedTokenizerBase,
++        num_requests: int,
++        lora_path: Optional[str] = None,
++        max_loras: Optional[int] = None,
++        output_len: Optional[int] = None,
++        **kwargs,
++    ) -> list:
++        samples: list = []
++        for entry in self.data:
++            if len(samples) >= num_requests:
++                break
++            
++            prompt_list = [d["value"] for d in entry["conversations"][::2]]
++            completion_list = [d["value"] for d in entry["conversations"][1::2]]
++            # prompt, completion = (
++            #     entry["conversations"][0]["value"],
++            #     entry["conversations"][1]["value"],
++            # )
++
++            lora_request, tokenizer = self.get_random_lora_request(
++                tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
++            
++            
++            prompt_ids_list = []
++            completion_ids_list = []
++            prompt_len_list = []
++            new_output_len_list = []
++            history_len = 0
++            for turn_id in range(len(prompt_list)):
++                try:
++                    prompt_ids = tokenizer(prompt_list[turn_id]).input_ids
++                    completion_ids = tokenizer(completion_list[turn_id]).input_ids
++                except:
++                    print(entry)
++                    raise
++                prompt_len = len(prompt_ids) + history_len
++                new_output_len = len(completion_ids) if output_len is None else output_len
++                if not is_valid_sequence(
++                                prompt_len,
++                                new_output_len,
++                                min_len=4,
++                                max_prompt_len=4096,
++                                max_total_len=8192,
++                                skip_min_output_len_check=output_len
++                                is not None):
++                    turn_id -= 1
++                    break
++                prompt_ids_list.append(prompt_ids)
++                completion_ids_list.append(completion_ids)
++                prompt_len_list.append(prompt_len)
++                new_output_len_list.append(new_output_len)
++                history_len += prompt_len
++                history_len += new_output_len
++                
++            if turn_id <= 0:
++                continue
++            
++            prompt_list = prompt_list[:turn_id+1]
++            
++            samples.append(
++                SampleRequest(
++                    prompt=prompt_list,
++                    prompt_len=prompt_len_list,
++                    expected_output_len=new_output_len_list,
++                    lora_request=lora_request,
++                ))
++        self.maybe_oversample_requests(samples, num_requests)
++        return samples
++    
+ 
+ # -----------------------------------------------------------------------------
+ # BurstGPT Dataset Implementation
+diff --git a/benchmarks/benchmark_serving.py b/benchmarks/benchmark_serving.py
+index b5bd840d8..7e670eb64 100644
+--- a/benchmarks/benchmark_serving.py
++++ b/benchmarks/benchmark_serving.py
+@@ -54,7 +54,7 @@ from benchmark_dataset import (AIMODataset, BurstGPTDataset,
+                                ConversationDataset, HuggingFaceDataset,
+                                InstructCoderDataset, RandomDataset,
+                                SampleRequest, ShareGPTDataset, SonnetDataset,
+-                               VisionArenaDataset)
++                               VisionArenaDataset, ShareGPTMultiTurnsDataset)
+ from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
+ 
+ MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+@@ -166,7 +166,7 @@ def calculate_metrics(
+                     tokenizer(outputs[i].generated_text,
+                               add_special_tokens=False).input_ids)
+             actual_output_lens.append(output_len)
+-            total_input += input_requests[i].prompt_len
++            total_input += outputs[i].prompt_len
+             tpot = 0
+             if output_len > 1:
+                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
+@@ -293,6 +293,8 @@ async def benchmark(
+     )
+ 
+     test_output = await request_func(request_func_input=test_input)
++    if backend == "openai-chat-multiturns":
++        test_output = test_output[-1]
+     if not test_output.success:
+         raise ValueError(
+             "Initial test run failed - Please make sure benchmark arguments "
+@@ -374,6 +376,8 @@ async def benchmark(
+                 limited_request_func(request_func_input=request_func_input,
+                                      pbar=pbar)))
+     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
++    if backend == "openai-chat-multiturns":
++        outputs = [o for sub_o in outputs for o in sub_o]
+ 
+     if profile:
+         print("Stopping profiler...")
+@@ -636,6 +640,15 @@ def main(args: argparse.Namespace):
+                                         num_requests=args.num_prompts,
+                                         output_len=args.sharegpt_output_len,
+                                     ),
++            "sharegpt_multiturns":
++            lambda: ShareGPTMultiTurnsDataset(
++                min_num_turns=4,
++                random_seed=args.seed,
++                dataset_path=args.dataset_path).sample(
++                    tokenizer=tokenizer,
++                    num_requests=args.num_prompts,
++                    output_len=args.sharegpt_output_len,
++                ),
+             "burstgpt":
+             lambda: BurstGPTDataset(random_seed=args.seed,
+                                     dataset_path=args.dataset_path).
+@@ -789,7 +802,7 @@ if __name__ == "__main__":
+         "--dataset-name",
+         type=str,
+         default="sharegpt",
+-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
++        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "sharegpt_multiturns"],
+         help="Name of the dataset to benchmark on.",
+     )
+     parser.add_argument("--dataset-path",
+diff --git a/benchmarks/flexkv_benchmark/multiturn_benchmark.sh b/benchmarks/flexkv_benchmark/multiturn_benchmark.sh
+new file mode 100644
+index 000000000..a7239f3ec
+--- /dev/null
++++ b/benchmarks/flexkv_benchmark/multiturn_benchmark.sh
+@@ -0,0 +1,17 @@
++current_time=$(date +"%Y-%m-%d-%H:%M:%S")
++for workers in 128; do
++    concurrency_multiplier=4
++    if [ $workers -gt 128 ]; then
++        concurrency_multiplier=2
++    fi
++    python ../benchmark_serving.py \
++        --backend openai-chat-multiturns \
++        --model /Qwen/Qwen3-8b \
++        --dataset-name sharegpt_multiturns \
++        --dataset-path /datasets/ShareGPT_V3_unfiltered_cleaned_split.json \
++        --num-prompts $((workers*concurrency_multiplier)) \
++        --max-concurrency $workers \
++        --host  0.0.0.0 \
++        --port 12599 \
++        --endpoint /v1/chat/completions 2>&1
++done
+\ No newline at end of file
+diff --git a/benchmarks/flexkv_benchmark/run_flexkv_server.sh b/benchmarks/flexkv_benchmark/run_flexkv_server.sh
+new file mode 100644
+index 000000000..e370fd8da
+--- /dev/null
++++ b/benchmarks/flexkv_benchmark/run_flexkv_server.sh
+@@ -0,0 +1,15 @@
++MODEL_PATH=/Qwen/Qwen3-8b
++
++CMD="python flexKV/examples/run_server.py \
++    --model-path $MODEL_PATH \
++    --tp-size 1 \
++    --dp-size 1 \
++    --block-size 16 \
++    --num-cpu-blocks 65536 \
++    --server-recv-port ipc:///tmp/tmpe0x8_0gq \
++    "
++echo
++echo
++
++echo $CMD
++eval $CMD
+\ No newline at end of file
+diff --git a/benchmarks/flexkv_benchmark/serving_vllm.sh b/benchmarks/flexkv_benchmark/serving_vllm.sh
+new file mode 100644
+index 000000000..2be4b0880
+--- /dev/null
++++ b/benchmarks/flexkv_benchmark/serving_vllm.sh
+@@ -0,0 +1,47 @@
++MODEL_PATH=/Qwen/Qwen3-8b
++
++type=${1}
++
++if [[ $type = 0 ]]; then
++    # no prefix cache
++    prefix_args="--no-enable-prefix-caching"
++elif [[ $type = 1 ]]; then
++    # gpu prefix cache
++    prefix_args=""
++elif [[ $type = 2 ]]; then
++    # flexkv
++    prefix_args=""
++    export ENABLE_FLEXKV="true"
++    export FLEXKV_SERVER_RECV_PORT="ipc:///tmp/tmpe0x8_0gq"
++else
++    echo "ERROR: Unknown running type [$running_type]"
++    exit -1
++fi
++
++# nccl envs
++export GLOO_SOCKET_IFNAME=eth0
++export NCCL_SOCKET_IFNAME=eth0
++export NCCL_IB_GID_INDEX=3
++export NCCL_IB_DISABLE=0
++export NCCL_NET_GDR_LEVEL=2
++export NCCL_IB_QPS_PER_CONNECTION=4
++export NCCL_IB_TC=160
++export NCCL_IB_TIMEOUT=22
++export NCCL_PXN_DISABLE=0
++
++CMD="python -m vllm.entrypoints.openai.api_server --model $MODEL_PATH \
++    --port=12599 \
++    --tensor-parallel-size=1 \
++    --data-parallel-size=1 \
++    --pipeline-parallel-size=1 \
++    --max-model-len=8192 \
++    --max-num-seqs=256 \
++    --gpu-memory-utilization 0.3 \
++    --max-num-batched-tokens 8192 \
++    $prefix_args \
++    "
++echo
++echo
++
++echo $CMD
++eval $CMD
+\ No newline at end of file
+diff --git a/examples/offline_inference/prefix_caching_flexkv.py b/examples/offline_inference/prefix_caching_flexkv.py
+new file mode 100644
+index 000000000..6ff17dfca
+--- /dev/null
++++ b/examples/offline_inference/prefix_caching_flexkv.py
+@@ -0,0 +1,123 @@
++# SPDX-License-Identifier: Apache-2.0
++import os
++
++from vllm import LLM, SamplingParams
++from vllm.distributed import cleanup_dist_env_and_memory
++
++# NOTE: This is just a running example. For benchmarking purpose,
++# please see benchmarks/benchmark_prefix_caching.py
++
++os.environ["ENABLE_FLEXKV"] = "true"
++os.environ["FLEXKV_SERVER_RECV_PORT"] = "ipc:///tmp/tmpe0x8_0gq"
++
++# Common prefix.
++prefix = (
++    "You are an expert school principal, skilled in effectively managing "
++    "faculty and staff. Draft 10-15 questions for a potential first grade "
++    "Head Teacher for my K-12, all-girls', independent school that emphasizes "
++    "community, joyful discovery, and life-long learning. The candidate is "
++    "coming in for a first-round panel interview for a 8th grade Math "
++    "teaching role. They have 5 years of previous teaching experience "
++    "as an assistant teacher at a co-ed, public school with experience "
++    "in middle school math teaching. Based on these information, fulfill "
++    "the following paragraph: ")
++
++# Sample prompts.
++prompts = [
++    "Hello, my name is",
++    "The president of the United States is",
++    "The capital of France is",
++    "The future of AI is",
++]
++
++generating_prompts = [prefix + prompt for prompt in prompts]
++
++# Create a sampling params object.
++sampling_params = SamplingParams(temperature=0.0)
++
++def main():
++    # Create an LLM without prefix caching as a baseline.
++    regular_llm = LLM(model="facebook/opt-125m", 
++                      enable_prefix_caching=False,
++                      gpu_memory_utilization=0.4)
++
++    print("Results without `enable_prefix_caching`")
++
++    # ruff: noqa: E501
++    # Generate texts from the prompts. The output is a list of RequestOutput objects
++    # that contain the prompt, generated text, and other information.
++    outputs = regular_llm.generate(generating_prompts, sampling_params)
++
++    regular_generated_texts = []
++    # Print the outputs.
++    print("-" * 50)
++    for output in outputs:
++        prompt = output.prompt
++        generated_text = output.outputs[0].text
++        regular_generated_texts.append(generated_text)
++        print(f"Prompt: {prompt!r}\nGenerated text: {generated_text!r}")
++        print("-" * 50)
++
++    # Destroy the LLM object and free up the GPU memory.
++    del regular_llm
++    cleanup_dist_env_and_memory()
++
++    # Create an LLM with prefix caching enabled.
++    prefix_cached_llm = LLM(model="facebook/opt-125m",
++                            enable_prefix_caching=True,
++                            gpu_memory_utilization=0.4)
++
++    # Warmup so that the shared prompt's KV cache is computed.
++    prefix_cached_llm.generate(generating_prompts[0], sampling_params)
++
++    # Generate with prefix caching.
++    outputs = prefix_cached_llm.generate(generating_prompts, sampling_params)
++
++    print("Results with `enable_prefix_caching`")
++
++    cached_generated_texts = []
++    # Print the outputs. You should see the same outputs as before.
++    print("-" * 50)
++    for output in outputs:
++        prompt = output.prompt
++        generated_text = output.outputs[0].text
++        cached_generated_texts.append(generated_text)
++        print(f"Prompt: {prompt!r}\nGenerated text: {generated_text!r}")
++        print("-" * 50)
++
++    # Compare the results and display the speedup
++    generated_same = all([
++        regular_generated_texts[i] == cached_generated_texts[i]
++        for i in range(len(prompts))
++    ])
++    print(f"Generated answers are the same: {generated_same}")
++
++    # reset prefix cache to use flexkv
++    prefix_cached_llm.reset_prefix_cache()
++
++    # Generate with prefix caching.
++    outputs = prefix_cached_llm.generate(generating_prompts, sampling_params)
++
++    print("Results with `flexkv`")
++
++    flexkv_generated_texts = []
++    # Print the outputs. You should see the same outputs as before.
++    print("-" * 50)
++    for output in outputs:
++        prompt = output.prompt
++        generated_text = output.outputs[0].text
++        flexkv_generated_texts.append(generated_text)
++        print(f"Prompt: {prompt!r}\nGenerated text: {generated_text!r}")
++        print("-" * 50)
++
++    # Compare the results and display the speedup
++    generated_same = all([
++        regular_generated_texts[i] == flexkv_generated_texts[i]
++        for i in range(len(prompts))
++    ])
++    print(f"Generated answers are the same: {generated_same}")
++
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vllm/distributed/flexkv_extension/__init__.py b/vllm/distributed/flexkv_extension/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/distributed/flexkv_extension/client.py b/vllm/distributed/flexkv_extension/client.py
+new file mode 100644
+index 000000000..11b7ff1c3
+--- /dev/null
++++ b/vllm/distributed/flexkv_extension/client.py
+@@ -0,0 +1,91 @@
++import torch
++from typing import Optional
++
++from flexkv.server.client import KVDPClient, KVTPClient
++from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
++from flexkv.common.config import ModelConfig
++from vllm.distributed.flexkv_extension.config import FlexKVConfig
++from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++class FlexKVDPClient:
++    def __init__(
++        self,
++        flexkv_config: FlexKVConfig
++    ):
++        self.flexkv_config = flexkv_config
++        self.server_recv_port = flexkv_config.server_recv_port
++        self.tp_size = flexkv_config.tp_size
++        self.model_config = ModelConfig(
++            num_layers=flexkv_config.num_layers,
++            num_kv_heads=flexkv_config.num_kv_heads,
++            head_size=flexkv_config.head_size,
++            use_mla=flexkv_config.use_mla,
++            dtype=flexkv_config.dtype,
++            tp_size=flexkv_config.tp_size,
++        )
++        
++        logger.info(f"start init FlexKVDPClient to {self.server_recv_port}")
++        self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
++        logger.info(f"finish init FlexKVDPClient")
++        
++    def put_async(
++        self,
++        token_ids: torch.Tensor,
++        slot_mapping: torch.Tensor,
++        token_mask: Optional[torch.Tensor] = None,
++    ) -> int:
++        " return task_id "
++        return self.dp_client.put_async(token_ids, slot_mapping, token_mask)
++    
++    def get_async(
++        self,
++        token_ids: torch.Tensor,
++        slot_mapping: torch.Tensor,
++        token_mask: Optional[torch.Tensor] = None,
++    ) -> int:
++        " return task_id "
++        return self.dp_client.get_async(token_ids, slot_mapping, token_mask)
++        
++    def wait(
++        self, 
++        wait_task_ids: list[int],
++    ) -> dict[int, torch.Tensor]:
++        return self.dp_client.wait(wait_task_ids)
++    
++    def try_wait(
++        self, 
++        wait_task_ids: list[int],
++    ) -> dict[int, Optional[torch.Tensor]]:
++        return self.dp_client.try_wait(wait_task_ids)
++        
++        
++class FlexKVTPClient:
++    def __init__(
++        self,
++        flexkv_config: FlexKVConfig,
++        dp_client_id: int,
++        tp_rank: int,
++        device_id: int,
++        gpu_blocks: list[torch.Tensor],
++        kv_shape: tuple[int],
++    ):
++        logger.info(f"start init FlexKVTPClient to {flexkv_config.server_recv_port}")
++        self.tp_client = KVTPClient(flexkv_config.server_recv_port, dp_client_id, device_id, tp_rank)
++        logger.info(f"finish init FlexKVTPClient")
++        gpu_layout = KVCacheLayout(
++            type=KVCacheLayoutType.LAYERWISE,
++            num_layer=flexkv_config.num_layers,
++            num_block=flexkv_config.num_blocks,
++            tokens_per_block=flexkv_config.block_size,
++            num_head=flexkv_config.num_kv_heads,
++            head_size=flexkv_config.head_size,
++            is_mla=flexkv_config.use_mla,
++        )
++        logger.info(f"start register FlexKVTPClient")
++        self.tp_client.register_to_server(gpu_blocks, gpu_layout)
++
++        logger.info(f"finish register FlexKVTPClient")
+\ No newline at end of file
+diff --git a/vllm/distributed/flexkv_extension/config.py b/vllm/distributed/flexkv_extension/config.py
+new file mode 100644
+index 000000000..f2724e712
+--- /dev/null
++++ b/vllm/distributed/flexkv_extension/config.py
+@@ -0,0 +1,45 @@
++from dataclasses import dataclass
++import json
++import os
++import torch
++from vllm.v1.kv_cache_interface import KVCacheConfig, FullAttentionSpec
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++@dataclass
++class FlexKVConfig:
++    enable_flexkv: bool
++    server_recv_port: str
++    num_blocks: int = None
++    block_size: int = None
++    num_layers: int = None
++    num_kv_heads: int = None
++    head_size: int = None
++    dtype: torch.dtype = None
++    use_mla: bool = False
++    tp_size: int = 1
++    
++    @classmethod
++    def from_env(cls) -> 'FlexKVConfig':
++        enable_flexkv = (os.getenv('ENABLE_FLEXKV', "false").lower() == "true")
++        server_recv_port = os.getenv('FLEXKV_SERVER_RECV_PORT', "")
++        
++        return cls(enable_flexkv=enable_flexkv,
++                   server_recv_port=server_recv_port)
++    
++    def post_init(
++        self, 
++        kv_cache_config: KVCacheConfig,
++        tp_size: int
++        ):
++        self.num_blocks = kv_cache_config.num_blocks
++        self.num_layers = len(kv_cache_config.kv_cache_groups)
++        kv_cache_spec: FullAttentionSpec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
++        self.block_size = kv_cache_spec.block_size
++        self.num_kv_heads = kv_cache_spec.num_kv_heads
++        self.head_size = kv_cache_spec.head_size
++        self.dtype = kv_cache_spec.dtype
++        self.use_mla = kv_cache_spec.use_mla
++        self.tp_size = tp_size
+\ No newline at end of file
+diff --git a/vllm/logger.py b/vllm/logger.py
+index 2b0b9da2d..7f377af6d 100644
+--- a/vllm/logger.py
++++ b/vllm/logger.py
+@@ -19,7 +19,7 @@ VLLM_LOGGING_CONFIG_PATH = envs.VLLM_LOGGING_CONFIG_PATH
+ VLLM_LOGGING_LEVEL = envs.VLLM_LOGGING_LEVEL
+ VLLM_LOGGING_PREFIX = envs.VLLM_LOGGING_PREFIX
+ 
+-_FORMAT = (f"{VLLM_LOGGING_PREFIX}%(levelname)s %(asctime)s "
++_FORMAT = (f"{VLLM_LOGGING_PREFIX}%(levelname)s %(asctime)s.%(msecs)03d "
+            "[%(filename)s:%(lineno)d] %(message)s")
+ _DATE_FORMAT = "%m-%d %H:%M:%S"
+ 
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index bd0e01d04..f4cadfba8 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -60,8 +60,9 @@ class PrefixCachingMetrics:
+         self.aggregated_requests = 0
+         self.aggregated_query_total = 0
+         self.aggregated_query_hit = 0
++        self.aggregated_query_flexkv_hit = 0
+         # A deque of (requests, queries, hits) for the most recent requests.
+-        self.query_queue: deque[tuple[int, int, int]] = deque()
++        self.query_queue: deque[tuple[int, int, int, int]] = deque()
+ 
+     def observe(self, stats: PrefixCacheStats):
+         """Observe the prefix caching for a set of requests.
+@@ -81,23 +82,26 @@ class PrefixCachingMetrics:
+             self.reset()
+ 
+         # Update the metrics.
+-        self.query_queue.append((stats.requests, stats.queries, stats.hits))
++        self.query_queue.append((stats.requests, stats.queries, stats.hits, stats.flexkv_hits))
+         self.aggregated_requests += stats.requests
+         self.aggregated_query_total += stats.queries
+         self.aggregated_query_hit += stats.hits
++        self.aggregated_query_flexkv_hit += stats.flexkv_hits
+ 
+         # Remove the oldest stats if the number of requests exceeds.
+         if self.aggregated_requests > self.interval:
+-            old_requests, old_queries, old_hits = self.query_queue.popleft()
++            old_requests, old_queries, old_hits, old_flexkv_hits = self.query_queue.popleft()
+             self.aggregated_requests -= old_requests
+             self.aggregated_query_total -= old_queries
+             self.aggregated_query_hit -= old_hits
++            self.aggregated_query_flexkv_hit -= old_flexkv_hits
+ 
+     def reset(self):
+         """Reset the metrics."""
+         self.aggregated_requests = 0
+         self.aggregated_query_total = 0
+         self.aggregated_query_hit = 0
++        self.aggregated_query_flexkv_hit = 0
+         self.query_queue.clear()
+ 
+     @property
+@@ -106,6 +110,15 @@ class PrefixCachingMetrics:
+         if self.aggregated_query_total == 0:
+             return 0.0
+         return self.aggregated_query_hit / self.aggregated_query_total
++    
++    @property
++    def flexkv_hit_rate(self) -> float:
++        """Calculate the hit rate for the past N requests."""
++        if self.aggregated_query_total == 0:
++            return 0.0
++        return self.aggregated_query_flexkv_hit / self.aggregated_query_total
++    
++
+ 
+ 
+ @dataclass
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index a81574875..e808e7537 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import time
++import torch
+ from collections import deque
+ from collections.abc import Iterable
+ from typing import Optional, Union
+@@ -27,6 +28,10 @@ from vllm.v1.request import Request, RequestStatus
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+ from vllm.v1.structured_output import StructuredOutputManager
+ 
++# flexkv
++from vllm.utils import cdiv
++from vllm.distributed.flexkv_extension.config import FlexKVConfig
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -118,6 +123,23 @@ class Scheduler(SchedulerInterface):
+         if speculative_config and speculative_config.method == "eagle":
+             self.num_lookahead_tokens = \
+                 speculative_config.num_speculative_tokens
++            
++        # flexkv
++        self.enable_flexkv = False
++        self.flexkv_client = None
++        # task_id -> Request
++        self.load_kv_tasks: dict[int, Request] = {}
++        # task_id -> Request
++        self.offload_kv_tasks: dict[int, Request] = {}
++        # request_id -> time info
++        self.flexkv_timer: dict[str, dict[str, float]] = {}
++
++
++    def init_flexkv(self, flexkv_config: FlexKVConfig) -> int:
++        self.enable_flexkv = True
++        from vllm.distributed.flexkv_extension.client import FlexKVDPClient
++        self.flexkv_client = FlexKVDPClient(flexkv_config)
++        return self.flexkv_client.dp_client.dp_client_id
+ 
+     def schedule(self) -> SchedulerOutput:
+         # NOTE(woosuk) on the scheduling algorithm:
+@@ -131,6 +153,13 @@ class Scheduler(SchedulerInterface):
+         # chunked prefills, prefix caching, speculative decoding,
+         # and the "jump decoding" optimization in the future.
+ 
++        # flexkv
++        if self.enable_flexkv:
++            # aviod busy loop
++            if self.get_num_unfinished_requests() == 0:
++                time.sleep(0.01)
++            self.check_offload_kv_tasks()
++
+         scheduled_new_reqs: list[Request] = []
+         scheduled_resumed_reqs: list[Request] = []
+         scheduled_running_reqs: list[Request] = []
+@@ -319,9 +348,9 @@ class Scheduler(SchedulerInterface):
+                 # Schedule encoder inputs.
+                 if request.has_encoder_inputs:
+                     (encoder_inputs_to_schedule, num_new_tokens,
+-                     new_encoder_budget) = self._try_schedule_encoder_inputs(
+-                         request, num_computed_tokens, num_new_tokens,
+-                         encoder_budget)
++                    new_encoder_budget) = self._try_schedule_encoder_inputs(
++                        request, num_computed_tokens, num_new_tokens,
++                        encoder_budget)
+                     if num_new_tokens == 0:
+                         # The request cannot be scheduled.
+                         break
+@@ -335,6 +364,29 @@ class Scheduler(SchedulerInterface):
+                     # The request cannot be scheduled.
+                     break
+ 
++                # flexkv
++                if self.enable_flexkv and num_new_tokens > self.block_size and request.status == RequestStatus.WAITING:
++                                        
++                    # don't match the last block
++                    num_new_blocks_to_get = cdiv(num_new_tokens, self.block_size)-1
++                    num_new_tokens_to_match = num_new_blocks_to_get*self.block_size
++                    num_tokens_to_get = num_computed_tokens + num_new_tokens_to_match
++                    blocks_ids_to_get = [block.block_id for block in new_blocks[:num_new_blocks_to_get]]
++                    slot_mapping = torch.tensor(blocks_ids_to_get).repeat_interleave(self.block_size)*self.block_size
++                    token_mask_to_get = torch.ones(num_tokens_to_get, dtype=torch.bool)
++                    token_mask_to_get[:num_computed_tokens] = False
++                    t_async_get_start = time.monotonic()
++                    task_id = self.flexkv_client.get_async(
++                        token_ids=torch.tensor(request.all_token_ids[:num_tokens_to_get]),
++                        slot_mapping=slot_mapping,
++                        token_mask=token_mask_to_get)
++                    t_async_get_return = time.monotonic()
++
++                    self.load_kv_tasks[task_id] = request
++                    self.flexkv_timer[request.request_id] = {}
++                    self.flexkv_timer[request.request_id]['get_async_start'] = t_async_get_start
++                    self.flexkv_timer[request.request_id]['get_async_return'] = t_async_get_return
++
+                 self.waiting.popleft()
+                 if request.use_structured_output:
+                     structured_output_request_ids[
+@@ -372,6 +424,29 @@ class Scheduler(SchedulerInterface):
+                         self.encoder_cache_manager.allocate(request, i)
+                     encoder_budget = new_encoder_budget
+ 
++            # batch wait
++            if self.enable_flexkv:
++                if len(self.load_kv_tasks) != 0:
++                    task_ids = list(self.load_kv_tasks.keys())
++                    results = self.flexkv_client.wait(task_ids)
++                    t_async_get_end = time.monotonic()
++                    for task_id, task_result in results.items():
++                        request = self.load_kv_tasks.pop(task_id)
++                        t_get_async_start = self.flexkv_timer[request.request_id]["get_async_start"]
++                        t_get_async_return =  self.flexkv_timer[request.request_id]["get_async_return"]
++                        match_length = task_result.sum().item()
++                        self.flexkv_timer.pop(request.request_id)
++                        logger.info(
++                            f"[FlexKV] req: {request.request_id}, task: {task_id}, "
++                            f"get {match_length} tokens cost {(t_async_get_end-t_get_async_start)*1000:.2f} ms, "
++                            f"get_async() api cost {(t_get_async_return-t_get_async_start)*1000:.2f} ms")
++                        
++                        token_budget += match_length
++                        num_scheduled_tokens[request.request_id] -= match_length
++                        request.num_computed_tokens += match_length
++                        self.kv_cache_manager.prefix_cache_stats.flexkv_hits += (match_length//self.block_size)
++
++
+         # Put back any skipped requests at the head of the waiting queue
+         if skipped_waiting_requests:
+             self.waiting.extendleft(skipped_waiting_requests)
+@@ -730,18 +805,36 @@ class Scheduler(SchedulerInterface):
+ 
+     def _free_request(self, request: Request) -> None:
+         assert request.is_finished()
+-        self.kv_cache_manager.free(request)
+-        self.kv_cache_manager.free_block_hashes(request)
+         self.encoder_cache_manager.free(request)
+         self._cached_reqs_data.pop(request.request_id, None)
+         del self.requests[request.request_id]
+         self.finished_req_ids.add(request.request_id)
+ 
++        if self.enable_flexkv:
++            self._offload_kv(request)
++        else:
++            self._free_block(request)
++
++    def _free_block(self, request: Request) -> None:
++        self.kv_cache_manager.free(request)
++        self.kv_cache_manager.free_block_hashes(request)
++
++    def _offload_kv(self, request: Request):
++        req_blocks = self.kv_cache_manager.req_to_blocks.get(request.request_id, [])
++        req_token_ids = torch.tensor(request.all_token_ids[:-1])
++        req_block_ids = torch.tensor([block.block_id for block in req_blocks])
++        slot_mapping = req_block_ids.repeat_interleave(self.block_size)[:len(req_token_ids)] * self.block_size
++        self.flexkv_timer[request.request_id] = {}
++        self.flexkv_timer[request.request_id]["put_async_start"] = time.monotonic()
++        task_id = self.flexkv_client.put_async(token_ids=req_token_ids, slot_mapping=slot_mapping)
++        self.offload_kv_tasks[task_id] = request
++        self.flexkv_timer[request.request_id]["put_async_return"] = time.monotonic()
++
+     def get_num_unfinished_requests(self) -> int:
+         return len(self.waiting) + len(self.running)
+ 
+     def has_finished_requests(self) -> bool:
+-        return len(self.finished_req_ids) > 0
++        return len(self.finished_req_ids) > 0 or len(self.offload_kv_tasks)
+ 
+     def get_num_unscheduled_requests(self) -> int:
+         """Number of requests that are not being processed by the executor."""
+@@ -777,3 +870,23 @@ class Scheduler(SchedulerInterface):
+         spec_decoding_stats.observe(num_draft_tokens=num_draft_tokens,
+                                     num_accepted_tokens=num_accepted_tokens)
+         return spec_decoding_stats
++
++    def check_offload_kv_tasks(self):
++        if len(self.offload_kv_tasks) == 0:
++            return
++        logger.info(f"check_offload_kv_tasks")
++        task_ids = list(self.offload_kv_tasks.keys())
++        results = self.flexkv_client.try_wait(task_ids)
++        t_async_put_end = time.monotonic()
++        for task_id, task_result in results.items():
++            if task_result is not None:
++                request = self.offload_kv_tasks.pop(task_id)
++                t_put_async_start = self.flexkv_timer[request.request_id]["put_async_start"]
++                t_put_async_return =  self.flexkv_timer[request.request_id]["put_async_return"]
++                self.flexkv_timer.pop(request.request_id)
++                logger.info(
++                    f"[FlexKV] req: {request.request_id}, task: {task_id}, "
++                    f"put {sum(task_result).item()} tokens cost {(t_async_put_end-t_put_async_start)*1000:.2f} ms, "
++                    f"put_async() api cost {(t_put_async_return-t_put_async_start)*1000:.2f} ms")
++                self._free_block(request) 
++            
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index f642e5100..3ce609b50 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -40,6 +40,8 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+ from vllm.v1.structured_output import StructuredOutputManager
+ from vllm.version import __version__ as VLLM_VERSION
+ 
++from vllm.distributed.flexkv_extension.config import FlexKVConfig
++
+ logger = init_logger(__name__)
+ 
+ POLLING_TIMEOUT_S = 2.5
+@@ -105,6 +107,8 @@ class EngineCore:
+             log_stats=self.log_stats,
+         )
+ 
++        self.init_flexkv(vllm_config, kv_cache_config)
++
+         # Setup MM Input Mapper.
+         self.mm_input_cache_server = MirroredProcessingCache(
+             vllm_config.model_config)
+@@ -164,6 +168,22 @@ class EngineCore:
+                      "warmup model) took %.2f seconds"), elapsed)
+         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
+ 
++    def init_flexkv(
++        self, 
++        taco_llm_config: VllmConfig, 
++        kv_cache_config: KVCacheConfig
++    ):
++        self.scheduler: V1Scheduler
++        if taco_llm_config.cache_config.enable_prefix_caching:
++            flexkv_config = FlexKVConfig.from_env()
++            if flexkv_config.enable_flexkv:
++                flexkv_config.post_init(
++                    kv_cache_config=kv_cache_config,
++                    tp_size=taco_llm_config.parallel_config.tensor_parallel_size,
++                )
++                dp_client_id = self.scheduler.init_flexkv(flexkv_config)
++                self.model_executor.init_flexkv(flexkv_config, dp_client_id)
++
+     def add_request(self, request: EngineCoreRequest):
+         """Add request to the scheduler."""
+ 
+diff --git a/vllm/v1/executor/abstract.py b/vllm/v1/executor/abstract.py
+index e3a4cd98c..dd009a3a4 100644
+--- a/vllm/v1/executor/abstract.py
++++ b/vllm/v1/executor/abstract.py
+@@ -14,6 +14,7 @@ from vllm.executor.uniproc_executor import (  # noqa
+     UniProcExecutor as UniProcExecutorV0)
+ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+ from vllm.v1.outputs import ModelRunnerOutput
++from vllm.distributed.flexkv_extension.config import FlexKVConfig
+ 
+ 
+ class Executor(ExecutorBase):
+@@ -78,6 +79,11 @@ class Executor(ExecutorBase):
+                                      args=(scheduler_output, ))
+         return output[0]
+ 
++
++    def init_flexkv(self, flexkv_config: FlexKVConfig, dp_client_id: int):
++        self.collective_rpc("init_flexkv",
++                            args=(flexkv_config, dp_client_id, ))
++
+     @property
+     def max_concurrent_batches(self) -> int:
+         return 1
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 3959be40b..69c5b59a1 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -90,7 +90,8 @@ class LoggingStatLogger(StatLoggerBase):
+             "Avg generation throughput: %.1f tokens/s, "
+             "Running: %d reqs, Waiting: %d reqs, "
+             "GPU KV cache usage: %.1f%%, "
+-            "Prefix cache hit rate: %.1f%%",
++            "Prefix cache hit rate: %.1f%%, "
++            "FlexKV hit rate: %.1f%%",
+             self.engine_index,
+             prompt_throughput,
+             generation_throughput,
+@@ -98,6 +99,7 @@ class LoggingStatLogger(StatLoggerBase):
+             scheduler_stats.num_waiting_reqs,
+             scheduler_stats.gpu_cache_usage * 100,
+             self.prefix_caching_metrics.hit_rate * 100,
++            self.prefix_caching_metrics.flexkv_hit_rate * 100,
+         )
+ 
+         if scheduler_stats.spec_decoding_stats is not None:
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index fd9492648..8915c4f78 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -23,6 +23,8 @@ class PrefixCacheStats:
+     queries: int = 0
+     # The number of hits in these requests.
+     hits: int = 0
++    # flexkv
++    flexkv_hits: int = 0
+ 
+ 
+ @dataclass
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 2972e0ffb..6bb8fa9ff 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -14,7 +14,7 @@ from vllm.device_allocator.cumem import CuMemAllocator
+ from vllm.distributed import (ensure_model_parallel_initialized,
+                               init_distributed_environment,
+                               set_custom_all_reduce)
+-from vllm.distributed.parallel_state import get_pp_group
++from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
+ from vllm.logger import init_logger
+ from vllm.lora.request import LoRARequest
+ from vllm.model_executor import set_random_seed
+@@ -25,6 +25,10 @@ from vllm.v1.outputs import ModelRunnerOutput
+ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+ from vllm.v1.worker.worker_base import WorkerBase
+ 
++# flexkv
++from vllm.distributed.flexkv_extension.config import FlexKVConfig
++from vllm.distributed.flexkv_extension.client import FlexKVTPClient
++
+ logger = init_logger(__name__)
+ 
+ if TYPE_CHECKING:
+@@ -282,7 +286,23 @@ class Worker(WorkerBase):
+             pattern=pattern,
+             max_size=max_size,
+         )
+-
++    
++    def init_flexkv(
++        self, 
++        flexkv_config: FlexKVConfig,
++        dp_client_id: int,
++    ) -> None:
++        from vllm.distributed.flexkv_extension.client import FlexKVTPClient
++        layer_kv_shape = self.model_runner.attn_backend.get_kv_cache_shape(
++                        flexkv_config.num_blocks, flexkv_config.block_size,
++                        flexkv_config.num_kv_heads, flexkv_config.head_size)
++        kv_shape = (flexkv_config.num_layers, *layer_kv_shape)
++        self.flexkv_client = FlexKVTPClient(flexkv_config=flexkv_config,
++                                            dp_client_id=dp_client_id,
++                                            tp_rank=get_tensor_model_parallel_rank(),
++                                            device_id=self.device.index,
++                                            gpu_blocks=self.model_runner.kv_caches,
++                                            kv_shape=kv_shape)
+ 
+ def init_worker_distributed_environment(
+     parallel_config: ParallelConfig,

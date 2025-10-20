@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Optional, Literal, List
 from enum import Enum
 from typing import Optional, List, Union, Dict, Any
 
@@ -33,15 +32,14 @@ class CacheConfig:
     enable_ssd: bool = False
     enable_remote: bool = False
     enable_gds: bool = False
-    use_pinned_memory: bool = False
     index_accel: bool = False
 
     # kv cache layout configs
     gpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
-    cpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
-    ssd_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
-    remote_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
-    gds_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
+    cpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
+    ssd_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
+    remote_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
+    gds_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
@@ -78,6 +76,18 @@ class CacheConfig:
     trace_max_file_size_mb: int = 100
     trace_max_files: int = 5
     trace_flush_interval_ms: int = 1000
-    
+
     #evict ratio
     evict_ratio: float = 0.0
+
+    def __post_init__(self):
+        layout_fields = ['gpu_kv_layout_type', 
+                         'cpu_kv_layout_type', 
+                         'ssd_kv_layout_type', 
+                         'remote_kv_layout_type',
+                         'gds_kv_layout_type']
+        for field in layout_fields:
+            value = getattr(self, field)
+            if isinstance(value, str):
+                setattr(self, field, KVCacheLayoutType[value.upper()])
+        

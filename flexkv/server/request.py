@@ -11,6 +11,7 @@ from flexkv.common.request import KVResponseStatus
 
 @dataclass
 class RegisterDPClientRequest:
+    dp_client_id: int
     model_config: ModelConfig
     client_recv_port: str
 
@@ -18,9 +19,7 @@ class RegisterDPClientRequest:
 @dataclass
 class RegisterTPClientRequest:
     dp_client_id: int
-    tp_rank: int
     device_id: int
-    client_recv_port: str
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
 
@@ -44,12 +43,12 @@ class GetRequest:
     slot_mapping: np.ndarray
     token_mask: Optional[np.ndarray]
     task_id: int = -1
+    layer_granularity: int = -1
 
 @dataclass
 class PutMatchRequest:
     dp_client_id: int
     token_ids: np.ndarray
-    slot_mapping: np.ndarray
     token_mask: Optional[np.ndarray]
     task_id: int = -1
 
@@ -57,14 +56,15 @@ class PutMatchRequest:
 class GetMatchRequest:
     dp_client_id: int
     token_ids: np.ndarray
-    slot_mapping: np.ndarray
     token_mask: Optional[np.ndarray]
+    layer_granularity: int
     task_id: int = -1
 
 @dataclass
 class LaunchTaskRequest:
     dp_client_id: int
     task_ids: List[int]
+    slot_mappings: List[np.ndarray]
 
 @dataclass
 class CancelTaskRequest:
@@ -101,11 +101,13 @@ class Response:
         return self.status is not None and \
                all(self.status[task_id] == KVResponseStatus.SUCCESS for task_id in self.status.keys())
 
+@dataclass
+class StartRequest:
+    dp_client_id: int
 
 @dataclass
 class ShutdownRequest:
     dp_client_id: int
-
 
 @dataclass
 class CheckRunningRequest:

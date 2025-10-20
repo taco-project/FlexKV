@@ -35,7 +35,6 @@ class StorageEngine:
                 device_type=DeviceType.CPU,
                 layout=self._cpu_layout,
                 dtype=self._model_config.dtype,
-                pin_memory=self._cache_config.use_pinned_memory,
             )
         if self._cache_config.enable_ssd:
             if not self._cache_config.ssd_kv_layout_type == self._cpu_layout.type:

@@ -95,15 +95,14 @@ class CPUAllocator(BaseStorageAllocator):
                  layout: KVCacheLayout,
                  dtype: torch.dtype,
                  **kwargs: Any) -> StorageHandle:
-        pin_memory = kwargs.get("pin_memory", True)
         total_size = layout.get_total_elements()
         # although the kv layout may have multiple dimensions, we only have one-dim CPU tensor
         flexkv_logger.info(f"CPU allocate total_size: {2 * total_size/1024/1024/1024} GB")
         physical_tensor = torch.empty(
                             size=(total_size,),
                             dtype=dtype,
-                    device="cpu",
-                            pin_memory=pin_memory,
+                            device="cpu",
+                            pin_memory=False,
                         )
         return StorageHandle(
             handle_type=AccessHandleType.TENSOR,
@@ -277,8 +276,6 @@ class RemoteAllocator(BaseStorageAllocator):
             dtype=dtype,
             remote_config_custom = remote_config_custom,
         )
-        return allocator
-
 
 class GDSAllocator(BaseStorageAllocator):
     def __init__(

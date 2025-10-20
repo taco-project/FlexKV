@@ -7,6 +7,9 @@ from setuptools import find_packages, setup
 from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
 
+def get_version():
+    with open(os.path.join(os.path.dirname(__file__), "VERSION")) as f:
+        return f.read().strip()
 
 build_dir = "build"
 os.makedirs(build_dir, exist_ok=True)
@@ -39,9 +42,9 @@ hpp_sources = [
     "csrc/gds/gds_manager.h",
 ]
 
-extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring", "-lcufile"] #"-lssl", "-lcrypto"
+extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring", "-lcufile"]
 extra_compile_args = ["-std=c++17", "-DENABLE_GDS"]
-include_dirs = [os.path.join(build_dir, "include"), "csrc"]
+include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
 
 # Add rpath to find libraries at runtime
 lib_dir = os.path.join(build_dir, "lib")
@@ -134,7 +137,7 @@ with open("requirements.txt") as f:
 setup(
     name="flexkv",
     description="A global KV-Cache manager for LLM inference",
-    version="0.1.0",
+    version=get_version(),
     packages=find_packages(exclude=("benchmarks", "csrc", "examples", "tests")),
     package_data={
         "flexkv": ["*.so", "lib/*.so", "lib/*.so.*"],

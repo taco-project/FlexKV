@@ -28,7 +28,7 @@ def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_c
     """Run tp_client process"""
     try:
         device_id = tp_rank + dp_client_id * model_config.tp_size
-        tp_client = KVTPClient(server_recv_port, dp_client_id, device_id, tp_rank)
+        tp_client = KVTPClient(server_recv_port, dp_client_id, device_id)
 
         gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
 
@@ -52,7 +52,6 @@ def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_c
         while True:
             time.sleep(1)
     except Exception as e:
-        print(f"[TP Client {tp_rank}] Error occurred: {e}")
         if child_conn is not None:
             child_conn.send(None)
             child_conn.close()
@@ -69,7 +68,7 @@ def shutdown_tp_client(tp_client_processes):
 
 @pytest.mark.parametrize("model_config", [
     {'tp_size': 1, 'dp_size': 1},
-   {'tp_size': 2, 'dp_size': 2},
+    {'tp_size': 2, 'dp_size': 2},
     {'dtype': torch.float32},
     {'use_mla': True},
     {'tp_size': 4, 'dp_size': 1, 'use_mla': True},
@@ -142,7 +141,7 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
 
         tp_client_process = Process(
             target=run_tp_client,
-            args=(0, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks, child_conn),
+            args=(0, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks + tp_rank, child_conn),
             daemon=True
         )
         tp_client_processes.append(tp_client_process)

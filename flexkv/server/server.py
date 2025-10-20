@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union
 
 import tempfile
 import zmq
@@ -10,6 +10,8 @@ from threading import Lock
 import multiprocessing as mp
 import socket
 import os
+import subprocess
+import textwrap
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
@@ -30,66 +32,11 @@ from flexkv.server.request import (
     WaitRequest,
     TryWaitRequest,
     Response,
+    StartRequest,
     ShutdownRequest,
     CheckRunningRequest,
 )
 import contextlib
-
-
-def _is_port_in_use(port_or_endpoint: str) -> bool:
-    """
-    check if the port or IPC endpoint is in use by another process
-    
-    Args:
-        port_or_endpoint: port number or IPC endpoint string (e.g. "ipc:///tmp/xxx" or "5555")
-    
-    Returns:
-        bool: True if the port/endpoint is in use, False if it is free
-    """
-    try:
-        if port_or_endpoint.startswith("ipc://"):
-            # IPC endpoint: check if the file exists
-            ipc_path = port_or_endpoint[6:]  # remove "ipc://" prefix
-            return os.path.exists(ipc_path)
-        elif port_or_endpoint.startswith("tcp://"):
-            # TCP endpoint: parse host and port
-            tcp_part = port_or_endpoint[6:]  # remove "tcp://" prefix
-            if ':' in tcp_part:
-                host, port_str = tcp_part.rsplit(':', 1)
-                port = int(port_str)
-            else:
-                host = "localhost"
-                port = int(tcp_part)
-            
-            # try to connect to the port to check if it is in use
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex((host, port))
-            sock.close()
-            return result == 0
-        else:
-            # assume it is a pure port number
-            port = int(port_or_endpoint)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(("localhost", port))
-            sock.close()
-            return result == 0
-    except (ValueError, OSError):
-        # if parsing fails or connection fails, assume the port is free
-        return False
-"""
-class TPClient:
-    def __init__(
-        self,
-        send_to_client: zmq.Socket,
-        tp_rank: int = 0,
-        device_id: int = 0,
-    ):
-        self.tp_rank = tp_rank
-        self.device_id = device_id
-        self.send_to_client = send_to_client
-"""
 
 class DPClient:
     def __init__(
@@ -104,34 +51,6 @@ class DPClient:
         self.send_to_client = send_to_client
 
         self.is_ready: bool = False
-"""
-    def register_tp_client(
-        self,
-        context: zmq.Context,
-        client_recv_port: str,
-        tp_rank: int = 0,
-        device_id: int = 0,
-    ) -> None:
-        if tp_rank in self.tp_client_dict:
-            flexkv_logger.error(f"TP rank: {tp_rank} in DP client: {self.client_id} has already registered.")
-            raise
-        if tp_rank >= self.tp_size:
-            flexkv_logger.error(f"TP rank: {tp_rank} is larger than TP size of DP client: {self.client_id}.")
-            raise
-
-        send_to_client = get_zmq_socket(
-            context, zmq.SocketType.PUSH, client_recv_port, False
-        )
-
-        self.tp_client_dict[tp_rank] = TPClient(send_to_client, tp_rank, device_id)
-
-        flexkv_logger.info(f"TP rank: {tp_rank} in DP client: {self.client_id} registered successfully.")
-
-        if len(self.tp_client_dict) == self.tp_size:
-            self.is_ready = True
-            flexkv_logger.info(f"All the TP clients in DP client: {self.client_id} has registered. "
-                           f"DP client: {self.client_id} is ready!")
-"""
 
 class ClientManager:
     def __init__(
@@ -147,11 +66,13 @@ class ClientManager:
         context: zmq.Context,
         client_recv_port: str,
         tp_size: int = 1,
+        client_id: Optional[int] = None,
     ) -> int:
-        if len(self.free_client_ids) == 0:
-            flexkv_logger.error("Client full. DP client registration failed.")
-            raise
-        client_id = self.free_client_ids.popleft()
+        if client_id is None:
+            if len(self.free_client_ids) == 0:
+                flexkv_logger.error("Client full. DP client registration failed.")
+                raise
+            client_id = self.free_client_ids.popleft()
         send_to_client = get_zmq_socket(
             context, zmq.SocketType.PUSH, client_recv_port, False
         )
@@ -164,21 +85,6 @@ class ClientManager:
         flexkv_logger.info(f"DP client {client_id} registered successfully")
 
         return client_id
-    """
-    def register_tp_client(
-        self,
-        context: zmq.Context,
-        dp_client_id: int,
-        client_recv_port: str,
-        tp_rank: int,
-        device_id: int
-    ) -> None:
-        if dp_client_id not in self.client_dict:
-            flexkv_logger.error(f"DP client: {dp_client_id} has not registered.")
-            raise
-        self.client_dict[dp_client_id].register_tp_client(
-            context, client_recv_port, tp_rank, device_id)
-    """
     def delete_dp_client(self, client_id: int) -> None:
         if client_id not in self.client_dict:
             flexkv_logger.error(f"DP client: {client_id} dosen't exist. Delete failed.")
@@ -200,20 +106,8 @@ class ClientManager:
         return False
 
 class KVServerHandle:
-    def __init__(self, process: mp.Process, ready_event: mp.Event):
+    def __init__(self, process: Union[mp.Process, 'subprocess.Popen']):
         self.process = process
-        self.ready_event = ready_event
-    
-    def shutdown(self) -> None:
-        self.process.join(timeout=5)
-        if self.process.is_alive():
-            flexkv_logger.info("force terminate the server process")
-            self.process.terminate()
-            self.process.join()
-
-    def __del__(self) -> None:
-        if self.process.is_alive():
-            self.shutdown()
 
 class KVServer:
     def __init__(
@@ -231,157 +125,135 @@ class KVServer:
 
         self.client_manager = ClientManager(max_num_dp_client=model_config.dp_size)
         self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port, False)
-        self.kv_task_engine.start()
-        self._is_ready = True
 
         self.req_counter = 0
-
-        flexkv_logger.info(f"Server Initialized! [Recv Port]: {server_recv_port}")
+        self._is_ready = False
         self._running = False
+
+        # Request handler dispatch table
+        self.request_handlers = {
+            StartRequest: self._handle_start_request,
+            RegisterDPClientRequest: self._handle_register_dp_client_request,
+            IsReadyRequest: self._handle_is_ready_request,
+            GetRequest: self._handle_get_request,
+            PutRequest: self._handle_put_request,
+            GetMatchRequest: self._handle_get_match_request,
+            PutMatchRequest: self._handle_put_match_request,
+            WaitRequest: self._handle_wait_request,
+            LaunchTaskRequest: self._handle_launch_task_request,
+            CancelTaskRequest: self._handle_cancel_task_request,
+            TryWaitRequest: self._handle_try_wait_request,
+            ShutdownRequest: self._handle_shutdown_request,
+        }
 
     def is_ready(self) -> bool:
         return self._is_ready
 
+    def start_server(self) -> None:
+        self.kv_task_engine.start()
+        self._is_ready = True
+
     @staticmethod
-    def _server_process(model_config: ModelConfig, 
+    def _server_process(model_config: ModelConfig,
                        cache_config: CacheConfig,
                        gpu_register_port: str,
-                       server_recv_port: str,
-                       ready_event: mp.Event) -> None:
-        
+                       server_recv_port: str) -> None:
+
         server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
-        ready_event.set()
         server.run()
-        
+
     @classmethod
     def create_server(cls,
                       model_config: ModelConfig,
                       cache_config: CacheConfig,
                       gpu_register_port: str,
-                      server_recv_port: Optional[str] = None) -> 'KVServerHandle':
-        if server_recv_port is None:
-            server_recv_port = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        #if _is_port_in_use(server_recv_port):
-        #    flexkv_logger.info(f"port {server_recv_port} is in use, skip starting new kvserver")
-        #    return None
-        #else:
-        #    flexkv_logger.info(f"port {server_recv_port} is free, starting new kvserver")
-        mp.set_start_method("spawn")
-        ready_event = mp.Event()
-        process = mp.Process(target=cls._server_process,
-                             args=(model_config, cache_config, gpu_register_port, server_recv_port, ready_event))
-        process.start()
-        flexkv_logger.info(f"KVServer process started, PID: {process.pid}")
+                      server_recv_port: Optional[str] = None,
+                      child_env: Optional[dict] = None,
+                      inherit_env: bool = True) -> 'KVServerHandle':
+
+        # Set spawn method for CUDA compatibility
+        with contextlib.suppress(RuntimeError):
+            mp.set_start_method("spawn")
         
-        return KVServerHandle(process, ready_event)
+        # Prepare environment variables for child process
+        if child_env is not None or not inherit_env:
+            # Use subprocess for better environment control
+            import subprocess
+            import pickle
+            import sys
+            
+            # Prepare environment
+            if inherit_env:
+                env = os.environ.copy()
+                if child_env:
+                    env.update(child_env)
+            else:
+                env = child_env or {}
+            
+            # Serialize arguments
+            args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port))
+            
+            # Start subprocess
+            flexkv_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            server_script = textwrap.dedent(f'''
+                import pickle
+                import sys
+                sys.path.insert(0, "{flexkv_root}")
+                from flexkv.server.server import KVServer
+
+                args_data = {args_data!r}
+                model_config, cache_config, gpu_register_port, server_recv_port = pickle.loads(args_data)
+                server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
+                server.run()
+            ''').strip()
+            process = subprocess.Popen([
+                sys.executable, '-c', server_script
+            ], env=env)
+            
+            flexkv_logger.info(f"KVServer subprocess started, PID: {process.pid}")
+            return KVServerHandle(process)
+        else:
+            # Use multiprocessing as before
+            process = mp.Process(target=cls._server_process,
+                                 args=(model_config, cache_config, gpu_register_port, server_recv_port))
+            process.start()
+            flexkv_logger.info(f"KVServer process started, PID: {process.pid}")
+            return KVServerHandle(process)
 
     def run(self) -> None:
         """Main server loop"""
 
         # TODO: handle error and return error response
         # TODO: support check finish
+        flexkv_logger.info("Servering waiting to be started")
+        req = self.recv_from_client.recv_pyobj()
+        if isinstance(req, StartRequest):
+            flexkv_logger.info(f"Received start request from DP client {req.dp_client_id}, "
+                               f"Starting server...")
+            self.start_server()
+        else:
+            raise TypeError(f"Received RequestType: {type(req)} from DP client "
+                            f"{req.dp_client_id} before the start request")
         self._running = True
         while self._running:
             try:
                 flexkv_logger.info("start waiting for req")
                 req = self.recv_from_client.recv_pyobj()
-                flexkv_logger.info(f"recv req: {type(req)}")
+                flexkv_logger.info(f"recv req: {type(req)} from DP client {req.dp_client_id}")
 
-                # register dp client
-                if isinstance(req, RegisterDPClientRequest):
-                    self._verify_model_config(req.model_config)
-                    client_id = self.client_manager.register_dp_client(
-                        self.context,
-                        req.client_recv_port,
-                        req.model_config.tp_size
-                    )
-                    response = Response(client_id)
-                    result_zmq = self.client_manager.get_zmq(client_id)
-                    result_zmq.send_pyobj(response)
+                # Use dispatch table for request handling
+                req_type = type(req)
+                handler = self.request_handlers.get(req_type)
 
-                elif isinstance(req, IsReadyRequest):
-                    is_ready = self.kv_task_engine.is_ready()
-                    response = Response(req.dp_client_id, is_ready=is_ready)
-                    result_zmq = self.client_manager.get_zmq(
-                        req.dp_client_id)
-                    result_zmq.send_pyobj(response)
+                if handler is None:
+                    raise TypeError(f"Unrecognized RequestType: {req_type}")
 
-                elif isinstance(req, GetRequest):
-                    #assert self.client_manager.is_dp_client_ready(req.dp_client_id)
-                    req_id = self.kv_task_engine.get_async(
-                        token_ids=torch.from_numpy(req.token_ids),
-                        slot_mapping=torch.from_numpy(req.slot_mapping),
-                        token_mask=torch.from_numpy(req.token_mask) if req.token_mask is not None else None,
-                        layer_granularity=-1,
-                        dp_id=req.dp_client_id,
-                        task_id=req.task_id,
-                    )
+                # Call the corresponding handler method
+                handler(req)
 
-                elif isinstance(req, PutRequest):
-                    #assert self.client_manager.is_dp_client_ready(req.dp_client_id)
-                    req_id = self.kv_task_engine.put_async(
-                        token_ids=torch.from_numpy(req.token_ids),
-                        slot_mapping=torch.from_numpy(req.slot_mapping),
-                        token_mask=torch.from_numpy(req.token_mask) if req.token_mask is not None else None,
-                        dp_id=req.dp_client_id,
-                        task_id=req.task_id,
-                    )
-        
-                elif isinstance(req, GetMatchRequest):
-                    #assert self.client_manager.is_dp_client_ready(req.dp_client_id)
-                    req_id, mask = self.kv_task_engine.get_match(
-                        token_ids=torch.from_numpy(req.token_ids),
-                        slot_mapping=torch.from_numpy(req.slot_mapping),
-                        token_mask=torch.from_numpy(req.token_mask) if req.token_mask is not None else None,
-                    )
-                    response = Response(req.dp_client_id, task_id=req_id, mask=mask)
-                    result_zmq = self.client_manager.get_zmq(
-                        req.dp_client_id)
-                    result_zmq.send_pyobj(response)
-
-                elif isinstance(req, PutMatchRequest):
-                    #assert self.client_manager.is_dp_client_ready(req.dp_client_id)
-                    req_id, mask = self.kv_task_engine.put_match(
-                        token_ids=torch.from_numpy(req.token_ids),
-                        slot_mapping=torch.from_numpy(req.slot_mapping),
-                        token_mask=torch.from_numpy(req.token_mask) if req.token_mask is not None else None,
-                    )
-                    response = Response(req.dp_client_id, task_id=req_id, mask=mask)
-                    result_zmq = self.client_manager.get_zmq(
-                        req.dp_client_id)
-                    result_zmq.send_pyobj(response)
-
-                elif isinstance(req, WaitRequest):
-                    kv_responses = self.kv_task_engine.wait(
-                        req.wait_task_ids,
-                        timeout=req.wait_timeout,
-                    )
-                    response = Response(req.dp_client_id, status=kv_responses)
-                    result_zmq = self.client_manager.get_zmq(
-                        req.dp_client_id)
-                    result_zmq.send_pyobj(response)
-
-                elif isinstance(req, TryWaitRequest):
-                    kv_responses = self.kv_task_engine.try_wait(
-                        req.try_wait_task_ids,
-                    )
-                    response = Response(req.dp_client_id, status=kv_responses)
-                    result_zmq = self.client_manager.get_zmq(
-                        req.dp_client_id)
-                    result_zmq.send_pyobj(response)
-
-                elif isinstance(req, ShutdownRequest):
-                    flexkv_logger.info(f"Received shutdown request from DP client {req.dp_client_id}")
-                    # Gracefully shutdown the server
-                    self._running = False
-                    # Send response back to client
-                    response = Response(req.dp_client_id, success=True)
-                    result_zmq = self.client_manager.get_zmq(req.dp_client_id)
-                    result_zmq.send_pyobj(response)
+                # If the request is a shutdown request, exit the loop
+                if req_type == ShutdownRequest:
                     break
-        
-                else:
-                    raise TypeError(f"Unregonized RequestType: {type(req)}")
 
             except zmq.ZMQError as e:
                 flexkv_logger.error(f"ZMQ Error: {e}", exc_info=True)
@@ -401,8 +273,110 @@ class KVServer:
         # TODO
         return True
 
+    # Request Handler Methods
+
+    def _handle_start_request(self, req: StartRequest) -> None:
+        """Handle start request"""
+        flexkv_logger.info(f"Received start request from DP client {req.dp_client_id}")
+
+    def _handle_register_dp_client_request(self, req: RegisterDPClientRequest) -> None:
+        """Handle DP client registration request"""
+        self._verify_model_config(req.model_config)
+        client_id = self.client_manager.register_dp_client(
+            self.context,
+            req.client_recv_port,
+            req.model_config.tp_size,
+            req.dp_client_id,
+        )
+
+    def _handle_is_ready_request(self, req: IsReadyRequest) -> None:
+        """Handle ready state check request"""
+        is_ready = self.kv_task_engine.is_ready()
+        response = Response(req.dp_client_id, is_ready=is_ready)
+        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+        result_zmq.send_pyobj(response)
+
+    def _handle_get_request(self, req: GetRequest) -> None:
+        """Handle Get request"""
+        req_id = self.kv_task_engine.get_async(
+            task_id=req.task_id,
+            token_ids=req.token_ids,
+            slot_mapping=req.slot_mapping,
+            token_mask=req.token_mask,
+            layer_granularity=req.layer_granularity,
+            dp_id=req.dp_client_id,
+        )
+
+    def _handle_put_request(self, req: PutRequest) -> None:
+        """Handle Put request"""
+        req_id = self.kv_task_engine.put_async(
+            token_ids=req.token_ids,
+            slot_mapping=req.slot_mapping,
+            token_mask=req.token_mask,
+            dp_id=req.dp_client_id,
+            task_id=req.task_id,
+        )
+
+    def _handle_get_match_request(self, req: GetMatchRequest) -> None:
+        """Handle GetMatch request"""
+        req_id, mask = self.kv_task_engine.get_match(
+            token_ids=req.token_ids,
+            token_mask=req.token_mask,
+            layer_granularity=req.layer_granularity,
+            dp_id=req.dp_client_id,
+            task_id=req.task_id,
+        )
+        response = Response(req.dp_client_id, task_id=req_id, mask=mask)
+        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+        result_zmq.send_pyobj(response)
+
+    def _handle_put_match_request(self, req: PutMatchRequest) -> None:
+        """Handle PutMatch request"""
+        req_id, mask = self.kv_task_engine.put_match(
+            token_ids=req.token_ids,
+            token_mask=req.token_mask,
+            dp_id=req.dp_client_id,
+            task_id=req.task_id,
+        )
+        response = Response(req.dp_client_id, task_id=req_id, mask=mask)
+        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+        result_zmq.send_pyobj(response)
+
+    def _handle_launch_task_request(self, req: LaunchTaskRequest) -> None:
+        """Handle LaunchTask request"""
+        self.kv_task_engine.launch_tasks(req.task_ids, req.slot_mappings)
+
+    def _handle_cancel_task_request(self, req: CancelTaskRequest) -> None:
+        """Handle CancelTask request"""
+        self.kv_task_engine.cancel_tasks(req.task_ids)
+
+    def _handle_wait_request(self, req: WaitRequest) -> None:
+        """Handle Wait request"""
+        kv_responses = self.kv_task_engine.wait(
+            req.wait_task_ids,
+            timeout=req.wait_timeout,
+            completely=req.completely,
+        )
+        response = Response(req.dp_client_id, status=kv_responses)
+        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+        result_zmq.send_pyobj(response)
+
+    def _handle_try_wait_request(self, req: TryWaitRequest) -> None:
+        """Handle TryWait request"""
+        kv_responses = self.kv_task_engine.try_wait(
+            req.try_wait_task_ids,
+        )
+        response = Response(req.dp_client_id, status=kv_responses)
+        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+        result_zmq.send_pyobj(response)
+
+    def _handle_shutdown_request(self, req: ShutdownRequest) -> None:
+        """Handle shutdown request"""
+        flexkv_logger.info(f"Received shutdown request from DP client {req.dp_client_id}")
+        self._running = False
+
     def __del__(self) -> None:
-        self.kvmanager.shutdown()
+        self.kv_task_engine.shutdown()
 
 if __name__ == "__main__":
     import torch
@@ -435,7 +409,6 @@ if __name__ == "__main__":
                                 enable_ssd=False,
                                 enable_remote=False,
                                 enable_gds=False,
-                                use_pinned_memory=True,
                                 tokens_per_block=tokens_per_block,
                                 num_cpu_blocks=num_cpu_blocks,)
 

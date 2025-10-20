@@ -56,6 +56,7 @@ class KVTask:
     graph: TransferOpGraph
     return_mask: np.ndarray
     callback: Optional[Callable]
+    op_callback_dict: Dict[int, Callable]
 
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
@@ -64,6 +65,7 @@ TASK_STATUS_TO_RESPONSE_STATUS = {
     TaskStatus.COMPLETED: KVResponseStatus.SUCCESS,
     TaskStatus.CANCELLED: KVResponseStatus.CANCELLED,
     TaskStatus.FAILED: KVResponseStatus.FAILED,
+    TaskStatus.RUNNING: KVResponseStatus.SUCCESS, # for early return: still running, but success
 }
 
 def convert_to_response_status(task_status: TaskStatus) -> KVResponseStatus:
@@ -126,7 +128,7 @@ class KVTaskManager:
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
-        graph, return_mask, callback, task_end_op_id = self.cache_engine.get(task_id,
+        graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.get(task_id,
                                                                                token_ids,
                                                                                token_mask,
                                                                                slot_mapping,
@@ -145,7 +147,8 @@ class KVTaskManager:
             dp_id=dp_id,
             graph=graph,
             return_mask=return_mask,
-            callback=callback)
+            callback=callback,
+            op_callback_dict=op_callback_dict)
 
         self.graph_to_task[graph.graph_id] = task_id
 
@@ -159,7 +162,7 @@ class KVTaskManager:
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
-        graph, return_mask, callback, task_end_op_id = self.cache_engine.put(task_id,
+        graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.put(task_id,
                                                                                token_ids,
                                                                                token_mask,
                                                                                slot_mapping,
@@ -177,7 +180,8 @@ class KVTaskManager:
             dp_id=dp_id,
             graph=graph,
             return_mask=return_mask,
-            callback=callback)
+            callback=callback,
+            op_callback_dict=op_callback_dict)
         self.graph_to_task[graph.graph_id] = task_id
 
     def _launch_task(self, task_id: int) -> None:
@@ -203,6 +207,8 @@ class KVTaskManager:
                 self._mark_completed(task_id)
             elif completed_op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
+            if completed_op_id in task.op_callback_dict:
+                task.op_callback_dict[completed_op_id]()
 
     def _cancel_task(self, task_id: int) -> None:
         task = self.tasks[task_id]

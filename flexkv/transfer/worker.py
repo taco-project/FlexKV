@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from torch.multiprocessing import Queue as MPQueue, Pipe as MPPipe
 from multiprocessing.connection import Connection
 from threading import Thread
-from typing import List, Any, Dict, Union, Optional, Tuple
+from typing import List, Any, Dict, Union, Optional
 
 import ctypes
 import numpy as np
@@ -90,7 +90,6 @@ class TransferWorkerBase(ABC):
         self.transfer_conn = transfer_conn  # receive end of pipe
         self.finished_ops_queue: MPQueue[int] = finished_ops_queue
 
-        flexkv_logger.info(f"[TransferWorkerBase] op buffer data ptr: {op_buffer_tensor.storage().data_ptr()}")
         self.op_buffer_tensor = op_buffer_tensor
         cudaHostRegister(self.op_buffer_tensor)
 
@@ -407,7 +406,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  op_buffer_tensor: torch.Tensor,
                  gpu_blocks: List[List[TensorSharedHandle]],
                  cpu_blocks: torch.Tensor,
-                 gpu_kv_layout: KVCacheLayout,
+                 gpu_kv_layouts: List[KVCacheLayout],
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  tp_group_size: int,
@@ -428,7 +427,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             imported_gpu_blocks.append(blocks_in_one_gpu)
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype
-        self.is_mla = gpu_kv_layout.is_mla
+        self.is_mla = gpu_kv_layouts[0].is_mla
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
@@ -436,19 +435,22 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         cudaHostRegister(cpu_blocks)
 
-        self.num_layers = gpu_kv_layout.num_layer
-        gpu_kv_layout_per_layer = gpu_kv_layout.div_layer(self.num_layers)
+        self.num_layers = gpu_kv_layouts[0].num_layer
+        gpu_kv_layouts_per_layer = [gpu_kv_layout.div_layer(self.num_layers) for gpu_kv_layout in gpu_kv_layouts]
 
-        self.gpu_chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
-        self.gpu_kv_stride_in_bytes = gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize
-        self.gpu_block_stride_in_bytes = gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize
+        self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize \
+                                for gpu_kv_layout_per_layer in gpu_kv_layouts_per_layer]
+        self.gpu_kv_strides_in_bytes = [gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize \
+                                for gpu_kv_layout_per_layer in gpu_kv_layouts_per_layer]
+        self.gpu_block_strides_in_bytes = [gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize \
+                                for gpu_kv_layout_per_layer in gpu_kv_layouts_per_layer]
 
         self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
 
-        if not gpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
+        if not gpu_kv_layouts[0].type == KVCacheLayoutType.LAYERWISE:
             raise ValueError("Only layerwise layout is supported for GPU")
 
         self.transfer_sms_h2d = transfer_sms_h2d
@@ -456,7 +458,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
-        self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id)
+        gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
+        gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
+        gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
+
+        self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
+                                                              gpu_kv_strides_tensor, gpu_block_strides_tensor, gpu_chunk_sizes_tensor)
 
 
     def _transfer_impl(self,
@@ -489,12 +496,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         if len(gpu_block_id_list) == 0:
             return
-
+        
         self.tp_transfer_thread_group.tp_group_transfer(
             gpu_block_id_list,
-            self.gpu_kv_stride_in_bytes,
-            self.gpu_block_stride_in_bytes,
-            self.gpu_chunk_size_in_bytes,
             cpu_block_id_list,
             self.cpu_kv_stride_in_bytes,
             self.cpu_layer_stride_in_bytes,
@@ -829,6 +833,13 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             end_time,
         )
 
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+        layer_id = transfer_op.layer_id
+        layer_granularity = transfer_op.layer_granularity
+        if layer_id == -1:
+            layer_id = 0
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
 
 class GDSTransferWorker(TransferWorkerBase):
     def __init__(
