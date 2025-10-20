@@ -2015,6 +2015,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                         src_data_size_per_block == dst_data_size_per_block
                     ), "src and dst blocks have different layout"
                     
+                    flexkv_logger.info(
+                        f"[_dist_cpu_op_parser] Processing segment: sub_src={sub_src_blocks}, sub_dst={sub_dst_blocks}, "
+                        f"num_ptrs={len(src_block_start_ptrs)}, block_size={src_data_size_per_block}, "
+                        f"src_ptrs={src_block_start_ptrs}, dst_ptrs={dst_block_start_ptrs}"
+                    )
+                    
                     for _ in range(len(src_block_start_ptrs)):
                         data_size = src_data_size_per_block * len(sub_src_blocks)
                         data_size_list.append(data_size)
