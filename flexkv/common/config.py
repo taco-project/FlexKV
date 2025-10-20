@@ -99,8 +99,9 @@ class CacheConfig:
     trace_max_files: int = 5
     trace_flush_interval_ms: int = 1000
 
-    #evict ratio
+    # Eviction configs
     evict_ratio: float = 0.0
+    evict_start_threshold: float = 1.0  # Start eviction when utilization reaches this threshold (0.0-1.0)
 
     def __post_init__(self):
         layout_fields = ['gpu_kv_layout_type', 

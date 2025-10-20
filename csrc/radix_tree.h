@@ -177,6 +177,10 @@ public:
     return is_leaf() && !in_use();
   }
 
+  int get_lock_cnt() const {
+    return lock_cnt;
+  }
+
   void lock() {
     assert(lock_cnt >= 0);
     lock_cnt++;
