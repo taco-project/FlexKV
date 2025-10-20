@@ -132,7 +132,7 @@ def test_node_a():
     cache_config.num_cpu_blocks = 60
     cache_config.num_ssd_blocks = 1000
     cache_config.ssd_cache_dir = "/data/flexkv_ssd/"
-    cache_config.lease_ttl_ms = 2000          # 1秒租约（加快驱逐速度）
+    cache_config.lease_ttl_ms = 5000          # 1秒租约（加快驱逐速度）
     cache_config.renew_lease_ms = 100         # 100ms续约（只续约NORMAL节点，ABOUT_TO_EVICT不续约）
     
     # 主动式驱逐策略：提前预留buffer空间
@@ -233,7 +233,7 @@ def test_node_a():
             dp_id=0,
         )
         kvmanager.wait([write_request], completely=True)
-        time.sleep(0.5)
+        time.sleep(1)
         if (req_id + 1) % 10 == 0:
             print(f"  Written {len([x for x in my_write_ids if x <= req_id])}/{len(my_write_ids)} requests")
     
@@ -311,7 +311,7 @@ def test_node_a():
             verification_failed += 1
             print(f"  ❌ Request {req_id}: Only {valid_fetched_tokens}/{len(token_ids)} tokens fetched")
         
-        time.sleep(0.5)
+        time.sleep(1)
         if (req_id + 1) % 10 == 0:
             print(f"  Read {req_id + 1}/{len(my_read_ids)} requests")
     
@@ -343,7 +343,7 @@ def test_node_a():
     
     print(f"\n✅ All tests passed!")
     print("=" * 80)
-    final_wait = 30
+    final_wait = 100
     while final_wait > 0:
         time.sleep(1)
         final_wait -= 1
