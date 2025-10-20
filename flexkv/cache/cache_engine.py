@@ -1038,7 +1038,8 @@ class GlobalCacheEngine:
                                                             fragment2_ssd_blocks,
                                                             is_ready=False,
                                                             match_result=ssd_matched_result)
-            op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, disk_node_to_unlock, disk_node_to_unlock.size())
+            disk_device_type = DeviceType.GDS if self.cache_config.enable_gds else DeviceType.SSD
+            op_node_to_ready[op_h2disk.op_id] = (disk_device_type, disk_node_to_unlock, disk_node_to_unlock.size())
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
