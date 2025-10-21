@@ -1,7 +1,7 @@
 setuptools>=40.0.0
 torch>=1.10.0
-nvtx==0.2.11; python_version >= "3.7"  # Skip on py36
-Cython<3  # Python 3.6 compatible
+# nvtx==0.2.11  # Skip nvtx for now due to compatibility issues
+Cython>=3.0.10
 pytest>=6.0.0
 pytest-benchmark>=3.0.0
 expiring-dict==1.1.2

@@ -22,12 +22,10 @@ if debug:
 enable_cfs = os.environ.get("FLEXKV_ENABLE_CFS", "0") == "1"
 enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
 
-# CUDA build toggle via env var (default: on)
-use_cuda = os.environ.get("FLEXKV_WITH_CUDA", "1") == "1"
-
 # Define C++ extensions
 cpp_sources = [
     "csrc/bindings.cpp",
+    "csrc/transfer.cu",  # Skip CUDA file for now
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/gds/tp_gds_transfer_thread_group.cpp",
@@ -40,10 +38,6 @@ cpp_sources = [
     "csrc/lease_meta_mempool.cpp",
 ]
 
-# Add CUDA sources if enabled
-if use_cuda:
-    cpp_sources.append("csrc/transfer.cu")
-
 hpp_sources = [
     "csrc/cache_utils.h",
     "csrc/tp_transfer_thread_group.h",
@@ -54,12 +48,8 @@ hpp_sources = [
 ]
 
 #extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
-extra_link_args = ["-lxxhash", "-lpthread", "-lrt", "-luring", "-lhiredis"]
-extra_compile_args_cxx = ["-std=c++17"]
-if use_cuda:
-    # Define CUDA_AVAILABLE for C++ compilation units as well
-    extra_compile_args_cxx.append("-DCUDA_AVAILABLE")
-    extra_link_args.append("-lcuda")
+extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring", "-lhiredis"]
+extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
 
 # Add rpath to find libraries at runtime
@@ -74,15 +64,8 @@ if enable_cfs:
     cpp_sources.append("csrc/pcfs/pcfs.cpp")
     hpp_sources.append("csrc/pcfs/pcfs.h")
     extra_link_args.append("-lhifs_client_sdk")
-    extra_compile_args_cxx.append("-DFLEXKV_ENABLE_CFS")
-
-# Choose extension class based on CUDA toggle
-ExtClass = cpp_extension.CUDAExtension if use_cuda else cpp_extension.CppExtension
-
-if use_cuda:
-    extra_compile_args = {"nvcc": ["-O3", "-DCUDA_AVAILABLE"], "cxx": extra_compile_args_cxx}
-else:
-    extra_compile_args = extra_compile_args_cxx
+    extra_compile_args.append("-DFLEXKV_ENABLE_CFS")
+extra_compile_args.append("-DCUDA_AVAILABLE")
 
 nvcc_compile_args = ["-O3"]
 if enable_gds:
@@ -92,13 +75,13 @@ if enable_gds:
     nvcc_compile_args.append("-DENABLE_GDS")
 
 cpp_extensions = [
-    ExtClass(
+    cpp_extension.CUDAExtension(
         name="flexkv.c_ext",
         sources=cpp_sources,
         library_dirs=[os.path.join(build_dir, "lib")],
         include_dirs=include_dirs,
         depends=hpp_sources,
-        extra_compile_args=extra_compile_args,
+        extra_compile_args={"nvcc": ["-O3"], "cxx": extra_compile_args},
         extra_link_args=extra_link_args,
     ),
 ]

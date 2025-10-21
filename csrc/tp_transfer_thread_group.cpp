@@ -15,9 +15,7 @@
  * limitations under the License.
  */
 #include "tp_transfer_thread_group.h"
-#ifdef CUDA_AVAILABLE
 #include "transfer.cuh"
-#endif
 #include <stdexcept>
 
 namespace flexkv {
@@ -90,20 +88,16 @@ TPTransferThreadGroup::TPTransferThreadGroup(
 
   dp_group_id_ = dp_group_id;
   streams_.resize(num_gpus_);
-#ifdef CUDA_AVAILABLE
   for (int i = 0; i < num_gpus_; i += 1) {
     cudaSetDevice(dp_group_id * num_gpus_ + i);
     cudaStreamCreate(&streams_[i]);
   }
-#endif
   // create the thread pool
   stop_pool_=false;
   for (int i = 0; i < num_gpus_; ++i) {
     threads_.emplace_back([this, i]() {
       int device_id = dp_group_id_ * num_gpus_ + i;
-#ifdef CUDA_AVAILABLE
       cudaSetDevice(device_id);  // only once
-#endif
 
       while (true) {
         Task task;
@@ -127,12 +121,7 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
   for (auto& cv : cvs_) cv.notify_all();
   for (auto& t : threads_) if (t.joinable()) t.join();
 
-  
-#ifdef CUDA_AVAILABLE
   cudaFreeHost(gpu_blocks_);
-#else
-  free(gpu_blocks_);
-#endif
   
   gpu_tensor_handlers_.clear();
   delete[] gpu_kv_strides_in_bytes_;
@@ -229,13 +218,11 @@ void TPTransferThreadGroup::tp_group_transfer(
             break;
         }
 
-#ifdef CUDA_AVAILABLE
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
           failed = true;
           error_msg = cudaGetErrorString(err);
         }
-#endif
       } catch (const std::exception &e) {
         failed = true;
         error_msg = e.what();
