@@ -4,15 +4,11 @@
 #include <vector>
 #include <map>
 
-#ifdef CUDA_AVAILABLE
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include "transfer.cuh"
-#endif
 #include <fcntl.h>
-#ifdef CUDA_AVAILABLE
 #include <nvToolsExt.h>
-#endif
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <sys/mman.h>
@@ -34,7 +30,6 @@
 
 namespace py = pybind11;
 
-#ifdef CUDA_AVAILABLE
 void transfer_kv_blocks_binding(
     torch::Tensor &gpu_block_id_tensor, torch::Tensor &gpu_layer_ptrs_tensor,
     int64_t gpu_kv_stride_in_bytes, int64_t gpu_block_stride_in_bytes,
@@ -66,9 +61,7 @@ void transfer_kv_blocks_binding(
     throw std::runtime_error(cudaGetErrorString(err));
   }
 }
-#endif
 
-#ifdef CUDA_AVAILABLE
 void transfer_kv_blocks_ssd_binding(
     flexkv::SSDIOCTX &ioctx,
     const torch::Tensor &cpu_layer_id_list, int64_t cpu_tensor_ptr,
@@ -90,7 +83,7 @@ void transfer_kv_blocks_ssd_binding(
       block_stride_in_bytes, is_read, num_blocks_per_file, round_robin,
       num_threads_per_device, is_mla);
 }
-#endif
+
 #ifdef FLEXKV_ENABLE_CFS
 void transfer_kv_blocks_remote(
     const py::list &file_nodeid_list, const torch::Tensor &cpu_layer_id_list,
@@ -171,7 +164,6 @@ void shared_transfer_kv_blocks_remote_read_binding(
 #endif
 
 PYBIND11_MODULE(c_ext, m) {
-#ifdef CUDA_AVAILABLE
   m.def("transfer_kv_blocks", &transfer_kv_blocks_binding,
         "Transfer multi-layer KV-cache between CPU and GPU");
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
@@ -184,7 +176,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("block_stride_in_bytes"), py::arg("is_read"),
         py::arg("num_blocks_per_file"), py::arg("round_robin") = 1,
         py::arg("num_threads_per_device") = 16, py::arg("is_mla") = false);
-#endif
+
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
         "Transfer KV blocks between remote and CPU memory",
@@ -260,7 +252,7 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("call_pcfs_write", &flexkv::call_pcfs_write,
         "Call Pcfs::write from C++", py::arg("file_nodeid"), py::arg("offset"),
         py::arg("buffer"), py::arg("size"), py::arg("thread_id"));
-#ifdef CUDA_AVAILABLE
+
   m.def("shared_transfer_kv_blocks_remote_read", 
         &shared_transfer_kv_blocks_remote_read_binding,
         "Shared transfer KV blocks from remote PCFS to CPU memory",
@@ -278,7 +270,6 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("total_layers"),
         py::arg("is_mla") = false,
         py::arg("num_threads_per_file") = 8);
-#endif
 #endif
 
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
