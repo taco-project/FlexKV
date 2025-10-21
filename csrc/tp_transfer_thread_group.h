@@ -18,12 +18,7 @@
 
 #include <atomic>
 #include <condition_variable>
-#ifdef CUDA_AVAILABLE
 #include <cuda_runtime.h>
-#else
-// Fallback type to allow non-CUDA builds to compile
-typedef void* cudaStream_t;
-#endif
 #include <memory>
 #include <mutex>
 #include <thread>
