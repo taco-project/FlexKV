@@ -833,14 +833,6 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             end_time,
         )
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
-        layer_id = transfer_op.layer_id
-        layer_granularity = transfer_op.layer_granularity
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-
 class GDSTransferWorker(TransferWorkerBase):
     def __init__(
         self,
