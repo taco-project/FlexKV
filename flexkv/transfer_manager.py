@@ -302,7 +302,6 @@ class TransferManagerOnRemote(TransferManager):
         def _run():
             instance = cls(**kwargs)
             instance.start()
-            # Keep process running, e.g., wait on a threading.Event or join worker thread
             if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
                 instance._worker_thread.join()  # block until worker thread exits
         process = Process(target=_run, daemon=False)

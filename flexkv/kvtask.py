@@ -5,7 +5,8 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Callable
 import multiprocessing as mp
-
+import copy
+import os
 from expiring_dict import ExpiringDict
 import nvtx
 import torch
@@ -88,58 +89,40 @@ class KVTaskManager:
         self._check_config(model_config, cache_config)
 
         self.is_multinode_tp = False
+        self.tp_size_per_node = model_config.tp_size
 
-        if self.model_config.tp_size > torch.cuda.device_count():
+        if self.model_config.tp_size > self.tp_size_per_node:
             if self.model_config.tp_size != torch.cuda.device_count() * 2:
                 raise ValueError("Only support 2 nodes TP")
             if self.model_config.dp_size != 1:
                 raise ValueError("Only support dp_size=1 for multi-node TP")
             self.is_multinode_tp = True
+            self.tp_size_per_node = torch.cuda.device_count()
 
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
-        """
-        多节点TP 单机测试：
-        1. 禁用本地的transfer manager，使用远程的transfer manager
-        """
-        # self.transfer_handles = [TransferManagerHandle(
-        #     self.model_config,
-        #     self.cache_config,
-        #     mode="process",
-        #     gpu_register_port=gpu_register_port
-        # )]
-        # if self.is_multinode_tp:
-        #     self.transfer_handles.append(TransferManagerHandle(
-        #         self.model_config,
-        #         self.cache_config,
-        #         mode="remote",
-        #         gpu_register_port=gpu_register_port,
-        #         master_host="tcp://localhost",
-        #         master_ports=("5556", "5557", "5558")
-        #     ))
 
-        """
-        2. 节点A启动handle，连接节点B的TransferManager进程
-        """
+        model_config_for_transfer = copy.deepcopy(self.model_config)
+        if self.is_multinode_tp and not self.model_config.use_mla:
+            model_config_for_transfer.num_kv_heads = self.tp_size_per_node
+
         self.transfer_handles = [TransferManagerHandle(
-                self.model_config,
+            model_config_for_transfer,
+            self.cache_config,
+            mode="process",
+            gpu_register_port=gpu_register_port
+        )]
+        if self.is_multinode_tp:
+            master_host = os.getenv("MASTER_HOST", "localhost")
+            master_ports = os.getenv("MASTER_PORTS", ("5556", "5557", "5558"))
+            master_ports = tuple(master_ports.split(","))
+            self.transfer_handles.append(TransferManagerHandle(
+                model_config_for_transfer,
                 self.cache_config,
                 mode="remote",
                 gpu_register_port=gpu_register_port,
-                master_host="tcp://localhost",
-                master_ports=("5556", "5557", "5558")
-            )
-        ]
-
-        """
-        3. 模拟节点B的TransferManager进程，实际场景中由vllm worker启动
-        """
-        self.remote_process = TransferManagerOnRemote.create_process(
-            model_config=self.model_config,
-            cache_config=self.cache_config,
-            gpu_register_port=gpu_register_port,
-            master_host="tcp://localhost",
-            master_ports=("5556", "5557", "5558")
-        )
+                master_host=f"tcp://{master_host}",
+                master_ports=master_ports
+            ))
 
         self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
         self.graph_to_task: Dict[int, int] = {}
@@ -166,9 +149,6 @@ class KVTaskManager:
     def shutdown(self) -> None:
         for transfer_handle in self.transfer_handles:
             transfer_handle.shutdown()
-
-        self.remote_process.terminate()
-        self.remote_process.join()
 
     def create_get_task(self,
                         task_id: int,
