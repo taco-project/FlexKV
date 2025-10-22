@@ -25,7 +25,10 @@ def split_contiguous_blocks(
     current_dst = [dst_list[0]]
 
     for i in range(1, len(src_list)):
-        if src_list[i] == src_list[i - 1] + 1:
+        src_cont = src_list[i] == src_list[i - 1] + 1
+        dst_cont = dst_list[i] == dst_list[i - 1] + 1
+
+        if src_cont and dst_cont:
             current_src.append(src_list[i])
             current_dst.append(dst_list[i])
         else:
@@ -35,7 +38,6 @@ def split_contiguous_blocks(
 
     result.append({"src": current_src, "dst": current_dst})
     return result
-
 def group_blocks_by_node_and_segment(
     src_block_ids: torch.Tensor,
     dst_block_ids: torch.Tensor,
