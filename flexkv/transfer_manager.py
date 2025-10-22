@@ -1,3 +1,4 @@
+import os
 import multiprocessing as mp
 import time
 import queue
@@ -130,20 +131,18 @@ class TransferManager:
     def shutdown(self) -> None:
         self.transfer_engine.shutdown()
 
+def get_master_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
+    master_host = os.getenv("MASTER_HOST", "localhost")
+    master_ports = os.getenv("MASTER_PORTS", "5556,5557,5558")
+    master_ports = tuple(master_ports.split(","))
+    return "tcp://" + master_host, master_ports
 
 class TransferManagerOnRemote(TransferManager):
     """
     TransferManager for remote mode, used for multi-node tensor parallelism.
     """
-    def __init__(self,
-                 model_config: ModelConfig,
-                 cache_config: CacheConfig,
-                 gpu_register_port: str,
-                 master_host: str,
-                 master_ports: Tuple[str, str, str]):  # command, result, query
-        super().__init__(model_config, cache_config, gpu_register_port)
-        self.master_host = master_host
-        self.master_ports = master_ports
+    def __init__(self):
+        self.master_host, self.master_ports = get_master_host_and_ports_from_env()
 
         self.context = zmq.Context()
         self.command_socket = self.context.socket(zmq.PULL)
@@ -161,6 +160,10 @@ class TransferManagerOnRemote(TransferManager):
         self._active_graphs_lock = threading.Lock()
 
         self._worker_thread: threading.Thread | None = None
+
+        self._connect_to_master_transfer_manager()
+
+        self._initialize_with_config()
 
     def _connect_to_master_transfer_manager(self) -> None:
         try:
@@ -181,6 +184,20 @@ class TransferManagerOnRemote(TransferManager):
         except Exception as e:
             flexkv_logger.error(f"Failed to connect to master transfer manager: {e}")
             raise
+
+    def _initialize_with_config(self) -> None:
+        flexkv_logger.info(f"Waiting for config from master at {self.master_host}:{self.master_ports[0]}")
+        config_msg = self.command_socket.recv_pyobj()
+        if isinstance(config_msg, dict) and config_msg.get('type') == 'config':
+            self.model_config = config_msg.get('model_config')
+            self.cache_config = config_msg.get('cache_config')
+            self.gpu_register_port = config_msg.get('gpu_register_port')
+            flexkv_logger.info(f"Received config from master, {self.model_config = }, \
+                {self.cache_config = }, {self.gpu_register_port = }.")
+        else:
+            raise RuntimeError(f"Expected config message, got: {config_msg}")
+
+        super().__init__(self.model_config, self.cache_config, self.gpu_register_port)
 
     def _polling_worker(self) -> None:
         flexkv_logger.info("Polling worker thread started")
@@ -258,8 +275,6 @@ class TransferManagerOnRemote(TransferManager):
         poller.unregister(self.query_socket)
 
     def start(self) -> None:
-        self._connect_to_master_transfer_manager()
-
         self.initialize_transfer_engine()
         super().start()
 
@@ -497,6 +512,8 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
         self._result_buffer: List[Tuple[int, int]] = []
         self._result_buffer_lock = threading.Lock()
 
+        self._bind_master_ports()
+
         self._polling_thread: threading.Thread | None = None
 
     def _bind_master_ports(self) -> None:
@@ -522,6 +539,20 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
             flexkv_logger.error(f"Master failed to bind ports: {e}")
             raise
 
+    def send_config_to_remotes(self) -> None:
+        flexkv_logger.info(f"Sending config to remote at {self.master_host}:{self.master_ports[0]}")
+        try:
+            config_msg = {
+                'type': 'config',
+                'model_config': self.model_config,
+                'cache_config': self.cache_config,
+                'gpu_register_port': self.gpu_register_port
+            }
+            self.command_socket.send_pyobj(config_msg)
+            flexkv_logger.info(f"Config sent to remote at {self.master_host}:{self.master_ports[0]}")
+        except Exception as e:
+            flexkv_logger.error(f"Failed to send config to remote: {e}")
+
     def _polling_worker(self) -> None:
         while not self._shutdown_flag:
             try:
@@ -542,8 +573,6 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
                     time.sleep(0.01)
 
     def start(self) -> None:
-        self._bind_master_ports()
-
         self._polling_thread = threading.Thread(target=self._polling_worker, daemon=True)
         self._polling_thread.start()
 

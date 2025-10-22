@@ -19,6 +19,7 @@ from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
+from flexkv.transfer_manager import get_master_host_and_ports_from_env
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -112,17 +113,16 @@ class KVTaskManager:
             gpu_register_port=gpu_register_port
         )]
         if self.is_multinode_tp:
-            master_host = os.getenv("MASTER_HOST", "localhost")
-            master_ports = os.getenv("MASTER_PORTS", ("5556", "5557", "5558"))
-            master_ports = tuple(master_ports.split(","))
+            master_host, master_ports = get_master_host_and_ports_from_env()
             self.transfer_handles.append(TransferManagerHandle(
                 model_config_for_transfer,
                 self.cache_config,
                 mode="remote",
                 gpu_register_port=gpu_register_port,
-                master_host=f"tcp://{master_host}",
+                master_host=master_host,
                 master_ports=master_ports
             ))
+            self.transfer_handles[0]._handle.send_config_to_remotes()
 
         self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
         self.graph_to_task: Dict[int, int] = {}
@@ -147,8 +147,9 @@ class KVTaskManager:
         self.shutdown()
 
     def shutdown(self) -> None:
-        for transfer_handle in self.transfer_handles:
-            transfer_handle.shutdown()
+        if hasattr(self, "transfer_handles") and self.transfer_handles is not None:
+            for transfer_handle in self.transfer_handles:
+                transfer_handle.shutdown()
 
     def create_get_task(self,
                         task_id: int,
