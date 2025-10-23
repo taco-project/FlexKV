@@ -256,7 +256,6 @@ void LocalRadixTree::publish_node_blocks(NewBlockMeta *node) {
   if (n == 0) return;
   std::vector<BlockMeta> metas;
   metas.reserve(n);
-  printf("we have get prepared to publish one node, the size of the node is %zu\n", n);
   for (size_t i = 0; i < n; ++i) {
     BlockMeta meta;
     if (i == 0) {
@@ -272,7 +271,7 @@ void LocalRadixTree::publish_node_blocks(NewBlockMeta *node) {
     metas.push_back(meta);
   }
   channel->publish(metas);
-  printf("we have published one node in publish_node_blocks\n");
+  //printf("we have published one node in publish_node_blocks, and the node size is %zu, the node hash is %ld\n", n, hashes[0]);
 }
 
 int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
@@ -433,13 +432,13 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
 std::shared_ptr<CMatchResult> LocalRadixTree::match_prefix(torch::Tensor &block_hashes,
   int num_blocks, bool update_cache_info) {
   // DEBUG: Print matching attempt info for local tree
-  if (num_blocks > 0 && block_hashes.numel() >= num_blocks) {
+  /*if (num_blocks > 0 && block_hashes.numel() >= num_blocks) {
     auto *hashes_ptr = block_hashes.data_ptr<int64_t>();
     for (int i = 0; i < std::min(num_blocks, 10); ++i) {
       printf("%ld%s", hashes_ptr[i], (i < num_blocks - 1 && i < 9) ? ", " : "");
     }
     printf("]\n");
-  }
+  }*/
   
   auto result = CRadixTreeIndex::match_prefix(block_hashes, num_blocks, update_cache_info);
   
