@@ -110,7 +110,7 @@ def block_ids_2_slot_mapping(block_ids, tokens_per_block, actual_length=-1):
         actual_length = len(block_ids) * tokens_per_block
     return slot_mapping[:actual_length]
 
-def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks):
+def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type = 0):
     """Create GPU KV layout"""
     num_layers = model_config.num_layers
     num_kv_heads = model_config.num_kv_heads
@@ -119,8 +119,14 @@ def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks):
     tp_size = model_config.tp_size
     tokens_per_block = cache_config.tokens_per_block
 
+    if gpu_layout_type == 0:
+        layout_type = KVCacheLayoutType.LAYERWISE
+    elif gpu_layout_type == 1:
+        layout_type = KVCacheLayoutType.BLOCKWISE
+    else:
+        raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
     tpgroup_gpu_kv_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
+        type=layout_type,
         num_layer=num_layers,
         num_block=num_gpu_blocks,
         tokens_per_block=tokens_per_block,
@@ -456,9 +462,11 @@ class GPUKVCacheVerifier:
                  gpu_kv_layout: KVCacheLayout,
                  tp_size: int,
                  tokens_per_block: int,
-                 dtype: torch.dtype)->None:
+                 dtype: torch.dtype,
+                 gpu_layout_type: int)->None:
         self.gpu_kv_layout = gpu_kv_layout
         self.num_layers = gpu_kv_layout.num_layer
+        self.gpu_layout_type = gpu_layout_type
         # we have to map the exported gpu blocks into the virtual space of current process
         if isinstance(shared_gpu_blocks[0], torch.Tensor):
             self.gpu_blocks = shared_gpu_blocks
@@ -527,7 +535,12 @@ class GPUKVCacheVerifier:
                                                               token_ids[start_token_idx:end_token_idx],
                                                               actual_head_id)
                             # GPU tensor dim：[kv_dim, num_block, tokens_per_block, num_head, head_size]
-                            gpu_tensor[kv_id, block_id, :, head_id, :] = hash_value
+                            if self.gpu_layout_type == 0:
+                                gpu_tensor[kv_id, block_id, :, head_id, :] = hash_value
+                            elif self.gpu_layout_type == 1:
+                                self.gpu_blocks[tp_id][block_id, layer_id, kv_id, :, head_id, :] = hash_value
+                            else:
+                                raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
     def verify_kv_blocks(self, token_ids, block_ids)->bool:
         assert len(token_ids) == len(block_ids) * self.tokens_per_block
@@ -557,8 +570,12 @@ class GPUKVCacheVerifier:
                             expected_hash_value = self.hash_all_values(layer_id, kv_id,
                                                                       token_ids[start_token_idx:end_token_idx],
                                                                       actual_head_id)
-
-                            actual_values = gpu_tensor[kv_id, block_id, :, head_id, :]
+                            if self.gpu_layout_type == 0:
+                                actual_values = gpu_tensor[kv_id, block_id, :, head_id, :]
+                            elif self.gpu_layout_type == 1:
+                                actual_values = self.gpu_blocks[tp_id][block_id, layer_id, kv_id, :, head_id, :]
+                            else:
+                                raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
                             if not torch.allclose(actual_values,
                                                 torch.full_like(actual_values, expected_hash_value),

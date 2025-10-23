@@ -285,7 +285,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
         # Get pointers first
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
-        self.gpu_layer_ptrs = self.gpu_blocks_ptrs
+        self.gpu_tensor_ptrs = self.gpu_blocks_ptrs
 
         self.cpu_tensor = cpu_blocks
 
@@ -299,13 +299,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
         self.gpu_kv_stride_in_bytes = gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize
         self.gpu_block_stride_in_bytes = gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize
+        self.gpu_layer_stride_in_bytes = gpu_kv_layout_per_layer.get_layer_stride() * self.dtype.itemsize
 
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
 
-        if not gpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
-            raise ValueError("Only layerwise layout is supported for GPU")
         # set GPU device
         if gpu_device_id != -1:
             torch.cuda.set_device(gpu_device_id)
@@ -346,15 +345,16 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         if len(gpu_block_id_list) == 0:
             return
 
-        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
+        self.gpu_block_type_ = 0 if len(self.gpu_blocks) == 1 else 1#TODO to be well supported later
 
-        gpu_layer_ptrs = self.gpu_layer_ptrs[layer_id_list].contiguous().pin_memory()
+        gpu_tensor_ptrs = self.gpu_tensor_ptrs.contiguous().pin_memory()
 
         transfer_kv_blocks(
             gpu_block_id_list,
-            gpu_layer_ptrs,
+            gpu_tensor_ptrs,
             self.gpu_kv_stride_in_bytes,
             self.gpu_block_stride_in_bytes,
+            self.gpu_layer_stride_in_bytes,
             cpu_block_id_list,
             self.cpu_tensor,
             self.cpu_kv_stride_in_bytes,
@@ -362,10 +362,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_block_stride_in_bytes,
             self.chunk_size_in_bytes,
             layer_id,
+            layer_granularity,
             transfer_sms,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
             self.is_mla,
+            self.gpu_block_type_,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
@@ -427,7 +429,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 blocks_in_one_gpu.append(handle.get_tensor())
             imported_gpu_blocks.append(blocks_in_one_gpu)
         self.gpu_blocks = imported_gpu_blocks
-        self.dtype = dtype
+        self.dtype = dtype # note this should be quantized data type
         self.is_mla = gpu_kv_layouts[0].is_mla
 
         self.num_gpus = len(self.gpu_blocks)
@@ -437,22 +439,21 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         cudaHostRegister(cpu_blocks)
 
         self.num_layers = gpu_kv_layouts[0].num_layer
-        gpu_kv_layouts_per_layer = [gpu_kv_layout.div_layer(self.num_layers) for gpu_kv_layout in gpu_kv_layouts]
-
-        self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize \
-                                for gpu_kv_layout_per_layer in gpu_kv_layouts_per_layer]
-        self.gpu_kv_strides_in_bytes = [gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize \
-                                for gpu_kv_layout_per_layer in gpu_kv_layouts_per_layer]
-        self.gpu_block_strides_in_bytes = [gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize \
-                                for gpu_kv_layout_per_layer in gpu_kv_layouts_per_layer]
+        
+        # here the chunk size doesn't include the layer info
+        self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
+                                for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_kv_strides_in_bytes = [gpu_kv_layout.get_kv_stride() * self.dtype.itemsize \
+                                for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_block_strides_in_bytes = [gpu_kv_layout.get_block_stride() * self.dtype.itemsize \
+                                for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_layer_strides_in_bytes = [gpu_kv_layout.get_layer_stride() * self.dtype.itemsize \
+                                for gpu_kv_layout in gpu_kv_layouts]
 
         self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
-
-        if not gpu_kv_layouts[0].type == KVCacheLayoutType.LAYERWISE:
-            raise ValueError("Only layerwise layout is supported for GPU")
 
         self.transfer_sms_h2d = transfer_sms_h2d
         self.transfer_sms_d2h = transfer_sms_d2h
@@ -462,10 +463,10 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
         gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
         gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
-
+        gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
         self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
-                                                              gpu_kv_strides_tensor, gpu_block_strides_tensor,
-                                                              gpu_chunk_sizes_tensor)
+                                                              self.num_layers, gpu_kv_strides_tensor, 
+                                                              gpu_block_strides_tensor, gpu_layer_strides_tensor, gpu_chunk_sizes_tensor)
 
 
     def _transfer_impl(self,

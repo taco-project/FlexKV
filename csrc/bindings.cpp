@@ -26,31 +26,30 @@
 namespace py = pybind11;
 
 void transfer_kv_blocks_binding(
-    torch::Tensor &gpu_block_id_tensor, torch::Tensor &gpu_layer_ptrs_tensor,
-    int64_t gpu_kv_stride_in_bytes, int64_t gpu_block_stride_in_bytes,
+    torch::Tensor &gpu_block_id_tensor, torch::Tensor &gpu_tensor_ptrs_tensor,
+    int64_t gpu_kv_stride_in_bytes, int64_t gpu_block_stride_in_bytes, int64_t gpu_layer_stride_in_bytes,
     torch::Tensor &cpu_block_id_tensor, torch::Tensor &cpu_tensor,
     int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_block_stride_in_bytes, int64_t chunk_size_in_bytes,
-    int start_layer_id, int transfer_sms = -1, bool is_host_to_device = true,
-    bool use_ce_transfer = false, bool is_mla = false) {
+    int start_layer_id, int num_layers, int transfer_sms = -1, bool is_host_to_device = true,
+    bool use_ce_transfer = false, bool is_mla = false, int gpu_block_type = 0) {
   int num_blocks = gpu_block_id_tensor.numel();
-  int num_layers = gpu_layer_ptrs_tensor.numel();
 
   int64_t *gpu_block_ids =
       static_cast<int64_t *>(gpu_block_id_tensor.data_ptr());
-  void **gpu_layer_ptrs = static_cast<void **>(
-      gpu_layer_ptrs_tensor.data_ptr()); // must be contiguous
+  void **gpu_tensor_ptrs = static_cast<void **>(
+      gpu_tensor_ptrs_tensor.data_ptr()); // must be contiguous
   int64_t *cpu_block_ids =
       static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
   void *cpu_ptr = static_cast<void *>(cpu_tensor.data_ptr());
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   flexkv::transfer_kv_blocks(
-      num_blocks, start_layer_id, num_layers, gpu_block_ids, gpu_layer_ptrs,
-      gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes, 0, cpu_block_ids, cpu_ptr,
+      num_blocks, start_layer_id, num_layers, gpu_block_ids, gpu_tensor_ptrs,
+      gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes, gpu_layer_stride_in_bytes, 0, cpu_block_ids, cpu_ptr,
       cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
       cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
-      is_host_to_device, use_ce_transfer, is_mla);
+      is_host_to_device, use_ce_transfer, is_mla, gpu_block_type);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(cudaGetErrorString(err));
@@ -303,7 +302,7 @@ PYBIND11_MODULE(c_ext, m) {
 
   py::class_<flexkv::TPTransferThreadGroup>(m, "TPTransferThreadGroup")
       .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
-                    torch::Tensor &, int, torch::Tensor &, torch::Tensor &, torch::Tensor &>())
+                    torch::Tensor &, int, int, torch::Tensor &, torch::Tensor &, torch::Tensor &, torch::Tensor &>())
       .def("tp_group_transfer",
            &flexkv::TPTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),
