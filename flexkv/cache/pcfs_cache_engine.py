@@ -166,11 +166,11 @@ class HierarchyLRCacheEngine:
                 else:
                     # For P2P mode, use node_ids directly
                     bnids_np = nids.cpu().numpy().astype(np.uint32)
-                    print(f"[REMOTE_MATCH {self.device_type.name}] Using remote data: block_ids={nps.cpu().numpy()[:min(4, len(nps))]}, node_ids={bnids_np[:min(4, len(bnids_np))]}")
+                    #print(f"[REMOTE_MATCH {self.device_type.name}] Using remote data: block_ids={nps.cpu().numpy()[:min(4, len(nps))]}, node_ids={bnids_np[:min(4, len(bnids_np))]}")
             else:
                 bnids_np = None
                 if mr_remote.num_matched_blocks > 0:
-                    print(f"[REMOTE_MATCH {self.device_type.name}] Warning: remote matched but block_node_ids is empty, falling back to local")
+                    #print(f"[REMOTE_MATCH {self.device_type.name}] Warning: remote matched but block_node_ids is empty, falling back to local")
                     chosen = mr_local
         phys_np = chosen.physical_blocks.cpu().numpy()
         if self.device_type == DeviceType.CPU and matched_pos == "remote" and mr_local.num_matched_blocks > 0:
@@ -380,6 +380,9 @@ class HierarchyLRCacheEngine:
                 "Not enough free blocks to take, ", required=num_required_blocks, available=self.mempool.num_free_blocks
             )
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
+        #print(f"[TAKE STATISTICS] device type: {self.device_type.name}, utilization: {utilization}, ",
+        #      f"should_evict: {should_evict}, num_required_blocks: {num_required_blocks}, ",
+        #      f"num_allocated_blocks: {num_allocated_blocks}, num_free_blocks: {self.mempool.num_free_blocks}")
         return self.mempool.allocate_blocks(num_allocated_blocks)
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
