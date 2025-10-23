@@ -5,15 +5,14 @@ import torch
 import tempfile
 from typing import TYPE_CHECKING
 from dataclasses import dataclass, field
+from pathlib import Path
+from transformers import AutoConfig as HFAutoConfig
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.integration.tensorrt_llm.utils import get_dp_tp_info
 
-if TYPE_CHECKING:
-    from tensorrt_llm.bindings.internal.args import TorchLlmArgs
-    from tensorrt_llm.models import AutoConfig
-    from pathlib import Path
-    from transformers import AutoConfig as HFAutoConfig
-    from flexkv.integration.tensorrt_llm.utils import get_dp_tp_info
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.bindings.executor import ExecutorConfig
 
 logger = flexkv_logger
 
@@ -61,18 +60,18 @@ class FlexKVConfig:
         
     def post_init_from_trt_config(
         self,
-        llm_args: TorchLlmArgs,
+        config: ExecutorConfig,
     ):
-        self.block_size = llm_args.kv_cache_config.tokens_per_block
-        self.dtype = llm_args.dtype
-        self.tp_size, self.dp_size, self.dp_rank = get_dp_tp_info(llm_args)
+        self.block_size = config.tokens_per_block
+        self.dtype = config.pytorch_backend_config.kv_cache_dtype
+        self.tp_size, self.dp_size, self.dp_rank = get_dp_tp_info(config)
         
-        model_path = Path(llm_args.model)
-        assert model_path.exists(), f"Model path {model_path} does not exist."
+        model_path = os.getenv('MODEL_PATH', None)
+        
         try:
             hf_config = HFAutoConfig.from_pretrained(
                 str(model_path), 
-                trust_remote_code=llm_args.trust_remote_code
+                trust_remote_code=True
             )
             self.num_layers = hf_config.num_hidden_layers
             self.num_kv_heads = getattr(hf_config, 'num_key_value_heads', 

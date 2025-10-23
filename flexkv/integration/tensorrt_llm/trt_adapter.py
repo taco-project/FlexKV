@@ -21,7 +21,7 @@ from flexkv.integration.tensorrt_llm.meta import(
 
 from flexkv.integration.tensorrt_llm.utils import RequestWrapper, get_dp_tp_info
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker,
     SchedulerOutput)
@@ -49,10 +49,10 @@ Date:   Wed Oct 15 11:53:57 2025 +0200
 """
 
 class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
-    def __init__(self, llm_args: TorchLlmArgs):
+    def __init__(self, config: ExecutorConfig):
         flexkv_config = FlexKVConfig.from_env()
-        flexkv_config.post_init_from_trt_config(llm_args) 
-        _, _, dp_rank = get_dp_tp_info(llm_args)
+        flexkv_config.post_init_from_trt_config(config) 
+        _, _, dp_rank = get_dp_tp_info(config)
 
         logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
         self.flexkv_config = flexkv_config
@@ -482,10 +482,10 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         return self.flexkv_manager.dp_client_id
 
 class FlexKVWorkerConnector(KvCacheConnectorWorker):
-    def __init__(self, llm_args: TorchLlmArgs):
+    def __init__(self, config: ExecutorConfig):
         flexkv_config = FlexKVConfig.from_env()
-        flexkv_config.post_init_from_trt_config(llm_args)
-        _, _, dp_rank = get_dp_tp_info(llm_args)
+        flexkv_config.post_init_from_trt_config(config)
+        _, _, dp_rank = get_dp_tp_info(config)
         dp_client_id = dp_rank
         
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.tp_size
