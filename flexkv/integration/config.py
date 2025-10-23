@@ -31,7 +31,7 @@ class FlexKVConfig:
     dtype: torch.dtype = None
     use_mla: bool = False
     tp_size: int = 1
-    
+    dp_size: int = 1
     # log config
     num_log_interval_requests: int = 200
     
@@ -66,3 +66,4 @@ class FlexKVConfig:
         self.dtype = vllm_config.model_config.dtype
         self.use_mla = vllm_config.model_config.is_deepseek_mla
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.dp_size = vllm_config.parallel_config.data_parallel_size

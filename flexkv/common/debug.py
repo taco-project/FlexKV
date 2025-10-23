@@ -16,14 +16,18 @@ class FlexkvLogger:
         self.enabled = False
         self.logger = logging.getLogger("FLEXKV")
 
-        formatter = logging.Formatter(
-            fmt=_FORMAT,
-            datefmt=_DATE_FORMAT,
+        has_console_handler = any(
+            isinstance(handler, logging.StreamHandler)
+            for handler in self.logger.handlers
         )
-
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        self.logger.addHandler(console_handler)
+        if not has_console_handler:
+            formatter = logging.Formatter(
+                fmt=_FORMAT,
+                datefmt=_DATE_FORMAT,
+            )
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(console_handler)
 
         self.set_level(debug_level)
 

@@ -38,7 +38,6 @@ DEFAULT_CACHE_CONFIG = {
     'remote_file_prefix': "remote_cache",
     'use_gds': False,
     'enable_trace': False,
-    'use_pinned_memory': False,
     'ssd_cache_dir': ["./ssd_cache", "./ssd_cache2/"],
     'ssd_cache_iouring_entries': 32,
     'remote_cache_path': ["remote_cache1", "remote_cache2"],

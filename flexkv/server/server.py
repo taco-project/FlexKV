@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union
 
 import tempfile
 import zmq
@@ -10,6 +10,8 @@ from threading import Lock
 import multiprocessing as mp
 import socket
 import os
+import subprocess
+import textwrap
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
@@ -64,11 +66,13 @@ class ClientManager:
         context: zmq.Context,
         client_recv_port: str,
         tp_size: int = 1,
+        client_id: Optional[int] = None,
     ) -> int:
-        if len(self.free_client_ids) == 0:
-            flexkv_logger.error("Client full. DP client registration failed.")
-            raise
-        client_id = self.free_client_ids.popleft()
+        if client_id is None:
+            if len(self.free_client_ids) == 0:
+                flexkv_logger.error("Client full. DP client registration failed.")
+                raise
+            client_id = self.free_client_ids.popleft()
         send_to_client = get_zmq_socket(
             context, zmq.SocketType.PUSH, client_recv_port, False
         )
@@ -81,7 +85,7 @@ class ClientManager:
         flexkv_logger.info(f"DP client {client_id} registered successfully")
 
         return client_id
-    
+
     def delete_dp_client(self, client_id: int) -> None:
         if client_id not in self.client_dict:
             flexkv_logger.error(f"DP client: {client_id} dosen't exist. Delete failed.")
@@ -103,19 +107,8 @@ class ClientManager:
         return False
 
 class KVServerHandle:
-    def __init__(self, process: mp.Process):
+    def __init__(self, process: Union[mp.Process, 'subprocess.Popen']):
         self.process = process
-    
-    def shutdown(self) -> None:
-        self.process.join(timeout=5)
-        if self.process.is_alive():
-            flexkv_logger.info("force terminate the server process")
-            self.process.terminate()
-            self.process.join()
-
-    def __del__(self) -> None:
-        if self.process.is_alive():
-            self.shutdown()
 
 class KVServer:
     def __init__(
@@ -137,7 +130,7 @@ class KVServer:
         self.req_counter = 0
         self._is_ready = False
         self._running = False
-        
+
         # Request handler dispatch table
         self.request_handlers = {
             StartRequest: self._handle_start_request,
@@ -162,35 +155,71 @@ class KVServer:
         self._is_ready = True
 
     @staticmethod
-    def _server_process(model_config: ModelConfig, 
+    def _server_process(model_config: ModelConfig,
                        cache_config: CacheConfig,
                        gpu_register_port: str,
                        server_recv_port: str) -> None:
-        
+
         server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
         server.run()
-        
+
     @classmethod
     def create_server(cls,
                       model_config: ModelConfig,
                       cache_config: CacheConfig,
                       gpu_register_port: str,
-                      server_recv_port: Optional[str] = None) -> 'KVServerHandle':
-        #if server_recv_port is None:
-        #    server_recv_port = f"ipc:///tmp/flexkv_srv_{uuid.uuid4().hex[:8]}" #TODO unify this
-        
+                      server_recv_port: Optional[str] = None,
+                      child_env: Optional[dict] = None,
+                      inherit_env: bool = True) -> 'KVServerHandle':
+
         # Set spawn method for CUDA compatibility
-        try:
+        with contextlib.suppress(RuntimeError):
             mp.set_start_method("spawn")
-        except RuntimeError:
-            # If already set, just continue
-            pass
-        process = mp.Process(target=cls._server_process,
-                             args=(model_config, cache_config, gpu_register_port, server_recv_port))
-        process.start()
-        flexkv_logger.info(f"KVServer process started, PID: {process.pid}")
         
-        return KVServerHandle(process)
+        # Prepare environment variables for child process
+        if child_env is not None or not inherit_env:
+            # Use subprocess for better environment control
+            import subprocess
+            import pickle
+            import sys
+            
+            # Prepare environment
+            if inherit_env:
+                env = os.environ.copy()
+                if child_env:
+                    env.update(child_env)
+            else:
+                env = child_env or {}
+            
+            # Serialize arguments
+            args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port))
+            
+            # Start subprocess
+            flexkv_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            server_script = textwrap.dedent(f'''
+                import pickle
+                import sys
+                sys.path.insert(0, "{flexkv_root}")
+                from flexkv.server.server import KVServer
+
+                args_data = {args_data!r}
+                model_config, cache_config, gpu_register_port, server_recv_port = pickle.loads(args_data)
+                server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
+                server.run()
+            ''').strip()
+            process = subprocess.Popen([
+                sys.executable, '-c', server_script
+            ], env=env)
+            
+            flexkv_logger.info(f"KVServer subprocess started, PID: {process.pid}")
+            return KVServerHandle(process)
+        else:
+            # Use multiprocessing as before
+            process = mp.Process(target=cls._server_process,
+                                 args=(model_config, cache_config, gpu_register_port, server_recv_port))
+            process.start()
+            flexkv_logger.info(f"KVServer process started, PID: {process.pid}")
+            return KVServerHandle(process)
 
     def run(self) -> None:
         """Main server loop"""
@@ -211,18 +240,18 @@ class KVServer:
             try:
                 flexkv_logger.info("start waiting for req")
                 req = self.recv_from_client.recv_pyobj()
-                flexkv_logger.info(f"recv req: {type(req)}")
+                flexkv_logger.info(f"recv req: {type(req)} from DP client {req.dp_client_id}")
 
                 # Use dispatch table for request handling
                 req_type = type(req)
                 handler = self.request_handlers.get(req_type)
-                
+
                 if handler is None:
                     raise TypeError(f"Unrecognized RequestType: {req_type}")
-                
+
                 # Call the corresponding handler method
                 handler(req)
-                
+
                 # If the request is a shutdown request, exit the loop
                 if req_type == ShutdownRequest:
                     break
@@ -246,7 +275,7 @@ class KVServer:
         return True
 
     # Request Handler Methods
-    
+
     def _handle_start_request(self, req: StartRequest) -> None:
         """Handle start request"""
         flexkv_logger.info(f"Received start request from DP client {req.dp_client_id}")
@@ -257,9 +286,9 @@ class KVServer:
         client_id = self.client_manager.register_dp_client(
             self.context,
             req.client_recv_port,
-            req.model_config.tp_size
+            req.model_config.tp_size,
+            req.dp_client_id,
         )
-        flexkv_logger.info(f"DP client {client_id} registered successfully")
 
     def _handle_is_ready_request(self, req: IsReadyRequest) -> None:
         """Handle ready state check request"""
@@ -317,7 +346,7 @@ class KVServer:
     def _handle_launch_task_request(self, req: LaunchTaskRequest) -> None:
         """Handle LaunchTask request"""
         self.kv_task_engine.launch_tasks(req.task_ids, req.slot_mappings)
-        
+
     def _handle_cancel_task_request(self, req: CancelTaskRequest) -> None:
         """Handle CancelTask request"""
         self.kv_task_engine.cancel_tasks(req.task_ids)
@@ -381,7 +410,6 @@ if __name__ == "__main__":
                                 enable_ssd=False,
                                 enable_remote=False,
                                 use_gds=False,
-                                use_pinned_memory=True,
                                 tokens_per_block=tokens_per_block,
                                 num_cpu_blocks=num_cpu_blocks,)
 

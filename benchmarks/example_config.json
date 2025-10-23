@@ -14,7 +14,6 @@
         "enable_remote": false,
         "tokens_per_block": 16,
         "use_gds": false,
-        "use_pinned_memory": true,
         "gpu_kv_layout_type": "LAYERWISE",
         "cpu_kv_layout_type": "BLOCKWISE",
         "ssd_kv_layout_type": "BLOCKWISE",

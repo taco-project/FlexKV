@@ -1,24 +1,9 @@
-From a434b67b8097990f20d8c020a8c713b10dd3d5b0 Mon Sep 17 00:00:00 2001
-From: zuogan <zuogan@tencent.com>
-Date: Wed, 3 Sep 2025 05:11:50 -0700
-Subject: [PATCH] add flexkv connector
-
----
- .../prefix_caching_flexkv.py                  | 163 +++++++++++++++
- .../kv_transfer/kv_connector/factory.py       |   5 +
- .../kv_connector/v1/flexkv_connector.py       | 191 ++++++++++++++++++
- vllm/v1/core/sched/scheduler.py               |  13 +-
- .../worker/kv_connector_model_runner_mixin.py |   6 +-
- 5 files changed, 373 insertions(+), 5 deletions(-)
- create mode 100644 examples/offline_inference/prefix_caching_flexkv.py
- create mode 100644 vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
-
 diff --git a/examples/offline_inference/prefix_caching_flexkv.py b/examples/offline_inference/prefix_caching_flexkv.py
 new file mode 100644
-index 000000000..4cfe2ef7f
+index 000000000..a57328ffd
 --- /dev/null
 +++ b/examples/offline_inference/prefix_caching_flexkv.py
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,162 @@
 +# SPDX-License-Identifier: Apache-2.0
 +import os
 +import time
@@ -36,7 +21,6 @@ index 000000000..4cfe2ef7f
 +    "cache_config": {
 +          "enable_cpu": True,
 +          "num_cpu_blocks": 10240,
-+          "use_pinned_memory": True
 +    },
 +    "num_log_interval_requests": 200
 +}
@@ -84,7 +68,7 @@ index 000000000..4cfe2ef7f
 +
 +def main():
 +    # Create an LLM without prefix caching as a baseline.
-+    regular_llm = LLM(model=model_path, 
++    regular_llm = LLM(model=model_path,
 +                      enable_prefix_caching=False,
 +                      gpu_memory_utilization=gpu_memory_utilization,
 +                      tensor_parallel_size=tp_size
@@ -114,7 +98,7 @@ index 000000000..4cfe2ef7f
 +    # return
 +
 +    # Create an LLM with prefix caching enabled.
-+    prefix_cached_llm = LLM(model=model_path, 
++    prefix_cached_llm = LLM(model=model_path,
 +                            enable_prefix_caching=True,
 +                            gpu_memory_utilization=gpu_memory_utilization,
 +                            tensor_parallel_size=tp_size,
@@ -124,7 +108,7 @@ index 000000000..4cfe2ef7f
 +    # Warmup so that the shared prompt's KV cache is computed.
 +    prefix_cached_llm.generate(generating_prompts[0], sampling_params)
 +
-+    # wait for offload kv task finished. 
++    # wait for offload kv task finished.
 +    time.sleep(2)
 +
 +    # Generate with prefix caching.
@@ -149,7 +133,7 @@ index 000000000..4cfe2ef7f
 +    ])
 +    print(f"Generated answers are the same: {generated_same}")
 +
-+    # wait for offload kv task finished. 
++    # wait for offload kv task finished.
 +    time.sleep(2)
 +
 +    # reset prefix cache to use flexkv
@@ -249,9 +233,9 @@ index 000000000..bdfa9f321
 +            **kwargs: additional arguments for the load operation
 +
 +        Note:
-+            The number of elements in kv_caches and layer_names should be 
++            The number of elements in kv_caches and layer_names should be
 +            the same.
-+            
++
 +        """
 +        self._flexkv_connector.start_load_kv(forward_context, **kwargs)
 +
@@ -260,7 +244,7 @@ index 000000000..bdfa9f321
 +        Block until the KV for a specific layer is loaded into vLLM's
 +        paged buffer. This is called from within attention layer to ensure
 +        async copying from start_load_kv is complete.
-+        
++
 +        This interface will be useful for layer-by-layer pipelining.
 +
 +        Args:
@@ -271,13 +255,13 @@ index 000000000..bdfa9f321
 +    def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
 +                      attn_metadata: "AttentionMetadata", **kwargs) -> None:
 +        """
-+        Start saving the a layer of KV cache from vLLM's paged buffer 
++        Start saving the a layer of KV cache from vLLM's paged buffer
 +        to the connector. This is called from within attention layer to
 +        enable async copying during execution.
 +
 +        Args:
 +            layer_name (str): the name of the layer.
-+            kv_layer (torch.Tensor): the paged KV buffer of the current 
++            kv_layer (torch.Tensor): the paged KV buffer of the current
 +                layer in vLLM.
 +            attn_metadata (AttentionMetadata): the attention metadata.
 +            **kwargs: additional arguments for the save operation.
@@ -310,7 +294,7 @@ index 000000000..bdfa9f321
 +            call to this method (this call or a prior one).
 +        """
 +        return self._flexkv_connector.get_finished(finished_req_ids)
-+    
++
 +    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
 +        """
 +        Initialize with the KV caches. Useful for pre-registering the
@@ -332,14 +316,14 @@ index 000000000..bdfa9f321
 +        """
 +        Get number of new tokens that can be loaded from the
 +        external KV cache beyond the num_computed_tokens.
-+        
++
 +        Args:
 +            request (Request): the request object.
 +            num_computed_tokens (int): the number of locally
 +                computed tokens for this request
 +
 +        Returns:
-+            the number of tokens that can be loaded from the 
++            the number of tokens that can be loaded from the
 +            external KV cache beyond what is already computed.
 +        """
 +        return self._flexkv_connector.get_num_new_matched_tokens(
@@ -398,30 +382,30 @@ index 981023409..a6c8fac38 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -118,6 +118,7 @@ class Scheduler(SchedulerInterface):
- 
+
          # KV Connector: requests in process of async KV loading or recving
          self.finished_recving_kv_req_ids: set[str] = set()
 +        self.sending_kv_reqs: dict[str, Request] = {}
- 
+
          # Encoder-related.
          # Calculate encoder cache size if applicable
 @@ -1029,7 +1030,8 @@ class Scheduler(SchedulerInterface):
- 
+
          if not delay_free_blocks:
              self._free_blocks(request)
 -
 +        else:
 +            self.sending_kv_reqs[request.request_id] = request
          return kv_xfer_params
- 
+
      def _free_blocks(self, request: Request):
 @@ -1041,7 +1043,7 @@ class Scheduler(SchedulerInterface):
          return len(self.waiting) + len(self.running)
- 
+
      def has_finished_requests(self) -> bool:
 -        return len(self.finished_req_ids) > 0
 +        return len(self.finished_req_ids) > 0 or len(self.sending_kv_reqs) > 0
- 
+
      def reset_prefix_cache(self) -> bool:
          return self.kv_cache_manager.reset_prefix_cache()
 @@ -1082,6 +1084,8 @@ class Scheduler(SchedulerInterface):
@@ -430,20 +414,20 @@ index 981023409..a6c8fac38 100644
              self.kv_event_publisher.shutdown()
 +        if self.connector and hasattr(self.connector, "shutdown"):
 +            self.connector.shutdown()
- 
+
      ########################################################################
      # KV Connector Related Methods
 @@ -1149,6 +1153,10 @@ class Scheduler(SchedulerInterface):
              scheduler the request during the next step.
          """
- 
+
 +        # avoid busy checking
 +        if len(self.running) == 0:
 +            time.sleep(0.01)
 +
          if self.connector is not None:
              self.connector.update_connector_output(kv_connector_output)
- 
+
 @@ -1158,4 +1166,5 @@ class Scheduler(SchedulerInterface):
              self.finished_recving_kv_req_ids.add(req_id)
          for req_id in (kv_connector_output.finished_sending or ()):
@@ -457,16 +441,13 @@ index a03ebe35d..8e4460957 100644
 @@ -66,9 +66,9 @@ class KVConnectorModelRunnerMixin:
                  scheduler_output, wait_for_save=False) as kv_connector_output:
              pass
- 
+
 -        if (not kv_connector_output.finished_sending
 -                and not kv_connector_output.finished_recving):
 -            return EMPTY_MODEL_RUNNER_OUTPUT
 +        # if (not kv_connector_output.finished_sending
 +        #         and not kv_connector_output.finished_recving):
 +        #     return EMPTY_MODEL_RUNNER_OUTPUT
- 
+
          output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
          output.kv_connector_output = kv_connector_output
--- 
-2.34.1
-

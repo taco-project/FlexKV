@@ -5,15 +5,15 @@
  **FlexKV 从 client-server 模式，变为推理加速引擎（如 vLLM）可直接调用的库函数**，以减少进程间消息传递的开销。
 这一变更引发了较大的 API 调整。因此，请注意：
 
-- **版本 >= `0.0.2`**：应使用 **当前版本 API**，vLLM patch位于 `examples/vllm_adaption/`。
-- **版本 == `0.0.1`**：仅支持 **Legacy 版本 API**, vLLM patch位于`examples/vllm_adaption_legacy/`。
+- **版本 >= `1.0.0`**：应使用 **当前版本 API**，vLLM patch位于 `examples/vllm_adaption/`。
+- **版本 == `0.1.0`**：仅支持 **Legacy 版本 API**, vLLM patch位于`examples/vllm_adaption_legacy/`。
 
 ---
 
-## 当前版本（>= 0.0.2）
+## 当前版本（>= 1.0.0）
 
 ### 适用版本
-- FlexKV >= `0.0.2`
+- FlexKV >= `1.0.0`
 - vLLM 原则上>= `0.8.5`版本均可参考示例代码进行修改
 
 ### 示例
@@ -40,7 +40,6 @@ cat <<EOF > ./flexkv_config.json
     "cache_config": {
           "enable_cpu": true,
           "num_cpu_blocks": 10240,
-          "use_pinned_memory": true
     },
     "num_log_interval_requests": 200
 }
@@ -63,10 +62,12 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
 
 ```
 
-## Legacy版本（<= 0.0.1）,目前的版本尽量不要使用
+> 注：`flexkv_config.json`配置仅为简单示例，选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
+
+## Legacy版本（<= 0.1.0）,目前的版本尽量不要使用
 
 ### 适用版本
-- FlexKV <= `0.0.1`
+- FlexKV <= `0.1.0`
 
 ### 示例
 在 vLLM 0.8.4 版本中应用patch `examples/vllm_adaption_legacy/flexkv_vllm_0_8_4.patch`，分别启动 FlexKV、vLLM 和测试脚本：
