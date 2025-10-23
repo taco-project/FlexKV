@@ -116,7 +116,7 @@ def test_node_b():
     # Configuration
     model_config = ModelConfig(**DEFAULT_MODEL_CONFIG)
     cache_config = CacheConfig(**DEFAULT_CACHE_CONFIG)
-    num_total_request = 40
+    num_total_request = 100
     cache_config.tokens_per_block = 4
     cache_config.enable_ssd = True
     cache_config.enable_kv_sharing = True
@@ -128,15 +128,19 @@ def test_node_b():
     cache_config.local_zmq_ip = "10.6.131.10"
     cache_config.local_zmq_port = 5555
     cache_config.local_ip = "10.6.131.10"
-    cache_config.num_cpu_blocks = 900
+    cache_config.num_cpu_blocks = 300
     cache_config.num_ssd_blocks = 1000
     cache_config.ssd_cache_dir = "/data1/flexkv_ssd/"
-    cache_config.lease_ttl_ms = 5000          # 1秒租约（加快驱逐速度）
-    cache_config.renew_lease_ms = 100         # 100ms续约（只续约NORMAL节点，ABOUT_TO_EVICT不续约）
+    cache_config.lease_ttl_ms = 10000          # 10秒租约
+    cache_config.refresh_batch_size = 256
+    cache_config.renew_lease_ms = 4000         # 5秒续约（降低Redis负载）
+    cache_config.remote_rebuild_interval_ms = 10000  # 10秒重建远程索引
     
     # 主动式驱逐策略：提前预留buffer空间
-    cache_config.evict_start_threshold = 0.8  # CPU使用率达80%就开始驱逐
-    cache_config.evict_ratio = 0.15            # 每次至少驱逐15%的blocks
+    # 一个很重要的前提是：IMPORTANT
+    # 驱逐开始时候，留下的缓冲blocks要足够大，作为期间request读写的buffer
+    cache_config.evict_start_threshold = 0.7  # CPU使用率达80%就开始驱逐
+    cache_config.evict_ratio = 0.1            # 每次至少驱逐15%的blocks
     
     num_gpu_blocks = 512
     tokens_per_block = cache_config.tokens_per_block
@@ -204,8 +208,8 @@ def test_node_b():
     
     # Generate 100 shared requests
     all_requests = generate_shared_requests(num_requests=num_total_request, tokens_per_block=tokens_per_block, blocks_per_request=4)
-    for req_id, token_ids, block_ids in all_requests:
-        print(f"Request {req_id}: Token IDs: {token_ids}, Block IDs: {block_ids}")
+    #for req_id, token_ids, block_ids in all_requests:
+    #    print(f"Request {req_id}: Token IDs: {token_ids}, Block IDs: {block_ids}")
     print(f"Generated {len(all_requests)} shared requests")
     
     print("\n" + "=" * 80)
@@ -233,7 +237,7 @@ def test_node_b():
             dp_id=0,
         )
         kvmanager.wait([write_request], completely=True)
-        time.sleep(2)
+        time.sleep(1)
         if (len([x for x in my_write_ids if x <= req_id]) % 10) == 0:
             print(f"  Written {len([x for x in my_write_ids if x <= req_id])}/{len(my_write_ids)} requests")
     
@@ -310,7 +314,7 @@ def test_node_b():
             verification_failed += 1
             print(f"  ❌ Request {req_id}: Only {valid_fetched_tokens}/{len(token_ids)} tokens fetched")
         
-        time.sleep(1)
+        time.sleep(0.5)
 
         if ((req_id - 50) + 1) % 10 == 0:
             print(f"  Read {(req_id - 50) + 1}/{len(my_read_ids)} requests")
@@ -343,7 +347,7 @@ def test_node_b():
     
     print(f"\n✅ All tests passed!")
     print("=" * 80)
-    final_wait = 100
+    final_wait = 200
     while final_wait > 0:
         time.sleep(1)
         final_wait -= 1
