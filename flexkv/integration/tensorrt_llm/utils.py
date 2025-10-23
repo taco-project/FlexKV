@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from flexkv.common import request
 from flexkv.common.debug import flexkv_logger
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
-from tensorrt_llm.bindings.internal.args import TorchLlmArgs
+from tensorrt_llm.bindings.executor import ExecutorConfig
 
 
 logger = flexkv_logger
@@ -53,14 +53,16 @@ class RequestWrapper:
                     f"{self._request.py_request_id=}\n"
                     f"{self._request.all_token_ids=}\n")
 
-def get_dp_tp_info(llm_args: TorchLlmArgs):
-    if llm_args.enable_attention_dp:
+def get_dp_tp_info(config: ExecutorConfig):
+    mapping = config.mapping
+    
+    if mapping.enable_attention_dp:
         # trt 也不支持同时开 tp+dp
         tp_size = 1
-        dp_size = llm_args.tensor_parallel_size
-        dp_rank = llm_args.parallel_config.to_mapping().tp_rank
+        dp_size = mapping.tp_size
+        dp_rank = mapping.rank
     else:
-        tp_size = llm_args.tensor_parallel_size
+        tp_size = mapping.tp_size
         dp_size = 1 
         dp_rank = 0
     return tp_size, dp_size, dp_rank
