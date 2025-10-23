@@ -1,0 +1,8 @@
+{
+    "server_recv_port": "ipc:///tmp/flexkv_test",
+    "cache_config": {
+          "enable_cpu": true,
+          "num_cpu_blocks": 10240
+    },
+    "num_log_interval_requests": 200
+}
