@@ -309,14 +309,38 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
       current_node->update_time(hit_reward_seconds);
     }
 
+    // Avoid out-of-bounds when the current node already consumes all remaining blocks.
+    // Only count the portion that truly matches.
+    if (prefix_blocks_num + current_node->size() >= num_blocks) {
+      int cmp_len = std::min(current_node->size(), num_blocks - prefix_blocks_num);
+      int matched_length = 0;
+      for (int i = 0; i < cmp_len; ++i) {
+        if (current_node->get_hash(i) == HashType(block_hashes_ptr[prefix_blocks_num + i])) {
+          matched_length++;
+        } else {
+          break;
+        }
+      }
+      physical_blocks->insert(physical_blocks->end(),
+                              current_node->get_physical_blocks().begin(), 
+                              current_node->get_physical_blocks().begin() + matched_length);
+      if (current_node->is_ready()) {
+        last_ready_node = current_node;
+        ready_prefix_blocks_num += matched_length;
+      }
+      last_node_matched_length = matched_length;
+      prefix_blocks_num += matched_length;
+      break;
+    }
+
     // Use get_hash_safe (matching Python's get_hash with boundary check and _has_hashes branch)
     auto child_hash_opt = get_hash_safe(
-        block_hashes_ptr, 
-        token_ids_ptr, 
-        prefix_blocks_num + current_node->size(), 
-        num_blocks,
-        has_hashes,
-        tokens_per_block);
+      block_hashes_ptr, 
+      token_ids_ptr, 
+      prefix_blocks_num + current_node->size(), 
+      num_blocks,
+      has_hashes,
+      tokens_per_block);
     if (child_hash_opt.has_value() && current_node->lookup_child(child_hash_opt.value())) {
       child_hash = child_hash_opt.value();
       if (current_node->is_ready()) {

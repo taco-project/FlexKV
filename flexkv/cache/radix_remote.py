@@ -93,10 +93,21 @@ class LocalRadixTree:
                  lease_ttl_ms: int = 100000,
                  renew_lease_ms: int = 0,
                  refresh_batch_size: int = 256,
-                 idle_sleep_ms: int = 10) -> None:
+                 idle_sleep_ms: int = 10,
+                 safety_ttl_ms: int = 100,
+                 swap_block_threshold: int = 1024) -> None:
         if _CLocalRadixTree is None:
             raise ImportError("c_ext.LocalRadixTree is not available")
-        self._c = _CLocalRadixTree(int(tokens_per_block), int(max_num_blocks), int(lease_ttl_ms), int(renew_lease_ms), int(refresh_batch_size), int(idle_sleep_ms))
+        self._c = _CLocalRadixTree(
+            int(tokens_per_block),
+            int(max_num_blocks),
+            int(lease_ttl_ms),
+            int(renew_lease_ms),
+            int(refresh_batch_size),
+            int(idle_sleep_ms),
+            int(safety_ttl_ms),
+            int(swap_block_threshold)
+        )
         self._started = False
 
     def __del__(self) -> None:
@@ -229,9 +240,12 @@ class LocalRadixTree:
         """
         return int(self._c.evict(evicted_blocks, int(num_evicted)))
 
-    def insert_and_publish(self, node: "CRadixNode") -> None:
+    def insert_and_publish(self, node: "CRadixNode") -> bool:
         if not self._started:
             raise RuntimeError("LocalRadixTree must be started before calling insert_and_publish")
-        self._c.insert_and_publish(node)
+        return bool(self._c.insert_and_publish(node))
+
+    def drain_pending_queues(self) -> int:
+        return int(self._c.drain_pending_queues())
 
 

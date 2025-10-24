@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <list>
 #include <cstdint>
 #include <sstream>
 #include <iomanip>
@@ -79,6 +80,10 @@ public:
 
   // Batch update lt for all block metas belonging to node_id
   bool renew_node_leases(uint32_t node_id, uint64_t new_lt, size_t batch_size = 200);
+
+  // Batch update lt only for the provided block hashes belonging to node_id
+  // hashes: list of block hashes to renew
+  bool renew_node_leases(uint32_t node_id, uint64_t new_lt, std::list<int64_t> &hashes, size_t batch_size);
 
   // Returns the global node id assigned to this process, or UINT32_MAX if uninitialized.
   uint32_t get_node_id() const;

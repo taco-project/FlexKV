@@ -12,7 +12,7 @@
 #include <iostream>
 
 namespace flexkv {
-DistributedRadixTree::DistributedRadixTree(int tokens_per_block, int max_num_blocks,
+DistributedRadixTree::DistributedRadixTree(int tokens_per_block, unsigned int max_num_blocks,
                   uint32_t nid,
                   size_t refresh_batch_size, uint32_t rebuild_interval_ms, uint32_t idle_sleep_ms,
                   uint32_t lease_renew_ms)
@@ -20,6 +20,10 @@ DistributedRadixTree::DistributedRadixTree(int tokens_per_block, int max_num_blo
     lt_pool(max_num_blocks) {
   refresh_batch_size_ = refresh_batch_size;
   rebuild_interval_ms_ = rebuild_interval_ms;
+  if (rebuild_interval_ms_ < 1000) {
+    std::cerr << "[WARNING] rebuild_interval_ms:"
+     << rebuild_interval_ms_ <<" is too small, we suggest to set it at least 1000ms." << std::endl;
+  }
   lease_renew_ms_ = lease_renew_ms;
   old_index.store(nullptr, std::memory_order_relaxed);
   c_index.store(nullptr, std::memory_order_relaxed);
@@ -27,6 +31,11 @@ DistributedRadixTree::DistributedRadixTree(int tokens_per_block, int max_num_blo
 
 DistributedRadixTree::~DistributedRadixTree() {
   stop();
+  // Drain renew_lease_queue; nodes are owned by RefRadixTree, do not delete here
+  CRadixNode* node_ptr = nullptr;
+  while (renew_lease_queue.pop(node_ptr)) {
+    // discard
+  }
 }
 
 
@@ -106,6 +115,7 @@ void DistributedRadixTree::refresh_worker() {
       if (new_idx != nullptr) {
         RefRadixTree* old_idx = c_index.exchange(new_idx, std::memory_order_acq_rel);
         RefRadixTree* old_idx2 = old_index.exchange(old_idx, std::memory_order_acq_rel);
+        //Usually, the rebuild_interval_ms is already a sufficient waiting time, so we directly release old_idx2.
         if (old_idx2 != nullptr) {
           old_idx2->dec_ref_cnt();
         }
@@ -170,12 +180,14 @@ struct NodeInfo {
 
 RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
   if (channel == nullptr) {
+    std::cerr << "[ERROR] remote_tree_refresh: channel is nullptr" << std::endl;
     return nullptr;
   }
   
   // 1) list node:* keys
   std::vector<std::string> node_keys;
   if (!channel->list_node_keys(node_keys)) {
+    std::cerr << "[DRT] remote_tree_refresh: list_node_keys failed" << std::endl;
     return nullptr;
   }
   
@@ -191,6 +203,7 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
   
   // 2) fetch ip for each node
   if (!channel->hmget_field_for_keys(node_keys, "ip", ips)) {
+    std::cerr << "[DRT] remote_tree_refresh: hmget ip failed" << std::endl;
     return nullptr;
   }
 
@@ -225,6 +238,7 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
     // list keys block:<nid>:*
     std::vector<std::string> bkeys;
     if (!channel->list_block_keys(nfo.nid, bkeys)) {
+      std::cerr << "[DRT] list_block_keys failed for nid=" << nfo.nid << std::endl;
       continue;
     }
     
@@ -235,6 +249,7 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
     std::vector<BlockMeta> metas;
     channel->load_metas_by_keys(bkeys, metas);
     if (metas.empty()) {
+      std::cerr << "[DRT] nid=" << nfo.nid << " load_metas_by_keys returned empty" << std::endl;
       continue;
     }
     // Merge into new_index via DFS+merge helpers
@@ -274,6 +289,7 @@ std::shared_ptr<CMatchResult> DistributedRadixTree::match_prefix(
   torch::Tensor &block_hashes, int num_blocks, bool update_cache_info) {
   RefRadixTree *idx = c_index.load(std::memory_order_acquire);
   if (idx == nullptr) {
+    std::cerr << "[WARN] match_prefix: c_index==null, returning empty" << std::endl;
     auto empty_i64 = torch::empty({0}, torch::dtype(torch::kInt64));
     auto empty_u32 = torch::empty({0}, torch::dtype(torch::kInt32));
     return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
@@ -331,7 +347,7 @@ void DistributedRadixTree::set_ready(CRadixNode *node, bool ready, int ready_len
   idx->set_ready(node, ready, ready_length);
 }
 
-RefRadixTree::RefRadixTree(int tokens_per_block, int max_num_blocks, uint32_t lease_renew_ms,
+RefRadixTree::RefRadixTree(int tokens_per_block, unsigned int max_num_blocks, uint32_t lease_renew_ms,
    LockFreeQueue<CRadixNode*> *renew_lease_queue, LeaseMetaMemPool* lt_pool)
   : CRadixTreeIndex(tokens_per_block, max_num_blocks) {
   lease_renew_ms_ = lease_renew_ms;
@@ -348,7 +364,7 @@ RefRadixTree::~RefRadixTree() {
       lt_pool_->free(lm);
     }
     node->set_parent(nullptr);
-    node_list.pop_front();  // Remove from list to avoid infinite loop
+    node_list.pop_front();
     delete node;
   }
 }
@@ -630,7 +646,10 @@ CRadixNode* dfs_build_subtree_from_meta(const BlockMeta* current_meta,
   auto& cbh = child_node->get_block_hashes();
   auto& cpb = child_node->get_physical_blocks();
   auto bni = child_node->get_block_node_ids();
-  if (bni == nullptr) return nullptr;
+  if (bni == nullptr) {
+    std::cerr << "[ERROR] dfs_build_subtree_from_meta: block_node_ids is nullptr for child_node @%p" << (void*)child_node << std::endl;
+    return nullptr;
+  }
 
   // Seed with the current meta
   cbh.push_back(current_meta->hash);
@@ -741,7 +760,14 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
         auto new_lm = lt_pool.alloc();
         if (new_lm == nullptr) return;
         new_lm->state = NODE_STATE_NORMAL;
-        new_lm->lease_time = current_root->get_lease_meta()->lease_time;
+        uint64_t base_lt = 0;
+        auto cr_lm = current_root->get_lease_meta();
+        if (cr_lm != nullptr) {
+          base_lt = cr_lm->lease_time;
+        } else {
+          std::cerr << "[ERROR] attach_and_merge_root_child: current_root's lease meta is nullptr" << std::endl;
+        }
+        new_lm->lease_time = base_lt;
         auto new_root = current_root->split(i);
         new_root->set_lease_meta(new_lm);
         current_root = new_root;
