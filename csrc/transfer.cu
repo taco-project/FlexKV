@@ -94,6 +94,7 @@ void transfer_kv_blocks(
   int64_t *cpu_ptr_int64 = reinterpret_cast<int64_t *>(cpu_ptr);
   int64_t cpu_kv_stride_int64 = cpu_kv_stride_in_bytes / sizeof(int64_t);
   int64_t cpu_block_stride_int64 = cpu_block_stride_in_bytes / sizeof(int64_t);
+  int64_t gpu_layer_stride_int64 = gpu_layer_stride_in_bytes / sizeof(int64_t);
   int64_t cpu_layer_stride_int64 = cpu_layer_stride_in_bytes / sizeof(int64_t);
   int64_t cpu_startoff_inside_chunks_int64 =
       cpu_startoff_inside_chunks / sizeof(int64_t);
@@ -140,7 +141,7 @@ void transfer_kv_blocks(
         cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64,
         cpu_layer_stride_int64, cpu_block_stride_int64,
         cpu_startoff_inside_chunks_int64, chunk_size_in_int64, is_mla,
-        is_host_to_device);
+        is_host_to_device, gpu_block_type);
   }
   cudaStreamSynchronize(stream);
 }
