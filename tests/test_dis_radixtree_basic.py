@@ -124,7 +124,9 @@ def test_local_radix_tree():
             lease_ttl_ms=10000,
             renew_lease_ms=2,
             refresh_batch_size=64,
-            idle_sleep_ms=1
+            idle_sleep_ms=1,
+            safety_ttl_ms=1,
+            swap_block_threshold=10
         )
         print("[OK] LocalRadixTree 创建成功")
         
@@ -141,7 +143,7 @@ def test_local_radix_tree():
             elif match_result.num_matched_blocks == 0:
                 print(f"[WARN] 查找操作失败: {match_result}")
                 return False
-            print(f"[OK] 查找操作成功: {match_result}")
+            print(f"[OK] 查找操作成功,匹配个数={match_result.num_matched_blocks}")
         except Exception as e:
             print(f"[WARN] 查找操作失败: {e}")
             return False
@@ -253,7 +255,9 @@ def test_distributed_radix_tree_integration():
             lease_ttl_ms=100000,
             renew_lease_ms=2,
             refresh_batch_size=64,
-            idle_sleep_ms=1
+            idle_sleep_ms=1,
+            safety_ttl_ms=1,
+            swap_block_threshold=10
         )
         
         local_tree2 = LocalRadixTree(
@@ -262,7 +266,9 @@ def test_distributed_radix_tree_integration():
             lease_ttl_ms=100000,
             renew_lease_ms=2,
             refresh_batch_size=64,
-            idle_sleep_ms=1
+            idle_sleep_ms=1,
+            safety_ttl_ms=1,
+            swap_block_threshold=10
         )
         
         # 创建DistributedRadixTree实例
@@ -334,7 +340,11 @@ def test_distributed_radix_tree_integration():
         )
         if node1 is not None:
             print(f"    [OK] LocalRadixTree1 insert成功，插入节点包含4个block")
-            local_tree1.insert_and_publish(node1)
+            ret = local_tree1.insert_and_publish(node1)
+            if not ret:
+                print("    [ERROR] LocalRadixTree1 insert_and_publish失败")
+            else:
+                print(f"    [OK] LocalRadixTree1 insert_and_publish成功，插入并发布节点包含4个block")
         else:
             print("    [WARN] LocalRadixTree1 insert返回None")
         
@@ -344,8 +354,11 @@ def test_distributed_radix_tree_integration():
             physical_blocks2, block_hashes2, 4, 4, True, None, -1, -1
         )
         if node2 is not None:
-            local_tree2.insert_and_publish(node2)
-            print(f"    [OK] LocalRadixTree2 insert_and_publish成功，插入并发布节点包含4个block")
+            ret = local_tree2.insert_and_publish(node2)
+            if not ret:
+                print("    [ERROR] LocalRadixTree2 insert_and_publish失败")
+            else:
+                print(f"    [OK] LocalRadixTree2 insert_and_publish成功，插入并发布节点包含4个block")
         else:
             print("    [WARN] LocalRadixTree2 insert返回None")
         
@@ -435,7 +448,76 @@ def test_distributed_radix_tree_integration():
             raise RuntimeError("LocalRadixTree2 match_prefix失败")
         print(f"  - LocalRadixTree1匹配结果: 匹配块数={match_result1.num_matched_blocks if match_result1 else 0}")
         print(f"  - LocalRadixTree2匹配结果: 匹配块数={match_result2.num_matched_blocks if match_result2 else 0}")
-        
+
+        # 新增: 测试 LocalRadixTree 的 evict 行为（先淘汰过期/允许淘汰的，再等待过期继续淘汰）
+        print("\n=== 测试 LocalRadixTree evict 行为（含 swap_block_threshold 场景） ===")
+        from flexkv.cache.radix_remote import LocalRadixTree
+        # 使用较小 ttl，不启动刷新线程；设置 max_num_blocks=10, swap_block_threshold=5
+        lrt_evict = LocalRadixTree(
+            tokens_per_block=4,
+            max_num_blocks=10,
+            lease_ttl_ms=50,      # 50ms 过期
+            renew_lease_ms=0,
+            refresh_batch_size=16,
+            idle_sleep_ms=1,
+            safety_ttl_ms=1,
+            swap_block_threshold=5
+        )
+
+        # 循环 10 轮：每轮插入 2 个节点（各 5 个 Block），然后分两次 evict（5+5）
+        for round_idx in range(10):
+            print(f"\n[Round {round_idx+1}] evict 测试：插入 2 个节点各 5 个 Block ...")
+            base = round_idx * 10000
+            # 第一个节点（5 块）
+            phys_1 = torch.tensor([base + 10001, base + 10002, base + 10003, base + 10004, base + 10005], dtype=torch.long)
+            hash_1 = torch.tensor([base + 11001, base + 11002, base + 11003, base + 11004, base + 11005], dtype=torch.long)
+            node_a = lrt_evict.insert(phys_1, hash_1, 5, 5, True, None, -1, -1)
+            if node_a is None:
+                print("[ERROR] LocalRadixTree evict(10) 第一个节点插入失败")
+                return False
+            # 第二个节点（5 块）
+            phys_2 = torch.tensor([base + 20001, base + 20002, base + 20003, base + 20004, base + 20005], dtype=torch.long)
+            hash_2 = torch.tensor([base + 21001, base + 21002, base + 21003, base + 21004, base + 21005], dtype=torch.long)
+            node_b = lrt_evict.insert(phys_2, hash_2, 5, 5, True, None, -1, -1)
+            if node_b is None:
+                print("[ERROR] LocalRadixTree evict(10) 第二个节点插入失败")
+                return False
+
+            prev_cached = lrt_evict.total_cached_blocks()
+            if prev_cached != 10:
+                print(f"[ERROR] LocalRadixTree evict(10) 轮次缓存数量异常: {prev_cached}, 期望=10")
+                return False
+
+            # 第一次驱逐：预计驱逐 5 个（无租约/阈值内的块）
+            evict_n = 10
+            evicted_buf = torch.empty(evict_n, dtype=torch.long)
+            evicted_cnt_1 = lrt_evict.evict(evicted_buf, evict_n)
+            print(f"[OK] 第一次 evict 返回: {evicted_cnt_1}, 期望=5")
+            if evicted_cnt_1 != 5:
+                print(f"[WARN] 第一次 evict 返回值异常: {evicted_cnt_1}")
+                return False
+
+            # 等待租约过期
+            time.sleep(0.2)  # 200ms > 50ms ttl
+
+            # 第二次驱逐：应再驱逐 5 个，合计 10 个
+            evicted_cnt_2 = lrt_evict.evict(evicted_buf, evict_n)
+            print(f"[OK] 第二次 evict 返回: {evicted_cnt_2}, 期望=5")
+            if evicted_cnt_2 != 5:
+                print(f"[WARN] 第二次 evict 返回值异常: {evicted_cnt_2}")
+                return False
+
+            new_cached = lrt_evict.total_cached_blocks()
+            if new_cached != 0:
+                print(f"[WARN] 轮次结束后缓存块数应为 0: 现在={new_cached}")
+                return False
+            # 每轮末清空 LocalRadixTree 的待处理队列，避免残留
+            try:
+                dropped = lrt_evict.drain_pending_queues()
+                print(f"[OK] Round {round_idx+1} evict 行为测试通过，清理队列条目: {dropped}")
+            except Exception as e:
+                print(f"[WARN] drain_pending_queues 失败: {e}")
+
         # 在DistributedRadixTree中测试匹配
         drt_match1 = distributed_tree1.match_prefix(test_hashes2, len(test_hashes2), True)
         print(f"  - DistributedRadixTree1匹配结果: {drt_match1}")

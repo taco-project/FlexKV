@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <vector>
+#include <map>
+#include <list>
 
 #include <torch/extension.h>
 #include <pthread.h>
@@ -22,20 +24,38 @@ struct NewBlockMeta {
   std::deque<int64_t> physical_blocks;
 };
 
+class OrderedHashList {
+private:
+  std::list<int64_t> list;
+  std::map<int64_t, std::list<int64_t>::iterator> map;
+public:
+  OrderedHashList();
+  ~OrderedHashList();
+  void insert(int64_t hash);
+  void remove(int64_t hash);
+  bool contains(int64_t hash);
+  std::list<int64_t>& get_list() { return list; }
+};
+
 class LocalRadixTree : public CRadixTreeIndex {
 private:
   RedisMetaChannel *channel;
   uint32_t node_id;
   uint32_t lease_ttl_ms;
-  uint32_t renew_lease_ms;
   uint32_t refresh_batch_size;
   uint32_t idle_sleep_ms = 10;
+  uint32_t safety_ttl_ms;
+  uint32_t renew_lease_ms;
+  uint32_t swap_block_threshold;
+  uint32_t current_block_count;
   // Queue created by default to buffer newly produced nodes for publishing
   LockFreeQueue<NewBlockMeta*> new_block_queue;
-  // Queues to record eviction decisions
-  LockFreeQueue<std::deque<int64_t>*> evicted_blocks_queue;
-  LockFreeQueue<std::deque<int64_t>*> about_to_evict_blocks_queue;
-  // Background refresh worker
+  // Queues to record eviction decisions (owning unique_ptr to avoid leaks/dangling)
+  LockFreeQueue<std::unique_ptr<std::deque<int64_t>>> evicted_blocks_queue;
+  LockFreeQueue<std::unique_ptr<std::deque<int64_t>>> about_to_evict_blocks_queue;
+  // record normal block hashes for refresh thread
+  // It's not thread safe, so we need to ensure only refresh thread can access it
+  OrderedHashList normal_block_hashes;
   bool refresh_started = false;
   volatile bool refresh_should_stop = false;
   pthread_t refresh_tid{};
@@ -52,17 +72,20 @@ private:
   void renew_relese_time();
 public:
   LocalRadixTree(int tokens_per_block,
-                 int max_num_blocks = 1000000,
+                 unsigned int max_num_blocks = 1000000u,
                  uint32_t lease_ttl_ms = 100000,
                  uint32_t renew_lease_ms = 0,
                  uint32_t refresh_batch_size = 256,
-                 uint32_t idle_sleep_ms = 10);
+                 uint32_t idle_sleep_ms = 10,
+                 uint32_t safety_ttl_ms = 100,
+                 uint32_t swap_block_threshold = 1024);
   ~LocalRadixTree();
 
   void set_meta_channel(RedisMetaChannel *ch);
 
   // Enqueue a copy of the given node to be published later by local_block_renew.
-  void insert_and_publish(const CRadixNode *node);
+  // Returns true if the node is published, false otherwise.
+  bool insert_and_publish(const CRadixNode *node);
 
   // Start background thread; initialize channel and node_id from ch first
   bool start(RedisMetaChannel *ch);
@@ -97,6 +120,9 @@ public:
   void inc_node_count();
   void dec_node_count();
   void set_ready(CRadixNode *node, bool ready = true, int ready_length = -1);
+
+  // Drain and free all pending items from eviction queues; returns total hashes dropped
+  size_t drain_pending_queues();
 };
 
 } // namespace flexkv

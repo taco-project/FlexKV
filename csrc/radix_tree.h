@@ -239,7 +239,7 @@ protected:
   std::list<CRadixNode *> node_list;
   std::list<CRadixNode *> leaf_list;
 
-  int max_num_blocks;
+  unsigned int max_num_blocks;
   int tokens_per_block;
   int node_count;
   int hit_reward_seconds;

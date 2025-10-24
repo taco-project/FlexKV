@@ -22,18 +22,15 @@ LeaseMetaMemPool::~LeaseMetaMemPool() {
 
 void LeaseMetaMemPool::allocate_block(size_t count) {
   assert(count > 0);
-  // layout: [pool_ptr(LeaseMetaMemPool*)][LeaseMeta x count]
-  const size_t header_size = sizeof(LeaseMetaMemPool*);
-  const size_t stride = header_size + sizeof(LeaseMeta);
+  // layout: contiguous LeaseMeta array (no in-band pool header)
+  const size_t stride = sizeof(LeaseMeta);
   const size_t bytes = stride * count;
   char* raw = reinterpret_cast<char*>(::operator new[](bytes));
-  // Construct per-object header and object, and seed free queue
+  // Construct objects and seed free queue
   {
     std::lock_guard<std::mutex> lk(allocated_mu);
     for (size_t i = 0; i < count; ++i) {
-      char* slot = raw + i * stride;
-      *reinterpret_cast<LeaseMetaMemPool**>(slot) = this;
-      LeaseMeta* obj = reinterpret_cast<LeaseMeta*>(slot + header_size);
+      LeaseMeta* obj = reinterpret_cast<LeaseMeta*>(raw + i * stride);
       new (obj) LeaseMeta();
       free_queue.push_back(obj);
     }
@@ -93,14 +90,6 @@ void LeaseMetaMemPool::free(LeaseMeta *ptr) {
   free_count.fetch_add(1, std::memory_order_relaxed);
 }
 
-void LeaseMetaMemPool::release(LeaseMeta *ptr) {
-  if (ptr == nullptr) return;
-  // Retrieve the owning pool pointer from header before the object
-  char* p = reinterpret_cast<char*>(ptr);
-  const size_t header_size = sizeof(LeaseMetaMemPool*);
-  LeaseMetaMemPool* pool = *reinterpret_cast<LeaseMetaMemPool**>(p - header_size);
-  pool->free(ptr);
-}
 
 size_t LeaseMetaMemPool::capacity() const {
   return total_capacity.load(std::memory_order_relaxed);

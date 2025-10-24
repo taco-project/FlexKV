@@ -82,13 +82,19 @@ block_hashes2 = torch.tensor([3001, 3002, 3003, 3004], dtype=torch.long)
 
 node1 = local_tree1.insert(physical_blocks1, block_hashes1, 4, 4, True, None, -1, -1)
 if node1:
-    local_tree1.insert_and_publish(node1)
-    print("   [OK] LocalRadixTree1 插入成功")
+    ret = local_tree1.insert_and_publish(node1)
+    if not ret:
+        print("   [ERROR] LocalRadixTree1 insert_and_publish失败")
+    else:
+        print("   [OK] LocalRadixTree1 insert_and_publish成功")
 
 node2 = local_tree2.insert(physical_blocks2, block_hashes2, 4, 4, True, None, -1, -1)
 if node2:
-    local_tree2.insert_and_publish(node2)
-    print("   [OK] LocalRadixTree2 插入成功")
+    ret = local_tree2.insert_and_publish(node2)
+    if not ret:
+        print("   [ERROR] LocalRadixTree2 insert_and_publish失败")
+    else:
+        print("   [OK] LocalRadixTree2 insert_and_publish成功")
 
 # 等待数据同步
 print("\n5. 等待 3 秒让数据同步...")

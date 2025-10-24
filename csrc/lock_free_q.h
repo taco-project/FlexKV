@@ -14,16 +14,19 @@ private:
         T data;
         std::atomic<Node*> next;
         Node(const T& item) : data(item), next(nullptr) {}
+        Node(T&& item) : data(std::move(item)), next(nullptr) {}
     };
     
     std::atomic<Node*> head;
     std::atomic<Node*> tail;
+    std::atomic<size_t> queue_size;
     
 public:
     LockFreeQueue() {
         Node* dummy = new Node(T{});
         head.store(dummy);
         tail.store(dummy);
+        queue_size.store(0);
     }
     
     ~LockFreeQueue() {
@@ -33,6 +36,7 @@ public:
             delete current;
             current = next;
         }
+        queue_size.store(0);
     }
     
     void push(const T& item) {
@@ -45,6 +49,27 @@ public:
                 if (next == nullptr) {
                     if (old_tail->next.compare_exchange_weak(next, new_node)) {
                         tail.compare_exchange_strong(old_tail, new_node);
+                        queue_size.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                } else {
+                    tail.compare_exchange_strong(old_tail, next);
+                }
+            }
+        }
+    }
+
+    void push(T&& item) {
+        Node* new_node = new Node(std::move(item));
+        Node* old_tail = tail.load();
+        
+        while (true) {
+            Node* next = old_tail->next.load();
+            if (old_tail == tail.load()) {
+                if (next == nullptr) {
+                    if (old_tail->next.compare_exchange_weak(next, new_node)) {
+                        tail.compare_exchange_strong(old_tail, new_node);
+                        queue_size.fetch_add(1, std::memory_order_relaxed);
                         return;
                     }
                 } else {
@@ -70,9 +95,10 @@ public:
                     if (next == nullptr) {
                         return false;
                     }
-                    item = next->data;
+                    item = std::move(next->data);
                     if (head.compare_exchange_weak(old_head, next)) {
                         delete old_head;
+                        queue_size.fetch_sub(1, std::memory_order_relaxed);
                         return true;
                     }
                 }
@@ -94,6 +120,14 @@ public:
             fn(node->data);
             node = node->next.load(std::memory_order_acquire);
         }
+    }
+
+    size_t size() const {
+        return queue_size.load(std::memory_order_relaxed);
+    }
+
+    bool empty() const {
+        return size() == 0;
     }
 };
 
