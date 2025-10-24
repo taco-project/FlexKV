@@ -13,6 +13,7 @@ import time
 import json
 import numpy as np
 import torch
+import os
 from multiprocessing import Process, Pipe
 
 from flexkv.common.config import ModelConfig, CacheConfig
@@ -113,6 +114,12 @@ def test_node_a():
     print("Node A: Distributed P2P Interleaved Test")
     print("=" * 80)
     
+    # Print environment info
+    print(f"Node A IP: {os.getenv('NODE_A_IP', '10.6.131.9')}")
+    print(f"Node B IP: {os.getenv('NODE_B_IP', '10.6.131.10')}")
+    print(f"Redis Host: {os.getenv('REDIS_HOST', '10.6.131.10')}")
+    print("=" * 80)
+    
     # Configuration
     model_config = ModelConfig(**DEFAULT_MODEL_CONFIG)
     model_config.tp_size = 1
@@ -136,6 +143,8 @@ def test_node_a():
     cache_config.lease_ttl_ms = 10000          # 10秒租约
     cache_config.renew_lease_ms = 4000         # 5秒续约（降低Redis负载）
     cache_config.remote_rebuild_interval_ms = 10000  # 10秒重建远程索引
+    cache_config.safety_ttl_ms = 100
+    cache_config.swap_block_threshold = 100
     
     # 主动式驱逐策略：提前预留buffer空间
     cache_config.evict_start_threshold = 0.7  # CPU使用率达80%就开始驱逐

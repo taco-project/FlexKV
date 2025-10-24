@@ -80,6 +80,8 @@ class CacheConfig:
     rebuild_interval_ms: int = 10000
     idle_sleep_ms: int = 10
     lease_ttl_ms: int = 100000
+    # for safety eviction, we set a safety ttl for lease time for local radix tree
+    safety_ttl_ms: int = 100
     renew_lease_ms: int = 0
 
     # distributed zmq configs

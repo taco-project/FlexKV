@@ -35,8 +35,8 @@ class KVManager:
                  gpu_register_port: Optional[str] = None,
                  server_recv_port: Optional[str] = None,
                  dp_client_id: int = 0):
-        flexkv_logger.info(f"{model_config = }")
-        flexkv_logger.info(f"{cache_config = }")
+        flexkv_logger.info(f"model_config = {model_config}")
+        flexkv_logger.info(f"cache_config = {cache_config}")
         self.model_config = model_config
         self.cache_config = cache_config
         self.gpu_register_port = gpu_register_port if gpu_register_port is not None else "ipc:///tmp/flexkv_test_gpu_register"

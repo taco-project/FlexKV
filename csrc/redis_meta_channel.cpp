@@ -340,6 +340,30 @@ bool RedisMetaChannel::renew_node_leases(uint32_t node_id, uint64_t new_lt, size
   return true;
 }
 
+bool RedisMetaChannel::renew_node_leases(uint32_t node_id, uint64_t new_lt, std::list<int64_t> &hashes, size_t batch_size) {
+  if (hashes.empty()) return true;
+  if (batch_size == 0) batch_size = 200;
+  // Build keys from provided hashes
+  std::vector<std::string> keys;
+  keys.reserve(hashes.size());
+  for (const auto &h : hashes) {
+    keys.emplace_back(make_block_key(node_id, (uint64_t)h));
+  }
+  size_t idx = 0, total = keys.size();
+  while (idx < total) {
+    size_t end = std::min(idx + batch_size, total);
+    std::vector<std::vector<std::string>> batch;
+    batch.reserve(end - idx);
+    for (size_t i = idx; i < end; ++i) {
+      batch.push_back({"HSET", keys[i], "lt", std::to_string(new_lt)});
+    }
+    std::vector<std::vector<std::string>> replies;
+    if (!client.pipeline(batch, replies)) return false;
+    idx = end;
+  }
+  return true;
+}
+
 uint32_t RedisMetaChannel::get_node_id() const {
   return node_id;
 }

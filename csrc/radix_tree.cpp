@@ -253,6 +253,29 @@ std::shared_ptr<CMatchResult> CRadixTreeIndex::match_prefix(
       current_node->update_time();
     }
 
+    // Avoid out-of-bounds when the current node already consumes all remaining blocks.
+    // Only count the portion that truly matches.
+    if (prefix_blocks_num + current_node->size() >= num_blocks) {
+      int cmp_len = std::min(current_node->size(), num_blocks - prefix_blocks_num);
+      int matched_length = 0;
+      auto &dq = current_node->get_physical_blocks();
+      for (int i = 0; i < cmp_len; ++i) {
+        if (current_node->get_hash(i) == HashType(block_hashes_ptr[prefix_blocks_num + i])) {
+          pb_out[pb_write++] = dq[i];
+          matched_length++;
+        } else {
+          break;
+        }
+      }
+      if (current_node->is_ready()) {
+        last_ready_node = current_node;
+        ready_prefix_blocks_num += matched_length;
+      }
+      last_node_matched_length = matched_length;
+      prefix_blocks_num += matched_length;
+      break;
+    }
+
     child_hash = HashType(block_hashes_ptr[prefix_blocks_num + current_node->size()]);
     // DEBUG: Print matching attempt
     bool is_root_node = (current_node->get_parent() == nullptr);
