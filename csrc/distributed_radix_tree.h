@@ -28,7 +28,7 @@ class RedisMetaChannel; // forward declaration
 
 class RefRadixTree : public CRadixTreeIndex {
 public:
-  RefRadixTree(int tokens_per_block, int max_num_blocks = 1000000, uint32_t lease_renew_ms = 5000,
+  RefRadixTree(int tokens_per_block, unsigned int max_num_blocks = 1000000u, uint32_t lease_renew_ms = 5000,
      LockFreeQueue<CRadixNode*> *renew_lease_queue = nullptr, LeaseMetaMemPool* lt_pool = nullptr);
   ~RefRadixTree();
   // Decrement reference count; when it reaches zero, delete this instance
@@ -91,7 +91,7 @@ private:
   void refresh_nodes_lease_from_redis(const std::vector<CRadixNode*> &batch);
 
 public:
-  DistributedRadixTree(int tokens_per_block, int max_num_blocks,
+  DistributedRadixTree(int tokens_per_block, unsigned int max_num_blocks,
                   uint32_t node_id,
                   size_t refresh_batch_size = 128,
                   uint32_t rebuild_interval_ms = 1000,

@@ -56,9 +56,6 @@ public:
   // Returns a LeaseMeta to the pool. The object is reset for reuse.
   void free(LeaseMeta *ptr);
 
-  // Static helper to release a LeaseMeta* without holding a pool reference.
-  // The pool pointer is stored in-band immediately before each LeaseMeta object.
-  static void release(LeaseMeta *ptr);
 
   // Iterate over currently allocated items and invoke callback for each.
   // The iteration is done on a snapshot to avoid holding the mutex while executing user code.
