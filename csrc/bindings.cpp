@@ -257,7 +257,16 @@ bool create_gds_file_binding(GDSManager& manager,
 
 PYBIND11_MODULE(c_ext, m) {
   m.def("transfer_kv_blocks", &transfer_kv_blocks_binding,
-        "Transfer multi-layer KV-cache between CPU and GPU");
+        "Transfer multi-layer KV-cache between CPU and GPU",
+        py::arg("gpu_block_id_tensor"), py::arg("gpu_tensor_ptrs_tensor"),
+        py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
+        py::arg("gpu_layer_stride_in_bytes"), py::arg("cpu_block_id_tensor"),
+        py::arg("cpu_tensor"), py::arg("cpu_kv_stride_in_bytes"),
+        py::arg("cpu_layer_stride_in_bytes"), py::arg("cpu_block_stride_in_bytes"),
+        py::arg("chunk_size_in_bytes"), py::arg("start_layer_id"),
+        py::arg("num_layers"), py::arg("transfer_sms") = -1,
+        py::arg("is_host_to_device") = true, py::arg("use_ce_transfer") = false,
+        py::arg("is_mla") = false, py::arg("gpu_block_type") = 0);
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory",
         py::arg("ioctx"), py::arg("cpu_layer_id_list"),

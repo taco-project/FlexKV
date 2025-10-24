@@ -517,12 +517,13 @@ class GPUKVCacheVerifier:
             kv_num = 2 if not self.is_mla else 1
             for kv_id in range(kv_num):
                 for tp_id in range(self.tp_size):
-                    if isinstance(self.gpu_blocks[0], list):
-                        # multiple gpu：gpu_blocks[tp_id][layer_id]
-                        gpu_tensor = self.gpu_blocks[tp_id][layer_id]
-                    else:
-                        # single gpu：gpu_blocks[layer_id]
-                        gpu_tensor = self.gpu_blocks[layer_id]
+                    if self.gpu_layout_type == 0:
+                        if isinstance(self.gpu_blocks[0], list):
+                            # multiple gpu：gpu_blocks[tp_id][layer_id]
+                            gpu_tensor = self.gpu_blocks[tp_id][layer_id]
+                        else:
+                            # single gpu：gpu_blocks[layer_id]
+                            gpu_tensor = self.gpu_blocks[layer_id]
 
                     for head_id in range(self.gpu_kv_layout.num_head):
                         actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if not self.is_mla else head_id
@@ -536,9 +537,12 @@ class GPUKVCacheVerifier:
                                                               actual_head_id)
                             # GPU tensor dim：[kv_dim, num_block, tokens_per_block, num_head, head_size]
                             if self.gpu_layout_type == 0:
+                                # gpu_layout_type 0: [num_layer][kv_dim, num_block, tokens_per_block, num_head, head_size]
                                 gpu_tensor[kv_id, block_id, :, head_id, :] = hash_value
                             elif self.gpu_layout_type == 1:
-                                self.gpu_blocks[tp_id][block_id, layer_id, kv_id, :, head_id, :] = hash_value
+                                # gpu_layout_type 1: [tp_id][0][num_block, num_layer, kv_dim, tokens_per_block, num_head, head_size]
+                                # Need to get the first (and only) tensor from the list
+                                self.gpu_blocks[tp_id][0][block_id, layer_id, kv_id, :, head_id, :] = hash_value
                             else:
                                 raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
@@ -557,10 +561,11 @@ class GPUKVCacheVerifier:
             kv_num = 2 if not self.is_mla else 1
             for kv_id in range(kv_num):
                 for tp_id in range(self.tp_size):
-                    if isinstance(self.gpu_blocks[0], list):
-                        gpu_tensor = self.gpu_blocks[tp_id][layer_id]
-                    else:
-                        gpu_tensor = self.gpu_blocks[layer_id]
+                    if self.gpu_layout_type == 0:
+                        if isinstance(self.gpu_blocks[0], list):
+                            gpu_tensor = self.gpu_blocks[tp_id][layer_id]
+                        else:
+                            gpu_tensor = self.gpu_blocks[layer_id]
 
                     for head_id in range(self.gpu_kv_layout.num_head):
                         actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if not self.is_mla else head_id
@@ -571,9 +576,12 @@ class GPUKVCacheVerifier:
                                                                       token_ids[start_token_idx:end_token_idx],
                                                                       actual_head_id)
                             if self.gpu_layout_type == 0:
+                                # gpu_layout_type 0: [num_layer][kv_dim, num_block, tokens_per_block, num_head, head_size]
                                 actual_values = gpu_tensor[kv_id, block_id, :, head_id, :]
                             elif self.gpu_layout_type == 1:
-                                actual_values = self.gpu_blocks[tp_id][block_id, layer_id, kv_id, :, head_id, :]
+                                # gpu_layout_type 1: [tp_id][0][num_block, num_layer, kv_dim, tokens_per_block, num_head, head_size]
+                                # Need to get the first (and only) tensor from the list
+                                actual_values = self.gpu_blocks[tp_id][0][block_id, layer_id, kv_id, :, head_id, :]
                             else:
                                 raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 

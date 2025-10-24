@@ -305,6 +305,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
 
+        self.gpu_block_type_ = 1 if gpu_kv_layout.type == KVCacheLayoutType.BLOCKWISE else 0
         # set GPU device
         if gpu_device_id != -1:
             torch.cuda.set_device(gpu_device_id)
@@ -345,9 +346,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         if len(gpu_block_id_list) == 0:
             return
 
-        self.gpu_block_type_ = 0 if len(self.gpu_blocks) == 1 else 1#TODO to be well supported later
-
-        gpu_tensor_ptrs = self.gpu_tensor_ptrs.contiguous().pin_memory()
+        gpu_tensor_ptrs = self.gpu_blocks_ptrs.contiguous().pin_memory()
 
         transfer_kv_blocks(
             gpu_block_id_list,
