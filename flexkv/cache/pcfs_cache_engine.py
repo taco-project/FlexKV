@@ -34,6 +34,7 @@ class HierarchyLRCacheEngine:
                  remote_refresh_batch_size: int = 1000,
                  remote_rebuild_interval_ms: int = 10000,
                  remote_idle_sleep_ms: int = 10,
+                 local_safety_ttl_ms: int = 100,
                  evict_start_threshold: float = 1.0,
                  meta: Optional[RedisMeta] = None) -> None:
         if num_total_blocks <= 0:
@@ -61,6 +62,8 @@ class HierarchyLRCacheEngine:
             renew_lease_ms=int(local_renew_lease_ms),
             refresh_batch_size=int(local_refresh_batch_size),
             idle_sleep_ms=int(local_idle_sleep_ms),
+            safety_ttl_ms=int(local_safety_ttl_ms),
+            swap_block_threshold=int(evict_ratio * num_total_blocks)
         )
 
 
@@ -466,6 +469,7 @@ class HierarchyLRCacheEngine:
             remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
             remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 1000)),
             remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
+            local_safety_ttl_ms=int(getattr(cache_config, "safety_ttl_ms", 100)),
             meta=meta,
         )
 
@@ -501,6 +505,7 @@ class HierarchyLRCacheEngine:
                 remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 128)),
                 remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 10000)),
                 remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
+                local_safety_ttl_ms=int(getattr(cache_config, "safety_ttl_ms", 100)),
                 evict_start_threshold=float(cache_config.evict_start_threshold),
                 meta=meta,
             )
