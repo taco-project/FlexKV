@@ -25,12 +25,14 @@ namespace flexkv {
 
 __global__ void transfer_kv_blocks_kernel(
     int num_blocks, int start_layer_id, int num_layers, int64_t *gpu_block_ids,
-    int64_t **gpu_layer_ptrs, int64_t gpu_kv_stride, int64_t gpu_block_stride,
-    int64_t gpu_startoff_inside_chunks,
+    int64_t **gpu_tensor_ptrs, int64_t gpu_kv_stride, int64_t gpu_block_stride,
+    int64_t gpu_layer_stride, int64_t gpu_startoff_inside_chunks,
     int64_t *cpu_block_ids, int64_t *cpu_ptr, int64_t cpu_kv_stride,
     int64_t cpu_layer_stride, int64_t cpu_block_stride,
     int64_t cpu_startoff_inside_chunks, int64_t copy_size, bool is_mla,
-    bool is_host_to_device) {
+    bool is_host_to_device, int gpu_block_type) { 
+      // start layer id should also be provided for gpu location calculation
+      // but for now, we only support full-layer transfer, so start_layer_id is always 0
   int kv_dim = is_mla ? 1 : 2;
   int num_chunks = num_layers * kv_dim * num_blocks;
   int64_t copy_size_in_float4 = copy_size * sizeof(int64_t) / sizeof(float4);
@@ -46,10 +48,18 @@ __global__ void transfer_kv_blocks_kernel(
         cpu_ptr + (layer_idx + start_layer_id) * cpu_layer_stride +
         kv_idx * cpu_kv_stride + cpu_block_idx * cpu_block_stride +
         cpu_startoff_inside_chunks;
-    int64_t *gpu_chunk_ptr = gpu_layer_ptrs[layer_idx] +
-                             kv_idx * gpu_kv_stride +
-                             gpu_block_idx * gpu_block_stride +
-                             gpu_startoff_inside_chunks;
+    int64_t *gpu_chunk_ptr = nullptr;
+    if (gpu_block_type == 0) { // VLLM
+      // for now, we don't support arbitrary combination of num_gpu_tensors x gpu_kv_layout
+      // only support layer_num gpu tensors x layerwise and one gpu tensor x blockwise
+      gpu_chunk_ptr = gpu_tensor_ptrs[layer_idx] + kv_idx * gpu_kv_stride +
+                      gpu_block_idx * gpu_block_stride + gpu_startoff_inside_chunks;
+    } else if (gpu_block_type == 1) { //TRTLLM
+      gpu_chunk_ptr = gpu_tensor_ptrs[0] + gpu_block_idx * gpu_block_stride + 
+                      layer_idx * gpu_layer_stride + kv_idx * gpu_kv_stride +
+                      gpu_startoff_inside_chunks;
+    }
+    assert(gpu_chunk_ptr != nullptr);
 
     int64_t *src_chunk_ptr = is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
     int64_t *dst_chunk_ptr = is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
@@ -64,13 +74,13 @@ __global__ void transfer_kv_blocks_kernel(
 
 void transfer_kv_blocks(
     int num_blocks, int start_layer_id, int num_layers, int64_t *gpu_block_ids,
-    void **gpu_layer_ptrs, int64_t gpu_kv_stride_in_bytes,
-    int64_t gpu_block_stride_in_bytes, int64_t gpu_startoff_inside_chunks,
+    void **gpu_tensor_ptrs, int64_t gpu_kv_stride_in_bytes,
+    int64_t gpu_block_stride_in_bytes, int64_t gpu_layer_stride_in_bytes, int64_t gpu_startoff_inside_chunks,
     int64_t *cpu_block_ids, void *cpu_ptr,
     int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_block_stride_in_bytes, int64_t cpu_startoff_inside_chunks,
     int64_t chunk_size_in_bytes, cudaStream_t stream, int transfer_sms,
-    bool is_host_to_device, bool use_ce_transfer, bool is_mla) {
+    bool is_host_to_device, bool use_ce_transfer, bool is_mla, int gpu_block_type) {
   int block_size = 128;
   static int max_blocks_per_sm = -1;
   if (max_blocks_per_sm == -1) {
@@ -84,12 +94,13 @@ void transfer_kv_blocks(
 
   int block_count = transfer_sms * max_blocks_per_sm;
 
-  int64_t **gpu_layer_ptrs_int64 = reinterpret_cast<int64_t **>(gpu_layer_ptrs);
+  int64_t **gpu_tensor_ptrs_int64 = reinterpret_cast<int64_t **>(gpu_tensor_ptrs);
   int64_t *cpu_ptr_int64 = reinterpret_cast<int64_t *>(cpu_ptr);
   int64_t gpu_kv_stride_int64 = gpu_kv_stride_in_bytes / sizeof(int64_t);
   int64_t cpu_kv_stride_int64 = cpu_kv_stride_in_bytes / sizeof(int64_t);
   int64_t gpu_block_stride_int64 = gpu_block_stride_in_bytes / sizeof(int64_t);
   int64_t cpu_block_stride_int64 = cpu_block_stride_in_bytes / sizeof(int64_t);
+  int64_t gpu_layer_stride_int64 = gpu_layer_stride_in_bytes / sizeof(int64_t);
   int64_t cpu_layer_stride_int64 = cpu_layer_stride_in_bytes / sizeof(int64_t);
   int64_t cpu_startoff_inside_chunks_int64 =
       cpu_startoff_inside_chunks / sizeof(int64_t);
@@ -99,6 +110,7 @@ void transfer_kv_blocks(
 
   dim3 blockDim(block_size);
   dim3 gridDim(block_count);
+  //TODO ce mode support
   if (use_ce_transfer) {
     for (int i = 0; i < num_layers; i++) {
       int kv_dim = is_mla ? 1 : 2;
@@ -110,7 +122,7 @@ void transfer_kv_blocks(
               cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
               j * cpu_kv_stride_int64 + cpu_block_idx * cpu_block_stride_int64 +
               cpu_startoff_inside_chunks_int64;
-          int64_t *gpu_chunk_ptr = gpu_layer_ptrs_int64[i] +
+          int64_t *gpu_chunk_ptr = gpu_tensor_ptrs_int64[i] +
                                    j * gpu_kv_stride_int64 +
                                    gpu_block_idx * gpu_block_stride_int64 +
                                    gpu_startoff_inside_chunks_int64;
@@ -128,12 +140,12 @@ void transfer_kv_blocks(
   } else {
     transfer_kv_blocks_kernel<<<gridDim, blockDim, 0, stream>>>(
         num_blocks, start_layer_id, num_layers, gpu_block_ids,
-        gpu_layer_ptrs_int64, gpu_kv_stride_int64, gpu_block_stride_int64,
-        gpu_startoff_inside_chunks_int64,
+        gpu_tensor_ptrs_int64, gpu_kv_stride_int64, gpu_block_stride_int64,
+        gpu_layer_stride_int64, gpu_startoff_inside_chunks_int64,
         cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64,
         cpu_layer_stride_int64, cpu_block_stride_int64,
         cpu_startoff_inside_chunks_int64, chunk_size_in_int64, is_mla,
-        is_host_to_device);
+        is_host_to_device, gpu_block_type);
   }
   cudaStreamSynchronize(stream);
 }

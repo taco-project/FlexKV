@@ -24,20 +24,34 @@ from test_utils import (
     create_gpu_kv_layout, GPUKVCacheVerifier
 )
 
-def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_config, num_gpu_blocks, child_conn):
+def run_tp_client(dp_client_id, 
+                  tp_rank, 
+                  server_recv_port, 
+                  model_config, 
+                  cache_config, 
+                  num_gpu_blocks, 
+                  child_conn,
+                  gpu_layout_type):
     """Run tp_client process"""
     try:
         device_id = tp_rank + dp_client_id * model_config.tp_size
         tp_client = KVTPClient(server_recv_port, dp_client_id, device_id)
 
-        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
+        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
 
         # Create GPU blocks for this tp_rank in the tp_client process
         gpu_blocks_for_tp = []
-        for _ in range(model_config.num_layers):
+        if gpu_layout_type == 0:
+            for _ in range(model_config.num_layers):
+                gpu_blocks_for_tp.append(
+                    torch.empty(size=tuple(gpu_kv_layout.kv_shape[1:]), dtype=model_config.dtype).cuda(device_id)
+                )
+        elif gpu_layout_type == 1:
             gpu_blocks_for_tp.append(
-                torch.empty(size=tuple(gpu_kv_layout.kv_shape[1:]), dtype=model_config.dtype).cuda(device_id)
+                torch.empty(size=tuple(gpu_kv_layout.kv_shape[:]), dtype=model_config.dtype).cuda(device_id)
             )
+        else:
+            raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
         tp_client.register_to_server(gpu_blocks_for_tp, gpu_kv_layout)
 
         # Send GPU blocks back to main process via pipe if connection provided
@@ -91,7 +105,11 @@ def shutdown_tp_client(tp_client_processes):
     KVCacheLayoutType.LAYERWISE,
     KVCacheLayoutType.BLOCKWISE,
 ])
-def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type):
+@pytest.mark.parametrize("gpu_layout_type", [
+    0,
+    1,
+])
+def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type, gpu_layout_type):
     tp_size = model_config.tp_size
     dp_size = model_config.dp_size
 
@@ -140,7 +158,7 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
 
         tp_client_process = mp_ctx.Process(
             target=run_tp_client,
-            args=(0, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks + tp_rank, child_conn),
+            args=(0, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks + tp_rank, child_conn, gpu_layout_type),
             daemon=True
         )
         tp_client_processes.append(tp_client_process)
@@ -167,14 +185,15 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
         print(f"[Main Process] Creating GPUKVCacheVerifier with GPU blocks from {len(all_gpu_blocks)} TP clients")
 
         # Get gpu_kv_layout from cache_config for GPUKVCacheVerifier
-        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
+        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
 
         gpu_kv_verifier = GPUKVCacheVerifier(
             shared_gpu_blocks=all_gpu_blocks,
             gpu_kv_layout=gpu_kv_layout,
             tp_size=model_config.tp_size,
             tokens_per_block=cache_config.tokens_per_block,
-            dtype=model_config.dtype
+            dtype=model_config.dtype,
+            gpu_layout_type=gpu_layout_type
         )
         print("[Main Process] GPUKVCacheVerifier created successfully")
     else:

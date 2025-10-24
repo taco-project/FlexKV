@@ -23,36 +23,54 @@ namespace flexkv {
 TPTransferThreadGroup::TPTransferThreadGroup(
     int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
     torch::Tensor &cpu_blocks, int dp_group_id,
+    int num_layers,
     torch::Tensor &gpu_kv_strides_tensor,
     torch::Tensor &gpu_block_strides_tensor,
+    torch::Tensor &gpu_layer_strides_tensor,
     torch::Tensor &gpu_chunk_sizes_tensor) {
 
   num_gpus_ = num_gpus;
   
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
+  gpu_layer_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_chunk_sizes_in_bytes_ = new int64_t[num_gpus];
   
   int64_t* kv_strides_ptr = gpu_kv_strides_tensor.data_ptr<int64_t>();
   int64_t* block_strides_ptr = gpu_block_strides_tensor.data_ptr<int64_t>();
+  int64_t* layer_strides_ptr = gpu_layer_strides_tensor.data_ptr<int64_t>();
   int64_t* chunk_sizes_ptr = gpu_chunk_sizes_tensor.data_ptr<int64_t>();
   
   for (int i = 0; i < num_gpus; i++) {
     gpu_kv_strides_in_bytes_[i] = kv_strides_ptr[i];
     gpu_block_strides_in_bytes_[i] = block_strides_ptr[i];
     gpu_chunk_sizes_in_bytes_[i] = chunk_sizes_ptr[i];
+    gpu_layer_strides_in_bytes_[i] = layer_strides_ptr[i];
   }
 
   queues_.resize(num_gpus_);
   mtxs_   = std::vector<std::mutex>(num_gpus_);
   cvs_    = std::vector<std::condition_variable>(num_gpus_);
 
-  int num_layers = gpu_blocks[0].size();
+  num_tensors_per_gpu_ = gpu_blocks[0].size();
+  if (num_tensors_per_gpu_ == 1) {
+    gpu_block_type_ = 1;//GPUBlockType::TRTLLM;
+  } else if (num_tensors_per_gpu_ == num_layers) {
+    // note sglang + mla may also satisfy this case, but we don't support it yet
+    // SGlang need to be supported later
+    gpu_block_type_ = 0; //GPUBlockType::VLLM; 
+  } else if (num_tensors_per_gpu_ == num_layers * 2) {
+    gpu_block_type_ = 2; //GPUBlockType::SGLANG;
+  } else {
+    gpu_block_type_ = 3; //GPUBlockType::UNKNOWN;
+    throw std::runtime_error("Unsupported GPU block type: " + std::to_string(num_tensors_per_gpu_));
+  }
+
   cudaMallocHost((void **)&gpu_blocks_,
-                 num_gpus_ * num_layers * sizeof(void *));
+                 num_gpus_ * num_tensors_per_gpu_ * sizeof(void *));
   for (int i = 0; i < num_gpus_; ++i) {
-    for (int j = 0; j < num_layers; ++j) {
-      gpu_blocks_[i * num_layers + j] = gpu_blocks[i][j].data_ptr();
+    for (int j = 0; j < num_tensors_per_gpu_; ++j) {
+      gpu_blocks_[i * num_tensors_per_gpu_ + j] = gpu_blocks[i][j].data_ptr();
     }
   }
 
@@ -140,8 +158,8 @@ void TPTransferThreadGroup::tp_group_transfer(
             static_cast<int64_t *>(gpu_block_id_tensor.data_ptr());
         int64_t *cpu_block_ids =
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
-        void **gpu_layer_ptrs =
-            static_cast<void **>(gpu_blocks_ + i * num_layers + layer_id);
+        void **gpu_tensor_ptrs =
+            static_cast<void **>(gpu_blocks_ + i * num_tensors_per_gpu_);
         void *cpu_ptr = cpu_blocks_;
         int64_t cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i];
         if (is_mla && !is_host_to_device) {
@@ -155,15 +173,16 @@ void TPTransferThreadGroup::tp_group_transfer(
         // even if they have different number of gpu_blocks
         int64_t chunk_size = is_mla && !is_host_to_device ? 
             gpu_chunk_sizes_in_bytes_[i] / num_gpus_ : gpu_chunk_sizes_in_bytes_[i];
-      
         flexkv::transfer_kv_blocks(
           num_blocks, layer_id, layer_granularity, gpu_block_ids,
-          gpu_layer_ptrs, gpu_kv_strides_in_bytes_[i], gpu_block_strides_in_bytes_[i],
+          gpu_tensor_ptrs, gpu_kv_strides_in_bytes_[i], gpu_block_strides_in_bytes_[i],
+          gpu_layer_strides_in_bytes_[i],
           gpu_startoff_inside_chunks,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
           cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
           cpu_startoff_inside_chunks, chunk_size, streams_[i],
-          transfer_sms, is_host_to_device, use_ce_transfer, is_mla
+          transfer_sms, is_host_to_device, use_ce_transfer, is_mla,
+          gpu_block_type_
         );
 
         cudaError_t err = cudaGetLastError();

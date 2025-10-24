@@ -506,27 +506,28 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
     
         logger.info(f"Start register kv_caches, shape: {kv_cache_tensor.shape}")
         
-        # TODO 跑一次来确定这个的 shape 然后接着写
-        
-        gpu_blocks = list(kv_caches.values())
-        num_layer = len(kv_caches)
         if self.flexkv_config.use_mla:
-            assert gpu_blocks[0].ndim == 3, (
-                f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
-            num_blocks = gpu_blocks[0].shape[0]
-            block_size = gpu_blocks[0].shape[1]
-            num_kv_heads = 1
-            head_size = gpu_blocks[0].shape[2]
-        else:
-            assert gpu_blocks[0].ndim == 5, (
-                f"expect kv cached tensor has 5 dim but get shape={gpu_blocks[0].shape}.")
-            num_blocks = gpu_blocks[0].shape[1]
-            block_size = gpu_blocks[0].shape[2]
-            num_kv_heads = gpu_blocks[0].shape[3]
-            head_size = gpu_blocks[0].shape[4]
+            assert kv_cache_tensor.ndim == 4, (f"expect kv cached tensor has 4 dim but get shape={kv_cache_tensor.shape}")
+
+        num_blocks = kv_cache_tensor.shape[0]
+        num_layers = kv_cache_tensor.shape[1]
+        kv_dim = kv_cache_tensor.shape[2]
+        block_size = self.flexkv_config.block_size
+        num_kv_heads = 1 if self.flexkv_config.use_mla else self.flexkv_config.num_kv_heads
+        head_size = self.flexkv_config.head_size
+        if self.flexkv_config.use_mla:
+            assert kv_dim == 1, (f"expect kv_dim eqals to 1 when using MLA but get kv_dim={kv_dim}")
+        
+        assert num_kv_heads * head_size * head_size == kv_cache_tensor.shape[3], \
+            (f"expect kv cached tensor last dim equals to num_kv_heads*head_size*block_size, " \
+            f"but get last_dim = {kv_cache_tensor.shape[3]}, " \
+            f"num_kv_heads = {num_kv_heads}, head_size = {head_size}, block_size = {block_size}")
+        
+        gpu_blocks = [kv_cache_tensor] # convert to list for flexkv register 
+ 
         gpu_layout = KVCacheLayout(
-            type=KVCacheLayoutType.LAYERWISE,
-            num_layer=num_layer,
+            type=KVCacheLayoutType.BLOCKWISE,
+            num_layer=num_layers,
             num_block=num_blocks,
             tokens_per_block=block_size,
             num_head=num_kv_heads,
