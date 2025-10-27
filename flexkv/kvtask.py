@@ -20,6 +20,7 @@ from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
 from flexkv.transfer_manager import get_master_host_and_ports_from_env
+from flexkv.common.debug import flexkv_logger
 
 class TaskStatus(Enum):
     # slot mapping is not ready

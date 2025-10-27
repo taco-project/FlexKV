@@ -26,8 +26,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker,
     SchedulerOutput)
 
-logger = flexkv_logger
-
 """ Developped based on the following commit:
 
 ---------- FlexKV ----------
@@ -54,7 +52,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         flexkv_config.post_init_from_trt_config(config) 
         _, _, dp_rank = get_dp_tp_info(config)
 
-        logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
+        flexkv_logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
         self.flexkv_config = flexkv_config
         self.server_recv_port = flexkv_config.server_recv_port
         self.tp_size = flexkv_config.tp_size
@@ -94,10 +92,10 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.flexkv_stats = FlexKVStats(flexkv_config.num_log_interval_requests)
 
         while not self.is_ready():
-            logger.info("Waiting for flexkv init...")
+            flexkv_logger.info("Waiting for flexkv init...")
             time.sleep(5)
 
-        logger.info("Finish init FlexKVSchedulerConnector")
+        flexkv_logger.info("Finish init FlexKVSchedulerConnector")
 
     def is_ready(
         self,
@@ -185,7 +183,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         # Auto cancel if not call update_state_after_alloc()
         match_end_time = time.perf_counter()
-        logger.debug(f"Get match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
+        flexkv_logger.debug(f"Get match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
         if num_new_matched_tokens > 0:
             self.req_id_to_task_dict[request.req_id] = task_id
             self.tasks_to_cancel[task_id] = FlexKVGetTask(task_id=task_id,
@@ -195,7 +193,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
                                                         match_start_time=match_start_time,
                                                         match_end_time=match_end_time)
 
-            logger.debug(f"FlexKV create get task: {self.tasks_to_cancel[task_id]}")
+            flexkv_logger.debug(f"FlexKV create get task: {self.tasks_to_cancel[task_id]}")
 
         return task_id, num_new_matched_tokens
 
@@ -330,7 +328,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         # Auto cancel if not need to put.
         match_end_time = time.perf_counter()
-        logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
+        flexkv_logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
 
         if num_unmatched_tokens > 0:
             self.req_id_to_task_dict[request.request_id] = task_id
@@ -340,7 +338,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
                                                         num_unmatched_tokens=num_unmatched_tokens,
                                                         match_start_time=match_start_time,
                                                         match_end_time=match_end_time)
-            logger.debug(f"FlexKV create put task: {self.tasks_to_cancel[task_id]}")
+            flexkv_logger.debug(f"FlexKV create put task: {self.tasks_to_cancel[task_id]}")
 
         return task_id, num_matched_tokens, num_unmatched_tokens
 
@@ -378,7 +376,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             return
         for task in self.tasks_to_cancel.values():
             del self.req_id_to_task_dict[task.request.request_id]
-            logger.info(f"FlexKV Cancel task: {task}")
+            flexkv_logger.info(f"FlexKV Cancel task: {task}")
         self.flexkv_manager.cancel(task_ids=list(self.tasks_to_cancel.keys()))
         self.tasks_to_cancel.clear()
     
@@ -393,7 +391,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         slot_mappings: list[np.ndarray] = []
 
         for task_id, task in self.tasks_to_launch.items():
-            logger.info(f"FlexKV Launch task: {task}")
+            flexkv_logger.info(f"FlexKV Launch task: {task}")
             task.task_launch_time = task_launch_time
             task_ids.append(task_id)
             slot_mappings.append(task.slot_mapping)
@@ -414,7 +412,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         """
         if len(self.req_id_to_task_dict) == 0:
             return set(), set()
-        logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
+        flexkv_logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
         task_ids = list(self.get_tasks.keys()) + list(self.put_tasks.keys())
         responses_from_manager = self.flexkv_manager.try_wait(task_ids)
         task_finished_time = time.perf_counter()
@@ -433,9 +431,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             del self.req_id_to_task_dict[task.request.request_id]
             task.task_finished_time = task_finished_time
             if success:
-                logger.info(f"{task} finished successfully.")
+                flexkv_logger.info(f"{task} finished successfully.")
             else:
-                logger.error(f"{task} failed, status: {response.status}.")
+                flexkv_logger.error(f"{task} failed, status: {response.status}.")
                 num_failed_tasks += 1
             # responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
             #                                             request=task.request, success=success))
@@ -461,9 +459,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             task = task_dict.pop(task_id)
             task.task_finished_time = task_finished_time
             if success:
-                logger.info(f"{task} finished successfully.")
+                flexkv_logger.info(f"{task} finished successfully.")
             else:
-                logger.error(f"{task} failed, status: {response.status}.")
+                flexkv_logger.error(f"{task} failed, status: {response.status}.")
             responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
                                                       request=task.request, success=success))
         return responses_to_return
@@ -490,9 +488,9 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.tp_size
         self.flexkv_config = flexkv_config
-        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.server_recv_port}, dp_client_id: {dp_client_id}")
+        flexkv_logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.server_recv_port}, dp_client_id: {dp_client_id}")
         self.tp_client = KVTPClient(flexkv_config.server_recv_port, dp_client_id, current_device_id)
-        logger.info("Finish init FlexKVWorkerConnector")
+        flexkv_logger.info("Finish init FlexKVWorkerConnector")
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         # vllm kv_caches: dict[str, torch.Tensor]
@@ -504,7 +502,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         # 3. mKVFactor{mCacheType == CacheType::kSELFKONLY ? 1 : 2}
         # 4. blockSize((numKvHeads * sizePerHead * tokensPerBlock) / quantSize)
     
-        logger.info(f"Start register kv_caches, shape: {kv_cache_tensor.shape}")
+        flexkv_logger.info(f"Start register kv_caches, shape: {kv_cache_tensor.shape}")
         
         if self.flexkv_config.use_mla:
             assert kv_cache_tensor.ndim == 4, (f"expect kv cached tensor has 4 dim but get shape={kv_cache_tensor.shape}")
@@ -535,7 +533,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             is_mla=self.flexkv_config.use_mla,
         )
         self.tp_client.register_to_server(gpu_blocks, gpu_layout)
-        logger.info("Finish register kv_caches")
+        flexkv_logger.info("Finish register kv_caches")
 
     def start_load_kv(self, stream: torch.cuda.Stream):
         return
