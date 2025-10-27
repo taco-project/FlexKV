@@ -1,10 +1,12 @@
+import os
 import multiprocessing as mp
 import time
 import queue
 from queue import Queue
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Any
 from abc import ABC, abstractmethod
 from multiprocessing import Process, Pipe, Event
+from sympy.assumptions.assume import true
 import zmq
 import tempfile
 import threading
@@ -56,7 +58,6 @@ class TransferManager:
                 flexkv_logger.info(f"GPU {device_id} registered successfully")
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
-
 
     def _register_gpu_blocks_via_socket(self) -> None:
         try:
@@ -130,6 +131,197 @@ class TransferManager:
     def shutdown(self) -> None:
         self.transfer_engine.shutdown()
 
+def get_master_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
+    master_host = os.getenv("MASTER_HOST", "localhost")
+    master_ports = os.getenv("MASTER_PORTS", "5556,5557,5558")
+    master_ports = tuple(master_ports.split(","))
+    return "tcp://" + master_host, master_ports
+
+class TransferManagerOnRemote(TransferManager):
+    """
+    TransferManager for remote mode, used for multi-node tensor parallelism.
+    """
+    def __init__(self):
+        self.master_host, self.master_ports = get_master_host_and_ports_from_env()
+
+        self.context = zmq.Context()
+        self.command_socket = self.context.socket(zmq.PULL)
+        self.command_socket.setsockopt(zmq.LINGER, 0)
+        self.result_socket = self.context.socket(zmq.PUSH)
+        self.result_socket.setsockopt(zmq.LINGER, 0)
+        self.query_socket = self.context.socket(zmq.REP)
+        self.query_socket.setsockopt(zmq.LINGER, 0)
+
+        self._shutdown_flag = False
+        self._is_ready = False
+
+        # key: graph_id, value: task_end_op_id
+        self._active_graphs: Dict[int, int] = {}
+        self._active_graphs_lock = threading.Lock()
+
+        self._worker_thread: threading.Thread | None = None
+
+        self._connect_to_master_transfer_manager()
+
+        self._initialize_with_config()
+
+    def _connect_to_master_transfer_manager(self) -> None:
+        try:
+            command_addr = f"{self.master_host}:{self.master_ports[0]}"
+            self.command_socket.connect(command_addr)
+            flexkv_logger.debug(f"Connected to master command port at {command_addr}")
+
+            result_addr = f"{self.master_host}:{self.master_ports[1]}"
+            self.result_socket.connect(result_addr)
+            flexkv_logger.debug(f"Connected to master result port at {result_addr}")
+
+            query_addr = f"{self.master_host}:{self.master_ports[2]}"
+            self.query_socket.connect(query_addr)
+            flexkv_logger.debug(f"Connected to master query port at {query_addr}")
+
+            flexkv_logger.debug("Successfully connected to master transfer manager")
+
+        except Exception as e:
+            flexkv_logger.error(f"Failed to connect to master transfer manager: {e}")
+            raise
+
+    def _initialize_with_config(self) -> None:
+        flexkv_logger.info(f"Waiting for config from master at {self.master_host}:{self.master_ports[0]}")
+        config_msg = self.command_socket.recv_pyobj()
+        if isinstance(config_msg, dict) and config_msg.get('type') == 'config':
+            self.model_config = config_msg.get('model_config')
+            self.cache_config = config_msg.get('cache_config')
+            self.gpu_register_port = config_msg.get('gpu_register_port')
+            flexkv_logger.info(f"Received config from master, {self.model_config = }, \
+                {self.cache_config = }, {self.gpu_register_port = }.")
+        else:
+            raise RuntimeError(f"Expected config message, got: {config_msg}")
+
+        super().__init__(self.model_config, self.cache_config, self.gpu_register_port)
+
+    def _polling_worker(self) -> None:
+        flexkv_logger.info("Polling worker thread started")
+
+        poller = zmq.Poller()
+        poller.register(self.command_socket, zmq.POLLIN)
+        poller.register(self.query_socket, zmq.POLLIN)
+
+        while not self._shutdown_flag:
+            try:
+                socks = dict(poller.poll(timeout=0.001))
+
+                if self.command_socket in socks:
+                    try:
+                        message = self.command_socket.recv_pyobj(zmq.NOBLOCK)
+
+                        if isinstance(message, dict) and message.get('type') == 'submit':
+                            graph = message.get('graph')
+                            task_end_op_id = message.get('task_end_op_id', -1)
+
+                            if graph is not None:
+                                graph_id = graph.graph_id
+
+                                with self._active_graphs_lock:
+                                    self._active_graphs[graph_id] = task_end_op_id
+
+                                self.submit(graph)
+                            else:
+                                flexkv_logger.warning("Received submit message without graph")
+                        else:
+                            flexkv_logger.warning(f"Unexpected command message: {message}")
+                    except zmq.Again:
+                        pass
+
+                if self.query_socket in socks:
+                    try:
+                        query_msg = self.query_socket.recv_pyobj(zmq.NOBLOCK)
+
+                        if isinstance(query_msg, dict) and query_msg.get('type') == 'query_ready':
+                            response = {'ready': self._is_ready}
+                            self.query_socket.send_pyobj(response)
+                        else:
+                            response = {'error': 'unknown query type'}
+                            self.query_socket.send_pyobj(response)
+                            flexkv_logger.warning(f"Unknown query message: {query_msg}")
+                    except zmq.Again:
+                        pass
+
+                try:
+                    completed = self.wait(timeout=0.001)
+
+                    if completed:
+                        with self._active_graphs_lock:
+                            for graph_id, op_id in completed:
+                                if graph_id in self._active_graphs:
+                                    task_end_op_id = self._active_graphs[graph_id]
+
+                                    if task_end_op_id != -1 and op_id == task_end_op_id:
+                                        self.result_socket.send_pyobj(
+                                            [task_end_op_id, graph_id]
+                                        )
+                                    if op_id == -1:
+                                        self.result_socket.send_pyobj([-1, graph_id])
+                                        del self._active_graphs[graph_id]
+
+                except queue.Empty:
+                    pass
+
+            except Exception as e:
+                if not self._shutdown_flag:
+                    flexkv_logger.error(f"Error in polling worker: {e}")
+                    time.sleep(0.01)
+
+        poller.unregister(self.command_socket)
+        poller.unregister(self.query_socket)
+
+    def start(self) -> None:
+        self.initialize_transfer_engine()
+        super().start()
+
+        self._is_ready = true
+
+        self._worker_thread = threading.Thread(
+            target=self._polling_worker, daemon=True
+        )
+        self._worker_thread.start()
+
+        flexkv_logger.info("TransferManagerOnRemote started successfully")
+
+    def shutdown(self) -> None:
+        flexkv_logger.info("Shutting down TransferManagerOnRemote")
+
+        self._shutdown_flag = True
+        self._is_ready = False
+
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=5.0)
+
+        super().shutdown()
+
+        try:
+            self.command_socket.close()
+            self.result_socket.close()
+            self.query_socket.close()
+            self.context.term()
+        except Exception as e:
+            flexkv_logger.error(f"Error closing sockets: {e}")
+
+        flexkv_logger.info("TransferManagerOnRemote shutdown complete")
+
+    def __del__(self) -> None:
+        if not self._shutdown_flag:
+            self.shutdown()
+
+    @classmethod
+    def create_process(cls, **kwargs: Any) -> Process:
+        def _run():
+            instance = cls(**kwargs)
+            instance.start()
+            if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
+                instance._worker_thread.join()  # block until worker thread exits
+        process = Process(target=_run, daemon=False)
+        process.start()
+        return process
 
 class TransferManagerHandleBase(ABC):
     @abstractmethod
@@ -141,7 +333,7 @@ class TransferManagerHandleBase(ABC):
         pass
 
     @abstractmethod
-    def submit(self, transfer_graph: TransferOpGraph) -> None:
+    def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
         pass
 
     @abstractmethod
@@ -169,7 +361,7 @@ class TransferManagerIntraProcessHandle(TransferManagerHandleBase):
     def is_ready(self) -> bool:
         return self._is_ready
 
-    def submit(self, transfer_graph: TransferOpGraph) -> None:
+    def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
         self.transfer_manager.submit(transfer_graph)
 
     def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
@@ -184,17 +376,17 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: str):
-        mp.set_start_method('spawn', force=True)
+        self.mp_ctx = mp.get_context('spawn')
 
         self.model_config = model_config
         self.cache_config = cache_config
         self.gpu_register_port = gpu_register_port
 
-        self.command_parent_conn, self.command_child_conn = Pipe()
-        self.result_parent_conn, self.result_child_conn = Pipe()
+        self.command_parent_conn, self.command_child_conn = self.mp_ctx.Pipe()
+        self.result_parent_conn, self.result_child_conn = self.mp_ctx.Pipe()
 
         self.process: Optional[Process] = None
-        self.ready_event = Event()
+        self.ready_event = self.mp_ctx.Event()
 
         self._completed_results: List[Tuple[int, int]] = []
 
@@ -202,7 +394,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         if self.process is not None and self.process.is_alive():
             return
 
-        self.process = Process(
+        self.process = self.mp_ctx.Process(
             target=self._process_worker,
             args=(self.model_config,
                   self.cache_config,
@@ -256,7 +448,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
     def is_ready(self) -> bool:
         return self.ready_event.is_set()
 
-    def submit(self, transfer_graph: TransferOpGraph) -> None:
+    def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
         self.command_parent_conn.send({
             'type': 'submit',
             'transfer_graph': transfer_graph
@@ -289,22 +481,202 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         self.shutdown()
 
 
+class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
+    def __init__(self,
+                 model_config: ModelConfig,
+                 cache_config: CacheConfig,
+                 gpu_register_port: str,
+                 master_host: str,
+                 master_ports: Tuple[str, str, str]):  # command, result, query
+        self.model_config = model_config
+        self.cache_config = cache_config
+        self.gpu_register_port = gpu_register_port
+
+        self.master_host = master_host
+        self.master_ports = master_ports
+
+        self.context = zmq.Context()
+        self.command_socket = self.context.socket(zmq.PUSH)
+        self.command_socket.setsockopt(zmq.LINGER, 0)
+        self.result_socket = self.context.socket(zmq.PULL)
+        self.result_socket.setsockopt(zmq.LINGER, 0)
+        self.query_socket = self.context.socket(zmq.REQ)
+        self.query_socket.setsockopt(zmq.LINGER, 0)
+        self.query_socket.setsockopt(zmq.REQ_RELAXED, 1)
+        self.query_socket.setsockopt(zmq.REQ_CORRELATE, 1)
+        self.query_socket.setsockopt(zmq.RCVTIMEO, 1000)
+
+        self._shutdown_flag = False
+        self._connected = False
+
+        self._result_buffer: List[Tuple[int, int]] = []
+        self._result_buffer_lock = threading.Lock()
+
+        self._bind_master_ports()
+
+        self._polling_thread: threading.Thread | None = None
+
+    def _bind_master_ports(self) -> None:
+        try:
+            command_addr = f"{self.master_host}:{self.master_ports[0]}"
+            self.command_socket.bind(command_addr)
+            flexkv_logger.debug(f"Master bound command port at {command_addr}")
+
+            result_addr = f"{self.master_host}:{self.master_ports[1]}"
+            self.result_socket.bind(result_addr)
+            flexkv_logger.debug(f"Master bound result port at {result_addr}")
+
+            query_addr = f"{self.master_host}:{self.master_ports[2]}"
+            self.query_socket.bind(query_addr)
+            flexkv_logger.debug(f"Master bound query port at {query_addr}")
+
+            self.result_socket.setsockopt(zmq.RCVTIMEO, 0)
+
+            self._connected = True
+            flexkv_logger.debug("Master transfer manager ready for remote connections")
+
+        except Exception as e:
+            flexkv_logger.error(f"Master failed to bind ports: {e}")
+            raise
+
+    def send_config_to_remotes(self) -> None:
+        flexkv_logger.info(f"Sending config to remote at {self.master_host}:{self.master_ports[0]}")
+        try:
+            config_msg = {
+                'type': 'config',
+                'model_config': self.model_config,
+                'cache_config': self.cache_config,
+                'gpu_register_port': self.gpu_register_port
+            }
+            self.command_socket.send_pyobj(config_msg)
+            flexkv_logger.info(f"Config sent to remote at {self.master_host}:{self.master_ports[0]}")
+        except Exception as e:
+            flexkv_logger.error(f"Failed to send config to remote: {e}")
+
+    def _polling_worker(self) -> None:
+        while not self._shutdown_flag:
+            try:
+                result = self.result_socket.recv_pyobj(zmq.NOBLOCK)
+                if isinstance(result, list) and len(result) == 2:
+                    op_id, graph_id = result
+
+                    with self._result_buffer_lock:
+                        self._result_buffer.append((graph_id, op_id))
+                else:
+                    flexkv_logger.warning(f"Unexpected result format from remote: {result}")
+
+            except zmq.Again:
+                time.sleep(0.001)
+            except Exception as e:
+                if not self._shutdown_flag:
+                    flexkv_logger.error(f"Error in polling thread: {e}")
+                    time.sleep(0.01)
+
+    def start(self) -> None:
+        self._polling_thread = threading.Thread(target=self._polling_worker, daemon=True)
+        self._polling_thread.start()
+
+    def is_ready(self) -> bool:
+        if not self._connected:
+            flexkv_logger.warning("Master not ready: ports not bound yet")
+            return False
+
+        try:
+            query_msg = {'type': 'query_ready'}
+            self.query_socket.send_pyobj(query_msg)
+
+            response = self.query_socket.recv_pyobj()
+            if response.get('ready'):
+                return True
+            else:
+                flexkv_logger.warning(f"Remote not ready, response: {response}")
+                return False
+
+        except zmq.Again:
+            flexkv_logger.warning("Timeout waiting for ready response from remote")
+            return False
+        except Exception as e:
+            flexkv_logger.error(f"Error checking remote ready status: {e}")
+
+            return False
+
+    def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
+        if not self._connected:
+            flexkv_logger.warning("Not connected to remote transfer manager")
+            return
+
+        try:
+            message = {
+                'type': 'submit',
+                'graph': transfer_graph,
+                'task_end_op_id': task_end_op_id
+            }
+            self.command_socket.send_pyobj(message)
+
+        except Exception as e:
+            flexkv_logger.error(f"Failed to submit graph to remote: {e}")
+
+    def wait(self, timeout: float | None = None) -> List[Tuple[int, int]]:
+        start_time = time.time()
+        results = []
+
+        while True:
+            with self._result_buffer_lock:
+                if self._result_buffer:
+                    results.extend(self._result_buffer)
+                    self._result_buffer.clear()
+                    break
+                elif timeout is not None and (time.time() - start_time) >= timeout:
+                    break
+
+            time.sleep(0.001)
+
+        return results
+
+    def shutdown(self) -> None:
+        flexkv_logger.info("Shutting down TransferManagerMultiNodeHandle")
+
+        self._shutdown_flag = True
+
+        if self._polling_thread is not None and self._polling_thread.is_alive():
+            self._polling_thread.join(timeout=5.0)
+
+        try:
+            self.command_socket.close()
+            self.result_socket.close()
+            self.query_socket.close()
+            self.context.term()
+        except Exception as e:
+            flexkv_logger.error(f"Error closing sockets: {e}")
+
+        flexkv_logger.info("TransferManagerMultiNodeHandle shutdown complete")
+
+
 class TransferManagerHandle:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-                 use_separate_process: bool = True,
-                 gpu_register_port: Optional[str] = None):
+                 gpu_register_port: Optional[str] = None,
+                 mode: str = "process",
+                 **kwargs): # process or thread or remote
         if gpu_register_port is None:
             gpu_register_port = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        if use_separate_process:
+        if mode == "process":
             self._handle: TransferManagerHandleBase = TransferManagerInterProcessHandle(
                 model_config, cache_config, gpu_register_port
             )
-        else:
+        elif mode == "thread":
             self._handle: TransferManagerHandleBase = TransferManagerIntraProcessHandle(
                 model_config, cache_config, gpu_register_port
             )
+        elif mode == "remote":
+            master_host = kwargs["master_host"]
+            master_ports = kwargs["master_ports"]
+            self._handle: TransferManagerHandleBase = TranserManagerMultiNodeHandle(
+                model_config, cache_config, gpu_register_port, master_host, master_ports
+            )
+        else:
+            raise ValueError(f"Invalid mode: {mode}, must be process, thread or remote")
 
     def start(self) -> None:
         self._handle.start()
@@ -312,8 +684,8 @@ class TransferManagerHandle:
     def is_ready(self) -> bool:
         return self._handle.is_ready()
 
-    def submit(self, transfer_graph: TransferOpGraph) -> None:
-        self._handle.submit(transfer_graph)
+    def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
+        self._handle.submit(transfer_graph, task_end_op_id)
 
     def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
         return self._handle.wait(timeout)
