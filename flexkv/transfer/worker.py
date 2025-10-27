@@ -291,7 +291,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.k_gpu_layer_ptrs = self.gpu_blocks_ptrs[:self.num_layers]
             self.v_gpu_layer_ptrs = self.gpu_blocks_ptrs[self.num_layers:]
         elif not gpu_kv_layout.is_mla and self.num_layers == len(self.gpu_blocks):
-            # x第0个维度的前一半是k，后一半是v
+            # dim 0 of x, k is the first half, v is the second half
             self.k_gpu_layer_ptrs = self._get_layer_ptrs(
                 [x[:x.shape[0]//2] for x in self.gpu_blocks]
             )
@@ -361,11 +361,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         v_gpu_layer_ptrs = self.v_gpu_layer_ptrs[layer_id_list].contiguous().pin_memory()
 
         transfer_kv_blocks(
-            gpu_block_id_list, # tensor, block id
-            k_gpu_layer_ptrs, # tensor # k gpu kv cache
-            v_gpu_layer_ptrs, # tensor # v gpu kv cache
+            gpu_block_id_list,
+            k_gpu_layer_ptrs,
+            v_gpu_layer_ptrs,
             self.gpu_block_stride_in_bytes,
-            cpu_block_id_list, # block id
+            cpu_block_id_list,
             self.cpu_tensor,
             self.cpu_kv_stride_in_bytes,
             self.cpu_layer_stride_in_bytes,
@@ -439,12 +439,6 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype
         self.is_mla = gpu_kv_layouts[0].is_mla
-        # if len(handles_in_one_gpu) > self.num_layers:
-        #     assert len(handles_in_one_gpu) == 2 * self.num_layers
-        #     self.kv_separate = True
-        # else:
-        #     self.kv_separate = False
-        # # self.kv_separate to transfer_kernel
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size

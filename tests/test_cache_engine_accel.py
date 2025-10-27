@@ -226,18 +226,12 @@ def test_cleanup(cache_engine: CacheEngineAccel):
 
     cache_engine.unlock(radixnode2)
     cache_engine.set_ready(radixnode2, True, radixnode2_size)
-    cache_engine.unlock(radixnode2)
-    cache_engine.set_ready(radixnode2, True, radixnode2_size)
     assert cache_engine.index.total_ready_blocks() == num_insert_blocks2
 
     cache_engine.unlock(radixnode1)
     cache_engine.set_ready(radixnode1, True, radixnode1_size)
-    cache_engine.unlock(radixnode1)
-    cache_engine.set_ready(radixnode1, True, radixnode1_size)
     assert cache_engine.index.total_ready_blocks() == num_insert_blocks1 + num_insert_blocks2
 
-    cache_engine.unlock(radixnode0)
-    cache_engine.set_ready(radixnode0, True, radixnode0_size)
     cache_engine.unlock(radixnode0)
     cache_engine.set_ready(radixnode0, True, radixnode0_size)
     assert cache_engine.index.total_ready_blocks() == num_insert_blocks0 + num_insert_blocks1 + num_insert_blocks2

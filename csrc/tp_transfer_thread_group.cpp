@@ -51,9 +51,8 @@ TPTransferThreadGroup::TPTransferThreadGroup(
 
   for (int i = 0; i < num_gpus_; ++i) {
     for (int j = 0; j < num_layers; ++j) {
-      // gpu_blocks[i][j] has shape [kv_dim, num_blocks, tokens_per_block,
-      // num_heads, head_size] where kv_dim=2 for non-MLA First half is K,
-      // second half is V
+      // gpu_blocks[gpu][layer]: [kv_dim, num_blocks, num_kv_heads, head_size]
+      // kv_dim=2: gpu_blocks = k_caches + v_caches
       torch::Tensor kv_tensor = gpu_blocks[i][j];
       if (kv_tensor.size(0) == 2) { // Non-MLA case: [2, num_blocks, ...]
         k_gpu_blocks_[i * num_layers + j] = kv_tensor[0].data_ptr();
