@@ -22,6 +22,7 @@ from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import RegisterTPClientRequest, Response
+from flexkv.common.debug import flexkv_logger
 
 
 class TransferManager:

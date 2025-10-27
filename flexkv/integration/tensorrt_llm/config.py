@@ -14,8 +14,6 @@ from flexkv.integration.tensorrt_llm.utils import get_dp_tp_info
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
-logger = flexkv_logger
-
 @dataclass
 class FlexKVConfig:
     #base config
@@ -41,7 +39,7 @@ class FlexKVConfig:
     @classmethod
     def from_env(cls) -> 'FlexKVConfig':
         config_file_path = os.getenv('FLEXKV_CONFIG_PATH', None)
-        logger.info(f"{config_file_path=}")
+        flexkv_logger.info(f"{config_file_path=}")
         if config_file_path is None:
             return cls(enable_flexkv=False,
                        server_recv_port="")
@@ -50,7 +48,7 @@ class FlexKVConfig:
         
         with open(config_file_path, 'r') as f:
             config_dict: dict = json.load(f)
-        logger.info(f"FlexKV Config Dict: {config_dict}")
+        flexkv_logger.info(f"FlexKV Config Dict: {config_dict}")
         
         return cls(
             server_recv_port=config_dict.get("server_recv_port", f"ipc:///tmp/flexkv_test"),
@@ -83,4 +81,4 @@ class FlexKVConfig:
                             hasattr(hf_config, 'qk_rope_head_dim') and 
                             hf_config.qk_rope_head_dim is not None)
         except Exception as e:
-            logger.error(f"Failed to load config from {model_path}: {e}")
+            flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
