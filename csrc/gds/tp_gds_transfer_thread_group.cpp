@@ -34,15 +34,45 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
     }
   }
 
+  queues_.resize(num_gpus_);
+  mtxs_   = std::vector<std::mutex>(num_gpus_);
+  cvs_    = std::vector<std::condition_variable>(num_gpus_);
+
   // Create CUDA streams for each GPU
   streams_.resize(num_gpus_);
   for (int i = 0; i < num_gpus_; ++i) {
     cudaSetDevice(dp_group_id_ * num_gpus_ + i);
     cudaStreamCreate(&streams_[i]);
   }
+
+  // Create the thread pool
+  stop_pool_ = false;
+  for (int i = 0; i < num_gpus_; ++i) {
+    threads_.emplace_back([this, i]() {
+      int device_id = dp_group_id_ * num_gpus_ + i;
+      cudaSetDevice(device_id);  // only once
+
+      while (true) {
+        Task task;
+        {
+          std::unique_lock<std::mutex> lk(mtxs_[i]);
+          cvs_[i].wait(lk, [&]{ return stop_pool_ || !queues_[i].empty(); });
+          if (stop_pool_ && queues_[i].empty()) return;
+
+          task = std::move(queues_[i].front());
+          queues_[i].pop();
+        }
+        task();  // 
+      }
+    });
+  }
 }
 
 TPGDSTransferThreadGroup::~TPGDSTransferThreadGroup() {
+  stop_pool_ = true;
+  for (auto& cv : cvs_) cv.notify_all();
+  for (auto& t : threads_) if (t.joinable()) t.join();
+
   // Clean up GDS managers
   for (auto* manager : gds_managers_) {
     delete manager;
@@ -58,6 +88,17 @@ TPGDSTransferThreadGroup::~TPGDSTransferThreadGroup() {
   if (gpu_blocks_) {
     cudaFreeHost(gpu_blocks_);
   }
+}
+
+std::future<void> TPGDSTransferThreadGroup::enqueue_for_gpu(int gpu_idx, Task task) {
+  auto pkg = std::make_shared<std::packaged_task<void()>>(std::move(task));
+  auto fut = pkg->get_future();
+  {
+      std::lock_guard<std::mutex> lk(mtxs_[gpu_idx]);
+      queues_[gpu_idx].emplace([pkg]{ (*pkg)(); });
+  }
+  cvs_[gpu_idx].notify_one();
+  return fut;
 }
 
 void TPGDSTransferThreadGroup::tp_group_transfer(
@@ -78,15 +119,12 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
 
   std::atomic<bool> failed{false};
   std::string error_msg;
-  threads_.clear();
-  threads_.reserve(num_gpus_);
+  std::vector<std::future<void>> futures;
+  futures.reserve(num_gpus_);
 
   for (int i = 0; i < num_gpus_; ++i) {
-    threads_.emplace_back([&, i]() {
+    futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
-        // Set CUDA device for this thread
-        cudaSetDevice(dp_group_id_ * num_gpus_ + i);
-        
         // Prepare layer ID list for this specific layer range
         torch::Tensor layer_id_list = torch::arange(layer_id, layer_id + layer_granularity, 
                                                     torch::TensorOptions().dtype(torch::kInt32));
@@ -107,7 +145,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
             gds_file_paths_,                // GDS file paths list
             layer_id_list,                  // Layer IDs to process
             gpu_layer_ptrs_tensor,          // GPU layer pointers
-            gds_block_id_tensor,         // GDS block IDs (adjusted for TP)
+            gds_block_id_tensor,            // GDS block IDs (adjusted for TP)
             gpu_block_id_tensor,            // GPU block IDs
             gpu_kv_stride_in_bytes,         // GPU K-V stride
             gds_layer_stride_in_bytes,      // GDS layer stride
@@ -132,13 +170,11 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
         failed = true;
         error_msg = e.what();
       }
-    });
+    }));
   }
 
-  // Wait for all threads to complete
-  for (auto &t : threads_) {
-    if (t.joinable())
-      t.join();
+  for (auto &f : futures) {
+    f.get();
   }
 
   if (failed) {

@@ -108,6 +108,7 @@ docker run -itd \
 
 ### 2.2 Configure FlexKV to Use GDS
 
+`export FLEXKV_ENABLE_GDS=1` to compile
 Configuration example after compilation `config.json`:
 
 ```json

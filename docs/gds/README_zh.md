@@ -107,6 +107,8 @@ docker run -itd \
 
 ### 2.2 配置 FlexKV 使用 GDS
 
+`export FLEXKV_ENABLE_GDS=1` 进行编译
+
 编译后config例子 `config.json`：
 
 ```json
