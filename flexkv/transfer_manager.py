@@ -395,11 +395,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
     def _start_process(self) -> None:
         if self.process is not None and self.process.is_alive():
             return
-
-        from flexkv.utils.subprocess import create_safe_process
         
-        self.process = create_safe_process(
-            self.mp_ctx,
+        self.process = self.mp_ctx.Process(
             target=self._process_worker,
             args=(self.model_config,
                   self.cache_config,
