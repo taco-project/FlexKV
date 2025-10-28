@@ -16,8 +16,12 @@ EOF
 
 export FLEXKV_CONFIG_PATH="./flexkv_config.json"
 export MODEL_PATH=$MODEL_PATH
-export PMIX_MCA_gds=hash
-# export CUDA_LAUNCH_BLOCKING=1
+# export PMIX_MCA_gds=hash
+export CUDA_LAUNCH_BLOCKING=1
+
+export OMPI_ALLOW_RUN_AS_ROOT=1
+export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+# export MPI4PY_RC_INITIALIZE=false
 
 trtllm-serve serve $MODEL_PATH \
     --host 0.0.0.0 \
