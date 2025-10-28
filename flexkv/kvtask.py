@@ -107,12 +107,28 @@ class KVTaskManager:
         if self.is_multinode_tp and not self.model_config.use_mla:
             model_config_for_transfer.num_kv_heads = self.tp_size_per_node
 
-        self.transfer_handles = [TransferManagerHandle(
-            model_config_for_transfer,
-            self.cache_config,
-            mode="process",
-            gpu_register_port=gpu_register_port
-        )]
+        # self.transfer_handles = [TransferManagerHandle(
+        #     model_config_for_transfer,
+        #     self.cache_config,
+        #     mode="process",
+        #     gpu_register_port=gpu_register_port
+        # )]
+        self.remote_process = TransferManagerOnRemote.create_process()
+        master_host, master_ports = get_master_host_and_ports_from_env()
+        self.transfer_handles = [
+            TransferManagerHandle(
+                model_config_for_transfer,
+                self.cache_config,
+                mode="remote",
+                gpu_register_port=gpu_register_port,
+                master_host=master_host,
+                master_ports=master_ports
+            )
+        ]
+        self.transfer_handles[0]._handle.send_config_to_remotes()
+
+        # self.remote_process.start()
+        
         if self.is_multinode_tp:
             master_host, master_ports = get_master_host_and_ports_from_env()
             self.transfer_handles.append(TransferManagerHandle(
@@ -151,6 +167,10 @@ class KVTaskManager:
         if hasattr(self, "transfer_handles") and self.transfer_handles is not None:
             for transfer_handle in self.transfer_handles:
                 transfer_handle.shutdown()
+        if hasattr(self, "remote_process") and self.remote_process is not None:
+            self.remote_process.join()
+            self.remote_process.close()
+            self.remote_process = None
 
     def create_get_task(self,
                         task_id: int,
