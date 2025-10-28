@@ -214,8 +214,14 @@ class KVServer:
             return KVServerHandle(process)
         else:
             # Use multiprocessing as before
-            process = mp.Process(target=cls._server_process,
-                                 args=(model_config, cache_config, gpu_register_port, server_recv_port))
+            from flexkv.utils.subprocess import create_safe_process
+            
+            mp_ctx = mp.get_context('spawn')
+            process = create_safe_process(
+                mp_ctx,
+                target=cls._server_process,
+                args=(model_config, cache_config, gpu_register_port, server_recv_port)
+            )
             process.start()
             flexkv_logger.info(f"KVServer process started, PID: {process.pid}")
             return KVServerHandle(process)
