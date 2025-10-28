@@ -386,6 +386,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         self.result_parent_conn, self.result_child_conn = self.mp_ctx.Pipe()
 
         self.process: Optional[Process] = None
+        self.start_event = self.mp_ctx.Event()
         self.ready_event = self.mp_ctx.Event()
 
         self._completed_results: List[Tuple[int, int]] = []
@@ -401,7 +402,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                   self.command_child_conn,
                   self.result_child_conn,
                   self.gpu_register_port,
-                  self.ready_event),
+                  self.ready_event,
+                  self.start_event),
             daemon=False
         )
         self.process.start()
@@ -412,8 +414,11 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         command_conn,
                         result_conn,
                         gpu_register_port: str,
-                        ready_event) -> None:
+                        ready_event,
+                        start_event) -> None:
         try:
+            start_event.set()
+            os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
             transfer_manager = TransferManager(model_config, cache_config, gpu_register_port)
             transfer_manager.initialize_transfer_engine()
             transfer_manager.start()
@@ -443,7 +448,10 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             result_conn.close()
 
     def start(self) -> None:
+        os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
         self._start_process()
+        self.start_event.wait()
+        os.environ['MPI4PY_RC_INITIALIZE'] = 'true'
 
     def is_ready(self) -> bool:
         return self.ready_event.is_set()
