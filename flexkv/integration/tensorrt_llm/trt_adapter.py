@@ -75,7 +75,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         )
         self.flexkv_manager = KVManager(model_config=self.model_config,
                                         cache_config=self.cache_config,
-                                        gpu_register_port=flexkv_config.server_recv_port,
+                                        server_recv_port=flexkv_config.server_recv_port,
                                         dp_client_id=dp_rank)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
@@ -488,8 +488,8 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.tp_size
         self.flexkv_config = flexkv_config
-        flexkv_logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.server_recv_port}, dp_client_id: {dp_client_id}")
-        self.tp_client = KVTPClient(flexkv_config.server_recv_port, dp_client_id, current_device_id)
+        flexkv_logger.info(f"Start init FlexKVWorkerConnector to ipc:///tmp/flexkv_test_gpu_register, dp_client_id: {dp_client_id}")
+        self.tp_client = KVTPClient("ipc:///tmp/flexkv_test_gpu_register", dp_client_id, current_device_id)
         flexkv_logger.info("Finish init FlexKVWorkerConnector")
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):

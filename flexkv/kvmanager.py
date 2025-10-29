@@ -59,7 +59,7 @@ class KVManager:
             self.dp_client = KVDPClient(self.server_recv_port, self.model_config, dp_client_id)
         else:
             self.server_handle = None
-            self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port)
+            self.kv_task_engine = KVTaskEngine(model_config, cache_config, self.gpu_register_port)
     
     @property
     def dpclient_id(self) -> int:
