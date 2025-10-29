@@ -120,25 +120,15 @@ class TransferWorkerBase(ABC):
                       finished_ops_queue: MPQueue,
                       op_buffer_tensor: torch.Tensor,
                       *args: Any, **kwargs: Any) -> 'WorkerHandle':
-        """
-        Generic worker creation template method.
-        
-        Uses create_safe_process to prevent MPI initialization issues when
-        parent process was launched with MPI.
-        """
-        from flexkv.utils.subprocess import create_safe_process
+        """Generic worker creation template method."""
         
         parent_conn, child_conn = mp_ctx.Pipe()  # create pipe
         ready_event = mp_ctx.Event()
         worker_id = cls._get_worker_id()
 
-        # Use safe process creation that sets environment variables in child
-        # This prevents MPI initialization issues when parent was launched with MPI
-        process = create_safe_process(
-            mp_ctx,
+        process = mp_ctx.Process(
             target=cls._worker_process,
             args=(worker_id, child_conn, finished_ops_queue, op_buffer_tensor, ready_event, *args),
-            kwargs=kwargs,
             daemon=True
         )
         process.start()

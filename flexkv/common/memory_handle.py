@@ -383,9 +383,7 @@ if __name__ == "__main__":
     socket = context.socket(zmq.SocketType.PUSH)
     socket.bind("tcp://127.0.0.1:5555")
 
-    from flexkv.utils.subprocess import create_safe_process
-    mp_ctx = mp.get_context('spawn')
-    process = create_safe_process(mp_ctx, target=_zmq_test_worker, daemon=True)
+    process = mp.Process(target=_zmq_test_worker, daemon=True)
     process.start()
 
     time.sleep(1)
