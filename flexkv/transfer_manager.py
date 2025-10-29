@@ -11,6 +11,10 @@ import zmq
 import tempfile
 import threading
 import numpy as np
+import textwrap
+import subprocess
+import pickle
+import sys
 
 from flexkv.common.transfer import TransferOpGraph
 from flexkv.common.config import CacheConfig, ModelConfig
@@ -65,9 +69,10 @@ class TransferManager:
             flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port}")
 
             expected_gpus = self.model_config.tp_size * self.model_config.dp_size
-
+            flexkv_logger.info(f"{self.model_config.tp_size=}, {self.model_config.dp_size=}, {expected_gpus=}")
             while len(self.all_gpu_blocks) < expected_gpus:
                 try:
+                    # Recv from: flexkv.server.client.KVTPClient.register_to_server
                     req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
                 except zmq.Again:
                     time.sleep(0.001)
@@ -313,16 +318,123 @@ class TransferManagerOnRemote(TransferManager):
         if not self._shutdown_flag:
             self.shutdown()
 
+    # @classmethod
+    # def create_process(cls, **kwargs: Any) -> Process:
+    #     def _run():
+    #         instance = cls(**kwargs)
+    #         instance.start()
+    #         if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
+    #             instance._worker_thread.join()  # block until worker thread exits
+    #     process = Process(target=_run, daemon=False)
+    #     process.start()
+    #     return process
+    
     @classmethod
     def create_process(cls, **kwargs: Any) -> Process:
-        def _run():
-            instance = cls(**kwargs)
-            instance.start()
-            if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
-                instance._worker_thread.join()  # block until worker thread exits
-        process = Process(target=_run, daemon=False)
-        process.start()
-        return process
+        import tempfile
+        import os
+        
+        # Serialize the class and kwargs
+        cls_data = pickle.dumps(cls)
+        kwargs_data = pickle.dumps(kwargs)
+        
+        # Create temporary files for serialized data
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.cls') as f:
+            f.write(cls_data)
+            cls_file = f.name
+            
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.kwargs') as f:
+            f.write(kwargs_data)
+            kwargs_file = f.name
+        
+        # Prepare environment - remove MPI-related variables to avoid conflicts
+        env = os.environ.copy()
+        mpi_vars = [k for k in env.keys() if any(prefix in k for prefix in ['MPI', 'OMPI', 'PMI', 'UCX'])]
+        for var in mpi_vars:
+            env.pop(var, None)
+        env['MPI4PY_RC_INITIALIZE'] = 'false'
+        env['PYTHONUNBUFFERED'] = '1'  # Ensure output is unbuffered
+        
+        # Create the subprocess script
+        transfer_manager_script = textwrap.dedent(f'''
+            import os
+            import sys
+            import pickle
+            import tempfile
+            
+            # Immediately disable MPI to avoid conflicts
+            os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
+    
+            # Add FlexKV to Python path
+            sys.path.insert(0, "/cfs_zhongwei/rongwei/FlexKV")
+
+            try:
+                # Load the class and kwargs
+                with open("{cls_file}", "rb") as f:
+                    cls = pickle.load(f)
+                
+                with open("{kwargs_file}", "rb") as f:
+                    kwargs = pickle.load(f)
+                
+                # Create and start TransferManager instance
+                instance = cls(**kwargs)
+                instance.start()
+                
+                # Keep running until worker thread exits
+                if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
+                    instance._worker_thread.join()
+                    
+            except Exception as e:
+                print(f"Error in TransferManager subprocess: {{e}}", file=sys.stderr)
+                sys.exit(1)
+            finally:
+                # Clean up temporary files
+                try:
+                    os.unlink("{cls_file}")
+                    os.unlink("{kwargs_file}")
+                except Exception:
+                    pass
+        ''').strip()
+        
+        # Start the subprocess
+        process = subprocess.Popen([
+            sys.executable, '-c', transfer_manager_script
+        ], env=env, stdout=None, stderr=None, text=True)  # None = inherit parent's stdout/stderr
+        flexkv_logger.info(f"TransferManager subprocess started, PID: {process.pid}")
+        
+        # Clean up temporary files after subprocess completes
+        def cleanup_files():
+            # Wait for subprocess to complete before cleaning up files
+            process.wait()
+            try:
+                os.unlink(cls_file)
+                os.unlink(kwargs_file)
+            except Exception:
+                pass
+        
+        import threading
+        cleanup_thread = threading.Thread(target=cleanup_files, daemon=True)
+        cleanup_thread.start()
+        
+        # Return a wrapper that mimics multiprocessing.Process interface
+        class SubprocessWrapper:
+            def __init__(self, popen_process):
+                self._popen = popen_process
+                self.pid = popen_process.pid
+                
+            def join(self, timeout=None):
+                return self._popen.wait(timeout)
+                
+            def close(self):
+                # Close the subprocess pipes
+                if self._popen.stdout:
+                    self._popen.stdout.close()
+                if self._popen.stderr:
+                    self._popen.stderr.close()
+                if self._popen.stdin:
+                    self._popen.stdin.close()
+        
+        return SubprocessWrapper(process)
 
 class TransferManagerHandleBase(ABC):
     @abstractmethod
