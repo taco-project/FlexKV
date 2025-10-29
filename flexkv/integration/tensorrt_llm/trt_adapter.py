@@ -516,7 +516,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         if self.flexkv_config.use_mla:
             assert kv_dim == 1, (f"expect kv_dim eqals to 1 when using MLA but get kv_dim={kv_dim}")
         
-        assert num_kv_heads * head_size * head_size == kv_cache_tensor.shape[3], \
+        assert num_kv_heads * head_size * block_size == kv_cache_tensor.shape[3], \
             (f"expect kv cached tensor last dim equals to num_kv_heads*head_size*block_size, " \
             f"but get last_dim = {kv_cache_tensor.shape[3]}, " \
             f"num_kv_heads = {num_kv_heads}, head_size = {head_size}, block_size = {block_size}")
