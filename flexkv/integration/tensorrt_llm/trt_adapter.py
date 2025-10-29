@@ -91,9 +91,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         self.flexkv_stats = FlexKVStats(flexkv_config.num_log_interval_requests)
 
-        while not self.is_ready():
-            flexkv_logger.info("Waiting for flexkv init...")
-            time.sleep(5)
+        # while not self.is_ready():
+        #     flexkv_logger.info("Waiting for flexkv init...")
+        #     time.sleep(5)
 
         flexkv_logger.info("Finish init FlexKVSchedulerConnector")
 
