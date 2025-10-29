@@ -128,6 +128,7 @@ class TransferWorkerBase(ABC):
         process = mp_ctx.Process(
             target=cls._worker_process,
             args=(worker_id, child_conn, finished_ops_queue, op_buffer_tensor, ready_event, *args),
+            kwargs=kwargs,
             daemon=True
         )
         process.start()

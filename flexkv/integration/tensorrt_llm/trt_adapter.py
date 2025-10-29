@@ -488,7 +488,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.tp_size
         self.flexkv_config = flexkv_config
-        flexkv_logger.info(f"Start init FlexKVWorkerConnector to ipc:///tmp/flexkv_test_gpu_register, dp_client_id: {dp_client_id}")
+        flexkv_logger.info(f"Start init FlexKVWorkerConnector to ipc:///tmp/flexkv_test_gpu_register, dp_client_id: {dp_client_id}, current_device_id: {current_device_id}, torch.cuda.current_device: {torch.cuda.current_device()}")
         self.tp_client = KVTPClient("ipc:///tmp/flexkv_test_gpu_register", dp_client_id, current_device_id)
         flexkv_logger.info("Finish init FlexKVWorkerConnector")
 
@@ -503,6 +503,26 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         # 4. blockSize((numKvHeads * sizePerHead * tokensPerBlock) / quantSize)
     
         flexkv_logger.info(f"Start register kv_caches, shape: {kv_cache_tensor.shape}")
+        
+        # Get actual device from tensor (more reliable in MPI environment)
+        logical_device_id = kv_cache_tensor.device.index
+        flexkv_logger.info(f"[DEBUG] Tensor is on device: {kv_cache_tensor.device}, logical device.index={logical_device_id}")
+        flexkv_logger.info(f"[DEBUG] self.tp_client.device_id (from init): {self.tp_client.device_id}")
+        
+        # Get physical GPU ID (in case CUDA_VISIBLE_DEVICES is set)
+        import os
+        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+        if cuda_visible_devices:
+            # Map logical ID to physical ID
+            visible_gpus = [int(x) for x in cuda_visible_devices.split(',')]
+            physical_device_id = visible_gpus[logical_device_id] if logical_device_id < len(visible_gpus) else logical_device_id
+            flexkv_logger.info(f"[DEBUG] CUDA_VISIBLE_DEVICES={cuda_visible_devices}, mapping logical {logical_device_id} -> physical {physical_device_id}")
+        else:
+            physical_device_id = logical_device_id
+            flexkv_logger.info(f"[DEBUG] No CUDA_VISIBLE_DEVICES set, using logical device ID {logical_device_id}")
+        
+        # Use physical device ID for registration
+        correct_device_id = physical_device_id
         
         if self.flexkv_config.use_mla:
             assert kv_cache_tensor.ndim == 4, (f"expect kv cached tensor has 4 dim but get shape={kv_cache_tensor.shape}")
@@ -532,8 +552,9 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             head_size=head_size,
             is_mla=self.flexkv_config.use_mla,
         )
-        self.tp_client.register_to_server(gpu_blocks, gpu_layout)
-        flexkv_logger.info("Finish register kv_caches")
+        # Use correct device_id from tensor's actual device
+        self.tp_client.register_to_server(gpu_blocks, gpu_layout, override_device_id=correct_device_id)
+        flexkv_logger.info(f"Finish register kv_caches on device {correct_device_id}")
 
     def start_load_kv(self, stream: torch.cuda.Stream):
         return

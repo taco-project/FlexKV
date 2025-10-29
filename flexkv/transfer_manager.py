@@ -355,6 +355,12 @@ class TransferManagerOnRemote(TransferManager):
         env['MPI4PY_RC_INITIALIZE'] = 'false'
         env['PYTHONUNBUFFERED'] = '1'  # Ensure output is unbuffered
         
+        # CRITICAL: Remove CUDA_VISIBLE_DEVICES to allow access to all GPUs
+        # TransferManager needs to access all physical GPUs for IPC
+        if 'CUDA_VISIBLE_DEVICES' in env:
+            flexkv_logger.info(f"Removing CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} for TransferManager subprocess")
+            env.pop('CUDA_VISIBLE_DEVICES', None)
+        
         # Create the subprocess script
         transfer_manager_script = textwrap.dedent(f'''
             import os
