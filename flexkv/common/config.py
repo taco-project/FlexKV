@@ -31,7 +31,7 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_remote: bool = False
-    use_gds: bool = False
+    enable_gds: bool = False
     index_accel: bool = False
 
     # kv cache layout configs
@@ -39,10 +39,12 @@ class CacheConfig:
     cpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
     ssd_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
     remote_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
+    gds_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
+    num_gds_blocks: int = 10000000
     num_remote_blocks: Optional[int] = None
 
     # CPU-GPU transfer configs
@@ -56,6 +58,9 @@ class CacheConfig:
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
     ssd_cache_iouring_entries: int = 0
     ssd_cache_iouring_flags: int = 0
+
+    # gds cache configs
+    gds_cache_dir: Optional[Union[str, List[str]]] = None
 
     # remote cache configs
     remote_cache_size_mode: str = "file_size"  # file_size or block_num
@@ -79,7 +84,8 @@ class CacheConfig:
         layout_fields = ['gpu_kv_layout_type', 
                          'cpu_kv_layout_type', 
                          'ssd_kv_layout_type', 
-                         'remote_kv_layout_type']
+                         'remote_kv_layout_type',
+                         'gds_kv_layout_type']
         for field in layout_fields:
             value = getattr(self, field)
             if isinstance(value, str):

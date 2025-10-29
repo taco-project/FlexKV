@@ -82,7 +82,9 @@ def shutdown_tp_client(tp_client_processes):
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False, 'ssd_cache_iouring_entries': 512},
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True, 'num_ssd_blocks': 256, 'num_remote_blocks': 512},
     {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True,
-    'num_ssd_blocks': 256, 'num_remote_blocks': 512, 'ssd_cache_iouring_entries': 512},
+     'num_ssd_blocks': 256, 'num_remote_blocks': 512, 'ssd_cache_iouring_entries': 512},
+    # GDS test configs
+    {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': False, 'enable_remote': False, 'num_gds_blocks': 512, 'gds_cache_dir': ["./gdstest"]},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
@@ -98,14 +100,17 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
     tokens_per_block = cache_config.tokens_per_block
     num_cpu_blocks = cache_config.num_cpu_blocks
     num_ssd_blocks = cache_config.num_ssd_blocks
+    num_gds_blocks = cache_config.num_gds_blocks
 
     enable_cpu = cache_config.enable_cpu
     enable_ssd = cache_config.enable_ssd
     enable_remote = cache_config.enable_remote
+    enable_gds = cache_config.enable_gds
 
     cache_config.cpu_kv_layout_type = flex_kv_layout_type
     cache_config.ssd_kv_layout_type = flex_kv_layout_type
     cache_config.remote_kv_layout_type = flex_kv_layout_type
+    cache_config.gds_kv_layout_type = flex_kv_layout_type
 
     num_gpu_blocks = test_config["num_gpu_blocks"]
     block_per_request = test_config['requests_per_block']
@@ -306,7 +311,8 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
     print(f"Total cache hit rate: {total_cache_hit / (total_cache_hit + total_cache_miss)}")
     if enable_cpu and num_cpu_blocks >= num_gpu_blocks or \
         enable_ssd and num_ssd_blocks >= num_gpu_blocks or \
-        enable_remote and num_remote_blocks >= num_gpu_blocks:
+        enable_remote and num_remote_blocks >= num_gpu_blocks or \
+        enable_gds and num_gds_blocks >= num_gpu_blocks:
         assert total_cache_miss == 0
     shutdown_tp_client(tp_client_processes)
     kvmanager.shutdown()

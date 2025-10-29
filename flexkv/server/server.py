@@ -85,7 +85,6 @@ class ClientManager:
         flexkv_logger.info(f"DP client {client_id} registered successfully")
 
         return client_id
-
     def delete_dp_client(self, client_id: int) -> None:
         if client_id not in self.client_dict:
             flexkv_logger.error(f"DP client: {client_id} dosen't exist. Delete failed.")
@@ -409,7 +408,7 @@ if __name__ == "__main__":
     cache_config = CacheConfig(enable_cpu=True,
                                 enable_ssd=False,
                                 enable_remote=False,
-                                use_gds=False,
+                                enable_gds=False,
                                 tokens_per_block=tokens_per_block,
                                 num_cpu_blocks=num_cpu_blocks,)
 

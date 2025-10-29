@@ -112,7 +112,7 @@ class FlexKVReplayEngine:
             cpu_kv_layout_type=self._parse_layout_type(cache_config_data['cpu_kv_layout_type']),
             ssd_kv_layout_type=self._parse_layout_type(cache_config_data['ssd_kv_layout_type']),
             remote_kv_layout_type=self._parse_layout_type(cache_config_data['remote_kv_layout_type']),
-            use_gds=cache_config_data['use_gds'],
+            enable_gds=cache_config_data['enable_gds'],
             remote_cache_size_mode=cache_config_data['remote_cache_size_mode'],
             num_cpu_blocks=cache_config_data['num_cpu_blocks'],
             num_ssd_blocks=cache_config_data['num_ssd_blocks'],

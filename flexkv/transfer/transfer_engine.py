@@ -35,6 +35,8 @@ from flexkv.transfer.worker import (
     CPURemoteTransferWorker,
     GPUCPUTransferWorker,
     tpGPUCPUTransferWorker,
+    GDSTransferWorker,
+    tpGDSTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.ring_buffer import SharedOpPool
@@ -57,6 +59,7 @@ class TransferEngine:
         cache_config: CacheConfig,
         cpu_handle: Optional[StorageHandle] = None,
         ssd_handle: Optional[StorageHandle] = None,
+        gds_handle: Optional[StorageHandle] = None,
         remote_handle: Optional[StorageHandle] = None):
         """
         Initialize transfer engine
@@ -66,6 +69,7 @@ class TransferEngine:
             cpu_handle: CPU handle
             ssd_handle: Optional SSD handle
             remote_handle: Optional remote handle
+            gds_handle: Optional GDS handle
         """
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
@@ -82,6 +86,7 @@ class TransferEngine:
         self.gpu_handles = gpu_handles
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
+        self._gds_handle = gds_handle
         self._remote_handle = remote_handle
         self._cache_config = cache_config
 
@@ -145,13 +150,23 @@ class TransferEngine:
         self._worker_map[TransferType.H2D] = self.gpucpu_workers
         self._worker_map[TransferType.D2H] = self.gpucpu_workers
 
+        self._ssd_handle = self._gds_handle if self._ssd_handle is None else self._ssd_handle
         if self._ssd_handle is not None and self._cpu_handle is not None:
+        # Initialize disk workers for either SSD or GDS
+        # When GDS is enabled, we use CPU->GDS two-step transfer instead of GPU->GDS direct transfer
+        # to free GPU memory early
+            file_list = self._ssd_handle.get_file_list()
+            if isinstance(file_list, list) and not isinstance(file_list, dict):
+                ssd_files = {0: file_list}
+            else:
+                ssd_files = file_list
+
             self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
-                ssd_files=self._ssd_handle.get_file_list(),
+                ssd_files=ssd_files,
                 cpu_kv_layout=self._cpu_handle.kv_layout,
                 ssd_kv_layout=self._ssd_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
@@ -163,7 +178,7 @@ class TransferEngine:
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
-                ssd_files=self._ssd_handle.get_file_list(),
+                ssd_files=ssd_files,
                 cpu_kv_layout=self._cpu_handle.kv_layout,
                 ssd_kv_layout=self._ssd_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
@@ -197,6 +212,41 @@ class TransferEngine:
             )
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
+        if self._gds_handle is not None:
+            if self.tp_size == 1:
+                self.gds_workers = [
+                    GDSTransferWorker.create_worker(
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        gpu_blocks=self.gpu_handles[i].get_tensor_handle_list(),
+                        gds_file_paths=self._gds_handle.data,  # Pass file paths instead of GDSManager
+                        num_blocks_per_file=self._gds_handle.num_blocks_per_file,
+                        gpu_kv_layout=self.gpu_handles[i].kv_layout,
+                        gds_kv_layout=self._gds_handle.kv_layout,
+                        dtype=self._gds_handle.dtype,
+                        gpu_device_id=i,
+                    )
+                    for i in range(self.dp_size)
+                ]
+            else:
+                self.gds_workers = [
+                    tpGDSTransferWorker.create_worker(
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
+                                    for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                        gds_file_paths=self._gds_handle.data,  # Pass file paths instead of GDSManager
+                        num_blocks_per_file=self._gds_handle.num_blocks_per_file,
+                        gpu_kv_layout=self.gpu_handles[i].kv_layout,
+                        gds_kv_layout=self._gds_handle.kv_layout,
+                        dtype=self._gds_handle.dtype,
+                        tp_group_size=self.tp_size,
+                        dp_group_id=i,
+                    )
+                    for i in range(self.dp_size)
+                ]
+            self._worker_map[TransferType.GDS2D] = self.gds_workers
+            self._worker_map[TransferType.D2GDS] = self.gds_workers
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
         # Wait for all workers to ready

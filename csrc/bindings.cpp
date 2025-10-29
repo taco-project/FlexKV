@@ -17,9 +17,11 @@
 #include "cache_utils.h"
 #include "pcfs/pcfs.h"
 #include "tp_transfer_thread_group.h"
+#include "gds/tp_gds_transfer_thread_group.h"
 #include "transfer.cuh"
 #include "transfer_ssd.h"
 #include "radix_tree.h"
+#include "gds/gds_manager.h"
 
 namespace py = pybind11;
 
@@ -105,6 +107,155 @@ void transfer_kv_blocks_remote(
 }
 #endif
 
+void transfer_kv_blocks_gds_binding(
+    GDSManager& gds_manager,
+    const py::list& gds_filepaths_py,
+    const torch::Tensor& gpu_layer_id_list,
+    const torch::Tensor& gpu_layer_ptrs_tensor,
+    const torch::Tensor& gds_block_ids,
+    const torch::Tensor& gpu_block_ids,
+    int64_t gpu_kv_stride_in_bytes,
+    int64_t gds_layer_stride_in_bytes,
+    int64_t gds_block_stride_in_bytes,
+    int64_t gds_kv_stride_in_bytes,
+    int64_t block_size_in_bytes,
+    int num_blocks_per_file,
+    int64_t total_layers,
+    bool is_read,
+    bool verbose = false,
+    bool is_mla = false
+) {
+    TORCH_CHECK(gpu_layer_ptrs_tensor.dtype() == torch::kInt64,
+                "gpu_layer_ptrs must be int64");
+    TORCH_CHECK(gds_block_ids.dtype() == torch::kInt64,
+                "gds_block_ids must be int64");
+    TORCH_CHECK(gpu_block_ids.dtype() == torch::kInt64,
+                "gpu_block_ids must be int64");
+    TORCH_CHECK(gpu_layer_id_list.dtype() == torch::kInt32,
+                "gpu_layer_id_list must be int32");
+
+    // Convert Python list to C++ vector
+    std::vector<std::string> gds_filepaths;
+    for (const auto& filepath_py : gds_filepaths_py) {
+        gds_filepaths.push_back(filepath_py.cast<std::string>());
+    }
+
+    transfer_kv_blocks_gds(
+        gds_manager, gds_filepaths, gpu_layer_id_list, gpu_layer_ptrs_tensor,
+        gds_block_ids, gpu_block_ids, gpu_kv_stride_in_bytes,
+        gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
+        block_size_in_bytes, 0, num_blocks_per_file, total_layers, is_read, verbose, is_mla);
+}
+
+// GDS Manager Python bindings
+py::list gds_batch_write_binding(GDSManager& manager, 
+                                 py::list operations_list) {
+    size_t batch_size = operations_list.size();
+    std::vector<BatchWriteOp> operations(batch_size);
+    std::vector<ssize_t> results(batch_size);
+    
+    for (size_t i = 0; i < batch_size; ++i) {
+        py::dict op_dict = operations_list[i].cast<py::dict>();
+        operations[i].filename = op_dict["filename"].cast<std::string>().c_str();
+        operations[i].gpu_data = op_dict["gpu_data"].cast<torch::Tensor>().data_ptr();
+        operations[i].size = op_dict["size"].cast<size_t>();
+        operations[i].file_offset = op_dict["file_offset"].cast<size_t>();
+        operations[i].result = &results[i];
+    }
+    
+    int batch_id = manager.batch_write(operations.data(), batch_size);
+    
+    py::list result_list;
+    result_list.append(batch_id);
+    for (size_t i = 0; i < batch_size; ++i) {
+        result_list.append(results[i]);
+    }
+    
+    return result_list;
+}
+
+py::list gds_batch_read_binding(GDSManager& manager, 
+                                py::list operations_list) {
+    size_t batch_size = operations_list.size();
+    std::vector<BatchReadOp> operations(batch_size);
+    std::vector<ssize_t> results(batch_size);
+    
+    for (size_t i = 0; i < batch_size; ++i) {
+        py::dict op_dict = operations_list[i].cast<py::dict>();
+        operations[i].filename = op_dict["filename"].cast<std::string>().c_str();
+        operations[i].gpu_buffer = op_dict["gpu_buffer"].cast<torch::Tensor>().data_ptr();
+        operations[i].size = op_dict["size"].cast<size_t>();
+        operations[i].file_offset = op_dict["file_offset"].cast<size_t>();
+        operations[i].result = &results[i];
+    }
+    
+    int batch_id = manager.batch_read(operations.data(), batch_size);
+    
+    py::list result_list;
+    result_list.append(batch_id);
+    for (size_t i = 0; i < batch_size; ++i) {
+        result_list.append(results[i]);
+    }
+    
+    return result_list;
+}
+
+ssize_t gds_write_binding(GDSManager& manager, 
+                         const std::string& filename,
+                         torch::Tensor gpu_data,
+                         size_t file_offset = 0) {
+    return manager.write(filename.c_str(), gpu_data.data_ptr(), 
+                        gpu_data.numel() * gpu_data.element_size(), file_offset);
+}
+
+ssize_t gds_read_binding(GDSManager& manager,
+                        const std::string& filename, 
+                        torch::Tensor gpu_buffer,
+                        size_t file_offset = 0) {
+    return manager.read(filename.c_str(), gpu_buffer.data_ptr(),
+                       gpu_buffer.numel() * gpu_buffer.element_size(), file_offset);
+}
+
+ssize_t gds_write_async_binding(GDSManager& manager,
+                               const std::string& filename,
+                               torch::Tensor gpu_data,
+                               size_t file_offset = 0) {
+    return manager.write_async(filename.c_str(), gpu_data.data_ptr(),
+                              gpu_data.numel() * gpu_data.element_size(), file_offset);
+}
+
+ssize_t gds_read_async_binding(GDSManager& manager,
+                              const std::string& filename,
+                              torch::Tensor gpu_buffer, 
+                              size_t file_offset = 0) {
+    return manager.read_async(filename.c_str(), gpu_buffer.data_ptr(),
+                             gpu_buffer.numel() * gpu_buffer.element_size(), file_offset);
+}
+
+// Helper function to create and initialize a GDS file with specified size
+bool create_gds_file_binding(GDSManager& manager, 
+                             const std::string& filename, 
+                             size_t file_size) {
+    // First create/truncate the file to the desired size
+    int fd = open(filename.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0) {
+        return false;
+    }
+    
+    // Pre-allocate the file to the specified size
+    if (ftruncate(fd, file_size) != 0) {
+        close(fd);
+        return false;
+    }
+    
+    // Ensure data is written to disk
+    fsync(fd);
+    close(fd);
+    
+    // Now add the file to GDS manager (this will open it with O_DIRECT and register with cuFile)
+    return manager.add_file(filename.c_str());
+}
+
 PYBIND11_MODULE(c_ext, m) {
   m.def("transfer_kv_blocks", &transfer_kv_blocks_binding,
         "Transfer multi-layer KV-cache between CPU and GPU");
@@ -133,6 +284,14 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("num_remote_blocks_per_file"), py::arg("use_mmap") = false,
         py::arg("num_threads_per_file") = 16, py::arg("is_mla") = false);
 #endif
+  m.def("transfer_kv_blocks_gds", &transfer_kv_blocks_gds_binding,
+        "Transfer KV blocks between GPU and GDS storage", py::arg("gds_manager"),
+        py::arg("gds_filepaths"), py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
+        py::arg("gds_block_ids"), py::arg("gpu_block_ids"),
+        py::arg("gpu_kv_stride_in_bytes"), py::arg("gds_layer_stride_in_bytes"),
+        py::arg("gds_block_stride_in_bytes"), py::arg("gds_kv_stride_in_bytes"),
+        py::arg("block_size_in_bytes"), py::arg("num_blocks_per_file"), py::arg("total_layers"), 
+        py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false);
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
@@ -154,6 +313,19 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_chunk_size_in_bytes"), py::arg("transfer_sms"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"),
+           py::arg("is_mla"));
+
+  py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")
+      .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
+                    const std::vector<std::string> &, int>())
+      .def("tp_group_transfer",
+           &flexkv::TPGDSTransferThreadGroup::tp_group_transfer,
+           py::arg("gpu_block_id_tensor"), py::arg("gds_block_id_tensor"),
+           py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
+           py::arg("gpu_chunk_size_in_bytes"), py::arg("gds_layer_stride_in_bytes"),
+           py::arg("gds_kv_stride_in_bytes"), py::arg("gds_block_stride_in_bytes"),
+           py::arg("gds_chunk_size_in_bytes"), py::arg("num_blocks_per_file"),
+           py::arg("is_read"), py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"));
 
   // Add Hasher class binding
@@ -226,4 +398,44 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readonly("num_ready_matched_blocks", &flexkv::CMatchResult::num_ready_matched_blocks)
       .def_readonly("num_matched_blocks", &flexkv::CMatchResult::num_matched_blocks)
       .def_readonly("last_node_matched_length", &flexkv::CMatchResult::last_node_matched_length);
+  // Add GDS Manager class binding
+  py::class_<GDSManager>(m, "GDSManager")
+      .def(py::init<const std::vector<std::string>&>(),
+           "Initialize GDS Manager with file list", py::arg("filenames"))
+      .def(py::init<>(), "Initialize GDS Manager without files")
+      .def("is_ready", &GDSManager::is_ready,
+           "Check if GDS manager is ready for operations")
+      .def("get_last_error", &GDSManager::get_last_error,
+           "Get the last error message")
+      .def("add_file", &GDSManager::add_file,
+           "Add and register a file with GDS (creates with O_DIRECT)", py::arg("filename"))
+      .def("remove_file", &GDSManager::remove_file,
+           "Remove and unregister a file from GDS", py::arg("filename"))
+      .def("write", &gds_write_binding,
+           "Write data from GPU memory to file", 
+           py::arg("filename"), py::arg("gpu_data"), py::arg("file_offset") = 0)
+      .def("read", &gds_read_binding,
+           "Read data from file to GPU memory",
+           py::arg("filename"), py::arg("gpu_buffer"), py::arg("file_offset") = 0)
+      .def("write_async", &gds_write_async_binding,
+           "Write data from GPU memory to file asynchronously",
+           py::arg("filename"), py::arg("gpu_data"), py::arg("file_offset") = 0)
+      .def("read_async", &gds_read_async_binding,
+           "Read data from file to GPU memory asynchronously",
+           py::arg("filename"), py::arg("gpu_buffer"), py::arg("file_offset") = 0)
+      .def("batch_write", &gds_batch_write_binding,
+           "Batch write operations", py::arg("operations"))
+      .def("batch_read", &gds_batch_read_binding,
+           "Batch read operations", py::arg("operations"))
+      .def("batch_synchronize", &GDSManager::batch_synchronize,
+           "Wait for batch operations to complete", py::arg("batch_id"))
+      .def("synchronize", &GDSManager::synchronize,
+           "Synchronize all internal CUDA streams")
+      .def("get_file_count", &GDSManager::get_file_count,
+           "Get number of files currently managed")
+             .def("get_managed_files", &GDSManager::get_managed_files,
+            "Get list of all managed files")
+       .def("create_gds_file", &create_gds_file_binding,
+            "Create and register a GDS file with specified size", 
+            py::arg("filename"), py::arg("file_size"));
 }

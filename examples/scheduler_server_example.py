@@ -51,7 +51,6 @@ def run_tp_client_process(dp_client_id, tp_rank, device_id, server_recv_port, mo
         # Keep TP client running
         while True:
             time.sleep(1)
-
     except Exception as e:
         print(f"TP client {tp_rank} error: {e}")
         import traceback
@@ -83,7 +82,7 @@ def main():
         enable_cpu=True,
         enable_ssd=False,
         enable_remote=False,
-        use_gds=False,
+        enable_gds=False,
         tokens_per_block=tokens_per_block,
         num_cpu_blocks=num_cpu_blocks,
     )
@@ -122,7 +121,6 @@ def main():
         if device_id >= available_gpus:
             device_id = device_id % available_gpus
             print(f"Warning: Using GPU {device_id} for TP rank {tp_rank} (not enough GPUs)")
-
         tp_client_process = Process(
             target=run_tp_client_process,
             args=(0, tp_rank, device_id, scheduler_server.get_server_port(), model_config, gpu_kv_layout),
@@ -140,13 +138,11 @@ def main():
     # Example: Create some test data (following benchmark_kvmanager.py pattern)
     batch_size = 4
     seq_len = 128
-
     print("\n=== Generating test data ===")
     # Generate separate sequences for each request (correct approach)
     batch_token_ids = []
     batch_slot_mappings = []
     batch_token_masks = []
-
     for i in range(batch_size):
         # Each sequence is independent (seq_len,) shape
         token_ids = torch.randint(0, 1000, (seq_len,))
@@ -172,7 +168,6 @@ def main():
         if task_id:
             put_task_ids.append(task_id)
             print(f"PUT task {task_id} created for sequence {i}")
-
     put_time = (time.time() - start_time) * 1000
     print(f"Created {len(put_task_ids)} PUT tasks, time: {put_time:.2f}ms")
     time.sleep(2)
@@ -201,7 +196,6 @@ def main():
         masks = scheduler_server.wait(all_task_ids)
         wait_time = (time.time() - start_time) * 1000
         print(f"All {len(all_task_ids)} tasks completed, time: {wait_time:.2f}ms")
-
         # Analyze results
         if masks:
             total_tokens = 0
@@ -210,7 +204,6 @@ def main():
                     tokens = mask.sum().item() if hasattr(mask, 'sum') else len(mask)
                     total_tokens += tokens
                     print(f"Task {task_id}: {tokens} tokens processed")
-
     print("\n=== Trying Non-blocking Wait ===")
     # Create a few more tasks and try non-blocking wait
     extra_task_ids = []
@@ -222,7 +215,6 @@ def main():
         )
         if task_id:
             extra_task_ids.append(task_id)
-
     if extra_task_ids:
         # Immediately try to wait (might not be completed yet)
         masks = scheduler_server.try_wait(extra_task_ids)
@@ -240,7 +232,6 @@ def main():
     print("\n=== Shutting down SchedulerServer ===")
     scheduler_server.shutdown()
     print("SchedulerServer has been shut down")
-
     # Terminate TP client processes
     print("Terminating TP client processes...")
     for i, process in enumerate(tp_client_processes):
