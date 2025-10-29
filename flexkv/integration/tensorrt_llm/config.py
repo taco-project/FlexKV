@@ -61,9 +61,24 @@ class FlexKVConfig:
         config: ExecutorConfig,
     ):
         self.block_size = config.tokens_per_block
-        self.dtype = config.pytorch_backend_config.kv_cache_dtype
-        if self.dtype == "auto":  # TODO: fix this
+        # Convert dtype string to torch.dtype
+        dtype_str = config.pytorch_backend_config.kv_cache_dtype
+        if dtype_str == "auto":
             self.dtype = torch.bfloat16
+        elif isinstance(dtype_str, str):
+            # Convert string to torch.dtype
+            dtype_map = {
+                "float16": torch.float16,
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+                "fp16": torch.float16,
+                "fp32": torch.float32,
+                "bf16": torch.bfloat16,
+            }
+            self.dtype = dtype_map.get(dtype_str, torch.bfloat16)
+        else:
+            self.dtype = dtype_str
+            
         self.tp_size, self.dp_size, self.dp_rank = get_dp_tp_info(config)
         
         model_path = os.getenv('MODEL_PATH', None)
