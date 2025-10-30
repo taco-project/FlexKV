@@ -98,7 +98,7 @@ class FlexKVConfig:
                 self.num_kv_heads = 1
             else:
                 self.head_size = hf_config.hidden_size // hf_config.num_key_value_heads // self.tp_size
-                self.num_kv_heads = hf_config.num_attention_heads
+                self.num_kv_heads = hf_config.num_key_value_heads
             
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
