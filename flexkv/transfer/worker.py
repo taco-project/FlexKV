@@ -305,7 +305,14 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
 
-        self.gpu_block_type_ = 1 if gpu_kv_layout.type == KVCacheLayoutType.BLOCKWISE else 0
+        if len(self.gpu_blocks) == 1:
+            self.gpu_block_type_ = 1
+        elif len(self.gpu_blocks) == self.num_layers:
+            self.gpu_block_type_ = 0
+        elif len(self.gpu_blocks) == self.num_layers * 2:
+            self.gpu_block_type_ = 2
+        else:
+            raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
         # set GPU device
         if gpu_device_id != -1:
             torch.cuda.set_device(gpu_device_id)
@@ -314,6 +321,18 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.transfer_sms_d2h = transfer_sms_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
+
+        print(f"GPU block type: {self.gpu_block_type_}")
+        print(f"GPU blocks pointers: {self.gpu_blocks_ptrs}")
+        print(f"GPU tensor pointers: {self.gpu_tensor_ptrs}")
+        print(f"chunk size: {self.chunk_size_in_bytes}")
+        print(f"gpu kv stride: {self.gpu_kv_stride_in_bytes}")
+        print(f"gpu block stride: {self.gpu_block_stride_in_bytes}")
+        print(f"gpu layer stride: {self.gpu_layer_stride_in_bytes}")
+        print(f"cpu layer stride: {self.cpu_layer_stride_in_bytes}")
+        print(f"cpu kv stride: {self.cpu_kv_stride_in_bytes}")
+        print(f"cpu block stride: {self.cpu_block_stride_in_bytes}")
+        print(f"num layers: {self.num_layers}")
 
     def _transfer_impl(
         self,

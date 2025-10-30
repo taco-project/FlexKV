@@ -7,7 +7,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include <pybind11/pybind11.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -44,12 +44,54 @@ void transfer_kv_blocks_binding(
   void *cpu_ptr = static_cast<void *>(cpu_tensor.data_ptr());
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  flexkv::transfer_kv_blocks(
-      num_blocks, start_layer_id, num_layers, gpu_block_ids, gpu_tensor_ptrs,
-      gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes, gpu_layer_stride_in_bytes, 0, cpu_block_ids, cpu_ptr,
-      cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
-      cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
-      is_host_to_device, use_ce_transfer, is_mla, gpu_block_type);
+  
+  // Determine backend type from gpu_block_type parameter
+  flexkv::BackendType backend_type;
+  if (gpu_block_type == 0) {
+    backend_type = flexkv::BackendType::VLLM;
+  } else if (gpu_block_type == 1) {
+    backend_type = flexkv::BackendType::TRTLLM;
+  } else if (gpu_block_type == 2) {
+    backend_type = flexkv::BackendType::SGLANG;
+  } else {
+    throw std::runtime_error("Unsupported gpu_block_type: " + std::to_string(gpu_block_type));
+  }
+  
+  // Create GTensorHandler
+  flexkv::GTensorHandler handler(
+      backend_type,
+      reinterpret_cast<int64_t**>(gpu_tensor_ptrs),
+      num_layers,
+      gpu_kv_stride_in_bytes,
+      gpu_block_stride_in_bytes,
+      gpu_layer_stride_in_bytes
+  );
+  
+  // Dispatch to appropriate template instantiation
+  switch (backend_type) {
+    case flexkv::BackendType::VLLM:
+      flexkv::transfer_kv_blocks<flexkv::BackendType::VLLM>(
+          num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
+          cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+          cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
+          is_host_to_device, use_ce_transfer, is_mla);
+      break;
+    case flexkv::BackendType::TRTLLM:
+      flexkv::transfer_kv_blocks<flexkv::BackendType::TRTLLM>(
+          num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
+          cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+          cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
+          is_host_to_device, use_ce_transfer, is_mla);
+      break;
+    case flexkv::BackendType::SGLANG:
+      flexkv::transfer_kv_blocks<flexkv::BackendType::SGLANG>(
+          num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
+          cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+          cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
+          is_host_to_device, use_ce_transfer, is_mla);
+      break;
+  }
+  
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(cudaGetErrorString(err));
@@ -311,7 +353,11 @@ PYBIND11_MODULE(c_ext, m) {
 
   py::class_<flexkv::TPTransferThreadGroup>(m, "TPTransferThreadGroup")
       .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
-                    torch::Tensor &, int, int, torch::Tensor &, torch::Tensor &, torch::Tensor &, torch::Tensor &>())
+                    torch::Tensor &, int, int, torch::Tensor &, torch::Tensor &, torch::Tensor &, torch::Tensor &>(),
+           py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("cpu_blocks"),
+           py::arg("dp_group_id"), py::arg("num_layers"),
+           py::arg("gpu_kv_strides_tensor"), py::arg("gpu_block_strides_tensor"),
+           py::arg("gpu_layer_strides_tensor"), py::arg("gpu_chunk_sizes_tensor"))
       .def("tp_group_transfer",
            &flexkv::TPTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),

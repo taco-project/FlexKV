@@ -53,25 +53,35 @@ TPTransferThreadGroup::TPTransferThreadGroup(
   cvs_    = std::vector<std::condition_variable>(num_gpus_);
 
   num_tensors_per_gpu_ = gpu_blocks[0].size();
-  if (num_tensors_per_gpu_ == 1) {
-    gpu_block_type_ = 1;//GPUBlockType::TRTLLM;
-  } else if (num_tensors_per_gpu_ == num_layers) {
-    // note sglang + mla may also satisfy this case, but we don't support it yet
-    // SGlang need to be supported later
-    gpu_block_type_ = 0; //GPUBlockType::VLLM; 
-  } else if (num_tensors_per_gpu_ == num_layers * 2) {
-    gpu_block_type_ = 2; //GPUBlockType::SGLANG;
-  } else {
-    gpu_block_type_ = 3; //GPUBlockType::UNKNOWN;
-    throw std::runtime_error("Unsupported GPU block type: " + std::to_string(num_tensors_per_gpu_));
-  }
-
   cudaMallocHost((void **)&gpu_blocks_,
                  num_gpus_ * num_tensors_per_gpu_ * sizeof(void *));
   for (int i = 0; i < num_gpus_; ++i) {
     for (int j = 0; j < num_tensors_per_gpu_; ++j) {
       gpu_blocks_[i * num_tensors_per_gpu_ + j] = gpu_blocks[i][j].data_ptr();
     }
+  }
+
+  if (num_tensors_per_gpu_ == 1) {
+    backend_type_ = BackendType::TRTLLM;
+  } else if (num_tensors_per_gpu_ == num_layers) {
+    backend_type_ = BackendType::VLLM;
+  } else if (num_tensors_per_gpu_ == num_layers * 2) {
+    backend_type_ = BackendType::SGLANG;
+  } else {
+    throw std::runtime_error("Unsupported GPU block type: " + std::to_string(num_tensors_per_gpu_));
+  }
+
+  gpu_tensor_handlers_.reserve(num_gpus_);
+  for (int i = 0; i < num_gpus_; i++) {
+    int64_t **gpu_blocks_ptr = reinterpret_cast<int64_t**>(gpu_blocks_ + i * num_tensors_per_gpu_);
+    gpu_tensor_handlers_.emplace_back(
+        backend_type_,
+        gpu_blocks_ptr,
+        num_layers,
+        gpu_kv_strides_in_bytes_[i],
+        gpu_block_strides_in_bytes_[i],
+        gpu_layer_strides_in_bytes_[i]
+    );
   }
 
   cpu_blocks_ = cpu_blocks.data_ptr();
@@ -113,8 +123,10 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
 
   cudaFreeHost(gpu_blocks_);
   
+  gpu_tensor_handlers_.clear();
   delete[] gpu_kv_strides_in_bytes_;
   delete[] gpu_block_strides_in_bytes_;
+  delete[] gpu_layer_strides_in_bytes_;
   delete[] gpu_chunk_sizes_in_bytes_;
 }
 
@@ -158,8 +170,6 @@ void TPTransferThreadGroup::tp_group_transfer(
             static_cast<int64_t *>(gpu_block_id_tensor.data_ptr());
         int64_t *cpu_block_ids =
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
-        void **gpu_tensor_ptrs =
-            static_cast<void **>(gpu_blocks_ + i * num_tensors_per_gpu_);
         void *cpu_ptr = cpu_blocks_;
         int64_t cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i];
         if (is_mla && !is_host_to_device) {
@@ -174,17 +184,39 @@ void TPTransferThreadGroup::tp_group_transfer(
         int64_t chunk_size = is_mla && !is_host_to_device ? 
             gpu_chunk_sizes_in_bytes_[i] / num_gpus_ : gpu_chunk_sizes_in_bytes_[i];
       
-        flexkv::transfer_kv_blocks(
-          num_blocks, layer_id, layer_granularity, gpu_block_ids,
-          gpu_tensor_ptrs, gpu_kv_strides_in_bytes_[i], gpu_block_strides_in_bytes_[i],
-          gpu_layer_strides_in_bytes_[i],
-          gpu_startoff_inside_chunks,
-          cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
-          cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-          cpu_startoff_inside_chunks, chunk_size, streams_[i],
-          transfer_sms, is_host_to_device, use_ce_transfer, is_mla,
-          gpu_block_type_
-        );
+        // Dispatch to the appropriate template based on backend type
+        switch (backend_type_) {
+          case BackendType::VLLM:
+            flexkv::transfer_kv_blocks<BackendType::VLLM>(
+              num_blocks, layer_id, layer_granularity, gpu_block_ids,
+              gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
+              cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
+              cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+              cpu_startoff_inside_chunks, chunk_size, streams_[i],
+              transfer_sms, is_host_to_device, use_ce_transfer, is_mla
+            );
+            break;
+          case BackendType::TRTLLM:
+            flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+              num_blocks, layer_id, layer_granularity, gpu_block_ids,
+              gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
+              cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
+              cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+              cpu_startoff_inside_chunks, chunk_size, streams_[i],
+              transfer_sms, is_host_to_device, use_ce_transfer, is_mla
+            );
+            break;
+          case BackendType::SGLANG:
+            flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+              num_blocks, layer_id, layer_granularity, gpu_block_ids,
+              gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
+              cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
+              cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+              cpu_startoff_inside_chunks, chunk_size, streams_[i],
+              transfer_sms, is_host_to_device, use_ce_transfer, is_mla
+            );
+            break;
+        }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
