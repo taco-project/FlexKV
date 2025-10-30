@@ -97,7 +97,7 @@ class FlexKVConfig:
                 self.head_size = hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
                 self.num_kv_heads = 1
             else:
-                self.head_size = hf_config.hidden_size // hf_config.num_attention_heads // 2
+                self.head_size = hf_config.hidden_size // hf_config.num_key_value_heads // self.tp_size
                 self.num_kv_heads = hf_config.num_attention_heads
             
         except Exception as e:
