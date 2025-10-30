@@ -11,6 +11,10 @@ import zmq
 
 from flexkv.common.debug import flexkv_logger
 
+
+class cudaIpcMemHandle_t(ctypes.Structure):
+    _fields_ = [('reserved', ctypes.c_byte * 64)]
+
 # Load CUDA runtime library
 try:
     cudart = ctypes.CDLL('libcudart.so')
@@ -243,7 +247,8 @@ class TensorSharedHandle:
         torch.cuda.set_device(device)
         
         # Create IPC handle buffer
-        ipc_handle = ctypes.create_string_buffer(CUDA_IPC_HANDLE_SIZE)
+        # ipc_handle = ctypes.create_string_buffer(CUDA_IPC_HANDLE_SIZE)
+        ipc_handle = cudaIpcMemHandle_t()
         
         # Call cudaIpcGetMemHandle
         result = cudart.cudaIpcGetMemHandle(
@@ -257,8 +262,9 @@ class TensorSharedHandle:
             raise RuntimeError(error_msg)
         
         # Return handle as bytes
-        handle_bytes = bytes(ipc_handle.raw)
-        flexkv_logger.debug(f"IPC handle exported successfully, first 16 bytes: {handle_bytes[:16].hex()}")
+        # handle_bytes = bytes(ipc_handle.raw)
+        handle_bytes = ctypes.string_at(ctypes.byref(ipc_handle), 64)
+        flexkv_logger.debug(f"IPC handle exported successfully, first 16 bytes: {handle_bytes.hex()}")
         return handle_bytes
     
     @staticmethod
@@ -284,19 +290,24 @@ class TensorSharedHandle:
         
         # Create IPC handle buffer
         ipc_handle_buf = ctypes.create_string_buffer(ipc_handle, CUDA_IPC_HANDLE_SIZE)
+
+        # 重建 IPC handle
+        handle = cudaIpcMemHandle_t()
+        ctypes.memmove(ctypes.byref(handle), ipc_handle, 64)
         
         # Open IPC memory handle
         dev_ptr = ctypes.c_void_p()
         result = cudart.cudaIpcOpenMemHandle(
             ctypes.byref(dev_ptr),
-            ipc_handle_buf,
+            handle,
             ctypes.c_int(1)  # cudaIpcMemLazyEnablePeerAccess = 1
         )
-        
+        flexkv_logger.debug(f"import CUDA IPC handle: device={device}, dev_ptr={hex(dev_ptr.value)}")
         if result != cudaSuccess:
             error_msg = f"cudaIpcOpenMemHandle failed with error code {result} for device {device_id}"
             flexkv_logger.error(error_msg)
-            flexkv_logger.error(f"IPC handle bytes (first 16): {ipc_handle[:16].hex()}")
+            # flexkv_logger.error(f"IPC handle bytes (first 16): {ipc_handle[:16].hex()}")
+            flexkv_logger.error(f"IPC handle bytes (first 16): {ipc_handle.hex()}")
             flexkv_logger.error(f"Current CUDA device: {torch.cuda.current_device()}")
             flexkv_logger.error(f"Target device: {device_id}")
             raise RuntimeError(error_msg)
@@ -305,19 +316,33 @@ class TensorSharedHandle:
         numel = 1
         for dim in shape:
             numel *= dim
-        
-        # Create storage from pointer
-        storage = torch.cuda.UntypedStorage._from_data_ptr(
-            data_ptr=dev_ptr.value,
-            device=device,
-            size_bytes=numel * torch._utils._element_size(dtype)
-        )
-        
-        # Create tensor from storage
-        tensor = torch.tensor([], dtype=dtype, device=device).set_(
-            storage, 0, shape
-        )
-        
+            
+        class CudaArrayInterface:
+            def __init__(self, data_ptr, shape, dtype, strides=None):
+                self.__cuda_array_interface__ = {
+                    "data": (data_ptr, False),  # (data_ptr, read_only)
+                    "shape": tuple(shape),
+                    "typestr": {
+                        torch.float32: "<f4",
+                        torch.float64: "<f8", 
+                        torch.float16: "<f2",
+                        torch.bfloat16: "<e",  # brain float16
+                        torch.int32: "<i4",
+                        torch.int64: "<i8",
+                        torch.int16: "<i2",
+                        torch.uint8: "|u1",
+                        torch.int8: "|i1",
+                        torch.bool: "|b1",
+                    }[dtype],
+                    "version": 3,
+                    "strides": strides,  # None for C-contiguous
+                    "descr": [("", "")]
+                }
+
+        # 使用方式：
+        cuda_interface = CudaArrayInterface(dev_ptr.value, shape, dtype)
+        tensor = torch.as_tensor(cuda_interface, device=device)
+ 
         flexkv_logger.debug(f"Imported tensor with shape {shape} from CUDA IPC handle")
         return tensor
 
