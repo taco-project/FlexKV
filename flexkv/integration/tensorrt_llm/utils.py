@@ -14,8 +14,7 @@ class RequestWrapper:
 
     @property
     def req_id(self):
-        logger.info(f"")
-        return self._request.py_request_id
+        return self._request.request_id
     
     @property
     def all_token_ids(self):
@@ -29,11 +28,12 @@ class RequestWrapper:
 
     @property
     def num_prompt_tokens(self):
-        return self._request.py_prompt_len
+        return self._request.prompt_len
 
     @property
     def num_new_matched_tokens(self):
-        return self._request.num_new_matched_tokens
+        return 0
+        # return self._request.local_prepopulated_prompt_len
 
     def is_finished(self):
         return self._request.is_finished
@@ -46,12 +46,12 @@ class RequestWrapper:
         #     return NORMAL
         # else:
         #     return ABNORMAL
-        return self._request.is_finished_normal()
+        return self._request.is_finished_normal
 
     def __post_init__(self):
-        logger.info(f"{self._request.py_prompt_len=}\n"
-                    f"{self._request.py_request_id=}\n"
-                    f"{self._request.all_token_ids=}\n")
+        logger.info(f"{self.num_prompt_tokens=}\n"
+                    f"{self.req_id=}\n"
+                    f"all_token_ids={self.all_token_ids}\n")
 
 def get_dp_tp_info(config: ExecutorConfig):
     mapping = config.mapping

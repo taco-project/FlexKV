@@ -131,7 +131,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
                             to get the new matched blocks from flexkv.
         """
         request = RequestWrapper(_request)
-        task_id, num_new_matched_tokens = self._get_match(request=request,
+        task_id, num_new_matched_tokens = self._get_match(_request=_request,
                                                           num_computed_tokens=num_computed_tokens)
         
         self.flexkv_stats.record_get(num_prompt_tokens=request.num_prompt_tokens,
@@ -165,7 +165,8 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         
         match_start_time = time.perf_counter()
         num_tokens_to_get = (request.num_prompt_tokens//self.block_size)*self.block_size
-        token_ids = request.all_token_ids[0][:num_tokens_to_get]
+        flexkv_logger.info(f"{request.all_token_ids=}")
+        token_ids = request.all_token_ids[:num_tokens_to_get]
 
         assert num_computed_tokens <= num_tokens_to_get, (
             f"{num_computed_tokens=} must less equal to {num_tokens_to_get=}")
@@ -232,12 +233,12 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             None.
         """
         # TODO 确认 block_ids 是所有的 blockids
+        request = RequestWrapper(_request)
         if request.num_new_matched_tokens == 0:
             return
-        request = RequestWrapper(_request)
-        
+
         # prepare to launch task
-        task_id = self.req_id_to_task_dict[request.request_id]
+        task_id = self.req_id_to_task_dict[request.req_id]
         task: FlexKVGetTask = self.tasks_to_cancel.pop(task_id)
         self.tasks_to_launch[task_id] = task
 
@@ -270,14 +271,14 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         request = RequestWrapper(_request)
         
         # Task not finished, can't free blocks
-        if request.request_id in self.req_id_to_task_dict:
+        if request.req_id in self.req_id_to_task_dict:
             return True
 
         # Abnormal finished, don't put
         if not (request.is_finished() and request.is_finished_normal()):
             return False
 
-        task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(request=request)
+        task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(_request=_request)
 
         self.flexkv_stats.record_put(num_all_tokens=request.num_tokens,
                                      num_unmatched_tokens=num_unmatched_tokens)
@@ -331,7 +332,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         flexkv_logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
 
         if num_unmatched_tokens > 0:
-            self.req_id_to_task_dict[request.request_id] = task_id
+            self.req_id_to_task_dict[request.req_id] = task_id
             self.tasks_to_cancel[task_id] = FlexKVPutTask(task_id=task_id,
                                                         request=request,
                                                         num_matched_tokens=num_matched_tokens,
@@ -473,7 +474,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         metadata = FlexKVConnectorMetadata(
             finished_sending=list(finished_sending),
             finished_recving=list(finished_recving))
-        return metadata.to_bytes()
+        return metadata
     
     @property
     def dp_client_id(self) -> int:
@@ -572,7 +573,6 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             self, finished_gen_req_ids: List[int],
             started_loading_req_ids: List[int]) -> Tuple[List[int], List[int]]:
         
-        # TODO 确认可以不用传入的参数
-        finished_sending = self.metadata.finished_sending
-        finished_recving = self.metadata.finished_recving
+        finished_sending = self._metadata.finished_sending
+        finished_recving = self._metadata.finished_recving
         return finished_sending, finished_recving
