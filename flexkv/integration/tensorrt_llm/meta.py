@@ -48,7 +48,7 @@ class FlexKVTask(ABC):
     
     def __str__(self):
         return (f"FlexKVTask(task_id={self.task_id}, "
-                f"request={self.request.request_id}, "
+                f"request={self.request.req_id}, "
                 f"match_cost {self.match_cost*1000:.2f} ms, "
                 f"task execute cost {self.task_execute_cost*1000:.2f} ms)")
 
@@ -64,7 +64,7 @@ class FlexKVGetTask(FlexKVTask):
     
     def __str__(self):
         return (f"FlexKVGetTask(task_id={self.task_id}, "
-                f"request={self.request.request_id}, "
+                f"request={self.request.req_id}, "
                 f"num_computed_tokens={self.num_computed_tokens}, "
                 f"num_new_matched_tokens={self.num_new_matched_tokens}, "
                 f"match_cost {self.match_cost*1000:.2f} ms, "
@@ -82,7 +82,7 @@ class FlexKVPutTask(FlexKVTask):
     
     def __str__(self):
         return (f"FlexKVPutTask(task_id={self.task_id}, "
-                f"request={self.request.request_id}, "
+                f"request={self.request.req_id}, "
                 f"num_matched_tokens={self.num_matched_tokens}, "
                 f"num_unmatched_tokens={self.num_unmatched_tokens}, "
                 f"match_cost {self.match_cost*1000:.2f} ms, "
