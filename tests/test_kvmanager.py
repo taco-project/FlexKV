@@ -139,6 +139,9 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type,
     # Skip tests based on GPU availability and configuration
     skip_if_insufficient_gpus(tp_size * dp_size)
 
+    if enable_gds and os.environ.get("FLEXKV_GDS_TEST", "0") == "0":
+        pytest.skip("skip because GDS test is not enabled")
+
     if enable_remote:
         pytest.skip("skip because enable_remote is not supported")
 
