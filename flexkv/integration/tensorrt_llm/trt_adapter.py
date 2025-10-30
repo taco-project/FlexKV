@@ -376,7 +376,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         if len(self.tasks_to_cancel) == 0:
             return
         for task in self.tasks_to_cancel.values():
-            del self.req_id_to_task_dict[task.request.request_id]
+            del self.req_id_to_task_dict[task.request.req_id]
             flexkv_logger.info(f"FlexKV Cancel task: {task}")
         self.flexkv_manager.cancel(task_ids=list(self.tasks_to_cancel.keys()))
         self.tasks_to_cancel.clear()
@@ -425,11 +425,11 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             success = (response.status == KVResponseStatus.SUCCESS)
             if task_id in self.get_tasks:
                 task = self.get_tasks.pop(task_id)
-                finished_recving.add(task.request.request_id)
+                finished_recving.add(task.request.req_id)
             else:
                 task = self.put_tasks.pop(task_id)
-                finished_sending.add(task.request.request_id)
-            del self.req_id_to_task_dict[task.request.request_id]
+                finished_sending.add(task.request.req_id)
+            del self.req_id_to_task_dict[task.request.req_id]
             task.task_finished_time = task_finished_time
             if success:
                 flexkv_logger.info(f"{task} finished successfully.")
