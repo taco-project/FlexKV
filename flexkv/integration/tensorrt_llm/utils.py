@@ -32,7 +32,7 @@ class RequestWrapper:
 
     @property
     def num_new_matched_tokens(self):
-        return 0
+        return self._request.num_connector_matched_tokens
         # return self._request.local_prepopulated_prompt_len
 
     def is_finished(self):
