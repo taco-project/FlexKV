@@ -165,6 +165,10 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         
         match_start_time = time.perf_counter()
         num_tokens_to_get = (request.num_prompt_tokens//self.block_size)*self.block_size
+        if num_tokens_to_get == 0:
+            return -1, 0
+
+        flexkv_logger.info(f"{request.num_prompt_tokens=}, {self.block_size=}, {num_tokens_to_get=}")
         flexkv_logger.info(f"{request.all_token_ids=}")
         token_ids = request.all_token_ids[:num_tokens_to_get]
 
