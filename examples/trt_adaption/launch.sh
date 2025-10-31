@@ -1,6 +1,9 @@
 mkdir -p logs
-TIMESTAMP=$(date +%Y%m%d%H%M%S)
+TIMESTAMP=$(date +%Y.%m.%d-%H:%M:%S)
 MODEL_PATH=/cfs_zhongwei/models/deepseek-ai/DeepSeek-V3.1-W4AFP8-MTP
+# MODEL_PATH=/cfs_zhongwei/models/Qwen3-0.6B
+TP_SIZE=8
+EP_SIZE=$TP_SIZE
 
 cat <<EOF > ./flexkv_config.json
 {
@@ -15,15 +18,15 @@ EOF
 
 export FLEXKV_CONFIG_PATH="./flexkv_config.json"
 export MODEL_PATH=$MODEL_PATH
-export CUDA_LAUNCH_BLOCKING=1
+# export CUDA_LAUNCH_BLOCKING=1
 
 
 trtllm-serve serve $MODEL_PATH \
     --host 0.0.0.0 \
     --port 6000 \
     --backend pytorch \
-    --tp_size 8 \
-    --ep_size 8 \
+    --tp_size $TP_SIZE \
+    --ep_size $EP_SIZE \
     --max_seq_len 49152 \
     --max_num_tokens 24576 \
     --max_batch_size 16 \
