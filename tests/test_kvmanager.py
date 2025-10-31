@@ -50,6 +50,11 @@ def run_tp_client(dp_client_id,
             gpu_blocks_for_tp.append(
                 torch.empty(size=tuple(gpu_kv_layout.kv_shape[:]), dtype=model_config.dtype).cuda(device_id)
             )
+        elif gpu_layout_type == 2:
+            for _ in range(model_config.num_layers * 2):
+                gpu_blocks_for_tp.append(
+                    torch.empty(size=tuple(gpu_kv_layout.kv_shape[2:]), dtype=model_config.dtype).cuda(device_id)
+                )
         else:
             raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
         tp_client.register_to_server(gpu_blocks_for_tp, gpu_kv_layout)
@@ -110,6 +115,7 @@ def shutdown_tp_client(tp_client_processes):
 @pytest.mark.parametrize("gpu_layout_type", [
     0,
     1,
+    2,
 ])
 def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type, gpu_layout_type):
     tp_size = model_config.tp_size

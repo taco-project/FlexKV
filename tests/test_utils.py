@@ -119,7 +119,7 @@ def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_
     tp_size = model_config.tp_size
     tokens_per_block = cache_config.tokens_per_block
 
-    if gpu_layout_type == 0:
+    if gpu_layout_type == 0 or gpu_layout_type == 2:
         layout_type = KVCacheLayoutType.LAYERWISE
     elif gpu_layout_type == 1:
         layout_type = KVCacheLayoutType.BLOCKWISE
@@ -518,12 +518,11 @@ class GPUKVCacheVerifier:
             for kv_id in range(kv_num):
                 for tp_id in range(self.tp_size):
                     if self.gpu_layout_type == 0:
-                        if isinstance(self.gpu_blocks[0], list):
-                            # multiple gpu：gpu_blocks[tp_id][layer_id]
-                            gpu_tensor = self.gpu_blocks[tp_id][layer_id]
-                        else:
-                            # single gpu：gpu_blocks[layer_id]
-                            gpu_tensor = self.gpu_blocks[layer_id]
+                        gpu_tensor = self.gpu_blocks[tp_id][layer_id]
+                    elif self.gpu_layout_type == 1:
+                        gpu_tensor = self.gpu_blocks[tp_id][0]
+                    elif self.gpu_layout_type == 2:
+                        gpu_tensor = self.gpu_blocks[tp_id][layer_id + self.num_layers * kv_id]
 
                     for head_id in range(self.gpu_kv_layout.num_head):
                         actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if not self.is_mla else head_id
@@ -542,7 +541,9 @@ class GPUKVCacheVerifier:
                             elif self.gpu_layout_type == 1:
                                 # gpu_layout_type 1: [tp_id][0][num_block, num_layer, kv_dim, tokens_per_block, num_head, head_size]
                                 # Need to get the first (and only) tensor from the list
-                                self.gpu_blocks[tp_id][0][block_id, layer_id, kv_id, :, head_id, :] = hash_value
+                                gpu_tensor[block_id, layer_id, kv_id, :, head_id, :] = hash_value
+                            elif self.gpu_layout_type == 2:
+                                gpu_tensor[block_id, :, head_id, :] = hash_value
                             else:
                                 raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
@@ -562,10 +563,12 @@ class GPUKVCacheVerifier:
             for kv_id in range(kv_num):
                 for tp_id in range(self.tp_size):
                     if self.gpu_layout_type == 0:
-                        if isinstance(self.gpu_blocks[0], list):
-                            gpu_tensor = self.gpu_blocks[tp_id][layer_id]
-                        else:
-                            gpu_tensor = self.gpu_blocks[layer_id]
+                        #if isinstance(self.gpu_blocks[0], list):
+                        gpu_tensor = self.gpu_blocks[tp_id][layer_id]
+                    elif self.gpu_layout_type == 1:
+                        gpu_tensor = self.gpu_blocks[tp_id][0]
+                    elif self.gpu_layout_type == 2:
+                        gpu_tensor = self.gpu_blocks[tp_id][layer_id + self.num_layers * kv_id]
 
                     for head_id in range(self.gpu_kv_layout.num_head):
                         actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if not self.is_mla else head_id
@@ -581,7 +584,9 @@ class GPUKVCacheVerifier:
                             elif self.gpu_layout_type == 1:
                                 # gpu_layout_type 1: [tp_id][0][num_block, num_layer, kv_dim, tokens_per_block, num_head, head_size]
                                 # Need to get the first (and only) tensor from the list
-                                actual_values = self.gpu_blocks[tp_id][0][block_id, layer_id, kv_id, :, head_id, :]
+                                actual_values = gpu_tensor[block_id, layer_id, kv_id, :, head_id, :]
+                            elif self.gpu_layout_type == 2:
+                                actual_values = gpu_tensor[block_id, :, head_id, :]
                             else:
                                 raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
