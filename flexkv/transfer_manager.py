@@ -317,17 +317,6 @@ class TransferManagerOnRemote(TransferManager):
     def __del__(self) -> None:
         if not self._shutdown_flag:
             self.shutdown()
-
-    # @classmethod
-    # def create_process(cls, **kwargs: Any) -> Process:
-    #     def _run():
-    #         instance = cls(**kwargs)
-    #         instance.start()
-    #         if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
-    #             instance._worker_thread.join()  # block until worker thread exits
-    #     process = Process(target=_run, daemon=False)
-    #     process.start()
-    #     return process
     
     @classmethod
     def create_process(cls, **kwargs: Any) -> Process:
@@ -349,18 +338,12 @@ class TransferManagerOnRemote(TransferManager):
         
         # Prepare environment - remove MPI-related variables to avoid conflicts
         env = os.environ.copy()
-        mpi_vars = [k for k in env.keys() if any(prefix in k for prefix in ['MPI', 'OMPI', 'PMI', 'UCX'])]
-        for var in mpi_vars:
-            env.pop(var, None)
-        env['MPI4PY_RC_INITIALIZE'] = 'false'
-        env['PYTHONUNBUFFERED'] = '1'  # Ensure output is unbuffered
-        
         # CRITICAL: Remove CUDA_VISIBLE_DEVICES to allow access to all GPUs
         # TransferManager needs to access all physical GPUs for IPC
         if 'CUDA_VISIBLE_DEVICES' in env:
             flexkv_logger.info(f"Removing CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} for TransferManager subprocess")
             env.pop('CUDA_VISIBLE_DEVICES', None)
-        
+
         # Create the subprocess script
         transfer_manager_script = textwrap.dedent(f'''
             import os
@@ -371,9 +354,6 @@ class TransferManagerOnRemote(TransferManager):
             # Immediately disable MPI to avoid conflicts
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
     
-            # Add FlexKV to Python path
-            sys.path.insert(0, "/cfs_zhongwei/rongwei/FlexKV")
-
             try:
                 # Load the class and kwargs
                 with open("{cls_file}", "rb") as f:
