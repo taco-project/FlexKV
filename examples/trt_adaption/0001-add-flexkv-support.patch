@@ -1,0 +1,137 @@
+From c5e4abcc26efaf122b7ab8fb9e2f61d671d2e81f Mon Sep 17 00:00:00 2001
+From: scutizhang <scutizhang@tencent.com>
+Date: Wed, 22 Oct 2025 14:23:31 +0800
+Subject: [PATCH] add flexkv support
+
+---
+ .../tensorrt_llm/batch_manager/llmRequest.h   | 22 +++++++++++++++++++
+ .../batch_manager/kvCacheManager.cpp          |  1 +
+ .../nanobind/batch_manager/bindings.cpp       |  2 ++
+ .../pybind/batch_manager/bindings.cpp         |  2 ++
+ .../_torch/pyexecutor/kv_cache_connector.py   |  6 +++++
+ .../_torch/pyexecutor/py_executor_creator.py  |  1 +
+ 6 files changed, 34 insertions(+)
+
+diff --git a/cpp/include/tensorrt_llm/batch_manager/llmRequest.h b/cpp/include/tensorrt_llm/batch_manager/llmRequest.h
+index f069e3ac7..e74e6a01a 100644
+--- a/cpp/include/tensorrt_llm/batch_manager/llmRequest.h
++++ b/cpp/include/tensorrt_llm/batch_manager/llmRequest.h
+@@ -1054,6 +1054,16 @@ public:
+         return mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
+     }
+ 
++    [[nodiscard]] SizeType32 getNumConnectorMatchedTokens() const
++    {
++        return mNumConnectorMatchedTokens;
++    }
++
++    void setNumConnectorMatchedTokens(SizeType32 numConnectorMatchedTokens)
++    {
++        mNumConnectorMatchedTokens = numConnectorMatchedTokens;
++    }
++
+     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
+     {
+         // Add debug log for prepopulatedPromptLen
+@@ -1658,6 +1668,15 @@ public:
+             [](auto reason) { return reason == executor::FinishReason::kLENGTH; });
+     }
+ 
++    [[nodiscard]] bool isFinishedNormal() const noexcept
++    {
++        return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
++            [](auto reason) { 
++                return  reason == executor::FinishReason::kEND_ID || \
++                        reason == executor::FinishReason::kSTOP_WORDS || \
++                        reason == executor::FinishReason::kLENGTH; });
++    }
++
+     [[nodiscard]] bool isTimedOut() const
+     {
+         if (!mAllottedTimeMs.has_value())
+@@ -1906,6 +1925,9 @@ protected:
+     SizeType32 mPrepopulatedPromptLenTarget{0};
+     SizeType32 mPrepopulatedPromptLenDraft{0};
+ 
++    // Number of tokens matched by KV cache connector for block reuse.
++    SizeType32 mNumConnectorMatchedTokens{0};
++
+     SizeType32 mMaxSentTokenLen;
+ 
+     std::optional<TensorPtr> mEmbeddingBias{std::nullopt};
+diff --git a/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp b/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp
+index 175b52577..98e1e6b40 100644
+--- a/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp
++++ b/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp
+@@ -1202,6 +1202,7 @@ void WindowBlockManager::addSequence(
+     if (mKvCacheConnectorManager && !llmRequest.isDummyRequest())
+     {
+         numConnectorMatchedTokens = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
++        llmRequest.setNumConnectorMatchedTokens(numConnectorMatchedTokens);
+     }
+ 
+     llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen + numConnectorMatchedTokens, getTokensPerBlock());
+diff --git a/cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp b/cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp
+index c170ca810..7fd5d5afe 100644
+--- a/cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp
++++ b/cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp
+@@ -159,9 +159,11 @@ void initBindings(nb::module_& m)
+         .def("set_finished_reason", &GenLlmReq::setFinishedReason, nb::arg("finish_reason"), nb::arg("beam"))
+         .def_prop_ro("is_finished", &GenLlmReq::isFinished)
+         .def_prop_ro("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
++        .def_prop_ro("is_finished_normal", &GenLlmReq::isFinishedNormal)
+         .def_prop_rw(
+             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
+         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
++        .def_prop_ro("num_connector_matched_tokens", &GenLlmReq::getNumConnectorMatchedTokens)
+         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
+         .def_prop_ro("context_phase_params", &GenLlmReq::getContextPhaseParams)
+         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
+diff --git a/cpp/tensorrt_llm/pybind/batch_manager/bindings.cpp b/cpp/tensorrt_llm/pybind/batch_manager/bindings.cpp
+index 53c9ec7ef..c4be230d2 100644
+--- a/cpp/tensorrt_llm/pybind/batch_manager/bindings.cpp
++++ b/cpp/tensorrt_llm/pybind/batch_manager/bindings.cpp
+@@ -164,9 +164,11 @@ void initBindings(pybind11::module_& m)
+         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
+         .def_property_readonly("is_finished", &GenLlmReq::isFinished)
+         .def_property_readonly("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
++        .def_property_readonly("is_finished_normal", &GenLlmReq::isFinishedNormal)
+         .def_property(
+             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
+         .def_property_readonly("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
++        .def_property_readonly("num_connector_matched_tokens", &GenLlmReq::getNumConnectorMatchedTokens)
+         .def_property(
+             "guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
+         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
+diff --git a/tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py b/tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py
+index 5e8bf6dfa..ec22d269e 100644
+--- a/tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py
++++ b/tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py
+@@ -392,6 +392,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
+ 
+     def get_num_new_matched_tokens(self, request: LlmRequest,
+                                    num_computed_tokens: int) -> int:
++        """ Called in C++:  KVCacheManager::addSequence
++        if (mKvCacheConnectorManager && !llmRequest.isDummyRequest())
++        {
++            numConnectorMatchedTokens = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
++        }
++        """
+         num_tokens, load_kv_async = self._run_on_leader(
+             lambda: self.scheduler.get_num_new_matched_tokens(
+                 request, num_computed_tokens))
+diff --git a/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py b/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
+index e824ee02d..753a476bb 100644
+--- a/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
++++ b/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
+@@ -202,6 +202,7 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
+                           tp_size=tensorrt_llm.mpi_world_size(),
+                           gpus_per_node=tensorrt_llm.default_gpus_per_node(),
+                           rank=tensorrt_llm.mpi_rank())
++        executor_config.mapping = mapping
+     else:
+         mapping = copy.deepcopy(executor_config.mapping)
+         mapping.rank = tensorrt_llm.mpi_rank()
+-- 
+2.43.0
+
