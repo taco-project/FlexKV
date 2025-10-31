@@ -94,7 +94,7 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
                         "enable_cpu": true,
                         "enable_ssd": false,
                         "enable_remote": false,
-                        "use_gds": false,
+                        "enable_gds": false,
                         "enable_trace": false,
                         "ssd_cache_iouring_entries": 512,
                         "tokens_per_block": 64,
