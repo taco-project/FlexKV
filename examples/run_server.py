@@ -81,7 +81,7 @@ if __name__ == "__main__":
         enable_cpu=args.enable_cpu,
         enable_ssd=args.enable_ssd,
         enable_remote=args.enable_remote,
-        use_gds=False,
+        enable_gds=False,
         enable_trace=False,
         ssd_cache_iouring_entries=512,
         tokens_per_block=args.block_size,
