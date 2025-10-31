@@ -49,9 +49,9 @@ class RequestWrapper:
         return self._request.is_finished_normal
 
     def __post_init__(self):
-        logger.info(f"{self.num_prompt_tokens=}\n"
-                    f"{self.req_id=}\n"
-                    f"all_token_ids={self.all_token_ids}\n")
+        logger.debug(f"{self.num_prompt_tokens=}, "
+                    f"{self.req_id=}, "
+                    f"all_token_ids={self.all_token_ids}")
 
 def get_dp_tp_info(config: ExecutorConfig):
     mapping = config.mapping
