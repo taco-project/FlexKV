@@ -130,6 +130,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
                             number of new matched tokens and whether it is necessary
                             to get the new matched blocks from flexkv.
         """
+        # todo: need to analyze why sometimes not aligned in tensorrt-llm
+        if num_computed_tokens % self.block_size != 0:
+            num_computed_tokens = (num_computed_tokens // self.block_size) * self.block_size
         request = RequestWrapper(_request)
         task_id, num_new_matched_tokens = self._get_match(_request=_request,
                                                           num_computed_tokens=num_computed_tokens)
