@@ -1,4 +1,4 @@
-From c5e4abcc26efaf122b7ab8fb9e2f61d671d2e81f Mon Sep 17 00:00:00 2001
+From 84774f3d66115a3b2c6055815333388ba8fa836b Mon Sep 17 00:00:00 2001
 From: scutizhang <scutizhang@tencent.com>
 Date: Wed, 22 Oct 2025 14:23:31 +0800
 Subject: [PATCH] add flexkv support
@@ -9,8 +9,9 @@ Subject: [PATCH] add flexkv support
  .../nanobind/batch_manager/bindings.cpp       |  2 ++
  .../pybind/batch_manager/bindings.cpp         |  2 ++
  .../_torch/pyexecutor/kv_cache_connector.py   |  6 +++++
+ tensorrt_llm/_torch/pyexecutor/py_executor.py |  8 +++++++
  .../_torch/pyexecutor/py_executor_creator.py  |  1 +
- 6 files changed, 34 insertions(+)
+ 7 files changed, 42 insertions(+)
 
 diff --git a/cpp/include/tensorrt_llm/batch_manager/llmRequest.h b/cpp/include/tensorrt_llm/batch_manager/llmRequest.h
 index f069e3ac7..e74e6a01a 100644
@@ -120,6 +121,32 @@ index 5e8bf6dfa..ec22d269e 100644
          num_tokens, load_kv_async = self._run_on_leader(
              lambda: self.scheduler.get_num_new_matched_tokens(
                  request, num_computed_tokens))
+diff --git a/tensorrt_llm/_torch/pyexecutor/py_executor.py b/tensorrt_llm/_torch/pyexecutor/py_executor.py
+index 4b3315560..80a0a056e 100644
+--- a/tensorrt_llm/_torch/pyexecutor/py_executor.py
++++ b/tensorrt_llm/_torch/pyexecutor/py_executor.py
+@@ -282,6 +282,8 @@ class PyExecutor:
+         if start_worker:
+             self.start_worker()
+ 
++        self._wait_for_flexkv_manager()
++
+     def _maybe_init_kv_connector_manager(self):
+         if self.kv_connector_manager is not None:
+             if self.kv_cache_transceiver is not None:
+@@ -309,6 +311,12 @@ class PyExecutor:
+                         self.kv_connector_manager.layer_pre_hook)
+                     module.register_forward_hook(
+                         self.kv_connector_manager.layer_post_hook)
++    
++    def _wait_for_flexkv_manager(self):
++        if self.kv_connector_manager is not None and self.dist.rank == 0:
++            while not self.kv_connector_manager.scheduler.is_ready():
++                time.sleep(0.1)
++            logger.info("FlexKV manager is ready")
+ 
+     def _event_loop_wrapper(self):
+         try:
 diff --git a/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py b/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
 index e824ee02d..753a476bb 100644
 --- a/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
