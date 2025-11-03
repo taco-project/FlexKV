@@ -1,0 +1,14 @@
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+enable_chunked_prefill: true
+kv_connector_config:
+  connector_module: "flexkv.integration.tensorrt_llm.trt_adapter"
+  connector_scheduler_class: "FlexKVSchedulerConnector"
+  connector_worker_class: "FlexKVWorkerConnector"

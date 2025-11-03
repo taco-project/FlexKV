@@ -1,8 +1,18 @@
 {
+    "enable_flexkv": true,
     "server_recv_port": "ipc:///tmp/flexkv_test",
     "cache_config": {
-          "enable_cpu": true,
-          "num_cpu_blocks": 10240
+        "enable_cpu": true,
+        "enable_ssd": true,
+        "enable_remote": false,
+        "use_gds": false,
+        "enable_trace": false,
+        "ssd_cache_iouring_entries": 512,
+        "num_cpu_blocks": 233000,
+        "num_ssd_blocks": 4096000,
+        "ssd_cache_dir": "/data/flexkv_ssd/",
+        "evict_ratio": 0.05,
+        "index_accel": true
     },
-    "num_log_interval_requests": 200
+    "num_log_interval_requests": 2000
 }
