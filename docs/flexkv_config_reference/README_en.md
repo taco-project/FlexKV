@@ -105,7 +105,7 @@ The FlexKV configuration file is a JSON file, primarily consisting of three part
 | `max_blocks_per_file` | int | 32000 | Maximum number of blocks per SSD file. `-1` means unlimited. |
 | `ssd_cache_dir` | str \| List[str] | None | **Required.** Path to SSD cache directory, e.g., `"/data/flexkv_ssd/"`. |
 | `ssd_cache_iouring_entries` | int | 0 | io_uring queue depth. Recommended: `512` for significantly improved concurrent I/O performance. |
-| `ssd_cache_iouring_flags` | int | 0 | io_uring flags. Keep as `0` in most cases. |
+| `ssd_cache_iouring_flags` | int | 0 | io_uring flags. Recommended: `1`.|
 
 > Note: To maximize bandwidth across multiple SSDs, bind each SSD to a separate directory and specify them as a list:  
 > `"ssd_cache_dir": ["/data0/flexkv_ssd/", "/data1/flexkv_ssd/"]`.  

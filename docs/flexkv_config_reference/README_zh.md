@@ -105,7 +105,7 @@ FlexKV 的配置文件是一个 JSON 文件，主要包含三个部分：
 | `max_blocks_per_file` | int | 32000 | 单个 SSD 文件最多包含的 block 数。-1 表示无限制 |
 | `ssd_cache_dir` | str \| List[str] | None | SSD 缓存目录路径，**必须设置**，如 `"/data/flexkv_ssd/"` |
 | `ssd_cache_iouring_entries` | int | 0 | io_uring 队列深度，推荐设为 `512` 以提升并发 IO 性能，实测比不使用iouring提升较大，推荐使用512 |
-| `ssd_cache_iouring_flags` | int | 0 | io_uring 标志位，一般保持 0 |
+| `ssd_cache_iouring_flags` | int | 1 | io_uring 标志位，推荐设置为 1。|
 
 > 注：为了充分利用多块SSD的带宽上限，可以将多块SSD绑定至不同目录，并使用如 `"ssd cache dir": ["/data0/flexkv_ssd/", "/data1/flexkv_ssd/"]`方式初始化，SSD KVCache会均匀分布在所有SSD中，充分利用多个SSD带宽。
 

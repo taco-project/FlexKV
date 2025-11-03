@@ -39,7 +39,8 @@ DEFAULT_CACHE_CONFIG = {
     'enable_gds': False,
     'enable_trace': False,
     'ssd_cache_dir': ["./ssd_cache", "./ssd_cache2/"],
-    'ssd_cache_iouring_entries': 32,
+    'ssd_cache_iouring_entries': 512,
+    'ssd_cache_iouring_flags': 1,
     'remote_cache_path': ["remote_cache1", "remote_cache2"],
     'remote_config_custom': {
         "pcfs_fsid": "f_l91fz6",
