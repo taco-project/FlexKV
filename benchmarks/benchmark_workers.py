@@ -82,10 +82,16 @@ def create_cpu_gpu_worker(
             num_chunks=model_config.num_layers,
         ))
     finished_ops_queue = mp.Queue()
+    # Create a shared memory buffer for transfer operations
+    # max_op_num=4, max_block_num should be larger than num_blocks_to_transfer
+    max_block_num = max(1024, cache_config.num_cpu_blocks)
+    op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
+    
     if model_config.tp_size == 1:
         worker_handle = GPUCPUTransferWorker.create_worker(
             mp_ctx=mp.get_context('spawn'),
             finished_ops_queue=finished_ops_queue,
+            op_buffer_tensor=op_buffer_tensor,
             gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
             cpu_blocks=cpu_handle.get_tensor(),
             gpu_kv_layout=gpu_handles[0].kv_layout,
@@ -101,6 +107,7 @@ def create_cpu_gpu_worker(
         worker_handle = tpGPUCPUTransferWorker.create_worker(
             mp_ctx=mp.get_context('spawn'),
             finished_ops_queue=finished_ops_queue,
+            op_buffer_tensor=op_buffer_tensor,
             gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
             cpu_blocks=cpu_handle.get_tensor(),
             gpu_kv_layout=gpu_handles[0].kv_layout,
@@ -150,9 +157,15 @@ def create_cpu_ssd_worker(
         cache_dir=cache_config.ssd_cache_dir,
     )
     finished_ops_queue = mp.Queue()
+    # Create a shared memory buffer for transfer operations
+    # max_op_num=4, max_block_num should be larger than num_blocks_to_transfer
+    max_block_num = max(1024, cache_config.num_cpu_blocks)
+    op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
+    
     worker_handle = CPUSSDDiskTransferWorker.create_worker(
                 mp_ctx=mp.get_context('spawn'),
                 finished_ops_queue=finished_ops_queue,
+                op_buffer_tensor=op_buffer_tensor,
                 cpu_blocks=cpu_handle.get_tensor(),
                 ssd_files=ssd_handle.get_file_list(),
                 cpu_kv_layout=cpu_handle.kv_layout,

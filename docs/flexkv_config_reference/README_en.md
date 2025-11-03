@@ -16,7 +16,7 @@ Below is a production-grade recommended configuration that balances performance 
         "enable_cpu": true,
         "enable_ssd": true,
         "enable_remote": false,
-        "use_gds": false,
+        "enable_gds": false,
         "enable_trace": false,
         "ssd_cache_iouring_entries": 512,
         "tokens_per_block": 64,
@@ -55,7 +55,7 @@ The FlexKV configuration file is a JSON file, primarily consisting of three part
 | `enable_cpu` | bool | true | Whether to enable CPU memory as a cache layer. Strongly recommended to enable. |
 | `enable_ssd` | bool | false | Whether to enable SSD as a cache layer. Recommended if NVMe SSD is available. |
 | `enable_remote` | bool | false | Whether to enable remote cache (e.g., scalable cloud storage). Requires remote cache engine and custom implementation. |
-| `use_gds` | bool | false | Whether to use GPU Direct Storage (GDS) to accelerate SSD I/O. Not currently supported. |
+| `enable_gds` | bool | false | Whether to use GPU Direct Storage (GDS) to accelerate SSD I/O. Not currently supported. |
 | `index_accel` | bool | false | Whether to enable C++ RadixTree. Recommended to enable. |
 
 ---

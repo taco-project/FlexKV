@@ -16,7 +16,7 @@
         "enable_cpu": true,
         "enable_ssd": true,
         "enable_remote": false,
-        "use_gds": false,
+        "enable_gds": false,
         "enable_trace": false,
         "ssd_cache_iouring_entries": 512,
         "tokens_per_block": 64,
@@ -55,7 +55,7 @@ FlexKV 的配置文件是一个 JSON 文件，主要包含三个部分：
 | `enable_cpu` | bool | true | 是否启用 CPU 内存作为缓存层。强烈建议开启。 |
 | `enable_ssd` | bool | false | 是否启用 SSD 作为缓存层。如配备 NVMe SSD，建议开启。 |
 | `enable_remote` | bool | false | 是否启用远程缓存（如可扩展云存储等）。需要配合远程缓存和自定义的远程缓存引擎使用 |
-| `use_gds` | bool | false | 是否使用 GPU Direct Storage（GDS）加速 SSD 读写。目前暂不支持。 |
+| `enable_gds` | bool | false | 是否使用 GPU Direct Storage（GDS）加速 SSD 读写。目前暂不支持。 |
 | `index_accel` | bool | false | 是否启用C++ RadixTree。推荐开启。 |
 
 ---
