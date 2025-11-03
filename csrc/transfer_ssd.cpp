@@ -255,8 +255,8 @@ void transfer_kv_blocks_ssd(
 
   std::vector<std::thread> threads;
   std::vector<std::future<std::exception_ptr>> futures;
-  for (int d = 0; d < num_devices; d++) {
-    for (int t = 0; t < num_threads_per_device; t++) {
+  for (int t = 0; t < num_threads_per_device; t++) {
+    for (int d = 0; d < num_devices; d++) {
       int start_layer = cpu_layer_id_list_ptr[0];
       int end_layer = cpu_layer_id_list_ptr[0] + num_layers;
       int num_transfer_blocks = cpu_blocks_partition[d].size();
@@ -302,8 +302,8 @@ void transfer_kv_blocks_ssd(
               }
             });
       }
-    } // end thread loop
-  } // end device loop
+    } // end device loop
+  } // end thread loop
 
   if (iouring.enabled()) {
     if (iouring.wait_completion()) {
