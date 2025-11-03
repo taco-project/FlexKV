@@ -1,8 +1,18 @@
 #pragma once
 #include <errno.h>
 #include <liburing.h>
+#include <linux/ioprio.h>
 #include <torch/extension.h>
 #include <vector>
+
+#ifndef IOPRIO_CLASS_SHIFT
+#define IOPRIO_CLASS_SHIFT 13
+#define IOPRIO_PRIO_MASK ((1UL << IOPRIO_CLASS_SHIFT) - 1)
+#define IOPRIO_PRIO_VALUE(class, data) (((class) << IOPRIO_CLASS_SHIFT) | data)
+#define IOPRIO_CLASS_RT 1
+#define IOPRIO_CLASS_BE 2
+#define IOPRIO_CLASS_IDLE 3
+#endif
 
 namespace flexkv {
 
@@ -102,6 +112,9 @@ public:
     iov->iov_base = ptr;
     iov->iov_len = size;
     io_uring_prep_readv(sqe, fd, iov, 1, offset);
+
+    sqe->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 0);
+
     io_uring_sqe_set_data(sqe, iov);
     prepared++;
     return 0;
@@ -122,6 +135,9 @@ public:
     iov->iov_base = ptr;
     iov->iov_len = size;
     io_uring_prep_writev(sqe, fd, iov, 1, offset);
+
+    sqe->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4);
+
     io_uring_sqe_set_data(sqe, iov);
     prepared++;
     return 0;
