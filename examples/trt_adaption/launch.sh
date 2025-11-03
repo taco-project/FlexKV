@@ -16,7 +16,7 @@ EP_SIZE=$TP_SIZE
 export FLEXKV_CONFIG_PATH="./flexkv_config.json"
 export MODEL_PATH=$MODEL_PATH
 # export CUDA_LAUNCH_BLOCKING=1
-
+export TENSORRT_LLM_USE_FLEXKV=1
 
 trtllm-serve serve $MODEL_PATH \
     --host 0.0.0.0 \
