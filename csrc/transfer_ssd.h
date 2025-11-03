@@ -56,21 +56,27 @@ public:
   }
 
   int wait_completion() {
+    constexpr int MAX_CQES = 32;
+    io_uring_cqe *cqes[MAX_CQES];
     while (total_completed < total_submitted) {
-      if (io_uring_wait_cqe(&ring, &cqe) < 0) {
-        continue;
+      unsigned count = io_uring_peek_batch_cqe(&ring, cqes, MAX_CQES);
+      if (count == 0) {
+        if (io_uring_wait_cqe(&ring, &cqe) < 0)
+          continue;
+        count = 1;
+        cqes[0] = cqe;
       }
 
-      if (cqe->res < 0) {
-        fprintf(stderr, "IOUring(%p), cqe->res = %d\n", this, cqe->res);
-        cqe_err++;
+      for (unsigned i = 0; i < count; i++) {
+        if (cqes[i]->res < 0) {
+          cqe_err++;
+        }
+        iov2 = reinterpret_cast<iovec *>(io_uring_cqe_get_data(cqes[i]));
+        delete iov2;
       }
-
-      iov2 = reinterpret_cast<iovec *>(io_uring_cqe_get_data(cqe));
-      io_uring_cqe_seen(&ring, cqe);
-      total_completed++;
-      inflight--;
-      delete iov2;
+      total_completed += count;
+      inflight -= count;
+      io_uring_cq_advance(&ring, count);
     }
 
     if (cqe_err) {
