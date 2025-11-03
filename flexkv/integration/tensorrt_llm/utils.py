@@ -48,10 +48,8 @@ class RequestWrapper:
         #     return ABNORMAL
         return self._request.is_finished_normal
 
-    def __post_init__(self):
-        logger.debug(f"{self.num_prompt_tokens=}, "
-                    f"{self.req_id=}, "
-                    f"all_token_ids={self.all_token_ids}")
+    def __repr__(self):
+        return f"RequestWrapper(req_id={self.req_id}, num_prompt_tokens={self.num_prompt_tokens}, num_tokens={len(self.all_token_ids)})"
 
 def get_dp_tp_info(config: ExecutorConfig):
     mapping = config.mapping

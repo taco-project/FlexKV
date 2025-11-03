@@ -171,13 +171,12 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         if num_tokens_to_get == 0:
             return -1, 0
 
-        flexkv_logger.info(f"{request.num_prompt_tokens=}, {self.block_size=}, {num_tokens_to_get=}")
-        flexkv_logger.info(f"{request.all_token_ids=}")
         token_ids = request.all_token_ids[:num_tokens_to_get]
 
         assert num_computed_tokens <= num_tokens_to_get, (
             f"{num_computed_tokens=} must less equal to {num_tokens_to_get=}")
-        assert num_computed_tokens % self.block_size == 0
+        assert num_computed_tokens % self.block_size == 0,(
+            f"{num_computed_tokens=}, {self.block_size=}")
 
         if num_tokens_to_get == num_computed_tokens:
             return -1, 0
@@ -336,8 +335,8 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         # Auto cancel if not need to put.
         match_end_time = time.perf_counter()
-        flexkv_logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
-
+        flexkv_logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms. {num_unmatched_tokens=}")
+        
         if num_unmatched_tokens > 0:
             self.req_id_to_task_dict[request.req_id] = task_id
             self.tasks_to_cancel[task_id] = FlexKVPutTask(task_id=task_id,
@@ -514,8 +513,8 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         
         # Get actual device from tensor (more reliable in MPI environment)
         logical_device_id = kv_cache_tensor.device.index
-        flexkv_logger.info(f"[DEBUG] Tensor is on device: {kv_cache_tensor.device}, logical device.index={logical_device_id}")
-        flexkv_logger.info(f"[DEBUG] self.tp_client.device_id (from init): {self.tp_client.device_id}")
+        flexkv_logger.debug(f"Tensor is on device: {kv_cache_tensor.device}, logical device.index={logical_device_id}")
+        flexkv_logger.debug(f"self.tp_client.device_id (from init): {self.tp_client.device_id}")
         
         # Get physical GPU ID (in case CUDA_VISIBLE_DEVICES is set)
         import os
@@ -524,10 +523,10 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             # Map logical ID to physical ID
             visible_gpus = [int(x) for x in cuda_visible_devices.split(',')]
             physical_device_id = visible_gpus[logical_device_id] if logical_device_id < len(visible_gpus) else logical_device_id
-            flexkv_logger.info(f"[DEBUG] CUDA_VISIBLE_DEVICES={cuda_visible_devices}, mapping logical {logical_device_id} -> physical {physical_device_id}")
+            flexkv_logger.debug(f"CUDA_VISIBLE_DEVICES={cuda_visible_devices}, mapping logical {logical_device_id} -> physical {physical_device_id}")
         else:
             physical_device_id = logical_device_id
-            flexkv_logger.info(f"[DEBUG] No CUDA_VISIBLE_DEVICES set, using logical device ID {logical_device_id}")
+            flexkv_logger.debug(f"No CUDA_VISIBLE_DEVICES set, using logical device ID {logical_device_id}")
         
         # Use physical device ID for registration
         correct_device_id = physical_device_id
