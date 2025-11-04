@@ -8,6 +8,9 @@ cuda_graph_config:
     - 16
     - 32
 enable_chunked_prefill: true
+kv_cache_config:
+  enable_partial_reuse: false
+  free_gpu_memory_fraction: 0.75
 kv_connector_config:
   connector_module: "flexkv.integration.tensorrt_llm.trt_adapter"
   connector_scheduler_class: "FlexKVSchedulerConnector"
