@@ -1,17 +1,18 @@
-From 84774f3d66115a3b2c6055815333388ba8fa836b Mon Sep 17 00:00:00 2001
+From 840161b405b729226c5331da65ae04b3457bb6b8 Mon Sep 17 00:00:00 2001
 From: scutizhang <scutizhang@tencent.com>
 Date: Wed, 22 Oct 2025 14:23:31 +0800
-Subject: [PATCH] add flexkv support
+Subject: [PATCH] 1. add flexkv support
 
+2. support flexkv + cuda graph
 ---
  .../tensorrt_llm/batch_manager/llmRequest.h   | 22 +++++++++++++++++++
  .../batch_manager/kvCacheManager.cpp          |  1 +
  .../nanobind/batch_manager/bindings.cpp       |  2 ++
  .../pybind/batch_manager/bindings.cpp         |  2 ++
  .../_torch/pyexecutor/kv_cache_connector.py   |  6 +++++
- tensorrt_llm/_torch/pyexecutor/py_executor.py |  8 +++++++
- .../_torch/pyexecutor/py_executor_creator.py  |  1 +
- 7 files changed, 42 insertions(+)
+ tensorrt_llm/_torch/pyexecutor/py_executor.py | 12 ++++++++--
+ .../_torch/pyexecutor/py_executor_creator.py  | 10 +++++++--
+ 7 files changed, 51 insertions(+), 4 deletions(-)
 
 diff --git a/cpp/include/tensorrt_llm/batch_manager/llmRequest.h b/cpp/include/tensorrt_llm/batch_manager/llmRequest.h
 index f069e3ac7..e74e6a01a 100644
@@ -122,7 +123,7 @@ index 5e8bf6dfa..ec22d269e 100644
              lambda: self.scheduler.get_num_new_matched_tokens(
                  request, num_computed_tokens))
 diff --git a/tensorrt_llm/_torch/pyexecutor/py_executor.py b/tensorrt_llm/_torch/pyexecutor/py_executor.py
-index 4b3315560..80a0a056e 100644
+index 4b3315560..56b2450e2 100644
 --- a/tensorrt_llm/_torch/pyexecutor/py_executor.py
 +++ b/tensorrt_llm/_torch/pyexecutor/py_executor.py
 @@ -282,6 +282,8 @@ class PyExecutor:
@@ -147,11 +148,37 @@ index 4b3315560..80a0a056e 100644
  
      def _event_loop_wrapper(self):
          try:
+@@ -518,7 +526,7 @@ class PyExecutor:
+                 if prev_device_step_time is None:
+                     prev_device_step_time = "N/A"  # Handle first iteration
+                 else:
+-                    prev_device_step_time = f"{prev_device_step_time}ms"
++                    prev_device_step_time = f"{prev_device_step_time:.3f} ms"
+                 host_step_time = (end_time - start_time) * 1000  # milliseconds
+                 formatted_timestamp = datetime.datetime.now().strftime(
+                     "%Y-%m-%d %H:%M:%S")
+@@ -528,7 +536,7 @@ class PyExecutor:
+                     f"rank = {self.dist.rank}, "
+                     f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
+                     f"{self.executor_request_queue.num_fetch_requests}, "
+-                    f"host_step_time = {host_step_time}ms, "
++                    f"host_step_time = {host_step_time:.3f} ms, "
+                     f"prev_device_step_time = {prev_device_step_time}, "
+                     f"timestamp = {formatted_timestamp}, "
+                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
 diff --git a/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py b/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
-index e824ee02d..753a476bb 100644
+index e824ee02d..63e0848ca 100644
 --- a/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
 +++ b/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
-@@ -202,6 +202,7 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
+@@ -1,6 +1,7 @@
+ import copy
+ import enum
+ import importlib
++import os
+ from concurrent.futures import ThreadPoolExecutor
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+@@ -202,6 +203,7 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
                            tp_size=tensorrt_llm.mpi_world_size(),
                            gpus_per_node=tensorrt_llm.default_gpus_per_node(),
                            rank=tensorrt_llm.mpi_rank())
@@ -159,6 +186,21 @@ index e824ee02d..753a476bb 100644
      else:
          mapping = copy.deepcopy(executor_config.mapping)
          mapping.rank = tensorrt_llm.mpi_rank()
+@@ -388,8 +390,12 @@ def create_py_executor(
+             f"Initializing kv connector with config: {kv_connector_config}")
+ 
+         if pytorch_backend_config.use_cuda_graph:
+-            raise NotImplementedError(
+-                "CUDA graphs are not supported with KV connector hooks.")
++            use_flexkv = os.getenv("TENSORRT_LLM_USE_FLEXKV", "0")
++            if use_flexkv == "0":
++                raise NotImplementedError(
++                    "CUDA graphs are not supported with KV connector hooks.")
++            else:
++                logger.info("Using FlexKV for KV connector")
+ 
+         if executor_config.scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+             raise NotImplementedError(
 -- 
 2.43.0
 
