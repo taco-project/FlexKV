@@ -27,6 +27,7 @@ class BenchmarkConfig:
     shuffle_ids: bool = False
     warmup_round: int = 1
     benchmark_round: int = 10
+    bidirectional: bool = False
 
 def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]:
     config_file = args.config
@@ -44,6 +45,7 @@ def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]
             bench_config.shuffle_ids = args.shuffle_ids
             bench_config.warmup_round = args.warmup_round
             bench_config.benchmark_round = args.benchmark_round
+            bench_config.bidirectional = args.bi
             return model_config, cache_config, bench_config
     except Exception as e:
         raise ValueError(f"Failed to load config file {config_file}: {e}") from None
@@ -86,7 +88,7 @@ def create_cpu_gpu_worker(
     # max_op_num=4, max_block_num should be larger than num_blocks_to_transfer
     max_block_num = max(1024, cache_config.num_cpu_blocks)
     op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
-    
+
     if model_config.tp_size == 1:
         worker_handle = GPUCPUTransferWorker.create_worker(
             mp_ctx=mp.get_context('spawn'),
@@ -161,7 +163,7 @@ def create_cpu_ssd_worker(
     # max_op_num=4, max_block_num should be larger than num_blocks_to_transfer
     max_block_num = max(1024, cache_config.num_cpu_blocks)
     op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
-    
+
     worker_handle = CPUSSDDiskTransferWorker.create_worker(
                 mp_ctx=mp.get_context('spawn'),
                 finished_ops_queue=finished_ops_queue,
@@ -182,11 +184,18 @@ def create_cpu_ssd_worker(
 def launch_transfer(worker_handle: WorkerHandle,
                     finished_ops_queue: mp.Queue,
                     transfer_op: TransferOp):
-    op_id = transfer_op.op_id
     worker_handle.submit_transfer(transfer_op)
-    ret_op_id = finished_ops_queue.get()
-    assert ret_op_id == op_id
-    return True
+
+def sync_all(finished_ops_queue: mp.Queue, num_ops: int):
+    for _ in range(num_ops):
+        finished_ops_queue.get()
+
+REVERSE_TYPE_MAP = {
+    TransferType.D2H: TransferType.H2D,
+    TransferType.H2D: TransferType.D2H,
+    TransferType.DISK2H: TransferType.H2DISK,
+    TransferType.H2DISK: TransferType.DISK2H,
+    }
 
 def bench_worker(args):
     model_config, cache_config, bench_config = make_configs(args)
@@ -204,6 +213,7 @@ def bench_worker(args):
         num_layers_to_transfer = model_config.num_layers
     num_blocks_to_transfer = bench_config.num_blocks_to_transfer
     shuffle_ids = bench_config.shuffle_ids
+    bidirectional = bench_config.bidirectional
 
     if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
         worker_handle, finished_ops_queue = create_cpu_gpu_worker(model_config, cache_config)
@@ -213,6 +223,15 @@ def bench_worker(args):
         raise ValueError(f"Unsupported transfer type: {transfer_type} for benchmark, "
                          f"currently only support {TransferType.H2D.name}, {TransferType.D2H.name}, "
                          f"{TransferType.H2DISK.name}, {TransferType.DISK2H.name}")
+    reverse_worker_handle = None
+    reverse_finished_ops_queue = None
+    if bidirectional:
+        if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
+            reverse_worker_handle, reverse_finished_ops_queue = \
+                create_cpu_gpu_worker(model_config, cache_config)
+        elif transfer_type == TransferType.H2DISK or transfer_type == TransferType.DISK2H:
+            reverse_worker_handle, reverse_finished_ops_queue = \
+                create_cpu_ssd_worker(model_config, cache_config)
 
     if shuffle_ids:
         block_ids = torch.randperm(num_blocks_to_transfer).numpy()
@@ -230,21 +249,54 @@ def bench_worker(args):
         successors=[],
         predecessors=[],
     )
-    if transfer_type == TransferType.DISK2H:
+
+    reverse_transfer_op = None
+    if bidirectional:
+        reverse_type = REVERSE_TYPE_MAP.get(transfer_type)
+        if reverse_type is None:
+            raise ValueError(f"Bidirectional test not supported for transfer type: {transfer_type}")
+
+        reverse_block_ids = torch.randperm(num_blocks_to_transfer).numpy()
+
+        reverse_transfer_op = TransferOp(
+            transfer_type=reverse_type,
+            layer_id=0,
+            layer_granularity=num_layers_to_transfer,
+            src_block_ids=reverse_block_ids,
+            dst_block_ids=reverse_block_ids,
+            graph_id=1,
+            dp_id=0,
+            successors=[],
+            predecessors=[],
+        )
+    if transfer_type == TransferType.DISK2H or transfer_type == TransferType.H2DISK:
         tmp_op = copy.deepcopy(transfer_op)
         tmp_op.transfer_type = TransferType.H2DISK
         tmp_op.src_block_ids = transfer_op.dst_block_ids
         tmp_op.dst_block_ids = transfer_op.src_block_ids
         launch_transfer(worker_handle, finished_ops_queue, tmp_op)
+        sync_all(finished_ops_queue, 1)
+
     for _ in range(warmup_round):
+        if bidirectional:
+            launch_transfer(reverse_worker_handle, reverse_finished_ops_queue, reverse_transfer_op)
         launch_transfer(worker_handle, finished_ops_queue, transfer_op)
+    sync_all(finished_ops_queue, warmup_round)
+    if bidirectional:
+        sync_all(reverse_finished_ops_queue, warmup_round)
+
     pbar = tqdm(total=benchmark_round, desc="Benchmarking")
     start_time = time.time()
     for _ in range(benchmark_round):
+        if bidirectional:
+            launch_transfer(reverse_worker_handle, reverse_finished_ops_queue, reverse_transfer_op)
         launch_transfer(worker_handle, finished_ops_queue, transfer_op)
         pbar.update(1)
     pbar.close()
+    sync_all(finished_ops_queue, benchmark_round)
     end_time = time.time()
+    if bidirectional:
+        sync_all(reverse_finished_ops_queue, benchmark_round)
     total_data_size_GB = (
         num_blocks_to_transfer *
         cache_config.tokens_per_block *
@@ -257,6 +309,8 @@ def bench_worker(args):
     print(f"Avg Time taken: {avg_time} seconds")
     print(f"Avg Bandwidth: {total_data_size_GB / avg_time} GB/s")
     worker_handle.shutdown()
+    if bidirectional:
+        reverse_worker_handle.shutdown()
 
 def parse_args():
     parser = ArgumentParser()
@@ -280,6 +334,9 @@ def parse_args():
     parser.add_argument("--benchmark-round",
                         type=int,
                         default=10)
+    parser.add_argument("--bi",
+                        action="store_true",
+                        help="benchmark bidirectional bandwidth")
     return parser.parse_args()
 
 if __name__ == "__main__":

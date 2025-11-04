@@ -56,8 +56,8 @@ class CacheConfig:
     # ssd cache configs
     max_blocks_per_file: int = 32000  # -1 means no limit
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
-    ssd_cache_iouring_entries: int = 0
-    ssd_cache_iouring_flags: int = 0
+    ssd_cache_iouring_entries: int = 512
+    ssd_cache_iouring_flags: int = 1
 
     # gds cache configs
     gds_cache_dir: Optional[Union[str, List[str]]] = None
@@ -81,13 +81,12 @@ class CacheConfig:
     evict_ratio: float = 0.0
 
     def __post_init__(self):
-        layout_fields = ['gpu_kv_layout_type', 
-                         'cpu_kv_layout_type', 
-                         'ssd_kv_layout_type', 
+        layout_fields = ['gpu_kv_layout_type',
+                         'cpu_kv_layout_type',
+                         'ssd_kv_layout_type',
                          'remote_kv_layout_type',
                          'gds_kv_layout_type']
         for field in layout_fields:
             value = getattr(self, field)
             if isinstance(value, str):
                 setattr(self, field, KVCacheLayoutType[value.upper()])
-        
