@@ -144,10 +144,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
          #note that for now only dp_size=1 is supported
         pytest.skip("skip because server-client mode is not ready for dp_size > 1")
 
-    import uuid
-    gpu_register_port = f"ipc:///tmp/flexkv_gpu_{uuid.uuid4().hex[:8]}"
-    server_recv_port = f"ipc:///tmp/flexkv_srv_{uuid.uuid4().hex[:8]}"
-    kvmanager = KVManager(model_config, cache_config, gpu_register_port, server_recv_port)
+    kvmanager = KVManager(model_config, cache_config)
     kvmanager.start()
 
     # Create pipes for each tp_client to send GPU blocks back
@@ -161,7 +158,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
 
         tp_client_process = mp_ctx.Process(
             target=run_tp_client,
-            args=(0, tp_rank, gpu_register_port, model_config, cache_config, \
+            args=(0, tp_rank, kvmanager.gpu_register_port, model_config, cache_config, \
                 num_gpu_blocks + tp_rank, child_conn, gpu_layout_type),
             daemon=True
         )

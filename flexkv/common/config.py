@@ -57,6 +57,9 @@ class CacheConfig:
 
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
+    server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
+    server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'flexkv_server'),
+
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKWISE').upper()),
     ssd_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_SSD_LAYOUT', 'BLOCKWISE').upper()),

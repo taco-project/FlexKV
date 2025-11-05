@@ -66,13 +66,12 @@ def shutdown_tp_client(tp_client_processes):
 def benchmark_flexkv(model_config: ModelConfig,
                      cache_config: CacheConfig,
                      benchmark_config: BenchmarkConfig,
-                     gpu_register_port: str,
-                     server_recv_port: str):
+                     ):
     if model_config.tp_size * model_config.dp_size > torch.cuda.device_count():
         raise ValueError(f"tp_size {model_config.tp_size} * dp_size {model_config.dp_size} is greater than "
                          f"the number of available GPUs {torch.cuda.device_count()}")
     print(f"{benchmark_config = }")
-    kvmanager = KVManager(model_config, cache_config, gpu_register_port, server_recv_port)
+    kvmanager = KVManager(model_config, cache_config)
     kvmanager.start()
 
     tp_client_processes = []
@@ -85,7 +84,7 @@ def benchmark_flexkv(model_config: ModelConfig,
     for tp_rank in range(model_config.tp_size):
         tp_client_process = Process(
             target=run_tp_client,
-            args=(0, tp_rank, gpu_register_port,
+            args=(0, tp_rank, kvmanager.gpu_register_port,
                     model_config, cache_config),
             daemon=True
         )
@@ -184,8 +183,5 @@ if __name__ == "__main__":
     # pad sequence length to divisible by tokens_per_block
     benchmark_config.sequence_length = \
         ((benchmark_config.sequence_length - 1) // cache_config.tokens_per_block + 1) * cache_config.tokens_per_block
-    import uuid
-    gpu_register_port = f"ipc:///tmp/flexkv_gpu_{uuid.uuid4().hex[:8]}"
-    server_recv_port = f"ipc:///tmp/flexkv_srv_{uuid.uuid4().hex[:8]}"
 
-    benchmark_flexkv(model_config, cache_config, benchmark_config, gpu_register_port, server_recv_port)
+    benchmark_flexkv(model_config, cache_config, benchmark_config)
