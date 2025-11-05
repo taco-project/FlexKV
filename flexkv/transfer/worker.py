@@ -23,7 +23,7 @@ from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
 from flexkv.common.transfer import get_nvtx_range_color
-from flexkv.common.config import CacheConfig
+from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
 
 try:
     from flexkv.c_ext import transfer_kv_blocks_remote
@@ -596,8 +596,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
 
         try:
-            self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), cache_config.ssd_cache_iouring_entries,
-                cache_config.ssd_cache_iouring_flags)
+            self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), GLOBAL_CONFIG_FROM_ENV.ssd_cache_iouring_entries,
+                GLOBAL_CONFIG_FROM_ENV.ssd_cache_iouring_flags)
         except Exception as e:
             flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
             raise RuntimeError("SSD Worker init failed") from e

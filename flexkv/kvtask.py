@@ -375,7 +375,7 @@ class KVTaskEngine(KVTaskManager):
                  gpu_register_port: Optional[str] = None,
                  ):
         super().__init__(model_config, cache_config, gpu_register_port)
-        self.tracer = FlexKVTracer(cache_config)
+        self.tracer = FlexKVTracer()
 
     def get_async(self,
                   token_ids: np.ndarray,

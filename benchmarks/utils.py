@@ -97,18 +97,6 @@ def load_config(config_path: str) -> Tuple[ModelConfig, CacheConfig]:
             config["CacheConfig"] = {}
         if "dtype" in config["ModelConfig"]:
             config["ModelConfig"]["dtype"] = eval(f"torch.{config['ModelConfig']['dtype']}")
-        if "gpu_kv_layout_type" in config["CacheConfig"]:
-            config["CacheConfig"]["gpu_kv_layout_type"] = \
-                KVCacheLayoutType(config["CacheConfig"]["gpu_kv_layout_type"])
-        if "cpu_kv_layout_type" in config["CacheConfig"]:
-            config["CacheConfig"]["cpu_kv_layout_type"] = \
-                KVCacheLayoutType(config["CacheConfig"]["cpu_kv_layout_type"])
-        if "ssd_kv_layout_type" in config["CacheConfig"]:
-            config["CacheConfig"]["ssd_kv_layout_type"] = \
-                KVCacheLayoutType(config["CacheConfig"]["ssd_kv_layout_type"])
-        if "remote_kv_layout_type" in config["CacheConfig"]:
-            config["CacheConfig"]["remote_kv_layout_type"] = \
-                KVCacheLayoutType(config["CacheConfig"]["remote_kv_layout_type"])
         model_config = ModelConfig(**config["ModelConfig"])
         cache_config = CacheConfig(**config["CacheConfig"])
         return model_config, cache_config

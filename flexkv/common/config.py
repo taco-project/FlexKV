@@ -76,9 +76,12 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.05)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
 
-    enable_trace=os.getenv('FLEXKV_ENABLE_TRACE', 'True').lower() == 'true',
+    enable_trace=os.getenv('FLEXKV_ENABLE_TRACE', 'False').lower() == 'true',
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),
     trace_max_file_size_mb=int(os.getenv('FLEXKV_TRACE_MAX_FILE_SIZE_MB', 100)),
     trace_max_files=int(os.getenv('FLEXKV_TRACE_MAX_FILES', 5)),
     trace_flush_interval_ms=int(os.getenv('FLEXKV_TRACE_FLUSH_INTERVAL_MS', 1000)),
 )
+
+def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
+    return int(size_in_GB * 1024 * 1024 * 1024 / block_size_in_bytes)

@@ -31,27 +31,8 @@ DEFAULT_CACHE_CONFIG = {
     'enable_remote': False,
     'num_cpu_blocks': 128,
     'num_ssd_blocks': 512,
-    'num_remote_blocks': 512,  # Aligned with ssd_blocks
-    'remote_cache_size_mode': "block_num",
-    'remote_file_size': (1024*1024*1024),
-    'remote_file_num': 16,
-    'remote_file_prefix': "remote_cache",
     'enable_gds': False,
-    'enable_trace': False,
     'ssd_cache_dir': ["./ssd_cache", "./ssd_cache2/"],
-    'ssd_cache_iouring_entries': 512,
-    'ssd_cache_iouring_flags': 1,
-    'remote_cache_path': ["remote_cache1", "remote_cache2"],
-    'remote_config_custom': {
-        "pcfs_fsid": "f_l91fz6",
-        "pcfs_port": 31,
-        "pcfs_ip": "172.21.16.177",
-        "pcfs_parent_nodeid": 144115188075855883  # Using transfer engine value for consistency
-    },
-    'use_ce_transfer_h2d': False,
-    'use_ce_transfer_d2h': False,
-    'transfer_sms_h2d': 8,
-    'transfer_sms_d2h': 8,
 }
 
 DEFAULT_TEST_CONFIG = {
@@ -537,10 +518,12 @@ class GPUKVCacheVerifier:
                                                               actual_head_id)
                             # GPU tensor dim：[kv_dim, num_block, tokens_per_block, num_head, head_size]
                             if self.gpu_layout_type == 0:
-                                # gpu_layout_type 0: [num_layer][kv_dim, num_block, tokens_per_block, num_head, head_size]
+                                # gpu_layout_type 0:
+                                #     [num_layer][kv_dim, num_block, tokens_per_block, num_head, head_size]
                                 gpu_tensor[kv_id, block_id, :, head_id, :] = hash_value
                             elif self.gpu_layout_type == 1:
-                                # gpu_layout_type 1: [tp_id][0][num_block, num_layer, kv_dim, tokens_per_block, num_head, head_size]
+                                # gpu_layout_type 1:
+                                #     [tp_id][0][num_block, num_layer, kv_dim, tokens_per_block, num_head, head_size]
                                 # Need to get the first (and only) tensor from the list
                                 gpu_tensor[block_id, layer_id, kv_id, :, head_id, :] = hash_value
                             elif self.gpu_layout_type == 2:
@@ -580,10 +563,12 @@ class GPUKVCacheVerifier:
                                                                       token_ids[start_token_idx:end_token_idx],
                                                                       actual_head_id)
                             if self.gpu_layout_type == 0:
-                                # gpu_layout_type 0: [num_layer][kv_dim, num_block, tokens_per_block, num_head, head_size]
+                                # gpu_layout_type 0:
+                                #     [num_layer][kv_dim, num_block, tokens_per_block, num_head, head_size]
                                 actual_values = gpu_tensor[kv_id, block_id, :, head_id, :]
                             elif self.gpu_layout_type == 1:
-                                # gpu_layout_type 1: [tp_id][0][num_block, num_layer, kv_dim, tokens_per_block, num_head, head_size]
+                                # gpu_layout_type 1:
+                                #     [tp_id][0][num_block, num_layer, kv_dim, tokens_per_block, num_head, head_size]
                                 # Need to get the first (and only) tensor from the list
                                 actual_values = gpu_tensor[block_id, layer_id, kv_id, :, head_id, :]
                             elif self.gpu_layout_type == 2:

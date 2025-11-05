@@ -7,7 +7,7 @@ import torch
 import multiprocessing as mp
 from multiprocessing import Process, Pipe
 
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
 from flexkv.kvtask import KVTaskEngine
@@ -24,12 +24,12 @@ from test_utils import (
     create_gpu_kv_layout, GPUKVCacheVerifier
 )
 
-def run_tp_client(dp_client_id, 
-                  tp_rank, 
-                  server_recv_port, 
-                  model_config, 
-                  cache_config, 
-                  num_gpu_blocks, 
+def run_tp_client(dp_client_id,
+                  tp_rank,
+                  server_recv_port,
+                  model_config,
+                  cache_config,
+                  num_gpu_blocks,
                   child_conn,
                   gpu_layout_type):
     """Run tp_client process"""
@@ -96,28 +96,22 @@ def shutdown_tp_client(tp_client_processes):
     {'tp_size': 4, 'dp_size': 1, 'use_mla': True},
 ], indirect=True)
 @pytest.mark.parametrize("cache_config", [
-    {'enable_cpu': True, 'enable_ssd': False, 'enable_remote': False, 'num_cpu_blocks': 1024},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False,},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False, 'ssd_cache_iouring_entries': 512},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True, 'num_ssd_blocks': 256, 'num_remote_blocks': 512},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True,
-     'num_ssd_blocks': 256, 'num_remote_blocks': 512, 'ssd_cache_iouring_entries': 512},
+    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
+    {'enable_cpu': True, 'enable_ssd': True},
+    {'enable_cpu': True, 'enable_ssd': True, 'num_ssd_blocks': 256},
     # GDS test configs
-    {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': False, 'enable_remote': False, 'num_gds_blocks': 512, 'gds_cache_dir': ["./gdstest"]},
+    {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': False, \
+        'num_gds_blocks': 512, 'gds_cache_dir': ["./gdstest"]},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
 ], indirect=True)
-@pytest.mark.parametrize("flex_kv_layout_type", [
-    KVCacheLayoutType.LAYERWISE,
-    KVCacheLayoutType.BLOCKWISE,
-])
 @pytest.mark.parametrize("gpu_layout_type", [
     0,
     1,
     2,
 ])
-def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type, gpu_layout_type):
+def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     tp_size = model_config.tp_size
     dp_size = model_config.dp_size
 
@@ -130,11 +124,6 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type,
     enable_ssd = cache_config.enable_ssd
     enable_remote = cache_config.enable_remote
     enable_gds = cache_config.enable_gds
-
-    cache_config.cpu_kv_layout_type = flex_kv_layout_type
-    cache_config.ssd_kv_layout_type = flex_kv_layout_type
-    cache_config.remote_kv_layout_type = flex_kv_layout_type
-    cache_config.gds_kv_layout_type = flex_kv_layout_type
 
     num_gpu_blocks = test_config["num_gpu_blocks"]
     block_per_request = test_config['requests_per_block']
@@ -172,7 +161,8 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type,
 
         tp_client_process = mp_ctx.Process(
             target=run_tp_client,
-            args=(0, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks + tp_rank, child_conn, gpu_layout_type),
+            args=(0, tp_rank, gpu_register_port, model_config, cache_config, \
+                num_gpu_blocks + tp_rank, child_conn, gpu_layout_type),
             daemon=True
         )
         tp_client_processes.append(tp_client_process)

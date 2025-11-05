@@ -29,7 +29,7 @@ from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.transfer_pattern import add_virtal_op_for_mutiple_finished_ops
 from flexkv.common.block import SequenceMeta
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
 from flexkv.common.transfer import (
     DeviceType, TransferOpGraph, TransferOp, TransferType
@@ -238,61 +238,65 @@ class GlobalCacheEngine:
         self.remote_cache_engine = None
         self.gds_cache_engine = None
 
+        self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
         self.cache_engines = {}
 
+        self.evict_ratio = GLOBAL_CONFIG_FROM_ENV.evict_ratio
+        self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
+
         if cache_config.enable_cpu:
-            if cache_config.index_accel:
+            if self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
-                                                cache_config.evict_ratio,
-                                                cache_config.hit_reward_seconds)
+                                                self.evict_ratio,
+                                                self.hit_reward_seconds)
             else:
                 self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
-                                                cache_config.evict_ratio,
-                                                cache_config.hit_reward_seconds)
+                                                self.evict_ratio,
+                                                self.hit_reward_seconds)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
-            if cache_config.index_accel:
+            if self.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
-                                                cache_config.evict_ratio,
-                                                cache_config.hit_reward_seconds)
+                                                self.evict_ratio,
+                                                self.hit_reward_seconds)
             else:
                 self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
-                                                cache_config.evict_ratio,
-                                                cache_config.hit_reward_seconds)
+                                                self.evict_ratio,
+                                                self.hit_reward_seconds)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
-            if cache_config.index_accel:
+            if self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
-                                                   cache_config.evict_ratio,
-                                                   cache_config.hit_reward_seconds)
+                                                   self.evict_ratio,
+                                                   self.hit_reward_seconds)
             else:
                 self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
-                                                   cache_config.evict_ratio,
-                                                   cache_config.hit_reward_seconds)
+                                                   self.evict_ratio,
+                                                   self.hit_reward_seconds)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
         if cache_config.enable_gds:
-            if cache_config.index_accel:
+            if self.index_accel:
                 self.gds_cache_engine = CacheEngineAccel(DeviceType.GDS,
                                                 cache_config.num_gds_blocks,
                                                 cache_config.tokens_per_block,
-                                                cache_config.evict_ratio)
+                                                self.evict_ratio)
             else:
                 self.gds_cache_engine = CacheEngine(DeviceType.GDS,
                                                 cache_config.num_gds_blocks,
                                                 cache_config.tokens_per_block,
-                                                cache_config.evict_ratio)
+                                                self.evict_ratio)
             self.cache_engines[DeviceType.GDS] = self.gds_cache_engine
 
         self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]] = \
@@ -587,7 +591,7 @@ class GlobalCacheEngine:
         assert self.cache_config.enable_cpu
         assert self.cpu_cache_engine is not None
 
-        if self.cache_config.index_accel:
+        if self.index_accel:
             cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta)
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
@@ -637,7 +641,8 @@ class GlobalCacheEngine:
                 )
                 transfer_graph.add_transfer_op(op_gds_transfer)
                 finished_ops_ids.append(op_gds_transfer.op_id)
-                op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.GDS, ssd_node_to_unlock, ssd_node_to_unlock.size())
+                op_node_to_ready[op_gds_transfer.op_id] = \
+                    (DeviceType.GDS, ssd_node_to_unlock, ssd_node_to_unlock.size())
             else:
                 fragment2_cpu_blocks = self.cpu_cache_engine.take(
                     num_required_blocks=fragment2_num_blocks,
@@ -681,7 +686,8 @@ class GlobalCacheEngine:
             graph_id = transfer_graph.graph_id,
             transfer_type = TransferType.H2D,
             src_block_ids = fragment12_cpu_blocks if not self.cache_config.enable_gds else fragment1_cpu_blocks,
-            dst_block_ids = fragment12_gpu_blocks if not self.cache_config.enable_gds else fragment12_gpu_blocks[:fragment1_num_blocks],
+            dst_block_ids = fragment12_gpu_blocks if not self.cache_config.enable_gds \
+                else fragment12_gpu_blocks[:fragment1_num_blocks],
             layer_id = 0,
             layer_granularity = layer_num
         )
@@ -803,7 +809,7 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
         assert self.remote_cache_engine is not None
 
-        if self.cache_config.index_accel:
+        if self.index_accel:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
         else:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
@@ -957,7 +963,7 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
         # assert self.ssd_cache_engine is not None
 
-        if  self.cache_config.index_accel:
+        if  self.index_accel:
             cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta)
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
@@ -981,7 +987,7 @@ class GlobalCacheEngine:
             protected_node = cpu_matched_result.last_node,
             strict=False
         )
-        
+
         # Determine which disk cache to use (GDS or SSD)
         disk_cache_engine = None
         if self.cache_config.enable_gds:
@@ -997,7 +1003,7 @@ class GlobalCacheEngine:
             )
         else:
             fragment2_ssd_blocks = np.array([], dtype=np.int64)
-            
+
         if len(fragment12_cpu_blocks) < fragment12_num_blocks or \
             len(fragment2_ssd_blocks) < fragment2_num_blocks:
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
@@ -1122,7 +1128,7 @@ class GlobalCacheEngine:
             ssd_matched_result = self.gds_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
-    
+
     @nvtx.annotate("Match Prefix", color="yellow")
     def match_local(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
@@ -1135,7 +1141,7 @@ class GlobalCacheEngine:
             ssd_matched_result = self.gds_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
-    
+
     @nvtx.annotate("Match All Prefix accel", color="yellow")
     def match_all_accel(self,
                         sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:

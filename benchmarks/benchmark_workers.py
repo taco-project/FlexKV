@@ -13,7 +13,7 @@ from flexkv.common.transfer import TransferOp, TransferType
 from flexkv.transfer.worker import GPUCPUTransferWorker, CPUSSDDiskTransferWorker, WorkerHandle, tpGPUCPUTransferWorker
 from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator
 from flexkv.common.storage import KVCacheLayoutType, KVCacheLayout
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 
 
@@ -55,7 +55,7 @@ def create_cpu_gpu_worker(
                   cache_config: CacheConfig) -> Tuple[WorkerHandle, mp.Queue]:
     mp.set_start_method('spawn', force=True)
     cpu_layout = KVCacheLayout(
-        type=KVCacheLayoutType(cache_config.cpu_kv_layout_type),
+        type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
         num_layer=model_config.num_layers,
         num_block=cache_config.num_cpu_blocks,
         tokens_per_block=cache_config.tokens_per_block,
@@ -132,7 +132,7 @@ def create_cpu_ssd_worker(
                   cache_config: CacheConfig) -> Tuple[WorkerHandle, mp.Queue]:
     mp.set_start_method('spawn', force=True)
     cpu_layout = KVCacheLayout(
-        type=KVCacheLayoutType(cache_config.cpu_kv_layout_type),
+        type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
         num_layer=model_config.num_layers,
         num_block=cache_config.num_cpu_blocks,
         tokens_per_block=cache_config.tokens_per_block,
@@ -140,7 +140,7 @@ def create_cpu_ssd_worker(
         head_size=model_config.head_size,
     )
     ssd_layout = KVCacheLayout(
-        type=KVCacheLayoutType(cache_config.ssd_kv_layout_type),
+        type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
         num_layer=model_config.num_layers,
         num_block=cache_config.num_ssd_blocks,
         tokens_per_block=cache_config.tokens_per_block,

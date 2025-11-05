@@ -38,7 +38,7 @@ from flexkv.transfer.worker import (
     GDSTransferWorker,
     tpGDSTransferWorker,
 )
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
 
 
@@ -118,10 +118,10 @@ class TransferEngine:
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=self.gpu_handles[i].dtype,
                     gpu_device_id=i,
-                    use_ce_transfer_h2d=self.cache_config.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=self.cache_config.use_ce_transfer_d2h,
-                    transfer_sms_h2d=self.cache_config.transfer_sms_h2d,
-                    transfer_sms_d2h=self.cache_config.transfer_sms_d2h,
+                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                    transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
+                    transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
                 )
                 for i in range(self.dp_size)
             ]
@@ -140,10 +140,10 @@ class TransferEngine:
                     dtype=self.gpu_handles[i].dtype,
                     tp_group_size=self.tp_size,
                     dp_group_id=i,
-                    use_ce_transfer_h2d=self.cache_config.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=self.cache_config.use_ce_transfer_d2h,
-                    transfer_sms_h2d=self.cache_config.transfer_sms_h2d,
-                    transfer_sms_d2h=self.cache_config.transfer_sms_d2h,
+                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                    transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
+                    transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
                 )
                 for i in range(self.dp_size)
             ]

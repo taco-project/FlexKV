@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from flexkv.server.client import KVTPClient
-from flexkv.common.storage import KVCacheLayout
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import ModelConfig, CacheConfig
 from utils import load_config
@@ -33,7 +33,7 @@ def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_c
     num_gpu_blocks = cache_config.num_gpu_blocks
 
     gpu_kv_layout = KVCacheLayout(
-        type=cache_config.gpu_kv_layout_type,
+        type=KVCacheLayoutType.LAYERWISE,
         num_layer=model_config.num_layers,
         num_block=num_gpu_blocks,
         tokens_per_block=cache_config.tokens_per_block,

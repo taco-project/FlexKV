@@ -3,25 +3,25 @@ import os
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional, List, Union
+from typing import Any, Optional, List, Union
 import torch
 import numpy as np
 
-from flexkv.common.config import CacheConfig
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 
 
 class FlexKVTracer:
     """FlexKV Tracer class for recording operations in JSON format"""
 
-    def __init__(self, cache_config: CacheConfig):
-        self.enabled = cache_config.enable_trace
+    def __init__(self):
+        self.enabled = GLOBAL_CONFIG_FROM_ENV.enable_trace
         if not self.enabled:
             return
-        print(f"FlexKVTracer enabled, trace_file_path: {cache_config.trace_file_path}")
-        self.trace_file_path = cache_config.trace_file_path
-        self.max_file_size_mb = cache_config.trace_max_file_size_mb
-        self.max_files = cache_config.trace_max_files
-        self.flush_interval_ms = cache_config.trace_flush_interval_ms
+        print(f"FlexKVTracer enabled, trace_file_path: {GLOBAL_CONFIG_FROM_ENV.trace_file_path}")
+        self.trace_file_path = GLOBAL_CONFIG_FROM_ENV.trace_file_path
+        self.max_file_size_mb = GLOBAL_CONFIG_FROM_ENV.trace_max_file_size_mb
+        self.max_files = GLOBAL_CONFIG_FROM_ENV.trace_max_files
+        self.flush_interval_ms = GLOBAL_CONFIG_FROM_ENV.trace_flush_interval_ms
 
         # Thread-safe file writing
         self._lock = threading.Lock()
