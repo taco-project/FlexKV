@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, List, Union, Dict, Any
+from argparse import Namespace
+import os
 
 import torch
 
@@ -32,15 +34,6 @@ class CacheConfig:
     enable_ssd: bool = False
     enable_remote: bool = False
     enable_gds: bool = False
-    index_accel: bool = False
-    hit_reward_seconds: int = 0
-
-    # kv cache layout configs
-    gpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.LAYERWISE
-    cpu_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
-    ssd_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
-    remote_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
-    gds_kv_layout_type: KVCacheLayoutType = KVCacheLayoutType.BLOCKWISE
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
@@ -48,22 +41,13 @@ class CacheConfig:
     num_gds_blocks: int = 10000000
     num_remote_blocks: Optional[int] = None
 
-    # CPU-GPU transfer configs
-    use_ce_transfer_h2d: bool = False
-    use_ce_transfer_d2h: bool = False
-    transfer_sms_h2d: int = 8
-    transfer_sms_d2h: int = 8
-
     # ssd cache configs
-    max_blocks_per_file: int = 32000  # -1 means no limit
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
-    ssd_cache_iouring_entries: int = 512
-    ssd_cache_iouring_flags: int = 1
 
     # gds cache configs
     gds_cache_dir: Optional[Union[str, List[str]]] = None
 
-    # remote cache configs
+    # remote cache configs for cfs
     remote_cache_size_mode: str = "file_size"  # file_size or block_num
     remote_file_size: Optional[int] = None
     remote_file_num: Optional[int] = None
@@ -71,23 +55,30 @@ class CacheConfig:
     remote_cache_path: Optional[Union[str, List[str]]] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
 
-    # Trace configs
-    enable_trace: bool = True
-    trace_file_path: str = "./flexkv_trace.log"
-    trace_max_file_size_mb: int = 100
-    trace_max_files: int = 5
-    trace_flush_interval_ms: int = 1000
 
-    #evict ratio
-    evict_ratio: float = 0.0
+GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
+    index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
+    cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKWISE').upper()),
+    ssd_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_SSD_LAYOUT', 'BLOCKWISE').upper()),
+    remote_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_REMOTE_LAYOUT', 'BLOCKWISE').upper()),
+    gds_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_GDS_LAYOUT', 'BLOCKWISE').upper()),
 
-    def __post_init__(self):
-        layout_fields = ['gpu_kv_layout_type',
-                         'cpu_kv_layout_type',
-                         'ssd_kv_layout_type',
-                         'remote_kv_layout_type',
-                         'gds_kv_layout_type']
-        for field in layout_fields:
-            value = getattr(self, field)
-            if isinstance(value, str):
-                setattr(self, field, KVCacheLayoutType[value.upper()])
+    use_ce_transfer_h2d=os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 'False').lower() == 'true',
+    use_ce_transfer_d2h=os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 'False').lower() == 'true',
+    transfer_sms_h2d=int(os.getenv('FLEXKV_TRANSFER_SMS_H2D', 8)),
+    transfer_sms_d2h=int(os.getenv('FLEXKV_TRANSFER_SMS_D2H', 8)),
+
+    ssd_cache_iouring_entries=int(os.getenv('FLEXKV_SSD_CACHE_IORING_ENTRIES', 512)),
+    ssd_cache_iouring_flags=int(os.getenv('FLEXKV_SSD_CACHE_IORING_FLAGS', 1)),
+
+    max_blocks_per_file=int(os.getenv('FLEXKV_MAX_BLOCKS_PER_FILE', 32000)),  # -1 means no limit
+
+    evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.05)),
+    hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
+
+    enable_trace=os.getenv('FLEXKV_ENABLE_TRACE', 'True').lower() == 'true',
+    trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),
+    trace_max_file_size_mb=int(os.getenv('FLEXKV_TRACE_MAX_FILE_SIZE_MB', 100)),
+    trace_max_files=int(os.getenv('FLEXKV_TRACE_MAX_FILES', 5)),
+    trace_flush_interval_ms=int(os.getenv('FLEXKV_TRACE_FLUSH_INTERVAL_MS', 1000)),
+)
