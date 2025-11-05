@@ -14,5 +14,5 @@
         "evict_ratio": 0.05,
         "index_accel": true
     },
-    "num_log_interval_requests": 2000
+    "num_log_interval_requests": 1000
 }

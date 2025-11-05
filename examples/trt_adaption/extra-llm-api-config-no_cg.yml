@@ -1,7 +1,0 @@
-cuda_graph_config: null
-print_iter_log: true
-enable_chunked_prefill: true
-kv_connector_config:
-  connector_module: "flexkv.integration.tensorrt_llm.trt_adapter"
-  connector_scheduler_class: "FlexKVSchedulerConnector"
-  connector_worker_class: "FlexKVWorkerConnector"
