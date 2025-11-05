@@ -90,7 +90,7 @@ class TransferEngine:
         self._remote_handle = remote_handle
         self._cache_config = cache_config
 
-        self.pin_buffer = SharedOpPool(2048, self.model_config.max_req_tokens // self.cache_config.tokens_per_block)
+        self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
 
