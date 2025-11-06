@@ -143,10 +143,7 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     assert user_config.ssd_cache_gb >= 0
 
     cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
-    if user_config.ssd_cache_gb > 0:
-        cache_config.enable_ssd = True
-        cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)
-        cache_config.ssd_cache_dir = user_config.ssd_cache_dir
-    else:
-        cache_config.enable_ssd = False
+    cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)
+    cache_config.ssd_cache_dir = user_config.ssd_cache_dir
+    cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds

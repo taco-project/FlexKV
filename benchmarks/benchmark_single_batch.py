@@ -160,7 +160,7 @@ def benchmark_flexkv(model_config: ModelConfig,
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="benchmarks/example_config.json")
+    parser.add_argument("--config", type=str, default="benchmarks/example_config.yml")
     # benchmark config
     parser.add_argument("--num-layers", type=int, default=-1)
     parser.add_argument("--batch-size", type=int, default=1)

@@ -31,7 +31,7 @@ def main(args):
     num_put_requests = 0
     request_id = 0
     for req in reqs:
-        fake_slot_mapping = torch.arange(req.token_mask[req.token_mask].sum(), dtype=torch.int64)
+        fake_slot_mapping = torch.arange(req.token_mask[req.token_mask].sum(), dtype=torch.int64).numpy()
         local_vars = {
             'cache_engine': cache_engine,
             'req': req,
@@ -41,23 +41,25 @@ def main(args):
         if req.request_type == "get":
             num_get_requests += 1
             if not args.only_put:
-                profiler.runctx('graph, return_mask, transfer_call_back, finished_ops_ids = '
+                profiler.runctx('graph, return_mask, transfer_call_back, op_callback_dict, finished_ops_ids = '
                                 'cache_engine.get(request_id, req.token_ids, req.token_mask, '
                                 'fake_slot_mapping, -1, -1)',
                                 globals(), local_vars)
             else:
-                graph, return_mask, transfer_call_back, finished_ops_ids = \
+                graph, return_mask, transfer_call_back, op_callback_dict, finished_ops_ids = \
                     cache_engine.get(request_id, req.token_ids, req.token_mask,
                                    fake_slot_mapping, -1, -1)
                 local_vars.update({
                     'graph': graph,
                     'return_mask': return_mask,
                     'transfer_call_back': transfer_call_back,
+                    'op_callback_dict': op_callback_dict,
                     'finished_ops_ids': finished_ops_ids
                 })
             profiler.runctx('transfer_call_back()', globals(), local_vars)
 
             return_mask = local_vars['return_mask']
+            op_callback_dict = local_vars['op_callback_dict']
             cache_hit_ratio = return_mask.sum() / req.token_mask.sum()
             cache_hit_ratio_list.append(cache_hit_ratio)
             flexkv_logger.info(f"need get {req.token_mask.sum()} tokens, "
@@ -66,16 +68,17 @@ def main(args):
         elif req.request_type == "put":
             num_put_requests += 1
             if not args.only_get:
-                profiler.runctx('graph, return_mask, transfer_call_back, finished_ops_ids = '
+                profiler.runctx('graph, return_mask, transfer_call_back, op_callback_dict, finished_ops_ids = '
                                 'cache_engine.put(request_id, req.token_ids, req.token_mask, fake_slot_mapping)',
                                 globals(), local_vars)
             else:
-                graph, return_mask, transfer_call_back, finished_ops_ids = \
+                graph, return_mask, transfer_call_back, op_callback_dict, finished_ops_ids = \
                     cache_engine.put(request_id, req.token_ids, req.token_mask, fake_slot_mapping)
                 local_vars.update({
                     'graph': graph,
                     'return_mask': return_mask,
                     'transfer_call_back': transfer_call_back,
+                    'op_callback_dict': op_callback_dict,
                     'finished_ops_ids': finished_ops_ids
                 })
 
@@ -105,7 +108,7 @@ def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--config",
                         type=str,
-                        default="./benchmarks/example_config.json")
+                        default="./benchmarks/example_config.yml")
     parser.add_argument("--only-get", action="store_true")
     parser.add_argument("--only-put", action="store_true")
     parser.add_argument("--num-users", type=int, default=20)

@@ -15,7 +15,7 @@ from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator
 from flexkv.common.storage import KVCacheLayoutType, KVCacheLayout
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
-
+from utils import load_config
 
 # flexkv_logger.set_level("OFF")
 
@@ -32,27 +32,29 @@ class BenchmarkConfig:
 def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]:
     config_file = args.config
     try:
-        with open(config_file) as f:
-            config = json.load(f)
-            model_config = ModelConfig(**config["ModelConfig"])
-            model_config.dtype = eval(f"torch.{model_config.dtype}")
-            cache_config = CacheConfig(**config["CacheConfig"])
-            cache_config.num_gpu_blocks = args.num_blocks
-            bench_config = BenchmarkConfig()
-            bench_config.transfer_type = TransferType(args.transfer_type)
-            bench_config.num_layers_to_transfer = args.num_layers
-            bench_config.num_blocks_to_transfer = args.num_blocks
-            bench_config.shuffle_ids = args.shuffle_ids
-            bench_config.warmup_round = args.warmup_round
-            bench_config.benchmark_round = args.benchmark_round
-            bench_config.bidirectional = args.bi
-            return model_config, cache_config, bench_config
+        model_config, cache_config = load_config(config_file)
+        if args.transfer_type == "H2D" or args.transfer_type == "D2H":
+            cache_config.enable_ssd = False
+        elif args.transfer_type == "H2DISK" or args.transfer_type == "DISK2H":
+            assert cache_config.enable_ssd, "SSD cache must be enabled for DISK2H or H2DISK benchmark"
+        bench_config = BenchmarkConfig(
+            transfer_type=TransferType(args.transfer_type),
+            num_layers_to_transfer=args.num_layers,
+            num_blocks_to_transfer=args.num_blocks,
+            shuffle_ids=args.shuffle_ids,
+            warmup_round=args.warmup_round,
+            benchmark_round=args.benchmark_round,
+            bidirectional=args.bi
+        )
+        cache_config.num_ssd_blocks = max(cache_config.num_ssd_blocks, bench_config.num_blocks_to_transfer)
+        return model_config, cache_config, bench_config
     except Exception as e:
         raise ValueError(f"Failed to load config file {config_file}: {e}") from None
 
 def create_cpu_gpu_worker(
                   model_config: ModelConfig,
-                  cache_config: CacheConfig) -> Tuple[WorkerHandle, mp.Queue]:
+                  cache_config: CacheConfig,
+                  num_gpu_blocks: int) -> Tuple[WorkerHandle, mp.Queue]:
     mp.set_start_method('spawn', force=True)
     cpu_layout = KVCacheLayout(
         type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
@@ -65,7 +67,7 @@ def create_cpu_gpu_worker(
     gpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERWISE,
         num_layer=model_config.num_layers,
-        num_block=cache_config.num_gpu_blocks,
+        num_block=num_gpu_blocks,
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
@@ -216,7 +218,7 @@ def bench_worker(args):
     bidirectional = bench_config.bidirectional
 
     if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
-        worker_handle, finished_ops_queue = create_cpu_gpu_worker(model_config, cache_config)
+        worker_handle, finished_ops_queue = create_cpu_gpu_worker(model_config, cache_config, num_blocks_to_transfer)
     elif transfer_type == TransferType.H2DISK or transfer_type == TransferType.DISK2H:
         worker_handle, finished_ops_queue = create_cpu_ssd_worker(model_config, cache_config)
     else:
@@ -325,7 +327,7 @@ def parse_args():
                         default=16)
     parser.add_argument("--config",
                         type=str,
-                        default="./benchmarks/example_config.json")
+                        default="./benchmarks/example_config.yml")
     parser.add_argument("--shuffle-ids",
                         action="store_true")
     parser.add_argument("--warmup-round",
