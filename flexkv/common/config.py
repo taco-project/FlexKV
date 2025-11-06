@@ -126,8 +126,8 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
 def load_user_config_from_env() -> UserConfig:
     return UserConfig(
         cpu_cache_gb=int(os.getenv('FLEXKV_CPU_CACHE_GB', 16)),
-        ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 256)),
-        ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./ssd_cache")),
+        ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
+        ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./flexkv_ssd")),
         enable_gds=bool(int(os.getenv('FLEXKV_ENABLE_GDS', 0))),
     )
 
