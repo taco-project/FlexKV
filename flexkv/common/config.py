@@ -54,7 +54,6 @@ class CacheConfig:
     remote_cache_path: Optional[Union[str, List[str]]] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
 
-
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'flexkv_server'),
@@ -78,12 +77,36 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.05)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
 
-    enable_trace=os.getenv('FLEXKV_ENABLE_TRACE', 'False').lower() == 'true',
+    enable_trace=os.getenv('FLEXKV_ENABLE_TRACE', 'False').lower() == 'true',  # False -> 0
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),
     trace_max_file_size_mb=int(os.getenv('FLEXKV_TRACE_MAX_FILE_SIZE_MB', 100)),
     trace_max_files=int(os.getenv('FLEXKV_TRACE_MAX_FILES', 5)),
     trace_flush_interval_ms=int(os.getenv('FLEXKV_TRACE_FLUSH_INTERVAL_MS', 1000)),
+
+    num_log_interval_requests=int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200)),
 )
+
+@dataclass
+class UserConfig:
+    cpu_cache_gb: int = 16
+    enable_ssd: bool = False
+    ssd_cache_gb: int = 256  # 0 means disable ssd
+    ssd_cache_dir: Optional[Union[str, List[str]]] = None
+    enable_gds: bool = False
+
+def load_user_config(config_file: str) -> UserConfig:
+    import json
+    import yaml
+    # read json config file or yaml config file
+    if config_file.endswith('.json'):
+        with open(config_file) as f:
+            config = json.load(f)
+    elif config_file.endswith('.yaml'):
+        with open(config_file) as f:
+            config = yaml.safe_load(f)
+    else:
+        raise ValueError(f"Unsupported config file extension: {config_file}")
+    return UserConfig(**config)
 
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
     return int(size_in_GB * 1024 * 1024 * 1024 / block_size_in_bytes)

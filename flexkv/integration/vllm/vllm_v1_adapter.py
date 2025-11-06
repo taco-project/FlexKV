@@ -10,7 +10,7 @@ import torch
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, ModelConfig, CacheConfig
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
@@ -155,7 +155,7 @@ class FlexKVSchedulerConnector:
         self.tasks_to_launch: dict[int, FlexKVTask] = {}
         self.tasks_to_cancel: dict[int, FlexKVTask] = {}
 
-        self.flexkv_stats = FlexKVStats(flexkv_config.num_log_interval_requests)
+        self.flexkv_stats = FlexKVStats(GLOBAL_CONFIG_FROM_ENV.num_log_interval_requests)
 
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")
@@ -534,7 +534,8 @@ class FlexKVWorkerConnector:
     ):
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.tp_size
         self.flexkv_config = flexkv_config
-        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.server_recv_port}, dp_client_id: {dp_client_id}")
+        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.server_recv_port}, \
+            dp_client_id: {dp_client_id}")
         self.tp_client = KVTPClient(flexkv_config.server_recv_port, dp_client_id, current_device_id)
         logger.info("Finish init FlexKVWorkerConnector")
 
