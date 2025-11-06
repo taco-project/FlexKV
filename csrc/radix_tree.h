@@ -16,7 +16,7 @@ private:
   bool on_leaf;
   bool ready;
   int lock_cnt;
-  time_t last_access_time;
+  time_t grace_time;
 
   std::deque<int64_t> block_hashes;
   std::deque<int64_t> physical_blocks;
@@ -48,18 +48,25 @@ public:
   }
 
   void set_time(time_t time) {
-    last_access_time = time;
+    grace_time = time;
   }
 
   time_t get_time() {
-    return last_access_time;
+    return grace_time;
   }
 
-  void update_time() {
+  void update_time(int hit_reward_seconds) {
     struct timeval now;
+    time_t now_time;
 
     gettimeofday(&now, nullptr);
-    last_access_time = now.tv_sec * 1000 + now.tv_usec / 10000;
+    now_time = now.tv_sec * 1000 + now.tv_usec / 10000;
+
+    if (grace_time > now_time) {
+      grace_time += hit_reward_seconds;
+    } else {
+      grace_time = now_time + hit_reward_seconds;
+    }
   }
 
   CRadixNode *get_parent() {
@@ -188,12 +195,14 @@ private:
   int max_num_blocks;
   int tokens_per_block;
   int node_count;
+  int hit_reward_seconds;
 
 public:
-  CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000) {
+  CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000, int hit_reward_seconds = 0) {
     this->tokens_per_block = tokens_per_block;
     this->max_num_blocks = max_num_blocks;
     this->node_count = 0;
+    this->hit_reward_seconds = hit_reward_seconds;
 
     root = new CRadixNode(this, true, 0);
     node_list.push_back(root);

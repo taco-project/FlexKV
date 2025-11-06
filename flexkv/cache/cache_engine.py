@@ -52,7 +52,8 @@ class CacheEngineAccel:
                  device_type: DeviceType,
                  num_total_blocks: int,
                  tokens_per_block: int,
-                 evict_ratio: float):
+                 evict_ratio: float,
+                 hit_reward_seconds: int):
         if not isinstance(device_type, DeviceType):
             raise InvalidConfigError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -63,7 +64,7 @@ class CacheEngineAccel:
 
         self.device_type = device_type
 
-        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks)
+        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
@@ -164,7 +165,6 @@ class CacheEngine:
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
-        self.hit_reward_seconds = hit_reward_seconds
 
     def reset(self) -> None:
         self.index.reset()
@@ -234,7 +234,8 @@ class GlobalCacheEngine:
                 self.cpu_cache_engine = CacheEngineAccel(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
-                                                cache_config.evict_ratio)
+                                                cache_config.evict_ratio,
+                                                cache_config.hit_reward_seconds)
             else:
                 self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
@@ -247,7 +248,8 @@ class GlobalCacheEngine:
                 self.ssd_cache_engine = CacheEngineAccel(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
-                                                cache_config.evict_ratio)
+                                                cache_config.evict_ratio,
+                                                cache_config.hit_reward_seconds)
             else:
                 self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
@@ -260,7 +262,8 @@ class GlobalCacheEngine:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
-                                                   cache_config.evict_ratio)
+                                                   cache_config.evict_ratio,
+                                                   cache_config.hit_reward_seconds)
             else:
                 self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
