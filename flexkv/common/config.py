@@ -3,6 +3,7 @@ from enum import Enum
 from typing import Optional, List, Union, Dict, Any
 from argparse import Namespace
 import os
+import copy
 
 import torch
 
@@ -11,9 +12,9 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 @dataclass
 class ModelConfig:
-    num_layers: int
-    num_kv_heads: int
-    head_size: int
+    num_layers: int = 0
+    num_kv_heads: int = 0
+    head_size: int = 0
     use_mla: bool = False
     dtype: torch.dtype = torch.bfloat16
 
@@ -56,7 +57,7 @@ class CacheConfig:
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
-    server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'flexkv_server'),
+    server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKWISE').upper()),
@@ -64,8 +65,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     remote_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_REMOTE_LAYOUT', 'BLOCKWISE').upper()),
     gds_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_GDS_LAYOUT', 'BLOCKWISE').upper()),
 
-    use_ce_transfer_h2d=os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 'False').lower() == 'true',
-    use_ce_transfer_d2h=os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 'False').lower() == 'true',
+    use_ce_transfer_h2d=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0))),
+    use_ce_transfer_d2h=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0))),
     transfer_sms_h2d=int(os.getenv('FLEXKV_TRANSFER_SMS_H2D', 8)),
     transfer_sms_d2h=int(os.getenv('FLEXKV_TRANSFER_SMS_D2H', 8)),
 
@@ -77,7 +78,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.05)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
 
-    enable_trace=os.getenv('FLEXKV_ENABLE_TRACE', 'False').lower() == 'true',  # False -> 0
+    enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),
     trace_max_file_size_mb=int(os.getenv('FLEXKV_TRACE_MAX_FILE_SIZE_MB', 100)),
     trace_max_files=int(os.getenv('FLEXKV_TRACE_MAX_FILES', 5)),
@@ -89,12 +90,24 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 @dataclass
 class UserConfig:
     cpu_cache_gb: int = 16
-    enable_ssd: bool = False
-    ssd_cache_gb: int = 256  # 0 means disable ssd
-    ssd_cache_dir: Optional[Union[str, List[str]]] = None
+    ssd_cache_gb: int = 0  # 0 means disable ssd
+    ssd_cache_dir: Union[str, List[str]] = "./ssd_cache"
     enable_gds: bool = False
 
-def load_user_config(config_file: str) -> UserConfig:
+    def __post_init__(self):
+        if self.cpu_cache_gb <= 0:
+            raise ValueError(f"Invalid cpu_cache_gb: {self.cpu_cache_gb}")
+        if self.ssd_cache_gb < 0:
+            raise ValueError(f"Invalid ssd_cache_gb: {self.ssd_cache_gb}")
+        if self.ssd_cache_gb > 0 and self.ssd_cache_gb <= self.cpu_cache_gb:
+            raise ValueError(f"Invalid ssd_cache_gb: {self.ssd_cache_gb}, "
+                             f"must be greater than cpu_cache_gb: {self.cpu_cache_gb}.")
+
+def parse_path_list(path_str: str) -> List[str]:
+    paths = [p.strip() for p in path_str.split(';') if p.strip()]
+    return paths
+
+def load_user_config_from_file(config_file: str) -> UserConfig:
     import json
     import yaml
     # read json config file or yaml config file
@@ -106,7 +119,34 @@ def load_user_config(config_file: str) -> UserConfig:
             config = yaml.safe_load(f)
     else:
         raise ValueError(f"Unsupported config file extension: {config_file}")
+    if 'ssd_cache_dir' in config:
+        config['ssd_cache_dir'] = parse_path_list(config['ssd_cache_dir'])
     return UserConfig(**config)
+
+def load_user_config_from_env() -> UserConfig:
+    return UserConfig(
+        cpu_cache_gb=int(os.getenv('FLEXKV_CPU_CACHE_GB', 16)),
+        ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 256)),
+        ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./ssd_cache")),
+        enable_gds=bool(int(os.getenv('FLEXKV_ENABLE_GDS', 0))),
+    )
 
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
     return int(size_in_GB * 1024 * 1024 * 1024 / block_size_in_bytes)
+
+def update_default_config_from_user_config(model_config: ModelConfig,
+                                           cache_config: CacheConfig,
+                                           user_config: UserConfig) -> None:
+    block_size_in_bytes = model_config.token_size_in_bytes * cache_config.tokens_per_block
+
+    assert user_config.cpu_cache_gb > 0
+    assert user_config.ssd_cache_gb >= 0
+
+    cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
+    if user_config.ssd_cache_gb > 0:
+        cache_config.enable_ssd = True
+        cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)
+        cache_config.ssd_cache_dir = user_config.ssd_cache_dir
+    else:
+        cache_config.enable_ssd = False
+    cache_config.enable_gds = user_config.enable_gds
