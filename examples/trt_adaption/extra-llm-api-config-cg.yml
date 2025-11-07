@@ -15,3 +15,6 @@ kv_connector_config:
   connector_module: "flexkv.integration.tensorrt_llm.trt_adapter"
   connector_scheduler_class: "FlexKVSchedulerConnector"
   connector_worker_class: "FlexKVWorkerConnector"
+speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3

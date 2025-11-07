@@ -1,8 +1,9 @@
 mkdir -p logs
 TIMESTAMP=$(date +%Y.%m.%d-%H:%M:%S)
-MODEL_PATH=/cfs_zhongwei/models/deepseek-ai/DeepSeek-V3.1-W4AFP8-MTP
-MAX_SEQ_LEN=32764
-MAX_NUM_TOKENS=16384
+# MODEL_PATH=/cfs_zhongwei/models/deepseek-ai/DeepSeek-V3.1-W4AFP8-MTP
+MODEL_PATH=/cfs_zhongwei/models/deepseek-ai/DeepSeek-V3.1-W4AFP8-MTP-TRTLLM
+MAX_SEQ_LEN=49152
+MAX_NUM_TOKENS=24576
 TP_SIZE=8
 EP_SIZE=$TP_SIZE
 
