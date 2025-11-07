@@ -10,7 +10,6 @@ import torch
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, ModelConfig, CacheConfig
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
@@ -141,7 +140,7 @@ class FlexKVSchedulerConnector:
         self.tasks_to_launch: dict[int, FlexKVTask] = {}
         self.tasks_to_cancel: dict[int, FlexKVTask] = {}
 
-        self.flexkv_stats = FlexKVStats(GLOBAL_CONFIG_FROM_ENV.num_log_interval_requests)
+        self.flexkv_stats = FlexKVStats(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200))
 
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")

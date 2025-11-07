@@ -16,7 +16,30 @@
 - FlexKV >= `1.0.0`
 - vLLM 原则上>= `0.8.5`版本均可参考示例代码进行修改
 
-### 示例
+### 配置
+
+#### 示例一：仅启用CPU卸载
+使用32GB的CPU内存作为二级缓存。
+```bash
+unset FLEXKV_CONFIG_PATH
+export FLEXKV_CPU_CACHE_GB=32
+```
+#### 示例二：启用SSD卸载
+使用32GB的CPU内存和1T的SSD存储。两个SSD分别挂载到/data0和/data1两个路径上。
+```bash
+# generate config
+cat <<EOF > ./flexkv_config.yml
+cpu_cache_gb: 32
+ssd_cache_gb: 1024
+ssd_cache_dir: /data0/flexkv_ssd/;/data1/flexkv_ssd/
+enable_gds: false
+EOF
+export FLEXKV_CONFIG_PATH="./flexkv_config.yml"
+```
+
+> 注：`flexkv_config.yml`配置仅为简单示例，选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
+
+### 运行
 我们提供了基于 **vLLM 0.10.1.1** 的适配示例：
 
 1. apply patch
@@ -33,19 +56,6 @@ python examples/offline_inference/prefix_caching_flexkv.py
 
 3. online serving
 ```bash
-# generate config
-cat <<EOF > ./flexkv_config.json
-{
-    "server_recv_port": "ipc:///tmp/flexkv_test",
-    "cache_config": {
-          "enable_cpu": true,
-          "num_cpu_blocks": 10240,
-    },
-    "num_log_interval_requests": 200
-}
-EOF
-export FLEXKV_CONFIG_PATH="./flexkv_config.json"
-
 VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
      --tensor-parallel-size 8 \
      --trust-remote-code \
@@ -62,14 +72,30 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
 
 ```
 
-> 注：`flexkv_config.json`配置仅为简单示例，选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
-
 ## Legacy版本（<= 0.1.0）,目前的版本尽量不要使用
 
 ### 适用版本
 - FlexKV <= `0.1.0`
 
-### 示例
+### 配置
+
+旧版本配置方式如下
+```bash
+# generate config
+cat <<EOF > ./flexkv_config.json
+{
+    "server_recv_port": "ipc:///tmp/flexkv_test",
+    "cache_config": {
+          "enable_cpu": true,
+          "num_cpu_blocks": 10240
+    },
+    "num_log_interval_requests": 200
+}
+EOF
+export FLEXKV_CONFIG_PATH="./flexkv_config.json"
+```
+
+### 运行
 在 vLLM 0.8.4 版本中应用patch `examples/vllm_adaption_legacy/flexkv_vllm_0_8_4.patch`，分别启动 FlexKV、vLLM 和测试脚本：
 
 ```bash

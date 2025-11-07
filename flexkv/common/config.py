@@ -83,8 +83,6 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     trace_max_file_size_mb=int(os.getenv('FLEXKV_TRACE_MAX_FILE_SIZE_MB', 100)),
     trace_max_files=int(os.getenv('FLEXKV_TRACE_MAX_FILES', 5)),
     trace_flush_interval_ms=int(os.getenv('FLEXKV_TRACE_FLUSH_INTERVAL_MS', 1000)),
-
-    num_log_interval_requests=int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200)),
 )
 
 @dataclass
@@ -111,7 +109,7 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
     import json
     import yaml
     from dataclasses import fields
-    
+
     # read json config file or yaml config file
     if config_file.endswith('.json'):
         with open(config_file) as f:
@@ -121,19 +119,19 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
             config = yaml.safe_load(f)
     else:
         raise ValueError(f"Unsupported config file extension: {config_file}")
-    
+
     if 'ssd_cache_dir' in config:
         config['ssd_cache_dir'] = parse_path_list(config['ssd_cache_dir'])
-    
+
     defined_fields = {f.name for f in fields(UserConfig)}
     known_config = {k: v for k, v in config.items() if k in defined_fields}
     extra_config = {k: v for k, v in config.items() if k not in defined_fields}
-    
+
     user_config = UserConfig(**known_config)
-    
+
     for key, value in extra_config.items():
         setattr(user_config, f"override_{key}", value)
-    
+
     return user_config
 
 def load_user_config_from_env() -> UserConfig:
@@ -168,11 +166,11 @@ def update_default_config_from_user_config(model_config: ModelConfig,
             if global_attr_name in global_config_attrs:
                 attr_value = getattr(user_config, attr_name)
                 original_value = getattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name)
-                
+
                 original_type = type(original_value)
-                
+
                 try:
-                    if original_type == bool:
+                    if original_type is bool:
                         if isinstance(attr_value, str):
                             attr_value = attr_value.lower() in ('true', '1', 'yes')
                         else:
@@ -186,8 +184,8 @@ def update_default_config_from_user_config(model_config: ModelConfig,
                         attr_value = original_type(attr_value)
                 except (ValueError, TypeError) as e:
                     raise ValueError(f"Cannot convert config value '{attr_value}' to type {original_type.__name__} "
-                                    f"for config '{global_attr_name}': {e}")
-                
+                                    f"for config '{global_attr_name}': {e}") from e
+
                 setattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name, attr_value)
                 flexkv_logger.info(f"Override environment variable: {'FLEXKV_' + global_attr_name.upper()} "
                                    f"to {attr_value} from config file.")
