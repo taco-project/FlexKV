@@ -596,8 +596,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
 
         try:
-            self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), GLOBAL_CONFIG_FROM_ENV.ssd_cache_iouring_entries,
-                GLOBAL_CONFIG_FROM_ENV.ssd_cache_iouring_flags)
+            self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+                GLOBAL_CONFIG_FROM_ENV.iouring_flags)
         except Exception as e:
             flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
             raise RuntimeError("SSD Worker init failed") from e

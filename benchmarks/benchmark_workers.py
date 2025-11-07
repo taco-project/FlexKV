@@ -159,6 +159,7 @@ def create_cpu_ssd_worker(
         dtype=model_config.dtype,
         num_chunks=model_config.num_layers,
         cache_dir=cache_config.ssd_cache_dir,
+        max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
     )
     finished_ops_queue = mp.Queue()
     # Create a shared memory buffer for transfer operations

@@ -8,7 +8,7 @@ import copy
 import torch
 
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-
+from flexkv.common.debug import flexkv_logger
 
 @dataclass
 class ModelConfig:
@@ -70,10 +70,10 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_sms_h2d=int(os.getenv('FLEXKV_TRANSFER_SMS_H2D', 8)),
     transfer_sms_d2h=int(os.getenv('FLEXKV_TRANSFER_SMS_D2H', 8)),
 
-    ssd_cache_iouring_entries=int(os.getenv('FLEXKV_SSD_CACHE_IORING_ENTRIES', 512)),
-    ssd_cache_iouring_flags=int(os.getenv('FLEXKV_SSD_CACHE_IORING_FLAGS', 1)),
+    iouring_entries=int(os.getenv('FLEXKV_IORING_ENTRIES', 512)),
+    iouring_flags=int(os.getenv('FLEXKV_IORING_FLAGS', 0)),
 
-    max_blocks_per_file=int(os.getenv('FLEXKV_MAX_BLOCKS_PER_FILE', 32000)),  # -1 means no limit
+    max_file_size_gb=float(os.getenv('FLEXKV_MAX_FILE_SIZE_GB', 32)),  # -1 means no limit
 
     evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.05)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
@@ -110,6 +110,8 @@ def parse_path_list(path_str: str) -> List[str]:
 def load_user_config_from_file(config_file: str) -> UserConfig:
     import json
     import yaml
+    from dataclasses import fields
+    
     # read json config file or yaml config file
     if config_file.endswith('.json'):
         with open(config_file) as f:
@@ -119,9 +121,20 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
             config = yaml.safe_load(f)
     else:
         raise ValueError(f"Unsupported config file extension: {config_file}")
+    
     if 'ssd_cache_dir' in config:
         config['ssd_cache_dir'] = parse_path_list(config['ssd_cache_dir'])
-    return UserConfig(**config)
+    
+    defined_fields = {f.name for f in fields(UserConfig)}
+    known_config = {k: v for k, v in config.items() if k in defined_fields}
+    extra_config = {k: v for k, v in config.items() if k not in defined_fields}
+    
+    user_config = UserConfig(**known_config)
+    
+    for key, value in extra_config.items():
+        setattr(user_config, f"override_{key}", value)
+    
+    return user_config
 
 def load_user_config_from_env() -> UserConfig:
     return UserConfig(
@@ -147,3 +160,37 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds
+
+    global_config_attrs = set(vars(GLOBAL_CONFIG_FROM_ENV).keys())
+    for attr_name in dir(user_config):
+        if attr_name.startswith('override_'):
+            global_attr_name = attr_name[9:]  # len('override_') = 9
+            if global_attr_name in global_config_attrs:
+                attr_value = getattr(user_config, attr_name)
+                original_value = getattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name)
+                
+                original_type = type(original_value)
+                
+                try:
+                    if original_type == bool:
+                        if isinstance(attr_value, str):
+                            attr_value = attr_value.lower() in ('true', '1', 'yes')
+                        else:
+                            attr_value = bool(int(attr_value))
+                    elif issubclass(original_type, Enum):  # KVCacheLayoutType
+                        if isinstance(attr_value, str):
+                            attr_value = original_type(attr_value.upper())
+                        elif not isinstance(attr_value, original_type):
+                            attr_value = original_type(attr_value)
+                    else:
+                        attr_value = original_type(attr_value)
+                except (ValueError, TypeError) as e:
+                    raise ValueError(f"Cannot convert config value '{attr_value}' to type {original_type.__name__} "
+                                    f"for config '{global_attr_name}': {e}")
+                
+                setattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name, attr_value)
+                flexkv_logger.info(f"Override environment variable: {'FLEXKV_' + global_attr_name.upper()} "
+                                   f"to {attr_value} from config file.")
+            else:
+                raise ValueError(f"Unknown config name: {global_attr_name} in config file, "
+                                 f"available config names: {global_config_attrs}")

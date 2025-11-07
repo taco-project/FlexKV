@@ -136,9 +136,9 @@ class SSDAllocator(BaseStorageAllocator):
                  **kwargs: Any) -> StorageHandle:
         cache_dir = kwargs.get("cache_dir")
         file_prefix = kwargs.get("file_prefix", "flexkv_ssd_cache")
-        cfg_max_blocks_per_file = kwargs.get("max_blocks_per_file", -1)
-        if cfg_max_blocks_per_file == -1:
-            cfg_max_blocks_per_file = int(1e9)
+        cfg_max_file_size_gb = kwargs.get("max_file_size_gb", -1)
+        cfg_max_blocks_per_file = int(1e9)
+        
         if cache_dir is None:
             raise ValueError("cache_dir is required for SSD allocator")
         if isinstance(cache_dir, str):
@@ -159,6 +159,10 @@ class SSDAllocator(BaseStorageAllocator):
         total_blocks_per_device = layout.num_block // num_ssd_devices
         block_size = layout.get_elements_per_block() * dtype.itemsize
 
+        if cfg_max_file_size_gb != -1:
+            cfg_max_blocks_per_file = int(cfg_max_file_size_gb * 1024 * 1024 * 1024 // block_size)
+        
+
         fsys_max_blocks_per_file = cls.get_file_size_limit(cache_dir[0]) // block_size
         num_blocks_per_file = min(fsys_max_blocks_per_file, cfg_max_blocks_per_file)
 
@@ -173,7 +177,10 @@ class SSDAllocator(BaseStorageAllocator):
                 with open(file_path, "wb+", buffering=0) as file:
                     cls._create_file(file, real_file_size)
                 ssd_files[i].append(file_path)
-
+        total_num_files = num_files_per_device * num_ssd_devices
+        real_total_size = total_num_files * real_file_size
+        flexkv_logger.info(f"SSD allocator create total {total_num_files} files in {cache_dir}, "
+                           f"each file has {real_file_size/1024/1024/1024:.2f} GB, total size {real_total_size/1024/1024/1024:.2f} GB")
         return StorageHandle(
             handle_type=AccessHandleType.FILE,
             data=ssd_files,

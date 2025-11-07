@@ -51,7 +51,7 @@ class StorageEngine:
                 layout=self._ssd_layout,
                 dtype=self._model_config.dtype,
                 cache_dir=self._cache_config.ssd_cache_dir,
-                max_blocks_per_file=GLOBAL_CONFIG_FROM_ENV.max_blocks_per_file
+                max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
         if self._cache_config.enable_remote:
             if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
@@ -91,7 +91,7 @@ class StorageEngine:
                 layout=self._gds_layout,
                 dtype=self._model_config.dtype,
                 gds_cache_dir=self._cache_config.gds_cache_dir,
-                max_blocks_per_file=GLOBAL_CONFIG_FROM_ENV.max_blocks_per_file
+                max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
 
     def register_gpu_blocks(self,
@@ -173,7 +173,7 @@ class StorageEngine:
                 )
         elif device_type == DeviceType.SSD:
             cache_dir = kwargs.get('cache_dir')
-            max_blocks_per_file = kwargs.get('max_blocks_per_file', -1)
+            max_file_size_gb = kwargs.get('max_file_size_gb', -1)
             if raw_data is not None:
                 assert isinstance(raw_data, str) or \
                     (isinstance(raw_data, list) and all(isinstance(x, str) for x in raw_data)), \
@@ -191,7 +191,7 @@ class StorageEngine:
                     dtype=dtype,
                     cache_dir=cache_dir,
                     file_prefix="flexkv_ssd_cache",
-                    max_blocks_per_file=max_blocks_per_file
+                    max_file_size_gb=max_file_size_gb
                 )
         elif device_type == DeviceType.REMOTE:
             file_path = kwargs.get('file_path')
@@ -222,13 +222,13 @@ class StorageEngine:
                 )
         elif device_type == DeviceType.GDS:
             gds_cache_dir = kwargs.get('gds_cache_dir')
-            max_blocks_per_file = kwargs.get('max_blocks_per_file', -1)
+            max_file_size_gb = kwargs.get('max_file_size_gb', -1)
 
             allocator = GDSAllocator(
                 layout=layout,
                 dtype=dtype,
                 gds_cache_dir=gds_cache_dir,
-                max_blocks_per_file=max_blocks_per_file
+                max_file_size_gb=max_file_size_gb
             )
             storage_handle = allocator.get_accessible_handle()
         else:
