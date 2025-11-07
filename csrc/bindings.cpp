@@ -422,7 +422,7 @@ PYBIND11_MODULE(c_ext, m) {
 #endif
 
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
-      .def(py::init<int, int>())
+      .def(py::init<int, int, int>())
       .def("is_empty", &flexkv::CRadixTreeIndex::is_empty)
       .def("reset", &flexkv::CRadixTreeIndex::reset)
       .def("lock", &flexkv::CRadixTreeIndex::lock, py::arg("node"))

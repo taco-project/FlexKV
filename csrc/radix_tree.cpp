@@ -21,7 +21,7 @@ CRadixNode::CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt) {
 
   struct timeval now;
   gettimeofday(&now, nullptr);
-  last_access_time = now.tv_sec * 1000 + now.tv_usec / 10000;
+  grace_time = now.tv_sec * 1000 + now.tv_usec / 10000;
 
   index->inc_node_count();
 }
@@ -215,7 +215,7 @@ std::shared_ptr<CMatchResult> CRadixTreeIndex::match_prefix(
 
   while (prefix_blocks_num < num_blocks) {
     if (update_cache_info) {
-      current_node->update_time();
+      current_node->update_time(hit_reward_seconds);
     }
 
     child_hash = HashType(block_hashes_ptr[prefix_blocks_num + current_node->size()]);
