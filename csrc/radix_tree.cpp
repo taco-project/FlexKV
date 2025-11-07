@@ -4,6 +4,7 @@
 #include <memory>
 #include <torch/extension.h>
 #include <type_traits>
+#include <optional>
 
 #include "cache_utils.h"
 #include "radix_tree.h"
@@ -273,9 +274,16 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
       current_node->update_time(hit_reward_seconds);
     }
 
-    child_hash =
-        HashType(block_hashes_ptr[prefix_blocks_num + current_node->size()]);
-    if (current_node->lookup_child(child_hash)) {
+    // Use get_hash_safe (matching Python's get_hash with boundary check and _has_hashes branch)
+    auto child_hash_opt = get_hash_safe(
+        block_hashes_ptr, 
+        token_ids_ptr, 
+        prefix_blocks_num + current_node->size(), 
+        num_blocks,
+        has_hashes,
+        tokens_per_block);
+    if (child_hash_opt.has_value() && current_node->lookup_child(child_hash_opt.value())) {
+      child_hash = child_hash_opt.value();
       if (current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += current_node->size();
@@ -295,8 +303,15 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
 
         while (left < right) {
           auto mid = (left + right) / 2;
-          if (current_node->get_hash(mid) ==
-              HashType(block_hashes_ptr[prefix_blocks_num + mid])) {
+          // Use get_hash_safe for boundary check (matching Python's get_hash with _has_hashes branch)
+          auto hash_opt = get_hash_safe(
+              block_hashes_ptr, 
+              token_ids_ptr, 
+              prefix_blocks_num + mid, 
+              num_blocks,
+              has_hashes,
+              tokens_per_block);
+          if (hash_opt.has_value() && current_node->get_hash(mid) == hash_opt.value()) {
             left = mid + 1;
           } else {
             right = mid;
