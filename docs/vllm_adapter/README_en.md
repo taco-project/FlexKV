@@ -26,7 +26,7 @@ unset FLEXKV_CONFIG_PATH
 export FLEXKV_CPU_CACHE_GB=32
 ```
 #### Example 2: SSD Offloading
-Use 32GB of CPU memory and 1TB of SSD storage. The two SSDs are mounted at /data0 and /data1 respectively.
+Use 32GB of CPU memory and 1TB of SSD storage as secondary and tertiary cache respectively. (Assume the machine has two SSDs mounted at /data0 and /data1 respectively.)
 ```bash
 # generate config
 cat <<EOF > ./flexkv_config.yml

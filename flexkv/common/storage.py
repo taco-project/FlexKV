@@ -59,7 +59,7 @@ class KVCacheLayout:
 
     def _compute_kv_shape(self) -> None:
         if self._kv_shape is None:
-            if self.type == KVCacheLayoutType.LAYERFIRST:  # for LAYERFIRST transfer
+            if self.type == KVCacheLayoutType.LAYERFIRST:  # for Layerwise transfer
                 self._kv_shape = torch.Size([self.num_layer,
                                              self._kv_dim,
                                              self.num_block,

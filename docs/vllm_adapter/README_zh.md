@@ -25,7 +25,7 @@ unset FLEXKV_CONFIG_PATH
 export FLEXKV_CPU_CACHE_GB=32
 ```
 #### 示例二：启用SSD卸载
-使用32GB的CPU内存和1T的SSD存储。两个SSD分别挂载到/data0和/data1两个路径上。
+使用32GB的CPU内存和1T的SSD存储分别作为二级和三级缓存。（假设机器有两个SSD，并分别挂载在/data0和/data1两个路径上。）
 ```bash
 # generate config
 cat <<EOF > ./flexkv_config.yml

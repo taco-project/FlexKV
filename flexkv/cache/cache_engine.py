@@ -330,9 +330,9 @@ class GlobalCacheEngine:
             layer_granularity = layer_num
 
         if layer_num != layer_granularity:
-            flexkv_logger.error(f"LAYERFIRST transfer is not supported yet, "
+            flexkv_logger.error(f"Layerwise transfer is not supported yet, "
                                 f"layer_num: {layer_num}, layer_granularity: {layer_granularity}")
-            raise NotImplementedError(f"LAYERFIRST transfer is not supported yet, "
+            raise NotImplementedError(f"Layerwise transfer is not supported yet, "
                                       f"layer_num: {layer_num}, layer_granularity: {layer_granularity}")
 
         # ignore the last incomplete block

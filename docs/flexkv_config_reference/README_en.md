@@ -6,7 +6,7 @@ This guide provides detailed instructions on how to configure and use FlexKV's o
 
 ## Basic Configuration Options
 
-### 1. Configuration via YML File
+### 1. Configuration via Config File
 
 If the `FLEXKV_CONFIG_PATH` environment variable is set, the configuration file specified by this variable will be used with priority. Both yml and json file formats are supported.
 

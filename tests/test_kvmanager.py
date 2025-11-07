@@ -97,8 +97,7 @@ def shutdown_tp_client(tp_client_processes):
 ], indirect=True)
 @pytest.mark.parametrize("cache_config", [
     {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
-    {'enable_cpu': True, 'enable_ssd': True},
-    {'enable_cpu': True, 'enable_ssd': True, 'num_ssd_blocks': 256},
+    {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 1024, 'num_ssd_blocks': 2048},
     # GDS test configs
     {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': False, \
         'num_gds_blocks': 512, 'gds_cache_dir': ["./gdstest"]},
