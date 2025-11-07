@@ -33,7 +33,7 @@ def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_c
     num_gpu_blocks = cache_config.num_gpu_blocks
 
     gpu_kv_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
+        type=KVCacheLayoutType.LAYERFIRST,
         num_layer=model_config.num_layers,
         num_block=num_gpu_blocks,
         tokens_per_block=cache_config.tokens_per_block,

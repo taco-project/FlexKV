@@ -102,9 +102,9 @@ def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_
     tokens_per_block = cache_config.tokens_per_block
 
     if gpu_layout_type == 0 or gpu_layout_type == 2:
-        layout_type = KVCacheLayoutType.LAYERWISE
+        layout_type = KVCacheLayoutType.LAYERFIRST
     elif gpu_layout_type == 1:
-        layout_type = KVCacheLayoutType.BLOCKWISE
+        layout_type = KVCacheLayoutType.BLOCKFIRST
     else:
         raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
     tpgroup_gpu_kv_layout = KVCacheLayout(
@@ -132,7 +132,7 @@ def generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_confi
     num_gpu_blocks = test_config["num_gpu_blocks"]
 
     tpgroup_gpu_kv_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
+        type=KVCacheLayoutType.LAYERFIRST,
         num_layer=num_layers,
         num_block=num_gpu_blocks,
         tokens_per_block=tokens_per_block,
@@ -391,7 +391,7 @@ def gpu_blocks_worker_process(conn, model_config, cache_config, gpu_kv_layout):
         # Create GPU blocks in subprocess
         gpu_blocks = []
         for layer_id in range(model_config.num_layers):
-            # LAYERWISE format: [kv_dim, num_block, tokens_per_block, num_head, head_size]
+            # LAYERFIRST format: [kv_dim, num_block, tokens_per_block, num_head, head_size]
             kv_dim = 2 if not model_config.use_mla else 1
             gpu_tensor = torch.zeros(
                 kv_dim,
@@ -449,7 +449,7 @@ def example_usage_gpu_kv_cache_verifier():
 
     # Create GPU KV layout
     gpu_kv_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
+        type=KVCacheLayoutType.LAYERFIRST,
         num_layer=model_config.num_layers,
         num_block=64,  # Assume 64 blocks
         tokens_per_block=cache_config.tokens_per_block,
@@ -461,7 +461,7 @@ def example_usage_gpu_kv_cache_verifier():
     # Create mock GPU blocks
     gpu_blocks = []
     for layer_id in range(model_config.num_layers):
-        # LAYERWISE format: [kv_dim, num_block, tokens_per_block, num_head, head_size]
+        # LAYERFIRST format: [kv_dim, num_block, tokens_per_block, num_head, head_size]
         kv_dim = 2 if not model_config.use_mla else 1
         gpu_tensor = torch.zeros(
             kv_dim,

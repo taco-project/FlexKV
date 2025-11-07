@@ -543,7 +543,7 @@ class FlexKVWorkerConnector:
             num_kv_heads = gpu_blocks[0].shape[3]
             head_size = gpu_blocks[0].shape[4]
         gpu_layout = KVCacheLayout(
-            type=KVCacheLayoutType.LAYERWISE,
+            type=KVCacheLayoutType.LAYERFIRST,
             num_layer=num_layer,
             num_block=num_blocks,
             tokens_per_block=block_size,

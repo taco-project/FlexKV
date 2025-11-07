@@ -1084,10 +1084,10 @@ class tpGDSTransferWorker(TransferWorkerBase):
         self.gds_kv_stride_in_bytes = gds_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.gds_block_stride_in_bytes = gds_kv_layout.get_block_stride() * self.dtype.itemsize
 
-        if not gpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
-            raise ValueError("Only layerwise layout is supported for GPU")
-        if not gds_kv_layout.type == KVCacheLayoutType.LAYERWISE:
-            raise ValueError("Only layerwise layout is supported for GDS")
+        if not gpu_kv_layout.type == KVCacheLayoutType.LAYERFIRST:
+            raise ValueError("Only LAYERFIRST layout is supported for GPU")
+        if not gds_kv_layout.type == KVCacheLayoutType.LAYERFIRST:
+            raise ValueError("Only LAYERFIRST layout is supported for GDS")
 
         # Create TP GDS Transfer Thread Group
         self.tp_gds_transfer_thread_group = TPGDSTransferThreadGroup(

@@ -81,10 +81,10 @@ Some configurations can only be set through environment variables.
 
 | Environment Variable | Type | Default | Description |
 |---------------------|------|---------|-------------|
-| `FLEXKV_CPU_LAYOUT` | str | BLOCKWISE | CPU storage layout, options: `LAYERWISE` and `BLOCKWISE`, recommended to use `BLOCKWISE` |
-| `FLEXKV_SSD_LAYOUT` | str | BLOCKWISE | SSD storage layout, options: `LAYERWISE` and `BLOCKWISE`, recommended to use `BLOCKWISE` |
-| `FLEXKV_REMOTE_LAYOUT` | str | BLOCKWISE | REMOTE storage layout, options: `LAYERWISE` and `BLOCKWISE`, recommended to use `BLOCKWISE` |
-| `FLEXKV_GDS_LAYOUT` | str | BLOCKWISE | GDS storage layout, options: `LAYERWISE` and `BLOCKWISE`, recommended to use `BLOCKWISE` |
+| `FLEXKV_CPU_LAYOUT` | str | BLOCKFIRST | CPU storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+| `FLEXKV_SSD_LAYOUT` | str | BLOCKFIRST | SSD storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+| `FLEXKV_REMOTE_LAYOUT` | str | BLOCKFIRST | REMOTE storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+| `FLEXKV_GDS_LAYOUT` | str | BLOCKFIRST | GDS storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
 
 ---
 

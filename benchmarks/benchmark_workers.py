@@ -65,7 +65,7 @@ def create_cpu_gpu_worker(
         head_size=model_config.head_size,
     )
     gpu_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
+        type=KVCacheLayoutType.LAYERFIRST,
         num_layer=model_config.num_layers,
         num_block=num_gpu_blocks,
         tokens_per_block=cache_config.tokens_per_block,

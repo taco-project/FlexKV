@@ -145,12 +145,12 @@ class FlexKVReplayEngine:
 
     def _parse_layout_type(self, layout_type_str: str) -> KVCacheLayoutType:
         """Parse layout type string to enum"""
-        if "LAYERWISE" in layout_type_str:
-            return KVCacheLayoutType.LAYERWISE
-        elif "BLOCKWISE" in layout_type_str:
-            return KVCacheLayoutType.BLOCKWISE
+        if "LAYERFIRST" in layout_type_str:
+            return KVCacheLayoutType.LAYERFIRST
+        elif "BLOCKFIRST" in layout_type_str:
+            return KVCacheLayoutType.BLOCKFIRST
         else:
-            return KVCacheLayoutType.LAYERWISE  # default
+            return KVCacheLayoutType.LAYERFIRST  # default
 
     def create_gpu_blocks(self):
         """Create GPU blocks for testing (similar to test code)"""
@@ -189,7 +189,7 @@ class FlexKVReplayEngine:
         if not self.gpu_layout:
             # Create default GPU layout if not provided in trace
             self.gpu_layout = KVCacheLayout(
-                type=KVCacheLayoutType.LAYERWISE,
+                type=KVCacheLayoutType.LAYERFIRST,
                 num_layer=self.model_config.num_layers,
                 num_block=self.gpu_blocks_num,  # default number of blocks
                 tokens_per_block=self.cache_config.tokens_per_block,
