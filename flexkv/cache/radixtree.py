@@ -163,9 +163,9 @@ class RadixTreeIndex:
         while prefix_blocks_num < sequence.num_blocks:
             if update_cache_info:
                 if current_node.grace_time < time.time():
-                    current_node.grace_time = time.time() + hit_reward_seconds
+                    current_node.grace_time = time.time() + self.hit_reward_seconds
                 else:
-                    current_node.grace_time += hit_reward_seconds
+                    current_node.grace_time += self.hit_reward_seconds
             child_hash = sequence.get_hash(prefix_blocks_num + current_node.size())
             if child_hash in current_node.children:
                 if current_node.is_ready:
