@@ -15,9 +15,32 @@ This change involves significant API adjustments. Therefore, please note:
 
 ### Supported Versions
 - FlexKV >= `1.0.0`
-- vLLM versions >= `0.8.5` can generally follow this version for adaptation
+- vLLM versions >= `0.8.5` can generally follow the example code for adaptation
 
-### Example
+### Configuration
+
+#### Example 1: CPU Offloading Only
+Use 32GB of CPU memory as secondary cache.
+```bash
+unset FLEXKV_CONFIG_PATH
+export FLEXKV_CPU_CACHE_GB=32
+```
+#### Example 2: SSD Offloading
+Use 32GB of CPU memory and 1TB of SSD storage as secondary and tertiary cache respectively. (Assume the machine has two SSDs mounted at /data0 and /data1 respectively.)
+```bash
+# generate config
+cat <<EOF > ./flexkv_config.yml
+cpu_cache_gb: 32
+ssd_cache_gb: 1024
+ssd_cache_dir: /data0/flexkv_ssd/;/data1/flexkv_ssd/
+enable_gds: false
+EOF
+export FLEXKV_CONFIG_PATH="./flexkv_config.yml"
+```
+
+> Note: The `flexkv_config.yml` configuration is provided as a simple example only. For full parameter options, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md)
+
+### Running
 We provide an adaptation example based on **vLLM 0.10.1.1**:
 
 1. apply patch
@@ -34,19 +57,6 @@ python examples/offline_inference/prefix_caching_flexkv.py
 
 3. online serving
 ```bash
-# generate config
-cat <<EOF > ./flexkv_config.json
-{
-    "server_recv_port": "ipc:///tmp/flexkv_test",
-    "cache_config": {
-          "enable_cpu": true,
-          "num_cpu_blocks": 10240,
-    },
-    "num_log_interval_requests": 200
-}
-EOF
-export FLEXKV_CONFIG_PATH="./flexkv_config.json"
-
 VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
      --tensor-parallel-size 8 \
      --trust-remote-code \
@@ -63,14 +73,30 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
 
 ```
 
-> Note: The `flexkv_config.json` configuration is provided as a simple example only. For full parameter options, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md)
-
 ## Legacy Version (<= 0.1.0) – Not Recommended for Current Use
 
 ### Supported Versions
 - FlexKV <= `0.1.0`
 
-### Example
+### Configuration
+
+Legacy version configuration:
+```bash
+# generate config
+cat <<EOF > ./flexkv_config.json
+{
+    "server_recv_port": "ipc:///tmp/flexkv_test",
+    "cache_config": {
+          "enable_cpu": true,
+          "num_cpu_blocks": 10240
+    },
+    "num_log_interval_requests": 200
+}
+EOF
+export FLEXKV_CONFIG_PATH="./flexkv_config.json"
+```
+
+### Running
 Apply the patch `examples/vllm_adaption_legacy/flexkv_vllm_0_8_4.patch` to vLLM 0.8.4, then start FlexKV, vLLM, and the benchmark script:
 
 ```bash

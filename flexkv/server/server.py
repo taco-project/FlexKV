@@ -174,14 +174,14 @@ class KVServer:
         # Set spawn method for CUDA compatibility
         with contextlib.suppress(RuntimeError):
             mp.set_start_method("spawn")
-        
+
         # Prepare environment variables for child process
         if child_env is not None or not inherit_env:
             # Use subprocess for better environment control
             import subprocess
             import pickle
             import sys
-            
+
             # Prepare environment
             if inherit_env:
                 env = os.environ.copy()
@@ -189,10 +189,10 @@ class KVServer:
                     env.update(child_env)
             else:
                 env = child_env or {}
-            
+
             # Serialize arguments
             args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port))
-            
+
             # Start subprocess
             flexkv_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
             server_script = textwrap.dedent(f'''
@@ -209,7 +209,7 @@ class KVServer:
             process = subprocess.Popen([
                 sys.executable, '-c', server_script
             ], env=env)
-            
+
             flexkv_logger.info(f"KVServer subprocess started, PID: {process.pid}")
             return KVServerHandle(process)
         else:
@@ -389,7 +389,7 @@ if __name__ == "__main__":
     tokens_per_block = 4
 
     gpu_kv_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
+        type=KVCacheLayoutType.LAYERFIRST,
         num_layer=num_layers,
         num_block=num_gpu_blocks,
         tokens_per_block=tokens_per_block,

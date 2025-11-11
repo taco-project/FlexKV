@@ -22,7 +22,7 @@ import torch
 from flexkv.server.client import KVDPClient
 from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 
 
@@ -30,16 +30,21 @@ class KVManager:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-                 gpu_register_port: Optional[str] = None,
-                 server_recv_port: Optional[str] = None,
-                 dp_client_id: int = 0):
+                 dp_client_id: int = 0,
+                 server_recv_port: str = ""):
         flexkv_logger.info(f"{model_config = }")
         flexkv_logger.info(f"{cache_config = }")
+        flexkv_logger.info(f"{GLOBAL_CONFIG_FROM_ENV = }")
         self.model_config = model_config
         self.cache_config = cache_config
-        self.gpu_register_port = gpu_register_port if gpu_register_port is not None else "ipc:///tmp/flexkv_test_gpu_register"
-        self.server_recv_port = server_recv_port if server_recv_port is not None else "ipc:///tmp/flexkv_test_server"
-        self.server_client_mode = model_config.dp_size > 1
+
+        if server_recv_port != "":
+            self.server_recv_port = server_recv_port
+        else:
+            self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
+        self.gpu_register_port = self.server_recv_port + "_gpu_register"
+
+        self.server_client_mode = model_config.dp_size > 1 or GLOBAL_CONFIG_FROM_ENV.server_client_mode
         self.dp_client_id = dp_client_id
         flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
         if self.server_client_mode:
@@ -50,17 +55,17 @@ class KVManager:
                 # Example: inherit_env = False  # to not inherit parent env
                 self.server_handle = KVServer.create_server(model_config=model_config,
                                                             cache_config=cache_config,
-                                                            gpu_register_port=gpu_register_port,
+                                                            gpu_register_port=self.gpu_register_port,
                                                             server_recv_port=self.server_recv_port,
                                                             inherit_env=False)
-                                                            
+
             else:
                 self.server_handle = None
             self.dp_client = KVDPClient(self.server_recv_port, self.model_config, dp_client_id)
         else:
             self.server_handle = None
-            self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port)
-    
+            self.kv_task_engine = KVTaskEngine(model_config, cache_config, self.gpu_register_port)
+
     @property
     def dpclient_id(self) -> int:
         return self.dp_client_id

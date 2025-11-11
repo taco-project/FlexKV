@@ -48,6 +48,8 @@ ignore = [
     "SIM108",
     # Logging statement uses f-string
     "G004",
+    # Use X | None for type annotations.
+    "UP045",
 ]
 
 [tool.mypy]

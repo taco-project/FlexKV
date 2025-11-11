@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional, List, Tuple, Union
 
 import torch
 
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
@@ -19,11 +19,9 @@ class StorageEngine:
         self._storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
         self._model_config = model_config
         self._cache_config = cache_config
-        if not self._cache_config.gpu_kv_layout_type == KVCacheLayoutType.LAYERWISE:
-            raise ValueError("Only layerwise layout is supported for GPU")
         if self._cache_config.enable_cpu:
             self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                type=self._cache_config.cpu_kv_layout_type,
+                type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
                 num_layer=self._model_config.num_layers,
                 num_block=self._cache_config.num_cpu_blocks,
                 tokens_per_block=self._cache_config.tokens_per_block,
@@ -37,10 +35,10 @@ class StorageEngine:
                 dtype=self._model_config.dtype,
             )
         if self._cache_config.enable_ssd:
-            if not self._cache_config.ssd_kv_layout_type == self._cpu_layout.type:
+            if not GLOBAL_CONFIG_FROM_ENV.ssd_layout_type == self._cpu_layout.type:
                 raise ValueError(f"SSD layout type must be the same as CPU layout type: {self._cpu_layout.type}")
             self._ssd_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                type=self._cache_config.ssd_kv_layout_type,
+                type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
                 num_layer=self._model_config.num_layers,
                 num_block=self._cache_config.num_ssd_blocks,
                 tokens_per_block=self._cache_config.tokens_per_block,
@@ -53,13 +51,13 @@ class StorageEngine:
                 layout=self._ssd_layout,
                 dtype=self._model_config.dtype,
                 cache_dir=self._cache_config.ssd_cache_dir,
-                max_blocks_per_file=self._cache_config.max_blocks_per_file
+                max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
         if self._cache_config.enable_remote:
-            if not self._cache_config.remote_kv_layout_type == self._cpu_layout.type:
+            if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
                 raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
             self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                type=self._cache_config.remote_kv_layout_type,
+                type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
                 num_layer=self._model_config.num_layers,
                 num_block=self._cache_config.num_remote_blocks,
                 tokens_per_block=self._cache_config.tokens_per_block,
@@ -76,11 +74,11 @@ class StorageEngine:
             )
         if self._cache_config.enable_gds:
             # GDS should follow similar constraints as CPU/SSD/Remote
-            if not self._cache_config.gds_kv_layout_type == self._cpu_layout.type:
+            if not GLOBAL_CONFIG_FROM_ENV.gds_layout_type == self._cpu_layout.type:
                 raise ValueError(f"GDS layout type must be the same as CPU layout type: {self._cpu_layout.type}")
-            
+
             self._gds_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                type=self._cache_config.gds_kv_layout_type,
+                type=GLOBAL_CONFIG_FROM_ENV.gds_layout_type,
                 num_layer=self._model_config.num_layers,
                 num_block=self._cache_config.num_gds_blocks,
                 tokens_per_block=self._cache_config.tokens_per_block,
@@ -93,7 +91,7 @@ class StorageEngine:
                 layout=self._gds_layout,
                 dtype=self._model_config.dtype,
                 gds_cache_dir=self._cache_config.gds_cache_dir,
-                max_blocks_per_file=self._cache_config.max_blocks_per_file
+                max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
 
     def register_gpu_blocks(self,
@@ -175,7 +173,7 @@ class StorageEngine:
                 )
         elif device_type == DeviceType.SSD:
             cache_dir = kwargs.get('cache_dir')
-            max_blocks_per_file = kwargs.get('max_blocks_per_file', -1)
+            max_file_size_gb = kwargs.get('max_file_size_gb', -1)
             if raw_data is not None:
                 assert isinstance(raw_data, str) or \
                     (isinstance(raw_data, list) and all(isinstance(x, str) for x in raw_data)), \
@@ -193,7 +191,7 @@ class StorageEngine:
                     dtype=dtype,
                     cache_dir=cache_dir,
                     file_prefix="flexkv_ssd_cache",
-                    max_blocks_per_file=max_blocks_per_file
+                    max_file_size_gb=max_file_size_gb
                 )
         elif device_type == DeviceType.REMOTE:
             file_path = kwargs.get('file_path')
@@ -224,13 +222,13 @@ class StorageEngine:
                 )
         elif device_type == DeviceType.GDS:
             gds_cache_dir = kwargs.get('gds_cache_dir')
-            max_blocks_per_file = kwargs.get('max_blocks_per_file', -1)
-            
+            max_file_size_gb = kwargs.get('max_file_size_gb', -1)
+
             allocator = GDSAllocator(
                 layout=layout,
                 dtype=dtype,
                 gds_cache_dir=gds_cache_dir,
-                max_blocks_per_file=max_blocks_per_file
+                max_file_size_gb=max_file_size_gb
             )
             storage_handle = allocator.get_accessible_handle()
         else:

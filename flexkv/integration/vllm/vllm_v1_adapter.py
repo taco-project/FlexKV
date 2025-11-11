@@ -10,7 +10,6 @@ import torch
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
@@ -119,29 +118,15 @@ class FlexKVSchedulerConnector:
         dp_rank: int = 0,
     ):
         logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
-        self.flexkv_config = flexkv_config
         self.server_recv_port = flexkv_config.server_recv_port
-        self.tp_size = flexkv_config.tp_size
-        self.dp_size = flexkv_config.dp_size
-        self.block_size = flexkv_config.block_size
-        self.model_config = ModelConfig(
-            num_layers=flexkv_config.num_layers,
-            num_kv_heads=flexkv_config.num_kv_heads,
-            head_size=flexkv_config.head_size,
-            use_mla=flexkv_config.use_mla,
-            dtype=flexkv_config.dtype,
-            tp_size=flexkv_config.tp_size,
-            dp_size=flexkv_config.dp_size,
-        )
-        if "tokens_per_block" in flexkv_config.cache_config:
-            assert flexkv_config.cache_config.pop("tokens_per_block") == flexkv_config.block_size
-        self.cache_config = CacheConfig(
-            tokens_per_block=flexkv_config.block_size,
-            **flexkv_config.cache_config,
-        )
+        self.tp_size = flexkv_config.model_config.tp_size
+        self.dp_size = flexkv_config.model_config.dp_size
+        self.block_size = flexkv_config.cache_config.tokens_per_block
+        self.model_config = flexkv_config.model_config
+        self.cache_config = flexkv_config.cache_config
         self.flexkv_manager = KVManager(model_config=self.model_config,
                                         cache_config=self.cache_config,
-                                        gpu_register_port=flexkv_config.server_recv_port,
+                                        server_recv_port=flexkv_config.server_recv_port,
                                         dp_client_id=dp_rank)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
@@ -155,7 +140,7 @@ class FlexKVSchedulerConnector:
         self.tasks_to_launch: dict[int, FlexKVTask] = {}
         self.tasks_to_cancel: dict[int, FlexKVTask] = {}
 
-        self.flexkv_stats = FlexKVStats(flexkv_config.num_log_interval_requests)
+        self.flexkv_stats = FlexKVStats(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200))
 
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")
@@ -532,9 +517,10 @@ class FlexKVWorkerConnector:
         flexkv_config: FlexKVConfig,
         dp_client_id: int,
     ):
-        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.tp_size
+        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
         self.flexkv_config = flexkv_config
-        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.server_recv_port}, dp_client_id: {dp_client_id}")
+        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.server_recv_port}, \
+            dp_client_id: {dp_client_id}")
         self.tp_client = KVTPClient(flexkv_config.server_recv_port, dp_client_id, current_device_id)
         logger.info("Finish init FlexKVWorkerConnector")
 
@@ -542,7 +528,7 @@ class FlexKVWorkerConnector:
         logger.info("Start register kv_caches")
         gpu_blocks = list(kv_caches.values())
         num_layer = len(kv_caches)
-        if self.flexkv_config.use_mla:
+        if self.flexkv_config.model_config.use_mla:
             assert gpu_blocks[0].ndim == 3, (
                 f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
             num_blocks = gpu_blocks[0].shape[0]
@@ -557,13 +543,13 @@ class FlexKVWorkerConnector:
             num_kv_heads = gpu_blocks[0].shape[3]
             head_size = gpu_blocks[0].shape[4]
         gpu_layout = KVCacheLayout(
-            type=KVCacheLayoutType.LAYERWISE,
+            type=KVCacheLayoutType.LAYERFIRST,
             num_layer=num_layer,
             num_block=num_blocks,
             tokens_per_block=block_size,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=self.flexkv_config.use_mla,
+            is_mla=self.flexkv_config.model_config.use_mla,
         )
         self.tp_client.register_to_server(gpu_blocks, gpu_layout)
         logger.info("Finish register kv_caches")

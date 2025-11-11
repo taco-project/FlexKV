@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from flexkv.server.client import KVTPClient
-from flexkv.common.storage import KVCacheLayout
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import ModelConfig, CacheConfig
 from utils import load_config
@@ -33,7 +33,7 @@ def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_c
     num_gpu_blocks = cache_config.num_gpu_blocks
 
     gpu_kv_layout = KVCacheLayout(
-        type=cache_config.gpu_kv_layout_type,
+        type=KVCacheLayoutType.LAYERFIRST,
         num_layer=model_config.num_layers,
         num_block=num_gpu_blocks,
         tokens_per_block=cache_config.tokens_per_block,
@@ -66,13 +66,12 @@ def shutdown_tp_client(tp_client_processes):
 def benchmark_flexkv(model_config: ModelConfig,
                      cache_config: CacheConfig,
                      benchmark_config: BenchmarkConfig,
-                     gpu_register_port: str,
-                     server_recv_port: str):
+                     ):
     if model_config.tp_size * model_config.dp_size > torch.cuda.device_count():
         raise ValueError(f"tp_size {model_config.tp_size} * dp_size {model_config.dp_size} is greater than "
                          f"the number of available GPUs {torch.cuda.device_count()}")
     print(f"{benchmark_config = }")
-    kvmanager = KVManager(model_config, cache_config, gpu_register_port, server_recv_port)
+    kvmanager = KVManager(model_config, cache_config)
     kvmanager.start()
 
     tp_client_processes = []
@@ -85,7 +84,7 @@ def benchmark_flexkv(model_config: ModelConfig,
     for tp_rank in range(model_config.tp_size):
         tp_client_process = Process(
             target=run_tp_client,
-            args=(0, tp_rank, gpu_register_port,
+            args=(0, tp_rank, kvmanager.gpu_register_port,
                     model_config, cache_config),
             daemon=True
         )
@@ -161,7 +160,7 @@ def benchmark_flexkv(model_config: ModelConfig,
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="benchmarks/example_config.json")
+    parser.add_argument("--config", type=str, default="benchmarks/example_config.yml")
     # benchmark config
     parser.add_argument("--num-layers", type=int, default=-1)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -184,8 +183,5 @@ if __name__ == "__main__":
     # pad sequence length to divisible by tokens_per_block
     benchmark_config.sequence_length = \
         ((benchmark_config.sequence_length - 1) // cache_config.tokens_per_block + 1) * cache_config.tokens_per_block
-    import uuid
-    gpu_register_port = f"ipc:///tmp/flexkv_gpu_{uuid.uuid4().hex[:8]}"
-    server_recv_port = f"ipc:///tmp/flexkv_srv_{uuid.uuid4().hex[:8]}"
 
-    benchmark_flexkv(model_config, cache_config, benchmark_config, gpu_register_port, server_recv_port)
+    benchmark_flexkv(model_config, cache_config, benchmark_config)

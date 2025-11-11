@@ -109,17 +109,13 @@ docker run -itd \
 ### 2.2 Configure FlexKV to Use GDS
 
 `export FLEXKV_ENABLE_GDS=1` to compile
-Configuration example after compilation `config.json`:
+Configuration example after compilation `config.yaml`:
 
-```json
-{
-    "cache_config": {
-          "enable_ssd": False,
-          "enable_gds": True,
-          "num_gds_blocks": 10000000,
-          "gds_cache_dir": ["./gdstest"]
-    },
-}
+```yaml
+cpu_cache_gb: 32
+ssd_cache_gb: 1024
+ssd_cache_dir: /data/flexkv_ssd/
+enable_gds: true
 ```
 
 ---

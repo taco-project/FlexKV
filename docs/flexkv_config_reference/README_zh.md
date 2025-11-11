@@ -4,142 +4,152 @@
 
 ---
 
-## 推荐配置方案
+## 基础配置选项
 
-以下是一个兼顾性能与稳定性的生产级推荐配置：
+### 一、通过文件配置
 
+如果设置了环境变量 `FLEXKV_CONFIG_PATH`，将优先使用该变量指定的配置文件。支持yml和json两种文件类型。
+
+以下是一个同时开启 CPU 和 SSD 缓存层的推荐配置示例：
+
+yml配置：
+```yml
+cpu_cache_gb: 32
+ssd_cache_gb: 1024
+ssd_cache_dir: /data/flexkv_ssd/
+enable_gds: false
+```
+或使用json配置：
 ```json
 {
-    "enable_flexkv": true,
-    "server_recv_port": "ipc:///tmp/flexkv_test",
-    "cache_config": {
-        "enable_cpu": true,
-        "enable_ssd": true,
-        "enable_remote": false,
-        "enable_gds": false,
-        "enable_trace": false,
-        "ssd_cache_iouring_entries": 512,
-        "tokens_per_block": 64,
-        "num_cpu_blocks": 233000,
-        "num_ssd_blocks": 4096000,
-        "ssd_cache_dir": "/data/flexkv_ssd/",
-        "evict_ratio": 0.05,
-        "index_accel": true
-    },
-    "num_log_interval_requests": 2000
+  "cpu_cache_gb": 32,
+  "ssd_cache_gb": 1024,
+  "ssd_cache_dir": "/data/flexkv_ssd/",
+  "enable_gds": false
 }
 ```
-- 其中的`num_cpu_blocks`和`num_ssd_blocks`分别代表内存和SSD中block的总数量，需要根据实际机器配置和模型来配置，具体计算方式见下文[缓存容量配置](#cache-capacity-config)
-- `ssd_cache_dir`为ssd中KVCache存放的文件目录
+- `cpu_cache_gb`：CPU 缓存层容量，单位为 GB，不能超过物理内存。
+- `ssd_cache_gb`：SSD 缓存层容量，单位为 GB。建议大于 `cpu_cache_gb`并为`FLEXKV_MAX_FILE_SIZE_GB`的整数倍，若仅用CPU缓存则设为 0（此时不启用 SSD 缓存）。
+- `ssd_cache_dir`：SSD 缓存数据的存放目录。若有多块 SSD，可通过分号 `;` 分隔多个挂载路径。例如 `ssd_cache_dir: /data0/flexkv_ssd/;/data1/flexkv_ssd/`，以提升带宽。
+- `enable_gds`：是否启用 GPU Direct Storage（GDS）。如硬件和驱动支持，开启后可提升 SSD 到 GPU 的数据吞吐能力。默认关闭。
 
 ---
 
-## 配置文件结构概览
+### 二、通过环境变量配置
 
-FlexKV 的配置文件是一个 JSON 文件，主要包含三个部分：
+如果未设置 `FLEXKV_CONFIG_PATH`环境变量，则可通过以下环境变量进行配置。
 
-- `enable_flexkv`: 是否启用 FlexKV 功能（必须设为 `true` 才生效）
-- `server_recv_port`: FlexKV 服务监听的 IPC 端口
-- `cache_config`: 核心缓存配置对象，包含所有缓存行为参数
-- `num_log_interval_requests`: 日志统计间隔（每处理 N 个请求输出一次性能日志）
+> 注：如果设置了`FLEXKV_CONFIG_PATH`，将优先使用`FLEXKV_CONFIG_PATH`指定的配置文件，以下环境变量将被忽略。
+
+| 环境变量             | 类型  | 默认值        | 说明                                                                                                            |
+|----------------------|-------|-------------|----------------------------------------------------------------------------------------------------------------|
+| `FLEXKV_CPU_CACHE_GB`    | int   | 16          | CPU 缓存层容量，单位为 GB，不能超过物理内存
+| `FLEXKV_SSD_CACHE_GB`    | int   | 0           | SSD 缓存层容量，单位为 GB。建议设置大于 `FLEXKV_CPU_CACHE_GB`并为`FLEXKV_MAX_FILE_SIZE_GB`的整数倍，若仅用CPU缓存则设为 0（此时不启用 SSD 缓存）               |
+| `FLEXKV_SSD_CACHE_DIR`   | str   | "./flexkv_ssd" | SSD 缓存数据的存放目录。若有多块 SSD，可通过分号 `;` 分隔多个挂载路径。例如 `"/data0/flexkv_ssd/;/data1/flexkv_ssd/"`，以提升带宽                  |
+| `FLEXKV_ENABLE_GDS`      | bool  | 0           | 是否启用 GPU Direct Storage（GDS）。如硬件和驱动支持，开启后可提升 SSD 到 GPU 的数据吞吐能力。默认关闭，开启请设为 1                    |
 
 ---
 
-## cache_config完整参数详解（来自 [`flexkv/common/config.py`](../../flexkv/common/config.py)）
+## 高级配置选项
+高级配置主要针对需要精细化性能优化或自定义特殊需求的用户，建议对 FlexKV 具备一定理解的用户使用。
+所有高级配置均支持通过环境变量或 yml/json 配置文件进行设置，如有多级配置冲突，最终生效顺序为：**配置文件 > 环境变量 > 默认内置参数**。
+如果在配置文件中设置，请去除`FLEXKV_`前缀并全部转换为小写，例如在yml文件中设置`server_client_mode: 1`将会覆盖`FLEXKV_SERVER_CLIENT_MODE`环境变量的值。
+部分配置只能通过环境变量设置。
 
-### 基础配置
+### 启用/禁用FLEXKV
 
-| 参数名 | 类型 | 默认值 | 说明 |
+> 注：该配置只能通过环境变量设置
+
+| 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `tokens_per_block` | int | 16 | 每个 KV Block 包含的 token 数量。需要与加速框架（如vLLM）中`block_size`保持一致 |
-| `enable_cpu` | bool | true | 是否启用 CPU 内存作为缓存层。强烈建议开启。 |
-| `enable_ssd` | bool | false | 是否启用 SSD 作为缓存层。如配备 NVMe SSD，建议开启。 |
-| `enable_remote` | bool | false | 是否启用远程缓存（如可扩展云存储等）。需要配合远程缓存和自定义的远程缓存引擎使用 |
-| `enable_gds` | bool | false | 是否使用 GPU Direct Storage（GDS）加速 SSD 读写。目前暂不支持。 |
-| `index_accel` | bool | false | 是否启用C++ RadixTree。推荐开启。 |
+| `ENABLE_FLEXKV` | bool | 1 | 0-禁用FLEXKV，1-启用FLEXKV |
 
 ---
 
-### KV 缓存布局类型（一般无需修改）
+### 服务器模式配置
 
-| 参数名 | 类型 | 默认值 | 说明 |
+| 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `gpu_kv_layout_type` | enum | LAYERWISE | GPU 上 KV Cache 的组织方式（按层或按块）。目前vLLM在GPU组织方式为`LAYERWISE`，因此FlexKV的`gpu_kv_layout_type`须与vLLM保持一致 |
-| `cpu_kv_layout_type` | enum | BLOCKWISE | CPU 上按块组织, 推荐使用`BLOCKWISE`，不需要与vLLM保持一致 |
-| `ssd_kv_layout_type` | enum | BLOCKWISE | SSD 上按块组织, 推荐使用`BLOCKWISE`，不需要与vLLM保持一致 |
-| `remote_kv_layout_type` | enum | BLOCKWISE | 远程缓存按块组织, 需要按照remote组织形式定义 |
-
-> 注：除非有特殊性能需求，否则不建议修改布局类型。
+| `FLEXKV_SERVER_CLIENT_MODE` | bool | 0 | `server_client_mode`: 是否强制启用服务器-客户端模式 |
+| `FLEXKV_SERVER_RECV_PORT` | str | "ipc:///tmp/flexkv_server" | `server_recv_port`: 服务器接收端口配置 |
 
 ---
 
-### 缓存容量配置 <a id="cache-capacity-config"></a>
+### KV 缓存布局类型
 
-| 参数名 | 类型 | 默认值 | 说明 |
+| 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `num_cpu_blocks` | int | 1000000 | CPU 缓存块数。根据内存大小调整。|
-| `num_ssd_blocks` | int | 10000000 | SSD 缓存块数。|
-| `num_remote_blocks` | int \| None | None | 远程缓存块数。|
-
-> 注：FlexKV里的各级缓存的block大小与GPU中的block大小保持一致，可以参考GPU的KVCache显存大小与block数量估算各级缓存中的block数量。
-
-> 注：block_size = num_layer * _kv_dim * tokens_per_block * num_head * self.head_size * torch_dtype.size()。
+| `FLEXKV_CPU_LAYOUT` | str | BLOCKFIRST | CPU 存储布局，可选`LAYERFIRST`和`BLOCKFIRST`, 推荐使用`BLOCKFIRST` |
+| `FLEXKV_SSD_LAYOUT` | str | BLOCKFIRST | SSD 存储布局，可选`LAYERFIRST`和`BLOCKFIRST`, 推荐使用`BLOCKFIRST` |
+| `FLEXKV_REMOTE_LAYOUT` | str | BLOCKFIRST | REMOTE 存储布局，可选`LAYERFIRST`和`BLOCKFIRST`, 推荐使用`BLOCKFIRST` |
+| `FLEXKV_GDS_LAYOUT` | str | BLOCKFIRST | GDS 存储布局，可选`LAYERFIRST`和`BLOCKFIRST`, 推荐使用`BLOCKFIRST` |
 
 ---
 
 ### CPU-GPU 传输优化
 
-| 参数名 | 类型 | 默认值 | 说明 |
+| 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `use_ce_transfer_h2d` | bool | false | 是否使用 cuda copy engine 优化 Host→Device 传输，使用CE可以减少GPU SM在传输上的使用，但是传输速度会降低，实际测试差距不大 |
-| `use_ce_transfer_d2h` | bool | false | 是否使用 cuda copy engine 优化 Device→Host 传输 |
-| `transfer_sms_h2d` | int | 8 | H2D 传输使用的流处理器数量 |
-| `transfer_sms_d2h` | int | 8 | D2H 传输使用的流处理器数量 |
+| `FLEXKV_USE_CE_TRANSFER_H2D` | bool | 0 | 是否使用 cudaMemcpyAsync 实现 Host→Device 传输，可以避免占用 SM，但是传输速度会降低 |
+| `FLEXKV_USE_CE_TRANSFER_D2H` | bool | 0 |  是否使用 cudaMemcpyAsync 实现 Device→Host 传输，可以避免占用 SM，但是传输速度会降低 |
+| `FLEXKV_TRANSFER_SMS_H2D` | int | 8 | H2D 传输使用的流处理器数量，仅在`FLEXKV_USE_CE_TRANSFER_H2D`为0时生效 |
+| `FLEXKV_TRANSFER_SMS_D2H` | int | 8 | D2H 传输使用的流处理器数量，仅在`FLEXKV_USE_CE_TRANSFER_D2H`为0时生效 |
 
 ---
 
-### SSD 缓存配置
+### SSD I/O优化
 
-| 参数名 | 类型 | 默认值 | 说明 |
+> 注：`iouring_entries`设置为0即禁用iouring，不推荐设置为0。
+
+| 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `max_blocks_per_file` | int | 32000 | 单个 SSD 文件最多包含的 block 数。-1 表示无限制 |
-| `ssd_cache_dir` | str \| List[str] | None | SSD 缓存目录路径，**必须设置**，如 `"/data/flexkv_ssd/"` |
-| `ssd_cache_iouring_entries` | int | 0 | io_uring 队列深度，推荐设为 `512` 以提升并发 IO 性能，实测比不使用iouring提升较大，推荐使用512 |
-| `ssd_cache_iouring_flags` | int | 1 | io_uring 标志位，推荐设置为 1。|
+| `FLEXKV_MAX_FILE_SIZE_GB` | float | -1 | 单个 SSD 文件的最大大小，-1表示不限 |
+| `FLEXKV_IORING_ENTRIES` | int | 512 | io_uring 队列深度，推荐设为 `512` 以提升并发 IO 性能 |
+| `FLEXKV_IORING_FLAGS` | int | 0 | io_uring 标志位，默认为 0|
 
-> 注：为了充分利用多块SSD的带宽上限，可以将多块SSD绑定至不同目录，并使用如 `"ssd cache dir": ["/data0/flexkv_ssd/", "/data1/flexkv_ssd/"]`方式初始化，SSD KVCache会均匀分布在所有SSD中，充分利用多个SSD带宽。
 
-> 注：`ssd_cache_iouring_entries`设置为0即不适用iouring，不推荐设置为0
 
 ---
 
-### 远程缓存配置（不启用时无需配置）
+### 多节点TP
 
-| 参数名 | 类型 | 默认值 | 说明 |
+> 注：这些配置只能通过环境变量设置
+
+| 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `remote_cache_size_mode` | str | "file_size" | 按文件大小或块数分配远程缓存空间 |
-| `remote_file_size` | int \| None | None | 单个远程文件大小（字节） |
-| `remote_file_num` | int \| None | None | 远程文件数量 |
-| `remote_file_prefix` | str \| None | None | 远程文件名前缀 |
-| `remote_cache_path` | str \| List[str] | None | 远程缓存路径（如 Redis URL、S3 路径等） |
-| `remote_config_custom` | dict \| None | None | 自定义远程缓存配置（如超时、认证等） |
+| `FLEXKV_MASTER_HOST` | str | "localhost" | 多节点TP的主节点IP |
+| `FLEXKV_MASTER_PORTS` | str | "5556,5557,5558" | 多节点TP的主节点端口。使用三个端口，用逗号分隔 |
 
 ---
 
-### 追踪与日志
+### 日志配置
 
-| 参数名 | 类型 | 默认值 | 说明 |
+> 注：这些配置只能通过环境变量设置
+
+| 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `enable_trace` | bool | true | 是否启用性能追踪。生产环境建议关闭（`false`）以减少开销 |
-| `trace_file_path` | str | "./flexkv_trace.log" | 追踪日志路径 |
-| `trace_max_file_size_mb` | int | 100 | 单个追踪文件最大大小（MB） |
-| `trace_max_files` | int | 5 | 最多保留的追踪文件数 |
-| `trace_flush_interval_ms` | int | 1000 | 追踪日志刷新间隔（毫秒） |
+| `FLEXKV_LOGGING_PREFIX` | str | "FLEXKV" | 日志前缀 |
+| `FLEXKV_LOG_LEVEL` | str | "INFO" | 日志输出等级，可选："DEBUG"  "INFO" "WARNING"  "ERROR"  "CRITICAL" "OFF" |
+| `FLEXKV_NUM_LOG_INTERVAL_REQUESTS` | int | 200 | 日志输出间隔请求数 |
 
 ---
 
-### 缓存淘汰策略
+### 追踪和调试
 
-| 参数名 | 类型 | 默认值 | 说明 |
+| 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `evict_ratio` | float | 0.0 | cpu，ssd一次evict主动淘汰比例（0.0 = 只淘汰最小的必要的block数量，较多的淘汰次数会影响性能）。建议保持 `0.05`，即每一次淘汰5%的最久未使用的block |
+| `FLEXKV_ENABLE_TRACE` | bool | 0 | 是否启用性能追踪。生产环境建议关闭（`0`）以减少开销 |
+| `FLEXKV_TRACE_FILE_PATH` | str | "./flexkv_trace.log" | 追踪日志路径 |
+| `FLEXKV_TRACE_MAX_FILE_SIZE_MB` | int | 100 | 单个追踪文件最大大小（MB） |
+| `FLEXKV_TRACE_MAX_FILES` | int | 5 | 最多保留的追踪文件数 |
+| `FLEXKV_TRACE_FLUSH_INTERVAL_MS` | int | 1000 | 追踪日志刷新间隔（毫秒） |
+
+
+---
+
+### 控制面优化
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `FLEXKV_INDEX_ACCEL` | bool | 1 | 0-启用Python版本RadixTree实现，1-启用C++版本RadixTree实现 |
+| `FLEXKV_EVICT_RATIO` | float | 0.05 | cpu，ssd一次evict主动淘汰比例（0.0 = 只淘汰最小的必要的block数）。建议保持 `0.05`，即每一次淘汰5%的最久未使用的block |
