@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <torch/extension.h>
 #include <vector>
+#include <unordered_map>
 #include <iostream>
 #include <execinfo.h>
 
@@ -20,7 +21,7 @@ private:
 
   std::deque<int64_t> block_hashes;
   std::deque<int64_t> physical_blocks;
-  std::map<HashType, CRadixNode *> children;
+  std::unordered_map<HashType, CRadixNode *> children;
 
   CRadixTreeIndex *index;
   CRadixNode *parent;
