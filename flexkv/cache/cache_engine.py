@@ -53,7 +53,7 @@ class CacheEngineAccel:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 hit_reward_seconds: int):
+                 hit_reward_seconds: int = 0):
         if not isinstance(device_type, DeviceType):
             raise InvalidConfigError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -152,7 +152,7 @@ class CacheEngine:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 hit_reward_seconds: int):
+                 hit_reward_seconds: int = 0):
         if not isinstance(device_type, DeviceType):
             raise InvalidConfigError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
