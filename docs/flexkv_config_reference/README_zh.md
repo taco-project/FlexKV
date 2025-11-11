@@ -103,7 +103,7 @@ enable_gds: false
 
 | 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `FLEXKV_MAX_FILE_SIZE_GB` | float | 32 | 单个 SSD 文件的最大大小，-1表示不限 |
+| `FLEXKV_MAX_FILE_SIZE_GB` | float | -1 | 单个 SSD 文件的最大大小，-1表示不限 |
 | `FLEXKV_IORING_ENTRIES` | int | 512 | io_uring 队列深度，推荐设为 `512` 以提升并发 IO 性能 |
 | `FLEXKV_IORING_FLAGS` | int | 0 | io_uring 标志位，默认为 0|
 

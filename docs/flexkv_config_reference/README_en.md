@@ -105,7 +105,7 @@ Some configurations can only be set through environment variables.
 
 | Environment Variable | Type | Default | Description |
 |---------------------|------|---------|-------------|
-| `FLEXKV_MAX_FILE_SIZE_GB` | float | 32 | Maximum size of a single SSD file, -1 means unlimited |
+| `FLEXKV_MAX_FILE_SIZE_GB` | float | -1 | Maximum size of a single SSD file, -1 means unlimited |
 | `FLEXKV_IORING_ENTRIES` | int | 512 | io_uring queue depth. Recommended to set to `512` to improve concurrent I/O performance |
 | `FLEXKV_IORING_FLAGS` | int | 0 | io_uring flags, default is 0 |
 

@@ -73,7 +73,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     iouring_entries=int(os.getenv('FLEXKV_IORING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IORING_FLAGS', 0)),
 
-    max_file_size_gb=float(os.getenv('FLEXKV_MAX_FILE_SIZE_GB', 32)),  # -1 means no limit
+    max_file_size_gb=float(os.getenv('FLEXKV_MAX_FILE_SIZE_GB', -1)),  # -1 means no limit
 
     evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.05)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
@@ -155,9 +155,16 @@ def update_default_config_from_user_config(model_config: ModelConfig,
 
     cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
     cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)
+
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds
+
+    if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
+        cache_config.num_ssd_blocks = \
+            cache_config.num_ssd_blocks // len(cache_config.ssd_cache_dir) * len(cache_config.ssd_cache_dir)
+        flexkv_logger.warning(f"num_ssd_blocks is not a multiple of num_ssd_devices, "
+                              f"adjust num_ssd_blocks to {cache_config.num_ssd_blocks}")
 
     global_config_attrs = set(vars(GLOBAL_CONFIG_FROM_ENV).keys())
     for attr_name in dir(user_config):
