@@ -236,7 +236,6 @@ class GlobalCacheEngine:
         self.cpu_cache_engine = None
         self.ssd_cache_engine = None
         self.remote_cache_engine = None
-        self.gds_cache_engine = None
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
         self.cache_engines = {}
@@ -286,18 +285,6 @@ class GlobalCacheEngine:
                                                    self.evict_ratio,
                                                    self.hit_reward_seconds)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
-        if cache_config.enable_gds:
-            if self.index_accel:
-                self.gds_cache_engine = CacheEngineAccel(DeviceType.GDS,
-                                                cache_config.num_gds_blocks,
-                                                cache_config.tokens_per_block,
-                                                self.evict_ratio)
-            else:
-                self.gds_cache_engine = CacheEngine(DeviceType.GDS,
-                                                cache_config.num_gds_blocks,
-                                                cache_config.tokens_per_block,
-                                                self.evict_ratio)
-            self.cache_engines[DeviceType.GDS] = self.gds_cache_engine
 
         self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]] = \
             lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0)
@@ -311,8 +298,6 @@ class GlobalCacheEngine:
             self.ssd_cache_engine.reset()
         if self.remote_cache_engine:
             self.remote_cache_engine.reset()
-        if self.gds_cache_engine:
-            self.gds_cache_engine.reset()
 
     def get(self,
             request_id: int,
@@ -630,10 +615,10 @@ class GlobalCacheEngine:
         fragment2_cpu_blocks = None
         if fragment2_num_blocks > 0:
             if self.cache_config.enable_gds:
-                # For GDS, transfer directly from GDS to GPU (GDS2D)
+                # For GDS, transfer directly from SSD to GPU using GDS transfer path (DISK2D)
                 op_gds_transfer = TransferOp(
                     graph_id = transfer_graph.graph_id,
-                    transfer_type = TransferType.GDS2D,
+                    transfer_type = TransferType.DISK2D,
                     src_block_ids = fragment2_ssd_blocks,
                     dst_block_ids = fragment12_gpu_blocks[-fragment2_num_blocks:],
                     layer_id = 0,
@@ -641,8 +626,7 @@ class GlobalCacheEngine:
                 )
                 transfer_graph.add_transfer_op(op_gds_transfer)
                 finished_ops_ids.append(op_gds_transfer.op_id)
-                op_node_to_ready[op_gds_transfer.op_id] = \
-                    (DeviceType.GDS, ssd_node_to_unlock, ssd_node_to_unlock.size())
+                op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
             else:
                 fragment2_cpu_blocks = self.cpu_cache_engine.take(
                     num_required_blocks=fragment2_num_blocks,
@@ -700,8 +684,7 @@ class GlobalCacheEngine:
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
         if ssd_node_to_unlock is not None:
-            device_type = DeviceType.GDS if self.cache_config.enable_gds else DeviceType.SSD
-            node_to_unlock[device_type] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
 
         return (
@@ -987,16 +970,9 @@ class GlobalCacheEngine:
             protected_node = cpu_matched_result.last_node,
             strict=False
         )
-
-        # Determine which disk cache to use (GDS or SSD)
-        disk_cache_engine = None
-        if self.cache_config.enable_gds:
-            disk_cache_engine = self.gds_cache_engine
-        elif self.cache_config.enable_ssd:
-            disk_cache_engine = self.ssd_cache_engine
-
-        if disk_cache_engine is not None:
-            fragment2_ssd_blocks = disk_cache_engine.take(
+        
+        if self.cache_config.enable_ssd:
+            fragment2_ssd_blocks = self.ssd_cache_engine.take(
                 num_required_blocks=fragment2_num_blocks,
                 protected_node = ssd_matched_result.last_node,
                 strict=False
@@ -1007,8 +983,8 @@ class GlobalCacheEngine:
         if len(fragment12_cpu_blocks) < fragment12_num_blocks or \
             len(fragment2_ssd_blocks) < fragment2_num_blocks:
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
-            if disk_cache_engine is not None:
-                disk_cache_engine.recycle(fragment2_ssd_blocks)
+            if self.cache_config.enable_ssd:
+                self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
             return self._empty_put_return(request_id)
 
         transfer_graph = TransferOpGraph()
@@ -1046,20 +1022,18 @@ class GlobalCacheEngine:
                                                           is_ready=False,
                                                           match_result=cpu_matched_result)
         op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
-        disk_node_to_unlock = None
+        ssd_node_to_unlock = None
         if len(fragment2_ssd_blocks) > 0:
-            disk_node_to_unlock = disk_cache_engine.insert(sequence_meta,
+            ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
                                                             fragment2_ssd_blocks,
                                                             is_ready=False,
                                                             match_result=ssd_matched_result)
-            disk_device_type = DeviceType.GDS if self.cache_config.enable_gds else DeviceType.SSD
-            op_node_to_ready[op_h2disk.op_id] = (disk_device_type, disk_node_to_unlock, disk_node_to_unlock.size())
+            op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
-        if disk_node_to_unlock is not None:
-            device_type = DeviceType.GDS if self.cache_config.enable_gds else DeviceType.SSD
-            node_to_unlock[device_type] = (disk_node_to_unlock, disk_node_to_unlock.size())
+        if ssd_node_to_unlock is not None:
+            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
 
         skipped_gpu_blocks = len(cpu_matched_blocks)
         return (
@@ -1078,10 +1052,6 @@ class GlobalCacheEngine:
             assert self.ssd_cache_engine is not None
             self.ssd_cache_engine.unlock(node_to_unlock[DeviceType.SSD][0])
             self.ssd_cache_engine.set_ready(node_to_unlock[DeviceType.SSD][0], True, node_to_unlock[DeviceType.SSD][1])
-        if DeviceType.GDS in node_to_unlock:
-            assert self.gds_cache_engine is not None
-            self.gds_cache_engine.unlock(node_to_unlock[DeviceType.GDS][0])
-            self.gds_cache_engine.set_ready(node_to_unlock[DeviceType.GDS][0], True, node_to_unlock[DeviceType.GDS][1])
         if DeviceType.REMOTE in node_to_unlock:
             assert self.remote_cache_engine is not None
             self.remote_cache_engine.unlock(node_to_unlock[DeviceType.REMOTE][0])
@@ -1095,9 +1065,6 @@ class GlobalCacheEngine:
             if DeviceType.SSD in buffer_to_free:
                 assert self.ssd_cache_engine is not None
                 self.ssd_cache_engine.recycle(buffer_to_free[DeviceType.SSD])
-            if DeviceType.GDS in buffer_to_free:
-                assert self.gds_cache_engine is not None
-                self.gds_cache_engine.recycle(buffer_to_free[DeviceType.GDS])
             if DeviceType.REMOTE in buffer_to_free:
                 assert self.remote_cache_engine is not None
                 self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
@@ -1109,9 +1076,6 @@ class GlobalCacheEngine:
         elif device_type == DeviceType.SSD:
             assert self.ssd_cache_engine is not None
             self.ssd_cache_engine.set_ready(node_to_ready, True, ready_length)
-        elif device_type == DeviceType.GDS:
-            assert self.gds_cache_engine is not None
-            self.gds_cache_engine.set_ready(node_to_ready, True, ready_length)
         elif device_type == DeviceType.REMOTE:
             assert self.remote_cache_engine is not None
             self.remote_cache_engine.set_ready(node_to_ready, True, ready_length)
@@ -1124,8 +1088,6 @@ class GlobalCacheEngine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
         if self.ssd_cache_engine:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
-        if self.gds_cache_engine:
-            ssd_matched_result = self.gds_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
 
@@ -1137,8 +1099,6 @@ class GlobalCacheEngine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
         if self.ssd_cache_engine:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
-        if self.gds_cache_engine:
-            ssd_matched_result = self.gds_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
 

@@ -11,7 +11,6 @@ class DeviceType(Enum):
     GPU = 1
     SSD = 2
     REMOTE = 3
-    GDS = 4
 
 class TransferType(Enum):
     H2D    = "H2D"
@@ -22,8 +21,6 @@ class TransferType(Enum):
     D2DISK = "D2DISK"
     REMOTE2H = "REMOTE2H"
     H2REMOTE = "H2REMOTE"
-    GDS2D  = "GDS2D"
-    D2GDS  = "D2GDS"
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of
@@ -119,9 +116,7 @@ class TransferOpGraph:
         if op.transfer_type == TransferType.H2D or \
             op.transfer_type == TransferType.D2H or \
             op.transfer_type == TransferType.D2DISK or \
-            op.transfer_type == TransferType.DISK2D or \
-            op.transfer_type == TransferType.GDS2D or \
-            op.transfer_type == TransferType.D2GDS:
+            op.transfer_type == TransferType.DISK2D:
             self._gpu_transfer_op_id.append(op.op_id)
         self._ready_ops.add(op.op_id)
 
@@ -175,12 +170,12 @@ class TransferOpGraph:
             transfer_type = self._op_map[op_id].transfer_type
             op = self._op_map[op_id]
             if transfer_type.name.endswith("2D"):
-                if transfer_type == TransferType.GDS2D:
+                if transfer_type == TransferType.DISK2D:
                     op.dst_block_ids = gpu_blocks[-op.dst_block_ids.size:]
                 else:
                     op.dst_block_ids = gpu_blocks[:op.dst_block_ids.size]
             else:
-                if transfer_type == TransferType.D2GDS:
+                if transfer_type == TransferType.D2DISK:
                     op.src_block_ids = gpu_blocks[-op.src_block_ids.size:]
                 else:
                     op.src_block_ids = gpu_blocks[:op.src_block_ids.size]

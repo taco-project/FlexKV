@@ -4,6 +4,7 @@
 #include <sys/types.h>
 #include <string>
 #include <unordered_map>
+#include <map>
 #include <vector>
 #include <initializer_list>
 #include <atomic>
@@ -22,16 +23,14 @@
 class GDSManager {
 public:
     /**
-     * Constructor - initializes with multiple files
-     * @param filenames List of file paths to initialize
+     * Constructor - initializes with device-organized files
+     * @param ssd_files Map of device_id -> file paths for that device
+     * @param num_devices Number of devices
+     * @param round_robin Round-robin granularity for block distribution
      */
-    GDSManager(const std::initializer_list<const char*>& filenames = {});
-    
-    /**
-     * Constructor - initializes with vector of files
-     * @param filenames Vector of file paths to initialize
-     */
-    explicit GDSManager(const std::vector<std::string>& filenames);
+    GDSManager(std::map<int, std::vector<std::string>>& ssd_files, 
+               int num_devices, 
+               int round_robin = 1);
     
     /**
      * Destructor - closes all files and cleans up all resources
@@ -118,10 +117,11 @@ public:
     size_t get_file_count() const;
     
     /**
-     * Get list of all managed files
-     * @return Vector of file paths
+     * Get file paths for a specific device
+     * @param device_id Device ID
+     * @return Vector of file paths for the device
      */
-    std::vector<std::string> get_managed_files() const;
+    const std::vector<std::string>& get_file_paths(int device_id) const;
     
     /**
      * Get the last error message
@@ -129,6 +129,24 @@ public:
      */
     const std::string& get_last_error() const;
     
+    /**
+     * Get number of devices
+     * @return Number of devices
+     */
+    int get_num_devices() const;
+    
+    /**
+     * Get number of files per device
+     * @return Number of files per device
+     */
+    int get_num_files_per_device() const;
+    
+    /**
+     * Get round-robin granularity
+     * @return Round-robin value
+     */
+    int get_round_robin() const;
+
     /**
      * Batch write operations
      * @param operations Array of batch write operations
@@ -176,6 +194,11 @@ private:
 
     bool is_ready_;
     std::string last_error_;
+    
+    int num_devices_;
+    int num_files_per_device_;
+    int round_robin_;
+    std::vector<std::vector<std::string>> file_paths_;
     
 #ifdef ENABLE_GDS
     std::unordered_map<std::string, FileResource> file_resources_;
@@ -252,8 +275,7 @@ struct BatchReadOp {
  * High-level transfer function for KV blocks between GPU and GDS
  * Similar to transfer_kv_blocks_ssd but for GPU-GDS transfers
  * 
- * @param gds_manager GDS manager instance to use for operations
- * @param gds_filepaths List of GDS file paths
+ * @param gds_manager GDS manager instance
  * @param gpu_layer_id_list Tensor of layer IDs to process
  * @param gpu_layer_ptrs_tensor Tensor containing GPU layer pointers
  * @param gds_block_ids Tensor of GDS block IDs
@@ -268,10 +290,10 @@ struct BatchReadOp {
  * @param total_layers Total number of layers
  * @param is_read true for GDS->GPU, false for GPU->GDS
  * @param verbose Enable verbose logging
+ * @param is_mla Whether using MLA
  */
 void transfer_kv_blocks_gds(
     GDSManager& gds_manager,
-    const std::vector<std::string>& gds_filepaths,
     const torch::Tensor& gpu_layer_id_list,
     const torch::Tensor& gpu_layer_ptrs_tensor,
     const torch::Tensor& gds_block_ids,

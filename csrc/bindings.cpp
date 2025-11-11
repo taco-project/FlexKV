@@ -150,7 +150,6 @@ void transfer_kv_blocks_remote(
 
 void transfer_kv_blocks_gds_binding(
     GDSManager& gds_manager,
-    const py::list& gds_filepaths_py,
     const torch::Tensor& gpu_layer_id_list,
     const torch::Tensor& gpu_layer_ptrs_tensor,
     const torch::Tensor& gds_block_ids,
@@ -175,14 +174,8 @@ void transfer_kv_blocks_gds_binding(
     TORCH_CHECK(gpu_layer_id_list.dtype() == torch::kInt32,
                 "gpu_layer_id_list must be int32");
 
-    // Convert Python list to C++ vector
-    std::vector<std::string> gds_filepaths;
-    for (const auto& filepath_py : gds_filepaths_py) {
-        gds_filepaths.push_back(filepath_py.cast<std::string>());
-    }
-
     transfer_kv_blocks_gds(
-        gds_manager, gds_filepaths, gpu_layer_id_list, gpu_layer_ptrs_tensor,
+        gds_manager, gpu_layer_id_list, gpu_layer_ptrs_tensor,
         gds_block_ids, gpu_block_ids, gpu_kv_stride_in_bytes,
         gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
         block_size_in_bytes, 0, num_blocks_per_file, total_layers, is_read, verbose, is_mla);
@@ -336,7 +329,7 @@ PYBIND11_MODULE(c_ext, m) {
 #endif
   m.def("transfer_kv_blocks_gds", &transfer_kv_blocks_gds_binding,
         "Transfer KV blocks between GPU and GDS storage", py::arg("gds_manager"),
-        py::arg("gds_filepaths"), py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
+        py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
         py::arg("gds_block_ids"), py::arg("gpu_block_ids"),
         py::arg("gpu_kv_stride_in_bytes"), py::arg("gds_layer_stride_in_bytes"),
         py::arg("gds_block_stride_in_bytes"), py::arg("gds_kv_stride_in_bytes"),
@@ -454,9 +447,9 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readonly("last_node_matched_length", &flexkv::CMatchResult::last_node_matched_length);
   // Add GDS Manager class binding
   py::class_<GDSManager>(m, "GDSManager")
-      .def(py::init<const std::vector<std::string>&>(),
-           "Initialize GDS Manager with file list", py::arg("filenames"))
-      .def(py::init<>(), "Initialize GDS Manager without files")
+      .def(py::init<std::map<int, std::vector<std::string>>&, int, int>(),
+           "Initialize GDS Manager with device-organized files",
+           py::arg("ssd_files"), py::arg("num_devices"), py::arg("round_robin") = 1)
       .def("is_ready", &GDSManager::is_ready,
            "Check if GDS manager is ready for operations")
       .def("get_last_error", &GDSManager::get_last_error,
@@ -487,9 +480,16 @@ PYBIND11_MODULE(c_ext, m) {
            "Synchronize all internal CUDA streams")
       .def("get_file_count", &GDSManager::get_file_count,
            "Get number of files currently managed")
-             .def("get_managed_files", &GDSManager::get_managed_files,
-            "Get list of all managed files")
-       .def("create_gds_file", &create_gds_file_binding,
+      .def("get_num_devices", &GDSManager::get_num_devices,
+           "Get number of devices")
+      .def("get_num_files_per_device", &GDSManager::get_num_files_per_device,
+           "Get number of files per device")
+      .def("get_round_robin", &GDSManager::get_round_robin,
+           "Get round-robin granularity")
+      .def("get_file_paths", &GDSManager::get_file_paths,
+           "Get file paths for a specific device",
+           py::arg("device_id"))
+      .def("create_gds_file", &create_gds_file_binding,
             "Create and register a GDS file with specified size", 
             py::arg("filename"), py::arg("file_size"));
 }
