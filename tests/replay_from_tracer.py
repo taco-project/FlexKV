@@ -20,11 +20,14 @@ import sys
 import time
 from typing import Dict, List, Optional, Any, Tuple
 import torch
+import zmq
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.kvtask import KVTaskEngine
+from flexkv.server.request import RegisterTPClientRequest
+from flexkv.server.utils import get_zmq_socket
 
 
 class FlexKVReplayEngine:
@@ -79,7 +82,31 @@ class FlexKVReplayEngine:
         data = event['data']
         model_config_data = data['model_config']
         cache_config_data = data['cache_config']
+        global_config_data = data.get('global_config', {})
         gpu_layout_data = data.get('gpu_layout')
+
+        # Restore GLOBAL_CONFIG_FROM_ENV from trace
+        if global_config_data:
+            self.log("Restoring global config from trace...")
+            from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+            
+            # Restore layout types
+            if 'cpu_layout_type' in global_config_data:
+                GLOBAL_CONFIG_FROM_ENV.cpu_layout_type = self._parse_layout_type(global_config_data['cpu_layout_type'])
+            if 'ssd_layout_type' in global_config_data:
+                GLOBAL_CONFIG_FROM_ENV.ssd_layout_type = self._parse_layout_type(global_config_data['ssd_layout_type'])
+            if 'remote_layout_type' in global_config_data:
+                GLOBAL_CONFIG_FROM_ENV.remote_layout_type = self._parse_layout_type(global_config_data['remote_layout_type'])
+            if 'gds_layout_type' in global_config_data:
+                GLOBAL_CONFIG_FROM_ENV.gds_layout_type = self._parse_layout_type(global_config_data['gds_layout_type'])
+            
+            # Restore other configs
+            for key in ['server_client_mode', 'index_accel', 'use_ce_transfer_h2d', 'use_ce_transfer_d2h',
+                       'transfer_sms_h2d', 'transfer_sms_d2h', 'iouring_entries', 'iouring_flags',
+                       'max_file_size_gb', 'evict_ratio', 'server_recv_port']:
+                if key in global_config_data:
+                    setattr(GLOBAL_CONFIG_FROM_ENV, key, global_config_data[key])
+                    self.log(f"  Restored {key} = {global_config_data[key]}")
 
         # Recreate model_config
         dtype_str = model_config_data['dtype']
@@ -109,19 +136,18 @@ class FlexKVReplayEngine:
             enable_ssd=cache_config_data['enable_ssd'],
             enable_remote=cache_config_data['enable_remote'],
             enable_gds=cache_config_data['enable_gds'],
-            remote_cache_size_mode=cache_config_data['remote_cache_size_mode'],
             num_cpu_blocks=cache_config_data['num_cpu_blocks'],
             num_ssd_blocks=cache_config_data['num_ssd_blocks'],
+            num_gds_blocks=cache_config_data['num_gds_blocks'],
             num_remote_blocks=cache_config_data['num_remote_blocks'],
+            ssd_cache_dir=cache_config_data['ssd_cache_dir'],
+            gds_cache_dir=cache_config_data['gds_cache_dir'],
+            remote_cache_size_mode=cache_config_data['remote_cache_size_mode'],
             remote_file_size=cache_config_data['remote_file_size'],
             remote_file_num=cache_config_data['remote_file_num'],
             remote_file_prefix=cache_config_data['remote_file_prefix'],
-            ssd_cache_dir=cache_config_data['ssd_cache_dir'],
-            ssd_cache_iouring_entries=cache_config_data['ssd_cache_iouring_entries'],
-            ssd_cache_iouring_flags=cache_config_data['ssd_cache_iouring_flags'],
             remote_cache_path=cache_config_data['remote_cache_path'],
             remote_config_custom=cache_config_data['remote_config_custom'],
-            enable_trace=False,  # Disable trace for replay
         )
 
         # Recreate gpu_layout if available
@@ -135,8 +161,7 @@ class FlexKVReplayEngine:
                 head_size=8,#gpu_layout_data['head_size'], #for local test
                 is_mla=gpu_layout_data['is_mla'],
             )
-
-        self.gpu_blocks_num = self.gpu_layout.num_block
+            self.gpu_blocks_num = self.gpu_layout.num_block
 
         self.log(f"Model config: {self.model_config}")
         self.log(f"Cache config loaded {self.cache_config}")
@@ -182,6 +207,46 @@ class FlexKVReplayEngine:
 
         self.log(f"Created GPU blocks for {total_gpus} GPUs with {self.gpu_blocks_num} blocks each")
 
+    def register_gpu_blocks_to_kvmanager(self, gpu_register_port: str):
+        """Register GPU blocks to KVManager via socket"""
+        self.log("Registering GPU blocks via socket...")
+        
+        total_gpus = self.model_config.tp_size * self.model_config.dp_size
+        
+        # Create zmq socket to send GPU blocks
+        context = zmq.Context(2)
+        send_socket = get_zmq_socket(
+            context, zmq.SocketType.PUSH, gpu_register_port, False
+        )
+        
+        # Register each GPU's blocks
+        for gpu_id in range(total_gpus):
+            # Convert torch tensors to TensorSharedHandle
+            handles = []
+            for layer_tensor in self.gpu_blocks[gpu_id]:
+                handle = TensorSharedHandle(layer_tensor, gpu_id)
+                handles.append(handle)
+            
+            # Create registration request
+            register_req = RegisterTPClientRequest(
+                dp_client_id=gpu_id // self.model_config.tp_size,  # DP client ID
+                device_id=gpu_id,
+                handles=handles,
+                gpu_layout=self.gpu_layout
+            )
+            
+            # Send registration request
+            send_socket.send_pyobj(register_req)
+            self.log(f"Registered GPU {gpu_id} blocks")
+        
+        # Wait a bit to ensure all registration requests are sent
+        time.sleep(0.1)
+        
+        # Close socket
+        send_socket.close()
+        context.term()
+        self.log("GPU blocks registration completed")
+
     def create_kvmanager(self,):
         """Create and initialize KVManager"""
         self.log("Creating KVManager...")
@@ -198,30 +263,42 @@ class FlexKVReplayEngine:
                 is_mla=self.model_config.use_mla
             )
 
-        # Create KVManager
+        # Create KVTaskEngine with gpu_register_port
+        import tempfile
+        gpu_register_port = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        
         self.kvmanager = KVTaskEngine(
             model_config=self.model_config,
             cache_config=self.cache_config,
-            gpu_layout=self.gpu_layout,
-            gpu_blocks=self.gpu_blocks
+            gpu_register_port=gpu_register_port
         )
 
-        # Start KVManager
-        if self.kvmanager.is_ready():
-            self.kvmanager.start()
-            self.log("KVManager started successfully")
-        else:
-            raise RuntimeError("KVManager is not ready")
+        # Start KVManager first so it can listen for registration requests
+        self.kvmanager.start()
+
+        # Register GPU blocks via socket after KVManager is started
+        self.register_gpu_blocks_to_kvmanager(gpu_register_port)
+        
+        # Wait for KVManager to be ready
+        max_wait_time = 30  # seconds
+        start_time = time.time()
+        while not self.kvmanager.is_ready():
+            if time.time() - start_time > max_wait_time:
+                raise RuntimeError("KVManager failed to become ready within timeout")
+            time.sleep(0.1)
+        
+        self.log("KVManager started successfully")
 
     def replay_request_event(self, event: Dict[str, Any]) -> int:
-        """Replay a request event (GET or PUT)"""
+        """Replay a request event (GET, PUT, GET_MATCH, PUT_MATCH)"""
         data = event['data']
         request_type = data['request_type']
 
-        # Convert lists back to tensors
-        token_ids = torch.tensor(data['token_ids'], dtype=torch.long)
-        slot_mapping = torch.tensor(data['slot_mapping'], dtype=torch.long)
-        token_mask = torch.tensor(data['token_mask'], dtype=torch.bool) if data['token_mask'] else None
+        # Convert lists back to numpy arrays (KVTaskEngine uses numpy, not torch)
+        import numpy as np
+        token_ids = np.array(data['token_ids'], dtype=np.int64)
+        slot_mapping = np.array(data['slot_mapping'], dtype=np.int64)
+        token_mask = np.array(data['token_mask'], dtype=bool) if data['token_mask'] else None
         layer_granularity = data.get('layer_granularity', -1)
         dp_id = data.get('dp_id', 0)
 
@@ -230,8 +307,9 @@ class FlexKVReplayEngine:
         if request_type == "GET":
             print(f"🔍🔍🔍GET token_ids: {token_ids[:128]}")
             print(f"request_id: {data['request_id']}, request_type: {request_type}, "
-                  f"input length: {len(token_ids)}, true in mask: {token_mask.sum()}")
-            task_id = self.kvmanager.get_async(
+                  f"input length: {len(token_ids)}, true in mask: {token_mask.sum() if token_mask is not None else 'N/A'}")
+            # get_async return (task_id, return_mask)
+            task_id, return_mask = self.kvmanager.get_async(
                 token_ids=token_ids,
                 slot_mapping=slot_mapping,
                 token_mask=token_mask,
@@ -241,10 +319,32 @@ class FlexKVReplayEngine:
         elif request_type == "PUT":
             print(f"✅✅✅PUT token_ids: {token_ids[:128]}")
             print(f"request_id: {data['request_id']}, request_type: {request_type}, "
-                  f"input length: {len(token_ids)}, true in mask: {token_mask.sum()}")
-            task_id = self.kvmanager.put_async(
+                  f"input length: {len(token_ids)}, true in mask: {token_mask.sum() if token_mask is not None else 'N/A'}")
+            # put_async return (task_id, return_mask)
+            task_id, return_mask = self.kvmanager.put_async(
                 token_ids=token_ids,
                 slot_mapping=slot_mapping,
+                token_mask=token_mask,
+                dp_id=dp_id
+            )
+        elif request_type == "GET_MATCH":
+            print(f"🔍📝GET_MATCH token_ids: {token_ids[:128]}")
+            print(f"request_id: {data['request_id']}, request_type: {request_type}, "
+                  f"input length: {len(token_ids)}, true in mask: {token_mask.sum() if token_mask is not None else 'N/A'}")
+            # get_match return (task_id, return_mask)
+            task_id, return_mask = self.kvmanager.get_match(
+                token_ids=token_ids,
+                token_mask=token_mask,
+                layer_granularity=layer_granularity,
+                dp_id=dp_id
+            )
+        elif request_type == "PUT_MATCH":
+            print(f"✅📝PUT_MATCH token_ids: {token_ids[:128]}")
+            print(f"request_id: {data['request_id']}, request_type: {request_type}, "
+                  f"input length: {len(token_ids)}, true in mask: {token_mask.sum() if token_mask is not None else 'N/A'}")
+            # put_match return (task_id, return_mask)
+            task_id, return_mask = self.kvmanager.put_match(
+                token_ids=token_ids,
                 token_mask=token_mask,
                 dp_id=dp_id
             )
@@ -253,33 +353,74 @@ class FlexKVReplayEngine:
 
         return task_id
 
+    def replay_launch_tasks_event(self, event: Dict[str, Any]):
+        """Replay a launch_tasks event"""
+        data = event['data']
+        task_ids = data['task_ids']
+        slot_mappings_list = data['slot_mappings']
+        
+        self.log(f"🚀🚀🚀Replaying launch_tasks for task_ids: {task_ids}")
+        
+        try:
+            # Convert lists back to numpy arrays
+            import numpy as np
+            slot_mappings = [np.array(sm, dtype=np.int64) for sm in slot_mappings_list]
+            
+            print(f"Launching {len(task_ids)} tasks with slot_mappings")
+            
+            # Call launch_tasks
+            self.kvmanager.launch_tasks(task_ids, slot_mappings)
+            
+            self.log(f"launch_tasks completed successfully for {len(task_ids)} tasks")
+            
+        except Exception as e:
+            self.log(f"Warning: launch_tasks operation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
     def replay_wait_event(self, event: Dict[str, Any]):
         """Replay a wait event"""
         data = event['data']
         wait_type = data['wait_type']
         task_ids = data['task_ids']
+        timeout = data.get('timeout', 20.0)  # default timeout
+        completely = data.get('completely', False)  # default completely
         layer_group_id = data.get('layer_group_id')
 
-        self.log(f"⏰⏰⏰Replaying {wait_type} for task_ids: {task_ids}")
+        self.log(f"⏰⏰⏰Replaying {wait_type} for task_ids: {task_ids}, timeout: {timeout}, completely: {completely}")
 
         try:
+            # wait and try_wait return Dict[int, KVResponse]
             if wait_type == "wait":
-                result = self.kvmanager.wait(task_ids)
-            elif wait_type == "wait_for_graph_finished":
-                result = self.kvmanager.wait_for_graph_finished(task_ids)
+                result = self.kvmanager.wait(task_ids, timeout=timeout, completely=completely)
             elif wait_type == "try_wait":
                 result = self.kvmanager.try_wait(task_ids)
             else:
                 raise ValueError(f"Unknown wait type: {wait_type}")
+            
+            # process result: result is Dict[int, KVResponse]
             successed_elements = []
+            statuses = []
             for task_id in task_ids:
-                successed_elements.append(result[task_id].sum().item())
-            print(f"wait result: task ids: {task_ids}, successed elements num: {successed_elements}")
+                if task_id in result:
+                    # return_mask in KVResponse may be None
+                    if result[task_id].return_mask is not None:
+                        successed_elements.append(result[task_id].return_mask.sum())
+                    else:
+                        successed_elements.append(0)
+                    statuses.append(result[task_id].status.name if hasattr(result[task_id], 'status') else "SUCCESS")
+                else:
+                    successed_elements.append(0)
+                    statuses.append("NOT_FOUND")
+            
+            print(f"✅ {wait_type} result: task_ids={task_ids}, successed_elements={successed_elements}, statuses={statuses}")
             self.log(f"Wait completed successfully for {wait_type}")
             return result
 
         except Exception as e:
             self.log(f"Warning: Wait operation failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def replay_all_events(self):
@@ -289,8 +430,10 @@ class FlexKVReplayEngine:
         config_events = [e for e in self.events if e['event_type'] == 'config']
         request_events = [e for e in self.events if e['event_type'] == 'request']
         wait_events = [e for e in self.events if e['event_type'] == 'wait']
+        launch_tasks_events = [e for e in self.events if e['event_type'] == 'launch_tasks']
 
-        self.log(f"Found {len(config_events)} config, {len(request_events)} request, {len(wait_events)} wait events")
+        self.log(f"Found {len(config_events)} config, {len(request_events)} request, "
+                f"{len(wait_events)} wait, {len(launch_tasks_events)} launch_tasks events")
 
         # Parse configuration first
         if config_events:
@@ -303,7 +446,7 @@ class FlexKVReplayEngine:
         self.create_gpu_blocks()
         self.create_kvmanager()
         # Replay all non-config events in timestamp order
-        other_events = request_events + wait_events
+        other_events = request_events + wait_events + launch_tasks_events
         other_events.sort(key=lambda e: e['timestamp'])
 
         request_id_mapping = {}  # Map original request_id to replayed task_id
@@ -315,6 +458,22 @@ class FlexKVReplayEngine:
                 replayed_task_id = self.replay_request_event(event)
                 request_id_mapping[original_request_id] = replayed_task_id
                 self.log(f"Mapped original request_id {original_request_id} to task_id {replayed_task_id}")
+
+            elif event_type == 'launch_tasks':
+                # Map original task_ids to replayed task_ids
+                original_task_ids = event['data']['task_ids']
+                mapped_task_ids = []
+                for orig_id in original_task_ids:
+                    if orig_id in request_id_mapping:
+                        mapped_task_ids.append(request_id_mapping[orig_id])
+                    else:
+                        self.log(f"Warning: Cannot find mapping for task_id {orig_id}")
+                        mapped_task_ids.append(orig_id)  # Use original if not found
+
+                # Update event data with mapped task_ids
+                event['data']['task_ids'] = mapped_task_ids
+                self.replay_launch_tasks_event(event)
+                print("launch_tasks done")
 
             elif event_type == 'wait':
                 # Map original task_ids to replayed task_ids

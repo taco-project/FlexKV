@@ -376,6 +376,8 @@ class KVTaskEngine(KVTaskManager):
                  ):
         super().__init__(model_config, cache_config, gpu_register_port)
         self.tracer = FlexKVTracer()
+        # trace config
+        self.tracer.trace_config(model_config, cache_config, gpu_layout=None)
 
     def get_async(self,
                   token_ids: np.ndarray,
@@ -391,6 +393,16 @@ class KVTaskEngine(KVTaskManager):
                                                     layer_granularity=layer_granularity,
                                                     dp_id=dp_id,
                                                     task_id=task_id)
+        # trace get request
+        self.tracer.trace_request(
+            request_type="GET",
+            request_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask,
+            layer_granularity=layer_granularity,
+            dp_id=dp_id
+        )
         self._launch_task(task_id)
         return task_id, return_mask
 
@@ -406,6 +418,16 @@ class KVTaskEngine(KVTaskManager):
                                                     token_mask=token_mask,
                                                     dp_id=dp_id,
                                                     task_id=task_id)
+        # trace put request
+        self.tracer.trace_request(
+            request_type="PUT",
+            request_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask,
+            layer_granularity=-1,  # put has no layer_granularity parameter
+            dp_id=dp_id
+        )
         self._launch_task(task_id)
         return task_id, return_mask
 
@@ -464,6 +486,13 @@ class KVTaskEngine(KVTaskManager):
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         nvtx.mark(f"try_wait task_ids: {task_ids}")
+        # trace try_wait request
+        self.tracer.trace_wait_request(
+            wait_type="try_wait",
+            task_ids=task_ids,
+            timeout=None,  # try_wait doesn't have explicit timeout
+            completely=False
+        )
         return_responses = self._wait_impl(task_ids,
                                            completely=False,
                                            only_return_finished=True)
@@ -476,6 +505,13 @@ class KVTaskEngine(KVTaskManager):
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         nvtx.push_range(f"wait task_ids: {task_ids}", color=get_nvtx_default_color())
+        # trace wait request
+        self.tracer.trace_wait_request(
+            wait_type="wait",
+            task_ids=task_ids,
+            timeout=timeout,
+            completely=completely
+        )
         return_responses = self._wait_impl(task_ids, timeout, completely=completely)
         nvtx.pop_range()
         return return_responses
@@ -489,13 +525,24 @@ class KVTaskEngine(KVTaskManager):
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
         fake_slot_mapping = np.zeros_like(token_ids[token_mask])
-        return self._get_match_impl(token_ids,
-                                    fake_slot_mapping,
-                                    is_fake_slot_mapping=True,
-                                    token_mask=token_mask,
-                                    layer_granularity=layer_granularity,
-                                    dp_id=dp_id,
-                                    task_id=task_id)
+        result_task_id, return_mask = self._get_match_impl(token_ids,
+                                                           fake_slot_mapping,
+                                                           is_fake_slot_mapping=True,
+                                                           token_mask=token_mask,
+                                                           layer_granularity=layer_granularity,
+                                                           dp_id=dp_id,
+                                                           task_id=task_id)
+        # trace get match request
+        self.tracer.trace_request(
+            request_type="GET_MATCH",
+            request_id=result_task_id,
+            token_ids=token_ids,
+            slot_mapping=fake_slot_mapping,
+            token_mask=token_mask,
+            layer_granularity=layer_granularity,
+            dp_id=dp_id
+        )
+        return result_task_id, return_mask
 
     def _get_match_impl(self,
                   token_ids: np.ndarray,
@@ -529,12 +576,23 @@ class KVTaskEngine(KVTaskManager):
                   dp_id: int = 0,
                   task_id: int = -1) -> Tuple[int, np.ndarray]:
         fake_slot_mapping = np.zeros_like(token_ids)
-        return self._put_match_impl(token_ids,
-                                    fake_slot_mapping,
-                                    is_fake_slot_mapping=True,
-                                    token_mask=token_mask,
-                                    dp_id=dp_id,
-                                    task_id=task_id)
+        result_task_id, return_mask = self._put_match_impl(token_ids,
+                                                           fake_slot_mapping,
+                                                           is_fake_slot_mapping=True,
+                                                           token_mask=token_mask,
+                                                           dp_id=dp_id,
+                                                           task_id=task_id)
+        # trace put match request
+        self.tracer.trace_request(
+            request_type="PUT_MATCH",
+            request_id=result_task_id,
+            token_ids=token_ids,
+            slot_mapping=fake_slot_mapping,
+            token_mask=token_mask,
+            layer_granularity=-1,  # put has no layer_granularity parameter
+            dp_id=dp_id
+        )
+        return result_task_id, return_mask
 
     def _put_match_impl(self,
                         token_ids: np.ndarray,
@@ -562,6 +620,8 @@ class KVTaskEngine(KVTaskManager):
                         task_ids: List[int],
                         slot_mappings: List[np.ndarray]) -> None:
         assert isinstance(slot_mappings[0], np.ndarray)
+        # trace launch tasks
+        self.tracer.trace_launch_tasks(task_ids, slot_mappings)
         self.set_slot_mappings(task_ids, slot_mappings)
         for task_id in task_ids:
             self._launch_task(task_id)
