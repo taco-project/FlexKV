@@ -125,11 +125,11 @@ std::future<void> TPGDSTransferThreadGroup::enqueue_for_gpu(int gpu_idx, Task ta
 
 void TPGDSTransferThreadGroup::tp_group_transfer(
     const torch::Tensor &gpu_block_id_tensor,
-    const torch::Tensor &gds_block_id_tensor,
-    const int64_t gds_layer_stride_in_bytes,
-    const int64_t gds_kv_stride_in_bytes,
-    const int64_t gds_block_stride_in_bytes,
-    const int64_t gds_chunk_size_in_bytes,
+    const torch::Tensor &ssd_block_id_tensor,
+    const int64_t ssd_layer_stride_in_bytes,
+    const int64_t ssd_kv_stride_in_bytes,
+    const int64_t ssd_block_stride_in_bytes,
+    const int64_t ssd_chunk_size_in_bytes,
     const int64_t num_blocks_per_file,
     const bool is_read,
     const int layer_id,
@@ -153,17 +153,17 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
         torch::Tensor gpu_layer_ptrs_tensor = torch::from_blob(
             gpu_layer_ptrs, {layer_granularity}, torch::TensorOptions().dtype(torch::kInt64));
         
-        int64_t gds_copy_off_inside_chunks;
+        int64_t ssd_copy_off_inside_chunks;
         int64_t gpu_chunk_size_in_bytes = gpu_chunk_sizes_in_bytes_[i];
         
         if (is_mla) {
           if (!is_read) {
-            gds_copy_off_inside_chunks = i * gpu_chunk_size_in_bytes;
+            ssd_copy_off_inside_chunks = i * gpu_chunk_size_in_bytes;
           } else {
-            gds_copy_off_inside_chunks = 0;
+            ssd_copy_off_inside_chunks = 0;
           }
         } else {
-          gds_copy_off_inside_chunks = i * gpu_chunk_size_in_bytes;
+          ssd_copy_off_inside_chunks = i * gpu_chunk_size_in_bytes;
         }
 
         int64_t chunk_size = is_mla && !is_read ? gpu_chunk_size_in_bytes / num_gpus_ : gpu_chunk_size_in_bytes;
@@ -173,15 +173,15 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
             *gds_managers_[i],              // GDS manager for this GPU
             layer_id_list,                  // Layer IDs to process
             gpu_layer_ptrs_tensor,          // GPU layer pointers
-            gds_block_id_tensor,            // GDS block IDs (adjusted for TP)
+            ssd_block_id_tensor,            // SSD block IDs (adjusted for TP)
             gpu_block_id_tensor,            // GPU block IDs
             gpu_kv_strides_in_bytes_[i],    // GPU K-V stride
             gpu_block_strides_in_bytes_[i], // GPU block stride
-            gds_layer_stride_in_bytes,      // GDS layer stride
-            gds_block_stride_in_bytes,      // GDS block stride
-            gds_kv_stride_in_bytes,         // GDS K-V stride
+            ssd_layer_stride_in_bytes,      // SSD layer stride
+            ssd_block_stride_in_bytes,      // SSD block stride
+            ssd_kv_stride_in_bytes,         // SSD K-V stride
             chunk_size,                     // Chunk size
-            gds_copy_off_inside_chunks,     // GDS copy off inside chunks
+            ssd_copy_off_inside_chunks,     // SSD copy off inside chunks
             num_blocks_per_file,            // Blocks per file
             layer_granularity,              // Total layers
             is_read,                        // Read or write

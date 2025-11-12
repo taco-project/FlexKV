@@ -373,10 +373,10 @@ PYBIND11_MODULE(c_ext, m) {
                     torch::Tensor &, torch::Tensor &, torch::Tensor &>())
       .def("tp_group_transfer",
            &flexkv::TPGDSTransferThreadGroup::tp_group_transfer,
-           py::arg("gpu_block_id_tensor"), py::arg("gds_block_id_tensor"),
-           py::arg("gds_layer_stride_in_bytes"),
-           py::arg("gds_kv_stride_in_bytes"), py::arg("gds_block_stride_in_bytes"),
-           py::arg("gds_chunk_size_in_bytes"), py::arg("num_blocks_per_file"),
+           py::arg("gpu_block_id_tensor"), py::arg("ssd_block_id_tensor"),
+           py::arg("ssd_layer_stride_in_bytes"),
+           py::arg("ssd_kv_stride_in_bytes"), py::arg("ssd_block_stride_in_bytes"),
+           py::arg("ssd_chunk_size_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"));
 

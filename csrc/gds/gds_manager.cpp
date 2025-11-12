@@ -567,19 +567,19 @@ int GDSManager::batch_read(const struct BatchReadOp* operations, int batch_size)
 
 //partition and remap blocks by device (same logic as SSD transfer)
 static void partition_and_remap_blocks_by_device_gds(
-    const int64_t* gds_block_ids, const int64_t* gpu_block_ids, int num_blocks,
+    const int64_t* ssd_block_ids, const int64_t* gpu_block_ids, int num_blocks,
     int num_devices, int round_robin,
     std::vector<std::vector<int>>& gpu_blocks_partition,
-    std::vector<std::vector<int>>& gds_blocks_partition) {
+    std::vector<std::vector<int>>& ssd_blocks_partition) {
     for (int i = 0; i < num_blocks; i++) {
-        int64_t gds_block_id = gds_block_ids[i];
+        int64_t ssd_block_id = ssd_block_ids[i];
         int64_t gpu_block_id = gpu_block_ids[i];
         // Use the exact same round-robin mapping as SSD transfer
-        int device_id = (gds_block_id / round_robin) % num_devices;
+        int device_id = (ssd_block_id / round_robin) % num_devices;
         int block_id_in_device =
-            ((gds_block_id / round_robin) / num_devices) * round_robin +
-            (gds_block_id % round_robin);
-        gds_blocks_partition[device_id].push_back(block_id_in_device);
+            ((ssd_block_id / round_robin) / num_devices) * round_robin +
+            (ssd_block_id % round_robin);
+        ssd_blocks_partition[device_id].push_back(block_id_in_device);
         gpu_blocks_partition[device_id].push_back(gpu_block_id);
     }
 }
@@ -588,15 +588,15 @@ void transfer_kv_blocks_gds(
     GDSManager& gds_manager,
     const torch::Tensor& gpu_layer_id_list,
     const torch::Tensor& gpu_layer_ptrs_tensor,
-    const torch::Tensor& gds_block_ids,
+    const torch::Tensor& ssd_block_ids,
     const torch::Tensor& gpu_block_ids,
     int64_t gpu_kv_stride_in_bytes,
     int64_t gpu_block_stride_in_bytes,
-    int64_t gds_layer_stride_in_bytes,
-    int64_t gds_block_stride_in_bytes,
-    int64_t gds_kv_stride_in_bytes,
+    int64_t ssd_layer_stride_in_bytes,
+    int64_t ssd_block_stride_in_bytes,
+    int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes,
-    int64_t gds_copy_off_inside_chunks,
+    int64_t ssd_copy_off_inside_chunks,
     int num_blocks_per_file,
     int64_t total_layers,
     bool is_read,
@@ -613,34 +613,34 @@ void transfer_kv_blocks_gds(
     
     // Get tensor data pointers
     const int64_t* layer_ptrs = gpu_layer_ptrs_tensor.data_ptr<int64_t>();
-    const int64_t* gds_block_id_ptr = gds_block_ids.data_ptr<int64_t>();
+    const int64_t* ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
     const int64_t* gpu_block_id_ptr = gpu_block_ids.data_ptr<int64_t>();
     
     const int num_layers = gpu_layer_id_list.size(0);
     const int32_t* gpu_layer_id_list_ptr = gpu_layer_id_list.data_ptr<int32_t>();
-    const int num_transfers = gds_block_ids.size(0);
+    const int num_transfers = ssd_block_ids.size(0);
     
     // Partition blocks by device using the same logic as SSD
     std::vector<std::vector<int>> gpu_blocks_partition(num_devices, std::vector<int>());
-    std::vector<std::vector<int>> gds_blocks_partition(num_devices, std::vector<int>());
+    std::vector<std::vector<int>> ssd_blocks_partition(num_devices, std::vector<int>());
     partition_and_remap_blocks_by_device_gds(
-        gds_block_id_ptr, gpu_block_id_ptr, num_transfers, num_devices, round_robin,
-        gpu_blocks_partition, gds_blocks_partition);
+        ssd_block_id_ptr, gpu_block_id_ptr, num_transfers, num_devices, round_robin,
+        gpu_blocks_partition, ssd_blocks_partition);
     
     // Process each device (like SSD transfer)
     for (int device_id = 0; device_id < num_devices; device_id++) {
         const std::vector<int>& gpu_blocks = gpu_blocks_partition[device_id];
-        const std::vector<int>& gds_blocks = gds_blocks_partition[device_id];
+        const std::vector<int>& ssd_blocks = ssd_blocks_partition[device_id];
         
         const std::vector<std::string>& file_list = gds_manager.get_file_paths(device_id);
         
         for (size_t j = 0; j < gpu_blocks.size(); j++) {
             int64_t gpu_block_id = gpu_blocks[j];
-            int64_t gds_block_id = gds_blocks[j];
+            int64_t ssd_block_id = ssd_blocks[j];
             
-            int file_id_in_device = gds_block_id % num_files_per_device;
+            int file_id_in_device = ssd_block_id % num_files_per_device;
             const std::string& filename = file_list[file_id_in_device];
-            int64_t block_id_in_file = gds_block_id / num_files_per_device;
+            int64_t block_id_in_file = ssd_block_id / num_files_per_device;
             
             // Process each layer for this block
             for (int i = 0; i < num_layers; i++) {
@@ -650,23 +650,23 @@ void transfer_kv_blocks_gds(
                 void* k_view = layer_ptr;
                 void* v_view = static_cast<char*>(layer_ptr) + gpu_kv_stride_in_bytes;
                 
-                int64_t gds_base_offset = 
-                    gds_layer_stride_in_bytes * layer_idx +
-                    gds_block_stride_in_bytes * block_id_in_file;
+                int64_t ssd_base_offset = 
+                    ssd_layer_stride_in_bytes * layer_idx +
+                    ssd_block_stride_in_bytes * block_id_in_file;
                 
-                int64_t gds_k_offset = gds_base_offset + gds_copy_off_inside_chunks;
-                int64_t gds_v_offset = gds_k_offset + gds_kv_stride_in_bytes;
+                int64_t ssd_k_offset = ssd_base_offset + ssd_copy_off_inside_chunks;
+                int64_t ssd_v_offset = ssd_k_offset + ssd_kv_stride_in_bytes;
                 
                 void* k_ptr = static_cast<char*>(k_view) + gpu_block_id * gpu_block_stride_in_bytes;
                 void* v_ptr = static_cast<char*>(v_view) + gpu_block_id * gpu_block_stride_in_bytes;
                 
                 ssize_t k_result;
                 if (is_read) {
-                    // GDS -> GPU (read from GDS file to GPU memory)
-                    k_result = gds_manager.read(filename.c_str(), k_ptr, chunk_size_in_bytes, gds_k_offset);
+                    // SSD -> GPU (read from SSD file to GPU memory)
+                    k_result = gds_manager.read(filename.c_str(), k_ptr, chunk_size_in_bytes, ssd_k_offset);
                 } else {
-                    // GPU -> GDS (write from GPU memory to GDS file) 
-                    k_result = gds_manager.write(filename.c_str(), k_ptr, chunk_size_in_bytes, gds_k_offset);
+                    // GPU -> SSD (write from GPU memory to SSD file) 
+                    k_result = gds_manager.write(filename.c_str(), k_ptr, chunk_size_in_bytes, ssd_k_offset);
                 }
                 
                 if (k_result != chunk_size_in_bytes) {
@@ -690,11 +690,11 @@ void transfer_kv_blocks_gds(
 
                 ssize_t v_result;
                 if (is_read) {
-                    // GDS -> GPU (read from GDS file to GPU memory)
-                    v_result = gds_manager.read(filename.c_str(), v_ptr, chunk_size_in_bytes, gds_v_offset);
+                    // SSD -> GPU (read from SSD file to GPU memory)
+                    v_result = gds_manager.read(filename.c_str(), v_ptr, chunk_size_in_bytes, ssd_v_offset);
                 } else {
-                    // GPU -> GDS (write from GPU memory to GDS file)
-                    v_result = gds_manager.write(filename.c_str(), v_ptr, chunk_size_in_bytes, gds_v_offset);
+                    // GPU -> SSD (write from GPU memory to SSD file)
+                    v_result = gds_manager.write(filename.c_str(), v_ptr, chunk_size_in_bytes, ssd_v_offset);
                 }
                 
                 if (v_result != chunk_size_in_bytes) {

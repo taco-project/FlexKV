@@ -34,13 +34,13 @@ public:
 
   void tp_group_transfer(
       const torch::Tensor &gpu_block_id_tensor,
-      const torch::Tensor &gds_block_id_tensor,
-      const int64_t gds_layer_stride_in_bytes,
-      const int64_t gds_kv_stride_in_bytes,
-      const int64_t gds_block_stride_in_bytes,
-      const int64_t gds_chunk_size_in_bytes,
+      const torch::Tensor &ssd_block_id_tensor,
+      const int64_t ssd_layer_stride_in_bytes,
+      const int64_t ssd_kv_stride_in_bytes,
+      const int64_t ssd_block_stride_in_bytes,
+      const int64_t ssd_chunk_size_in_bytes,
       const int64_t num_blocks_per_file,
-      const bool is_read,  // true for GDS->GPU, false for GPU->GDS
+      const bool is_read,  // true for SSD->GPU, false for GPU->SSD
       const int layer_id,
       const int layer_granularity, 
       const bool is_mla);
