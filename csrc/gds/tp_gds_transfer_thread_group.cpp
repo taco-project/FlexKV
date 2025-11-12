@@ -12,6 +12,7 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
     int num_layers,
     torch::Tensor &gpu_kv_strides_tensor,
     torch::Tensor &gpu_block_strides_tensor,
+    torch::Tensor &gpu_layer_strides_tensor,
     torch::Tensor &gpu_chunk_sizes_tensor) {
   
   num_gpus_ = num_gpus;
@@ -20,25 +21,52 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
   // per-GPU layout parameters
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
+  gpu_layer_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_chunk_sizes_in_bytes_ = new int64_t[num_gpus];
   
   int64_t* kv_strides_ptr = gpu_kv_strides_tensor.data_ptr<int64_t>();
   int64_t* block_strides_ptr = gpu_block_strides_tensor.data_ptr<int64_t>();
+  int64_t* layer_strides_ptr = gpu_layer_strides_tensor.data_ptr<int64_t>();
   int64_t* chunk_sizes_ptr = gpu_chunk_sizes_tensor.data_ptr<int64_t>();
   
   for (int i = 0; i < num_gpus; i++) {
     gpu_kv_strides_in_bytes_[i] = kv_strides_ptr[i];
     gpu_block_strides_in_bytes_[i] = block_strides_ptr[i];
+    gpu_layer_strides_in_bytes_[i] = layer_strides_ptr[i];
     gpu_chunk_sizes_in_bytes_[i] = chunk_sizes_ptr[i];
   }
   
-  // Prepare GPU blocks pointers
-  cudaMallocHost((void **)&gpu_blocks_, num_gpus_ * num_layers * sizeof(void *));
+  num_tensors_per_gpu_ = gpu_blocks[0].size();
+  cudaMallocHost((void **)&gpu_blocks_, num_gpus_ * num_tensors_per_gpu_ * sizeof(void *));
   
   for (int i = 0; i < num_gpus_; ++i) {
-    for (int j = 0; j < num_layers; ++j) {
-      gpu_blocks_[i * num_layers + j] = gpu_blocks[i][j].data_ptr();
+    for (int j = 0; j < num_tensors_per_gpu_; ++j) {
+      gpu_blocks_[i * num_tensors_per_gpu_ + j] = gpu_blocks[i][j].data_ptr();
     }
+  }
+  
+  if (num_tensors_per_gpu_ == 1) {
+    backend_type_ = BackendType::TRTLLM;
+  } else if (num_tensors_per_gpu_ == num_layers) {
+    backend_type_ = BackendType::VLLM;
+  } else if (num_tensors_per_gpu_ == num_layers * 2) {
+    backend_type_ = BackendType::SGLANG;
+  } else {
+    throw std::runtime_error("Unsupported GPU block type: " + std::to_string(num_tensors_per_gpu_));
+  }
+  
+  // Create GTensorHandler for each GPU
+  gpu_tensor_handlers_.reserve(num_gpus_);
+  for (int i = 0; i < num_gpus_; i++) {
+    int64_t **gpu_blocks_ptr = reinterpret_cast<int64_t**>(gpu_blocks_ + i * num_tensors_per_gpu_);
+    gpu_tensor_handlers_.emplace_back(
+        backend_type_,
+        gpu_blocks_ptr,
+        num_layers,
+        gpu_kv_strides_in_bytes_[i],
+        gpu_block_strides_in_bytes_[i],
+        gpu_layer_strides_in_bytes_[i]
+    );
   }
 
   // Create GDS managers for each GPU thread
@@ -106,9 +134,12 @@ TPGDSTransferThreadGroup::~TPGDSTransferThreadGroup() {
     cudaFreeHost(gpu_blocks_);
   }
   
+  gpu_tensor_handlers_.clear();
+  
   // Clean up per-GPU layout parameters
   delete[] gpu_kv_strides_in_bytes_;
   delete[] gpu_block_strides_in_bytes_;
+  delete[] gpu_layer_strides_in_bytes_;
   delete[] gpu_chunk_sizes_in_bytes_;
 }
 
@@ -148,11 +179,6 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
         torch::Tensor layer_id_list = torch::arange(layer_id, layer_id + layer_granularity, 
                                                     torch::TensorOptions().dtype(torch::kInt32));
         
-        // Prepare GPU layer pointers for this GPU and layer range
-        void **gpu_layer_ptrs = static_cast<void **>(gpu_blocks_ + i * layer_granularity + layer_id);
-        torch::Tensor gpu_layer_ptrs_tensor = torch::from_blob(
-            gpu_layer_ptrs, {layer_granularity}, torch::TensorOptions().dtype(torch::kInt64));
-        
         int64_t ssd_copy_off_inside_chunks;
         int64_t gpu_chunk_size_in_bytes = gpu_chunk_sizes_in_bytes_[i];
         
@@ -168,26 +194,65 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
 
         int64_t chunk_size = is_mla && !is_read ? gpu_chunk_size_in_bytes / num_gpus_ : gpu_chunk_size_in_bytes;
         
-        // Call the transfer_kv_blocks_gds function with multi-file support
-        transfer_kv_blocks_gds(
-            *gds_managers_[i],              // GDS manager for this GPU
-            layer_id_list,                  // Layer IDs to process
-            gpu_layer_ptrs_tensor,          // GPU layer pointers
-            ssd_block_id_tensor,            // SSD block IDs (adjusted for TP)
-            gpu_block_id_tensor,            // GPU block IDs
-            gpu_kv_strides_in_bytes_[i],    // GPU K-V stride
-            gpu_block_strides_in_bytes_[i], // GPU block stride
-            ssd_layer_stride_in_bytes,      // SSD layer stride
-            ssd_block_stride_in_bytes,      // SSD block stride
-            ssd_kv_stride_in_bytes,         // SSD K-V stride
-            chunk_size,                     // Chunk size
-            ssd_copy_off_inside_chunks,     // SSD copy off inside chunks
-            num_blocks_per_file,            // Blocks per file
-            layer_granularity,              // Total layers
-            is_read,                        // Read or write
-            false,                          // Verbose logging
-            is_mla                          // MLA
-        );
+        switch (backend_type_) {
+          case BackendType::VLLM:
+            flexkv::transfer_kv_blocks_gds<BackendType::VLLM>(
+                *gds_managers_[i],
+                layer_id_list,
+                gpu_tensor_handlers_[i],
+                ssd_block_id_tensor,
+                gpu_block_id_tensor,
+                ssd_layer_stride_in_bytes,
+                ssd_block_stride_in_bytes,
+                ssd_kv_stride_in_bytes,
+                chunk_size,
+                ssd_copy_off_inside_chunks,
+                num_blocks_per_file,
+                layer_granularity,
+                is_read,
+                false,  // verbose
+                is_mla
+            );
+            break;
+          case BackendType::TRTLLM:
+            flexkv::transfer_kv_blocks_gds<BackendType::TRTLLM>(
+                *gds_managers_[i],
+                layer_id_list,
+                gpu_tensor_handlers_[i],
+                ssd_block_id_tensor,
+                gpu_block_id_tensor,
+                ssd_layer_stride_in_bytes,
+                ssd_block_stride_in_bytes,
+                ssd_kv_stride_in_bytes,
+                chunk_size,
+                ssd_copy_off_inside_chunks,
+                num_blocks_per_file,
+                layer_granularity,
+                is_read,
+                false,  // verbose
+                is_mla
+            );
+            break;
+          case BackendType::SGLANG:
+            flexkv::transfer_kv_blocks_gds<BackendType::SGLANG>(
+                *gds_managers_[i],
+                layer_id_list,
+                gpu_tensor_handlers_[i],
+                ssd_block_id_tensor,
+                gpu_block_id_tensor,
+                ssd_layer_stride_in_bytes,
+                ssd_block_stride_in_bytes,
+                ssd_kv_stride_in_bytes,
+                chunk_size,
+                ssd_copy_off_inside_chunks,
+                num_blocks_per_file,
+                layer_granularity,
+                is_read,
+                false,  // verbose
+                is_mla
+            );
+            break;
+        }
         
         // Check for CUDA errors
         cudaError_t err = cudaGetLastError();

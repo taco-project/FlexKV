@@ -565,6 +565,8 @@ int GDSManager::batch_read(const struct BatchReadOp* operations, int batch_size)
 #endif
 }
 
+namespace flexkv {
+
 //partition and remap blocks by device (same logic as SSD transfer)
 static void partition_and_remap_blocks_by_device_gds(
     const int64_t* ssd_block_ids, const int64_t* gpu_block_ids, int num_blocks,
@@ -584,14 +586,13 @@ static void partition_and_remap_blocks_by_device_gds(
     }
 }
 
+template<BackendType Type>
 void transfer_kv_blocks_gds(
     GDSManager& gds_manager,
     const torch::Tensor& gpu_layer_id_list,
-    const torch::Tensor& gpu_layer_ptrs_tensor,
+    GTensorHandler gpu_tensor_handler,
     const torch::Tensor& ssd_block_ids,
     const torch::Tensor& gpu_block_ids,
-    int64_t gpu_kv_stride_in_bytes,
-    int64_t gpu_block_stride_in_bytes,
     int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes,
     int64_t ssd_kv_stride_in_bytes,
@@ -612,7 +613,6 @@ void transfer_kv_blocks_gds(
     int round_robin = gds_manager.get_round_robin();
     
     // Get tensor data pointers
-    const int64_t* layer_ptrs = gpu_layer_ptrs_tensor.data_ptr<int64_t>();
     const int64_t* ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
     const int64_t* gpu_block_id_ptr = gpu_block_ids.data_ptr<int64_t>();
     
@@ -645,10 +645,9 @@ void transfer_kv_blocks_gds(
             // Process each layer for this block
             for (int i = 0; i < num_layers; i++) {
                 int32_t layer_idx = gpu_layer_id_list_ptr[i];
-                void* layer_ptr = reinterpret_cast<void*>(layer_ptrs[layer_idx]);
                 
-                void* k_view = layer_ptr;
-                void* v_view = static_cast<char*>(layer_ptr) + gpu_kv_stride_in_bytes;
+                int64_t *gpu_k_ptr = ptr_at<Type>(gpu_tensor_handler, i, 0, gpu_block_id);
+                int64_t *gpu_v_ptr = is_mla ? nullptr : ptr_at<Type>(gpu_tensor_handler, i, 1, gpu_block_id);
                 
                 int64_t ssd_base_offset = 
                     ssd_layer_stride_in_bytes * layer_idx +
@@ -657,16 +656,13 @@ void transfer_kv_blocks_gds(
                 int64_t ssd_k_offset = ssd_base_offset + ssd_copy_off_inside_chunks;
                 int64_t ssd_v_offset = ssd_k_offset + ssd_kv_stride_in_bytes;
                 
-                void* k_ptr = static_cast<char*>(k_view) + gpu_block_id * gpu_block_stride_in_bytes;
-                void* v_ptr = static_cast<char*>(v_view) + gpu_block_id * gpu_block_stride_in_bytes;
-                
                 ssize_t k_result;
                 if (is_read) {
                     // SSD -> GPU (read from SSD file to GPU memory)
-                    k_result = gds_manager.read(filename.c_str(), k_ptr, chunk_size_in_bytes, ssd_k_offset);
+                    k_result = gds_manager.read(filename.c_str(), gpu_k_ptr, chunk_size_in_bytes, ssd_k_offset);
                 } else {
                     // GPU -> SSD (write from GPU memory to SSD file) 
-                    k_result = gds_manager.write(filename.c_str(), k_ptr, chunk_size_in_bytes, ssd_k_offset);
+                    k_result = gds_manager.write(filename.c_str(), gpu_k_ptr, chunk_size_in_bytes, ssd_k_offset);
                 }
                 
                 if (k_result != chunk_size_in_bytes) {
@@ -690,11 +686,9 @@ void transfer_kv_blocks_gds(
 
                 ssize_t v_result;
                 if (is_read) {
-                    // SSD -> GPU (read from SSD file to GPU memory)
-                    v_result = gds_manager.read(filename.c_str(), v_ptr, chunk_size_in_bytes, ssd_v_offset);
+                    v_result = gds_manager.read(filename.c_str(), gpu_v_ptr, chunk_size_in_bytes, ssd_v_offset);
                 } else {
-                    // GPU -> SSD (write from GPU memory to SSD file)
-                    v_result = gds_manager.write(filename.c_str(), v_ptr, chunk_size_in_bytes, ssd_v_offset);
+                    v_result = gds_manager.write(filename.c_str(), gpu_v_ptr, chunk_size_in_bytes, ssd_v_offset);
                 }
                 
                 if (v_result != chunk_size_in_bytes) {
@@ -719,4 +713,22 @@ void transfer_kv_blocks_gds(
     
     // Synchronize to ensure all operations complete
     gds_manager.synchronize();
+}
+
+// Explicit template instantiations
+template void transfer_kv_blocks_gds<BackendType::VLLM>(
+    GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int64_t, bool, bool, bool);
+
+template void transfer_kv_blocks_gds<BackendType::TRTLLM>(
+    GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int64_t, bool, bool, bool);
+
+template void transfer_kv_blocks_gds<BackendType::SGLANG>(
+    GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int64_t, bool, bool, bool);
+
 }

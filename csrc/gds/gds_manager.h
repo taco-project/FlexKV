@@ -9,6 +9,7 @@
 #include <initializer_list>
 #include <atomic>
 #include <torch/extension.h>
+#include "../gtensor_handler.cuh"
 
 #ifdef ENABLE_GDS
 #include <cuda_runtime.h>
@@ -271,20 +272,22 @@ struct BatchReadOp {
     ssize_t* result;              // Output: bytes read or -1 on error
 }; 
 
+namespace flexkv {
+
 /**
  * High-level transfer function for KV blocks between GPU and SSD
  * Similar to transfer_kv_blocks_ssd but for GPU-SSD transfers
  * 
+ * @tparam Type Backend type (VLLM, TRTLLM, or SGLANG)
  * @param gds_manager GDS manager instance
  * @param gpu_layer_id_list Tensor of layer IDs to process
- * @param gpu_layer_ptrs_tensor Tensor containing GPU layer pointers
+ * @param gpu_tensor_handler GTensorHandler for GPU memory layout
  * @param ssd_block_ids Tensor of SSD block IDs
- * @param gpu_block_ids Tensor of GPU block IDs  
- * @param gpu_kv_stride_in_bytes Stride between K and V in GPU memory
+ * @param gpu_block_ids Tensor of GPU block IDs
  * @param ssd_layer_stride_in_bytes Stride between layers in SSD file
  * @param ssd_block_stride_in_bytes Stride between blocks in SSD file
  * @param ssd_kv_stride_in_bytes Stride between K and V in SSD file
- * @param block_size_in_bytes Size of each block in bytes
+ * @param chunk_size_in_bytes Size of each chunk in bytes
  * @param ssd_copy_off_inside_chunks Copy offset inside each chunk in SSD file
  * @param num_blocks_per_file Number of blocks per file
  * @param total_layers Total number of layers
@@ -292,22 +295,23 @@ struct BatchReadOp {
  * @param verbose Enable verbose logging
  * @param is_mla Whether using MLA
  */
+template<BackendType Type>
 void transfer_kv_blocks_gds(
     GDSManager& gds_manager,
     const torch::Tensor& gpu_layer_id_list,
-    const torch::Tensor& gpu_layer_ptrs_tensor,
+    GTensorHandler gpu_tensor_handler,
     const torch::Tensor& ssd_block_ids,
     const torch::Tensor& gpu_block_ids,
-    int64_t gpu_kv_stride_in_bytes,
-    int64_t gpu_block_stride_in_bytes,
     int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_block_stride_in_bytes,
     int64_t ssd_kv_stride_in_bytes,
-    int64_t block_size_in_bytes,
+    int64_t chunk_size_in_bytes,
     int64_t ssd_copy_off_inside_chunks,
     int num_blocks_per_file,
     int64_t total_layers,
     bool is_read,
     bool verbose = false,
     bool is_mla = false
-); 
+);
+
+} // namespace flexkv 

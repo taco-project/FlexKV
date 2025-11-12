@@ -909,11 +909,21 @@ class GDSTransferWorker(TransferWorkerBase):
         self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
         self.gpu_kv_stride_in_bytes = gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize
         self.gpu_block_stride_in_bytes = gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize
+        self.gpu_layer_stride_in_bytes = gpu_kv_layout_per_layer.get_layer_stride() * self.dtype.itemsize
 
         # SSD layout calculations
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
         self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+
+        if len(self.gpu_blocks) == 1:
+            self.gpu_block_type_ = 1  # TRTLLM
+        elif len(self.gpu_blocks) == self.num_layers:
+            self.gpu_block_type_ = 0  # VLLM
+        elif len(self.gpu_blocks) == self.num_layers * 2:
+            self.gpu_block_type_ = 2  # SGLANG
+        else:
+            raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
 
         # Set GPU device and create stream
         self.gpu_device_id = gpu_device_id
@@ -973,6 +983,7 @@ class GDSTransferWorker(TransferWorkerBase):
                 gpu_block_id_list,              # GPU block IDs
                 self.gpu_kv_stride_in_bytes,    # GPU K-V stride
                 self.gpu_block_stride_in_bytes, # GPU block stride
+                self.gpu_layer_stride_in_bytes, # GPU layer stride
                 self.ssd_layer_stride_in_bytes, # SSD layer stride
                 self.ssd_block_stride_in_bytes, # SSD block stride
                 self.ssd_kv_stride_in_bytes,    # SSD K-V stride
@@ -982,7 +993,8 @@ class GDSTransferWorker(TransferWorkerBase):
                 self.num_layers,                # Total layers
                 is_read,                        # Read or write
                 False,                          # Verbose logging
-                self.is_mla                     # MLA
+                self.is_mla,                    # MLA
+                self.gpu_block_type_            # GPU block type
             )
 
         except Exception as e:
@@ -1086,6 +1098,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
                                         for gpu_kv_layout in gpu_kv_layouts]
         self.gpu_block_strides_in_bytes = [gpu_kv_layout.get_block_stride() * self.dtype.itemsize \
                                            for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_layer_strides_in_bytes = [gpu_kv_layout.get_layer_stride() * self.dtype.itemsize \
+                                           for gpu_kv_layout in gpu_kv_layouts]
 
         # SSD layout calculations
         self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
@@ -1096,10 +1110,11 @@ class tpGDSTransferWorker(TransferWorkerBase):
         # Create TP GDS Transfer Thread Group
         gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
         gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
+        gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
         gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
         self.tp_gds_transfer_thread_group = TPGDSTransferThreadGroup(
             self.num_gpus, self.gpu_blocks, ssd_files, dp_group_id, self.num_layers,
-            gpu_kv_strides_tensor, gpu_block_strides_tensor, gpu_chunk_sizes_tensor)
+            gpu_kv_strides_tensor, gpu_block_strides_tensor, gpu_layer_strides_tensor, gpu_chunk_sizes_tensor)
 
     def _transfer_impl(self,
                        src_block_ids: torch.Tensor,

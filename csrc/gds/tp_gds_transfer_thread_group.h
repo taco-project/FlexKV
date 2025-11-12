@@ -13,6 +13,7 @@
 #include <queue>
 #include <functional>
 #include <future>
+#include "../gtensor_handler.cuh"
 
 // Forward declaration
 class GDSManager;
@@ -29,6 +30,7 @@ public:
       int num_layers,
       torch::Tensor &gpu_kv_strides_tensor,
       torch::Tensor &gpu_block_strides_tensor,
+      torch::Tensor &gpu_layer_strides_tensor,
       torch::Tensor &gpu_chunk_sizes_tensor);
   ~TPGDSTransferThreadGroup();
 
@@ -52,10 +54,15 @@ private:
   int num_gpus_;
   int dp_group_id_;
   void **gpu_blocks_;
+  int num_tensors_per_gpu_;
   
   int64_t *gpu_kv_strides_in_bytes_;
   int64_t *gpu_block_strides_in_bytes_;
+  int64_t *gpu_layer_strides_in_bytes_;
   int64_t *gpu_chunk_sizes_in_bytes_;
+  
+  BackendType backend_type_;
+  std::vector<GTensorHandler> gpu_tensor_handlers_;
   
   std::vector<GDSManager*> gds_managers_;
   std::vector<std::thread> threads_;
