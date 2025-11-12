@@ -155,10 +155,12 @@ void transfer_kv_blocks_gds_binding(
     const torch::Tensor& gds_block_ids,
     const torch::Tensor& gpu_block_ids,
     int64_t gpu_kv_stride_in_bytes,
+    int64_t gpu_block_stride_in_bytes,
     int64_t gds_layer_stride_in_bytes,
     int64_t gds_block_stride_in_bytes,
     int64_t gds_kv_stride_in_bytes,
     int64_t block_size_in_bytes,
+    int64_t gds_copy_off_inside_chunks,
     int num_blocks_per_file,
     int64_t total_layers,
     bool is_read,
@@ -177,8 +179,9 @@ void transfer_kv_blocks_gds_binding(
     transfer_kv_blocks_gds(
         gds_manager, gpu_layer_id_list, gpu_layer_ptrs_tensor,
         gds_block_ids, gpu_block_ids, gpu_kv_stride_in_bytes,
-        gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
-        block_size_in_bytes, 0, num_blocks_per_file, total_layers, is_read, verbose, is_mla);
+        gpu_block_stride_in_bytes, gds_layer_stride_in_bytes, gds_block_stride_in_bytes,
+        gds_kv_stride_in_bytes, block_size_in_bytes,
+        gds_copy_off_inside_chunks, num_blocks_per_file, total_layers, is_read, verbose, is_mla);
 }
 
 // GDS Manager Python bindings
@@ -331,9 +334,11 @@ PYBIND11_MODULE(c_ext, m) {
         "Transfer KV blocks between GPU and GDS storage", py::arg("gds_manager"),
         py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
         py::arg("gds_block_ids"), py::arg("gpu_block_ids"),
-        py::arg("gpu_kv_stride_in_bytes"), py::arg("gds_layer_stride_in_bytes"),
-        py::arg("gds_block_stride_in_bytes"), py::arg("gds_kv_stride_in_bytes"),
-        py::arg("block_size_in_bytes"), py::arg("num_blocks_per_file"), py::arg("total_layers"), 
+        py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
+        py::arg("gds_layer_stride_in_bytes"), py::arg("gds_block_stride_in_bytes"),
+        py::arg("gds_kv_stride_in_bytes"), py::arg("block_size_in_bytes"),
+        py::arg("gds_copy_off_inside_chunks"),
+        py::arg("num_blocks_per_file"), py::arg("total_layers"), 
         py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false);
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
@@ -364,12 +369,12 @@ PYBIND11_MODULE(c_ext, m) {
 
   py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")
       .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
-                    const std::vector<std::string> &, int>())
+                    std::map<int, std::vector<std::string>> &, int, int,
+                    torch::Tensor &, torch::Tensor &, torch::Tensor &>())
       .def("tp_group_transfer",
            &flexkv::TPGDSTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("gds_block_id_tensor"),
-           py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
-           py::arg("gpu_chunk_size_in_bytes"), py::arg("gds_layer_stride_in_bytes"),
+           py::arg("gds_layer_stride_in_bytes"),
            py::arg("gds_kv_stride_in_bytes"), py::arg("gds_block_stride_in_bytes"),
            py::arg("gds_chunk_size_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"), py::arg("layer_granularity"),

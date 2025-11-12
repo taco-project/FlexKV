@@ -299,6 +299,7 @@ void transfer_kv_blocks_gds(
     const torch::Tensor& gds_block_ids,
     const torch::Tensor& gpu_block_ids,
     int64_t gpu_kv_stride_in_bytes,
+    int64_t gpu_block_stride_in_bytes,
     int64_t gds_layer_stride_in_bytes,
     int64_t gds_block_stride_in_bytes,
     int64_t gds_kv_stride_in_bytes,

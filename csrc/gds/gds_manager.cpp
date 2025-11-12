@@ -148,8 +148,6 @@ bool GDSManager::open_file_internal(const char* filename) {
         return false;
     }
     
-
-    
     // Store the resource
     file_resources_[file_key] = resource;
     return true;
@@ -593,10 +591,11 @@ void transfer_kv_blocks_gds(
     const torch::Tensor& gds_block_ids,
     const torch::Tensor& gpu_block_ids,
     int64_t gpu_kv_stride_in_bytes,
+    int64_t gpu_block_stride_in_bytes,
     int64_t gds_layer_stride_in_bytes,
     int64_t gds_block_stride_in_bytes,
     int64_t gds_kv_stride_in_bytes,
-    int64_t block_size_in_bytes,
+    int64_t chunk_size_in_bytes,
     int64_t gds_copy_off_inside_chunks,
     int num_blocks_per_file,
     int64_t total_layers,
@@ -658,19 +657,19 @@ void transfer_kv_blocks_gds(
                 int64_t gds_k_offset = gds_base_offset + gds_copy_off_inside_chunks;
                 int64_t gds_v_offset = gds_k_offset + gds_kv_stride_in_bytes;
                 
-                void* k_ptr = static_cast<char*>(k_view) + gpu_block_id * block_size_in_bytes;
-                void* v_ptr = static_cast<char*>(v_view) + gpu_block_id * block_size_in_bytes;
+                void* k_ptr = static_cast<char*>(k_view) + gpu_block_id * gpu_block_stride_in_bytes;
+                void* v_ptr = static_cast<char*>(v_view) + gpu_block_id * gpu_block_stride_in_bytes;
                 
                 ssize_t k_result;
                 if (is_read) {
                     // GDS -> GPU (read from GDS file to GPU memory)
-                    k_result = gds_manager.read(filename.c_str(), k_ptr, block_size_in_bytes, gds_k_offset);
+                    k_result = gds_manager.read(filename.c_str(), k_ptr, chunk_size_in_bytes, gds_k_offset);
                 } else {
                     // GPU -> GDS (write from GPU memory to GDS file) 
-                    k_result = gds_manager.write(filename.c_str(), k_ptr, block_size_in_bytes, gds_k_offset);
+                    k_result = gds_manager.write(filename.c_str(), k_ptr, chunk_size_in_bytes, gds_k_offset);
                 }
                 
-                if (k_result != block_size_in_bytes) {
+                if (k_result != chunk_size_in_bytes) {
                     throw std::runtime_error("Failed to transfer K block for layer " + 
                                            std::to_string(layer_idx) + ", block " + std::to_string(j) +
                                            ", file " + filename + ": " + gds_manager.get_last_error());
@@ -692,13 +691,13 @@ void transfer_kv_blocks_gds(
                 ssize_t v_result;
                 if (is_read) {
                     // GDS -> GPU (read from GDS file to GPU memory)
-                    v_result = gds_manager.read(filename.c_str(), v_ptr, block_size_in_bytes, gds_v_offset);
+                    v_result = gds_manager.read(filename.c_str(), v_ptr, chunk_size_in_bytes, gds_v_offset);
                 } else {
                     // GPU -> GDS (write from GPU memory to GDS file)
-                    v_result = gds_manager.write(filename.c_str(), v_ptr, block_size_in_bytes, gds_v_offset);
+                    v_result = gds_manager.write(filename.c_str(), v_ptr, chunk_size_in_bytes, gds_v_offset);
                 }
                 
-                if (v_result != block_size_in_bytes) {
+                if (v_result != chunk_size_in_bytes) {
                     throw std::runtime_error("Failed to transfer V block for layer " + 
                                            std::to_string(layer_idx) + ", block " + std::to_string(j) +
                                            ", file " + filename + ": " + gds_manager.get_last_error());

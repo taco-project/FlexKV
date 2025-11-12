@@ -972,10 +972,12 @@ class GDSTransferWorker(TransferWorkerBase):
                 ssd_block_id_list,              # SSD block IDs
                 gpu_block_id_list,              # GPU block IDs
                 self.gpu_kv_stride_in_bytes,    # GPU K-V stride
+                self.gpu_block_stride_in_bytes, # GPU block stride
                 self.ssd_layer_stride_in_bytes, # SSD layer stride
                 self.ssd_block_stride_in_bytes, # SSD block stride
                 self.ssd_kv_stride_in_bytes,    # SSD K-V stride
-                self.chunk_size_in_bytes,       # Block size
+                self.chunk_size_in_bytes,       # Chunk size
+                0,                              # SSD copy offset
                 self.num_blocks_per_file,       # Blocks per file
                 self.num_layers,                # Total layers
                 is_read,                        # Read or write
@@ -1028,9 +1030,9 @@ class tpGDSTransferWorker(TransferWorkerBase):
         finished_ops_queue: MPQueue,
         op_buffer_tensor: torch.Tensor,
         gpu_blocks: List[List[TensorSharedHandle]],
-        ssd_files: List[str],
+        ssd_files: Dict[int, List[str]],
         num_blocks_per_file: int,
-        gpu_kv_layout: KVCacheLayout,
+        gpu_kv_layouts: List[KVCacheLayout],
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         tp_group_size: int,
@@ -1044,9 +1046,9 @@ class tpGDSTransferWorker(TransferWorkerBase):
             transfer_queue: Queue for incoming transfer operations
             finished_ops_queue: Queue for completed operations
             gpu_blocks: List of GPU memory block handles for each GPU in TP group
-            ssd_files: List of SSD file paths
+            ssd_files: Dict of SSD file paths
             num_blocks_per_file: Number of blocks per file
-            gpu_kv_layout: Layout of GPU KV cache
+            gpu_kv_layouts: Layout of GPU KV cache
             ssd_kv_layout: Layout of SSD KV cache
             dtype: Data type
             tp_group_size: Size of tensor parallel group
@@ -1065,25 +1067,25 @@ class tpGDSTransferWorker(TransferWorkerBase):
             imported_gpu_blocks.append(blocks_in_one_gpu)
         self.gpu_blocks = imported_gpu_blocks
         self.num_blocks_per_file = num_blocks_per_file
-        self.num_files = len(ssd_files)
+        self.num_files = sum(len(file_list) for file_list in ssd_files.values())
 
         self.dtype = dtype
-        self.is_mla = gpu_kv_layout.is_mla
+        self.is_mla = gpu_kv_layouts[0].is_mla
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
         self.dp_group_id = dp_group_id
 
         # Layout information
-        self.num_layers = gpu_kv_layout.num_layer
-        gpu_kv_layout_per_layer = gpu_kv_layout.div_layer(self.num_layers)
-        
-        # GDS layout per file (similar to CPU-SSD worker)
+        self.num_layers = gpu_kv_layouts[0].num_layer
         ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
 
         # GPU layout calculations
-        self.gpu_chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
-        self.gpu_kv_stride_in_bytes = gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize
-        self.gpu_block_stride_in_bytes = gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize
+        self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
+                                         for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_kv_strides_in_bytes = [gpu_kv_layout.get_kv_stride() * self.dtype.itemsize \
+                                        for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_block_strides_in_bytes = [gpu_kv_layout.get_block_stride() * self.dtype.itemsize \
+                                           for gpu_kv_layout in gpu_kv_layouts]
 
         # SSD layout calculations
         self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
@@ -1091,14 +1093,13 @@ class tpGDSTransferWorker(TransferWorkerBase):
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
         self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
 
-        if not gpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
-            raise ValueError("Only layerwise layout is supported for GPU")
-        if not ssd_kv_layout.type == KVCacheLayoutType.LAYERWISE:
-            raise ValueError("Only layerwise layout is supported for GDS")
-
         # Create TP GDS Transfer Thread Group
+        gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
+        gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
+        gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
         self.tp_gds_transfer_thread_group = TPGDSTransferThreadGroup(
-            self.num_gpus, self.gpu_blocks, ssd_files, dp_group_id)
+            self.num_gpus, self.gpu_blocks, ssd_files, dp_group_id, self.num_layers,
+            gpu_kv_strides_tensor, gpu_block_strides_tensor, gpu_chunk_sizes_tensor)
 
     def _transfer_impl(self,
                        src_block_ids: torch.Tensor,
@@ -1135,9 +1136,6 @@ class tpGDSTransferWorker(TransferWorkerBase):
         self.tp_gds_transfer_thread_group.tp_group_transfer(
             gpu_block_id_list,
             ssd_block_id_list,
-            self.gpu_kv_stride_in_bytes,
-            self.gpu_block_stride_in_bytes,
-            self.gpu_chunk_size_in_bytes,
             self.ssd_layer_stride_in_bytes,
             self.ssd_kv_stride_in_bytes,
             self.ssd_block_stride_in_bytes,

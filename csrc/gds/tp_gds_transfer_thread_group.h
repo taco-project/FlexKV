@@ -9,6 +9,7 @@
 #include <torch/extension.h>
 #include <vector>
 #include <string>
+#include <map>
 #include <queue>
 #include <functional>
 #include <future>
@@ -23,16 +24,17 @@ public:
   TPGDSTransferThreadGroup(
       int num_gpus, 
       const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-      const std::vector<std::string> &gds_file_paths, 
-      int dp_group_id);
+      std::map<int, std::vector<std::string>> &ssd_files, 
+      int dp_group_id,
+      int num_layers,
+      torch::Tensor &gpu_kv_strides_tensor,
+      torch::Tensor &gpu_block_strides_tensor,
+      torch::Tensor &gpu_chunk_sizes_tensor);
   ~TPGDSTransferThreadGroup();
 
   void tp_group_transfer(
       const torch::Tensor &gpu_block_id_tensor,
       const torch::Tensor &gds_block_id_tensor,
-      const int64_t gpu_kv_stride_in_bytes,
-      const int64_t gpu_block_stride_in_bytes,
-      const int64_t gpu_chunk_size_in_bytes,
       const int64_t gds_layer_stride_in_bytes,
       const int64_t gds_kv_stride_in_bytes,
       const int64_t gds_block_stride_in_bytes,
@@ -50,8 +52,12 @@ private:
   int num_gpus_;
   int dp_group_id_;
   void **gpu_blocks_;
+  
+  int64_t *gpu_kv_strides_in_bytes_;
+  int64_t *gpu_block_strides_in_bytes_;
+  int64_t *gpu_chunk_sizes_in_bytes_;
+  
   std::vector<GDSManager*> gds_managers_;
-  std::vector<std::string> gds_file_paths_;
   std::vector<std::thread> threads_;
   std::vector<cudaStream_t> streams_;
 

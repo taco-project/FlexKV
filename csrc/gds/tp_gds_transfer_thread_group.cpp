@@ -7,15 +7,32 @@ namespace flexkv {
 TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
     int num_gpus, 
     const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-    const std::vector<std::string> &gds_file_paths, 
-    int dp_group_id) {
+    std::map<int, std::vector<std::string>> &ssd_files, 
+    int dp_group_id,
+    int num_layers,
+    torch::Tensor &gpu_kv_strides_tensor,
+    torch::Tensor &gpu_block_strides_tensor,
+    torch::Tensor &gpu_chunk_sizes_tensor) {
   
   num_gpus_ = num_gpus;
   dp_group_id_ = dp_group_id;
-  gds_file_paths_ = gds_file_paths;
+  
+  // per-GPU layout parameters
+  gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
+  gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
+  gpu_chunk_sizes_in_bytes_ = new int64_t[num_gpus];
+  
+  int64_t* kv_strides_ptr = gpu_kv_strides_tensor.data_ptr<int64_t>();
+  int64_t* block_strides_ptr = gpu_block_strides_tensor.data_ptr<int64_t>();
+  int64_t* chunk_sizes_ptr = gpu_chunk_sizes_tensor.data_ptr<int64_t>();
+  
+  for (int i = 0; i < num_gpus; i++) {
+    gpu_kv_strides_in_bytes_[i] = kv_strides_ptr[i];
+    gpu_block_strides_in_bytes_[i] = block_strides_ptr[i];
+    gpu_chunk_sizes_in_bytes_[i] = chunk_sizes_ptr[i];
+  }
   
   // Prepare GPU blocks pointers
-  int num_layers = gpu_blocks[0].size();
   cudaMallocHost((void **)&gpu_blocks_, num_gpus_ * num_layers * sizeof(void *));
   
   for (int i = 0; i < num_gpus_; ++i) {
@@ -27,7 +44,7 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
   // Create GDS managers for each GPU thread
   gds_managers_.resize(num_gpus_);
   for (int i = 0; i < num_gpus_; ++i) {
-    gds_managers_[i] = new GDSManager(gds_file_paths_);
+    gds_managers_[i] = new GDSManager(ssd_files, ssd_files.size(), 1);
     if (!gds_managers_[i]->is_ready()) {
       throw std::runtime_error("Failed to initialize GDS Manager for GPU " + std::to_string(i) + 
                               ": " + gds_managers_[i]->get_last_error());
@@ -88,6 +105,11 @@ TPGDSTransferThreadGroup::~TPGDSTransferThreadGroup() {
   if (gpu_blocks_) {
     cudaFreeHost(gpu_blocks_);
   }
+  
+  // Clean up per-GPU layout parameters
+  delete[] gpu_kv_strides_in_bytes_;
+  delete[] gpu_block_strides_in_bytes_;
+  delete[] gpu_chunk_sizes_in_bytes_;
 }
 
 std::future<void> TPGDSTransferThreadGroup::enqueue_for_gpu(int gpu_idx, Task task) {
@@ -104,9 +126,6 @@ std::future<void> TPGDSTransferThreadGroup::enqueue_for_gpu(int gpu_idx, Task ta
 void TPGDSTransferThreadGroup::tp_group_transfer(
     const torch::Tensor &gpu_block_id_tensor,
     const torch::Tensor &gds_block_id_tensor,
-    const int64_t gpu_kv_stride_in_bytes,
-    const int64_t gpu_block_stride_in_bytes,
-    const int64_t gpu_chunk_size_in_bytes,
     const int64_t gds_layer_stride_in_bytes,
     const int64_t gds_kv_stride_in_bytes,
     const int64_t gds_block_stride_in_bytes,
@@ -134,24 +153,34 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
         torch::Tensor gpu_layer_ptrs_tensor = torch::from_blob(
             gpu_layer_ptrs, {layer_granularity}, torch::TensorOptions().dtype(torch::kInt64));
         
-        int64_t gds_copy_off_inside_chunks = 0;
-        if (!is_mla && num_gpus_ > 1) {
+        int64_t gds_copy_off_inside_chunks;
+        int64_t gpu_chunk_size_in_bytes = gpu_chunk_sizes_in_bytes_[i];
+        
+        if (is_mla) {
+          if (!is_read) {
+            gds_copy_off_inside_chunks = i * gpu_chunk_size_in_bytes;
+          } else {
+            gds_copy_off_inside_chunks = 0;
+          }
+        } else {
           gds_copy_off_inside_chunks = i * gpu_chunk_size_in_bytes;
         }
+
+        int64_t chunk_size = is_mla && !is_read ? gpu_chunk_size_in_bytes / num_gpus_ : gpu_chunk_size_in_bytes;
         
         // Call the transfer_kv_blocks_gds function with multi-file support
         transfer_kv_blocks_gds(
             *gds_managers_[i],              // GDS manager for this GPU
-            gds_file_paths_,                // GDS file paths list
             layer_id_list,                  // Layer IDs to process
             gpu_layer_ptrs_tensor,          // GPU layer pointers
             gds_block_id_tensor,            // GDS block IDs (adjusted for TP)
             gpu_block_id_tensor,            // GPU block IDs
-            gpu_kv_stride_in_bytes,         // GPU K-V stride
+            gpu_kv_strides_in_bytes_[i],    // GPU K-V stride
+            gpu_block_strides_in_bytes_[i], // GPU block stride
             gds_layer_stride_in_bytes,      // GDS layer stride
             gds_block_stride_in_bytes,      // GDS block stride
             gds_kv_stride_in_bytes,         // GDS K-V stride
-            gpu_chunk_size_in_bytes,        // Block size
+            chunk_size,                     // Chunk size
             gds_copy_off_inside_chunks,     // GDS copy off inside chunks
             num_blocks_per_file,            // Blocks per file
             layer_granularity,              // Total layers

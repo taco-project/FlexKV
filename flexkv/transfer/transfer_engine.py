@@ -226,7 +226,8 @@ class TransferEngine:
                                     for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
                         ssd_files=self._ssd_handle.get_file_list(),
                         num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
-                        gpu_kv_layout=self.gpu_handles[i].kv_layout,
+                        gpu_kv_layouts=[self.gpu_handles[j].kv_layout \
+                                       for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         tp_group_size=self.tp_size,
