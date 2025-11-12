@@ -99,8 +99,8 @@ def shutdown_tp_client(tp_client_processes):
     {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
     {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 1024, 'num_ssd_blocks': 2048},
     # GDS test configs
-    {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': False, \
-        'num_gds_blocks': 512, 'gds_cache_dir': ["./gdstest"]},
+    {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': True, \
+        'enable_remote': False, 'num_ssd_blocks': 512},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
@@ -117,7 +117,6 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     tokens_per_block = cache_config.tokens_per_block
     num_cpu_blocks = cache_config.num_cpu_blocks
     num_ssd_blocks = cache_config.num_ssd_blocks
-    num_gds_blocks = cache_config.num_gds_blocks
 
     enable_cpu = cache_config.enable_cpu
     enable_ssd = cache_config.enable_ssd
@@ -326,7 +325,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     if enable_cpu and num_cpu_blocks >= num_gpu_blocks or \
         enable_ssd and num_ssd_blocks >= num_gpu_blocks or \
         enable_remote and num_remote_blocks >= num_gpu_blocks or \
-        enable_gds and num_gds_blocks >= num_gpu_blocks:
+        enable_gds and num_ssd_blocks >= num_gpu_blocks:
         assert total_cache_miss == 0
     shutdown_tp_client(tp_client_processes)
     kvmanager.shutdown()
