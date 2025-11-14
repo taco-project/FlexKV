@@ -46,14 +46,15 @@ bool OrderedHashList::contains(int64_t hash) {
 LocalRadixTree::LocalRadixTree(int tokens_per_block, unsigned int max_num_blocks,
   uint32_t ttl_ms, uint32_t renew_ms,
   uint32_t batch_sz, uint32_t idle_sleep_ms,
-  uint32_t safety_ttl_ms, uint32_t swap_block_threshold)
-  : CRadixTreeIndex(tokens_per_block, max_num_blocks), 
+  uint32_t safety_ttl_ms, uint32_t swap_block_threshold, uint32_t hit_reward_seconds)
+  : CRadixTreeIndex(tokens_per_block, max_num_blocks, hit_reward_seconds), 
   channel(nullptr), node_id(0), 
   lease_ttl_ms(ttl_ms), refresh_batch_size(batch_sz),
   lease_pool(max_num_blocks),
   idle_sleep_ms(idle_sleep_ms),
   safety_ttl_ms(safety_ttl_ms),
-  swap_block_threshold(swap_block_threshold) {
+  swap_block_threshold(swap_block_threshold),
+  hit_reward_seconds(hit_reward_seconds) {
   if (renew_ms == 0) {
     renew_lease_ms = (uint32_t)(ttl_ms * 2 / 10);
     if (renew_lease_ms == 0) {

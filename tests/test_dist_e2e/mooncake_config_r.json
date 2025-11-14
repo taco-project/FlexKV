@@ -1,9 +1,9 @@
 {
-    "engine_ip": "10.6.131.9",
+    "engine_ip": "10.6.131.12",
     "engine_port": 12346,
     "metadata_backend": "redis",
-    "metadata_server": "redis://10.6.131.10:6380",
+    "metadata_server": "redis://10.6.131.12:6380",
     "metadata_server_auth": "redis-serving-passwd",
     "protocol": "rdma",
-    "device_name": "mlx5_7"
+    "device_name": "mlx5_6"
 }

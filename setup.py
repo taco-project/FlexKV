@@ -31,7 +31,7 @@ cpp_sources = [
     "csrc/gds/tp_gds_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
-    "csrc/gds/gds_manager.cpp"
+    "csrc/gds/gds_manager.cpp",
     "csrc/distributed_radix_tree.cpp",
     "csrc/local_radix_tree.cpp",
     "csrc/redis_meta_channel.cpp",

@@ -11,8 +11,8 @@ from flexkv.cache.redis_meta import RedisMetaChannel as _PyRedisMetaChannel
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.block import SequenceMeta
 from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
-if TYPE_CHECKING:
-    from flexkv.common.config import CacheConfig
+#if TYPE_CHECKING:
+from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import DeviceType
 from flexkv.common.type import MatchResultAccel
 
@@ -36,6 +36,7 @@ class HierarchyLRCacheEngine:
                  remote_idle_sleep_ms: int = 10,
                  local_safety_ttl_ms: int = 100,
                  evict_start_threshold: float = 1.0,
+                 hit_reward_seconds: int = 0,
                  meta: Optional[RedisMeta] = None) -> None:
         if num_total_blocks <= 0:
             raise InvalidConfigError(f"Invalid num_total_blocks: {num_total_blocks}")
@@ -63,7 +64,8 @@ class HierarchyLRCacheEngine:
             refresh_batch_size=int(local_refresh_batch_size),
             idle_sleep_ms=int(local_idle_sleep_ms),
             safety_ttl_ms=int(local_safety_ttl_ms),
-            swap_block_threshold=int(evict_ratio * num_total_blocks)
+            swap_block_threshold=int(evict_ratio * num_total_blocks),
+            hit_reward_seconds=int(hit_reward_seconds),
         )
 
 
@@ -76,6 +78,7 @@ class HierarchyLRCacheEngine:
             rebuild_interval_ms=int(remote_rebuild_interval_ms),
             idle_sleep_ms=int(remote_idle_sleep_ms),
             lease_renew_ms=int(local_renew_lease_ms),
+            hit_reward_seconds=int(hit_reward_seconds),
         )
         # defer channel start to start(meta)
 
@@ -391,7 +394,7 @@ class HierarchyLRCacheEngine:
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
 
-
+    #TODO pfcs may not work now
     @classmethod
     def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
         """Create a PCFSCacheEngine from CacheConfig.
@@ -460,22 +463,23 @@ class HierarchyLRCacheEngine:
             tokens_per_block=int(cache_config.tokens_per_block),
             evict_ratio=float(cache_config.evict_ratio),
             device_type=DeviceType.REMOTE,
-            local_lease_ttl_ms=int(getattr(cache_config, "lease_ttl_ms", 100000)),
-            local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 10)),
-            local_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
-            local_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
+            local_lease_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.lease_ttl_ms),
+            local_renew_lease_ms=int(GLOBAL_CONFIG_FROM_ENV.renew_lease_ms),
+            local_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+            local_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
             remote_max_num_blocks=num_blocks,
             redis_node_id=int(node_id),
-            remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
-            remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 1000)),
-            remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
-            local_safety_ttl_ms=int(getattr(cache_config, "safety_ttl_ms", 100)),
+            remote_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+            remote_rebuild_interval_ms=int(GLOBAL_CONFIG_FROM_ENV.rebuild_interval_ms),
+            remote_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
+            local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
             meta=meta,
         )
 
     #TODO is this enough for peercpu and peerssd?
     @classmethod
     def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, device_type: DeviceType, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
+
         if device_type == DeviceType.REMOTE:
             return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta)
         else:
@@ -485,28 +489,30 @@ class HierarchyLRCacheEngine:
             elif device_type == DeviceType.SSD:
                 local_max_num_blocks = int(cache_config.num_ssd_blocks)
             else:
-                local_max_num_blocks = int(cache_config.num_local_blocks or 0)
+                raise InvalidConfigError(f"Invalid device type: {device_type}")
+                #local_max_num_blocks = int(cache_config.num_local_blocks or 0)
             
             return cls(
                 num_total_blocks=int(cache_config.num_remote_blocks or 0),
                 tokens_per_block=int(cache_config.tokens_per_block),
-                evict_ratio=float(cache_config.evict_ratio),
+                evict_ratio=float(GLOBAL_CONFIG_FROM_ENV.evict_ratio),
                 device_type=device_type,
                 local_max_num_blocks=local_max_num_blocks,
-                local_lease_ttl_ms=int(getattr(cache_config, "lease_ttl_ms", 100000)),
-                local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 0)),
-                local_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
-                local_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
+                local_lease_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.lease_ttl_ms),
+                local_renew_lease_ms=int(GLOBAL_CONFIG_FROM_ENV.renew_lease_ms),
+                local_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+                local_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
                 # local_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
                 remote_max_num_blocks=int(cache_config.num_remote_blocks or 0),
                 redis_node_id=int(node_id),
                 # remote_node_id=int(node_id),
                 # remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
-                remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 128)),
-                remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 10000)),
-                remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
-                local_safety_ttl_ms=int(getattr(cache_config, "safety_ttl_ms", 100)),
-                evict_start_threshold=float(cache_config.evict_start_threshold),
+                remote_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+                remote_rebuild_interval_ms=int(GLOBAL_CONFIG_FROM_ENV.rebuild_interval_ms),
+                remote_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
+                local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
+                evict_start_threshold=float(GLOBAL_CONFIG_FROM_ENV.evict_start_threshold),
+                hit_reward_seconds=int(GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds),
                 meta=meta,
             )
             raise InvalidConfigError("Invalid device type: {cache_config.device_type}")
