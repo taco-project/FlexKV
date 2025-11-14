@@ -8,9 +8,13 @@
 #endif
 
 #include <vector>
+#include <map>
 
-GDSManager::GDSManager(const std::initializer_list<const char*>& filenames) 
-    : is_ready_(false)
+GDSManager::GDSManager(std::map<int, std::vector<std::string>>& ssd_files, 
+                       int num_devices, 
+                       int round_robin) 
+    : is_ready_(false), num_devices_(num_devices), 
+      round_robin_(round_robin)
 #ifdef ENABLE_GDS
     , driver_initialized_(false), next_batch_id_(1)
 #endif
@@ -28,41 +32,18 @@ GDSManager::GDSManager(const std::initializer_list<const char*>& filenames)
     }
 #endif
     
-    // Initialize with provided files
-    for (const char* filename : filenames) {
-        if (filename) {
-            add_file(filename);
+    this->num_files_per_device_ = ssd_files[0].size();
+    
+    file_paths_.resize(num_devices);
+    for (const auto& kv : ssd_files) {
+        int device_id = kv.first;
+        file_paths_[device_id] = kv.second;
+        
+        for (const auto& filename : kv.second) {
+            add_file(filename.c_str());
         }
     }
-    
-    is_ready_ = true;
-    set_error("GDS Manager initialized successfully");
-}
-
-GDSManager::GDSManager(const std::vector<std::string>& filenames) 
-    : is_ready_(false)
-#ifdef ENABLE_GDS
-    , driver_initialized_(false), next_batch_id_(1)
-#endif
-{
-    if (!initialize_driver()) {
-        return;
-    }
-    
-#ifdef ENABLE_GDS
-    // Create shared CUDA stream
-    cudaError_t cuda_status = cudaStreamCreate(&shared_stream_);
-    if (cuda_status != cudaSuccess) {
-        set_error("Failed to create shared CUDA stream");
-        return;
-    }
-#endif
-    
-    // Initialize with provided files
-    for (const auto& filename : filenames) {
-        add_file(filename.c_str());
-    }
-    
+ 
     is_ready_ = true;
     set_error("GDS Manager initialized successfully");
 }
@@ -77,6 +58,18 @@ bool GDSManager::is_ready() const {
 
 const std::string& GDSManager::get_last_error() const {
     return last_error_;
+}
+
+int GDSManager::get_num_devices() const {
+    return num_devices_;
+}
+
+int GDSManager::get_num_files_per_device() const {
+    return num_files_per_device_;
+}
+
+int GDSManager::get_round_robin() const {
+    return round_robin_;
 }
 
 void GDSManager::set_error(const std::string& error) {
@@ -154,8 +147,6 @@ bool GDSManager::open_file_internal(const char* filename) {
         set_error("Failed to register file with cuFile: " + file_key);
         return false;
     }
-    
-
     
     // Store the resource
     file_resources_[file_key] = resource;
@@ -253,17 +244,8 @@ size_t GDSManager::get_file_count() const {
 #endif
 }
 
-std::vector<std::string> GDSManager::get_managed_files() const {
-    std::vector<std::string> files;
-    
-#ifdef ENABLE_GDS
-    files.reserve(file_resources_.size());
-    for (const auto& pair : file_resources_) {
-        files.push_back(pair.first);
-    }
-#endif
-    
-    return files;
+const std::vector<std::string>& GDSManager::get_file_paths(int device_id) const {
+    return file_paths_[device_id];
 }
 
 void GDSManager::synchronize() {
@@ -583,19 +565,39 @@ int GDSManager::batch_read(const struct BatchReadOp* operations, int batch_size)
 #endif
 }
 
+namespace flexkv {
+
+//partition and remap blocks by device (same logic as SSD transfer)
+static void partition_and_remap_blocks_by_device_gds(
+    const int64_t* ssd_block_ids, const int64_t* gpu_block_ids, int num_blocks,
+    int num_devices, int round_robin,
+    std::vector<std::vector<int>>& gpu_blocks_partition,
+    std::vector<std::vector<int>>& ssd_blocks_partition) {
+    for (int i = 0; i < num_blocks; i++) {
+        int64_t ssd_block_id = ssd_block_ids[i];
+        int64_t gpu_block_id = gpu_block_ids[i];
+        // Use the exact same round-robin mapping as SSD transfer
+        int device_id = (ssd_block_id / round_robin) % num_devices;
+        int block_id_in_device =
+            ((ssd_block_id / round_robin) / num_devices) * round_robin +
+            (ssd_block_id % round_robin);
+        ssd_blocks_partition[device_id].push_back(block_id_in_device);
+        gpu_blocks_partition[device_id].push_back(gpu_block_id);
+    }
+}
+
+template<BackendType Type>
 void transfer_kv_blocks_gds(
     GDSManager& gds_manager,
-    const std::vector<std::string>& gds_filepaths,
     const torch::Tensor& gpu_layer_id_list,
-    const torch::Tensor& gpu_layer_ptrs_tensor,
-    const torch::Tensor& gds_block_ids,
+    GTensorHandler gpu_tensor_handler,
+    const torch::Tensor& ssd_block_ids,
     const torch::Tensor& gpu_block_ids,
-    int64_t gpu_kv_stride_in_bytes,
-    int64_t gds_layer_stride_in_bytes,
-    int64_t gds_block_stride_in_bytes,
-    int64_t gds_kv_stride_in_bytes,
-    int64_t block_size_in_bytes,
-    int64_t gds_copy_off_inside_chunks,
+    int64_t ssd_layer_stride_in_bytes,
+    int64_t ssd_block_stride_in_bytes,
+    int64_t ssd_kv_stride_in_bytes,
+    int64_t chunk_size_in_bytes,
+    int64_t ssd_copy_off_inside_chunks,
     int num_blocks_per_file,
     int64_t total_layers,
     bool is_read,
@@ -606,109 +608,127 @@ void transfer_kv_blocks_gds(
         throw std::runtime_error("GDS Manager not ready: " + gds_manager.get_last_error());
     }
     
-    if (gds_filepaths.empty()) {
-        throw std::runtime_error("No GDS file paths provided");
-    }
+    int num_devices = gds_manager.get_num_devices();
+    int num_files_per_device = gds_manager.get_num_files_per_device();
+    int round_robin = gds_manager.get_round_robin();
     
     // Get tensor data pointers
-    const int64_t* layer_ptrs = gpu_layer_ptrs_tensor.data_ptr<int64_t>();
-    const int64_t* gds_block_id_ptr = gds_block_ids.data_ptr<int64_t>();
+    const int64_t* ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
     const int64_t* gpu_block_id_ptr = gpu_block_ids.data_ptr<int64_t>();
     
     const int num_layers = gpu_layer_id_list.size(0);
     const int32_t* gpu_layer_id_list_ptr = gpu_layer_id_list.data_ptr<int32_t>();
-    const int num_transfers = gds_block_ids.size(0);
-    const int num_files = gds_filepaths.size();
+    const int num_transfers = ssd_block_ids.size(0);
     
-    // Process each layer
-    for (int i = 0; i < num_layers; i++) {
-        int32_t layer_idx = gpu_layer_id_list_ptr[i];
-        void* layer_ptr = reinterpret_cast<void*>(layer_ptrs[layer_idx]);
+    // Partition blocks by device using the same logic as SSD
+    std::vector<std::vector<int>> gpu_blocks_partition(num_devices, std::vector<int>());
+    std::vector<std::vector<int>> ssd_blocks_partition(num_devices, std::vector<int>());
+    partition_and_remap_blocks_by_device_gds(
+        ssd_block_id_ptr, gpu_block_id_ptr, num_transfers, num_devices, round_robin,
+        gpu_blocks_partition, ssd_blocks_partition);
+    
+    // Process each device (like SSD transfer)
+    for (int device_id = 0; device_id < num_devices; device_id++) {
+        const std::vector<int>& gpu_blocks = gpu_blocks_partition[device_id];
+        const std::vector<int>& ssd_blocks = ssd_blocks_partition[device_id];
         
-        // Calculate K and V base pointers for this layer
-        void* k_view = layer_ptr;
-        void* v_view = static_cast<char*>(layer_ptr) + gpu_kv_stride_in_bytes;
+        const std::vector<std::string>& file_list = gds_manager.get_file_paths(device_id);
         
-        // Process each block transfer for this layer
-        for (int j = 0; j < num_transfers; j++) {
-            int64_t gds_block_id = gds_block_id_ptr[j];
-            int64_t gpu_block_id = gpu_block_id_ptr[j];
+        for (size_t j = 0; j < gpu_blocks.size(); j++) {
+            int64_t gpu_block_id = gpu_blocks[j];
+            int64_t ssd_block_id = ssd_blocks[j];
             
-            // Multi-file support: determine which file and block within file
-            // Similar to SSD transfer logic
-            int file_idx = gds_block_id / num_blocks_per_file;
-            int64_t block_id_in_file = gds_block_id % num_blocks_per_file;
+            int file_id_in_device = ssd_block_id % num_files_per_device;
+            const std::string& filename = file_list[file_id_in_device];
+            int64_t block_id_in_file = ssd_block_id / num_files_per_device;
             
-            // Ensure file index is valid
-            if (file_idx >= num_files) {
-                throw std::runtime_error("GDS block ID " + std::to_string(gds_block_id) + 
-                                       " exceeds available files (file_idx=" + std::to_string(file_idx) + 
-                                       ", num_files=" + std::to_string(num_files) + ")");
-            }
-            
-            const std::string& filename = gds_filepaths[file_idx];
-            
-            // Calculate GDS file offsets using block_id_in_file
-            int64_t gds_base_offset = 
-                gds_layer_stride_in_bytes * layer_idx +
-                gds_block_stride_in_bytes * block_id_in_file;
-            
-            int64_t gds_k_offset = gds_base_offset + gds_copy_off_inside_chunks;
-            int64_t gds_v_offset = gds_k_offset + gds_kv_stride_in_bytes;
-            
-            // Calculate GPU memory pointers
-            void* k_ptr = static_cast<char*>(k_view) + gpu_block_id * block_size_in_bytes;
-            void* v_ptr = static_cast<char*>(v_view) + gpu_block_id * block_size_in_bytes;
-            
-            // Perform K block transfer
-            ssize_t k_result;
-            if (is_read) {
-                // GDS -> GPU (read from GDS file to GPU memory)
-                k_result = gds_manager.read(filename.c_str(), k_ptr, block_size_in_bytes, gds_k_offset);
-            } else {
-                // GPU -> GDS (write from GPU memory to GDS file) 
-                k_result = gds_manager.write(filename.c_str(), k_ptr, block_size_in_bytes, gds_k_offset);
-            }
-            
-            if (k_result != block_size_in_bytes) {
-                throw std::runtime_error("Failed to transfer K block for layer " + 
-                                       std::to_string(layer_idx) + ", block " + std::to_string(j) +
-                                       ", file " + filename + ": " + gds_manager.get_last_error());
-            }
-            
-            if (is_mla) {
-                continue;
-            }
+            // Process each layer for this block
+            for (int i = 0; i < num_layers; i++) {
+                int32_t layer_idx = gpu_layer_id_list_ptr[i];
+                
+                int64_t *gpu_k_ptr = ptr_at<Type>(gpu_tensor_handler, i, 0, gpu_block_id);
+                int64_t *gpu_v_ptr = is_mla ? nullptr : ptr_at<Type>(gpu_tensor_handler, i, 1, gpu_block_id);
+                
+                int64_t ssd_base_offset = 
+                    ssd_layer_stride_in_bytes * layer_idx +
+                    ssd_block_stride_in_bytes * block_id_in_file;
+                
+                int64_t ssd_k_offset = ssd_base_offset + ssd_copy_off_inside_chunks;
+                int64_t ssd_v_offset = ssd_k_offset + ssd_kv_stride_in_bytes;
+                
+                ssize_t k_result;
+                if (is_read) {
+                    // SSD -> GPU (read from SSD file to GPU memory)
+                    k_result = gds_manager.read(filename.c_str(), gpu_k_ptr, chunk_size_in_bytes, ssd_k_offset);
+                } else {
+                    // GPU -> SSD (write from GPU memory to SSD file) 
+                    k_result = gds_manager.write(filename.c_str(), gpu_k_ptr, chunk_size_in_bytes, ssd_k_offset);
+                }
+                
+                if (k_result != chunk_size_in_bytes) {
+                    throw std::runtime_error("Failed to transfer K block for layer " + 
+                                           std::to_string(layer_idx) + ", block " + std::to_string(j) +
+                                           ", file " + filename + ": " + gds_manager.get_last_error());
+                }
+                
+                if (is_mla) {
+                    if (verbose) {
+                        std::cerr << "Layer " << layer_idx << " Block " << j
+                                  << " Operation: " << (is_read ? "Read" : "Write")
+                                  << " Device: " << device_id 
+                                  << " File_in_device: " << file_id_in_device
+                                  << " Block_in_file: " << block_id_in_file
+                                  << " GPU Block ID: " << gpu_block_id 
+                                  << " K bytes: " << k_result << std::endl;
+                    }
+                    continue;
+                }
 
-            // Perform V block transfer
-            ssize_t v_result;
-            if (is_read) {
-                // GDS -> GPU (read from GDS file to GPU memory)
-                v_result = gds_manager.read(filename.c_str(), v_ptr, block_size_in_bytes, gds_v_offset);
-            } else {
-                // GPU -> GDS (write from GPU memory to GDS file)
-                v_result = gds_manager.write(filename.c_str(), v_ptr, block_size_in_bytes, gds_v_offset);
-            }
-            
-            if (v_result != block_size_in_bytes) {
-                throw std::runtime_error("Failed to transfer V block for layer " + 
-                                       std::to_string(layer_idx) + ", block " + std::to_string(j) +
-                                       ", file " + filename + ": " + gds_manager.get_last_error());
-            }
-            
-            if (verbose) {
-                std::cerr << "Layer " << layer_idx << " Block " << j
-                          << " Operation: " << (is_read ? "Read" : "Write")
-                          << " GDS Block ID: " << gds_block_id << " (file " << file_idx 
-                          << ", block_in_file " << block_id_in_file << ")"
-                          << " GPU Block ID: " << gpu_block_id 
-                          << " File: " << filename
-                          << " K bytes: " << k_result
-                          << " V bytes: " << v_result << std::endl;
-            }
-        }
-    }
+                ssize_t v_result;
+                if (is_read) {
+                    v_result = gds_manager.read(filename.c_str(), gpu_v_ptr, chunk_size_in_bytes, ssd_v_offset);
+                } else {
+                    v_result = gds_manager.write(filename.c_str(), gpu_v_ptr, chunk_size_in_bytes, ssd_v_offset);
+                }
+                
+                if (v_result != chunk_size_in_bytes) {
+                    throw std::runtime_error("Failed to transfer V block for layer " + 
+                                           std::to_string(layer_idx) + ", block " + std::to_string(j) +
+                                           ", file " + filename + ": " + gds_manager.get_last_error());
+                }
+                
+                if (verbose) {
+                    std::cerr << "Layer " << layer_idx << " Block " << j
+                              << " Operation: " << (is_read ? "Read" : "Write")
+                              << " Device: " << device_id 
+                              << " File_in_device: " << file_id_in_device
+                              << " Block_in_file: " << block_id_in_file
+                              << " GPU Block ID: " << gpu_block_id 
+                              << " K bytes: " << k_result
+                              << " V bytes: " << v_result << std::endl;
+                }
+            } // end layer loop
+        } // end block loop
+    } // end device loop
     
     // Synchronize to ensure all operations complete
     gds_manager.synchronize();
+}
+
+// Explicit template instantiations
+template void transfer_kv_blocks_gds<BackendType::VLLM>(
+    GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int64_t, bool, bool, bool);
+
+template void transfer_kv_blocks_gds<BackendType::TRTLLM>(
+    GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int64_t, bool, bool, bool);
+
+template void transfer_kv_blocks_gds<BackendType::SGLANG>(
+    GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int64_t, bool, bool, bool);
+
 }

@@ -4,10 +4,12 @@
 #include <sys/types.h>
 #include <string>
 #include <unordered_map>
+#include <map>
 #include <vector>
 #include <initializer_list>
 #include <atomic>
 #include <torch/extension.h>
+#include "../gtensor_handler.cuh"
 
 #ifdef ENABLE_GDS
 #include <cuda_runtime.h>
@@ -22,16 +24,14 @@
 class GDSManager {
 public:
     /**
-     * Constructor - initializes with multiple files
-     * @param filenames List of file paths to initialize
+     * Constructor - initializes with device-organized files
+     * @param ssd_files Map of device_id -> file paths for that device
+     * @param num_devices Number of devices
+     * @param round_robin Round-robin granularity for block distribution
      */
-    GDSManager(const std::initializer_list<const char*>& filenames = {});
-    
-    /**
-     * Constructor - initializes with vector of files
-     * @param filenames Vector of file paths to initialize
-     */
-    explicit GDSManager(const std::vector<std::string>& filenames);
+    GDSManager(std::map<int, std::vector<std::string>>& ssd_files, 
+               int num_devices, 
+               int round_robin = 1);
     
     /**
      * Destructor - closes all files and cleans up all resources
@@ -118,10 +118,11 @@ public:
     size_t get_file_count() const;
     
     /**
-     * Get list of all managed files
-     * @return Vector of file paths
+     * Get file paths for a specific device
+     * @param device_id Device ID
+     * @return Vector of file paths for the device
      */
-    std::vector<std::string> get_managed_files() const;
+    const std::vector<std::string>& get_file_paths(int device_id) const;
     
     /**
      * Get the last error message
@@ -129,6 +130,24 @@ public:
      */
     const std::string& get_last_error() const;
     
+    /**
+     * Get number of devices
+     * @return Number of devices
+     */
+    int get_num_devices() const;
+    
+    /**
+     * Get number of files per device
+     * @return Number of files per device
+     */
+    int get_num_files_per_device() const;
+    
+    /**
+     * Get round-robin granularity
+     * @return Round-robin value
+     */
+    int get_round_robin() const;
+
     /**
      * Batch write operations
      * @param operations Array of batch write operations
@@ -176,6 +195,11 @@ private:
 
     bool is_ready_;
     std::string last_error_;
+    
+    int num_devices_;
+    int num_files_per_device_;
+    int round_robin_;
+    std::vector<std::vector<std::string>> file_paths_;
     
 #ifdef ENABLE_GDS
     std::unordered_map<std::string, FileResource> file_resources_;
@@ -248,43 +272,46 @@ struct BatchReadOp {
     ssize_t* result;              // Output: bytes read or -1 on error
 }; 
 
+namespace flexkv {
+
 /**
- * High-level transfer function for KV blocks between GPU and GDS
- * Similar to transfer_kv_blocks_ssd but for GPU-GDS transfers
+ * High-level transfer function for KV blocks between GPU and SSD
+ * Similar to transfer_kv_blocks_ssd but for GPU-SSD transfers
  * 
- * @param gds_manager GDS manager instance to use for operations
- * @param gds_filepaths List of GDS file paths
+ * @tparam Type Backend type (VLLM, TRTLLM, or SGLANG)
+ * @param gds_manager GDS manager instance
  * @param gpu_layer_id_list Tensor of layer IDs to process
- * @param gpu_layer_ptrs_tensor Tensor containing GPU layer pointers
- * @param gds_block_ids Tensor of GDS block IDs
- * @param gpu_block_ids Tensor of GPU block IDs  
- * @param gpu_kv_stride_in_bytes Stride between K and V in GPU memory
- * @param gds_layer_stride_in_bytes Stride between layers in GDS file
- * @param gds_block_stride_in_bytes Stride between blocks in GDS file
- * @param gds_kv_stride_in_bytes Stride between K and V in GDS file
- * @param block_size_in_bytes Size of each block in bytes
- * @param gds_copy_off_inside_chunks Copy offset inside each chunk in GDS file
+ * @param gpu_tensor_handler GTensorHandler for GPU memory layout
+ * @param ssd_block_ids Tensor of SSD block IDs
+ * @param gpu_block_ids Tensor of GPU block IDs
+ * @param ssd_layer_stride_in_bytes Stride between layers in SSD file
+ * @param ssd_block_stride_in_bytes Stride between blocks in SSD file
+ * @param ssd_kv_stride_in_bytes Stride between K and V in SSD file
+ * @param chunk_size_in_bytes Size of each chunk in bytes
+ * @param ssd_copy_off_inside_chunks Copy offset inside each chunk in SSD file
  * @param num_blocks_per_file Number of blocks per file
  * @param total_layers Total number of layers
- * @param is_read true for GDS->GPU, false for GPU->GDS
+ * @param is_read true for SSD->GPU, false for GPU->SSD
  * @param verbose Enable verbose logging
+ * @param is_mla Whether using MLA
  */
+template<BackendType Type>
 void transfer_kv_blocks_gds(
     GDSManager& gds_manager,
-    const std::vector<std::string>& gds_filepaths,
     const torch::Tensor& gpu_layer_id_list,
-    const torch::Tensor& gpu_layer_ptrs_tensor,
-    const torch::Tensor& gds_block_ids,
+    GTensorHandler gpu_tensor_handler,
+    const torch::Tensor& ssd_block_ids,
     const torch::Tensor& gpu_block_ids,
-    int64_t gpu_kv_stride_in_bytes,
-    int64_t gds_layer_stride_in_bytes,
-    int64_t gds_block_stride_in_bytes,
-    int64_t gds_kv_stride_in_bytes,
-    int64_t block_size_in_bytes,
-    int64_t gds_copy_off_inside_chunks,
+    int64_t ssd_layer_stride_in_bytes,
+    int64_t ssd_block_stride_in_bytes,
+    int64_t ssd_kv_stride_in_bytes,
+    int64_t chunk_size_in_bytes,
+    int64_t ssd_copy_off_inside_chunks,
     int num_blocks_per_file,
     int64_t total_layers,
     bool is_read,
     bool verbose = false,
     bool is_mla = false
-); 
+);
+
+} // namespace flexkv 

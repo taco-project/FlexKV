@@ -33,19 +33,15 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_remote: bool = False
-    enable_gds: bool = False
+    enable_gds: bool = False  # Requires enable_ssd=True
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
-    num_gds_blocks: int = 10000000
     num_remote_blocks: Optional[int] = None
 
     # ssd cache configs
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
-
-    # gds cache configs
-    gds_cache_dir: Optional[Union[str, List[str]]] = None
 
     # remote cache configs for cfs
     remote_cache_size_mode: str = "file_size"  # file_size or block_num

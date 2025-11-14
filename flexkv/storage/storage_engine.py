@@ -8,7 +8,7 @@ from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_EN
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
-from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator, GDSAllocator
+from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator
 
 
 class StorageEngine:
@@ -71,27 +71,6 @@ class StorageEngine:
                 dtype=self._model_config.dtype,
                 file_path=self._cache_config.remote_cache_path,
                 remote_config_custom = self._cache_config.remote_config_custom
-            )
-        if self._cache_config.enable_gds:
-            # GDS should follow similar constraints as CPU/SSD/Remote
-            if not GLOBAL_CONFIG_FROM_ENV.gds_layout_type == self._cpu_layout.type:
-                raise ValueError(f"GDS layout type must be the same as CPU layout type: {self._cpu_layout.type}")
-
-            self._gds_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                type=GLOBAL_CONFIG_FROM_ENV.gds_layout_type,
-                num_layer=self._model_config.num_layers,
-                num_block=self._cache_config.num_gds_blocks,
-                tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads,
-                head_size=self._model_config.head_size,
-                is_mla=self._model_config.use_mla
-            )
-            self.allocate(
-                device_type=DeviceType.GDS,
-                layout=self._gds_layout,
-                dtype=self._model_config.dtype,
-                gds_cache_dir=self._cache_config.gds_cache_dir,
-                max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
 
     def register_gpu_blocks(self,
@@ -220,17 +199,6 @@ class StorageEngine:
                     file_path=file_path,
                     remote_config_custom=remote_config_custom
                 )
-        elif device_type == DeviceType.GDS:
-            gds_cache_dir = kwargs.get('gds_cache_dir')
-            max_file_size_gb = kwargs.get('max_file_size_gb', -1)
-
-            allocator = GDSAllocator(
-                layout=layout,
-                dtype=dtype,
-                gds_cache_dir=gds_cache_dir,
-                max_file_size_gb=max_file_size_gb
-            )
-            storage_handle = allocator.get_accessible_handle()
         else:
             raise ValueError(f"Unsupported device type: {device_type}")
         self._storage_handles[key] = storage_handle

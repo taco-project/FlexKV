@@ -150,21 +150,24 @@ void transfer_kv_blocks_remote(
 
 void transfer_kv_blocks_gds_binding(
     GDSManager& gds_manager,
-    const py::list& gds_filepaths_py,
     const torch::Tensor& gpu_layer_id_list,
     const torch::Tensor& gpu_layer_ptrs_tensor,
     const torch::Tensor& gds_block_ids,
     const torch::Tensor& gpu_block_ids,
     int64_t gpu_kv_stride_in_bytes,
+    int64_t gpu_block_stride_in_bytes,
+    int64_t gpu_layer_stride_in_bytes,
     int64_t gds_layer_stride_in_bytes,
     int64_t gds_block_stride_in_bytes,
     int64_t gds_kv_stride_in_bytes,
     int64_t block_size_in_bytes,
+    int64_t gds_copy_off_inside_chunks,
     int num_blocks_per_file,
     int64_t total_layers,
     bool is_read,
     bool verbose = false,
-    bool is_mla = false
+    bool is_mla = false,
+    int gpu_block_type = 0
 ) {
     TORCH_CHECK(gpu_layer_ptrs_tensor.dtype() == torch::kInt64,
                 "gpu_layer_ptrs must be int64");
@@ -174,18 +177,52 @@ void transfer_kv_blocks_gds_binding(
                 "gpu_block_ids must be int64");
     TORCH_CHECK(gpu_layer_id_list.dtype() == torch::kInt32,
                 "gpu_layer_id_list must be int32");
-
-    // Convert Python list to C++ vector
-    std::vector<std::string> gds_filepaths;
-    for (const auto& filepath_py : gds_filepaths_py) {
-        gds_filepaths.push_back(filepath_py.cast<std::string>());
+    
+    flexkv::BackendType backend_type;
+    if (gpu_block_type == 0) {
+        backend_type = flexkv::BackendType::VLLM;
+    } else if (gpu_block_type == 1) {
+        backend_type = flexkv::BackendType::TRTLLM;
+    } else if (gpu_block_type == 2) {
+        backend_type = flexkv::BackendType::SGLANG;
+    } else {
+        throw std::runtime_error("Unsupported gpu_block_type: " + std::to_string(gpu_block_type));
     }
-
-    transfer_kv_blocks_gds(
-        gds_manager, gds_filepaths, gpu_layer_id_list, gpu_layer_ptrs_tensor,
-        gds_block_ids, gpu_block_ids, gpu_kv_stride_in_bytes,
-        gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
-        block_size_in_bytes, 0, num_blocks_per_file, total_layers, is_read, verbose, is_mla);
+    
+    // Create GTensorHandler
+    void **gpu_tensor_ptrs = static_cast<void **>(gpu_layer_ptrs_tensor.data_ptr());
+    flexkv::GTensorHandler handler(
+        backend_type,
+        reinterpret_cast<int64_t**>(gpu_tensor_ptrs),
+        total_layers,
+        gpu_kv_stride_in_bytes,
+        gpu_block_stride_in_bytes,
+        gpu_layer_stride_in_bytes
+    );
+    
+    switch (backend_type) {
+        case flexkv::BackendType::VLLM:
+            flexkv::transfer_kv_blocks_gds<flexkv::BackendType::VLLM>(
+                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
+                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
+                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                total_layers, is_read, verbose, is_mla);
+            break;
+        case flexkv::BackendType::TRTLLM:
+            flexkv::transfer_kv_blocks_gds<flexkv::BackendType::TRTLLM>(
+                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
+                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
+                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                total_layers, is_read, verbose, is_mla);
+            break;
+        case flexkv::BackendType::SGLANG:
+            flexkv::transfer_kv_blocks_gds<flexkv::BackendType::SGLANG>(
+                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
+                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
+                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                total_layers, is_read, verbose, is_mla);
+            break;
+    }
 }
 
 // GDS Manager Python bindings
@@ -336,12 +373,16 @@ PYBIND11_MODULE(c_ext, m) {
 #endif
   m.def("transfer_kv_blocks_gds", &transfer_kv_blocks_gds_binding,
         "Transfer KV blocks between GPU and GDS storage", py::arg("gds_manager"),
-        py::arg("gds_filepaths"), py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
+        py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
         py::arg("gds_block_ids"), py::arg("gpu_block_ids"),
-        py::arg("gpu_kv_stride_in_bytes"), py::arg("gds_layer_stride_in_bytes"),
-        py::arg("gds_block_stride_in_bytes"), py::arg("gds_kv_stride_in_bytes"),
-        py::arg("block_size_in_bytes"), py::arg("num_blocks_per_file"), py::arg("total_layers"), 
-        py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false);
+        py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
+        py::arg("gpu_layer_stride_in_bytes"),
+        py::arg("gds_layer_stride_in_bytes"), py::arg("gds_block_stride_in_bytes"),
+        py::arg("gds_kv_stride_in_bytes"), py::arg("block_size_in_bytes"),
+        py::arg("gds_copy_off_inside_chunks"),
+        py::arg("num_blocks_per_file"), py::arg("total_layers"), 
+        py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false,
+        py::arg("gpu_block_type") = 0);
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
@@ -371,14 +412,18 @@ PYBIND11_MODULE(c_ext, m) {
 
   py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")
       .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
-                    const std::vector<std::string> &, int>())
+                    std::map<int, std::vector<std::string>> &, int, int,
+                    torch::Tensor &, torch::Tensor &, torch::Tensor &, torch::Tensor &>(),
+           py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("ssd_files"),
+           py::arg("dp_group_id"), py::arg("num_layers"),
+           py::arg("gpu_kv_strides_tensor"), py::arg("gpu_block_strides_tensor"),
+           py::arg("gpu_layer_strides_tensor"), py::arg("gpu_chunk_sizes_tensor"))
       .def("tp_group_transfer",
            &flexkv::TPGDSTransferThreadGroup::tp_group_transfer,
-           py::arg("gpu_block_id_tensor"), py::arg("gds_block_id_tensor"),
-           py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
-           py::arg("gpu_chunk_size_in_bytes"), py::arg("gds_layer_stride_in_bytes"),
-           py::arg("gds_kv_stride_in_bytes"), py::arg("gds_block_stride_in_bytes"),
-           py::arg("gds_chunk_size_in_bytes"), py::arg("num_blocks_per_file"),
+           py::arg("gpu_block_id_tensor"), py::arg("ssd_block_id_tensor"),
+           py::arg("ssd_layer_stride_in_bytes"),
+           py::arg("ssd_kv_stride_in_bytes"), py::arg("ssd_block_stride_in_bytes"),
+           py::arg("ssd_chunk_size_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"));
 
@@ -454,9 +499,9 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readonly("last_node_matched_length", &flexkv::CMatchResult::last_node_matched_length);
   // Add GDS Manager class binding
   py::class_<GDSManager>(m, "GDSManager")
-      .def(py::init<const std::vector<std::string>&>(),
-           "Initialize GDS Manager with file list", py::arg("filenames"))
-      .def(py::init<>(), "Initialize GDS Manager without files")
+      .def(py::init<std::map<int, std::vector<std::string>>&, int, int>(),
+           "Initialize GDS Manager with device-organized files",
+           py::arg("ssd_files"), py::arg("num_devices"), py::arg("round_robin") = 1)
       .def("is_ready", &GDSManager::is_ready,
            "Check if GDS manager is ready for operations")
       .def("get_last_error", &GDSManager::get_last_error,
@@ -487,9 +532,16 @@ PYBIND11_MODULE(c_ext, m) {
            "Synchronize all internal CUDA streams")
       .def("get_file_count", &GDSManager::get_file_count,
            "Get number of files currently managed")
-             .def("get_managed_files", &GDSManager::get_managed_files,
-            "Get list of all managed files")
-       .def("create_gds_file", &create_gds_file_binding,
+      .def("get_num_devices", &GDSManager::get_num_devices,
+           "Get number of devices")
+      .def("get_num_files_per_device", &GDSManager::get_num_files_per_device,
+           "Get number of files per device")
+      .def("get_round_robin", &GDSManager::get_round_robin,
+           "Get round-robin granularity")
+      .def("get_file_paths", &GDSManager::get_file_paths,
+           "Get file paths for a specific device",
+           py::arg("device_id"))
+      .def("create_gds_file", &create_gds_file_binding,
             "Create and register a GDS file with specified size", 
             py::arg("filename"), py::arg("file_size"));
 }
