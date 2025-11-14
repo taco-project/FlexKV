@@ -12,9 +12,9 @@ from flexkv.common.debug import flexkv_logger
 
 @dataclass
 class ModelConfig:
-    num_layers: int = 0
-    num_kv_heads: int = 0
-    head_size: int = 0
+    num_layers: int = 1
+    num_kv_heads: int = 1
+    head_size: int = 1
     use_mla: bool = False
     dtype: torch.dtype = torch.bfloat16
 
