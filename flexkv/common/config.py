@@ -56,6 +56,7 @@ class CacheConfig:
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
 
     # remote cache configs for cfs
+    # todo: remove this in the future
     remote_cache_size_mode: str = "file_size"  # file_size or block_num
     remote_file_size: Optional[int] = None
     remote_file_num: Optional[int] = None
@@ -76,7 +77,6 @@ class CacheConfig:
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
         self.enable_remote = self.enable_3rd_remote
-        self.index_accel = self.enable_p2p_cpu or self.enable_p2p_ssd or self.index_accel
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
@@ -98,8 +98,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     max_file_size_gb=float(os.getenv('FLEXKV_MAX_FILE_SIZE_GB', -1)),  # -1 means no limit
 
-    evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.05)),
-    evict_start_threshold=float(os.getenv('FLEXKV_EVICT_START_THRESHOLD', 1.0)),
+    evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.1)),
+    evict_start_threshold=float(os.getenv('FLEXKV_EVICT_START_THRESHOLD', 0.7)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
 
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
@@ -109,11 +109,12 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     trace_flush_interval_ms=int(os.getenv('FLEXKV_TRACE_FLUSH_INTERVAL_MS', 1000)),
 
     lt_pool_initial_capacity=int(os.getenv('FLEXKV_LT_POOL_INITIAL_CAPACITY', 10000000)),
-    refresh_batch_size=int(os.getenv('FLEXKV_REFRESH_BATCH_SIZE', 128)),
-    rebuild_interval_ms=int(os.getenv('FLEXKV_REBUILD_INTERVAL_MS', 1000)),
+    refresh_batch_size=int(os.getenv('FLEXKV_REFRESH_BATCH_SIZE', 256)),
+    rebuild_interval_ms=int(os.getenv('FLEXKV_REBUILD_INTERVAL_MS', 10000)),
     idle_sleep_ms=int(os.getenv('FLEXKV_IDLE_SLEEP_MS', 10)),
-    lease_ttl_ms=int(os.getenv('FLEXKV_LEASE_TTL_MS', 100000)),
-    renew_lease_ms=int(os.getenv('FLEXKV_RENEW_LEASE_MS', 0)),
+    lease_ttl_ms=int(os.getenv('FLEXKV_LEASE_TTL_MS', 10000)),
+    safety_ttl_ms=int(os.getenv('FLEXKV_SAFETY_TTL_MS', 100)),
+    renew_lease_ms=int(os.getenv('FLEXKV_RENEW_LEASE_MS', 4000)),
 )
 
 @dataclass

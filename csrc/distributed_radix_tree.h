@@ -29,6 +29,7 @@ class RedisMetaChannel; // forward declaration
 class RefRadixTree : public CRadixTreeIndex {
 public:
   RefRadixTree(int tokens_per_block, unsigned int max_num_blocks = 1000000u, uint32_t lease_renew_ms = 5000,
+    uint32_t hit_reward_seconds = 0,
      LockFreeQueue<CRadixNode*> *renew_lease_queue = nullptr, LeaseMetaMemPool* lt_pool = nullptr);
   ~RefRadixTree();
   // Decrement reference count; when it reaches zero, delete this instance
@@ -52,6 +53,7 @@ private:
   int evict(torch::Tensor &evicted_blocks, int num_evicted) override;
   std::atomic<uint32_t> ref_cnt;
   uint32_t lease_renew_ms_;
+  uint32_t hit_reward_seconds_;
   LockFreeQueue<CRadixNode*> *renew_lease_queue_;
   LeaseMetaMemPool* lt_pool_;
 };
@@ -80,6 +82,7 @@ private:
   uint32_t rebuild_interval_ms_ = 1000;
   uint32_t idle_sleep_ms_ = 10;
   uint32_t lease_renew_ms_ = 5000;
+  uint32_t hit_reward_seconds_ = 0;
   LockFreeQueue<CRadixNode*> renew_lease_queue;
   bool refresh_started = false;
   volatile bool refresh_should_stop = false;
@@ -96,7 +99,8 @@ public:
                   size_t refresh_batch_size = 128,
                   uint32_t rebuild_interval_ms = 1000,
                   uint32_t idle_sleep_ms = 10,
-                  uint32_t lease_renew_ms = 5000);
+                  uint32_t lease_renew_ms = 5000,
+                  uint32_t hit_reward_seconds = 0);
   ~DistributedRadixTree();
 
   void set_meta_channel(RedisMetaChannel *ch) { channel = ch; }

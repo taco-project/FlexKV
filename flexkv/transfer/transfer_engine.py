@@ -94,7 +94,7 @@ class TransferEngine:
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
         self._cache_config = cache_config
-        self._enable_pcfs_sharing = cache_config.index_accel and cache_config.enable_kv_sharing
+        self._enable_pcfs_sharing = GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing # TODO: is this correct?
 
         self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 
@@ -256,6 +256,7 @@ class TransferEngine:
 
             flexkv_logger.info(f"[transfer_engine] initializing the PEER2CPUTransferWorker!")
             self.cpu_remote_cpu_worker: WorkerHandle = PEER2CPUTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),

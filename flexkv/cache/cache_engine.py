@@ -288,10 +288,6 @@ class GlobalCacheEngine:
         else:
             self.enable_kv_sharing = False
         self.cache_engines = {}
-        if cache_config.index_accel:
-            self.index_accel = True
-        else:
-            self.index_accel = False
 
         self.evict_ratio = GLOBAL_CONFIG_FROM_ENV.evict_ratio
         self.evict_start_threshold = GLOBAL_CONFIG_FROM_ENV.evict_start_threshold
@@ -300,7 +296,7 @@ class GlobalCacheEngine:
         if cache_config.enable_cpu:
             if cache_config.enable_p2p_cpu:
                 self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
-            elif cache_config.index_accel:
+            elif self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
@@ -318,7 +314,7 @@ class GlobalCacheEngine:
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
                 self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
-            elif cache_config.index_accel:
+            elif self.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
@@ -337,7 +333,7 @@ class GlobalCacheEngine:
             if cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
                 self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
-            elif cache_config.index_accel:
+            elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
@@ -937,7 +933,7 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
         assert self.remote_cache_engine is not None
 
-        if self.cache_config.index_accel:
+        if self.index_accel:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta, False)
         else:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
@@ -1249,16 +1245,24 @@ class GlobalCacheEngine:
 
     @nvtx.annotate("Match Prefix Accel", color="yellow")
     def match_local_accel(self, sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel]:
+        #from flexkv.common.debug import flexkv_logger
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
-        if self.cpu_cache_engine and not self.cache_config.enable_p2p_cpu:
-            cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
-        else:
-            cpu_matched_result = self.cpu_cache_engine.match_local(sequence_meta)
-        if self.ssd_cache_engine and not self.cache_config.enable_p2p_ssd:
-            ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
-        else:
-            ssd_matched_result = self.ssd_cache_engine.match_local(sequence_meta)
+        if self.cpu_cache_engine:
+            if not self.cache_config.enable_p2p_cpu:
+                cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
+            else:
+                # FIXED: 应该调用 match_all() 以查询远程索引，而不是 match_local()
+                #flexkv_logger.info(f"[MATCH DEBUG] CPU P2P enabled, calling match_all() instead of match_local()")
+                cpu_matched_result = self.cpu_cache_engine.match_all(sequence_meta)
+        #TODO: we assume that ssd and gds are not enabled at the same time
+        if self.ssd_cache_engine:
+            if not self.cache_config.enable_p2p_ssd:
+                ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
+            else:
+                # FIXED: 应该调用 match_all() 以查询远程索引，而不是 match_local()
+                #flexkv_logger.info(f"[MATCH DEBUG] SSD P2P enabled, calling match_all() instead of match_local()")
+                ssd_matched_result = self.ssd_cache_engine.match_all(sequence_meta)
         return cpu_matched_result, ssd_matched_result
 
     @nvtx.annotate("Match Prefix", color="yellow")

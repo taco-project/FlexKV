@@ -32,20 +32,12 @@ class KVManager:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-<<<<<<< HEAD
                  dp_client_id: int = 0,
                  server_recv_port: str = "",
                  gpu_register_port: str = ""):
         flexkv_logger.info(f"{model_config = }")
         flexkv_logger.info(f"{cache_config = }")
         flexkv_logger.info(f"{GLOBAL_CONFIG_FROM_ENV = }")
-=======
-                 gpu_register_port: Optional[str] = None,
-                 server_recv_port: Optional[str] = None,
-                 dp_client_id: int = 0):
-        flexkv_logger.info(f"model_config = {model_config}")
-        flexkv_logger.info(f"cache_config = {cache_config}")
->>>>>>> bb2454f (Add swap buffer feature for SSD and PCFS scheduling to the CPU LocalRadixTree)
         self.model_config = model_config
         self.cache_config = cache_config
 
@@ -62,6 +54,7 @@ class KVManager:
         self.dp_client_id = dp_client_id
         flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
         
+        self.redis_meta_client = None
         if self.cache_config.enable_kv_sharing:
             flexkv_logger.info(f"[kv manager] initializing RedisMeta and connection to \
                         {self.cache_config.redis_host}:{self.cache_config.redis_port}")

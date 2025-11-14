@@ -20,8 +20,7 @@ import json
 from flexkv import c_ext
 
 from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, \
-    transfer_kv_blocks_gds, TPTransferThreadGroup, TPGDSTransferThreadGroup, \
-    shared_transfer_kv_blocks_remote_read
+    transfer_kv_blocks_gds, TPTransferThreadGroup, TPGDSTransferThreadGroup
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -1434,8 +1433,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.ioctx = c_ext.SSDIOCTX(
                     ssd_files,
                     len(ssd_files),
-                    cache_config.ssd_cache_iouring_entries,
-                    cache_config.ssd_cache_iouring_flags,
+                    GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+                    GLOBAL_CONFIG_FROM_ENV.iouring_flags,
                 )
             except Exception as e:
                 flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
@@ -2035,7 +2034,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         else:
             raise ValueError(f"Invalid cpu_blocks type: {type(cpu_blocks)}")
         
-        if self.cpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
+        if self.cpu_kv_layout.type == KVCacheLayoutType.LAYERFIRST:
             for layer_id in range(layer_start_id, layer_start_id + layer_granularity):
                 for kv_id in range(self.kv_dim):
                     element_offset = (
@@ -2049,7 +2048,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     )
                     src_block_ptrs.append(cpu_base_ptr + element_offset)
 
-        elif self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKWISE:
+        elif self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST:
             block_volume = self.cpu_kv_layout.get_block_stride()
             element_offset = block_id_int * block_volume * self.dtype.itemsize
             src_block_ptrs.append(cpu_base_ptr + element_offset)
