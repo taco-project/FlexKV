@@ -31,7 +31,8 @@ class KVManager:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  dp_client_id: int = 0,
-                 server_recv_port: str = ""):
+                 server_recv_port: str = "",
+                 gpu_register_port: str = ""):
         flexkv_logger.info(f"{model_config = }")
         flexkv_logger.info(f"{cache_config = }")
         flexkv_logger.info(f"{GLOBAL_CONFIG_FROM_ENV = }")
@@ -42,7 +43,10 @@ class KVManager:
             self.server_recv_port = server_recv_port
         else:
             self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
-        self.gpu_register_port = self.server_recv_port + "_gpu_register"
+        if gpu_register_port != "":
+            self.gpu_register_port = gpu_register_port
+        else:
+            self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
         self.server_client_mode = model_config.dp_size > 1 or GLOBAL_CONFIG_FROM_ENV.server_client_mode
         self.dp_client_id = dp_client_id
