@@ -81,11 +81,11 @@ class RedisMetaChannel:
         return str(self._c.make_block_key(int(node_id), int(hash_value)))
 
     def publish_one(self, meta: BlockMeta) -> bool:
-        """发布单个 BlockMeta 到 Redis"""
+        """publish single BlockMeta to Redis"""
         return self._c.publish_one(meta.to_c())
 
     def publish_batch(self, metas: Iterable[BlockMeta], batch_size: int = 100) -> bool:
-        """批量发布 BlockMeta 到 Redis"""
+        """batch publish BlockMeta to Redis"""
         cms = [m.to_c() for m in metas]
         return self._c.publish_batch(cms, int(batch_size))
 
@@ -105,15 +105,15 @@ class RedisMetaChannel:
         return [(a, b) for a, b in self._c.hmget_two_fields_for_keys(list(keys), f1, f2)]
 
     def renew_node_leases(self, node_id: int, new_lt: int, batch_size: int = 200) -> bool:
-        """批量更新指定节点的租约时间"""
+        """batch update lease time for specified node"""
         return self._c.renew_node_leases(int(node_id), int(new_lt), int(batch_size))
 
     def update_block_state_batch(self, node_id: int, hashes: Iterable[int], state: int, batch_size: int = 200) -> bool:
-        """批量更新指定节点的块状态"""
+        """batch update block state for specified node"""
         return self._c.update_block_state_batch(int(node_id), list(int(h) for h in hashes), int(state), int(batch_size))
 
     def delete_blockmeta_batch(self, node_id: int, hashes: Iterable[int], batch_size: int = 200) -> bool:
-        """批量删除指定节点的块元数据"""
+        """batch delete block metadata for specified node"""
         return self._c.delete_blockmeta_batch(int(node_id), list(int(h) for h in hashes), int(batch_size))
 
 class RedisNodeInfo:
@@ -135,17 +135,17 @@ class RedisNodeInfo:
         self._sub_client: Optional[_redis.Redis] = None
         self._cleanup_done = False
         
-        # 注册退出时的清理函数
+        # register cleanup function on exit
         atexit.register(self._cleanup_on_exit)
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def __del__(self) -> None:
-        """析构函数，确保在对象被销毁时进行清理"""
+        """destructor, ensure cleanup is performed when object is destroyed"""
         try:
             self._cleanup_on_exit()
         except Exception:
-            # 忽略析构函数中的异常，避免影响程序退出
+            # ignore exceptions in destructor, avoid affecting program exit
             pass
     
     def _get_client(self) -> _redis.Redis:
@@ -195,7 +195,7 @@ class RedisNodeInfo:
     
     def _signal_handler(self, signum: int, frame) -> None:
         """Signal handler for graceful shutdown"""
-        print(f"收到信号 {signum}，开始清理 RedisNodeInfo...")
+        print(f"received signal {signum}, starting cleanup of RedisNodeInfo...")
         self._cleanup()
         sys.exit(0)
     
@@ -211,14 +211,14 @@ class RedisNodeInfo:
         self._cleanup_done = True
         
         try:
-            # 注销节点
+            # unregister node
             if self._node_id is not None:
                 self.unregister_node()
             
-            # 断开连接
+            # disconnect
             self.disconnect()
         except Exception:
-            # 忽略清理过程中的异常
+            # ignore exceptions in cleanup
             pass
     
     def register_node(self) -> Optional[int]:
@@ -235,7 +235,8 @@ class RedisNodeInfo:
             node_key = f"node:{node_id}"
             self._client.hset(node_key, mapping={
                 "node_id": str(node_id),
-                "local_ip": self.local_ip,
+                "ip": self.local_ip,  # Changed from "local_ip" to "ip" to match C++ code expectation
+                "local_ip": self.local_ip,  # Keep for backward compatibility
                 "uuid": self.uuid,
                 "status": "active",
                 "timestamp": str(int(time.time()))
@@ -276,11 +277,11 @@ class RedisNodeInfo:
         return self.uuid
     
     def get_active_node_ids(self) -> List[int]:
-        """Get all active node IDs - 无锁RCU读取"""
+        """Get all active node IDs - lock-free RCU read"""
         return list(self.current_node_id_set)
     
     def is_node_active(self, node_id: int) -> bool:
-        """Check if a node_id is active - 无锁RCU检查"""
+        """Check if a node_id is active - lock-free RCU check"""
         return node_id in self.current_node_id_set
     
     def _listener_worker(self) -> None:
@@ -347,7 +348,7 @@ class RedisNodeInfo:
                 if cursor == 0:
                     break
             
-            # 无锁RCU切换：原子性赋值
+            # lock-free RCU switch: atomic assignment
             self.current_node_id_set = new_active_nodes
                 
         except Exception:
@@ -368,14 +369,14 @@ class RedisMeta:
         self.decode_responses = bool(decode_responses)
         self._node_id: Optional[int] = None
         
-        # 初始化状态管理
+        # initialize state management
         self._init_lock = threading.Lock()
         self._initialized = False
         self._init_error: Optional[Exception] = None
         
-        # 创建 RedisNodeInfo 对象
+        # create RedisNodeInfo object
         self.nodeinfo = RedisNodeInfo(host, port, local_ip, password or "")
-        # 通过 nodeinfo 获取 UUID
+        # get UUID via nodeinfo
         self._uuid = self.nodeinfo.get_uuid()
 
     def _client(self):
@@ -391,33 +392,33 @@ class RedisMeta:
             RuntimeError: If initialization fails or has already been called
         """
         with self._init_lock:
-            # 检查是否已经初始化
+            # check if already initialized
             if self._initialized:
                 if self._init_error:
                     raise self._init_error
                 return self._node_id
             
             try:
-                # 连接 RedisNodeInfo
+                # connect to RedisNodeInfo
                 if not self.nodeinfo.connect():
                     raise RuntimeError("Failed to connect to Redis via RedisNodeInfo")
                 
-                # 注册节点
+                # register node
                 node_id = self.nodeinfo.register_node()
                 if node_id is None:
                     raise RuntimeError("Failed to register node via RedisNodeInfo")
                 
                 self._node_id = node_id
-                #初始化阶段，先扫描一次活跃节点
+                # initialization phase, scan active nodes first
                 self.nodeinfo.scan_active_nodes()
                 
-                # 标记为已初始化
+                # mark as initialized
                 self._initialized = True
                 
                 return node_id
                 
             except Exception as e:
-                # 记录初始化错误
+                # record initialization error
                 self._init_error = e
                 return None
 
@@ -454,7 +455,7 @@ class RedisMeta:
         return channel
 
     def unregister_node(self, node_id: Optional[int] = None) -> None:
-        # 使用 RedisNodeInfo 注销节点
+        # use RedisNodeInfo to unregister node
         if self.nodeinfo:
             self.nodeinfo.unregister_node()
         self._node_id = None
@@ -463,13 +464,13 @@ class RedisMeta:
         return self._uuid
     
     def get_active_node_ids(self) -> List[int]:
-        """获取所有活跃节点ID列表"""
+        """get all active node IDs list"""
         if self.nodeinfo:
             return self.nodeinfo.get_active_node_ids()
         return []
     
     def is_node_active(self, node_id: int) -> bool:
-        """检查指定节点是否活跃"""
+        """check if specified node is active"""
         if self.nodeinfo:
             return self.nodeinfo.is_node_active(node_id)
         return False

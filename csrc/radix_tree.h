@@ -7,7 +7,7 @@
 #include <execinfo.h>
 
 #include "cache_utils.h"
-#include "lease_meta_mempool.h"  // for flexkv::LeaseMeta
+#include "dist/lease_meta_mempool.h"  // for flexkv::LeaseMeta
 
 namespace flexkv {
 
@@ -121,6 +121,14 @@ public:
   HashType get_head_hash() {
     if (size() > 0) {
       return HashType(block_hashes[0]);
+    } else {
+      return HashType(0);
+    }
+  }
+
+  HashType get_tail_hash() {
+    if (size() > 0) {
+      return HashType(block_hashes[size() - 1]);
     } else {
       return HashType(0);
     }

@@ -19,8 +19,7 @@ import json
 
 from flexkv import c_ext
 
-from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, \
-    TPTransferThreadGroup, shared_transfer_kv_blocks_remote_read
+from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
 
 # GDS imports are optional (only available when compiled with FLEXKV_ENABLE_GDS=1)
 try:
@@ -193,12 +192,14 @@ class TransferWorkerBase(ABC):
         src_slot_id = transfer_op.src_slot_id
         dst_slot_id = transfer_op.dst_slot_id
         valid_block_num = transfer_op.valid_block_num
+        
         if src_slot_id == -1:
             src_block_ids = torch.from_numpy(transfer_op.src_block_ids).to(dtype=torch.int64)
             if pinned:
                 src_block_ids = src_block_ids.pin_memory()
         else:
             src_block_ids = self.op_buffer_tensor[src_slot_id, :valid_block_num]
+            
         if dst_slot_id == -1:
             dst_block_ids = torch.from_numpy(transfer_op.dst_block_ids).to(dtype=torch.int64)
             if pinned:
@@ -410,7 +411,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.gpu_block_type_,
         )
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         nvtx_range = nvtx.start_range(
             message=f"GPUCPUWorker.launch_transfer[{transfer_op.transfer_op_id}]",
             color="purple")
@@ -445,7 +446,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             )
         nvtx.end_range(nvtx_range)
 
-        return
+        return True
         
 class tpGPUCPUTransferWorker(TransferWorkerBase):
     def __init__(self,
@@ -708,8 +709,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             src_block_ids,
             dst_block_ids,
             transfer_op.transfer_type,
-            transfer_op.layer_id,
-            transfer_op.layer_granularity,
+            layer_id,           # Use corrected value, not transfer_op.layer_id
+            layer_granularity,  # Use corrected value, not transfer_op.layer_granularity
         )
         end_time = time.time()
 
@@ -935,8 +936,8 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             src_block_ids,
             dst_block_ids,
             transfer_op.transfer_type,
-            transfer_op.layer_id,
-            transfer_op.layer_granularity,
+            layer_id,           # Use corrected value, not transfer_op.layer_id
+            layer_granularity,  # Use corrected value, not transfer_op.layer_granularity
             src_block_node_ids=transfer_op.src_block_node_ids,
         )
         end_time = time.time()
@@ -990,10 +991,9 @@ class GDSTransferWorker(TransferWorkerBase):
         self.num_blocks_per_file = num_blocks_per_file
         self.num_files = sum(len(file_list) for file_list in ssd_files.values())
 
-        # Create GDSManager from file paths in this worker process
-        from flexkv import c_ext
         # Use same round_robin as SSD transfer to ensure consistent block mapping
         self.round_robin = 1
+        # Create GDSManager from file paths in this worker process
         self.gds_manager = c_ext.GDSManager(
             ssd_files,
             len(ssd_files),
@@ -1110,7 +1110,7 @@ class GDSTransferWorker(TransferWorkerBase):
             flexkv_logger.error(f"GDS transfer failed: {e}")
             raise RuntimeError(f"Failed to transfer KV blocks: {e}") from e
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         """Launch a GDS transfer operation"""
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
@@ -1141,6 +1141,7 @@ class GDSTransferWorker(TransferWorkerBase):
                 start_time,
                 end_time,
             )
+        return True
 
 
 class tpGDSTransferWorker(TransferWorkerBase):
@@ -1275,7 +1276,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             self.is_mla,
         )
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         """Launch a TP GDS transfer operation"""
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
@@ -1305,6 +1306,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
             start_time,
             end_time,
         )
+
+        return True
 
 class PEER2CPUTransferWorker(TransferWorkerBase):
     def __init__(self,
@@ -1346,7 +1349,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         ## initialize distributed environment
         if self.cache_config.enable_kv_sharing:
-            # step1: initialize the redis meta clent for node info
+            # step1: initialize the redis meta client for node info
             self.redis_meta_client = RedisMeta(
                 self.cache_config.redis_host,
                 self.cache_config.redis_port,
@@ -1457,8 +1460,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.ioctx = c_ext.SSDIOCTX(
                     ssd_files,
                     len(ssd_files),
-                    cache_config.ssd_cache_iouring_entries,
-                    cache_config.ssd_cache_iouring_flags,
+                    GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+                    GLOBAL_CONFIG_FROM_ENV.iouring_flags,
                 )
             except Exception as e:
                 flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
@@ -1733,7 +1736,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             task_info_list.append(
                 RDMATaskInfo(
                     ssd_task_id,
-                    self.mooncake_transfer_engine.get_engine_addr(),  ## for ssd transfer, peer engine addr refers to local mooncake engien
+                    self.mooncake_transfer_engine.get_engine_addr(),  ## for ssd transfer, peer engine addr refers to local mooncake engine
                     peer_engine_addr,
                     peer_zmq_addr,
                     None,
@@ -1789,6 +1792,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                                                 task_id=recv_meta.task_id, status = NotifyStatus.SUCCESS) ## used when transfer fails
                 
                 # step2: ckeck the recieved info, early return if check error
+                nvtx_range = nvtx.start_range(message=f"ssd_handle_loop. check and load_data", color="orange")
                 if len(recv_meta.ssd_block_ids) == 0 or len(recv_meta.cpu_block_ids) == 0 \
                     or len(recv_meta.cpu_block_ids)!=len(recv_meta.ssd_block_ids):
                         flexkv_logger.warning(
@@ -1866,6 +1870,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     dst_ptr_list.extend(dst_ptrs)
                     assert len(src_ptr_list) == len(data_size_list) and len(dst_ptr_list) == len(data_size_list)
 
+                nvtx.end_range(nvtx_range)
+                nvtx_range = nvtx.start_range(message=f"ssd_handle_loop. write_data_back_to_peer", color="orange")
                 ## step4: do rdma transfer and send notify
                 if not all_copy_complete:
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
@@ -1877,7 +1883,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     continue
                     
                 self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, success_msg)
-
+                nvtx.end_range(nvtx_range)
             except Exception as e:
                 flexkv_logger.error(f"Unexpected error in ssd_handle_loop: {e}")
                 time.sleep(0.001)
@@ -2058,7 +2064,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         else:
             raise ValueError(f"Invalid cpu_blocks type: {type(cpu_blocks)}")
         
-        if self.cpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
+        if self.cpu_kv_layout.type == KVCacheLayoutType.LAYERFIRST:
             for layer_id in range(layer_start_id, layer_start_id + layer_granularity):
                 for kv_id in range(self.kv_dim):
                     element_offset = (
@@ -2072,7 +2078,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     )
                     src_block_ptrs.append(cpu_base_ptr + element_offset)
 
-        elif self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKWISE:
+        elif self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST:
             block_volume = self.cpu_kv_layout.get_block_stride()
             element_offset = block_id_int * block_volume * self.dtype.itemsize
             src_block_ptrs.append(cpu_base_ptr + element_offset)

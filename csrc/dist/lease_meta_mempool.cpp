@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <iostream>
 
 namespace flexkv {
 
@@ -63,9 +64,18 @@ LeaseMeta *LeaseMetaMemPool::alloc() {
       allocated_set.insert(ptr);
     }
   }
+  
+  // Check for allocation failure
+  if (ptr == nullptr) {
+    std::cerr << "[MEMPOOL ERROR] alloc() failed - free_queue is empty after growth attempt! "
+              << "capacity=" << total_capacity.load() << " free=" << free_count.load() << std::endl;
+    return nullptr;
+  }
+  
   // Reset to defaults
   ptr->state = NODE_STATE_NORMAL;
   ptr->lease_time = 0;
+  ptr->published = false;
   free_count.fetch_sub(1, std::memory_order_relaxed);
   return ptr;
 }
@@ -78,13 +88,16 @@ void LeaseMetaMemPool::free(LeaseMeta *ptr) {
     std::lock_guard<std::mutex> lk(allocated_mu);
     auto it = allocated_set.find(ptr);
     if (it == allocated_set.end()) {
-      // not allocated from this pool or already freed: ignore safely (idempotent)
+      // not allocated from this pool or already freed: double free attempt!
+      std::cerr << "[DOUBLE_FREE] Pool @" << (void*)this << " trying to free LeaseMeta @" << (void*)ptr 
+                << " - NOT in allocated_set! (already freed or from different pool)" << std::endl;
       return;
     }
     allocated_set.erase(it);
     // Reset for reuse then push back to free queue under the same lock
     ptr->state = NODE_STATE_EVICTED;
     ptr->lease_time = 0;
+    ptr->published = false;
     free_queue.push_back(ptr);
   }
   free_count.fetch_add(1, std::memory_order_relaxed);

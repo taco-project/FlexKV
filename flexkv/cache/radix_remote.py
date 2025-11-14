@@ -20,20 +20,21 @@ class DistributedRadixTree:
                  refresh_batch_size: int = 128,
                  rebuild_interval_ms: int = 1000,
                  idle_sleep_ms: int = 10,
-                 lease_renew_ms: int = 5000) -> None:
+                 lease_renew_ms: int = 5000,
+                 hit_reward_seconds: int = 0) -> None:
         if _CDistributedRadixTree is None:
             raise ImportError("c_ext.DistributedRadixTree is not available")
         self._c = _CDistributedRadixTree(int(tokens_per_block), int(max_num_blocks), int(node_id),
-                                         int(refresh_batch_size), int(rebuild_interval_ms), int(idle_sleep_ms), int(lease_renew_ms))
+                                         int(refresh_batch_size), int(rebuild_interval_ms), int(idle_sleep_ms), int(lease_renew_ms), int(hit_reward_seconds))
         self._started = False
 
     def __del__(self) -> None:
-        """析构函数，确保在对象被销毁时调用stop方法"""
+        """destructor, ensure stop method is called when object is destroyed"""
         try:
             if hasattr(self, '_started') and self._started:
                 self.stop()
         except Exception:
-            # 忽略析构函数中的异常，避免影响程序退出
+            # ignore exceptions in destructor, avoid affecting program exit
             pass
 
     def start(self, channel: _PyRedisMetaChannel) -> bool:
@@ -95,7 +96,8 @@ class LocalRadixTree:
                  refresh_batch_size: int = 256,
                  idle_sleep_ms: int = 10,
                  safety_ttl_ms: int = 100,
-                 swap_block_threshold: int = 1024) -> None:
+                 swap_block_threshold: int = 1024,
+                 hit_reward_seconds: int = 0) -> None:
         if _CLocalRadixTree is None:
             raise ImportError("c_ext.LocalRadixTree is not available")
         self._c = _CLocalRadixTree(
@@ -106,17 +108,18 @@ class LocalRadixTree:
             int(refresh_batch_size),
             int(idle_sleep_ms),
             int(safety_ttl_ms),
-            int(swap_block_threshold)
+            int(swap_block_threshold),
+            int(hit_reward_seconds)
         )
         self._started = False
 
     def __del__(self) -> None:
-        """析构函数，确保在对象被销毁时调用stop方法"""
+        """destructor, ensure stop method is called when object is destroyed"""
         try:
             if hasattr(self, '_started') and self._started:
                 self.stop()
         except Exception:
-            # 忽略析构函数中的异常，避免影响程序退出
+            # ignore exceptions in destructor, avoid affecting program exit
             pass
 
     def set_meta_channel(self, channel: _PyRedisMetaChannel) -> None:

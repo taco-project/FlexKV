@@ -161,7 +161,9 @@ class SSDAllocator(BaseStorageAllocator):
 
         if cfg_max_file_size_gb != -1:
             cfg_max_blocks_per_file = int(cfg_max_file_size_gb * 1024 * 1024 * 1024 // block_size)
-        
+        else:
+            # when we don't set max_file_size_gb, we will create a file, size is exactly the required capacity
+            cfg_max_blocks_per_file = total_blocks_per_device
 
         fsys_max_blocks_per_file = cls.get_file_size_limit(cache_dir[0]) // block_size
         num_blocks_per_file = min(fsys_max_blocks_per_file, cfg_max_blocks_per_file, total_blocks_per_device)

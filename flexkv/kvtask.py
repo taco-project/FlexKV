@@ -339,6 +339,11 @@ class KVTaskManager:
         task = self.tasks[task_id]
         if completely:
             return task.is_completed()
+        # For tasks with callback (e.g., PUT tasks that need to call insert_and_publish),
+        # we must wait until _mark_completed is called (i.e., is_completed() returns True)
+        # to ensure the callback is executed before returning success.
+        #if task.callback is not None:
+        #    return task.is_completed()
         return task.is_completed() or task.task_end_op_finished
 
     def set_slot_mappings(self,

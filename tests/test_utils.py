@@ -37,7 +37,6 @@ DEFAULT_CACHE_CONFIG = {
     'remote_file_size': (1024*1024*1024),
     'remote_file_num': 16,
     'remote_file_prefix': "remote_cache",
-    'enable_trace': False,
     'ssd_cache_dir': ["./ssd_cache", "./ssd_cache2/"],
 }
 
@@ -312,6 +311,7 @@ class GPUKVCacheVerifier:
                 print(f"  ... and {len(errors) - 10} more errors")
         else:
             print("KV blocks verification passed!")
+        assert verification_passed
 
         return verification_passed
 

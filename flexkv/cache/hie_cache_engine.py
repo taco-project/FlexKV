@@ -10,9 +10,8 @@ from flexkv.cache.radix_remote import LocalRadixTree, DistributedRadixTree
 from flexkv.cache.redis_meta import RedisMetaChannel as _PyRedisMetaChannel
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.block import SequenceMeta
-from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
-if TYPE_CHECKING:
-    from flexkv.common.config import CacheConfig
+#if TYPE_CHECKING:
+from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import DeviceType
 from flexkv.common.type import MatchResultAccel
 
@@ -36,11 +35,12 @@ class HierarchyLRCacheEngine:
                  remote_idle_sleep_ms: int = 10,
                  local_safety_ttl_ms: int = 100,
                  evict_start_threshold: float = 1.0,
+                 hit_reward_seconds: int = 0,
                  meta: Optional[RedisMeta] = None) -> None:
         if num_total_blocks <= 0:
-            raise InvalidConfigError(f"Invalid num_total_blocks: {num_total_blocks}")
+            raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
-            raise InvalidConfigError(
+            raise ValueError(
                 f"Invalid tokens_per_block: {tokens_per_block}, tokens_per_block must be a power of 2"
             )
 
@@ -63,7 +63,8 @@ class HierarchyLRCacheEngine:
             refresh_batch_size=int(local_refresh_batch_size),
             idle_sleep_ms=int(local_idle_sleep_ms),
             safety_ttl_ms=int(local_safety_ttl_ms),
-            swap_block_threshold=int(evict_ratio * num_total_blocks)
+            swap_block_threshold=int(evict_ratio * num_total_blocks),
+            hit_reward_seconds=int(hit_reward_seconds),
         )
 
 
@@ -76,6 +77,7 @@ class HierarchyLRCacheEngine:
             rebuild_interval_ms=int(remote_rebuild_interval_ms),
             idle_sleep_ms=int(remote_idle_sleep_ms),
             lease_renew_ms=int(local_renew_lease_ms),
+            hit_reward_seconds=int(hit_reward_seconds),
         )
         # defer channel start to start(meta)
 
@@ -86,10 +88,17 @@ class HierarchyLRCacheEngine:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
+        
+        # cumulative statistics: for analyzing distributed KV reuse benefits
+        self._stats_total_queried_tokens = 0       # total tokens queried
+        self._stats_gpu_matched_tokens = 0         # total tokens matched in GPU memory
+        self._stats_local_matched_tokens = 0       # total tokens matched in FlexKV local
+        self._stats_distributed_matched_tokens = 0 # total tokens matched in FlexKV global (distributed reuse)
+        self._stats_match_count = 0                # match_all call count
 
     def start(self) -> None:
         if self._meta is None:
-            raise InvalidConfigError("RedisMeta is not provided; ensure from_cache_config stores it or pass it to start().")
+            raise ValueError("RedisMeta is not provided; ensure from_cache_config stores it or pass it to start().")
         #TODO can we use like this to distinguish the different tree pairs?
         if self.device_type == DeviceType.REMOTE:
             local_ch_block_key = "PCFSB"
@@ -101,7 +110,7 @@ class HierarchyLRCacheEngine:
             local_ch_block_key = "SSDB"
             remote_ch_block_key = "SSDB"
         else:
-            raise InvalidConfigError(f"Invalid device type: {self.device_type}")
+            raise ValueError(f"Invalid device type: {self.device_type}")
         self.remote_ch = self._meta.get_redis_meta_channel(remote_ch_block_key)
         self.local_ch = self._meta.get_redis_meta_channel(local_ch_block_key)
                 # Load and store mapping of node_id -> file_nodeids from Redis
@@ -109,7 +118,7 @@ class HierarchyLRCacheEngine:
             try:
                 self.nid_to_file_nodeids = self._meta.load_pcfs_file_nodeids()
             except Exception:
-                raise InvalidConfigError("Failed to load PCFS file nodeids from Redis")
+                raise ValueError("Failed to load PCFS file nodeids from Redis")
         self.local_index.start(self.local_ch)
         self.remote_index.start(self.remote_ch)
 
@@ -134,28 +143,64 @@ class HierarchyLRCacheEngine:
             MatchResultAccel: The match result
         """
         return self.match_all(sequence_meta)
-
-    def match_all(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
+    #match all will be called for get
+    def match_all(self, sequence_meta: SequenceMeta, gpu_matched_blocks: int = 0) -> MatchResultAccel:
         sequence_meta.gen_hashes()
         block_hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
         num_blocks = sequence_meta.num_blocks
 
         # Query both local and remote
+        import time
+        t0 = time.perf_counter()
         mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
+        t1 = time.perf_counter()
         mr_remote = self.remote_index.match_prefix(block_hashes_t, int(num_blocks), True)
-        print(f"[MATCH {self.device_type.name}] local: {mr_local.num_matched_blocks}/{mr_local.num_ready_matched_blocks}, remote: {mr_remote.num_matched_blocks}/{mr_remote.num_ready_matched_blocks}")
+        t2 = time.perf_counter()
+        print(f"[match_prefix timing] local: {(t1-t0)*1000:.3f}ms, remote: {(t2-t1)*1000:.3f}ms")
         # For simplicy, we choose the one with the larger matched length; tie-break on ready length
         # We should allow to combine the two results in the future.
         local_key = (int(mr_local.num_matched_blocks), int(mr_local.num_ready_matched_blocks))
         remote_key = (int(mr_remote.num_matched_blocks), int(mr_remote.num_ready_matched_blocks))
         matched_pos = "local" if local_key >= remote_key else "remote"
         chosen = mr_local if local_key >= remote_key else mr_remote
-
+        
+        # update cumulative statistics
+        queried_tokens = num_blocks * self.tokens_per_block
+        gpu_matched_tokens = gpu_matched_blocks * self.tokens_per_block
+        local_matched_tokens = int(mr_local.num_matched_blocks) * self.tokens_per_block
+        distributed_matched_tokens = int(chosen.num_matched_blocks) * self.tokens_per_block
+        
+        self._stats_total_queried_tokens += queried_tokens
+        self._stats_gpu_matched_tokens += gpu_matched_tokens
+        self._stats_local_matched_tokens += local_matched_tokens
+        self._stats_distributed_matched_tokens += distributed_matched_tokens
+        self._stats_match_count += 1
+        
+        # calculate hit ratio for each level
+        total = self._stats_total_queried_tokens
+        gpu_pct = (self._stats_gpu_matched_tokens * 100 / total) if total > 0 else 0
+        local_pct = (self._stats_local_matched_tokens * 100 / total) if total > 0 else 0
+        distributed_pct = (self._stats_distributed_matched_tokens * 100 / total) if total > 0 else 0
+        
+        # calculate extra benefits for each level
+        extra_from_local = self._stats_local_matched_tokens - self._stats_gpu_matched_tokens
+        extra_from_distributed = self._stats_distributed_matched_tokens - self._stats_local_matched_tokens
+        extra_local_pct = (extra_from_local * 100 / total) if total > 0 else 0
+        extra_distributed_pct = (extra_from_distributed * 100 / total) if total > 0 else 0
+        
+        print(
+            f"[STATS][REUSE] cnt={self._stats_match_count}, queried={total}, "
+            f"gpu={self._stats_gpu_matched_tokens} ({gpu_pct:.2f}%), "
+            f"flexkv_local={self._stats_local_matched_tokens} ({local_pct:.2f}%, +{extra_local_pct:.2f}%), "
+            f"flexkv_global={self._stats_distributed_matched_tokens} ({distributed_pct:.2f}%, "
+            f"+{extra_distributed_pct:.2f}%)"
+        )
+        
         # physical blocks
         bnids_np = None
         if chosen is mr_remote:
-            #尝试使用DistributedRadixTree的block_node_ids
-            #如果检查失败，则使用LocalRadixTree的匹配结果
+            #try to use DistributedRadixTree's block_node_ids
+            #if check fails, use LocalRadixTree's match result
             nids = chosen.block_node_ids
             nps = chosen.physical_blocks
             # Convert tensors to numpy views (CPU) if present
@@ -166,6 +211,7 @@ class HierarchyLRCacheEngine:
                     bnids_np = self.nodeids_to_file_nodeids(nids.cpu().numpy(), nps.cpu().numpy())
                     if bnids_np is None:
                         chosen = mr_local
+                        matched_pos = "local"  # Update matched_pos after fallback
                 else:
                     # For P2P mode, use node_ids directly
                     bnids_np = nids.cpu().numpy().astype(np.uint32)
@@ -175,7 +221,9 @@ class HierarchyLRCacheEngine:
                 if mr_remote.num_matched_blocks > 0:
                     #print(f"[REMOTE_MATCH {self.device_type.name}] Warning: remote matched but block_node_ids is empty, falling back to local")
                     chosen = mr_local
+                    matched_pos = "local"  # Update matched_pos after fallback
         phys_np = chosen.physical_blocks.cpu().numpy()
+        #maybe we should always not insert
         if self.device_type == DeviceType.CPU and matched_pos == "remote" and mr_local.num_matched_blocks > 0:
             insert_to_local_cpu_index = False
         else:
@@ -220,13 +268,13 @@ class HierarchyLRCacheEngine:
         
         for i in range(bnids_np.shape[0]):
             nid = int(bnids_np[i])
-            #检查节点是否活跃
+            #check if node is active
             is_active = self._meta.is_node_active(nid)
             if not is_active:
                 print(f"[DEBUG] Node {nid} is not active, returning None")
                 return None
             file_list = self.nid_to_file_nodeids.get(nid)
-            #检查文件列表是否为空
+            #check if file list is empty
             if not file_list:
                 return None
             remote_file_num = len(file_list)
@@ -236,7 +284,7 @@ class HierarchyLRCacheEngine:
             f_idx = (block_id // rr) % remote_file_num
             out[i] = np.uint32(file_list[f_idx])
         return out
-
+    #match local will only be called for put
     def match_local(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
         sequence_meta.gen_hashes()
         block_hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
@@ -266,6 +314,7 @@ class HierarchyLRCacheEngine:
         sequence_meta.gen_hashes()
         phys_t = torch.from_numpy(physical_block_ids).to(torch.int64) if isinstance(physical_block_ids, np.ndarray) else physical_block_ids.to(torch.int64)
         hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
+        
         if match_result is None:
             node = self.local_index.insert(
                 phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks), bool(is_ready)
@@ -317,8 +366,10 @@ class HierarchyLRCacheEngine:
             is_remote_node = False
         if is_remote_node:
             self.remote_index.unlock(node)
+            #self.remote_index.set_ready(node, True, cleanup_length)
         else:
             self.local_index.unlock(node)
+            #self.local_index.set_ready(node, True, cleanup_length)
 
     def set_ready(self, node: CRadixNode, ready: bool = True, ready_length: int = -1) -> None:
         """Set the ready state of a node in the appropriate index (local or remote).
@@ -338,10 +389,6 @@ class HierarchyLRCacheEngine:
             self.remote_index.set_ready(node, ready, ready_length)
         else:
             self.local_index.set_ready(node, ready, ready_length)
-
-    def cleanup(self, node: CRadixNode, cleanup_length: int) -> None:
-        unlock(node)
-        set_ready(node, ready, ready_length)
 
     def take(self,
              num_required_blocks: int,
@@ -373,13 +420,14 @@ class HierarchyLRCacheEngine:
                 num_evicted = self.local_index.evict(target_blocks, evict_block_num)
                 if num_evicted != evict_block_num:
                     target_blocks.resize_(num_evicted)
-                self.mempool.recycle_blocks(target_blocks.numpy())
+                evicted_np = target_blocks.numpy()
+                self.mempool.recycle_blocks(evicted_np)
             
             if protected_node is not None:
                 self.local_index.unlock(protected_node)
         
         if strict and num_required_blocks > self.mempool.num_free_blocks:
-            raise NotEnoughSpaceError(
+            raise ValueError(
                 "Not enough free blocks to take, ", required=num_required_blocks, available=self.mempool.num_free_blocks
             )
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
@@ -391,7 +439,7 @@ class HierarchyLRCacheEngine:
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
 
-
+    #TODO pfcs may not work now
     @classmethod
     def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
         """Create a PCFSCacheEngine from CacheConfig.
@@ -403,9 +451,9 @@ class HierarchyLRCacheEngine:
 
         # 1) Generate unique remote_file_prefix using uuid and build remote_cache_path
         if cache_config.remote_file_prefix is None:
-            raise InvalidConfigError("remote_file_prefix must be provided in CacheConfig when enable_remote is True")
+            raise ValueError("remote_file_prefix must be provided in CacheConfig when enable_remote is True")
         if cache_config.remote_file_num is None or cache_config.remote_file_num <= 0:
-            raise InvalidConfigError("remote_file_num must be a positive integer in CacheConfig when enable_remote is True")
+            raise ValueError("remote_file_num must be a positive integer in CacheConfig when enable_remote is True")
 
         # Prefer uuid from RedisMeta to ensure cluster-wide uniqueness, fallback to Python uuid if meta is None
         try:
@@ -426,11 +474,11 @@ class HierarchyLRCacheEngine:
         pcfs_ip = remote_cfg.get("pcfs_ip")
         pcfs_parent_nodeid = remote_cfg.get("pcfs_parent_nodeid")
         if None in (pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid):
-            raise InvalidConfigError("Some required PCFS config fields are missing: pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid")
+            raise ValueError("Some required PCFS config fields are missing: pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid")
 
         pcfs = c_ext.Pcfs(pcfs_fsid, pcfs_port, pcfs_ip, False, pcfs_parent_nodeid)
         if not pcfs.init():
-            raise InvalidConfigError(f"PCFS init failed: fsid={pcfs_fsid}, ip={pcfs_ip}")
+            raise ValueError(f"PCFS init failed: fsid={pcfs_fsid}, ip={pcfs_ip}")
 
         node_ids: List[int] = []
         # Derive file size if available; otherwise, use 0 when not provided (only lookup or create placeholder)
@@ -442,7 +490,7 @@ class HierarchyLRCacheEngine:
         for remote_path in cache_config.remote_cache_path:
             nodeid = pcfs.lookup_or_create_file(remote_path, file_size, True)
             if nodeid == 0:
-                raise InvalidConfigError(f"lookup or create file failed for file: {remote_path}")
+                raise ValueError(f"lookup or create file failed for file: {remote_path}")
             node_ids.append(int(nodeid))
 
         # 3) Register nodeids into Redis for discovery
@@ -460,54 +508,57 @@ class HierarchyLRCacheEngine:
             tokens_per_block=int(cache_config.tokens_per_block),
             evict_ratio=float(cache_config.evict_ratio),
             device_type=DeviceType.REMOTE,
-            local_lease_ttl_ms=int(getattr(cache_config, "lease_ttl_ms", 100000)),
-            local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 10)),
-            local_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
-            local_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
+            local_lease_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.lease_ttl_ms),
+            local_renew_lease_ms=int(GLOBAL_CONFIG_FROM_ENV.renew_lease_ms),
+            local_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+            local_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
             remote_max_num_blocks=num_blocks,
             redis_node_id=int(node_id),
-            remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
-            remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 1000)),
-            remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
-            local_safety_ttl_ms=int(getattr(cache_config, "safety_ttl_ms", 100)),
+            remote_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+            remote_rebuild_interval_ms=int(GLOBAL_CONFIG_FROM_ENV.rebuild_interval_ms),
+            remote_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
+            local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
             meta=meta,
         )
 
     #TODO is this enough for peercpu and peerssd?
     @classmethod
     def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, device_type: DeviceType, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
+
         if device_type == DeviceType.REMOTE:
             return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta)
         else:
-            # 根据device_type选择正确的blocks配置
+            # select correct blocks configuration based on device_type
             if device_type == DeviceType.CPU:
                 local_max_num_blocks = int(cache_config.num_cpu_blocks)
             elif device_type == DeviceType.SSD:
                 local_max_num_blocks = int(cache_config.num_ssd_blocks)
             else:
-                local_max_num_blocks = int(cache_config.num_local_blocks or 0)
+                raise ValueError(f"Invalid device type: {device_type}")
+                #local_max_num_blocks = int(cache_config.num_local_blocks or 0)
             
             return cls(
-                num_total_blocks=int(cache_config.num_remote_blocks or 0),
+                num_total_blocks=int(local_max_num_blocks or 0),
                 tokens_per_block=int(cache_config.tokens_per_block),
-                evict_ratio=float(cache_config.evict_ratio),
+                evict_ratio=float(GLOBAL_CONFIG_FROM_ENV.evict_ratio),
                 device_type=device_type,
                 local_max_num_blocks=local_max_num_blocks,
-                local_lease_ttl_ms=int(getattr(cache_config, "lease_ttl_ms", 100000)),
-                local_renew_lease_ms=int(getattr(cache_config, "renew_lease_ms", 0)),
-                local_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 256)),
-                local_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
+                local_lease_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.lease_ttl_ms),
+                local_renew_lease_ms=int(GLOBAL_CONFIG_FROM_ENV.renew_lease_ms),
+                local_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+                local_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
                 # local_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
                 remote_max_num_blocks=int(cache_config.num_remote_blocks or 0),
                 redis_node_id=int(node_id),
                 # remote_node_id=int(node_id),
                 # remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
-                remote_refresh_batch_size=int(getattr(cache_config, "refresh_batch_size", 128)),
-                remote_rebuild_interval_ms=int(getattr(cache_config, "rebuild_interval_ms", 10000)),
-                remote_idle_sleep_ms=int(getattr(cache_config, "idle_sleep_ms", 10)),
-                local_safety_ttl_ms=int(getattr(cache_config, "safety_ttl_ms", 100)),
-                evict_start_threshold=float(cache_config.evict_start_threshold),
+                remote_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+                remote_rebuild_interval_ms=int(GLOBAL_CONFIG_FROM_ENV.rebuild_interval_ms),
+                remote_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
+                local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
+                evict_start_threshold=float(GLOBAL_CONFIG_FROM_ENV.evict_start_threshold),
+                hit_reward_seconds=int(GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds),
                 meta=meta,
             )
-            raise InvalidConfigError("Invalid device type: {cache_config.device_type}")
+            raise ValueError("Invalid device type: {cache_config.device_type}")
 

@@ -24,12 +24,12 @@
 #include "transfer.cuh"
 #include "transfer_ssd.h"
 #include "radix_tree.h"
-#include "local_radix_tree.h"
-#include "distributed_radix_tree.h"
-#include "redis_meta_channel.h"
-#include "block_meta.h"
-#include "lock_free_q.h"
-#include "lease_meta_mempool.h"
+#include "dist/local_radix_tree.h"
+#include "dist/distributed_radix_tree.h"
+#include "dist/redis_meta_channel.h"
+#include "dist/block_meta.h"
+#include "dist/lock_free_q.h"
+#include "dist/lease_meta_mempool.h"
 #include <deque>
 
 namespace py = pybind11;
@@ -173,13 +173,13 @@ void shared_transfer_kv_blocks_remote_read_binding(
     bool is_mla = false,
     int num_threads_per_file = 8) {
     
-    // 转换 file_nodeids
+    // convert file_nodeids
     std::vector<std::uint64_t> file_nodeids;
     for (const auto &file_nodeid : file_nodeid_list) {
         file_nodeids.push_back(file_nodeid.cast<std::uint64_t>());
     }
     
-    // 转换 cfs_blocks_partition
+    // convert cfs_blocks_partition
     std::vector<std::vector<int64_t>> cfs_blocks_partition;
     for (const auto &block_list : cfs_blocks_partition_list) {
         std::vector<int64_t> blocks;
@@ -189,7 +189,7 @@ void shared_transfer_kv_blocks_remote_read_binding(
         cfs_blocks_partition.push_back(std::move(blocks));
     }
     
-    // 转换 cpu_blocks_partition
+    // convert cpu_blocks_partition
     std::vector<std::vector<int64_t>> cpu_blocks_partition;
     for (const auto &block_list : cpu_blocks_partition_list) {
         std::vector<int64_t> blocks;
@@ -199,7 +199,7 @@ void shared_transfer_kv_blocks_remote_read_binding(
         cpu_blocks_partition.push_back(std::move(blocks));
     }
     
-    // 调用 C++ 实现
+    // call C++ implementation
     flexkv::shared_transfer_kv_blocks_remote_read(
         file_nodeids, cfs_blocks_partition, cpu_blocks_partition, cpu_layer_id_list,
         cpu_tensor_ptr, cpu_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
@@ -556,7 +556,10 @@ PYBIND11_MODULE(c_ext, m) {
 #endif
 
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
-      .def(py::init<int, unsigned int>())
+      .def(py::init<int, unsigned int, int>(),
+           py::arg("tokens_per_block"),
+           py::arg("max_num_blocks") = 1000000,
+           py::arg("hit_reward_seconds") = 0)
       .def("is_empty", &flexkv::CRadixTreeIndex::is_empty)
       .def("reset", &flexkv::CRadixTreeIndex::reset)
       .def("lock", &flexkv::CRadixTreeIndex::lock, py::arg("node"))
@@ -688,7 +691,7 @@ PYBIND11_MODULE(c_ext, m) {
 
   // LocalRadixTree bindings (derived from CRadixTreeIndex)
   py::class_<flexkv::LocalRadixTree, flexkv::CRadixTreeIndex>(m, "LocalRadixTree")
-      .def(py::init<int, unsigned int, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>(),
+      .def(py::init<int, unsigned int, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>(),
            py::arg("tokens_per_block"),
            py::arg("max_num_blocks") = 1000000u,
            py::arg("lease_ttl_ms") = 100000,
@@ -696,11 +699,21 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("refresh_batch_size") = 256,
            py::arg("idle_sleep_ms") = 10,
            py::arg("safety_ttl_ms") = 100,
-           py::arg("swap_block_threshold") = 1024)
+           py::arg("swap_block_threshold") = 1024,
+           py::arg("hit_reward_seconds") = 0)
       .def("set_meta_channel", &flexkv::LocalRadixTree::set_meta_channel, py::arg("channel"))
       .def("start", &flexkv::LocalRadixTree::start, py::arg("channel"))
       .def("stop", &flexkv::LocalRadixTree::stop)
       .def("insert_and_publish", &flexkv::LocalRadixTree::insert_and_publish, py::arg("node"))
+      // IMPORTANT: Override base class insert/evict to use LocalRadixTree's implementation
+      // (which handles LeaseMeta and current_block_count)
+      .def("insert", &flexkv::LocalRadixTree::insert, py::return_value_policy::reference,
+           py::arg("physical_block_ids"), py::arg("block_hashes"), py::arg("num_blocks"),
+           py::arg("num_insert_blocks"), py::arg("ready") = true, py::arg("node") = nullptr,
+           py::arg("num_matched_blocks") = -1, py::arg("last_node_matched_length") = -1,
+           py::call_guard<py::gil_scoped_release>())
+      .def("evict", &flexkv::LocalRadixTree::evict, py::arg("evicted_blocks"), py::arg("num_evicted"),
+           py::call_guard<py::gil_scoped_release>())
       // Mirror CRadixTreeIndex APIs explicitly on LocalRadixTree
       .def("match_prefix", &flexkv::LocalRadixTree::match_prefix,
            py::arg("block_hashes"), py::arg("num_blocks"), py::arg("update_cache_info") = true,
@@ -728,14 +741,15 @@ PYBIND11_MODULE(c_ext, m) {
 
   // DistributedRadixTree bindings (remote reference tree manager)
   py::class_<flexkv::DistributedRadixTree>(m, "DistributedRadixTree")
-      .def(py::init<int, unsigned int, uint32_t, size_t, uint32_t, uint32_t, uint32_t>(),
+      .def(py::init<int, unsigned int, uint32_t, size_t, uint32_t, uint32_t, uint32_t, uint32_t>(),
            py::arg("tokens_per_block"),
            py::arg("max_num_blocks"),
            py::arg("node_id"),
            py::arg("refresh_batch_size") = 128,
            py::arg("rebuild_interval_ms") = 1000,
            py::arg("idle_sleep_ms") = 10,
-           py::arg("lease_renew_ms") = 5000)
+           py::arg("lease_renew_ms") = 5000,
+           py::arg("hit_reward_seconds") = 0)
       .def("start", &flexkv::DistributedRadixTree::start, py::arg("channel"))
       .def("stop", &flexkv::DistributedRadixTree::stop)
       .def("remote_tree_refresh", &flexkv::DistributedRadixTree::remote_tree_refresh, py::return_value_policy::reference)
@@ -748,13 +762,18 @@ PYBIND11_MODULE(c_ext, m) {
       .def("set_ready", &flexkv::DistributedRadixTree::set_ready, py::arg("node"), py::arg("ready") = true, py::arg("ready_length") = -1);
 
   // RefRadixTree bindings (for type information)
+  // Note: RefRadixTree is primarily used internally by DistributedRadixTree.
+  // The Python binding provides a simplified constructor without the internal queue/pool parameters.
   py::class_<flexkv::RefRadixTree, flexkv::CRadixTreeIndex>(m, "RefRadixTree")
-      .def(py::init<int, unsigned int, uint32_t, flexkv::LockFreeQueue<flexkv::CRadixNode*>*, flexkv::LeaseMetaMemPool*>(),
+      .def(py::init<int, unsigned int, uint32_t, uint32_t, flexkv::LockFreeQueue<flexkv::QueuedNode>*, flexkv::LeaseMetaMemPool*, uint64_t>(),
            py::arg("tokens_per_block"),
            py::arg("max_num_blocks") = 1000000u,
            py::arg("lease_renew_ms") = 5000,
+           py::arg("hit_reward_seconds") = 0,
            py::arg("renew_lease_queue") = nullptr,
-           py::arg("lt_pool") = nullptr)
+           py::arg("lt_pool") = nullptr,
+           py::arg("generation") = 0)
       .def("dec_ref_cnt", &flexkv::RefRadixTree::dec_ref_cnt)
-      .def("inc_ref_cnt", &flexkv::RefRadixTree::inc_ref_cnt);
+      .def("inc_ref_cnt", &flexkv::RefRadixTree::inc_ref_cnt)
+      .def("get_generation", &flexkv::RefRadixTree::get_generation);
 }

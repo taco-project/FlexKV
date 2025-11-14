@@ -8,7 +8,7 @@
 #include <torch/extension.h>
 #include <pthread.h>
 
-#include "radix_tree.h"
+#include "../radix_tree.h"
 #include "block_meta.h"
 #include "lock_free_q.h"
 #include "lease_meta_mempool.h"
@@ -48,6 +48,7 @@ private:
   uint32_t renew_lease_ms;
   uint32_t swap_block_threshold;
   uint32_t current_block_count;
+  uint32_t hit_reward_seconds;
   // Queue created by default to buffer newly produced nodes for publishing
   LockFreeQueue<NewBlockMeta*> new_block_queue;
   // Queues to record eviction decisions (owning unique_ptr to avoid leaks/dangling)
@@ -68,6 +69,8 @@ private:
   // Pop at most max_batch nodes from new_block_queue and publish their BlockMeta to Redis.
   // Returns number of nodes published.
   size_t local_block_report(size_t max_batch = 1024);
+  // Helper function to publish a single node to Redis
+  bool publish_single_node(CRadixNode *src);
   // Renew in-memory LeaseMeta times and refresh Redis lt for this node
   void renew_relese_time();
 public:
@@ -78,7 +81,8 @@ public:
                  uint32_t refresh_batch_size = 256,
                  uint32_t idle_sleep_ms = 10,
                  uint32_t safety_ttl_ms = 100,
-                 uint32_t swap_block_threshold = 1024);
+                 uint32_t swap_block_threshold = 1024,
+                 uint32_t hit_reward_seconds = 0);
   ~LocalRadixTree();
 
   void set_meta_channel(RedisMetaChannel *ch);
