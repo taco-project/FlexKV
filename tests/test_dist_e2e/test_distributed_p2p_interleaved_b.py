@@ -55,12 +55,12 @@ def generate_shared_requests(num_requests=100, tokens_per_block=4, blocks_per_re
     return requests
 
 
-def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks):
+def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type=0):
     """Create GPU KV cache layout"""
     from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
     
     gpu_kv_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERWISE,
+        type=KVCacheLayoutType.LAYERFIRST,
         num_layer=model_config.num_layers,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
@@ -115,9 +115,9 @@ def test_node_b():
     print("=" * 80)
     
     # Print environment info
-    print(f"Node A IP: {os.getenv('NODE_A_IP', '10.6.131.9')}")
-    print(f"Node B IP: {os.getenv('NODE_B_IP', '10.6.131.10')}")
-    print(f"Redis Host: {os.getenv('REDIS_HOST', '10.6.131.10')}")
+    print(f"Node A IP: {os.getenv('NODE_A_IP', '10.6.131.12')}")
+    print(f"Node B IP: {os.getenv('NODE_B_IP', '10.6.131.12')}")
+    print(f"Redis Host: {os.getenv('REDIS_HOST', '10.6.131.12')}")
     print("=" * 80)
     
     # Configuration
@@ -129,15 +129,16 @@ def test_node_b():
     cache_config.enable_kv_sharing = True
     cache_config.enable_p2p_cpu = True
     cache_config.enable_p2p_ssd = True
-    cache_config.redis_host = "10.6.131.10"
+    cache_config.redis_host = "10.6.131.12"
     cache_config.redis_port = 6379
     cache_config.redis_password = "redis-serving-passwd"
-    cache_config.local_zmq_ip = "10.6.131.10"
-    cache_config.local_zmq_port = 5555
-    cache_config.local_ip = "10.6.131.10"
+    cache_config.local_zmq_ip = "10.6.131.12"
+    cache_config.local_zmq_port = 5458  # 修改为5458，避免与A节点的5456和5457冲突
+    cache_config.local_ip = "10.6.131.12"
     cache_config.num_cpu_blocks = 300
     cache_config.num_ssd_blocks = 1000
-    cache_config.ssd_cache_dir = "/data1/flexkv_ssd/"
+    #cache_config.num_local_blocks = cache_config.num_ssd_blocks
+    cache_config.ssd_cache_dir = "/workspace/FlexKV/flexkv_ssd2/"
     cache_config.lease_ttl_ms = 10000          # 10秒租约
     cache_config.refresh_batch_size = 256
     cache_config.renew_lease_ms = 4000         # 5秒续约（降低Redis负载）
@@ -155,11 +156,11 @@ def test_node_b():
     tokens_per_block = cache_config.tokens_per_block
     
     import uuid
-    gpu_register_port = f"ipc:///tmp/flexkv_gpu_{uuid.uuid4().hex[:8]}"
-    server_recv_port = f"ipc:///tmp/flexkv_srv_{uuid.uuid4().hex[:8]}"
+    #gpu_register_port = f"ipc:///tmp/flexkv_gpu_{uuid.uuid4().hex[:8]}"
+    server_recv_port = f"ipc:///tmp/flexkv_srv_{uuid.uuid4().hex[:8]}_2"
     
     # Initialize KVManager
-    kvmanager = KVManager(model_config, cache_config, gpu_register_port, server_recv_port)
+    kvmanager = KVManager(model_config, cache_config, server_recv_port=server_recv_port)
     kvmanager.start()
     
     # Start TP client
@@ -173,7 +174,7 @@ def test_node_b():
         
         tp_client_process = Process(
             target=run_tp_client,
-            args=(0, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks, child_conn),
+            args=(0, tp_rank, kvmanager.gpu_register_port, model_config, cache_config, num_gpu_blocks, child_conn),
             daemon=True
         )
         tp_client_processes.append(tp_client_process)
@@ -195,14 +196,16 @@ def test_node_b():
     gpu_kv_verifier = None
     if all_gpu_blocks and len(all_gpu_blocks) == model_config.tp_size:
         print(f"[Main Process] Creating GPUKVCacheVerifier with GPU blocks from {len(all_gpu_blocks)} TP clients")
-        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
+        gpu_layout_type = 0  # Default GPU layout type
+        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
         
         gpu_kv_verifier = GPUKVCacheVerifier(
             shared_gpu_blocks=all_gpu_blocks,
             gpu_kv_layout=gpu_kv_layout,
             tp_size=model_config.tp_size,
             tokens_per_block=cache_config.tokens_per_block,
-            dtype=model_config.dtype
+            dtype=model_config.dtype,
+            gpu_layout_type=gpu_layout_type
         )
         print("[Main Process] GPUKVCacheVerifier created successfully")
     

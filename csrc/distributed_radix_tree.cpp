@@ -15,7 +15,7 @@ namespace flexkv {
 DistributedRadixTree::DistributedRadixTree(int tokens_per_block, unsigned int max_num_blocks,
                   uint32_t nid,
                   size_t refresh_batch_size, uint32_t rebuild_interval_ms, uint32_t idle_sleep_ms,
-                  uint32_t lease_renew_ms)
+                  uint32_t lease_renew_ms, uint32_t hit_reward_seconds)
   : channel(nullptr), node_id(nid), tokens_per_block(tokens_per_block), max_num_blocks(max_num_blocks),
     lt_pool(max_num_blocks) {
   refresh_batch_size_ = refresh_batch_size;
@@ -25,6 +25,7 @@ DistributedRadixTree::DistributedRadixTree(int tokens_per_block, unsigned int ma
      << rebuild_interval_ms_ <<" is too small, we suggest to set it at least 1000ms." << std::endl;
   }
   lease_renew_ms_ = lease_renew_ms;
+  hit_reward_seconds_ = hit_reward_seconds;
   old_index.store(nullptr, std::memory_order_relaxed);
   c_index.store(nullptr, std::memory_order_relaxed);
 }
@@ -231,7 +232,7 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
   std::sort(nodes.begin(), nodes.end(), [](const NodeInfo &a, const NodeInfo &b){ return a.dst < b.dst; });
 
   // 4) iterate nodes and load their block metas
-  RefRadixTree* new_index = new RefRadixTree(tokens_per_block, max_num_blocks, lease_renew_ms_,
+  RefRadixTree* new_index = new RefRadixTree(tokens_per_block, max_num_blocks, lease_renew_ms_, hit_reward_seconds_,
      &renew_lease_queue, &lt_pool);
   
   for (const auto &nfo : nodes) {
@@ -348,12 +349,14 @@ void DistributedRadixTree::set_ready(CRadixNode *node, bool ready, int ready_len
 }
 
 RefRadixTree::RefRadixTree(int tokens_per_block, unsigned int max_num_blocks, uint32_t lease_renew_ms,
+  uint32_t hit_reward_seconds,
    LockFreeQueue<CRadixNode*> *renew_lease_queue, LeaseMetaMemPool* lt_pool)
-  : CRadixTreeIndex(tokens_per_block, max_num_blocks) {
+  : CRadixTreeIndex(tokens_per_block, max_num_blocks, hit_reward_seconds) {
   lease_renew_ms_ = lease_renew_ms;
   renew_lease_queue_ = renew_lease_queue;
   lt_pool_ = lt_pool;
   ref_cnt.store(1);
+  hit_reward_seconds_ = hit_reward_seconds;
 }
 
 RefRadixTree::~RefRadixTree() {
@@ -440,7 +443,7 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   while (prefix_blocks_num < num_blocks) {
     
     if (update_cache_info) {
-      current_node->update_time();
+      current_node->update_time(hit_reward_seconds);
     }
     
     // For non-root nodes, first verify blocks match, then check lease validity before copying
