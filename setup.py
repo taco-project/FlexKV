@@ -34,6 +34,7 @@ cpp_sources = [
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/fiemap_extent.cpp",
     "csrc/monitoring/metrics_manager.cpp",  # Monitoring support
 ]
 
@@ -42,6 +43,7 @@ hpp_sources = [
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
+    "csrc/fiemap_extent.h",
     "csrc/monitoring/metrics_manager.h",  # Monitoring support
 ]
 
