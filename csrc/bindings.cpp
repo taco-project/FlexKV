@@ -30,6 +30,7 @@
 #include "block_meta.h"
 #include "lock_free_q.h"
 #include "lease_meta_mempool.h"
+#include "fiemap_extent.h"
 #include <deque>
 
 namespace py = pybind11;
@@ -449,6 +450,10 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
         py::arg("hasher"), py::arg("token_ids"), py::arg("tokens_per_block"),
         py::arg("block_hashes"));
+  m.def("get_fm_extents", &flexkv::get_fm_extents,
+        "Get FIEMAP extents of a file",
+        py::arg("fd"), py::arg("max_extents") = 256,
+        py::call_guard<py::gil_scoped_release>());
 
   py::class_<flexkv::SSDIOCTX>(m, "SSDIOCTX")
       .def(py::init<std::map<int, std::vector<std::string>> &, int, int, int>());
@@ -751,4 +756,10 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("lt_pool") = nullptr)
       .def("dec_ref_cnt", &flexkv::RefRadixTree::dec_ref_cnt)
       .def("inc_ref_cnt", &flexkv::RefRadixTree::inc_ref_cnt);
+
+  py::class_<flexkv::FileExtent>(m, "FileExtent")
+      .def(py::init<>())
+      .def_readonly("logical", &flexkv::FileExtent::logical)
+      .def_readonly("physical", &flexkv::FileExtent::physical)
+      .def_readonly("length", &flexkv::FileExtent::length);
 }

@@ -36,6 +36,7 @@ cpp_sources = [
     "csrc/local_radix_tree.cpp",
     "csrc/redis_meta_channel.cpp",
     "csrc/lease_meta_mempool.cpp",
+    "csrc/fiemap_extent.cpp",
 ]
 
 hpp_sources = [
@@ -45,6 +46,7 @@ hpp_sources = [
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
     "csrc/gds/gds_manager.h",
+    "csrc/fiemap_extent.h",
 ]
 
 #extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
