@@ -416,11 +416,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         """
         if len(self.req_id_to_task_dict) == 0:
             return set(), set()
-        flexkv_logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
         task_ids = list(self.get_tasks.keys()) + list(self.put_tasks.keys())
         responses_from_manager = self.flexkv_manager.try_wait(task_ids)
         task_finished_time = time.perf_counter()
-        # responses_to_return: list[FlexKVResponse] = []
         finished_sending = set()
         finished_recving = set()
         num_failed_tasks = 0
@@ -439,8 +437,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             else:
                 flexkv_logger.error(f"{task} failed, status: {response.status}.")
                 num_failed_tasks += 1
-            # responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
-            #                                             request=task.request, success=success))
+        flexkv_logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
         self.flexkv_stats.record_faild(num_failed_requests=num_failed_tasks)
         return finished_sending, finished_recving
 
