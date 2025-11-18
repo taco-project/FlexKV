@@ -16,27 +16,6 @@ BATCH_SIZE=4
 TP_SIZE=8
 EP_SIZE=$TP_SIZE
 
-cat <<EOF > ./flexkv_config.json
-{
-    "enable_flexkv": true,
-    "server_recv_port": "ipc:///tmp/flexkv_test",
-    "cache_config": {
-        "enable_cpu": true,
-        "enable_ssd": true,
-        "enable_remote": false,
-        "use_gds": false,
-        "enable_trace": false,
-        "ssd_cache_iouring_entries": 512,
-        "num_cpu_blocks": 233000,
-        "num_ssd_blocks": 4096000,
-        "ssd_cache_dir": "/data/flexkv_ssd/",
-        "evict_ratio": 0.05,
-        "index_accel": true
-    },
-    "num_log_interval_requests": 1000
-}
-EOF
-
 export FLEXKV_CONFIG_PATH="./flexkv_config.json"
 export MODEL_PATH=$MODEL_PATH
 # export CUDA_LAUNCH_BLOCKING=1
