@@ -519,9 +519,10 @@ class FlexKVWorkerConnector:
     ):
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
         self.flexkv_config = flexkv_config
-        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, \
+        self.gpu_register_port = flexkv_config.server_recv_port + "_gpu_register"
+        logger.info(f"Start init FlexKVWorkerConnector to {self.gpu_register_port}, \
             dp_client_id: {dp_client_id}")
-        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_client_id, current_device_id)
+        self.tp_client = KVTPClient(self.gpu_register_port, dp_client_id, current_device_id)
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):

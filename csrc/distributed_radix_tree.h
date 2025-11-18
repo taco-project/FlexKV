@@ -42,6 +42,10 @@ public:
   void set_ready(CRadixNode *node, bool ready = true, int ready_length = -1) override;
   std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,
     int num_blocks, bool update_cache_info = true) override;
+  // Remove node from node_list without deleting it (for manual memory management)
+  void detach_node_from_list(CRadixNode *node) {
+    node_list.remove(node);
+  }
 private:
 
   // Override base methods with custom behavior

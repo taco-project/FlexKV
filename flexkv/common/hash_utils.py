@@ -32,6 +32,14 @@ def hash_array(array: np.ndarray) -> HashType:
     _HASHER.update(array)
     return HashType(_HASHER.digest())
 
+def hash_array_with_prefix(array: np.ndarray, prefix: int) -> HashType:
+    """Hash array with a prefix value (e.g., device type) to avoid collisions."""
+    _HASHER.reset()
+    # Add prefix as a single-element array to the hash
+    _HASHER.update(np.array([prefix], dtype=np.int64))
+    _HASHER.update(array)
+    return HashType(_HASHER.digest())
+
 def gen_hashes(token_ids: np.ndarray, tokens_per_block: int, hasher: Optional[Hasher] = None) -> np.ndarray:
     block_hashes = np.zeros(token_ids.size // tokens_per_block, dtype=np.uint64)
     if hasher is None:
