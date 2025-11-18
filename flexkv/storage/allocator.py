@@ -164,7 +164,7 @@ class SSDAllocator(BaseStorageAllocator):
         
 
         fsys_max_blocks_per_file = cls.get_file_size_limit(cache_dir[0]) // block_size
-        num_blocks_per_file = min(fsys_max_blocks_per_file, cfg_max_blocks_per_file)
+        num_blocks_per_file = min(fsys_max_blocks_per_file, cfg_max_blocks_per_file, total_blocks_per_device)
 
         num_files_per_device = (total_blocks_per_device + num_blocks_per_file - 1) // num_blocks_per_file
         real_file_size = num_blocks_per_file * block_size
