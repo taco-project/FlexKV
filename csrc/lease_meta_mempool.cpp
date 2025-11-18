@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <iostream>
 
 namespace flexkv {
 
@@ -78,7 +79,9 @@ void LeaseMetaMemPool::free(LeaseMeta *ptr) {
     std::lock_guard<std::mutex> lk(allocated_mu);
     auto it = allocated_set.find(ptr);
     if (it == allocated_set.end()) {
-      // not allocated from this pool or already freed: ignore safely (idempotent)
+      // not allocated from this pool or already freed: double free attempt!
+      std::cerr << "[DOUBLE_FREE] Pool @" << (void*)this << " trying to free LeaseMeta @" << (void*)ptr 
+                << " - NOT in allocated_set! (already freed or from different pool)" << std::endl;
       return;
     }
     allocated_set.erase(it);

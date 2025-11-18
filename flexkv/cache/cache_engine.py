@@ -796,7 +796,7 @@ class GlobalCacheEngine:
                                                                     match_result=cpu_matched_result)
                     op_node_to_ready[op_disk2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
                 else:
-                    cpu_blocks_to_free.extend(fragment2_cpu_blocks)
+                    cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment2_cpu_blocks])
         if self.cache_config.enable_kv_sharing and cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
             fragment1_cpu_blocks = fragment1_cpu_blocks_local
 
@@ -1087,18 +1087,19 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
         # assert self.ssd_cache_engine is not None
 
-        if  self.index_accel:
-            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta)
+        if self.index_accel:
+            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta, is_put=True)
         else:
-            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
+            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, is_put=True)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         
-        # DEBUG: Log PUT operation with hash info
-        #if len(sequence_meta.block_hashes) > 0:
-        #    print(f"[PUT {request_id}] hash[0]={sequence_meta.block_hashes[0]}, CPU_match={cpu_matched_result.num_matched_blocks}, SSD_match={ssd_matched_result.num_matched_blocks}")
+        if len(cpu_matched_blocks) > len(ssd_matched_blocks):
+            print(f"[PUT_LOCAL] CPU matched blocks are greater than SSD matched blocks, skipping")
+            return self._empty_put_return(request_id)
+        
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
@@ -1244,7 +1245,7 @@ class GlobalCacheEngine:
             self.remote_cache_engine.set_ready(node_to_ready, True, ready_length)
 
     @nvtx.annotate("Match Prefix Accel", color="yellow")
-    def match_local_accel(self, sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel]:
+    def match_local_accel(self, sequence_meta: SequenceMeta, is_put: bool = False) -> Tuple[MatchResultAccel, MatchResultAccel]:
         #from flexkv.common.debug import flexkv_logger
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
@@ -1252,21 +1253,26 @@ class GlobalCacheEngine:
             if not self.cache_config.enable_p2p_cpu:
                 cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
             else:
-                # FIXED: 应该调用 match_all() 以查询远程索引，而不是 match_local()
                 #flexkv_logger.info(f"[MATCH DEBUG] CPU P2P enabled, calling match_all() instead of match_local()")
-                cpu_matched_result = self.cpu_cache_engine.match_all(sequence_meta)
+                if is_put:
+                    cpu_matched_result = self.cpu_cache_engine.match_local(sequence_meta)
+                else:
+                    cpu_matched_result = self.cpu_cache_engine.match_all(sequence_meta)
         #TODO: we assume that ssd and gds are not enabled at the same time
         if self.ssd_cache_engine:
             if not self.cache_config.enable_p2p_ssd:
                 ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
             else:
-                # FIXED: 应该调用 match_all() 以查询远程索引，而不是 match_local()
                 #flexkv_logger.info(f"[MATCH DEBUG] SSD P2P enabled, calling match_all() instead of match_local()")
-                ssd_matched_result = self.ssd_cache_engine.match_all(sequence_meta)
+                if is_put:
+                    ssd_matched_result = self.ssd_cache_engine.match_local(sequence_meta)
+                else:
+                    ssd_matched_result = self.ssd_cache_engine.match_all(sequence_meta)
+
         return cpu_matched_result, ssd_matched_result
 
     @nvtx.annotate("Match Prefix", color="yellow")
-    def match_local(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult]:
+    def match_local(self, sequence_meta: SequenceMeta, is_put: bool = False) -> Tuple[MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
         if self.cpu_cache_engine:

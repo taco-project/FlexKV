@@ -1,0 +1,11 @@
+enable_p2p_cpu: true
+enable_p2p_ssd: true
+cpu_cache_gb: 32
+ssd_cache_gb: 100
+local_zmq_ip: "10.6.131.12"
+local_zmq_port: 5454
+redis_host: "10.6.131.12"
+redis_port: 6379
+local_ip: "10.6.131.12"
+redis_password: "redis-serving-passwd"
+ssd_cache_dir: /workspace/FlexKV/flexkv_ssd1/
