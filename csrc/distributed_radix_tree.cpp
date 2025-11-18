@@ -93,10 +93,14 @@ void DistributedRadixTree::refresh_worker() {
   const uint32_t rebuild_interval_ms = rebuild_interval_ms_;
   struct timeval tv_start; gettimeofday(&tv_start, nullptr);
   uint64_t last_rebuild_ms = (uint64_t)tv_start.tv_sec * 1000 + (uint64_t)(tv_start.tv_usec / 1000);
+  //uint64_t last_print_ms = last_rebuild_ms;  // used to track the last time we printed the node count
+  //const uint64_t print_interval_ms = 10000;  // print the node count every 5 seconds
+  
   while (!refresh_should_stop) {
     std::vector<CRadixNode*> batch;
     batch.reserve(batch_size);
     CRadixNode* node = nullptr;
+    //collect nodes that need to be refreshed
     while (batch.size() < batch_size && renew_lease_queue.pop(node)) {
       if (node != nullptr) batch.push_back(node);
     }
@@ -113,6 +117,7 @@ void DistributedRadixTree::refresh_worker() {
     
     if (time_since_last >= rebuild_interval_ms) {
       RefRadixTree* new_idx = remote_tree_refresh();
+      //new match request may come in during the deletion of original tree, so we need 3-tier index
       if (new_idx != nullptr) {
         RefRadixTree* old_idx = c_index.exchange(new_idx, std::memory_order_acq_rel);
         RefRadixTree* old_idx2 = old_index.exchange(old_idx, std::memory_order_acq_rel);
@@ -124,6 +129,26 @@ void DistributedRadixTree::refresh_worker() {
       last_rebuild_ms = now_ms;
     }
 
+    // print the node count every 5 seconds
+    /*if (now_ms - last_print_ms >= print_interval_ms) {
+      try {
+        RefRadixTree* current_idx = c_index.load(std::memory_order_acquire);
+        if (current_idx != nullptr) {
+          // 使用 RAII 方式管理引用计数，确保异常安全
+          RefCntGuard guard{current_idx};
+          int node_count = current_idx->total_node_num();
+          std::cout << "[DistributedRadixTree] Node count: " << node_count << std::endl;
+        } else {
+          std::cout << "[DistributedRadixTree] Node count: <not initialized>" << std::endl;
+        }
+      } catch (const std::exception& e) {
+        std::cerr << "[DistributedRadixTree] Error in print: " << e.what() << std::endl;
+      } catch (...) {
+        std::cerr << "[DistributedRadixTree] Unknown error in print" << std::endl;
+      }
+      last_print_ms = now_ms;
+    }*/
+
     // Sleep if no work
     if (batch.empty()) {
       usleep(1000 * idle_sleep_ms_);
@@ -132,6 +157,7 @@ void DistributedRadixTree::refresh_worker() {
 }
 
 void DistributedRadixTree::refresh_nodes_lease_from_redis(const std::vector<CRadixNode*> &batch) {
+  //build keys from batched node that need to be refreshed for lease time
   std::vector<std::string> keys;
   for (CRadixNode* n : batch) {
     auto &hashes = n->get_block_hashes();
@@ -145,7 +171,7 @@ void DistributedRadixTree::refresh_nodes_lease_from_redis(const std::vector<CRad
 
   std::vector<std::pair<std::string, std::string>> lt_state;
   channel->hmget_two_fields_for_keys(keys, "lt", "state", lt_state);
-
+  //update lease time for batched node
   size_t idx = 0;
   for (CRadixNode* n : batch) {
     auto *lm = n->get_lease_meta();
@@ -264,7 +290,7 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
       }
       std::unordered_set<int64_t> processed_hashes;
       std::vector<CRadixNode*> temp_root_children;
-      for (const auto& root_child_ptr : parent_to_children[0]) {
+      for (const auto& root_child_ptr : parent_to_children[0]) {// processing from the root child
         if (processed_hashes.find(root_child_ptr->hash) != processed_hashes.end()) continue;
         // Note: pass nullptr as parent for root children - they will be attached to tree root later
         CRadixNode* temp_root_child = dfs_build_subtree_from_meta(root_child_ptr, new_index, nullptr,
@@ -699,22 +725,6 @@ CRadixNode* dfs_build_subtree_from_meta(const BlockMeta* current_meta,
   return child_node;
 }
 
-// Helper function to recursively register all nodes in a subtree
-static void register_subtree_nodes(CRadixTreeIndex* tree, CRadixNode* node) {
-  if (!tree || !node) return;
-  
-  // Add this node to the tree's node_list
-  tree->add_node(node);
-  if (node->is_leaf()) {
-    tree->add_leaf(node);
-  }
-  
-  // Recursively register all children
-  node->for_each_child([&](HashType hash, CRadixNode* child) {
-    register_subtree_nodes(tree, child);
-  });
-}
-
 void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_child, 
   CRadixNode* current_root, LeaseMetaMemPool& lt_pool) {
   if (!temp_tree || !root_child || !current_root) return;
@@ -737,9 +747,11 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
       // Attach root_child directly under current_root
       current_root->set_child(head_hash, root_child);
       root_child->set_parent(current_root);
-      // Register all nodes in the subtree to the tree's node_list
-      // This recursively adds root_child and all its descendants
-      register_subtree_nodes(temp_tree, root_child);
+      // Only add root_child itself to node_list (descendants were already added in dfs_build)
+      temp_tree->add_node(root_child);
+      if (root_child->is_leaf()) {
+        temp_tree->add_leaf(root_child);
+      }
       return;  // Don't delete root_child - it's now part of the tree
     } else {
       // Child with same head hash already exists, merge into it
@@ -784,6 +796,22 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
           current_root->set_child(root_child->get_head_hash(), root_child);
           if (matched_root_child != nullptr &&
               matched_root_child != root_child) {
+            // Detach from index's node_list (added by split())
+            auto idx = matched_root_child->get_index();
+            if (idx != nullptr) {
+              RefRadixTree* ref_idx = dynamic_cast<RefRadixTree*>(idx);
+              if (ref_idx != nullptr) {
+                ref_idx->detach_node_from_list(matched_root_child);
+              }
+            }
+            // Free LeaseMeta before deleting node to prevent memory leak
+            auto lm = matched_root_child->get_lease_meta();
+            if (lm != nullptr) {
+              lt_pool.free(lm);
+              matched_root_child->set_lease_meta(nullptr);
+            }
+            // Set parent to nullptr before deletion (required by destructor assertion)
+            matched_root_child->set_parent(nullptr);
             delete matched_root_child;
           }
           return;
@@ -818,7 +846,21 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
   // The children have been re-parented to current_root or recursively merged
   matched_root_child->clear_children();
   
-  // matched_root_child node data has been merged or its children re-attached; clear its
+  // Detach from index's node_list if present (it might have been added by split())
+  auto idx = matched_root_child->get_index();
+  if (idx != nullptr) {
+    RefRadixTree* ref_idx = dynamic_cast<RefRadixTree*>(idx);
+    if (ref_idx != nullptr) {
+      ref_idx->detach_node_from_list(matched_root_child);
+    }
+  }
+  
+  // Free LeaseMeta before deleting node to prevent memory leak and double-free
+  auto lm = matched_root_child->get_lease_meta();
+  if (lm != nullptr) {
+    lt_pool.free(lm);
+    matched_root_child->set_lease_meta(nullptr);
+  }
   // Must set parent to nullptr before deletion (required by destructor assertion)
   matched_root_child->set_parent(nullptr);
   delete matched_root_child;

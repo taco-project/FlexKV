@@ -137,7 +137,7 @@ class HierarchyLRCacheEngine:
             MatchResultAccel: The match result
         """
         return self.match_all(sequence_meta)
-
+    #match all will be called for get
     def match_all(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
         sequence_meta.gen_hashes()
         block_hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
@@ -169,6 +169,7 @@ class HierarchyLRCacheEngine:
                     bnids_np = self.nodeids_to_file_nodeids(nids.cpu().numpy(), nps.cpu().numpy())
                     if bnids_np is None:
                         chosen = mr_local
+                        matched_pos = "local"  # Update matched_pos after fallback
                 else:
                     # For P2P mode, use node_ids directly
                     bnids_np = nids.cpu().numpy().astype(np.uint32)
@@ -178,7 +179,9 @@ class HierarchyLRCacheEngine:
                 if mr_remote.num_matched_blocks > 0:
                     #print(f"[REMOTE_MATCH {self.device_type.name}] Warning: remote matched but block_node_ids is empty, falling back to local")
                     chosen = mr_local
+                    matched_pos = "local"  # Update matched_pos after fallback
         phys_np = chosen.physical_blocks.cpu().numpy()
+        #maybe we should always not insert
         if self.device_type == DeviceType.CPU and matched_pos == "remote" and mr_local.num_matched_blocks > 0:
             insert_to_local_cpu_index = False
         else:
@@ -239,7 +242,7 @@ class HierarchyLRCacheEngine:
             f_idx = (block_id // rr) % remote_file_num
             out[i] = np.uint32(file_list[f_idx])
         return out
-
+    #match local will only be called for put
     def match_local(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
         sequence_meta.gen_hashes()
         block_hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
@@ -493,7 +496,7 @@ class HierarchyLRCacheEngine:
                 #local_max_num_blocks = int(cache_config.num_local_blocks or 0)
             
             return cls(
-                num_total_blocks=int(cache_config.num_remote_blocks or 0),
+                num_total_blocks=int(local_max_num_blocks or 0),
                 tokens_per_block=int(cache_config.tokens_per_block),
                 evict_ratio=float(GLOBAL_CONFIG_FROM_ENV.evict_ratio),
                 device_type=device_type,

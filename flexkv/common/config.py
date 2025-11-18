@@ -123,6 +123,18 @@ class UserConfig:
     ssd_cache_gb: int = 0  # 0 means disable ssd
     ssd_cache_dir: Union[str, List[str]] = "./ssd_cache"
     enable_gds: bool = False
+    enable_p2p_cpu: bool = False
+    enable_p2p_ssd: bool = False
+    enable_3rd_remote: bool = False
+    
+    # distributed zmq configs
+    local_zmq_ip: Optional[str] = None
+    local_zmq_port: Optional[int] = None
+    # Redis configs (for KV sharing / metadata)
+    redis_host: Optional[str] = None
+    redis_port: Optional[int] = None
+    local_ip: Optional[str] = None
+    redis_password: Optional[str] = None
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
@@ -191,12 +203,35 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds
+    cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
+    cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
+    cache_config.enable_3rd_remote = user_config.enable_3rd_remote
+    
+    # Update derived flags after setting p2p and remote configs
+    cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or 
+                                      cache_config.enable_p2p_ssd or 
+                                      cache_config.enable_3rd_remote)
+    cache_config.enable_remote = cache_config.enable_3rd_remote
 
     if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
         cache_config.num_ssd_blocks = \
             (cache_config.num_ssd_blocks // len(cache_config.ssd_cache_dir) + 1) * len(cache_config.ssd_cache_dir)
         flexkv_logger.warning(f"num_ssd_blocks is not a multiple of num_ssd_devices, "
                               f"adjust num_ssd_blocks to {cache_config.num_ssd_blocks}")
+
+    # Update distributed zmq and Redis configs if provided in user_config
+    if user_config.local_zmq_ip is not None:
+        cache_config.local_zmq_ip = user_config.local_zmq_ip
+    if user_config.local_zmq_port is not None:
+        cache_config.local_zmq_port = user_config.local_zmq_port
+    if user_config.redis_host is not None:
+        cache_config.redis_host = user_config.redis_host
+    if user_config.redis_port is not None:
+        cache_config.redis_port = user_config.redis_port
+    if user_config.local_ip is not None:
+        cache_config.local_ip = user_config.local_ip
+    if user_config.redis_password is not None:
+        cache_config.redis_password = user_config.redis_password
 
     global_config_attrs = set(vars(GLOBAL_CONFIG_FROM_ENV).keys())
     for attr_name in dir(user_config):
