@@ -211,14 +211,14 @@ class KVDPClient:
 class KVTPClient:
     def __init__(
         self,
-        server_recv_port: str,
+        gpu_register_port: str,
         dp_client_id: int,
         device_id: int,
     ):
         # Init inter-process communication
         context = zmq.Context(2)
         self.send_to_server = get_zmq_socket(
-            context, zmq.SocketType.PUSH, server_recv_port, False
+            context, zmq.SocketType.PUSH, gpu_register_port, False
         )
 
         self.dp_client_id = dp_client_id
