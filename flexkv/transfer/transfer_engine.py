@@ -44,8 +44,45 @@ from flexkv.common.ring_buffer import SharedOpPool
 
 
 def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
-    op.src_slot_id = pin_buffer.allocate_slot(op.src_block_ids)
-    op.dst_slot_id = pin_buffer.allocate_slot(op.dst_block_ids)
+    """
+    Register transfer operation to buffer with device type prefixes.
+    
+    Device type prefixes prevent hash collisions when different device types
+    use the same block ID values (e.g., CPU block 0 vs SSD block 0).
+    """
+    # Map TransferType to (src_device_type, dst_device_type) for hash prefix
+    # This prevents hash collisions when different devices use the same block IDs
+    transfer_type_to_devices = {
+        TransferType.D2H: (1, 2),      # GPU -> CPU
+        TransferType.H2D: (2, 1),      # CPU -> GPU
+        TransferType.H2DISK: (2, 3),   # CPU -> SSD
+        TransferType.DISK2H: (3, 2),   # SSD -> CPU
+        TransferType.DISK2D: (3, 1),   # SSD -> GPU
+        TransferType.D2DISK: (1, 3),   # GPU -> SSD
+        TransferType.H2REMOTE: (2, 4), # CPU -> REMOTE
+        TransferType.REMOTE2H: (4, 2), # REMOTE -> CPU
+        TransferType.PEERH2H: (5, 2),  # PEER_CPU -> CPU
+        TransferType.H2PEERH: (2, 5),  # CPU -> PEER_CPU
+        TransferType.PEERSSD2H: (6, 2),# PEER_SSD -> CPU
+        TransferType.H2PEERSSD: (2, 6),# CPU -> PEER_SSD
+        TransferType.GDS2D: (7, 1),    # GDS -> GPU
+        TransferType.D2GDS: (1, 7),    # GPU -> GDS
+    }
+    
+    src_device, dst_device = transfer_type_to_devices.get(op.transfer_type, (0, 0))
+    
+    op.src_slot_id = pin_buffer.allocate_slot(op.src_block_ids, device_type_prefix=src_device)
+    op.dst_slot_id = pin_buffer.allocate_slot(op.dst_block_ids, device_type_prefix=dst_device)
+    
+    # Debug for H2DISK operations
+    if op.transfer_type == TransferType.H2DISK:
+        flexkv_logger.info(f"[REG_H2DISK] op_id={op.op_id}, graph_id={op.graph_id}, "
+                          f"src_len={len(op.src_block_ids)}, dst_len={len(op.dst_block_ids)}, "
+                          f"src_slot={op.src_slot_id}, dst_slot={op.dst_slot_id}, "
+                          f"src_prefix={src_device}, dst_prefix={dst_device}, "
+                          f"valid_blocks={op.valid_block_num}, "
+                          f"src_sample={op.src_block_ids[:min(3, len(op.src_block_ids))] if len(op.src_block_ids) > 0 else 'EMPTY'}, "
+                          f"dst_sample={op.dst_block_ids[:min(3, len(op.dst_block_ids))] if len(op.dst_block_ids) > 0 else 'EMPTY'}")
 
 def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
     if op.src_slot_id != -1:
@@ -326,7 +363,7 @@ class TransferEngine:
                         self.completed_queue.put((op.graph_id, op.op_id))
                     else:
                         self.op_id_to_op[op.op_id] = op
-                        # copy block ids into buffer and update slot id info
+                        # Register op to buffer with device-specific hash prefixes
                         register_op_to_buffer(op, self.pin_buffer)
                         self._assign_op_to_worker(op)
                 # Handle completed graphs
