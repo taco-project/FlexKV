@@ -13,13 +13,13 @@ bash build.sh
 cd TENSORRT_LLM_DIR
 git apply examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
 ```
+注：TensorRT-LLM 的编译方式可以参考[这里](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html#build-from-source-linux)
+
 ### 1.2. 方法二
 您也可以安装我们预先编译好的包：
 ```bash
 pip install https://flexkv-1252113659.cos.ap-shanghai.myqcloud.com/TensorRT-LLM/tensorrt_llm-1.1.0rc2-cp312-cp312-linux_x86_64.whl
 ```
-注：TensorRT-LLM 的编译方式可以参考[这里](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html#build-from-source-linux)
-
 # 2. 运行
 ## 2.1 相关文件介绍
 `examples/trtllm_adaption` 目录中有我们提供的启动脚本的示例，其中的文件包括：
