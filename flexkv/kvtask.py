@@ -108,9 +108,8 @@ class KVTaskManager:
         model_config_for_transfer = copy.deepcopy(self.model_config)
         if self.is_multinode_tp and not self.model_config.use_mla:
             model_config_for_transfer.num_kv_heads = self.tp_size_per_node
-        self.use_flexkv_with_trtllm = os.getenv("TENSORRT_LLM_USE_FLEXKV", "0") == "1"
         
-        if not self.use_flexkv_with_trtllm:
+        if os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1":
             self.transfer_handles = [TransferManagerHandle(
                 model_config_for_transfer,
                 self.cache_config,
@@ -118,6 +117,9 @@ class KVTaskManager:
                 gpu_register_port=gpu_register_port
             )]
         else:
+            # When using FlexKV with TensorRT-LLM, we use remote mode to transfer data
+            #  to avoid the way we launch subprocess in FlexKV
+            #  conflict with TensorRT-LLM's MPI initialization
             self.remote_process = TransferManagerOnRemote.create_process()
             master_host, master_ports = get_master_host_and_ports_from_env()
             self.transfer_handles = [

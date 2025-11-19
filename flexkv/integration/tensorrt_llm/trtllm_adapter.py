@@ -78,6 +78,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.flexkv_stats = FlexKVStats(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200))
 
         flexkv_logger.info("Finish init FlexKVSchedulerConnector")
+        
+        # Set environment variable for FlexKV with TensorRT-LLM
+        os.environ['FLEXKV_WITH_TRTLLM'] = '1'
 
     def is_ready(
         self,
