@@ -124,7 +124,7 @@ class KVTaskManager:
                 master_host=master_host,
                 master_ports=master_ports
             ))
-            self.transfer_handles[0]._handle.send_config_to_remotes()
+            self.transfer_handles[-1]._handle.send_config_to_remotes()
 
         self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
         self.graph_to_task: Dict[int, int] = {}
