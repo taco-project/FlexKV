@@ -1,20 +1,35 @@
 import os
 import time
 
-
-import engine
-from engine import TransferEngine
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import MooncakeTransferEngineConfig
 from flexkv.transfer.utils import RDMATaskInfo
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus
 from typing import List
 
+# Lazy import: engine module is only imported when MoonCakeTransferEngineWrapper is actually instantiated
+# This allows FlexKV to work without mooncake engine installed if distributed shared memory is not needed
+try:
+    import engine
+    from engine import TransferEngine
+    MOONCAKE_AVAILABLE = True
+except ImportError:
+    MOONCAKE_AVAILABLE = False
+    engine = None
+    TransferEngine = None
+
 
 class MoonCakeTransferEngineWrapper:
     def __init__(
         self, config: MooncakeTransferEngineConfig
     ):
+        if not MOONCAKE_AVAILABLE:
+            raise ImportError(
+                "Mooncake engine module is not available. "
+                "Please install mooncake transfer library to use distributed shared memory features. "
+                "If you don't need distributed shared memory, make sure enable_kv_sharing is set to False."
+            )
+        
         if config is None:
             mooncake_config_path = os.environ["MOONCAKE_CONFIG_PATH"]
             self.config = MooncakeTransferEngineConfig.from_file(mooncake_config_path)
@@ -78,12 +93,16 @@ class MoonCakeTransferEngineWrapper:
         return ret if ret == 0 else -1
     
     def transfer_sync_write_with_notify(self, peer_engine_addr: str, src_ptr: int, dst_ptr: int, data_size: int, notify_name: str, msg : NotifyMsg):
+        if not MOONCAKE_AVAILABLE:
+            raise RuntimeError("Mooncake engine is not available")
         notify = engine.TransferNotify(notify_name, msg.to_string())
         ret = self.engine.transfer_sync(
             peer_engine_addr, src_ptr, dst_ptr, data_size, engine.TransferOpcode.Write, notify)
         return ret if ret == 0 else -1
     
     def transfer_failure_notify(self, peer_engine_addr: str, src_ptr: int, dst_ptr: int, notify_name: str, notify_msg: NotifyMsg):
+        if not MOONCAKE_AVAILABLE:
+            raise RuntimeError("Mooncake engine is not available")
         notify = engine.TransferNotify(notify_name, notify_msg.to_string())
         ret = self.engine.transfer_sync(
            peer_engine_addr, src_ptr, dst_ptr, 0, engine.TransferOpcode.Write, notify)
