@@ -132,8 +132,8 @@ class TransferManager:
         self.transfer_engine.shutdown()
 
 def get_master_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
-    master_host = os.getenv("MASTER_HOST", "localhost")
-    master_ports = os.getenv("MASTER_PORTS", "5556,5557,5558")
+    master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
+    master_ports = os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558")
     master_ports = tuple(master_ports.split(","))
     return "tcp://" + master_host, master_ports
 
