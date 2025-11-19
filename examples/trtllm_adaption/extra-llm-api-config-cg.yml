@@ -12,10 +12,10 @@ kv_cache_config:
   enable_partial_reuse: false
   free_gpu_memory_fraction: 0.75
 kv_connector_config:
-  connector_module: "flexkv.integration.tensorrt_llm.trt_adapter"
+  connector_module: "flexkv.integration.tensorrt_llm.trtllm_adapter"
   connector_scheduler_class: "FlexKVSchedulerConnector"
   connector_worker_class: "FlexKVWorkerConnector"
 # disable_overlap_scheduler: true
-speculative_config:
-    decoding_type: MTP
-    num_nextn_predict_layers: 3
+# speculative_config:
+#     decoding_type: MTP
+#     num_nextn_predict_layers: 3
