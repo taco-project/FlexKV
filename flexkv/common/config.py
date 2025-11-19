@@ -67,7 +67,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_sms_d2h=int(os.getenv('FLEXKV_TRANSFER_SMS_D2H', 8)),
 
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
-    iouring_flags=int(os.getenv('FLEXKV_IORING_FLAGS', 0)),
+    iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),
 
     max_file_size_gb=float(os.getenv('FLEXKV_MAX_FILE_SIZE_GB', -1)),  # -1 means no limit
 
