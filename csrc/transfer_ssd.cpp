@@ -55,14 +55,14 @@ static void _transfer_iouring_impl(
     ssd_block_id /= num_files_per_device; // block id in single file
 
     if (enable_block_first_transfer) {
-      int layers_chunk_size_in_bytes =
+      int64_t layers_chunk_size_in_bytes =
           cpu_layer_stride_in_bytes * (end_layer - start_layer);
-      int cpu_layers_chunk_offset = start_layer * cpu_layer_stride_in_bytes;
-      int ssd_layers_chunk_offset = start_layer * ssd_layer_stride_in_bytes;
+      int64_t cpu_layers_chunk_offset = start_layer * cpu_layer_stride_in_bytes;
+      int64_t ssd_layers_chunk_offset = start_layer * ssd_layer_stride_in_bytes;
       void *cpu_block_ptr = reinterpret_cast<char *>(cpu_tensor_ptr) +
                             block_stride_in_bytes * cpu_block_id +
                             cpu_layers_chunk_offset;
-      int ssd_block_offset =
+      int64_t ssd_block_offset =
           ssd_block_id * block_stride_in_bytes + ssd_layers_chunk_offset;
 
       ssize_t bytes_transfer = 0;
