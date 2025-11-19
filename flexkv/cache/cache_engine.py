@@ -20,6 +20,7 @@ from queue import Queue
 from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field
 
+import os
 import numpy as np
 import nvtx
 import torch
@@ -70,6 +71,7 @@ class CacheEngineAccel:
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
+        self.use_with_trtllm = os.getenv("TENSORRT_LLM_USE_FLEXKV", "0") == "1"
 
     def reset(self) -> None:
         self.index.reset()
@@ -320,7 +322,11 @@ class GlobalCacheEngine:
                                       f"layer_num: {layer_num}, layer_granularity: {layer_granularity}")
 
         # ignore the last incomplete block
-        aligned_length = ((token_ids.shape[0] - 1) // self.tokens_per_block) * self.tokens_per_block
+        if not self.use_with_trtllm:
+            aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
+        else:
+            aligned_length = ((token_ids.shape[0] - 1) // self.tokens_per_block) * self.tokens_per_block
+
         aligned_token_ids = token_ids[:aligned_length]
         token_mask = token_mask[:aligned_length]
 
