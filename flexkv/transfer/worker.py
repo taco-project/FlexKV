@@ -185,12 +185,14 @@ class TransferWorkerBase(ABC):
         src_slot_id = transfer_op.src_slot_id
         dst_slot_id = transfer_op.dst_slot_id
         valid_block_num = transfer_op.valid_block_num
+        
         if src_slot_id == -1:
             src_block_ids = torch.from_numpy(transfer_op.src_block_ids).to(dtype=torch.int64)
             if pinned:
                 src_block_ids = src_block_ids.pin_memory()
         else:
             src_block_ids = self.op_buffer_tensor[src_slot_id, :valid_block_num]
+            
         if dst_slot_id == -1:
             dst_block_ids = torch.from_numpy(transfer_op.dst_block_ids).to(dtype=torch.int64)
             if pinned:
@@ -687,8 +689,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             src_block_ids,
             dst_block_ids,
             transfer_op.transfer_type,
-            transfer_op.layer_id,
-            transfer_op.layer_granularity,
+            layer_id,           # Use corrected value, not transfer_op.layer_id
+            layer_granularity,  # Use corrected value, not transfer_op.layer_granularity
         )
         end_time = time.time()
 
@@ -914,8 +916,8 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             src_block_ids,
             dst_block_ids,
             transfer_op.transfer_type,
-            transfer_op.layer_id,
-            transfer_op.layer_granularity,
+            layer_id,           # Use corrected value, not transfer_op.layer_id
+            layer_granularity,  # Use corrected value, not transfer_op.layer_granularity
             src_block_node_ids=transfer_op.src_block_node_ids,
         )
         end_time = time.time()
