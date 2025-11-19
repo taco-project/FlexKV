@@ -26,26 +26,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker,
     SchedulerOutput)
 
-""" Developped based on the following commit:
-
----------- FlexKV ----------
-Author: peaceforeverCN <leolingli@tencent.com>
-Date:   Wed Sep 17 19:18:58 2025 +0800
-
-    Merge pull request #19 from linhu-nv/mla-transfer-opt
-    
-    [feature] Mla d2h transfer optimization
-
----------- TensorRT-LLM ----------
-Author: mpikulski <206748156+ixlmar@users.noreply.github.com>
-Date:   Wed Oct 15 11:53:57 2025 +0200
-
-    [TRTLLM-8551][feat] add cache_salt in LLM.generate and refactor test_return_logits.py (#8317)
-    
-    Signed-off-by: ixlmar <206748156+ixlmar@users.noreply.github.com>
-
-"""
-
 class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
     def __init__(self, config: ExecutorConfig):
         tp_size, dp_size, dp_rank = get_dp_tp_info(config)
