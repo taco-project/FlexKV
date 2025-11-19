@@ -65,8 +65,6 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
         TransferType.H2PEERH: (2, 5),  # CPU -> PEER_CPU
         TransferType.PEERSSD2H: (6, 2),# PEER_SSD -> CPU
         TransferType.H2PEERSSD: (2, 6),# CPU -> PEER_SSD
-        TransferType.GDS2D: (7, 1),    # GDS -> GPU
-        TransferType.D2GDS: (1, 7),    # GPU -> GDS
     }
     
     src_device, dst_device = transfer_type_to_devices.get(op.transfer_type, (0, 0))
