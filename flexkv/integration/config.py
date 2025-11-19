@@ -146,9 +146,8 @@ class FlexKVConfig:
         self.model_config.dp_size = dp_size
         self.model_config.dp_rank = dp_rank
         
-        model_path = os.getenv('MODEL_PATH', None)
-        
         try:
+            model_path = getattr(config, 'hf_model_dir', None)
             hf_config = HFAutoConfig.from_pretrained(
                 str(model_path), 
                 trust_remote_code=True

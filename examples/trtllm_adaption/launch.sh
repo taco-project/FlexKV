@@ -9,7 +9,6 @@ MAX_SEQ_LEN=155648
 MAX_NUM_TOKENS=16384
 
 export FLEXKV_CONFIG_PATH="./flexkv_config.json"
-export MODEL_PATH=$MODEL_PATH
 export TENSORRT_LLM_USE_FLEXKV=1
 
 trtllm-serve serve $MODEL_PATH \
