@@ -25,10 +25,10 @@ class BenchmarkConfig:
     cache_ratio: float
     clear_cpu_cache: bool
 
-def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_config):
+def run_tp_client(dp_client_id, tp_rank, gpu_register_port, model_config, cache_config):
     """Run tp_client process"""
     device_id = tp_rank + dp_client_id * model_config.tp_size
-    tp_client = KVTPClient(server_recv_port, dp_client_id, device_id)
+    tp_client = KVTPClient(gpu_register_port, dp_client_id, device_id)
 
     num_gpu_blocks = cache_config.num_gpu_blocks
 
