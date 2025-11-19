@@ -66,7 +66,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_sms_h2d=int(os.getenv('FLEXKV_TRANSFER_SMS_H2D', 8)),
     transfer_sms_d2h=int(os.getenv('FLEXKV_TRANSFER_SMS_D2H', 8)),
 
-    iouring_entries=int(os.getenv('FLEXKV_IORING_ENTRIES', 512)),
+    iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IORING_FLAGS', 0)),
 
     max_file_size_gb=float(os.getenv('FLEXKV_MAX_FILE_SIZE_GB', -1)),  # -1 means no limit
@@ -110,7 +110,7 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
     if config_file.endswith('.json'):
         with open(config_file) as f:
             config = json.load(f)
-    elif config_file.endswith('.yaml'):
+    elif config_file.endswith(('.yaml', '.yml')):
         with open(config_file) as f:
             config = yaml.safe_load(f)
     else:
@@ -158,7 +158,7 @@ def update_default_config_from_user_config(model_config: ModelConfig,
 
     if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
         cache_config.num_ssd_blocks = \
-            cache_config.num_ssd_blocks // len(cache_config.ssd_cache_dir) * len(cache_config.ssd_cache_dir)
+            (cache_config.num_ssd_blocks // len(cache_config.ssd_cache_dir) + 1) * len(cache_config.ssd_cache_dir)
         flexkv_logger.warning(f"num_ssd_blocks is not a multiple of num_ssd_devices, "
                               f"adjust num_ssd_blocks to {cache_config.num_ssd_blocks}")
 

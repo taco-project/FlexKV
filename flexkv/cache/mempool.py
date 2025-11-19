@@ -3,8 +3,6 @@ from typing import List
 
 import numpy as np
 
-from flexkv.common.exceptions import NotEnoughSpaceError
-
 
 class Mempool:
     def __init__(
@@ -29,7 +27,7 @@ class Mempool:
         if num < 0:
             raise ValueError(f"num must be greater than 0, but got {num}")
         if num > self._num_free:
-            raise NotEnoughSpaceError("Not enough free blocks", required=num, available=self._num_free)
+            raise ValueError(f"Not enough free blocks, required: {num}, available: {self._num_free}")
 
         if num > len(self._free_ids) - self._free_ids_offset:
             self._update_free_ids()

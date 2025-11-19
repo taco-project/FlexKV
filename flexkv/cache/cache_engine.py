@@ -30,7 +30,6 @@ from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.transfer_pattern import add_virtal_op_for_mutiple_finished_ops
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
-from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
 from flexkv.common.transfer import (
     DeviceType, TransferOpGraph, TransferOp, TransferType
 )
@@ -55,11 +54,11 @@ class CacheEngineAccel:
                  evict_ratio: float,
                  hit_reward_seconds: int = 0):
         if not isinstance(device_type, DeviceType):
-            raise InvalidConfigError(f"Unknown device type: {device_type}")
+            raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
-            raise InvalidConfigError(f"Invalid num_total_blocks: {num_total_blocks}")
+            raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
-            raise InvalidConfigError(f"Invalid tokens_per_block: {tokens_per_block}, "
+            raise ValueError(f"Invalid tokens_per_block: {tokens_per_block}, "
                               f"tokens_per_block must be a power of 2")
 
         self.device_type = device_type
@@ -137,9 +136,9 @@ class CacheEngineAccel:
             if protected_node is not None:
                 self.index.unlock(protected_node)
         if strict and num_required_blocks > self.mempool.num_free_blocks:
-            raise NotEnoughSpaceError("Not enough free blocks to take, ",
-                                      required=num_required_blocks,
-                                      available=self.mempool.num_free_blocks)
+            raise RuntimeError(f"Not enough free blocks to take, "
+                               f"required: {num_required_blocks}, "
+                               f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         return self.mempool.allocate_blocks(num_allocated_blocks)
 
@@ -154,11 +153,11 @@ class CacheEngine:
                  evict_ratio: float,
                  hit_reward_seconds: int = 0):
         if not isinstance(device_type, DeviceType):
-            raise InvalidConfigError(f"Unknown device type: {device_type}")
+            raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
-            raise InvalidConfigError(f"Invalid num_total_blocks: {num_total_blocks}")
+            raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
-            raise InvalidConfigError(f"Invalid tokens_per_block: {tokens_per_block}, "
+            raise ValueError(f"Invalid tokens_per_block: {tokens_per_block}, "
                               f"tokens_per_block must be a power of 2")
 
         self.device_type = device_type
@@ -218,9 +217,9 @@ class CacheEngine:
             if protected_node is not None:
                 self.index.unlock(protected_node)
         if strict and num_required_blocks > self.mempool.num_free_blocks:
-            raise NotEnoughSpaceError("Not enough free blocks to take, ",
-                                      required=num_required_blocks,
-                                      available=self.mempool.num_free_blocks)
+            raise RuntimeError("Not enough free blocks to take, ",
+                               f"required: {num_required_blocks}, "
+                               f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         return self.mempool.allocate_blocks(num_allocated_blocks)
 
@@ -626,7 +625,9 @@ class GlobalCacheEngine:
                 )
                 transfer_graph.add_transfer_op(op_gds_transfer)
                 finished_ops_ids.append(op_gds_transfer.op_id)
-                op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+                op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.SSD,
+                                                           ssd_node_to_unlock,
+                                                           ssd_node_to_unlock.size())
             else:
                 fragment2_cpu_blocks = self.cpu_cache_engine.take(
                     num_required_blocks=fragment2_num_blocks,
@@ -970,7 +971,7 @@ class GlobalCacheEngine:
             protected_node = cpu_matched_result.last_node,
             strict=False
         )
-        
+
         if self.cache_config.enable_ssd:
             fragment2_ssd_blocks = self.ssd_cache_engine.take(
                 num_required_blocks=fragment2_num_blocks,

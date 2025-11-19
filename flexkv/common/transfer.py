@@ -62,7 +62,9 @@ class TransferOp:
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
             self.src_block_ids.size != self.dst_block_ids.size:
-            raise ValueError("src_block_ids and dst_block_ids must have the same number of physical blocks")
+            raise ValueError(f"src_block_ids and dst_block_ids must have the same number of physical blocks, but got "
+                             f"src_block_ids.size={self.src_block_ids.size}, "
+                             f"dst_block_ids.size={self.dst_block_ids.size}")
         with TransferOp._lock:
             self.op_id = TransferOp._next_op_id
             TransferOp._next_op_id += 1

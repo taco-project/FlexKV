@@ -22,7 +22,6 @@ import torch
 
 from flexkv.common.block import SequenceMeta
 from flexkv.common.hash_utils import HashType, Hasher
-from flexkv.common.exceptions import LogicError
 
 
 @dataclass
@@ -288,13 +287,11 @@ class RadixTreeIndex:
         return evicted_blocks
 
     def lock(self, node: RadixNode) -> None:
-        if node.lock_cnt < 0:
-            raise LogicError("before lock, lock_cnt < 0")
+        assert node.lock_cnt >= 0
         node.lock_cnt += 1
 
     def unlock(self, node: RadixNode) -> None:
-        if node.lock_cnt <= 0:
-            raise LogicError("before unlock, lock_cnt <= 0")
+        assert node.lock_cnt > 0
         node.lock_cnt -= 1
 
     def set_ready(self, node: RadixNode, is_ready: bool = True, ready_length: int = -1) -> None:
@@ -303,10 +300,8 @@ class RadixTreeIndex:
             ready_length -= node.size()
             num_node = 1
             while ready_length > 0:
-                if node.parent is None:
-                    raise LogicError("node is None in set_ready")
-                else:
-                    node = node.parent
+                assert node.parent is not None
+                node = node.parent
                 ready_length -= node.size()
                 node.is_ready = True
                 num_node += 1

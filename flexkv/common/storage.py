@@ -28,7 +28,7 @@ class KVCacheLayout:
     tokens_per_block: int
     num_head: int
     head_size: int
-    is_mla: bool = False
+    is_mla: bool
     _kv_shape: Optional[torch.Size] = None
 
     def __eq__(self, other: object) -> bool:
