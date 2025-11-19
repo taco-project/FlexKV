@@ -6,7 +6,6 @@ import numpy as np
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.cache_engine import CacheEngine
 from flexkv.common.transfer import DeviceType
-from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
 from flexkv.common.block import SequenceMeta
 
 @pytest.fixture
@@ -33,7 +32,7 @@ def cache_engine(request: pytest.FixtureRequest) -> CacheEngine:
 )
 def test_config_init(config: dict, should_raise: bool):
     if should_raise:
-        with pytest.raises(InvalidConfigError) as e:
+        with pytest.raises(ValueError) as e:
             CacheEngine(**config)
     else:
         engine = CacheEngine(**config)
@@ -56,7 +55,7 @@ def test_mempool():
                            mempool.allocate_blocks(16)])
     assert mempool.num_free_blocks == 0
 
-    with pytest.raises(NotEnoughSpaceError):
+    with pytest.raises(ValueError):
         mempool.allocate_blocks(1)
 
     mempool.recycle_blocks(block_ids)
@@ -164,7 +163,7 @@ def test_take_and_recycle(cache_engine: CacheEngine):
 
     with pytest.raises(ValueError):
         cache_engine.take(-1)
-    with pytest.raises(NotEnoughSpaceError):
+    with pytest.raises(RuntimeError):
         cache_engine.take(num_total_blocks, protected_node=radixnode, strict=True)
 
     physical_blocks2 = cache_engine.take(num_total_blocks, protected_node=radixnode, strict=False)
@@ -174,7 +173,7 @@ def test_take_and_recycle(cache_engine: CacheEngine):
     cache_engine.recycle(physical_blocks2)
 
     cache_engine.lock_node(radixnode)
-    with pytest.raises(NotEnoughSpaceError):
+    with pytest.raises(RuntimeError):
         cache_engine.take(num_total_blocks, protected_node=radixnode, strict=True)
     cache_engine.unlock(radixnode)
     cache_engine.set_ready(radixnode, True, radixnode.size())
