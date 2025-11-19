@@ -20,4 +20,4 @@ trtllm-serve serve $MODEL_PATH \
     --max_seq_len $MAX_SEQ_LEN \
     --max_num_tokens $MAX_NUM_TOKENS \
     --max_batch_size $BATCH_SIZE \
-    --extra_llm_api_options extra-llm-api-config-cg.yml 2>&1 | tee logs/$TIMESTAMP.log 
+    --extra_llm_api_options extra-llm-api-config.yml 2>&1 | tee logs/$TIMESTAMP.log 
