@@ -15,7 +15,7 @@ from flexkv.common.request import KVResponseStatus
 from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
 from flexkv.integration.utils import cdiv
-from flexkv.integration.tensorrt_llm.config import FlexKVConfig
+from flexkv.integration.config import FlexKVConfig
 from flexkv.integration.tensorrt_llm.meta import(
     FlexKVResponse, FlexKVTask, FlexKVGetTask, FlexKVPutTask, FlexKVConnectorMetadata)
 
@@ -48,31 +48,17 @@ Date:   Wed Oct 15 11:53:57 2025 +0200
 
 class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
     def __init__(self, config: ExecutorConfig):
+        tp_size, dp_size, dp_rank = get_dp_tp_info(config)
         flexkv_config = FlexKVConfig.from_env()
-        flexkv_config.post_init_from_trt_config(config) 
-        _, _, dp_rank = get_dp_tp_info(config)
+        flexkv_config.post_init_from_trt_config(config, tp_size, dp_size, dp_rank)
 
         flexkv_logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
-        self.flexkv_config = flexkv_config
         self.server_recv_port = flexkv_config.server_recv_port
-        self.tp_size = flexkv_config.tp_size
-        self.dp_size = flexkv_config.dp_size
-        self.block_size = flexkv_config.block_size
-        self.model_config = ModelConfig(
-            num_layers=flexkv_config.num_layers,
-            num_kv_heads=flexkv_config.num_kv_heads,
-            head_size=flexkv_config.head_size,
-            use_mla=flexkv_config.use_mla,
-            dtype=flexkv_config.dtype,
-            tp_size=flexkv_config.tp_size,
-            dp_size=flexkv_config.dp_size,
-        )
-        if "tokens_per_block" in flexkv_config.cache_config:
-            assert flexkv_config.cache_config.pop("tokens_per_block") == flexkv_config.block_size
-        self.cache_config = CacheConfig(
-            tokens_per_block=flexkv_config.block_size,
-            **flexkv_config.cache_config,
-        )
+        self.tp_size = flexkv_config.model_config.tp_size
+        self.dp_size = flexkv_config.model_config.dp_size
+        self.block_size = flexkv_config.cache_config.tokens_per_block
+        self.model_config = flexkv_config.model_config
+        self.cache_config = flexkv_config.cache_config
         self.flexkv_manager = KVManager(model_config=self.model_config,
                                         cache_config=self.cache_config,
                                         server_recv_port=flexkv_config.server_recv_port,
@@ -89,11 +75,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.tasks_to_launch: dict[int, FlexKVTask] = {}
         self.tasks_to_cancel: dict[int, FlexKVTask] = {}
 
-        self.flexkv_stats = FlexKVStats(flexkv_config.num_log_interval_requests)
-
-        # while not self.is_ready():
-        #     flexkv_logger.info("Waiting for flexkv init...")
-        #     time.sleep(5)
+        self.flexkv_stats = FlexKVStats(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200))
 
         flexkv_logger.info("Finish init FlexKVSchedulerConnector")
 
@@ -162,6 +144,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
                             the task_id and number of new matched tokens.
         """
         request = RequestWrapper(_request)
+        flexkv_logger.info(f"Get match request: {request}")
         
         match_start_time = time.perf_counter()
         num_tokens_to_get = (request.num_prompt_tokens//self.block_size)*self.block_size
@@ -235,9 +218,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         Returns:
             None.
         """
-        # TODO 确认 block_ids 是所有的 blockids
         request = RequestWrapper(_request)
         if request.num_new_matched_tokens == 0:
+            flexkv_logger.info(f"No new matched tokens, skip update state after alloc.")
             return
 
         # prepare to launch task
@@ -261,7 +244,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
     def request_finished(
         self,
         _request: "LlmRequest",
-        block_ids: list[int], # NOTE trt 接口是 cache_block_ids，不确定是否一样
+        block_ids: list[int],
     ) -> bool:
         """
         Args:
@@ -296,12 +279,12 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.tasks_to_launch[task_id] = task
 
         # compute slot mapping
-        # num_blocks_to_put = (num_matched_tokens+num_unmatched_tokens) // self.block_size
         num_matched_blocks = num_matched_tokens // self.block_size
-        num_unmatched_tokens = num_unmatched_tokens // self.block_size
-        block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_tokens]
+        num_unmatched_blocks = num_unmatched_tokens // self.block_size
+        block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_blocks]
+        flexkv_logger.info(f"{num_matched_blocks=}, {num_matched_blocks+num_unmatched_blocks=}, {len(block_ids)=}")
         task.slot_mapping = np.array(block_ids_to_put).repeat(self.block_size)*self.block_size
-
+        flexkv_logger.info(f"{task_id=}, {num_matched_tokens=}, {num_unmatched_tokens=}, {len(block_ids_to_put)=}, {self.block_size=}, {task.slot_mapping.shape=}")
         return True
 
     def _put_match(
@@ -317,6 +300,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
                             the task_id, number of matched tokens and number of unmatched tokens.
         """
         request = RequestWrapper(_request)
+        flexkv_logger.info(f"Put match request: {request}")
         match_start_time = time.perf_counter()
         num_tokens_to_put = (cdiv(request.num_tokens+1, self.block_size)-1)*self.block_size
         token_ids = request.all_token_ids[:num_tokens_to_put]
@@ -375,7 +359,6 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         Cancel tasks in self.cancel_tasks.
         Call before launch_tasks() to delete req_id in self.req_id_to_task_dict
         """
-        # TODO: check if this method is inproc.
         if len(self.tasks_to_cancel) == 0:
             return
         for task in self.tasks_to_cancel.values():
@@ -482,15 +465,16 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
 class FlexKVWorkerConnector(KvCacheConnectorWorker):
     def __init__(self, config: ExecutorConfig):
+        tp_size, dp_size, dp_rank = get_dp_tp_info(config)
         flexkv_config = FlexKVConfig.from_env()
-        flexkv_config.post_init_from_trt_config(config)
-        _, _, dp_rank = get_dp_tp_info(config)
+        flexkv_config.post_init_from_trt_config(config, tp_size, dp_size, dp_rank)
         dp_client_id = dp_rank
         
-        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.tp_size
+        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
         self.flexkv_config = flexkv_config
-        flexkv_logger.info(f"Start init FlexKVWorkerConnector to ipc:///tmp/flexkv_test_gpu_register, dp_client_id: {dp_client_id}, current_device_id: {current_device_id}, torch.cuda.current_device: {torch.cuda.current_device()}")
-        self.tp_client = KVTPClient("ipc:///tmp/flexkv_test_gpu_register", dp_client_id, current_device_id)
+        flexkv_logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, \
+            dp_client_id: {dp_client_id}")
+        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_client_id, current_device_id)
         flexkv_logger.info("Finish init FlexKVWorkerConnector")
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
@@ -525,16 +509,16 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         # Use physical device ID for registration
         correct_device_id = physical_device_id
         
-        if self.flexkv_config.use_mla:
+        if self.flexkv_config.model_config.use_mla:
             assert kv_cache_tensor.ndim == 4, (f"expect kv cached tensor has 4 dim but get shape={kv_cache_tensor.shape}")
 
         num_blocks = kv_cache_tensor.shape[0]
         num_layers = kv_cache_tensor.shape[1]
         kv_dim = kv_cache_tensor.shape[2]
-        block_size = self.flexkv_config.block_size
-        num_kv_heads = 1 if self.flexkv_config.use_mla else self.flexkv_config.num_kv_heads
-        head_size = self.flexkv_config.head_size
-        if self.flexkv_config.use_mla:
+        block_size = self.flexkv_config.cache_config.tokens_per_block
+        num_kv_heads = 1 if self.flexkv_config.model_config.use_mla else self.flexkv_config.model_config.num_kv_heads
+        head_size = self.flexkv_config.model_config.head_size
+        if self.flexkv_config.model_config.use_mla:
             assert kv_dim == 1, (f"expect kv_dim eqals to 1 when using MLA but get kv_dim={kv_dim}")
         
         assert num_kv_heads * head_size * block_size == kv_cache_tensor.shape[3], \
@@ -545,13 +529,13 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         gpu_blocks = [kv_cache_tensor] # convert to list for flexkv register 
  
         gpu_layout = KVCacheLayout(
-            type=KVCacheLayoutType.BLOCKWISE,
+            type=KVCacheLayoutType.BLOCKFIRST,
             num_layer=num_layers,
             num_block=num_blocks,
             tokens_per_block=block_size,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=self.flexkv_config.use_mla,
+            is_mla=self.flexkv_config.model_config.use_mla,
         )
         # Use correct device_id from tensor's actual device
         self.tp_client.register_to_server(gpu_blocks, gpu_layout, override_device_id=correct_device_id)

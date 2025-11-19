@@ -49,7 +49,10 @@ class RequestWrapper:
         return self._request.is_finished_normal
 
     def __repr__(self):
-        return f"RequestWrapper(req_id={self.req_id}, num_prompt_tokens={self.num_prompt_tokens}, num_tokens={len(self.all_token_ids)})"
+        return f"RequestWrapper(req_id={self.req_id}, " \
+                f"num_prompt_tokens={self.num_prompt_tokens}, " \
+                f"num_tokens={len(self.all_token_ids)}, " \
+                f"num_new_matched_tokens={self.num_new_matched_tokens})"
 
 def get_dp_tp_info(config: ExecutorConfig):
     mapping = config.mapping
