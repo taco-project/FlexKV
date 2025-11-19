@@ -230,18 +230,22 @@ class KVTPClient:
         self,
         kv_caches: List[torch.Tensor],
         kv_layout: KVCacheLayout,
+        override_device_id: Optional[int] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
 
+        # Use override_device_id if provided, otherwise use self.device_id
+        device_id = override_device_id if override_device_id is not None else self.device_id
+
         handles = []
         for _, tensor in enumerate(kv_caches):
-            handle = TensorSharedHandle(tensor, self.device_id)
+            handle = TensorSharedHandle(tensor, device_id)
             handles.append(handle)
 
         register_req = RegisterTPClientRequest(
             self.dp_client_id,
-            self.device_id,
+            device_id,
             handles,
             kv_layout
         )

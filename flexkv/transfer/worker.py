@@ -120,7 +120,8 @@ class TransferWorkerBase(ABC):
                       finished_ops_queue: MPQueue,
                       op_buffer_tensor: torch.Tensor,
                       *args: Any, **kwargs: Any) -> 'WorkerHandle':
-        """Generic worker creation template method"""
+        """Generic worker creation template method."""
+        
         parent_conn, child_conn = mp_ctx.Pipe()  # create pipe
         ready_event = mp_ctx.Event()
         worker_id = cls._get_worker_id()
@@ -138,6 +139,8 @@ class TransferWorkerBase(ABC):
     @classmethod
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
                         op_buffer_tensor: torch.Tensor, ready_event: Any, *args: Any, **kwargs: Any) -> None:
+        # Note: MPI initialization prevention is handled by create_safe_process
+        # Environment variables are set before this function is called
         worker = cls(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs)
         ready_event.set()
         worker.run()
@@ -446,7 +449,6 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         cudaHostRegister(cpu_blocks)
 
         self.num_layers = gpu_kv_layouts[0].num_layer
-
         # here the chunk size doesn't include the layer info
         self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
                                 for gpu_kv_layout in gpu_kv_layouts]

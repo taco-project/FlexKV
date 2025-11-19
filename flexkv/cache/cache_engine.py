@@ -20,6 +20,7 @@ from queue import Queue
 from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field
 
+import os
 import numpy as np
 import nvtx
 import torch
@@ -319,8 +320,12 @@ class GlobalCacheEngine:
             raise NotImplementedError(f"Layerwise transfer is not supported yet, "
                                       f"layer_num: {layer_num}, layer_granularity: {layer_granularity}")
 
-        # ignore the last incomplete block
-        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
+        if not os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1":
+            aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
+        else:
+            # When using FlexKV with TensorRT-LLM, we ignore the last incomplete block.
+            aligned_length = ((token_ids.shape[0] - 1) // self.tokens_per_block) * self.tokens_per_block
+
         aligned_token_ids = token_ids[:aligned_length]
         token_mask = token_mask[:aligned_length]
 
