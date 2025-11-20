@@ -450,8 +450,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 class FlexKVWorkerConnector(KvCacheConnectorWorker):
     def __init__(self, config: ExecutorConfig):
         flexkv_config = FlexKVConfig.from_env()
+        self.node_rank, self.tp_rank, self.dp_rank = get_rank_info_from_trt_config(config)
         flexkv_config.post_init_from_trt_config(config)
-        dp_client_id = flexkv_config.model_config.dp_rank
+        dp_client_id = self.dp_rank
         
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
         self.flexkv_config = flexkv_config
@@ -480,8 +481,8 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             bool: True if need to create TransferManagerOnRemote process, False otherwise.
         """
         try:
-            is_master_node = self.flexkv_config.model_config.node_rank == 0
-            is_worker0 = self.flexkv_config.model_config.tp_rank == 0
+            is_master_node = self.node_rank == 0
+            is_worker0 = self.tp_rank == 0
             is_multinode_tp = self.flexkv_config.model_config.tp_size > torch.cuda.device_count()
             flexkv_logger.info(f"{is_master_node=}, {is_worker0=}, {is_multinode_tp=}")
             
@@ -609,3 +610,14 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         """Cleanup on deletion."""
         if hasattr(self, 'remote_process') and self.remote_process is not None:
             self.shutdown()
+    
+def get_rank_info_from_trt_config(config: ExecutorConfig):
+    if config.mapping.enable_attention_dp:
+        node_rank = config.mapping.node_rank
+        tp_rank = config.mapping.tp_rank
+        dp_rank = config.mapping.rank
+    else:
+        node_rank = config.mapping.node_rank
+        tp_rank = config.mapping.tp_rank
+        dp_rank = 0
+    return node_rank, tp_rank, dp_rank

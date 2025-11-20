@@ -119,9 +119,6 @@ class FlexKVConfig:
     def post_init_from_trt_config(
         self,
         config,
-        tp_size: int,
-        dp_size: int,
-        dp_rank: int,
     ):
         self.cache_config.tokens_per_block = config.tokens_per_block
         # Convert dtype string to torch.dtype
@@ -144,17 +141,11 @@ class FlexKVConfig:
         
         # Set model config (parallel configs part)
         if config.mapping.enable_attention_dp:
-            self.model_config.node_rank = config.mapping.node_rank
             self.model_config.tp_size = 1
-            self.model_config.tp_rank = config.mapping.tp_rank
             self.model_config.dp_size = config.mapping.tp_size
-            self.model_config.dp_rank = config.mapping.rank
         else:
-            self.model_config.node_rank = config.mapping.node_rank
             self.model_config.tp_size = config.mapping.tp_size
-            self.model_config.tp_rank = config.mapping.tp_rank
             self.model_config.dp_size = 1
-            self.model_config.dp_rank = 0
             
         # self.model_config (model configs part)
         try:
