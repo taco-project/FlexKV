@@ -141,11 +141,22 @@ class FlexKVConfig:
             self.model_config.dtype = dtype_map.get(dtype_str, torch.bfloat16)
         else:
             self.model_config.dtype = dtype_str
-            
-        self.model_config.tp_size = tp_size
-        self.model_config.dp_size = dp_size
-        self.model_config.dp_rank = dp_rank
         
+        # Set model config (parallel configs part)
+        if config.mapping.enable_attention_dp:
+            self.model_config.node_rank = config.mapping.node_rank
+            self.model_config.tp_size = 1
+            self.model_config.tp_rank = config.mapping.tp_rank
+            self.model_config.dp_size = config.mapping.tp_size
+            self.model_config.dp_rank = config.mapping.rank
+        else:
+            self.model_config.node_rank = config.mapping.node_rank
+            self.model_config.tp_size = config.mapping.tp_size
+            self.model_config.tp_rank = config.mapping.tp_rank
+            self.model_config.dp_size = 1
+            self.model_config.dp_rank = 0
+            
+        # self.model_config (model configs part)
         try:
             model_path = getattr(config, 'hf_model_dir', None)
             hf_config = HFAutoConfig.from_pretrained(

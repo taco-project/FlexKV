@@ -19,8 +19,11 @@ class ModelConfig:
     dtype: torch.dtype = torch.bfloat16
 
     # parallel configs
+    node_rank: int = 0
     tp_size: int = 1
+    tp_rank: int = 0
     dp_size: int = 1
+    dp_rank: int = 0
 
     @property
     def token_size_in_bytes(self) -> int:
