@@ -31,7 +31,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
     def __init__(self, config: ExecutorConfig):
         # Set environment variable for FlexKV with TensorRT-LLM，this must before KVManager initialization
         os.environ['FLEXKV_WITH_TRTLLM'] = '1'
-        flexkv_config = FlexKVConfig.from_env()
+        flexkv_config = FlexKVConfig.from_env() 
         flexkv_config.post_init_from_trt_config(config)
 
         flexkv_logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
