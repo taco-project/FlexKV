@@ -109,7 +109,7 @@ class KVTaskManager:
         if self.is_multinode_tp and not self.model_config.use_mla:
             model_config_for_transfer.num_kv_heads = self.tp_size_per_node
         
-        if os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1":
+        if os.getenv("FLEXKV_WITH_TRTLLM", "0") == "0":
             self.transfer_handles = [TransferManagerHandle(
                 model_config_for_transfer,
                 self.cache_config,
