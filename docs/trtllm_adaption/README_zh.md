@@ -6,7 +6,7 @@
 您可以使用我们提供的 patch，然后重新编译：
 ```bash
 cd TensorRT-LLM
-git apply FLEXKV_DIR/examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
+git apply FLEXKV_DIR/examples/trtllm_adaption/trtllm_v1.1.0rc2.patch
 ```
 注：TensorRT-LLM 的编译方式可以参考[这里](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html#build-from-source-linux)
 
@@ -45,22 +45,22 @@ EOF
 export FLEXKV_CONFIG_PATH="./flexkv_config.yml"
 ```
 
-## 2.1 相关文件介绍
+## 2.2 相关文件介绍
 `examples/trtllm_adaption` 目录中有我们提供的启动脚本的示例，其中的文件包括：
-- `vllm_0_10_1_1-flexkv-connector.patch`：TensorRT-LLM 适配 FLexKV 的 patch
+- `trtllm_v1.1.0rc2.patch`：TensorRT-LLM 适配 FLexKV 的 patch
 
-- `flexkv_config.json`：FLexKV 相关的配置
+- `flexkv_config.json`：FlexKV 相关的配置
 - `extra-llm-api-config.yml`：TensorRT-LLM 额外的一些启动配置
 - `launch.sh`：示例启动脚本
-## 2.2 启动方式
-### 2.2.1. 方式一：使用我们提供的示例脚本
+## 2.3 启动方式
+### 2.3.1. 方式一：使用我们提供的示例脚本
 ```bash
 cd FLEXKV_DIR/examples/trtllm_adaption
 bash launch.sh YOUR_MODEL_PATH
 ```
-注：`launch.sh` 脚本会同时启动 TensorRT-LLM 和 FlexKV，并通过同路径下的`flexkv_config.json`进行Flexkv的配置
-### 2.2.2. 方式二：自定义启动
-首先按照 [2.1](#21-配置flexkv) 节的指示配置好Flexkv，接着创建您的 `extra-llm-api-config.yml`：
+注：`launch.sh` 脚本会同时启动 TensorRT-LLM 和 FlexKV，并通过同路径下的`flexkv_config.json`进行FlexKV的配置
+### 2.3.2. 方式二：自定义启动
+首先按照 [2.1](#21-配置flexkv) 节的指示配置好FlexKV，接着创建您的 `extra-llm-api-config.yml`：
 ```bash
 cat <<EOF > extra-llm-api-config.yml
 kv_cache_config:
@@ -86,7 +86,7 @@ trtllm-serve serve $MODEL_PATH \
     --extra_llm_api_options extra-llm-api-config.yml
 ```
 
-## 2.3 TensorRT-LLM 潜在的问题
+## 2.4 TensorRT-LLM 潜在的问题
 如果您向 TensorRT-LLM 发送了超过 `max_seq_len` 长度的请求，会出现类似下面的报错：
 ```
 [W] `default_max_tokens` (-40205) should be greater than 0, `default_max_tokens` (-40205) = max_seq_len (40961) - `splited_prompt_len` (81166) - `query_token_len` (0)
