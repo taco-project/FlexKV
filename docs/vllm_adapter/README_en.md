@@ -43,10 +43,11 @@ export FLEXKV_CONFIG_PATH="./flexkv_config.yml"
 ### Running
 We provide an adaptation example based on **vLLM 0.10.1.1**:
 
-1. apply patch
+1. apply patch && installation
 ```bash
-# FLEXKV_DIR/examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
-git apply examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
+cd vllm
+git apply FLEXKV_DIR/examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
+pip install -e . # build and install vllm from source
 ```
 
 2. offline test
