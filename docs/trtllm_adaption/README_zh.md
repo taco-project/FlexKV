@@ -29,7 +29,7 @@ export TENSORRT_LLM_USE_FLEXKV=1
 #### 示例一：仅启用CPU卸载
 使用32GB的CPU内存作为二级缓存。
 ```bash
-unset FLEXKV_CONFIG_PATH  # 优先使用 FLEXKV_CONFIG_PATH 指定的配置文件
+unset FLEXKV_CONFIG_PATH
 export FLEXKV_CPU_CACHE_GB=32
 ```
 #### 示例二：启用SSD卸载
@@ -53,30 +53,14 @@ bash launch.sh YOUR_MODEL_PATH
 ```
 注：`launch.sh` 脚本会同时启动 TensorRT-LLM 和 FlexKV，并通过同路径下的`flexkv_config.json`进行FlexKV的配置
 ### 2.2.2. 方式二：自定义启动
-首先按照 [2.1](#21-配置flexkv) 节的指示配置好FlexKV，接着创建您的 `extra-llm-api-config.yml`：
-```bash
-cat <<EOF > extra-llm-api-config.yml
+按照 [2.1](#21-配置flexkv) 节的指示配置好FlexKV，接着在您的 `extra-llm-api-config.yml`加入下面的内容：
+```txt
 kv_cache_config:
   enable_partial_reuse: false
 kv_connector_config:
   connector_module: "flexkv.integration.tensorrt_llm.trtllm_adapter"
   connector_scheduler_class: "FlexKVSchedulerConnector"
   connector_worker_class: "FlexKVWorkerConnector"
-EOF
-```
-最后在trtllm的启动参数中加入 `--extra_llm_api_options extra-llm-api-config.yml`
-，例如：
-```bash
-trtllm-serve serve $MODEL_PATH \
-    --host 0.0.0.0 \
-    --port 6000 \
-    --backend pytorch \
-    --tp_size 8 \
-    --ep_size 8 \
-    --max_seq_len 155648 \
-    --max_num_tokens 16384 \
-    --max_batch_size 4 \
-    --extra_llm_api_options extra-llm-api-config.yml
 ```
 
 ## 2.3 TensorRT-LLM 潜在的问题
