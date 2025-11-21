@@ -109,7 +109,8 @@ class KVTaskManager:
         if self.is_multinode_tp and not self.model_config.use_mla:
             model_config_for_transfer.num_kv_heads = self.tp_size_per_node
         
-        if os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1":
+        combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
+        if not combine_with_trtllm:
             self.transfer_handles = [TransferManagerHandle(
                 model_config_for_transfer,
                 self.cache_config,
@@ -173,6 +174,8 @@ class KVTaskManager:
             for transfer_handle in self.transfer_handles:
                 transfer_handle.shutdown()
         if hasattr(self, "remote_process") and self.remote_process is not None:
+            assert self.remote_process.is_alive()
+            self.remote_process.terminate()
             self.remote_process.join()
             self.remote_process.close()
             self.remote_process = None
