@@ -12,7 +12,7 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 ```bash
 apt install liburing-dev
-apt install libxxhash-dev 
+apt install libxxhash-dev
 ```
 
 ### 编译 FlexKV
@@ -22,9 +22,13 @@ apt install libxxhash-dev
 #./build.sh --release for cython package
 ```
 
-### 以 vLLM 为例使用 FlexKV
+### 在 vLLM 中使用 FlexKV
 
 见[docs/vllm_adapter/README_zh.md](docs/vllm_adapter/README_zh.md)
+
+### 在 TensorRT-LLM 中使用 Flexkv
+
+见[docs/trtllm_adaption/README_zh.md](docs/trtllm_adaption/README_zh.md)
 
 ### FlexKV和Dynamo框架的集成
 
