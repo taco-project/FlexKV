@@ -16,11 +16,10 @@ from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import TransferOpGraph, get_nvtx_default_color
 from flexkv.common.tracer import FlexKVTracer
-from flexkv.cache.cache_engine import GlobalCacheEngine
+from flexkv.cache.cache_engine import GlobalCacheEngine, DEFAULT_CACHE_STRATEGY
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
 from flexkv.transfer_manager import get_master_host_and_ports_from_env
-from flexkv.common.debug import flexkv_logger
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -39,6 +38,7 @@ class TaskStatus(Enum):
 class TaskType(Enum):
     GET = "get"
     PUT = "put"
+    PREFETCH = "prefetch"
 
 @dataclass
 class KVTask:
@@ -108,7 +108,7 @@ class KVTaskManager:
         model_config_for_transfer = copy.deepcopy(self.model_config)
         if self.is_multinode_tp and not self.model_config.use_mla:
             model_config_for_transfer.num_kv_heads = self.tp_size_per_node
-        
+
         combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
         if not combine_with_trtllm:
             self.transfer_handles = [TransferManagerHandle(
@@ -246,6 +246,41 @@ class KVTaskManager:
             callback=callback,
             op_callback_dict=op_callback_dict)
         self.graph_to_task[graph.graph_id] = task_id
+
+    def create_prefetch_task(self,
+                            task_id: int,
+                            token_ids: np.ndarray,
+                            ) -> None:
+        if task_id in self.tasks:
+            raise ValueError(f"Task ID {task_id} already exists")
+        fake_slot_mapping = np.zeros_like(token_ids)
+        fake_token_mask = np.ones_like(token_ids)
+        temp_cache_strategy = copy.deepcopy(DEFAULT_CACHE_STRATEGY)
+        temp_cache_strategy.ignore_gpu = True  # upload to CPU only
+        temp_cache_strategy.ignore_gds = True
+        graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.get(task_id,
+                                                                               token_ids,
+                                                                               fake_token_mask,
+                                                                               fake_slot_mapping,
+                                                                               self.model_config.num_layers,
+                                                                               temp_cache_strategy=temp_cache_strategy)
+        self.tasks[task_id] = KVTask(
+            task_id=task_id,
+            task_type=TaskType.PREFETCH,
+            task_end_op_id=task_end_op_id,
+            task_end_op_finished=False,
+            status=TaskStatus.READY,  # gpu slots are not needed for prefetch
+            token_ids=token_ids,
+            slot_mapping=fake_slot_mapping,  # ignore slot_mapping for prefetch
+            token_mask=fake_token_mask,  # ignore token_mask for prefetch
+            dp_id=0,  # ignore dp_id for prefetch
+            graph=graph,
+            return_mask=return_mask,
+            callback=callback,
+            op_callback_dict=op_callback_dict)
+
+        self.graph_to_task[graph.graph_id] = task_id
+
 
     def _launch_task(self, task_id: int) -> None:
         task = self.tasks[task_id]
@@ -642,6 +677,35 @@ class KVTaskEngine(KVTaskManager):
         self._process_empty_graph(task_id)
         nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
+
+    def prefetch_async(self,
+                       token_ids: np.ndarray,
+                       dp_id: int = 0,
+                       task_id: int = -1) -> int:
+        result_task_id = self.prefetch_match(token_ids, task_id)
+        # trace prefetch async request
+        self.tracer.trace_request(
+            request_type="PREFETCH_ASYNC",
+            request_id=result_task_id,
+            token_ids=token_ids,
+            slot_mapping=np.zeros_like(token_ids),
+            token_mask=np.ones_like(token_ids),
+            layer_granularity=-1,
+            dp_id=dp_id
+        )
+        self._launch_task(result_task_id)
+        return result_task_id
+
+    def prefetch_match(self,
+                       token_ids: np.ndarray,
+                       task_id: int = -1) -> int:
+        if task_id == -1:
+            task_id = self._gen_task_id()
+        nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
+        self.create_prefetch_task(task_id, token_ids)
+        self._process_empty_graph(task_id)
+        nvtx.pop_range()
+        return task_id
 
     def launch_tasks(self,
                         task_ids: List[int],

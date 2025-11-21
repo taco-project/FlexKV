@@ -46,6 +46,12 @@ class GetRequest:
     layer_granularity: int = -1
 
 @dataclass
+class PrefetchRequest:
+    dp_client_id: int
+    token_ids: np.ndarray
+    task_id: int = -1
+
+@dataclass
 class PutMatchRequest:
     dp_client_id: int
     token_ids: np.ndarray
@@ -99,7 +105,7 @@ class Response:
     @property
     def success(self) -> bool:
         return self.status is not None and \
-               all(self.status[task_id] == KVResponseStatus.SUCCESS for task_id in self.status.keys())
+               all(self.status[task_id] == KVResponseStatus.SUCCESS for task_id in self.status)
 
 @dataclass
 class StartRequest:
