@@ -416,10 +416,7 @@ class TransferManagerOnRemote(TransferManager):
                 self._popen.terminate()
                 
             def join(self, timeout=None):
-                try:
-                    return self._popen.wait(timeout)
-                except subprocess.TimeoutExpired:
-                    return None
+                return self._popen.wait(timeout)
                 
             def close(self):
                 # Close the subprocess pipes
