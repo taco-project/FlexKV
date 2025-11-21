@@ -135,7 +135,8 @@ class TransferManager:
         self.transfer_engine.start()
 
     def shutdown(self) -> None:
-        self.transfer_engine.shutdown()
+        if hasattr(self, 'transfer_engine'):
+            self.transfer_engine.shutdown()
 
 def get_master_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
     master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
@@ -408,8 +409,17 @@ class TransferManagerOnRemote(TransferManager):
                 self._popen = popen_process
                 self.pid = popen_process.pid
                 
+            def is_alive(self):
+                return self._popen.poll() is None
+                
+            def terminate(self):
+                self._popen.terminate()
+                
             def join(self, timeout=None):
-                return self._popen.wait(timeout)
+                try:
+                    return self._popen.wait(timeout)
+                except subprocess.TimeoutExpired:
+                    return None
                 
             def close(self):
                 # Close the subprocess pipes
@@ -644,6 +654,13 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
 
         except Exception as e:
             flexkv_logger.error(f"Master failed to bind ports: {e}")
+            try:
+                self.command_socket.close()
+                self.result_socket.close()
+                self.query_socket.close()
+                self.context.term()
+            except Exception:
+                pass
             raise
 
     def send_config_to_remotes(self) -> None:
