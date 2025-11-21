@@ -581,7 +581,7 @@ class GlobalCacheEngine:
         # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
         return (
             transfer_graph, finished_ops_ids, node_to_unlock, {}, buffer_to_free,
-            len(fragment123_gpu_blocks)  # op_node_to_ready: {}
+            len(fragment123_gpu_blocks) if enable_gpu else 0  # op_node_to_ready: {}
         )
 
     def _get_impl_local(self,
@@ -728,7 +728,7 @@ class GlobalCacheEngine:
         nvtx.end_range(nvtx_range)
         return (
             transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
-            buffer_to_free, len(fragment12_gpu_blocks)
+            buffer_to_free, len(fragment12_gpu_blocks) if enable_gpu else 0
         )
 
     def put(self,
@@ -759,6 +759,7 @@ class GlobalCacheEngine:
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
                                      tokens_per_block=self.cache_config.tokens_per_block)
 
+        assert not temp_cache_strategy.ignore_gpu
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
              buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
