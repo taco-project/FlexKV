@@ -26,7 +26,7 @@ First, set the environment variable `TENSORRT_LLM_USE_FLEXKV` to enable FlexKV:
 export TENSORRT_LLM_USE_FLEXKV=1
 ```
 
-FlexKV can be configured through environment variables and configuration files. For details, please refer to [`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md). Below are two simple configuration examples.
+FlexKV can be configured through environment variables and configuration files. For details, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md). Below are two simple configuration examples.
 ##### Example 1: Enable CPU Offloading Only
 Use 32GB of CPU memory as secondary cache.
 ```bash
