@@ -172,6 +172,17 @@ class KVManager:
             task_id, mask = self.kv_task_engine.put_match(token_ids, token_mask, dp_id)
         return task_id, mask
 
+    def prefetch_async(self,
+                       token_ids: np.ndarray,
+                       dp_id: int = 0) -> int:
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+        if self.server_client_mode:
+            task_id = self.dp_client.prefetch_async(token_ids)
+        else:
+            task_id = self.kv_task_engine.prefetch_async(token_ids, dp_id=dp_id)
+        return task_id
+
     def launch(self,
                task_ids: Union[int, List[int]],
                slot_mappings: Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]],
