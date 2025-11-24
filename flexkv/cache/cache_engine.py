@@ -799,7 +799,7 @@ class GlobalCacheEngine:
                     op_node_to_ready[op_disk2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
                 else:
                     cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment2_cpu_blocks])
-        if self.cache_config.enable_kv_sharing and cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
+        if self.cache_config.enable_p2p_cpu and cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
             fragment1_cpu_blocks = fragment1_cpu_blocks_local
 
         if fragment2_cpu_blocks is not None:
@@ -1098,9 +1098,9 @@ class GlobalCacheEngine:
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         
-        if len(cpu_matched_blocks) > len(ssd_matched_blocks):
-            print(f"[PUT_LOCAL] CPU matched blocks are greater than SSD matched blocks, skipping")
-            return self._empty_put_return(request_id)
+        #if len(cpu_matched_blocks) > len(ssd_matched_blocks):
+        #    print(f"[PUT_LOCAL] CPU matched blocks are greater than SSD matched blocks, skipping")
+        #    return self._empty_put_return(request_id)
         
 
         num_skipped_blocks = len(cpu_matched_blocks)
