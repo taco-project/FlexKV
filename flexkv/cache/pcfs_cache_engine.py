@@ -323,8 +323,10 @@ class HierarchyLRCacheEngine:
             is_remote_node = False
         if is_remote_node:
             self.remote_index.unlock(node)
+            #self.remote_index.set_ready(node, True, cleanup_length)
         else:
             self.local_index.unlock(node)
+            #self.local_index.set_ready(node, True, cleanup_length)
 
     def set_ready(self, node: CRadixNode, ready: bool = True, ready_length: int = -1) -> None:
         """Set the ready state of a node in the appropriate index (local or remote).
@@ -344,10 +346,6 @@ class HierarchyLRCacheEngine:
             self.remote_index.set_ready(node, ready, ready_length)
         else:
             self.local_index.set_ready(node, ready, ready_length)
-
-    def cleanup(self, node: CRadixNode, cleanup_length: int) -> None:
-        unlock(node)
-        set_ready(node, ready, ready_length)
 
     def take(self,
              num_required_blocks: int,

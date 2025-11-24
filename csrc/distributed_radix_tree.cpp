@@ -536,6 +536,8 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
         if (current_node->is_ready()) {
           last_ready_node = current_node;
           ready_prefix_blocks_num += matched;
+        } else {
+          std::cerr << "[ERROR] current_node is not ready in distributed radix tree" << std::endl;
         }
         
         prefix_blocks_num += matched;
@@ -580,11 +582,12 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
         // If not all blocks match, we have a partial match - collect what matches and stop
         if (child_matched < to_check) {
           // Collect the matched blocks from child
-          if (current_node->is_ready() && child_matched == child_size) {
+          if (current_node->is_ready()) {
             last_ready_node = current_node;
             ready_prefix_blocks_num += child_matched;
+          } else {
+            std::cerr << "[ERROR] current_node is not ready in distributed radix tree" << std::endl;
           }
-          
           auto &cpb = current_node->get_physical_blocks();
           for (int i = 0; i < child_matched; i++) {
             pb_out[pb_write++] = cpb[i];
@@ -604,7 +607,7 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
         // All blocks matched, collect them and continue
         // But only collect up to what we need (remaining blocks in query)
         int blocks_to_collect = std::min(child_size, remaining);
-        if (current_node->is_ready() && child_matched == child_size) {
+        if (current_node->is_ready()) {
           last_ready_node = current_node;
           ready_prefix_blocks_num += blocks_to_collect;
         }
@@ -634,10 +637,11 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
       break;
     }
   }
-
+  //NOTE nodes in distributed radix tree are always ready!
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
   auto node_ids = node_ids_tensor.narrow(0, 0, ni_write);
-  return std::make_shared<CMatchResult>(prefix_blocks_num, ready_prefix_blocks_num, last_node_matched_length,
+  assert(ready_prefix_blocks_num == prefix_blocks_num);
+  return std::make_shared<CMatchResult>(prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
     last_ready_node, current_node, physical_blocks, node_ids);
 }
 

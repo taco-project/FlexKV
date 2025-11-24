@@ -71,16 +71,6 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
     
     op.src_slot_id = pin_buffer.allocate_slot(op.src_block_ids, device_type_prefix=src_device)
     op.dst_slot_id = pin_buffer.allocate_slot(op.dst_block_ids, device_type_prefix=dst_device)
-    
-    # Debug for H2DISK operations
-    if op.transfer_type == TransferType.H2DISK:
-        flexkv_logger.info(f"[REG_H2DISK] op_id={op.op_id}, graph_id={op.graph_id}, "
-                          f"src_len={len(op.src_block_ids)}, dst_len={len(op.dst_block_ids)}, "
-                          f"src_slot={op.src_slot_id}, dst_slot={op.dst_slot_id}, "
-                          f"src_prefix={src_device}, dst_prefix={dst_device}, "
-                          f"valid_blocks={op.valid_block_num}, "
-                          f"src_sample={op.src_block_ids[:min(3, len(op.src_block_ids))] if len(op.src_block_ids) > 0 else 'EMPTY'}, "
-                          f"dst_sample={op.dst_block_ids[:min(3, len(op.dst_block_ids))] if len(op.dst_block_ids) > 0 else 'EMPTY'}")
 
 def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
     if op.src_slot_id != -1:

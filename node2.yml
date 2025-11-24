@@ -1,6 +1,6 @@
 enable_p2p_cpu: true
-enable_p2p_ssd: true
-cpu_cache_gb: 32
+enable_p2p_ssd: false
+cpu_cache_gb: 98
 ssd_cache_gb: 100
 local_zmq_ip: "10.6.131.12"
 local_zmq_port: 5458
