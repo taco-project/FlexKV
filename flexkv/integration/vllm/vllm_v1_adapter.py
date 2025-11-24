@@ -15,10 +15,12 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
 from flexkv.integration.utils import cdiv
 from flexkv.integration.config import FlexKVConfig
+from flexkv.transfer_manager import TransferManagerOnRemote
 
 # vllm
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata, KVConnectorRole)
+from vllm.distributed.parallel_state import get_tp_group
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -517,8 +519,14 @@ class FlexKVWorkerConnector:
         flexkv_config: FlexKVConfig,
         dp_client_id: int,
     ):
+        self.is_local_leader = get_tp_group().local_rank == 0
+        self.launch_remote_transfer_manager = get_tp_group().local_rank == 0 and \
+            get_tp_group().rank_in_group != 0
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
         self.flexkv_config = flexkv_config
+        if self.launch_remote_transfer_manager:
+            self.remote_transfer_manager_process = TransferManagerOnRemote.create_process()
+
         logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, \
             dp_client_id: {dp_client_id}")
         self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_client_id, current_device_id)
@@ -554,6 +562,12 @@ class FlexKVWorkerConnector:
         self.tp_client.register_to_server(gpu_blocks, gpu_layout)
         logger.info("Finish register kv_caches")
 
+    def __del__(self):
+        if hasattr(self, "remote_transfer_manager_process") and \
+            self.remote_transfer_manager_process is not None:
+            self.remote_transfer_manager_process.join()
+            self.remote_transfer_manager_process.close()
+            self.remote_transfer_manager_process = None
 
 class FlexKVConnectorV1Impl:
     def __init__(self, vllm_config: "VllmConfig", role: "KVConnectorRole"):
