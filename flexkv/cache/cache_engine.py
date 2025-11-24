@@ -53,7 +53,8 @@ class CacheEngineAccel:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 hit_reward_seconds: int = 0):
+                 hit_reward_seconds: int = 0,
+                 block_dedup: bool = False):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -66,7 +67,7 @@ class CacheEngineAccel:
 
         self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds)
 
-        self.mempool = Mempool(num_total_blocks=num_total_blocks)
+        self.mempool = Mempool(num_total_blocks=num_total_blocks, block_dedup=block_dedup)
 
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
@@ -141,7 +142,7 @@ class CacheEngineAccel:
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        return self.mempool.allocate_blocks(num_allocated_blocks)
+        return self.mempool.allocate_blocks(num_allocated_blocks, None)[0]
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
@@ -152,7 +153,8 @@ class CacheEngine:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 hit_reward_seconds: int = 0):
+                 hit_reward_seconds: int = 0,
+                 block_dedup: bool = False):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -165,7 +167,7 @@ class CacheEngine:
 
         self.index = RadixTreeIndex(tokens_per_block=tokens_per_block, hit_reward_seconds=hit_reward_seconds)
 
-        self.mempool = Mempool(num_total_blocks=num_total_blocks)
+        self.mempool = Mempool(num_total_blocks=num_total_blocks, block_dedup=block_dedup)
 
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
@@ -222,7 +224,7 @@ class CacheEngine:
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        return self.mempool.allocate_blocks(num_allocated_blocks)
+        return self.mempool.allocate_blocks(num_allocated_blocks, None)[0]
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
@@ -242,6 +244,7 @@ class GlobalCacheEngine:
 
         self.evict_ratio = GLOBAL_CONFIG_FROM_ENV.evict_ratio
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
+        self.block_dedup = GLOBAL_CONFIG_FROM_ENV.block_dedup
 
         if cache_config.enable_cpu:
             if self.index_accel:
@@ -249,13 +252,15 @@ class GlobalCacheEngine:
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.block_dedup)
             else:
                 self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.block_dedup)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if self.index_accel:
@@ -263,13 +268,15 @@ class GlobalCacheEngine:
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.block_dedup)
             else:
                 self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.block_dedup)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
             if self.index_accel:
@@ -277,13 +284,15 @@ class GlobalCacheEngine:
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
                                                    self.evict_ratio,
-                                                   self.hit_reward_seconds)
+                                                   self.hit_reward_seconds,
+                                                   self.block_dedup)
             else:
                 self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
                                                    self.evict_ratio,
-                                                   self.hit_reward_seconds)
+                                                   self.hit_reward_seconds,
+                                                   self.block_dedup)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
         self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]] = \

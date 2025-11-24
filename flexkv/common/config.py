@@ -73,6 +73,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.05)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
+    block_dedup=bool(os.getenv('FLEXKV_HIT_BLOCK_DEDUP', 0)),
 
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),

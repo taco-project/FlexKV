@@ -41,7 +41,7 @@ def test_config_init(config: dict, should_raise: bool):
 def test_mempool():
     mempool = Mempool(num_total_blocks=64)
     assert mempool.num_free_blocks == 64
-    block_ids = mempool.allocate_blocks(16)
+    block_ids = mempool.allocate_blocks(16)[0]
     assert isinstance(block_ids, np.ndarray)
     assert block_ids.dtype == np.int64
     assert block_ids.shape == (16,)
@@ -49,25 +49,25 @@ def test_mempool():
     mempool.recycle_blocks(block_ids)
     assert mempool.num_free_blocks == 64
 
-    block_ids = np.concatenate([mempool.allocate_blocks(16),
-                           mempool.allocate_blocks(16),
-                           mempool.allocate_blocks(16),
-                           mempool.allocate_blocks(16)])
+    block_ids = np.concatenate([mempool.allocate_blocks(16)[0],
+                           mempool.allocate_blocks(16)[0],
+                           mempool.allocate_blocks(16)[0],
+                           mempool.allocate_blocks(16)[0]])
     assert mempool.num_free_blocks == 0
 
     with pytest.raises(ValueError):
-        mempool.allocate_blocks(1)
+        mempool.allocate_blocks(1)[0]
 
     mempool.recycle_blocks(block_ids)
     assert mempool.num_free_blocks == 64
 
-    empty_blocks = mempool.allocate_blocks(0)
+    empty_blocks = mempool.allocate_blocks(0)[0]
     assert empty_blocks.shape == (0, )
     assert empty_blocks.dtype == np.int64
     assert mempool.num_free_blocks == 64
 
     with pytest.raises(ValueError):
-        mempool.allocate_blocks(-1)
+        mempool.allocate_blocks(-1)[0]
 
     mempool.recycle_blocks(np.array([], dtype=np.int64))
     assert mempool.num_free_blocks == 64
