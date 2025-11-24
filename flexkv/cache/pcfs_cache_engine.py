@@ -10,7 +10,6 @@ from flexkv.cache.radix_remote import LocalRadixTree, DistributedRadixTree
 from flexkv.cache.redis_meta import RedisMetaChannel as _PyRedisMetaChannel
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.block import SequenceMeta
-from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
 #if TYPE_CHECKING:
 from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import DeviceType
@@ -39,9 +38,9 @@ class HierarchyLRCacheEngine:
                  hit_reward_seconds: int = 0,
                  meta: Optional[RedisMeta] = None) -> None:
         if num_total_blocks <= 0:
-            raise InvalidConfigError(f"Invalid num_total_blocks: {num_total_blocks}")
+            raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
-            raise InvalidConfigError(
+            raise ValueError(
                 f"Invalid tokens_per_block: {tokens_per_block}, tokens_per_block must be a power of 2"
             )
 
@@ -92,7 +91,7 @@ class HierarchyLRCacheEngine:
 
     def start(self) -> None:
         if self._meta is None:
-            raise InvalidConfigError("RedisMeta is not provided; ensure from_cache_config stores it or pass it to start().")
+            raise ValueError("RedisMeta is not provided; ensure from_cache_config stores it or pass it to start().")
         #TODO can we use like this to distinguish the different tree pairs?
         if self.device_type == DeviceType.REMOTE:
             local_ch_block_key = "PCFSB"
@@ -104,7 +103,7 @@ class HierarchyLRCacheEngine:
             local_ch_block_key = "SSDB"
             remote_ch_block_key = "SSDB"
         else:
-            raise InvalidConfigError(f"Invalid device type: {self.device_type}")
+            raise ValueError(f"Invalid device type: {self.device_type}")
         self.remote_ch = self._meta.get_redis_meta_channel(remote_ch_block_key)
         self.local_ch = self._meta.get_redis_meta_channel(local_ch_block_key)
                 # Load and store mapping of node_id -> file_nodeids from Redis
@@ -112,7 +111,7 @@ class HierarchyLRCacheEngine:
             try:
                 self.nid_to_file_nodeids = self._meta.load_pcfs_file_nodeids()
             except Exception:
-                raise InvalidConfigError("Failed to load PCFS file nodeids from Redis")
+                raise ValueError("Failed to load PCFS file nodeids from Redis")
         self.local_index.start(self.local_ch)
         self.remote_index.start(self.remote_ch)
 
@@ -383,7 +382,7 @@ class HierarchyLRCacheEngine:
                 self.local_index.unlock(protected_node)
         
         if strict and num_required_blocks > self.mempool.num_free_blocks:
-            raise NotEnoughSpaceError(
+            raise ValueError(
                 "Not enough free blocks to take, ", required=num_required_blocks, available=self.mempool.num_free_blocks
             )
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
@@ -407,9 +406,9 @@ class HierarchyLRCacheEngine:
 
         # 1) Generate unique remote_file_prefix using uuid and build remote_cache_path
         if cache_config.remote_file_prefix is None:
-            raise InvalidConfigError("remote_file_prefix must be provided in CacheConfig when enable_remote is True")
+            raise ValueError("remote_file_prefix must be provided in CacheConfig when enable_remote is True")
         if cache_config.remote_file_num is None or cache_config.remote_file_num <= 0:
-            raise InvalidConfigError("remote_file_num must be a positive integer in CacheConfig when enable_remote is True")
+            raise ValueError("remote_file_num must be a positive integer in CacheConfig when enable_remote is True")
 
         # Prefer uuid from RedisMeta to ensure cluster-wide uniqueness, fallback to Python uuid if meta is None
         try:
@@ -430,11 +429,11 @@ class HierarchyLRCacheEngine:
         pcfs_ip = remote_cfg.get("pcfs_ip")
         pcfs_parent_nodeid = remote_cfg.get("pcfs_parent_nodeid")
         if None in (pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid):
-            raise InvalidConfigError("Some required PCFS config fields are missing: pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid")
+            raise ValueError("Some required PCFS config fields are missing: pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid")
 
         pcfs = c_ext.Pcfs(pcfs_fsid, pcfs_port, pcfs_ip, False, pcfs_parent_nodeid)
         if not pcfs.init():
-            raise InvalidConfigError(f"PCFS init failed: fsid={pcfs_fsid}, ip={pcfs_ip}")
+            raise ValueError(f"PCFS init failed: fsid={pcfs_fsid}, ip={pcfs_ip}")
 
         node_ids: List[int] = []
         # Derive file size if available; otherwise, use 0 when not provided (only lookup or create placeholder)
@@ -446,7 +445,7 @@ class HierarchyLRCacheEngine:
         for remote_path in cache_config.remote_cache_path:
             nodeid = pcfs.lookup_or_create_file(remote_path, file_size, True)
             if nodeid == 0:
-                raise InvalidConfigError(f"lookup or create file failed for file: {remote_path}")
+                raise ValueError(f"lookup or create file failed for file: {remote_path}")
             node_ids.append(int(nodeid))
 
         # 3) Register nodeids into Redis for discovery
@@ -490,7 +489,7 @@ class HierarchyLRCacheEngine:
             elif device_type == DeviceType.SSD:
                 local_max_num_blocks = int(cache_config.num_ssd_blocks)
             else:
-                raise InvalidConfigError(f"Invalid device type: {device_type}")
+                raise ValueError(f"Invalid device type: {device_type}")
                 #local_max_num_blocks = int(cache_config.num_local_blocks or 0)
             
             return cls(
@@ -516,5 +515,5 @@ class HierarchyLRCacheEngine:
                 hit_reward_seconds=int(GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds),
                 meta=meta,
             )
-            raise InvalidConfigError("Invalid device type: {cache_config.device_type}")
+            raise ValueError("Invalid device type: {cache_config.device_type}")
 
