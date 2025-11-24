@@ -292,7 +292,6 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
   auto prefix_blocks_num = 0;
   auto ready_prefix_blocks_num = 0;
   auto last_node_matched_length = 0;
-  // Preallocate tensor for up to num_blocks entries and fill directly to avoid extra copy
   auto physical_blocks_tensor = torch::empty({num_blocks}, torch::dtype(torch::kInt64));
   auto *pb_out = physical_blocks_tensor.data_ptr<int64_t>();
   int64_t pb_write = 0;
@@ -314,16 +313,15 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
     if (prefix_blocks_num + current_node->size() >= num_blocks) {
       int cmp_len = std::min(current_node->size(), num_blocks - prefix_blocks_num);
       int matched_length = 0;
+      auto &dq = current_node->get_physical_blocks();
       for (int i = 0; i < cmp_len; ++i) {
         if (current_node->get_hash(i) == HashType(block_hashes_ptr[prefix_blocks_num + i])) {
+          pb_out[pb_write++] = dq[i];
           matched_length++;
         } else {
           break;
         }
       }
-      physical_blocks->insert(physical_blocks->end(),
-                              current_node->get_physical_blocks().begin(), 
-                              current_node->get_physical_blocks().begin() + matched_length);
       if (current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += matched_length;
@@ -348,9 +346,10 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
         ready_prefix_blocks_num += current_node->size();
       }
       prefix_blocks_num += current_node->size();
-      physical_blocks->insert(physical_blocks->end(),
-                              current_node->get_physical_blocks().begin(),
-                              current_node->get_physical_blocks().end());
+      auto &pbs = current_node->get_physical_blocks();
+      for (auto pb : pbs) {
+        pb_out[pb_write++] = pb;
+      }
       current_node = current_node->get_child(child_hash);
     } else {
       auto matched_length = 0;
@@ -377,9 +376,10 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
           }
         }
         matched_length = left;
-        physical_blocks->insert(
-            physical_blocks->end(), current_node->get_physical_blocks().begin(),
-            current_node->get_physical_blocks().begin() + matched_length);
+        auto &pbs = current_node->get_physical_blocks();
+        for (int i = 0; i < matched_length; i++) {
+          pb_out[pb_write++] = pbs[i];
+        }
       } else {
         matched_length = 0;
       }
@@ -395,6 +395,7 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
     }
   }
 
+  auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
   auto empty_uint32 = torch::Tensor();
   return std::make_shared<CMatchResult>(ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
     last_ready_node, current_node, physical_blocks, empty_uint32);
