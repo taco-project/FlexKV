@@ -8,7 +8,7 @@ export PYTHONPATH=/workspace/sdk/:$PYTHONPATH
 export MOONCAKE_CONFIG_PATH="/workspace/FlexKV/tests/test_dist_e2e/mooncake_config_r.json"
 export MC_REDIS_PASSWORD="redis-serving-passwd"
 export MC_LEGACY_RPC_PORT_BINDING=12841
-export FLEXKV_IORING_ENTRIES=0
+#export FLEXKV_IORING_ENTRIES=0
 #VLLM_USE_V1=1 python3 -m vllm.entrypoints.cli.main serve /workspace/Qwen3-8B \
 VLLM_USE_V1=1 python3 -m vllm.entrypoints.openai.api_server \
      --model /workspace/Qwen3-8B \

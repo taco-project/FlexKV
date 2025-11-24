@@ -669,6 +669,7 @@ class GlobalCacheEngine:
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
 
+
         # DEBUG: Log GET operation with hash info
         #if len(sequence_meta.block_hashes) > 0:
         #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
@@ -712,8 +713,10 @@ class GlobalCacheEngine:
 
         #allocated new cpu blocks for this request
         allocated_cpu_block_num = fragment2_num_blocks
-        if cpu_matched_result.matched_pos == "remote" and cpu_matched_result.insert_to_local_cpu_index:
-            allocated_cpu_block_num += fragment1_num_blocks ## NOTE: fix bug?
+        # NOTE: When matched_pos is "remote", we ALWAYS need to allocate local CPU blocks
+        # to receive the data, regardless of whether we insert to local index or not
+        if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
+            allocated_cpu_block_num += fragment1_num_blocks
         allocated_cpu_blocks = self.cpu_cache_engine.take(
             num_required_blocks=allocated_cpu_block_num,
             protected_node=cpu_matched_result.last_node,
@@ -1202,17 +1205,15 @@ class GlobalCacheEngine:
             cpu_node = node_to_unlock[DeviceType.CPU][0]
             self.cpu_cache_engine.unlock(cpu_node)
             self.cpu_cache_engine.set_ready(cpu_node, True, node_to_unlock[DeviceType.CPU][1])
-            if is_put and self.enable_kv_sharing:
-                if self.cache_config.enable_p2p_cpu:
-                    self.cpu_cache_engine.local_index.insert_and_publish(cpu_node)
+            if is_put and self.cache_config.enable_p2p_cpu:
+                self.cpu_cache_engine.local_index.insert_and_publish(cpu_node)
         if DeviceType.SSD in node_to_unlock:
             assert self.ssd_cache_engine is not None
             ssd_node = node_to_unlock[DeviceType.SSD][0]
             self.ssd_cache_engine.unlock(ssd_node)
             self.ssd_cache_engine.set_ready(ssd_node, True, node_to_unlock[DeviceType.SSD][1])
-            if is_put and self.enable_kv_sharing:
-                if self.cache_config.enable_p2p_ssd:
-                    self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
+            if is_put and self.cache_config.enable_p2p_ssd:
+                self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
         if DeviceType.REMOTE in node_to_unlock:
             assert self.remote_cache_engine is not None
             self.remote_cache_engine.unlock(node_to_unlock[DeviceType.REMOTE][0])
