@@ -41,6 +41,7 @@ hpp_sources = [
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
     "csrc/gds/gds_manager.h",
+    "csrc/mempool.h",
 ]
 
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
