@@ -20,7 +20,6 @@ from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
 from flexkv.transfer_manager import get_master_host_and_ports_from_env
-from flexkv.common.debug import flexkv_logger
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -93,7 +92,7 @@ class KVTaskManager:
         self._check_config(model_config, cache_config)
 
         self.is_multinode_tp = False
-        self.tp_size_per_node = model_config.tp_size
+        self.tp_size_per_node = min(model_config.tp_size, torch.cuda.device_count())
 
         if self.model_config.tp_size > self.tp_size_per_node:
             if self.model_config.tp_size != torch.cuda.device_count() * 2:
@@ -101,14 +100,15 @@ class KVTaskManager:
             if self.model_config.dp_size != 1:
                 raise ValueError("Only support dp_size=1 for multi-node TP")
             self.is_multinode_tp = True
-            self.tp_size_per_node = torch.cuda.device_count()
 
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
 
         model_config_for_transfer = copy.deepcopy(self.model_config)
-        if self.is_multinode_tp and not self.model_config.use_mla:
-            model_config_for_transfer.num_kv_heads = self.tp_size_per_node
-        
+        if self.is_multinode_tp:
+            model_config_for_transfer.tp_size = self.tp_size_per_node
+            if not self.model_config.use_mla:
+                model_config_for_transfer.num_kv_heads = self.tp_size_per_node
+
         combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
         if not combine_with_trtllm:
             self.transfer_handles = [TransferManagerHandle(
