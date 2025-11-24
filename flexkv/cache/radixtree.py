@@ -22,7 +22,7 @@ import torch
 
 from flexkv.common.block import SequenceMeta
 from flexkv.common.hash_utils import HashType, Hasher
-
+from flexkv.cache.mempool import Mempool
 
 @dataclass
 class MatchResult:
@@ -123,7 +123,7 @@ class RadixNode:
         self.children.clear()
 
 class RadixTreeIndex:
-    def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000, hit_reward_seconds: int = 0):
+    def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000, hit_reward_seconds: int = 0, block_dedup: bool = False):
         self.root_node: RadixNode = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                               physical_blocks=np.array([], dtype=np.int64),
                                               is_ready=True,
@@ -138,6 +138,8 @@ class RadixTreeIndex:
 
         self.hit_reward_seconds = hit_reward_seconds
 
+        self.mempool = Mempool(num_total_blocks=max_num_blocks, block_dedup=block_dedup)
+
     def reset(self) -> None:
         self.root_node = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                    physical_blocks=np.array([], dtype=np.int64),
@@ -145,6 +147,19 @@ class RadixTreeIndex:
                                    lock_cnt=0,
                                    grace_time=time.time())
         self.leaf_nodes.clear()
+        self.mempool.reset()
+
+    def num_total_blocks(self) -> int:
+        return self.mempool.num_total_blocks
+
+    def num_free_blocks(self) -> int:
+        return self.mempool.num_free_blocks
+
+    def recycle_blocks(self, physical_blocks: np.ndarray) -> None:
+        self.mempool.recycle_blocks(physical_blocks)
+
+    def allocate_blocks(self, num_allocated_blocks int, block_hashes: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray | None]
+        return self.mempool.allocate_blocks(num_allocated_blocks, block_hashes)
 
     def is_empty(self) -> bool:
         return len(self.leaf_nodes) == 0
@@ -262,29 +277,46 @@ class RadixTreeIndex:
 
         return new_node
 
-    def evict(self, num_evicted: int) -> np.ndarray:
+    def evict(self, num_evicted: int) -> None:
         candidates = []
         for node in self.leaf_nodes.values():
             if node.evictable():
                 candidates.append(node)
         heapq.heapify(candidates)
         evicted_blocks = np.array([], dtype=np.int64)
-        while len(evicted_blocks) < num_evicted and candidates:
-            node = heapq.heappop(candidates)
-            if node.size() > num_evicted - len(evicted_blocks):
-                physical_blocks = node.shrink(num_evicted - len(evicted_blocks))
-            else:
-                assert node.parent is not None  # node is not root
-                node.parent.children.pop(node.head_hash())
-                self.leaf_nodes.pop(node.head_hash(), None)
-                if node.parent.is_leaf():
-                    self.leaf_nodes[node.parent.head_hash()] = node.parent
-                if node.parent.evictable():
-                    heapq.heappush(candidates, node.parent)
-                physical_blocks = node.physical_blocks
-                node.parent = None
-            evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
-        return evicted_blocks
+        if self.mempool.block_dedup:
+            while self.mempool.num_free_blocks < num_evicted and candidate:
+                node = heapq.heappop(candidates)
+                if node.size() > num_evicted - len(evicted_blocks):
+                    physical_blocks = node.shrink(num_evicted - len(evicted_blocks))
+                else:
+                    assert node.parent is not None  # node is not root
+                    node.parent.children.pop(node.head_hash())
+                    self.leaf_nodes.pop(node.head_hash(), None)
+                    if node.parent.is_leaf():
+                        self.leaf_nodes[node.parent.head_hash()] = node.parent
+                    if node.parent.evictable():
+                        heapq.heappush(candidates, node.parent)
+                    physical_blocks = node.physical_blocks
+                    node.parent = None
+                    self.mempool.recycle_blocks(physical_blocks)
+        else:
+             while len(evicted_blocks) < num_evicted and candidate:
+                node = heapq.heappop(candidates)
+                if node.size() > num_evicted - len(evicted_blocks):
+                    physical_blocks = node.shrink(num_evicted - len(evicted_blocks))
+                else:
+                    assert node.parent is not None  # node is not root
+                    node.parent.children.pop(node.head_hash())
+                    self.leaf_nodes.pop(node.head_hash(), None)
+                    if node.parent.is_leaf():
+                        self.leaf_nodes[node.parent.head_hash()] = node.parent
+                    if node.parent.evictable():
+                        heapq.heappush(candidates, node.parent)
+                    physical_blocks = node.physical_blocks
+                    node.parent = None
+                evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
+            self.mempool.recycle_blocks(evicted_blocks)
 
     def lock(self, node: RadixNode) -> None:
         assert node.lock_cnt >= 0

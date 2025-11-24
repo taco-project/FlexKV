@@ -204,9 +204,7 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
 int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   int64_t *evicted_blocks_ptr = evicted_blocks.data_ptr<int64_t>();
   int has_evicted = 0;
-  std::priority_queue<CRadixNode *, std::vector<CRadixNode *>,
-                      CRadixNode::Compare>
-      candidate;
+  std::priority_queue<CRadixNode *, std::vector<CRadixNode *>, CRadixNode::Compare> candidate;
 
   for (auto it = leaf_list.begin(); it != leaf_list.end(); it++) {
     if ((*it)->evictable()) {
@@ -214,7 +212,7 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, int num_evicted) {
     }
   }
 
-  while ((has_evicted < num_evicted) && candidate.size()) {
+  while ((mempool->num_free_blocks() < num_evicted) && candidate.size()) {
     auto node = candidate.top();
     candidate.pop();
 
@@ -247,6 +245,11 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, int num_evicted) {
       node->clear_parent();
       remove_leaf(node);
       remove_node(node);
+    }
+
+    if (has_evicted == num_evicted) {
+      mempool->recycle_blocks(evicted_blocks);
+      has_evicted = 0;
     }
   }
   return has_evicted;

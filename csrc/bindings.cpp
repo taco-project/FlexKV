@@ -467,7 +467,7 @@ PYBIND11_MODULE(c_ext, m) {
 #endif
 
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
-      .def(py::init<int, int, int>())
+      .def(py::init<int, int, int, bool>())
       .def("is_empty", &flexkv::CRadixTreeIndex::is_empty)
       .def("reset", &flexkv::CRadixTreeIndex::reset)
       .def("lock", &flexkv::CRadixTreeIndex::lock, py::arg("node"))
@@ -483,7 +483,13 @@ PYBIND11_MODULE(c_ext, m) {
       .def("total_unready_blocks", &flexkv::CRadixTreeIndex::total_unready_blocks)
       .def("total_ready_blocks", &flexkv::CRadixTreeIndex::total_ready_blocks)
       .def("match_prefix", &flexkv::CRadixTreeIndex::match_prefix,
-           py::arg("block_hashes"), py::arg("num_blocks"), py::arg("update_cache_info"));
+           py::arg("block_hashes"), py::arg("num_blocks"), py::arg("update_cache_info"))
+      .def("num_total_blocks", &flexkv::CRadixTreeIndex::num_total_blocks)
+      .def("num_free_blocks", &flexkv::CRadixTreeIndex::num_free_blocks)
+      .def("recycle_blocks", &flexkv::CRadixTreeIndex::recycle_blocks, py::arg("physical_blocks"))
+      .def("allocate_blocks", &flexkv::CRadixTreeIndex::allocate_blocks,
+           py::arg("num_allocated_blocks"), py::arg("block_hashes"),
+	   py::arg("free_block_ids"), py::arg("free_block_refcnt"));
 
   py::class_<flexkv::CRadixNode>(m, "CRadixNode")
       .def(py::init<flexkv::CRadixTreeIndex *, bool, int>())

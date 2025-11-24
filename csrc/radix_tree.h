@@ -7,6 +7,7 @@
 #include <execinfo.h>
 
 #include "cache_utils.h"
+#include "mempool.h"
 
 namespace flexkv {
 
@@ -189,6 +190,7 @@ public:
 
 class CRadixTreeIndex {
 private:
+  CMemPool *mempool;
   CRadixNode *root;
   std::list<CRadixNode *> node_list;
   std::list<CRadixNode *> leaf_list;
@@ -199,14 +201,14 @@ private:
   int hit_reward_seconds;
 
 public:
-  CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000, int hit_reward_seconds = 0) {
+  CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000, int hit_reward_seconds = 0, bool block_dedup = false) {
     this->tokens_per_block = tokens_per_block;
-    this->max_num_blocks = max_num_blocks;
     this->node_count = 0;
     this->hit_reward_seconds = hit_reward_seconds;
 
     root = new CRadixNode(this, true, 0);
     node_list.push_back(root);
+    mempool = new CMemPool(max_num_blocks, block_dedup);
   }
 
   ~CRadixTreeIndex() {
@@ -222,6 +224,8 @@ public:
     if (node_count) {
       std::cerr << "CRadix Node count" << node_count << std::endl;
     }
+
+    delete mempool;
   }
 
   void reset() {
@@ -236,6 +240,25 @@ public:
 
     root = new CRadixNode(this, true, 0);
     node_list.push_back(root);
+
+    mempool->reset();
+  }
+
+  int num_total_blocks() {
+    return mempool->num_total_blocks();
+  }
+
+  int num_free_blocks() {
+    return mempool->num_free_blocks();
+  }
+
+  void recycle_blocks(torch::Tensor &physical_blocks) {
+    mempool->recycle_blocks(physical_blocks);
+  }
+
+  int allocate_blocks(int num_allocated_blocks, torch::Tensor &block_hashes,
+                      torch::Tensor &free_block_ids, torch::Tensor &free_block_refcnt) {
+    return mempool->allocate_blocks(num_allocated_blocks, block_hashes, free_block_ids, free_block_refcnt);
   }
 
   bool is_root(CRadixNode *node) {

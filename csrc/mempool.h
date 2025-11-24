@@ -61,25 +61,25 @@ public:
 class CMemPool {
 private:
   bool block_dedup;
-  int num_total_blocks;
+  int num_total;
   int num_free;
   int free_ids_offset;
 
   std::vector<BlockInfo> *total_block_list;
-  std::vector<int64_t> *free_blockid_list;
-  std::unordered_map<HashType, int64_t> *hash_id_map;
+  std::vector<int64_t> *free_ids;
+  std::unordered_map<int64_t, int64_t> *hash_id_map;
 
 public:
-  CMemPool(int num_total_blocks, bool block_dedup) {
-    assert(num_total_blocks > 0);
+  CMemPool(int num_total, bool block_dedup) {
+    assert(num_total > 0);
 
     this->block_dedup = block_dedup;
-    this->num_total_blocks = num_total_blocks;
-    this->num_free = num_total_blocks;
+    this->num_total = num_total;
+    this->num_free = num_total;
     this->free_ids_offset = 0;
 
-    total_block_list = new std::vector<BlockInfo>(num_total_blocks);
-    free_ids = new std::vector<int64_t>(num_total_blocks);
+    total_block_list = new std::vector<BlockInfo>(num_total);
+    free_ids = new std::vector<int64_t>(num_total);
     std::iota(free_ids->begin(), free_ids->end(), 0);
     hash_id_map = new std::unordered_map<int64_t, int64_t>();
   }
@@ -91,10 +91,10 @@ public:
   };
 
   void reset() {
-    this->num_free = this->num_total_blocks;
+    this->num_free = this->num_total;
     this->free_ids_offset = 0;
 
-    for (auto& it = total_block_list->begin(); it != total_block_list->end(); it++) {
+    for (auto it = total_block_list->begin(); it != total_block_list->end(); it++) {
       it->set_hash(0);
       it->set_ref(0);
     }
@@ -103,10 +103,10 @@ public:
     hash_id_map->clear();
   }
 
-  void allocate_blocks(int num, torch::Tensor &block_hash_list, torch::Tensor &block_id_list, torch::Tensor &block_ref_list) {
-    auto *block_hash_list_ptr = block_hash_list.data_ptr<int64_t>();
-    auto *block_id_list_ptr = block_id_list.data_ptr<int64_t>();
-    auto *block_ref_list_ptr = block_ref_list.data_ptr<int64_t>();
+  int allocate_blocks(int num, torch::Tensor &block_hash_list, torch::Tensor &block_id_list, torch::Tensor &block_ref_list) {
+    int64_t *block_hash_list_ptr = block_hash_list.data_ptr<int64_t>();
+    int64_t *block_id_list_ptr = block_id_list.data_ptr<int64_t>();
+    int64_t *block_ref_list_ptr = block_ref_list.data_ptr<int64_t>();
     int i;
 
     assert(block_hash_list.dim() == 1);
@@ -126,39 +126,43 @@ public:
       throw std::runtime_error("Not enough free blocks, required=" + std::to_string(num) + ", available=" + std::to_string(num_free));
     }
 
-    if (num > (free_ids->size() - free_ids_offset)) {
+    if ((unsigned int)num > (free_ids->size() - free_ids_offset)) {
       update_free_ids();
     }
+
+    if ((unsigned int)num > (free_ids->size() - free_ids_offset))
+      return -1;
 
     for (i = 0; i < num; i++) {
       if (block_dedup) {
         auto iter = hash_id_map->find(block_hash_list_ptr[i]);
         if (iter != hash_id_map->end()) {
-          auto& block = total_block_list[iter.second()];
+          auto& block = (*total_block_list)[iter->second];
 
 	  assert(block.get_hash() == block_hash_list_ptr[i]);
 	  block.inc_ref();
 
-	  block_id_list_ptr[i] = iter.second();
+	  block_id_list_ptr[i] = iter->second;
 	  block_ref_list_ptr[i] = block.get_ref();
           num_free--;
 	  continue;
 	}
       }
 
-      auto& block = total_block_list[free_ids[free_ids_offset]];
+      auto& block = (*total_block_list)[(*free_ids)[free_ids_offset]];
 
       block.set_ref(1);
       block.set_hash(block_hash_list_ptr[i]);
-      block_id_list_ptr[i] = free_ids[free_ids_offset];
+      block_id_list_ptr[i] = (*free_ids)[free_ids_offset];
       block_ref_list_ptr[i] = 1;
-      hash_id_map->insert(block_hash_list_ptr[i], free_ids->at(free_ids_offset));
+      hash_id_map->insert({block_hash_list_ptr[i], (*free_ids)[free_ids_offset]});
       free_ids_offset++;
       num_free--;
     }
+    return 0;
   }
 
-  void recycle_blocks(torch::Tensor block_ids) {
+  void recycle_blocks(torch::Tensor &block_ids) {
     int block_ids_len = block_ids.size(0);
     int64_t *block_ids_ptr = block_ids.data_ptr<int64_t>();
     int i;
@@ -188,7 +192,7 @@ public:
   void update_free_ids() {
     free_ids->clear();
 
-    for (auto& it = total_block_list->begin(); it != total_block_list->end(); it++) {
+    for (auto it = total_block_list->begin(); it != total_block_list->end(); it++) {
       if (it->get_ref() == 0) {
         free_ids->push_back(std::distance(total_block_list->begin(), it));
       }
@@ -202,7 +206,11 @@ public:
   }
 
   int num_used_blocks() {
-    return num_total_blocks - num_free;
+    return num_total - num_free;
+  }
+
+  int num_total_blocks() {
+    return num_total;
   }
 };
 

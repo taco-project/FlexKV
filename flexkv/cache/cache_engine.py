@@ -26,7 +26,6 @@ import nvtx
 import torch
 from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
 
-from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.transfer_pattern import add_virtal_op_for_mutiple_finished_ops
 from flexkv.common.block import SequenceMeta
@@ -65,9 +64,7 @@ class CacheEngineAccel:
 
         self.device_type = device_type
 
-        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds)
-
-        self.mempool = Mempool(num_total_blocks=num_total_blocks, block_dedup=block_dedup)
+        self.index = CRadixTreeIndex(num_total_blocks, tokens_per_block, hit_reward_seconds, block_dedup)
 
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
@@ -75,7 +72,6 @@ class CacheEngineAccel:
 
     def reset(self) -> None:
         self.index.reset()
-        self.mempool.reset()
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
         sequence_meta.gen_hashes()
@@ -122,30 +118,30 @@ class CacheEngineAccel:
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
              strict: bool = True) -> torch.Tensor:
-        if num_required_blocks > self.mempool.num_free_blocks:
+        if num_required_blocks > self.index.num_free_blocks():
             if protected_node is not None:
                 self.index.lock(protected_node)
             evict_block_num = max(
-                num_required_blocks - self.mempool.num_free_blocks,
-                int(self.mempool.num_total_blocks * self.evict_ratio)
+                num_required_blocks - self.index.num_free_blocks(),
+                int(self.index.num_total_blocks() * self.evict_ratio)
             )
             target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
-            num_evicted = self.index.evict(target_blocks, evict_block_num)
-            if num_evicted != evict_block_num:
-                target_blocks.resize_(num_evicted)
-            self.mempool.recycle_blocks(target_blocks.numpy())
+            self.index.evict(target_blocks, evict_block_num)
 
             if protected_node is not None:
                 self.index.unlock(protected_node)
-        if strict and num_required_blocks > self.mempool.num_free_blocks:
+        if strict and num_required_blocks > self.index.num_free_blocks():
             raise RuntimeError(f"Not enough free blocks to take, "
                                f"required: {num_required_blocks}, "
-                               f"available: {self.mempool.num_free_blocks}")
-        num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        return self.mempool.allocate_blocks(num_allocated_blocks, None)[0]
+                               f"available: {self.index.num_free_blocks()}")
+        num_allocated_blocks = min(num_required_blocks, self.index.num_free_blocks())
+        free_block_ids = torch.zeros(num_allocated_blocks, dtype=torch.int64)
+        free_block_refcnt = torch.zeros(num_allocated_blocks, dtype=torch.int32)
+        self.index.allocate_blocks(num_allocated_blocks, None, free_block_ids, free_block_refcnt);
+        return free_block_ids;
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
-        self.mempool.recycle_blocks(physical_blocks)
+        self.index.recycle_blocks(torch.from_numpy(physical_blocks).to(torch.int64))
 
 class CacheEngine:
     def __init__(self,
@@ -165,9 +161,8 @@ class CacheEngine:
 
         self.device_type = device_type
 
-        self.index = RadixTreeIndex(tokens_per_block=tokens_per_block, hit_reward_seconds=hit_reward_seconds)
-
-        self.mempool = Mempool(num_total_blocks=num_total_blocks, block_dedup=block_dedup)
+        self.index = RadixTreeIndex(num_total_blocks=num_total_blocks, tokens_per_block=tokens_per_block,
+                                    hit_reward_seconds=hit_reward_seconds, block_dedup=block_dedup)
 
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
@@ -175,7 +170,6 @@ class CacheEngine:
 
     def reset(self) -> None:
         self.index.reset()
-        self.mempool.reset()
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResult:
         match_result = self.index.match_prefix(sequence_meta,
@@ -207,27 +201,25 @@ class CacheEngine:
              num_required_blocks: int,
              protected_node: Optional[RadixNode] = None,
              strict: bool = True) -> np.ndarray:
-        if num_required_blocks > self.mempool.num_free_blocks:
+        if num_required_blocks > self.index.num_free_blocks():
             if protected_node is not None:
                 self.index.lock(protected_node)
             evict_block_num = max(
-                num_required_blocks - self.mempool.num_free_blocks,
-                int(self.mempool.num_total_blocks * self.evict_ratio)
+                num_required_blocks - self.index.num_free_blocks(),
+                int(self.index.num_total_blocks() * self.evict_ratio)
             )
-            self.mempool.recycle_blocks(
-                self.index.evict(evict_block_num)
-            )
+            self.index.evict(evict_block_num)
             if protected_node is not None:
                 self.index.unlock(protected_node)
-        if strict and num_required_blocks > self.mempool.num_free_blocks:
+        if strict and num_required_blocks > self.index.num_free_blocks():
             raise RuntimeError("Not enough free blocks to take, ",
                                f"required: {num_required_blocks}, "
-                               f"available: {self.mempool.num_free_blocks}")
-        num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        return self.mempool.allocate_blocks(num_allocated_blocks, None)[0]
+                               f"available: {self.index.num_free_blocks()}")
+        num_allocated_blocks = min(num_required_blocks, self.index.num_free_blocks())
+        return self.index.allocate_blocks(num_allocated_blocks, None)[0]
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
-        self.mempool.recycle_blocks(physical_blocks)
+        self.index.recycle_blocks(physical_blocks)
 
 class GlobalCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig):
