@@ -12,7 +12,7 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 
 ```bash
 apt install liburing-dev
-apt install libxxhash-dev
+apt install libxxhash-dev 
 ```
 
 ### Build FlexKV
@@ -25,10 +25,6 @@ apt install libxxhash-dev
 ### Use FlexKV with vLLM
 
 See [docs/vllm_adapter/README_en.md](docs/vllm_adapter/README_en.md)
-
-### Use FlexKV with TensorRT-LLM
-
-See [docs/trtllm_adaption/README_en.md](docs/trtllm_adaption/README_en.md)
 
 ### FlexKV Integration with Dynamo
 
@@ -94,7 +90,7 @@ FlexKV performs:
 
 ## Roadmap
 
-- **In-Process Cache Engine Integration**: In the dev branch, the implementation, integration, and invocation of the Cache Engine will be further optimized, along with synchronized updates to related APIs.
+- **In-Process Cache Engine Integration**: In the dev branch, the implementation, integration, and invocation of the Cache Engine will be further optimized, along with synchronized updates to related APIs. 
 - **Framework Integration**: Support works for vLLM, SGLang, and other acceleration frameworks will be updated soon.
 - **Distributed Query Support**: Enable scalable, distributed KVCache lookup.
 - **Latency Optimization**: Further reduce *get* latency via smarter prefetching and compression.

@@ -1,4 +1,0 @@
-cpu_cache_gb: 32
-ssd_cache_gb: 64
-ssd_cache_dir: ./ssd_cache/
-enable_gds: false

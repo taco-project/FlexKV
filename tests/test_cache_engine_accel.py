@@ -1,4 +1,3 @@
-from multiprocessing import Value
 import random
 
 import pytest
@@ -7,6 +6,7 @@ import numpy as np
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.cache_engine import CacheEngineAccel
 from flexkv.common.transfer import DeviceType
+from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
 from flexkv.common.block import SequenceMeta
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def cache_engine(request: pytest.FixtureRequest) -> CacheEngineAccel:
 )
 def test_config_init(config: dict, should_raise: bool):
     if should_raise:
-        with pytest.raises(ValueError) as e:
+        with pytest.raises(InvalidConfigError) as e:
             CacheEngineAccel(**config)
     else:
         engine = CacheEngineAccel(**config)
@@ -56,7 +56,7 @@ def test_mempool():
                            mempool.allocate_blocks(16)])
     assert mempool.num_free_blocks == 0
 
-    with pytest.raises(ValueError):
+    with pytest.raises(NotEnoughSpaceError):
         mempool.allocate_blocks(1)
 
     mempool.recycle_blocks(block_ids)
@@ -160,7 +160,7 @@ def test_take_and_recycle(cache_engine: CacheEngineAccel):
 
     with pytest.raises(ValueError):
         cache_engine.take(-1)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(NotEnoughSpaceError):
         cache_engine.take(num_total_blocks, protected_node=radixnode, strict=True)
 
     physical_blocks2 = cache_engine.take(num_total_blocks, protected_node=radixnode, strict=False)
@@ -170,10 +170,9 @@ def test_take_and_recycle(cache_engine: CacheEngineAccel):
     cache_engine.recycle(physical_blocks2)
 
     cache_engine.lock_node(radixnode)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(NotEnoughSpaceError):
         cache_engine.take(num_total_blocks, protected_node=radixnode, strict=True)
-    cache_engine.unlock(radixnode)
-    cache_engine.set_ready(radixnode, True, radixnode.size())
+    cache_engine.cleanup(radixnode, radixnode.size())
 
     physical_blocks = cache_engine.take(num_total_blocks, protected_node=None, strict=True)
     assert physical_blocks.shape == (num_total_blocks, )
@@ -223,14 +222,11 @@ def test_cleanup(cache_engine: CacheEngineAccel):
     assert cache_engine.index.total_unready_blocks() == total_insert_blocks
     assert cache_engine.index.total_ready_blocks() == 0
 
-    cache_engine.unlock(radixnode2)
-    cache_engine.set_ready(radixnode2, True, radixnode2_size)
+    cache_engine.cleanup(radixnode2, radixnode2_size)
     assert cache_engine.index.total_ready_blocks() == num_insert_blocks2
 
-    cache_engine.unlock(radixnode1)
-    cache_engine.set_ready(radixnode1, True, radixnode1_size)
+    cache_engine.cleanup(radixnode1, radixnode1_size)
     assert cache_engine.index.total_ready_blocks() == num_insert_blocks1 + num_insert_blocks2
 
-    cache_engine.unlock(radixnode0)
-    cache_engine.set_ready(radixnode0, True, radixnode0_size)
+    cache_engine.cleanup(radixnode0, radixnode0_size)
     assert cache_engine.index.total_ready_blocks() == num_insert_blocks0 + num_insert_blocks1 + num_insert_blocks2

@@ -211,14 +211,14 @@ class KVDPClient:
 class KVTPClient:
     def __init__(
         self,
-        gpu_register_port: str,
+        server_recv_port: str,
         dp_client_id: int,
         device_id: int,
     ):
         # Init inter-process communication
         context = zmq.Context(2)
         self.send_to_server = get_zmq_socket(
-            context, zmq.SocketType.PUSH, gpu_register_port, False
+            context, zmq.SocketType.PUSH, server_recv_port, False
         )
 
         self.dp_client_id = dp_client_id
@@ -230,22 +230,21 @@ class KVTPClient:
         self,
         kv_caches: List[torch.Tensor],
         kv_layout: KVCacheLayout,
-        override_device_id: Optional[int] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
 
-        # Use override_device_id if provided, otherwise use self.device_id
-        device_id = override_device_id if override_device_id is not None else self.device_id
-
         handles = []
         for _, tensor in enumerate(kv_caches):
-            handle = TensorSharedHandle(tensor, device_id)
+            if tensor.device.index != self.device_id:
+                raise ValueError(f"All tensors must be on specified device: {self.device_id}")
+
+            handle = TensorSharedHandle(tensor)
             handles.append(handle)
 
         register_req = RegisterTPClientRequest(
             self.dp_client_id,
-            device_id,
+            self.device_id,
             handles,
             kv_layout
         )

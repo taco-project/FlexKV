@@ -73,6 +73,3 @@ cover/
 
 # VSCode
 .vscode/
-
-# logs
-*.log

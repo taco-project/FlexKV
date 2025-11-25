@@ -12,13 +12,12 @@ class AccessHandleType(Enum):
     TENSOR = auto()  # single tensor or tensor list
     FILE = auto()  # single file or file list
     TENSOR_HANDLE = auto()  # single tensor handle or tensor handle list
-    GDS_MANAGER = auto()
 
-# NOTE: currently, we assume that the layout type of GPU should always be LAYERFIRST
-# and the layout type of CPU, SSD, remote should be the same, either laywise or BLOCKFIRST
+# NOTE: currently, we assume that the layout type of GPU should always be layerwise
+# and the layout type of CPU, SSD, remote should be the same, either laywise or blockwise
 class KVCacheLayoutType(Enum):
-    LAYERFIRST = "LAYERFIRST"
-    BLOCKFIRST = "BLOCKFIRST"
+    LAYERWISE = "LAYERWISE"
+    BLOCKWISE = "BLOCKWISE"
 
 @dataclass
 class KVCacheLayout:
@@ -28,7 +27,7 @@ class KVCacheLayout:
     tokens_per_block: int
     num_head: int
     head_size: int
-    is_mla: bool
+    is_mla: bool = False
     _kv_shape: Optional[torch.Size] = None
 
     def __eq__(self, other: object) -> bool:
@@ -59,14 +58,14 @@ class KVCacheLayout:
 
     def _compute_kv_shape(self) -> None:
         if self._kv_shape is None:
-            if self.type == KVCacheLayoutType.LAYERFIRST:  # for Layerwise transfer
+            if self.type == KVCacheLayoutType.LAYERWISE:  # for layerwise transfer
                 self._kv_shape = torch.Size([self.num_layer,
                                              self._kv_dim,
                                              self.num_block,
                                              self.tokens_per_block,
                                              self.num_head,
                                              self.head_size])
-            elif self.type == KVCacheLayoutType.BLOCKFIRST:
+            elif self.type == KVCacheLayoutType.BLOCKWISE:
                 self._kv_shape = torch.Size([self.num_block,
                                              self.num_layer,
                                              self._kv_dim,
@@ -126,25 +125,25 @@ class KVCacheLayout:
         return self.tokens_per_block * self.num_head * self.head_size
 
     def get_layer_stride(self) -> int:
-        if self.type == KVCacheLayoutType.LAYERFIRST:
+        if self.type == KVCacheLayoutType.LAYERWISE:
             return self.kv_shape[1:].numel()
-        elif self.type == KVCacheLayoutType.BLOCKFIRST:
+        elif self.type == KVCacheLayoutType.BLOCKWISE:
             return self.kv_shape[2:].numel()
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
 
     def get_block_stride(self) -> int:
-        if self.type == KVCacheLayoutType.LAYERFIRST:
+        if self.type == KVCacheLayoutType.LAYERWISE:
             return self.kv_shape[3:].numel()
-        elif self.type == KVCacheLayoutType.BLOCKFIRST:
+        elif self.type == KVCacheLayoutType.BLOCKWISE:
             return self.kv_shape[1:].numel()
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
 
     def get_kv_stride(self) -> int:
-        if self.type == KVCacheLayoutType.LAYERFIRST:
+        if self.type == KVCacheLayoutType.LAYERWISE:
             return self.kv_shape[2:].numel()
-        elif self.type == KVCacheLayoutType.BLOCKFIRST:
+        elif self.type == KVCacheLayoutType.BLOCKWISE:
             return self.kv_shape[3:].numel()
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")

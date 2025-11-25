@@ -1,15 +1,14 @@
 import asyncio
+import json
 import random
 import time
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Any
-import yaml
 
 import torch
-import numpy as np
 from tqdm import tqdm
 
-from flexkv.common.config import *
+from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.storage import KVCacheLayoutType
 
 
@@ -18,9 +17,9 @@ class KVRequest:
     user_id: int
     turn_id: int
     request_type: str  # "get" or "put"
-    token_ids: np.ndarray
-    token_mask: np.ndarray
-    slot_mapping: Optional[np.ndarray] = None
+    token_ids: torch.Tensor
+    token_mask: torch.Tensor
+    slot_mapping: Optional[torch.Tensor] = None
 
     request_id: int = field(init=False)
     _request_id_counter: int = field(init=False, default=0)
@@ -29,12 +28,6 @@ class KVRequest:
         self.request_id = KVRequest._request_id_counter
         KVRequest._request_id_counter += 1
 
-        if isinstance(self.token_ids, torch.Tensor):
-            self.token_ids = self.token_ids.numpy().astype(np.int64)
-        if isinstance(self.token_mask, torch.Tensor):
-            self.token_mask = self.token_mask.numpy().astype(np.int64)
-        if isinstance(self.slot_mapping, torch.Tensor):
-            self.slot_mapping = self.slot_mapping.numpy().astype(np.int64)
 
 def generate_random_multiturn(num_user_requests: int,
                               num_turns: int,
@@ -95,32 +88,27 @@ def generate_random_multiturn(num_user_requests: int,
 
 def load_config(config_path: str) -> Tuple[ModelConfig, CacheConfig]:
     with open(config_path) as f:
-        config = yaml.load(f, Loader=yaml.SafeLoader)
-        print(config)
-        model_config = ModelConfig()
-        cache_config = CacheConfig()
-        user_config = UserConfig()
-        model_config.num_layers = config["num_layers"]
-        model_config.num_kv_heads = config["num_kv_heads"]
-        model_config.head_size = config["head_size"]
-        model_config.dtype = eval(f"torch.{config['dtype']}")
-        model_config.use_mla = config["use_mla"]
-        model_config.tp_size = config["tp_size"]
-        model_config.dp_size = config["dp_size"]
-        cache_config.tokens_per_block = config["tokens_per_block"]
-
-        if "cpu_cache_gb" in config:
-            user_config.cpu_cache_gb = config["cpu_cache_gb"]
-        if "ssd_cache_gb" in config:
-            user_config.ssd_cache_gb = config["ssd_cache_gb"]
-        if "ssd_cache_dir" in config:
-            user_config.ssd_cache_dir = parse_path_list(config["ssd_cache_dir"])
-        if "enable_gds" in config:
-            user_config.enable_gds = config["enable_gds"]
-        update_default_config_from_user_config(model_config, cache_config, user_config)
+        config = json.load(f)
+        if "ModelConfig" not in config:
+            print("ModelConfig not found in config, using default values")
+            config["ModelConfig"] = {}
+        if "CacheConfig" not in config:
+            print("CacheConfig not found in config, using default values")
+            config["CacheConfig"] = {}
+        if "dtype" in config["ModelConfig"]:
+            config["ModelConfig"]["dtype"] = eval(f"torch.{config['ModelConfig']['dtype']}")
+        if "gpu_kv_layout_type" in config["CacheConfig"]:
+            config["CacheConfig"]["gpu_kv_layout_type"] = \
+                KVCacheLayoutType(config["CacheConfig"]["gpu_kv_layout_type"])
+        if "cpu_kv_layout_type" in config["CacheConfig"]:
+            config["CacheConfig"]["cpu_kv_layout_type"] = \
+                KVCacheLayoutType(config["CacheConfig"]["cpu_kv_layout_type"])
+        if "ssd_kv_layout_type" in config["CacheConfig"]:
+            config["CacheConfig"]["ssd_kv_layout_type"] = \
+                KVCacheLayoutType(config["CacheConfig"]["ssd_kv_layout_type"])
+        if "remote_kv_layout_type" in config["CacheConfig"]:
+            config["CacheConfig"]["remote_kv_layout_type"] = \
+                KVCacheLayoutType(config["CacheConfig"]["remote_kv_layout_type"])
+        model_config = ModelConfig(**config["ModelConfig"])
+        cache_config = CacheConfig(**config["CacheConfig"])
         return model_config, cache_config
-
-if __name__ == "__main__":
-    model_config, cache_config = load_config("./benchmarks/example_config.yml")
-    print(model_config)
-    print(cache_config)
