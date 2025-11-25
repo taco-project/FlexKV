@@ -1,7 +1,7 @@
 from collections import deque
 from typing import List
 
-import torch
+import numpy as np
 
 from flexkv.common.exceptions import NotEnoughSpaceError
 
@@ -14,18 +14,18 @@ class Mempool:
         assert num_total_blocks > 0
         self.num_total_blocks = num_total_blocks
 
-        self._free_mask = torch.ones(self.num_total_blocks, dtype=torch.bool)
+        self._free_mask = np.ones(self.num_total_blocks, dtype=np.bool_)
         self._num_free = num_total_blocks
-        self._free_ids = self._free_mask.nonzero().squeeze(1)
+        self._free_ids = self._free_mask.nonzero()[0]
         self._free_ids_offset = 0
 
     def reset(self) -> None:
-        self._free_mask.fill_(True)
+        self._free_mask.fill(True)
         self._num_free = self.num_total_blocks
-        self._free_ids = self._free_mask.nonzero().squeeze(1)
+        self._free_ids = self._free_mask.nonzero()[0]
         self._free_ids_offset = 0
 
-    def allocate_blocks(self, num: int) -> torch.Tensor:
+    def allocate_blocks(self, num: int) -> np.ndarray:
         if num < 0:
             raise ValueError(f"num must be greater than 0, but got {num}")
         if num > self._num_free:
@@ -41,8 +41,8 @@ class Mempool:
         self._num_free -= num
         return free_ids
 
-    def recycle_blocks(self, block_ids: torch.Tensor) -> None:
-        if block_ids.ndim != 1 or block_ids.dtype != torch.int64:
+    def recycle_blocks(self, block_ids: np.ndarray) -> None:
+        if block_ids.ndim != 1 or block_ids.dtype != np.int64:
             raise ValueError("block_ids must be a 1D tensor of int64")
         if self._free_mask[block_ids].any():
             free_ids = block_ids[self._free_mask[block_ids]]
@@ -51,7 +51,7 @@ class Mempool:
         self._num_free += len(block_ids)
 
     def _update_free_ids(self) -> None:
-        self._free_ids = self._free_mask.nonzero().squeeze(1)
+        self._free_ids = self._free_mask.nonzero()[0]
         self._free_ids_offset = 0
 
     @property

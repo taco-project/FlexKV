@@ -121,7 +121,6 @@ class FlexKVTracer:
             "ssd_kv_layout_type": str(cache_config.ssd_kv_layout_type),
             "remote_kv_layout_type": str(cache_config.remote_kv_layout_type),
             "use_gds": cache_config.use_gds,
-            "use_pinned_memory": cache_config.use_pinned_memory,
             "remote_cache_size_mode": cache_config.remote_cache_size_mode,
             "num_cpu_blocks": cache_config.num_cpu_blocks,
             "num_ssd_blocks": cache_config.num_ssd_blocks,
@@ -134,6 +133,7 @@ class FlexKVTracer:
             "ssd_cache_iouring_flags": cache_config.ssd_cache_iouring_flags,
             "remote_cache_path": cache_config.remote_cache_path,
             "remote_config_custom": cache_config.remote_config_custom,
+            "evict_ratio": cache_config.evict_ratio,
         }
 
         # Convert gpu_layout to dict if provided

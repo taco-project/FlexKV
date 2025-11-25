@@ -8,28 +8,27 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 ## 如何使用
 
+### 安装依赖
+
+```bash
+apt install liburing-dev
+apt install libxxhash-dev 
+```
+
 ### 编译 FlexKV
 
 ```bash
 ./build.sh
+#./build.sh --release for cython package
 ```
 
 ### 以 vLLM 为例使用 FlexKV
 
-在 vLLM 0.8.4 版本中应用patch `examples/vllm_adaption/flexkv_vllm_0_8_4.patch`，分别启动 FlexKV、vLLM 和测试脚本：
+见[docs/vllm_adapter/README_zh.md](docs/vllm_adapter/README_zh.md)
 
-```bash
-# 启动 FlexKV 作为服务端
-bash benchmarks/flexkv_benchmark/run_flexkv_server.sh
+### FlexKV和Dynamo框架的集成
 
-# 启动 vLLM 作为客户端
-bash benchmarks/flexkv_benchmark/serving_vllm.sh
-
-# 启动性能测试
-bash benchmarks/flexkv_benchmark/multiturn_benchmark.sh
-```
-
-> **注意**：当前脚本仅适配 `main` 分支。`dev` 分支的最新特性支持脚本正在开发中。
+见[docs/dynamo_integration/README_zh.md](docs/dynamo_integration/README_zh.md)
 
 ## 设计框架
 
@@ -84,8 +83,10 @@ FlexKV 在处理 *get* 请求时：
 - *put*请求可以异步调用，从GPU copy到内存的时间可以与之后的计算重合。内存与SSD以及扩展存储间的传输则完全由TransferEngine之后执行，主进程不感知。
 
 ## Branch
-- main 为稳定分支，维护已经测试过的commit。
-- dev 为开发分支，维护较新特性。
+- main 为稳定分支，维护已经测试过的commit。需要稳定的代码请从此分支拉取。
+- dev 为开发分支，维护较新特性。需要新特性和开发新特性请从此分支拉取和合入。
+- bugfix 为bug分支，维护需要立即解决的bug或需要立即更新的文档。需要解决bug和立即更新的文档请从此分支拉取和合入。
+- stable 为上一个版本的main分支位置，仅用于回滚以及极其保守的情况使用（如产品化）。不鼓励使用此版本。
 
 ## Roadmap
 

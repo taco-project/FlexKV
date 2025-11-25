@@ -12,16 +12,16 @@ from flexkv.server.server import KVServer
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    
+
     # NAME
-    parser.add_argument("--enable-cpu", 
-                        action=argparse.BooleanOptionalAction, 
+    parser.add_argument("--enable-cpu",
+                        action=argparse.BooleanOptionalAction,
                         default=True)
-    parser.add_argument("--enable-ssd", 
-                        action=argparse.BooleanOptionalAction, 
+    parser.add_argument("--enable-ssd",
+                        action=argparse.BooleanOptionalAction,
                         default=False,)
-    parser.add_argument("--enable-remote", 
-                        action=argparse.BooleanOptionalAction, 
+    parser.add_argument("--enable-remote",
+                        action=argparse.BooleanOptionalAction,
                         default=False,)
     parser.add_argument("--model-path", type=str, help="model path", default="")
     parser.add_argument("--tp-size", type=int, default=1)
@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     hf_config = AutoConfig.from_pretrained(args.model_path)
-    
+
     num_layers=hf_config.num_hidden_layers
     if hasattr(hf_config, 'num_key_value_heads'):
         num_kv_heads=hf_config.num_key_value_heads
@@ -65,7 +65,7 @@ if __name__ == "__main__":
     head_size=(hf_config.head_dim if hasattr(hf_config, 'head_dim')
                 else hf_config.hidden_size//hf_config.num_attention_heads)
     use_mla=hf_config.architectures[0].startswith("Deepseek")
-    
+
     # TODO: different model config may have different attribute name
     model_config = ModelConfig(
         num_layers=num_layers,
@@ -76,14 +76,13 @@ if __name__ == "__main__":
         dp_size=args.dp_size,
         dtype=hf_config.torch_dtype
     )
-    
+
     cache_config = CacheConfig(
         enable_cpu=args.enable_cpu,
         enable_ssd=args.enable_ssd,
         enable_remote=args.enable_remote,
         use_gds=False,
         enable_trace=False,
-        use_pinned_memory=False,
         ssd_cache_iouring_entries=512,
         tokens_per_block=args.block_size,
         num_cpu_blocks=args.num_cpu_blocks,
@@ -93,6 +92,6 @@ if __name__ == "__main__":
         remote_cache_size_mode=args.remote_cache_size_mode,
         remote_cache_path=args.remote_cache_path,
     )
-    
+
     kvserver = KVServer(model_config, cache_config, args.server_recv_port)
     kvserver.run()
