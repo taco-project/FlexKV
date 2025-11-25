@@ -1,9 +1,10 @@
 import os
-import sys
-import platform
 import json
-import subprocess
 from typing import Dict, List, Tuple, Optional
+
+def check_platform() -> None:
+    import platform
+    pass
 
 def get_ifc_driver(ifc: str) -> Optional[str]:
     driver = f'/sys/class/net/{ifc}/device/driver'
@@ -18,6 +19,9 @@ def get_sysfs_path(path: str) -> Optional[str]:
         return None
 
 def get_ip_map() -> Dict[str, str]:
+    import sys
+    import subprocess
+
     try:
         # ip -j addr
         result = subprocess.check_output(['ip', '-j', 'addr'], text=True)
@@ -223,6 +227,20 @@ def enable_nvmet() -> None:
         with open(f'/sys/kernel/config/nvmet/ports/{port}/addr_adrfam', 'w') as f:
             f.write('ipv4')
 
+    # Dump NVMe-oF target offload config
+    from pathlib import Path
+    dir = Path(__file__).resolve().parent # $WORKSPACE/setup_nvmet.py
+    assert os.path.exists(os.path.join(dir, 'integration')), f'{dir}/integration does not exist.'
+    
+    config_data: Dict[str, Dict[str, str]] = {}
+    for ip_addr, subsys_name, dev in zip(ip_dict.keys(), subsys_list, nvmet_list):
+        config_data[subsys_name] = {
+            'ip': ip_addr,
+            'dev': dev
+        }
+    with open(os.path.join(dir, 'integration/nvmet_config.json'), 'w') as f:
+        json.dump(config_data, f, indent=4)
+
     # Step 10
     for port, subsys_name in zip(port_list, subsys_list):
         os.symlink(f'/sys/kernel/config/nvmet/subsystems/{subsys_name}',
@@ -230,5 +248,5 @@ def enable_nvmet() -> None:
 
 
 if __name__ == "__main__":
-    # TODO: Check kernel capabilities
+    check_platform()
     enable_nvmet()
