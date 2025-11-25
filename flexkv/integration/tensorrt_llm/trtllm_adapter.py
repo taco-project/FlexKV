@@ -28,6 +28,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
 
 class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
     def __init__(self, config: ExecutorConfig):
+        # Set environment variable for FlexKV with TensorRT-LLM，this must before KVManager initialization
+        os.environ['FLEXKV_WITH_TRTLLM'] = '1'
         tp_size, dp_size, dp_rank = get_dp_tp_info(config)
         flexkv_config = FlexKVConfig.from_env()
         flexkv_config.post_init_from_trt_config(config, tp_size, dp_size, dp_rank)
@@ -59,8 +61,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         flexkv_logger.info("Finish init FlexKVSchedulerConnector")
         
-        # Set environment variable for FlexKV with TensorRT-LLM
-        os.environ['FLEXKV_WITH_TRTLLM'] = '1'
+
 
     def is_ready(
         self,
