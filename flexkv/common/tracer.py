@@ -3,25 +3,25 @@ import os
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional, List, Union
+from typing import Any, Optional, List, Union
 import torch
 import numpy as np
 
-from flexkv.common.config import CacheConfig
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 
 
 class FlexKVTracer:
     """FlexKV Tracer class for recording operations in JSON format"""
 
-    def __init__(self, cache_config: CacheConfig):
-        self.enabled = cache_config.enable_trace
+    def __init__(self):
+        self.enabled = GLOBAL_CONFIG_FROM_ENV.enable_trace
         if not self.enabled:
             return
-        print(f"FlexKVTracer enabled, trace_file_path: {cache_config.trace_file_path}")
-        self.trace_file_path = cache_config.trace_file_path
-        self.max_file_size_mb = cache_config.trace_max_file_size_mb
-        self.max_files = cache_config.trace_max_files
-        self.flush_interval_ms = cache_config.trace_flush_interval_ms
+        print(f"FlexKVTracer enabled, trace_file_path: {GLOBAL_CONFIG_FROM_ENV.trace_file_path}")
+        self.trace_file_path = GLOBAL_CONFIG_FROM_ENV.trace_file_path
+        self.max_file_size_mb = GLOBAL_CONFIG_FROM_ENV.trace_max_file_size_mb
+        self.max_files = GLOBAL_CONFIG_FROM_ENV.trace_max_files
+        self.flush_interval_ms = GLOBAL_CONFIG_FROM_ENV.trace_flush_interval_ms
 
         # Thread-safe file writing
         self._lock = threading.Lock()
@@ -116,24 +116,40 @@ class FlexKVTracer:
             "enable_cpu": cache_config.enable_cpu,
             "enable_ssd": cache_config.enable_ssd,
             "enable_remote": cache_config.enable_remote,
-            "gpu_kv_layout_type": str(cache_config.gpu_kv_layout_type),
-            "cpu_kv_layout_type": str(cache_config.cpu_kv_layout_type),
-            "ssd_kv_layout_type": str(cache_config.ssd_kv_layout_type),
-            "remote_kv_layout_type": str(cache_config.remote_kv_layout_type),
-            "use_gds": cache_config.use_gds,
-            "remote_cache_size_mode": cache_config.remote_cache_size_mode,
+            "enable_gds": cache_config.enable_gds,
             "num_cpu_blocks": cache_config.num_cpu_blocks,
             "num_ssd_blocks": cache_config.num_ssd_blocks,
+            "num_gds_blocks": cache_config.num_gds_blocks,
             "num_remote_blocks": cache_config.num_remote_blocks,
+            "ssd_cache_dir": cache_config.ssd_cache_dir,
+            "gds_cache_dir": cache_config.gds_cache_dir,
+            "remote_cache_size_mode": cache_config.remote_cache_size_mode,
             "remote_file_size": cache_config.remote_file_size,
             "remote_file_num": cache_config.remote_file_num,
             "remote_file_prefix": cache_config.remote_file_prefix,
-            "ssd_cache_dir": cache_config.ssd_cache_dir,
-            "ssd_cache_iouring_entries": cache_config.ssd_cache_iouring_entries,
-            "ssd_cache_iouring_flags": cache_config.ssd_cache_iouring_flags,
             "remote_cache_path": cache_config.remote_cache_path,
             "remote_config_custom": cache_config.remote_config_custom,
-            "evict_ratio": cache_config.evict_ratio,
+        }
+
+        # Convert GLOBAL_CONFIG_FROM_ENV to dict
+        from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+        global_config_dict = {
+            "server_client_mode": GLOBAL_CONFIG_FROM_ENV.server_client_mode,
+            "server_recv_port": GLOBAL_CONFIG_FROM_ENV.server_recv_port,
+            "index_accel": GLOBAL_CONFIG_FROM_ENV.index_accel,
+            "cpu_layout_type": str(GLOBAL_CONFIG_FROM_ENV.cpu_layout_type),
+            "ssd_layout_type": str(GLOBAL_CONFIG_FROM_ENV.ssd_layout_type),
+            "remote_layout_type": str(GLOBAL_CONFIG_FROM_ENV.remote_layout_type),
+            "gds_layout_type": str(GLOBAL_CONFIG_FROM_ENV.gds_layout_type),
+            "use_ce_transfer_h2d": GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+            "use_ce_transfer_d2h": GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+            "transfer_sms_h2d": GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
+            "transfer_sms_d2h": GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
+            "iouring_entries": GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+            "iouring_flags": GLOBAL_CONFIG_FROM_ENV.iouring_flags,
+            "max_file_size_gb": GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
+            "evict_ratio": GLOBAL_CONFIG_FROM_ENV.evict_ratio,
+            # Note: trace-related configs are excluded as they should not affect replay
         }
 
         # Convert gpu_layout to dict if provided
@@ -156,6 +172,7 @@ class FlexKVTracer:
             "data": {
                 "model_config": model_config_dict,
                 "cache_config": cache_config_dict,
+                "global_config": global_config_dict,
                 "gpu_layout": gpu_layout_dict,
             }
         }
@@ -173,9 +190,9 @@ class FlexKVTracer:
     def trace_request(self,
                      request_type: str,
                      request_id: int,
-                     token_ids: torch.Tensor,
-                     slot_mapping: torch.Tensor,
-                     token_mask: Optional[torch.Tensor] = None,
+                     token_ids: Union[torch.Tensor, np.ndarray],
+                     slot_mapping: Union[torch.Tensor, np.ndarray],
+                     token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                      layer_granularity: int = -1,
                      dp_id: int = 0,
                      **kwargs):
@@ -185,7 +202,7 @@ class FlexKVTracer:
 
         timestamp = datetime.now().isoformat()
 
-        # Convert tensors to lists for JSON serialization
+        # Convert tensors/arrays to lists for JSON serialization
         data = {
             "request_type": request_type,
             "request_id": request_id,
@@ -220,6 +237,8 @@ class FlexKVTracer:
     def trace_wait_request(self,
                           wait_type: str,
                           task_ids: Union[int, List[int]],
+                          timeout: Optional[float] = None,
+                          completely: Optional[bool] = None,
                           layer_group_id: Optional[int] = None):
         """Record a wait operation"""
         if not self.enabled:
@@ -236,11 +255,52 @@ class FlexKVTracer:
         data = {
             "wait_type": wait_type,
             "task_ids": task_ids_list,
+            "timeout": timeout,
+            "completely": completely,
             "layer_group_id": layer_group_id,
         }
         record = {
             "timestamp": timestamp,
             "event_type": "wait",
+            "component": "KVManager",
+            "data": data
+        }
+
+        json_record = json.dumps(record, ensure_ascii=False, separators=(',', ':'))
+
+        with self._lock:
+            self._buffer.append(json_record)
+
+            # Check if we need to flush
+            current_time = time.time()
+            if (current_time - self._last_flush_time) * 1000 >= self.flush_interval_ms:
+                self._flush_buffer()
+
+    def trace_launch_tasks(self,
+                          task_ids: List[int],
+                          slot_mappings: List[Union[torch.Tensor, np.ndarray]]):
+        """Record a launch_tasks operation"""
+        if not self.enabled:
+            return
+
+        timestamp = datetime.now().isoformat()
+
+        # Convert slot_mappings to lists
+        slot_mappings_list = []
+        slot_mappings_shapes = []
+        for slot_mapping in slot_mappings:
+            slot_mappings_list.append(self._convert_tensor_to_list(slot_mapping))
+            slot_mappings_shapes.append(list(slot_mapping.shape))
+
+        data = {
+            "task_ids": task_ids,
+            "slot_mappings": slot_mappings_list,
+            "slot_mappings_shapes": slot_mappings_shapes,
+        }
+        
+        record = {
+            "timestamp": timestamp,
+            "event_type": "launch_tasks",
             "component": "KVManager",
             "data": data
         }

@@ -62,7 +62,9 @@ class TransferOp:
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
             self.src_block_ids.size != self.dst_block_ids.size:
-            raise ValueError("src_block_ids and dst_block_ids must have the same number of physical blocks")
+            raise ValueError(f"src_block_ids and dst_block_ids must have the same number of physical blocks, but got "
+                             f"src_block_ids.size={self.src_block_ids.size}, "
+                             f"dst_block_ids.size={self.dst_block_ids.size}")
         with TransferOp._lock:
             self.op_id = TransferOp._next_op_id
             TransferOp._next_op_id += 1
@@ -80,7 +82,7 @@ class TransferOpGraph:
         self._op_map: Dict[int, TransferOp] = {}
         self._ready_ops: Set[int] = set()
         self._trigger_ops: Set[int] = set()
-        self._gpu_transfer_op_id: int = -1
+        self._gpu_transfer_op_id: List[int] = []
 
     @classmethod
     def _get_graph_id(cls) -> int:
@@ -117,10 +119,7 @@ class TransferOpGraph:
             op.transfer_type == TransferType.D2H or \
             op.transfer_type == TransferType.D2DISK or \
             op.transfer_type == TransferType.DISK2D:
-            if self._gpu_transfer_op_id == -1:
-                self._gpu_transfer_op_id = op.op_id
-            else:
-                raise ValueError("Only one GPU transfer op is allowed")
+            self._gpu_transfer_op_id.append(op.op_id)
         self._ready_ops.add(op.op_id)
 
     def add_dependency(self, successor_op_id: int, predecessor_op_id: int) -> None:
@@ -169,14 +168,21 @@ class TransferOpGraph:
                    for op in self._op_map.values())
 
     def set_gpu_blocks(self, gpu_blocks: np.ndarray) -> None:
-        transfer_type = self._op_map[self._gpu_transfer_op_id].transfer_type
-        op = self._op_map[self._gpu_transfer_op_id]
-        if transfer_type.name.endswith("2D"):
-            op.dst_block_ids = gpu_blocks
-        else:
-            op.src_block_ids = gpu_blocks
-        assert op.src_block_ids.size == op.dst_block_ids.size, \
-            f"src_block_ids.size={op.src_block_ids.size}, dst_block_ids.size={op.dst_block_ids.size}"
+        for op_id in self._gpu_transfer_op_id:
+            transfer_type = self._op_map[op_id].transfer_type
+            op = self._op_map[op_id]
+            if transfer_type.name.endswith("2D"):
+                if transfer_type == TransferType.DISK2D:
+                    op.dst_block_ids = gpu_blocks[-op.dst_block_ids.size:]
+                else:
+                    op.dst_block_ids = gpu_blocks[:op.dst_block_ids.size]
+            else:
+                if transfer_type == TransferType.D2DISK:
+                    op.src_block_ids = gpu_blocks[-op.src_block_ids.size:]
+                else:
+                    op.src_block_ids = gpu_blocks[:op.src_block_ids.size]
+            assert op.src_block_ids.size == op.dst_block_ids.size, \
+                f"src_block_ids.size={op.src_block_ids.size}, dst_block_ids.size={op.dst_block_ids.size}"
 
     @property
     def num_ops(self) -> int:

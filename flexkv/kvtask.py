@@ -4,8 +4,9 @@ import threading
 from enum import Enum
 from dataclasses import dataclass
 from typing import Callable
-
-
+import multiprocessing as mp
+import copy
+import os
 from expiring_dict import ExpiringDict
 import nvtx
 import torch
@@ -16,8 +17,9 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import TransferOpGraph, get_nvtx_default_color
 from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import GlobalCacheEngine
-from flexkv.transfer_manager import TransferManagerHandle
+from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
+from flexkv.transfer_manager import get_master_host_and_ports_from_env
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -56,6 +58,7 @@ class KVTask:
     graph: TransferOpGraph
     return_mask: np.ndarray
     callback: Optional[Callable]
+    op_callback_dict: Dict[int, Callable]
 
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
@@ -75,29 +78,80 @@ class KVTaskManager:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
-                 use_separate_process: bool = True,
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
         if cache_config.enable_remote and not cache_config.enable_ssd:
             raise ValueError("enable_ssd must be True if enable_remote is True")
-        if not cache_config.enable_cpu and not cache_config.use_gds:
-            raise ValueError("use_gds must be True if enable_cpu is False")
+        if not cache_config.enable_cpu and not cache_config.enable_gds:
+            raise ValueError("enable_gds must be True if enable_cpu is False")
+        if cache_config.enable_gds and not cache_config.enable_ssd:
+            raise ValueError("enable_ssd must be True if enable_gds is True")
         self.cache_config = cache_config
         self.model_config = model_config
         self._check_config(model_config, cache_config)
 
+        self.is_multinode_tp = False
+        self.tp_node_count = 1
+        if self.model_config.tp_size > torch.cuda.device_count():
+            if self.model_config.tp_size != torch.cuda.device_count() * 2:
+                raise ValueError("Only support 2 nodes TP for now")
+            assert self.model_config.dp_size == 1
+            self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
+            self.is_multinode_tp = True
+
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
 
-        self.transfer_handle = TransferManagerHandle(
-            self.model_config,
-            self.cache_config,
-            use_separate_process=use_separate_process,
-            gpu_register_port=gpu_register_port
-        )
+        model_config_for_transfer = copy.deepcopy(self.model_config)
+        if self.is_multinode_tp:
+            model_config_for_transfer.tp_size //= self.tp_node_count
+            if not self.model_config.use_mla:
+                model_config_for_transfer.num_kv_heads //= self.tp_node_count
+
+        combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
+        if not combine_with_trtllm:
+            self.transfer_handles = [TransferManagerHandle(
+                model_config_for_transfer,
+                self.cache_config,
+                mode="process",
+                gpu_register_port=gpu_register_port
+            )]
+        else:
+            # When using FlexKV with TensorRT-LLM, we use remote mode to transfer data
+            #  to avoid the way we launch subprocess in FlexKV
+            #  conflict with TensorRT-LLM's MPI initialization
+            self.remote_process = TransferManagerOnRemote.create_process()
+            master_host, master_ports = get_master_host_and_ports_from_env()
+            self.transfer_handles = [
+                TransferManagerHandle(
+                    model_config_for_transfer,
+                    self.cache_config,
+                    mode="remote",
+                    gpu_register_port=gpu_register_port,
+                    master_host=master_host,
+                    master_ports=master_ports
+                )
+            ]
+            self.transfer_handles[0]._handle.send_config_to_remotes()
+
+        if self.is_multinode_tp:
+            master_host, master_ports = get_master_host_and_ports_from_env()
+            self.transfer_handles.append(TransferManagerHandle(
+                model_config_for_transfer,
+                self.cache_config,
+                mode="remote",
+                gpu_register_port=gpu_register_port,
+                master_host=master_host,
+                master_ports=master_ports
+            ))
+            self.transfer_handles[-1]._handle.send_config_to_remotes()
 
         self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
         self.graph_to_task: Dict[int, int] = {}
+
+        self.uncompleted_ops: Dict[int, int] = {}  # op_id -> completed_count
+        self.uncompleted_graphs: Dict[int, int] = {}  # graph_id -> completed_count
+        self.required_completed_count: int = len(self.transfer_handles)
 
         self.task_id_counter = 0
         self.task_id_lock = threading.Lock()
@@ -105,16 +159,25 @@ class KVTaskManager:
         self.running_tasks: int = 0
 
     def start(self) -> None:
-        self.transfer_handle.start()
+        for transfer_handle in self.transfer_handles:
+            transfer_handle.start()
 
     def is_ready(self) -> bool:
-        return self.transfer_handle.is_ready()
+        return all(transfer_handle.is_ready() for transfer_handle in self.transfer_handles)
 
     def __del__(self) -> None:
         self.shutdown()
 
     def shutdown(self) -> None:
-        self.transfer_handle.shutdown()
+        if hasattr(self, "transfer_handles") and self.transfer_handles is not None:
+            for transfer_handle in self.transfer_handles:
+                transfer_handle.shutdown()
+        if hasattr(self, "remote_process") and self.remote_process is not None:
+            assert self.remote_process.is_alive()
+            self.remote_process.terminate()
+            self.remote_process.join()
+            self.remote_process.close()
+            self.remote_process = None
 
     def create_get_task(self,
                         task_id: int,
@@ -127,7 +190,7 @@ class KVTaskManager:
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
-        graph, return_mask, callback, task_end_op_id = self.cache_engine.get(task_id,
+        graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.get(task_id,
                                                                                token_ids,
                                                                                token_mask,
                                                                                slot_mapping,
@@ -146,7 +209,8 @@ class KVTaskManager:
             dp_id=dp_id,
             graph=graph,
             return_mask=return_mask,
-            callback=callback)
+            callback=callback,
+            op_callback_dict=op_callback_dict)
 
         self.graph_to_task[graph.graph_id] = task_id
 
@@ -160,7 +224,7 @@ class KVTaskManager:
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
-        graph, return_mask, callback, task_end_op_id = self.cache_engine.put(task_id,
+        graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.put(task_id,
                                                                                token_ids,
                                                                                token_mask,
                                                                                slot_mapping,
@@ -178,7 +242,8 @@ class KVTaskManager:
             dp_id=dp_id,
             graph=graph,
             return_mask=return_mask,
-            callback=callback)
+            callback=callback,
+            op_callback_dict=op_callback_dict)
         self.graph_to_task[graph.graph_id] = task_id
 
     def _launch_task(self, task_id: int) -> None:
@@ -191,7 +256,8 @@ class KVTaskManager:
         task.status = TaskStatus.RUNNING
         nvtx.mark(f"launch task: task_id={task_id}, graph_id={transfer_graph.graph_id}")
         if transfer_graph.num_ops > 0:
-            self.transfer_handle.submit(transfer_graph)
+            for transfer_handle in self.transfer_handles:
+                transfer_handle.submit(transfer_graph)
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
         completed_ops = self._get_completed_ops(timeout)
@@ -204,6 +270,8 @@ class KVTaskManager:
                 self._mark_completed(task_id)
             elif completed_op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
+            if completed_op_id in task.op_callback_dict:
+                task.op_callback_dict[completed_op_id]()
 
     def _cancel_task(self, task_id: int) -> None:
         task = self.tasks[task_id]
@@ -263,7 +331,25 @@ class KVTaskManager:
             self._mark_completed(task_id)
 
     def _get_completed_ops(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
-        return self.transfer_handle.wait(timeout)
+        results = []
+        for transfer_handle in self.transfer_handles:
+            completed_ops = transfer_handle.wait(timeout)
+            for op_id, graph_id in completed_ops:
+                if op_id == -1:
+                    completed_count = self.uncompleted_graphs.get(graph_id, 0) + 1
+                    if completed_count == self.required_completed_count:
+                        results.append((-1, graph_id))
+                        self.uncompleted_graphs.pop(graph_id, None)
+                    else:
+                        self.uncompleted_graphs[graph_id] = completed_count
+                else:
+                    completed_count = self.uncompleted_ops.get(op_id, 0) + 1
+                    if completed_count == self.required_completed_count:
+                        results.append((op_id, graph_id))
+                        self.uncompleted_ops.pop(op_id, None)
+                    else:
+                        self.uncompleted_ops[op_id] = completed_count
+        return results
 
     def _check_config(self, model_config: ModelConfig, cache_config: CacheConfig) -> None:
         if cache_config.enable_remote:
@@ -308,16 +394,16 @@ class KVTaskManager:
             else:
                 raise ValueError("remote_cache_size_mode must block_num or file_size model")
 
-
 class KVTaskEngine(KVTaskManager):
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
-                 use_separate_process: bool = True,
                  ):
-        super().__init__(model_config, cache_config, gpu_register_port, use_separate_process)
-        self.tracer = FlexKVTracer(cache_config)
+        super().__init__(model_config, cache_config, gpu_register_port)
+        self.tracer = FlexKVTracer()
+        # trace config
+        self.tracer.trace_config(model_config, cache_config, gpu_layout=None)
 
     def get_async(self,
                   token_ids: np.ndarray,
@@ -333,6 +419,16 @@ class KVTaskEngine(KVTaskManager):
                                                     layer_granularity=layer_granularity,
                                                     dp_id=dp_id,
                                                     task_id=task_id)
+        # trace get request
+        self.tracer.trace_request(
+            request_type="GET",
+            request_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask,
+            layer_granularity=layer_granularity,
+            dp_id=dp_id
+        )
         self._launch_task(task_id)
         return task_id, return_mask
 
@@ -348,6 +444,16 @@ class KVTaskEngine(KVTaskManager):
                                                     token_mask=token_mask,
                                                     dp_id=dp_id,
                                                     task_id=task_id)
+        # trace put request
+        self.tracer.trace_request(
+            request_type="PUT",
+            request_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask,
+            layer_granularity=-1,  # put has no layer_granularity parameter
+            dp_id=dp_id
+        )
         self._launch_task(task_id)
         return task_id, return_mask
 
@@ -406,6 +512,13 @@ class KVTaskEngine(KVTaskManager):
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         nvtx.mark(f"try_wait task_ids: {task_ids}")
+        # trace try_wait request
+        self.tracer.trace_wait_request(
+            wait_type="try_wait",
+            task_ids=task_ids,
+            timeout=None,  # try_wait doesn't have explicit timeout
+            completely=False
+        )
         return_responses = self._wait_impl(task_ids,
                                            completely=False,
                                            only_return_finished=True)
@@ -418,6 +531,13 @@ class KVTaskEngine(KVTaskManager):
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         nvtx.push_range(f"wait task_ids: {task_ids}", color=get_nvtx_default_color())
+        # trace wait request
+        self.tracer.trace_wait_request(
+            wait_type="wait",
+            task_ids=task_ids,
+            timeout=timeout,
+            completely=completely
+        )
         return_responses = self._wait_impl(task_ids, timeout, completely=completely)
         nvtx.pop_range()
         return return_responses
@@ -431,13 +551,24 @@ class KVTaskEngine(KVTaskManager):
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
         fake_slot_mapping = np.zeros_like(token_ids[token_mask])
-        return self._get_match_impl(token_ids,
-                                    fake_slot_mapping,
-                                    is_fake_slot_mapping=True,
-                                    token_mask=token_mask,
-                                    layer_granularity=layer_granularity,
-                                    dp_id=dp_id,
-                                    task_id=task_id)
+        result_task_id, return_mask = self._get_match_impl(token_ids,
+                                                           fake_slot_mapping,
+                                                           is_fake_slot_mapping=True,
+                                                           token_mask=token_mask,
+                                                           layer_granularity=layer_granularity,
+                                                           dp_id=dp_id,
+                                                           task_id=task_id)
+        # trace get match request
+        self.tracer.trace_request(
+            request_type="GET_MATCH",
+            request_id=result_task_id,
+            token_ids=token_ids,
+            slot_mapping=fake_slot_mapping,
+            token_mask=token_mask,
+            layer_granularity=layer_granularity,
+            dp_id=dp_id
+        )
+        return result_task_id, return_mask
 
     def _get_match_impl(self,
                   token_ids: np.ndarray,
@@ -471,12 +602,23 @@ class KVTaskEngine(KVTaskManager):
                   dp_id: int = 0,
                   task_id: int = -1) -> Tuple[int, np.ndarray]:
         fake_slot_mapping = np.zeros_like(token_ids)
-        return self._put_match_impl(token_ids,
-                                    fake_slot_mapping,
-                                    is_fake_slot_mapping=True,
-                                    token_mask=token_mask,
-                                    dp_id=dp_id,
-                                    task_id=task_id)
+        result_task_id, return_mask = self._put_match_impl(token_ids,
+                                                           fake_slot_mapping,
+                                                           is_fake_slot_mapping=True,
+                                                           token_mask=token_mask,
+                                                           dp_id=dp_id,
+                                                           task_id=task_id)
+        # trace put match request
+        self.tracer.trace_request(
+            request_type="PUT_MATCH",
+            request_id=result_task_id,
+            token_ids=token_ids,
+            slot_mapping=fake_slot_mapping,
+            token_mask=token_mask,
+            layer_granularity=-1,  # put has no layer_granularity parameter
+            dp_id=dp_id
+        )
+        return result_task_id, return_mask
 
     def _put_match_impl(self,
                         token_ids: np.ndarray,
@@ -504,6 +646,8 @@ class KVTaskEngine(KVTaskManager):
                         task_ids: List[int],
                         slot_mappings: List[np.ndarray]) -> None:
         assert isinstance(slot_mappings[0], np.ndarray)
+        # trace launch tasks
+        self.tracer.trace_launch_tasks(task_ids, slot_mappings)
         self.set_slot_mappings(task_ids, slot_mappings)
         for task_id in task_ids:
             self._launch_task(task_id)

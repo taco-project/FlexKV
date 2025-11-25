@@ -1,147 +1,160 @@
 # FlexKV Configuration Guide
 
-This guide explains how to configure and use the FlexKV online serving configuration file (`flexkv_config.json`), including the meaning of all parameters, recommended values, and typical usage scenarios.
+This guide provides detailed instructions on how to configure and use FlexKV's online service configuration file (`flexkv_config.json`), covering the meaning of all parameters, recommended values, and typical usage scenarios.
 
 ---
 
-## Recommended Configuration
+## Basic Configuration Options
 
-Below is a production-grade recommended configuration that balances performance and stability:
+### 1. Configuration via Config File
 
+If the `FLEXKV_CONFIG_PATH` environment variable is set, the configuration file specified by this variable will be used with priority. Both yml and json file formats are supported.
+
+Below is a recommended configuration example that enables both CPU and SSD cache layers:
+
+YML configuration:
+```yml
+cpu_cache_gb: 32
+ssd_cache_gb: 1024
+ssd_cache_dir: /data/flexkv_ssd/
+enable_gds: false
+```
+Or using JSON configuration:
 ```json
 {
-    "enable_flexkv": true,
-    "server_recv_port": "ipc:///tmp/flexkv_test",
-    "cache_config": {
-        "enable_cpu": true,
-        "enable_ssd": true,
-        "enable_remote": false,
-        "use_gds": false,
-        "enable_trace": false,
-        "ssd_cache_iouring_entries": 512,
-        "tokens_per_block": 64,
-        "num_cpu_blocks": 233000,
-        "num_ssd_blocks": 4096000,
-        "ssd_cache_dir": "/data/flexkv_ssd/",
-        "evict_ratio": 0.05,
-        "index_accel": true
-    },
-    "num_log_interval_requests": 2000
+  "cpu_cache_gb": 32,
+  "ssd_cache_gb": 1024,
+  "ssd_cache_dir": "/data/flexkv_ssd/",
+  "enable_gds": false
 }
 ```
-- `num_cpu_blocks` and `num_ssd_blocks` represent the total number of blocks in CPU memory and SSD respectively. These values must be configured according to your machine specs and model size. See [Cache Capacity Configuration](#cache-capacity-config) for calculation details.
-- `ssd_cache_dir` specifies the directory where SSD-stored KV cache files are saved.
+- `cpu_cache_gb`: CPU cache layer capacity in GB, must not exceed physical memory.
+- `ssd_cache_gb`: SSD cache layer capacity in GB. Recommended to be greater than `cpu_cache_gb` and a multiple of `FLEXKV_MAX_FILE_SIZE_GB`. Set to 0 if only using CPU cache (SSD cache will not be enabled).
+- `ssd_cache_dir`: Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `ssd_cache_dir: /data0/flexkv_ssd/;/data1/flexkv_ssd/` to improve bandwidth.
+- `enable_gds`: Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default.
 
 ---
 
-## Configuration File Structure Overview
+### 2. Configuration via Environment Variables
 
-The FlexKV configuration file is a JSON file, primarily consisting of three parts:
+If the `FLEXKV_CONFIG_PATH` environment variable is not set, configuration can be done through the following environment variables.
 
-- `enable_flexkv`: Whether to enable FlexKV (must be set to `true` to take effect).
-- `server_recv_port`: The IPC port on which the FlexKV service listens.
-- `cache_config`: The core cache configuration object, containing all cache behavior parameters.
-- `num_log_interval_requests`: Log statistics interval (outputs performance log every N requests).
+> Note: If `FLEXKV_CONFIG_PATH` is set, the configuration file specified by `FLEXKV_CONFIG_PATH` will take priority, and the following environment variables will be ignored.
 
----
-
-## Complete `cache_config` Parameter Reference (from [`flexkv/common/config.py`](../../flexkv/common/config.py))
-
-### Basic Configuration
-
-| Parameter Name | Type | Default | Description |
-|----------------|------|---------|-------------|
-| `tokens_per_block` | int | 16 | Number of tokens per KV block. Must match the `block_size` used in the acceleration framework (e.g., vLLM). |
-| `enable_cpu` | bool | true | Whether to enable CPU memory as a cache layer. Strongly recommended to enable. |
-| `enable_ssd` | bool | false | Whether to enable SSD as a cache layer. Recommended if NVMe SSD is available. |
-| `enable_remote` | bool | false | Whether to enable remote cache (e.g., scalable cloud storage). Requires remote cache engine and custom implementation. |
-| `use_gds` | bool | false | Whether to use GPU Direct Storage (GDS) to accelerate SSD I/O. Not currently supported. |
-| `index_accel` | bool | false | Whether to enable C++ RadixTree. Recommended to enable. |
+| Environment Variable | Type | Default | Description |
+|----------------------|------|---------|-------------|
+| `FLEXKV_CPU_CACHE_GB` | int | 16 | CPU cache layer capacity in GB, must not exceed physical memory |
+| `FLEXKV_SSD_CACHE_GB` | int | 0 | SSD cache layer capacity in GB. Recommended to be greater than `FLEXKV_CPU_CACHE_GB` and a multiple of `FLEXKV_MAX_FILE_SIZE_GB`. Set to 0 if only using CPU cache (SSD cache will not be enabled) |
+| `FLEXKV_SSD_CACHE_DIR` | str | "./flexkv_ssd" | Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `"/data0/flexkv_ssd/;/data1/flexkv_ssd/"` to improve bandwidth |
+| `FLEXKV_ENABLE_GDS` | bool | 0 | Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default, set to 1 to enable |
 
 ---
 
-### KV Cache Layout Types (Generally No Need to Modify)
+## Advanced Configuration Options
+Advanced configuration is mainly for users who need fine-tuned performance optimization or custom special requirements. It is recommended for users with some understanding of FlexKV.
+All advanced configurations support configuration via environment variables or yml/json configuration files. In case of conflicts with multiple configuration levels, the final priority order is: **Configuration file > Environment variables > Built-in default parameters**.
+If setting in a configuration file, remove the `FLEXKV_` prefix and convert everything to lowercase. For example, setting `server_client_mode: 1` in a yml file will override the value of the `FLEXKV_SERVER_CLIENT_MODE` environment variable.
+Some configurations can only be set through environment variables.
 
-| Parameter Name | Type | Default | Description |
-|----------------|------|---------|-------------|
-| `gpu_kv_layout_type` | enum | LAYERWISE | Organization of KV cache on GPU (layer-wise or block-wise). Must match vLLM’s layout (currently `LAYERWISE`). |
-| `cpu_kv_layout_type` | enum | BLOCKWISE | Organization on CPU. Recommended to use `BLOCKWISE`. Does not need to match vLLM. |
-| `ssd_kv_layout_type` | enum | BLOCKWISE | Organization on SSD. Recommended to use `BLOCKWISE`. Does not need to match vLLM. |
-| `remote_kv_layout_type` | enum | BLOCKWISE | Organization for remote cache. Must be defined according to remote backend’s layout. |
+### Enable/Disable FLEXKV
 
-> Note: Do not modify layout types unless you have specific performance requirements.
+> Note: This configuration can only be set through environment variables
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `ENABLE_FLEXKV` | bool | 1 | 0-Disable FLEXKV, 1-Enable FLEXKV |
+
+
 
 ---
 
-### Cache Capacity Configuration <a id="cache-capacity-config"></a>
+### Server Mode Configuration
 
-| Parameter Name | Type | Default | Description |
-|----------------|------|---------|-------------|
-| `num_cpu_blocks` | int | 1000000 | Number of blocks allocated in CPU memory. Adjust based on available RAM. |
-| `num_ssd_blocks` | int | 10000000 | Number of blocks allocated on SSD. |
-| `num_remote_blocks` | int \| None | None | Number of blocks allocated in remote cache. |
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_SERVER_CLIENT_MODE` | bool | 0 | `server_client_mode`: Whether to force enable server-client mode |
+| `FLEXKV_SERVER_RECV_PORT` | str | "ipc:///tmp/flexkv_server" | `server_recv_port`: Server receive port configuration |
 
-> Note: Block size in all cache levels (CPU/SSD/Remote) matches the GPU block size. Estimate cache capacities based on GPU KV cache memory usage and block count.
+---
 
-> Note: `block_size = num_layer * _kv_dim * tokens_per_block * num_head * head_size * dtype_size`.
+### KV Cache Layout Types
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_CPU_LAYOUT` | str | BLOCKFIRST | CPU storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+| `FLEXKV_SSD_LAYOUT` | str | BLOCKFIRST | SSD storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+| `FLEXKV_REMOTE_LAYOUT` | str | BLOCKFIRST | REMOTE storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+| `FLEXKV_GDS_LAYOUT` | str | BLOCKFIRST | GDS storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
 
 ---
 
 ### CPU-GPU Transfer Optimization
 
-| Parameter Name | Type | Default | Description |
-|----------------|------|---------|-------------|
-| `use_ce_transfer_h2d` | bool | false | Whether to use CUDA Copy Engine for Host→Device transfers. Reduces SM usage but may slightly reduce bandwidth. Real-world difference is minimal. |
-| `use_ce_transfer_d2h` | bool | false | Whether to use CUDA Copy Engine for Device→Host transfers. |
-| `transfer_sms_h2d` | int | 8 | Number of SMs (Streaming Multiprocessors) allocated for H2D transfers. |
-| `transfer_sms_d2h` | int | 8 | Number of SMs allocated for D2H transfers. |
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_USE_CE_TRANSFER_H2D` | bool | 0 | Whether to use cudaMemcpyAsync for Host→Device transfers. Can avoid occupying SM, but transfer speed will be reduced |
+| `FLEXKV_USE_CE_TRANSFER_D2H` | bool | 0 | Whether to use cudaMemcpyAsync for Device→Host transfers. Can avoid occupying SM, but transfer speed will be reduced |
+| `FLEXKV_TRANSFER_SMS_H2D` | int | 8 | Number of streaming multiprocessors used for H2D transfer, only effective when `FLEXKV_USE_CE_TRANSFER_H2D` is 0 |
+| `FLEXKV_TRANSFER_SMS_D2H` | int | 8 | Number of streaming multiprocessors used for D2H transfer, only effective when `FLEXKV_USE_CE_TRANSFER_D2H` is 0 |
 
 ---
 
-### SSD Cache Configuration
+### SSD I/O Optimization
 
-| Parameter Name | Type | Default | Description |
-|----------------|------|---------|-------------|
-| `max_blocks_per_file` | int | 32000 | Maximum number of blocks per SSD file. `-1` means unlimited. |
-| `ssd_cache_dir` | str \| List[str] | None | **Required.** Path to SSD cache directory, e.g., `"/data/flexkv_ssd/"`. |
-| `ssd_cache_iouring_entries` | int | 0 | io_uring queue depth. Recommended: `512` for significantly improved concurrent I/O performance. |
-| `ssd_cache_iouring_flags` | int | 0 | io_uring flags. Keep as `0` in most cases. |
+> Note: Setting `iouring_entries` to 0 disables iouring. Not recommended to set to 0.
 
-> Note: To maximize bandwidth across multiple SSDs, bind each SSD to a separate directory and specify them as a list:  
-> `"ssd_cache_dir": ["/data0/flexkv_ssd/", "/data1/flexkv_ssd/"]`.  
-> KV blocks will be evenly distributed across all SSDs.
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_MAX_FILE_SIZE_GB` | float | -1 | Maximum size of a single SSD file, -1 means unlimited |
+| `FLEXKV_IOURING_ENTRIES` | int | 512 | io_uring queue depth. Recommended to set to `512` to improve concurrent I/O performance |
+| `FLEXKV_IOURING_FLAGS` | int | 0 | io_uring flags, default is 0 |
 
-> Note: Setting `ssd_cache_iouring_entries` to `0` disables io_uring. Not recommended.
+
 
 ---
 
-### Remote Cache Configuration (Skip if not enabled)
+### Multi-Node TP
 
-| Parameter Name | Type | Default | Description |
-|----------------|------|---------|-------------|
-| `remote_cache_size_mode` | str | "file_size" | Allocate remote cache space by file size or block count. |
-| `remote_file_size` | int \| None | None | Size (in bytes) of each remote file. |
-| `remote_file_num` | int \| None | None | Number of remote files. |
-| `remote_file_prefix` | str \| None | None | Prefix for remote file names. |
-| `remote_cache_path` | str \| List[str] | None | Remote cache path (e.g., Redis URL, S3 path). |
-| `remote_config_custom` | dict \| None | None | Custom remote cache configurations (e.g., timeout, authentication). |
+> Note: These configurations can only be set through environment variables
 
----
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_MASTER_HOST` | str | "localhost" | Master node IP for multi-node TP |
+| `FLEXKV_MASTER_PORTS` | str | "5556,5557,5558" | Master node ports for multi-node TP. Uses three ports, separated by commas |
 
-### Tracing and Logging
-
-| Parameter Name | Type | Default | Description |
-|----------------|------|---------|-------------|
-| `enable_trace` | bool | true | Whether to enable performance tracing. Disable (`false`) in production to reduce overhead. |
-| `trace_file_path` | str | "./flexkv_trace.log" | Path to trace log file. |
-| `trace_max_file_size_mb` | int | 100 | Maximum size (MB) per trace log file. |
-| `trace_max_files` | int | 5 | Maximum number of trace log files to retain. |
-| `trace_flush_interval_ms` | int | 1000 | Trace log flush interval (milliseconds). |
 
 ---
 
-### Cache Eviction Policy
+### Logging Configuration
 
-| Parameter Name | Type | Default | Description |
-|----------------|------|---------|-------------|
-| `evict_ratio` | float | 0.0 | Ratio of blocks to proactively evict from CPU/SSD per eviction cycle. `0.0` = evict only the minimal necessary blocks (more eviction cycles may impact performance). Recommended: `0.05` (evict 5% of least recently used blocks per cycle). |
+> Note: These configurations can only be set through environment variables
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_LOGGING_PREFIX` | str | "FLEXKV" | Logging prefix |
+| `FLEXKV_LOG_LEVEL` | str | "INFO" | Log output level, options: "DEBUG" "INFO" "WARNING" "ERROR" "CRITICAL" "OFF" |
+| `FLEXKV_NUM_LOG_INTERVAL_REQUESTS` | int | 200 | Log output interval request count |
+
+
+
+---
+
+### Tracing and Debugging
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_ENABLE_TRACE` | bool | 0 | Whether to enable performance tracing. Recommended to disable (`0`) in production to reduce overhead |
+| `FLEXKV_TRACE_FILE_PATH` | str | "./flexkv_trace.log" | Trace log file path |
+| `FLEXKV_TRACE_MAX_FILE_SIZE_MB` | int | 100 | Maximum size (MB) per trace log file |
+| `FLEXKV_TRACE_MAX_FILES` | int | 5 | Maximum number of trace log files to retain |
+| `FLEXKV_TRACE_FLUSH_INTERVAL_MS` | int | 1000 | Trace log flush interval (milliseconds) |
+
+
+---
+
+### Control Plane Optimization
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_INDEX_ACCEL` | bool | 1 | 0-Enable Python version RadixTree implementation, 1-Enable C++ version RadixTree implementation |
+| `FLEXKV_EVICT_RATIO` | float | 0.05 | CPU and SSD eviction ratio for proactive eviction per cycle (0.0 = only evict the minimal necessary blocks). Recommended to keep at `0.05`, i.e., evict 5% of least recently used blocks per cycle |

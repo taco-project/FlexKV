@@ -1,14 +1,47 @@
-#include <errno.h>
-#include <torch/extension.h>
-#include <deque>
-#include <memory>
-#include <type_traits>
 #include <algorithm>
+#include <deque>
+#include <errno.h>
+#include <memory>
+#include <torch/extension.h>
+#include <type_traits>
+#include <optional>
 
 #include "cache_utils.h"
 #include "radix_tree.h"
 
 namespace flexkv {
+
+// Helper function matching Python's get_hash with boundary check and _has_hashes branch
+// Returns std::nullopt if block_id is out of bounds (like Python returning None)
+// If has_hashes is true, reads from block_hashes_ptr; otherwise computes from token_ids
+static std::optional<HashType> get_hash_safe(
+    int64_t *block_hashes_ptr, 
+    int64_t *token_ids_ptr,  // Can be nullptr if has_hashes is true
+    int block_id, 
+    int num_blocks,
+    bool has_hashes,
+    int tokens_per_block) {
+  if (block_id >= num_blocks) {
+    return std::nullopt;  // Out of bounds, return None (similar to Python)
+  }
+  
+  if (has_hashes) {
+    // Read from pre-computed block_hashes (matching Python: if self._has_hashes)
+    return HashType(block_hashes_ptr[block_id]);
+  } else {
+    // Compute hash from token_ids (matching Python: hash_array(self.token_ids[...]))
+    if (token_ids_ptr == nullptr) {
+      // Cannot compute without token_ids, return nullopt
+      return std::nullopt;
+    }
+    // Compute hash for tokens up to (block_id+1)*tokens_per_block
+    // Matching Python: hash_array(self.token_ids[:(block_id+1)*self.tokens_per_block])
+    Hasher hasher;
+    hasher.reset();  // Reset hasher (matching Python's _HASHER.reset())
+    hasher.update(token_ids_ptr, (block_id + 1) * tokens_per_block * sizeof(int64_t));
+    return hasher.digest();
+  }
+}
 
 CRadixNode::CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt) {
   assert(index != nullptr);
@@ -21,7 +54,7 @@ CRadixNode::CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt) {
 
   struct timeval now;
   gettimeofday(&now, nullptr);
-  last_access_time = now.tv_sec * 1000 + now.tv_usec / 10000;
+  grace_time = now.tv_sec * 1000 + now.tv_usec / 10000;
 
   index->inc_node_count();
 }
@@ -49,11 +82,16 @@ CRadixNode *CRadixNode::split(int prefix_length) {
   auto &new_block_hashes = new_node->get_block_hashes();
   auto &new_physical_blocks = new_node->get_physical_blocks();
 
-  new_block_hashes.insert(new_block_hashes.end(), block_hashes.cbegin(), block_hashes.cbegin() + prefix_length);
-  new_physical_blocks.insert(new_physical_blocks.end(), physical_blocks.cbegin(), physical_blocks.cbegin() + prefix_length);
+  new_block_hashes.insert(new_block_hashes.end(), block_hashes.cbegin(),
+                          block_hashes.cbegin() + prefix_length);
+  new_physical_blocks.insert(new_physical_blocks.end(),
+                             physical_blocks.cbegin(),
+                             physical_blocks.cbegin() + prefix_length);
 
-  block_hashes.erase(block_hashes.begin(), block_hashes.begin() + prefix_length);
-  physical_blocks.erase(physical_blocks.begin(), physical_blocks.begin() + prefix_length);
+  block_hashes.erase(block_hashes.begin(),
+                     block_hashes.begin() + prefix_length);
+  physical_blocks.erase(physical_blocks.begin(),
+                        physical_blocks.begin() + prefix_length);
 
   parent->set_child(new_node->get_head_hash(), new_node);
   new_node->set_parent(parent);
@@ -70,9 +108,10 @@ void CRadixNode::merge_child() {
   assert(child->is_leaf());
 
   block_hashes.insert(block_hashes.end(), child->get_block_hashes().cbegin(),
-            child->get_block_hashes().cend());
-  physical_blocks.insert(physical_blocks.end(), child->get_physical_blocks().cbegin(),
-            child->get_physical_blocks().cend());
+                      child->get_block_hashes().cend());
+  physical_blocks.insert(physical_blocks.end(),
+                         child->get_physical_blocks().cbegin(),
+                         child->get_physical_blocks().cend());
 
   set_time(std::max(get_time(), child->get_time()));
   children.clear();
@@ -91,17 +130,24 @@ std::deque<int64_t> *CRadixNode::shrink(int length) {
   auto remaining_length = size() - length;
   auto shrink_blocks = new std::deque<int64_t>();
 
-  shrink_blocks->insert(shrink_blocks->end(), physical_blocks.begin() + remaining_length, physical_blocks.end());
+  shrink_blocks->insert(shrink_blocks->end(),
+                        physical_blocks.begin() + remaining_length,
+                        physical_blocks.end());
 
-  block_hashes.erase(block_hashes.begin() + remaining_length, block_hashes.end());
-  physical_blocks.erase(physical_blocks.begin() + remaining_length, physical_blocks.end());
+  block_hashes.erase(block_hashes.begin() + remaining_length,
+                     block_hashes.end());
+  physical_blocks.erase(physical_blocks.begin() + remaining_length,
+                        physical_blocks.end());
 
   return shrink_blocks;
 }
 
 CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
-  torch::Tensor &block_hashes, int num_blocks, int num_insert_blocks, bool ready,
-  CRadixNode *last_node, int num_matched_blocks, int last_node_matched_length) {
+                                    torch::Tensor &block_hashes, int num_blocks,
+                                    int num_insert_blocks, bool ready,
+                                    CRadixNode *last_node,
+                                    int num_matched_blocks,
+                                    int last_node_matched_length) {
   if (num_insert_blocks == -1) {
     num_insert_blocks = num_blocks;
   }
@@ -131,8 +177,10 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
   auto block_hashes_ptr = block_hashes.data_ptr<int64_t>();
   auto physical_block_ids_ptr = physical_block_ids.data_ptr<int64_t>();
   for (auto i = 0; i + num_matched_blocks < num_insert_blocks; i++) {
-    new_block_hashes.insert(new_block_hashes.end(), block_hashes_ptr[i+num_matched_blocks]);
-    new_physical_blocks.insert(new_physical_blocks.end(), physical_block_ids_ptr[i]);
+    new_block_hashes.insert(new_block_hashes.end(),
+                            block_hashes_ptr[i + num_matched_blocks]);
+    new_physical_blocks.insert(new_physical_blocks.end(),
+                               physical_block_ids_ptr[i]);
   }
 
   if (last_node_matched_length < last_node->size()) {
@@ -156,7 +204,9 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
 int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   int64_t *evicted_blocks_ptr = evicted_blocks.data_ptr<int64_t>();
   int has_evicted = 0;
-  std::priority_queue<CRadixNode*, std::vector<CRadixNode*>, CRadixNode::Compare> candidate;
+  std::priority_queue<CRadixNode *, std::vector<CRadixNode *>,
+                      CRadixNode::Compare>
+      candidate;
 
   for (auto it = leaf_list.begin(); it != leaf_list.end(); it++) {
     if ((*it)->evictable()) {
@@ -202,8 +252,9 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   return has_evicted;
 }
 
-std::shared_ptr<CMatchResult> CRadixTreeIndex::match_prefix(
-  torch::Tensor &block_hashes, int num_blocks, bool update_cache_info) {
+std::shared_ptr<CMatchResult>
+CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
+                              bool update_cache_info) {
   auto current_node = root;
   auto last_ready_node = root;
   auto prefix_blocks_num = 0;
@@ -212,40 +263,64 @@ std::shared_ptr<CMatchResult> CRadixTreeIndex::match_prefix(
   auto physical_blocks = new std::vector<int64_t>();
   auto block_hashes_ptr = block_hashes.data_ptr<int64_t>();
   HashType child_hash;
+  
+  // In C++ version, block_hashes is always pre-computed (has_hashes = true)
+  // token_ids_ptr is nullptr since we don't have token_ids in this function signature
+  bool has_hashes = true;
+  int64_t *token_ids_ptr = nullptr;
 
   while (prefix_blocks_num < num_blocks) {
     if (update_cache_info) {
-      current_node->update_time();
+      current_node->update_time(hit_reward_seconds);
     }
 
-    child_hash = HashType(block_hashes_ptr[prefix_blocks_num + current_node->size()]);
-    if (current_node->lookup_child(child_hash)) {
+    // Use get_hash_safe (matching Python's get_hash with boundary check and _has_hashes branch)
+    auto child_hash_opt = get_hash_safe(
+        block_hashes_ptr, 
+        token_ids_ptr, 
+        prefix_blocks_num + current_node->size(), 
+        num_blocks,
+        has_hashes,
+        tokens_per_block);
+    if (child_hash_opt.has_value() && current_node->lookup_child(child_hash_opt.value())) {
+      child_hash = child_hash_opt.value();
       if (current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += current_node->size();
       }
       prefix_blocks_num += current_node->size();
-      physical_blocks->insert(physical_blocks->end(), current_node->get_physical_blocks().begin(),
-        current_node->get_physical_blocks().end());
+      physical_blocks->insert(physical_blocks->end(),
+                              current_node->get_physical_blocks().begin(),
+                              current_node->get_physical_blocks().end());
       current_node = current_node->get_child(child_hash);
     } else {
       auto matched_length = 0;
       if (is_root(current_node) == false) {
-        auto cmp_length = std::min(current_node->size(), num_blocks - prefix_blocks_num);
+        auto cmp_length =
+            std::min(current_node->size(), num_blocks - prefix_blocks_num);
         auto left = 0;
         auto right = cmp_length;
 
         while (left < right) {
           auto mid = (left + right) / 2;
-          if (current_node->get_hash(mid) == HashType(block_hashes_ptr[prefix_blocks_num+mid])) {
+          // Use get_hash_safe for boundary check (matching Python's get_hash with _has_hashes branch)
+          auto hash_opt = get_hash_safe(
+              block_hashes_ptr, 
+              token_ids_ptr, 
+              prefix_blocks_num + mid, 
+              num_blocks,
+              has_hashes,
+              tokens_per_block);
+          if (hash_opt.has_value() && current_node->get_hash(mid) == hash_opt.value()) {
             left = mid + 1;
           } else {
             right = mid;
           }
         }
         matched_length = left;
-        physical_blocks->insert(physical_blocks->end(), current_node->get_physical_blocks().begin(),
-          current_node->get_physical_blocks().begin() + matched_length);
+        physical_blocks->insert(
+            physical_blocks->end(), current_node->get_physical_blocks().begin(),
+            current_node->get_physical_blocks().begin() + matched_length);
       } else {
         matched_length = 0;
       }
@@ -261,8 +336,9 @@ std::shared_ptr<CMatchResult> CRadixTreeIndex::match_prefix(
     }
   }
 
-  return std::make_shared<CMatchResult>(prefix_blocks_num, ready_prefix_blocks_num, last_node_matched_length,
-    last_ready_node, current_node, physical_blocks);
+  return std::make_shared<CMatchResult>(
+      ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
+      last_ready_node, current_node, physical_blocks);
 }
 
-} // namespace flexkv
+} //  namespace flexkv

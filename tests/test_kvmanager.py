@@ -7,7 +7,7 @@ import torch
 import multiprocessing as mp
 from multiprocessing import Process, Pipe
 
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
 from flexkv.kvtask import KVTaskEngine
@@ -24,20 +24,39 @@ from test_utils import (
     create_gpu_kv_layout, GPUKVCacheVerifier
 )
 
-def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_config, num_gpu_blocks, child_conn):
+def run_tp_client(dp_client_id,
+                  tp_rank,
+                  server_recv_port,
+                  model_config,
+                  cache_config,
+                  num_gpu_blocks,
+                  child_conn,
+                  gpu_layout_type):
     """Run tp_client process"""
     try:
         device_id = tp_rank + dp_client_id * model_config.tp_size
         tp_client = KVTPClient(server_recv_port, dp_client_id, device_id)
 
-        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
+        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
 
         # Create GPU blocks for this tp_rank in the tp_client process
         gpu_blocks_for_tp = []
-        for _ in range(model_config.num_layers):
+        if gpu_layout_type == 0:
+            for _ in range(model_config.num_layers):
+                gpu_blocks_for_tp.append(
+                    torch.empty(size=tuple(gpu_kv_layout.kv_shape[1:]), dtype=model_config.dtype).cuda(device_id)
+                )
+        elif gpu_layout_type == 1:
             gpu_blocks_for_tp.append(
-                torch.empty(size=tuple(gpu_kv_layout.kv_shape[1:]), dtype=model_config.dtype).cuda(device_id)
+                torch.empty(size=tuple(gpu_kv_layout.kv_shape[:]), dtype=model_config.dtype).cuda(device_id)
             )
+        elif gpu_layout_type == 2:
+            for _ in range(model_config.num_layers * 2):
+                gpu_blocks_for_tp.append(
+                    torch.empty(size=tuple(gpu_kv_layout.kv_shape[2:]), dtype=model_config.dtype).cuda(device_id)
+                )
+        else:
+            raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
         tp_client.register_to_server(gpu_blocks_for_tp, gpu_kv_layout)
 
         # Send GPU blocks back to main process via pipe if connection provided
@@ -52,6 +71,9 @@ def run_tp_client(dp_client_id, tp_rank, server_recv_port, model_config, cache_c
         while True:
             time.sleep(1)
     except Exception as e:
+        print(f"[TP Client {tp_rank}] Exception occurred: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         if child_conn is not None:
             child_conn.send(None)
             child_conn.close()
@@ -74,21 +96,21 @@ def shutdown_tp_client(tp_client_processes):
     {'tp_size': 4, 'dp_size': 1, 'use_mla': True},
 ], indirect=True)
 @pytest.mark.parametrize("cache_config", [
-    {'enable_cpu': True, 'enable_ssd': False, 'enable_remote': False, 'num_cpu_blocks': 1024},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False,},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': False, 'ssd_cache_iouring_entries': 512},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True, 'num_ssd_blocks': 256, 'num_remote_blocks': 512},
-    {'enable_cpu': True, 'enable_ssd': True, 'enable_remote': True,
-    'num_ssd_blocks': 256, 'num_remote_blocks': 512, 'ssd_cache_iouring_entries': 512},
+    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
+    {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 1024, 'num_ssd_blocks': 2048},
+    # GDS test configs
+    {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': True, \
+        'enable_remote': False, 'num_ssd_blocks': 512},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
 ], indirect=True)
-@pytest.mark.parametrize("flex_kv_layout_type", [
-    KVCacheLayoutType.LAYERWISE,
-    KVCacheLayoutType.BLOCKWISE,
+@pytest.mark.parametrize("gpu_layout_type", [
+    0,
+    1,
+    2,
 ])
-def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type):
+def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     tp_size = model_config.tp_size
     dp_size = model_config.dp_size
 
@@ -99,10 +121,7 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
     enable_cpu = cache_config.enable_cpu
     enable_ssd = cache_config.enable_ssd
     enable_remote = cache_config.enable_remote
-
-    cache_config.cpu_kv_layout_type = flex_kv_layout_type
-    cache_config.ssd_kv_layout_type = flex_kv_layout_type
-    cache_config.remote_kv_layout_type = flex_kv_layout_type
+    enable_gds = cache_config.enable_gds
 
     num_gpu_blocks = test_config["num_gpu_blocks"]
     block_per_request = test_config['requests_per_block']
@@ -113,6 +132,9 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
     # Skip tests based on GPU availability and configuration
     skip_if_insufficient_gpus(tp_size * dp_size)
 
+    if enable_gds and os.environ.get("FLEXKV_GDS_TEST", "0") == "0":
+        pytest.skip("skip because GDS test is not enabled")
+
     if enable_remote:
         pytest.skip("skip because enable_remote is not supported")
 
@@ -120,23 +142,22 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
          #note that for now only dp_size=1 is supported
         pytest.skip("skip because server-client mode is not ready for dp_size > 1")
 
-    import uuid
-    gpu_register_port = f"ipc:///tmp/flexkv_gpu_{uuid.uuid4().hex[:8]}"
-    server_recv_port = f"ipc:///tmp/flexkv_srv_{uuid.uuid4().hex[:8]}"
-    kvmanager = KVManager(model_config, cache_config, gpu_register_port, server_recv_port)
+    kvmanager = KVManager(model_config, cache_config)
     kvmanager.start()
 
     # Create pipes for each tp_client to send GPU blocks back
+    mp_ctx = mp.get_context('spawn')
     pipe_connections = []
     tp_client_processes = []
 
     for tp_rank in range(tp_size):
-        parent_conn, child_conn = Pipe()
+        parent_conn, child_conn = mp_ctx.Pipe()
         pipe_connections.append(parent_conn)
 
-        tp_client_process = Process(
+        tp_client_process = mp_ctx.Process(
             target=run_tp_client,
-            args=(0, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks + tp_rank, child_conn),
+            args=(0, tp_rank, kvmanager.gpu_register_port, model_config, cache_config, \
+                num_gpu_blocks + tp_rank, child_conn, gpu_layout_type),
             daemon=True
         )
         tp_client_processes.append(tp_client_process)
@@ -163,14 +184,15 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
         print(f"[Main Process] Creating GPUKVCacheVerifier with GPU blocks from {len(all_gpu_blocks)} TP clients")
 
         # Get gpu_kv_layout from cache_config for GPUKVCacheVerifier
-        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks)
+        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
 
         gpu_kv_verifier = GPUKVCacheVerifier(
             shared_gpu_blocks=all_gpu_blocks,
             gpu_kv_layout=gpu_kv_layout,
             tp_size=model_config.tp_size,
             tokens_per_block=cache_config.tokens_per_block,
-            dtype=model_config.dtype
+            dtype=model_config.dtype,
+            gpu_layout_type=gpu_layout_type
         )
         print("[Main Process] GPUKVCacheVerifier created successfully")
     else:
@@ -302,7 +324,8 @@ def test_kvmanager(model_config, cache_config, test_config, flex_kv_layout_type)
     print(f"Total cache hit rate: {total_cache_hit / (total_cache_hit + total_cache_miss)}")
     if enable_cpu and num_cpu_blocks >= num_gpu_blocks or \
         enable_ssd and num_ssd_blocks >= num_gpu_blocks or \
-        enable_remote and num_remote_blocks >= num_gpu_blocks:
+        enable_remote and num_remote_blocks >= num_gpu_blocks or \
+        enable_gds and num_ssd_blocks >= num_gpu_blocks:
         assert total_cache_miss == 0
     shutdown_tp_client(tp_client_processes)
     kvmanager.shutdown()
