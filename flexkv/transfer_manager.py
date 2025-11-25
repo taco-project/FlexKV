@@ -26,7 +26,6 @@ from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import RegisterTPClientRequest, Response
-from flexkv.common.debug import flexkv_logger
 
 
 class TransferManager:
@@ -60,7 +59,6 @@ class TransferManager:
             try:
                 self.all_gpu_blocks[device_id] = req.handles
                 self.all_gpu_layouts[device_id] = req.gpu_layout
-                flexkv_logger.info(f"GPU {device_id} registered successfully")
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
 
@@ -81,6 +79,8 @@ class TransferManager:
                 if isinstance(req, RegisterTPClientRequest):
                     flexkv_logger.info(f"Received GPU blocks registration request: {type(req)}")
                     self._handle_gpu_blocks_registration(req)
+                    flexkv_logger.info(f"GPU {req.device_id} registered successfully, \
+                        waiting for {expected_gpus - len(self.all_gpu_blocks)} GPUs to register")
                 else:
                     flexkv_logger.error(f"Unrecognized RequestType in SchedulerServer: {type(req)}")
 
@@ -318,31 +318,32 @@ class TransferManagerOnRemote(TransferManager):
     def __del__(self) -> None:
         if not self._shutdown_flag:
             self.shutdown()
-    
+
     @classmethod
     def create_process(cls, **kwargs: Any) -> Process:
         import tempfile
         import os
-        
+
         # Serialize the class and kwargs
         cls_data = pickle.dumps(cls)
         kwargs_data = pickle.dumps(kwargs)
-        
+
         # Create temporary files for serialized data
         with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.cls') as f:
             f.write(cls_data)
             cls_file = f.name
-            
+
         with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.kwargs') as f:
             f.write(kwargs_data)
             kwargs_file = f.name
-        
+
         # Prepare environment - remove MPI-related variables to avoid conflicts
         env = os.environ.copy()
         # CRITICAL: Remove CUDA_VISIBLE_DEVICES to allow access to all GPUs
         # TransferManager needs to access all physical GPUs for IPC
         if 'CUDA_VISIBLE_DEVICES' in env:
-            flexkv_logger.info(f"Removing CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} for TransferManager subprocess")
+            flexkv_logger.info(f"Removing CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} "
+                               "for TransferManager subprocess")
             env.pop('CUDA_VISIBLE_DEVICES', None)
 
         # Create the subprocess script
@@ -351,26 +352,26 @@ class TransferManagerOnRemote(TransferManager):
             import sys
             import pickle
             import tempfile
-            
+
             # Immediately disable MPI to avoid conflicts
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
-    
+
             try:
                 # Load the class and kwargs
                 with open("{cls_file}", "rb") as f:
                     cls = pickle.load(f)
-                
+
                 with open("{kwargs_file}", "rb") as f:
                     kwargs = pickle.load(f)
-                
+
                 # Create and start TransferManager instance
                 instance = cls(**kwargs)
                 instance.start()
-                
+
                 # Keep running until worker thread exits
                 if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
                     instance._worker_thread.join()
-                    
+
             except Exception as e:
                 print(f"Error in TransferManager subprocess: {{e}}", file=sys.stderr)
                 sys.exit(1)
@@ -382,13 +383,13 @@ class TransferManagerOnRemote(TransferManager):
                 except Exception:
                     pass
         ''').strip()
-        
+
         # Start the subprocess
         process = subprocess.Popen([
             sys.executable, '-c', transfer_manager_script
         ], env=env, stdout=None, stderr=None, text=True)  # None = inherit parent's stdout/stderr
         flexkv_logger.info(f"TransferManager subprocess started, PID: {process.pid}")
-        
+
         # Clean up temporary files after subprocess completes
         def cleanup_files():
             # Wait for subprocess to complete before cleaning up files
@@ -398,26 +399,26 @@ class TransferManagerOnRemote(TransferManager):
                 os.unlink(kwargs_file)
             except Exception:
                 pass
-        
+
         import threading
         cleanup_thread = threading.Thread(target=cleanup_files, daemon=True)
         cleanup_thread.start()
-        
+
         # Return a wrapper that mimics multiprocessing.Process interface
         class SubprocessWrapper:
             def __init__(self, popen_process):
                 self._popen = popen_process
                 self.pid = popen_process.pid
-                
+
             def is_alive(self):
                 return self._popen.poll() is None
-                
+
             def terminate(self):
                 self._popen.terminate()
-                
+
             def join(self, timeout=None):
                 return self._popen.wait(timeout)
-                
+
             def close(self):
                 # Close the subprocess pipes
                 if self._popen.stdout:
@@ -426,7 +427,7 @@ class TransferManagerOnRemote(TransferManager):
                     self._popen.stderr.close()
                 if self._popen.stdin:
                     self._popen.stdin.close()
-        
+
         return SubprocessWrapper(process)
 
 class TransferManagerHandleBase(ABC):
@@ -500,7 +501,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
     def _start_process(self) -> None:
         if self.process is not None and self.process.is_alive():
             return
-        
+
         self.process = self.mp_ctx.Process(
             target=self._process_worker,
             args=(self.model_config,
