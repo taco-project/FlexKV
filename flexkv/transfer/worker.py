@@ -16,13 +16,14 @@ import torch
 
 from flexkv import c_ext
 
-from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
+from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, \
+    transfer_kv_blocks_gds, TPTransferThreadGroup, TPGDSTransferThreadGroup
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
 from flexkv.common.transfer import get_nvtx_range_color
-from flexkv.common.config import CacheConfig
+from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
 
 try:
     from flexkv.c_ext import transfer_kv_blocks_remote
@@ -115,15 +116,17 @@ class TransferWorkerBase(ABC):
 
     @classmethod
     def create_worker(cls,
+                      mp_ctx: Any,
                       finished_ops_queue: MPQueue,
                       op_buffer_tensor: torch.Tensor,
                       *args: Any, **kwargs: Any) -> 'WorkerHandle':
-        """Generic worker creation template method"""
-        parent_conn, child_conn = MPPipe()  # create pipe
-        ready_event = mp.Event()
+        """Generic worker creation template method."""
+        
+        parent_conn, child_conn = mp_ctx.Pipe()  # create pipe
+        ready_event = mp_ctx.Event()
         worker_id = cls._get_worker_id()
 
-        process = mp.Process(
+        process = mp_ctx.Process(
             target=cls._worker_process,
             args=(worker_id, child_conn, finished_ops_queue, op_buffer_tensor, ready_event, *args),
             kwargs=kwargs,
@@ -136,6 +139,8 @@ class TransferWorkerBase(ABC):
     @classmethod
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
                         op_buffer_tensor: torch.Tensor, ready_event: Any, *args: Any, **kwargs: Any) -> None:
+        # Note: MPI initialization prevention is handled by create_safe_process
+        # Environment variables are set before this function is called
         worker = cls(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs)
         ready_event.set()
         worker.run()
@@ -284,7 +289,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
         # Get pointers first
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
-        self.gpu_layer_ptrs = self.gpu_blocks_ptrs
+        self.gpu_tensor_ptrs = self.gpu_blocks_ptrs
 
         self.cpu_tensor = cpu_blocks
 
@@ -298,13 +303,20 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
         self.gpu_kv_stride_in_bytes = gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize
         self.gpu_block_stride_in_bytes = gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize
+        self.gpu_layer_stride_in_bytes = gpu_kv_layout_per_layer.get_layer_stride() * self.dtype.itemsize
 
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
 
-        if not gpu_kv_layout.type == KVCacheLayoutType.LAYERWISE:
-            raise ValueError("Only layerwise layout is supported for GPU")
+        if len(self.gpu_blocks) == 1:
+            self.gpu_block_type_ = 1
+        elif len(self.gpu_blocks) == self.num_layers:
+            self.gpu_block_type_ = 0
+        elif len(self.gpu_blocks) == self.num_layers * 2:
+            self.gpu_block_type_ = 2
+        else:
+            raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
         # set GPU device
         if gpu_device_id != -1:
             torch.cuda.set_device(gpu_device_id)
@@ -345,15 +357,14 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         if len(gpu_block_id_list) == 0:
             return
 
-        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
-
-        gpu_layer_ptrs = self.gpu_layer_ptrs[layer_id_list].contiguous().pin_memory()
+        gpu_tensor_ptrs = self.gpu_blocks_ptrs.contiguous().pin_memory()
 
         transfer_kv_blocks(
             gpu_block_id_list,
-            gpu_layer_ptrs,
+            gpu_tensor_ptrs,
             self.gpu_kv_stride_in_bytes,
             self.gpu_block_stride_in_bytes,
+            self.gpu_layer_stride_in_bytes,
             cpu_block_id_list,
             self.cpu_tensor,
             self.cpu_kv_stride_in_bytes,
@@ -361,10 +372,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_block_stride_in_bytes,
             self.chunk_size_in_bytes,
             layer_id,
+            layer_granularity,
             transfer_sms,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
             self.is_mla,
+            self.gpu_block_type_,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
@@ -426,7 +439,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 blocks_in_one_gpu.append(handle.get_tensor())
             imported_gpu_blocks.append(blocks_in_one_gpu)
         self.gpu_blocks = imported_gpu_blocks
-        self.dtype = dtype
+        self.dtype = dtype # note this should be quantized data type
         self.is_mla = gpu_kv_layouts[0].is_mla
 
         self.num_gpus = len(self.gpu_blocks)
@@ -436,22 +449,20 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         cudaHostRegister(cpu_blocks)
 
         self.num_layers = gpu_kv_layouts[0].num_layer
-        gpu_kv_layouts_per_layer = [gpu_kv_layout.div_layer(self.num_layers) for gpu_kv_layout in gpu_kv_layouts]
-
-        self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize \
-                                for gpu_kv_layout_per_layer in gpu_kv_layouts_per_layer]
-        self.gpu_kv_strides_in_bytes = [gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize \
-                                for gpu_kv_layout_per_layer in gpu_kv_layouts_per_layer]
-        self.gpu_block_strides_in_bytes = [gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize \
-                                for gpu_kv_layout_per_layer in gpu_kv_layouts_per_layer]
+        # here the chunk size doesn't include the layer info
+        self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
+                                for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_kv_strides_in_bytes = [gpu_kv_layout.get_kv_stride() * self.dtype.itemsize \
+                                for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_block_strides_in_bytes = [gpu_kv_layout.get_block_stride() * self.dtype.itemsize \
+                                for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_layer_strides_in_bytes = [gpu_kv_layout.get_layer_stride() * self.dtype.itemsize \
+                                for gpu_kv_layout in gpu_kv_layouts]
 
         self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
-
-        if not gpu_kv_layouts[0].type == KVCacheLayoutType.LAYERWISE:
-            raise ValueError("Only layerwise layout is supported for GPU")
 
         self.transfer_sms_h2d = transfer_sms_h2d
         self.transfer_sms_d2h = transfer_sms_d2h
@@ -461,9 +472,11 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
         gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
         gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
-
+        gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
         self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
-                                                              gpu_kv_strides_tensor, gpu_block_strides_tensor, gpu_chunk_sizes_tensor)
+                                                              self.num_layers, gpu_kv_strides_tensor,
+                                                              gpu_block_strides_tensor, gpu_layer_strides_tensor,
+                                                              gpu_chunk_sizes_tensor)
 
 
     def _transfer_impl(self,
@@ -496,7 +509,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         if len(gpu_block_id_list) == 0:
             return
-        
+
         self.tp_transfer_thread_group.tp_group_transfer(
             gpu_block_id_list,
             cpu_block_id_list,
@@ -585,8 +598,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
 
         try:
-            self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), cache_config.ssd_cache_iouring_entries,
-                cache_config.ssd_cache_iouring_flags)
+            self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+                GLOBAL_CONFIG_FROM_ENV.iouring_flags)
         except Exception as e:
             flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
             raise RuntimeError("SSD Worker init failed") from e
@@ -825,6 +838,355 @@ class CPURemoteTransferWorker(TransferWorkerBase):
 
         kv_dim = 2 if not self.is_mla else 1
         transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
+
+        self._log_transfer_performance(
+            transfer_op,
+            transfer_size,
+            start_time,
+            end_time,
+        )
+
+class GDSTransferWorker(TransferWorkerBase):
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        gpu_blocks: List[TensorSharedHandle],
+        ssd_files: Dict[int, List[str]],
+        num_blocks_per_file: int,
+        gpu_kv_layout: KVCacheLayout,
+        ssd_kv_layout: KVCacheLayout,
+        dtype: torch.dtype,
+        gpu_device_id: int = 0,
+    ) -> None:
+        """
+        Initialize GDS Transfer Worker
+
+        Args:
+            worker_id: Worker ID
+            transfer_queue: Queue for incoming transfer operations
+            finished_ops_queue: Queue for completed operations
+            gpu_blocks: GPU memory block handles
+            ssd_files: Dict of SSD file paths (ssd_device_id -> file_paths)
+            num_blocks_per_file: Number of blocks per file
+            gpu_kv_layout: Layout of GPU KV cache
+            ssd_kv_layout: Layout of SSD KV cache
+            dtype: Data type
+            gpu_device_id: GPU device ID
+        """
+        # Initialize base class first
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+
+        self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
+        self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
+        self.gpu_layer_ptrs = self.gpu_blocks_ptrs
+        self.num_blocks_per_file = num_blocks_per_file
+        self.num_files = sum(len(file_list) for file_list in ssd_files.values())
+
+        # Create GDSManager from file paths in this worker process
+        from flexkv import c_ext
+        # Use same round_robin as SSD transfer to ensure consistent block mapping
+        self.round_robin = 1
+        self.gds_manager = c_ext.GDSManager(
+            ssd_files,
+            len(ssd_files),
+            self.round_robin
+        )
+        
+        if not self.gds_manager.is_ready():
+            raise RuntimeError(f"Failed to initialize GDS Manager in worker {worker_id}: "
+                               f"{self.gds_manager.get_last_error()}")
+
+        self.dtype = dtype
+        self.is_mla = gpu_kv_layout.is_mla
+
+        # Layout information
+        self.num_layers = gpu_kv_layout.num_layer
+        gpu_kv_layout_per_layer = gpu_kv_layout.div_layer(self.num_layers)
+        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
+
+        # GPU layout calculations
+        self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
+        self.gpu_kv_stride_in_bytes = gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize
+        self.gpu_block_stride_in_bytes = gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize
+        self.gpu_layer_stride_in_bytes = gpu_kv_layout_per_layer.get_layer_stride() * self.dtype.itemsize
+
+        # SSD layout calculations
+        self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+        self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
+        self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+
+        if len(self.gpu_blocks) == 1:
+            self.gpu_block_type_ = 1  # TRTLLM
+        elif len(self.gpu_blocks) == self.num_layers:
+            self.gpu_block_type_ = 0  # VLLM
+        elif len(self.gpu_blocks) == self.num_layers * 2:
+            self.gpu_block_type_ = 2  # SGLANG
+        else:
+            raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
+
+        # Set GPU device and create stream
+        self.gpu_device_id = gpu_device_id
+        if gpu_device_id != -1:
+            torch.cuda.set_device(gpu_device_id)
+        self.transfer_stream = torch.cuda.Stream()
+
+    def _transfer_impl(
+        self,
+        src_block_ids: torch.Tensor,
+        dst_block_ids: torch.Tensor,
+        transfer_type: TransferType,
+        layer_id: int,
+        layer_granularity: int,
+        **kwargs: Any,
+    ) -> None:
+        """Implement actual transfer between GPU and SSD"""
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
+        assert len(src_block_ids) == len(dst_block_ids)
+
+        if layer_id == -1:
+            layer_id = 0
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
+
+        # Convert to tensors
+        # SSD uses DISK2D/D2DISK transfer types (same as traditional SSD I/O)
+        if transfer_type == TransferType.DISK2D:
+            # SSD to GPU via GDS path: src=SSD, dst=GPU
+            ssd_block_id_list = src_block_ids
+            gpu_block_id_list = dst_block_ids
+        elif transfer_type == TransferType.D2DISK:
+            # GPU to SSD via GDS path: src=GPU, dst=SSD
+            gpu_block_id_list = src_block_ids
+            ssd_block_id_list = dst_block_ids
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_type} for GDSTransferWorker. Expected DISK2D or D2DISK.")
+
+        if len(ssd_block_id_list) == 0:
+            return
+
+        # Process transfer for each layer
+        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
+
+        # Determine if this is a read operation
+        is_read = (transfer_type == TransferType.DISK2D)
+
+        # Use the optimized C++ function for KV block transfers
+        # Note: topology information (files, devices, round_robin) is now encapsulated in gds_manager
+        try:
+            transfer_kv_blocks_gds(
+                self.gds_manager,               # GDS manager (contains topology info)
+                layer_id_list,                  # GPU layer IDs to process
+                self.gpu_layer_ptrs,            # GPU layer pointers tensor
+                ssd_block_id_list,              # SSD block IDs
+                gpu_block_id_list,              # GPU block IDs
+                self.gpu_kv_stride_in_bytes,    # GPU K-V stride
+                self.gpu_block_stride_in_bytes, # GPU block stride
+                self.gpu_layer_stride_in_bytes, # GPU layer stride
+                self.ssd_layer_stride_in_bytes, # SSD layer stride
+                self.ssd_block_stride_in_bytes, # SSD block stride
+                self.ssd_kv_stride_in_bytes,    # SSD K-V stride
+                self.chunk_size_in_bytes,       # Chunk size
+                0,                              # SSD copy offset
+                self.num_blocks_per_file,       # Blocks per file
+                self.num_layers,                # Total layers
+                is_read,                        # Read or write
+                False,                          # Verbose logging
+                self.is_mla,                    # MLA
+                self.gpu_block_type_            # GPU block type
+            )
+
+        except Exception as e:
+            flexkv_logger.error(f"GDS transfer failed: {e}")
+            raise RuntimeError(f"Failed to transfer KV blocks: {e}") from e
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+        """Launch a GDS transfer operation"""
+        layer_id = transfer_op.layer_id
+        layer_granularity = transfer_op.layer_granularity
+        if layer_id == -1:
+            layer_id = 0
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
+
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+
+        with torch.cuda.stream(self.transfer_stream):
+            start_time = time.time()
+            self._transfer_impl(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type,
+                layer_id,
+                layer_granularity,
+            )
+            end_time = time.time()
+
+            kv_dim = 2 if not self.is_mla else 1
+            transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
+
+            self._log_transfer_performance(
+                transfer_op,
+                transfer_size,
+                start_time,
+                end_time,
+            )
+
+
+class tpGDSTransferWorker(TransferWorkerBase):
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        gpu_blocks: List[List[TensorSharedHandle]],
+        ssd_files: Dict[int, List[str]],
+        num_blocks_per_file: int,
+        gpu_kv_layouts: List[KVCacheLayout],
+        ssd_kv_layout: KVCacheLayout,
+        dtype: torch.dtype,
+        tp_group_size: int,
+        dp_group_id: int,
+    ) -> None:
+        """
+        Initialize TP GDS Transfer Worker
+
+        Args:
+            worker_id: Worker ID
+            transfer_queue: Queue for incoming transfer operations
+            finished_ops_queue: Queue for completed operations
+            gpu_blocks: List of GPU memory block handles for each GPU in TP group
+            ssd_files: Dict of SSD file paths
+            num_blocks_per_file: Number of blocks per file
+            gpu_kv_layouts: Layout of GPU KV cache
+            ssd_kv_layout: Layout of SSD KV cache
+            dtype: Data type
+            tp_group_size: Size of tensor parallel group
+            dp_group_id: Data parallel group ID
+        """
+        # Initialize base class first
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+
+        assert len(gpu_blocks) == tp_group_size
+        # Handle tensor import for multi-process case
+        imported_gpu_blocks = []
+        for handles_in_one_gpu in gpu_blocks:
+            blocks_in_one_gpu = []
+            for handle in handles_in_one_gpu:
+                blocks_in_one_gpu.append(handle.get_tensor())
+            imported_gpu_blocks.append(blocks_in_one_gpu)
+        self.gpu_blocks = imported_gpu_blocks
+        self.num_blocks_per_file = num_blocks_per_file
+        self.num_files = sum(len(file_list) for file_list in ssd_files.values())
+
+        self.dtype = dtype
+        self.is_mla = gpu_kv_layouts[0].is_mla
+        self.num_gpus = len(self.gpu_blocks)
+        self.tp_group_size = tp_group_size
+        self.dp_group_id = dp_group_id
+
+        # Layout information
+        self.num_layers = gpu_kv_layouts[0].num_layer
+        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
+
+        # GPU layout calculations
+        self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
+                                         for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_kv_strides_in_bytes = [gpu_kv_layout.get_kv_stride() * self.dtype.itemsize \
+                                        for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_block_strides_in_bytes = [gpu_kv_layout.get_block_stride() * self.dtype.itemsize \
+                                           for gpu_kv_layout in gpu_kv_layouts]
+        self.gpu_layer_strides_in_bytes = [gpu_kv_layout.get_layer_stride() * self.dtype.itemsize \
+                                           for gpu_kv_layout in gpu_kv_layouts]
+
+        # SSD layout calculations
+        self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
+        self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+        self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
+        self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+
+        # Create TP GDS Transfer Thread Group
+        gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
+        gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
+        gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
+        gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
+        self.tp_gds_transfer_thread_group = TPGDSTransferThreadGroup(
+            self.num_gpus, self.gpu_blocks, ssd_files, dp_group_id, self.num_layers,
+            gpu_kv_strides_tensor, gpu_block_strides_tensor, gpu_layer_strides_tensor, gpu_chunk_sizes_tensor)
+
+    def _transfer_impl(self,
+                       src_block_ids: torch.Tensor,
+                       dst_block_ids: torch.Tensor,
+                       transfer_type: TransferType,
+                       layer_id: int,
+                       layer_granularity: int,
+                       **kwargs: Any,
+                       ) -> None:
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
+        assert len(src_block_ids) == len(dst_block_ids)
+
+        # GDS uses DISK2D/D2DISK transfer types (same as traditional SSD I/O)
+        if transfer_type == TransferType.D2DISK:
+            gpu_block_ids = src_block_ids
+            ssd_block_ids = dst_block_ids
+            is_read = False  # GPU -> SSD via GDS (write)
+        elif transfer_type == TransferType.DISK2D:
+            gpu_block_ids = dst_block_ids
+            ssd_block_ids = src_block_ids
+            is_read = True   # SSD -> GPU via GDS (read)
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_type} for tpGDSTransferWorker. Expected DISK2D or D2DISK.")
+
+        gpu_block_id_list = gpu_block_ids
+        ssd_block_id_list = ssd_block_ids
+
+        assert len(gpu_block_id_list) == len(ssd_block_id_list)
+
+        if len(gpu_block_id_list) == 0:
+            return
+
+        self.tp_gds_transfer_thread_group.tp_group_transfer(
+            gpu_block_id_list,
+            ssd_block_id_list,
+            self.ssd_layer_stride_in_bytes,
+            self.ssd_kv_stride_in_bytes,
+            self.ssd_block_stride_in_bytes,
+            self.ssd_chunk_size_in_bytes,
+            self.num_blocks_per_file,
+            is_read,
+            layer_id,
+            layer_granularity,
+            self.is_mla,
+        )
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+        """Launch a TP GDS transfer operation"""
+        layer_id = transfer_op.layer_id
+        layer_granularity = transfer_op.layer_granularity
+        if layer_id == -1:
+            layer_id = 0
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
+
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+
+        start_time = time.time()
+        self._transfer_impl(
+            src_block_ids,
+            dst_block_ids,
+            transfer_op.transfer_type,
+            layer_id,
+            layer_granularity,
+        )
+        end_time = time.time()
+
+        kv_dim = 2 if not self.is_mla else 1
+        transfer_size = self.ssd_chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
 
         self._log_transfer_performance(
             transfer_op,

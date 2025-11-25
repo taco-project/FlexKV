@@ -32,7 +32,7 @@ cd FlexKV && ./build.sh
 
 ```bash
 # Navigate to vLLM directory
-cd /opt/vllm 
+cd /opt/vllm
 # apply patch
 git apply /your/path/to/FlexKV/examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
 ```
@@ -82,48 +82,29 @@ python -m dynamo.frontend --router-mode kv --http-port 8000 &
 # Define number of worker nodes
 NUM_WORKERS=4
 
-# When using multiple workers, ensure FlexKV ports are different to avoid hanging at flexkv init
-# Adjust num_cpu_blocks and num_ssd_blocks values according to your server configuration
-for i in $(seq 0 $((NUM_WORKERS-1))); do
-    cat <<EOF > ./flexkv_config_${i}.json
-{
-        "enable_flexkv": true,
-        "server_recv_port": "ipc:///tmp/flexkv_${i}_test",
-        "cache_config": {
-                        "enable_cpu": true,
-                        "enable_ssd": false,
-                        "enable_remote": false,
-                        "use_gds": false,
-                        "enable_trace": false,
-                        "ssd_cache_iouring_entries": 512,
-                        "tokens_per_block": 64,
-                        "num_cpu_blocks": 10240,
-                        "num_ssd_blocks": 256000,
-                        "ssd_cache_dir": "/data/flexkv_ssd/",
-                        "evict_ratio": 0.05,
-                        "index_accel": true
-
-        },
-        "num_log_interval_requests": 200
-}
-EOF
-done
-
+# Configure FlexKV using environment variables, disabling config file
+unset FLEXKV_CONFIG_PATH
+# Adjust CPU and SSD space sizes according to your server configuration
+export FLEXKV_CPU_CACHE_GB=32
+export FLEXKV_SSD_CACHE_GB=128
+export FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/"
 # Use a loop to start worker nodes
 for i in $(seq 0 $((NUM_WORKERS-1))); do
     # Calculate GPU device IDs
     GPU_START=$((i*2))
     GPU_END=$((i*2+1))
-    
+
     if [ $i -lt $((NUM_WORKERS-1)) ]; then
-        FLEXKV_CONFIG_PATH="./flexkv_config_${i}.json" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310 &
+        # When using multiple workers, ensure FlexKV ports are different to avoid hanging at flexkv init
+        # Set FlexKV port via the `FLEXKV_SERVER_RECV_PORT` environment variable
+        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310 &
     else
-        FLEXKV_CONFIG_PATH="./flexkv_config_${i}.json" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310
+        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310
     fi
 done
 ```
 
-> Note: The `flexkv_config.json` configuration is provided as a simple example only. For full parameter options, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md)
+> Note: You can configure using YAML or JSON files. The above configuration is provided as a simple example only. For full parameter options, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md)
 
 ### Verification
 

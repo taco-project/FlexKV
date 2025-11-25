@@ -20,6 +20,7 @@ if debug:
     print("Running in debug mode - Cython compilation disabled")
 
 enable_cfs = os.environ.get("FLEXKV_ENABLE_CFS", "0") == "1"
+enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
 
 # Define C++ extensions
 cpp_sources = [
@@ -27,15 +28,19 @@ cpp_sources = [
     "csrc/transfer.cu",
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
+    "csrc/gds/tp_gds_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/gds/gds_manager.cpp"
 ]
 
 hpp_sources = [
     "csrc/cache_utils.h",
     "csrc/tp_transfer_thread_group.h",
+    "csrc/gds/tp_gds_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
+    "csrc/gds/gds_manager.h",
 ]
 
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
@@ -56,6 +61,13 @@ if enable_cfs:
     extra_link_args.append("-lhifs_client_sdk")
     extra_compile_args.append("-DFLEXKV_ENABLE_CFS")
 
+nvcc_compile_args = ["-O3"]
+if enable_gds:
+    print("ENABLE_GDS = true: Compiling and linking gds related content")
+    extra_link_args.append("-lcufile")
+    extra_compile_args.append("-DENABLE_GDS")
+    nvcc_compile_args.append("-DENABLE_GDS")
+
 cpp_extensions = [
     cpp_extension.CUDAExtension(
         name="flexkv.c_ext",
@@ -63,7 +75,7 @@ cpp_extensions = [
         library_dirs=[os.path.join(build_dir, "lib")],
         include_dirs=include_dirs,
         depends=hpp_sources,
-        extra_compile_args={"nvcc": ["-O3"], "cxx": extra_compile_args},
+        extra_compile_args={"nvcc": nvcc_compile_args, "cxx": extra_compile_args},
         extra_link_args=extra_link_args,
     ),
 ]
@@ -150,3 +162,4 @@ setup(
     },
     python_requires=">=3.8",
 )
+
