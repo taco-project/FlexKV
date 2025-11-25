@@ -352,7 +352,8 @@ class TransferManagerOnRemote(TransferManager):
             import sys
             import pickle
             import tempfile
-
+            from flexkv.common.debug import flexkv_logger
+            
             # Immediately disable MPI to avoid conflicts
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
 

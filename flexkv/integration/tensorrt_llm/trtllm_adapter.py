@@ -33,6 +33,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         os.environ['FLEXKV_WITH_TRTLLM'] = '1'
         flexkv_config = FlexKVConfig.from_env() 
         flexkv_config.post_init_from_trt_config(config)
+        self.node_rank, self.tp_rank, self.dp_rank = get_rank_info_from_trt_config(config)
 
         flexkv_logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
         self.server_recv_port = flexkv_config.server_recv_port
@@ -44,7 +45,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.flexkv_manager = KVManager(model_config=self.model_config,
                                         cache_config=self.cache_config,
                                         server_recv_port=flexkv_config.server_recv_port,
-                                        dp_client_id=flexkv_config.model_config.dp_rank)
+                                        dp_client_id=self.dp_rank)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
 
@@ -61,8 +62,6 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         flexkv_logger.info("Finish init FlexKVSchedulerConnector")
         
-
-
     def is_ready(
         self,
     ) -> bool:
@@ -457,7 +456,6 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
         self.flexkv_config = flexkv_config
         
-        
         # For multi-node TP on remote node (node B), worker0 needs to create TransferManagerOnRemote process
         self.remote_process = None
         if self._need_to_create_remote_process():
@@ -482,11 +480,11 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         """
         try:
             is_master_node = self.node_rank == 0
-            is_worker0 = self.tp_rank == 0
+            is_first_worker = self.tp_rank % 8 == 0
             is_multinode_tp = self.flexkv_config.model_config.tp_size > torch.cuda.device_count()
-            flexkv_logger.info(f"{is_master_node=}, {is_worker0=}, {is_multinode_tp=}")
+            flexkv_logger.info(f"{is_master_node=}, {is_first_worker=}, {is_multinode_tp=}")
             
-            return is_multinode_tp and not is_master_node and is_worker0
+            return is_multinode_tp and not is_master_node and is_first_worker
         except Exception as e:
             flexkv_logger.error(f"Failed to get node info from flexkv_config: {e}")
             flexkv_logger.error(traceback.format_exc())

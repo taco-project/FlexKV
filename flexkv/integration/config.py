@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import *
-from transformers import AutoConfig as HFAutoConfig
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig, FullAttentionSpec
@@ -150,6 +149,7 @@ class FlexKVConfig:
         # self.model_config (model configs part)
         try:
             model_path = getattr(config, 'hf_model_dir', None)
+            from transformers import AutoConfig as HFAutoConfig
             hf_config = HFAutoConfig.from_pretrained(
                 str(model_path), 
                 trust_remote_code=True
