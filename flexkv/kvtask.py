@@ -92,22 +92,21 @@ class KVTaskManager:
         self._check_config(model_config, cache_config)
 
         self.is_multinode_tp = False
-        self.tp_size_per_node = min(model_config.tp_size, torch.cuda.device_count())
-
-        if self.model_config.tp_size > self.tp_size_per_node:
+        self.tp_node_count = 1
+        if self.model_config.tp_size > torch.cuda.device_count():
             if self.model_config.tp_size != torch.cuda.device_count() * 2:
-                raise ValueError("Only support 2 nodes TP")
-            if self.model_config.dp_size != 1:
-                raise ValueError("Only support dp_size=1 for multi-node TP")
+                raise ValueError("Only support 2 nodes TP for now")
+            assert self.model_config.dp_size == 1
+            self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
             self.is_multinode_tp = True
 
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
 
         model_config_for_transfer = copy.deepcopy(self.model_config)
         if self.is_multinode_tp:
-            model_config_for_transfer.tp_size = self.tp_size_per_node
+            model_config_for_transfer.tp_size //= self.tp_node_count
             if not self.model_config.use_mla:
-                model_config_for_transfer.num_kv_heads = self.tp_size_per_node
+                model_config_for_transfer.num_kv_heads //= self.tp_node_count
 
         combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
         if not combine_with_trtllm:
