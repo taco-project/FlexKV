@@ -1,3 +1,59 @@
+diff --git a/python/sglang/jit_kernel/include/sgl_kernel/tensor.h b/python/sglang/jit_kernel/include/sgl_kernel/tensor.h
+index 5df90dc53..eb2d5bebf 100644
+--- a/python/sglang/jit_kernel/include/sgl_kernel/tensor.h
++++ b/python/sglang/jit_kernel/include/sgl_kernel/tensor.h
+@@ -56,7 +56,7 @@ inline constexpr auto kNullDType = static_cast<DLDataTypeCode>(18u);
+ inline constexpr auto kNullDevice = static_cast<DLDeviceType>(-1);
+
+ template <typename... Ts>
+-inline constexpr auto kDTypeList = std::array{dtype_trait<Ts>::value...};
++inline constexpr auto kDTypeList = std::array<DLDataType, sizeof...(Ts)>{dtype_trait<Ts>::value...};
+
+ template <auto... Codes>
+ inline constexpr auto kDeviceList = std::array<DLDevice, sizeof...(Codes)>{
+@@ -71,24 +71,24 @@ struct PrintAbleSpan {
+ // define DLDataType comparison and printing in root namespace
+ template <void* = nullptr>
+ inline constexpr auto kDeviceStringMap = [] {
+-  constexpr auto map = std::array{
+-      std::pair{DLDeviceType::kDLCPU, "cpu"},
+-      std::pair{DLDeviceType::kDLCUDA, "cuda"},
+-      std::pair{DLDeviceType::kDLCUDAHost, "cuda_host"},
+-      std::pair{DLDeviceType::kDLOpenCL, "opencl"},
+-      std::pair{DLDeviceType::kDLVulkan, "vulkan"},
+-      std::pair{DLDeviceType::kDLMetal, "metal"},
+-      std::pair{DLDeviceType::kDLVPI, "vpi"},
+-      std::pair{DLDeviceType::kDLROCM, "rocm"},
+-      std::pair{DLDeviceType::kDLROCMHost, "rocm_host"},
+-      std::pair{DLDeviceType::kDLExtDev, "ext_dev"},
+-      std::pair{DLDeviceType::kDLCUDAManaged, "cuda_managed"},
+-      std::pair{DLDeviceType::kDLOneAPI, "oneapi"},
+-      std::pair{DLDeviceType::kDLWebGPU, "webgpu"},
+-      std::pair{DLDeviceType::kDLHexagon, "hexagon"},
+-      std::pair{DLDeviceType::kDLMAIA, "maia"},
+-      std::pair{DLDeviceType::kDLTrn, "trn"},
+-  };
++  constexpr std::array<std::pair<DLDeviceType, std::string_view>, 16> map{{
++      {DLDeviceType::kDLCPU, "cpu"},
++      {DLDeviceType::kDLCUDA, "cuda"},
++      {DLDeviceType::kDLCUDAHost, "cuda_host"},
++      {DLDeviceType::kDLOpenCL, "opencl"},
++      {DLDeviceType::kDLVulkan, "vulkan"},
++      {DLDeviceType::kDLMetal, "metal"},
++      {DLDeviceType::kDLVPI, "vpi"},
++      {DLDeviceType::kDLROCM, "rocm"},
++      {DLDeviceType::kDLROCMHost, "rocm_host"},
++      {DLDeviceType::kDLExtDev, "ext_dev"},
++      {DLDeviceType::kDLCUDAManaged, "cuda_managed"},
++      {DLDeviceType::kDLOneAPI, "oneapi"},
++      {DLDeviceType::kDLWebGPU, "webgpu"},
++      {DLDeviceType::kDLHexagon, "hexagon"},
++      {DLDeviceType::kDLMAIA, "maia"},
++      {DLDeviceType::kDLTrn, "trn"},
++  }};
+   constexpr auto max_type = stdr::max(map | stdv::keys);
+   auto result = std::array<std::string_view, max_type + 1>{};
+   for (const auto& [code, name] : map) {
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
 index 879c66df0..33f3111c1 100644
 --- a/python/sglang/srt/managers/scheduler.py
@@ -32,21 +88,21 @@ index 879c66df0..33f3111c1 100644
                      req_to_token_pool=self.req_to_token_pool,
 diff --git a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_config.yaml b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_config.yaml
 new file mode 100644
-index 000000000..54cf09d22
+index 000000000..e65821aa4
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_config.yaml
 @@ -0,0 +1,4 @@
-+cpu_cache_gb: 45
++cpu_cache_gb: 100
 +ssd_cache_gb: 0
 +ssd_cache_dir: /data/flexkv_ssd/
 +enable_gds: false
 \ No newline at end of file
 diff --git a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
 new file mode 100644
-index 000000000..a70eeec16
+index 000000000..5c34aef9d
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
-@@ -0,0 +1,593 @@
+@@ -0,0 +1,729 @@
 +import time
 +import torch
 +import logging
@@ -54,7 +110,7 @@ index 000000000..a70eeec16
 +import numpy as np
 +from typing import List, Optional, Dict, Callable
 +
-+from sglang.srt.configs.model_config import ModelConfig, AttentionArch
++from sglang.srt.configs.model_config import ModelConfig
 +from sglang.srt.managers.schedule_batch import Req
 +from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 +from sglang.srt.mem_cache.base_prefix_cache import MatchResult
@@ -115,8 +171,12 @@ index 000000000..a70eeec16
 +        self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, 0, self.rank)
 +        self.register_to_server(self.k_pool, self.v_pool)
 +
-+        # Track task_id -> req_id mapping of store_async (only maintained on rank 0),
++        # inflight_taskid2reqid: rank 0 only, inflight_reqid2node: all ranks, inflight_skipped_reqids: rank 0 only
++
++        # task_id -> req_id mapping of store_async (only maintained on rank 0),
 +        self.inflight_taskid2reqid: Dict[int, int] = {} if self.rank == 0 else {}
++        # req_ids that were skipped (no store launched) on rank 0; used to release locks on all ranks
++        self.inflight_skipped_reqids: List[int] = [] if self.rank == 0 else []
 +
 +        if self.rank == 0:
 +            while not self.kv_manager.is_ready():
@@ -129,6 +189,42 @@ index 000000000..a70eeec16
 +    def chunk_size(self) -> int:
 +        """Return the chunk size used by FlexKV."""
 +        return self.flexkv_config.cache_config.tokens_per_block
++
++    def poll_completed_store_tasks(self) -> List[int]:
++        """
++        Non-blocking poll to collect completed async store tasks and return their req_ids (rank 0 only).
++        Other ranks return an empty list.
++        """
++        if self.rank == 0:
++            inflight_task_ids = list(self.inflight_taskid2reqid.keys())
++            if not inflight_task_ids:
++                return []
++            completed_dict = self.kv_manager.try_wait(task_ids=inflight_task_ids)  # task_id -> KVResponse
++            completed_req_ids: List[int] = []
++            for task_id in completed_dict:
++                req_id = self.inflight_taskid2reqid[task_id]
++                del self.inflight_taskid2reqid[task_id]
++                completed_req_ids.append(req_id)
++            if completed_req_ids:
++                logger.debug(f"[FlexKV] poll_completed_store_tasks: {len(completed_req_ids)} completed")
++            return completed_req_ids
++        else:
++            return []
++
++    def poll_skipped_store_tasks(self) -> List[int]:
++        """
++        Non-blocking poll to collect req_ids that were skipped (no store launched).
++        Rank 0 returns and clears the list; other ranks return [].
++        """
++        if self.rank == 0:
++            if not self.inflight_skipped_reqids:
++                return []
++            skipped = self.inflight_skipped_reqids
++            self.inflight_skipped_reqids = []
++            if skipped:
++                logger.debug(f"[FlexKV] poll_skipped_store_tasks: {len(skipped)} skipped")
++            return skipped
++        return []
 +
 +    def start_load_kv(
 +        self,
@@ -158,16 +254,8 @@ index 000000000..a70eeec16
 +                token_mask=token_mask,
 +            )
 +
-+            # try_wait any in-flight store tasks to get completed req_ids
-+            inflight_task_ids = list(self.inflight_taskid2reqid.keys())
-+            completed_dict = self.kv_manager.try_wait(task_ids=inflight_task_ids) # task_id -> KVResponse
-+            completed_req_ids = []
-+            for task_id in completed_dict:
-+                if task_id in self.inflight_taskid2reqid:
-+                    req_id = self.inflight_taskid2reqid[task_id]
-+                    del self.inflight_taskid2reqid[task_id]
-+                    completed_req_ids.append(req_id)
-+            logger.info(f"[flexkv][inside start_load_kv] nums of completed reqs: {len(completed_req_ids)}")
++            completed_req_ids = self.poll_completed_store_tasks()
++            skipped_req_ids = self.poll_skipped_store_tasks()
 +
 +            if matched_mask.sum() > 0:
 +                filtered_slot_mapping = slot_mapping[matched_mask]
@@ -187,12 +275,14 @@ index 000000000..a70eeec16
 +                        'num_loaded': num_loaded,
 +                        'loaded_slot_ids': loaded_slot_ids,
 +                        'completed_req_ids': completed_req_ids,
++                        'skipped_req_ids': skipped_req_ids,
 +                    }
 +            else:
 +                broadcast_data = {
 +                    'num_loaded': 0,
 +                    'loaded_slot_ids': None,
 +                    'completed_req_ids': completed_req_ids,
++                    'skipped_req_ids': skipped_req_ids,
 +                }
 +        else:
 +            broadcast_data = None
@@ -205,6 +295,20 @@ index 000000000..a70eeec16
 +            for req_id in broadcast_data['completed_req_ids']:
 +                if req_id in inflight_reqid2node:
 +                    node = inflight_reqid2node[req_id]
++                    logger.debug(
++                        f"[FlexKV] store completed (broadcast), releasing lock req={req_id} "
++                        f"node={node.id} key_len={len(node.key)}"
++                    )
++                    dec_lock_ref_fn(node)
++                    del inflight_reqid2node[req_id]
++            # release locks for skipped reqs
++            for req_id in broadcast_data.get('skipped_req_ids', []):
++                if req_id in inflight_reqid2node:
++                    node = inflight_reqid2node[req_id]
++                    logger.debug(
++                        f"[FlexKV] store skipped (broadcast), releasing lock req={req_id} "
++                        f"node={node.id} key_len={len(node.key)}"
++                    )
 +                    dec_lock_ref_fn(node)
 +                    del inflight_reqid2node[req_id]
 +
@@ -216,6 +320,20 @@ index 000000000..a70eeec16
 +                for req_id in broadcast_data['completed_req_ids']:
 +                    if req_id in inflight_reqid2node:
 +                        node = inflight_reqid2node[req_id]
++                        logger.debug(
++                            f"[FlexKV] store completed, releasing lock req={req_id} "
++                            f"node={node.id} key_len={len(node.key)}"
++                        )
++                        dec_lock_ref_fn(node)
++                        del inflight_reqid2node[req_id]
++                # release locks for skipped reqs
++                for req_id in broadcast_data.get('skipped_req_ids', []):
++                    if req_id in inflight_reqid2node:
++                        node = inflight_reqid2node[req_id]
++                        logger.debug(
++                            f"[FlexKV] store skipped, releasing lock req={req_id} "
++                            f"node={node.id} key_len={len(node.key)}"
++                        )
 +                        dec_lock_ref_fn(node)
 +                        del inflight_reqid2node[req_id]
 +
@@ -256,6 +374,8 @@ index 000000000..a70eeec16
 +                    return task_id
 +                else:
 +                    logger.debug(f"All {len(token_ids)} tokens already in FlexKV cache")
++                    # record skipped store so locks can be released across ranks
++                    self.inflight_skipped_reqids.append(req_id)
 +                    return -1  # No task launched
 +            else:
 +                # Other ranks don't perform actual operations
@@ -489,6 +609,12 @@ index 000000000..a70eeec16
 +        3. Track the node to prevent eviction during transfer
 +        """
 +
++        # Periodically release completed store locks
++        try:
++            self._release_completed_store_locks()
++        except Exception:
++            pass
++
 +        # Insert into GPU radix tree
 +        super().cache_finished_req(req, is_insert=is_insert)
 +
@@ -506,6 +632,7 @@ index 000000000..a70eeec16
 +            logger.warning("[FlexKV] req.last_node is None, skipping FlexKV store")
 +            return
 +
++        self.inc_lock_ref(new_last_node)
 +        try:
 +            task_id = self.flexkv_connector.store_kv_async(
 +                token_ids=token_ids,
@@ -516,21 +643,31 @@ index 000000000..a70eeec16
 +            logger.error(f"[FlexKV] Failed to store KV: {e}")
 +            return
 +
-+        # Lock the node to prevent eviction during transfer
-+        self.inc_lock_ref(new_last_node)
++        if req.req_pool_idx in self.inflight_reqid2node:
++            self.dec_lock_ref(self.inflight_reqid2node[req.req_pool_idx])
++            del self.inflight_reqid2node[req.req_pool_idx]
++            logger.debug(
++                f"[FlexKV] request {req.req_pool_idx} is already in inflight_reqid2node, decrement lock ref."
++            )
 +
 +        self.inflight_reqid2node[req.req_pool_idx] = new_last_node
-+
-+        # logger.debug(f"[FlexKV] Locked nodes: {len(self.inflight_reqid2node)}, protected_size: {self.protected_size()}, evictable_size: {self.evictable_size()}")
++        logger.debug(
++            f"[FlexKV] store_lock added req={req.req_pool_idx} task={task_id} "
++            f"node={new_last_node.id} key_len={len(new_last_node.key)} "
++            f"protected_size={self.protected_size()} evictable_size={self.evictable_size()}"
++        )
++        logger.debug(f"[FlexKV] Locked nodes: {len(self.inflight_reqid2node)}, protected_size: {self.protected_size()}, evictable_size: {self.evictable_size()}")
 +
 +    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
 +        """Cache request when it is unfinished."""
 +
-+        if self.disable:
-+            return
++        # # Periodically release completed store locks
++        # try:
++        #     self._release_completed_store_locks()
++        # except Exception:
++        #     pass
 +
-+        if req.req_pool_idx is None:
-+            logger.warning("[FlexKV] req_pool_idx is None, request may have been retracted")
++        if self.disable:
 +            return
 +
 +        token_ids = req.fill_ids
@@ -574,19 +711,31 @@ index 000000000..a70eeec16
 +            req.prefix_indices = new_indices
 +        req.last_node = new_last_node
 +
-+        try:
-+            task_id = self.flexkv_connector.store_kv_async(
-+                token_ids=page_aligned_token_ids,
-+                kv_indices=page_aligned_kv_indices,
-+                req_id=req.req_pool_idx,
-+            )
-+        except Exception as e:
-+            logger.error(f"[FlexKV] Failed to store KV: {e}")
-+            return
++        # self.inc_lock_ref(new_last_node)
++        # try:
++        #     task_id = self.flexkv_connector.store_kv_async(
++        #         token_ids=page_aligned_token_ids,
++        #         kv_indices=page_aligned_kv_indices,
++        #         req_id=req.req_pool_idx,
++        #     )
++        # except Exception as e:
++        #     logger.error(f"[FlexKV] Failed to store KV: {e}")
++        #     return
 +
-+        self.inc_lock_ref(new_last_node)
-+        self.inflight_reqid2node[req.req_pool_idx] = new_last_node
-+        logger.info(f"[FlexKV] Locked nodes: {len(self.inflight_reqid2node)}, protected_size: {self.protected_size()}, evictable_size: {self.evictable_size()}")
++        # if req.req_pool_idx in self.inflight_reqid2node:
++        #     self.dec_lock_ref(self.inflight_reqid2node[req.req_pool_idx])
++        #     del self.inflight_reqid2node[req.req_pool_idx]
++        #     logger.debug(
++        #         f"[FlexKV] request {req.req_pool_idx} is already in inflight_reqid2node, decrement lock ref."
++        #     )
++
++        # self.inflight_reqid2node[req.req_pool_idx] = new_last_node
++        # logger.debug(
++        #     f"[FlexKV] store_lock added req={req.req_pool_idx} task={task_id} "
++        #     f"node={new_last_node.id} key_len={len(new_last_node.key)} "
++        #     f"protected_size={self.protected_size()} evictable_size={self.evictable_size()}"
++        # )
++        # logger.info(f"[FlexKV] Locked nodes: {len(self.inflight_reqid2node)}, protected_size: {self.protected_size()}, evictable_size: {self.evictable_size()}")
 +
 +    def evict(self, num_tokens: int) -> None:
 +        """
@@ -609,6 +758,10 @@ index 000000000..a70eeec16
 +
 +        for req_id in remaining_reqids:
 +            node = self.inflight_reqid2node[req_id]
++            logger.debug(
++                f"[FlexKV] evict() releasing store_lock req={req_id} "
++                f"node={node.id} key_len={len(node.key)}"
++            )
 +            self.dec_lock_ref(node)
 +        self.inflight_reqid2node.clear()
 +
@@ -622,6 +775,45 @@ index 000000000..a70eeec16
 +            )
 +        except Exception:
 +            pass
++
++    def _release_completed_store_locks(self) -> None:
++        """
++        Poll for completed store tasks and release corresponding locks.
++        Works for both single-rank and tensor-parallel multi-rank cases.
++        """
++        # Rank 0 polls the FlexKV manager; others will receive the broadcast payload.
++        completed_req_ids: List[int]
++        if self.flexkv_connector.rank == 0:
++            completed_req_ids = self.flexkv_connector.poll_completed_store_tasks()
++            skipped_req_ids = self.flexkv_connector.poll_skipped_store_tasks()
++        else:
++            completed_req_ids = []
++            skipped_req_ids = []
++
++        # Broadcast to all ranks if using tensor-parallel group
++        if self.tp_group is not None and self.flexkv_connector.tp_size > 1:
++            payload = {'completed_req_ids': completed_req_ids, 'skipped_req_ids': skipped_req_ids} if self.rank == 0 else None
++            payload = broadcast_pyobj([payload], self.rank, self.tp_group, src=0)[0]
++            to_release = (payload.get('completed_req_ids') or []) + (payload.get('skipped_req_ids') or [])
++        else:
++            to_release = completed_req_ids + skipped_req_ids
++
++        released = 0
++        for req_id in to_release:
++            if req_id in self.inflight_reqid2node:
++                node = self.inflight_reqid2node[req_id]
++                logger.debug(
++                    f"[FlexKV] periodic release store_lock req={req_id} "
++                    f"node={node.id} key_len={len(node.key)}"
++                )
++                self.dec_lock_ref(node)
++                del self.inflight_reqid2node[req_id]
++                released += 1
++        if released:
++            logger.debug(
++                f"[FlexKV] periodic released {released} store locks; "
++                f"protected_size={self.protected_size()} evictable_size={self.evictable_size()}"
++            )
 +
 +
 +if __name__ == "__main__":
