@@ -93,7 +93,7 @@ class FlexKVConfig:
 
         if hasattr(sglang_config, "get_num_kv_heads"):
             try:
-                self.model_config.num_kv_heads = int(sglang_config.get_num_kv_heads(tp_size))
+                self.model_config.num_kv_heads = int(sglang_config.get_total_num_kv_heads())
             except Exception:
                 self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
         else:
