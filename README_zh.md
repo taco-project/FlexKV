@@ -25,7 +25,7 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 针对 TensorRT-LLM 
 - 在 TensorRT-LLM 上支持使用 FlexKV ([#48](https://github.com/taco-project/FlexKV/pull/48))
-
+- 支持 vLLM+FlexKV 的 TP16 ([#53](https://github.com/taco-project/FlexKV/pull/53))
 ### 优化
 - MLA d2h 传输优化 ([#19](https://github.com/taco-project/FlexKV/pull/19))
 - 优化 SSD I/O ([#33](https://github.com/taco-project/FlexKV/pull/33))

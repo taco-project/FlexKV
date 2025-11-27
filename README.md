@@ -26,6 +26,7 @@ Targeting vLLM:
 
 Targeting TensorRT-LLM 
 - Support using FlexKV on TensorRT-LLM ([#48](https://github.com/taco-project/FlexKV/pull/48))
+- Support TP16 for TensorRT-LLM+FlexKV ([#53](https://github.com/taco-project/FlexKV/pull/53))
 
 ### Optimization
 - Mla d2h transfer optimization ([#19](https://github.com/taco-project/FlexKV/pull/19))

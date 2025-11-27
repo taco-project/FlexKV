@@ -6,14 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-### Feature
-Targeting TensorRT-LLM:
-- Support TP16 for TensorRT-LLM+FlexKV ([#53](https://github.com/taco-project/FlexKV/pull/53))
-
-### Bugfix
-- Fix vllm init num_kv_heads bug ([#67](https://github.com/taco-project/FlexKV/pull/67))
-- Fix model_config for non-MLA models ([#68](https://github.com/taco-project/FlexKV/pull/68))
-
 
 ## [1.2.0] - 2025-11-25
 ### Feature
@@ -33,6 +25,7 @@ Targeting vllm:
 
 Targeting TensorRT-LLM:
 - Support using FlexKV on TensorRT-LLM ([#48](https://github.com/taco-project/FlexKV/pull/48))
+- Support TP16 for TensorRT-LLM+FlexKV ([#53](https://github.com/taco-project/FlexKV/pull/53))
 
 ### Optimization
 - Mla d2h transfer optimization ([#19](https://github.com/taco-project/FlexKV/pull/19))
@@ -48,6 +41,8 @@ Targeting TensorRT-LLM:
 - Fix cache_info ([#40](https://github.com/taco-project/FlexKV/pull/40))
 - Fix port for GPU registration ([#45](https://github.com/taco-project/FlexKV/pull/45))
 - Fix SSD allocator ([#46](https://github.com/taco-project/FlexKV/pull/46))
+- Fix vllm init num_kv_heads bug ([#67](https://github.com/taco-project/FlexKV/pull/67))
+- Fix model_config for non-MLA models ([#68](https://github.com/taco-project/FlexKV/pull/68))
 
 ### Misc
 - Add doc for: 
