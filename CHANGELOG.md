@@ -5,10 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] - 2025-11-27
+## [Unreleased]
+### Feature
+Targeting TensorRT-LLM:
+- Support TP16 for TensorRT-LLM+FlexKV ([#53](https://github.com/taco-project/FlexKV/pull/53))
+
+### Bugfix
+- Fix vllm init num_kv_heads bug ([#67](https://github.com/taco-project/FlexKV/pull/67))
+- Fix model_config for non-MLA models ([#68](https://github.com/taco-project/FlexKV/pull/68))
+
+
+## [1.2.0] - 2025-11-25
 ### Feature
 Universal:
-- Add op-level callback for local get/put [#13](https://github.com/taco-project/FlexKV/pull/13)
 - Add support for distributed sharing of the KV Cache, to suppot KV Cache sharing between CPU and SSD, as well as distributed sharing of PCFS  ([#17](https://github.com/taco-project/FlexKV/pull/17))
 - Add GDS (GPU Direct Storage) Support ([#25](https://github.com/taco-project/FlexKV/pull/25))
 - TP16 support ([#26](https://github.com/taco-project/FlexKV/pull/26))
@@ -22,9 +31,8 @@ Targeting vllm:
 - Add launch scripts for vllm adaption ([#47](https://github.com/taco-project/FlexKV/pull/47))
 - Support TP16 for vLLM+FlexKV ([#59](https://github.com/taco-project/FlexKV/pull/59))
 
-Targeting TensorRT-LLM 
+Targeting TensorRT-LLM:
 - Support using FlexKV on TensorRT-LLM ([#48](https://github.com/taco-project/FlexKV/pull/48))
-- Support TP16 for TensorRT-LLM+FlexKV ([#53](https://github.com/taco-project/FlexKV/pull/53))
 
 ### Optimization
 - Mla d2h transfer optimization ([#19](https://github.com/taco-project/FlexKV/pull/19))
@@ -40,17 +48,17 @@ Targeting TensorRT-LLM
 - Fix cache_info ([#40](https://github.com/taco-project/FlexKV/pull/40))
 - Fix port for GPU registration ([#45](https://github.com/taco-project/FlexKV/pull/45))
 - Fix SSD allocator ([#46](https://github.com/taco-project/FlexKV/pull/46))
-- Fix vllm init num_kv_heads bug ([#67](https://github.com/taco-project/FlexKV/pull/67))
-- Fix model_config for non-MLA models ([#68](https://github.com/taco-project/FlexKV/pull/68))
 
 ### Misc
 - Add doc for: 
-  FlexKV + Dynamo ([#14](https://github.com/taco-project/FlexKV/pull/14)), 
-  flexkv_config.json ([#15](https://github.com/taco-project/FlexKV/pull/15)),
   FlexKV + TensorRT-LLM ([#52](https://github.com/taco-project/FlexKV/pull/52))
 - For config: Simplify user configuration ([#37](https://github.com/taco-project/FlexKV/pull/37)), and other slight update ([#43](https://github.com/taco-project/FlexKV/pull/43))
 
-
+## [1.1.0] - 2025-09-15 
+- Add op-level callback for local get/put [#13](https://github.com/taco-project/FlexKV/pull/13)
+- Add doc for: 
+  FlexKV + Dynamo ([#14](https://github.com/taco-project/FlexKV/pull/14)), 
+  flexkv_config.json ([#15](https://github.com/taco-project/FlexKV/pull/15)),
 
 ## [1.0.0] - 2025-09-11
 

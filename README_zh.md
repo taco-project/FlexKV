@@ -6,7 +6,7 @@ FlexKV是腾讯云TACO团队和社区合作开发推出的面向超大规模 LLM
 
 FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICENSE) 文件。
 
-## 最新版本主要变更 (1.1.0)
+## 最新版本主要变更
 ### 功能
 通用功能:
 - 添加本地 get/put 的操作级回调 [#13](https://github.com/taco-project/FlexKV/pull/13)
@@ -18,14 +18,13 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 - 支持直接从 CUDA IPC Handle 构造 TensorSharedHandle ([#44](https://github.com/taco-project/FlexKV/pull/44))
 
 
-针对 vllm: 
-- 在 vllm 集成中支持 dp > 1 ([#18](https://github.com/taco-project/FlexKV/pull/18))
-- 添加 vllm 适配的启动脚本 ([#47](https://github.com/taco-project/FlexKV/pull/47))
+针对 vLLM: 
+- 在 vLLM 集成中支持 dp > 1 ([#18](https://github.com/taco-project/FlexKV/pull/18))
+- 添加 vLLM 适配的启动脚本 ([#47](https://github.com/taco-project/FlexKV/pull/47))
 - 支持 vLLM+FlexKV 的 TP16 ([#59](https://github.com/taco-project/FlexKV/pull/59))
 
 针对 TensorRT-LLM 
 - 在 TensorRT-LLM 上支持使用 FlexKV ([#48](https://github.com/taco-project/FlexKV/pull/48))
-- 支持 TensorRT-LLM+FlexKV 的 TP16 ([#53](https://github.com/taco-project/FlexKV/pull/53))
 
 ### 优化
 - MLA d2h 传输优化 ([#19](https://github.com/taco-project/FlexKV/pull/19))
