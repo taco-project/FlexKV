@@ -479,7 +479,6 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         flexkv_logger.debug(f"self.tp_client.device_id (from init): {self.tp_client.device_id}")
         
         # Get physical GPU ID (in case CUDA_VISIBLE_DEVICES is set)
-        import os
         cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
         if cuda_visible_devices:
             # Map logical ID to physical ID
@@ -505,11 +504,6 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         if self.flexkv_config.model_config.use_mla:
             assert kv_dim == 1, (f"expect kv_dim eqals to 1 when using MLA but get kv_dim={kv_dim}")
         
-        assert num_kv_heads * head_size * block_size == kv_cache_tensor.shape[3], \
-            (f"expect kv cached tensor last dim equals to num_kv_heads*head_size*block_size, " \
-            f"but get last_dim = {kv_cache_tensor.shape[3]}, " \
-            f"num_kv_heads = {num_kv_heads}, head_size = {head_size}, block_size = {block_size}")
-        
         gpu_blocks = [kv_cache_tensor] # convert to list for flexkv register 
  
         gpu_layout = KVCacheLayout(
@@ -521,6 +515,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             head_size=head_size,
             is_mla=self.flexkv_config.model_config.use_mla,
         )
+        flexkv_logger.info(f"gpu_layout: {gpu_layout}")
         # Use correct device_id from tensor's actual device
         self.tp_client.register_to_server(gpu_blocks, gpu_layout, override_device_id=correct_device_id)
         flexkv_logger.info(f"Finish register kv_caches on device {correct_device_id}")
