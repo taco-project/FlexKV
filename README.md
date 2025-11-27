@@ -116,11 +116,15 @@ FlexKV performs:
 - *get* requests can be called asynchronously; the time for matching and data transfer can overlap with prior computation through prefetching.
 - *put* requests can be called asynchronously; the time to copy data from GPU to CPU memory can overlap with subsequent computation. Data transfers between CPU memory, SSD, and scalable storage are fully handled asynchronously by the TransferEngine and transparent to the main process.
 
-## Branch
-- The main branch is the stable branch, which maintains already tested commits. Please pull from main branch if you need stable code.
-- The dev branch is the development branch, which contains newer features. Please branch from and merge into dev if you need new features or are developing new functionality.
-- The bugfix branch is for bug fixes, maintaining urgent bugs that need immediate resolution or documentation that requires prompt updates. If you need to fix a bug or update documentation urgently, please branch from and merge into the bugfix branch.
-- The stable branch refers to the previous main branch state, intended only for rollback or extremely conservative use cases (e.g., production deployment). Its use is discouraged.
+## Branching Strategy
+
+The branch management strategy of this project is as follows:
+
+- **`main` branch**: The main development branch that contains the latest features and changes. All pull requests are merged directly into `main` to ensure rapid iteration and continuous integration.
+
+- **`release-*` branches**: When `main` reaches a stable state, we create dedicated release branches (e.g., `release-1.0`, `release-1.1`) to provide stable, production-ready versions for users.
+
+Note: Critical fixes discovered in released versions are applied directly to the corresponding `release-*` branch and then backported to `main` to maintain consistency across all active branches.
 
 ## Roadmap
 
