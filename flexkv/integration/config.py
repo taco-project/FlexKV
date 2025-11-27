@@ -164,8 +164,13 @@ class FlexKVConfig:
                 self.model_config.head_size = hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
                 self.model_config.num_kv_heads = 1
             else:
-                self.model_config.head_size = hf_config.hidden_size // hf_config.num_key_value_heads // self.model_config.tp_size
-                self.model_config.num_kv_heads = hf_config.num_key_value_heads
+                if hasattr(hf_config, 'num_key_value_heads'):
+                    assert hf_config.num_attention_heads != hf_config.num_key_value_heads, f"{hf_config.num_attention_heads=}, {hf_config.num_key_value_heads=}"
+                    self.model_config.head_size = hf_config.head_dim
+                    self.model_config.num_kv_heads = hf_config.num_key_value_heads
+                else:
+                    self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
+                    self.model_config.num_kv_heads = hf_config.num_attention_heads
             
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
