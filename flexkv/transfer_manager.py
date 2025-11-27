@@ -46,6 +46,7 @@ class TransferManager:
 
         self.transfer_engine: Optional[TransferEngine] = None
         self.storage_engine = StorageEngine(self.model_config, self.cache_config)
+        flexkv_logger.info(f"Initialized TransferManager with config successfully")
 
     def _handle_gpu_blocks_registration(self, req: RegisterTPClientRequest) -> None:
         device_id = req.device_id
@@ -96,6 +97,7 @@ class TransferManager:
             # self.context.term()
 
     def initialize_transfer_engine(self) -> None:
+        flexkv_logger.info(f"Initializing TransferEngine...")
         self._register_gpu_blocks_via_socket()
 
         assert len(self.all_gpu_layouts) == self.model_config.tp_size * self.model_config.dp_size
@@ -124,6 +126,7 @@ class TransferManager:
                                               cpu_handle=cpu_handle,
                                               ssd_handle=ssd_handle,
                                               remote_handle=remote_handle)
+        flexkv_logger.info(f"Initialized TransferEngine successfully")
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:
         self.transfer_engine.submit_transfer_graph(transfer_graph)
@@ -144,12 +147,23 @@ def get_master_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
     master_ports = tuple(master_ports.split(","))
     return "tcp://" + master_host, master_ports
 
+def get_trtllm_subprocess_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
+    flexkv_trt_subprocess_host = os.getenv("FLEXKV_TRT_SUBPROCESS_HOST", "localhost")
+    flexkv_trt_subprocess_ports = os.getenv("FLEXKV_TRT_SUBPROCESS_PORTS", "6667,6668,6669")
+    flexkv_trt_subprocess_ports = tuple(flexkv_trt_subprocess_ports.split(","))
+    return "tcp://" + flexkv_trt_subprocess_host, flexkv_trt_subprocess_ports
+
 class TransferManagerOnRemote(TransferManager):
     """
     TransferManager for remote mode, used for multi-node tensor parallelism.
     """
-    def __init__(self):
-        self.master_host, self.master_ports = get_master_host_and_ports_from_env()
+    def __init__(self, mode: str = "Default"):
+        if mode == "Default":
+            self.master_host, self.master_ports = get_master_host_and_ports_from_env()
+        elif mode == "TrtllmSubprocess":
+            self.master_host, self.master_ports = get_trtllm_subprocess_host_and_ports_from_env()
+        else:
+            raise ValueError(f"Invalid mode: {mode}, must be Default or TrtllmSubprocess")
 
         self.context = zmq.Context()
         self.command_socket = self.context.socket(zmq.PULL)
@@ -171,6 +185,7 @@ class TransferManagerOnRemote(TransferManager):
         self._connect_to_master_transfer_manager()
 
         self._initialize_with_config()
+        flexkv_logger.info(f"Initialized TransferManagerOnRemote with config successfully")
 
     def _connect_to_master_transfer_manager(self) -> None:
         try:
@@ -203,7 +218,7 @@ class TransferManagerOnRemote(TransferManager):
                 {self.cache_config = }, {self.gpu_register_port = }.")
         else:
             raise RuntimeError(f"Expected config message, got: {config_msg}")
-
+        flexkv_logger.info(f"Received config from master successfully")
         super().__init__(self.model_config, self.cache_config, self.gpu_register_port)
 
     def _polling_worker(self) -> None:
@@ -352,7 +367,8 @@ class TransferManagerOnRemote(TransferManager):
             import sys
             import pickle
             import tempfile
-
+            from flexkv.common.debug import flexkv_logger
+            
             # Immediately disable MPI to avoid conflicts
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
 
@@ -364,10 +380,13 @@ class TransferManagerOnRemote(TransferManager):
                 with open("{kwargs_file}", "rb") as f:
                     kwargs = pickle.load(f)
 
-                # Create and start TransferManager instance
+                # Create and start TransferManagerOnRemote instance
+                flexkv_logger.info(f"Creating TransferManagerOnRemote instance...")
                 instance = cls(**kwargs)
+                flexkv_logger.info(f"Starting TransferManagerOnRemote instance...")
                 instance.start()
-
+                flexkv_logger.info(f"TransferManager instance started successfully")
+                
                 # Keep running until worker thread exits
                 if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
                     instance._worker_thread.join()

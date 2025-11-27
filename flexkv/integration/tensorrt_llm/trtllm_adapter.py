@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
-
+import traceback
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -18,8 +18,9 @@ from flexkv.integration.utils import cdiv
 from flexkv.integration.config import FlexKVConfig
 from flexkv.integration.tensorrt_llm.meta import(
     FlexKVResponse, FlexKVTask, FlexKVGetTask, FlexKVPutTask, FlexKVConnectorMetadata)
+from flexkv.transfer_manager import TransferManagerOnRemote
 
-from flexkv.integration.tensorrt_llm.utils import RequestWrapper, get_dp_tp_info
+from flexkv.integration.tensorrt_llm.utils import RequestWrapper
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
@@ -30,9 +31,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
     def __init__(self, config: ExecutorConfig):
         # Set environment variable for FlexKV with TensorRT-LLM，this must before KVManager initialization
         os.environ['FLEXKV_WITH_TRTLLM'] = '1'
-        tp_size, dp_size, dp_rank = get_dp_tp_info(config)
-        flexkv_config = FlexKVConfig.from_env()
-        flexkv_config.post_init_from_trt_config(config, tp_size, dp_size, dp_rank)
+        flexkv_config = FlexKVConfig.from_env() 
+        flexkv_config.post_init_from_trt_config(config)
+        self.node_rank, self.tp_rank, self.dp_rank = get_rank_info_from_trt_config(config)
 
         flexkv_logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
         self.server_recv_port = flexkv_config.server_recv_port
@@ -44,7 +45,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.flexkv_manager = KVManager(model_config=self.model_config,
                                         cache_config=self.cache_config,
                                         server_recv_port=flexkv_config.server_recv_port,
-                                        dp_client_id=dp_rank)
+                                        dp_client_id=self.dp_rank)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
 
@@ -61,8 +62,6 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         flexkv_logger.info("Finish init FlexKVSchedulerConnector")
         
-
-
     def is_ready(
         self,
     ) -> bool:
@@ -449,17 +448,47 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
 class FlexKVWorkerConnector(KvCacheConnectorWorker):
     def __init__(self, config: ExecutorConfig):
-        tp_size, dp_size, dp_rank = get_dp_tp_info(config)
         flexkv_config = FlexKVConfig.from_env()
-        flexkv_config.post_init_from_trt_config(config, tp_size, dp_size, dp_rank)
-        dp_client_id = dp_rank
+        self.node_rank, self.tp_rank, self.dp_rank = get_rank_info_from_trt_config(config)
+        flexkv_config.post_init_from_trt_config(config)
+        dp_client_id = self.dp_rank
         
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
         self.flexkv_config = flexkv_config
-        flexkv_logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, \
-            dp_client_id: {dp_client_id}")
+        
+        # For multi-node TP on remote node (node B), worker0 needs to create TransferManagerOnRemote process
+        self.remote_process = None
+        if self._need_to_create_remote_process():
+            flexkv_logger.info("Multi-node TP detected on remote node, worker0 creating TransferManagerOnRemote process")
+            self.remote_process = TransferManagerOnRemote.create_process()
+            flexkv_logger.info(f"TransferManagerOnRemote process created, PID: {self.remote_process.pid}")
+        
+        flexkv_logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, dp_client_id: {dp_client_id}")
         self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_client_id, current_device_id)
         flexkv_logger.info("Finish init FlexKVWorkerConnector")
+    
+    def _need_to_create_remote_process(self) -> bool:
+        """Check if need to create TransferManagerOnRemote process.
+        
+        Returns True when all of the following conditions are met:
+        - Multi-node TP is detected (tp_size > gpus_per_node)
+        - Current node is not master node (node_rank > 0)
+        - Current worker is worker0 in TP group (tp_rank == 0)
+        
+        Returns:
+            bool: True if need to create TransferManagerOnRemote process, False otherwise.
+        """
+        try:
+            is_master_node = self.node_rank == 0
+            is_first_worker = self.tp_rank % 8 == 0
+            is_multinode_tp = self.flexkv_config.model_config.tp_size > torch.cuda.device_count()
+            flexkv_logger.info(f"{is_master_node=}, {is_first_worker=}, {is_multinode_tp=}")
+            
+            return is_multinode_tp and not is_master_node and is_first_worker
+        except Exception as e:
+            flexkv_logger.error(f"Failed to get node info from flexkv_config: {e}")
+            flexkv_logger.error(traceback.format_exc())
+            raise e
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         # vllm kv_caches: dict[str, torch.Tensor]
@@ -539,3 +568,49 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         finished_sending = self._metadata.finished_sending
         finished_recving = self._metadata.finished_recving
         return finished_sending, finished_recving
+    
+    def shutdown(self) -> None:
+        """Shutdown the worker connector and cleanup resources.
+        
+        For node B worker0, this will shutdown the TransferManagerOnRemote process.
+        """
+        if hasattr(self, 'remote_process') and self.remote_process is not None:
+            flexkv_logger.info("Shutting down TransferManagerOnRemote process on node B worker0")
+            try:
+                # Terminate the process
+                if hasattr(self.remote_process, '_popen'):
+                    self.remote_process._popen.terminate()
+                    self.remote_process._popen.wait(timeout=5.0)
+                    if self.remote_process._popen.poll() is None:
+                        flexkv_logger.warning("TransferManagerOnRemote process did not terminate, killing it")
+                        self.remote_process._popen.kill()
+                        self.remote_process._popen.wait()
+                else:
+                    # Fallback for subprocess.Popen
+                    self.remote_process.terminate()
+                    self.remote_process.wait(timeout=5.0)
+                    if self.remote_process.poll() is None:
+                        flexkv_logger.warning("TransferManagerOnRemote process did not terminate, killing it")
+                        self.remote_process.kill()
+                        self.remote_process.wait()
+                flexkv_logger.info("TransferManagerOnRemote process shutdown complete")
+            except Exception as e:
+                flexkv_logger.error(f"Error shutting down TransferManagerOnRemote process: {e}")
+            finally:
+                self.remote_process = None
+    
+    def __del__(self):
+        """Cleanup on deletion."""
+        if hasattr(self, 'remote_process') and self.remote_process is not None:
+            self.shutdown()
+    
+def get_rank_info_from_trt_config(config: ExecutorConfig):
+    if config.mapping.enable_attention_dp:
+        node_rank = config.mapping.node_rank
+        tp_rank = config.mapping.tp_rank
+        dp_rank = config.mapping.rank
+    else:
+        node_rank = config.mapping.node_rank
+        tp_rank = config.mapping.tp_rank
+        dp_rank = 0
+    return node_rank, tp_rank, dp_rank

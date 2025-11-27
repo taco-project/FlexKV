@@ -6,6 +6,36 @@ FlexKV is a distributed KV store and multi-level cache management system develop
 
 FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) file for details.
 
+
+## Main Change for latest version
+### Feature
+Universal:
+- Add op-level callback for local get/put [#13](https://github.com/taco-project/FlexKV/pull/13)
+- Add support for distributed sharing of the KV Cache, to suppot KV Cache sharing between CPU and SSD, as well as distributed sharing of PCFS  ([#17](https://github.com/taco-project/FlexKV/pull/17))
+- Add GDS (GPU Direct Storage) Support ([#25](https://github.com/taco-project/FlexKV/pull/25))
+- TP16 support ([#26](https://github.com/taco-project/FlexKV/pull/26))
+- Support more kv cache layout. Now include: vLLM, SGLang, TensorRT-LM ([#27](https://github.com/taco-project/FlexKV/pull/27))
+- GDS refactor & gtensor support ([#42](https://github.com/taco-project/FlexKV/pull/42))
+- Support construct TensorSharedHandle directly from CUDA IPC Handle ([#44](https://github.com/taco-project/FlexKV/pull/44))
+
+
+Targeting vLLM: 
+- Support dp > 1 while integrated with vLLM ([#18](https://github.com/taco-project/FlexKV/pull/18))
+- Add launch scripts for vLLM adaption ([#47](https://github.com/taco-project/FlexKV/pull/47))
+- Support TP16 for vLLM+FlexKV ([#59](https://github.com/taco-project/FlexKV/pull/59))
+
+Targeting TensorRT-LLM 
+- Support using FlexKV on TensorRT-LLM ([#48](https://github.com/taco-project/FlexKV/pull/48))
+- Support TP16 for TensorRT-LLM+FlexKV ([#53](https://github.com/taco-project/FlexKV/pull/53))
+
+### Optimization
+- Mla d2h transfer optimization ([#19](https://github.com/taco-project/FlexKV/pull/19))
+- optimize SSD I/O ([#33](https://github.com/taco-project/FlexKV/pull/33))
+- Enhance cache eviction with frequency-aware grace time mechanism ([#38](https://github.com/taco-project/FlexKV/pull/38))
+- Replace std::map with std::unordered_map in RadixTree ([#41](https://github.com/taco-project/FlexKV/pull/41))
+
+For more details, see [CHANGELOG](CHANGELOG.md)
+
 ## How to Use
 
 ### Install Dependencies
@@ -86,11 +116,15 @@ FlexKV performs:
 - *get* requests can be called asynchronously; the time for matching and data transfer can overlap with prior computation through prefetching.
 - *put* requests can be called asynchronously; the time to copy data from GPU to CPU memory can overlap with subsequent computation. Data transfers between CPU memory, SSD, and scalable storage are fully handled asynchronously by the TransferEngine and transparent to the main process.
 
-## Branch
-- The main branch is the stable branch, which maintains already tested commits. Please pull from main branch if you need stable code.
-- The dev branch is the development branch, which contains newer features. Please branch from and merge into dev if you need new features or are developing new functionality.
-- The bugfix branch is for bug fixes, maintaining urgent bugs that need immediate resolution or documentation that requires prompt updates. If you need to fix a bug or update documentation urgently, please branch from and merge into the bugfix branch.
-- The stable branch refers to the previous main branch state, intended only for rollback or extremely conservative use cases (e.g., production deployment). Its use is discouraged.
+## Branching Strategy
+
+The branch management strategy of this project is as follows:
+
+- **`main` branch**: The main development branch that contains the latest features and changes. All pull requests are merged directly into `main` to ensure rapid iteration and continuous integration.
+
+- **`release-*` branches**: When `main` reaches a stable state, we create dedicated release branches (e.g., `release-1.0`, `release-1.1`) to provide stable, production-ready versions for users.
+
+Note: Critical fixes discovered in released versions are applied directly to the corresponding `release-*` branch and then backported to `main` to maintain consistency across all active branches.
 
 ## Roadmap
 
