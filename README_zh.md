@@ -6,6 +6,35 @@ FlexKV是腾讯云TACO团队和社区合作开发推出的面向超大规模 LLM
 
 FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICENSE) 文件。
 
+## 最新版本主要变更 (1.1.0)
+### 功能
+通用功能:
+- 添加本地 get/put 的操作级回调 [#13](https://github.com/taco-project/FlexKV/pull/13)
+- 添加分布式 KV Cache 共享支持，支持 CPU 和 SSD 之间的 KV Cache 共享，以及 PCFS 的分布式共享 ([#17](https://github.com/taco-project/FlexKV/pull/17))
+- 添加 GDS (GPU Direct Storage) 支持 ([#25](https://github.com/taco-project/FlexKV/pull/25))
+- TP16 支持 ([#26](https://github.com/taco-project/FlexKV/pull/26))
+- 支持更多 kv cache 布局。现在包括：vLLM、SGLang、TensorRT-LM ([#27](https://github.com/taco-project/FlexKV/pull/27))
+- GDS 重构和 gtensor 支持 ([#42](https://github.com/taco-project/FlexKV/pull/42))
+- 支持直接从 CUDA IPC Handle 构造 TensorSharedHandle ([#44](https://github.com/taco-project/FlexKV/pull/44))
+
+
+针对 vllm: 
+- 在 vllm 集成中支持 dp > 1 ([#18](https://github.com/taco-project/FlexKV/pull/18))
+- 添加 vllm 适配的启动脚本 ([#47](https://github.com/taco-project/FlexKV/pull/47))
+- 支持 vLLM+FlexKV 的 TP16 ([#59](https://github.com/taco-project/FlexKV/pull/59))
+
+针对 TensorRT-LLM 
+- 在 TensorRT-LLM 上支持使用 FlexKV ([#48](https://github.com/taco-project/FlexKV/pull/48))
+- 支持 TensorRT-LLM+FlexKV 的 TP16 ([#53](https://github.com/taco-project/FlexKV/pull/53))
+
+### 优化
+- MLA d2h 传输优化 ([#19](https://github.com/taco-project/FlexKV/pull/19))
+- 优化 SSD I/O ([#33](https://github.com/taco-project/FlexKV/pull/33))
+- 增强缓存淘汰机制，引入频率感知的宽限时间 ([#38](https://github.com/taco-project/FlexKV/pull/38))
+- 在 RadixTree 中使用 std::unordered_map 替代 std::map ([#41](https://github.com/taco-project/FlexKV/pull/41))
+
+更多详细信息，请参阅 [CHANGELOG](CHANGELOG.md)
+
 ## 如何使用
 
 ### 安装依赖
@@ -98,3 +127,28 @@ FlexKV 在处理 *get* 请求时：
 - **加速框架支持**：对 vLLM、SGLang 等主流推理框架的适配将陆续发布
 - **分布式查询支持**：实现可扩展的分布式 KVCache 查询能力
 - **延迟优化**：通过预取、压缩等手段进一步降低 *get* 请求延迟
+
+## 更新日志
+
+本项目遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 格式，并采用 [语义化版本](https://semver.org/spec/v2.0.0.html)。
+
+### [Unreleased]
+
+### [1.0.0] - 2025-09-11
+
+#### 新增功能
+- C++ radix tree 用于快速匹配，需要在 cache_config 中设置 "index_accel": true
+- 同步内核启动
+- 重大变更：将缓存引擎改为库形式供加速器（如 vLLM）使用，替代原有的服务端-客户端模式。当没有匹配的 KVCache 时，这可以加速 get 和 put 操作。此版本包含破坏性 API 变更，不向后兼容。
+- 添加 evict_ratio 参数，需要在 cache_config 中设置 "evict_ratio": 0.05
+- 减少内核启动内部的 bubble
+- 添加 vLLM 0.10.1.1 适配器
+
+#### 修复
+- cython 发布包
+
+### [0.1.0] - 2025-08-29
+
+#### 初始化
+- 初始版本
+- 添加许可证
