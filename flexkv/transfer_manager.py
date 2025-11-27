@@ -148,10 +148,10 @@ def get_master_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
     return "tcp://" + master_host, master_ports
 
 def get_trtllm_subprocess_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
-    trt_subprocess_host = os.getenv("TRT_SUBPROCESS_HOST", "localhost")
-    trt_subprocess_ports = os.getenv("TRT_SUBPROCESS_PORTS", "6667,6668,6669")
-    trt_subprocess_ports = tuple(trt_subprocess_ports.split(","))
-    return "tcp://" + trt_subprocess_host, trt_subprocess_ports
+    flexkv_trt_subprocess_host = os.getenv("FLEXKV_TRT_SUBPROCESS_HOST", "localhost")
+    flexkv_trt_subprocess_ports = os.getenv("FLEXKV_TRT_SUBPROCESS_PORTS", "6667,6668,6669")
+    flexkv_trt_subprocess_ports = tuple(flexkv_trt_subprocess_ports.split(","))
+    return "tcp://" + flexkv_trt_subprocess_host, flexkv_trt_subprocess_ports
 
 class TransferManagerOnRemote(TransferManager):
     """
