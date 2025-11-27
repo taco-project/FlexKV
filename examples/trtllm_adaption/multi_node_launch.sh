@@ -5,7 +5,7 @@ MAX_SEQ_LEN=155648
 MAX_NUM_TOKENS=16384
 # MAX_SEQ_LEN=8192
 # MAX_NUM_TOKENS=8192
-HOSTFILE=/cfs_zhongwei/rongwei/scripts/flexkv/trtllm_hostfile
+HOSTFILE=YOUR_HOSTFILE
 MODEL_PATH=${1:-YOUR_MODEL_PATH}
 
 export FLEXKV_CONFIG_PATH=$(realpath "./flexkv_config.json")
