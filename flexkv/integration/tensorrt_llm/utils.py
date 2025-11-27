@@ -53,17 +53,3 @@ class RequestWrapper:
                 f"num_prompt_tokens={self.num_prompt_tokens}, " \
                 f"num_tokens={len(self.all_token_ids)}, " \
                 f"num_new_matched_tokens={self.num_new_matched_tokens})"
-
-def get_dp_tp_info(config: ExecutorConfig):
-    mapping = config.mapping
-    
-    if mapping.enable_attention_dp:
-        # trt 也不支持同时开 tp+dp
-        tp_size = 1
-        dp_size = mapping.tp_size
-        dp_rank = mapping.rank
-    else:
-        tp_size = mapping.tp_size
-        dp_size = 1 
-        dp_rank = 0
-    return tp_size, dp_size, dp_rank

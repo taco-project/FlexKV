@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import *
-from transformers import AutoConfig as HFAutoConfig
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig, FullAttentionSpec
@@ -119,9 +118,6 @@ class FlexKVConfig:
     def post_init_from_trt_config(
         self,
         config,
-        tp_size: int,
-        dp_size: int,
-        dp_rank: int,
     ):
         self.cache_config.tokens_per_block = config.tokens_per_block
         # Convert dtype string to torch.dtype
@@ -141,13 +137,19 @@ class FlexKVConfig:
             self.model_config.dtype = dtype_map.get(dtype_str, torch.bfloat16)
         else:
             self.model_config.dtype = dtype_str
-            
-        self.model_config.tp_size = tp_size
-        self.model_config.dp_size = dp_size
-        self.model_config.dp_rank = dp_rank
         
+        # Set model config (parallel configs part)
+        if config.mapping.enable_attention_dp:
+            self.model_config.tp_size = 1
+            self.model_config.dp_size = config.mapping.tp_size
+        else:
+            self.model_config.tp_size = config.mapping.tp_size
+            self.model_config.dp_size = 1
+            
+        # self.model_config (model configs part)
         try:
             model_path = getattr(config, 'hf_model_dir', None)
+            from transformers import AutoConfig as HFAutoConfig
             hf_config = HFAutoConfig.from_pretrained(
                 str(model_path), 
                 trust_remote_code=True
