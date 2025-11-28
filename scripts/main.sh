@@ -27,7 +27,7 @@ DATASET_PATH="$CACHE_DIR/sharegpt/"
 # Default values for Benchmark configuration
 REQUEST_RATE=32
 WORKERS=32
-MAX_TURNS=10
+MAX_TURNS=5
 CONCURRENCY=2
 
 # Default values for Log configuration
@@ -233,6 +233,7 @@ export FLEXKV_CPU_CACHE_GB=$FLEXKV_CPU_CACHE_GB
 export FLEXKV_SSD_CACHE_GB=$FLEXKV_SSD_CACHE_GB
 export FLEXKV_SSD_CACHE_DIR=$FLEXKV_SSD_CACHE_DIR
 export FLEXKV_ENABLE_GDS=$FLEXKV_ENABLE_GDS
+export FLEXKV_LOG_LEVEL="INFO"
 unset FLEXKV_CONFIG_PATH  # use environment variables instead of config file
 
 info "==================================="

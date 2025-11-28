@@ -4,6 +4,30 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
+# Signal handler for graceful shutdown
+cleanup() {
+    local exit_code=$?
+    echo ""
+    warn "Benchmark interrupted by user (Ctrl+C)"
+    warn "Cleaning up..."
+
+    # Kill Python benchmark process if still running
+    if [ ! -z "$BENCHMARK_PID" ]; then
+        kill -TERM $BENCHMARK_PID 2>/dev/null
+        wait $BENCHMARK_PID 2>/dev/null
+    fi
+
+    if [ ! -z "$BENCHMARK_LOG" ]; then
+        echo "[$(date)] Benchmark interrupted by user" >> "$BENCHMARK_LOG"
+    fi
+
+    error "✗ Benchmark terminated early"
+    error "End time: $(date)"
+    exit 130
+}
+
+trap cleanup INT TERM
+
 VLLM_URL="http://localhost:30001"
 VLLM_PATH=""
 MODEL_PATH=""
@@ -173,7 +197,18 @@ CMD="python3 $BENCHMARK_SCRIPT \
     > "$BENCHMARK_LOG" 2>&1"
 
 info "Running command: $CMD"
-eval $CMD
 
-info "✓ All benchmarks completed"
-info "End time: $(date)"
+eval $CMD &
+BENCHMARK_PID=$!
+
+wait $BENCHMARK_PID
+BENCHMARK_EXIT_CODE=$?
+
+if [ $BENCHMARK_EXIT_CODE -eq 0 ]; then
+    info "✓ All benchmarks completed successfully"
+    info "End time: $(date)"
+else
+    error "✗ Benchmark failed with exit code: $BENCHMARK_EXIT_CODE"
+    error "End time: $(date)"
+    exit $BENCHMARK_EXIT_CODE
+fi
