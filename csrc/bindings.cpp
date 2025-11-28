@@ -31,6 +31,7 @@
 #include "lock_free_q.h"
 #include "lease_meta_mempool.h"
 #include "fiemap_extent.h"
+#include "nvme_connect.h"
 #include <deque>
 
 namespace py = pybind11;
@@ -454,6 +455,9 @@ PYBIND11_MODULE(c_ext, m) {
         "Get FIEMAP extents of a file",
         py::arg("fd"), py::arg("max_extents") = 256,
         py::call_guard<py::gil_scoped_release>());
+  m.def("nvme_connect", &flexkv::nvme_connect,
+        "Connect NVMe-oF targets",
+        py::arg("nvmets"));
 
   py::class_<flexkv::SSDIOCTX>(m, "SSDIOCTX")
       .def(py::init<std::map<int, std::vector<std::string>> &, int, int, int>());
