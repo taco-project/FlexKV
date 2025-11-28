@@ -199,6 +199,8 @@ def enable_nvmet() -> None:
         port_list = list(range(len(nvmet_list)))
     else:
         port_list = nsid_list
+
+    user_port_list: List[str] = []
     for port, ip_addr, subsys_name, dev in zip(port_list, ip_dict.keys(), subsys_list, nvmet_list):
         os.mkdir(f'/sys/kernel/config/nvmet/ports/{port}')
 
@@ -215,6 +217,9 @@ def enable_nvmet() -> None:
                 break
             else:
                 print("Invalid input. Please enter a numeric port number.")
+
+        user_port_list.append(user_port)
+
         # 1 port <-> 1 offloading subsystem <-> 1 namespace <-> 1 physical NVMe dev
         with open(f'/sys/kernel/config/nvmet/ports/{port}/addr_trsvcid', 'w') as f:
             f.write(user_port)
@@ -233,9 +238,10 @@ def enable_nvmet() -> None:
     assert os.path.exists(os.path.join(dir, 'integration')), f'{dir}/integration does not exist.'
     
     config_data: Dict[str, Dict[str, str]] = {}
-    for ip_addr, subsys_name, dev in zip(ip_dict.keys(), subsys_list, nvmet_list):
+    for ip_addr, user_port, subsys_name, dev in zip(ip_dict.keys(), subsys_list, nvmet_list):
         config_data[subsys_name] = {
             'ip': ip_addr,
+            'port': user_port,
             'dev': dev
         }
     with open(os.path.join(dir, 'integration/nvmet_config.json'), 'w') as f:
