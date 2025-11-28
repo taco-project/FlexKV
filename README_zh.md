@@ -6,6 +6,34 @@ FlexKV是腾讯云TACO团队和社区合作开发推出的面向超大规模 LLM
 
 FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICENSE) 文件。
 
+## 最新版本主要变更
+### 功能
+通用功能:
+- 添加本地 get/put 的操作级回调 [#13](https://github.com/taco-project/FlexKV/pull/13)
+- 添加分布式 KV Cache 共享支持，支持 CPU 和 SSD 之间的 KV Cache 共享，以及 PCFS 的分布式共享 ([#17](https://github.com/taco-project/FlexKV/pull/17))
+- 添加 GDS (GPU Direct Storage) 支持 ([#25](https://github.com/taco-project/FlexKV/pull/25))
+- TP16 支持 ([#26](https://github.com/taco-project/FlexKV/pull/26))
+- 支持更多 kv cache 布局。现在包括：vLLM、SGLang、TensorRT-LM ([#27](https://github.com/taco-project/FlexKV/pull/27))
+- GDS 重构和 gtensor 支持 ([#42](https://github.com/taco-project/FlexKV/pull/42))
+- 支持直接从 CUDA IPC Handle 构造 TensorSharedHandle ([#44](https://github.com/taco-project/FlexKV/pull/44))
+
+
+针对 vLLM: 
+- 在 vLLM 集成中支持 dp > 1 ([#18](https://github.com/taco-project/FlexKV/pull/18))
+- 添加 vLLM 适配的启动脚本 ([#47](https://github.com/taco-project/FlexKV/pull/47))
+- 支持 vLLM+FlexKV 的 TP16 ([#59](https://github.com/taco-project/FlexKV/pull/59))
+
+针对 TensorRT-LLM 
+- 在 TensorRT-LLM 上支持使用 FlexKV ([#48](https://github.com/taco-project/FlexKV/pull/48))
+- 支持 vLLM+FlexKV 的 TP16 ([#53](https://github.com/taco-project/FlexKV/pull/53))
+### 优化
+- MLA d2h 传输优化 ([#19](https://github.com/taco-project/FlexKV/pull/19))
+- 优化 SSD I/O ([#33](https://github.com/taco-project/FlexKV/pull/33))
+- 增强缓存淘汰机制，引入频率感知的宽限时间 ([#38](https://github.com/taco-project/FlexKV/pull/38))
+- 在 RadixTree 中使用 std::unordered_map 替代 std::map ([#41](https://github.com/taco-project/FlexKV/pull/41))
+
+更多详细信息，请参阅 [CHANGELOG](CHANGELOG.md)
+
 ## 如何使用
 
 ### 安装依赖
@@ -86,11 +114,15 @@ FlexKV 在处理 *get* 请求时：
 - *get*请求可以异步调用，*get*匹配和传输时间可以通过预取与之前的计算重合。
 - *put*请求可以异步调用，从GPU copy到内存的时间可以与之后的计算重合。内存与SSD以及扩展存储间的传输则完全由TransferEngine之后执行，主进程不感知。
 
-## Branch
-- main 为稳定分支，维护已经测试过的commit。需要稳定的代码请从此分支拉取。
-- dev 为开发分支，维护较新特性。需要新特性和开发新特性请从此分支拉取和合入。
-- bugfix 为bug分支，维护需要立即解决的bug或需要立即更新的文档。需要解决bug和立即更新的文档请从此分支拉取和合入。
-- stable 为上一个版本的main分支位置，仅用于回滚以及极其保守的情况使用（如产品化）。不鼓励使用此版本。
+## 分支策略
+
+本项目的分支管理策略如下：
+
+- **`main` 分支**：主开发分支，包含最新的功能和变更。所有拉取请求都直接合并到 `main` 分支，以确保快速迭代和持续集成。
+
+- **`release-*` 分支**：当 `main` 分支达到稳定状态时，我们会创建专门的发布分支（例如 `release-1.0`、`release-1.1`），为用户提供稳定、可用于生产环境的版本。
+
+注意：在已发布版本中发现的关键修复会直接应用到对应的 `release-*` 分支，然后回退到 `main` 分支，以保持所有活跃分支的一致性。
 
 ## Roadmap
 

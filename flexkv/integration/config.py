@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import *
-from transformers import AutoConfig as HFAutoConfig
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig, FullAttentionSpec
@@ -65,12 +64,15 @@ class FlexKVConfig:
         self.cache_config.tokens_per_block = vllm_config.cache_config.block_size
 
         self.model_config.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
-        self.model_config.num_kv_heads = vllm_config.model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.model_config.head_size = vllm_config.model_config.get_head_size()
         self.model_config.dtype = vllm_config.model_config.dtype
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
+        if self.model_config.use_mla:
+            self.model_config.num_kv_heads = 1
+        else:
+            self.model_config.num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
 
         self.__post_init__()
 
@@ -119,9 +121,6 @@ class FlexKVConfig:
     def post_init_from_trt_config(
         self,
         config,
-        tp_size: int,
-        dp_size: int,
-        dp_rank: int,
     ):
         self.cache_config.tokens_per_block = config.tokens_per_block
         # Convert dtype string to torch.dtype
@@ -141,13 +140,19 @@ class FlexKVConfig:
             self.model_config.dtype = dtype_map.get(dtype_str, torch.bfloat16)
         else:
             self.model_config.dtype = dtype_str
-            
-        self.model_config.tp_size = tp_size
-        self.model_config.dp_size = dp_size
-        self.model_config.dp_rank = dp_rank
         
+        # Set model config (parallel configs part)
+        if config.mapping.enable_attention_dp:
+            self.model_config.tp_size = 1
+            self.model_config.dp_size = config.mapping.tp_size
+        else:
+            self.model_config.tp_size = config.mapping.tp_size
+            self.model_config.dp_size = 1
+            
+        # self.model_config (model configs part)
         try:
             model_path = getattr(config, 'hf_model_dir', None)
+            from transformers import AutoConfig as HFAutoConfig
             hf_config = HFAutoConfig.from_pretrained(
                 str(model_path), 
                 trust_remote_code=True
@@ -161,8 +166,13 @@ class FlexKVConfig:
                 self.model_config.head_size = hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
                 self.model_config.num_kv_heads = 1
             else:
-                self.model_config.head_size = hf_config.hidden_size // hf_config.num_key_value_heads // self.model_config.tp_size
-                self.model_config.num_kv_heads = hf_config.num_key_value_heads
+                if hasattr(hf_config, 'num_key_value_heads'):
+                    assert hf_config.num_attention_heads != hf_config.num_key_value_heads, f"{hf_config.num_attention_heads=}, {hf_config.num_key_value_heads=}"
+                    self.model_config.head_size = hf_config.head_dim
+                    self.model_config.num_kv_heads = hf_config.num_key_value_heads
+                else:
+                    self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
+                    self.model_config.num_kv_heads = hf_config.num_attention_heads
             
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")

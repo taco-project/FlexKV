@@ -19,7 +19,10 @@ from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
-from flexkv.transfer_manager import get_master_host_and_ports_from_env
+from flexkv.transfer_manager import (
+    get_master_host_and_ports_from_env,
+    get_trtllm_subprocess_host_and_ports_from_env
+)
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -120,8 +123,8 @@ class KVTaskManager:
             # When using FlexKV with TensorRT-LLM, we use remote mode to transfer data
             #  to avoid the way we launch subprocess in FlexKV
             #  conflict with TensorRT-LLM's MPI initialization
-            self.remote_process = TransferManagerOnRemote.create_process()
-            master_host, master_ports = get_master_host_and_ports_from_env()
+            master_host, master_ports = get_trtllm_subprocess_host_and_ports_from_env()
+            self.remote_process = TransferManagerOnRemote.create_process(mode="TrtllmSubprocess")
             self.transfer_handles = [
                 TransferManagerHandle(
                     model_config_for_transfer,
