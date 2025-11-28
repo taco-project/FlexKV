@@ -318,6 +318,25 @@ fi
 
 info "Server log: $SERVER_LOG"
 
+# Print benchmark summary
+BENCHMARK_LOG="$LOG_DIR/benchmark_${TIMESTAMP}.log"
+if [ -f "$BENCHMARK_LOG" ]; then
+    info "==================================="
+    info "Benchmark Summary"
+    info "==================================="
+
+    if grep -q "Parameters:" "$BENCHMARK_LOG"; then
+        info "Benchmark log: $BENCHMARK_LOG"
+        echo ""
+        # Print from "Parameters:" to end of file, removing ANSI color codes
+        sed -n '/Parameters:/,$ { s/\x1b\[[0-9;]*m//g; p }' "$BENCHMARK_LOG"
+    else
+        warn "No summary found in benchmark log"
+    fi
+else
+    warn "Benchmark log not found: $BENCHMARK_LOG"
+fi
+
 if [ $BENCHMARK_EXIT_CODE -eq 0 ]; then
     info "✓ Benchmark completed successfully"
 else
