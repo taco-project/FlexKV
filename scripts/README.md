@@ -1,6 +1,6 @@
-# FlexKV Benchmark Scripts
+# FlexKV Benchmark Script
 
-This directory contains scripts for running FlexKV-enabled vLLM server with multi-turn benchmarks.
+This script ([./run_benchmark.sh](./run_benchmark.sh)) is used to run FlexKV-enabled vLLM server with multi-turn benchmarks.
 
 ## Prerequisites
 
