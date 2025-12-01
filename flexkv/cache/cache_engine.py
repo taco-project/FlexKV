@@ -754,11 +754,29 @@ class GlobalCacheEngine:
                 cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment1_cpu_blocks_local])
 
         if fragment2_num_blocks > 0:
-            if self.cache_config.enable_gds:
-                # For GDS, transfer directly from GDS to GPU (GDS2D)
+            if self.cache_config.enable_gds and ssd_matched_result.matched_pos == 'remote':
+                assert self.cache_config.enable_p2p_nvmet, 'Must enable NVMe-oF for GDS to access remote disk'
+                op_gds_nvmf_transfer = TransferOp(
+                    graph_id= transfer_graph.graph_id,
+                    transfer_type=TransferType.PEERSSD2D,
+                    src_block_ids= fragment2_ssd_blocks,
+                    dst_block_ids= fragment12_gpu_blocks[-fragment2_num_blocks:],
+                    layer_id= 0,
+                    layer_granularity= layer_num,
+                    remote_node_ids=ssd_matched_result.matched_node_ids,
+                    src_block_node_ids=ssd_matched_result.matched_node_ids
+                )
+                transfer_graph.add_transfer_op(op_gds_nvmf_transfer)
+                finished_ops_ids.append(op_gds_nvmf_transfer.op_id)
+                # TODO: Necessary?
+                op_node_to_ready[op_gds_nvmf_transfer.op_id] = (DeviceType.SSD,
+                                                                ssd_node_to_unlock,
+                                                                ssd_node_to_unlock.size())
+            elif self.cache_config.enable_gds:
+                # For GDS, transfer directly from GDS to GPU
                 op_gds_transfer = TransferOp(
                     graph_id = transfer_graph.graph_id,
-                    transfer_type = TransferType.GDS2D,
+                    transfer_type = TransferType.DISK2D,
                     src_block_ids = fragment2_ssd_blocks,
                     dst_block_ids = fragment12_gpu_blocks[-fragment2_num_blocks:],
                     layer_id = 0,
@@ -1258,7 +1276,6 @@ class GlobalCacheEngine:
                     cpu_matched_result = self.cpu_cache_engine.match_local(sequence_meta)
                 else:
                     cpu_matched_result = self.cpu_cache_engine.match_all(sequence_meta)
-        #TODO: we assume that ssd and gds are not enabled at the same time
         if self.ssd_cache_engine:
             if not self.cache_config.enable_p2p_ssd:
                 ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
