@@ -190,6 +190,7 @@ CMD="python3 $BENCHMARK_SCRIPT \
     --request-rate $REQUEST_RATE \
     --max-turns $MAX_TURNS \
     --conversation-sampling round_robin \
+    --no-early-stop \
     --verbose \
     --print-content \
     --output-file "$BENCHMARK_RESULT" \

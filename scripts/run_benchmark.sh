@@ -311,10 +311,38 @@ info "==================================="
 info "Stop vLLM Server"
 info "==================================="
 if [ -n "$SERVER_PID" ]; then
-    info "Stop vLLM Server (PID: $SERVER_PID)..."
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
-    info "✓ vLLM Server is stopped"
+    if ps -p $SERVER_PID > /dev/null 2>&1; then
+        info "Stopping vLLM Server (PID: $SERVER_PID)..."
+
+        kill $SERVER_PID 2>/dev/null || true
+
+        STOP_TIMEOUT=10
+        STOP_ELAPSED=0
+        while [ $STOP_ELAPSED -lt $STOP_TIMEOUT ]; do
+            if ! ps -p $SERVER_PID > /dev/null 2>&1; then
+                info "✓ vLLM Server stopped gracefully in ${STOP_ELAPSED}s"
+                break
+            fi
+            sleep 1
+            STOP_ELAPSED=$((STOP_ELAPSED + 1))
+        done
+
+        if ps -p $SERVER_PID > /dev/null 2>&1; then
+            warn "vLLM Server did not stop gracefully, forcing termination..."
+            kill -9 $SERVER_PID 2>/dev/null || true
+            sleep 1
+
+            if ps -p $SERVER_PID > /dev/null 2>&1; then
+                error "✗ Failed to stop vLLM Server (PID: $SERVER_PID)"
+            else
+                info "✓ vLLM Server stopped forcefully"
+            fi
+        fi
+    else
+        warn "vLLM Server (PID: $SERVER_PID) not found, may have already exited"
+    fi
+else
+    warn "No SERVER_PID found, skipping server shutdown"
 fi
 
 info "Server log: $SERVER_LOG"

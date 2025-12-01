@@ -238,6 +238,9 @@ def convert_sharegpt_to_openai(
             content = turn["value"]
             messages.append({"role": role, "content": content})
 
+        if len(messages) % 2 == 1:
+            messages.pop()
+
         # Add the converted conversation to the OpenAI format
         if len(messages) > 0:
             valid_messages = True
