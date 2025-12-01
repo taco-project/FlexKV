@@ -44,7 +44,8 @@ Required arguments:
 
 Optional arguments:
   --vllm-port <port>              vLLM服务端口 (default: $VLLM_PORT)
-  --tensor-parallel-size <size>   张量并行大小 (default: $TENSOR_PARALLEL_SIZE)
+  --tensor-parallel-size, --tp-size <size>
+                                  张量并行大小 (default: $TENSOR_PARALLEL_SIZE)
   --max-num-seqs <num>            最大序列数 (default: $MAX_NUM_SEQS)
   --max-model-len <len>           最大模型长度 (default: $MAX_MODEL_LEN)
   --gpu-memory-util <ratio>       GPU内存使用率 (default: $GPU_MEMORY_UTIL)
@@ -90,7 +91,7 @@ while [[ $# -gt 0 ]]; do
             VLLM_PORT="$2"
             shift 2
             ;;
-        --tensor-parallel-size)
+        --tensor-parallel-size|--tp-size)
             TENSOR_PARALLEL_SIZE="$2"
             shift 2
             ;;
