@@ -756,10 +756,10 @@ class GlobalCacheEngine:
 
         if fragment2_num_blocks > 0:
             if self.cache_config.enable_gds:
-                # For GDS, transfer directly from GDS to GPU (GDS2D)
+                # For GDS, transfer directly from GDS to GPU
                 op_gds_transfer = TransferOp(
                     graph_id = transfer_graph.graph_id,
-                    transfer_type = TransferType.GDS2D,
+                    transfer_type = TransferType.DISK2D,
                     src_block_ids = fragment2_ssd_blocks,
                     dst_block_ids = fragment12_gpu_blocks[-fragment2_num_blocks:],
                     layer_id = 0,
