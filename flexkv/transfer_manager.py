@@ -67,10 +67,9 @@ class TransferManager:
 
     def _register_gpu_blocks_via_socket(self) -> None:
         try:
-            flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port}")
-
             expected_gpus = self.model_config.tp_size * self.model_config.dp_size
-            flexkv_logger.info(f"{self.model_config.tp_size=}, {self.model_config.dp_size=}, {expected_gpus=}")
+            flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port},"
+                               f"expected {expected_gpus} GPUs to register")
             while len(self.all_gpu_blocks) < expected_gpus:
                 try:
                     # Recv from: flexkv.server.client.KVTPClient.register_to_server
@@ -82,8 +81,8 @@ class TransferManager:
                 if isinstance(req, RegisterTPClientRequest):
                     flexkv_logger.info(f"Received GPU blocks registration request: {type(req)}")
                     self._handle_gpu_blocks_registration(req)
-                    flexkv_logger.info(f"GPU {req.device_id} registered successfully, \
-                        waiting for {expected_gpus - len(self.all_gpu_blocks)} GPUs to register")
+                    flexkv_logger.info(f"GPU {req.device_id} registered successfully, "
+                                       f"waiting for {expected_gpus - len(self.all_gpu_blocks)} GPUs to register")
                 else:
                     flexkv_logger.error(f"Unrecognized RequestType in SchedulerServer: {type(req)}")
 
