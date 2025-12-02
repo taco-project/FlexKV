@@ -634,8 +634,12 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         except Exception as e:
             flexkv_logger.error(f"Failed to initialize transfer manager process: {e}")
         finally:
-            # Cleanup selector
-            sel.close()
+            # Cleanup selector (only if it was created)
+            if 'sel' in locals():
+                try:
+                    sel.close()
+                except Exception as e:
+                    flexkv_logger.error(f"Error closing selector: {e}")
             
             command_conn.close()
             result_conn.close()

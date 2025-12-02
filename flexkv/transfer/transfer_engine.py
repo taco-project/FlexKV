@@ -308,13 +308,10 @@ class TransferEngine:
                             try:
                                 transfer_graph = self.task_queue.get_nowait()
                                 # Handle batch submission (list of graphs)
-                                if isinstance(transfer_graph, list):
-                                    for graph in transfer_graph:
-                                        self.scheduler.add_transfer_graph(graph)
-                                    new_graphs_num += len(transfer_graph)
-                                else:
-                                    self.scheduler.add_transfer_graph(transfer_graph)
-                                    new_graphs_num += 1
+                                graphs = transfer_graph if isinstance(transfer_graph, list) else [transfer_graph]
+                                for graph in graphs:
+                                    self.scheduler.add_transfer_graph(graph)
+                                new_graphs_num += len(graphs)
                             except queue.Empty:
                                 break
                         nvtx.end_range(nvtx_r1)
@@ -432,9 +429,9 @@ class TransferEngine:
             # Send shutdown signal via pipe to wake up selector immediately
             try:
                 os.write(self.shutdown_write_fd, b'1')
-            except (OSError, BrokenPipeError):
+            except (OSError, BrokenPipeError) as e:
                 # Pipe already closed, that's ok
-                pass
+                flexkv_logger.debug(f"Shutdown pipe already closed during write: {e}")
             
             self._scheduler_thread.join(timeout=5)
             
@@ -442,8 +439,12 @@ class TransferEngine:
             try:
                 os.close(self.shutdown_read_fd)
                 os.close(self.shutdown_write_fd)
-            except OSError:
-                pass
+            except OSError as e:
+                # Only ignore EBADF (bad file descriptor, already closed)
+                if e.errno != 9:  # errno.EBADF = 9
+                    flexkv_logger.warning(f"Unexpected error closing shutdown pipes: {e}")
+                else:
+                    flexkv_logger.debug(f"Shutdown pipes already closed: {e}")
 
             # shutdown all workers
             for worker in self._worker_map.values():

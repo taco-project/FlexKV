@@ -250,13 +250,9 @@ class KVTaskManager:
         self.graph_to_task[graph.graph_id] = task_id
 
     def _launch_task(self, task_id: int) -> None:
-        task = self.tasks[task_id]
-        if task.is_completed():
+        transfer_graph = self.check_task_ready(task_id)
+        if transfer_graph is None:
             return
-        if task.status != TaskStatus.READY:
-            raise ValueError(f"Task {task_id} status is {task.status}, cannot launch")
-        transfer_graph = task.graph
-        task.status = TaskStatus.RUNNING
         nvtx.mark(f"launch task: task_id={task_id}, graph_id={transfer_graph.graph_id}")
         if transfer_graph.num_ops > 0:
             for transfer_handle in self.transfer_handles:
@@ -317,6 +313,15 @@ class KVTaskManager:
             old_value = self.task_id_counter
             self.task_id_counter += 1
             return old_value
+
+    def check_task_ready(self, task_id: int) -> TransferOpGraph:
+        task = self.tasks[task_id]
+        if task.is_completed():
+            return None
+        if task.status != TaskStatus.READY:
+            raise ValueError(f"Task {task_id} status is {task.status}, cannot launch")
+        task.status = TaskStatus.RUNNING
+        return task.graph
 
     def _mark_completed(self, task_id: int) -> None:
         task = self.tasks[task_id]
@@ -661,14 +666,8 @@ class KVTaskEngine(KVTaskManager):
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
         transfer_graphs = []
         for task_id in task_ids:
-            task = self.tasks[task_id]
-            if task.is_completed():
-                continue
-            if task.status != TaskStatus.READY:
-                raise ValueError(f"Task {task_id} status is {task.status}, cannot launch")
-            transfer_graph = task.graph
-            task.status = TaskStatus.RUNNING
-            if transfer_graph.num_ops > 0:
+            transfer_graph = self.check_task_ready(task_id)
+            if transfer_graph is not None and transfer_graph.num_ops > 0:
                 transfer_graphs.append(transfer_graph)
         
         # Submit all graphs in batch to reduce IPC overhead
