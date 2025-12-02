@@ -16,6 +16,8 @@ import queue
 import threading
 import time
 import multiprocessing as mp
+import selectors
+import os
 from queue import Queue
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -77,10 +79,15 @@ class TransferEngine:
 
         # Initialize scheduler
         self.scheduler = TransferScheduler()
-        self.task_queue: Queue[TransferOpGraph] = Queue()
-        self.completed_queue: Queue[Tuple[int, int]] = Queue()
+        # Use mp.Queue instead of queue.Queue to enable selector monitoring
+        self.task_queue = self.mp_ctx.Queue()
+        # Use mp.Queue for completed_queue to enable daemon process to monitor it via selector
+        self.completed_queue = self.mp_ctx.Queue()
         self.finished_ops_queue = self.mp_ctx.Queue()
         self.op_id_to_op: Dict[int, TransferOp] = {}
+        
+        # Create shutdown pipe for zero-latency selector
+        self.shutdown_read_fd, self.shutdown_write_fd = os.pipe()
         self.gpu_handles = gpu_handles
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
@@ -260,48 +267,108 @@ class TransferEngine:
         self._init_workers()
 
     def _scheduler_loop(self) -> None:
-        """Main scheduler loop"""
+        """Event-driven scheduler loop using selectors (ZERO LATENCY with shutdown pipe)"""
+        from flexkv.common.debug import flexkv_logger
+        
+        # Setup selector to monitor both queues simultaneously
+        sel = selectors.DefaultSelector()
+        
+        # Register both queues for monitoring
+        sel.register(self.task_queue._reader, selectors.EVENT_READ, data="new_graph")
+        sel.register(self.finished_ops_queue._reader, selectors.EVENT_READ, data="finished_op")
+        
+        # Register shutdown pipe for zero-latency shutdown
+        sel.register(self.shutdown_read_fd, selectors.EVENT_READ, data="shutdown")
+        
+        flexkv_logger.info("TransferEngine scheduler loop started with ZERO-LATENCY selector (timeout=None)")
+        
         while self._running:
-            # Process new transfer graphs
-            new_graphs_num = 0
-            while True:
-                try:
-                    transfer_graph = self.task_queue.get_nowait()
-                    self.scheduler.add_transfer_graph(transfer_graph)
-                    new_graphs_num += 1
-                except queue.Empty:
+            try:
+                # Complete blocking with NO TIMEOUT for zero latency!
+                # Shutdown via pipe signal instead of timeout
+                events = sel.select(timeout=None)
+                
+                new_graphs_num = 0
+                finished_ops: List[TransferOp] = []
+                should_shutdown = False
+                
+                # Process events from selector
+                for key, mask in events:
+                    if key.data == "shutdown":
+                        # Shutdown signal received via pipe
+                        flexkv_logger.info("Scheduler loop received shutdown signal via pipe")
+                        should_shutdown = True
+                        break
+                    
+                    elif key.data == "new_graph":
+                        # Process new transfer graphs (batch get all available)
+                        nvtx_r1 = nvtx.start_range(message=f"transfer scheduler. get new graphs", color="orange")
+                        # Get all available graphs in one go to reduce system calls
+                        while True:
+                            try:
+                                transfer_graph = self.task_queue.get_nowait()
+                                # Handle batch submission (list of graphs)
+                                if isinstance(transfer_graph, list):
+                                    for graph in transfer_graph:
+                                        self.scheduler.add_transfer_graph(graph)
+                                    new_graphs_num += len(transfer_graph)
+                                else:
+                                    self.scheduler.add_transfer_graph(transfer_graph)
+                                    new_graphs_num += 1
+                            except queue.Empty:
+                                break
+                        nvtx.end_range(nvtx_r1)
+                    
+                    elif key.data == "finished_op":
+                        # Collect finished ops (batch get all available)
+                        nvtx_r2 = nvtx.start_range(message=f"transfer scheduler. collect finished ops", color="orange")
+                        # Get all available ops in one go to reduce system calls
+                        while True:
+                            try:
+                                op_id = self.finished_ops_queue.get_nowait()
+                                op = self.op_id_to_op[op_id]
+                                free_op_from_buffer(op, self.pin_buffer)
+                                self.completed_queue.put((op.graph_id, op.op_id))
+                                finished_ops.append(op)
+                                del self.op_id_to_op[op_id]
+                            except queue.Empty:
+                                break
+                        nvtx.end_range(nvtx_r2)
+                
+                # Exit loop if shutdown requested
+                if should_shutdown:
                     break
-            # Collect finished ops
-            finished_ops: List[TransferOp] = []
-            while True:
-                try:
-                    op_id = self.finished_ops_queue.get_nowait()
-                    op = self.op_id_to_op[op_id]
-                    free_op_from_buffer(op, self.pin_buffer)
-                    self.completed_queue.put((op.graph_id, op.op_id))
-                    finished_ops.append(op)
-                    del self.op_id_to_op[op_id]
-                except queue.Empty:
-                    break
-            for op in finished_ops:
-                nvtx.end_range(self.op_id_to_nvtx_range[op.op_id])
-                self.op_id_to_nvtx_range.pop(op.op_id)
-            if finished_ops or new_graphs_num > 0:
+                
+                # End NVTX ranges for finished ops
+                for op in finished_ops:
+                    nvtx.end_range(self.op_id_to_nvtx_range[op.op_id])
+                    self.op_id_to_nvtx_range.pop(op.op_id)
+                
                 # Schedule next operations
-                completed_graph_ids, next_ops = self.scheduler.schedule(finished_ops)
-                # Distribute new ops to workers
-                for op in next_ops:
-                    if op.transfer_type == TransferType.VIRTUAL:
-                        self.completed_queue.put((op.graph_id, op.op_id))
-                    else:
-                        self.op_id_to_op[op.op_id] = op
-                        # copy block ids into buffer and update slot id info
-                        register_op_to_buffer(op, self.pin_buffer)
-                        self._assign_op_to_worker(op)
-                # Handle completed graphs
-                for graph_id in completed_graph_ids:
-                    self.completed_queue.put((graph_id, -1))
-            time.sleep(0.001)  # Prevent busy waiting
+                nvtx_r3 = nvtx.start_range(message=f"transfer scheduler. schedule next ops", color="orange")
+                if finished_ops or new_graphs_num > 0:
+                    completed_graph_ids, next_ops = self.scheduler.schedule(finished_ops)
+                    # Distribute new ops to workers
+                    for op in next_ops:
+                        if op.transfer_type == TransferType.VIRTUAL:
+                            self.completed_queue.put((op.graph_id, op.op_id))
+                        else:
+                            self.op_id_to_op[op.op_id] = op
+                            # copy block ids into buffer and update slot id info
+                            register_op_to_buffer(op, self.pin_buffer)
+                            self._assign_op_to_worker(op)
+                    # Handle completed graphs
+                    for graph_id in completed_graph_ids:
+                        self.completed_queue.put((graph_id, -1))
+                nvtx.end_range(nvtx_r3)
+                
+            except Exception as e:
+                flexkv_logger.error(f"Error in scheduler loop: {e}")
+                time.sleep(0.001)  # Fallback on error
+        
+        # Cleanup
+        sel.close()
+        flexkv_logger.info("TransferEngine scheduler loop stopped")
 
     def _assign_op_to_worker(self, op: TransferOp) -> None:
         self.op_id_to_nvtx_range[op.op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
@@ -321,9 +388,13 @@ class TransferEngine:
         else:
             worker.submit_transfer(op)
 
-    def submit_transfer_graph(self, transfer_graph: TransferOpGraph) -> None:
+    def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:
         """Submit a transfer graph for execution"""
+        nvtx_range = nvtx.start_range(message=f"TransferEngine.submit_transfer_graph", color="green")
+        if not isinstance(transfer_graph, List):
+            transfer_graph = [transfer_graph]
         self.task_queue.put(transfer_graph)
+        nvtx.end_range(nvtx_range)
 
     def get_completed_graphs_and_ops(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
         """Get IDs of all completed transfer graphs at current moment
@@ -357,7 +428,22 @@ class TransferEngine:
             if not self._running:
                 return
             self._running = False
+            
+            # Send shutdown signal via pipe to wake up selector immediately
+            try:
+                os.write(self.shutdown_write_fd, b'1')
+            except (OSError, BrokenPipeError):
+                # Pipe already closed, that's ok
+                pass
+            
             self._scheduler_thread.join(timeout=5)
+            
+            # Close shutdown pipe
+            try:
+                os.close(self.shutdown_read_fd)
+                os.close(self.shutdown_write_fd)
+            except OSError:
+                pass
 
             # shutdown all workers
             for worker in self._worker_map.values():
