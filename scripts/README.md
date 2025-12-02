@@ -56,7 +56,7 @@ This script ([./run_benchmark.sh](./run_benchmark.sh)) is used to run FlexKV-ena
 | `--request-rate <rate>` | Request rate (requests per second) | 32 |
 | `--workers <num>` | Number of workers | 32 |
 | `--max-turns <num>` | Maximum number of turns | 5 |
-| `--concurrency <num>` | Concurrency | 2 |
+| `--concurrency <num>` | Concurrency | 1 |
 
 #### Logging Configuration
 

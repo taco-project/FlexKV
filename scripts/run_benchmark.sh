@@ -28,7 +28,7 @@ DATASET_PATH="$CACHE_DIR/sharegpt/"
 REQUEST_RATE=32
 WORKERS=32
 MAX_TURNS=5
-CONCURRENCY=2
+CONCURRENCY=1
 
 # Default values for Log configuration
 LOG_DIR="$SCRIPT_DIR/../logs"
