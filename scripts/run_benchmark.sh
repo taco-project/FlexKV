@@ -29,6 +29,10 @@ REQUEST_RATE=32
 WORKERS=32
 MAX_TURNS=5
 CONCURRENCY=1
+PROFILE=0
+PROFILE_DELAY=60
+PROFILE_DURATION=600
+
 
 # Default values for Log configuration
 LOG_DIR="$SCRIPT_DIR/../logs"
@@ -63,6 +67,9 @@ Optional arguments:
   --workers <num>                 工作线程数 (default: $WORKERS)
   --max-turns <num>               最大轮数 (default: $MAX_TURNS)
   --concurrency <num>             并发数 (default: $CONCURRENCY)
+  --profile                       启用性能分析
+  --profile-delay <seconds>       性能分析延迟时间 (default: $PROFILE_DELAY)
+  --profile-duration <seconds>    性能分析持续时间 (default: $PROFILE_DURATION)
 
   --log-dir <path>                日志目录 (default: $LOG_DIR)
 
@@ -151,6 +158,18 @@ while [[ $# -gt 0 ]]; do
             CONCURRENCY="$2"
             shift 2
             ;;
+        --profile)
+            PROFILE=1
+            shift 1
+            ;;
+        --profile-delay)
+            PROFILE_DELAY="$2"
+            shift 2
+            ;;
+        --profile-duration)
+            PROFILE_DURATION="$2"
+            shift 2
+            ;;
         --log-dir)
             LOG_DIR="$2"
             shift 2
@@ -179,12 +198,26 @@ fi
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 SERVER_LOG="$LOG_DIR/vllm_server_${TIMESTAMP}.log"
+PROFILE_FILE="$LOG_DIR/vllm_profile_${TIMESTAMP}.nsys-rep"
 
 if lsof -i:$VLLM_PORT > /dev/null 2>&1; then
     error "Port $VLLM_PORT is already in use"
     exit 1
 fi
 
+if [ $PROFILE -eq 1 ]; then
+    if ! command -v nsys &> /dev/null; then
+        error "Nsight Systems is not installed"
+        error "Please install Nsight Systems using the following command:"
+        error "    apt update"
+        error "    apt install -y --no-install-recommends gnupg"
+        error "    echo \"deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo \"$DISTRIB_RELEASE\" | tr -d .)/$(dpkg --print-architecture) /\" | tee /etc/apt/sources.list.d/nvidia-devtools.list"
+        error "    apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub"
+        error "    apt update"
+        error "    apt install -y nsight-systems-cli"
+        exit 1
+    fi
+fi
 
 # Prepare ShareGPT Dataset
 info "==================================="
@@ -242,6 +275,13 @@ info "Launch vLLM Server"
 info "==================================="
 info "Server log file: $SERVER_LOG"
 
+if [ $PROFILE -eq 1 ]; then
+    info "Profiling enabled"
+    info "Profile file: $PROFILE_FILE"
+    info "Profile delay: $PROFILE_DELAY s"
+    info "Profile duration: $PROFILE_DURATION s"
+fi
+
 # Launch vLLM server in background
 SERVER_PID=$(bash "$SCRIPT_DIR/launch_vllm_server.sh" \
         --port "$VLLM_PORT" \
@@ -251,7 +291,11 @@ SERVER_PID=$(bash "$SCRIPT_DIR/launch_vllm_server.sh" \
         --max-model-len "$MAX_MODEL_LEN" \
         --gpu-memory-utilization "$GPU_MEMORY_UTIL" \
         --enable-flexkv "$ENABLE_FLEXKV" \
-        --log "$SERVER_LOG")
+        --log "$SERVER_LOG" \
+        --profile "$PROFILE" \
+        --profile-delay "$PROFILE_DELAY" \
+        --profile-duration "$PROFILE_DURATION" \
+        --profile-file "$PROFILE_FILE")
 
 info "vLLM Server process started with PID: $SERVER_PID"
 
@@ -370,6 +414,28 @@ if [ $BENCHMARK_EXIT_CODE -eq 0 ]; then
     info "✓ Benchmark completed successfully"
 else
     error "✗ Benchmark failed with exit code: $BENCHMARK_EXIT_CODE"
+fi
+
+# stop profiling
+if [ $PROFILE -eq 1 ]; then
+    info "==================================="
+    info "Stop profiling"
+    info "==================================="
+
+    EXISTING_SESSIONS=$(nsys sessions list 2>/dev/null | grep -E "^\s*[0-9]+" | awk '{print $1}')
+    info "Existing nsys sessions: $EXISTING_SESSIONS"
+
+    if [ -n "$EXISTING_SESSIONS" ]; then
+        nsys sessions list 2>/dev/null
+        echo "$EXISTING_SESSIONS" | while read -r SESSION_ID; do
+            info "Stopping session ID: $SESSION_ID"
+            nsys stop --session="$SESSION_ID" 2>/dev/null
+        done
+    else
+        warn "No active nsys sessions found."
+    fi
+
+    info "Profiling completed, nsys-rep file: $PROFILE_FILE"
 fi
 
 exit $BENCHMARK_EXIT_CODE

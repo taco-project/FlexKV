@@ -2,10 +2,9 @@
 
 This script ([./run_benchmark.sh](./run_benchmark.sh)) is used to run FlexKV-enabled vLLM server with multi-turn benchmarks.
 
-## Prerequisites
+## Install vLLM+FlexKV
 
-- vLLM+FlexKV installation (see [README.md](../README.md))
-- HuggingFace Models
+- See [README.md](../README.md)
 
 ## Usage
 
@@ -57,6 +56,9 @@ This script ([./run_benchmark.sh](./run_benchmark.sh)) is used to run FlexKV-ena
 | `--workers <num>` | Number of workers | 32 |
 | `--max-turns <num>` | Maximum number of turns | 5 |
 | `--concurrency <num>` | Concurrency | 1 |
+| `--profile` | Enable profiling | - |
+| `--profile-duration <seconds>` | Profiling duration | 600 |
+| `--profile-delay <seconds>` | Profiling delay | 60 |
 
 #### Logging Configuration
 
@@ -69,40 +71,6 @@ This script ([./run_benchmark.sh](./run_benchmark.sh)) is used to run FlexKV-ena
 | Argument | Description |
 |----------|-------------|
 | `-h, --help` | Display help information |
-
-## Examples
-
-### Basic Example
-
-Run with default settings:
-
-```bash
-./run_benchmark.sh \
-  --vllm-path /home/user/vllm \
-  --model-path /models/Qwen3-32B
-```
-
-### Advanced Example with Custom Configuration
-
-```bash
-./run_benchmark.sh \
-  --vllm-path /home/user/vllm \
-  --model-path /models/llama-70b \
-  --vllm-port 30002 \
-  --tensor-parallel-size 4 \
-  --max-num-seqs 256 \
-  --max-model-len 8192 \
-  --gpu-memory-util 0.9 \
-  --flexkv-cpu-cache-gb 128 \
-  --flexkv-ssd-cache-gb 2048 \
-  --flexkv-ssd-cache-dir /data/flexkv_cache \
-  --flexkv-enable-gds 1 \
-  --request-rate 64 \
-  --workers 64 \
-  --max-turns 10 \
-  --concurrency 4 \
-  --log-dir /data/logs
-```
 
 ## What the Script Does
 
@@ -118,3 +86,6 @@ The script generates the following log files in the log directory:
 
 - `vllm_server_YYYYMMDD_HHMMSS.log` - vLLM server logs
 - `benchmark_YYYYMMDD_HHMMSS.log` - Benchmark results and summary
+
+If profiling is enabled, the following file will also be generated:
+- `vllm_profile_YYYYMMDD_HHMMSS.nsys-rep` - Profiling report
