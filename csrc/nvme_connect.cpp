@@ -12,6 +12,7 @@
 #include <utility>
 #include <chrono>
 #include <iostream>
+#include <string>
 
 static std::unique_ptr<folly::IOThreadPoolExecutor> g_executor; // Pool of EventBase loops
 static std::unique_ptr<folly::CPUThreadPoolExecutor> g_blocking_executor; // For (blocking) write to /dev/nvme-fabrics
@@ -27,7 +28,6 @@ void init_folly() {
 
 struct Target {
     int node_id;
-    int idx; // RAID0 order
     std::string subsys_nqn;
     std::string ip;
     std::string port;
@@ -37,13 +37,8 @@ struct Target {
 // Struct to hold the result of a connection attempt
 struct Connection {
     int node_id;
-    int idx;
     bool success;
     std::string local_view;
-
-    std::string subsys_nqn;
-    std::string ip;
-    std::string port;
     std::string remote_dev;
 };
 
@@ -73,13 +68,8 @@ folly::coro::Task<Connection> connect_target_async(Target target) {
 
     Connection result{
         .node_id = target.node_id,
-        .idx = target.idx,
         .success = false,
         // .local_view = "",
-
-        .subsys_nqn = target.subsys_nqn,
-        .ip = target.ip,
-        .port = target.port,
         .remote_dev = target.dev
     };
     // Create thread-local libnvme root. 
@@ -134,21 +124,20 @@ folly::coro::Task<std::vector<Connection>> run_connection_batch(std::vector<Targ
 namespace flexkv {
 
 // We may some day revampt it to a std::exec version.
-std::unordered_map<int, py::dict> nvme_connect(std::unordered_map<int, py::dict>& nvmets) {
+py::dict nvme_connect(py::dict nvmets) {
     init_folly();
 
     // 1. Flatten inputs, must hold GIL
     std::vector<Target> all_targets;
-    for (auto& [node_id, targets] : nvmets) { // node_id: int, targets: OrderedDict[str, Dict[str, str]]
-        int raid0_order = 0;
-        // Preserves the OrderedDict order (RAID0 geometry)
+    for (auto per_node : nvmets) {
+        auto node_id = per_node.first.cast<int>();
+        auto targets = per_node.second.cast<py::dict>() // Dict[str, Dict[str, str]]
         for (auto subsys : targets) {
             Target t;
             t.node_id = node_id;
-            t.idx = raid0_order++;
-            t.subsys_nqn = py::str(subsys.first);
+            t.subsys_nqn = py::str(subsys.first.cast<std::string>());
     
-            py::dict details = subsys.second.cast<py::dict>();
+            auto details = subsys.second.cast<py::dict>();
             t.ip = details["ip"].cast<std::string>();
             t.port = details["port"].cast<std::string>();
             t.dev = details["dev"].cast<std::string>();
@@ -170,27 +159,17 @@ std::unordered_map<int, py::dict> nvme_connect(std::unordered_map<int, py::dict>
         if (c.success) {
             grouped_results[c.node_id].push_back(c);
         } else {
-            std::cerr << "Error connecting to " << c.subsys_nqn << " at " << c.ip << std::endl;
+            std::cerr << "Error connecting to node " << c.node_id << "'s " << c.remote_dev << std::endl;
         }
     }
 
-    std::unordered_map<int, py::dict> result;
+    py::dict result; // Dict[int, Dict[str, str]
     for (auto& [node_id, targets] : grouped_results) {
-        // Sort by RAID order
-        std::sort(targets.begin(), targets.end(), [](const Connection& a, const Connection& b) {
-            return a.idx < b.idx;
-        });
-
-        py::dict per_node; // OrderedDict
+        py::dict per_node; // Dict[str, str]
         for (const auto& t : targets) {
-            per_node[t.local_view.c_str()] = py::make_tuple(
-                t.remote_dev,
-                t.subsys_nqn,
-                t.ip,
-                t.port
-            );
+            per_node[t.remote_dev] = t.local_view;
         }
-        result[node_id] = per_node;
+        result[py::int_(node_id)] = per_node;
     }
 
     return result;
