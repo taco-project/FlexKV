@@ -578,6 +578,7 @@ class GlobalCacheEngine:
         SSD:     ...      | fragment1 | fragment2      | (uncached)
 
         """
+        nvtx_range = nvtx.start_range(message=f"CacheEngine.get_impl_local[{request_id}]", color="cyan")
         assert self.cache_config.enable_cpu
         assert self.cpu_cache_engine is not None
 
@@ -693,7 +694,7 @@ class GlobalCacheEngine:
         if ssd_node_to_unlock is not None:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
-
+        nvtx.end_range(nvtx_range)
         return (
             transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
             buffer_to_free, len(fragment12_gpu_blocks)

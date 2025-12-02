@@ -250,13 +250,9 @@ class KVTaskManager:
         self.graph_to_task[graph.graph_id] = task_id
 
     def _launch_task(self, task_id: int) -> None:
-        task = self.tasks[task_id]
-        if task.is_completed():
+        transfer_graph = self.check_task_ready(task_id)
+        if transfer_graph is None:
             return
-        if task.status != TaskStatus.READY:
-            raise ValueError(f"Task {task_id} status is {task.status}, cannot launch")
-        transfer_graph = task.graph
-        task.status = TaskStatus.RUNNING
         nvtx.mark(f"launch task: task_id={task_id}, graph_id={transfer_graph.graph_id}")
         if transfer_graph.num_ops > 0:
             for transfer_handle in self.transfer_handles:
@@ -317,6 +313,15 @@ class KVTaskManager:
             old_value = self.task_id_counter
             self.task_id_counter += 1
             return old_value
+
+    def check_task_ready(self, task_id: int) -> TransferOpGraph:
+        task = self.tasks[task_id]
+        if task.is_completed():
+            return None
+        if task.status != TaskStatus.READY:
+            raise ValueError(f"Task {task_id} status is {task.status}, cannot launch")
+        task.status = TaskStatus.RUNNING
+        return task.graph
 
     def _mark_completed(self, task_id: int) -> None:
         task = self.tasks[task_id]
@@ -473,6 +478,7 @@ class KVTaskEngine(KVTaskManager):
         self._update_tasks(timeout=0)
 
         for task_id in task_ids:
+            nvtx_range = nvtx.start_range(message=f"KVTask.wait[{task_id}]", color="red")
             while True:
                 if task_id not in self.tasks:
                     flexkv_logger.error(f"task_id {task_id} not submitted into flexKV")
@@ -509,6 +515,7 @@ class KVTaskEngine(KVTaskManager):
                     )
                     break
                 self._update_tasks(timeout=0.001)
+            nvtx.end_range(nvtx_range)
         return return_responses
 
     def try_wait(self, task_ids: Union[int, List[int]]) -> Dict[int, KVResponse]:
@@ -551,6 +558,7 @@ class KVTaskEngine(KVTaskManager):
                   layer_granularity: int = -1,
                   dp_id: int = 0,
                   task_id: int = -1) -> Tuple[int, np.ndarray]:
+        nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
         fake_slot_mapping = np.zeros_like(token_ids[token_mask])
@@ -571,6 +579,7 @@ class KVTaskEngine(KVTaskManager):
             layer_granularity=layer_granularity,
             dp_id=dp_id
         )
+        nvtx.pop_range()
         return result_task_id, return_mask
 
     def _get_match_impl(self,
@@ -652,8 +661,21 @@ class KVTaskEngine(KVTaskManager):
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings)
         self.set_slot_mappings(task_ids, slot_mappings)
+        
+        # Batch optimization: collect all transfer graphs first
+        nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
+        transfer_graphs = []
         for task_id in task_ids:
-            self._launch_task(task_id)
+            transfer_graph = self.check_task_ready(task_id)
+            if transfer_graph is not None and transfer_graph.num_ops > 0:
+                transfer_graphs.append(transfer_graph)
+        
+        # Submit all graphs in batch to reduce IPC overhead
+        if transfer_graphs:
+            for transfer_handle in self.transfer_handles:
+                transfer_handle.submit_batch(transfer_graphs)
+        
+        nvtx.end_range(nvtx_range)
 
     def cancel_tasks(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):

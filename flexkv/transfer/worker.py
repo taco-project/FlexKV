@@ -381,6 +381,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+        nvtx_range = nvtx.start_range(message=f"GPUCPUWorker.launch_transfer[{transfer_op.transfer_op_id}]", color="purple")
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
         if layer_id == -1:
@@ -410,6 +411,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 start_time,
                 end_time,
             )
+        nvtx.end_range(nvtx_range)
 
 class tpGPUCPUTransferWorker(TransferWorkerBase):
     def __init__(self,
