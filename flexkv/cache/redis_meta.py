@@ -530,6 +530,8 @@ class RedisMeta:
             return True
         return False
 
+    # TODO: Refactor code and unify metadata publishing/reading interface
+
     def regist_node_meta(self, node_id: int, addr: str, zmq_addr: str, cpu_buffer_ptr: int, ssd_buffer_ptr: int) -> None:
         """Register node meta information as a Redis hash.
 
@@ -575,6 +577,46 @@ class RedisMeta:
         key = f"meta:{int(node_id)}"
         return bool(r.delete(key))
 
+    def publish_nvmet_meta(self, nvmet: str) -> None:
+        '''
+        Args:
+            nvmet (str): Path to the NVMe-oF target metadata file to publish
+        '''
+        r = self._client()
+        key = f'nvmet:meta:{self.get_node_id()}'
+        with open(nvmet, 'r') as f:
+            content = f.read()
+        r.set(key, content)
+
+    def get_all_nvmet_meta(self) -> Dict[int, Dict[str, Dict[str, str]]]:
+        '''
+        Returns:
+            Dict[int, Dict[str, Dict[str, str]]]: Dict[node ID, Dict[subsys, Dict[IP/port/dev]]]
+        '''
+        import json
+
+        r = self._client()
+        result = {}
+        
+        keys = r.keys("nvmet:meta:*") # Dozens of keys
+        if keys:
+            values = r.mget(keys)
+            for key, value in zip(keys, values):
+                try:
+                    if not isinstance(key, str):
+                        key = str(key)
+                    nid = int(key.split(":")[-1])
+                    
+                    if value:
+                        try:
+                            per_node = json.loads(value)
+                            if per_node:
+                                result[nid] = per_node
+                        except json.JSONDecodeError:
+                            continue
+                except (IndexError, ValueError):
+                    continue
+        return result
 
     def set_node_id(self, node_id: int):
         self._node_id = int(node_id)
@@ -616,3 +658,31 @@ class RedisMeta:
         except Exception:
             return result
         return result
+
+    def latch(self, world_size: int, timeout: float = 60.0) -> bool:
+        r = self._client()
+        latch_key = 'count'
+        release_key = 'released'
+        
+        # 1. Arrive at latch
+        count = r.incr(latch_key)
+        
+        # Set expiry on 1st arrival to prevent dead keys from sticking around forever
+        # Buffer expiry by 60s beyond timeout
+        expire_sec = int(timeout) + 60
+        if count == 1:
+            r.expire(latch_key, expire_sec)
+
+        # 2. Check if we are the last one
+        if count >= world_size:
+            r.set(release_key, "1", ex=expire_sec)
+            return True
+        
+        # 3. Wait for release
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if r.exists(release_key):
+                return True
+            time.sleep(0.1) # Polling interval
+            
+        return False

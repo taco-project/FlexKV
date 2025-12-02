@@ -9,16 +9,18 @@ from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
 from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator
-
+from flexkv.cache.redis_meta import RedisMeta
 
 class StorageEngine:
     def __init__(self,
                  model_config: ModelConfig,
-                 cache_config: CacheConfig):
+                 cache_config: CacheConfig,
+                 redis_meta: Optional[RedisMeta] = None):
         """Initialize storage engine"""
         self._storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
         self._model_config = model_config
         self._cache_config = cache_config
+        self._redis_meta = redis_meta
         if self._cache_config.enable_cpu:
             self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
@@ -37,6 +39,18 @@ class StorageEngine:
         if self._cache_config.enable_ssd:
             if not GLOBAL_CONFIG_FROM_ENV.ssd_layout_type == self._cpu_layout.type:
                 raise ValueError(f"SSD layout type must be the same as CPU layout type: {self._cpu_layout.type}")
+
+            if cache_config.enable_p2p_nvmet:
+                assert cache_config.enable_p2p_ssd and cache_config.ssd_cache_nvmet is not None, \
+                    ''
+                assert redis_meta is not None, 'Require redis_meta for publishing NVMf target metadata'
+
+                import os
+                from flexkv.c_ext import nvme_connect
+                redis_meta.publish_nvmet_meta(cache_config.ssd_cache_nvmet)
+                redis_meta.latch(world_size=int(os.getenv('FLEXKV_NUM_NODES', '2')))
+                nvme_connect(redis_meta.get_all_nvmet_meta())
+
             self._ssd_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
                 num_layer=self._model_config.num_layers,
@@ -170,7 +184,10 @@ class StorageEngine:
                     dtype=dtype,
                     cache_dir=cache_dir,
                     file_prefix="flexkv_ssd_cache",
-                    max_file_size_gb=max_file_size_gb
+                    max_file_size_gb=max_file_size_gb,
+                    enable_nvmet=self._cache_config.enable_p2p_nvmet,
+                    md_dev=self._cache_config.ssd_cache_md_dev,
+                    redis_meta=self._redis_meta
                 )
         elif device_type == DeviceType.REMOTE:
             file_path = kwargs.get('file_path')
