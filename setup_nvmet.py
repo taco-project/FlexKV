@@ -238,7 +238,7 @@ def enable_nvmet() -> None:
     assert os.path.exists(os.path.join(dir, 'integration')), f'{dir}/integration does not exist.'
     
     config_data: Dict[str, Dict[str, str]] = {}
-    for ip_addr, user_port, subsys_name, dev in zip(ip_dict.keys(), subsys_list, nvmet_list):
+    for ip_addr, user_port, subsys_name, dev in zip(ip_dict.keys(), user_port_list, subsys_list, nvmet_list):
         config_data[subsys_name] = {
             'ip': ip_addr,
             'port': user_port,

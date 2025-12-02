@@ -25,8 +25,12 @@ class TransferType(Enum):
     H2REMOTE = "H2REMOTE"
     PEERH2H = "PEERH2H"
     H2PEERH = "H2PEERH"
+    PEERH2D = "PEERH2D"
+    # D2PEERH
     PEERSSD2H = "PEERSSD2H"
     H2PEERSSD = "H2PEERSSD"
+    PEERSSD2D = "PEERSSD2D"
+    # D2PEERSSD
 
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
