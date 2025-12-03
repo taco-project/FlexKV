@@ -30,8 +30,8 @@ from flexkv.server.request import (
     CheckRunningRequest,
     StartRequest,
     ShutdownRequest,
-    Response,
-    PrefetchRequest
+    PrefetchRequest,
+    Response
 )
 
 class KVDPClient:

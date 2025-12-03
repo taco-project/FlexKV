@@ -23,6 +23,7 @@ from flexkv.transfer_manager import (
     get_master_host_and_ports_from_env,
     get_trtllm_subprocess_host_and_ports_from_env
 )
+from flexkv.common.hash_utils import hash_array
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -152,6 +153,11 @@ class KVTaskManager:
             self.transfer_handles[-1]._handle.send_config_to_remotes()
 
         self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
+
+        # hash(token_ids) -> task_id
+        self.prefetch_tasks: ExpiringDict[int, int] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
+        self._hash_func = lambda x: hash_array(x)
+
         self.graph_to_task: Dict[int, int] = {}
 
         self.uncompleted_ops: Dict[int, int] = {}  # op_id -> completed_count
@@ -283,8 +289,9 @@ class KVTaskManager:
             callback=callback,
             op_callback_dict=op_callback_dict)
 
-        self.graph_to_task[graph.graph_id] = task_id
+        self.prefetch_tasks[self._hash_func(token_ids)] = task_id
 
+        self.graph_to_task[graph.graph_id] = task_id
 
     def _launch_task(self, task_id: int) -> None:
         transfer_graph = self.check_task_ready(task_id)
@@ -461,6 +468,7 @@ class KVTaskEngine(KVTaskManager):
                   layer_granularity: int = -1,
                   dp_id: int = 0,
                   task_id: int = -1) -> Tuple[int, np.ndarray]:
+        self._sync_prefetch(token_ids)
         task_id, return_mask = self._get_match_impl(token_ids,
                                                     slot_mapping,
                                                     is_fake_slot_mapping=False,
@@ -593,6 +601,14 @@ class KVTaskEngine(KVTaskManager):
         nvtx.pop_range()
         return return_responses
 
+    def _sync_prefetch(self, token_ids: np.ndarray) -> None:
+        prefetch_task_id = self.prefetch_tasks.get(self._hash_func(token_ids), None)
+        if prefetch_task_id is not None:
+            start_time = time.time()
+            self.wait([prefetch_task_id], completely=True)
+            end_time = time.time()
+            flexkv_logger.debug(f"sync prefetch task {prefetch_task_id} cost {(end_time - start_time) * 1000} ms")
+
     def get_match(self,
                   token_ids: np.ndarray,
                   token_mask: Optional[np.ndarray] = None,
@@ -600,6 +616,7 @@ class KVTaskEngine(KVTaskManager):
                   dp_id: int = 0,
                   task_id: int = -1) -> Tuple[int, np.ndarray]:
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
+        self._sync_prefetch(token_ids)
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
         fake_slot_mapping = np.zeros_like(token_ids[token_mask])
@@ -699,29 +716,23 @@ class KVTaskEngine(KVTaskManager):
                        token_ids: np.ndarray,
                        dp_id: int = 0,
                        task_id: int = -1) -> int:
-        result_task_id = self.prefetch_match(token_ids, task_id)
-        # trace prefetch async request
-        self.tracer.trace_request(
-            request_type="PREFETCH_ASYNC",
-            request_id=result_task_id,
-            token_ids=token_ids,
-            slot_mapping=np.zeros_like(token_ids),
-            token_mask=np.ones_like(token_ids),
-            layer_granularity=-1,
-            dp_id=dp_id
-        )
-        self._launch_task(result_task_id)
-        return result_task_id
-
-    def prefetch_match(self,
-                       token_ids: np.ndarray,
-                       task_id: int = -1) -> int:
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
         self.create_prefetch_task(task_id, token_ids)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
+        # trace prefetch async request
+        self.tracer.trace_request(
+            request_type="PREFETCH_ASYNC",
+            request_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=np.zeros_like(token_ids),
+            token_mask=np.ones_like(token_ids),
+            layer_granularity=-1,
+            dp_id=dp_id
+        )
+        self._launch_task(task_id)
         return task_id
 
     def merge_to_batch_kvtask(self, batch_id: int, task_ids: List[int]) -> TransferOpGraph:
@@ -775,7 +786,7 @@ class KVTaskEngine(KVTaskManager):
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
         self.set_slot_mappings(task_ids, slot_mappings)
-        
+
         # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
         
@@ -795,7 +806,7 @@ class KVTaskEngine(KVTaskManager):
         if transfer_graphs:
             for transfer_handle in self.transfer_handles:
                 transfer_handle.submit_batch(transfer_graphs)
-        
+
         nvtx.end_range(nvtx_range)
         return task_ids
 
