@@ -1,10 +1,13 @@
 import os
+import glob
 from abc import ABC, abstractmethod
 from typing import Tuple, Optional, List, Union, Dict, Any, BinaryIO
 try:
     from flexkv.c_ext import Pcfs
+    from flexkv.c_ext import get_fm_extents, FileExtent
 except ImportError:
     Pcfs = None
+    FileExtent = None
 
 import numpy as np
 import torch
@@ -12,6 +15,7 @@ import torch
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
+from flexkv.cache.redis_meta import RedisMeta
 
 
 class BaseStorageAllocator(ABC):
@@ -138,7 +142,10 @@ class SSDAllocator(BaseStorageAllocator):
         file_prefix = kwargs.get("file_prefix", "flexkv_ssd_cache")
         cfg_max_file_size_gb = kwargs.get("max_file_size_gb", -1)
         cfg_max_blocks_per_file = int(1e9)
-        
+        enable_nvmet: bool = kwargs.get('enable_nvmet', False)
+        md_dev: str = kwargs.get('md_dev', '/dev/md0')
+        redis_meta: Optional[RedisMeta] = kwargs.get('redis_meta', None)
+
         if cache_dir is None:
             raise ValueError("cache_dir is required for SSD allocator")
         if isinstance(cache_dir, str):
@@ -150,6 +157,9 @@ class SSDAllocator(BaseStorageAllocator):
                 raise ValueError("cache_dir must be a directory")
         if not isinstance(file_prefix, str):
             raise ValueError("file_prefix must be a string")
+        if enable_nvmet:
+            assert FileExtent is not None, 'FileExtent class unavailable'
+            assert redis_meta is not None, 'redis_meta is required for NVMe-oF target offload'
 
         num_ssd_devices = len(cache_dir)
         if layout.num_block % num_ssd_devices != 0:
@@ -171,14 +181,28 @@ class SSDAllocator(BaseStorageAllocator):
         num_files_per_device = (total_blocks_per_device + num_blocks_per_file - 1) // num_blocks_per_file
         real_file_size = num_blocks_per_file * block_size
 
+        # Publish RAID geomoetry
+        if enable_nvmet and md_dev is not None:
+            assert num_ssd_devices == 1, 'Use a single SSD cache dir for RAID0' # Only support RAID0
+            # NVMf offloaded targets are individually exported. In case this is a RAID, publish
+            # chunk size and RAID order.
+            redis_meta.publish_raid_geometry(cls._get_md_chunk_size(md_dev),
+                                             cls._get_md_member_devs(md_dev))
         ssd_files: Dict[int, List[str]] = {}
+        all_file_extents: Dict[Tuple[int, int], List[FileExtent]] = {}
+        # TODO: Parallelize file allocation + flush & sync + layout detection
         for i in range(num_ssd_devices):
             ssd_files[i] = []
             for j in range(num_files_per_device):
                 file_path = os.path.join(cache_dir[i], f"{file_prefix}_{i}_{j}.bin")
                 with open(file_path, "wb+", buffering=0) as file:
-                    cls._create_file(file, real_file_size)
+                    extent: FileExtent = cls._create_file(file, real_file_size, get_layout=enable_nvmet)
+                    if enable_nvmet:
+                        all_file_extents[(i, j)] = extent
                 ssd_files[i].append(file_path)
+        if enable_nvmet:
+            redis_meta.publish_file_extents_batch(all_file_extents)
+
         total_num_files = num_files_per_device * num_ssd_devices
         real_total_size = total_num_files * real_file_size
         flexkv_logger.info(f"SSD allocator create total {total_num_files} files in {cache_dir}, "
@@ -192,13 +216,31 @@ class SSDAllocator(BaseStorageAllocator):
         )
 
     @classmethod
-    def _create_file(cls, file: BinaryIO, total_size_per_file: int) -> None:
+    def _create_file(cls, file: BinaryIO, total_size_per_file: int, *,
+                     get_layout: bool = False) -> Optional[List[FileExtent]]:
+        '''Physically allocate file space, flush to disk and optionally detect layout.
+
+        Args:
+            file (BinaryIO): opened file handle
+            total_size_per_file (int): total size to allocate for this file
+            get_layout (bool): whether to collect layout metadata
+
+        Returns:
+            Optional[List[FileExtent]]
+        '''
+        fd = file.fileno()
         try:
-            os.truncate(file.fileno(), total_size_per_file)
+            os.posix_fallocate(fd, 0, total_size_per_file) # Eager file allocation
         except OSError as e:
             raise RuntimeError(f"Failed to initialize file: {e}") from e
         file.flush()
-        os.fsync(file.fileno())
+        os.fsync(fd)
+
+        if not get_layout:
+            return None
+        
+        extents: List[FileExtent] = get_fm_extents(fd, max_extents=256)
+        return extents
 
     @classmethod
     def from_raw_data(cls,
@@ -212,6 +254,66 @@ class SSDAllocator(BaseStorageAllocator):
     def get_file_size_limit(file_path: str) -> int:
         st = os.statvfs(file_path)
         return st.f_frsize * st.f_bavail
+
+    @staticmethod
+    def _get_md_chunk_size(md_dev: str) -> int:
+        '''Get chunk size of md device. Only support RAID0.
+
+        Args:
+            md_dev (str): md device path (not partition path), e.g. /dev/md0 instead of /dev/md0p1
+
+        Returns:
+            int: chunk size in bytes
+        '''
+        sysfs_path = f'/sys/block/{os.path.basename(md_dev)}/md/chunk_size'
+        with open(sysfs_path, 'r') as f:
+            return int(f.read().strip())
+
+    @staticmethod
+    def _get_md_member_devs(md_dev: str) -> List[str]:
+        '''Return member device names in md's internal order.
+        WARN: 
+
+        Args:
+            md_dev (str): md device path (not partition path), e.g. /dev/md0 instead of /dev/md0p1
+
+        Returns:
+            List[str]: list of member device names
+        '''
+        md_name = os.path.basename(md_dev)
+        base = f"/sys/block/{md_name}/md"
+
+        entries: Dict[int, str] = {}
+
+        # /sys/block/md0/md/rdX symlinks
+        for rd_path in glob.glob(os.path.join(base, "rd*")):
+            rd_name = os.path.basename(rd_path)
+            if not rd_name.startswith("rd"):
+                continue
+            try:
+                idx = int(rd_name[2:]) # rd0 -> 0, rd1 -> 1, ...
+            except ValueError:
+                continue
+
+            target = os.readlink(rd_path) # e.g. dev-nvme2n1
+            # dev-nvme2n1 -> nvme2n1
+            dev_name = target.split("-", 1)[1] if "-" in target else target
+            entries[idx] = dev_name
+
+        if not entries:
+            # fall back to check /sys/block/md0/md/dev-nvmeXn1/slot
+            for slot_path in glob.glob(os.path.join(base, "dev-nvme*n1/slot")):
+                # slot_path: /sys/block/md0/md/dev-nvmeXn1/slot
+                dev_dir = os.path.dirname(slot_path)
+                dev_name = os.path.basename(dev_dir)[len("dev-"):] # strip dev-
+                with open(slot_path, "r") as f:
+                    idx = int(f.read().strip())
+                entries[idx] = dev_name
+
+        if not entries:
+            raise RuntimeError(f"No md members found under {base}")
+
+        return [dev_name for _, dev_name in sorted(entries.items())]
 
 class RemoteAllocator(BaseStorageAllocator):
     @classmethod

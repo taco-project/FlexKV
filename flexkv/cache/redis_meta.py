@@ -1,4 +1,4 @@
-from typing import Iterable, List, Tuple, Optional, Union, Dict
+from typing import Iterable, List, Tuple, Optional, Union, Dict, Any
 from dataclasses import dataclass
 from enum import IntEnum
 from uuid import uuid1
@@ -7,6 +7,7 @@ import time
 import atexit
 import signal
 import sys
+import json
 try:  # redis-py
     import redis as _redis
 except Exception:  # pragma: no cover
@@ -17,10 +18,12 @@ try:
     # Ensure flexkv.c_ext is loaded first
     import flexkv.c_ext
     from flexkv.c_ext import RedisMetaChannel as _CRedisMetaChannel, BlockMeta as _CBlockMeta
+    from flexkv.c_ext import FileExtent
 except Exception as e:  # pragma: no cover
     raise ImportError(f"Failed to import C++ extensions: {e}")
     _CRedisMetaChannel = None  # type: ignore
     _CBlockMeta = None  # type: ignore
+    FileExtent = None
 
 
 class NodeState(IntEnum):
@@ -593,8 +596,6 @@ class RedisMeta:
         Returns:
             Dict[int, Dict[str, Dict[str, str]]]: Dict[node ID, Dict[subsys, Dict[IP/port/dev]]]
         '''
-        import json
-
         r = self._client()
         result = {}
         
@@ -616,6 +617,97 @@ class RedisMeta:
                             continue
                 except (IndexError, ValueError):
                     continue
+        return result
+
+    def publish_raid_geometry(self, chunk_size: int, member_devs: List[str]) -> None:
+        '''
+        Args:
+            chunk_size (int): RAID chunk size in bytes
+            member_devs (List[str]): List of member device names, e.g. ['nvme0n1', 'nvme1n1']
+        '''
+        r = self._client()
+        key = f"raid:{self.get_node_id()}"
+        r.hset(key, mapping={
+            "chunk_size": int(chunk_size),
+            "member_devs": json.dumps(member_devs)
+        })
+
+    def get_raid_geometry_batch(self, node_ids: List[int]) -> Dict[int, Tuple[int, List[str]]]:
+        r = self._client()
+        pipe = r.pipeline()
+
+        # Keep track of the order of queries
+        for node_id in node_ids:
+            key = f"raid:{node_id}"
+            pipe.hgetall(key)
+        # Execute pipeline
+        results = pipe.execute()
+        
+        geometry_map = {}
+        for node_id, data in zip(node_ids, results):
+            if not data:
+                continue
+            try:
+                chunk_size = int(data.get("chunk_size", 0))
+                member_devs = json.loads(data.get("member_devs", "[]"))
+                geometry_map[node_id] = (chunk_size, member_devs)
+            except (ValueError, json.JSONDecodeError):
+                continue
+                
+        return geometry_map
+
+    def publish_file_extents_batch(self, file_extents: Dict[Tuple[int, int], List[FileExtent]]) -> None:
+        '''Publish all file extents on a node
+        '''
+        assert FileExtent is not None, ''
+
+        r = self._client()
+        key = f"fe:{self.get_node_id()}"
+
+        mapping = {}
+        for (didx, fidx), extents in file_extents.items(): # (Device idx, file idx), file extents
+            serialized_extents = []
+            for extent in extents:
+                serialized_extents.append({
+                    'file_offset': extent.logical,
+                    'md_offset': extent.physical,
+                    'length': extent.length
+                })
+            # Use a string key for JSON serialization: "didx,fidx"
+            mapping[f'{didx},{fidx}'] = json.dumps(serialized_extents)
+            
+        if mapping:
+            r.hset(key, mapping=mapping)
+
+    def get_file_extents_batch(self, files: Dict[int, List[Tuple[int, int]]]) -> Dict[int, Dict[Tuple[int, int], List[FileExtent]]]:
+        r = self._client()
+        pipe = r.pipeline()
+        
+        # Keep track of the order of queries
+        query_order = []
+        for node_id, files_per_node in files.items():
+            key = f'fe:{node_id}'
+            fields = [f'{d},{f}' for d, f in files_per_node]
+            if fields:
+                pipe.hmget(key, fields)
+                query_order.append((node_id, files_per_node))
+        if not query_order:
+            return {}
+        # Execute pipeline
+        pipeline_results = pipe.execute()
+
+        result = {}
+        for (node_id, files_per_node), values in zip(query_order, pipeline_results):
+            per_node = {}
+            for (didx, fidx), val in zip(files_per_node, values):
+                if val:
+                    try:
+                        per_node[(didx, fidx)] = json.loads(val)
+                    except json.JSONDecodeError:
+                        pass
+            if per_node:
+                result[node_id] = per_node
+
         return result
 
     def set_node_id(self, node_id: int):
