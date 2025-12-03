@@ -19,9 +19,8 @@ from flexkv.common.debug import flexkv_logger
 # Import utilities from test_utils
 from test_utils import (
     DEFAULT_MODEL_CONFIG, DEFAULT_CACHE_CONFIG, DEFAULT_TEST_CONFIG,
-    generate_request_pair, verify_data, block_ids_2_slot_mapping,
-    generate_gpu_blocks_with_ground_truth, skip_if_insufficient_gpus,
-    create_gpu_kv_layout, GPUKVCacheVerifier
+    generate_request_pair, block_ids_2_slot_mapping,
+    skip_if_insufficient_gpus,create_gpu_kv_layout, GPUKVCacheVerifier
 )
 
 def run_tp_client(dp_client_id,
@@ -220,6 +219,8 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
             dp_id=dp_id,
         )
         kvmanager.wait([write_request], completely=True)
+        if gpu_kv_verifier is not None:
+            gpu_kv_verifier.clear_gpu_blocks(block_ids)
 
     #corner case: input token length for put is less than tokens_per_block
     write_request = kvmanager.put_async(
@@ -275,6 +276,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
             token_mask=None,
             dp_id=dp_id,
         )
+        req_id2block_ids[request_id] = block_ids
         flexkv_id2req_id[request_id] = i
         print(f"write flexkv request_id {request_id} to req_id {i}")
         running_put_requests.append(request_id)
@@ -284,6 +286,9 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
             i == num_requests - 1):
             if len(running_put_requests) > 0:
                 kvmanager.wait(running_put_requests, completely=True)
+                if gpu_kv_verifier is not None:
+                    for req_id in running_put_requests:
+                        gpu_kv_verifier.clear_gpu_blocks(req_id2block_ids[req_id])
             if len(running_get_requests) > 0:
                 return_results = kvmanager.wait(running_get_requests, completely=True)
                 if gpu_kv_verifier is not None:
