@@ -298,13 +298,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.is_mla = gpu_kv_layout.is_mla
 
         self.num_layers = gpu_kv_layout.num_layer
-        gpu_kv_layout_per_layer = gpu_kv_layout.div_layer(self.num_layers)
 
         # a chunk can be located by layer_id * layer_stride + kv_id * kv_stride + block_id * block_stride
-        self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
-        self.gpu_kv_stride_in_bytes = gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize
-        self.gpu_block_stride_in_bytes = gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize
-        self.gpu_layer_stride_in_bytes = gpu_kv_layout_per_layer.get_layer_stride() * self.dtype.itemsize
+        self.chunk_size_in_bytes = gpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+        self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+        self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
+        self.gpu_layer_stride_in_bytes = gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
 
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
@@ -382,7 +381,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
-        nvtx_range = nvtx.start_range(message=f"GPUCPUWorker.launch_transfer[{transfer_op.transfer_op_id}]", color="purple")
+        nvtx_range = nvtx.start_range(
+            message=f"GPUCPUWorker.launch_transfer[{transfer_op.transfer_op_id}]",
+            color="purple")
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
         if layer_id == -1:
@@ -968,7 +969,7 @@ class GDSTransferWorker(TransferWorkerBase):
             ssd_block_id_list = dst_block_ids
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for GDSTransferWorker. "
-                             f"Expected DISK2D or D2DISK")
+                             f"Expected DISK2D or D2DISK.")
 
         if len(ssd_block_id_list) == 0:
             return
