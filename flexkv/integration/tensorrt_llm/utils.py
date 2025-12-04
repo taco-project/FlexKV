@@ -1,5 +1,8 @@
 
 from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
 from flexkv.common import request
 from flexkv.common.debug import flexkv_logger
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
@@ -21,6 +24,23 @@ class RequestWrapper:
         all_token_ids = self._request.get_tokens()
         assert len(all_token_ids) == 1, "Don't support beam search."
         return all_token_ids[0]
+
+    @property
+    def np_token_ids(self) -> np.ndarray:
+        """
+        Cache the list->numpy conversion once and reuse it to avoid repeated copying in hot path.
+        """
+        cached: Optional[np.ndarray] = getattr(self, "_np_token_ids_cache", None)
+        if cached is not None:
+            return cached
+
+        tokens = self.all_token_ids
+        if isinstance(tokens, np.ndarray):
+            cached = tokens
+        else:
+            cached = np.asarray(tokens, dtype=np.int64)
+        setattr(self, "_np_token_ids_cache", cached)
+        return cached
     
     @property
     def num_tokens(self):

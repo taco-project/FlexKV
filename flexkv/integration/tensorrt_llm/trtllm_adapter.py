@@ -130,11 +130,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         flexkv_logger.info(f"Get match request: {request}")
         
         match_start_time = time.perf_counter()
-        num_tokens_to_get = (request.num_prompt_tokens//self.block_size)*self.block_size
+        num_tokens_to_get = (request.num_prompt_tokens // self.block_size) * self.block_size
         if num_tokens_to_get == 0:
             return -1, 0
-
-        token_ids = request.all_token_ids[:num_tokens_to_get]
 
         assert num_computed_tokens <= num_tokens_to_get, (
             f"{num_computed_tokens=} must less equal to {num_tokens_to_get=}")
@@ -144,11 +142,20 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         if num_tokens_to_get == num_computed_tokens:
             return -1, 0
 
-        np_token_ids = np.array(token_ids)
+        # Use cached numpy token sequence to avoid repeated list->numpy conversion in hot path
+        np_all_token_ids = request.np_token_ids
+        if np_all_token_ids.shape[0] < num_tokens_to_get:
+            raise ValueError(
+                f"Request {request.req_id} tokens shorter than expected: "
+                f"{np_all_token_ids.shape[0]=}, {num_tokens_to_get=}"
+            )
+        np_token_ids = np_all_token_ids[:num_tokens_to_get]
         np_token_mask = np.ones_like(np_token_ids, dtype=bool)
         np_token_mask[:num_computed_tokens] = False
-        task_id, matched_mask = self.flexkv_manager.get_match(token_ids=np_token_ids,
-                                                         token_mask=np_token_mask)
+        task_id, matched_mask = self.flexkv_manager.get_match(
+            token_ids=np_token_ids,
+            token_mask=np_token_mask,
+        )
         num_new_matched_tokens = matched_mask.sum().item()
 
         # Auto cancel if not call update_state_after_alloc()
@@ -285,13 +292,19 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         request = RequestWrapper(_request)
         flexkv_logger.info(f"Put match request: {request}")
         match_start_time = time.perf_counter()
-        num_tokens_to_put = (cdiv(request.num_tokens+1, self.block_size)-1)*self.block_size
-        token_ids = request.all_token_ids[:num_tokens_to_put]
+        num_tokens_to_put = (cdiv(request.num_tokens + 1, self.block_size) - 1) * self.block_size
 
         if num_tokens_to_put == 0:
             return -1, 0, 0
 
-        np_token_ids = np.array(token_ids)
+        # Use cached numpy token sequence
+        np_all_token_ids = request.np_token_ids
+        if np_all_token_ids.shape[0] < num_tokens_to_put:
+            raise ValueError(
+                f"Request {request.req_id} tokens shorter than expected: "
+                f"{np_all_token_ids.shape[0]=}, {num_tokens_to_put=}"
+            )
+        np_token_ids = np_all_token_ids[:num_tokens_to_put]
         task_id, unmatched_mask = self.flexkv_manager.put_match(token_ids=np_token_ids)
 
         num_unmatched_tokens = unmatched_mask.sum().item()
