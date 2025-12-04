@@ -119,100 +119,6 @@ def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_
     gpu_kv_layout = tpgroup_gpu_kv_layout.div_head(tp_size) if not use_mla else tpgroup_gpu_kv_layout
     return gpu_kv_layout
 
-def generate_gpu_blocks_with_ground_truth(model_config, cache_config, test_config):
-    """Generate GPU blocks with ground truth data for kvmanager tests"""
-    num_layers = model_config.num_layers
-    num_kv_heads = model_config.num_kv_heads
-    head_size = model_config.head_size
-    use_mla = model_config.use_mla
-    tp_size = model_config.tp_size
-    dp_size = model_config.dp_size
-    dtype = model_config.dtype
-    tokens_per_block = cache_config.tokens_per_block
-    num_gpu_blocks = test_config["num_gpu_blocks"]
-
-    tpgroup_gpu_kv_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERFIRST,
-        num_layer=num_layers,
-        num_block=num_gpu_blocks,
-        tokens_per_block=tokens_per_block,
-        num_head=num_kv_heads,
-        head_size=head_size,
-        is_mla=model_config.use_mla
-    )
-    gpu_blocks = {}
-    dp_wise_gpu_blocks_gt = []
-    for dp_id in range(dp_size):
-        tp_group_tensors_gt = [
-            torch.randn(size=tpgroup_gpu_kv_layout.kv_shape[1:], dtype=dtype)
-            for _ in range(num_layers)
-        ]
-        head_per_tp = num_kv_heads // tp_size
-        for tp_id in range(tp_size):
-            global_gpu_id = dp_id * tp_size + tp_id
-            device = (
-                torch.device(f"cuda:{global_gpu_id}")
-                if global_gpu_id < torch.cuda.device_count() else torch.device("cuda:0")
-            )
-            gpu_blocks[global_gpu_id] = []
-            for layer_id in range(num_layers):
-                if not use_mla:
-                    start_head = tp_id * head_per_tp
-                    end_head = (tp_id + 1) * head_per_tp
-                else:
-                    start_head = 0
-                    end_head = num_kv_heads
-                tp_tensor = tp_group_tensors_gt[layer_id][:, :, :, start_head:end_head, :].to(device)
-                gpu_blocks[global_gpu_id].append(tp_tensor)
-        dp_wise_gpu_blocks_gt.append(tp_group_tensors_gt)
-    gpu_kv_layout = tpgroup_gpu_kv_layout.div_head(tp_size) if not use_mla else tpgroup_gpu_kv_layout
-    return gpu_blocks, dp_wise_gpu_blocks_gt, gpu_kv_layout
-
-def verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers, use_mla):
-    """Verify data consistency between GPU blocks and ground truth"""
-    head_per_tp = num_kv_heads // tp_size
-    for dp_id in range(dp_size):
-        gt = dp_wise_gpu_blocks_gt[dp_id]
-        for tp_id in range(tp_size):
-            global_gpu_id = dp_id * tp_size + tp_id
-            gpu_tensors = gpu_blocks[global_gpu_id]
-            for layer in range(num_layers):
-                gpu_tensor = gpu_tensors[layer].cpu()
-                if not use_mla:
-                    start_head = tp_id * head_per_tp
-                    end_head = (tp_id + 1) * head_per_tp
-                else:
-                    start_head = 0
-                    end_head = num_kv_heads
-                gt_tensor_slice = gt[layer][:, :, :, start_head:end_head, :]
-                if not torch.allclose(gpu_tensor, gt_tensor_slice):
-                    print(f"Mismatch at dp_id={dp_id}, tp_id={tp_id}, global_gpu_id={global_gpu_id}, layer={layer}")
-                    print(f"GPU tensor shape: {gpu_tensor.shape}, GT slice shape: {gt_tensor_slice.shape}")
-                assert torch.allclose(gpu_tensor, gt_tensor_slice), \
-                    f"Mismatch at dp_id={dp_id}, tp_id={tp_id}, global_gpu_id={global_gpu_id}, layer={layer}"
-    print("verify done")
-
-def wait_for_transfer_completion(transfer_engine, expected_graph_ids: List[int], max_wait_time: float = 15.0) -> bool:
-    """Wait for transfer graphs to complete and return success status"""
-    completed_graph_ids = set()
-    start_time = time.time()
-
-    while len(completed_graph_ids) < len(expected_graph_ids) and (time.time() - start_time) < max_wait_time:
-        results = transfer_engine.get_completed_graphs_and_ops(timeout=0.1)
-        for graph_id, op_id in results:
-            if op_id == -1:  # Graph completion
-                completed_graph_ids.add(graph_id)
-        time.sleep(0.001)
-
-    return len(completed_graph_ids) == len(expected_graph_ids)
-
-def cleanup_ssd_cache_dirs(cache_config):
-    """Clean up SSD cache directories"""
-    if hasattr(cache_config, 'ssd_cache_dir') and cache_config.ssd_cache_dir:
-        for dir_path in cache_config.ssd_cache_dir:
-            if os.path.exists(dir_path):
-                shutil.rmtree(dir_path)
-
 def skip_if_insufficient_gpus(required_gpus: int):
     """Skip test if insufficient GPUs available"""
     if torch.cuda.device_count() < required_gpus:
@@ -316,6 +222,20 @@ class GPUKVCacheVerifier:
                                 gpu_tensor[block_id, :, head_id, :] = hash_value
                             else:
                                 raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
+
+    def clear_gpu_blocks(self, block_ids):
+        for layer_id in range(self.num_layers):
+            kv_num = 2 if not self.is_mla else 1
+            for kv_id in range(kv_num):
+                for tp_id in range(self.tp_size):
+                    if self.gpu_layout_type == 0:
+                        self.gpu_blocks[tp_id][layer_id][kv_id, block_ids, :, :, :] = 0
+                    elif self.gpu_layout_type == 1:
+                        self.gpu_blocks[tp_id][0][block_ids, layer_id, kv_id, :, :, :] = 0
+                    elif self.gpu_layout_type == 2:
+                        self.gpu_blocks[tp_id][layer_id + self.num_layers * kv_id][block_ids, :, :, :] = 0
+                    else:
+                        raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
     def verify_kv_blocks(self, token_ids, block_ids)->bool:
         assert len(token_ids) == len(block_ids) * self.tokens_per_block
