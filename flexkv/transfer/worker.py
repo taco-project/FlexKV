@@ -121,7 +121,7 @@ class TransferWorkerBase(ABC):
                       op_buffer_tensor: torch.Tensor,
                       *args: Any, **kwargs: Any) -> 'WorkerHandle':
         """Generic worker creation template method."""
-        
+
         parent_conn, child_conn = mp_ctx.Pipe()  # create pipe
         ready_event = mp_ctx.Event()
         worker_id = cls._get_worker_id()
@@ -285,6 +285,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         # Register CPU tensors with CUDA
+        flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
         self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
         # Get pointers first
@@ -448,6 +449,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.tp_group_size = tp_group_size
         self.dp_group_id = dp_group_id
 
+        flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
 
         self.num_layers = gpu_kv_layouts[0].num_layer
@@ -896,7 +898,7 @@ class GDSTransferWorker(TransferWorkerBase):
             len(ssd_files),
             self.round_robin
         )
-        
+
         if not self.gds_manager.is_ready():
             raise RuntimeError(f"Failed to initialize GDS Manager in worker {worker_id}: "
                                f"{self.gds_manager.get_last_error()}")
@@ -965,7 +967,8 @@ class GDSTransferWorker(TransferWorkerBase):
             gpu_block_id_list = src_block_ids
             ssd_block_id_list = dst_block_ids
         else:
-            raise ValueError(f"Invalid transfer type: {transfer_type} for GDSTransferWorker. Expected DISK2D or D2DISK.")
+            raise ValueError(f"Invalid transfer type: {transfer_type} for GDSTransferWorker. "
+                             f"Expected DISK2D or D2DISK")
 
         if len(ssd_block_id_list) == 0:
             return
@@ -1142,7 +1145,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
             ssd_block_ids = src_block_ids
             is_read = True   # SSD -> GPU via GDS (read)
         else:
-            raise ValueError(f"Invalid transfer type: {transfer_type} for tpGDSTransferWorker. Expected DISK2D or D2DISK.")
+            raise ValueError(f"Invalid transfer type: {transfer_type} for tpGDSTransferWorker. "
+                             f"Expected DISK2D or D2DISK.")
 
         gpu_block_id_list = gpu_block_ids
         ssd_block_id_list = ssd_block_ids

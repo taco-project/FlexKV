@@ -18,14 +18,14 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 - 支持直接从 CUDA IPC Handle 构造 TensorSharedHandle ([#44](https://github.com/taco-project/FlexKV/pull/44))
 
 
-针对 vLLM: 
+针对 vLLM:
 - 在 vLLM 集成中支持 dp > 1 ([#18](https://github.com/taco-project/FlexKV/pull/18))
 - 添加 vLLM 适配的启动脚本 ([#47](https://github.com/taco-project/FlexKV/pull/47))
 - 支持 vLLM+FlexKV 的 TP16 ([#59](https://github.com/taco-project/FlexKV/pull/59))
 
-针对 TensorRT-LLM 
+针对 TensorRT-LLM
 - 在 TensorRT-LLM 上支持使用 FlexKV ([#48](https://github.com/taco-project/FlexKV/pull/48))
-- 支持 vLLM+FlexKV 的 TP16 ([#53](https://github.com/taco-project/FlexKV/pull/53))
+- 支持 TensorRT-LLM+FlexKV 的 TP16 ([#53](https://github.com/taco-project/FlexKV/pull/53))
 ### 优化
 - MLA d2h 传输优化 ([#19](https://github.com/taco-project/FlexKV/pull/19))
 - 优化 SSD I/O ([#33](https://github.com/taco-project/FlexKV/pull/33))

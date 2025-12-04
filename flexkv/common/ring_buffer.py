@@ -20,8 +20,6 @@ class SharedOpPool:
         # move tensor to share memory
         self.buffer = self.buffer_o.share_memory_()
 
-        flexkv_logger.info(f"[SharedOpPool] block ids buffer data_ptr: {self.buffer.storage().data_ptr()}")
-
         self.free_slots = deque(range(max_op_num))
         self.slot_map = dict() # {slot_hash: slot_id}
 
