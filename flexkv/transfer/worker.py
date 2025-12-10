@@ -1767,6 +1767,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                                                 task_id=recv_meta.task_id, status = NotifyStatus.SUCCESS) ## used when transfer fails
                 
                 # step2: ckeck the recieved info, early return if check error
+                nvtx_range = nvtx.start_range(message=f"ssd_handle_loop. check and load_data", color="orange")
                 if len(recv_meta.ssd_block_ids) == 0 or len(recv_meta.cpu_block_ids) == 0 \
                     or len(recv_meta.cpu_block_ids)!=len(recv_meta.ssd_block_ids):
                         flexkv_logger.warning(
@@ -1844,6 +1845,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     dst_ptr_list.extend(dst_ptrs)
                     assert len(src_ptr_list) == len(data_size_list) and len(dst_ptr_list) == len(data_size_list)
 
+                nvtx.end_range(nvtx_range)
+                nvtx_range = nvtx.start_range(message=f"ssd_handle_loop. write_data_back_to_peer", color="orange")
                 ## step4: do rdma transfer and send notify
                 if not all_copy_complete:
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
@@ -1855,7 +1858,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     continue
                     
                 self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, success_msg)
-
+                nvtx.end_range(nvtx_range)
             except Exception as e:
                 flexkv_logger.error(f"Unexpected error in ssd_handle_loop: {e}")
                 time.sleep(0.001)

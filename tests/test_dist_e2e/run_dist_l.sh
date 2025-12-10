@@ -12,4 +12,4 @@ export MC_REDIS_PASSWORD="redis-serving-passwd"
 export MC_LEGACY_RPC_PORT_BINDING=24620
 strings $so_dir/engine.cpython-310-x86_64-linux-gnu.so | grep Version
 #python test_distributed_e2e_l.py
-python test_distributed_p2p_interleaved_b.py
+python3 test_distributed_p2p_interleaved_b.py

@@ -527,7 +527,6 @@ class FlexKVWorkerConnector:
         if self.launch_remote_transfer_manager:
             self.remote_transfer_manager_process = TransferManagerOnRemote.create_process()
 
-        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, \
         self.gpu_register_port = flexkv_config.server_recv_port + "_gpu_register"
         logger.info(f"Start init FlexKVWorkerConnector to {self.gpu_register_port}, \
             dp_client_id: {dp_client_id}")
