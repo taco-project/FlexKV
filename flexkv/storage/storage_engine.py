@@ -165,11 +165,14 @@ class StorageEngine:
             else:
                 if not cache_dir:
                     raise ValueError("cache_dir is required for SSD allocator")
+                import time
+                rand_suffix = f"{int(time.time() * 1e6)}"
+                file_prefix = f"flexkv_ssdcache_{rand_suffix}"
                 storage_handle = SSDAllocator.allocate(
                     layout=layout,
                     dtype=dtype,
                     cache_dir=cache_dir,
-                    file_prefix="flexkv_ssd_cache",
+                    file_prefix=file_prefix,
                     max_file_size_gb=max_file_size_gb
                 )
         elif device_type == DeviceType.REMOTE:
