@@ -344,7 +344,7 @@ class KVServer:
 
     def _handle_launch_task_request(self, req: LaunchTaskRequest) -> None:
         """Handle LaunchTask request"""
-        self.kv_task_engine.launch_tasks(req.task_ids, req.slot_mappings)
+        self.kv_task_engine.launch_tasks(req.task_ids, req.slot_mappings, req.as_batch, req.batch_id)
 
     def _handle_cancel_task_request(self, req: CancelTaskRequest) -> None:
         """Handle CancelTask request"""

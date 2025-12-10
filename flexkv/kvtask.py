@@ -14,7 +14,7 @@ import numpy as np
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.transfer import TransferOpGraph, get_nvtx_default_color
+from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color
 from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
@@ -41,6 +41,7 @@ class TaskStatus(Enum):
 class TaskType(Enum):
     GET = "get"
     PUT = "put"
+    BATCH_GET = "batch_get"
 
 @dataclass
 class KVTask:
@@ -59,8 +60,8 @@ class KVTask:
 
     # cache engine return
     graph: TransferOpGraph
-    return_mask: np.ndarray
-    callback: Optional[Callable]
+    return_mask: Union[np.ndarray, list[np.ndarray]]
+    callback: Optional[Union[Callable, List[Callable]]]
     op_callback_dict: Dict[int, Callable]
 
     def is_completed(self) -> bool:
@@ -328,7 +329,11 @@ class KVTaskManager:
         if task.is_completed():
             return
         if task.callback:
-            task.callback()
+            if isinstance(task.callback, list):
+                for callback in task.callback:
+                    callback()
+            else:
+                task.callback()
         task.status = TaskStatus.COMPLETED
         task.task_end_op_finished = True
         self.graph_to_task.pop(task.graph.graph_id)
@@ -654,21 +659,72 @@ class KVTaskEngine(KVTaskManager):
         nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
 
+    def merge_to_batch_kvtask(self, batch_id: int, task_ids: List[int]) -> TransferOpGraph:
+        op_callback_dict = {}
+        task_end_op_ids = []
+        callbacks = []
+        transfer_graphs = []
+        return_masks = []
+        for task_id in task_ids:
+            assert self.tasks[task_id].task_type == TaskType.GET, "only get task can be launched as batch"
+            transfer_graph = self.check_task_ready(task_id)
+            if transfer_graph is not None and transfer_graph.num_ops > 0:
+                transfer_graphs.append(transfer_graph)
+                op_callback_dict.update(self.tasks[task_id].op_callback_dict)
+                task_end_op_ids.append(self.tasks[task_id].task_end_op_id)
+                callbacks.append(self.tasks[task_id].callback)
+                return_masks.append(self.tasks[task_id].return_mask)
+        
+        batch_task_graph, task_end_op_id, op_callback_dict = merge_to_batch_graph(batch_id,
+                                                                                  transfer_graphs, 
+                                                                                  task_end_op_ids, 
+                                                                                  op_callback_dict)
+        self.tasks[batch_id] = KVTask(
+            task_id=batch_id,
+            token_ids=np.concatenate([self.tasks[task_id].token_ids for task_id in task_ids]),
+            slot_mapping=np.concatenate([self.tasks[task_id].slot_mapping for task_id in task_ids]),
+            token_mask=np.concatenate([self.tasks[task_id].token_mask for task_id in task_ids]),
+            task_type=TaskType.BATCH_GET,
+            task_end_op_id=task_end_op_id,
+            task_end_op_finished=False,
+            status=TaskStatus.READY,
+            dp_id=self.tasks[task_ids[0]].dp_id,
+            graph=batch_task_graph,
+            return_mask=return_masks,
+            callback=callbacks, # this is a list now
+            op_callback_dict=op_callback_dict,
+        )
+        self.graph_to_task[batch_task_graph.graph_id] = batch_id
+        # pop those tasks which are merged into batch
+        for task_id in task_ids:
+            self.graph_to_task.pop(self.tasks[task_id].graph.graph_id, None)
+            self.tasks.pop(task_id, None)
+        return batch_task_graph
+
     def launch_tasks(self,
-                        task_ids: List[int],
-                        slot_mappings: List[np.ndarray]) -> None:
+                    task_ids: List[int],
+                    slot_mappings: List[np.ndarray],
+                    as_batch: bool = False,
+                    batch_id: int = -1) -> List[int]:
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
-        self.tracer.trace_launch_tasks(task_ids, slot_mappings)
+        self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
         self.set_slot_mappings(task_ids, slot_mappings)
         
         # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
-        transfer_graphs = []
-        for task_id in task_ids:
-            transfer_graph = self.check_task_ready(task_id)
-            if transfer_graph is not None and transfer_graph.num_ops > 0:
-                transfer_graphs.append(transfer_graph)
+        
+        if len(task_ids) > 1 and as_batch:
+            if batch_id == -1:
+                batch_id = self._gen_task_id()
+            transfer_graphs = [self.merge_to_batch_kvtask(batch_id, task_ids)]
+            task_ids = [batch_id]
+        else:
+            transfer_graphs = []
+            for task_id in task_ids:
+                transfer_graph = self.check_task_ready(task_id)
+                if transfer_graph is not None and transfer_graph.num_ops > 0:
+                    transfer_graphs.append(transfer_graph)
         
         # Submit all graphs in batch to reduce IPC overhead
         if transfer_graphs:
@@ -676,6 +732,7 @@ class KVTaskEngine(KVTaskManager):
                 transfer_handle.submit_batch(transfer_graphs)
         
         nvtx.end_range(nvtx_range)
+        return task_ids
 
     def cancel_tasks(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):

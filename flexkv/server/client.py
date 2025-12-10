@@ -158,9 +158,14 @@ class KVDPClient:
         self,
         task_ids: List[int],
         slot_mappings: List[np.ndarray],
-    ) -> None:
-        req = LaunchTaskRequest(self.dp_client_id, task_ids, slot_mappings)
+        as_batch: bool = False,
+    ) -> List[int]:
+        batch_id = -1
+        if as_batch:
+            batch_id = self._get_task_id()
+        req = LaunchTaskRequest(self.dp_client_id, task_ids, slot_mappings, as_batch, batch_id)
         self.send_to_server.send_pyobj(req)
+        return [batch_id] if as_batch else task_ids
 
     def cancel_task(
         self,

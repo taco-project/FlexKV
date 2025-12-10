@@ -278,7 +278,9 @@ class FlexKVTracer:
 
     def trace_launch_tasks(self,
                           task_ids: List[int],
-                          slot_mappings: List[Union[torch.Tensor, np.ndarray]]):
+                          slot_mappings: List[Union[torch.Tensor, np.ndarray]],
+                          as_batch: bool = False,
+                          batch_id: int = -1):
         """Record a launch_tasks operation"""
         if not self.enabled:
             return
@@ -296,6 +298,8 @@ class FlexKVTracer:
             "task_ids": task_ids,
             "slot_mappings": slot_mappings_list,
             "slot_mappings_shapes": slot_mappings_shapes,
+            "as_batch": as_batch,
+            "batch_id": batch_id,
         }
         
         record = {
