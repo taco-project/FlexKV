@@ -65,6 +65,8 @@ class LaunchTaskRequest:
     dp_client_id: int
     task_ids: List[int]
     slot_mappings: List[np.ndarray]
+    as_batch: bool = False
+    batch_id: int = -1
 
 @dataclass
 class CancelTaskRequest:

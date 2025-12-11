@@ -358,7 +358,8 @@ class FlexKVReplayEngine:
         data = event['data']
         task_ids = data['task_ids']
         slot_mappings_list = data['slot_mappings']
-        
+        as_batch = data.get('as_batch', False)
+        batch_id = data.get('batch_id', -1)
         self.log(f"🚀🚀🚀Replaying launch_tasks for task_ids: {task_ids}")
         
         try:
@@ -369,7 +370,7 @@ class FlexKVReplayEngine:
             print(f"Launching {len(task_ids)} tasks with slot_mappings")
             
             # Call launch_tasks
-            self.kvmanager.launch_tasks(task_ids, slot_mappings)
+            self.kvmanager.launch_tasks(task_ids, slot_mappings, as_batch, batch_id)
             
             self.log(f"launch_tasks completed successfully for {len(task_ids)} tasks")
             
