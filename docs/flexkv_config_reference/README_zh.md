@@ -66,12 +66,14 @@ enable_gds: false
 
 ---
 
-### 服务器模式配置
+### 多实例模式配置
 
 | 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
+| `FLEXKV_INSTANCE_NUM` | int | 1 | 推理引擎实例数量 |
+| `FLEXKV_INSTANCE_ID` | int | 0 | 推理引擎实例ID |
 | `FLEXKV_SERVER_CLIENT_MODE` | bool | 0 | `server_client_mode`: 是否强制启用服务器-客户端模式 |
-| `FLEXKV_SERVER_RECV_PORT` | str | "ipc:///tmp/flexkv_server" | `server_recv_port`: 服务器接收端口配置 |
+| `FLEXKV_SERVER_RECV_PORT` | str | "ipc:///tmp/flexkv_server" | `server_recv_port`: 服务器接收端口配置，多实例模式下不同实例应当使用相同的端口 |
 
 ---
 
