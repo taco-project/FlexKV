@@ -3,6 +3,7 @@ from enum import Enum
 from typing import Any, Dict, Optional, List, Tuple, Union
 
 import torch
+import hashlib
 
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.memory_handle import TensorSharedHandle
@@ -165,8 +166,9 @@ class StorageEngine:
             else:
                 if not cache_dir:
                     raise ValueError("cache_dir is required for SSD allocator")
-                import time
-                rand_suffix = f"{int(time.time() * 1e6)}"
+                server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
+                hash_value = hashlib.md5(server_recv_port.encode()).hexdigest()
+                rand_suffix = f"{hash_value[:6]}"
                 file_prefix = f"flexkv_ssdcache_{rand_suffix}"
                 storage_handle = SSDAllocator.allocate(
                     layout=layout,
