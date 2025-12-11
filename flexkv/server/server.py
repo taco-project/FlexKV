@@ -35,6 +35,7 @@ from flexkv.server.request import (
     StartRequest,
     ShutdownRequest,
     CheckRunningRequest,
+    PrefetchRequest,
 )
 import contextlib
 
@@ -139,6 +140,7 @@ class KVServer:
             PutRequest: self._handle_put_request,
             GetMatchRequest: self._handle_get_match_request,
             PutMatchRequest: self._handle_put_match_request,
+            PrefetchRequest: self._handle_prefetch_request,
             WaitRequest: self._handle_wait_request,
             LaunchTaskRequest: self._handle_launch_task_request,
             CancelTaskRequest: self._handle_cancel_task_request,
@@ -341,6 +343,14 @@ class KVServer:
         response = Response(req.dp_client_id, task_id=req_id, mask=mask)
         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
         result_zmq.send_pyobj(response)
+
+    def _handle_prefetch_request(self, req: PrefetchRequest) -> None:
+        """Handle Prefetch request"""
+        task_id = self.kv_task_engine.prefetch_async(
+            token_ids=req.token_ids,
+            dp_id=req.dp_client_id,
+            task_id=req.task_id
+        )
 
     def _handle_launch_task_request(self, req: LaunchTaskRequest) -> None:
         """Handle LaunchTask request"""
