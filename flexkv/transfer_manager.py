@@ -48,7 +48,7 @@ class TransferManager:
 
         self.transfer_engine: Optional[TransferEngine] = None
         self.storage_engine = StorageEngine(self.model_config, self.cache_config)
-        flexkv_logger.info(f"Initialized TransferManager with config successfully")
+        flexkv_logger.info("Initialized TransferManager with config successfully")
 
     def _handle_gpu_blocks_registration(self, req: RegisterTPClientRequest) -> None:
         device_id = req.device_id
@@ -98,7 +98,7 @@ class TransferManager:
             # self.context.term()
 
     def initialize_transfer_engine(self) -> None:
-        flexkv_logger.info(f"Initializing TransferEngine...")
+        flexkv_logger.info("Initializing TransferEngine...")
         self._register_gpu_blocks_via_socket()
 
         assert len(self.all_gpu_layouts) == self.model_config.tp_size * self.model_config.dp_size
@@ -127,7 +127,7 @@ class TransferManager:
                                               cpu_handle=cpu_handle,
                                               ssd_handle=ssd_handle,
                                               remote_handle=remote_handle)
-        flexkv_logger.info(f"Initialized TransferEngine successfully")
+        flexkv_logger.info("Initialized TransferEngine successfully")
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:
         self.transfer_engine.submit_transfer_graph(transfer_graph)
@@ -189,7 +189,7 @@ class TransferManagerOnRemote(TransferManager):
         self._connect_to_master_transfer_manager()
 
         self._initialize_with_config()
-        flexkv_logger.info(f"Initialized TransferManagerOnRemote with config successfully")
+        flexkv_logger.info("Initialized TransferManagerOnRemote with config successfully")
 
     def _connect_to_master_transfer_manager(self) -> None:
         try:
@@ -222,7 +222,7 @@ class TransferManagerOnRemote(TransferManager):
                 {self.cache_config = }, {self.gpu_register_port = }.")
         else:
             raise RuntimeError(f"Expected config message, got: {config_msg}")
-        flexkv_logger.info(f"Received config from master successfully")
+        flexkv_logger.info("Received config from master successfully")
         super().__init__(self.model_config, self.cache_config, self.gpu_register_port)
 
     def _polling_worker(self) -> None:
@@ -294,10 +294,10 @@ class TransferManagerOnRemote(TransferManager):
 
                                     if task_end_op_id != -1 and op_id == task_end_op_id:
                                         self.result_socket.send_pyobj(
-                                            [task_end_op_id, graph_id]
+                                            [graph_id, task_end_op_id]
                                         )
                                     if op_id == -1:
-                                        self.result_socket.send_pyobj([-1, graph_id])
+                                        self.result_socket.send_pyobj([graph_id, -1])
                                         del self._active_graphs[graph_id]
 
                 except queue.Empty:
@@ -383,7 +383,7 @@ class TransferManagerOnRemote(TransferManager):
             import pickle
             import tempfile
             from flexkv.common.debug import flexkv_logger
-            
+
             # Immediately disable MPI to avoid conflicts
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
 
@@ -401,7 +401,7 @@ class TransferManagerOnRemote(TransferManager):
                 flexkv_logger.info(f"Starting TransferManagerOnRemote instance...")
                 instance.start()
                 flexkv_logger.info(f"TransferManager instance started successfully")
-                
+
                 # Keep running until worker thread exits
                 if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
                     instance._worker_thread.join()
@@ -571,29 +571,29 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             transfer_manager.initialize_transfer_engine()
             transfer_manager.start()
             ready_event.set()
-            
+
             # Setup selector for event-driven processing (complete zero polling!)
             sel = selectors.DefaultSelector()
             sel.register(command_conn.fileno(), selectors.EVENT_READ, data="command")
             # Also monitor completed_queue for finished ops (now it's mp.Queue with _reader)
-            sel.register(transfer_manager.transfer_engine.completed_queue._reader, 
+            sel.register(transfer_manager.transfer_engine.completed_queue._reader,
                         selectors.EVENT_READ, data="finished_ops")
-            
+
             flexkv_logger.info("TransferManager daemon process started with selector-based event monitoring (command + finished_ops)")
-            
+
             while True:
                 try:
                     # Event-driven: wait for command OR finished_ops (ZERO LATENCY!)
                     # Complete blocking with NO TIMEOUT - shutdown via terminate()
                     events = sel.select(timeout=None)
-                    
+
                     # Process all events
                     has_finished_ops = False
-                    
+
                     for key, mask in events:
                         if key.data == "command":
                             # New command available
-                            inner_range = nvtx.start_range(message=f"TransferManagerInter.process_worker.req", color="red")
+                            inner_range = nvtx.start_range(message="TransferManagerInter.process_worker.req", color="red")
                             request = command_conn.recv()
                             request_type = request.get('type')
                             if request_type == 'submit':
@@ -603,14 +603,14 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                             else:
                                 flexkv_logger.error(f"Unrecognized request type: {request_type}")
                             nvtx.end_range(inner_range)
-                        
+
                         elif key.data == "finished_ops":
                             # Selector reports finished_ops queue has data
                             has_finished_ops = True
-                    
+
                     # Only collect finished_ops if selector reported data available
                     if has_finished_ops:
-                        inner_range = nvtx.start_range(message=f"TransferManagerInter.process_worker.results", color="red")
+                        inner_range = nvtx.start_range(message="TransferManagerInter.process_worker.results", color="red")
                         try:
                             # Directly get from completed_queue without timeout to avoid poll
                             finished_ops = []
@@ -620,13 +620,13 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                                     finished_ops.append(completed_queue.get_nowait())
                                 except queue.Empty:
                                     break
-                            
+
                             if finished_ops:
                                 result_conn.send(finished_ops)
                         except Exception as e:
                             flexkv_logger.error(f"Error collecting finished ops: {e}")
                         nvtx.end_range(inner_range)
-                    
+
                 except Exception as e:
                     flexkv_logger.error(f"Error in transfer manager process: {e}")
 
@@ -639,7 +639,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     sel.close()
                 except Exception as e:
                     flexkv_logger.error(f"Error closing selector: {e}")
-            
+
             command_conn.close()
             result_conn.close()
 
@@ -653,7 +653,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         return self.ready_event.is_set()
 
     def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
-        nvtx_range = nvtx.start_range(message=f"TransferManagerInterProcessHandle.submit", color="green")
+        nvtx_range = nvtx.start_range(message="TransferManagerInterProcessHandle.submit", color="green")
         self.command_parent_conn.send({
             'type': 'submit',
             'transfer_graph': transfer_graph
@@ -663,7 +663,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         # Batch submit to reduce IPC overhead
         nvtx_range = nvtx.start_range(
-            message=f"TransferManagerInterProcessHandle.submit_batch count={len(transfer_graphs)}", 
+            message=f"TransferManagerInterProcessHandle.submit_batch count={len(transfer_graphs)}",
             color="green"
         )
         self.command_parent_conn.send({
@@ -783,7 +783,7 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
             try:
                 result = self.result_socket.recv_pyobj(zmq.NOBLOCK)
                 if isinstance(result, list) and len(result) == 2:
-                    op_id, graph_id = result
+                    graph_id, op_id = result
 
                     with self._result_buffer_lock:
                         self._result_buffer.append((graph_id, op_id))
