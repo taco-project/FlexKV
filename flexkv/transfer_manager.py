@@ -536,7 +536,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         self.start_event = self.mp_ctx.Event()
         self.ready_event = self.mp_ctx.Event()
 
-        self._completed_results: List[Tuple[int, int]] = []
+        self._completed_results: List[CompletedOp] = []
 
     def _start_process(self) -> None:
         if self.process is not None and self.process.is_alive():
@@ -728,7 +728,7 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
         self._shutdown_flag = False
         self._connected = False
 
-        self._result_buffer: List[Tuple[int, int]] = []
+        self._result_buffer: List[CompletedOp] = []
         self._result_buffer_lock = threading.Lock()
 
         self._bind_master_ports()
@@ -786,10 +786,6 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
                 if isinstance(result, CompletedOp):
                     with self._result_buffer_lock:
                         self._result_buffer.append(result)
-                elif isinstance(result, list) and len(result) == 2:
-                    completed_op = CompletedOp.from_tuple(tuple(result))
-                    with self._result_buffer_lock:
-                        self._result_buffer.append(completed_op)
                 else:
                     flexkv_logger.warning(f"Unexpected result format from remote: {result}")
 
