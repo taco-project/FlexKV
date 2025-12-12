@@ -866,7 +866,6 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
         while True:
             with self._result_buffer_lock:
                 if self._result_buffer:
-                    # _result_buffer 直接存储 CompletedOp 对象
                     results.extend(self._result_buffer)
                     self._result_buffer.clear()
                     break
