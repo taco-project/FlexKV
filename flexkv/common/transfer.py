@@ -6,6 +6,26 @@ from typing import ClassVar, List, Set, Dict, Callable, Tuple
 import numpy as np
 
 
+@dataclass(frozen=True)
+class CompletedOp:
+    graph_id: int
+    op_id: int
+
+    def is_graph_completed(self) -> bool:
+        return self.op_id == -1
+
+    def to_tuple(self) -> Tuple[int, int]:
+        return (self.graph_id, self.op_id)
+
+    @classmethod
+    def from_tuple(cls, data: Tuple[int, int]) -> 'CompletedOp':
+        return cls(graph_id=data[0], op_id=data[1])
+
+    @classmethod
+    def completed_graph(cls, graph_id: int) -> 'CompletedOp':
+        return cls(graph_id=graph_id, op_id=-1)
+
+
 class DeviceType(Enum):
     CPU = 0
     GPU = 1
@@ -191,7 +211,7 @@ class TransferOpGraph:
     def bind_to_dp_group(self, dp_id: int) -> None:
         for op in self._op_map.values():
             op.dp_id = dp_id
-            
+
     def visualize(self) -> str:
         """
         Visualize the transfer op graph in a readable format.
@@ -201,36 +221,36 @@ class TransferOpGraph:
         lines.append(f"╔{'═' * 70}╗")
         lines.append(f"║ TransferOpGraph (graph_id={self.graph_id}, num_ops={self.num_ops})".ljust(71) + "║")
         lines.append(f"╠{'═' * 70}╣")
-        
+
         if not self._op_map:
-            lines.append(f"║ (empty graph)".ljust(71) + "║")
+            lines.append("║ (empty graph)".ljust(71) + "║")
             lines.append(f"╚{'═' * 70}╝")
             return "\n".join(lines)
-        
+
         # Sort ops by op_id for consistent display
         sorted_ops = sorted(self._op_map.values(), key=lambda op: op.op_id)
-        
+
         for i, op in enumerate(sorted_ops):
             # Op header
             status_symbol = {"PENDING": "○", "RUNNING": "◐", "COMPLETED": "●"}.get(op.status.name, "?")
             lines.append(f"║ [{status_symbol}] Op {op.op_id}: {op.transfer_type.value}".ljust(71) + "║")
-            
+
             # Dependencies
             if op.predecessors:
                 pred_str = ", ".join(str(p) for p in sorted(op.predecessors))
                 lines.append(f"║     ├─ predecessors: [{pred_str}]".ljust(71) + "║")
             else:
-                lines.append(f"║     ├─ predecessors: (none - ready)".ljust(71) + "║")
-            
+                lines.append("║     ├─ predecessors: (none - ready)".ljust(71) + "║")
+
             if op.successors:
                 succ_str = ", ".join(str(s) for s in sorted(op.successors))
                 lines.append(f"║     ├─ successors:   [{succ_str}]".ljust(71) + "║")
-            
+
             # Block info (truncate if too long)
             if op.transfer_type != TransferType.VIRTUAL:
                 src_size = op.src_block_ids.size
                 dst_size = op.dst_block_ids.size
-                
+
                 # Show first few and last few block ids
                 def format_blocks(block_ids, max_show=4):
                     if block_ids.size == 0:
@@ -241,30 +261,30 @@ class TransferOpGraph:
                         first = block_ids[:max_show].tolist()
                         last = block_ids[-max_show:].tolist()
                         return f"{first[:-1]}...{last[-1]}] (n={block_ids.size})"
-                
+
                 src_str = format_blocks(op.src_block_ids)
                 dst_str = format_blocks(op.dst_block_ids)
                 lines.append(f"║     ├─ src_blocks:   {src_str}".ljust(71) + "║")
                 lines.append(f"║     ├─ dst_blocks:   {dst_str}".ljust(71) + "║")
                 lines.append(f"║     └─ layer_id={op.layer_id}, dp_id={op.dp_id}".ljust(71) + "║")
             else:
-                lines.append(f"║     └─ (VIRTUAL - no blocks)".ljust(71) + "║")
-            
+                lines.append("║     └─ (VIRTUAL - no blocks)".ljust(71) + "║")
+
             # Separator between ops
             if i < len(sorted_ops) - 1:
                 lines.append(f"║{'-' * 70}║")
-        
+
         # Show ready ops
         lines.append(f"╠{'═' * 70}╣")
         ready_str = ", ".join(str(op_id) for op_id in sorted(self._ready_ops)) if self._ready_ops else "(none)"
         lines.append(f"║ Ready ops: [{ready_str}]".ljust(71) + "║")
-        
+
         if self._trigger_ops:
             trigger_str = ", ".join(str(op_id) for op_id in sorted(self._trigger_ops))
             lines.append(f"║ Trigger ops: [{trigger_str}]".ljust(71) + "║")
-        
+
         lines.append(f"╚{'═' * 70}╝")
-        
+
         result = "\n".join(lines)
         print(result)
         return result
@@ -273,20 +293,20 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
                          op_callback_dict: Dict[int, Callable]) -> Tuple[TransferOpGraph, int, Dict[int, Callable]]:
     """
     Merge multiple TransferOpGraphs into a single batch graph.
-    
+
     Simplified assumption: each graph has at most two ops - DISK2H and H2D.
     - All DISK2H ops are merged into one (if any exist)
     - All H2D ops are merged into one
     - Dependency: DISK2H -> H2D
     - H2D becomes the task_end_op_id
     - For other transfer types (REMOTE, GDS, etc.), raise error
-    
+
     Args:
         batch_id: ID for the new batch graph
         transfer_graphs: List of graphs to merge
         task_end_op_ids: List of end op IDs for each task (one per graph)
         op_callback_dict: Dict mapping old op_id -> callback
-    
+
     Returns:
         (merged_graph, batch_end_op_id, new_op_callback_dict)
     """
@@ -294,18 +314,18 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
         empty_graph = TransferOpGraph()
         empty_graph.set_graph_id(batch_id)
         return empty_graph, -1, {}
-    
+
     merged_graph = TransferOpGraph()
     merged_graph.set_graph_id(batch_id)
-    
+
     # Collect DISK2H and H2D ops separately
     disk2h_ops: List[TransferOp] = []
     h2d_ops: List[TransferOp] = []
-    
+
     # New callback dict: merged_op_id -> list of callbacks
     disk2h_callbacks: List[Callable] = []
     h2d_callbacks: List[Callable] = []
-    
+
     for graph in transfer_graphs:
         for op_id, op in graph._op_map.items():
             if op.transfer_type == TransferType.VIRTUAL:
@@ -326,16 +346,16 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
                     f"Only DISK2H and H2D are supported. "
                     f"Remote access and GDS are not yet supported for batch merge."
                 )
-    
+
     new_op_callback_dict: Dict[int, Callable] = {}
     merged_disk2h_op = None
     merged_h2d_op = None
-    
+
     # Merge all DISK2H ops into one
     if disk2h_ops:
         src_blocks = np.concatenate([op.src_block_ids for op in disk2h_ops])
         dst_blocks = np.concatenate([op.dst_block_ids for op in disk2h_ops])
-        
+
         merged_disk2h_op = TransferOp(
             graph_id=merged_graph.graph_id,
             transfer_type=TransferType.DISK2H,
@@ -346,7 +366,7 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
             dp_id=disk2h_ops[0].dp_id,
         )
         merged_graph.add_transfer_op(merged_disk2h_op)
-        
+
         # Attach callbacks - create a combined callback if multiple
         if disk2h_callbacks:
             if len(disk2h_callbacks) == 1:
@@ -359,12 +379,12 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
                             cb(*args, **kwargs)
                     return combined_callback
                 new_op_callback_dict[merged_disk2h_op.op_id] = make_combined_callback(disk2h_callbacks)
-    
+
     # Merge all H2D ops into one
     if h2d_ops:
         src_blocks = np.concatenate([op.src_block_ids for op in h2d_ops])
         dst_blocks = np.concatenate([op.dst_block_ids for op in h2d_ops])
-        
+
         merged_h2d_op = TransferOp(
             graph_id=merged_graph.graph_id,
             transfer_type=TransferType.H2D,
@@ -375,7 +395,7 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
             dp_id=h2d_ops[0].dp_id,
         )
         merged_graph.add_transfer_op(merged_h2d_op)
-        
+
         # Attach callbacks - create a combined callback if multiple
         if h2d_callbacks:
             if len(h2d_callbacks) == 1:
@@ -387,11 +407,11 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
                             cb(*args, **kwargs)
                     return combined_callback
                 new_op_callback_dict[merged_h2d_op.op_id] = make_combined_callback(h2d_callbacks)
-    
+
     # Add dependency: DISK2H -> H2D
     if merged_disk2h_op is not None and merged_h2d_op is not None:
         merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
-    
+
     # Determine the batch_end_op_id
     # Priority: H2D (if exists) -> DISK2H (if exists) -> -1
     if merged_h2d_op is not None:
@@ -400,7 +420,7 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
         batch_end_op_id = merged_disk2h_op.op_id
     else:
         batch_end_op_id = -1
-    
+
     return merged_graph, batch_end_op_id, new_op_callback_dict
 
 

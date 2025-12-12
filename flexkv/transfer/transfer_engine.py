@@ -27,7 +27,7 @@ import torch
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import StorageHandle
-from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType
+from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp
 from flexkv.common.transfer import get_nvtx_range_color
 from flexkv.common.storage import KVCacheLayoutType
 from flexkv.transfer.scheduler import TransferScheduler
@@ -85,7 +85,7 @@ class TransferEngine:
         self.completed_queue = self.mp_ctx.Queue()
         self.finished_ops_queue = self.mp_ctx.Queue()
         self.op_id_to_op: Dict[int, TransferOp] = {}
-        
+
         # Create shutdown pipe for zero-latency selector
         self.shutdown_read_fd, self.shutdown_write_fd = os.pipe()
         self.gpu_handles = gpu_handles
@@ -269,29 +269,29 @@ class TransferEngine:
     def _scheduler_loop(self) -> None:
         """Event-driven scheduler loop using selectors (ZERO LATENCY with shutdown pipe)"""
         from flexkv.common.debug import flexkv_logger
-        
+
         # Setup selector to monitor both queues simultaneously
         sel = selectors.DefaultSelector()
-        
+
         # Register both queues for monitoring
         sel.register(self.task_queue._reader, selectors.EVENT_READ, data="new_graph")
         sel.register(self.finished_ops_queue._reader, selectors.EVENT_READ, data="finished_op")
-        
+
         # Register shutdown pipe for zero-latency shutdown
         sel.register(self.shutdown_read_fd, selectors.EVENT_READ, data="shutdown")
-        
+
         flexkv_logger.info("TransferEngine scheduler loop started with ZERO-LATENCY selector (timeout=None)")
-        
+
         while self._running:
             try:
                 # Complete blocking with NO TIMEOUT for zero latency!
                 # Shutdown via pipe signal instead of timeout
                 events = sel.select(timeout=None)
-                
+
                 new_graphs_num = 0
                 finished_ops: List[TransferOp] = []
                 should_shutdown = False
-                
+
                 # Process events from selector
                 for key, mask in events:
                     if key.data == "shutdown":
@@ -299,10 +299,10 @@ class TransferEngine:
                         flexkv_logger.info("Scheduler loop received shutdown signal via pipe")
                         should_shutdown = True
                         break
-                    
+
                     elif key.data == "new_graph":
                         # Process new transfer graphs (batch get all available)
-                        nvtx_r1 = nvtx.start_range(message=f"transfer scheduler. get new graphs", color="orange")
+                        nvtx_r1 = nvtx.start_range(message="transfer scheduler. get new graphs", color="orange")
                         # Get all available graphs in one go to reduce system calls
                         while True:
                             try:
@@ -315,40 +315,40 @@ class TransferEngine:
                             except queue.Empty:
                                 break
                         nvtx.end_range(nvtx_r1)
-                    
+
                     elif key.data == "finished_op":
                         # Collect finished ops (batch get all available)
-                        nvtx_r2 = nvtx.start_range(message=f"transfer scheduler. collect finished ops", color="orange")
+                        nvtx_r2 = nvtx.start_range(message="transfer scheduler. collect finished ops", color="orange")
                         # Get all available ops in one go to reduce system calls
                         while True:
                             try:
                                 op_id = self.finished_ops_queue.get_nowait()
                                 op = self.op_id_to_op[op_id]
                                 free_op_from_buffer(op, self.pin_buffer)
-                                self.completed_queue.put((op.graph_id, op.op_id))
+                                self.completed_queue.put(CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
                                 finished_ops.append(op)
                                 del self.op_id_to_op[op_id]
                             except queue.Empty:
                                 break
                         nvtx.end_range(nvtx_r2)
-                
+
                 # Exit loop if shutdown requested
                 if should_shutdown:
                     break
-                
+
                 # End NVTX ranges for finished ops
                 for op in finished_ops:
                     nvtx.end_range(self.op_id_to_nvtx_range[op.op_id])
                     self.op_id_to_nvtx_range.pop(op.op_id)
-                
+
                 # Schedule next operations
-                nvtx_r3 = nvtx.start_range(message=f"transfer scheduler. schedule next ops", color="orange")
+                nvtx_r3 = nvtx.start_range(message="transfer scheduler. schedule next ops", color="orange")
                 if finished_ops or new_graphs_num > 0:
                     completed_graph_ids, next_ops = self.scheduler.schedule(finished_ops)
                     # Distribute new ops to workers
                     for op in next_ops:
                         if op.transfer_type == TransferType.VIRTUAL:
-                            self.completed_queue.put((op.graph_id, op.op_id))
+                            self.completed_queue.put(CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
                         else:
                             self.op_id_to_op[op.op_id] = op
                             # copy block ids into buffer and update slot id info
@@ -356,13 +356,13 @@ class TransferEngine:
                             self._assign_op_to_worker(op)
                     # Handle completed graphs
                     for graph_id in completed_graph_ids:
-                        self.completed_queue.put((graph_id, -1))
+                        self.completed_queue.put(CompletedOp.completed_graph(graph_id))
                 nvtx.end_range(nvtx_r3)
-                
+
             except Exception as e:
                 flexkv_logger.error(f"Error in scheduler loop: {e}")
                 time.sleep(0.001)  # Fallback on error
-        
+
         # Cleanup
         sel.close()
         flexkv_logger.info("TransferEngine scheduler loop stopped")
@@ -387,37 +387,38 @@ class TransferEngine:
 
     def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:
         """Submit a transfer graph for execution"""
-        nvtx_range = nvtx.start_range(message=f"TransferEngine.submit_transfer_graph", color="green")
+        nvtx_range = nvtx.start_range(message="TransferEngine.submit_transfer_graph", color="green")
         if not isinstance(transfer_graph, List):
             transfer_graph = [transfer_graph]
         self.task_queue.put(transfer_graph)
         nvtx.end_range(nvtx_range)
 
-    def get_completed_graphs_and_ops(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
+    def get_completed_graphs_and_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         """Get IDs of all completed transfer graphs at current moment
 
         Args:
             timeout: Optional timeout for the first graph retrieval
 
         Returns:
-            List of completed graph IDs. Empty list if no graphs are completed.
+            List of CompletedOp objects. Empty list if no graphs are completed.
         """
-        completed_graph_ids: List[Tuple[int, int]] = []
+        completed_ops: List[CompletedOp] = []
 
         if self.completed_queue.empty():
-            return completed_graph_ids
+            return completed_ops
 
         try:
-            first_graph = self.completed_queue.get(timeout=timeout)
-            completed_graph_ids.append(first_graph)
+            first_op = self.completed_queue.get(timeout=timeout)
+            completed_ops.append(first_op)
 
             while not self.completed_queue.empty():
-                completed_graph_ids.append(self.completed_queue.get_nowait())
+                completed_op = self.completed_queue.get_nowait()
+                completed_ops.append(completed_op)
 
         except queue.Empty:
             pass
 
-        return completed_graph_ids
+        return completed_ops
 
     def shutdown(self) -> None:
         """Shutdown the transfer engine"""
@@ -425,16 +426,16 @@ class TransferEngine:
             if not self._running:
                 return
             self._running = False
-            
+
             # Send shutdown signal via pipe to wake up selector immediately
             try:
                 os.write(self.shutdown_write_fd, b'1')
             except (OSError, BrokenPipeError) as e:
                 # Pipe already closed, that's ok
                 flexkv_logger.debug(f"Shutdown pipe already closed during write: {e}")
-            
+
             self._scheduler_thread.join(timeout=5)
-            
+
             # Close shutdown pipe
             try:
                 os.close(self.shutdown_read_fd)

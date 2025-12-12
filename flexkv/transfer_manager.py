@@ -18,7 +18,7 @@ import subprocess
 import pickle
 import sys
 
-from flexkv.common.transfer import TransferOpGraph
+from flexkv.common.transfer import TransferOpGraph, CompletedOp
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
@@ -135,7 +135,7 @@ class TransferManager:
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         self.transfer_engine.submit_transfer_graph(transfer_graphs)
 
-    def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
+    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         return self.transfer_engine.get_completed_graphs_and_ops(timeout)
 
     def start(self) -> None:
@@ -288,17 +288,16 @@ class TransferManagerOnRemote(TransferManager):
 
                     if completed:
                         with self._active_graphs_lock:
-                            for graph_id, op_id in completed:
-                                if graph_id in self._active_graphs:
-                                    task_end_op_id = self._active_graphs[graph_id]
+                            for completed_op in completed:
+                                if completed_op.graph_id in self._active_graphs:
+                                    task_end_op_id = self._active_graphs[completed_op.graph_id]
 
-                                    if task_end_op_id != -1 and op_id == task_end_op_id:
-                                        self.result_socket.send_pyobj(
-                                            [graph_id, task_end_op_id]
-                                        )
-                                    if op_id == -1:
-                                        self.result_socket.send_pyobj([graph_id, -1])
-                                        del self._active_graphs[graph_id]
+                                    if task_end_op_id != -1 and completed_op.op_id == task_end_op_id:
+                                        end_op = CompletedOp(graph_id=completed_op.graph_id, op_id=task_end_op_id)
+                                        self.result_socket.send_pyobj(end_op)
+                                    if completed_op.is_graph_completed():
+                                        self.result_socket.send_pyobj(completed_op)
+                                        del self._active_graphs[completed_op.graph_id]
 
                 except queue.Empty:
                     pass
@@ -482,7 +481,7 @@ class TransferManagerHandleBase(ABC):
         pass
 
     @abstractmethod
-    def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
+    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         pass
 
     @abstractmethod
@@ -512,7 +511,7 @@ class TransferManagerIntraProcessHandle(TransferManagerHandleBase):
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         self.transfer_manager.submit_batch(transfer_graphs)
 
-    def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
+    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         return self.transfer_manager.wait(timeout)
 
     def shutdown(self) -> None:
@@ -672,13 +671,15 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         })
         nvtx.end_range(nvtx_range)
 
-    def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
-        finished_ops: List[Tuple[int, int]] = []
+    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
+        finished_ops: List[CompletedOp] = []
         try:
             if self.result_parent_conn.poll(timeout=timeout):
-                finished_ops += self.result_parent_conn.recv()
+                received_ops = self.result_parent_conn.recv()
+                finished_ops += received_ops
                 while self.result_parent_conn.poll():
-                    finished_ops += self.result_parent_conn.recv()
+                    received_ops = self.result_parent_conn.recv()
+                    finished_ops += received_ops
         except EOFError:
             pass
 
@@ -782,11 +783,13 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
         while not self._shutdown_flag:
             try:
                 result = self.result_socket.recv_pyobj(zmq.NOBLOCK)
-                if isinstance(result, list) and len(result) == 2:
-                    graph_id, op_id = result
-
+                if isinstance(result, CompletedOp):
                     with self._result_buffer_lock:
-                        self._result_buffer.append((graph_id, op_id))
+                        self._result_buffer.append(result)
+                elif isinstance(result, list) and len(result) == 2:
+                    completed_op = CompletedOp.from_tuple(tuple(result))
+                    with self._result_buffer_lock:
+                        self._result_buffer.append(completed_op)
                 else:
                     flexkv_logger.warning(f"Unexpected result format from remote: {result}")
 
@@ -856,13 +859,14 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
         except Exception as e:
             flexkv_logger.error(f"Failed to submit batch graphs to remote: {e}")
 
-    def wait(self, timeout: float | None = None) -> List[Tuple[int, int]]:
+    def wait(self, timeout: float | None = None) -> List[CompletedOp]:
         start_time = time.time()
         results = []
 
         while True:
             with self._result_buffer_lock:
                 if self._result_buffer:
+                    # _result_buffer 直接存储 CompletedOp 对象
                     results.extend(self._result_buffer)
                     self._result_buffer.clear()
                     break
@@ -930,7 +934,7 @@ class TransferManagerHandle:
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         self._handle.submit_batch(transfer_graphs)
 
-    def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
+    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         return self._handle.wait(timeout)
 
     def shutdown(self) -> None:
