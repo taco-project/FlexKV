@@ -18,7 +18,7 @@ import subprocess
 import pickle
 import sys
 
-from flexkv.common.transfer import TransferOpGraph
+from flexkv.common.transfer import TransferOpGraph, CompletedOp
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
@@ -48,7 +48,7 @@ class TransferManager:
 
         self.transfer_engine: Optional[TransferEngine] = None
         self.storage_engine = StorageEngine(self.model_config, self.cache_config)
-        flexkv_logger.info(f"Initialized TransferManager with config successfully")
+        flexkv_logger.info("Initialized TransferManager with config successfully")
 
     def _handle_gpu_blocks_registration(self, req: RegisterTPClientRequest) -> None:
         device_id = req.device_id
@@ -98,7 +98,7 @@ class TransferManager:
             # self.context.term()
 
     def initialize_transfer_engine(self) -> None:
-        flexkv_logger.info(f"Initializing TransferEngine...")
+        flexkv_logger.info("Initializing TransferEngine...")
         self._register_gpu_blocks_via_socket()
 
         assert len(self.all_gpu_layouts) == self.model_config.tp_size * self.model_config.dp_size
@@ -127,7 +127,7 @@ class TransferManager:
                                               cpu_handle=cpu_handle,
                                               ssd_handle=ssd_handle,
                                               remote_handle=remote_handle)
-        flexkv_logger.info(f"Initialized TransferEngine successfully")
+        flexkv_logger.info("Initialized TransferEngine successfully")
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:
         self.transfer_engine.submit_transfer_graph(transfer_graph)
@@ -135,7 +135,7 @@ class TransferManager:
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         self.transfer_engine.submit_transfer_graph(transfer_graphs)
 
-    def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
+    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         return self.transfer_engine.get_completed_graphs_and_ops(timeout)
 
     def start(self) -> None:
@@ -189,7 +189,7 @@ class TransferManagerOnRemote(TransferManager):
         self._connect_to_master_transfer_manager()
 
         self._initialize_with_config()
-        flexkv_logger.info(f"Initialized TransferManagerOnRemote with config successfully")
+        flexkv_logger.info("Initialized TransferManagerOnRemote with config successfully")
 
     def _connect_to_master_transfer_manager(self) -> None:
         try:
@@ -222,7 +222,7 @@ class TransferManagerOnRemote(TransferManager):
                 {self.cache_config = }, {self.gpu_register_port = }.")
         else:
             raise RuntimeError(f"Expected config message, got: {config_msg}")
-        flexkv_logger.info(f"Received config from master successfully")
+        flexkv_logger.info("Received config from master successfully")
         super().__init__(self.model_config, self.cache_config, self.gpu_register_port)
 
     def _polling_worker(self) -> None:
@@ -288,17 +288,16 @@ class TransferManagerOnRemote(TransferManager):
 
                     if completed:
                         with self._active_graphs_lock:
-                            for graph_id, op_id in completed:
-                                if graph_id in self._active_graphs:
-                                    task_end_op_id = self._active_graphs[graph_id]
+                            for completed_op in completed:
+                                if completed_op.graph_id in self._active_graphs:
+                                    task_end_op_id = self._active_graphs[completed_op.graph_id]
 
-                                    if task_end_op_id != -1 and op_id == task_end_op_id:
-                                        self.result_socket.send_pyobj(
-                                            [task_end_op_id, graph_id]
-                                        )
-                                    if op_id == -1:
-                                        self.result_socket.send_pyobj([-1, graph_id])
-                                        del self._active_graphs[graph_id]
+                                    if task_end_op_id != -1 and completed_op.op_id == task_end_op_id:
+                                        end_op = CompletedOp(graph_id=completed_op.graph_id, op_id=task_end_op_id)
+                                        self.result_socket.send_pyobj(end_op)
+                                    if completed_op.is_graph_completed():
+                                        self.result_socket.send_pyobj(completed_op)
+                                        del self._active_graphs[completed_op.graph_id]
 
                 except queue.Empty:
                     pass
@@ -383,7 +382,7 @@ class TransferManagerOnRemote(TransferManager):
             import pickle
             import tempfile
             from flexkv.common.debug import flexkv_logger
-            
+
             # Immediately disable MPI to avoid conflicts
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
 
@@ -401,7 +400,7 @@ class TransferManagerOnRemote(TransferManager):
                 flexkv_logger.info(f"Starting TransferManagerOnRemote instance...")
                 instance.start()
                 flexkv_logger.info(f"TransferManager instance started successfully")
-                
+
                 # Keep running until worker thread exits
                 if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
                     instance._worker_thread.join()
@@ -482,7 +481,7 @@ class TransferManagerHandleBase(ABC):
         pass
 
     @abstractmethod
-    def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
+    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         pass
 
     @abstractmethod
@@ -512,7 +511,7 @@ class TransferManagerIntraProcessHandle(TransferManagerHandleBase):
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         self.transfer_manager.submit_batch(transfer_graphs)
 
-    def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
+    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         return self.transfer_manager.wait(timeout)
 
     def shutdown(self) -> None:
@@ -537,7 +536,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         self.start_event = self.mp_ctx.Event()
         self.ready_event = self.mp_ctx.Event()
 
-        self._completed_results: List[Tuple[int, int]] = []
+        self._completed_results: List[CompletedOp] = []
 
     def _start_process(self) -> None:
         if self.process is not None and self.process.is_alive():
@@ -571,29 +570,29 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             transfer_manager.initialize_transfer_engine()
             transfer_manager.start()
             ready_event.set()
-            
+
             # Setup selector for event-driven processing (complete zero polling!)
             sel = selectors.DefaultSelector()
             sel.register(command_conn.fileno(), selectors.EVENT_READ, data="command")
             # Also monitor completed_queue for finished ops (now it's mp.Queue with _reader)
-            sel.register(transfer_manager.transfer_engine.completed_queue._reader, 
+            sel.register(transfer_manager.transfer_engine.completed_queue._reader,
                         selectors.EVENT_READ, data="finished_ops")
-            
+
             flexkv_logger.info("TransferManager daemon process started with selector-based event monitoring (command + finished_ops)")
-            
+
             while True:
                 try:
                     # Event-driven: wait for command OR finished_ops (ZERO LATENCY!)
                     # Complete blocking with NO TIMEOUT - shutdown via terminate()
                     events = sel.select(timeout=None)
-                    
+
                     # Process all events
                     has_finished_ops = False
-                    
+
                     for key, mask in events:
                         if key.data == "command":
                             # New command available
-                            inner_range = nvtx.start_range(message=f"TransferManagerInter.process_worker.req", color="red")
+                            inner_range = nvtx.start_range(message="TransferManagerInter.process_worker.req", color="red")
                             request = command_conn.recv()
                             request_type = request.get('type')
                             if request_type == 'submit':
@@ -603,14 +602,14 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                             else:
                                 flexkv_logger.error(f"Unrecognized request type: {request_type}")
                             nvtx.end_range(inner_range)
-                        
+
                         elif key.data == "finished_ops":
                             # Selector reports finished_ops queue has data
                             has_finished_ops = True
-                    
+
                     # Only collect finished_ops if selector reported data available
                     if has_finished_ops:
-                        inner_range = nvtx.start_range(message=f"TransferManagerInter.process_worker.results", color="red")
+                        inner_range = nvtx.start_range(message="TransferManagerInter.process_worker.results", color="red")
                         try:
                             # Directly get from completed_queue without timeout to avoid poll
                             finished_ops = []
@@ -620,13 +619,13 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                                     finished_ops.append(completed_queue.get_nowait())
                                 except queue.Empty:
                                     break
-                            
+
                             if finished_ops:
                                 result_conn.send(finished_ops)
                         except Exception as e:
                             flexkv_logger.error(f"Error collecting finished ops: {e}")
                         nvtx.end_range(inner_range)
-                    
+
                 except Exception as e:
                     flexkv_logger.error(f"Error in transfer manager process: {e}")
 
@@ -639,7 +638,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     sel.close()
                 except Exception as e:
                     flexkv_logger.error(f"Error closing selector: {e}")
-            
+
             command_conn.close()
             result_conn.close()
 
@@ -653,7 +652,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         return self.ready_event.is_set()
 
     def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
-        nvtx_range = nvtx.start_range(message=f"TransferManagerInterProcessHandle.submit", color="green")
+        nvtx_range = nvtx.start_range(message="TransferManagerInterProcessHandle.submit", color="green")
         self.command_parent_conn.send({
             'type': 'submit',
             'transfer_graph': transfer_graph
@@ -663,7 +662,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         # Batch submit to reduce IPC overhead
         nvtx_range = nvtx.start_range(
-            message=f"TransferManagerInterProcessHandle.submit_batch count={len(transfer_graphs)}", 
+            message=f"TransferManagerInterProcessHandle.submit_batch count={len(transfer_graphs)}",
             color="green"
         )
         self.command_parent_conn.send({
@@ -672,13 +671,15 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         })
         nvtx.end_range(nvtx_range)
 
-    def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
-        finished_ops: List[Tuple[int, int]] = []
+    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
+        finished_ops: List[CompletedOp] = []
         try:
             if self.result_parent_conn.poll(timeout=timeout):
-                finished_ops += self.result_parent_conn.recv()
+                received_ops = self.result_parent_conn.recv()
+                finished_ops += received_ops
                 while self.result_parent_conn.poll():
-                    finished_ops += self.result_parent_conn.recv()
+                    received_ops = self.result_parent_conn.recv()
+                    finished_ops += received_ops
         except EOFError:
             pass
 
@@ -727,7 +728,7 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
         self._shutdown_flag = False
         self._connected = False
 
-        self._result_buffer: List[Tuple[int, int]] = []
+        self._result_buffer: List[CompletedOp] = []
         self._result_buffer_lock = threading.Lock()
 
         self._bind_master_ports()
@@ -782,11 +783,9 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
         while not self._shutdown_flag:
             try:
                 result = self.result_socket.recv_pyobj(zmq.NOBLOCK)
-                if isinstance(result, list) and len(result) == 2:
-                    op_id, graph_id = result
-
+                if isinstance(result, CompletedOp):
                     with self._result_buffer_lock:
-                        self._result_buffer.append((graph_id, op_id))
+                        self._result_buffer.append(result)
                 else:
                     flexkv_logger.warning(f"Unexpected result format from remote: {result}")
 
@@ -856,7 +855,7 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
         except Exception as e:
             flexkv_logger.error(f"Failed to submit batch graphs to remote: {e}")
 
-    def wait(self, timeout: float | None = None) -> List[Tuple[int, int]]:
+    def wait(self, timeout: float | None = None) -> List[CompletedOp]:
         start_time = time.time()
         results = []
 
@@ -930,7 +929,7 @@ class TransferManagerHandle:
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         self._handle.submit_batch(transfer_graphs)
 
-    def wait(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
+    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         return self._handle.wait(timeout)
 
     def shutdown(self) -> None:
