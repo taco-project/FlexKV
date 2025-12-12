@@ -347,18 +347,18 @@ class KVTaskManager:
         results = []
         for transfer_handle in self.transfer_handles:
             completed_ops = transfer_handle.wait(timeout)
-            for op_id, graph_id in completed_ops:
+            for graph_id, op_id in completed_ops:
                 if op_id == -1:
                     completed_count = self.uncompleted_graphs.get(graph_id, 0) + 1
                     if completed_count == self.required_completed_count:
-                        results.append((-1, graph_id))
+                        results.append((graph_id, -1))
                         self.uncompleted_graphs.pop(graph_id, None)
                     else:
                         self.uncompleted_graphs[graph_id] = completed_count
                 else:
                     completed_count = self.uncompleted_ops.get(op_id, 0) + 1
                     if completed_count == self.required_completed_count:
-                        results.append((op_id, graph_id))
+                        results.append((graph_id, op_id))
                         self.uncompleted_ops.pop(op_id, None)
                     else:
                         self.uncompleted_ops[op_id] = completed_count
