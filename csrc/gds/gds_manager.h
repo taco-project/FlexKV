@@ -32,6 +32,20 @@ public:
     ~GDSManager();
     
     /**
+     * Add a new file to the manager
+     * @param filename Path to the file to add
+     * @return true on success, false on failure
+     */
+    bool add_file(const char* filename);
+    
+    /**
+     * Remove a file from the manager
+     * @param filename Path to the file to remove
+     * @return true on success, false on failure
+     */
+    bool remove_file(const char* filename);
+    
+    /**
      * Write data from GPU memory directly to storage
      * @param filename Path to the file (will be created if not exists)
      * @param gpu_data Pointer to GPU memory containing data to write
@@ -65,6 +79,12 @@ public:
     const std::vector<std::string>& get_file_paths(int device_id) const;
     
     /**
+     * Get number of devices
+     * @return Number of devices
+     */
+    int get_num_devices() const;
+    
+    /**
      * Get number of files per device
      * @return Number of files per device
      */
@@ -76,7 +96,7 @@ public:
      * @param count Number of operations
      * @return batch_id on success, or -1 on error
      */
-    int batch_write(const struct BatchWriteOp* operations, int count);
+    int batch_write(const struct BatchOp* operations, int count);
 
 private:
     // Non-copyable and non-movable
@@ -85,27 +105,26 @@ private:
     GDSManager(GDSManager&&) = delete;
     GDSManager& operator=(GDSManager&&) = delete;
 
-    // File resource structure
-    struct FileResource {
-#ifdef ENABLE_GDS
-        int fd;
-        CUfileHandle_t cf_handle;
-#endif
-        std::string filepath;
-        
-        FileResource() 
-#ifdef ENABLE_GDS
-            : fd(-1)
-#endif
-        {}
-    };
-
+    int num_devices_;
     int num_files_per_device_;
     std::vector<std::vector<std::string>> file_paths_;
     
 #ifdef ENABLE_GDS
     std::unordered_map<std::string, FileResource> file_resources_;
 #endif
+    
+    /**
+     * Open and register a single file with cuFile
+     * @param filename Path to the file
+     * @return true on success, false on failure
+     */
+    bool open_file_internal(const char* filename);
+    
+    /**
+     * Close and cleanup a single file resource
+     * @param filename Path to the file
+     */
+    virtual void close_file_internal(const char* filename) = 0;
     
     /**
      * Get or create file resource
@@ -118,12 +137,14 @@ private:
 /**
  * Batch operation structures
  */
-struct BatchWriteOp {
-    const char* filename;         // File path
-    void* gpu_data;         // GPU memory containing data to write
-    size_t size;                  // Number of bytes to write
-    size_t file_offset;           // Offset in file where to write
-    ssize_t* result;              // Output: bytes written or -1 on error
+struct BatchWriteOp : public BatchOp {
+    const char* filename; // File path
+    void* gpu_data;       // GPU memory containing data to write
+};
+
+struct BatchReadOp : public BatchOp {
+    const char* filename; // File path
+    void* gpu_buffer;     // GPU memory buffer to receive data
 }; 
 
 namespace flexkv {
