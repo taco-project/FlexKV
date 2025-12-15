@@ -30,6 +30,7 @@ from flexkv.server.request import (
     CheckRunningRequest,
     StartRequest,
     ShutdownRequest,
+    PrefetchRequest,
     Response
 )
 
@@ -118,6 +119,14 @@ class KVDPClient:
         else:
             flexkv_logger.error(f"put_match failed, error_msg: {response.error_msg}")
             return None
+
+    def prefetch_async(
+        self,
+        token_ids: np.ndarray,
+    ) -> int:
+        req = PrefetchRequest(self.dp_client_id, token_ids, self._get_task_id())
+        self.send_to_server.send_pyobj(req)
+        return req.task_id
 
     def get_async(
         self,

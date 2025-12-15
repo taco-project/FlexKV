@@ -227,6 +227,19 @@ class CacheEngine:
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
 
+@dataclass
+class CacheStrategy:
+    # if True, will not put or get blocks from GPU
+    ignore_gpu: bool = False
+    # if True, will not put or get blocks from SSD
+    ignore_ssd: bool = False
+    # if True, will not get blocks from REMOTE
+    ignore_remote: bool = False
+    # if True, will not use GDS
+    ignore_gds: bool = False
+
+DEFAULT_CACHE_STRATEGY = CacheStrategy()
+
 class GlobalCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig):
         self.cache_config = cache_config
@@ -306,7 +319,9 @@ class GlobalCacheEngine:
             slot_mapping: np.ndarray,
             layer_num: int = -1,
             layer_granularity: int = -1,
-            dp_id: int = 0) -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
+            dp_id: int = 0,
+            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         if layer_num == -1:
@@ -338,7 +353,7 @@ class GlobalCacheEngine:
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
                                      tokens_per_block=self.cache_config.tokens_per_block)
 
-        if not self.cache_config.enable_remote:
+        if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             (transfer_graph, finished_ops_ids, node_to_unlock,
              op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
                 self._get_impl_local(
@@ -347,7 +362,8 @@ class GlobalCacheEngine:
                     block_start_idx,
                     block_end_idx,
                     gpu_block_ids,
-                    layer_num
+                    layer_num,
+                    temp_cache_strategy
                 )
         else:
             (transfer_graph, finished_ops_ids, node_to_unlock,
@@ -358,7 +374,8 @@ class GlobalCacheEngine:
                     block_start_idx,
                     block_end_idx,
                     gpu_block_ids,
-                    layer_num
+                    layer_num,
+                    temp_cache_strategy
                 )
 
         transfer_graph, task_end_op_id = add_virtal_op_for_mutiple_finished_ops(
@@ -398,7 +415,9 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num: int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
+            layer_num: int,
+            temp_cache_strategy: CacheStrategy) \
+                 -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
         """
         transfer pattern:
 
@@ -409,7 +428,11 @@ class GlobalCacheEngine:
         SSD:     ...      | fragment1 | fragment2      | fragment3(new)
 
         """
-        assert self.cache_config.enable_cpu and self.cache_config.enable_remote
+        enable_gpu = not temp_cache_strategy.ignore_gpu
+        enable_cpu = self.cache_config.enable_cpu
+        enable_ssd = self.cache_config.enable_ssd
+        enable_remote = self.cache_config.enable_remote and not temp_cache_strategy.ignore_remote
+        assert enable_cpu and enable_remote
         assert self.cpu_cache_engine is not None
         assert self.remote_cache_engine is not None
 
@@ -497,7 +520,7 @@ class GlobalCacheEngine:
 
         # prepare ssd blocks to transfer
         write_ssd_blocks_from_remote = False
-        if (self.cache_config.enable_ssd and
+        if (enable_ssd and
             op_remote2h is not None and
             ssd_matched_result.num_ready_matched_blocks >= block_mask_start and
             ssd_matched_result.num_ready_matched_blocks == ssd_matched_result.num_matched_blocks):
@@ -529,21 +552,21 @@ class GlobalCacheEngine:
                                                                     block_mask_start,
                                                                 is_ready=False,
                                                                 match_result=ssd_matched_result)
-
-        op_h2d = TransferOp(
-            graph_id = transfer_graph.graph_id,
-            transfer_type = TransferType.H2D,
-            src_block_ids = fragment123_cpu_blocks,
-            dst_block_ids = fragment123_gpu_blocks,
-            layer_id = 0,
-            layer_granularity = layer_num
-        )
-        transfer_graph.add_transfer_op(op_h2d)
-        if op_disk2h is not None:
-            transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
-        if op_remote2h is not None:
-            transfer_graph.add_dependency(op_h2d.op_id, op_remote2h.op_id)
-        finished_ops_ids.append(op_h2d.op_id)
+        if enable_gpu:
+            op_h2d = TransferOp(
+                graph_id = transfer_graph.graph_id,
+                transfer_type = TransferType.H2D,
+                src_block_ids = fragment123_cpu_blocks,
+                dst_block_ids = fragment123_gpu_blocks,
+                layer_id = 0,
+                layer_granularity = layer_num
+            )
+            transfer_graph.add_transfer_op(op_h2d)
+            if op_disk2h is not None:
+                transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
+            if op_remote2h is not None:
+                transfer_graph.add_dependency(op_h2d.op_id, op_remote2h.op_id)
+            finished_ops_ids.append(op_h2d.op_id)
 
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
@@ -558,7 +581,7 @@ class GlobalCacheEngine:
         # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
         return (
             transfer_graph, finished_ops_ids, node_to_unlock, {}, buffer_to_free,
-            len(fragment123_gpu_blocks)  # op_node_to_ready: {}
+            len(fragment123_gpu_blocks) if enable_gpu else 0  # op_node_to_ready: {}
         )
 
     def _get_impl_local(self,
@@ -567,7 +590,9 @@ class GlobalCacheEngine:
                         block_mask_start: int,
                         block_mask_end: int,
                         gpu_block_ids: np.ndarray,
-                        layer_num: int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
+                        layer_num: int,
+                        temp_cache_strategy: CacheStrategy) \
+                            -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
         """
         transfer pattern:
 
@@ -579,13 +604,17 @@ class GlobalCacheEngine:
 
         """
         nvtx_range = nvtx.start_range(message=f"CacheEngine.get_impl_local[{request_id}]", color="cyan")
-        assert self.cache_config.enable_cpu
+        enable_gpu = not temp_cache_strategy.ignore_gpu
+        enable_cpu = self.cache_config.enable_cpu
+        enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
+        enable_gds = self.cache_config.enable_gds and not temp_cache_strategy.ignore_gds
+        assert enable_cpu
         assert self.cpu_cache_engine is not None
 
         if self.index_accel:
-            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta)
+            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta, temp_cache_strategy)
         else:
-            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
+            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
 
         # tailor the blocks to assure:
         # the blocks are needed by the mask & the blocks are ready
@@ -620,7 +649,7 @@ class GlobalCacheEngine:
         op_gds_transfer = None
         fragment2_cpu_blocks = None
         if fragment2_num_blocks > 0:
-            if self.cache_config.enable_gds:
+            if enable_gds:
                 # For GDS, transfer directly from SSD to GPU using GDS transfer path (DISK2D)
                 op_gds_transfer = TransferOp(
                     graph_id = transfer_graph.graph_id,
@@ -674,19 +703,21 @@ class GlobalCacheEngine:
             fragment12_cpu_blocks = np.concatenate([fragment1_cpu_blocks, fragment2_cpu_blocks])
         else:
             fragment12_cpu_blocks = fragment1_cpu_blocks
-        op_h2d = TransferOp(
-            graph_id = transfer_graph.graph_id,
-            transfer_type = TransferType.H2D,
-            src_block_ids = fragment12_cpu_blocks if not self.cache_config.enable_gds else fragment1_cpu_blocks,
-            dst_block_ids = fragment12_gpu_blocks if not self.cache_config.enable_gds \
-                else fragment12_gpu_blocks[:fragment1_num_blocks],
-            layer_id = 0,
-            layer_granularity = layer_num
-        )
-        transfer_graph.add_transfer_op(op_h2d)
-        if op_disk2h is not None:
-            transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
-        finished_ops_ids.append(op_h2d.op_id)
+
+        if enable_gpu:
+            op_h2d = TransferOp(
+                graph_id = transfer_graph.graph_id,
+                transfer_type = TransferType.H2D,
+                src_block_ids = fragment12_cpu_blocks if not enable_gds else fragment1_cpu_blocks,
+                dst_block_ids = fragment12_gpu_blocks if not enable_gds \
+                    else fragment12_gpu_blocks[:fragment1_num_blocks],
+                layer_id = 0,
+                layer_granularity = layer_num
+            )
+            transfer_graph.add_transfer_op(op_h2d)
+            if op_disk2h is not None:
+                transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
+            finished_ops_ids.append(op_h2d.op_id)
 
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
@@ -697,7 +728,7 @@ class GlobalCacheEngine:
         nvtx.end_range(nvtx_range)
         return (
             transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
-            buffer_to_free, len(fragment12_gpu_blocks)
+            buffer_to_free, len(fragment12_gpu_blocks) if enable_gpu else 0
         )
 
     def put(self,
@@ -706,7 +737,9 @@ class GlobalCacheEngine:
             token_mask: np.ndarray,
             slot_mapping: np.ndarray,
             layer_num : int = -1,
-            dp_id: int = 0) -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
+            dp_id: int = 0,
+            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         if layer_num == -1:
@@ -726,7 +759,8 @@ class GlobalCacheEngine:
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
                                      tokens_per_block=self.cache_config.tokens_per_block)
 
-        if not self.cache_config.enable_remote:
+        assert not temp_cache_strategy.ignore_gpu
+        if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
              buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
                 self._put_impl_local(
@@ -735,7 +769,8 @@ class GlobalCacheEngine:
                     block_start_idx,
                     block_end_idx,
                     gpu_block_ids,
-                    layer_num
+                    layer_num,
+                    temp_cache_strategy
                 )
         else:
             (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
@@ -746,7 +781,8 @@ class GlobalCacheEngine:
                     block_start_idx,
                     block_end_idx,
                     gpu_block_ids,
-                    layer_num
+                    layer_num,
+                    temp_cache_strategy
                 )
 
         transfer_graph, task_end_op_id = add_virtal_op_for_mutiple_finished_ops(
@@ -781,7 +817,9 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num : int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
+            layer_num : int,
+            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
         """
         transfer pattern:
 
@@ -796,14 +834,22 @@ class GlobalCacheEngine:
         REMOTE:     (remote cached)   |   fragment3(new)   |
 
         """
-        assert self.cache_config.enable_cpu and self.cache_config.enable_remote
+        enable_gpu = not temp_cache_strategy.ignore_gpu
+        enable_cpu = self.cache_config.enable_cpu
+        enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
+        enable_remote = self.cache_config.enable_remote and not temp_cache_strategy.ignore_remote
+        assert enable_gpu
+        assert enable_cpu
+        assert enable_remote
         assert self.cpu_cache_engine is not None
         assert self.remote_cache_engine is not None
 
         if self.index_accel:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta,
+                                                                                               temp_cache_strategy=temp_cache_strategy)
         else:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta,
+                                                                                           temp_cache_strategy=temp_cache_strategy)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
@@ -816,7 +862,7 @@ class GlobalCacheEngine:
         if fragment12_num_blocks == 0:
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
-        if not self.cache_config.enable_ssd:
+        if not enable_ssd:
             fragment2_num_blocks = 0
         fragment3_num_blocks = len(gpu_block_ids) - len(remote_matched_blocks)
 
@@ -831,7 +877,7 @@ class GlobalCacheEngine:
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
             return self._empty_put_return(request_id)
         put_to_ssd = False
-        if self.cache_config.enable_ssd and fragment2_num_blocks > 0:
+        if enable_ssd and fragment2_num_blocks > 0:
             fragment2_ssd_blocks = self.ssd_cache_engine.take(
                 num_required_blocks=fragment2_num_blocks,
                 protected_node = ssd_matched_result.last_node,
@@ -872,7 +918,12 @@ class GlobalCacheEngine:
         finished_ops_ids.append(op_d2h.op_id)
 
         if put_to_ssd:
-            fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
+            if len(fragment12_cpu_blocks) < fragment2_num_blocks:
+                num_needed_from_cpu_matched = fragment2_num_blocks - len(fragment12_cpu_blocks)
+                fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[-num_needed_from_cpu_matched:], \
+                    fragment12_cpu_blocks])
+            else:
+                fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
             op_h2disk = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2DISK,
@@ -939,7 +990,9 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num : int) -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
+            layer_num : int,
+            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
         """
         transfer pattern:
 
@@ -950,14 +1003,20 @@ class GlobalCacheEngine:
         SSD:          (ssd cached)         | fragment2(new) |
 
         """
-        assert self.cache_config.enable_cpu
+        enable_gpu = not temp_cache_strategy.ignore_gpu
+        enable_cpu = self.cache_config.enable_cpu
+        enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
+        enable_gds = self.cache_config.enable_gds and not temp_cache_strategy.ignore_gds
+        assert enable_gpu
+        assert enable_cpu
         assert self.cpu_cache_engine is not None
-        # assert self.ssd_cache_engine is not None
 
         if  self.index_accel:
-            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta)
+            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta,
+                                                                            temp_cache_strategy=temp_cache_strategy)
         else:
-            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta)
+            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta,
+                                                                      temp_cache_strategy=temp_cache_strategy)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
@@ -968,7 +1027,7 @@ class GlobalCacheEngine:
         if fragment12_num_blocks == 0:
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
-        if not self.cache_config.enable_ssd and not self.cache_config.enable_gds:
+        if not enable_ssd:
             fragment2_num_blocks = 0
 
         fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
@@ -979,7 +1038,7 @@ class GlobalCacheEngine:
             strict=False
         )
 
-        if self.cache_config.enable_ssd:
+        if enable_ssd:
             fragment2_ssd_blocks = self.ssd_cache_engine.take(
                 num_required_blocks=fragment2_num_blocks,
                 protected_node = ssd_matched_result.last_node,
@@ -991,7 +1050,7 @@ class GlobalCacheEngine:
         if len(fragment12_cpu_blocks) < fragment12_num_blocks or \
             len(fragment2_ssd_blocks) < fragment2_num_blocks:
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
-            if self.cache_config.enable_ssd:
+            if enable_ssd:
                 self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
             return self._empty_put_return(request_id)
 
@@ -1012,10 +1071,13 @@ class GlobalCacheEngine:
 
         if fragment2_num_blocks > 0:
             if len(fragment12_cpu_blocks) < fragment2_num_blocks:
-                flexkv_logger.warning(f"fragment12_cpu_blocks: {len(fragment12_cpu_blocks)}, fragment2_num_blocks: {fragment2_num_blocks}, \
-                    cpu match blocks is bigger than SSD match blocks number. This should not often happen if CPU cache size is smaller than SSD cache size.")
+                flexkv_logger.warning(f"fragment12_cpu_blocks: {len(fragment12_cpu_blocks)}, "
+                                      f"fragment2_num_blocks: {fragment2_num_blocks}, "
+                                      f"cpu match blocks are bigger than SSD match blocks number. "
+                                      f"This should not often happen if CPU cache size is smaller than SSD cache size.")
                 num_needed_from_cpu_matched = fragment2_num_blocks - len(fragment12_cpu_blocks)
-                fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[-num_needed_from_cpu_matched:], fragment12_cpu_blocks])
+                fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[-num_needed_from_cpu_matched:], \
+                    fragment12_cpu_blocks])
             else:
                 fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
             op_h2disk = TransferOp(
@@ -1095,53 +1157,64 @@ class GlobalCacheEngine:
             self.remote_cache_engine.set_ready(node_to_ready, True, ready_length)
 
     @nvtx.annotate("Match Prefix Accel", color="yellow")
-    def match_local_accel(self, sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel]:
+    def match_local_accel(self,
+                          sequence_meta: SequenceMeta,
+                          temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                              -> Tuple[MatchResultAccel, MatchResultAccel]:
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
         if self.cpu_cache_engine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
-        if self.ssd_cache_engine:
+        if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
 
     @nvtx.annotate("Match Prefix", color="yellow")
-    def match_local(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult]:
+    def match_local(self,
+                    sequence_meta: SequenceMeta,
+                    temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                        -> Tuple[MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
         if self.cpu_cache_engine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
-        if self.ssd_cache_engine:
+        if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result
 
     @nvtx.annotate("Match All Prefix accel", color="yellow")
     def match_all_accel(self,
-                        sequence_meta: SequenceMeta) -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:
+                        sequence_meta: SequenceMeta,
+                        temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                            -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
         remote_matched_result = MatchResultAccel()
         # TODO: avoid redundant match?
         if self.cpu_cache_engine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
-        if self.ssd_cache_engine:
+        if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
-        if self.remote_cache_engine:
+        if self.remote_cache_engine and not temp_cache_strategy.ignore_remote:
             remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result
     @nvtx.annotate("Match All Prefix", color="yellow")
-    def match_all(self, sequence_meta: SequenceMeta) -> Tuple[MatchResult, MatchResult, MatchResult]:
+    def match_all(self,
+                  sequence_meta: SequenceMeta,
+                  temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                      -> Tuple[MatchResult, MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
         remote_matched_result = MatchResult()
         # TODO: avoid redundant match?
         if self.cpu_cache_engine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
-        if self.ssd_cache_engine:
+        if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
-        if self.remote_cache_engine:
+        if self.remote_cache_engine and not temp_cache_strategy.ignore_remote:
             remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result

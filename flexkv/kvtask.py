@@ -16,13 +16,14 @@ from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
 from flexkv.common.tracer import FlexKVTracer
-from flexkv.cache.cache_engine import GlobalCacheEngine
+from flexkv.cache.cache_engine import GlobalCacheEngine, DEFAULT_CACHE_STRATEGY
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
 from flexkv.transfer_manager import (
     get_master_host_and_ports_from_env,
     get_trtllm_subprocess_host_and_ports_from_env
 )
+from flexkv.common.hash_utils import hash_array
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -41,6 +42,7 @@ class TaskStatus(Enum):
 class TaskType(Enum):
     GET = "get"
     PUT = "put"
+    PREFETCH = "prefetch"
     BATCH_GET = "batch_get"
 
 @dataclass
@@ -151,6 +153,11 @@ class KVTaskManager:
             self.transfer_handles[-1]._handle.send_config_to_remotes()
 
         self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
+
+        # hash(token_ids) -> task_id
+        self.prefetch_tasks: ExpiringDict[int, int] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
+        self._hash_func = lambda x: hash_array(x)
+
         self.graph_to_task: Dict[int, int] = {}
 
         self.uncompleted_ops: Dict[int, int] = {}  # op_id -> completed_count
@@ -248,6 +255,42 @@ class KVTaskManager:
             return_mask=return_mask,
             callback=callback,
             op_callback_dict=op_callback_dict)
+        self.graph_to_task[graph.graph_id] = task_id
+
+    def create_prefetch_task(self,
+                            task_id: int,
+                            token_ids: np.ndarray,
+                            ) -> None:
+        if task_id in self.tasks:
+            raise ValueError(f"Task ID {task_id} already exists")
+        fake_slot_mapping = np.zeros_like(token_ids)
+        fake_token_mask = np.ones_like(token_ids)
+        temp_cache_strategy = copy.deepcopy(DEFAULT_CACHE_STRATEGY)
+        temp_cache_strategy.ignore_gpu = True  # upload to CPU only
+        temp_cache_strategy.ignore_gds = True
+        graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.get(task_id,
+                                                                               token_ids,
+                                                                               fake_token_mask,
+                                                                               fake_slot_mapping,
+                                                                               self.model_config.num_layers,
+                                                                               temp_cache_strategy=temp_cache_strategy)
+        self.tasks[task_id] = KVTask(
+            task_id=task_id,
+            task_type=TaskType.PREFETCH,
+            task_end_op_id=task_end_op_id,
+            task_end_op_finished=False,
+            status=TaskStatus.READY,  # gpu slots are not needed for prefetch
+            token_ids=token_ids,
+            slot_mapping=fake_slot_mapping,  # ignore slot_mapping for prefetch
+            token_mask=fake_token_mask,  # ignore token_mask for prefetch
+            dp_id=0,  # ignore dp_id for prefetch
+            graph=graph,
+            return_mask=return_mask,
+            callback=callback,
+            op_callback_dict=op_callback_dict)
+
+        self.prefetch_tasks[self._hash_func(token_ids)] = task_id
+
         self.graph_to_task[graph.graph_id] = task_id
 
     def _launch_task(self, task_id: int) -> None:
@@ -425,6 +468,7 @@ class KVTaskEngine(KVTaskManager):
                   layer_granularity: int = -1,
                   dp_id: int = 0,
                   task_id: int = -1) -> Tuple[int, np.ndarray]:
+        self._sync_prefetch(token_ids)
         task_id, return_mask = self._get_match_impl(token_ids,
                                                     slot_mapping,
                                                     is_fake_slot_mapping=False,
@@ -557,6 +601,14 @@ class KVTaskEngine(KVTaskManager):
         nvtx.pop_range()
         return return_responses
 
+    def _sync_prefetch(self, token_ids: np.ndarray) -> None:
+        prefetch_task_id = self.prefetch_tasks.get(self._hash_func(token_ids), None)
+        if prefetch_task_id is not None:
+            start_time = time.time()
+            self.wait([prefetch_task_id], completely=True)
+            end_time = time.time()
+            flexkv_logger.debug(f"sync prefetch task {prefetch_task_id} cost {(end_time - start_time) * 1000} ms")
+
     def get_match(self,
                   token_ids: np.ndarray,
                   token_mask: Optional[np.ndarray] = None,
@@ -564,6 +616,7 @@ class KVTaskEngine(KVTaskManager):
                   dp_id: int = 0,
                   task_id: int = -1) -> Tuple[int, np.ndarray]:
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
+        self._sync_prefetch(token_ids)
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
         fake_slot_mapping = np.zeros_like(token_ids[token_mask])
@@ -658,6 +711,29 @@ class KVTaskEngine(KVTaskManager):
         self._process_empty_graph(task_id)
         nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
+
+    def prefetch_async(self,
+                       token_ids: np.ndarray,
+                       dp_id: int = 0,
+                       task_id: int = -1) -> int:
+        if task_id == -1:
+            task_id = self._gen_task_id()
+        nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
+        self.create_prefetch_task(task_id, token_ids)
+        self._process_empty_graph(task_id)
+        nvtx.pop_range()
+        # trace prefetch async request
+        self.tracer.trace_request(
+            request_type="PREFETCH_ASYNC",
+            request_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=np.zeros_like(token_ids),
+            token_mask=np.ones_like(token_ids),
+            layer_granularity=-1,
+            dp_id=dp_id
+        )
+        self._launch_task(task_id)
+        return task_id
 
     def merge_to_batch_kvtask(self, batch_id: int, task_ids: List[int]) -> TransferOpGraph:
         op_callback_dict = {}
