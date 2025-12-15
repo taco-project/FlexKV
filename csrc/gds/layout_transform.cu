@@ -27,6 +27,7 @@ __global__ void layout_transform_kernel(
     int64_t buffer_layer_stride,
     int64_t buffer_kv_stride,
     int64_t buffer_block_stride,
+    int64_t buffer_chunk_offset,
     int64_t chunk_size,
     GTensorHandler gpu_handler,
     int64_t* gpu_block_ids,
@@ -50,7 +51,8 @@ __global__ void layout_transform_kernel(
         int64_t* buffer_ptr = buffer_base + 
                                block_local_idx * buffer_block_stride +
                                layer_idx * buffer_layer_stride +
-                               kv_idx * buffer_kv_stride;
+                               kv_idx * buffer_kv_stride +
+                               buffer_chunk_offset;
         
         // Calculate target GPU pointer
         int64_t* gpu_ptr = ptr_at<Type>(gpu_handler, layer_idx, kv_idx, gpu_block_idx);
@@ -71,6 +73,7 @@ void launch_layout_transform_kernel(
     int64_t buffer_layer_stride,
     int64_t buffer_kv_stride,
     int64_t buffer_block_stride,
+    int64_t buffer_chunk_offset,
     int64_t chunk_size,
     GTensorHandler gpu_handler,
     int64_t* gpu_block_ids,
@@ -103,6 +106,7 @@ void launch_layout_transform_kernel(
         buffer_layer_stride,
         buffer_kv_stride,
         buffer_block_stride,
+        buffer_chunk_offset,
         chunk_size,
         gpu_handler,
         gpu_block_ids,
@@ -115,15 +119,15 @@ void launch_layout_transform_kernel(
 
 // Explicit template instantiations
 template void launch_layout_transform_kernel<BackendType::VLLM>(
-    int64_t*, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
+    int64_t*, int64_t, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
     int, int, bool, bool, cudaStream_t);
 
 template void launch_layout_transform_kernel<BackendType::TRTLLM>(
-    int64_t*, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
+    int64_t*, int64_t, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
     int, int, bool, bool, cudaStream_t);
 
 template void launch_layout_transform_kernel<BackendType::SGLANG>(
-    int64_t*, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
+    int64_t*, int64_t, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
     int, int, bool, bool, cudaStream_t);
 
 } // namespace flexkv

@@ -715,6 +715,10 @@ void transfer_kv_blocks_gds(
     const int64_t total_buffer_size = ssd_block_stride_in_bytes * num_slots;
     
 #ifdef ENABLE_GDS
+
+    int current_device;
+    cudaGetDevice(&current_device);
+    
     void* buffer_ptr = nullptr;
     cudaError_t cuda_status = cudaMalloc(&buffer_ptr, total_buffer_size);
     if (cuda_status != cudaSuccess) {
@@ -744,8 +748,9 @@ void transfer_kv_blocks_gds(
     }
 
     const int64_t buffer_layer_stride = ssd_layer_stride_in_bytes / sizeof(int64_t);
-    const int64_t buffer_kv_stride = chunk_size_in_bytes / sizeof(int64_t);
+    const int64_t buffer_kv_stride = ssd_kv_stride_in_bytes / sizeof(int64_t);
     const int64_t buffer_block_stride = ssd_block_stride_in_bytes / sizeof(int64_t);
+    const int64_t buffer_chunk_offset = ssd_copy_off_inside_chunks / sizeof(int64_t);
     const int64_t chunk_size = chunk_size_in_bytes / sizeof(int64_t);
     const int32_t start_layer = gpu_layer_id_list_ptr[0];
     
@@ -762,7 +767,9 @@ void transfer_kv_blocks_gds(
             const int ssd_block_id = ssd_blocks[j];
             const int slot_id = (device_id * gpu_blocks.size() + j) % num_slots;
             
-            futures.push_back(gds_manager.enqueue_task([&, device_id, gpu_block_id, ssd_block_id, slot_id]() {
+            futures.push_back(gds_manager.enqueue_task([&, device_id, gpu_block_id, ssd_block_id, slot_id, current_device]() {
+                // Set correct CUDA device for this worker thread
+                cudaSetDevice(current_device);
                 
                 std::lock_guard<std::mutex> slot_lock(slot_mutexes[slot_id]);
                 // Sync stream to ensure previous kernel on this slot completed
@@ -778,8 +785,7 @@ void transfer_kv_blocks_gds(
                 
                 const int64_t ssd_block_offset = 
                     ssd_block_stride_in_bytes * block_id_in_file +
-                    start_layer * ssd_layer_stride_in_bytes +
-                    ssd_copy_off_inside_chunks;
+                    start_layer * ssd_layer_stride_in_bytes;
                                 
                 // Per-slot stream and d_gpu_block_id
                 int64_t* d_my_block_id = d_gpu_block_ids + slot_id;
@@ -797,6 +803,7 @@ void transfer_kv_blocks_gds(
                         buffer_layer_stride,
                         buffer_kv_stride,
                         buffer_block_stride,
+                        buffer_chunk_offset,
                         chunk_size,
                         gpu_tensor_handler,
                         d_my_block_id,
@@ -814,6 +821,7 @@ void transfer_kv_blocks_gds(
                         buffer_layer_stride,
                         buffer_kv_stride,
                         buffer_block_stride,
+                        buffer_chunk_offset,
                         chunk_size,
                         gpu_tensor_handler,
                         d_my_block_id,
