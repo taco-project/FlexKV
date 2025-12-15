@@ -152,16 +152,16 @@ void transfer_kv_blocks_gds_binding(
     GDSManager& gds_manager,
     const torch::Tensor& gpu_layer_id_list,
     const torch::Tensor& gpu_layer_ptrs_tensor,
-    const torch::Tensor& gds_block_ids,
+    const torch::Tensor& ssd_block_ids,
     const torch::Tensor& gpu_block_ids,
     int64_t gpu_kv_stride_in_bytes,
     int64_t gpu_block_stride_in_bytes,
     int64_t gpu_layer_stride_in_bytes,
-    int64_t gds_layer_stride_in_bytes,
-    int64_t gds_block_stride_in_bytes,
-    int64_t gds_kv_stride_in_bytes,
+    int64_t ssd_layer_stride_in_bytes,
+    int64_t ssd_block_stride_in_bytes,
+    int64_t ssd_kv_stride_in_bytes,
     int64_t block_size_in_bytes,
-    int64_t gds_copy_off_inside_chunks,
+    int64_t ssd_copy_off_inside_chunks,
     int num_blocks_per_file,
     int64_t total_layers,
     bool is_read,
@@ -171,8 +171,8 @@ void transfer_kv_blocks_gds_binding(
 ) {
     TORCH_CHECK(gpu_layer_ptrs_tensor.dtype() == torch::kInt64,
                 "gpu_layer_ptrs must be int64");
-    TORCH_CHECK(gds_block_ids.dtype() == torch::kInt64,
-                "gds_block_ids must be int64");
+    TORCH_CHECK(ssd_block_ids.dtype() == torch::kInt64,
+                "ssd_block_ids must be int64");
     TORCH_CHECK(gpu_block_ids.dtype() == torch::kInt64,
                 "gpu_block_ids must be int64");
     TORCH_CHECK(gpu_layer_id_list.dtype() == torch::kInt32,
@@ -203,23 +203,23 @@ void transfer_kv_blocks_gds_binding(
     switch (backend_type) {
         case flexkv::BackendType::VLLM:
             flexkv::transfer_kv_blocks_gds<flexkv::BackendType::VLLM>(
-                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
-                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
-                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                gds_manager, gpu_layer_id_list, handler, ssd_block_ids, gpu_block_ids,
+                ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes,
+                block_size_in_bytes, ssd_copy_off_inside_chunks, num_blocks_per_file,
                 total_layers, is_read, verbose, is_mla);
             break;
         case flexkv::BackendType::TRTLLM:
             flexkv::transfer_kv_blocks_gds<flexkv::BackendType::TRTLLM>(
-                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
-                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
-                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                gds_manager, gpu_layer_id_list, handler, ssd_block_ids, gpu_block_ids,
+                ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes,
+                block_size_in_bytes, ssd_copy_off_inside_chunks, num_blocks_per_file,
                 total_layers, is_read, verbose, is_mla);
             break;
         case flexkv::BackendType::SGLANG:
             flexkv::transfer_kv_blocks_gds<flexkv::BackendType::SGLANG>(
-                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
-                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
-                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                gds_manager, gpu_layer_id_list, handler, ssd_block_ids, gpu_block_ids,
+                ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes,
+                block_size_in_bytes, ssd_copy_off_inside_chunks, num_blocks_per_file,
                 total_layers, is_read, verbose, is_mla);
             break;
     }
@@ -374,12 +374,12 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("transfer_kv_blocks_gds", &transfer_kv_blocks_gds_binding,
         "Transfer KV blocks between GPU and GDS storage", py::arg("gds_manager"),
         py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
-        py::arg("gds_block_ids"), py::arg("gpu_block_ids"),
+        py::arg("ssd_block_ids"), py::arg("gpu_block_ids"),
         py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
         py::arg("gpu_layer_stride_in_bytes"),
-        py::arg("gds_layer_stride_in_bytes"), py::arg("gds_block_stride_in_bytes"),
-        py::arg("gds_kv_stride_in_bytes"), py::arg("block_size_in_bytes"),
-        py::arg("gds_copy_off_inside_chunks"),
+        py::arg("ssd_layer_stride_in_bytes"), py::arg("ssd_block_stride_in_bytes"),
+        py::arg("ssd_kv_stride_in_bytes"), py::arg("block_size_in_bytes"),
+        py::arg("ssd_copy_off_inside_chunks"),
         py::arg("num_blocks_per_file"), py::arg("total_layers"), 
         py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false,
         py::arg("gpu_block_type") = 0);
