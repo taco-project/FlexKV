@@ -505,6 +505,38 @@ bool RedisMetaChannel::hmget_two_fields_for_keys(const std::vector<std::string> 
   return true;
 }
 
+bool RedisMetaChannel::hmget_three_fields_for_keys(const std::vector<std::string> &keys,
+                                                   const std::string &field1,
+                                                   const std::string &field2,
+                                                   const std::string &field3,
+                                                   std::vector<std::tuple<std::string, std::string, std::string>> &out) {
+  if (keys.empty()) return true;
+  
+  out.clear();
+  out.reserve(keys.size());
+  
+  // Batch HMGET for three fields
+  std::vector<std::vector<std::string>> batch;
+  batch.reserve(keys.size());
+  
+  for (const auto& key : keys) {
+    batch.push_back({"HMGET", key, field1, field2, field3});
+  }
+  
+  std::vector<std::vector<std::string>> replies;
+  if (!client.pipeline(batch, replies)) return false;
+  
+  for (const auto& reply : replies) {
+    if (reply.size() >= 3) {
+      out.emplace_back(reply[0], reply[1], reply[2]);
+    } else {
+      out.emplace_back("", "", "");
+    }
+  }
+  
+  return true;
+}
+
 size_t RedisMetaChannel::load_metas_by_keys(const std::vector<std::string> &keys,
                                             std::vector<BlockMeta> &out) {
   out.clear();

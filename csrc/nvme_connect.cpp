@@ -163,7 +163,7 @@ py::dict nvme_connect(py::dict nvmets) {
         }
     }
 
-    py::dict result; // Dict[int, Dict[str, str]
+    py::dict result; // Dict[int, Dict[str, str]]
     for (auto& [node_id, targets] : grouped_results) {
         py::dict per_node; // Dict[str, str]
         for (const auto& t : targets) {
