@@ -14,7 +14,7 @@ import numpy as np
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color
+from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
 from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
@@ -261,17 +261,17 @@ class KVTaskManager:
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
         completed_ops = self._get_completed_ops(timeout)
-        for completed_graph_id, completed_op_id in completed_ops:
-            if completed_graph_id not in self.graph_to_task:
+        for completed_op in completed_ops:
+            if completed_op.graph_id not in self.graph_to_task:
                 continue
-            task_id = self.graph_to_task[completed_graph_id]
+            task_id = self.graph_to_task[completed_op.graph_id]
             task = self.tasks[task_id]
-            if completed_op_id == -1:  # the graph is totally finished
+            if completed_op.is_graph_completed():
                 self._mark_completed(task_id)
-            elif completed_op_id == task.task_end_op_id:
+            elif completed_op.op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
-            if completed_op_id in task.op_callback_dict:
-                task.op_callback_dict[completed_op_id]()
+            if completed_op.op_id in task.op_callback_dict:
+                task.op_callback_dict[completed_op.op_id]()
 
     def _cancel_task(self, task_id: int) -> None:
         task = self.tasks[task_id]
@@ -343,25 +343,25 @@ class KVTaskManager:
         if task.graph.num_ops == 0:
             self._mark_completed(task_id)
 
-    def _get_completed_ops(self, timeout: Optional[float] = None) -> List[Tuple[int, int]]:
+    def _get_completed_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         results = []
         for transfer_handle in self.transfer_handles:
             completed_ops = transfer_handle.wait(timeout)
-            for op_id, graph_id in completed_ops:
-                if op_id == -1:
-                    completed_count = self.uncompleted_graphs.get(graph_id, 0) + 1
+            for completed_op in completed_ops:
+                if completed_op.is_graph_completed():
+                    completed_count = self.uncompleted_graphs.get(completed_op.graph_id, 0) + 1
                     if completed_count == self.required_completed_count:
-                        results.append((-1, graph_id))
-                        self.uncompleted_graphs.pop(graph_id, None)
+                        results.append(completed_op)
+                        self.uncompleted_graphs.pop(completed_op.graph_id, None)
                     else:
-                        self.uncompleted_graphs[graph_id] = completed_count
+                        self.uncompleted_graphs[completed_op.graph_id] = completed_count
                 else:
-                    completed_count = self.uncompleted_ops.get(op_id, 0) + 1
+                    completed_count = self.uncompleted_ops.get(completed_op.op_id, 0) + 1
                     if completed_count == self.required_completed_count:
-                        results.append((op_id, graph_id))
-                        self.uncompleted_ops.pop(op_id, None)
+                        results.append(completed_op)
+                        self.uncompleted_ops.pop(completed_op.op_id, None)
                     else:
-                        self.uncompleted_ops[op_id] = completed_count
+                        self.uncompleted_ops[completed_op.op_id] = completed_count
         return results
 
     def _check_config(self, model_config: ModelConfig, cache_config: CacheConfig) -> None:
@@ -674,10 +674,10 @@ class KVTaskEngine(KVTaskManager):
                 task_end_op_ids.append(self.tasks[task_id].task_end_op_id)
                 callbacks.append(self.tasks[task_id].callback)
                 return_masks.append(self.tasks[task_id].return_mask)
-        
+
         batch_task_graph, task_end_op_id, op_callback_dict = merge_to_batch_graph(batch_id,
-                                                                                  transfer_graphs, 
-                                                                                  task_end_op_ids, 
+                                                                                  transfer_graphs,
+                                                                                  task_end_op_ids,
                                                                                   op_callback_dict)
         self.tasks[batch_id] = KVTask(
             task_id=batch_id,
@@ -710,10 +710,10 @@ class KVTaskEngine(KVTaskManager):
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
         self.set_slot_mappings(task_ids, slot_mappings)
-        
+
         # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
-        
+
         if len(task_ids) > 1 and as_batch:
             if batch_id == -1:
                 batch_id = self._gen_task_id()
@@ -725,12 +725,12 @@ class KVTaskEngine(KVTaskManager):
                 transfer_graph = self.check_task_ready(task_id)
                 if transfer_graph is not None and transfer_graph.num_ops > 0:
                     transfer_graphs.append(transfer_graph)
-        
+
         # Submit all graphs in batch to reduce IPC overhead
         if transfer_graphs:
             for transfer_handle in self.transfer_handles:
                 transfer_handle.submit_batch(transfer_graphs)
-        
+
         nvtx.end_range(nvtx_range)
         return task_ids
 
