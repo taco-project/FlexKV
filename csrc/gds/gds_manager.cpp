@@ -44,6 +44,45 @@ int GDSManager::get_num_worker_threads() const {
     return num_worker_threads_;
 }
 
+bool GDSManager::initialize_driver() {
+#ifdef ENABLE_GDS
+    if (driver_initialized_) {
+        return true;
+    }
+    
+    CUfileError_t status = cuFileDriverOpen();
+    if (status.err == 0) {
+        driver_initialized_ = true;
+        return true;
+    } else {
+        set_error("Failed to initialize cuFile driver");
+        return false;
+    }
+#else
+    set_error("GDS support not compiled in (ENABLE_GDS not defined)");
+    return false;
+#endif
+}
+
+bool GDSManager::add_file(const char* filename) {
+    if (!filename) {
+        set_error("Invalid filename");
+        return false;
+    }
+    
+    return open_file_internal(filename);
+}
+
+bool GDSManager::remove_file(const char* filename) {
+    if (!filename) {
+        set_error("Invalid filename");
+        return false;
+    }
+    
+    close_file_internal(filename);
+    return true;
+}
+
 bool GDSManager::open_file_internal(const char* filename) {
     std::string file_key(filename);
     
@@ -323,7 +362,7 @@ ssize_t GDSManager::read_async(const char* filename, void* gpu_buffer, size_t si
     return bytes_read;
 }
 
-int GDSManager::batch_write(const struct BatchWriteOp* operations, int batch_size) {
+int GDSManager::batch_write(const struct BatchOp* operations, int batch_size) {
     if (!is_ready_) {
         set_error("GDS Manager not ready");
         return -1;
@@ -338,7 +377,7 @@ int GDSManager::batch_write(const struct BatchWriteOp* operations, int batch_siz
     std::vector<CUfileIOParams_t> io_params(batch_size);
     
     for (int i = 0; i < batch_size; ++i) {
-        const BatchWriteOp& op = operations[i];
+        const BatchOp& op = operations[i];
         
         if (!op.filename) {
             if (op.result) *op.result = -1;
@@ -387,7 +426,7 @@ int GDSManager::batch_write(const struct BatchWriteOp* operations, int batch_siz
     return batch_id;
 }
 
-int GDSManager::batch_read(const struct BatchReadOp* operations, int batch_size) {
+int GDSManager::batch_read(const struct BatchOp* operations, int batch_size) {
     if (!is_ready_) {
         set_error("GDS Manager not ready");
         return -1;
@@ -402,7 +441,7 @@ int GDSManager::batch_read(const struct BatchReadOp* operations, int batch_size)
     std::vector<CUfileIOParams_t> io_params(batch_size);
     
     for (int i = 0; i < batch_size; ++i) {
-        const BatchReadOp& op = operations[i];
+        const BatchOp& op = operations[i];
         
         if (!op.filename) {
             if (op.result) *op.result = -1;

@@ -12,6 +12,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_set>
+#include <tuple>
 
 #include "block_meta.h"
 
@@ -118,6 +119,13 @@ public:
                                  const std::string &field1,
                                  const std::string &field2,
                                  std::vector<std::pair<std::string, std::string>> &out);
+
+  // Pipeline HMGET for three fields over many keys. out[i] = {field1, field2, field3} for keys[i]
+  bool hmget_three_fields_for_keys(const std::vector<std::string> &keys,
+                                   const std::string &field1,
+                                   const std::string &field2,
+                                   const std::string &field3,
+                                   std::vector<std::tuple<std::string, std::string, std::string>> &out);
 
   // Load BlockMeta for provided keys via HMGET ph pb nid hash lt state
   size_t load_metas_by_keys(const std::vector<std::string> &keys,

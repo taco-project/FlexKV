@@ -1,16 +1,15 @@
 #pragma once
 
 #include <sys/types.h>
+#include <cstdint>
 #include <unordered_map>
 #include <string>
 #include <atomic>
 
-struct BatchReadOp {
-    const char* filename;         // File path
-    void* gpu_buffer;             // GPU memory buffer to receive data
-    size_t size;                  // Number of bytes to read
-    size_t file_offset;           // Offset in file from where to read
-    ssize_t* result;              // Output: bytes read or -1 on error
+struct BatchOp {
+    size_t size;
+    size_t file_offset;
+    ssize_t* result;
 };
 
 /// GPUDirect Storage base class. Will be derived to support local NVMe devices and NVMe-oF targets.
@@ -25,20 +24,6 @@ public:
      * @return true if ready for operations, false otherwise
      */
     bool is_ready() const;
-
-    /**
-     * Add a new file or block device to the manager
-     * @param filename Path to the file or block device to add
-     * @return true on success, false on failure
-     */
-    bool add_file(const char* filename);
-    
-    /**
-     * Remove a file or block device from the manager
-     * @param filename Path to the file or block device to remove
-     * @return true on success, false on failure
-     */
-    bool remove_file(const char* filename);
 
     /**
      * Read data from (remote) storage directly to GPU memory
@@ -80,12 +65,6 @@ public:
     const std::string& get_last_error() const;
 
     /**
-     * Get number of devices
-     * @return Number of devices
-     */
-    int get_num_devices() const;
-
-    /**
      * Get round-robin granularity
      * @return Round-robin value
      */
@@ -97,7 +76,7 @@ public:
      * @param count Number of operations
      * @return batch_id on success, or -1 on error
      */
-    virtual int batch_read(const struct BatchReadOp* operations, int count) = 0;
+    virtual int batch_read(const struct BatchOp* operations, int count) = 0;
 
     /**
      * Wait for batch operations to complete and destroy batch
@@ -107,11 +86,25 @@ public:
     int batch_synchronize(int batch_id);
 
 protected:
+    // File resource structure
+    struct FileResource {
+#ifdef ENABLE_GDS
+        int fd;
+        CUfileHandle_t cf_handle;
+#endif
+        std::string filepath;
+        
+        FileResource() 
+#ifdef ENABLE_GDS
+            : fd(-1)
+#endif
+        {}
+    };
+
     bool is_ready_;
     std::string last_error_;
 
-    int num_devices_;
-    int round_robin_;
+    int round_robin_; // Symmetric config
 
 #ifdef ENABLE_GDS
     bool driver_initialized_;
@@ -138,19 +131,6 @@ protected:
      */
     bool initialize_driver();
 
-    /**
-     * Open and register a single file or block device with cuFile
-     * @param filename Path to the file or block device
-     * @return true on success, false on failure
-     */
-    virtual bool open_file_internal(const char* filename) = 0;
-
-    /**
-     * Close and cleanup a single file or block device resource
-     * @param filename Path to the file or block device
-     */
-    virtual void close_file_internal(const char* filename) = 0;
-
     /// Close and cleanup all resources
     virtual void cleanup() = 0;
 
@@ -161,3 +141,10 @@ private:
     GDSBase(GDSBase&&) = delete;
     GDSBase& operator=(GDSBase&&) = delete;
 };
+
+/// Partition and remap blocks by device (same logic as SSD transfer)
+static void partition_and_remap_blocks_by_device_gds(
+    const int64_t* ssd_block_ids, const int64_t* gpu_block_ids, int num_blocks,
+    int num_devices, int round_robin,
+    std::vector<std::vector<int>>& gpu_blocks_partition,
+    std::vector<std::vector<int>>& ssd_blocks_partition);

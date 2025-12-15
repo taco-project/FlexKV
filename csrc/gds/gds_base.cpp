@@ -13,14 +13,14 @@ GDSBase::GDSBase(int round_robin)
     , driver_initialized_(false), next_batch_id_(1)
 #endif
 {
-    if (!initialize_driver()) {
+    if (!initialize_driver()) [[unlikely]] {
         return;
     }
 
 #ifdef ENABLE_GDS
     // Create shared CUDA stream
     cudaError_t cuda_status = cudaStreamCreate(&shared_stream_);
-    if (cuda_status != cudaSuccess) {
+    if (cuda_status != cudaSuccess) [[unlikely]] {
         set_error("Failed to create shared CUDA stream");
         return;
     }
@@ -31,28 +31,9 @@ bool GDSBase::is_ready() const {
     return is_ready_;
 }
 
-bool GDSBase::add_file(const char* filename) {
-    if (!filename) {
-        set_error("Invalid filename");
-        return false;
-    }
-    
-    return open_file_internal(filename);
-}
-
-bool GDSBase::remove_file(const char* filename) {
-    if (!filename) {
-        set_error("Invalid filename");
-        return false;
-    }
-    
-    close_file_internal(filename);
-    return true;
-}
-
 void GDSBase::synchronize() {
 #ifdef ENABLE_GDS
-    if (is_ready_) {
+    if (is_ready_) [[likely]] {
         cudaStreamSynchronize(shared_stream_);
     }
 #endif
@@ -68,16 +49,12 @@ const std::string& GDSBase::get_last_error() const {
     return last_error_;
 }
 
-int GDSBase::get_num_devices() const {
-    return num_devices_;
-}
-
 int GDSBase::get_round_robin() const {
     return round_robin_;
 }
 
 int GDSBase::batch_synchronize(int batch_id) {
-    if (!is_ready_) {
+    if (!is_ready_) [[unlikely]] {
         set_error("not ready");
         return -1;
     }
@@ -85,7 +62,7 @@ int GDSBase::batch_synchronize(int batch_id) {
 #ifdef ENABLE_GDS
     // Find the batch info
     auto it = batch_info_.find(batch_id);
-    if (it == batch_info_.end()) {
+    if (it == batch_info_.end()) [[unlikely]] {
         set_error("Invalid batch ID");
         return -1;
     }
@@ -103,7 +80,7 @@ int GDSBase::batch_synchronize(int batch_id) {
         memset(io_events.data(), 0, io_events.size() * sizeof(CUfileIOEvents_t));
         nr = static_cast<unsigned int>(batch_info.batch_size);
         status = cuFileBatchIOGetStatus(batch_handle, batch_info.batch_size, &nr, io_events.data(), NULL);	
-        if (status.err !=0) {
+        if (status.err !=0) [[unlikely]] {
             set_error("cuFileBatchIOGetStatus failed");
             // Clean up the batch handle even if status check failed
             cuFileBatchIODestroy(batch_handle);
@@ -135,10 +112,10 @@ bool GDSBase::initialize_driver() {
     }
     
     CUfileError_t status = cuFileDriverOpen();
-    if (status.err == 0) {
+    if (status.err == 0) [[likely]] {
         driver_initialized_ = true;
         return true;
-    } else {
+    } else [[unlikely]] {
         set_error("Failed to initialize cuFile driver");
         return false;
     }
@@ -146,4 +123,22 @@ bool GDSBase::initialize_driver() {
     set_error("GDS support not compiled in (ENABLE_GDS not defined)");
     return false;
 #endif
+}
+
+static void partition_and_remap_blocks_by_device_gds(
+    const int64_t* ssd_block_ids, const int64_t* gpu_block_ids, int num_blocks,
+    int num_devices, int round_robin,
+    std::vector<std::vector<int>>& gpu_blocks_partition,
+    std::vector<std::vector<int>>& ssd_blocks_partition) {
+    for (int i = 0; i < num_blocks; i++) {
+        int64_t ssd_block_id = ssd_block_ids[i];
+        int64_t gpu_block_id = gpu_block_ids[i];
+        // Use the exact same round-robin mapping as SSD transfer
+        int device_id = (ssd_block_id / round_robin) % num_devices;
+        int block_id_in_device =
+            ((ssd_block_id / round_robin) / num_devices) * round_robin +
+            (ssd_block_id % round_robin);
+        ssd_blocks_partition[device_id].push_back(block_id_in_device);
+        gpu_blocks_partition[device_id].push_back(gpu_block_id);
+    }
 }
