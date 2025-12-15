@@ -708,8 +708,8 @@ class GlobalCacheEngine:
             op_h2d = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2D,
-                src_block_ids = fragment12_cpu_blocks if enable_gds else fragment1_cpu_blocks,
-                dst_block_ids = fragment12_gpu_blocks if enable_gds \
+                src_block_ids = fragment12_cpu_blocks if not enable_gds else fragment1_cpu_blocks,
+                dst_block_ids = fragment12_gpu_blocks if not enable_gds \
                     else fragment12_gpu_blocks[:fragment1_num_blocks],
                 layer_id = 0,
                 layer_granularity = layer_num
@@ -1073,7 +1073,7 @@ class GlobalCacheEngine:
             if len(fragment12_cpu_blocks) < fragment2_num_blocks:
                 flexkv_logger.warning(f"fragment12_cpu_blocks: {len(fragment12_cpu_blocks)}, "
                                       f"fragment2_num_blocks: {fragment2_num_blocks}, "
-                                      f"cpu match blocks is bigger than SSD match blocks number. "
+                                      f"cpu match blocks are bigger than SSD match blocks number. "
                                       f"This should not often happen if CPU cache size is smaller than SSD cache size.")
                 num_needed_from_cpu_matched = fragment2_num_blocks - len(fragment12_cpu_blocks)
                 fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[-num_needed_from_cpu_matched:], \
