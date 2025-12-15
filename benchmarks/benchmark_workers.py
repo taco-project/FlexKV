@@ -10,7 +10,8 @@ import copy
 import torch
 
 from flexkv.common.transfer import TransferOp, TransferType
-from flexkv.transfer.worker import GPUCPUTransferWorker, CPUSSDDiskTransferWorker, WorkerHandle, tpGPUCPUTransferWorker
+from flexkv.transfer.worker import GPUCPUTransferWorker, CPUSSDDiskTransferWorker, WorkerHandle, tpGPUCPUTransferWorker, \
+    GDSTransferWorker, tpGDSTransferWorker
 from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator
 from flexkv.common.storage import KVCacheLayoutType, KVCacheLayout
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
@@ -28,6 +29,7 @@ class BenchmarkConfig:
     warmup_round: int = 1
     benchmark_round: int = 10
     bidirectional: bool = False
+    gpu_layout_type: int = 0
 
 def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]:
     config_file = args.config
@@ -37,6 +39,8 @@ def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]
             cache_config.enable_ssd = False
         elif args.transfer_type == "H2DISK" or args.transfer_type == "DISK2H":
             assert cache_config.enable_ssd, "SSD cache must be enabled for DISK2H or H2DISK benchmark"
+        elif args.transfer_type == "DISK2D" or args.transfer_type == "D2DISK":
+            assert cache_config.enable_ssd, "SSD cache must be enabled for DISK2D or D2DISK benchmark"
         bench_config = BenchmarkConfig(
             transfer_type=TransferType(args.transfer_type),
             num_layers_to_transfer=args.num_layers,
@@ -44,7 +48,8 @@ def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]
             shuffle_ids=args.shuffle_ids,
             warmup_round=args.warmup_round,
             benchmark_round=args.benchmark_round,
-            bidirectional=args.bi
+            bidirectional=args.bi,
+            gpu_layout_type=args.gpu_layout_type
         )
         cache_config.num_ssd_blocks = max(cache_config.num_ssd_blocks, bench_config.num_blocks_to_transfer)
         return model_config, cache_config, bench_config
@@ -54,7 +59,8 @@ def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]
 def create_cpu_gpu_worker(
                   model_config: ModelConfig,
                   cache_config: CacheConfig,
-                  num_gpu_blocks: int) -> Tuple[WorkerHandle, mp.Queue]:
+                  num_gpu_blocks: int,
+                  gpu_layout_type: int = 0) -> Tuple[WorkerHandle, mp.Queue]:
     mp.set_start_method('spawn', force=True)
     cpu_layout = KVCacheLayout(
         type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
@@ -65,8 +71,24 @@ def create_cpu_gpu_worker(
         head_size=model_config.head_size,
         is_mla=model_config.use_mla,
     )
+    if gpu_layout_type == 0 or gpu_layout_type == 2:
+        layout_type = KVCacheLayoutType.LAYERFIRST
+    elif gpu_layout_type == 1:
+        layout_type = KVCacheLayoutType.BLOCKFIRST
+    else:
+        raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
+    
+    if gpu_layout_type == 0:
+        num_chunks = model_config.num_layers
+    elif gpu_layout_type == 1:
+        num_chunks = 1
+    elif gpu_layout_type == 2:
+        num_chunks = model_config.num_layers * 2
+    else:
+        raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
+    
     gpu_layout = KVCacheLayout(
-        type=KVCacheLayoutType.LAYERFIRST,
+        type=layout_type,
         num_layer=model_config.num_layers,
         num_block=num_gpu_blocks,
         tokens_per_block=cache_config.tokens_per_block,
@@ -85,7 +107,7 @@ def create_cpu_gpu_worker(
         gpu_handles.append(GPUAllocator.allocate(
             layout=gpu_layout,
             dtype=model_config.dtype,
-            num_chunks=model_config.num_layers,
+            num_chunks=num_chunks,
         ))
     finished_ops_queue = mp.Queue()
     # Create a shared memory buffer for transfer operations
@@ -188,6 +210,101 @@ def create_cpu_ssd_worker(
         finished_ops_queue,
     )
 
+def create_gpu_ssd_worker(
+                  model_config: ModelConfig,
+                  cache_config: CacheConfig,
+                  num_gpu_blocks: int,
+                  gpu_layout_type: int = 0) -> Tuple[WorkerHandle, mp.Queue]:
+    mp.set_start_method('spawn', force=True)
+    
+    if gpu_layout_type == 0 or gpu_layout_type == 2:
+        layout_type = KVCacheLayoutType.LAYERFIRST
+    elif gpu_layout_type == 1:
+        layout_type = KVCacheLayoutType.BLOCKFIRST
+    else:
+        raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
+    
+    if gpu_layout_type == 0:
+        num_chunks = model_config.num_layers
+    elif gpu_layout_type == 1:
+        num_chunks = 1
+    elif gpu_layout_type == 2:
+        num_chunks = model_config.num_layers * 2 
+    else:
+        raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
+    
+    gpu_layout = KVCacheLayout(
+        type=layout_type,
+        num_layer=model_config.num_layers,
+        num_block=num_gpu_blocks,
+        tokens_per_block=cache_config.tokens_per_block,
+        num_head=model_config.num_kv_heads,
+        head_size=model_config.head_size,
+        is_mla=model_config.use_mla,
+    )
+    ssd_layout = KVCacheLayout(
+        type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
+        num_layer=model_config.num_layers,
+        num_block=cache_config.num_ssd_blocks,
+        tokens_per_block=cache_config.tokens_per_block,
+        num_head=model_config.num_kv_heads,
+        head_size=model_config.head_size,
+        is_mla=model_config.use_mla,
+    )
+    gpu_layout = gpu_layout.div_head(model_config.tp_size) if not model_config.use_mla else gpu_layout
+    
+    gpu_handles = []
+    for tp_id in range(model_config.tp_size):
+        gpu_handles.append(GPUAllocator.allocate(
+            layout=gpu_layout,
+            dtype=model_config.dtype,
+            num_chunks=num_chunks,
+        ))
+    
+    ssd_handle = SSDAllocator.allocate(
+        layout=ssd_layout,
+        dtype=model_config.dtype,
+        num_chunks=model_config.num_layers,
+        cache_dir=cache_config.ssd_cache_dir,
+        max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
+    )
+    
+    finished_ops_queue = mp.Queue()
+    max_block_num = max(1024, cache_config.num_ssd_blocks)
+    op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
+
+    if model_config.tp_size == 1:
+        worker_handle = GDSTransferWorker.create_worker(
+            mp_ctx=mp.get_context('spawn'),
+            finished_ops_queue=finished_ops_queue,
+            op_buffer_tensor=op_buffer_tensor,
+            gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
+            ssd_files=ssd_handle.get_file_list(),
+            num_blocks_per_file=ssd_handle.num_blocks_per_file,
+            gpu_kv_layout=gpu_handles[0].kv_layout,
+            ssd_kv_layout=ssd_handle.kv_layout,
+            dtype=model_config.dtype,
+            gpu_device_id=0,
+        )
+    else:
+        worker_handle = tpGDSTransferWorker.create_worker(
+            mp_ctx=mp.get_context('spawn'),
+            finished_ops_queue=finished_ops_queue,
+            op_buffer_tensor=op_buffer_tensor,
+            gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
+            ssd_files=ssd_handle.get_file_list(),
+            num_blocks_per_file=ssd_handle.num_blocks_per_file,
+            gpu_kv_layout=gpu_handles[0].kv_layout,
+            ssd_kv_layout=ssd_handle.kv_layout,
+            dtype=model_config.dtype,
+            tp_group_size=model_config.tp_size,
+            dp_group_id=0,
+        )
+    return (
+        worker_handle,
+        finished_ops_queue,
+    )
+
 def launch_transfer(worker_handle: WorkerHandle,
                     finished_ops_queue: mp.Queue,
                     transfer_op: TransferOp):
@@ -202,6 +319,8 @@ REVERSE_TYPE_MAP = {
     TransferType.H2D: TransferType.D2H,
     TransferType.DISK2H: TransferType.H2DISK,
     TransferType.H2DISK: TransferType.DISK2H,
+    TransferType.DISK2D: TransferType.D2DISK,
+    TransferType.D2DISK: TransferType.DISK2D,
     }
 
 def bench_worker(args):
@@ -221,24 +340,31 @@ def bench_worker(args):
     num_blocks_to_transfer = bench_config.num_blocks_to_transfer
     shuffle_ids = bench_config.shuffle_ids
     bidirectional = bench_config.bidirectional
+    gpu_layout_type = bench_config.gpu_layout_type
 
     if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
-        worker_handle, finished_ops_queue = create_cpu_gpu_worker(model_config, cache_config, num_blocks_to_transfer)
+        worker_handle, finished_ops_queue = create_cpu_gpu_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type)
     elif transfer_type == TransferType.H2DISK or transfer_type == TransferType.DISK2H:
         worker_handle, finished_ops_queue = create_cpu_ssd_worker(model_config, cache_config)
+    elif transfer_type == TransferType.DISK2D or transfer_type == TransferType.D2DISK:
+        worker_handle, finished_ops_queue = create_gpu_ssd_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type)
     else:
         raise ValueError(f"Unsupported transfer type: {transfer_type} for benchmark, "
                          f"currently only support {TransferType.H2D.name}, {TransferType.D2H.name}, "
-                         f"{TransferType.H2DISK.name}, {TransferType.DISK2H.name}")
+                         f"{TransferType.H2DISK.name}, {TransferType.DISK2H.name}, "
+                         f"{TransferType.DISK2D.name}, {TransferType.D2DISK.name}")
     reverse_worker_handle = None
     reverse_finished_ops_queue = None
     if bidirectional:
         if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
             reverse_worker_handle, reverse_finished_ops_queue = \
-                create_cpu_gpu_worker(model_config, cache_config)
+                create_cpu_gpu_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type)
         elif transfer_type == TransferType.H2DISK or transfer_type == TransferType.DISK2H:
             reverse_worker_handle, reverse_finished_ops_queue = \
                 create_cpu_ssd_worker(model_config, cache_config)
+        elif transfer_type == TransferType.DISK2D or transfer_type == TransferType.D2DISK:
+            reverse_worker_handle, reverse_finished_ops_queue = \
+                create_gpu_ssd_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type)
 
     if shuffle_ids:
         block_ids = torch.randperm(num_blocks_to_transfer).numpy()
@@ -279,6 +405,13 @@ def bench_worker(args):
     if transfer_type == TransferType.DISK2H or transfer_type == TransferType.H2DISK:
         tmp_op = copy.deepcopy(transfer_op)
         tmp_op.transfer_type = TransferType.H2DISK
+        tmp_op.src_block_ids = transfer_op.dst_block_ids
+        tmp_op.dst_block_ids = transfer_op.src_block_ids
+        launch_transfer(worker_handle, finished_ops_queue, tmp_op)
+        sync_all(finished_ops_queue, 1)
+    elif transfer_type == TransferType.DISK2D:
+        tmp_op = copy.deepcopy(transfer_op)
+        tmp_op.transfer_type = TransferType.D2DISK
         tmp_op.src_block_ids = transfer_op.dst_block_ids
         tmp_op.dst_block_ids = transfer_op.src_block_ids
         launch_transfer(worker_handle, finished_ops_queue, tmp_op)
@@ -344,6 +477,11 @@ def parse_args():
     parser.add_argument("--bi",
                         action="store_true",
                         help="benchmark bidirectional bandwidth")
+    parser.add_argument("--gpu-layout-type",
+                        type=int,
+                        default=0,
+                        choices=[0, 1, 2],
+                        help="GPU KV cache layout type")
     return parser.parse_args()
 
 if __name__ == "__main__":
