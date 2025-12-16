@@ -20,7 +20,7 @@ from flexkv.integration.tensorrt_llm.meta import(
     FlexKVResponse, FlexKVTask, FlexKVGetTask, FlexKVPutTask, FlexKVConnectorMetadata)
 from flexkv.transfer_manager import TransferManagerOnRemote
 
-from flexkv.integration.tensorrt_llm.utils import RequestWrapper
+from flexkv.integration.tensorrt_llm.utils import RequestWrapper, get_mapping_from_config
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
@@ -292,7 +292,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         request = RequestWrapper(_request)
         flexkv_logger.info(f"Put match request: {request}")
         match_start_time = time.perf_counter()
-        num_tokens_to_put = (cdiv(request.num_tokens + 1, self.block_size) - 1) * self.block_size
+        num_tokens_to_put = (cdiv(request.num_tokens, self.block_size) - 1) * self.block_size
 
         if num_tokens_to_put == 0:
             return -1, 0, 0
@@ -616,14 +616,21 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         """Cleanup on deletion."""
         if hasattr(self, 'remote_process') and self.remote_process is not None:
             self.shutdown()
-    
-def get_rank_info_from_trt_config(config: ExecutorConfig):
-    if config.mapping.enable_attention_dp:
-        node_rank = config.mapping.node_rank
-        tp_rank = config.mapping.tp_rank
-        dp_rank = config.mapping.rank
-    else:
-        node_rank = config.mapping.node_rank
-        tp_rank = config.mapping.tp_rank
-        dp_rank = 0
+
+def get_rank_info_from_trt_config(config: Any) -> Tuple[int, int, int]:
+    """
+    返回 (node_rank, tp_rank, dp_rank)。
+
+    兼容旧版 `ExecutorConfig.mapping` 与新版 `TorchLlmArgs.parallel_config`。
+    """
+    mapping = get_mapping_from_config(config)
+
+    # 保守默认：单机单卡
+    if mapping is None:
+        return 0, 0, 0
+
+    enable_attention_dp = bool(getattr(mapping, "enable_attention_dp", False))
+    node_rank = int(getattr(mapping, "node_rank", 0))
+    tp_rank = int(getattr(mapping, "tp_rank", 0)) if not enable_attention_dp else 0
+    dp_rank = int(getattr(mapping, "rank", 0)) if enable_attention_dp else 0
     return node_rank, tp_rank, dp_rank
