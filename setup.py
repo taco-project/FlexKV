@@ -28,21 +28,15 @@ cpp_sources = [
     "csrc/transfer.cu",
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
-    "csrc/gds/tp_gds_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
-    "csrc/gds/gds_manager.cpp",
-    "csrc/gds/layout_transform.cu"
 ]
 
 hpp_sources = [
     "csrc/cache_utils.h",
     "csrc/tp_transfer_thread_group.h",
-    "csrc/gds/tp_gds_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
-    "csrc/gds/gds_manager.h",
-    "csrc/gds/layout_transform.cuh"
 ]
 
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
@@ -66,9 +60,19 @@ if enable_cfs:
 nvcc_compile_args = ["-O3"]
 if enable_gds:
     print("ENABLE_GDS = true: Compiling and linking gds related content")
+    cpp_sources.extend([
+        "csrc/gds/gds_manager.cpp",
+        "csrc/gds/tp_gds_transfer_thread_group.cpp",
+        "csrc/gds/layout_transform.cu",
+    ])
+    hpp_sources.extend([
+        "csrc/gds/gds_manager.h",
+        "csrc/gds/tp_gds_transfer_thread_group.h",
+        "csrc/gds/layout_transform.cuh",
+    ])
     extra_link_args.append("-lcufile")
-    extra_compile_args.append("-DENABLE_GDS")
-    nvcc_compile_args.append("-DENABLE_GDS")
+    extra_compile_args.append("-DFLEXKV_ENABLE_GDS")
+    nvcc_compile_args.append("-DFLEXKV_ENABLE_GDS")
 
 cpp_extensions = [
     cpp_extension.CUDAExtension(

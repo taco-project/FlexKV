@@ -16,11 +16,8 @@
 #include <future>
 #include <torch/extension.h>
 #include "../gtensor_handler.cuh"
-
-#ifdef ENABLE_GDS
 #include <cuda_runtime.h>
 #include <cufile.h>
-#endif
 
 /**
  * GPU Direct Storage Manager Class
@@ -109,13 +106,11 @@ public:
      */
     void synchronize();
     
-#ifdef ENABLE_GDS
     /**
      * Get the internal CUDA stream (uses first available stream)
      * @return CUDA stream handle
      */
     cudaStream_t get_stream() const;
-#endif
     
     /**
      * Get number of files currently managed
@@ -183,14 +178,12 @@ public:
      */
     int batch_synchronize(int batch_id);
     
-#ifdef ENABLE_GDS
     /**
      * Enqueue a task to the worker thread pool
      * @param task Task to execute
      * @return Future that will be ready when task completes
      */
     std::future<void> enqueue_task(std::function<void()> task);
-#endif
 
 private:
     // Non-copyable and non-movable
@@ -201,17 +194,11 @@ private:
 
     // File resource structure
     struct FileResource {
-#ifdef ENABLE_GDS
         int fd;
         CUfileHandle_t cf_handle;
-#endif
         std::string filepath;
         
-        FileResource() 
-#ifdef ENABLE_GDS
-            : fd(-1)
-#endif
-        {}
+        FileResource() : fd(-1) {}
     };
 
     bool is_ready_;
@@ -222,7 +209,6 @@ private:
     int round_robin_;
     std::vector<std::vector<std::string>> file_paths_;
     
-#ifdef ENABLE_GDS
     std::unordered_map<std::string, FileResource> file_resources_;
     bool driver_initialized_;
     cudaStream_t shared_stream_;
@@ -242,7 +228,6 @@ private:
     std::condition_variable queue_cv_;
     std::atomic<bool> stop_workers_;
     int num_worker_threads_;
-#endif
     
     /**
      * Set error message
@@ -281,7 +266,6 @@ private:
      */
     void cleanup();
     
-#ifdef ENABLE_GDS
     /**
      * Initialize worker thread pool
      */
@@ -291,7 +275,6 @@ private:
      * Shutdown worker thread pool
      */
     void shutdown_worker_threads();
-#endif
 };
 
 /**
@@ -355,4 +338,4 @@ void transfer_kv_blocks_gds(
     bool is_mla = false
 );
 
-} // namespace flexkv 
+} // namespace flexkv

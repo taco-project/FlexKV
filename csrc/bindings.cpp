@@ -17,11 +17,11 @@
 #include "cache_utils.h"
 #include "pcfs/pcfs.h"
 #include "tp_transfer_thread_group.h"
+#include "gds/gds_manager.h"
 #include "gds/tp_gds_transfer_thread_group.h"
 #include "transfer.cuh"
 #include "transfer_ssd.h"
 #include "radix_tree.h"
-#include "gds/gds_manager.h"
 
 namespace py = pybind11;
 
@@ -148,6 +148,7 @@ void transfer_kv_blocks_remote(
 }
 #endif
 
+#ifdef FLEXKV_ENABLE_GDS
 void transfer_kv_blocks_gds_binding(
     GDSManager& gds_manager,
     const torch::Tensor& gpu_layer_id_list,
@@ -333,6 +334,7 @@ bool create_gds_file_binding(GDSManager& manager,
     // Now add the file to GDS manager (this will open it with O_DIRECT and register with cuFile)
     return manager.add_file(filename.c_str());
 }
+#endif
 
 PYBIND11_MODULE(c_ext, m) {
   m.def("transfer_kv_blocks", &transfer_kv_blocks_binding,
@@ -371,6 +373,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("num_remote_blocks_per_file"), py::arg("use_mmap") = false,
         py::arg("num_threads_per_file") = 16, py::arg("is_mla") = false);
 #endif
+#ifdef FLEXKV_ENABLE_GDS
   m.def("transfer_kv_blocks_gds", &transfer_kv_blocks_gds_binding,
         "Transfer KV blocks between GPU and GDS storage", py::arg("gds_manager"),
         py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
@@ -383,6 +386,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("num_blocks_per_file"), py::arg("total_layers"), 
         py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false,
         py::arg("gpu_block_type") = 0);
+#endif
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
@@ -410,6 +414,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"));
 
+#ifdef FLEXKV_ENABLE_GDS
   py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")
       .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
                     std::map<int, std::vector<std::string>> &, int, int,
@@ -426,6 +431,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ssd_chunk_size_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"));
+#endif
 
   // Add Hasher class binding
   py::class_<flexkv::Hasher>(m, "Hasher")
@@ -497,6 +503,7 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readonly("num_ready_matched_blocks", &flexkv::CMatchResult::num_ready_matched_blocks)
       .def_readonly("num_matched_blocks", &flexkv::CMatchResult::num_matched_blocks)
       .def_readonly("last_node_matched_length", &flexkv::CMatchResult::last_node_matched_length);
+#ifdef FLEXKV_ENABLE_GDS
   // Add GDS Manager class binding
   py::class_<GDSManager>(m, "GDSManager")
       .def(py::init<std::map<int, std::vector<std::string>>&, int, int>(),
@@ -544,4 +551,5 @@ PYBIND11_MODULE(c_ext, m) {
       .def("create_gds_file", &create_gds_file_binding,
             "Create and register a GDS file with specified size", 
             py::arg("filename"), py::arg("file_size"));
+#endif
 }
