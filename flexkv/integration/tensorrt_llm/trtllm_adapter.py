@@ -285,7 +285,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         request = RequestWrapper(_request)
         flexkv_logger.info(f"Put match request: {request}")
         match_start_time = time.perf_counter()
-        num_tokens_to_put = (cdiv(request.num_tokens+1, self.block_size)-1)*self.block_size
+        num_tokens_to_put = (cdiv(request.num_tokens, self.block_size) - 1) * self.block_size
         token_ids = request.all_token_ids[:num_tokens_to_put]
 
         if num_tokens_to_put == 0:
