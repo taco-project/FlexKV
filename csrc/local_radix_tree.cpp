@@ -269,48 +269,102 @@ size_t LocalRadixTree::local_block_report(size_t max_batch) {
   return processed;
 }
 
-bool LocalRadixTree::insert_and_publish(const CRadixNode *node) {
-  if (node == nullptr) return false;
-  // Create a detached copy of the node sufficient for publishing
-  CRadixNode *src = const_cast<CRadixNode *>(node);
-  // alloc a new node metadata
-  NewBlockMeta *cp = new NewBlockMeta();
-  assert(cp != nullptr);
-  cp->parent_hash = src->get_parent()->get_head_hash();
-  // Copy block hashes and physical blocks
-  auto &dst_hashes = cp->block_hashes;
-  auto &dst_phys = cp->physical_blocks;
-  auto &src_hashes = src->get_block_hashes();
-  auto &src_phys = src->get_physical_blocks();
+// Helper function to publish a single node
+bool LocalRadixTree::publish_single_node(CRadixNode *src) {
+  if (src == nullptr) return false;
+  
   auto *src_lm = src->get_lease_meta();
   if (src_lm == nullptr) {
-    //lease_meta is nullptr, which means the block can be evicted immediately.
+    // lease_meta is nullptr, which means the block can be evicted immediately.
     // we don't need to publish it to redis
     return false;
   }
+  
+  // Skip if already published
+  if (src_lm->published) {
+    return true;
+  }
+  
   if (src_lm->lease_time < safety_ttl_ms) {
-    std::cout << "[WARN] insert_and_publish: lease time is less than safety_ttl_ms, lease time: "
+    std::cout << "[WARN] publish_single_node: lease time is less than safety_ttl_ms, lease time: "
      << src_lm->lease_time << ", safety_ttl_ms: " << safety_ttl_ms << std::endl;
     return false;
   }
+  
+  auto &src_hashes = src->get_block_hashes();
+  auto &src_phys = src->get_physical_blocks();
+  
   if (src_hashes.size() != src_phys.size()) {
-    std::cout << "[WARN] insert_and_publish: block hashes and physical blocks size mismatch, hashes size: "
+    std::cout << "[WARN] publish_single_node: block hashes and physical blocks size mismatch, hashes size: "
      << src_hashes.size() << ", phys size: " << src_phys.size() << std::endl;
     return false;
   }
+  
+  // Skip root node (empty node)
+  if (src_hashes.empty()) {
+    return true;
+  }
+  
+  // alloc a new node metadata
+  NewBlockMeta *cp = new NewBlockMeta();
+  assert(cp != nullptr);
+  
+  CRadixNode* parent = src->get_parent();
+  // Use tail_hash (last block's hash) for parent_hash, because DFS rebuild
+  // uses tail_hash to find children (compressed nodes chain by tail)
+  cp->parent_hash = (parent != nullptr) ? parent->get_tail_hash() : 0;
+  
+  // Copy block hashes and physical blocks
+  auto &dst_hashes = cp->block_hashes;
+  auto &dst_phys = cp->physical_blocks;
+  
   cp->lease_meta.state = src_lm->state;
-  //we set lease_time on redis to be the actual lease time minus safety_ttl_ms, 
+  // we set lease_time on redis to be the actual lease time minus safety_ttl_ms, 
   // so that we can ensure the block is still in the cache after lease_time of redis
   cp->lease_meta.lease_time = src_lm->lease_time - safety_ttl_ms;
   dst_hashes.insert(dst_hashes.end(), src_hashes.begin(), src_hashes.end());
   dst_phys.insert(dst_phys.end(), src_phys.begin(), src_phys.end());
-  // Lease meta is optional for publishing; keep nullptr so publisher treats as defaults
-  // DEBUG: Print block hashes being published
-  /*for (size_t i = 0; i < std::min(dst_hashes.size(), size_t(10)); ++i) {
-    printf("  [%zu] hash=%ld, pb=%ld\n", i, dst_hashes[i], dst_phys[i]);
-  }*/
+  
+  
   new_block_queue.push(cp);
+  
+  // Mark as published
+  src_lm->published = true;
+  
   return true;
+}
+
+bool LocalRadixTree::insert_and_publish(const CRadixNode *node) {
+  if (node == nullptr) return false;
+  
+  CRadixNode *src = const_cast<CRadixNode *>(node);
+  
+  // Collect all unpublished ancestors from root to this node
+  std::vector<CRadixNode*> nodes_to_publish;
+  CRadixNode* current = src;
+  
+  while (current != nullptr) {
+    auto* lm = current->get_lease_meta();
+    // Stop when we reach an already published node or root
+    if (lm != nullptr && !lm->published && !current->get_block_hashes().empty()) {
+      nodes_to_publish.push_back(current);
+    } else if (lm != nullptr && lm->published) {
+      // Found an already published ancestor, stop here
+      break;
+    }
+    current = current->get_parent();
+  }
+  
+  // Publish from root to leaf (reverse order)
+  // This ensures parent nodes are published before children
+  bool success = true;
+  for (auto it = nodes_to_publish.rbegin(); it != nodes_to_publish.rend(); ++it) {
+    if (!publish_single_node(*it)) {
+      success = false;
+    }
+  }
+  
+  return success;
 }
 
 void* LocalRadixTree::refresh_worker_trampoline(void* arg) {
@@ -422,7 +476,6 @@ void LocalRadixTree::publish_node_blocks(NewBlockMeta *node) {
     std::cerr << "publish_node_blocks: publish failed. block hashes: " << hashes[0] << std::endl;
     return;
   }
-  //printf("we have published one node in publish_node_blocks, and the node size is %zu, the node hash is %ld\n", n, hashes[0]);
 }
 
 int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {

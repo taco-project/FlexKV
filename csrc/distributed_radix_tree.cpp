@@ -106,7 +106,6 @@ void DistributedRadixTree::refresh_worker() {
     }
 
     if (!batch.empty() && channel != nullptr) {
-      printf("we have got the batch from the renew_lease_queue, now we call the refresh_nodes_lease_from_redis\n");
       refresh_nodes_lease_from_redis(batch);
     }
 
@@ -261,6 +260,7 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
   RefRadixTree* new_index = new RefRadixTree(tokens_per_block, max_num_blocks, lease_renew_ms_, hit_reward_seconds_,
      &renew_lease_queue, &lt_pool);
   
+  size_t total_blocks_loaded = 0;
   for (const auto &nfo : nodes) {
     // list keys block:<nid>:*
     std::vector<std::string> bkeys;
@@ -272,6 +272,7 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
     if (bkeys.empty()) {
       continue;
     }
+    total_blocks_loaded += bkeys.size();
 
     std::vector<BlockMeta> metas;
     channel->load_metas_by_keys(bkeys, metas);
@@ -316,7 +317,7 @@ std::shared_ptr<CMatchResult> DistributedRadixTree::match_prefix(
   torch::Tensor &block_hashes, int num_blocks, bool update_cache_info) {
   RefRadixTree *idx = c_index.load(std::memory_order_acquire);
   if (idx == nullptr) {
-    std::cerr << "[WARN] match_prefix: c_index==null, returning empty" << std::endl;
+    std::cerr << "[DRT WARN] match_prefix: c_index==null (remote index not yet built), returning empty" << std::endl;
     auto empty_i64 = torch::empty({0}, torch::dtype(torch::kInt64));
     auto empty_u32 = torch::empty({0}, torch::dtype(torch::kInt32));
     return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
@@ -457,6 +458,7 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   int64_t pb_write = 0;
   auto block_hashes_ptr = block_hashes.data_ptr<int64_t>();
   HashType child_hash;
+  
   // node ids stored as int32 tensor (PyTorch lacks uint32 dtype)
   auto node_ids_tensor = torch::empty({num_blocks}, torch::dtype(torch::kInt32));
   auto *ni_out = node_ids_tensor.data_ptr<int32_t>();
@@ -509,9 +511,10 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
           //  break;
           //}
           // Check if lease needs renewal
-          // if the lease time is less than 1s, we don't use it
-          // this is important, and we hard-coded this as 1 s for now.
-          if ((int64_t)lt - (int64_t)now_ms <= 1500) {
+          // if the lease time is less than 1.5s, we don't use it
+          // this is important, and we hard-coded this as 1.5s for now.
+          int64_t time_remaining = (int64_t)lt - (int64_t)now_ms;
+          if (time_remaining <= 1500) {
             if (renew_lease_queue_ != nullptr) {
               renew_lease_queue_->push(current_node);
             }
@@ -557,89 +560,19 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
 
     // Look for the next child node (note: for non-root nodes, we've already consumed their blocks above)
     child_hash = HashType(block_hashes_ptr[prefix_blocks_num]);
+    
     if (current_node->lookup_child(child_hash)) {
       // Simply move to the child node; we'll process its blocks in the next iteration
       current_node = current_node->get_child(child_hash);
-      
-      // CRITICAL: For compressed nodes with multiple blocks, verify all blocks match
-      // (lookup_child only verified the first block's hash)
-      if (current_node->size() > 0) {
-        int child_matched = 0;
-        int child_size = current_node->size();
-        int remaining = num_blocks - prefix_blocks_num;
-        int to_check = std::min(child_size, remaining);
-        
-        
-        for (int i = 0; i < to_check; i++) {
-          if (current_node->get_hash(i) == HashType(block_hashes_ptr[prefix_blocks_num + i])) {
-            child_matched++;
-          } else {
-            break;
-          }
-        }
-        
-        
-        // If not all blocks match, we have a partial match - collect what matches and stop
-        if (child_matched < to_check) {
-          // Collect the matched blocks from child
-          if (current_node->is_ready()) {
-            last_ready_node = current_node;
-            ready_prefix_blocks_num += child_matched;
-          } else {
-            std::cerr << "[ERROR] current_node is not ready in distributed radix tree" << std::endl;
-          }
-          auto &cpb = current_node->get_physical_blocks();
-          for (int i = 0; i < child_matched; i++) {
-            pb_out[pb_write++] = cpb[i];
-          }
-          auto cbnis = current_node->get_block_node_ids();
-          if (cbnis != nullptr) {
-            for (int i = 0; i < child_matched; i++) {
-              ni_out[ni_write++] = (*cbnis)[i];
-            }
-          }
-          
-          last_node_matched_length = child_matched;
-          prefix_blocks_num += child_matched;
-          break;  // Stop matching
-        }
-        
-        // All blocks matched, collect them and continue
-        // But only collect up to what we need (remaining blocks in query)
-        int blocks_to_collect = std::min(child_size, remaining);
-        if (current_node->is_ready()) {
-          last_ready_node = current_node;
-          ready_prefix_blocks_num += blocks_to_collect;
-        }
-        prefix_blocks_num += blocks_to_collect;
-        auto &cpb = current_node->get_physical_blocks();
-        for (int i = 0; i < blocks_to_collect; i++) {
-          pb_out[pb_write++] = cpb[i];
-        }
-        auto cbnis = current_node->get_block_node_ids();
-        if (cbnis != nullptr) {
-          for (int i = 0; i < blocks_to_collect; i++) {
-            ni_out[ni_write++] = (*cbnis)[i];
-          }
-        } else {
-          std::cerr << "child block_node_ids is nullptr" << std::endl;
-        }
-        
-        // If we've collected all requested blocks, stop here
-        if (prefix_blocks_num >= num_blocks) {
-          break;
-        }
-      }
     } else {
       // No child found - we've matched as far as possible
-      // For non-root nodes, we've already processed their blocks in the loop above
-      // For root nodes, there's nothing to match
       break;
     }
   }
   //NOTE nodes in distributed radix tree are always ready!
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
   auto node_ids = node_ids_tensor.narrow(0, 0, ni_write);
+  
   assert(ready_prefix_blocks_num == prefix_blocks_num);
   return std::make_shared<CMatchResult>(prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
     last_ready_node, current_node, physical_blocks, node_ids);

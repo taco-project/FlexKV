@@ -12,6 +12,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 import random
 
+# 步骤1：先发 100 个请求到 Node1，等处理完成
+#python3 benchmark_jsonl.py --jsonl /workspace/chansi_a_day_0815.jsonl \
+#    --hosts 10.6.131.12:30001 \  # 只发到 Node1
+#    --num-requests 100 --concurrency 8
+
+# 步骤2：等 Node1 处理完成（观察日志直到所有 put 完成）
+
+# 步骤3：把相同的 100 个请求发到 Node2
+#python3 benchmark_jsonl.py --jsonl /workspace/chansi_a_day_0815.jsonl \
+#    --hosts 10.6.131.12:30002 \  # 只发到 Node2
+#    --num-requests 100 --concurrency 8 --start-line 0  # 相同的数据
+
 class VLLMBenchmark:
     def __init__(self, hosts, max_output_tokens=1024, model_name=None):
         """
@@ -171,6 +183,13 @@ class VLLMBenchmark:
         else:
             data_to_test = all_data[start_line:start_line + num_requests]
         
+        # Repeat 策略：重复使用第一条数据
+        if strategy == 'repeat':
+            print(f"🔁 Repeat 策略：所有请求使用相同的数据（第 {start_line} 行）")
+            first_item = data_to_test[0] if data_to_test else all_data[start_line]
+            data_to_test = [first_item] * num_requests
+            print(f"   所有 {num_requests} 个请求将使用相同的 prompt")
+        
         # Shuffle 策略：打乱数据顺序
         if strategy == 'shuffle':
             print(f"📊 Shuffle 策略：打乱数据顺序后使用 round-robin 分发")
@@ -178,6 +197,9 @@ class VLLMBenchmark:
             shuffle_random.shuffle(data_to_test)
             print(f"   数据已随机打乱")
             # 打乱后使用 round-robin
+            actual_strategy = 'round-robin'
+        elif strategy == 'repeat':
+            # repeat 策略使用 round-robin 分发
             actual_strategy = 'round-robin'
         else:
             actual_strategy = strategy
@@ -273,8 +295,8 @@ def main():
     parser.add_argument('--max-tokens', type=int, default=1024, help='最大输出 token 数')
     parser.add_argument('--model', type=str, default='/workspace/Qwen3-8B', help='模型名称')
     parser.add_argument('--strategy', type=str, default='round-robin', 
-                       choices=['round-robin', 'random', 'shuffle'], 
-                       help='负载均衡策略: round-robin(轮询), random(随机), shuffle(打乱后轮询)')
+                       choices=['round-robin', 'random', 'shuffle', 'repeat'], 
+                       help='负载均衡策略: round-robin(轮询), random(随机), shuffle(打乱后轮询), repeat(重复发送相同请求)')
     parser.add_argument('--start-line', type=int, default=0, help='起始行号')
     
     args = parser.parse_args()

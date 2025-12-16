@@ -18,7 +18,8 @@ namespace flexkv {
 struct LeaseMeta {
   volatile int state;
   volatile uint64_t lease_time;
-  LeaseMeta() : state(NODE_STATE_NORMAL), lease_time(0) {
+  volatile bool published;  // Track if this node has been published to Redis
+  LeaseMeta() : state(NODE_STATE_NORMAL), lease_time(0), published(false) {
   }
 };
 // A lock-free memory pool for LeaseMeta objects.

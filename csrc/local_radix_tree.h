@@ -69,6 +69,8 @@ private:
   // Pop at most max_batch nodes from new_block_queue and publish their BlockMeta to Redis.
   // Returns number of nodes published.
   size_t local_block_report(size_t max_batch = 1024);
+  // Helper function to publish a single node to Redis
+  bool publish_single_node(CRadixNode *src);
   // Renew in-memory LeaseMeta times and refresh Redis lt for this node
   void renew_relese_time();
 public:

@@ -126,6 +126,14 @@ public:
     }
   }
 
+  HashType get_tail_hash() {
+    if (size() > 0) {
+      return HashType(block_hashes[size() - 1]);
+    } else {
+      return HashType(0);
+    }
+  }
+
   int size() {
     return block_hashes.size();
   }

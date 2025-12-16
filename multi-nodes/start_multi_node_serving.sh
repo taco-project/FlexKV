@@ -184,6 +184,7 @@ EOF
     # 设置环境变量并启动 vLLM serving
     export FLEXKV_CONFIG_PATH="${config_file}"
     export FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${node_id}"
+    export FLEXKV_LEASE_TTL_MS=30000
     export LD_LIBRARY_PATH=/workspace/sdk/:$LD_LIBRARY_PATH
     export PYTHONPATH=/workspace/sdk/:$PYTHONPATH
     export MOONCAKE_CONFIG_PATH="${mooncake_config_file}"
@@ -195,6 +196,7 @@ EOF
         CUDA_VISIBLE_DEVICES="$cuda_devices" \
         FLEXKV_CONFIG_PATH="${config_file}" \
         FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${node_id}" \
+        FLEXKV_LEASE_TTL_MS=30000 \
         LD_LIBRARY_PATH=/workspace/sdk/:$LD_LIBRARY_PATH \
         PYTHONPATH=/workspace/sdk/:$PYTHONPATH \
         MOONCAKE_CONFIG_PATH="${mooncake_config_file}" \

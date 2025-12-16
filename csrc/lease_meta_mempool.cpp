@@ -67,6 +67,7 @@ LeaseMeta *LeaseMetaMemPool::alloc() {
   // Reset to defaults
   ptr->state = NODE_STATE_NORMAL;
   ptr->lease_time = 0;
+  ptr->published = false;
   free_count.fetch_sub(1, std::memory_order_relaxed);
   return ptr;
 }
@@ -88,6 +89,7 @@ void LeaseMetaMemPool::free(LeaseMeta *ptr) {
     // Reset for reuse then push back to free queue under the same lock
     ptr->state = NODE_STATE_EVICTED;
     ptr->lease_time = 0;
+    ptr->published = false;
     free_queue.push_back(ptr);
   }
   free_count.fetch_add(1, std::memory_order_relaxed);

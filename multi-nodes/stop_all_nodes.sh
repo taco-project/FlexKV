@@ -42,10 +42,10 @@ if [ -n "$main_pids" ]; then
     echo ""
     echo "步骤 1/4: 发送 SIGTERM 信号给主进程..."
     for pid in $main_pids; do
-        echo "  停止 PID: $pid"
+    echo "  停止 PID: $pid"
         kill -15 $pid 2>/dev/null
-    done
-    
+done
+
     # 等待进程响应
     echo "  等待 5 秒..."
     sleep 5
@@ -61,7 +61,7 @@ pkill -9 -f 'VLLM::Engine' 2>/dev/null && echo "  已停止 VLLM::Engine 进程"
 sleep 2
 
 # 方法3：停止剩余的 Python 进程（与 vLLM 相关的）
-echo ""
+    echo ""
 echo "步骤 3/4: 检查剩余的相关进程..."
 remaining_pids=$(ps aux | grep -E '(vllm|VllmWorker|VLLM)' | grep -v grep | awk '{print $2}')
 
