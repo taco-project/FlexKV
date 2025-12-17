@@ -790,7 +790,8 @@ class KVTaskEngine(KVTaskManager):
                     task_ids: List[int],
                     slot_mappings: List[np.ndarray],
                     as_batch: bool = False,
-                    batch_id: int = -1) -> List[int]:
+                    batch_id: int = -1,
+                    layerwise_transfer: bool = False) -> List[int]:
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
@@ -802,7 +803,11 @@ class KVTaskEngine(KVTaskManager):
         if len(task_ids) > 1 and as_batch:
             if batch_id == -1:
                 batch_id = self._gen_task_id()
-            transfer_graphs = [self.merge_to_batch_kvtask(batch_id, task_ids)]
+            batch_task_graph = self.merge_to_batch_kvtask(batch_id, task_ids)
+            if layerwise_transfer:
+                # TODO: merge all ops into one layerwise transfer op
+                pass
+            transfer_graphs = [batch_task_graph]
             task_ids = [batch_id]
         else:
             transfer_graphs = []
