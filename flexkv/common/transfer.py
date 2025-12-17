@@ -5,6 +5,8 @@ from typing import ClassVar, List, Set, Dict, Callable, Tuple, Optional
 
 import numpy as np
 
+from flexkv.common.debug import flexkv_logger
+
 
 @dataclass(frozen=True)
 class CompletedOp:
@@ -53,6 +55,7 @@ class TransferType(Enum):
     # so that the op 3 will not be executed actually, but can indicate the completion of
     # a group of transfer ops
     VIRTUAL = "Virtual"
+    LAYERWISE = "LAYERWISE"
 
 # class DistType(Enum):
 #     DISTH = "DISTH"
@@ -105,8 +108,30 @@ class TransferOp:
             TransferOp._next_op_id += 1
         assert self.src_block_ids.dtype == np.int64
         assert self.dst_block_ids.dtype == np.int64
-        self.valid_block_num = self.src_block_ids.size
 
+@dataclass
+class LayerwiseTransferOp(TransferOp):
+
+    src_block_ids_h2d: np.ndarray
+    dst_block_ids_h2d: np.ndarray
+    src_block_ids_disk2h: np.ndarray
+    dst_block_ids_disk2h: np.ndarray
+
+    def __post_init__(self) -> None:
+        self.transfer_type = TransferType.LAYERWISE
+        if self.layer_granularity == -1:
+            flexkv_logger.warning("layer_granularity is not set, using default value 1")
+            self.layer_granularity = 1
+        assert self.src_block_ids_h2d.size == self.dst_block_ids_h2d.size
+        assert self.src_block_ids_disk2h.size == self.dst_block_ids_disk2h.size
+        with LayerwiseTransferOp._lock:
+            self.op_id = LayerwiseTransferOp._next_op_id
+            LayerwiseTransferOp._next_op_id += 1
+
+        assert self.src_block_ids_h2d.dtype == np.int64
+        assert self.dst_block_ids_h2d.dtype == np.int64
+        assert self.src_block_ids_disk2h.dtype == np.int64
+        assert self.dst_block_ids_disk2h.dtype == np.int64
 
 class TransferOpGraph:
     _next_graph_id = 0
@@ -336,8 +361,11 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
     return merged_op
 
 
-def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], task_end_op_ids: List[int],
-                         op_callback_dict: Dict[int, Callable]) -> Tuple[TransferOpGraph, int, Dict[int, Callable]]:
+def merge_to_batch_graph(batch_id: int,
+                         transfer_graphs: List[TransferOpGraph],
+                         task_end_op_ids: List[int],
+                         op_callback_dict: Dict[int, Callable],
+                         layerwise_transfer: bool = False) -> Tuple[TransferOpGraph, int, Dict[int, Callable]]:
     """
     Merge multiple TransferOpGraphs into a single batch graph.
 
@@ -351,6 +379,7 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
         transfer_graphs: List of graphs to merge
         task_end_op_ids: List of end op IDs for each task (one per graph)
         op_callback_dict: Dict mapping old op_id -> callback
+        layerwise_transfer: Whether to merge the graphs into a layerwise transfer op
 
     Returns:
         (merged_graph, batch_end_op_id, new_op_callback_dict)
@@ -394,6 +423,24 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
                                merged_graph, callbacks_by_type[TransferType.H2D], new_op_callback_dict)
     if merged_disk2h_op is not None and merged_h2d_op is not None:
         merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
+    if layerwise_transfer:  # FIXME: rebase issue
+        if merged_h2d_op is not None:
+            layerwise_transfer_op = LayerwiseTransferOp(
+                graph_id=merged_graph.graph_id,
+                src_block_ids_h2d=merged_h2d_op.src_block_ids,
+                dst_block_ids_h2d=merged_h2d_op.dst_block_ids,
+                src_block_ids_disk2h=merged_disk2h_op.src_block_ids \
+                    if merged_disk2h_op is not None \
+                    else np.array([], dtype=np.int64),
+                dst_block_ids_disk2h=merged_disk2h_op.dst_block_ids \
+                    if merged_disk2h_op is not None \
+                    else np.array([], dtype=np.int64),
+                layer_id=0,
+                layer_granularity=1,
+                dp_id=h2d_ops[0].dp_id,
+            )
+            merged_graph.add_transfer_op(layerwise_transfer_op)
+        batch_end_op_id = -1
 
     # PUT path: D2H -> H2DISK
     merged_d2h_op = _merge_ops(ops_by_type[TransferType.D2H], TransferType.D2H,
@@ -414,6 +461,7 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
         batch_end_op_id = merged_d2h_op.op_id
     else:
         batch_end_op_id = -1
+
 
     return merged_graph, batch_end_op_id, new_op_callback_dict
 
