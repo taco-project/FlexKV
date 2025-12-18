@@ -12,7 +12,7 @@ import nvtx
 import torch
 import numpy as np
 
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.block import hash_token
 from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
@@ -777,9 +777,12 @@ class KVTaskEngine(KVTaskManager):
         return task_id
 
     def merge_to_batch_kvtask(self,
+                             
                               batch_id: int,
+                             
                               task_ids: List[int],
-                              batch_task_type: TaskType) -> TransferOpGraph:
+                              batch_task_type: TaskType,
+                              layerwise_transfer: bool = False) -> TransferOpGraph:
         op_callback_dict = {}
         task_end_op_ids = []
         callbacks = []
@@ -800,7 +803,8 @@ class KVTaskEngine(KVTaskManager):
         batch_task_graph, task_end_op_id, op_callback_dict = merge_to_batch_graph(batch_id,
                                                                                   transfer_graphs,
                                                                                   task_end_op_ids,
-                                                                                  op_callback_dict)
+                                                                                  op_callback_dict,
+                                                                                  layerwise_transfer)
         self.tasks[batch_id] = KVTask(
             task_id=batch_id,
             token_ids=np.concatenate([self.tasks[task_id].token_ids for task_id in task_ids]),
@@ -841,11 +845,10 @@ class KVTaskEngine(KVTaskManager):
         if len(task_ids) > 1 and as_batch and (all_get or all_put):
             if batch_id == -1:
                 batch_id = self._gen_task_id()
+            if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+                layerwise_transfer = False
             batch_task_type = TaskType.BATCH_GET if all_get else TaskType.BATCH_PUT
-            batch_task_graph = self.merge_to_batch_kvtask(batch_id, task_ids, batch_task_type)
-            if layerwise_transfer:
-                # TODO: merge all ops into one layerwise transfer op
-                pass
+            batch_task_graph = self.merge_to_batch_kvtask(batch_id, task_ids, batch_task_type, layerwise_transfer)
             transfer_graphs = [batch_task_graph]
             self.tasks[batch_id].status = TaskStatus.RUNNING
             task_ids = [batch_id]
