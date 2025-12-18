@@ -81,7 +81,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.gpu_layer_strides_in_bytes = [gpu_kv_layout.get_layer_stride() * self.dtype.itemsize \
                                 for gpu_kv_layout in gpu_kv_layouts]
 
-        # 确定 GPU block 类型 (使用第一个 GPU 的 block 数量来判断)
         num_blocks_first_gpu = len(imported_gpu_blocks[0]) if imported_gpu_blocks else 0
         if num_blocks_first_gpu == 1:
             self.gpu_block_type_ = 1  # TRTLLM
@@ -93,7 +92,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             raise ValueError(f"Invalid GPU block type: {num_blocks_first_gpu}")
 
         # initialize CPU storage
-        flexkv_logger.info(f"[LayerwiseWorker-{worker_id}] Pinning CPU Memory: "
+        flexkv_logger.info(f"Pinning CPU Memory: "
                            f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
         self.cpu_blocks = cpu_blocks
