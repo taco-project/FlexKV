@@ -409,7 +409,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_kv_stride_in_bytes"),
            py::arg("cpu_layer_stride_in_bytes"),
            py::arg("cpu_block_stride_in_bytes"),
-           py::arg("cpu_chunk_size_in_bytes"), py::arg("transfer_sms"),
+           py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_sms"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"));

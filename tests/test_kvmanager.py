@@ -94,6 +94,7 @@ def shutdown_tp_client(tp_client_processes):
     {'dtype': torch.float32},
     {'use_mla': True},
     {'tp_size': 4, 'dp_size': 1, 'use_mla': True},
+    {'tp_size': 4, 'dp_size': 1},
 ], indirect=True)
 @pytest.mark.parametrize("cache_config", [
     {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},

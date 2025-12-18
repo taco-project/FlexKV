@@ -282,14 +282,23 @@ class GPUKVCacheVerifier:
                             else:
                                 raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
+                            expected_tensor = torch.full_like(actual_values, expected_hash_value)
                             if not torch.allclose(actual_values,
-                                                torch.full_like(actual_values, expected_hash_value),
+                                                expected_tensor,
                                                 rtol=1e-5, atol=1e-6):
                                 verification_passed = False
+                                mismatch_mask = ~torch.isclose(actual_values,
+                                                            expected_tensor,
+                                                            rtol=1e-5, atol=1e-6)
+                                mismatch_idx = mismatch_mask.nonzero(as_tuple=False)[0]
+                                mismatch_value = actual_values[mismatch_idx[0], mismatch_idx[1]].item()
+                                max_abs_diff = (actual_values - expected_tensor).abs().max().item()
                                 errors.append(
                                     f"Mismatch at layer={layer_id}, kv={kv_id}, tp={tp_id}, "
                                     f"head={head_id}, block={block_id}: "
-                                    f"expected={expected_hash_value}, got={actual_values[0, 0].item()}"
+                                    f"expected={expected_hash_value}, got={mismatch_value} "
+                                    f"at token={mismatch_idx[0].item()}, dim={mismatch_idx[1].item()}, "
+                                    f"max_abs_diff={max_abs_diff}"
                                 )
 
         if not verification_passed:

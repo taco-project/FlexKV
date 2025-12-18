@@ -147,7 +147,7 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_kv_stride_in_bytes,
     const int64_t cpu_layer_stride_in_bytes,
     const int64_t cpu_block_stride_in_bytes,
-    const int64_t cpu_chunk_size_in_bytes, const int transfer_sms,
+    const int64_t cpu_tp_stride_in_bytes, const int transfer_sms,
     const bool is_host_to_device, const bool use_ce_transfer,
     const int layer_id, const int layer_granularity, const bool is_mla) {
 
@@ -171,7 +171,7 @@ void TPTransferThreadGroup::tp_group_transfer(
         int64_t *cpu_block_ids =
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
         void *cpu_ptr = cpu_blocks_;
-        int64_t cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i];
+        int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
         if (is_mla && !is_host_to_device) {
           cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
         } else if (is_mla && is_host_to_device) {

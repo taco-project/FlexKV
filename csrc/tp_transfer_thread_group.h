@@ -51,7 +51,7 @@ public:
                          const int64_t cpu_kv_stride_in_bytes,
                          const int64_t cpu_layer_stride_in_bytes,
                          const int64_t cpu_block_stride_in_bytes,
-                         const int64_t cpu_chunk_size_in_bytes,
+                         const int64_t cpu_tp_stride_in_bytes,
                          const int transfer_sms, const bool is_host_to_device,
                          const bool use_ce_transfer, const int layer_id,
                          const int layer_granularity, const bool is_mla);
