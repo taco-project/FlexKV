@@ -112,10 +112,10 @@ class TransferOp:
 @dataclass
 class LayerwiseTransferOp(TransferOp):
 
-    src_block_ids_h2d: np.ndarray
-    dst_block_ids_h2d: np.ndarray
-    src_block_ids_disk2h: np.ndarray
-    dst_block_ids_disk2h: np.ndarray
+    src_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    dst_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    src_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    dst_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
 
     def __post_init__(self) -> None:
         self.transfer_type = TransferType.LAYERWISE
