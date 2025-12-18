@@ -103,16 +103,38 @@ class LayerwiseTransferOp(TransferOp):
     src_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     dst_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
 
+    def __init__(self,
+                graph_id: int,
+                src_block_ids_h2d: np.ndarray,
+                dst_block_ids_h2d: np.ndarray,
+                src_block_ids_disk2h: np.ndarray,
+                dst_block_ids_disk2h: np.ndarray,
+                layer_id: int = 0,
+                layer_granularity: int = 1,
+                dp_id: int = 0) -> None:
+        self.src_block_ids_h2d = src_block_ids_h2d
+        self.dst_block_ids_h2d = dst_block_ids_h2d
+        self.src_block_ids_disk2h = src_block_ids_disk2h
+        self.dst_block_ids_disk2h = dst_block_ids_disk2h
+
+        super().__init__(
+            graph_id=graph_id,
+            transfer_type=TransferType.LAYERWISE,
+            src_block_ids=np.array([], dtype=np.int64),
+            dst_block_ids=np.array([], dtype=np.int64),
+            layer_id=layer_id,
+            layer_granularity=layer_granularity,
+            dp_id=dp_id,
+        )
+
     def __post_init__(self) -> None:
-        self.transfer_type = TransferType.LAYERWISE
+        super().__post_init__()
+
         if self.layer_granularity == -1:
             flexkv_logger.warning("layer_granularity is not set, using default value 1")
             self.layer_granularity = 1
         assert self.src_block_ids_h2d.size == self.dst_block_ids_h2d.size
         assert self.src_block_ids_disk2h.size == self.dst_block_ids_disk2h.size
-        with LayerwiseTransferOp._lock:
-            self.op_id = LayerwiseTransferOp._next_op_id
-            LayerwiseTransferOp._next_op_id += 1
 
         assert self.src_block_ids_h2d.dtype == np.int64
         assert self.dst_block_ids_h2d.dtype == np.int64
@@ -435,7 +457,6 @@ def merge_to_batch_graph(batch_id: int,
                             cb(*args, **kwargs)
                     return combined_callback
                 new_op_callback_dict[merged_h2d_op.op_id] = make_combined_callback(h2d_callbacks)
-
     if layerwise_transfer:
         if merged_h2d_op is not None:
             layerwise_transfer_op = LayerwiseTransferOp(

@@ -273,6 +273,7 @@ class TransferEngine:
                 )
                 for i in range(self.dp_size)
             ]
+            self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
         # Wait for all workers to ready
