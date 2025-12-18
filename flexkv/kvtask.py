@@ -845,8 +845,16 @@ class KVTaskEngine(KVTaskManager):
         if len(task_ids) > 1 and as_batch and (all_get or all_put):
             if batch_id == -1:
                 batch_id = self._gen_task_id()
-            if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
-                layerwise_transfer = False
+            if layerwise_transfer:
+                if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+                    flexkv_logger.warning("layerwise transfer is not enabled")
+                    layerwise_transfer = False
+                else:
+                    for task_id in task_ids:
+                        if self.tasks[task_id].task_type != TaskType.GET:
+                            flexkv_logger.warning("only support layerwise get")
+                            layerwise_transfer = False
+                            break
             batch_task_type = TaskType.BATCH_GET if all_get else TaskType.BATCH_PUT
             batch_task_graph = self.merge_to_batch_kvtask(batch_id, task_ids, batch_task_type, layerwise_transfer)
             transfer_graphs = [batch_task_graph]
