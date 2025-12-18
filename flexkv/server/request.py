@@ -73,6 +73,7 @@ class LaunchTaskRequest:
     slot_mappings: List[np.ndarray]
     as_batch: bool = False
     batch_id: int = -1
+    layerwise_transfer: bool = False
 
 @dataclass
 class CancelTaskRequest:
