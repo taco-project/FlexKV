@@ -29,8 +29,9 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
-from flexkv.common.transfer import get_nvtx_range_color
+from flexkv.common.transfer import get_nvtx_range_color, LayerwiseTransferOp
 from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
 
 try:
     from flexkv.c_ext import transfer_kv_blocks_remote
@@ -54,36 +55,6 @@ def cudaHostUnregister(tensor: torch.Tensor) -> None:
     size = tensor.numel() * tensor.element_size()
     ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
 
-@dataclass
-class WorkerTransferOp:
-    transfer_op_id: int
-    transfer_graph_id: int
-    transfer_type: TransferType
-    layer_id: int
-    layer_granularity: int
-    src_slot_id: int
-    dst_slot_id: int
-    valid_block_num: int
-    src_block_ids: np.ndarray
-    dst_block_ids: np.ndarray
-    # successors: List[int]
-
-    def __init__(self, transfer_op: TransferOp):
-        self.transfer_op_id = transfer_op.op_id
-        self.transfer_graph_id = transfer_op.graph_id
-        self.transfer_type = transfer_op.transfer_type
-        self.layer_id = transfer_op.layer_id
-        self.layer_granularity = transfer_op.layer_granularity
-        self.src_slot_id = transfer_op.src_slot_id
-        self.dst_slot_id = transfer_op.dst_slot_id
-        self.valid_block_num = transfer_op.valid_block_num
-        if self.src_slot_id == -1:
-            self.src_block_ids = transfer_op.src_block_ids
-            self.dst_block_ids = transfer_op.dst_block_ids
-        else:
-            self.src_block_ids = np.empty(0)
-            self.dst_block_ids = np.empty(0)
-        # self.successors = list(transfer_op.successors)  # for nvtx
 
 class TransferWorkerBase(ABC):
     _worker_id_counter = 0
@@ -253,8 +224,12 @@ class WorkerHandle:
         self.process = process
         self.ready_event = ready_event
 
-    def submit_transfer(self, op: TransferOp) -> None:
-        self.transfer_conn.send(WorkerTransferOp(op))
+    def submit_transfer(self, op: Union[TransferOp, LayerwiseTransferOp]) -> None:
+        if isinstance(op, LayerwiseTransferOp):
+            worker_op = WorkerLayerwiseTransferOp(op)
+        else:
+            worker_op = WorkerTransferOp(op)
+        self.transfer_conn.send(worker_op)
 
     def shutdown(self) -> None:
         try:
