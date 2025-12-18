@@ -198,14 +198,13 @@ class TransferWorkerBase(ABC):
                     for op in batch_ops:
                         try:
                             nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
-                                                f"graph_id: {op.transfer_graph_id}, "
-                                                f"num_blocks: {op.valid_block_num}",
+                                                f"graph_id: {op.transfer_graph_id}",
                                                 color=get_nvtx_range_color(op.transfer_graph_id))
                             self.launch_transfer(op)
                             nvtx.pop_range()
                         except Exception as e:
                             flexkv_logger.error(f"Error launching transfer: {e}\n"
-                                        f"Failed transfer op: {op}")
+                                        f"Failed transfer op: {op.transfer_op_id}")
                         self.finished_ops_queue.put(op.transfer_op_id)
                 else:
                     continue

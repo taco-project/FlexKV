@@ -197,7 +197,12 @@ class KVManager:
         if self.server_client_mode:
             return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch, layerwise_transfer)
         else:
-            return self.kv_task_engine.launch_tasks(task_ids, slot_mappings, as_batch, layerwise_transfer)
+            return self.kv_task_engine.launch_tasks(
+                task_ids,
+                slot_mappings,
+                as_batch=as_batch,
+                layerwise_transfer=layerwise_transfer
+            )
 
     def cancel(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):
