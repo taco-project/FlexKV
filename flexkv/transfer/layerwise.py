@@ -30,7 +30,7 @@ try:
 except ImportError:
     transfer_kv_blocks_remote = None
 
-from flexkv.transfer.worker import WorkerTransferOp
+from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
 from flexkv.transfer.worker import TransferWorkerBase, cudaHostRegister
 
 class LayerwiseTransferWorker(TransferWorkerBase):
@@ -48,7 +48,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  dtype: torch.dtype,
                  tp_group_size: int,
                  dp_group_id: int,
-                 gpu_device_id: int,
                  num_blocks_per_file: int,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
@@ -82,17 +81,16 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.gpu_layer_strides_in_bytes = [gpu_kv_layout.get_layer_stride() * self.dtype.itemsize \
                                 for gpu_kv_layout in gpu_kv_layouts]
 
-        self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
-
-        # 确定 GPU block 类型
-        if len(self.gpu_blocks) == 1:
+        # 确定 GPU block 类型 (使用第一个 GPU 的 block 数量来判断)
+        num_blocks_first_gpu = len(imported_gpu_blocks[0]) if imported_gpu_blocks else 0
+        if num_blocks_first_gpu == 1:
             self.gpu_block_type_ = 1  # TRTLLM
-        elif len(self.gpu_blocks) == self.num_layers:
+        elif num_blocks_first_gpu == self.num_layers:
             self.gpu_block_type_ = 0  # VLLM
-        elif len(self.gpu_blocks) == self.num_layers * 2:
+        elif num_blocks_first_gpu == self.num_layers * 2:
             self.gpu_block_type_ = 2  # SGLANG
         else:
-            raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
+            raise ValueError(f"Invalid GPU block type: {num_blocks_first_gpu}")
 
         # initialize CPU storage
         flexkv_logger.info(f"[LayerwiseWorker-{worker_id}] Pinning CPU Memory: "
@@ -138,21 +136,62 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
         gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
         gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
-        self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
-                                                              self.num_layers, gpu_kv_strides_tensor,
-                                                              gpu_block_strides_tensor, gpu_layer_strides_tensor,
-                                                              gpu_chunk_sizes_tensor)
+        self.tp_transfer_thread_group = TPTransferThreadGroup(
+            self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
+            self.num_layers, gpu_kv_strides_tensor,
+            gpu_block_strides_tensor, gpu_layer_strides_tensor,
+            gpu_chunk_sizes_tensor)
 
     def _transfer_impl(self,
-                      src_block_ids: torch.Tensor,
-                      dst_block_ids: torch.Tensor,
-                      transfer_type: TransferType,
+                      src_block_ids_h2d: torch.Tensor,
+                      dst_block_ids_h2d: torch.Tensor,
+                      src_block_ids_disk2h: torch.Tensor,
+                      dst_block_ids_disk2h: torch.Tensor,
                       layer_id: int,
                       layer_granularity: int,
                       **kwargs: Any) -> None:
-        pass
+        assert src_block_ids_h2d.dtype == torch.int64
+        assert dst_block_ids_h2d.dtype == torch.int64
+        assert src_block_ids_disk2h.dtype == torch.int64
+        assert dst_block_ids_disk2h.dtype == torch.int64
+        assert len(src_block_ids_h2d) == len(dst_block_ids_h2d)
+        assert len(src_block_ids_disk2h) == len(dst_block_ids_disk2h)
+        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
+        if len(src_block_ids_disk2h) > 0:
+            transfer_kv_blocks_ssd(
+                ioctx=self.ioctx,
+                cpu_layer_id_list=layer_id_list,
+                cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
+                ssd_block_ids=src_block_ids_disk2h,
+                cpu_block_ids=dst_block_ids_disk2h,
+                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
+                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
+                ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
+                ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
+                chunk_size_in_bytes=self.chunk_size_in_bytes,
+                block_stride_in_bytes=self.block_stride_in_bytes,
+                is_read=True,
+                num_blocks_per_file=self.num_blocks_per_file,
+                round_robin=self.round_robin,
+                num_threads_per_device=32,
+                is_mla=self.is_mla,
+            )
+        self.tp_transfer_thread_group.tp_group_transfer(
+            dst_block_ids_h2d,
+            src_block_ids_h2d,
+            self.cpu_kv_stride_in_bytes,
+            self.cpu_layer_stride_in_bytes,
+            self.cpu_block_stride_in_bytes,
+            self.cpu_chunk_size_in_bytes,
+            self.transfer_sms_h2d,
+            True,  # is H2D
+            self.use_ce_transfer_h2d,
+            layer_id,
+            layer_granularity,
+            self.is_mla,
+        )
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
+    def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> None:
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
         if layer_id == -1:
@@ -160,12 +199,16 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         if layer_granularity == -1:
             layer_granularity = self.num_layers
 
-        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+        src_block_ids_h2d = transfer_op.src_block_ids_h2d
+        dst_block_ids_h2d = transfer_op.dst_block_ids_h2d
+        src_block_ids_disk2h = transfer_op.src_block_ids_disk2h
+        dst_block_ids_disk2h = transfer_op.dst_block_ids_disk2h
 
         self._transfer_impl(
-            src_block_ids,
-            dst_block_ids,
-            transfer_op.transfer_type,
+            src_block_ids_h2d,
+            dst_block_ids_h2d,
+            src_block_ids_disk2h,
+            dst_block_ids_disk2h,
             layer_id,
             layer_granularity,
         )

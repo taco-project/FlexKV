@@ -41,6 +41,7 @@ from flexkv.transfer.worker import (
     tpGDSTransferWorker,
     PEER2CPUTransferWorker,
 )
+from flexkv.transfer.layerwise import LayerwiseTransferWorker
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
 
@@ -52,6 +53,8 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
     Device type prefixes prevent hash collisions when different device types
     use the same block ID values (e.g., CPU block 0 vs SSD block 0).
     """
+    if op.transfer_type == TransferType.LAYERWISE:
+        return
     # Map TransferType to (src_device_type, dst_device_type) for hash prefix
     # This prevents hash collisions when different devices use the same block IDs
     transfer_type_to_devices = {
@@ -269,6 +272,31 @@ class TransferEngine:
                 ]
             self._worker_map[TransferType.DISK2D] = self.gds_workers
             self._worker_map[TransferType.D2DISK] = self.gds_workers
+        if GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+            self.layerwise_workers = [
+                LayerwiseTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
+                                for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                    cpu_blocks=self._cpu_handle.get_tensor(),
+                    ssd_files=self._ssd_handle.get_file_list(),
+                    gpu_kv_layouts=[self.gpu_handles[i].kv_layout \
+                                for i in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    ssd_kv_layout=self._ssd_handle.kv_layout,
+                    dtype=self.gpu_handles[i].dtype,
+                    tp_group_size=self.tp_size,
+                    dp_group_id=i,
+                    num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                    transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
+                    transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
+                )
+                for i in range(self.dp_size)
+            ]
             
         if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
             or (self._ssd_handle and self.cache_config.enable_p2p_ssd)):
