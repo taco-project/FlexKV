@@ -17,11 +17,11 @@
 #include "cache_utils.h"
 #include "pcfs/pcfs.h"
 #include "tp_transfer_thread_group.h"
+#include "gds/gds_manager.h"
 #include "gds/tp_gds_transfer_thread_group.h"
 #include "transfer.cuh"
 #include "transfer_ssd.h"
 #include "radix_tree.h"
-#include "gds/gds_manager.h"
 
 namespace py = pybind11;
 
@@ -148,20 +148,21 @@ void transfer_kv_blocks_remote(
 }
 #endif
 
+#ifdef FLEXKV_ENABLE_GDS
 void transfer_kv_blocks_gds_binding(
     GDSManager& gds_manager,
     const torch::Tensor& gpu_layer_id_list,
     const torch::Tensor& gpu_layer_ptrs_tensor,
-    const torch::Tensor& gds_block_ids,
+    const torch::Tensor& ssd_block_ids,
     const torch::Tensor& gpu_block_ids,
     int64_t gpu_kv_stride_in_bytes,
     int64_t gpu_block_stride_in_bytes,
     int64_t gpu_layer_stride_in_bytes,
-    int64_t gds_layer_stride_in_bytes,
-    int64_t gds_block_stride_in_bytes,
-    int64_t gds_kv_stride_in_bytes,
+    int64_t ssd_layer_stride_in_bytes,
+    int64_t ssd_block_stride_in_bytes,
+    int64_t ssd_kv_stride_in_bytes,
     int64_t block_size_in_bytes,
-    int64_t gds_copy_off_inside_chunks,
+    int64_t ssd_copy_off_inside_chunks,
     int num_blocks_per_file,
     int64_t total_layers,
     bool is_read,
@@ -171,8 +172,8 @@ void transfer_kv_blocks_gds_binding(
 ) {
     TORCH_CHECK(gpu_layer_ptrs_tensor.dtype() == torch::kInt64,
                 "gpu_layer_ptrs must be int64");
-    TORCH_CHECK(gds_block_ids.dtype() == torch::kInt64,
-                "gds_block_ids must be int64");
+    TORCH_CHECK(ssd_block_ids.dtype() == torch::kInt64,
+                "ssd_block_ids must be int64");
     TORCH_CHECK(gpu_block_ids.dtype() == torch::kInt64,
                 "gpu_block_ids must be int64");
     TORCH_CHECK(gpu_layer_id_list.dtype() == torch::kInt32,
@@ -203,23 +204,23 @@ void transfer_kv_blocks_gds_binding(
     switch (backend_type) {
         case flexkv::BackendType::VLLM:
             flexkv::transfer_kv_blocks_gds<flexkv::BackendType::VLLM>(
-                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
-                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
-                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                gds_manager, gpu_layer_id_list, handler, ssd_block_ids, gpu_block_ids,
+                ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes,
+                block_size_in_bytes, ssd_copy_off_inside_chunks, num_blocks_per_file,
                 total_layers, is_read, verbose, is_mla);
             break;
         case flexkv::BackendType::TRTLLM:
             flexkv::transfer_kv_blocks_gds<flexkv::BackendType::TRTLLM>(
-                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
-                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
-                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                gds_manager, gpu_layer_id_list, handler, ssd_block_ids, gpu_block_ids,
+                ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes,
+                block_size_in_bytes, ssd_copy_off_inside_chunks, num_blocks_per_file,
                 total_layers, is_read, verbose, is_mla);
             break;
         case flexkv::BackendType::SGLANG:
             flexkv::transfer_kv_blocks_gds<flexkv::BackendType::SGLANG>(
-                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
-                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
-                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                gds_manager, gpu_layer_id_list, handler, ssd_block_ids, gpu_block_ids,
+                ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes,
+                block_size_in_bytes, ssd_copy_off_inside_chunks, num_blocks_per_file,
                 total_layers, is_read, verbose, is_mla);
             break;
     }
@@ -333,6 +334,7 @@ bool create_gds_file_binding(GDSManager& manager,
     // Now add the file to GDS manager (this will open it with O_DIRECT and register with cuFile)
     return manager.add_file(filename.c_str());
 }
+#endif
 
 PYBIND11_MODULE(c_ext, m) {
   m.def("transfer_kv_blocks", &transfer_kv_blocks_binding,
@@ -371,18 +373,20 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("num_remote_blocks_per_file"), py::arg("use_mmap") = false,
         py::arg("num_threads_per_file") = 16, py::arg("is_mla") = false);
 #endif
+#ifdef FLEXKV_ENABLE_GDS
   m.def("transfer_kv_blocks_gds", &transfer_kv_blocks_gds_binding,
         "Transfer KV blocks between GPU and GDS storage", py::arg("gds_manager"),
         py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
-        py::arg("gds_block_ids"), py::arg("gpu_block_ids"),
+        py::arg("ssd_block_ids"), py::arg("gpu_block_ids"),
         py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
         py::arg("gpu_layer_stride_in_bytes"),
-        py::arg("gds_layer_stride_in_bytes"), py::arg("gds_block_stride_in_bytes"),
-        py::arg("gds_kv_stride_in_bytes"), py::arg("block_size_in_bytes"),
-        py::arg("gds_copy_off_inside_chunks"),
+        py::arg("ssd_layer_stride_in_bytes"), py::arg("ssd_block_stride_in_bytes"),
+        py::arg("ssd_kv_stride_in_bytes"), py::arg("block_size_in_bytes"),
+        py::arg("ssd_copy_off_inside_chunks"),
         py::arg("num_blocks_per_file"), py::arg("total_layers"), 
         py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false,
         py::arg("gpu_block_type") = 0);
+#endif
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
@@ -410,6 +414,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"));
 
+#ifdef FLEXKV_ENABLE_GDS
   py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")
       .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
                     std::map<int, std::vector<std::string>> &, int, int,
@@ -426,6 +431,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ssd_chunk_size_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"));
+#endif
 
   // Add Hasher class binding
   py::class_<flexkv::Hasher>(m, "Hasher")
@@ -497,6 +503,7 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readonly("num_ready_matched_blocks", &flexkv::CMatchResult::num_ready_matched_blocks)
       .def_readonly("num_matched_blocks", &flexkv::CMatchResult::num_matched_blocks)
       .def_readonly("last_node_matched_length", &flexkv::CMatchResult::last_node_matched_length);
+#ifdef FLEXKV_ENABLE_GDS
   // Add GDS Manager class binding
   py::class_<GDSManager>(m, "GDSManager")
       .def(py::init<std::map<int, std::vector<std::string>>&, int, int>(),
@@ -544,4 +551,5 @@ PYBIND11_MODULE(c_ext, m) {
       .def("create_gds_file", &create_gds_file_binding,
             "Create and register a GDS file with specified size", 
             py::arg("filename"), py::arg("file_size"));
+#endif
 }

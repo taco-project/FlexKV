@@ -8,13 +8,16 @@
 #include <vector>
 #include <initializer_list>
 #include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <functional>
+#include <future>
 #include <torch/extension.h>
 #include "../gtensor_handler.cuh"
-
-#ifdef ENABLE_GDS
 #include <cuda_runtime.h>
 #include <cufile.h>
-#endif
 
 /**
  * GPU Direct Storage Manager Class
@@ -103,13 +106,11 @@ public:
      */
     void synchronize();
     
-#ifdef ENABLE_GDS
     /**
      * Get the internal CUDA stream (uses first available stream)
      * @return CUDA stream handle
      */
     cudaStream_t get_stream() const;
-#endif
     
     /**
      * Get number of files currently managed
@@ -149,6 +150,12 @@ public:
     int get_round_robin() const;
 
     /**
+     * Get number of worker threads in the thread pool
+     * @return Number of worker threads
+     */
+    int get_num_worker_threads() const;
+
+    /**
      * Batch write operations
      * @param operations Array of batch write operations
      * @param count Number of operations
@@ -170,6 +177,13 @@ public:
      * @return 0 on success, or -1 on error
      */
     int batch_synchronize(int batch_id);
+    
+    /**
+     * Enqueue a task to the worker thread pool
+     * @param task Task to execute
+     * @return Future that will be ready when task completes
+     */
+    std::future<void> enqueue_task(std::function<void()> task);
 
 private:
     // Non-copyable and non-movable
@@ -180,17 +194,11 @@ private:
 
     // File resource structure
     struct FileResource {
-#ifdef ENABLE_GDS
         int fd;
         CUfileHandle_t cf_handle;
-#endif
         std::string filepath;
         
-        FileResource() 
-#ifdef ENABLE_GDS
-            : fd(-1)
-#endif
-        {}
+        FileResource() : fd(-1) {}
     };
 
     bool is_ready_;
@@ -201,7 +209,6 @@ private:
     int round_robin_;
     std::vector<std::vector<std::string>> file_paths_;
     
-#ifdef ENABLE_GDS
     std::unordered_map<std::string, FileResource> file_resources_;
     bool driver_initialized_;
     cudaStream_t shared_stream_;
@@ -213,7 +220,14 @@ private:
         int batch_size;
     };
     std::unordered_map<int, BatchInfo> batch_info_;
-#endif
+    
+    using Task = std::function<void()>;
+    std::vector<std::thread> worker_threads_;
+    std::queue<Task> task_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::atomic<bool> stop_workers_;
+    int num_worker_threads_;
     
     /**
      * Set error message
@@ -251,6 +265,16 @@ private:
      * Close and cleanup all resources
      */
     void cleanup();
+    
+    /**
+     * Initialize worker thread pool
+     */
+    void initialize_worker_threads();
+    
+    /**
+     * Shutdown worker thread pool
+     */
+    void shutdown_worker_threads();
 };
 
 /**
@@ -314,4 +338,4 @@ void transfer_kv_blocks_gds(
     bool is_mla = false
 );
 
-} // namespace flexkv 
+} // namespace flexkv

@@ -197,59 +197,29 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
         switch (backend_type_) {
           case BackendType::VLLM:
             flexkv::transfer_kv_blocks_gds<BackendType::VLLM>(
-                *gds_managers_[i],
-                layer_id_list,
-                gpu_tensor_handlers_[i],
-                ssd_block_id_tensor,
-                gpu_block_id_tensor,
-                ssd_layer_stride_in_bytes,
-                ssd_block_stride_in_bytes,
-                ssd_kv_stride_in_bytes,
-                chunk_size,
-                ssd_copy_off_inside_chunks,
-                num_blocks_per_file,
-                layer_granularity,
-                is_read,
-                false,  // verbose
-                is_mla
+                *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
+                ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
+                ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
+                ssd_copy_off_inside_chunks, num_blocks_per_file, layer_granularity,
+                is_read, false, is_mla
             );
             break;
           case BackendType::TRTLLM:
             flexkv::transfer_kv_blocks_gds<BackendType::TRTLLM>(
-                *gds_managers_[i],
-                layer_id_list,
-                gpu_tensor_handlers_[i],
-                ssd_block_id_tensor,
-                gpu_block_id_tensor,
-                ssd_layer_stride_in_bytes,
-                ssd_block_stride_in_bytes,
-                ssd_kv_stride_in_bytes,
-                chunk_size,
-                ssd_copy_off_inside_chunks,
-                num_blocks_per_file,
-                layer_granularity,
-                is_read,
-                false,  // verbose
-                is_mla
+                *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
+                ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
+                ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
+                ssd_copy_off_inside_chunks, num_blocks_per_file, layer_granularity,
+                is_read, false, is_mla
             );
             break;
           case BackendType::SGLANG:
             flexkv::transfer_kv_blocks_gds<BackendType::SGLANG>(
-                *gds_managers_[i],
-                layer_id_list,
-                gpu_tensor_handlers_[i],
-                ssd_block_id_tensor,
-                gpu_block_id_tensor,
-                ssd_layer_stride_in_bytes,
-                ssd_block_stride_in_bytes,
-                ssd_kv_stride_in_bytes,
-                chunk_size,
-                ssd_copy_off_inside_chunks,
-                num_blocks_per_file,
-                layer_granularity,
-                is_read,
-                false,  // verbose
-                is_mla
+                *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
+                ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
+                ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
+                ssd_copy_off_inside_chunks, num_blocks_per_file, layer_granularity,
+                is_read, false, is_mla
             );
             break;
         }
