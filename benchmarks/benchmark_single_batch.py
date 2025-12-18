@@ -133,19 +133,20 @@ def benchmark_flexkv(model_config: ModelConfig,
     all_tokens = 0
     start_time = time.time()
     batch_get_ids = []
+    return_masks = []
+    cached_tokens = 0
     for i in range(batch_size):
         all_tokens += len(batch_sequence_tensor[i])
-        task_id, _ = kvmanager.get_match(batch_sequence_tensor[i],
+        task_id, return_mask = kvmanager.get_match(batch_sequence_tensor[i],
                                       token_mask=None)
         batch_get_ids.append(task_id)
+        cached_tokens += return_mask.sum().item()
     get_match_time = time.time() - start_time
-    kvmanager.launch(batch_get_ids, batch_slot_mapping)
-    get_result = kvmanager.wait(batch_get_ids)
+    batch_id_list =kvmanager.launch(batch_get_ids, batch_slot_mapping, as_batch=True)
+    get_result = kvmanager.wait(batch_id_list)
     elapsed_time_get = time.time() - start_time
-    cached_tokens = 0
     for _, response in get_result.items():
-        if response.status == KVResponseStatus.SUCCESS:
-            cached_tokens += response.return_mask.sum().item()
+        assert response.status == KVResponseStatus.SUCCESS
     transfer_data_size_GB = cached_tokens * model_config.token_size_in_bytes / 1024 / 1024 / 1024
     transfer_bandwidth_get = transfer_data_size_GB / elapsed_time_get
     print(f"get {cached_tokens} tokens, data_size: {transfer_data_size_GB:.3f} GB, "
