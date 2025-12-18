@@ -54,7 +54,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  transfer_sms_h2d: int = 8,
                  transfer_sms_d2h: int = 8) -> None:
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
-        assert len(gpu_blocks) == tp_group_size
+        assert len(gpu_blocks) == tp_group_size, f"len(gpu_blocks) = {len(gpu_blocks)}, tp_group_size = {tp_group_size}"
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
             blocks_in_one_gpu = []
@@ -118,8 +118,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
         self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
 
-        # assert self.ssd_block_stride_in_bytes == self.cpu_block_stride_in_bytes
-
         try:
             self.ioctx = c_ext.SSDIOCTX(
                 ssd_files,
@@ -140,6 +138,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.num_layers, gpu_kv_strides_tensor,
             gpu_block_strides_tensor, gpu_layer_strides_tensor,
             gpu_chunk_sizes_tensor)
+
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
 
     def _transfer_impl(self,
                       src_block_ids_h2d: torch.Tensor,
@@ -167,8 +167,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
                 ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
                 ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
-                chunk_size_in_bytes=self.chunk_size_in_bytes,
-                block_stride_in_bytes=self.block_stride_in_bytes,
+                chunk_size_in_bytes=self.cpu_chunk_size_in_bytes,
+                block_stride_in_bytes=self.cpu_block_stride_in_bytes,
                 is_read=True,
                 num_blocks_per_file=self.num_blocks_per_file,
                 round_robin=self.round_robin,
@@ -198,11 +198,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         if layer_granularity == -1:
             layer_granularity = self.num_layers
 
-        src_block_ids_h2d = transfer_op.src_block_ids_h2d
-        dst_block_ids_h2d = transfer_op.dst_block_ids_h2d
-        src_block_ids_disk2h = transfer_op.src_block_ids_disk2h
-        dst_block_ids_disk2h = transfer_op.dst_block_ids_disk2h
-
+        src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64)
+        dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64)
+        src_block_ids_disk2h = torch.from_numpy(transfer_op.src_block_ids_disk2h).to(dtype=torch.int64)
+        dst_block_ids_disk2h = torch.from_numpy(transfer_op.dst_block_ids_disk2h).to(dtype=torch.int64)
+        layer_granularity = self.num_layers  # TODO: remove this
         self._transfer_impl(
             src_block_ids_h2d,
             dst_block_ids_h2d,

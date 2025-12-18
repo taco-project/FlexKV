@@ -297,6 +297,7 @@ class TransferEngine:
                 )
                 for i in range(self.dp_size)
             ]
+            self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
             
         if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
             or (self._ssd_handle and self.cache_config.enable_p2p_ssd)):
