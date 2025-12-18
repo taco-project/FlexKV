@@ -108,6 +108,7 @@ class TransferOp:
             TransferOp._next_op_id += 1
         assert self.src_block_ids.dtype == np.int64
         assert self.dst_block_ids.dtype == np.int64
+        self.valid_block_num = self.src_block_ids.size
 
 @dataclass
 class LayerwiseTransferOp(TransferOp):
