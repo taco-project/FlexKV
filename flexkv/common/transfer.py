@@ -468,6 +468,8 @@ def merge_to_batch_graph(batch_id: int,
             )
             merged_graph.add_transfer_op(layerwise_transfer_op)
         batch_end_op_id = -1
+        # layerwise transfer op does not need callbacks
+        new_op_callback_dict.clear()
     else:
         if merged_disk2h_op is not None:
             merged_graph.add_transfer_op(merged_disk2h_op)
