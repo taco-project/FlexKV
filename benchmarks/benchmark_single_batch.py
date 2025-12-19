@@ -142,7 +142,7 @@ def benchmark_flexkv(model_config: ModelConfig,
         batch_get_ids.append(task_id)
         cached_tokens += return_mask.sum().item()
     get_match_time = time.time() - start_time
-    batch_id_list =kvmanager.launch(batch_get_ids, batch_slot_mapping, as_batch=True, layerwise_transfer=True)
+    batch_id_list =kvmanager.launch(batch_get_ids, batch_slot_mapping, as_batch=True, layerwise_transfer=False)
     get_result = kvmanager.wait(batch_id_list)
     elapsed_time_get = time.time() - start_time
     for _, response in get_result.items():
