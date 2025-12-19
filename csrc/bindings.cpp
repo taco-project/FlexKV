@@ -23,7 +23,9 @@
 #include "transfer.cuh"
 #include "transfer_ssd.h"
 #include "radix_tree.h"
+#include "gds/gds_base.h"
 #include "gds/gds_manager.h"
+#include "gds/nvmf/gds_nvmf_manager.h"
 #include "local_radix_tree.h"
 #include "distributed_radix_tree.h"
 #include "redis_meta_channel.h"
@@ -287,11 +289,102 @@ void transfer_kv_blocks_gds_binding(
     }
 }
 
+void transfer_kv_blocks_gds_nvmf_binding(
+    GDSNVMfManager& gds_nvmf_manager,
+    const torch::Tensor& gpu_layer_id_list,
+    const torch::Tensor& gpu_layer_ptrs_tensor,
+    const torch::Tensor& gds_block_ids,
+    const py::array_t<uint32_t>& ssd_block_node_ids,
+    const torch::Tensor& gpu_block_ids,
+
+    int64_t gpu_kv_stride_in_bytes,
+    int64_t gpu_block_stride_in_bytes,
+    int64_t gpu_layer_stride_in_bytes,
+    int64_t gds_layer_stride_in_bytes,
+    int64_t gds_block_stride_in_bytes,
+    int64_t gds_kv_stride_in_bytes,
+
+    int64_t total_layers,
+
+    //bool verbose = false,
+    bool is_mla = false,
+    int gpu_block_type = 0
+) {
+    TORCH_CHECK(gpu_layer_ptrs_tensor.dtype() == torch::kInt64,
+                "gpu_layer_ptrs must be int64");
+    TORCH_CHECK(gds_block_ids.dtype() == torch::kInt64,
+                "gds_block_ids must be int64");
+    TORCH_CHECK(gpu_block_ids.dtype() == torch::kInt64,
+                "gpu_block_ids must be int64");
+    TORCH_CHECK(gpu_layer_id_list.dtype() == torch::kInt32,
+                "gpu_layer_id_list must be int32");
+
+    flexkv::BackendType backend_type = static_cast<flexkv::BackendType>(gpu_block_type); // Susceptible to UB
+
+    void **gpu_tensor_ptrs = static_cast<void **>(gpu_layer_ptrs_tensor.data_ptr());
+    flexkv::GTensorHandler handler(
+        backend_type,
+        reinterpret_cast<int64_t**>(gpu_tensor_ptrs),
+        total_layers,
+        gpu_kv_stride_in_bytes,
+        gpu_block_stride_in_bytes,
+        gpu_layer_stride_in_bytes
+    );
+
+    switch (backend_type) {
+        case flexkv::BackendType::VLLM:
+            flexkv::transfer_kv_blocks_gds_nvmf<flexkv::BackendType::VLLM>(
+                gds_nvmf_manager,
+                gpu_layer_id_list,
+                handler,
+                gds_block_ids,
+                ssd_block_node_ids,
+                gpu_block_ids,
+                gds_layer_stride_in_bytes,
+                gds_block_stride_in_bytes,
+                gds_kv_stride_in_bytes,
+                //verbose,
+                is_mla
+            );
+            break;
+        case flexkv::BackendType::TRTLLM:
+            flexkv::transfer_kv_blocks_gds_nvmf<flexkv::BackendType::TRTLLM>(
+                gds_nvmf_manager,
+                gpu_layer_id_list,
+                handler,
+                gds_block_ids,
+                ssd_block_node_ids,
+                gpu_block_ids,
+                gds_layer_stride_in_bytes,
+                gds_block_stride_in_bytes,
+                gds_kv_stride_in_bytes,
+                //verbose,
+                is_mla
+            );
+            break;
+        case flexkv::BackendType::SGLANG:
+            flexkv::transfer_kv_blocks_gds_nvmf<flexkv::BackendType::SGLANG>(
+                gds_nvmf_manager,
+                gpu_layer_id_list,
+                handler,
+                gds_block_ids,
+                ssd_block_node_ids,
+                gpu_block_ids,
+                gds_layer_stride_in_bytes,
+                gds_block_stride_in_bytes,
+                gds_kv_stride_in_bytes,
+                //verbose,
+                is_mla
+            );
+            break;
+    }
+}
+
 // GDS Manager Python bindings
 py::list gds_batch_write_binding(GDSManager& manager, 
                                  py::list operations_list) {
     size_t batch_size = operations_list.size();
-    std::vector<BatchWriteOp> operations(batch_size);
+    std::vector<BatchOp> operations(batch_size);
     std::vector<ssize_t> results(batch_size);
     
     for (size_t i = 0; i < batch_size; ++i) {
@@ -317,7 +410,7 @@ py::list gds_batch_write_binding(GDSManager& manager,
 py::list gds_batch_read_binding(GDSManager& manager, 
                                 py::list operations_list) {
     size_t batch_size = operations_list.size();
-    std::vector<BatchReadOp> operations(batch_size);
+    std::vector<BatchOp> operations(batch_size);
     std::vector<ssize_t> results(batch_size);
     
     for (size_t i = 0; i < batch_size; ++i) {
@@ -445,6 +538,27 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("gds_copy_off_inside_chunks"),
         py::arg("num_blocks_per_file"), py::arg("total_layers"), 
         py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false,
+        py::arg("gpu_block_type") = 0);
+  m.def("transfer_kv_blocks_gds_nvmf", &transfer_kv_blocks_gds_nvmf_binding,
+        "Transfer KV blocks between GPU and GDS storage",
+        py::arg("gds_nvmf_manager"),
+        py::arg("gpu_layer_id_list"),
+        py::arg("gpu_layer_ptrs_tensor"),
+        py::arg("gds_block_ids"),
+        py::arg("ssd_block_node_ids"),
+        py::arg("gpu_block_ids"),
+
+        py::arg("gpu_kv_stride_in_bytes"),
+        py::arg("gpu_block_stride_in_bytes"),
+        py::arg("gpu_layer_stride_in_bytes"),
+        py::arg("gds_layer_stride_in_bytes"),
+        py::arg("gds_block_stride_in_bytes"),
+        py::arg("gds_kv_stride_in_bytes"),
+
+        py::arg("total_layers"),
+
+        //py::arg("verbose") = false,
+        py::arg("is_mla") = false,
         py::arg("gpu_block_type") = 0);
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
