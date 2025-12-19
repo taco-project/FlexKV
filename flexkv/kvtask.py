@@ -778,6 +778,7 @@ class KVTaskEngine(KVTaskManager):
         for task_id in task_ids:
             self.graph_to_task.pop(self.tasks[task_id].graph.graph_id, None)
             self.tasks.pop(task_id, None)
+        batch_task_graph = self.check_task_ready(batch_id)
         return batch_task_graph
 
     def launch_tasks(self,
@@ -794,7 +795,7 @@ class KVTaskEngine(KVTaskManager):
         # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
 
-        if len(task_ids) > 1 and as_batch:
+        if as_batch:
             if batch_id == -1:
                 batch_id = self._gen_task_id()
             if layerwise_transfer:
