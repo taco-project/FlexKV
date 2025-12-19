@@ -974,10 +974,9 @@ class GDSTransferWorker(TransferWorkerBase):
         self.num_blocks_per_file = num_blocks_per_file
         self.num_files = sum(len(file_list) for file_list in ssd_files.values())
 
-        # Create GDSManager from file paths in this worker process
-        from flexkv import c_ext
         # Use same round_robin as SSD transfer to ensure consistent block mapping
         self.round_robin = 1
+        # Create GDSManager from file paths in this worker process
         self.gds_manager = c_ext.GDSManager(
             ssd_files,
             len(ssd_files),
@@ -1324,7 +1323,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         ## initialize distributed environment
         if self.cache_config.enable_kv_sharing:
-            # step1: initialize the redis meta clent for node info
+            # step1: initialize the redis meta client for node info
             self.redis_meta_client = RedisMeta(
                 self.cache_config.redis_host,
                 self.cache_config.redis_port,
@@ -1711,7 +1710,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             task_info_list.append(
                 RDMATaskInfo(
                     ssd_task_id,
-                    self.mooncake_transfer_engine.get_engine_addr(),  ## for ssd transfer, peer engine addr refers to local mooncake engien
+                    self.mooncake_transfer_engine.get_engine_addr(),  ## for ssd transfer, peer engine addr refers to local mooncake engine
                     peer_engine_addr,
                     peer_zmq_addr,
                     None,
