@@ -35,6 +35,8 @@ from flexkv.common.transfer import (
     DeviceType, TransferOpGraph, TransferOp, TransferType
 )
 from flexkv.common.debug import flexkv_logger
+from flexkv.integration.dynamo.kvevents import KVEventPublisher
+
 @dataclass
 class MatchResultAccel:
     num_ready_matched_blocks: int = 0
@@ -152,7 +154,8 @@ class CacheEngine:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 hit_reward_seconds: int = 0):
+                 hit_reward_seconds: int = 0,
+                 event_publisher: Optional[KVEventPublisher] = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -171,6 +174,8 @@ class CacheEngine:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
 
+        self.event_publisher = event_publisher
+
     def reset(self) -> None:
         self.index.reset()
         self.mempool.reset()
@@ -186,11 +191,16 @@ class CacheEngine:
                num_insert_blocks: int = -1,
                is_ready: bool = True,
                match_result: Optional[MatchResult] = None) -> Optional[RadixNode]:
-        return self.index.insert(sequence_meta,
+        node = self.index.insert(sequence_meta,
                                  physical_block_ids,
                                  num_insert_blocks=num_insert_blocks,
                                  is_ready=is_ready,
                                  match_result=match_result)
+        if self.event_publisher is not None:
+            self.event_publisher.publish_stored(event_id=time.time_ns(),
+                                                block_hashes=sequence_meta.block_hashes[:num_insert_blocks],
+                                                token_ids=sequence_meta.token_ids[:num_insert_blocks] if sequence_meta.token_ids is not None else None)
+        return node
 
     def lock_node(self, node: RadixNode) -> None:
         self.index.lock(node)
@@ -212,9 +222,11 @@ class CacheEngine:
                 num_required_blocks - self.mempool.num_free_blocks,
                 int(self.mempool.num_total_blocks * self.evict_ratio)
             )
-            self.mempool.recycle_blocks(
-                self.index.evict(evict_block_num)
-            )
+            evicted_blocks = self.index.evict(evict_block_num)
+            self.mempool.recycle_blocks(evicted_blocks)
+            if self.event_publisher is not None:
+                self.event_publisher.publish_removed(event_id=time.time_ns(),
+                                                     block_hashes=evicted_blocks)
             if protected_node is not None:
                 self.index.unlock(protected_node)
         if strict and num_required_blocks > self.mempool.num_free_blocks:
@@ -228,7 +240,8 @@ class CacheEngine:
         self.mempool.recycle_blocks(physical_blocks)
 
 class GlobalCacheEngine:
-    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig):
+    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig,
+                 event_publisher: Optional[KVEventPublisher] = None):
         self.cache_config = cache_config
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
@@ -269,7 +282,8 @@ class GlobalCacheEngine:
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                event_publisher)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
             if self.index_accel:
