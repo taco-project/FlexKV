@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include <cuda_runtime.h>
+#include <cstdio>
 #include "layout_transform.cuh"
 
 namespace flexkv {
@@ -27,7 +28,6 @@ __global__ void layout_transform_kernel(
     int64_t buffer_layer_stride,
     int64_t buffer_kv_stride,
     int64_t buffer_block_stride,
-    int64_t buffer_chunk_offset,
     int64_t chunk_size,
     GTensorHandler gpu_handler,
     int64_t* gpu_block_ids,
@@ -51,8 +51,7 @@ __global__ void layout_transform_kernel(
         int64_t* buffer_ptr = buffer_base + 
                                block_local_idx * buffer_block_stride +
                                layer_idx * buffer_layer_stride +
-                               kv_idx * buffer_kv_stride +
-                               buffer_chunk_offset;
+                               kv_idx * buffer_kv_stride;
         
         // Calculate target GPU pointer
         int64_t* gpu_ptr = ptr_at<Type>(gpu_handler, layer_idx, kv_idx, gpu_block_idx);
@@ -73,7 +72,6 @@ void launch_layout_transform_kernel(
     int64_t buffer_layer_stride,
     int64_t buffer_kv_stride,
     int64_t buffer_block_stride,
-    int64_t buffer_chunk_offset,
     int64_t chunk_size,
     GTensorHandler gpu_handler,
     int64_t* gpu_block_ids,
@@ -85,28 +83,26 @@ void launch_layout_transform_kernel(
 ) {
     if (num_blocks == 0 || num_layers == 0) return;
     
-    int block_size = 128;
+    int block_size = 128; // TODO: warp level ?
     int kv_dim = is_mla ? 1 : 2;
     int num_chunks = num_layers * kv_dim * num_blocks;
     
     int device_id;
     cudaGetDevice(&device_id);
     
-    int num_sms;
-    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id);
-    
     int max_blocks_per_sm = 1;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm, layout_transform_kernel<Type>, block_size, 0);
+
+    int available_blocks_per_sm = 4; //TODO: flexible size?
     
-    int grid_size = std::min(num_chunks, num_sms * max_blocks_per_sm);
+    int grid_size = std::min(num_chunks, available_blocks_per_sm * max_blocks_per_sm);
     
     layout_transform_kernel<Type><<<grid_size, block_size, 0, stream>>>(
         buffer_base,
         buffer_layer_stride,
         buffer_kv_stride,
         buffer_block_stride,
-        buffer_chunk_offset,
         chunk_size,
         gpu_handler,
         gpu_block_ids,
@@ -115,19 +111,20 @@ void launch_layout_transform_kernel(
         is_mla,
         buffer_to_target
     );
+
 }
 
 // Explicit template instantiations
 template void launch_layout_transform_kernel<BackendType::VLLM>(
-    int64_t*, int64_t, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
+    int64_t*, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
     int, int, bool, bool, cudaStream_t);
 
 template void launch_layout_transform_kernel<BackendType::TRTLLM>(
-    int64_t*, int64_t, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
+    int64_t*, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
     int, int, bool, bool, cudaStream_t);
 
 template void launch_layout_transform_kernel<BackendType::SGLANG>(
-    int64_t*, int64_t, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
+    int64_t*, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
     int, int, bool, bool, cudaStream_t);
 
 } // namespace flexkv

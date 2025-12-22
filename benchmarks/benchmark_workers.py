@@ -104,10 +104,12 @@ def create_cpu_gpu_worker(
     )
     gpu_handles = []
     for tp_id in range(model_config.tp_size):
+        torch.cuda.set_device(tp_id)
         gpu_handles.append(GPUAllocator.allocate(
             layout=gpu_layout,
             dtype=model_config.dtype,
             num_chunks=num_chunks,
+            device_id=tp_id,
         ))
     finished_ops_queue = mp.Queue()
     # Create a shared memory buffer for transfer operations
@@ -138,7 +140,7 @@ def create_cpu_gpu_worker(
             op_buffer_tensor=op_buffer_tensor,
             gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
             cpu_blocks=cpu_handle.get_tensor(),
-            gpu_kv_layout=gpu_handles[0].kv_layout,
+            gpu_kv_layouts=[gpu_handles[tp_id].kv_layout for tp_id in range(model_config.tp_size)],
             cpu_kv_layout=cpu_handle.kv_layout,
             dtype=model_config.dtype,
             tp_group_size=model_config.tp_size,
@@ -255,10 +257,12 @@ def create_gpu_ssd_worker(
     
     gpu_handles = []
     for tp_id in range(model_config.tp_size):
+        torch.cuda.set_device(tp_id)
         gpu_handles.append(GPUAllocator.allocate(
             layout=gpu_layout,
             dtype=model_config.dtype,
             num_chunks=num_chunks,
+            device_id=tp_id,
         ))
     
     ssd_handle = SSDAllocator.allocate(
@@ -294,7 +298,7 @@ def create_gpu_ssd_worker(
             gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
             ssd_files=ssd_handle.get_file_list(),
             num_blocks_per_file=ssd_handle.num_blocks_per_file,
-            gpu_kv_layout=gpu_handles[0].kv_layout,
+            gpu_kv_layouts=[gpu_handles[tp_id].kv_layout for tp_id in range(model_config.tp_size)],
             ssd_kv_layout=ssd_handle.kv_layout,
             dtype=model_config.dtype,
             tp_group_size=model_config.tp_size,

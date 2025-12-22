@@ -331,6 +331,8 @@ void transfer_kv_blocks_gds(
     int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes,
     int64_t ssd_copy_off_inside_chunks,
+    int64_t gpu_buffer_size_in_bytes,
+    int gpu_id,
     int num_blocks_per_file,
     int64_t total_layers,
     bool is_read,
