@@ -27,7 +27,6 @@ void launch_layout_transform_kernel(
     int64_t buffer_layer_stride,
     int64_t buffer_kv_stride,
     int64_t buffer_block_stride,
-    int64_t buffer_chunk_offset,
     int64_t chunk_size,
     GTensorHandler gpu_handler,
     int64_t* gpu_block_ids,

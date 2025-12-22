@@ -16,8 +16,15 @@ import torch
 
 from flexkv import c_ext
 
-from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, \
-    transfer_kv_blocks_gds, TPTransferThreadGroup, TPGDSTransferThreadGroup
+from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
+
+# GDS imports are optional (only available when compiled with FLEXKV_ENABLE_GDS=1)
+try:
+    from flexkv.c_ext import transfer_kv_blocks_gds, TPGDSTransferThreadGroup
+except ImportError:
+    transfer_kv_blocks_gds = None
+    TPGDSTransferThreadGroup = None
+
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -1009,7 +1016,8 @@ class GDSTransferWorker(TransferWorkerBase):
                 is_read,                        # Read or write
                 False,                          # Verbose logging
                 self.is_mla,                    # MLA
-                self.gpu_block_type_            # GPU block type
+                self.gpu_block_type_,            # GPU block type
+                self.gpu_device_id              # GPU device ID
             )
 
         except Exception as e:
@@ -1105,6 +1113,10 @@ class tpGDSTransferWorker(TransferWorkerBase):
         # Layout information
         self.num_layers = gpu_kv_layouts[0].num_layer
         ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
+        self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
+        self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+        if not self.is_mla:
+            ssd_kv_layout_per_file = ssd_kv_layout_per_file.div_head(self.tp_group_size)
 
         # GPU layout calculations
         self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
@@ -1117,10 +1129,9 @@ class tpGDSTransferWorker(TransferWorkerBase):
                                            for gpu_kv_layout in gpu_kv_layouts]
 
         # SSD layout calculations
-        self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-        self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+        self.ssd_tp_stride_in_bytes = self.ssd_block_stride_in_bytes // self.tp_group_size if not self.is_mla else self.ssd_block_stride_in_bytes
 
         # Create TP GDS Transfer Thread Group
         gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
@@ -1170,7 +1181,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             self.ssd_layer_stride_in_bytes,
             self.ssd_kv_stride_in_bytes,
             self.ssd_block_stride_in_bytes,
-            self.ssd_chunk_size_in_bytes,
+            self.ssd_tp_stride_in_bytes,
             self.num_blocks_per_file,
             is_read,
             layer_id,

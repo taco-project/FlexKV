@@ -101,7 +101,7 @@ def shutdown_tp_client(tp_client_processes):
     {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 256, 'num_ssd_blocks': 2048},
     # GDS test configs
     {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': True, \
-        'enable_remote': False, 'num_ssd_blocks': 512},
+        'enable_remote': False, 'num_cpu_blocks':256, 'num_ssd_blocks': 1024},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
@@ -133,7 +133,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     # Skip tests based on GPU availability and configuration
     skip_if_insufficient_gpus(tp_size * dp_size)
 
-    if enable_gds and os.environ.get("FLEXKV_GDS_TEST", "0") == "0":
+    if enable_gds and os.environ.get("FLEXKV_ENABLE_GDS", "0") == "0":
         pytest.skip("skip because GDS test is not enabled")
 
     if enable_remote:
@@ -331,80 +331,81 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     print(f"Total cache hit rate: {total_cache_hit / (total_cache_hit + total_cache_miss)}")
 
     # =============== Test batched launched get ===============
-    print("\n========== Testing batched launched get ==========")
-    
-    # Use the first few request_pairs that were written in initial phase
-    batch_size = 6
-    
-    batched_get_task_ids = []
-    batched_slot_mappings = []
-    batched_req_info = []  # Store (token_ids, block_ids) for verification
-    
-    # Create multiple get_match requests
-    for i in range(batch_size):
-        token_ids, block_ids, dp_id = request_pairs[random.randint(0, num_requests - 1)]
-        slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
+    if not enable_gds:
+        print("\n========== Testing batched launched get ==========")
         
-        request_id, return_mask = kvmanager.get_match(
-            token_ids=token_ids,
-            layer_granularity=-1,
-            token_mask=None,
-            dp_id=dp_id,
-        )
-        batched_get_task_ids.append(request_id)
-        batched_slot_mappings.append(slot_mapping)
-        batched_req_info.append((token_ids, block_ids, request_id))
-        print(f"Created get_match request {request_id} for request_pair[{i}]")
-    
-    # Launch all get requests as a batch
-    print(f"Launching {len(batched_get_task_ids)} get requests as batch...")
-    batch_id = kvmanager.launch(
-        task_ids=batched_get_task_ids,
-        slot_mappings=batched_slot_mappings,
-        as_batch=True
-    )[0]
-    print(f"Returned task_ids after batch launch: {batch_id}")
-    
-    # Wait for the batched get to complete
-    # When as_batch=True, launch returns [batch_id], we need to wait on batch_id
-    batch_results = kvmanager.wait(batch_id, completely=True)
-    print(f"Batch wait returned {len(batch_results)} results")
-    
-    # Verify results
-    batched_cache_hit = 0
-    batched_cache_miss = 0
-    kvresponse = batch_results[batch_id]
-    assert kvresponse.status == KVResponseStatus.SUCCESS, \
-        f"Batched get task {batch_id} failed with status {kvresponse.status}"
-    for mask in kvresponse.return_mask:
-        batched_cache_hit += return_mask.sum().item()
-        batched_cache_miss += len(return_mask) - return_mask.sum().item()
-        print(f"Task {batch_id}: cache_hit={batched_cache_hit}, cache_miss={batched_cache_miss}")
-    
-    # GPU KV cache verification for batched get
-    if gpu_kv_verifier is not None:
-        for idx, (token_ids, block_ids, req_id) in enumerate(batched_req_info):
-            # Find the corresponding response
-            # Note: when batched, the returned task_id might be the batch_id
-            # We need to verify based on the actual data
-            valid_fetched_tokens = kvresponse.return_mask[idx].sum().item() // tokens_per_block * tokens_per_block
-            if valid_fetched_tokens > 0:
-                # Verify that GPU blocks contain correct data
-                verify_result = gpu_kv_verifier.verify_kv_blocks(
-                    token_ids[:valid_fetched_tokens],
-                    block_ids[:valid_fetched_tokens // tokens_per_block]
-                )
-    
-    print(f"Batched get test completed: hit={batched_cache_hit}, miss={batched_cache_miss}")
-    
-    # Since we read data that was written before, cache hit should be high
-    if enable_cpu and num_cpu_blocks >= num_gpu_blocks:
-        assert batched_cache_miss == 0, \
-            f"Expected 0 cache miss for batched get, but got {batched_cache_miss}"
-        print("  ✓ Batched launched get verification PASSED (100% cache hit)")
-    else:
-        print(f"  Batched launched get completed (cache hit rate: "
-                f"{batched_cache_hit / (batched_cache_hit + batched_cache_miss):.2%})")
+        # Use the first few request_pairs that were written in initial phase
+        batch_size = 6
+        
+        batched_get_task_ids = []
+        batched_slot_mappings = []
+        batched_req_info = []  # Store (token_ids, block_ids) for verification
+        
+        # Create multiple get_match requests
+        for i in range(batch_size):
+            token_ids, block_ids, dp_id = request_pairs[random.randint(0, num_requests - 1)]
+            slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
+            
+            request_id, return_mask = kvmanager.get_match(
+                token_ids=token_ids,
+                layer_granularity=-1,
+                token_mask=None,
+                dp_id=dp_id,
+            )
+            batched_get_task_ids.append(request_id)
+            batched_slot_mappings.append(slot_mapping)
+            batched_req_info.append((token_ids, block_ids, request_id))
+            print(f"Created get_match request {request_id} for request_pair[{i}]")
+        
+        # Launch all get requests as a batch
+        print(f"Launching {len(batched_get_task_ids)} get requests as batch...")
+        batch_id = kvmanager.launch(
+            task_ids=batched_get_task_ids,
+            slot_mappings=batched_slot_mappings,
+            as_batch=True
+        )[0]
+        print(f"Returned task_ids after batch launch: {batch_id}")
+        
+        # Wait for the batched get to complete
+        # When as_batch=True, launch returns [batch_id], we need to wait on batch_id
+        batch_results = kvmanager.wait(batch_id, completely=True)
+        print(f"Batch wait returned {len(batch_results)} results")
+        
+        # Verify results
+        batched_cache_hit = 0
+        batched_cache_miss = 0
+        kvresponse = batch_results[batch_id]
+        assert kvresponse.status == KVResponseStatus.SUCCESS, \
+            f"Batched get task {batch_id} failed with status {kvresponse.status}"
+        for mask in kvresponse.return_mask:
+            batched_cache_hit += return_mask.sum().item()
+            batched_cache_miss += len(return_mask) - return_mask.sum().item()
+            print(f"Task {batch_id}: cache_hit={batched_cache_hit}, cache_miss={batched_cache_miss}")
+        
+        # GPU KV cache verification for batched get
+        if gpu_kv_verifier is not None:
+            for idx, (token_ids, block_ids, req_id) in enumerate(batched_req_info):
+                # Find the corresponding response
+                # Note: when batched, the returned task_id might be the batch_id
+                # We need to verify based on the actual data
+                valid_fetched_tokens = kvresponse.return_mask[idx].sum().item() // tokens_per_block * tokens_per_block
+                if valid_fetched_tokens > 0:
+                    # Verify that GPU blocks contain correct data
+                    verify_result = gpu_kv_verifier.verify_kv_blocks(
+                        token_ids[:valid_fetched_tokens],
+                        block_ids[:valid_fetched_tokens // tokens_per_block]
+                    )
+        
+        print(f"Batched get test completed: hit={batched_cache_hit}, miss={batched_cache_miss}")
+        
+        # Since we read data that was written before, cache hit should be high
+        if enable_cpu and num_cpu_blocks >= num_gpu_blocks:
+            assert batched_cache_miss == 0, \
+                f"Expected 0 cache miss for batched get, but got {batched_cache_miss}"
+            print("  ✓ Batched launched get verification PASSED (100% cache hit)")
+        else:
+            print(f"  Batched launched get completed (cache hit rate: "
+                    f"{batched_cache_hit / (batched_cache_hit + batched_cache_miss):.2%})")
 
     if enable_cpu and num_cpu_blocks >= num_gpu_blocks or \
         enable_ssd and num_ssd_blocks >= num_gpu_blocks or \

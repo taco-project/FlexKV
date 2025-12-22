@@ -3,9 +3,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <cerrno>
 #include <cufile.h>
 #include <vector>
 #include <map>
+#include <sys/stat.h>
 
 GDSManager::GDSManager(std::map<int, std::vector<std::string>>& ssd_files, 
                        int num_devices, 
@@ -602,6 +604,8 @@ void transfer_kv_blocks_gds(
     int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes,
     int64_t ssd_copy_off_inside_chunks,
+    int64_t gpu_buffer_size_in_bytes,
+    int gpu_id,
     int num_blocks_per_file,
     int64_t total_layers,
     bool is_read,
@@ -634,13 +638,12 @@ void transfer_kv_blocks_gds(
         ssd_block_id_ptr, gpu_block_id_ptr, num_transfers, num_devices, round_robin,
         gpu_blocks_partition, ssd_blocks_partition);
 
-    int current_device;
-    cudaGetDevice(&current_device);
+    cudaSetDevice(gpu_id);
     
     // Number of buffer slots = number of worker threads
     const int num_slots = std::max(num_worker_threads, 1);
     void* buffer_ptr = nullptr;
-    const int64_t total_buffer_size = ssd_block_stride_in_bytes * num_slots;
+    const int64_t total_buffer_size = gpu_buffer_size_in_bytes * num_slots;
     
     cudaError_t cuda_status = cudaMalloc(&buffer_ptr, total_buffer_size);
     if (cuda_status != cudaSuccess) {
@@ -671,7 +674,7 @@ void transfer_kv_blocks_gds(
 
     const int64_t buffer_layer_stride = ssd_layer_stride_in_bytes / sizeof(int64_t);
     const int64_t buffer_kv_stride = ssd_kv_stride_in_bytes / sizeof(int64_t);
-    const int64_t buffer_block_stride = ssd_block_stride_in_bytes / sizeof(int64_t);
+    const int64_t buffer_block_stride = gpu_buffer_size_in_bytes / sizeof(int64_t);
     const int64_t buffer_chunk_offset = ssd_copy_off_inside_chunks / sizeof(int64_t);
     const int64_t chunk_size = chunk_size_in_bytes / sizeof(int64_t);
     const int32_t start_layer = gpu_layer_id_list_ptr[0];
@@ -689,9 +692,9 @@ void transfer_kv_blocks_gds(
             const int ssd_block_id = ssd_blocks[j];
             const int slot_id = (device_id * gpu_blocks.size() + j) % num_slots;
             
-            futures.push_back(gds_manager.enqueue_task([&, device_id, gpu_block_id, ssd_block_id, slot_id, current_device]() {
+            futures.push_back(gds_manager.enqueue_task([&, device_id, gpu_block_id, ssd_block_id, slot_id, gpu_id]() {
                 // Set correct CUDA device for this worker thread
-                cudaSetDevice(current_device);
+                cudaSetDevice(gpu_id);
                 
                 std::lock_guard<std::mutex> slot_lock(slot_mutexes[slot_id]);
                 // Sync stream to ensure previous kernel on this slot completed
@@ -703,14 +706,14 @@ void transfer_kv_blocks_gds(
                 const std::string& filename = file_list[file_id_in_device];
                 
                 char* buffer_slot_ptr = reinterpret_cast<char*>(buffer_ptr) + 
-                                       slot_id * ssd_block_stride_in_bytes;
+                                       slot_id * gpu_buffer_size_in_bytes;
                 
                 const int64_t ssd_block_offset = 
-                    ssd_block_stride_in_bytes * block_id_in_file +
+                    ssd_block_stride_in_bytes * block_id_in_file + ssd_copy_off_inside_chunks + 
                     start_layer * ssd_layer_stride_in_bytes;
                                 
                 // Per-slot stream and d_gpu_block_id
-                int64_t* d_my_block_id = d_gpu_block_ids + slot_id;
+                int64_t* d_my_block_id = d_gpu_block_ids + slot_id; //TODO directly pass this as parameter
                 const int64_t gpu_block_id_64 = gpu_block_id;
                 cudaMemcpyAsync(d_my_block_id, &gpu_block_id_64, sizeof(int64_t),
                                cudaMemcpyHostToDevice, slot_stream);
@@ -718,14 +721,13 @@ void transfer_kv_blocks_gds(
                 
                 if (is_read) {
                     // READ: SSD -> buffer_slot -> GPU
-                    gds_manager.read(filename.c_str(), buffer_slot_ptr, ssd_block_stride_in_bytes, ssd_block_offset);
+                    gds_manager.read(filename.c_str(), buffer_slot_ptr, gpu_buffer_size_in_bytes, ssd_block_offset);
                     
                     launch_layout_transform_kernel<Type>(
                         reinterpret_cast<int64_t*>(buffer_slot_ptr),
                         buffer_layer_stride,
                         buffer_kv_stride,
                         buffer_block_stride,
-                        buffer_chunk_offset,
                         chunk_size,
                         gpu_tensor_handler,
                         d_my_block_id,
@@ -743,7 +745,6 @@ void transfer_kv_blocks_gds(
                         buffer_layer_stride,
                         buffer_kv_stride,
                         buffer_block_stride,
-                        buffer_chunk_offset,
                         chunk_size,
                         gpu_tensor_handler,
                         d_my_block_id,
@@ -755,7 +756,7 @@ void transfer_kv_blocks_gds(
                     );
                     cudaStreamSynchronize(slot_stream);
                     
-                    gds_manager.write(filename.c_str(), buffer_slot_ptr, ssd_block_stride_in_bytes, ssd_block_offset);
+                    gds_manager.write(filename.c_str(), buffer_slot_ptr, gpu_buffer_size_in_bytes, ssd_block_offset);
                 }
                 
                 if (verbose) {
@@ -792,17 +793,17 @@ void transfer_kv_blocks_gds(
 // Explicit template instantiations
 template void transfer_kv_blocks_gds<BackendType::VLLM>(
     GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
-    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int, int64_t, bool, bool, bool);
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int, int64_t, bool, bool, bool);
 
 template void transfer_kv_blocks_gds<BackendType::TRTLLM>(
     GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
-    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int, int64_t, bool, bool, bool);
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int, int64_t, bool, bool, bool);
 
 template void transfer_kv_blocks_gds<BackendType::SGLANG>(
     GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
-    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int, int64_t, bool, bool, bool);
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int, int64_t, bool, bool, bool);
 
 }

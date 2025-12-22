@@ -160,7 +160,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
     const int64_t ssd_layer_stride_in_bytes,
     const int64_t ssd_kv_stride_in_bytes,
     const int64_t ssd_block_stride_in_bytes,
-    const int64_t ssd_chunk_size_in_bytes,
+    const int64_t ssd_tp_stride_in_bytes,
     const int64_t num_blocks_per_file,
     const bool is_read,
     const int layer_id,
@@ -178,29 +178,24 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
         // Prepare layer ID list for this specific layer range
         torch::Tensor layer_id_list = torch::arange(layer_id, layer_id + layer_granularity, 
                                                     torch::TensorOptions().dtype(torch::kInt32));
-        
+        //here the ssd_copy_off_inside_chunks is the offset of the ssd block in the ssd file
         int64_t ssd_copy_off_inside_chunks;
         int64_t gpu_chunk_size_in_bytes = gpu_chunk_sizes_in_bytes_[i];
-        
+        //for simplicity, we don't consider write deduplication for multiple gpus for mla (in fact write will not be used)
         if (is_mla) {
-          if (!is_read) {
-            ssd_copy_off_inside_chunks = i * gpu_chunk_size_in_bytes;
-          } else {
             ssd_copy_off_inside_chunks = 0;
-          }
         } else {
-          ssd_copy_off_inside_chunks = i * gpu_chunk_size_in_bytes;
+          ssd_copy_off_inside_chunks = i * ssd_tp_stride_in_bytes;
         }
 
-        int64_t chunk_size = is_mla && !is_read ? gpu_chunk_size_in_bytes / num_gpus_ : gpu_chunk_size_in_bytes;
-        
+        int64_t chunk_size = gpu_chunk_size_in_bytes;
         switch (backend_type_) {
           case BackendType::VLLM:
             flexkv::transfer_kv_blocks_gds<BackendType::VLLM>(
                 *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
-                ssd_copy_off_inside_chunks, num_blocks_per_file, layer_granularity,
+                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, i, num_blocks_per_file, layer_granularity,
                 is_read, false, is_mla
             );
             break;
@@ -209,7 +204,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
-                ssd_copy_off_inside_chunks, num_blocks_per_file, layer_granularity,
+                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, i, num_blocks_per_file, layer_granularity,
                 is_read, false, is_mla
             );
             break;
@@ -218,7 +213,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
-                ssd_copy_off_inside_chunks, num_blocks_per_file, layer_granularity,
+                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, i, num_blocks_per_file, layer_granularity,
                 is_read, false, is_mla
             );
             break;
