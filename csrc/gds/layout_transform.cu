@@ -83,7 +83,7 @@ void launch_layout_transform_kernel(
 ) {
     if (num_blocks == 0 || num_layers == 0) return;
     
-    int block_size = 128; // TODO: warp level 
+    int block_size = 128; // TODO: warp level ?
     int kv_dim = is_mla ? 1 : 2;
     int num_chunks = num_layers * kv_dim * num_blocks;
     
@@ -94,7 +94,7 @@ void launch_layout_transform_kernel(
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm, layout_transform_kernel<Type>, block_size, 0);
 
-    int available_blocks_per_sm = 4;
+    int available_blocks_per_sm = 4; //TODO: flexible size?
     
     int grid_size = std::min(num_chunks, available_blocks_per_sm * max_blocks_per_sm);
     
@@ -112,17 +112,6 @@ void launch_layout_transform_kernel(
         buffer_to_target
     );
 
-    // 捕获并打印 kernel 启动或执行错误
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "layout_transform_kernel launch failed: %s\n", cudaGetErrorString(err));
-        return;
-    }
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "layout_transform_kernel execution failed: %s\n", cudaGetErrorString(err));
-        return;
-    }
 }
 
 // Explicit template instantiations
