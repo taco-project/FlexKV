@@ -37,7 +37,7 @@ namespace flexkv {
 
 class GDSNVMfManager: public GDSBase {
 public:
-    /// \param nvmf_targets Python Dict[int, Dict[str, str]], or Dict[node ID, Dict[remove dev, local view]]
+    /// \param nvmf_targets Python Dict[int, Dict[str, str]], or Dict[node ID, Dict[remove dev, local view]], excluding self
     GDSNVMfManager(std::unordered_map<int, std::unordered_map<std::string, std::string>>&& nvmf_targets,
                    int chunk_size,
                    RedisMetaChannel* channel,
