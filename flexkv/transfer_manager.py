@@ -27,13 +27,15 @@ from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import RegisterTPClientRequest, Response
 from flexkv.common.debug import flexkv_logger
+from flexkv.cache.redis_meta import RedisMeta
 
 
 class TransferManager:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-                 gpu_register_port: str):
+                 gpu_register_port: str,
+                 redis_meta: Optional[RedisMeta] = None):
         self.model_config = model_config
         self.cache_config = cache_config
         self.gpu_register_port = gpu_register_port
@@ -46,7 +48,7 @@ class TransferManager:
             self.context, zmq.SocketType.PULL, gpu_register_port, True)
 
         self.transfer_engine: Optional[TransferEngine] = None
-        self.storage_engine = StorageEngine(self.model_config, self.cache_config)
+        self.storage_engine = StorageEngine(self.model_config, self.cache_config, redis_meta)
 
     def _handle_gpu_blocks_registration(self, req: RegisterTPClientRequest) -> None:
         device_id = req.device_id
@@ -455,8 +457,9 @@ class TransferManagerIntraProcessHandle(TransferManagerHandleBase):
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-                 gpu_register_port: str):
-        self.transfer_manager = TransferManager(model_config, cache_config, gpu_register_port)
+                 gpu_register_port: str,
+                 redis_meta: Optional[RedisMeta] = None):
+        self.transfer_manager = TransferManager(model_config, cache_config, gpu_register_port, redis_meta)
         self._is_ready = False
 
     def start(self) -> None:
@@ -481,12 +484,14 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-                 gpu_register_port: str):
+                 gpu_register_port: str,
+                 redis_meta: Optional[RedisMeta] = None):
         self.mp_ctx = mp.get_context('spawn')
 
         self.model_config = model_config
         self.cache_config = cache_config
         self.gpu_register_port = gpu_register_port
+        self.redis_meta = redis_meta
 
         self.command_parent_conn, self.command_child_conn = self.mp_ctx.Pipe()
         self.result_parent_conn, self.result_child_conn = self.mp_ctx.Pipe()
@@ -525,7 +530,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         try:
             start_event.set()
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
-            transfer_manager = TransferManager(model_config, cache_config, gpu_register_port)
+            transfer_manager = TransferManager(model_config, cache_config, gpu_register_port, self.redis_meta)
             transfer_manager.initialize_transfer_engine()
             transfer_manager.start()
             ready_event.set()
@@ -779,16 +784,17 @@ class TransferManagerHandle:
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
                  mode: str = "process",
+                 redis_meta: Optional[RedisMeta] = None,
                  **kwargs): # process or thread or remote
         if gpu_register_port is None:
             gpu_register_port = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
         if mode == "process":
             self._handle: TransferManagerHandleBase = TransferManagerInterProcessHandle(
-                model_config, cache_config, gpu_register_port
+                model_config, cache_config, gpu_register_port, redis_meta
             )
         elif mode == "thread":
             self._handle: TransferManagerHandleBase = TransferManagerIntraProcessHandle(
-                model_config, cache_config, gpu_register_port
+                model_config, cache_config, gpu_register_port, redis_meta
             )
         elif mode == "remote":
             master_host = kwargs["master_host"]
