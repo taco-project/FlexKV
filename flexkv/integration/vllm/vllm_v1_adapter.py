@@ -177,9 +177,9 @@ class FlexKVSchedulerConnector:
                                 which means not need to transfer from flexkv.
 
         Returns:
-            tuple[int, bool]: A tuple containing two integer values representing the
+            tuple[int, bool]: A tuple containing an integer and a bool representing the
                             number of new matched tokens and whether it is necessary
-                            to get the new matched blocks from flexkv.
+                            to get the new matched blocks from flexkv, respectively.
         """
         task_id, num_new_matched_tokens = self._get_match(request=request,
                                                           num_computed_tokens=num_computed_tokens)
@@ -426,7 +426,7 @@ class FlexKVSchedulerConnector:
 
     def launch_tasks(self) -> None:
         """
-        Launch tasks in self.unlaunched_tasks
+        Launch tasks in self.tasks_to_launch
         """
         if len(self.tasks_to_launch) == 0:
             return
