@@ -620,4 +620,45 @@ void transfer_kv_blocks_gds_nvmf(
     /// TODO: Check by byte read
 }
 
+// Explicit template instantiations
+template void transfer_kv_blocks_gds_nvmf<BackendType::VLLM>(
+    GDSNVMfManager&,
+    const torch::Tensor&,
+    GTensorHandler,
+    const torch::Tensor&,
+    const py::array_t<uint32_t>&,
+    const torch::Tensor&,
+    int64_t,
+    int64_t,
+    int64_t,
+    //bool,
+    bool
+);
+template void transfer_kv_blocks_gds_nvmf<BackendType::TRTLLM>(
+    GDSNVMfManager&,
+    const torch::Tensor&,
+    GTensorHandler,
+    const torch::Tensor&,
+    const py::array_t<uint32_t>&,
+    const torch::Tensor&,
+    int64_t,
+    int64_t,
+    int64_t,
+    //bool,
+    bool
+);
+template void transfer_kv_blocks_gds_nvmf<BackendType::SGLANG>(
+    GDSNVMfManager&,
+    const torch::Tensor&,
+    GTensorHandler,
+    const torch::Tensor&,
+    const py::array_t<uint32_t>&,
+    const torch::Tensor&,
+    int64_t,
+    int64_t,
+    int64_t,
+    //bool,
+    bool
+);
+
 } // namespace flexkv

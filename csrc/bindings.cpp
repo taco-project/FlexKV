@@ -540,7 +540,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false,
         py::arg("gpu_block_type") = 0);
   m.def("transfer_kv_blocks_gds_nvmf", &transfer_kv_blocks_gds_nvmf_binding,
-        "Transfer KV blocks between GPU and GDS storage",
+        "Read KV blocks to GPU from multi-node GDS storage",
         py::arg("gds_nvmf_manager"),
         py::arg("gpu_layer_id_list"),
         py::arg("gpu_layer_ptrs_tensor"),
@@ -755,6 +755,21 @@ PYBIND11_MODULE(c_ext, m) {
       .def("create_gds_file", &create_gds_file_binding,
             "Create and register a GDS file with specified size", 
             py::arg("filename"), py::arg("file_size"));
+
+  py::class_<flexkv::GDSNVMfManager>(m, "GDSNVMfManager")
+      .def(py::init<std::unordered_map<int, std::unordered_map<std::string, std::string>>&&,
+                    int,
+                    RedisMetaChannel*,
+                    int>(),
+           "Initialize GDS NVMf Manager with all NVMf targets",
+           py::arg("nvmf_targets"),
+           py::arg("chunk_size"),
+           py::arg("channel"),
+           py::arg("round_robin") = 1)
+      .def("is_ready", &flexkv::GDSNVMfManager::is_ready,
+           "Check if GDS NVMf manager is ready for KV cache transfer")
+      .def("get_last_error", &flexkv::GDSNVMfManager::get_last_error,
+           "Get the last error message");
 
   // BlockMeta binding
   py::class_<flexkv::BlockMeta>(m, "BlockMeta")
