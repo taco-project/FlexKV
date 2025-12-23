@@ -82,7 +82,7 @@ class KVTaskManager:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
-                 redis_meta: RedisMeta = None
+                 redis_meta: Optional[RedisMeta] = None
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
@@ -121,7 +121,8 @@ class KVTaskManager:
                 model_config_for_transfer,
                 self.cache_config,
                 mode="process",
-                gpu_register_port=gpu_register_port
+                gpu_register_port=gpu_register_port,
+                redis_meta=redis_meta
             )]
         else:
             # When using FlexKV with TensorRT-LLM, we use remote mode to transfer data
