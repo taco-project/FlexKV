@@ -51,11 +51,6 @@ class RequestWrapper:
     def num_prompt_tokens(self):
         return self._request.prompt_len
 
-    @property
-    def num_new_matched_tokens(self):
-        return self._request.num_connector_matched_tokens
-        # return self._request.local_prepopulated_prompt_len
-
     def is_finished(self):
         return self._request.is_finished
     
@@ -72,9 +67,7 @@ class RequestWrapper:
     def __repr__(self):
         return f"RequestWrapper(req_id={self.req_id}, " \
                 f"num_prompt_tokens={self.num_prompt_tokens}, " \
-                f"num_tokens={len(self.all_token_ids)}, " \
-                f"num_new_matched_tokens={self.num_new_matched_tokens})"
-
+                f"num_tokens={len(self.all_token_ids)}, "
 
 def get_mapping_from_config(config):
     if hasattr(config, "mapping"):

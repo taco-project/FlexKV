@@ -209,8 +209,8 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             None.
         """
         request = RequestWrapper(_request)
-        if request.num_new_matched_tokens == 0:
-            flexkv_logger.info(f"No new matched tokens, skip update state after alloc.")
+        if request.req_id not in self.req_id_to_task_dict:
+            flexkv_logger.info(f"Request {request.req_id} didn't launch task, skip update state after alloc.")
             return
 
         # prepare to launch task
@@ -220,7 +220,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         # compute slot_mapping
         num_computed_blocks = task.num_computed_tokens // self.block_size
-        num_blocks_to_get = request.num_new_matched_tokens // self.block_size
+        num_blocks_to_get = task.num_new_matched_tokens // self.block_size
         block_ids_to_get = block_ids[num_computed_blocks:num_computed_blocks+num_blocks_to_get]
         task.slot_mapping = np.array(block_ids_to_get).repeat(self.block_size)*self.block_size
 
