@@ -20,7 +20,7 @@ import json
 from flexkv import c_ext
 
 from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, \
-    transfer_kv_blocks_gds, TPTransferThreadGroup, TPGDSTransferThreadGroup
+    transfer_kv_blocks_gds, transfer_kv_blocks_gds_nvmf, TPTransferThreadGroup, TPGDSTransferThreadGroup, FileExtent
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -29,7 +29,7 @@ from flexkv.common.transfer import get_nvtx_range_color
 from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
-from flexkv.cache.redis_meta import RedisMeta
+from flexkv.cache.redis_meta import RedisMeta, RedisMetaChannel
 from flexkv.transfer.utils import group_blocks_by_node_and_segment, group_blocks_by_node, split_contiguous_blocks, RemoteSSD2HMetaInfo, NodeMetaInfo, RDMATaskInfo
 try:
     from flexkv.c_ext import (
@@ -2091,3 +2091,172 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.info(f"Fetched node {node_id} meta from Redis.")
 
         return self.node_metas[node_id]
+
+class GDSNVMfTransferWorker(TransferWorkerBase):
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+
+        gpu_blocks: List[TensorSharedHandle],
+        gpu_kv_layout: KVCacheLayout,
+        nvmf_targets: Dict[int, Dict[str, str]],
+        ssd_kv_layout: KVCacheLayout, # Assume symmetric nodes with identical KV layout
+        num_files: int,
+
+        dtype: torch.dtype,
+        cache_config: CacheConfig,
+
+        gpu_device_id: int = 0
+    ) -> None:
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+
+        self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
+        self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
+        self.gpu_layer_ptrs = self.gpu_blocks_ptrs
+
+        self.num_files = num_files
+
+        # Initialize Redis client
+        # NOTE: We only need hiredis client for file extents.
+        self.redis_client = RedisMeta(
+            cache_config.redis_host,
+            cache_config.redis_port,
+            cache_config.redis_password,
+            cache_config.local_ip
+        )
+        self.redis_client.set_node_id(cache_config.distributed_node_id)
+        redis_channel: RedisMetaChannel = self.redis_client.get_redis_meta_channel()
+        try:
+            channel = getattr(redis_channel, '_c', redis_channel)
+        except Exception:
+            raise RuntimeError('Failed to get hiredis channel')
+        # Use same round_robin as SSD transfer to ensure consistent block mapping
+        self.round_robin = 1
+
+        self.dtype = dtype
+        self.is_mla = gpu_kv_layout.is_mla
+
+        # Layout information
+        self.num_layers = gpu_kv_layout.num_layer
+        gpu_kv_layout_per_layer = gpu_kv_layout.div_layer(self.num_layers)
+        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
+
+        # GPU layout calculations
+        self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
+        self.gpu_kv_stride_in_bytes = gpu_kv_layout_per_layer.get_kv_stride() * self.dtype.itemsize
+        self.gpu_block_stride_in_bytes = gpu_kv_layout_per_layer.get_block_stride() * self.dtype.itemsize
+        self.gpu_layer_stride_in_bytes = gpu_kv_layout_per_layer.get_layer_stride() * self.dtype.itemsize
+
+        # SSD layout calculations
+        self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+        self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
+        self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+
+        # Create GDSNVMfManager from NVMe device names in this worker process
+        self.gds_nvmf_manager = c_ext.GDSNVMfManager(
+            nvmf_targets,
+            self.chunk_size_in_bytes
+            channel,
+            self.round_robin
+        )
+        if not self.gds_nvmf_manager.is_ready():
+            raise RuntimeError(f'Failed to initialize GDSNVMf Manager in worker {worker_id}: '
+                               f'{self.gds_nvmf_manager.get_last_error()}')
+
+        if len(self.gpu_blocks) == 1:
+            self.gpu_block_type_ = 1  # TRTLLM
+        elif len(self.gpu_blocks) == self.num_layers:
+            self.gpu_block_type_ = 0  # VLLM
+        elif len(self.gpu_blocks) == self.num_layers * 2:
+            self.gpu_block_type_ = 2  # SGLANG
+        else:
+            raise ValueError(f'Invalid GPU block type: {len(self.gpu_blocks)}')
+
+        self.gpu_device_id = gpu_device_id
+        if gpu_device_id != -1:
+            torch.cuda.set_device(gpu_device_id)
+        self.transfer_stream = torch.cuda.Stream()
+
+    def _transfer_impl(
+        self,
+        src_block_ids: torch.Tensor,
+        dst_block_ids: torch.Tensor,
+        transfer_type: TransferType,
+        layer_id: int,
+        layer_granularity: int,
+        **kwargs: Any
+    ) -> None:
+        assert transfer_type == TransferType.PEERSSD2D, 'GDSNVMfTransferWorker is read-only.'
+
+        src_block_node_ids: np.ndarray = kwargs['src_block_node_ids']
+        assert len(src_block_ids) == len(src_block_node_ids) == len(dst_block_ids)
+        if len(src_block_ids) == 0:
+            return
+
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
+
+        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
+        try:
+            transfer_kv_blocks_gds_nvmf(
+                self.gds_nvmf_manager,          # GDS manager for NVMf (contains topology info)
+                layer_id_list,                  # GPU layer IDs to process
+                self.gpu_layer_ptrs,            # GPU layer pointers tensor
+                src_block_ids,                  # SSD block IDs
+                src_block_node_ids,             #
+                dst_block_ids,                  # GPU block IDs
+
+                self.gpu_kv_stride_in_bytes,    # GPU K-V stride
+                self.gpu_block_stride_in_bytes, # GPU block stride
+                self.gpu_layer_stride_in_bytes, # GPU layer stride
+                self.ssd_layer_stride_in_bytes, # SSD layer stride
+                self.ssd_block_stride_in_bytes, # SSD block stride
+                self.ssd_kv_stride_in_bytes,    # SSD K-V stride
+
+                self.num_layers,                # Total layers
+
+                #False,                          # Verbose logging
+                self.is_mla,                    # MLA
+                self.gpu_block_type_            # GPU block type
+            )
+        except Exception as e:
+            flexkv_logger.error(f'GDSNVMf transfer failed: {e}')
+            raise RuntimeError(f'Failed to transfer KV blocks: {e}') from e
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        layer_id: int = transfer_op.layer_id
+        if layer_id == -1:
+            layer_id = 0
+
+        layer_granularity: int = transfer_op.layer_granularity
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
+
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op, pinned=False) # Pin mem?
+
+        with torch.cuda.stream(self.transfer_stream):
+            start_time = time.time()
+            self._transfer_impl(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type,
+                layer_id,
+                layer_granularity,
+                src_block_node_ids=transfer_op.src_block_node_ids
+            )
+            end_time = time.time()
+
+            kv_dim = 2 if not self.is_mla else 1
+            transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
+
+            self._log_transfer_performance(
+                transfer_op,
+                transfer_size,
+                start_time,
+                end_time,
+            )
+        # TODO: Check read status
+        return True
