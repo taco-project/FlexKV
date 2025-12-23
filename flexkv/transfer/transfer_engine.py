@@ -38,6 +38,7 @@ from flexkv.transfer.worker import (
     GDSTransferWorker,
     tpGDSTransferWorker,
     PEER2CPUTransferWorker,
+    GDSNVMfTransferWorker
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
@@ -63,8 +64,10 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
         TransferType.REMOTE2H: (4, 2), # REMOTE -> CPU
         TransferType.PEERH2H: (5, 2),  # PEER_CPU -> CPU
         TransferType.H2PEERH: (2, 5),  # CPU -> PEER_CPU
+        TransferType.PEERH2D: (5, 1),  # PEER_CPU -> GPU
         TransferType.PEERSSD2H: (6, 2),# PEER_SSD -> CPU
         TransferType.H2PEERSSD: (2, 6),# CPU -> PEER_SSD
+        TransferType.PEERSSD2D: (6, 1) # PEER_SSD -> GPU
     }
     
     src_device, dst_device = transfer_type_to_devices.get(op.transfer_type, (0, 0))
@@ -297,6 +300,35 @@ class TransferEngine:
             if self.cache_config.enable_p2p_ssd:
                 self._worker_map[TransferType.PEERSSD2H] = self.cpu_remote_cpu_worker
 
+        if self.cache_config.enable_kv_sharing and \
+           self._ssd_handle is not None        and \
+           self.cache_config.enable_p2p_ssd    and \
+           self.cache_config.enable_p2p_nvmet:
+            assert self.cache_config.enable_gds, 'Must use GDS for NVMe-oF target'
+            flexkv_logger.info('[transfer_engine] initializing the PEER2GPUTransferWorker!')
+            if self.tp_size == 1:
+                self.gds_nvmf_workers: List[WorkerHandle] = [
+                    GDSNVMfTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor = self.pin_buffer.get_buffer(),
+
+                        gpu_blocks=self.gpu_handles[i].get_tensor_handle_list(),
+                        gpu_kv_layout=self.gpu_handles[i].kv_layout,
+                        nvmf_targets=self._ssd_handle.nvmf_targets,
+                        ssd_kv_layout=self._ssd_handle.kv_layout, # Assume symmetric nodes with identical KV layout
+                        num_files=sum(len(files) for files in self._ssd_handle.get_file_list().values()), # Possibly asymmetric nodes with same config
+
+                        dtype=self._ssd_handle.dtype,
+                        cache_config=self.cache_config, # For Redis client initialization
+
+                        gpu_device_id=i,
+                    )
+                    for i in range(self.dp_size)
+                ]
+            else:
+                raise NotImplementedError('tpGDSNVMfTransferWorker not implemented')
+            self._worker_map[TransferType.PEERSSD2D] = self.gds_nvmf_workers
             
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
