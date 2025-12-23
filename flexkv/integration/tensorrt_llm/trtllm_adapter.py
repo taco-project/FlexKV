@@ -1,4 +1,5 @@
 import os
+from typing import Any, Optional, Tuple
 import time
 from typing import TYPE_CHECKING, Optional, Literal, Any, List, Tuple
 from dataclasses import dataclass, field
@@ -61,7 +62,15 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.flexkv_stats = FlexKVStats(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200))
 
         flexkv_logger.info("Finish init FlexKVSchedulerConnector")
-        
+
+    def wait_for_initialization(self):
+        """
+        Wait for the FlexKV manager to be initialized.
+        """
+        while not self.flexkv_manager.is_ready():
+            time.sleep(0.1)
+        flexkv_logger.info("FlexKV manager is ready")
+
     def is_ready(
         self,
     ) -> bool:
