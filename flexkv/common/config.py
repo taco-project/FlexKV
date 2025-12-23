@@ -40,6 +40,7 @@ class CacheConfig:
     enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
+    enable_p2p_nvmet: bool = False # Requires enable_p2p_ssd=True
     enable_3rd_remote: bool = False
 
     distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
@@ -54,6 +55,8 @@ class CacheConfig:
 
     # ssd cache configs
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
+    ssd_cache_nvmet: Optional[str] = None  # JSON file path for NVMe-oF targets
+    ssd_cache_md_dev: Optional[str] = None # Only support RAID0, e.g. /dev/md0
 
     # remote cache configs for cfs
     # todo: remove this in the future
@@ -122,9 +125,12 @@ class UserConfig:
     cpu_cache_gb: int = 16
     ssd_cache_gb: int = 0  # 0 means disable ssd
     ssd_cache_dir: Union[str, List[str]] = "./ssd_cache"
+    ssd_cache_nvmet: Optional[Dict[str, Dict[str, str]]] = None
+    ssd_cache_md_dev: Optional[str] = None
     enable_gds: bool = False
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
+    enable_p2p_nvmet: bool = False
     enable_3rd_remote: bool = False
     
     # distributed zmq configs
@@ -152,6 +158,7 @@ def parse_path_list(path_str: str) -> List[str]:
 def load_user_config_from_file(config_file: str) -> UserConfig:
     import json
     import yaml
+    from pathlib import Path
     from dataclasses import fields
 
     # read json config file or yaml config file
@@ -166,6 +173,13 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
 
     if 'ssd_cache_dir' in config:
         config['ssd_cache_dir'] = parse_path_list(config['ssd_cache_dir'])
+    nvmet_config_file: str = os.path.join(Path(__file__).resolve().parent, 'nvmet_config.json')
+    if os.path.exists(nvmet_config_file):
+        assert 'enable_p2p_nvmet' in config and config['enable_p2p_nvmet'], \
+            'Must enable NVMe-oF in config file'
+        with open(nvmet_config_file) as f:
+            nvmet_config = json.load(f)
+        config['ssd_cache_nvmet'] = nvmet_config
 
     defined_fields = {f.name for f in fields(UserConfig)}
     known_config = {k: v for k, v in config.items() if k in defined_fields}
@@ -201,10 +215,13 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)
 
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
+    cache_config.ssd_cache_nvmet = user_config.ssd_cache_nvmet
+    cache_config.ssd_cache_md_dev = user_config.ssd_cache_md_dev
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
+    cache_config.enable_p2p_nvmet = user_config.enable_p2p_nvmet
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote
     
     # Update derived flags after setting p2p and remote configs

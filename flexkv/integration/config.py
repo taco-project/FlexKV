@@ -53,7 +53,7 @@ class FlexKVConfig:
                        user_config=user_config)
         else:
             logger.info(f"Loading flexkv config from file: {config_file_path}")
-            user_config = load_user_config_from_file(config_file_path)
+            user_config = load_user_config_from_file(config_file_path) # NVMe-oF must be enabled using config file.
             return cls(enable_flexkv=enable_flexkv,
                        user_config=user_config)
 
