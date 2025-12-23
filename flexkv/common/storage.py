@@ -171,6 +171,7 @@ class StorageHandle:
     # Optional metadata
     num_blocks_per_file: Optional[int] = None
     gpu_device_id: Optional[int] = None
+    nvmf_targets: Optional[Dict[int, Dict[str, str]]] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
 
     def get_tensor_list(self) -> List[torch.Tensor]:

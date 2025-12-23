@@ -1,5 +1,4 @@
 import os
-import glob
 from abc import ABC, abstractmethod
 from typing import Tuple, Optional, List, Union, Dict, Any, BinaryIO
 try:
@@ -144,6 +143,7 @@ class SSDAllocator(BaseStorageAllocator):
         cfg_max_blocks_per_file = int(1e9)
         enable_nvmet: bool = kwargs.get('enable_nvmet', False)
         md_dev: str = kwargs.get('md_dev', '/dev/md0')
+        nvmf_targets: Optional[Dict[int, Dict[str, str]]] = kwargs.get('nvmf_targets', None)
         redis_meta: Optional[RedisMeta] = kwargs.get('redis_meta', None)
 
         if cache_dir is None:
@@ -159,6 +159,7 @@ class SSDAllocator(BaseStorageAllocator):
             raise ValueError("file_prefix must be a string")
         if enable_nvmet:
             assert FileExtent is not None, 'FileExtent class unavailable'
+            assert nvmf_targets is not None, 'nvmf_targets is invalid for NVMe-oF target offload'
             assert redis_meta is not None, 'redis_meta is required for NVMe-oF target offload'
 
         num_ssd_devices = len(cache_dir)
@@ -182,12 +183,16 @@ class SSDAllocator(BaseStorageAllocator):
         real_file_size = num_blocks_per_file * block_size
 
         # Publish RAID geomoetry
-        if enable_nvmet and md_dev is not None:
-            assert num_ssd_devices == 1, 'Use a single SSD cache dir for RAID0' # Only support RAID0
-            # NVMf offloaded targets are individually exported. In case this is a RAID, publish
-            # chunk size and RAID order.
-            redis_meta.publish_raid_geometry(cls._get_md_chunk_size(md_dev),
-                                             cls._get_md_member_devs(md_dev))
+        if enable_nvmet:
+            if md_dev is not None:
+                assert num_ssd_devices == 1, 'Use a single SSD cache dir for RAID0' # Only support RAID0
+                redis_meta.publish_nvme_geometry(cls._get_md_member_devs(md_dev),
+                                                 num_files_per_device,
+                                                 cls._get_md_chunk_size(md_dev))
+            else:
+                redis_meta.publish_nvme_geometry(cls._get_backing_devs(cache_dir),
+                                                 num_files_per_device)
+
         ssd_files: Dict[int, List[str]] = {}
         all_file_extents: Dict[Tuple[int, int], List[FileExtent]] = {}
         # TODO: Parallelize file allocation + flush & sync + layout detection
@@ -213,6 +218,7 @@ class SSDAllocator(BaseStorageAllocator):
             kv_layout=layout,
             dtype=dtype,
             num_blocks_per_file=num_blocks_per_file,
+            nvmf_targets=nvmf_targets,
         )
 
     @classmethod
@@ -280,6 +286,8 @@ class SSDAllocator(BaseStorageAllocator):
         Returns:
             List[str]: list of member device names
         '''
+        import glob
+
         md_name = os.path.basename(md_dev)
         base = f"/sys/block/{md_name}/md"
 
@@ -314,6 +322,71 @@ class SSDAllocator(BaseStorageAllocator):
             raise RuntimeError(f"No md members found under {base}")
 
         return [dev_name for _, dev_name in sorted(entries.items())]
+
+    @staticmethod
+    def _get_backing_devs(cache_dir: List[str]) -> List[str]:
+        '''
+        Returns:
+            List[str]: list of backing NVMe device names for given cache dir, e.g. ['nvme0n1', 'nvme1n1']
+        '''
+        import subprocess
+
+        def _get_mount_source(path: str) -> Optional[str]:
+            try:
+                _path = os.path.realpath(path)
+                cmd = ['findmnt', '-n', '-o', 'SOURCE', '--target', _path]
+                # Example output:
+                #     /dev/vda2
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                source = result.stdout.strip()
+                # Filter out non-device mounts, e.g. overlay, tmpfs, etc.)
+                if source.startswith('/dev/'):
+                    return source
+                return None
+            except (subprocess.CalledProcessError, OSError):
+                return None
+
+        def _resolve_physical_nvme(device_path: str) -> Optional[str]:
+            import re
+
+            try:
+                cmd = ['lsblk', '--inverse', '-p', '-n', '-r', '-o', 'NAME,TYPE', device_path]
+                # Example output:
+                #     /dev/vda2 part
+                #     /dev/vda disk
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+                nvme_pattern = re.compile(r'/dev/nvme\d+n\d+$') # Matches nvme0n1, ignores p1
+                for line in result.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+
+                    current_path, current_type = parts[0], parts[1]
+                    if current_type == 'disk' and nvme_pattern.match(current_path):
+                        return os.path.basename(current_path)
+
+                return None
+            except subprocess.CalledProcessError:
+                return None
+
+        results: List[str] = []
+        dev_cache: Dict[str, str] = {}
+        for dir in cache_dir:
+            # 1. Find logical device
+            logical_dev: Optional[str] = _get_mount_source(dir)
+            assert logical_dev is not None, f'Failed in finding logical device for {dir}'
+            # 2. Check cache
+            if logical_dev in dev_cache:
+                results.append(dev_cache[logical_dev])
+                continue
+            # 3. Resolve physical device
+            physical_dev: Optional[str] = _resolve_physical_nvme(logical_dev)
+            assert physical_dev is not None, f'Failed in resolving physical NVMe device for {dir}'
+            dev_cache[logical_dev] = physical_dev
+            results.append(physical_dev)
+
+        return results
 
 class RemoteAllocator(BaseStorageAllocator):
     @classmethod

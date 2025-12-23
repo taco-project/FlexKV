@@ -40,17 +40,18 @@ class StorageEngine:
             if not GLOBAL_CONFIG_FROM_ENV.ssd_layout_type == self._cpu_layout.type:
                 raise ValueError(f"SSD layout type must be the same as CPU layout type: {self._cpu_layout.type}")
 
+            nvmf_targets: Optional[Dict[int, Dict[str, str]]] = None
             if cache_config.enable_p2p_nvmet:
-                assert cache_config.enable_p2p_ssd and cache_config.ssd_cache_nvmet is not None, \
-                    ''
+                assert cache_config.enable_p2p_ssd and cache_config.ssd_cache_nvmet is not None
                 assert redis_meta is not None, 'Require redis_meta for publishing NVMf target metadata'
 
                 import os
                 from flexkv.c_ext import nvme_connect
                 redis_meta.publish_nvmet_meta(cache_config.ssd_cache_nvmet)
                 redis_meta.latch(world_size=int(os.getenv('FLEXKV_NUM_NODES', '2')))
-                nvme_connect(redis_meta.get_all_nvmet_meta())
-
+                nvmf_targets = nvme_connect(redis_meta.get_all_nvmet_meta(
+                    without=[self._cache_config.distributed_node_id,] # Exclude self
+                ))
             self._ssd_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
                 num_layer=self._model_config.num_layers,
@@ -65,7 +66,8 @@ class StorageEngine:
                 layout=self._ssd_layout,
                 dtype=self._model_config.dtype,
                 cache_dir=self._cache_config.ssd_cache_dir,
-                max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
+                max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
+                nvmf_targets=nvmf_targets
             )
         if self._cache_config.enable_remote:
             if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
@@ -167,6 +169,7 @@ class StorageEngine:
         elif device_type == DeviceType.SSD:
             cache_dir = kwargs.get('cache_dir')
             max_file_size_gb = kwargs.get('max_file_size_gb', -1)
+            nvmf_targets = kwargs.get('nvmf_targets', None)
             if raw_data is not None:
                 assert isinstance(raw_data, str) or \
                     (isinstance(raw_data, list) and all(isinstance(x, str) for x in raw_data)), \
@@ -175,6 +178,7 @@ class StorageEngine:
                     data=raw_data,  # type: ignore
                     layout=layout,
                     dtype=dtype,
+                    nvmf_targets=nvmf_targets
                 )
             else:
                 if not cache_dir:
@@ -187,6 +191,7 @@ class StorageEngine:
                     max_file_size_gb=max_file_size_gb,
                     enable_nvmet=self._cache_config.enable_p2p_nvmet,
                     md_dev=self._cache_config.ssd_cache_md_dev,
+                    nvmf_targets=nvmf_targets,
                     redis_meta=self._redis_meta
                 )
         elif device_type == DeviceType.REMOTE:
