@@ -586,20 +586,23 @@ class RedisMeta:
             nvmet (str): Path to the NVMe-oF target metadata file to publish
         '''
         r = self._client()
-        key = f'nvmet:meta:{self.get_node_id()}'
+        key = f'nvmet:{self.get_node_id()}'
         with open(nvmet, 'r') as f:
             content = f.read()
         r.set(key, content)
 
-    def get_all_nvmet_meta(self) -> Dict[int, Dict[str, Dict[str, str]]]:
+    def get_all_nvmet_meta(self, without: Optional[List[int]] = None) -> Dict[int, Dict[str, Dict[str, str]]]:
         '''
+        Args:
+            without (Optional[List[int]]): List of node IDs to exclude from the result
+
         Returns:
             Dict[int, Dict[str, Dict[str, str]]]: Dict[node ID, Dict[subsys, Dict[IP/port/dev]]]
         '''
         r = self._client()
         result = {}
-        
-        keys = r.keys("nvmet:meta:*") # Dozens of keys
+
+        keys = r.keys("nvmet:*") # Dozens of keys
         if keys:
             values = r.mget(keys)
             for key, value in zip(keys, values):
@@ -607,7 +610,10 @@ class RedisMeta:
                     if not isinstance(key, str):
                         key = str(key)
                     nid = int(key.split(":")[-1])
-                    
+                    # Exclude self
+                    if without is not None and nid in without:
+                        continue
+
                     if value:
                         try:
                             per_node = json.loads(value)
@@ -619,42 +625,23 @@ class RedisMeta:
                     continue
         return result
 
-    def publish_raid_geometry(self, chunk_size: int, member_devs: List[str]) -> None:
-        '''
+    def publish_nvme_geometry(self, member_devs: List[str], num_files: int, chunk_size: int = 0) -> None:
+        '''Publish NVMe geometry for resident KV cache.
+        
+        In case of non-RAID, member device order matches KV cache dir order.
+
         Args:
             chunk_size (int): RAID chunk size in bytes
+            num_files (int): Number of files per device
             member_devs (List[str]): List of member device names, e.g. ['nvme0n1', 'nvme1n1']
         '''
         r = self._client()
-        key = f"raid:{self.get_node_id()}"
+        key = f'nvme:{self.get_node_id()}'
         r.hset(key, mapping={
-            "chunk_size": int(chunk_size),
-            "member_devs": json.dumps(member_devs)
+            'member_devs': json.dumps(member_devs),
+            'num_files': int(num_files),
+            'chunk_size': int(chunk_size)
         })
-
-    def get_raid_geometry_batch(self, node_ids: List[int]) -> Dict[int, Tuple[int, List[str]]]:
-        r = self._client()
-        pipe = r.pipeline()
-
-        # Keep track of the order of queries
-        for node_id in node_ids:
-            key = f"raid:{node_id}"
-            pipe.hgetall(key)
-        # Execute pipeline
-        results = pipe.execute()
-        
-        geometry_map = {}
-        for node_id, data in zip(node_ids, results):
-            if not data:
-                continue
-            try:
-                chunk_size = int(data.get("chunk_size", 0))
-                member_devs = json.loads(data.get("member_devs", "[]"))
-                geometry_map[node_id] = (chunk_size, member_devs)
-            except (ValueError, json.JSONDecodeError):
-                continue
-                
-        return geometry_map
 
     def publish_file_extents_batch(self, file_extents: Dict[Tuple[int, int], List[FileExtent]]) -> None:
         '''Publish all file extents on a node
@@ -669,8 +656,8 @@ class RedisMeta:
             serialized_extents = []
             for extent in extents:
                 serialized_extents.append({
-                    'file_offset': extent.logical,
-                    'md_offset': extent.physical,
+                    'logical': extent.logical,
+                    'physical': extent.physical,
                     'length': extent.length
                 })
             # Use a string key for JSON serialization: "didx,fidx"
@@ -678,37 +665,6 @@ class RedisMeta:
             
         if mapping:
             r.hset(key, mapping=mapping)
-
-    def get_file_extents_batch(self, files: Dict[int, List[Tuple[int, int]]]) -> Dict[int, Dict[Tuple[int, int], List[FileExtent]]]:
-        r = self._client()
-        pipe = r.pipeline()
-        
-        # Keep track of the order of queries
-        query_order = []
-        for node_id, files_per_node in files.items():
-            key = f'fe:{node_id}'
-            fields = [f'{d},{f}' for d, f in files_per_node]
-            if fields:
-                pipe.hmget(key, fields)
-                query_order.append((node_id, files_per_node))
-        if not query_order:
-            return {}
-        # Execute pipeline
-        pipeline_results = pipe.execute()
-
-        result = {}
-        for (node_id, files_per_node), values in zip(query_order, pipeline_results):
-            per_node = {}
-            for (didx, fidx), val in zip(files_per_node, values):
-                if val:
-                    try:
-                        per_node[(didx, fidx)] = json.loads(val)
-                    except json.JSONDecodeError:
-                        pass
-            if per_node:
-                result[node_id] = per_node
-
-        return result
 
     def set_node_id(self, node_id: int):
         self._node_id = int(node_id)
