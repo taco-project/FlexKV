@@ -234,7 +234,7 @@ class TransferEngine:
             )
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
-        if self.cache_config.enable_gds:
+        if self._ssd_handle is not None and self.cache_config.enable_gds:
             if self.tp_size == 1:
                 self.gds_workers = [
                     GDSTransferWorker.create_worker(
@@ -274,8 +274,12 @@ class TransferEngine:
             self._worker_map[TransferType.DISK2D] = self.gds_workers
             self._worker_map[TransferType.D2DISK] = self.gds_workers
             
-        if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
-            or (self._ssd_handle and self.cache_config.enable_p2p_ssd)):
+        if self.cache_config.enable_kv_sharing           \
+           and self._cpu_handle is not None              \
+           and (self.cache_config.enable_p2p_cpu         \
+                or (self._ssd_handle is not None         \
+                    and self.cache_config.enable_p2p_ssd \
+                    and not self.cache_config.enable_p2p_nvmet)):
             ## NOTE:if we have the cpu handle and enable p2p cpu transfer we need this worker 
             ## (currently we inplement cpu and ssd distributed transfer in one worker)
 
