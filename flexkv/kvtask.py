@@ -126,7 +126,8 @@ class KVTaskManager:
                 model_config_for_transfer,
                 self.cache_config,
                 mode="process",
-                gpu_register_port=gpu_register_port
+                gpu_register_port=gpu_register_port,
+                redis_meta=redis_meta
             )]
         else:
             # When using FlexKV with TensorRT-LLM, we use remote mode to transfer data
