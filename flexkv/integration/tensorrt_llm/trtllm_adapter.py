@@ -627,16 +627,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             self.shutdown()
 
 def get_rank_info_from_trt_config(config: Any) -> Tuple[int, int, int]:
-    """
-    返回 (node_rank, tp_rank, dp_rank)。
-
-    兼容旧版 `ExecutorConfig.mapping` 与新版 `TorchLlmArgs.parallel_config`。
-    """
     mapping = get_mapping_from_config(config)
-
-    # 保守默认：单机单卡
-    if mapping is None:
-        return 0, 0, 0
 
     enable_attention_dp = bool(getattr(mapping, "enable_attention_dp", False))
     node_rank = int(getattr(mapping, "node_rank", 0))
