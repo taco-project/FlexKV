@@ -64,6 +64,14 @@ LeaseMeta *LeaseMetaMemPool::alloc() {
       allocated_set.insert(ptr);
     }
   }
+  
+  // Check for allocation failure
+  if (ptr == nullptr) {
+    std::cerr << "[MEMPOOL ERROR] alloc() failed - free_queue is empty after growth attempt! "
+              << "capacity=" << total_capacity.load() << " free=" << free_count.load() << std::endl;
+    return nullptr;
+  }
+  
   // Reset to defaults
   ptr->state = NODE_STATE_NORMAL;
   ptr->lease_time = 0;

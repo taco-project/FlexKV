@@ -741,14 +741,18 @@ PYBIND11_MODULE(c_ext, m) {
       .def("set_ready", &flexkv::DistributedRadixTree::set_ready, py::arg("node"), py::arg("ready") = true, py::arg("ready_length") = -1);
 
   // RefRadixTree bindings (for type information)
+  // Note: RefRadixTree is primarily used internally by DistributedRadixTree.
+  // The Python binding provides a simplified constructor without the internal queue/pool parameters.
   py::class_<flexkv::RefRadixTree, flexkv::CRadixTreeIndex>(m, "RefRadixTree")
-      .def(py::init<int, unsigned int, uint32_t, uint32_t, flexkv::LockFreeQueue<flexkv::CRadixNode*>*, flexkv::LeaseMetaMemPool*>(),
+      .def(py::init<int, unsigned int, uint32_t, uint32_t, flexkv::LockFreeQueue<flexkv::QueuedNode>*, flexkv::LeaseMetaMemPool*, uint64_t>(),
            py::arg("tokens_per_block"),
            py::arg("max_num_blocks") = 1000000u,
            py::arg("lease_renew_ms") = 5000,
            py::arg("hit_reward_seconds") = 0,
            py::arg("renew_lease_queue") = nullptr,
-           py::arg("lt_pool") = nullptr)
+           py::arg("lt_pool") = nullptr,
+           py::arg("generation") = 0)
       .def("dec_ref_cnt", &flexkv::RefRadixTree::dec_ref_cnt)
-      .def("inc_ref_cnt", &flexkv::RefRadixTree::inc_ref_cnt);
+      .def("inc_ref_cnt", &flexkv::RefRadixTree::inc_ref_cnt)
+      .def("get_generation", &flexkv::RefRadixTree::get_generation);
 }

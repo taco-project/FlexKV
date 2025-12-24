@@ -145,7 +145,6 @@ class HierarchyLRCacheEngine:
         # Query both local and remote
         mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
         mr_remote = self.remote_index.match_prefix(block_hashes_t, int(num_blocks), True)
-        print(f"[MATCH {self.device_type.name}] local: {mr_local.num_matched_blocks}/{mr_local.num_ready_matched_blocks}, remote: {mr_remote.num_matched_blocks}/{mr_remote.num_ready_matched_blocks}")
         # For simplicy, we choose the one with the larger matched length; tie-break on ready length
         # We should allow to combine the two results in the future.
         local_key = (int(mr_local.num_matched_blocks), int(mr_local.num_ready_matched_blocks))

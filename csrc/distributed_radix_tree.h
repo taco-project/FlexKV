@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <vector>
 #include <atomic>
+#include <iostream>
+#include <shared_mutex>
 #include <torch/extension.h>
 #include <pthread.h>
 
@@ -26,15 +28,29 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
 
 class RedisMetaChannel; // forward declaration
 
+// QueuedNode: stores node pointer along with the generation ID of the tree it belongs to.
+// This prevents use-after-free when nodes from deleted trees are still in the queue.
+struct QueuedNode {
+  CRadixNode* node;
+  uint64_t generation;  // Generation ID of the tree this node belongs to
+  
+  QueuedNode() : node(nullptr), generation(0) {}
+  QueuedNode(CRadixNode* n, uint64_t gen) : node(n), generation(gen) {}
+};
+
 class RefRadixTree : public CRadixTreeIndex {
 public:
   RefRadixTree(int tokens_per_block, unsigned int max_num_blocks = 1000000u, uint32_t lease_renew_ms = 5000,
     uint32_t hit_reward_seconds = 0,
-     LockFreeQueue<CRadixNode*> *renew_lease_queue = nullptr, LeaseMetaMemPool* lt_pool = nullptr);
+     LockFreeQueue<QueuedNode> *renew_lease_queue = nullptr, LeaseMetaMemPool* lt_pool = nullptr,
+     uint64_t generation = 0);
   ~RefRadixTree();
   // Decrement reference count; when it reaches zero, delete this instance
   void dec_ref_cnt();
   void inc_ref_cnt();
+  uint32_t get_ref_cnt() const { return ref_cnt.load(std::memory_order_relaxed); }
+  // Get this tree's generation ID
+  uint64_t get_generation() const { return generation_; }
   // Wrappers mirroring CRadixTreeIndex APIs
   void lock(CRadixNode *node) override;
   void unlock(CRadixNode *node) override;
@@ -58,14 +74,17 @@ private:
   std::atomic<uint32_t> ref_cnt;
   uint32_t lease_renew_ms_;
   uint32_t hit_reward_seconds_;
-  LockFreeQueue<CRadixNode*> *renew_lease_queue_;
+  uint64_t generation_;  // Generation ID for this tree instance
+  LockFreeQueue<QueuedNode> *renew_lease_queue_;
   LeaseMetaMemPool* lt_pool_;
 };
 
 struct RefCntGuard {
   RefRadixTree *owner;
   explicit RefCntGuard(RefRadixTree *o) : owner(o) {
-    owner->inc_ref_cnt();
+    if (owner != nullptr) {
+      owner->inc_ref_cnt();
+    }
   }
   RefCntGuard(const RefCntGuard&) = delete;
   RefCntGuard& operator=(const RefCntGuard&) = delete;
@@ -87,12 +106,20 @@ private:
   uint32_t idle_sleep_ms_ = 10;
   uint32_t lease_renew_ms_ = 5000;
   uint32_t hit_reward_seconds_ = 0;
-  LockFreeQueue<CRadixNode*> renew_lease_queue;
+  LockFreeQueue<QueuedNode> renew_lease_queue;
   bool refresh_started = false;
   volatile bool refresh_should_stop = false;
   pthread_t refresh_tid{};
   std::atomic<RefRadixTree *> c_index;
   std::atomic<RefRadixTree *> old_index;
+  // Generation counter for creating unique tree IDs
+  std::atomic<uint64_t> generation_counter{0};
+  // Track valid generations (c_index and old_index)
+  std::atomic<uint64_t> c_index_generation{0};
+  std::atomic<uint64_t> old_index_generation{0};
+  // Mutex to protect index access during refresh
+  // shared_lock for readers (match_prefix), unique_lock for writers (refresh_worker)
+  mutable std::shared_mutex index_mutex;
   void refresh_worker();
   static void* refresh_worker_trampoline(void* arg);
   void refresh_nodes_lease_from_redis(const std::vector<CRadixNode*> &batch);

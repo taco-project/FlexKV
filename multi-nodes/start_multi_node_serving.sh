@@ -152,10 +152,10 @@ for ((i=1; i<=NUM_NODES; i++)); do
     
     # 生成 FlexKV 配置文件（所有节点都使用 Redis 6379 作为 FlexKV 后端）
     cat > $config_file <<EOF
-enable_p2p_cpu: true
-enable_p2p_ssd: true
-cpu_cache_gb: 50
-ssd_cache_gb: 100
+enable_p2p_cpu: false
+enable_p2p_ssd: false
+cpu_cache_gb: 20
+ssd_cache_gb: 60
 local_zmq_ip: "$LOCAL_IP"
 local_zmq_port: $zmq_port
 redis_host: "$REDIS_HOST"
