@@ -164,10 +164,10 @@ def enable_nvmet() -> None:
     for dev, subsys_name in zip(nvmet_list, subsys_list):
         match = re.search(r'nvme(\d+)n\d+', dev)
         if match:
-            nsid = match.group(1)
+            nsid = str(int(match.group(1)) + 1)
         else:
             print('WARN: NVMe device names do not follow nvmeXnY pattern.')
-            nsid = '0'
+            nsid = '1'
         assert os.path.exists(f'/sys/kernel/config/nvmet/subsystems/{subsys_name}/namespaces'), \
             f'Dir /sys/kernel/config/nvmet/subsystems/{subsys_name}/namespaces must exist to enable NVMf target offload'
         os.mkdir(f'/sys/kernel/config/nvmet/subsystems/{subsys_name}/namespaces/{nsid}')
@@ -182,7 +182,7 @@ def enable_nvmet() -> None:
 
     # Step 8
     for subsys_name, nsid in zip(subsys_list, nsid_list):
-        with open(f'/sys/kernel/config/nvmet/subsystems/{subsys_name}/namespaces/{nsid}/enable') as f:
+        with open(f'/sys/kernel/config/nvmet/subsystems/{subsys_name}/namespaces/{nsid}/enable', 'w') as f:
             f.write('1')
 
     # Step 9
@@ -195,8 +195,8 @@ def enable_nvmet() -> None:
     ip_dict: Dict[str, str] = associate_nvme_to_ip(nvmet_list)
     # In case NVMe device names do not follow nvmeXnY pattern s.t. namespaces are all '0', use
     # natural number as port name.
-    if all(nsid == '0' for nsid in nsid_list):
-        port_list = list(range(len(nvmet_list)))
+    if all(nsid == '1' for nsid in nsid_list):
+        port_list = list(range(1, len(nvmet_list) + 1))
     else:
         port_list = nsid_list
 
@@ -224,8 +224,8 @@ def enable_nvmet() -> None:
         with open(f'/sys/kernel/config/nvmet/ports/{port}/addr_trsvcid', 'w') as f:
             f.write(user_port)
         with open(f'/sys/kernel/config/nvmet/ports/{port}/addr_traddr', 'w') as f:
-            print(f'NIC with IP address {ip_addr} and NVMe device {dev} are connected under the \
-                  same PCIe root complex. Common PCIe address prefix: {ip_dict[ip_addr]}')
+            print(f'NIC with IP address {ip_addr} and NVMe device {dev} are connected under the '
+                  f'same PCIe root complex. Common PCIe address prefix: {ip_dict[ip_addr]}')
             f.write(ip_addr)
         with open(f'/sys/kernel/config/nvmet/ports/{port}/addr_trtype', 'w') as f:
             f.write('rdma')
@@ -235,7 +235,7 @@ def enable_nvmet() -> None:
     # Dump NVMe-oF target offload config
     from pathlib import Path
     dir = Path(__file__).resolve().parent # $WORKSPACE/setup_nvmet.py
-    assert os.path.exists(os.path.join(dir, 'integration')), f'{dir}/integration does not exist.'
+    assert os.path.exists(os.path.join(dir, 'flexkv/integration')), f'{dir}/flexkv/integration does not exist.'
     
     config_data: Dict[str, Dict[str, str]] = {}
     for ip_addr, user_port, subsys_name, dev in zip(ip_dict.keys(), user_port_list, subsys_list, nvmet_list):
@@ -244,7 +244,7 @@ def enable_nvmet() -> None:
             'port': user_port,
             'dev': dev
         }
-    with open(os.path.join(dir, 'integration/nvmet_config.json'), 'w') as f:
+    with open(os.path.join(dir, 'flexkv/integration/nvmet_config.json'), 'w') as f:
         json.dump(config_data, f, indent=4)
 
     # Step 10
