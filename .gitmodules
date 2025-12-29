@@ -1,3 +1,9 @@
 [submodule "third_party/xxHash"]
 	path = third_party/xxHash
 	url = https://github.com/Cyan4973/xxHash.git
+[submodule "third_party/folly"]
+	path = third_party/folly
+	url = https://github.com/facebook/folly.git
+[submodule "third_party/json"]
+	path = third_party/json
+	url = https://github.com/nlohmann/json.git
