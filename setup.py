@@ -68,7 +68,7 @@ else:
 if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6;9.0"
 
-extra_compile_args = ["-std=c++17"]
+extra_compile_args = ["-std=c++20"]
 if enable_metrics:
     extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
@@ -94,11 +94,13 @@ if enable_metrics:
 if enable_gds:
     print("ENABLE_GDS = true: Compiling and linking GDS content")
     cpp_sources.extend([
+        "csrc/gds/gds_base.cpp",
         "csrc/gds/gds_manager.cpp",
         "csrc/gds/tp_gds_transfer_thread_group.cpp",
         "csrc/gds/layout_transform.cu",
     ])
     hpp_sources.extend([
+        "csrc/gds/gds_base.h",
         "csrc/gds/gds_manager.h",
         "csrc/gds/tp_gds_transfer_thread_group.h",
         "csrc/gds/layout_transform.cuh",
@@ -115,6 +117,16 @@ if enable_p2p:
         "csrc/dist/lease_meta_mempool.cpp",
     ])
     extra_compile_args.append("-DFLEXKV_ENABLE_P2P")
+if enable_gds and enable_p2p:
+    print("ENABLE_GDS and ENABLE_P2P = true: Compiling and linking NVMe-oF content")
+    cpp_sources.extend([
+        "csrc/nvme_connect.cpp",
+        "csrc/gds/nvmf/gds_nvmf_manager.cpp"
+    ])
+    hpp_sources.extend([
+        "csrc/nvme_connect.h",
+        "csrc/gds/nvmf/gds_nvmf_manager.h"
+    ])
 if not enable_gds:
     print("ENABLE_GDS = false: Skipping GDS code")
 if not enable_p2p:
