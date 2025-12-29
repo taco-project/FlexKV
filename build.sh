@@ -70,3 +70,8 @@ elif [ "$BUILD_TYPE" = "release" ]; then
 else
   FLEXKV_DEBUG=0 pip install -v --no-build-isolation -e .
 fi
+
+# Optionally configure NVMe-oF target offload
+if [ -n "$FLEXKV_ENABLED_NVMET" ]; then
+  sudo -E python3 setup_nvmet.py
+fi

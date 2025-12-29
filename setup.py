@@ -31,12 +31,15 @@ cpp_sources = [
     "csrc/gds/tp_gds_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/gds/gds_base.cpp"
     "csrc/gds/gds_manager.cpp",
+    "csrc/gds/nvmf/gds_nvmf_manager.cpp",
     "csrc/distributed_radix_tree.cpp",
     "csrc/local_radix_tree.cpp",
     "csrc/redis_meta_channel.cpp",
     "csrc/lease_meta_mempool.cpp",
     "csrc/fiemap_extent.cpp",
+    "csrc/nvme_connect.cpp"
 ]
 
 hpp_sources = [
@@ -45,13 +48,16 @@ hpp_sources = [
     "csrc/gds/tp_gds_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
+    "csrc/gds/gds_base.h",
     "csrc/gds/gds_manager.h",
+    "csrc/gds/nvmf/gds_nvmf_manager.h",
     "csrc/fiemap_extent.h",
+    "csrc/nvme_connect.h"
 ]
 
 #extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring", "-lhiredis"]
-extra_compile_args = ["-std=c++17"]
+extra_compile_args = ["-std=c++20"]
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
 
 # Add rpath to find libraries at runtime
