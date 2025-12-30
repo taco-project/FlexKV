@@ -693,6 +693,15 @@ PYBIND11_MODULE(c_ext, m) {
       .def("start", &flexkv::LocalRadixTree::start, py::arg("channel"))
       .def("stop", &flexkv::LocalRadixTree::stop)
       .def("insert_and_publish", &flexkv::LocalRadixTree::insert_and_publish, py::arg("node"))
+      // IMPORTANT: Override base class insert/evict to use LocalRadixTree's implementation
+      // (which handles LeaseMeta and current_block_count)
+      .def("insert", &flexkv::LocalRadixTree::insert, py::return_value_policy::reference,
+           py::arg("physical_block_ids"), py::arg("block_hashes"), py::arg("num_blocks"),
+           py::arg("num_insert_blocks"), py::arg("ready") = true, py::arg("node") = nullptr,
+           py::arg("num_matched_blocks") = -1, py::arg("last_node_matched_length") = -1,
+           py::call_guard<py::gil_scoped_release>())
+      .def("evict", &flexkv::LocalRadixTree::evict, py::arg("evicted_blocks"), py::arg("num_evicted"),
+           py::call_guard<py::gil_scoped_release>())
       // Mirror CRadixTreeIndex APIs explicitly on LocalRadixTree
       .def("match_prefix", &flexkv::LocalRadixTree::match_prefix,
            py::arg("block_hashes"), py::arg("num_blocks"), py::arg("update_cache_info") = true,

@@ -88,6 +88,12 @@ class HierarchyLRCacheEngine:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
+        
+        # 累积统计：用于分析分布式 KV reuse 收益
+        self._stats_total_queried_tokens = 0       # 试图查询的 token 总数
+        self._stats_local_matched_tokens = 0       # 本地能 match 的 token 总数
+        self._stats_distributed_matched_tokens = 0 # 有分布式 reuse 后实际命中的 token 总数
+        self._stats_match_count = 0                # match_all 调用次数
 
     def start(self) -> None:
         if self._meta is None:
@@ -151,7 +157,29 @@ class HierarchyLRCacheEngine:
         remote_key = (int(mr_remote.num_matched_blocks), int(mr_remote.num_ready_matched_blocks))
         matched_pos = "local" if local_key >= remote_key else "remote"
         chosen = mr_local if local_key >= remote_key else mr_remote
-
+        
+        # 更新累积统计
+        queried_tokens = num_blocks * self.tokens_per_block
+        local_matched_tokens = int(mr_local.num_matched_blocks) * self.tokens_per_block
+        distributed_matched_tokens = int(chosen.num_matched_blocks) * self.tokens_per_block
+        
+        self._stats_total_queried_tokens += queried_tokens
+        self._stats_local_matched_tokens += local_matched_tokens
+        self._stats_distributed_matched_tokens += distributed_matched_tokens
+        self._stats_match_count += 1
+        
+        # 计算分布式 reuse 带来的额外收益并打印
+        extra_from_distributed = self._stats_distributed_matched_tokens - self._stats_local_matched_tokens
+        extra_pct = (extra_from_distributed * 100 / self._stats_total_queried_tokens 
+                     if self._stats_total_queried_tokens > 0 else 0)
+        print(
+            f"[STATS][REUSE] cnt={self._stats_match_count}, "
+            f"queried={self._stats_total_queried_tokens}, "
+            f"local={self._stats_local_matched_tokens}, "
+            f"distributed={self._stats_distributed_matched_tokens}, "
+            f"extra={extra_from_distributed} ({extra_pct:.2f}%)"
+        )
+        
         # physical blocks
         bnids_np = None
         if chosen is mr_remote:
@@ -270,6 +298,7 @@ class HierarchyLRCacheEngine:
         sequence_meta.gen_hashes()
         phys_t = torch.from_numpy(physical_block_ids).to(torch.int64) if isinstance(physical_block_ids, np.ndarray) else physical_block_ids.to(torch.int64)
         hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
+        
         if match_result is None:
             node = self.local_index.insert(
                 phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks), bool(is_ready)
@@ -375,7 +404,8 @@ class HierarchyLRCacheEngine:
                 num_evicted = self.local_index.evict(target_blocks, evict_block_num)
                 if num_evicted != evict_block_num:
                     target_blocks.resize_(num_evicted)
-                self.mempool.recycle_blocks(target_blocks.numpy())
+                evicted_np = target_blocks.numpy()
+                self.mempool.recycle_blocks(evicted_np)
             
             if protected_node is not None:
                 self.local_index.unlock(protected_node)
