@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,21 +16,21 @@
  */
 #pragma once
 
-#include <cuda_runtime.h>
 #include "gtensor_handler.cuh"
+#include <cuda_runtime.h>
 
 namespace flexkv {
 
 // Template function for transfer, specialized for each backend type
-template<BackendType Type>
+template <BackendType Type>
 void transfer_kv_blocks(
     int num_blocks, int start_layer_id, int num_layers, int64_t *gpu_block_ids,
-    GTensorHandler gpu_tensor_handler,  // Pass by value!
-    int64_t gpu_startoff_inside_chunks,
-    int64_t *cpu_block_ids, void *cpu_ptr,
+    GTensorHandler gpu_tensor_handler, // Pass by value!
+    int64_t gpu_startoff_inside_chunks, int64_t *cpu_block_ids, void *cpu_ptr,
     int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_block_stride_in_bytes, int64_t cpu_startoff_inside_chunks,
     int64_t chunk_size_in_bytes, cudaStream_t stream, int transfer_sms,
-    bool is_host_to_device, bool use_ce_transfer, bool is_mla);
+    bool is_host_to_device, bool use_ce_transfer, bool is_mla,
+    bool sync = true);
 
 } // namespace flexkv
