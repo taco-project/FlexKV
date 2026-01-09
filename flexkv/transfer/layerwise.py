@@ -17,7 +17,8 @@ import torch
 from flexkv import c_ext
 
 from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, \
-    transfer_kv_blocks_gds, TPTransferThreadGroup, TPGDSTransferThreadGroup
+    transfer_kv_blocks_gds, TPTransferThreadGroup, TPGDSTransferThreadGroup, \
+    LayerwiseTransferGroup
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -109,8 +110,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
         # initialize SSD storage
         self.enable_ssd = len(ssd_files) > 0
+        self.ssd_files = ssd_files
         if self.enable_ssd:
-            self.ssd_files = ssd_files
             self.num_blocks_per_file = num_blocks_per_file
             self.num_files = sum(len(file_list) for file_list in ssd_files.values())
             self.round_robin = 1
@@ -119,29 +120,26 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
             self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
             self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
-
-            try:
-                self.ioctx = c_ext.SSDIOCTX(
-                    ssd_files,
-                    len(ssd_files),
-                    GLOBAL_CONFIG_FROM_ENV.iouring_entries,
-                    GLOBAL_CONFIG_FROM_ENV.iouring_flags
-                )
-            except Exception as e:
-                flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
-                raise RuntimeError("SSD Worker init failed") from e
+        else:
+            self.num_blocks_per_file = 0
+            self.round_robin = 1
+            self.ssd_kv_stride_in_bytes = 0
+            self.ssd_layer_stride_in_bytes = 0
+            self.ssd_block_stride_in_bytes = 0
 
         gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
         gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
         gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
         gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
-        self.tp_transfer_thread_group = TPTransferThreadGroup(
-            self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
-            self.num_layers, gpu_kv_strides_tensor,
-            gpu_block_strides_tensor, gpu_layer_strides_tensor,
-            gpu_chunk_sizes_tensor)
 
-        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+        # Create LayerwiseTransferGroup which handles both SSD->CPU and CPU->GPU transfers
+        self.layerwise_transfer_group = LayerwiseTransferGroup(
+            self.num_gpus, self.gpu_blocks, cpu_blocks, ssd_files,
+            dp_group_id, self.num_layers,
+            gpu_kv_strides_tensor, gpu_block_strides_tensor,
+            gpu_layer_strides_tensor, gpu_chunk_sizes_tensor,
+            GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+            GLOBAL_CONFIG_FROM_ENV.iouring_flags)
 
     def _transfer_impl(self,
                       src_block_ids_h2d: torch.Tensor,
@@ -158,29 +156,20 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             assert src_block_ids_disk2h.dtype == torch.int64
             assert dst_block_ids_disk2h.dtype == torch.int64
             assert len(src_block_ids_disk2h) == len(dst_block_ids_disk2h)
-        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
-        if src_block_ids_disk2h is not None and \
-            len(src_block_ids_disk2h) > 0:
-            assert self.enable_ssd, "SSD is not enabled for LayerwiseTransferWorker"
-            transfer_kv_blocks_ssd(
-                ioctx=self.ioctx,
-                cpu_layer_id_list=layer_id_list,
-                cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
-                ssd_block_ids=src_block_ids_disk2h,
-                cpu_block_ids=dst_block_ids_disk2h,
-                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-                ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
-                ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
-                chunk_size_in_bytes=self.cpu_chunk_size_in_bytes,
-                block_stride_in_bytes=self.cpu_block_stride_in_bytes,
-                is_read=True,
-                num_blocks_per_file=self.num_blocks_per_file,
-                round_robin=self.round_robin,
-                num_threads_per_device=32,
-                is_mla=self.is_mla,
-            )
-        self.tp_transfer_thread_group.tp_group_transfer(
+
+        # Use unified layerwise transfer C++ interface
+        ssd_block_ids = src_block_ids_disk2h if src_block_ids_disk2h is not None else torch.empty(0, dtype=torch.int64)
+        cpu_block_ids_d2h = dst_block_ids_disk2h if dst_block_ids_disk2h is not None \
+            else torch.empty(0, dtype=torch.int64)
+
+        self.layerwise_transfer_group.layerwise_transfer(
+            ssd_block_ids,
+            cpu_block_ids_d2h,
+            self.ssd_layer_stride_in_bytes,
+            self.ssd_kv_stride_in_bytes,
+            self.num_blocks_per_file,
+            self.round_robin,
+            32,  # num_threads_per_device
             dst_block_ids_h2d,
             src_block_ids_h2d,
             self.cpu_kv_stride_in_bytes,
@@ -188,7 +177,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.cpu_block_stride_in_bytes,
             self.cpu_chunk_size_in_bytes,
             self.transfer_sms_h2d,
-            True,  # is H2D
             self.use_ce_transfer_h2d,
             layer_id,
             layer_granularity,
