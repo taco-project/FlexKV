@@ -1,17 +1,10 @@
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
 #include <cuda_runtime.h>
 #include <fcntl.h>
-#include <functional>
-#include <future>
 #include <map>
 #include <memory>
-#include <mutex>
-#include <queue>
 #include <string>
-#include <thread>
 #include <torch/extension.h>
 #include <vector>
 
@@ -35,7 +28,7 @@ public:
 
   ~LayerwiseTransferGroup();
 
-  // Layerwise transfer: SSD->CPU + CPU->GPU in one call
+  // Layerwise transfer: SSD->CPU + CPU->GPU
   void layerwise_transfer(
       const torch::Tensor
           &ssd_block_ids, // SSD source block ids (for disk2host)
@@ -52,13 +45,10 @@ public:
       const int64_t cpu_layer_stride_in_bytes,
       const int64_t cpu_block_stride_in_bytes,
       const int64_t cpu_chunk_size_in_bytes, const int transfer_sms,
-      const bool use_ce_transfer, const int layer_id,
+      const bool use_ce_transfer, const int num_layers,
       const int layer_granularity, const bool is_mla);
 
 private:
-  using Task = std::function<void()>;
-  std::future<void> enqueue_for_gpu(int gpu_idx, Task task);
-
   int num_gpus_;
   int dp_group_id_;
   void **gpu_blocks_;
@@ -72,17 +62,14 @@ private:
   BackendType backend_type_;
   std::vector<GTensorHandler> gpu_tensor_handlers_;
 
-  std::vector<std::thread> threads_;
   std::vector<cudaStream_t> streams_;
-
-  std::vector<std::queue<Task>> queues_;
-  std::vector<std::mutex> mtxs_;
-  std::vector<std::condition_variable> cvs_;
-  std::atomic<bool> stop_pool_;
+  std::vector<cudaEvent_t> events_;
 
   // SSD IO context
   bool enable_ssd_;
   std::unique_ptr<SSDIOCTX> ioctx_;
+
+  void layer_done_callback(int start_layer, int layers_this_batch);
 };
 
 } // namespace flexkv

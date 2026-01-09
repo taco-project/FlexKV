@@ -90,7 +90,7 @@ def shutdown_tp_client(tp_client_processes):
                 tp_process.join(timeout=2)
 
 @pytest.mark.parametrize("model_config", [
-    {'tp_size': 1, 'dp_size': 1},
+    {'tp_size': 4, 'dp_size': 1},
     {'tp_size': 2, 'dp_size': 2},
     {'dtype': torch.float32},
     {'use_mla': True},

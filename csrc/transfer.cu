@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,36 +24,34 @@ namespace flexkv {
 #define FLOAT4_PTR(ptr) reinterpret_cast<float4 *>(ptr)
 
 // Templated CUDA kernel - backend type determined at compile time
-template<BackendType Type>
+template <BackendType Type>
 __global__ void transfer_kv_blocks_kernel(
     int num_blocks, int start_layer_id, int num_layers, int64_t *gpu_block_ids,
-    GTensorHandler gpu_handler,
-    int64_t gpu_startoff_inside_chunks,
+    GTensorHandler gpu_handler, int64_t gpu_startoff_inside_chunks,
     int64_t *cpu_block_ids, int64_t *cpu_ptr, int64_t cpu_kv_stride,
     int64_t cpu_layer_stride, int64_t cpu_block_stride,
     int64_t cpu_startoff_inside_chunks, int64_t copy_size, bool is_mla,
-    bool is_host_to_device) { 
-      // start layer id should also be provided for gpu location calculation
-      // but for now, we only support full-layer transfer, so start_layer_id is always 0
+    bool is_host_to_device) {
   int kv_dim = is_mla ? 1 : 2;
   int num_chunks = num_layers * kv_dim * num_blocks;
   int64_t copy_size_in_float4 = copy_size * sizeof(int64_t) / sizeof(float4);
 
   for (int chunk_idx = blockIdx.x; chunk_idx < num_chunks;
        chunk_idx += gridDim.x) {
-    int layer_idx = chunk_idx / (num_blocks * kv_dim);
+    int layer_idx = start_layer_id + chunk_idx / (num_blocks * kv_dim);
     int kv_idx = (chunk_idx % (num_blocks * kv_dim)) / num_blocks;
     int gpu_block_idx = gpu_block_ids[chunk_idx % num_blocks];
     int cpu_block_idx = cpu_block_ids[chunk_idx % num_blocks];
 
     int64_t *cpu_chunk_ptr =
-        cpu_ptr + (layer_idx + start_layer_id) * cpu_layer_stride +
-        kv_idx * cpu_kv_stride + cpu_block_idx * cpu_block_stride +
-        cpu_startoff_inside_chunks;
-    
+        cpu_ptr + layer_idx * cpu_layer_stride + kv_idx * cpu_kv_stride +
+        cpu_block_idx * cpu_block_stride + cpu_startoff_inside_chunks;
+
     // Use template specialization to compute gpu pointer
-    int64_t *gpu_ptr = ptr_at<Type>(gpu_handler, layer_idx, kv_idx, gpu_block_idx);
-    int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t*>(gpu_ptr) + gpu_startoff_inside_chunks;
+    int64_t *gpu_ptr =
+        ptr_at<Type>(gpu_handler, layer_idx, kv_idx, gpu_block_idx);
+    int64_t *gpu_chunk_ptr =
+        reinterpret_cast<int64_t *>(gpu_ptr) + gpu_startoff_inside_chunks;
 
     int64_t *src_chunk_ptr = is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
     int64_t *dst_chunk_ptr = is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
@@ -67,17 +65,16 @@ __global__ void transfer_kv_blocks_kernel(
 }
 
 // Templated host function
-template<BackendType Type>
+template <BackendType Type>
 void transfer_kv_blocks(
     int num_blocks, int start_layer_id, int num_layers, int64_t *gpu_block_ids,
-    GTensorHandler gpu_tensor_handler,
-    int64_t gpu_startoff_inside_chunks,
-    int64_t *cpu_block_ids, void *cpu_ptr,
-    int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
-    int64_t cpu_block_stride_in_bytes, int64_t cpu_startoff_inside_chunks,
-    int64_t chunk_size_in_bytes, cudaStream_t stream, int transfer_sms,
-    bool is_host_to_device, bool use_ce_transfer, bool is_mla) {
-  
+    GTensorHandler gpu_tensor_handler, int64_t gpu_startoff_inside_chunks,
+    int64_t *cpu_block_ids, void *cpu_ptr, int64_t cpu_kv_stride_in_bytes,
+    int64_t cpu_layer_stride_in_bytes, int64_t cpu_block_stride_in_bytes,
+    int64_t cpu_startoff_inside_chunks, int64_t chunk_size_in_bytes,
+    cudaStream_t stream, int transfer_sms, bool is_host_to_device,
+    bool use_ce_transfer, bool is_mla, bool sync) {
+
   int block_size = 128;
   static int max_blocks_per_sm = -1;
   if (max_blocks_per_sm == -1) {
@@ -103,7 +100,7 @@ void transfer_kv_blocks(
 
   dim3 blockDim(block_size);
   dim3 gridDim(block_count);
-  
+
   // CE transfer mode (Copy Engine using cudaMemcpyAsync)
   if (use_ce_transfer) {
     int kv_dim = is_mla ? 1 : 2;
@@ -112,14 +109,15 @@ void transfer_kv_blocks(
         for (int k = 0; k < num_blocks; k++) {
           int64_t gpu_block_idx = gpu_block_ids[k];
           int64_t cpu_block_idx = cpu_block_ids[k];
-          
+
           int64_t *cpu_chunk_ptr =
               cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
               j * cpu_kv_stride_int64 + cpu_block_idx * cpu_block_stride_int64 +
               cpu_startoff_inside_chunks_int64;
-          
-          int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler, i, j, gpu_block_idx);
-          int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t*>(gpu_ptr) + 
+
+          int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
+                                          i + start_layer_id, j, gpu_block_idx);
+          int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
                                    gpu_startoff_inside_chunks_int64;
 
           if (is_host_to_device) {
@@ -136,26 +134,32 @@ void transfer_kv_blocks(
     // Custom kernel transfer
     transfer_kv_blocks_kernel<Type><<<gridDim, blockDim, 0, stream>>>(
         num_blocks, start_layer_id, num_layers, gpu_block_ids,
-        gpu_tensor_handler, gpu_startoff_inside_chunks_int64,
-        cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64,
-        cpu_layer_stride_int64, cpu_block_stride_int64,
-        cpu_startoff_inside_chunks_int64, chunk_size_in_int64, is_mla,
-        is_host_to_device);
+        gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
+        cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
+        cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+        chunk_size_in_int64, is_mla, is_host_to_device);
   }
-  cudaStreamSynchronize(stream);
+  if (sync) {
+    cudaStreamSynchronize(stream);
+  }
 }
 
 // Explicit template instantiations
-template void transfer_kv_blocks<BackendType::VLLM>(
-    int, int, int, int64_t*, GTensorHandler, int64_t, int64_t*, void*,
-    int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool, bool);
+template void transfer_kv_blocks<BackendType::VLLM>(int, int, int, int64_t *,
+                                                    GTensorHandler, int64_t,
+                                                    int64_t *, void *, int64_t,
+                                                    int64_t, int64_t, int64_t,
+                                                    int64_t, cudaStream_t, int,
+                                                    bool, bool, bool, bool);
 
 template void transfer_kv_blocks<BackendType::TRTLLM>(
-    int, int, int, int64_t*, GTensorHandler, int64_t, int64_t*, void*,
-    int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool, bool);
+    int, int, int, int64_t *, GTensorHandler, int64_t, int64_t *, void *,
+    int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool,
+    bool, bool);
 
 template void transfer_kv_blocks<BackendType::SGLANG>(
-    int, int, int, int64_t*, GTensorHandler, int64_t, int64_t*, void*,
-    int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool, bool);
+    int, int, int, int64_t *, GTensorHandler, int64_t, int64_t *, void *,
+    int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool,
+    bool, bool);
 
 } // namespace flexkv
