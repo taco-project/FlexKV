@@ -30,6 +30,7 @@ cpp_sources = [
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/layerwise.cpp"
 ]
 
 hpp_sources = [
@@ -37,6 +38,7 @@ hpp_sources = [
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
+    "csrc/layerwise.h",
 ]
 
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
@@ -168,4 +170,3 @@ setup(
     },
     python_requires=">=3.8",
 )
-
