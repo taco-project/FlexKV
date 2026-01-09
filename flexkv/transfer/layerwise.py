@@ -108,26 +108,28 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.transfer_sms_d2h = transfer_sms_d2h
 
         # initialize SSD storage
-        self.ssd_files = ssd_files
-        self.num_blocks_per_file = num_blocks_per_file
-        self.num_files = sum(len(file_list) for file_list in ssd_files.values())
-        self.round_robin = 1
+        self.enable_ssd = len(ssd_files) > 0
+        if self.enable_ssd:
+            self.ssd_files = ssd_files
+            self.num_blocks_per_file = num_blocks_per_file
+            self.num_files = sum(len(file_list) for file_list in ssd_files.values())
+            self.round_robin = 1
 
-        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
-        self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-        self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
-        self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+            ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
+            self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
+            self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+            self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
 
-        try:
-            self.ioctx = c_ext.SSDIOCTX(
-                ssd_files,
-                len(ssd_files),
-                GLOBAL_CONFIG_FROM_ENV.iouring_entries,
-                GLOBAL_CONFIG_FROM_ENV.iouring_flags
-            )
-        except Exception as e:
-            flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
-            raise RuntimeError("SSD Worker init failed") from e
+            try:
+                self.ioctx = c_ext.SSDIOCTX(
+                    ssd_files,
+                    len(ssd_files),
+                    GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+                    GLOBAL_CONFIG_FROM_ENV.iouring_flags
+                )
+            except Exception as e:
+                flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
+                raise RuntimeError("SSD Worker init failed") from e
 
         gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
         gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
@@ -144,19 +146,22 @@ class LayerwiseTransferWorker(TransferWorkerBase):
     def _transfer_impl(self,
                       src_block_ids_h2d: torch.Tensor,
                       dst_block_ids_h2d: torch.Tensor,
-                      src_block_ids_disk2h: torch.Tensor,
-                      dst_block_ids_disk2h: torch.Tensor,
+                      src_block_ids_disk2h: Optional[torch.Tensor],
+                      dst_block_ids_disk2h: Optional[torch.Tensor],
                       layer_id: int,
                       layer_granularity: int,
                       **kwargs: Any) -> None:
         assert src_block_ids_h2d.dtype == torch.int64
         assert dst_block_ids_h2d.dtype == torch.int64
-        assert src_block_ids_disk2h.dtype == torch.int64
-        assert dst_block_ids_disk2h.dtype == torch.int64
         assert len(src_block_ids_h2d) == len(dst_block_ids_h2d)
-        assert len(src_block_ids_disk2h) == len(dst_block_ids_disk2h)
+        if src_block_ids_disk2h is not None:
+            assert src_block_ids_disk2h.dtype == torch.int64
+            assert dst_block_ids_disk2h.dtype == torch.int64
+            assert len(src_block_ids_disk2h) == len(dst_block_ids_disk2h)
         layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
-        if len(src_block_ids_disk2h) > 0:
+        if src_block_ids_disk2h is not None and \
+            len(src_block_ids_disk2h) > 0:
+            assert self.enable_ssd, "SSD is not enabled for LayerwiseTransferWorker"
             transfer_kv_blocks_ssd(
                 ioctx=self.ioctx,
                 cpu_layer_id_list=layer_id_list,
@@ -200,8 +205,13 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
         src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
         dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
-        src_block_ids_disk2h = torch.from_numpy(transfer_op.src_block_ids_disk2h).to(dtype=torch.int64)
-        dst_block_ids_disk2h = torch.from_numpy(transfer_op.dst_block_ids_disk2h).to(dtype=torch.int64)
+
+        if transfer_op.src_block_ids_disk2h.size > 0:
+            src_block_ids_disk2h = torch.from_numpy(transfer_op.src_block_ids_disk2h).to(dtype=torch.int64)
+            dst_block_ids_disk2h = torch.from_numpy(transfer_op.dst_block_ids_disk2h).to(dtype=torch.int64)
+        else:
+            src_block_ids_disk2h = None
+            dst_block_ids_disk2h = None
         layer_granularity = self.num_layers  # TODO: remove this
         self._transfer_impl(
             src_block_ids_h2d,
