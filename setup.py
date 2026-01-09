@@ -30,6 +30,7 @@ cpp_sources = [
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/layerwise.cpp"
     "csrc/dist/distributed_radix_tree.cpp",
     "csrc/dist/local_radix_tree.cpp",
     "csrc/dist/redis_meta_channel.cpp",
@@ -41,6 +42,7 @@ hpp_sources = [
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
+    "csrc/layerwise.h",
 ]
 
 #extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
@@ -175,4 +177,3 @@ setup(
     #python_requires=">=3.8",
     python_requires=">=3.6",
 )
-
