@@ -146,7 +146,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                       dst_block_ids_h2d: torch.Tensor,
                       src_block_ids_disk2h: Optional[torch.Tensor],
                       dst_block_ids_disk2h: Optional[torch.Tensor],
-                      layer_id: int,
                       layer_granularity: int,
                       **kwargs: Any) -> None:
         assert src_block_ids_h2d.dtype == torch.int64
@@ -178,16 +177,13 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.cpu_chunk_size_in_bytes,
             self.transfer_sms_h2d,
             self.use_ce_transfer_h2d,
-            layer_id,
+            self.num_layers,
             layer_granularity,
             self.is_mla,
         )
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> None:
-        layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
-        if layer_id == -1:
-            layer_id = 0
         if layer_granularity == -1:
             layer_granularity = self.num_layers
 
@@ -200,12 +196,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         else:
             src_block_ids_disk2h = None
             dst_block_ids_disk2h = None
-        layer_granularity = self.num_layers  # TODO: remove this
+
         self._transfer_impl(
             src_block_ids_h2d,
             dst_block_ids_h2d,
             src_block_ids_disk2h,
             dst_block_ids_disk2h,
-            layer_id,
             layer_granularity,
         )

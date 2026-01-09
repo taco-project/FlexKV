@@ -87,7 +87,7 @@ void transfer_kv_blocks(
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_block_stride_in_bytes,
     int64_t cpu_startoff_inside_chunks, int64_t chunk_size_in_bytes,
     cudaStream_t stream, int transfer_num_cta, bool is_host_to_device,
-    bool use_ce_transfer, bool is_mla) {
+    bool use_ce_transfer, bool is_mla, bool sync) {
 
   int block_size = 1024;
 
@@ -120,8 +120,8 @@ void transfer_kv_blocks(
               j * cpu_kv_stride_int64 + cpu_block_idx * cpu_block_stride_int64 +
               cpu_startoff_inside_chunks_int64;
 
-          int64_t *gpu_ptr =
-              ptr_at<Type>(gpu_tensor_handler, i, j, gpu_block_idx);
+          int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
+                                          i + start_layer_id, j, gpu_block_idx);
           int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
                                    gpu_startoff_inside_chunks_int64;
 
@@ -167,7 +167,9 @@ void transfer_kv_blocks(
         actual_chunk_bytes * static_cast<int64_t>(num_layers) *
             static_cast<int64_t>(kv_dim) * static_cast<int64_t>(num_blocks));
   }
-  cudaStreamSynchronize(stream);
+  if (sync) {
+    cudaStreamSynchronize(stream);
+  }
 }
 
 // Explicit template instantiations
@@ -176,16 +178,16 @@ template void transfer_kv_blocks<BackendType::VLLM>(int, int, int, int64_t *,
                                                     int64_t *, void *, int64_t,
                                                     int64_t, int64_t, int64_t,
                                                     int64_t, cudaStream_t, int,
-                                                    bool, bool, bool);
+                                                    bool, bool, bool, bool);
 
 template void transfer_kv_blocks<BackendType::TRTLLM>(
     int, int, int, int64_t *, GTensorHandler, int64_t, int64_t *, void *,
     int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool,
-    bool);
+    bool, bool);
 
 template void transfer_kv_blocks<BackendType::SGLANG>(
     int, int, int, int64_t *, GTensorHandler, int64_t, int64_t *, void *,
     int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool,
-    bool);
+    bool, bool);
 
 } // namespace flexkv
