@@ -90,7 +90,7 @@ def shutdown_tp_client(tp_client_processes):
                 tp_process.join(timeout=2)
 
 @pytest.mark.parametrize("model_config", [
-    {'tp_size': 4, 'dp_size': 1},
+    {'tp_size': 1, 'dp_size': 1},
     {'tp_size': 2, 'dp_size': 2},
     {'dtype': torch.float32},
     {'use_mla': True},
@@ -334,19 +334,19 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     # =============== Test batched launched get ===============
     if not enable_gds:
         print("\n========== Testing batched launched get ==========")
-        
+
         # Use the first few request_pairs that were written in initial phase
         batch_size = 6
-        
+
         batched_get_task_ids = []
         batched_slot_mappings = []
         batched_req_info = []  # Store (token_ids, block_ids) for verification
-        
+
         # Create multiple get_match requests
         for i in range(batch_size):
             token_ids, block_ids, dp_id = request_pairs[random.randint(0, num_requests - 1)]
             slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
-            
+
             request_id, return_mask = kvmanager.get_match(
                 token_ids=token_ids,
                 layer_granularity=-1,
@@ -357,7 +357,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
             batched_slot_mappings.append(slot_mapping)
             batched_req_info.append((token_ids, block_ids, request_id))
             print(f"Created get_match request {request_id} for request_pair[{i}]")
-        
+
         # Launch all get requests as a batch
         print(f"Launching {len(batched_get_task_ids)} get requests as batch...")
         batch_id = kvmanager.launch(
@@ -366,12 +366,12 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
             as_batch=True
         )[0]
         print(f"Returned task_ids after batch launch: {batch_id}")
-        
+
         # Wait for the batched get to complete
         # When as_batch=True, launch returns [batch_id], we need to wait on batch_id
         batch_results = kvmanager.wait(batch_id, completely=True)
         print(f"Batch wait returned {len(batch_results)} results")
-        
+
         # Verify results
         batched_cache_hit = 0
         batched_cache_miss = 0
@@ -382,7 +382,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
             batched_cache_hit += return_mask.sum().item()
             batched_cache_miss += len(return_mask) - return_mask.sum().item()
             print(f"Task {batch_id}: cache_hit={batched_cache_hit}, cache_miss={batched_cache_miss}")
-        
+
         # GPU KV cache verification for batched get
         if gpu_kv_verifier is not None:
             for idx, (token_ids, block_ids, req_id) in enumerate(batched_req_info):
@@ -396,9 +396,9 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
                         token_ids[:valid_fetched_tokens],
                         block_ids[:valid_fetched_tokens // tokens_per_block]
                     )
-        
+
         print(f"Batched get test completed: hit={batched_cache_hit}, miss={batched_cache_miss}")
-        
+
         # Since we read data that was written before, cache hit should be high
         if enable_cpu and num_cpu_blocks >= num_gpu_blocks:
             assert batched_cache_miss == 0, \

@@ -16,20 +16,13 @@ import torch
 
 from flexkv import c_ext
 
-from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, \
-    transfer_kv_blocks_gds, TPTransferThreadGroup, TPGDSTransferThreadGroup, \
-    LayerwiseTransferGroup
+from flexkv.c_ext import LayerwiseTransferGroup
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
 from flexkv.common.transfer import get_nvtx_range_color
 from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
-
-try:
-    from flexkv.c_ext import transfer_kv_blocks_remote
-except ImportError:
-    transfer_kv_blocks_remote = None
 
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
 from flexkv.transfer.worker import TransferWorkerBase, cudaHostRegister
