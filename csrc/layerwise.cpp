@@ -17,6 +17,8 @@ static void CUDART_CB layer_done_host_callback(void *userData) {
   LayerCallbackData *data = static_cast<LayerCallbackData *>(userData);
   int completed = data->counter->fetch_add(1) + 1;
   if (completed == data->num_gpus) {
+    // TODO: use eventfd to notify the consumer that [start_layer, start_layer +
+    // layers_this_batch) transfer completed
     printf(
         "[LayerwiseTransfer] All %d GPUs: Layers [%d, %d) transfer completed\n",
         data->num_gpus, data->start_layer,
