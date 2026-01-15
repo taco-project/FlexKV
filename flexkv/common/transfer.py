@@ -117,6 +117,7 @@ class LayerwiseTransferOp(TransferOp):
     dst_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     src_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     dst_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    counter_id: int = 0  # Counter set index for triple buffering eventfd notification
 
     def __init__(self,
                 graph_id: int,
@@ -126,11 +127,13 @@ class LayerwiseTransferOp(TransferOp):
                 dst_block_ids_disk2h: np.ndarray,
                 layer_id: int = 0,
                 layer_granularity: int = 1,
-                dp_id: int = 0) -> None:
+                dp_id: int = 0,
+                counter_id: int = 0) -> None:
         self.src_block_ids_h2d = src_block_ids_h2d
         self.dst_block_ids_h2d = dst_block_ids_h2d
         self.src_block_ids_disk2h = src_block_ids_disk2h
         self.dst_block_ids_disk2h = dst_block_ids_disk2h
+        self.counter_id = counter_id
 
         super().__init__(
             graph_id=graph_id,
@@ -356,7 +359,8 @@ def merge_to_batch_graph(batch_id: int,
                          transfer_graphs: List[TransferOpGraph],
                          task_end_op_ids: List[int],
                          op_callback_dict: Dict[int, Callable],
-                         layerwise_transfer: bool = False) -> Tuple[TransferOpGraph, int, Dict[int, Callable]]:
+                         layerwise_transfer: bool = False,
+                         counter_id: int = 0) -> Tuple[TransferOpGraph, int, Dict[int, Callable]]:
     """
     Merge multiple TransferOpGraphs into a single batch graph.
 
@@ -487,6 +491,7 @@ def merge_to_batch_graph(batch_id: int,
                 layer_id=0,
                 layer_granularity=1,
                 dp_id=h2d_ops[0].dp_id,
+                counter_id=counter_id,
             )
             merged_graph.add_transfer_op(layerwise_transfer_op)
         batch_end_op_id = -1

@@ -74,6 +74,7 @@ class LaunchTaskRequest:
     as_batch: bool = False
     batch_id: int = -1
     layerwise_transfer: bool = False
+    counter_id: int = 0  # Counter set index for triple buffering eventfd notification
 
 @dataclass
 class CancelTaskRequest:

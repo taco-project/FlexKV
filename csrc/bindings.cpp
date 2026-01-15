@@ -426,14 +426,15 @@ PYBIND11_MODULE(c_ext, m) {
         .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
                       torch::Tensor &, std::map<int, std::vector<std::string>> &,
                       int, int, torch::Tensor &, torch::Tensor &, torch::Tensor &,
-                      torch::Tensor &, int, int>(),
+                      torch::Tensor &, int, int, torch::Tensor &, int>(),
              py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("cpu_blocks"),
              py::arg("ssd_files"), py::arg("dp_group_id"), py::arg("num_layers"),
              py::arg("gpu_kv_strides_tensor"),
              py::arg("gpu_block_strides_tensor"),
              py::arg("gpu_layer_strides_tensor"),
              py::arg("gpu_chunk_sizes_tensor"), py::arg("iouring_entries"),
-             py::arg("iouring_flags"))
+             py::arg("iouring_flags"), py::arg("layer_eventfds_tensor"),
+             py::arg("tp_size"))
         .def("layerwise_transfer",
              &flexkv::LayerwiseTransferGroup::layerwise_transfer,
              py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -446,7 +447,8 @@ PYBIND11_MODULE(c_ext, m) {
              py::arg("cpu_block_stride_in_bytes"),
              py::arg("cpu_chunk_size_in_bytes"), py::arg("transfer_sms"),
              py::arg("use_ce_transfer"), py::arg("num_layers"),
-             py::arg("layer_granularity"), py::arg("is_mla"));
+             py::arg("layer_granularity"), py::arg("is_mla"),
+             py::arg("counter_id") = 0);
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
         "Transfer KV blocks between remote and CPU memory",
