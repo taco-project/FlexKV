@@ -51,6 +51,7 @@ class WorkerLayerwiseTransferOp:
     dst_block_ids_h2d: np.ndarray
     src_block_ids_disk2h: np.ndarray
     dst_block_ids_disk2h: np.ndarray
+    counter_id: int  # Counter set index for triple buffering eventfd notification
 
     def __init__(self, transfer_op: LayerwiseTransferOp):
         self.transfer_op_id = transfer_op.op_id
@@ -63,3 +64,4 @@ class WorkerLayerwiseTransferOp:
         self.dst_block_ids_h2d = transfer_op.dst_block_ids_h2d
         self.src_block_ids_disk2h = transfer_op.src_block_ids_disk2h
         self.dst_block_ids_disk2h = transfer_op.dst_block_ids_disk2h
+        self.counter_id = transfer_op.counter_id
