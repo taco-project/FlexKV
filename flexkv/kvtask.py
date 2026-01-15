@@ -738,7 +738,8 @@ class KVTaskEngine(KVTaskManager):
     def merge_to_batch_kvtask(self,
                               batch_id: int,
                               task_ids: List[int],
-                              layerwise_transfer: bool = False) -> TransferOpGraph:
+                              layerwise_transfer: bool = False,
+                              counter_id: int = 0) -> TransferOpGraph:
         op_callback_dict = {}
         task_end_op_ids = []
         callbacks = []
@@ -757,7 +758,8 @@ class KVTaskEngine(KVTaskManager):
                                                                                   transfer_graphs,
                                                                                   task_end_op_ids,
                                                                                   op_callback_dict,
-                                                                                  layerwise_transfer)
+                                                                                  layerwise_transfer,
+                                                                                  counter_id)
         self.tasks[batch_id] = KVTask(
             task_id=batch_id,
             token_ids=np.concatenate([self.tasks[task_id].token_ids for task_id in task_ids]),
@@ -786,7 +788,8 @@ class KVTaskEngine(KVTaskManager):
                     slot_mappings: List[np.ndarray],
                     as_batch: bool = False,
                     batch_id: int = -1,
-                    layerwise_transfer: bool = False) -> List[int]:
+                    layerwise_transfer: bool = False,
+                    counter_id: int = 0) -> List[int]:
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
@@ -808,7 +811,7 @@ class KVTaskEngine(KVTaskManager):
                             flexkv_logger.warning("only support layerwise get")
                             layerwise_transfer = False
                             break
-            batch_task_graph = self.merge_to_batch_kvtask(batch_id, task_ids, layerwise_transfer)
+            batch_task_graph = self.merge_to_batch_kvtask(batch_id, task_ids, layerwise_transfer, counter_id)
             transfer_graphs = [batch_task_graph]
             task_ids = [batch_id]
         else:

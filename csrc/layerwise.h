@@ -7,6 +7,8 @@
 #include <string>
 #include <torch/extension.h>
 #include <vector>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 #include "gtensor_handler.cuh"
 #include "transfer.cuh"
@@ -24,7 +26,7 @@ public:
       torch::Tensor &gpu_block_strides_tensor,
       torch::Tensor &gpu_layer_strides_tensor,
       torch::Tensor &gpu_chunk_sizes_tensor, int iouring_entries,
-      int iouring_flags);
+      int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size);
 
   ~LayerwiseTransferGroup();
 
@@ -46,7 +48,8 @@ public:
       const int64_t cpu_block_stride_in_bytes,
       const int64_t cpu_chunk_size_in_bytes, const int transfer_sms,
       const bool use_ce_transfer, const int num_layers,
-      const int layer_granularity, const bool is_mla);
+      const int layer_granularity, const bool is_mla,
+      const int counter_id = 0);  // Counter set index for triple buffering
 
 private:
   int num_gpus_;
@@ -68,6 +71,15 @@ private:
   // SSD IO context
   bool enable_ssd_;
   std::unique_ptr<SSDIOCTX> ioctx_;
+
+  // Layer eventfds for notification
+  // Shape: [tp_size, num_counters, num_layers]
+  bool enable_eventfd_;
+  int tp_size_;
+  int num_counters_;
+  int num_layers_;
+  std::vector<int> layer_eventfds_;  // Flat array
+  int current_counter_id_;  // Current counter set index for this transfer
 
   void layer_done_callback(int start_layer, int layers_this_batch);
 };

@@ -358,7 +358,8 @@ class KVServer:
                                          req.slot_mappings,
                                          req.as_batch,
                                          req.batch_id,
-                                         req.layerwise_transfer)
+                                         req.layerwise_transfer,
+                                         req.counter_id)
 
     def _handle_cancel_task_request(self, req: CancelTaskRequest) -> None:
         """Handle CancelTask request"""

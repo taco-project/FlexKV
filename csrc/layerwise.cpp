@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <stdexcept>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 namespace flexkv {
 
@@ -11,18 +13,51 @@ struct LayerCallbackData {
   int layers_this_batch;
   int num_gpus;
   std::atomic<int> *counter;
+  // Eventfd info for notification
+  bool enable_eventfd;
+  int tp_size;
+  int num_layers;
+  int *layer_eventfds;  // Pointer to eventfds array for current counter set
 };
 
 static void CUDART_CB layer_done_host_callback(void *userData) {
   LayerCallbackData *data = static_cast<LayerCallbackData *>(userData);
   int completed = data->counter->fetch_add(1) + 1;
   if (completed == data->num_gpus) {
-    // TODO: use eventfd to notify the consumer that [start_layer, start_layer +
-    // layers_this_batch) transfer completed
-    printf(
-        "[LayerwiseTransfer] All %d GPUs: Layers [%d, %d) transfer completed\n",
-        data->num_gpus, data->start_layer,
-        data->start_layer + data->layers_this_batch);
+    // Notify via eventfd when all GPUs complete this layer batch
+    if (data->enable_eventfd && data->layer_eventfds != nullptr) {
+      // Signal each tp_rank's eventfd for completed layers
+      for (int layer = data->start_layer; 
+           layer < data->start_layer + data->layers_this_batch; ++layer) {
+        for (int tp_rank = 0; tp_rank < data->tp_size; ++tp_rank) {
+          int fd = data->layer_eventfds[tp_rank * data->num_layers + layer];
+          if (fd >= 0) {
+            // Write 2 to support both get_key_buffer and get_value_buffer waits
+            uint64_t val = 2;
+            ssize_t ret = write(fd, &val, sizeof(val));
+            // if (ret == sizeof(val)) {
+            //   fprintf(stderr, "[LayerwiseTransfer] eventfd_write SUCCESS: tp_rank=%d, layer=%d, fd=%d, val=%lu\n", 
+            //          tp_rank, layer, fd, val);
+            // } else {
+            //   fprintf(stderr, 
+            //       "[LayerwiseTransfer] Warning: eventfd_write failed for "
+            //       "tp_rank %d, layer %d, fd %d, errno=%d\n", tp_rank, layer, fd, errno);
+            // }
+            // fflush(stderr);
+          }
+        }
+      }
+    }
+    // else {
+    //   fprintf(stderr, "[LayerwiseTransfer] WARNING: eventfd disabled or null! enable=%d, ptr=%p\n",
+    //           data->enable_eventfd, (void*)data->layer_eventfds);
+    //   fflush(stderr);
+    // }    
+    
+    // fprintf(stderr,
+    //     "[LayerwiseTransfer] All %d GPUs: Layers [%d, %d) transfer completed\n",
+    //     data->num_gpus, data->start_layer,
+    //     data->start_layer + data->layers_this_batch);
     delete data->counter;
   }
   delete data;
@@ -36,9 +71,31 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     torch::Tensor &gpu_block_strides_tensor,
     torch::Tensor &gpu_layer_strides_tensor,
     torch::Tensor &gpu_chunk_sizes_tensor, int iouring_entries,
-    int iouring_flags) {
+    int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size) {
 
   num_gpus_ = num_gpus;
+  num_layers_ = num_layers;
+  tp_size_ = tp_size;
+  current_counter_id_ = 0;
+
+  // Initialize eventfds
+  enable_eventfd_ = (layer_eventfds_tensor.numel() > 0);
+  if (enable_eventfd_) {
+    // layer_eventfds_tensor layout: [num_counters, tp_size, num_layers]
+    // Index formula: counter_id * tp_size * num_layers + tp_rank * num_layers + layer
+    int total_fds = layer_eventfds_tensor.numel();
+    num_counters_ = total_fds / (tp_size * num_layers);
+    
+    int32_t *fds_ptr = layer_eventfds_tensor.data_ptr<int32_t>();
+    layer_eventfds_.assign(fds_ptr, fds_ptr + total_fds);
+    
+    printf("[LayerwiseTransferGroup] Initialized with eventfds: "
+           "tp_size=%d, num_counters=%d, num_layers=%d, total_fds=%d\n",
+           tp_size_, num_counters_, num_layers_, total_fds);
+  } else {
+    num_counters_ = 0;
+    printf("[LayerwiseTransferGroup] Initialized without eventfds\n");
+  }
 
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
@@ -126,9 +183,19 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
 void LayerwiseTransferGroup::layer_done_callback(int start_layer,
                                                  int layers_this_batch) {
   std::atomic<int> *counter = new std::atomic<int>(0);
+  
+  // Get eventfd pointer for current counter set
+  int *eventfds_ptr = nullptr;
+  if (enable_eventfd_ && num_counters_ > 0) {
+    // Offset into layer_eventfds_ for current counter set
+    int offset = current_counter_id_ * tp_size_ * num_layers_;
+    eventfds_ptr = layer_eventfds_.data() + offset;
+  }
+  
   for (int i = 0; i < num_gpus_; ++i) {
     LayerCallbackData *data = new LayerCallbackData{
-        start_layer, layers_this_batch, num_gpus_, counter};
+        start_layer, layers_this_batch, num_gpus_, counter,
+        enable_eventfd_, tp_size_, num_layers_, eventfds_ptr};
     cudaLaunchHostFunc(streams_[i], layer_done_host_callback, data);
   }
 }
@@ -145,7 +212,11 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t cpu_block_stride_in_bytes,
     const int64_t cpu_chunk_size_in_bytes, const int transfer_sms,
     const bool use_ce_transfer, const int num_layers,
-    const int layer_granularity, const bool is_mla) {
+    const int layer_granularity, const bool is_mla,
+    const int counter_id) {
+
+  // Set current counter ID for eventfd notification
+  current_counter_id_ = counter_id;
 
   int num_blocks = gpu_block_id_tensor.numel();
   int64_t *gpu_block_ids =
