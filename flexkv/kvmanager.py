@@ -23,6 +23,7 @@ from flexkv.server.client import KVDPClient
 from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.common.debug import flexkv_logger
 
 
@@ -32,7 +33,8 @@ class KVManager:
                  cache_config: CacheConfig,
                  dp_client_id: int = 0,
                  server_recv_port: str = "",
-                 gpu_register_port: str = ""):
+                 gpu_register_port: str = "",
+                 event_collector: Optional[KVEventCollector] = None):
         flexkv_logger.info(f"{model_config = }")
         flexkv_logger.info(f"{cache_config = }")
         flexkv_logger.info(f"{GLOBAL_CONFIG_FROM_ENV = }")
@@ -68,7 +70,7 @@ class KVManager:
             self.dp_client = KVDPClient(self.server_recv_port, self.model_config, dp_client_id)
         else:
             self.server_handle = None
-            self.kv_task_engine = KVTaskEngine(model_config, cache_config, self.gpu_register_port)
+            self.kv_task_engine = KVTaskEngine(model_config, cache_config, self.gpu_register_port, event_collector)
     @property
     def dpclient_id(self) -> int:
         return self.dp_client_id
