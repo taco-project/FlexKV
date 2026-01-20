@@ -38,7 +38,9 @@ from flexkv.common.transfer import (
 )
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.type import MatchResultAccel
-from flexkv.integration.dynamo.kvevents import KVEventPublisher
+from flexkv.integration.dynamo.collector import KVEventCollector
+
+DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
 
 class CacheEngineAccel:
     def __init__(self,
@@ -47,7 +49,8 @@ class CacheEngineAccel:
                  tokens_per_block: int,
                  evict_ratio: float,
                  hit_reward_seconds: int = 0,
-                 evict_start_threshold: float = 1.0):
+                 evict_start_threshold: float = 1.0,
+                 event_collector: Optional[KVEventCollector] = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -66,6 +69,8 @@ class CacheEngineAccel:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
+        
+        self.event_collector = event_collector
 
     def reset(self) -> None:
         self.index.reset()
@@ -100,20 +105,28 @@ class CacheEngineAccel:
                match_result: Optional[MatchResultAccel] = None) -> Optional[CRadixNode]:
         sequence_meta.gen_hashes()
         if match_result is None:
-          return self.index.insert(torch.from_numpy(physical_block_ids).to(torch.int64),
-                                 torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
-                                 sequence_meta.num_blocks,
-                                 num_insert_blocks,
-                                 is_ready)
+            node = self.index.insert(torch.from_numpy(physical_block_ids).to(torch.int64),
+                                     torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
+                                     sequence_meta.num_blocks,
+                                     num_insert_blocks,
+                                     is_ready)
         else:
-          return self.index.insert(torch.from_numpy(physical_block_ids).to(torch.int64),
-                                 torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
-                                 sequence_meta.num_blocks,
-                                 num_insert_blocks,
-                                 is_ready,
-                                 match_result.last_node,
-                                 match_result.num_matched_blocks,
-                                 match_result.last_node_matched_length)
+            node = self.index.insert(torch.from_numpy(physical_block_ids).to(torch.int64),
+                                     torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
+                                     sequence_meta.num_blocks,
+                                     num_insert_blocks,
+                                     is_ready,
+                                     match_result.last_node,
+                                     match_result.num_matched_blocks,
+                                     match_result.last_node_matched_length)
+
+        if self.event_collector is not None:
+            self.event_collector.publish_stored(
+                block_hashes=sequence_meta.block_hashes[:num_insert_blocks],
+                block_size=self.tokens_per_block,
+                medium=DEVICE_TYPE[self.device_type]
+            )
+        return node
 
     def lock_node(self, node: CRadixNode) -> None:
         self.index.lock(node)
@@ -154,8 +167,14 @@ class CacheEngineAccel:
                 num_evicted = self.index.evict(target_blocks, evict_block_num)
                 if num_evicted != evict_block_num:
                     target_blocks.resize_(num_evicted)
-                self.mempool.recycle_blocks(target_blocks.numpy())
-            
+                target_blocks = target_blocks.numpy()
+                self.mempool.recycle_blocks(target_blocks)
+
+                if self.event_collector is not None:
+                    self.event_collector.publish_removed(
+                        block_hashes=target_blocks,
+                        medium=DEVICE_TYPE[self.device_type]
+                    )
             if protected_node is not None:
                 self.index.unlock(protected_node)
         
@@ -177,7 +196,7 @@ class CacheEngine:
                  evict_ratio: float,
                  hit_reward_seconds: int = 0,
                  evict_start_threshold: float = 1.0,
-                 event_publisher: Optional[KVEventPublisher] = None):
+                 event_collector: Optional[KVEventCollector] = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -197,7 +216,7 @@ class CacheEngine:
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
 
-        self.event_publisher = event_publisher
+        self.event_collector = event_collector
 
     def reset(self) -> None:
         self.index.reset()
@@ -219,10 +238,10 @@ class CacheEngine:
                                  num_insert_blocks=num_insert_blocks,
                                  is_ready=is_ready,
                                  match_result=match_result)
-        if self.event_publisher is not None:
-            self.event_publisher.publish_stored(event_id=time.time_ns(),
-                                                block_hashes=sequence_meta.block_hashes[:num_insert_blocks],
-                                                token_ids=sequence_meta.token_ids[:num_insert_blocks] if sequence_meta.token_ids is not None else None)
+        if self.event_collector is not None:
+            self.event_collector.publish_stored(block_hashes=sequence_meta.block_hashes[:num_insert_blocks],
+                                                block_size=self.tokens_per_block,
+                                                medium=DEVICE_TYPE[self.device_type])
         return node
 
     def lock_node(self, node: RadixNode) -> None:
@@ -261,9 +280,9 @@ class CacheEngine:
             if evict_block_num > 0:
                 evicted_blocks = self.index.evict(evict_block_num)
                 self.mempool.recycle_blocks(evicted_blocks)
-                if self.event_publisher is not None:
-                    self.event_publisher.publish_removed(event_id=time.time_ns(),
-                                                         block_hashes=evicted_blocks)
+                if self.event_collector is not None:
+                    self.event_collector.publish_removed(block_hashes=evicted_blocks,
+                                                         medium=DEVICE_TYPE[self.device_type])
             if protected_node is not None:
                 self.index.unlock(protected_node)
         
@@ -292,7 +311,7 @@ DEFAULT_CACHE_STRATEGY = CacheStrategy()
 
 class GlobalCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None,
-                 event_publisher: Optional[KVEventPublisher] = None):
+                 event_collector: Optional[KVEventCollector] = None):
         self.cache_config = cache_config
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
@@ -324,14 +343,16 @@ class GlobalCacheEngine:
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
                                                 self.hit_reward_seconds,
-                                                self.evict_start_threshold)
+                                                self.evict_start_threshold,
+                                                event_collector)
             else:
                 self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
                                                 self.hit_reward_seconds,
-                                                self.evict_start_threshold)
+                                                self.evict_start_threshold,
+                                                event_collector)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
@@ -342,7 +363,8 @@ class GlobalCacheEngine:
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
                                                 self.hit_reward_seconds,
-                                                self.evict_start_threshold)
+                                                self.evict_start_threshold,
+                                                event_collector)
             else:
                 self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
@@ -350,7 +372,7 @@ class GlobalCacheEngine:
                                                 self.evict_ratio,
                                                 self.hit_reward_seconds,
                                                 self.evict_start_threshold,
-                                                event_publisher)
+                                                event_collector)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
