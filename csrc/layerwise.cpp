@@ -225,10 +225,29 @@ void LayerwiseTransferGroup::layerwise_transfer(
       static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
   void *cpu_ptr = cpu_blocks_;
 
+  // Create CUDA events for timing each layer batch (on GPU 0)
+  int num_batches = (num_layers + layer_granularity - 1) / layer_granularity;
+  std::vector<cudaEvent_t> timing_events(num_batches + 1);  // +1 for start event
+  std::vector<int> batch_start_layers(num_batches);
+  std::vector<int> batch_layers_count(num_batches);
+  
+  cudaSetDevice(dp_group_id_ * num_gpus_);
+  for (int i = 0; i <= num_batches; ++i) {
+    cudaEventCreate(&timing_events[i]);
+  }
+  
+  // Record start event
+  cudaEventRecord(timing_events[0], streams_[0]);
+
+  int batch_idx = 0;
   for (int start_layer = 0; start_layer < num_layers;
        start_layer += layer_granularity) {
     int layers_this_batch =
         std::min(layer_granularity, num_layers - start_layer);
+    
+    batch_start_layers[batch_idx] = start_layer;
+    batch_layers_count[batch_idx] = layers_this_batch;
+    
     // Step 1: SSD -> CPU transfer
     if (enable_ssd_ && ssd_block_ids.numel() > 0) {
       torch::Tensor layer_id_list =
@@ -245,8 +264,9 @@ void LayerwiseTransferGroup::layerwise_transfer(
     }
 
     // Step 2: CPU -> GPU transfer
+    cudaSetDevice(dp_group_id_ * num_gpus_ + 0);
     for (int i = 0; i < num_gpus_; ++i) {
-      cudaSetDevice(dp_group_id_ * num_gpus_ + i);
+      
 
       int64_t cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i];
       if (is_mla) {
@@ -283,7 +303,12 @@ void LayerwiseTransferGroup::layerwise_transfer(
       }
     }
 
+    // Record event after this batch on GPU 0
+    cudaSetDevice(dp_group_id_ * num_gpus_);
+    cudaEventRecord(timing_events[batch_idx + 1], streams_[0]);
+
     layer_done_callback(start_layer, layers_this_batch);
+    batch_idx++;
   }
   for (int i = 0; i < num_gpus_; ++i) {
     cudaError_t err = cudaStreamSynchronize(streams_[i]);
@@ -292,6 +317,47 @@ void LayerwiseTransferGroup::layerwise_transfer(
                                std::to_string(i) + ": " +
                                cudaGetErrorString(err));
     }
+  }
+
+  // Calculate and print timing for each layer batch
+  // chunk_size per GPU * num_gpus * 2 (K+V) * layers_this_batch * num_blocks
+  fprintf(stderr, "\n[LayerwiseTransfer] CPU->GPU Transfer Timing (num_blocks=%d):\n", num_blocks);
+  float total_time_ms = 0.0f;
+  int64_t total_bytes = 0;
+  
+  for (int i = 0; i < num_batches; ++i) {
+    float elapsed_ms = 0.0f;
+    cudaEventElapsedTime(&elapsed_ms, timing_events[i], timing_events[i + 1]);
+    
+    // Calculate bytes transferred for this batch
+    // For each GPU: chunk_size * 2 (K+V) * layers * num_blocks
+    int64_t bytes_this_batch = 0;
+    for (int g = 0; g < num_gpus_; ++g) {
+      bytes_this_batch += gpu_chunk_sizes_in_bytes_[g] * 2 * batch_layers_count[i] * num_blocks;
+    }
+    
+    double bandwidth_gbps = (bytes_this_batch / (1024.0 * 1024.0 * 1024.0)) / (elapsed_ms / 1000.0);
+    
+    fprintf(stderr, "  Layers [%d, %d): time=%.3f ms, size=%.2f MB, bandwidth=%.2f GB/s\n",
+            batch_start_layers[i], 
+            batch_start_layers[i] + batch_layers_count[i],
+            elapsed_ms,
+            bytes_this_batch / (1024.0 * 1024.0),
+            bandwidth_gbps);
+    
+    total_time_ms += elapsed_ms;
+    total_bytes += bytes_this_batch;
+  }
+  
+  double total_bandwidth_gbps = (total_bytes / (1024.0 * 1024.0 * 1024.0)) / (total_time_ms / 1000.0);
+  fprintf(stderr, "  Total: time=%.3f ms, size=%.2f MB, avg_bandwidth=%.2f GB/s\n\n",
+          total_time_ms, total_bytes / (1024.0 * 1024.0), total_bandwidth_gbps);
+  fflush(stderr);
+
+  // Cleanup timing events
+  cudaSetDevice(dp_group_id_ * num_gpus_);
+  for (int i = 0; i <= num_batches; ++i) {
+    cudaEventDestroy(timing_events[i]);
   }
 }
 
