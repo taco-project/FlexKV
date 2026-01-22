@@ -116,7 +116,8 @@ class KVServer:
         model_config: ModelConfig,
         cache_config: CacheConfig,
         gpu_register_port: str,
-        server_recv_port: str
+        server_recv_port: str,
+        total_clients: int = 0,
     ):
 
         # Init inter-process communication
@@ -124,7 +125,9 @@ class KVServer:
         self.recv_from_client = get_zmq_socket(
             self.context, zmq.SocketType.PULL, server_recv_port, True)
 
-        self.client_manager = ClientManager(max_num_dp_client=model_config.dp_size)
+        # Use total_clients if provided (multi-instance mode), otherwise use dp_size
+        max_clients = total_clients if total_clients > 0 else model_config.dp_size
+        self.client_manager = ClientManager(max_num_dp_client=max_clients)
         self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port, False)
 
         self.req_counter = 0
@@ -159,9 +162,10 @@ class KVServer:
     def _server_process(model_config: ModelConfig,
                        cache_config: CacheConfig,
                        gpu_register_port: str,
-                       server_recv_port: str) -> None:
+                       server_recv_port: str,
+                       total_clients: int = 0) -> None:
 
-        server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
+        server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port, total_clients)
         server.run()
 
     @classmethod
@@ -170,6 +174,7 @@ class KVServer:
                       cache_config: CacheConfig,
                       gpu_register_port: str,
                       server_recv_port: Optional[str] = None,
+                      total_clients: int = 0,
                       child_env: Optional[dict] = None,
                       inherit_env: bool = True) -> 'KVServerHandle':
 
@@ -191,9 +196,12 @@ class KVServer:
                     env.update(child_env)
             else:
                 env = child_env or {}
+            
+            # Remove CUDA_VISIBLE_DEVICES so server can see all GPUs
+            env.pop('CUDA_VISIBLE_DEVICES', None)
 
             # Serialize arguments
-            args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port))
+            args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port, total_clients))
 
             # Start subprocess
             flexkv_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -204,22 +212,22 @@ class KVServer:
                 from flexkv.server.server import KVServer
 
                 args_data = {args_data!r}
-                model_config, cache_config, gpu_register_port, server_recv_port = pickle.loads(args_data)
-                server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
+                model_config, cache_config, gpu_register_port, server_recv_port, total_clients = pickle.loads(args_data)
+                server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port, total_clients)
                 server.run()
             ''').strip()
             process = subprocess.Popen([
                 sys.executable, '-c', server_script
             ], env=env)
 
-            flexkv_logger.info(f"KVServer subprocess started, PID: {process.pid}")
+            flexkv_logger.info(f"KVServer subprocess started, PID: {process.pid}, total_clients: {total_clients}")
             return KVServerHandle(process)
         else:
             # Use multiprocessing as before
             process = mp.Process(target=cls._server_process,
-                                 args=(model_config, cache_config, gpu_register_port, server_recv_port))
+                                 args=(model_config, cache_config, gpu_register_port, server_recv_port, total_clients))
             process.start()
-            flexkv_logger.info(f"KVServer process started, PID: {process.pid}")
+            flexkv_logger.info(f"KVServer process started, PID: {process.pid}, total_clients: {total_clients}")
             return KVServerHandle(process)
 
     def run(self) -> None:

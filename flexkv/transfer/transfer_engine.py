@@ -56,7 +56,7 @@ def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
 
 class TransferEngine:
     def __init__(self,
-        gpu_handles: List[StorageHandle],
+        gpu_handles: Dict[int, List[StorageHandle]],
         model_config: ModelConfig,
         cache_config: CacheConfig,
         cpu_handle: Optional[StorageHandle] = None,
@@ -66,7 +66,7 @@ class TransferEngine:
         Initialize transfer engine
 
         Args:
-            gpu_handles: List of GPU handles
+            gpu_handles: Dict mapping dp_client_id -> list of GPU handles for that TP group
             cpu_handle: CPU handle
             ssd_handle: Optional SSD handle
             remote_handle: Optional remote handle
@@ -100,8 +100,10 @@ class TransferEngine:
 
         self.dp_size = model_config.dp_size
         self.tp_size = model_config.tp_size
-
-        assert len(gpu_handles) == self.dp_size * self.tp_size
+        self.num_gpu_groups = len(self.gpu_handles)
+        
+        flexkv_logger.info(f"TransferEngine: num_gpu_groups={self.num_gpu_groups}, "
+                           f"dp_size={self.dp_size}, tp_size={self.tp_size}")
         self._running = False
 
     def _init_workers(self) -> None:
@@ -110,46 +112,46 @@ class TransferEngine:
         self._worker_map: Dict[TransferType, Union[WorkerHandle, List[WorkerHandle]]] = {}
 
         assert self._cpu_handle is not None
+        # Use num_gpu_groups to support multi-instance mode
+        # Use gpu_device_id from StorageHandle for correct CUDA device selection
         if self.tp_size == 1:
             self.gpucpu_workers: List[WorkerHandle] = [
                 GPUCPUTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor = self.pin_buffer.get_buffer(),
-                    gpu_blocks=self.gpu_handles[i].get_tensor_handle_list(),
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    gpu_blocks=handles[0].get_tensor_handle_list(),
                     cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layout=self.gpu_handles[i].kv_layout,
+                    gpu_kv_layout=handles[0].kv_layout,
                     cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=self.gpu_handles[i].dtype,
-                    gpu_device_id=i,
+                    dtype=handles[0].dtype,
+                    gpu_device_id=handles[0].gpu_device_id,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
                     transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
                 )
-                for i in range(self.dp_size)
+                for _, handles in self.gpu_handles.items()
             ]
         else:
             self.gpucpu_workers = [
                 tpGPUCPUTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor = self.pin_buffer.get_buffer(),
-                    gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
-                                for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    gpu_blocks=[h.get_tensor_handle_list() for h in handles],
                     cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layouts=[self.gpu_handles[i].kv_layout \
-                        for i in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                    gpu_kv_layouts=[h.kv_layout for h in handles],
                     cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=self.gpu_handles[i].dtype,
+                    dtype=handles[0].dtype,
                     tp_group_size=self.tp_size,
-                    dp_group_id=i,
+                    dp_group_id=dp_client_id,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
                     transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
                 )
-                for i in range(self.dp_size)
+                for dp_client_id, handles in self.gpu_handles.items()
             ]
         self._worker_map[TransferType.H2D] = self.gpucpu_workers
         self._worker_map[TransferType.D2H] = self.gpucpu_workers
@@ -213,15 +215,15 @@ class TransferEngine:
                         mp_ctx=self.mp_ctx,
                         finished_ops_queue=self.finished_ops_queue,
                         op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=self.gpu_handles[i].get_tensor_handle_list(),
+                        gpu_blocks=handles[0].get_tensor_handle_list(),
                         ssd_files=self._ssd_handle.get_file_list(),
                         num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
-                        gpu_kv_layout=self.gpu_handles[i].kv_layout,
+                        gpu_kv_layout=handles[0].kv_layout,
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
-                        gpu_device_id=i,
+                        gpu_device_id=handles[0].gpu_device_id,
                     )
-                    for i in range(self.dp_size)
+                    for _, handles in self.gpu_handles.items()
                 ]
             else:
                 self.gds_workers = [
@@ -229,20 +231,17 @@ class TransferEngine:
                         mp_ctx=self.mp_ctx,
                         finished_ops_queue=self.finished_ops_queue,
                         op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
-                                    for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                        gpu_blocks=[h.get_tensor_handle_list() for h in handles],
                         ssd_files=self._ssd_handle.get_file_list(),
                         num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
-                        gpu_kv_layouts=[self.gpu_handles[j].kv_layout \
-                                       for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                        gpu_kv_layouts=[h.kv_layout for h in handles],
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         tp_group_size=self.tp_size,
-                        dp_group_id=i,
+                        dp_group_id=dp_client_id,
                     )
-                    for i in range(self.dp_size)
+                    for dp_client_id, handles in self.gpu_handles.items()
                 ]
-            # GDS workers handle DISK2D/D2DISK operations using the GDS transfer path
             self._worker_map[TransferType.DISK2D] = self.gds_workers
             self._worker_map[TransferType.D2DISK] = self.gds_workers
         if len(self._worker_map) == 0:
