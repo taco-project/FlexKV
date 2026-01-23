@@ -128,7 +128,7 @@ class KVServer:
         # Use total_clients if provided (multi-instance mode), otherwise use dp_size
         max_clients = total_clients if total_clients > 0 else model_config.dp_size
         self.client_manager = ClientManager(max_num_dp_client=max_clients)
-        self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port, False)
+        self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port)
 
         self.req_counter = 0
         self._is_ready = False
@@ -200,6 +200,7 @@ class KVServer:
             # Remove CUDA_VISIBLE_DEVICES so server can see all GPUs
             env.pop('CUDA_VISIBLE_DEVICES', None)
 
+            env.update({"FLEXKV_INSTANCE_NUM": str(total_clients // model_config.dp_size)})
             # Serialize arguments
             args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port, total_clients))
 
