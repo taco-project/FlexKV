@@ -45,6 +45,8 @@ class TransferManager:
         # Calculate total expected GPUs across all instances
         self.expected_gpus = self.instance_num * model_config.tp_size * model_config.dp_size
 
+        flexkv_logger.info(f"instance_num={self.instance_num}, tp_size={self.model_config.tp_size}, dp_size={self.model_config.dp_size}")
+
         self.all_gpu_layouts: Dict[int, KVCacheLayout] = {}
         self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks
         self.gpu_client_mapping: Dict[int, int] = {}  # device_id -> dp_client_id
@@ -68,7 +70,8 @@ class TransferManager:
                 self.all_gpu_blocks[device_id] = req.handles
                 self.all_gpu_layouts[device_id] = req.gpu_layout
                 self.gpu_client_mapping[device_id] = req.dp_client_id
-                flexkv_logger.info(f"Registered GPU {device_id}, dp_client={req.dp_client_id}")
+                tensor_device_ids = [handle.device.index for handle in req.handles]
+                flexkv_logger.info(f"Registered GPU {device_id}, dp_client={req.dp_client_id}, tensor_device_ids={tensor_device_ids}")
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
 
@@ -123,7 +126,7 @@ class TransferManager:
         
         # Group GPU handles by dp_client_id
         grouped_gpu_handles: Dict[int, List] = {}
-        for device_id in self.all_gpu_blocks.keys():
+        for device_id in sorted(self.all_gpu_blocks.keys()):
             dp_client_id = self.gpu_client_mapping[device_id]
             if dp_client_id not in grouped_gpu_handles:
                 grouped_gpu_handles[dp_client_id] = []

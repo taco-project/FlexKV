@@ -200,7 +200,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
-                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, i, num_blocks_per_file, layer_granularity,
+                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
                 is_read, false, is_mla
             );
             break;
@@ -209,7 +209,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
-                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, i, num_blocks_per_file, layer_granularity,
+                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
                 is_read, false, is_mla
             );
             break;
@@ -218,7 +218,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
-                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, i, num_blocks_per_file, layer_granularity,
+                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
                 is_read, false, is_mla
             );
             break;
