@@ -62,6 +62,7 @@ private:
 
   int num_gpus_;
   int dp_group_id_;
+  std::vector<int> gpu_device_ids_;
   void **gpu_blocks_;
   void *cpu_blocks_;
   int num_tensors_per_gpu_;

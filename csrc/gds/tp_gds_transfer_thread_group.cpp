@@ -83,10 +83,15 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
   mtxs_   = std::vector<std::mutex>(num_gpus_);
   cvs_    = std::vector<std::condition_variable>(num_gpus_);
 
+  gpu_device_ids_.resize(num_gpus_);
+  for (int i = 0; i < num_gpus_; ++i) {
+    gpu_device_ids_[i] = gpu_blocks[i][0].device().index();
+  }
+
   // Create CUDA streams for each GPU
   streams_.resize(num_gpus_);
   for (int i = 0; i < num_gpus_; ++i) {
-    cudaSetDevice(dp_group_id_ * num_gpus_ + i);
+    cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamCreate(&streams_[i]);
   }
 
@@ -94,7 +99,7 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
   stop_pool_ = false;
   for (int i = 0; i < num_gpus_; ++i) {
     threads_.emplace_back([this, i]() {
-      int device_id = dp_group_id_ * num_gpus_ + i;
+      int device_id = gpu_device_ids_[i];
       cudaSetDevice(device_id);  // only once
 
       while (true) {
