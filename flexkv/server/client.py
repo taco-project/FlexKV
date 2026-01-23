@@ -168,11 +168,13 @@ class KVDPClient:
         task_ids: List[int],
         slot_mappings: List[np.ndarray],
         as_batch: bool = False,
+        layerwise_transfer: bool = False,
+        counter_id: int = 0,
     ) -> List[int]:
         batch_id = -1
         if as_batch:
             batch_id = self._get_task_id()
-        req = LaunchTaskRequest(self.dp_client_id, task_ids, slot_mappings, as_batch, batch_id)
+        req = LaunchTaskRequest(self.dp_client_id, task_ids, slot_mappings, as_batch, batch_id, layerwise_transfer, counter_id)
         self.send_to_server.send_pyobj(req)
         return [batch_id] if as_batch else task_ids
 

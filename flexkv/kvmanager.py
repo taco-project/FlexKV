@@ -186,7 +186,9 @@ class KVManager:
     def launch(self,
                task_ids: Union[int, List[int]],
                slot_mappings: Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]],
-               as_batch: bool = False) -> List[int]:
+               as_batch: bool = False,
+               layerwise_transfer: bool = False,
+               counter_id: int = 0) -> List[int]:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         if not isinstance(slot_mappings, List):
@@ -194,10 +196,16 @@ class KVManager:
         if isinstance(slot_mappings[0], torch.Tensor):
             slot_mappings = [slot_mapping.numpy() for slot_mapping in slot_mappings]
         if self.server_client_mode:
-            return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch)
+            return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch, layerwise_transfer, counter_id)
         else:
-            return self.kv_task_engine.launch_tasks(task_ids, slot_mappings, as_batch)
-            
+            return self.kv_task_engine.launch_tasks(
+                task_ids,
+                slot_mappings,
+                as_batch=as_batch,
+                layerwise_transfer=layerwise_transfer,
+                counter_id=counter_id
+            )
+
     def cancel(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):
             task_ids = [task_ids]

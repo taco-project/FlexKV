@@ -12,7 +12,7 @@ import nvtx
 import torch
 import numpy as np
 
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
 from flexkv.common.tracer import FlexKVTracer
@@ -735,7 +735,11 @@ class KVTaskEngine(KVTaskManager):
         self._launch_task(task_id)
         return task_id
 
-    def merge_to_batch_kvtask(self, batch_id: int, task_ids: List[int]) -> TransferOpGraph:
+    def merge_to_batch_kvtask(self,
+                              batch_id: int,
+                              task_ids: List[int],
+                              layerwise_transfer: bool = False,
+                              counter_id: int = 0) -> TransferOpGraph:
         op_callback_dict = {}
         task_end_op_ids = []
         callbacks = []
@@ -750,11 +754,12 @@ class KVTaskEngine(KVTaskManager):
                 task_end_op_ids.append(self.tasks[task_id].task_end_op_id)
                 callbacks.append(self.tasks[task_id].callback)
                 return_masks.append(self.tasks[task_id].return_mask)
-
         batch_task_graph, task_end_op_id, op_callback_dict = merge_to_batch_graph(batch_id,
                                                                                   transfer_graphs,
                                                                                   task_end_op_ids,
-                                                                                  op_callback_dict)
+                                                                                  op_callback_dict,
+                                                                                  layerwise_transfer,
+                                                                                  counter_id)
         self.tasks[batch_id] = KVTask(
             task_id=batch_id,
             token_ids=np.concatenate([self.tasks[task_id].token_ids for task_id in task_ids]),
@@ -775,13 +780,16 @@ class KVTaskEngine(KVTaskManager):
         for task_id in task_ids:
             self.graph_to_task.pop(self.tasks[task_id].graph.graph_id, None)
             self.tasks.pop(task_id, None)
+        batch_task_graph = self.check_task_ready(batch_id)
         return batch_task_graph
 
     def launch_tasks(self,
                     task_ids: List[int],
                     slot_mappings: List[np.ndarray],
                     as_batch: bool = False,
-                    batch_id: int = -1) -> List[int]:
+                    batch_id: int = -1,
+                    layerwise_transfer: bool = False,
+                    counter_id: int = 0) -> List[int]:
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
@@ -790,10 +798,21 @@ class KVTaskEngine(KVTaskManager):
         # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
 
-        if len(task_ids) > 1 and as_batch:
+        if as_batch:
             if batch_id == -1:
                 batch_id = self._gen_task_id()
-            transfer_graphs = [self.merge_to_batch_kvtask(batch_id, task_ids)]
+            if layerwise_transfer:
+                if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+                    flexkv_logger.warning("layerwise transfer is not enabled")
+                    layerwise_transfer = False
+                else:
+                    for task_id in task_ids:
+                        if self.tasks[task_id].task_type != TaskType.GET:
+                            flexkv_logger.warning("only support layerwise get")
+                            layerwise_transfer = False
+                            break
+            batch_task_graph = self.merge_to_batch_kvtask(batch_id, task_ids, layerwise_transfer, counter_id)
+            transfer_graphs = [batch_task_graph]
             task_ids = [batch_id]
         else:
             transfer_graphs = []
