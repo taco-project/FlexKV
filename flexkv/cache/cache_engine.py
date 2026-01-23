@@ -721,6 +721,7 @@ class GlobalCacheEngine:
         fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
         #early return if no blocks to transfer
         if fragment12_num_blocks == 0:
+            nvtx.end_range(nvtx_range)
             return self._empty_get_return(request_id)
         assert fragment12_num_blocks <= len(gpu_block_ids)
 
