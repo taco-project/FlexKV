@@ -59,17 +59,11 @@ class KVManager:
         # Calculate global_client_id for multi-instance mode
         self.global_client_id = self.instance_id * model_config.dp_size + dp_client_id
         
-        flexkv_logger.info(f"server_client_mode: {self.server_client_mode}, "
-                          f"instance_id: {self.instance_id}, dp_client_id: {dp_client_id}, "
-                          f"global_client_id: {self.global_client_id}")
-        
+        flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
         if self.server_client_mode:
             # Server should only be created once across all instances and dp ranks
-            # Only instance_id == 0 and dp_client_id == 0 creates the server
             if self.instance_id == 0 and dp_client_id == 0:
-                # Calculate total clients for all instances
                 total_clients = self.instance_num * model_config.dp_size
-                # inherit_env=False ensures server can see all GPUs
                 self.server_handle = KVServer.create_server(model_config=model_config,
                                                             cache_config=cache_config,
                                                             gpu_register_port=self.gpu_register_port,
@@ -79,7 +73,6 @@ class KVManager:
 
             else:
                 self.server_handle = None
-            # Use global_client_id for server communication
             self.dp_client = KVDPClient(self.server_recv_port, self.model_config, self.global_client_id)
         else:
             self.server_handle = None

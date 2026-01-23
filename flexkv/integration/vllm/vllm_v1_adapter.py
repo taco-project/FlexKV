@@ -533,17 +533,16 @@ class FlexKVWorkerConnector:
                               GLOBAL_CONFIG_FROM_ENV.server_client_mode)
         
         if server_client_mode:
-            # Server can see all GPUs, use global device ID
+            # Assuming Server can see all GPUs, use global device ID
             cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
             if cuda_visible:
                 visible_ids = [int(x.strip()) for x in cuda_visible.split(',') if x.strip()]
                 device_id = visible_ids[local_device] if local_device < len(visible_ids) else local_device
             else:
                 device_id = local_device
-            # Calculate global_client_id for multi-instance mode
+            
             client_id = GLOBAL_CONFIG_FROM_ENV.instance_id * flexkv_config.model_config.dp_size + dp_client_id
         else:
-            # Non server_client_mode: TransferManager inherits CUDA_VISIBLE_DEVICES, use local device ID
             device_id = local_device
             client_id = dp_client_id
         

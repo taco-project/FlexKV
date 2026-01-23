@@ -199,7 +199,6 @@ class KVServer:
             
             # Remove CUDA_VISIBLE_DEVICES so server can see all GPUs
             env.pop('CUDA_VISIBLE_DEVICES', None)
-
             env.update({"FLEXKV_INSTANCE_NUM": str(total_clients // model_config.dp_size)})
             # Serialize arguments
             args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port, total_clients))

@@ -81,6 +81,7 @@ python -m dynamo.frontend --router-mode kv --http-port 8000 &
 
 # Define number of worker nodes
 NUM_WORKERS=4
+export FLEXKV_INSTANCE_NUM=${NUM_WORKERS}
 
 # Configure FlexKV using environment variables, disabling config file
 unset FLEXKV_CONFIG_PATH
@@ -88,6 +89,7 @@ unset FLEXKV_CONFIG_PATH
 export FLEXKV_CPU_CACHE_GB=32
 export FLEXKV_SSD_CACHE_GB=128
 export FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/"
+export FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server"
 # Use a loop to start worker nodes
 for i in $(seq 0 $((NUM_WORKERS-1))); do
     # Calculate GPU device IDs
@@ -95,11 +97,9 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
     GPU_END=$((i*2+1))
 
     if [ $i -lt $((NUM_WORKERS-1)) ]; then
-        # When using multiple workers, ensure FlexKV ports are different to avoid hanging at flexkv init
-        # Set FlexKV port via the `FLEXKV_SERVER_RECV_PORT` environment variable
-        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310 &
+        FLEXKV_INSTANCE_ID=${i} CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310 &
     else
-        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310
+        FLEXKV_INSTANCE_ID=${i} CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310
     fi
 done
 ```

@@ -101,9 +101,6 @@ class TransferEngine:
         self.dp_size = model_config.dp_size
         self.tp_size = model_config.tp_size
         self.num_gpu_groups = len(self.gpu_handles)
-        
-        flexkv_logger.info(f"TransferEngine: num_gpu_groups={self.num_gpu_groups}, "
-                           f"dp_size={self.dp_size}, tp_size={self.tp_size}")
         self._running = False
 
     def _init_workers(self) -> None:
