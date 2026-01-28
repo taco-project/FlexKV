@@ -87,6 +87,7 @@ class UserConfig:
     ssd_cache_gb: int = 0  # 0 means disable ssd
     ssd_cache_dir: Union[str, List[str]] = "./ssd_cache"
     enable_gds: bool = False
+    kv_cache_dtype: Optional[str] = None  # Override kv_cache_dtype when TRT config uses "auto". Supported values: "fp8", "float8", "e4m3", "fp16", "float16", "bf16", "bfloat16", "fp32", "float32"
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
@@ -136,6 +137,7 @@ def load_user_config_from_env() -> UserConfig:
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
         ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./flexkv_ssd")),
         enable_gds=bool(int(os.getenv('FLEXKV_ENABLE_GDS', 0))),
+        kv_cache_dtype=os.getenv('FLEXKV_KV_CACHE_DTYPE', None),
     )
 
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
