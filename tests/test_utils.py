@@ -282,9 +282,27 @@ class GPUKVCacheVerifier:
                             else:
                                 raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
-                            if not torch.allclose(actual_values,
-                                                torch.full_like(actual_values, expected_hash_value),
-                                                rtol=1e-5, atol=1e-6):
+                            # 对 fp8 做特判：转成 float32 再比较，避免 PyTorch 在 fp8 上缺少 mul_cuda 等算子
+                            if actual_values.dtype == getattr(torch, "float8_e4m3fn", None):
+                                actual_f32 = actual_values.to(torch.float32)
+                                expected_f32 = torch.full_like(
+                                    actual_f32, float(expected_hash_value)
+                                )
+                                allclose_ok = torch.allclose(
+                                    actual_f32,
+                                    expected_f32,
+                                    rtol=1e-5,
+                                    atol=1e-6,
+                                )
+                            else:
+                                allclose_ok = torch.allclose(
+                                    actual_values,
+                                    torch.full_like(actual_values, expected_hash_value),
+                                    rtol=1e-5,
+                                    atol=1e-6,
+                                )
+
+                            if not allclose_ok:
                                 verification_passed = False
                                 errors.append(
                                     f"Mismatch at layer={layer_id}, kv={kv_id}, tp={tp_id}, "

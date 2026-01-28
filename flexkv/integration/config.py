@@ -136,6 +136,9 @@ class FlexKVConfig:
                 "fp16": torch.float16,
                 "fp32": torch.float32,
                 "bf16": torch.bfloat16,
+                "fp8": torch.float8_e4m3fn, 
+                "float8": torch.float8_e4m3fn,
+                "e4m3": torch.float8_e4m3fn,                
             }
             self.model_config.dtype = dtype_map.get(dtype_str, torch.bfloat16)
         else:

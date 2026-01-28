@@ -87,13 +87,25 @@ def shutdown_tp_client(tp_client_processes):
                 tp_process.kill()
                 tp_process.join(timeout=2)
 
-@pytest.mark.parametrize("model_config", [
-    {'tp_size': 1, 'dp_size': 1},
-    {'tp_size': 2, 'dp_size': 2},
-    {'dtype': torch.float32},
-    {'use_mla': True},
-    {'tp_size': 4, 'dp_size': 1, 'use_mla': True},
-], indirect=True)
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1},
+        {"tp_size": 2, "dp_size": 2},
+        {"dtype": torch.float32},
+        {"use_mla": True},
+        {"tp_size": 4, "dp_size": 1, "use_mla": True},
+        # fp8 端到端流程覆盖（仅在当前 PyTorch 支持 float8_e4m3fn 时启用）
+        pytest.param(
+            {"dtype": torch.float8_e4m3fn},
+            marks=pytest.mark.skipif(
+                not hasattr(torch, "float8_e4m3fn"),
+                reason="fp8 not supported in this torch build",
+            ),
+        ),
+    ],
+    indirect=True,
+)
 @pytest.mark.parametrize("cache_config", [
     {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
     {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 1024, 'num_ssd_blocks': 2048},

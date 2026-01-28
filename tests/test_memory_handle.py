@@ -405,6 +405,9 @@ def test_tensor_dtype_string_mapping():
         ("int32", torch.int32),
         ("int64", torch.int64),
         ("bool", torch.bool),
+        ("float8", torch.float8_e4m3fn),
+        ("fp8", torch.float8_e4m3fn),
+        ("e4m3", torch.float8_e4m3fn),
     ]
 
     for dtype_str, expected_dtype in test_cases:
@@ -453,6 +456,56 @@ def test_tensor_shared_memory_modification():
 
     result = parent_conn.recv()
     assert result is True
+
+    process.join(timeout=5)
+    parent_conn.close()
+
+
+@pytest.mark.skipif(
+    (not torch.cuda.is_available()) or (not hasattr(torch, "float8_e4m3fn")),
+    reason="CUDA with fp8 support required",
+)
+def test_fp8_tensor_from_bytes_roundtrip():
+    """End-to-end test: fp8 tensor -> direct IPC handle -> bytes -> TensorSharedHandle -> get_tensor"""
+    mp.set_start_method("spawn", force=True)
+
+    device_id = 0
+
+    # 1. 在子进程外创建一个 fp8 tensor
+    base = torch.arange(200, dtype=torch.float32).reshape(10, 20).cuda(device_id)
+    original_tensor = base.to(torch.float8_e4m3fn)
+
+    # 2. 通过 direct CUDA IPC 导出 IPC handle
+    source_handle = TensorSharedHandle(
+        original_tensor, device_id=device_id, force_direct_ipc=True
+    )
+
+    # 3. 用 bytes + 字符串 dtype="fp8" 构造新的 TensorSharedHandle
+    handle = TensorSharedHandle(
+        source_handle.ipc_handle,
+        device_id=device_id,
+        tensor_shape=source_handle.tensor_shape,
+        tensor_dtype="fp8",
+    )
+
+    assert handle.use_direct_ipc
+    assert handle.tensor_dtype == torch.float8_e4m3fn
+    assert handle.tensor_shape == (10, 20)
+
+    # 4. 把这个 handle 发送到子进程，验证 get_tensor() 是否能正确还原数据
+    parent_conn, child_conn = Pipe()
+    process = Process(
+        target=_worker_test_fp8_tensor_from_bytes, args=(child_conn, device_id), daemon=True
+    )
+    process.start()
+
+    parent_conn.send(handle)
+    result = parent_conn.recv()
+    # result 为子进程计算出来的 max_diff（int 或 float）
+    assert not isinstance(
+        result, str
+    ), f"Child process fp8 test failed with error: {result}"
+    print(f"[FP8 TEST] parent received max int8 diff: {result}")
 
     process.join(timeout=5)
     parent_conn.close()

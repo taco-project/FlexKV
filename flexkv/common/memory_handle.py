@@ -187,6 +187,9 @@ class TensorSharedHandle:
                 "float": torch.float32,
                 "float16": torch.float16,
                 "fp16": torch.float16,
+                "fp8": torch.float8_e4m3fn,
+                "e4m3": torch.float8_e4m3fn,
+                "float8": torch.float8_e4m3fn,
                 "half": torch.float16,
                 "bfloat16": torch.bfloat16,
                 "bf16": torch.bfloat16,
@@ -294,6 +297,21 @@ class TensorSharedHandle:
             # Create as uint16 first, then view as bfloat16 (zero-copy type reinterpretation)
             tensor_u16 = torch.as_tensor(cuda_interface, dtype=torch.uint16, device=device)
             return tensor_u16.view(torch.bfloat16)
+
+        elif hasattr(torch, 'float8_e4m3fn') and dtype == torch.float8_e4m3fn:
+            class CudaArrayInterface:
+                def __init__(self, ptr, shape, strides=None):
+                    self.__cuda_array_interface__ = {
+                        "data": (ptr, False),
+                        "shape": tuple(shape),
+                        "typestr": "|u1",  # uint8，跳过不支持的 |f1 
+                        "version": 3,
+                        "strides": strides,
+                        "descr": [("", "")],
+                    }
+            cuda_interface = CudaArrayInterface(data_ptr, shape, strides)
+            # 先作为 uint8 认领，再 view 为 fp8
+            return torch.as_tensor(cuda_interface, dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
         else:
             # For other dtypes, use standard typestr mapping
             if dtype not in TYPESTR_MAP:
