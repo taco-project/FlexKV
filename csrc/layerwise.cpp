@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <nvtx3/nvToolsExt.h>
 
 namespace flexkv {
 
@@ -18,6 +19,11 @@ struct LayerCallbackData {
   int tp_size;
   int num_layers;
   int *layer_eventfds;  // Pointer to eventfds array for current counter set
+  // NVTX range id for CPU->GPU transfer
+  nvtxRangeId_t *current_range_id_ptr;  // Pointer to current layer's range ID
+  bool is_last_batch;  // Whether this is the last batch
+  char next_range_name[64];  // Name for next layer's range (if not last batch)
+  nvtxRangeId_t *next_range_id_ptr;  // Pointer to next layer's range ID storage
 };
 
 static void CUDART_CB layer_done_host_callback(void *userData) {
@@ -35,29 +41,18 @@ static void CUDART_CB layer_done_host_callback(void *userData) {
             // Write 2 to support both get_key_buffer and get_value_buffer waits
             uint64_t val = 2;
             ssize_t ret = write(fd, &val, sizeof(val));
-            // if (ret == sizeof(val)) {
-            //   fprintf(stderr, "[LayerwiseTransfer] eventfd_write SUCCESS: tp_rank=%d, layer=%d, fd=%d, val=%lu\n", 
-            //          tp_rank, layer, fd, val);
-            // } else {
-            //   fprintf(stderr, 
-            //       "[LayerwiseTransfer] Warning: eventfd_write failed for "
-            //       "tp_rank %d, layer %d, fd %d, errno=%d\n", tp_rank, layer, fd, errno);
-            // }
-            // fflush(stderr);
           }
         }
       }
     }
-    // else {
-    //   fprintf(stderr, "[LayerwiseTransfer] WARNING: eventfd disabled or null! enable=%d, ptr=%p\n",
-    //           data->enable_eventfd, (void*)data->layer_eventfds);
-    //   fflush(stderr);
-    // }    
-    
-    // fprintf(stderr,
-    //     "[LayerwiseTransfer] All %d GPUs: Layers [%d, %d) transfer completed\n",
-    //     data->num_gpus, data->start_layer,
-    //     data->start_layer + data->layers_this_batch);
+    // End current NVTX range when all GPUs complete
+    if (data->current_range_id_ptr != nullptr && *data->current_range_id_ptr != 0) {
+      nvtxRangeEnd(*data->current_range_id_ptr);
+    }
+    // Start next layer's NVTX range (so it begins right after current layer ends)
+    if (!data->is_last_batch && data->next_range_id_ptr != nullptr) {
+      *data->next_range_id_ptr = nvtxRangeStartA(data->next_range_name);
+    }
     delete data->counter;
   }
   delete data;
@@ -150,9 +145,14 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
   // Create CUDA streams for each GPU
   streams_.resize(num_gpus_);
   events_.resize(num_gpus_);
+  
+  // Get highest priority (lowest value)
+  int leastPriority, greatestPriority;
+  cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority);
+  
   for (int i = 0; i < num_gpus_; i++) {
     cudaSetDevice(dp_group_id * num_gpus_ + i);
-    cudaStreamCreate(&streams_[i]);
+    cudaStreamCreateWithPriority(&streams_[i], cudaStreamNonBlocking, greatestPriority);
     cudaEventCreate(&events_[i]);
   }
 
@@ -181,7 +181,11 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
 }
 
 void LayerwiseTransferGroup::layer_done_callback(int start_layer,
-                                                 int layers_this_batch) {
+                                                 int layers_this_batch,
+                                                 nvtxRangeId_t *current_range_id_ptr,
+                                                 bool is_last_batch,
+                                                 const char *next_range_name,
+                                                 nvtxRangeId_t *next_range_id_ptr) {
   std::atomic<int> *counter = new std::atomic<int>(0);
   
   // Get eventfd pointer for current counter set
@@ -195,7 +199,12 @@ void LayerwiseTransferGroup::layer_done_callback(int start_layer,
   for (int i = 0; i < num_gpus_; ++i) {
     LayerCallbackData *data = new LayerCallbackData{
         start_layer, layers_this_batch, num_gpus_, counter,
-        enable_eventfd_, tp_size_, num_layers_, eventfds_ptr};
+        enable_eventfd_, tp_size_, num_layers_, eventfds_ptr,
+        current_range_id_ptr, is_last_batch, {0}, next_range_id_ptr};
+    // Copy next range name
+    if (next_range_name != nullptr) {
+      snprintf(data->next_range_name, sizeof(data->next_range_name), "%s", next_range_name);
+    }
     cudaLaunchHostFunc(streams_[i], layer_done_host_callback, data);
   }
 }
@@ -239,6 +248,29 @@ void LayerwiseTransferGroup::layerwise_transfer(
   // Record start event
   cudaEventRecord(timing_events[0], streams_[0]);
 
+  // Allocate storage for NVTX range IDs (one per batch)
+  std::vector<nvtxRangeId_t> h2d_range_ids(num_batches, 0);
+  // Pre-generate all range names with data size info
+  std::vector<std::string> h2d_range_names(num_batches);
+  for (int b = 0; b < num_batches; ++b) {
+    int sl = b * layer_granularity;
+    int ltb = std::min(layer_granularity, num_layers - sl);
+    // Calculate data size for this batch: chunk_size * 2 (K+V) * layers * num_blocks
+    int64_t bytes_this_batch = 0;
+    for (int g = 0; g < num_gpus_; ++g) {
+      bytes_this_batch += gpu_chunk_sizes_in_bytes_[g] * 2 * ltb * num_blocks;
+    }
+    double mb_this_batch = bytes_this_batch / (1024.0 * 1024.0);
+    char name[128];
+    snprintf(name, sizeof(name), "CPU->GPU Layer[%d,%d) %.2fMB", sl, sl + ltb, mb_this_batch);
+    h2d_range_names[b] = name;
+  }
+
+  // Start the first batch's NVTX range in main thread
+  if (num_batches > 0) {
+    h2d_range_ids[0] = nvtxRangeStartA(h2d_range_names[0].c_str());
+  }
+
   int batch_idx = 0;
   for (int start_layer = 0; start_layer < num_layers;
        start_layer += layer_granularity) {
@@ -250,6 +282,15 @@ void LayerwiseTransferGroup::layerwise_transfer(
     
     // Step 1: SSD -> CPU transfer
     if (enable_ssd_ && ssd_block_ids.numel() > 0) {
+      // Calculate SSD->CPU data size: cpu_chunk_size * 2 (K+V) * layers * num_ssd_blocks
+      int num_ssd_blocks = ssd_block_ids.numel();
+      int64_t ssd_bytes = cpu_chunk_size_in_bytes * 2 * layers_this_batch * num_ssd_blocks;
+      double ssd_mb = ssd_bytes / (1024.0 * 1024.0);
+      char ssd_range_name[128];
+      snprintf(ssd_range_name, sizeof(ssd_range_name),
+               "SSD->CPU Layer[%d,%d) %.2fMB", start_layer, start_layer + layers_this_batch, ssd_mb);
+      nvtxRangePushA(ssd_range_name);
+
       torch::Tensor layer_id_list =
           torch::arange(start_layer, start_layer + layers_this_batch,
                         torch::TensorOptions().dtype(torch::kInt32));
@@ -261,9 +302,14 @@ void LayerwiseTransferGroup::layerwise_transfer(
           cpu_block_stride_in_bytes,
           true, // is_read: SSD -> CPU
           num_blocks_per_file, round_robin, num_threads_per_device, is_mla);
+
+      nvtxRangePop();
     }
 
     // Step 2: CPU -> GPU transfer
+    // NVTX range for this batch was already started (by main thread for first batch,
+    // or by previous batch's callback for subsequent batches)
+
     cudaSetDevice(dp_group_id_ * num_gpus_ + 0);
     for (int i = 0; i < num_gpus_; ++i) {
       
@@ -307,7 +353,14 @@ void LayerwiseTransferGroup::layerwise_transfer(
     cudaSetDevice(dp_group_id_ * num_gpus_);
     cudaEventRecord(timing_events[batch_idx + 1], streams_[0]);
 
-    layer_done_callback(start_layer, layers_this_batch);
+    // NVTX: current range ends in callback, next range starts in callback
+    bool is_last_batch = (batch_idx == num_batches - 1);
+    const char *next_name = is_last_batch ? nullptr : h2d_range_names[batch_idx + 1].c_str();
+    nvtxRangeId_t *next_id_ptr = is_last_batch ? nullptr : &h2d_range_ids[batch_idx + 1];
+    
+    layer_done_callback(start_layer, layers_this_batch,
+                        &h2d_range_ids[batch_idx], is_last_batch,
+                        next_name, next_id_ptr);
     batch_idx++;
   }
   for (int i = 0; i < num_gpus_; ++i) {
@@ -328,7 +381,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
   for (int i = 0; i < num_batches; ++i) {
     float elapsed_ms = 0.0f;
     cudaEventElapsedTime(&elapsed_ms, timing_events[i], timing_events[i + 1]);
-    
+
     // Calculate bytes transferred for this batch
     // For each GPU: chunk_size * 2 (K+V) * layers * num_blocks
     int64_t bytes_this_batch = 0;
