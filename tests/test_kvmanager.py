@@ -51,7 +51,8 @@ def run_tp_client(dp_client_id,
                 torch.empty(size=tuple(gpu_kv_layout.kv_shape[:]), dtype=model_config.dtype).cuda(device_id)
             )
         elif gpu_layout_type == 2:
-            for _ in range(model_config.num_layers * 2):
+            kv_dim = 1 if model_config.use_mla else 2
+            for _ in range(model_config.num_layers * kv_dim):
                 gpu_blocks_for_tp.append(
                     torch.empty(size=tuple(gpu_kv_layout.kv_shape[2:]), dtype=model_config.dtype).cuda(device_id)
                 )

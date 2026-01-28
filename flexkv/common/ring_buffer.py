@@ -7,7 +7,7 @@ from collections import OrderedDict,deque
 import numpy as np
 from flexkv.common.transfer import TransferOp
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.hash_utils import hash_array
+from flexkv.common.hash_utils import hash_array, hash_array_with_prefix
 
 
 class SharedOpPool:
@@ -28,11 +28,12 @@ class SharedOpPool:
 
         self.lock = threading.Lock()
 
-    def allocate_slot(self, block_ids: np.ndarray):
+    def allocate_slot(self, block_ids: np.ndarray, device_type_prefix: int = 0):
         """
         Allocating a slot for the given block ids
         Params:
             block_ids: the block ids of src address or dst address
+            device_type_prefix: optional prefix to distinguish different device types
         Returns:
             slot_id: the slot which is assigned to the given block ids, -1 if failed
         """
@@ -41,7 +42,11 @@ class SharedOpPool:
         if num_blocks > self.max_block_num or num_blocks == 0:
             return -1
 
-        slot_hash = hash_array(block_ids)
+        # Use prefix to avoid hash collisions between different device types
+        if device_type_prefix != 0:
+            slot_hash = hash_array_with_prefix(block_ids, device_type_prefix)
+        else:
+            slot_hash = hash_array(block_ids)
         reuse = False
 
         # get the slot of empty buffer

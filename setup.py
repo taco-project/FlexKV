@@ -26,11 +26,15 @@ enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
 # Define C++ extensions
 cpp_sources = [
     "csrc/bindings.cpp",
-    "csrc/transfer.cu",
+    "csrc/transfer.cu",  # Skip CUDA file for now
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/dist/distributed_radix_tree.cpp",
+    "csrc/dist/local_radix_tree.cpp",
+    "csrc/dist/redis_meta_channel.cpp",
+    "csrc/dist/lease_meta_mempool.cpp",
 ]
 
 hpp_sources = [
@@ -40,10 +44,11 @@ hpp_sources = [
     "csrc/radix_tree.h",
 ]
 
-extra_link_args = ["-lxxhash", "-lpthread", "-lrt", "-luring"]
-if not enable_cputest:
-    extra_link_args.append("-lcuda")
-else:
+#extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
+extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring", "-lhiredis"]
+
+if enable_cputest:
+    extra_link_args.remove("-lcuda")
     # Set TORCH_CUDA_ARCH_LIST to avoid IndexError when no GPU is available
     os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
 
@@ -63,6 +68,7 @@ if enable_cfs:
     hpp_sources.append("csrc/pcfs/pcfs.h")
     extra_link_args.append("-lhifs_client_sdk")
     extra_compile_args.append("-DFLEXKV_ENABLE_CFS")
+extra_compile_args.append("-DCUDA_AVAILABLE")
 
 nvcc_compile_args = ["-O3"]
 if enable_gds:
@@ -88,7 +94,7 @@ cpp_extensions = [
         library_dirs=[os.path.join(build_dir, "lib")],
         include_dirs=include_dirs,
         depends=hpp_sources,
-        extra_compile_args={"nvcc": nvcc_compile_args, "cxx": extra_compile_args},
+        extra_compile_args={"nvcc": ["-O3"], "cxx": extra_compile_args},
         extra_link_args=extra_link_args,
     ),
 ]
@@ -173,5 +179,6 @@ setup(
             build_temp=os.path.join(build_dir, "temp"),  # Temporary build files
         )
     },
-    python_requires=">=3.8",
+    #python_requires=">=3.8",
+    python_requires=">=3.6",
 )

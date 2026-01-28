@@ -39,7 +39,6 @@ class FlexKVConfig:
             self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         if self.gpu_register_port == "":
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
-        update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
 
     @classmethod
     def from_env(cls) -> 'FlexKVConfig':
@@ -73,8 +72,8 @@ class FlexKVConfig:
             self.model_config.num_kv_heads = 1
         else:
             self.model_config.num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
+        update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
 
-        self.__post_init__()
 
     def post_init_from_sglang_config(
         self,
@@ -115,8 +114,7 @@ class FlexKVConfig:
 
         self.model_config.tp_size = int(tp_size)
         self.model_config.dp_size = int(getattr(sglang_config, "dp_size", 1))
-
-        self.__post_init__()
+        update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
 
     def post_init_from_trt_config(
         self,
@@ -176,5 +174,5 @@ class FlexKVConfig:
             
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
-
-        self.__post_init__()
+        # Update cache config with user config after model config is initialized
+        update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)

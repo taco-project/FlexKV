@@ -19,7 +19,7 @@ import pickle
 import sys
 
 from flexkv.common.transfer import TransferOpGraph, CompletedOp
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.transfer import DeviceType
@@ -38,9 +38,16 @@ class TransferManager:
         self.model_config = model_config
         self.cache_config = cache_config
         self.gpu_register_port = gpu_register_port
+        
+        # Multi-instance support: get instance_num from environment
+        self.instance_num = GLOBAL_CONFIG_FROM_ENV.instance_num
+        
+        # Calculate total expected GPUs across all instances
+        self.expected_gpus = self.instance_num * model_config.tp_size * model_config.dp_size
 
         self.all_gpu_layouts: Dict[int, KVCacheLayout] = {}
         self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks
+        self.gpu_client_mapping: Dict[int, int] = {}  # device_id -> dp_client_id
 
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
@@ -48,29 +55,29 @@ class TransferManager:
 
         self.transfer_engine: Optional[TransferEngine] = None
         self.storage_engine = StorageEngine(self.model_config, self.cache_config)
-        flexkv_logger.info("Initialized TransferManager with config successfully")
+        flexkv_logger.info(f"Initialized TransferManager with config successfully, "
+                           f"instance_num={self.instance_num}, expected_gpus={self.expected_gpus}")
 
     def _handle_gpu_blocks_registration(self, req: RegisterTPClientRequest) -> None:
         device_id = req.device_id
 
         if device_id in self.all_gpu_blocks:
             flexkv_logger.error(f"GPU {device_id} has already registered.")
-        elif device_id >= self.model_config.tp_size * self.model_config.dp_size:
-            flexkv_logger.error(f"GPU {device_id} is larger than TP size: "
-                                f"{self.model_config.tp_size * self.model_config.dp_size}.")
         else:
             try:
                 self.all_gpu_blocks[device_id] = req.handles
                 self.all_gpu_layouts[device_id] = req.gpu_layout
+                self.gpu_client_mapping[device_id] = req.dp_client_id
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
 
     def _register_gpu_blocks_via_socket(self) -> None:
         try:
-            expected_gpus = self.model_config.tp_size * self.model_config.dp_size
-            flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port},"
-                               f"expected {expected_gpus} GPUs to register")
-            while len(self.all_gpu_blocks) < expected_gpus:
+            flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port}, "
+                               f"expected {self.expected_gpus} GPUs to register "
+                               f"(instance_num={self.instance_num}, tp={self.model_config.tp_size}, "
+                               f"dp={self.model_config.dp_size})")
+            while len(self.all_gpu_blocks) < self.expected_gpus:
                 try:
                     # Recv from: flexkv.server.client.KVTPClient.register_to_server
                     req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
@@ -82,11 +89,11 @@ class TransferManager:
                     flexkv_logger.info(f"Received GPU blocks registration request: {type(req)}")
                     self._handle_gpu_blocks_registration(req)
                     flexkv_logger.info(f"GPU {req.device_id} registered successfully, "
-                                       f"waiting for {expected_gpus - len(self.all_gpu_blocks)} GPUs to register")
+                                       f"waiting for {self.expected_gpus - len(self.all_gpu_blocks)} GPUs to register")
                 else:
                     flexkv_logger.error(f"Unrecognized RequestType in SchedulerServer: {type(req)}")
 
-            flexkv_logger.info(f"All {expected_gpus} GPUs registered successfully")
+            flexkv_logger.info(f"All {self.expected_gpus} GPUs registered successfully")
 
         except Exception as e:
             flexkv_logger.error(f"Error in GPU registration server: {e}")
@@ -101,17 +108,27 @@ class TransferManager:
         flexkv_logger.info("Initializing TransferEngine...")
         self._register_gpu_blocks_via_socket()
 
-        assert len(self.all_gpu_layouts) == self.model_config.tp_size * self.model_config.dp_size
-        assert len(self.all_gpu_blocks) == self.model_config.tp_size * self.model_config.dp_size
+        assert len(self.all_gpu_layouts) == self.expected_gpus, \
+            f"Expected {self.expected_gpus} GPU layouts, got {len(self.all_gpu_layouts)}"
+        assert len(self.all_gpu_blocks) == self.expected_gpus, \
+            f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
+        
+        # Register GPU blocks with their global device IDs
         for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
             self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper,
                                                     self.all_gpu_layouts[device_id],
                                                     device_id,
                                                     dtype=self.model_config.dtype)
-        self.gpu_handles = [
-            self.storage_engine.get_storage_handle(DeviceType.GPU, i)
-            for i in range(self.model_config.tp_size * self.model_config.dp_size)
-        ]
+        
+        # Group GPU handles by dp_client_id
+        grouped_gpu_handles: Dict[int, List] = {}
+        for device_id in sorted(self.all_gpu_blocks.keys()):
+            dp_client_id = self.gpu_client_mapping[device_id]
+            if dp_client_id not in grouped_gpu_handles:
+                grouped_gpu_handles[dp_client_id] = []
+            grouped_gpu_handles[dp_client_id].append(
+                self.storage_engine.get_storage_handle(DeviceType.GPU, device_id))
+        
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
@@ -121,7 +138,7 @@ class TransferManager:
             if self.cache_config.enable_remote \
             else None
         )
-        self.transfer_engine = TransferEngine(gpu_handles=self.gpu_handles,
+        self.transfer_engine = TransferEngine(gpu_handles=grouped_gpu_handles,
                                               model_config=self.model_config,
                                               cache_config=self.cache_config,
                                               cpu_handle=cpu_handle,
