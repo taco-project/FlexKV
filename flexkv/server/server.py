@@ -1,4 +1,5 @@
 from collections import deque
+from dataclasses import fields
 from typing import Optional, Dict, List, Union
 
 import tempfile
@@ -120,6 +121,7 @@ class KVServer:
         total_clients: int = 0,
     ):
 
+        self.model_config = model_config
         # Init inter-process communication
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
@@ -277,11 +279,14 @@ class KVServer:
         flexkv_logger.info("Server shutdown complete")
 
 
-    def _verify_model_config(
-        self,
-        model_config: ModelConfig) -> bool:
-        # TODO
-        return True
+    def _verify_model_config(self, model_config: ModelConfig) -> None:
+        """Verify that client's model config matches server's config."""
+        for field in fields(ModelConfig):
+            client_val = getattr(model_config, field.name)
+            server_val = getattr(self.model_config, field.name)
+            print(f"ModelConfig.{field.name} mismatch: client={client_val}, server={server_val}")
+            assert client_val == server_val, \
+                f"ModelConfig.{field.name} mismatch: client={client_val}, server={server_val}"
 
     # Request Handler Methods
 

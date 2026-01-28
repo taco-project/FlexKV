@@ -89,8 +89,6 @@ unset FLEXKV_CONFIG_PATH
 export FLEXKV_CPU_CACHE_GB=32
 export FLEXKV_SSD_CACHE_GB=128
 export FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/"
-export FLEXKV_INSTANCE_NUM=${NUM_WORKERS}
-export FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server"
 # 使用for循环启动工作节点
 for i in $(seq 0 $((NUM_WORKERS-1))); do
     # 计算GPU设备ID
@@ -98,9 +96,11 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
     GPU_END=$((i*2+1))
 
     if [ $i -lt $((NUM_WORKERS-1)) ]; then
-        FLEXKV_INSTANCE_ID=${i} CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310 &
+        # 多个worker时注意Flexkv的端口应不同，否则会卡在flexkv init这一步
+        # 通过环境变量 `FLEXKV_SERVER_RECV_PORT` 设置Flexkv的端口
+        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310 &
     else
-        FLEXKV_INSTANCE_ID=${i} CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310
+        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310
     fi
 done
 ```

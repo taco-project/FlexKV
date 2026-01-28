@@ -72,8 +72,8 @@ enable_gds: false
 |--------|------|--------|------|
 | `FLEXKV_SERVER_CLIENT_MODE` | bool | 0 | `server_client_mode`: 是否强制启用服务器-客户端模式 |
 | `FLEXKV_SERVER_RECV_PORT` | str | "ipc:///tmp/flexkv_server" | `server_recv_port`: 服务器接收端口配置，多实例模式下不同实例应当使用相同的端口 |
-| `FLEXKV_INSTANCE_NUM` | int | 1 | Number of inference engine instances |
-| `FLEXKV_INSTANCE_ID` | int | 0 | Inference engine instance ID |
+| `FLEXKV_INSTANCE_NUM` | int | 1 | 推理引擎实例的数量 |
+| `FLEXKV_INSTANCE_ID` | int | 0 | 推理引擎实例ID |
 
 ---
 
