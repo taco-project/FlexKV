@@ -197,6 +197,29 @@ class FlexKVSchedulerConnector:
         return num_new_matched_tokens, True
 
     def _extract_namespace(self, request: "Request") -> Optional[List[str]]:
+        """
+        Extract namespace information from vLLM Request for cache isolation.
+        
+        This method extracts namespace components from multiple sources in priority order:
+        1. lora_request.lora_name: LoRA adapter name for multi-tenant LoRA serving
+        2. cache_salt: Explicit cache isolation identifier
+        3. namespace_info: User-defined namespace hierarchy (can be list or single value)
+        
+        The namespace components are combined to form a hierarchical namespace path,
+        enabling fine-grained KV cache isolation across different tenants, users, or sessions.
+        
+        Args:
+            request: vLLM Request object containing namespace-related fields
+            
+        Returns:
+            Optional[List[str]]: Ordered list of namespace components forming the hierarchy,
+                                or None if no namespace information is available
+                                
+        Example:
+            If request has lora_name="tenant_A", cache_salt="session_1", 
+            namespace_info=["user_1"], the result will be:
+            ["tenant_A", "session_1", "user_1"]
+        """
         namespace_info = []
         
         if hasattr(request, 'lora_request') and request.lora_request is not None:
