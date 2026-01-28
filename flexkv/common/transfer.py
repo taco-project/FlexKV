@@ -1,7 +1,7 @@
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, List, Set, Dict, Callable, Tuple
+from typing import ClassVar, List, Set, Dict, Callable, Tuple, Optional
 
 import numpy as np
 
@@ -31,6 +31,8 @@ class DeviceType(Enum):
     GPU = 1
     SSD = 2
     REMOTE = 3
+    PEERCPU = 4
+    PEERSSD = 5
 
 class TransferType(Enum):
     H2D    = "H2D"
@@ -41,11 +43,20 @@ class TransferType(Enum):
     D2DISK = "D2DISK"
     REMOTE2H = "REMOTE2H"
     H2REMOTE = "H2REMOTE"
+    PEERH2H = "PEERH2H"
+    H2PEERH = "H2PEERH"
+    PEERSSD2H = "PEERSSD2H"
+    H2PEERSSD = "H2PEERSSD"
+
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of
     # a group of transfer ops
     VIRTUAL = "Virtual"
+
+# class DistType(Enum):
+#     DISTH = "DISTH"
+#     DISTSSD = "DISTSSD"
 
 class PartitionBlockType(Enum):
     ROUND_ROBIN = 0
@@ -63,11 +74,12 @@ class TransferOp:
 
     op_id: int = field(init=False)
     graph_id: int
-    transfer_type: TransferType
+    transfer_type: TransferType 
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
     layer_id: int = 0
     layer_granularity: int = -1
+    # src_block_node_ids: Optional[np.ndarray] = None
     # this will change dynamically as transfer ops executed
     predecessors: Set[int] = field(default_factory=set)
     # this will keep the full info
@@ -78,6 +90,9 @@ class TransferOp:
     src_slot_id: int = -1
     dst_slot_id: int = -1
     valid_block_num: int = 0
+    remote_node_ids: Optional[np.ndarray] = None
+    # used for distributed cpu and ssd
+    src_block_node_ids: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \

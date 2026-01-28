@@ -25,6 +25,8 @@ import numpy as np
 import nvtx
 import torch
 from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
+from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
+from flexkv.cache.redis_meta import RedisMeta
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
@@ -35,17 +37,8 @@ from flexkv.common.transfer import (
     DeviceType, TransferOpGraph, TransferOp, TransferType
 )
 from flexkv.common.debug import flexkv_logger
-@dataclass
-class MatchResultAccel:
-    num_ready_matched_blocks: int = 0
-    num_matched_blocks: int = 0
-    last_ready_node: Optional['CRadixNode'] = None
-    last_node: Optional['CRadixNode'] = None
-    last_node_matched_length: int = 0
-    physical_blocks: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
-
-    def __post_init__(self) -> None:
-        assert self.physical_blocks.ndim == 1
+from flexkv.common.type import MatchResultAccel
+from flexkv.cache.redis_meta import RedisMeta
 
 class CacheEngineAccel:
     def __init__(self,
@@ -53,7 +46,8 @@ class CacheEngineAccel:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 hit_reward_seconds: int = 0):
+                 hit_reward_seconds: int = 0,
+                 evict_start_threshold: float = 1.0):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -71,6 +65,7 @@ class CacheEngineAccel:
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
+        self.evict_start_threshold = evict_start_threshold
 
     def reset(self) -> None:
         self.index.reset()
@@ -80,10 +75,22 @@ class CacheEngineAccel:
         sequence_meta.gen_hashes()
         match_result = self.index.match_prefix(torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
                                               sequence_meta.num_blocks, True)
+        # physical blocks (torch.Tensor -> numpy, zero-copy on CPU)
+        phys = match_result.physical_blocks.cpu().numpy()
+        # optional block_node_ids
+        try:
+            bnis = getattr(match_result, "block_node_ids", None)
+            if isinstance(bnis, torch.Tensor) and bnis.numel() > 0:
+                bnids_np = bnis.cpu().numpy()
+            else:
+                bnids_np = None
+        except Exception:
+            bnids_np = None
         return MatchResultAccel(match_result.num_ready_matched_blocks, match_result.num_matched_blocks,
                             match_result.last_ready_node, match_result.last_node,
                             match_result.last_node_matched_length,
-                            torch.tensor(match_result.physical_blocks, dtype=torch.int64).numpy())
+                            phys,
+                            bnids_np)
 
     def insert(self,
                sequence_meta: SequenceMeta,
@@ -121,21 +128,37 @@ class CacheEngineAccel:
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
              strict: bool = True) -> torch.Tensor:
-        if num_required_blocks > self.mempool.num_free_blocks:
+        # Calculate current utilization
+        utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
+        
+        # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
+        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
+        
+        if should_evict:
             if protected_node is not None:
                 self.index.lock(protected_node)
+            
+            # Calculate how many blocks to evict
+            # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
+            target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
+            evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
+            
             evict_block_num = max(
-                num_required_blocks - self.mempool.num_free_blocks,
-                int(self.mempool.num_total_blocks * self.evict_ratio)
+                num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
+                evict_to_reach_target,                               # Or reach target free ratio
+                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
             )
-            target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
-            num_evicted = self.index.evict(target_blocks, evict_block_num)
-            if num_evicted != evict_block_num:
-                target_blocks.resize_(num_evicted)
-            self.mempool.recycle_blocks(target_blocks.numpy())
-
+            
+            if evict_block_num > 0:
+                target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
+                num_evicted = self.index.evict(target_blocks, evict_block_num)
+                if num_evicted != evict_block_num:
+                    target_blocks.resize_(num_evicted)
+                self.mempool.recycle_blocks(target_blocks.numpy())
+            
             if protected_node is not None:
                 self.index.unlock(protected_node)
+        
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise RuntimeError(f"Not enough free blocks to take, "
                                f"required: {num_required_blocks}, "
@@ -152,7 +175,8 @@ class CacheEngine:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  evict_ratio: float,
-                 hit_reward_seconds: int = 0):
+                 hit_reward_seconds: int = 0,
+                 evict_start_threshold: float = 1.0):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -170,6 +194,7 @@ class CacheEngine:
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
+        self.evict_start_threshold = evict_start_threshold
 
     def reset(self) -> None:
         self.index.reset()
@@ -205,18 +230,35 @@ class CacheEngine:
              num_required_blocks: int,
              protected_node: Optional[RadixNode] = None,
              strict: bool = True) -> np.ndarray:
-        if num_required_blocks > self.mempool.num_free_blocks:
+        # Calculate current utilization
+        utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
+        
+        # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
+        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
+        
+        if should_evict:
             if protected_node is not None:
                 self.index.lock(protected_node)
+            
+            # Calculate how many blocks to evict
+            # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
+            target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
+            evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
+            
             evict_block_num = max(
-                num_required_blocks - self.mempool.num_free_blocks,
-                int(self.mempool.num_total_blocks * self.evict_ratio)
+                num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
+                evict_to_reach_target,                               # Or reach target free ratio
+                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
             )
-            self.mempool.recycle_blocks(
-                self.index.evict(evict_block_num)
-            )
+            
+            if evict_block_num > 0:
+                self.mempool.recycle_blocks(
+                    self.index.evict(evict_block_num)
+                )
+            
             if protected_node is not None:
                 self.index.unlock(protected_node)
+        
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise RuntimeError("Not enough free blocks to take, ",
                                f"required: {num_required_blocks}, "
@@ -241,7 +283,7 @@ class CacheStrategy:
 DEFAULT_CACHE_STRATEGY = CacheStrategy()
 
 class GlobalCacheEngine:
-    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig):
+    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None):
         self.cache_config = cache_config
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
@@ -251,58 +293,90 @@ class GlobalCacheEngine:
         self.remote_cache_engine = None
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
+        if cache_config.enable_kv_sharing:
+            assert redis_meta != None
+            self.redis_meta = redis_meta
+            self.node_id = self.redis_meta.get_node_id()
+            self.enable_kv_sharing = True
+        else:
+            self.enable_kv_sharing = False
         self.cache_engines = {}
 
         self.evict_ratio = GLOBAL_CONFIG_FROM_ENV.evict_ratio
+        self.evict_start_threshold = GLOBAL_CONFIG_FROM_ENV.evict_start_threshold
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
 
         if cache_config.enable_cpu:
-            if self.index_accel:
+            if cache_config.enable_p2p_cpu:
+                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
+            elif self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.evict_start_threshold)
             else:
                 self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.evict_start_threshold)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
-            if self.index_accel:
+            if cache_config.enable_p2p_ssd:
+                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
+            elif self.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.evict_start_threshold)
             else:
                 self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
-                                                self.hit_reward_seconds)
+                                                self.hit_reward_seconds,
+                                                self.evict_start_threshold)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
-            if self.index_accel:
+            if cache_config.enable_kv_sharing:
+                # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
+                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
+            elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
                                                    self.evict_ratio,
-                                                   self.hit_reward_seconds)
+                                                   self.hit_reward_seconds,
+                                                   self.evict_start_threshold)
             else:
                 self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
                                                    self.evict_ratio,
-                                                   self.hit_reward_seconds)
+                                                   self.hit_reward_seconds,
+                                                   self.evict_start_threshold)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
+
+        #TODO move this to kvmanager.start()
+        self.start()
 
         self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]] = \
             lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0)
         self._empty_put_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]] = \
             lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0, 0)
+
+    def start(self) -> None:
+        if self.cpu_cache_engine and self.cache_config.enable_p2p_cpu:
+            self.cpu_cache_engine.start()
+        if self.ssd_cache_engine and self.cache_config.enable_p2p_ssd:
+            self.ssd_cache_engine.start()
+        if self.remote_cache_engine and self.cache_config.enable_3rd_remote:
+            self.remote_cache_engine.start()
 
     def reset(self) -> None:
         if self.cpu_cache_engine:
@@ -343,7 +417,7 @@ class GlobalCacheEngine:
             aligned_length = ((token_ids.shape[0] - 1) // self.tokens_per_block) * self.tokens_per_block
 
         aligned_token_ids = token_ids[:aligned_length]
-        token_mask = token_mask[:aligned_length]
+        token_mask[aligned_length:] = False
 
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
         assert block_end_idx == aligned_length // self.tokens_per_block
@@ -354,6 +428,7 @@ class GlobalCacheEngine:
                                      tokens_per_block=self.cache_config.tokens_per_block)
 
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
+            # from this entrance, we will also handle the case of peer_cpu and peer_ssd
             (transfer_graph, finished_ops_ids, node_to_unlock,
              op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
                 self._get_impl_local(
@@ -366,6 +441,7 @@ class GlobalCacheEngine:
                     temp_cache_strategy
                 )
         else:
+            #TODO pcfs will be supported later
             (transfer_graph, finished_ops_ids, node_to_unlock,
              op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
                 self._get_impl_global(
@@ -435,16 +511,20 @@ class GlobalCacheEngine:
         assert enable_cpu and enable_remote
         assert self.cpu_cache_engine is not None
         assert self.remote_cache_engine is not None
-
-        cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
-
+        if self.index_accel:
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
+        else:
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         remote_matched_blocks = remote_matched_result.physical_blocks[
             :remote_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-
+        shared_pcfs_read = self.cache_config.enable_kv_sharing and self.index_accel
+        remote_file_nodeids = None
+        if shared_pcfs_read:
+            remote_file_nodeids = remote_matched_result.block_node_ids
         fragment123_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks), len(remote_matched_blocks))
         #early return if no blocks to transfer
         if fragment123_num_blocks == 0:
@@ -464,7 +544,9 @@ class GlobalCacheEngine:
         fragment123_cpu_blocks = cpu_matched_blocks
         fragment2_ssd_blocks = ssd_matched_blocks[-fragment2_num_blocks:]
         fragment3_remote_blocks = remote_matched_blocks[-fragment3_num_blocks:]
-
+        fragment3_remote_file_nodeids = None
+        if shared_pcfs_read:
+            fragment3_remote_file_nodeids = remote_file_nodeids[-fragment3_num_blocks:]
         cpu_node_to_unlock = cpu_matched_result.last_ready_node
         ssd_node_to_unlock = ssd_matched_result.last_ready_node
         remote_node_to_unlock = remote_matched_result.last_ready_node
@@ -514,7 +596,8 @@ class GlobalCacheEngine:
                 src_block_ids = fragment3_remote_blocks,
                 dst_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
                 layer_id = 0,
-                layer_granularity = layer_num
+                layer_granularity = layer_num,
+                src_block_node_ids = fragment3_remote_file_nodeids
             )
             transfer_graph.add_transfer_op(op_remote2h)
 
@@ -596,11 +679,11 @@ class GlobalCacheEngine:
         """
         transfer pattern:
 
-        GPU: (gpu cached) | fragment1 | fragment2      | (need compute)
+        GPU          : (gpu cached) | fragment1 | fragment2      | (need compute)
                                ↑          ↑
-        CPU:     ...      | fragment1 | fragment2(new) | (uncached)
+        CPU(+peerCPU):     ...      | fragment1 | fragment2(new) | (uncached)
                                           ↑
-        SSD:     ...      | fragment1 | fragment2      | (uncached)
+        SSD(+peerSSD):     ...      | fragment1 | fragment2      | (uncached)
 
         """
         nvtx_range = nvtx.start_range(message=f"CacheEngine.get_impl_local[{request_id}]", color="cyan")
@@ -612,9 +695,14 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
 
         if self.index_accel:
-            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta, temp_cache_strategy)
+            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta, temp_cache_strategy, is_put=False, gpu_matched_blocks=block_mask_start)
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
+
+
+        # DEBUG: Log GET operation with hash info
+        #if len(sequence_meta.block_hashes) > 0:
+        #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
 
         # tailor the blocks to assure:
         # the blocks are needed by the mask & the blocks are ready
@@ -623,6 +711,10 @@ class GlobalCacheEngine:
         # if ssd disabled, len(ssd_physical_blocks) is 0
         ssd_matched_blocks = ssd_matched_result.physical_blocks[:ssd_matched_result.num_ready_matched_blocks]
         ssd_matched_blocks = ssd_matched_blocks[block_mask_start:block_mask_end]
+
+        # TODO: is this possible?
+        if len(cpu_matched_blocks) > len(ssd_matched_blocks):
+            ssd_matched_blocks = np.array([], dtype=np.int64)
 
         fragment12_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks))
         fragment1_num_blocks = len(cpu_matched_blocks)
@@ -648,6 +740,49 @@ class GlobalCacheEngine:
         op_disk2h = None
         op_gds_transfer = None
         fragment2_cpu_blocks = None
+
+        #allocated new cpu blocks for this request
+        allocated_cpu_block_num = fragment2_num_blocks
+        # NOTE: When matched_pos is "remote", we ALWAYS need to allocate local CPU blocks
+        # to receive the data, regardless of whether we insert to local index or not
+        if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
+            allocated_cpu_block_num += fragment1_num_blocks
+        allocated_cpu_blocks = self.cpu_cache_engine.take(
+            num_required_blocks=allocated_cpu_block_num,
+            protected_node=cpu_matched_result.last_node,
+            strict=False
+        )
+        # NOTE: not enough space to allocate, skip the request
+        # there might be a better way to handle this
+        if len(allocated_cpu_blocks) < allocated_cpu_block_num:
+            self.cpu_cache_engine.recycle(allocated_cpu_blocks)
+            return self._empty_get_return(request_id)
+
+        if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
+            fragment1_cpu_blocks_local = allocated_cpu_blocks[-fragment1_num_blocks:]
+            op_peerh2h = TransferOp(
+                graph_id = transfer_graph.graph_id,
+                transfer_type = TransferType.PEERH2H,
+                src_block_ids = fragment1_cpu_blocks,
+                dst_block_ids = fragment1_cpu_blocks_local,
+                layer_id = 0,
+                layer_granularity = layer_num,
+                remote_node_ids = cpu_matched_result.matched_node_ids,
+                src_block_node_ids = cpu_matched_result.matched_node_ids  # Add this for worker
+            )
+            transfer_graph.add_transfer_op(op_peerh2h)
+            #TODO here we dont combine peer cpu or local cpu match results, so we can safely add remote results to local cpu
+            #TODO here assume all matched blocks are ready blocks for peer cpu
+            if (cpu_matched_result.insert_to_local_cpu_index and 
+                cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
+                cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
+                cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
+                                                                  fragment1_cpu_blocks_local,
+                                                                  is_ready=False)
+                op_node_to_ready[op_peerh2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+            else:
+                cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment1_cpu_blocks_local])
+
         if fragment2_num_blocks > 0:
             if enable_gds:
                 # For GDS, transfer directly from SSD to GPU using GDS transfer path (DISK2D)
@@ -665,30 +800,25 @@ class GlobalCacheEngine:
                                                            ssd_node_to_unlock,
                                                            ssd_node_to_unlock.size())
             else:
-                fragment2_cpu_blocks = self.cpu_cache_engine.take(
-                    num_required_blocks=fragment2_num_blocks,
-                    protected_node=cpu_matched_result.last_node,
-                    strict=False
-                )
-                if len(fragment2_cpu_blocks) < fragment2_num_blocks:
-                    # NOTE: not enough space to allocate, skip the request
-                    # there might be a better way to handle this
-                    self.cpu_cache_engine.recycle(fragment2_cpu_blocks)
-                    return self._empty_get_return(request_id)
+                fragment2_cpu_blocks = allocated_cpu_blocks[:fragment2_num_blocks]
 
                 op_disk2h = TransferOp(
                     graph_id = transfer_graph.graph_id,
-                    transfer_type = TransferType.DISK2H,
+                    transfer_type = TransferType.PEERSSD2H if ssd_matched_result.matched_pos == "remote" else TransferType.DISK2H,
                     src_block_ids = fragment2_ssd_blocks,
                     dst_block_ids = fragment2_cpu_blocks,
                     layer_id = 0,
-                    layer_granularity = layer_num
+                    layer_granularity = layer_num,
+                    remote_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None,
+                    src_block_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None
                 )
                 transfer_graph.add_transfer_op(op_disk2h)
                 # we only insert the buffer blocks to cpu cache engine only:
                 # 1. the cpu cache engine satisfies prefix cache after insertion
                 # 2. the sequence is all ready blocks
-                if (cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
+                # TODO: for simplicity, if we use peer cpu results, we dont insert the buffer ssd blocks to local cpu any more
+                if (cpu_matched_result.matched_pos == "local" and
+                    cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
                     cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
                     cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                                     fragment2_cpu_blocks,
@@ -698,7 +828,10 @@ class GlobalCacheEngine:
                                                                     match_result=cpu_matched_result)
                     op_node_to_ready[op_disk2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
                 else:
-                    cpu_blocks_to_free = fragment2_cpu_blocks
+                    cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment2_cpu_blocks])
+        if self.cache_config.enable_p2p_cpu and cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
+            fragment1_cpu_blocks = fragment1_cpu_blocks_local
+
         if fragment2_cpu_blocks is not None:
             fragment12_cpu_blocks = np.concatenate([fragment1_cpu_blocks, fragment2_cpu_blocks])
         else:
@@ -717,6 +850,8 @@ class GlobalCacheEngine:
             transfer_graph.add_transfer_op(op_h2d)
             if op_disk2h is not None:
                 transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
+            if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
+                transfer_graph.add_dependency(op_h2d.op_id, op_peerh2h.op_id)
             finished_ops_ids.append(op_h2d.op_id)
 
         node_to_unlock = {}
@@ -747,7 +882,7 @@ class GlobalCacheEngine:
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
         aligned_token_ids = token_ids[:aligned_length]
-        token_mask = token_mask[:aligned_length]
+        token_mask[aligned_length:] = False
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
 
         # the mask should has a prefix of True
@@ -800,7 +935,8 @@ class GlobalCacheEngine:
 
         callback = partial(self._transfer_callback,
                            node_to_unlock=node_to_unlock,
-                           buffer_to_free=buffer_to_free)
+                           buffer_to_free=buffer_to_free,
+                           is_put=True)
 
         op_callback_dict = {}
         for op_id in op_node_to_ready:
@@ -846,7 +982,8 @@ class GlobalCacheEngine:
 
         if self.index_accel:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta,
-                                                                                               temp_cache_strategy=temp_cache_strategy)
+                                                                                               temp_cache_strategy=temp_cache_strategy,
+                                                                                               is_get=False)
         else:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta,
                                                                                            temp_cache_strategy=temp_cache_strategy)
@@ -1011,16 +1148,23 @@ class GlobalCacheEngine:
         assert enable_cpu
         assert self.cpu_cache_engine is not None
 
-        if  self.index_accel:
+        if self.index_accel:
             cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta,
-                                                                            temp_cache_strategy=temp_cache_strategy)
+                                                                            temp_cache_strategy=temp_cache_strategy,
+                                                                            is_put=True)
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta,
-                                                                      temp_cache_strategy=temp_cache_strategy)
+                                                                      temp_cache_strategy=temp_cache_strategy,
+                                                                      is_put=True)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
+        
+        #if len(cpu_matched_blocks) > len(ssd_matched_blocks):
+        #    print(f"[PUT_LOCAL] CPU matched blocks are greater than SSD matched blocks, skipping")
+        #    return self._empty_put_return(request_id)
+        
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
@@ -1049,6 +1193,7 @@ class GlobalCacheEngine:
 
         if len(fragment12_cpu_blocks) < fragment12_num_blocks or \
             len(fragment2_ssd_blocks) < fragment2_num_blocks:
+            print(f"[WARNING] PUT request {request_id} FAILED: CPU={len(fragment12_cpu_blocks)}/{fragment12_num_blocks}, SSD={len(fragment2_ssd_blocks)}/{fragment2_num_blocks}")
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
             if enable_ssd:
                 self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
@@ -1119,21 +1264,30 @@ class GlobalCacheEngine:
 
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
-                           buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None) -> None:
+                           buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
+                           is_put: bool = False) -> None:
         if DeviceType.CPU in node_to_unlock:
             assert self.cpu_cache_engine is not None
-            self.cpu_cache_engine.unlock(node_to_unlock[DeviceType.CPU][0])
-            self.cpu_cache_engine.set_ready(node_to_unlock[DeviceType.CPU][0], True, node_to_unlock[DeviceType.CPU][1])
+            cpu_node = node_to_unlock[DeviceType.CPU][0]
+            self.cpu_cache_engine.unlock(cpu_node)
+            self.cpu_cache_engine.set_ready(cpu_node, True, node_to_unlock[DeviceType.CPU][1])
+            if is_put and self.cache_config.enable_p2p_cpu:
+                self.cpu_cache_engine.local_index.insert_and_publish(cpu_node)
         if DeviceType.SSD in node_to_unlock:
             assert self.ssd_cache_engine is not None
-            self.ssd_cache_engine.unlock(node_to_unlock[DeviceType.SSD][0])
-            self.ssd_cache_engine.set_ready(node_to_unlock[DeviceType.SSD][0], True, node_to_unlock[DeviceType.SSD][1])
+            ssd_node = node_to_unlock[DeviceType.SSD][0]
+            self.ssd_cache_engine.unlock(ssd_node)
+            self.ssd_cache_engine.set_ready(ssd_node, True, node_to_unlock[DeviceType.SSD][1])
+            if is_put and self.cache_config.enable_p2p_ssd:
+                self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
         if DeviceType.REMOTE in node_to_unlock:
             assert self.remote_cache_engine is not None
             self.remote_cache_engine.unlock(node_to_unlock[DeviceType.REMOTE][0])
             self.remote_cache_engine.set_ready(
                 node_to_unlock[DeviceType.REMOTE][0], True, node_to_unlock[DeviceType.REMOTE][1]
             )
+            if is_put and self.enable_kv_sharing:
+                self.remote_cache_engine.insert_and_publish(node_to_unlock[DeviceType.REMOTE][0])
         if buffer_to_free is not None:
             if DeviceType.CPU in buffer_to_free:
                 assert self.cpu_cache_engine is not None
@@ -1158,22 +1312,43 @@ class GlobalCacheEngine:
 
     @nvtx.annotate("Match Prefix Accel", color="yellow")
     def match_local_accel(self,
-                          sequence_meta: SequenceMeta,
-                          temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
-                              -> Tuple[MatchResultAccel, MatchResultAccel]:
+                        sequence_meta: SequenceMeta,
+                        temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
+                        is_put: bool = False,
+                        gpu_matched_blocks: int = 0) \
+                            -> Tuple[MatchResultAccel, MatchResultAccel]:
+        #from flexkv.common.debug import flexkv_logger
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
         if self.cpu_cache_engine:
-            cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
-        if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
-            ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
+            if not self.cache_config.enable_p2p_cpu:
+                cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
+            else:
+                #flexkv_logger.info(f"[MATCH DEBUG] CPU P2P enabled, calling match_all() instead of match_local()")
+                if is_put:
+                    cpu_matched_result = self.cpu_cache_engine.match_local(sequence_meta)
+                else:
+                    cpu_matched_result = self.cpu_cache_engine.match_all(sequence_meta, gpu_matched_blocks)
+        if temp_cache_strategy.ignore_ssd:
+            return cpu_matched_result, ssd_matched_result
+        #TODO: we assume that ssd and gds are not enabled at the same time
+        if self.ssd_cache_engine:
+            if not self.cache_config.enable_p2p_ssd:
+                ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
+            else:
+                #flexkv_logger.info(f"[MATCH DEBUG] SSD P2P enabled, calling match_all() instead of match_local()")
+                if is_put:
+                    ssd_matched_result = self.ssd_cache_engine.match_local(sequence_meta)
+                else:
+                    ssd_matched_result = self.ssd_cache_engine.match_all(sequence_meta, gpu_matched_blocks)
 
         return cpu_matched_result, ssd_matched_result
 
     @nvtx.annotate("Match Prefix", color="yellow")
     def match_local(self,
                     sequence_meta: SequenceMeta,
-                    temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                    temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
+                    is_put: bool = False) \
                         -> Tuple[MatchResult, MatchResult]:
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
@@ -1187,20 +1362,27 @@ class GlobalCacheEngine:
     @nvtx.annotate("Match All Prefix accel", color="yellow")
     def match_all_accel(self,
                         sequence_meta: SequenceMeta,
-                        temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                        temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
+                        is_get: bool = True) \
                             -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
         remote_matched_result = MatchResultAccel()
-        # TODO: avoid redundant match?
         if self.cpu_cache_engine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
         if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
             ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
         if self.remote_cache_engine and not temp_cache_strategy.ignore_remote:
-            remote_matched_result = self.remote_cache_engine.match(sequence_meta)
+            if self.enable_kv_sharing:
+                if is_get:
+                    remote_matched_result = self.remote_cache_engine.match_all(sequence_meta)
+                else:
+                    remote_matched_result = self.remote_cache_engine.match_local(sequence_meta)
+            else:
+                remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result
+
     @nvtx.annotate("Match All Prefix", color="yellow")
     def match_all(self,
                   sequence_meta: SequenceMeta,
@@ -1209,7 +1391,6 @@ class GlobalCacheEngine:
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
         remote_matched_result = MatchResult()
-        # TODO: avoid redundant match?
         if self.cpu_cache_engine:
             cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
         if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
@@ -1242,7 +1423,7 @@ class GlobalCacheEngine:
                          token_mask: np.ndarray) -> Tuple[int, int]:
         mask_idx = np.where(token_mask)[0]
         if len(mask_idx) == 0:
-            return len(token_mask)//self.tokens_per_block, len(token_mask)//self.tokens_per_block
+            return 0, 0
         start_idx = mask_idx[0].item() // self.tokens_per_block
         end_idx = mask_idx[-1].item() // self.tokens_per_block
         return start_idx, end_idx + 1

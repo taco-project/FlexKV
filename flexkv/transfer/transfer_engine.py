@@ -39,14 +39,40 @@ from flexkv.transfer.worker import (
     tpGPUCPUTransferWorker,
     GDSTransferWorker,
     tpGDSTransferWorker,
+    PEER2CPUTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
 
 
 def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
-    op.src_slot_id = pin_buffer.allocate_slot(op.src_block_ids)
-    op.dst_slot_id = pin_buffer.allocate_slot(op.dst_block_ids)
+    """
+    Register transfer operation to buffer with device type prefixes.
+    
+    Device type prefixes prevent hash collisions when different device types
+    use the same block ID values (e.g., CPU block 0 vs SSD block 0).
+    """
+    # Map TransferType to (src_device_type, dst_device_type) for hash prefix
+    # This prevents hash collisions when different devices use the same block IDs
+    transfer_type_to_devices = {
+        TransferType.D2H: (1, 2),      # GPU -> CPU
+        TransferType.H2D: (2, 1),      # CPU -> GPU
+        TransferType.H2DISK: (2, 3),   # CPU -> SSD
+        TransferType.DISK2H: (3, 2),   # SSD -> CPU
+        TransferType.DISK2D: (3, 1),   # SSD -> GPU
+        TransferType.D2DISK: (1, 3),   # GPU -> SSD
+        TransferType.H2REMOTE: (2, 4), # CPU -> REMOTE
+        TransferType.REMOTE2H: (4, 2), # REMOTE -> CPU
+        TransferType.PEERH2H: (5, 2),  # PEER_CPU -> CPU
+        TransferType.H2PEERH: (2, 5),  # CPU -> PEER_CPU
+        TransferType.PEERSSD2H: (6, 2),# PEER_SSD -> CPU
+        TransferType.H2PEERSSD: (2, 6),# CPU -> PEER_SSD
+    }
+    
+    src_device, dst_device = transfer_type_to_devices.get(op.transfer_type, (0, 0))
+    
+    op.src_slot_id = pin_buffer.allocate_slot(op.src_block_ids, device_type_prefix=src_device)
+    op.dst_slot_id = pin_buffer.allocate_slot(op.dst_block_ids, device_type_prefix=dst_device)
 
 def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
     if op.src_slot_id != -1:
@@ -93,6 +119,7 @@ class TransferEngine:
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
         self._cache_config = cache_config
+        self._enable_pcfs_sharing = GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing # TODO: is this correct?
 
         self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 
@@ -191,6 +218,7 @@ class TransferEngine:
                 remote_kv_layout=self._remote_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
                 remote_config_custom=self._remote_handle.remote_config_custom,
+                enable_pcfs_sharing=self._enable_pcfs_sharing,
             )
             self.remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
@@ -241,6 +269,34 @@ class TransferEngine:
                 ]
             self._worker_map[TransferType.DISK2D] = self.gds_workers
             self._worker_map[TransferType.D2DISK] = self.gds_workers
+            
+        if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
+            or (self._ssd_handle and self.cache_config.enable_p2p_ssd)):
+            ## NOTE:if we have the cpu handle and enable p2p cpu transfer we need this worker 
+            ## (currently we inplement cpu and ssd distributed transfer in one worker)
+
+            flexkv_logger.info(f"[transfer_engine] initializing the PEER2CPUTransferWorker!")
+            self.cpu_remote_cpu_worker: WorkerHandle = PEER2CPUTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor = self.pin_buffer.get_buffer(),
+                cpu_blocks=self._cpu_handle.get_tensor(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                # TODO: get remote kv_layout, now we can assume that remote kv layout is same as current node
+                remote_kv_layout=self._cpu_handle.kv_layout, 
+                dtype=self._cpu_handle.dtype,
+                cache_config = self.cache_config,
+                ssd_kv_layout = self._ssd_handle.kv_layout if self._ssd_handle else None,
+                ssd_files = self._ssd_handle.get_file_list() if self._ssd_handle else None,
+                num_blocks_per_file = self._ssd_handle.num_blocks_per_file if self._ssd_handle else None
+            )
+            # NOTE: now peerH2H and peerSSD2H op use the same worker
+            if self.cache_config.enable_p2p_cpu:
+                self._worker_map[TransferType.PEERH2H] = self.cpu_remote_cpu_worker
+            if self.cache_config.enable_p2p_ssd:
+                self._worker_map[TransferType.PEERSSD2H] = self.cpu_remote_cpu_worker
+
+            
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
         # Wait for all workers to ready

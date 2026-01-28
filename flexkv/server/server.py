@@ -111,6 +111,17 @@ class KVServerHandle:
     def __init__(self, process: Union[mp.Process, 'subprocess.Popen']):
         self.process = process
 
+    def shutdown(self) -> None:
+        self.process.join(timeout=5)
+        if self.process.is_alive():
+            flexkv_logger.info("force terminate the server process")
+            self.process.terminate()
+            self.process.join()
+
+    def __del__(self) -> None:
+        if self.process.is_alive():
+            self.shutdown()
+
 class KVServer:
     def __init__(
         self,
