@@ -451,3 +451,294 @@ index a03ebe35d..8e4460957 100644
 
          output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
          output.kv_connector_output = kv_connector_output
+diff --git a/vllm/distributed/kv_transfer/kv_connector/factory.py b/vllm/distributed/kv_transfer/kv_connector/factory.py
+index 584fc1d65..db1cfe36b 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/factory.py
++++ b/vllm/distributed/kv_transfer/kv_connector/factory.py
+@@ -105,3 +105,8 @@ KVConnectorFactory.register_connector(
+     "MultiConnector",
+     "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector",
+     "MultiConnector")
++
++KVConnectorFactory.register_connector(
++    "FlexKVConnectorV1",
++    "vllm.distributed.kv_transfer.kv_connector.v1.flexkv_connector",
++    "FlexKVConnectorV1")
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 61f1a09d3..1d365b6ec 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -316,6 +316,13 @@ class ResponsesRequest(OpenAIBaseModel):
+             "access by 3rd parties, and long enough to be "
+             "unpredictable (e.g., 43 characters base64-encoded, corresponding "
+             "to 256 bit). Not supported by vLLM engine V0."))
++    namespace_info: Optional[Union[str, list[str]]] = Field(
++        default=None,
++        description=(
++            "Optional namespace information for isolation. "
++            "Can be a single namespace string or a list of namespace strings. "
++            "This can be used for multi-tenant scenarios, request grouping, "
++            "or custom routing logic. Not supported by vLLM engine V0."))
+     # --8<-- [end:responses-extra-params]
+ 
+     _DEFAULT_SAMPLING_PARAMS = {
+@@ -585,6 +592,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             "access by 3rd parties, and long enough to be "
+             "unpredictable (e.g., 43 characters base64-encoded, corresponding "
+             "to 256 bit). Not supported by vLLM engine V0."))
++    namespace_info: Optional[Union[str, list[str]]] = Field(
++        default=None,
++        description=(
++            "Optional namespace information for isolation. "
++            "Can be a single namespace string or a list of namespace strings. "
++            "This can be used for multi-tenant scenarios, request grouping, "
++            "or custom routing logic. Not supported by vLLM engine V0."))
+     kv_transfer_params: Optional[dict[str, Any]] = Field(
+         default=None,
+         description="KVTransfer parameters used for disaggregated serving.")
+@@ -1073,6 +1087,14 @@ class CompletionRequest(OpenAIBaseModel):
+             "unpredictable (e.g., 43 characters base64-encoded, corresponding "
+             "to 256 bit). Not supported by vLLM engine V0."))
+ 
++    namespace_info: Optional[Union[str, list[str]]] = Field(
++        default=None,
++        description=(
++            "Optional namespace information for isolation. "
++            "Can be a single namespace string or a list of namespace strings. "
++            "This can be used for multi-tenant scenarios, request grouping, "
++            "or custom routing logic. Not supported by vLLM engine V0."))
++
+     kv_transfer_params: Optional[dict[str, Any]] = Field(
+         default=None,
+         description="KVTransfer parameters used for disaggregated serving.")
+diff --git a/vllm/entrypoints/openai/serving_engine.py b/vllm/entrypoints/openai/serving_engine.py
+index 0f4a7c018..df1ffdf9e 100644
+--- a/vllm/entrypoints/openai/serving_engine.py
++++ b/vllm/entrypoints/openai/serving_engine.py
+@@ -812,9 +812,15 @@ class OpenAIServing:
+         cache_salt = request.cache_salt if (
+             hasattr(request, "cache_salt")
+             and request.cache_salt is not None) else None
++        namespace_info = request.namespace_info if (
++            hasattr(request, "namespace_info")
++            and request.namespace_info is not None) else None
+         if cache_salt:
+             for prompt_text in engine_prompts_text:
+                 prompt_text["cache_salt"] = cache_salt
++        if namespace_info:
++            for prompt_text in engine_prompts_text:
++                prompt_text["namespace_info"] = namespace_info
+ 
+         # This check is equivalent to simply checking if
+         # `request_prompts_embeds` is empty, but it's difficult to propagate
+@@ -835,6 +841,9 @@ class OpenAIServing:
+         if cache_salt:
+             for prompt_embed in engine_prompts_embeds:
+                 prompt_embed["cache_salt"] = cache_salt
++        if namespace_info:
++            for prompt_embed in engine_prompts_embeds:
++                prompt_embed["namespace_info"] = namespace_info
+ 
+         request_prompts = request_prompts_embeds + request_prompts_text
+         engine_prompts = engine_prompts_embeds + engine_prompts_text
+@@ -948,6 +957,8 @@ class OpenAIServing:
+ 
+         if hasattr(request, "cache_salt") and request.cache_salt is not None:
+             engine_prompt["cache_salt"] = request.cache_salt
++        if hasattr(request, "namespace_info") and request.namespace_info is not None:
++            engine_prompt["namespace_info"] = request.namespace_info
+ 
+         return conversation, [request_prompt], [engine_prompt]
+ 
+diff --git a/vllm/inputs/data.py b/vllm/inputs/data.py
+index 23cb5e502..dc95ba8af 100644
+--- a/vllm/inputs/data.py
++++ b/vllm/inputs/data.py
+@@ -35,6 +35,11 @@ class TextPrompt(TypedDict):
+     Optional cache salt to be used for prefix caching.
+     """
+ 
++    namespace_info: NotRequired[Union[str, list[str]]]
++    """
++    Optional namespace information for isolation.
++    """
++
+ 
+ class TokensPrompt(TypedDict):
+     """Schema for a tokenized prompt."""
+@@ -64,6 +69,11 @@ class TokensPrompt(TypedDict):
+     Optional cache salt to be used for prefix caching.
+     """
+ 
++    namespace_info: NotRequired[Union[str, list[str]]]
++    """
++    Optional namespace information for isolation.
++    """
++
+ 
+ class EmbedsPrompt(TypedDict):
+     """Schema for a prompt provided via token embeddings."""
+@@ -76,6 +86,11 @@ class EmbedsPrompt(TypedDict):
+     Optional cache salt to be used for prefix caching.
+     """
+ 
++    namespace_info: NotRequired[Union[str, list[str]]]
++    """
++    Optional namespace information for isolation.
++    """
++
+ 
+ SingletonPrompt = Union[str, TextPrompt, TokensPrompt, EmbedsPrompt]
+ """
+@@ -187,12 +202,18 @@ class TokenInputs(TypedDict):
+     Optional cache salt to be used for prefix caching.
+     """
+ 
++    namespace_info: NotRequired[Union[str, list[str]]]
++    """
++    Optional namespace information for isolation.
++    """
++
+ 
+ def token_inputs(
+     prompt_token_ids: list[int],
+     token_type_ids: Optional[list[int]] = None,
+     prompt: Optional[str] = None,
+     cache_salt: Optional[str] = None,
++    namespace_info: Optional[Union[str, list[str]]] = None,
+ ) -> TokenInputs:
+     """Construct [`TokenInputs`][vllm.inputs.data.TokenInputs] from optional
+     values."""
+@@ -204,6 +225,8 @@ def token_inputs(
+         inputs["token_type_ids"] = token_type_ids
+     if cache_salt is not None:
+         inputs["cache_salt"] = cache_salt
++    if namespace_info is not None:
++        inputs["namespace_info"] = namespace_info
+ 
+     return inputs
+ 
+@@ -222,10 +245,16 @@ class EmbedsInputs(TypedDict):
+     Optional cache salt to be used for prefix caching.
+     """
+ 
++    namespace_info: NotRequired[Union[str, list[str]]]
++    """
++    Optional namespace information for isolation.
++    """
++
+ 
+ def embeds_inputs(
+     prompt_embeds: torch.Tensor,
+     cache_salt: Optional[str] = None,
++    namespace_info: Optional[Union[str, list[str]]] = None,
+ ) -> EmbedsInputs:
+     """Construct [`EmbedsInputs`][vllm.inputs.data.EmbedsInputs] from optional
+     values."""
+@@ -233,6 +262,8 @@ def embeds_inputs(
+ 
+     if cache_salt is not None:
+         inputs["cache_salt"] = cache_salt
++    if namespace_info is not None:
++        inputs["namespace_info"] = namespace_info
+ 
+     return inputs
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 981023409..a6c8fac38 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -118,6 +118,7 @@ class Scheduler(SchedulerInterface):
+ 
+         # KV Connector: requests in process of async KV loading or recving
+         self.finished_recving_kv_req_ids: set[str] = set()
++        self.sending_kv_reqs: dict[str, Request] = {}
+ 
+         # Encoder-related.
+         # Calculate encoder cache size if applicable
+@@ -1029,7 +1030,8 @@ class Scheduler(SchedulerInterface):
+ 
+         if not delay_free_blocks:
+             self._free_blocks(request)
+-
++        else:
++            self.sending_kv_reqs[request.request_id] = request
+         return kv_xfer_params
+ 
+     def _free_blocks(self, request: Request):
+@@ -1041,7 +1043,7 @@ class Scheduler(SchedulerInterface):
+         return len(self.waiting) + len(self.running)
+ 
+     def has_finished_requests(self) -> bool:
+-        return len(self.finished_req_ids) > 0
++        return len(self.finished_req_ids) > 0 or len(self.sending_kv_reqs) > 0
+ 
+     def reset_prefix_cache(self) -> bool:
+         return self.kv_cache_manager.reset_prefix_cache()
+@@ -1082,6 +1084,8 @@ class Scheduler(SchedulerInterface):
+     def shutdown(self) -> None:
+         if self.kv_event_publisher:
+             self.kv_event_publisher.shutdown()
++        if self.connector and hasattr(self.connector, "shutdown"):
++            self.connector.shutdown()
+ 
+     ########################################################################
+     # KV Connector Related Methods
+@@ -1149,6 +1153,10 @@ class Scheduler(SchedulerInterface):
+             scheduler the request during the next step.
+         """
+ 
++        # avoid busy checking
++        if len(self.running) == 0:
++            time.sleep(0.01)
++
+         if self.connector is not None:
+             self.connector.update_connector_output(kv_connector_output)
+ 
+@@ -1158,4 +1166,5 @@ class Scheduler(SchedulerInterface):
+             self.finished_recving_kv_req_ids.add(req_id)
+         for req_id in (kv_connector_output.finished_sending or ()):
+             logger.debug("Finished sending KV transfer for request %s", req_id)
++            del self.sending_kv_reqs[req_id]
+             self._free_blocks(self.requests[req_id])
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+index f7ec982db..4f32819aa 100644
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -57,6 +57,7 @@ class EngineCoreRequest(
+     arrival_time: float
+     lora_request: Optional[LoRARequest]
+     cache_salt: Optional[str]
++    namespace_info: Optional[Union[str, list[str]]]
+     data_parallel_rank: Optional[int]
+ 
+     # Index of the client, used to ensure outputs are sent back to the same
+diff --git a/vllm/v1/engine/processor.py b/vllm/v1/engine/processor.py
+index c6a23cdbf..7bdc7d896 100644
+--- a/vllm/v1/engine/processor.py
++++ b/vllm/v1/engine/processor.py
+@@ -343,6 +343,7 @@ class Processor:
+             arrival_time=arrival_time,
+             lora_request=lora_request,
+             cache_salt=decoder_inputs.get("cache_salt"),
++            namespace_info=decoder_inputs.get("namespace_info"),
+             priority=priority,
+             data_parallel_rank=data_parallel_rank,
+         )
+diff --git a/vllm/v1/worker/kv_connector_model_runner_mixin.py b/vllm/v1/worker/kv_connector_model_runner_mixin.py
+index a03ebe35d..8e4460957 100644
+--- a/vllm/v1/worker/kv_connector_model_runner_mixin.py
++++ b/vllm/v1/worker/kv_connector_model_runner_mixin.py
+@@ -66,9 +66,9 @@ class KVConnectorModelRunnerMixin:
+                 scheduler_output, wait_for_save=False) as kv_connector_output:
+             pass
+ 
+-        if (not kv_connector_output.finished_sending
+-                and not kv_connector_output.finished_recving):
+-            return EMPTY_MODEL_RUNNER_OUTPUT
++        # if (not kv_connector_output.finished_sending
++        #         and not kv_connector_output.finished_recving):
++        #     return EMPTY_MODEL_RUNNER_OUTPUT
+ 
+         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+         output.kv_connector_output = kv_connector_output
