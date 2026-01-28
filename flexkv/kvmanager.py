@@ -38,6 +38,8 @@ class KVManager:
         flexkv_logger.info(f"{GLOBAL_CONFIG_FROM_ENV = }")
         self.model_config = model_config
         self.cache_config = cache_config
+        self.instance_id = GLOBAL_CONFIG_FROM_ENV.instance_id
+        self.instance_num = GLOBAL_CONFIG_FROM_ENV.instance_num
 
         if server_recv_port != "":
             self.server_recv_port = server_recv_port
@@ -48,24 +50,30 @@ class KVManager:
         else:
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
-        self.server_client_mode = model_config.dp_size > 1 or GLOBAL_CONFIG_FROM_ENV.server_client_mode
+        # Multi-instance mode also requires server_client_mode
+        self.server_client_mode = (model_config.dp_size > 1 or 
+                                   self.instance_num > 1 or 
+                                   GLOBAL_CONFIG_FROM_ENV.server_client_mode)
         self.dp_client_id = dp_client_id
+        
+        # Calculate global_client_id for multi-instance mode
+        self.global_client_id = self.instance_id * model_config.dp_size + dp_client_id
+        
         flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
         if self.server_client_mode:
-            # server should only be created once but kvmanager will init in every dp rank.
-            if dp_client_id == 0:
-                # You can control child process environment variables here
-                # Example: child_env = {"CUDA_VISIBLE_DEVICES": "0"}
-                # Example: inherit_env = False  # to not inherit parent env
+            # Server should only be created once across all instances and dp ranks
+            if self.instance_id == 0 and dp_client_id == 0:
+                total_clients = self.instance_num * model_config.dp_size
                 self.server_handle = KVServer.create_server(model_config=model_config,
                                                             cache_config=cache_config,
                                                             gpu_register_port=self.gpu_register_port,
                                                             server_recv_port=self.server_recv_port,
+                                                            total_clients=total_clients,
                                                             inherit_env=False)
 
             else:
                 self.server_handle = None
-            self.dp_client = KVDPClient(self.server_recv_port, self.model_config, dp_client_id)
+            self.dp_client = KVDPClient(self.server_recv_port, self.model_config, self.global_client_id)
         else:
             self.server_handle = None
             self.kv_task_engine = KVTaskEngine(model_config, cache_config, self.gpu_register_port)

@@ -52,6 +52,11 @@ class CacheConfig:
     remote_config_custom: Optional[Dict[str, Any]] = None
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
+    # Multi-instance configuration
+    instance_num=int(os.getenv('FLEXKV_INSTANCE_NUM', 1)),
+    instance_id=int(os.getenv('FLEXKV_INSTANCE_ID', 0)),
+    
+    # Server-client mode configuration
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 

@@ -142,7 +142,7 @@ class FlexKVSchedulerConnector:
         self.tasks_to_launch: dict[int, FlexKVTask] = {}
         self.tasks_to_cancel: dict[int, FlexKVTask] = {}
 
-        self.flexkv_stats = FlexKVStats(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200))
+        self.flexkv_stats = FlexKVStats(int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', '200')))
 
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")
@@ -519,17 +519,41 @@ class FlexKVWorkerConnector:
         flexkv_config: FlexKVConfig,
         dp_client_id: int,
     ):
+        from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+        
         self.is_local_leader = get_tp_group().local_rank == 0
         self.launch_remote_transfer_manager = get_tp_group().local_rank == 0 and \
             get_tp_group().rank_in_group != 0
-        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
+        
+        local_device = torch.cuda.current_device()
+        
+        # Determine if server_client_mode (same logic as KVManager)
+        server_client_mode = (GLOBAL_CONFIG_FROM_ENV.instance_num > 1 or 
+                              flexkv_config.model_config.dp_size > 1 or 
+                              GLOBAL_CONFIG_FROM_ENV.server_client_mode)
+        
+        if server_client_mode:
+            # Assuming Server can see all GPUs, use global device ID
+            cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+            if cuda_visible:
+                visible_ids = [int(x.strip()) for x in cuda_visible.split(',') if x.strip()]
+                device_id = visible_ids[local_device] if local_device < len(visible_ids) else local_device
+            else:
+                device_id = local_device
+            
+            client_id = GLOBAL_CONFIG_FROM_ENV.instance_id * flexkv_config.model_config.dp_size + dp_client_id
+        else:
+            device_id = local_device
+            client_id = dp_client_id
+        
         self.flexkv_config = flexkv_config
         if self.launch_remote_transfer_manager:
             self.remote_transfer_manager_process = TransferManagerOnRemote.create_process()
 
-        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, \
-            dp_client_id: {dp_client_id}")
-        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_client_id, current_device_id)
+        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, "
+                    f"server_client_mode={server_client_mode}, dp_client_id={dp_client_id}, "
+                    f"client_id={client_id}, device_id={device_id}")
+        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, client_id, device_id)
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):

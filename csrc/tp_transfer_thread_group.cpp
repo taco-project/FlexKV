@@ -87,16 +87,22 @@ TPTransferThreadGroup::TPTransferThreadGroup(
   cpu_blocks_ = cpu_blocks.data_ptr();
 
   dp_group_id_ = dp_group_id;
+  
+  gpu_device_ids_.resize(num_gpus_);
+  for (int i = 0; i < num_gpus_; ++i) {
+    gpu_device_ids_[i] = gpu_blocks[i][0].device().index();
+  }
+  
   streams_.resize(num_gpus_);
   for (int i = 0; i < num_gpus_; i += 1) {
-    cudaSetDevice(dp_group_id * num_gpus_ + i);
+    cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamCreate(&streams_[i]);
   }
   // create the thread pool
   stop_pool_=false;
   for (int i = 0; i < num_gpus_; ++i) {
     threads_.emplace_back([this, i]() {
-      int device_id = dp_group_id_ * num_gpus_ + i;
+      int device_id = gpu_device_ids_[i];
       cudaSetDevice(device_id);  // only once
 
       while (true) {
