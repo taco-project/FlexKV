@@ -428,7 +428,7 @@ class HierarchyLRCacheEngine:
         
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise ValueError(
-                "Not enough free blocks to take, ", required=num_required_blocks, available=self.mempool.num_free_blocks
+                f"Not enough free blocks to take, required: {num_required_blocks}, available: {self.mempool.num_free_blocks}"
             )
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         #print(f"[TAKE STATISTICS] device type: {self.device_type.name}, utilization: {utilization}, ",
