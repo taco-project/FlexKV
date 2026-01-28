@@ -9,6 +9,7 @@
 #include <vector>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include "gtensor_handler.cuh"
 #include "transfer.cuh"
@@ -81,7 +82,11 @@ private:
   std::vector<int> layer_eventfds_;  // Flat array
   int current_counter_id_;  // Current counter set index for this transfer
 
-  void layer_done_callback(int start_layer, int layers_this_batch);
+  void layer_done_callback(int start_layer, int layers_this_batch,
+                           nvtxRangeId_t *current_range_id_ptr,
+                           bool is_last_batch,
+                           const char *next_range_name,
+                           nvtxRangeId_t *next_range_id_ptr);
 };
 
 } // namespace flexkv
