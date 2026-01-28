@@ -116,6 +116,16 @@ FlexKV performs:
 - *get* requests can be called asynchronously; the time for matching and data transfer can overlap with prior computation through prefetching.
 - *put* requests can be called asynchronously; the time to copy data from GPU to CPU memory can overlap with subsequent computation. Data transfers between CPU memory, SSD, and scalable storage are fully handled asynchronously by the TransferEngine and transparent to the main process.
 
+### Distributed KVCache Reuse
+
+FlexKV supports distributed KVCache reuse to enable efficient sharing of KVCache across multiple nodes.
+
+Key features include:
+- **Distributed RadixTree**: Each node maintains a local snapshot of the global index to avoid centralized bottlenecks and network round-trips during query.
+- **Lease Mechanism**: Ensures data validity during cross-node data transfer.
+- **Upload & Rebuild**: Local indexes are periodically uploaded to a Global Meta Store (GMS, typically a Redis service), and distributed indexes are rebuilt by pulling metadata from other nodes.
+- **Mooncake Transfer Engine**: We use [Mooncake Transfer Engine](https://github.com/kvcache-ai/Mooncake), an RDMA-based transfer engine, to achieve high-performance KVCache transfer between nodes.
+
 ## Branching Strategy
 
 The branch management strategy of this project is as follows:

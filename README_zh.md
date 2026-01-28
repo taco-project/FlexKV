@@ -114,6 +114,16 @@ FlexKV 在处理 *get* 请求时：
 - *get*请求可以异步调用，*get*匹配和传输时间可以通过预取与之前的计算重合。
 - *put*请求可以异步调用，从GPU copy到内存的时间可以与之后的计算重合。内存与SSD以及扩展存储间的传输则完全由TransferEngine之后执行，主进程不感知。
 
+### 分布式 KVCache 复用
+
+FlexKV 支持分布式 KVCache 复用，实现多节点间的高效共享。
+
+核心特性包括：
+- **分布式 RadixTree**：每个节点维护全局索引的本地快照，避免查询时的中心化瓶颈和网络往返。
+- **租约机制**：保证跨节点数据传输期间的数据有效性。
+- **Upload & Rebuild**：本地索引定期上传到全局元数据存储 (GMS，通常是 Redis 服务)，并通过拉取其他节点的元数据重建分布式索引。
+- **Mooncake Transfer Engine**：我们使用 [Mooncake Transfer Engine](https://github.com/kvcache-ai/Mooncake) 这一基于 RDMA 的传输引擎，实现节点间高性能 KVCache 传输。
+
 ## 分支策略
 
 本项目的分支管理策略如下：
