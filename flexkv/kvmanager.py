@@ -98,6 +98,7 @@ class KVManager:
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   layer_granularity: int = -1,
                   dp_id: int = 0,
+                  namespace: Optional[List[str]] = None,
                   ) -> int:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
@@ -109,13 +110,15 @@ class KVManager:
             task_id = self.dp_client.get_async(token_ids,
                                                slot_mapping,
                                                token_mask,
-                                               layer_granularity)
+                                               layer_granularity,
+                                               namespace=namespace)
         else:
             task_id, _ = self.kv_task_engine.get_async(token_ids,
                                                        slot_mapping,
                                                        token_mask,
                                                        layer_granularity,
-                                                       dp_id)
+                                                       dp_id,
+                                                       namespace=namespace)
         return task_id
 
     def get_match(self,
@@ -123,6 +126,7 @@ class KVManager:
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   layer_granularity: int = -1,
                   dp_id: int = 0,
+                  namespace: Optional[List[str]] = None,
                   ) -> Tuple[int, np.ndarray]:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
@@ -131,12 +135,14 @@ class KVManager:
         if self.server_client_mode:
             task_id, mask = self.dp_client.get_match(token_ids,
                                                      token_mask,
-                                                     layer_granularity)
+                                                     layer_granularity,
+                                                     namespace=namespace)
         else:
             task_id, mask = self.kv_task_engine.get_match(token_ids,
                                                           token_mask,
                                                           layer_granularity,
-                                                          dp_id)
+                                                          dp_id,
+                                                          namespace=namespace)
         return task_id, mask
 
     def put_async(self,
@@ -144,6 +150,7 @@ class KVManager:
                   slot_mapping: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   dp_id: int = 0,
+                  namespace: Optional[List[str]] = None,
                   ) -> int:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
@@ -152,35 +159,37 @@ class KVManager:
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask)
+            task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask, namespace=namespace)
         else:
-            task_id, _ = self.kv_task_engine.put_async(token_ids, slot_mapping, token_mask, dp_id)
+            task_id, _ = self.kv_task_engine.put_async(token_ids, slot_mapping, token_mask, dp_id, namespace=namespace)
         return task_id
 
     def put_match(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   dp_id: int = 0,
+                  namespace: Optional[List[str]] = None,
                   ) -> Tuple[int, np.ndarray]:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id, mask = self.dp_client.put_match(token_ids, token_mask)
+            task_id, mask = self.dp_client.put_match(token_ids, token_mask, namespace=namespace)
         else:
-            task_id, mask = self.kv_task_engine.put_match(token_ids, token_mask, dp_id)
+            task_id, mask = self.kv_task_engine.put_match(token_ids, token_mask, dp_id, namespace=namespace)
         return task_id, mask
 
     def prefetch_async(self,
                        token_ids: np.ndarray,
-                       dp_id: int = 0) -> int:
+                       dp_id: int = 0,
+                       namespace: Optional[List[str]] = None) -> int:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if self.server_client_mode:
-            task_id = self.dp_client.prefetch_async(token_ids)
+            task_id = self.dp_client.prefetch_async(token_ids, namespace=namespace)
         else:
-            task_id = self.kv_task_engine.prefetch_async(token_ids, dp_id=dp_id)
+            task_id = self.kv_task_engine.prefetch_async(token_ids, dp_id=dp_id, namespace=namespace)
         return task_id
 
     def launch(self,

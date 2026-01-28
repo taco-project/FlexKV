@@ -21,7 +21,8 @@ if debug:
 
 enable_cfs = os.environ.get("FLEXKV_ENABLE_CFS", "0") == "1"
 enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
-
+enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
+ 
 # Define C++ extensions
 cpp_sources = [
     "csrc/bindings.cpp",
@@ -39,7 +40,13 @@ hpp_sources = [
     "csrc/radix_tree.h",
 ]
 
-extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
+extra_link_args = ["-lxxhash", "-lpthread", "-lrt", "-luring"]
+if not enable_cputest:
+    extra_link_args.append("-lcuda")
+else:
+    # Set TORCH_CUDA_ARCH_LIST to avoid IndexError when no GPU is available
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
+
 extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
 
@@ -168,4 +175,3 @@ setup(
     },
     python_requires=">=3.8",
 )
-
