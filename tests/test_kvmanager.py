@@ -17,8 +17,8 @@ from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.server.client import KVTPClient
 from flexkv.common.debug import flexkv_logger
 
-# Import utilities from test_utils
-from test_utils import (
+# Import utilities from common_utils
+from common_utils import (
     DEFAULT_MODEL_CONFIG, DEFAULT_CACHE_CONFIG, DEFAULT_TEST_CONFIG,
     generate_request_pair, block_ids_2_slot_mapping,
     skip_if_insufficient_gpus,create_gpu_kv_layout, GPUKVCacheVerifier

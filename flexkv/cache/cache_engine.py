@@ -47,7 +47,8 @@ class CacheEngineAccel:
                  tokens_per_block: int,
                  evict_ratio: float,
                  hit_reward_seconds: int = 0,
-                 evict_start_threshold: float = 1.0):
+                 evict_start_threshold: float = 1.0,
+                 eviction_policy: str = "lru"):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -58,7 +59,7 @@ class CacheEngineAccel:
 
         self.device_type = device_type
 
-        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds)
+        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
@@ -176,7 +177,8 @@ class CacheEngine:
                  tokens_per_block: int,
                  evict_ratio: float,
                  hit_reward_seconds: int = 0,
-                 evict_start_threshold: float = 1.0):
+                 evict_start_threshold: float = 1.0,
+                 eviction_policy: str = "lru"):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -187,7 +189,7 @@ class CacheEngine:
 
         self.device_type = device_type
 
-        self.index = RadixTreeIndex(tokens_per_block=tokens_per_block, hit_reward_seconds=hit_reward_seconds)
+        self.index = RadixTreeIndex(tokens_per_block=tokens_per_block, hit_reward_seconds=hit_reward_seconds, eviction_policy=eviction_policy)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
@@ -305,6 +307,7 @@ class GlobalCacheEngine:
         self.evict_ratio = GLOBAL_CONFIG_FROM_ENV.evict_ratio
         self.evict_start_threshold = GLOBAL_CONFIG_FROM_ENV.evict_start_threshold
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
+        self.eviction_policy = GLOBAL_CONFIG_FROM_ENV.eviction_policy
 
         if cache_config.enable_cpu:
             if cache_config.enable_p2p_cpu:
@@ -315,14 +318,16 @@ class GlobalCacheEngine:
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
                                                 self.hit_reward_seconds,
-                                                self.evict_start_threshold)
+                                                self.evict_start_threshold,
+                                                self.eviction_policy)
             else:
                 self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
                                                 self.hit_reward_seconds,
-                                                self.evict_start_threshold)
+                                                self.evict_start_threshold,
+                                                self.eviction_policy)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
@@ -333,14 +338,16 @@ class GlobalCacheEngine:
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
                                                 self.hit_reward_seconds,
-                                                self.evict_start_threshold)
+                                                self.evict_start_threshold,
+                                                self.eviction_policy)
             else:
                 self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
                                                 cache_config.tokens_per_block,
                                                 self.evict_ratio,
                                                 self.hit_reward_seconds,
-                                                self.evict_start_threshold)
+                                                self.evict_start_threshold,
+                                                self.eviction_policy)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
@@ -352,14 +359,16 @@ class GlobalCacheEngine:
                                                    cache_config.tokens_per_block,
                                                    self.evict_ratio,
                                                    self.hit_reward_seconds,
-                                                   self.evict_start_threshold)
+                                                   self.evict_start_threshold,
+                                                   self.eviction_policy)
             else:
                 self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
                                                    cache_config.tokens_per_block,
                                                    self.evict_ratio,
                                                    self.hit_reward_seconds,
-                                                   self.evict_start_threshold)
+                                                   self.evict_start_threshold,
+                                                   self.eviction_policy)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
         #TODO move this to kvmanager.start()

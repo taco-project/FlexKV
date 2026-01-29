@@ -36,6 +36,7 @@ class HierarchyLRCacheEngine:
                  local_safety_ttl_ms: int = 100,
                  evict_start_threshold: float = 1.0,
                  hit_reward_seconds: int = 0,
+                 eviction_policy: str = "lru",
                  meta: Optional[RedisMeta] = None) -> None:
         if num_total_blocks <= 0:
             raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
@@ -65,6 +66,7 @@ class HierarchyLRCacheEngine:
             safety_ttl_ms=int(local_safety_ttl_ms),
             swap_block_threshold=int(evict_ratio * num_total_blocks),
             hit_reward_seconds=int(hit_reward_seconds),
+            eviction_policy=eviction_policy,
         )
 
 
@@ -518,6 +520,7 @@ class HierarchyLRCacheEngine:
             remote_rebuild_interval_ms=int(GLOBAL_CONFIG_FROM_ENV.rebuild_interval_ms),
             remote_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
             local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
+            eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
             meta=meta,
         )
 
@@ -558,6 +561,7 @@ class HierarchyLRCacheEngine:
                 local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
                 evict_start_threshold=float(GLOBAL_CONFIG_FROM_ENV.evict_start_threshold),
                 hit_reward_seconds=int(GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds),
+                eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
                 meta=meta,
             )
             raise ValueError("Invalid device type: {cache_config.device_type}")

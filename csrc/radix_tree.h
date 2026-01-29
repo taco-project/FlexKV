@@ -11,6 +11,11 @@
 
 namespace flexkv {
 
+enum class EvictionPolicy {
+  LRU,
+  LFU
+};
+
 class CRadixTreeIndex;
 
 class CRadixNode {
@@ -18,7 +23,9 @@ private:
   bool on_leaf;
   bool ready;
   int lock_cnt;
-  time_t grace_time;
+  uint64_t grace_time;
+  int hit_count;
+  int leaf_vector_index = -1;
 
   std::deque<int64_t> block_hashes;
   std::deque<int64_t> physical_blocks;
@@ -35,10 +42,10 @@ public:
   ~CRadixNode();
 
   struct Compare {
-    bool operator() (CRadixNode *a, CRadixNode *b) {
-      return a->get_time() > b->get_time();
-    }
+    bool operator() (CRadixNode *a, CRadixNode *b);
   };
+
+  double get_priority();
 
   bool get_leaf_state() {
     return on_leaf;
@@ -80,26 +87,44 @@ public:
     return index;
   }
 
-  void set_time(time_t time) {
+  void set_time(uint64_t time) {
     grace_time = time;
   }
 
-  time_t get_time() {
+  uint64_t get_time() {
     return grace_time;
+  }
+
+  void set_hit_count(int count) {
+    hit_count = count;
+  }
+
+  int get_hit_count() {
+    return hit_count;
+  }
+
+  void set_leaf_vector_index(int index) {
+    leaf_vector_index = index;
+  }
+
+  int get_leaf_vector_index() {
+    return leaf_vector_index;
   }
 
   void update_time(int hit_reward_seconds) {
     struct timeval now;
-    time_t now_time;
+    uint64_t now_time;
 
     gettimeofday(&now, nullptr);
-    now_time = now.tv_sec * 1000 + now.tv_usec / 10000;
+    now_time = (uint64_t)now.tv_sec * 1000000 + (uint64_t)now.tv_usec;
+    uint64_t reward_us = (uint64_t)hit_reward_seconds * 1000000;
 
     if (grace_time > now_time) {
-      grace_time += hit_reward_seconds;
+      grace_time += reward_us;
     } else {
-      grace_time = now_time + hit_reward_seconds;
+      grace_time = now_time + reward_us;
     }
+    hit_count++;
   }
 
   CRadixNode *get_parent() {
@@ -245,22 +270,28 @@ class CRadixTreeIndex {
 protected:
   CRadixNode *root;
   std::list<CRadixNode *> node_list;
-  std::list<CRadixNode *> leaf_list;
+  std::vector<CRadixNode *> leaf_list;
 
   unsigned int max_num_blocks;
   int tokens_per_block;
   int node_count;
   int hit_reward_seconds;
+  EvictionPolicy eviction_policy;
 
 public:
-  CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000, int hit_reward_seconds = 0) {
+  CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000, int hit_reward_seconds = 0, EvictionPolicy eviction_policy = EvictionPolicy::LRU) {
     this->tokens_per_block = tokens_per_block;
     this->max_num_blocks = max_num_blocks;
     this->node_count = 0;
     this->hit_reward_seconds = hit_reward_seconds;
+    this->eviction_policy = eviction_policy;
 
     root = new CRadixNode(this, true, 0);
     node_list.push_back(root);
+  }
+
+  EvictionPolicy get_eviction_policy() {
+    return eviction_policy;
   }
 
   virtual ~CRadixTreeIndex() {
@@ -316,7 +347,16 @@ public:
       return;
     }
 
-    leaf_list.remove(node);
+    int idx = node->get_leaf_vector_index();
+    if (idx >= 0 && idx < leaf_list.size()) {
+      CRadixNode* last = leaf_list.back();
+      if (node != last) {
+        leaf_list[idx] = last;
+        last->set_leaf_vector_index(idx);
+      }
+      leaf_list.pop_back();
+    }
+    node->set_leaf_vector_index(-1);
     node->set_leaf_state(false);
   }
 
@@ -335,6 +375,7 @@ public:
     }
 
     leaf_list.push_back(node);
+    node->set_leaf_vector_index(leaf_list.size() - 1);
     node->set_leaf_state(true);
   }
 

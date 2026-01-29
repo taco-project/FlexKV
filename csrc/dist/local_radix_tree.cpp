@@ -46,9 +46,11 @@ bool OrderedHashList::contains(int64_t hash) {
 LocalRadixTree::LocalRadixTree(int tokens_per_block, unsigned int max_num_blocks,
   uint32_t ttl_ms, uint32_t renew_ms,
   uint32_t batch_sz, uint32_t idle_sleep_ms,
-  uint32_t safety_ttl_ms, uint32_t swap_block_threshold, uint32_t hit_reward_seconds)
-  : CRadixTreeIndex(tokens_per_block, max_num_blocks, hit_reward_seconds), 
-  channel(nullptr), node_id(0), 
+  uint32_t safety_ttl_ms, uint32_t swap_block_threshold, uint32_t hit_reward_seconds,
+  std::string eviction_policy)
+  : CRadixTreeIndex(tokens_per_block, max_num_blocks, hit_reward_seconds,
+      (eviction_policy == "lfu" ? EvictionPolicy::LFU : EvictionPolicy::LRU)), 
+  channel(nullptr), node_id(0),
   lease_ttl_ms(ttl_ms), refresh_batch_size(batch_sz),
   lease_pool(max_num_blocks),
   idle_sleep_ms(idle_sleep_ms),
@@ -481,8 +483,13 @@ void LocalRadixTree::publish_node_blocks(NewBlockMeta *node) {
 int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   int64_t *evicted_blocks_ptr = evicted_blocks.data_ptr<int64_t>();
   int has_evicted = 0;
-  std::priority_queue<CRadixNode*, std::vector<CRadixNode*>, CRadixNode::Compare> expired_q;
-  std::priority_queue<CRadixNode*, std::vector<CRadixNode*>, CRadixNode::Compare> fresh_q;
+  
+  std::vector<CRadixNode*> expired_candidates;
+  std::vector<CRadixNode*> fresh_candidates;
+  // Reserve memory to avoid reallocations
+  expired_candidates.reserve(leaf_list.size() / 2);
+  fresh_candidates.reserve(leaf_list.size() / 2);
+
   std::unique_ptr<std::deque<int64_t>> evicted_q(new std::deque<int64_t>());
   std::unique_ptr<std::deque<int64_t>> about_to_evict_q;
 
@@ -512,18 +519,24 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
     LeaseMeta *lm = node->get_lease_meta();
     bool expired = (lm == nullptr) || ((uint64_t)lm->lease_time <= now_ms);
     if (expired) {
-      expired_q.push(node);
+      expired_candidates.push_back(node);
       expired_count++;
     } else {
       // 只有NORMAL状态的节点才加入fresh_q，跳过ABOUT_TO_EVICT
       if (lm && lm->state == NODE_STATE_NORMAL) {
-        fresh_q.push(node);
+        fresh_candidates.push_back(node);
         fresh_count++;
       } else {
         about_to_evict_count++;
       }
     }
   }
+
+  // Batch build heaps
+  std::priority_queue<CRadixNode*, std::vector<CRadixNode*>, CRadixNode::Compare> 
+      expired_q(CRadixNode::Compare(), std::move(expired_candidates));
+  std::priority_queue<CRadixNode*, std::vector<CRadixNode*>, CRadixNode::Compare> 
+      fresh_q(CRadixNode::Compare(), std::move(fresh_candidates));
   
   // Log eviction状态 when eviction is attempted
   /*printf("[EVICT] need=%d, leaf_list=%zu, evictable=%d (expired=%d, fresh_normal=%d, about_to_evict=%d), not_evictable=%d (locked=%d, not_ready=%d)\n",

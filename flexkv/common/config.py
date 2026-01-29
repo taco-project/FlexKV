@@ -32,6 +32,7 @@ class ModelConfig:
 @dataclass
 class CacheConfig:
     tokens_per_block: int = 16
+    eviction_policy: str = "lru"
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_gds: bool = False # Requires enable_ssd=True
@@ -106,6 +107,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.1)),
     evict_start_threshold=float(os.getenv('FLEXKV_EVICT_START_THRESHOLD', 0.7)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
+    eviction_policy=os.getenv('FLEXKV_EVICTION_POLICY', 'lru'),
 
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),
