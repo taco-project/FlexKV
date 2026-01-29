@@ -489,7 +489,7 @@ def merge_to_batch_graph(batch_id: int,
                     if merged_disk2h_op is not None \
                     else np.array([], dtype=np.int64),
                 layer_id=0,
-                layer_granularity=16,
+                layer_granularity=1,
                 dp_id=h2d_ops[0].dp_id,
                 counter_id=counter_id,
             )
