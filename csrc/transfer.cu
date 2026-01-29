@@ -36,8 +36,15 @@ __global__ void transfer_kv_blocks_kernel(
   int num_chunks = num_layers * kv_dim * num_blocks;
   int64_t copy_size_in_float4 = copy_size * sizeof(int64_t) / sizeof(float4);
 
-  for (int chunk_idx = blockIdx.x; chunk_idx < num_chunks;
-       chunk_idx += gridDim.x) {
+  // 计算warp信息
+  int warp_id = threadIdx.x / 32;
+  int lane_id = threadIdx.x % 32;
+  int warps_per_block = blockDim.x / 32;
+  int total_warps = gridDim.x * warps_per_block;
+  
+  // 每个warp处理一个chunk
+  for (int chunk_idx = blockIdx.x * warps_per_block + warp_id; 
+       chunk_idx < num_chunks; chunk_idx += total_warps) {
     int layer_idx = start_layer_id + chunk_idx / (num_blocks * kv_dim);
     int kv_idx = (chunk_idx % (num_blocks * kv_dim)) / num_blocks;
     int gpu_block_idx = gpu_block_ids[chunk_idx % num_blocks];
@@ -56,10 +63,17 @@ __global__ void transfer_kv_blocks_kernel(
     int64_t *src_chunk_ptr = is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
     int64_t *dst_chunk_ptr = is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
 
-    for (int64_t idx = threadIdx.x; idx < copy_size_in_float4;
-         idx += blockDim.x) {
-      float4 element = __ldg(&FLOAT4_PTR(src_chunk_ptr)[idx]);
-      FLOAT4_PTR(dst_chunk_ptr)[idx] = element;
+    // warp内的线程协作拷贝数据
+    for (int64_t idx = lane_id; idx < copy_size_in_float4; idx += 32) {
+      float4 element;
+      asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3},[%4];" 
+                   : "=f"(element.x), "=f"(element.y), "=f"(element.z), "=f"(element.w)
+                   : "l"(&FLOAT4_PTR(src_chunk_ptr)[idx]) 
+                   : "memory");
+      asm volatile("st.global.cg.v4.f32 [%0],{%1,%2,%3,%4};" 
+                   :: "l"(&FLOAT4_PTR(dst_chunk_ptr)[idx]), 
+                      "f"(element.x), "f"(element.y), "f"(element.z), "f"(element.w)
+                   : "memory");
     }
   }
 }
@@ -75,18 +89,18 @@ void transfer_kv_blocks(
     cudaStream_t stream, int transfer_sms, bool is_host_to_device,
     bool use_ce_transfer, bool is_mla, bool sync) {
 
-  int block_size = 128;
+  int block_size = 1024;
   static int max_blocks_per_sm = -1;
   if (max_blocks_per_sm == -1) {
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm, transfer_kv_blocks_kernel<Type>, block_size, 0);
   }
 
-  if (transfer_sms == -1) {
-    transfer_sms = 4;
-  }
+  // if (transfer_sms == -1) {
+  //   transfer_sms = 4;
+  // }
 
-  int block_count = transfer_sms * max_blocks_per_sm;
+  int block_count = transfer_sms; // transfer_sms * max_blocks_per_sm;
 
   int64_t *cpu_ptr_int64 = reinterpret_cast<int64_t *>(cpu_ptr);
   int64_t cpu_kv_stride_int64 = cpu_kv_stride_in_bytes / sizeof(int64_t);
