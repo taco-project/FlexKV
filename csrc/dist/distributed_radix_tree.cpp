@@ -550,6 +550,12 @@ int RefRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   return 0;
 }
 
+int RefRadixTree::evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted_block_hashes, int num_evicted) {
+  (void)evicted_blocks; (void)evicted_block_hashes; (void)num_evicted;
+  // we do nothing here, since the RefRadixTree is only used for reference and rebuild from remote nodes
+  return 0;
+}
+
 std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   torch::Tensor &block_hashes, int num_blocks, bool update_cache_info) {
   // Increment ref count at entry and guarantee decrement on all exit paths

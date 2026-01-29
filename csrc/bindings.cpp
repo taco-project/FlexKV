@@ -556,10 +556,14 @@ PYBIND11_MODULE(c_ext, m) {
 #endif
 
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
-      .def(py::init<int, unsigned int, int>(),
+      .def(py::init([](int tokens_per_block, unsigned int max_num_blocks, int hit_reward_seconds, std::string eviction_policy) {
+           flexkv::EvictionPolicy policy = (eviction_policy == "lfu") ? flexkv::EvictionPolicy::LFU : flexkv::EvictionPolicy::LRU;
+           return new flexkv::CRadixTreeIndex(tokens_per_block, max_num_blocks, hit_reward_seconds, policy);
+      }),
            py::arg("tokens_per_block"),
            py::arg("max_num_blocks") = 1000000,
-           py::arg("hit_reward_seconds") = 0)
+           py::arg("hit_reward_seconds") = 0,
+           py::arg("eviction_policy") = "lru")
       .def("is_empty", &flexkv::CRadixTreeIndex::is_empty)
       .def("reset", &flexkv::CRadixTreeIndex::reset)
       .def("lock", &flexkv::CRadixTreeIndex::lock, py::arg("node"))
@@ -697,7 +701,7 @@ PYBIND11_MODULE(c_ext, m) {
 
   // LocalRadixTree bindings (derived from CRadixTreeIndex)
   py::class_<flexkv::LocalRadixTree, flexkv::CRadixTreeIndex>(m, "LocalRadixTree")
-      .def(py::init<int, unsigned int, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>(),
+      .def(py::init<int, unsigned int, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, std::string>(),
            py::arg("tokens_per_block"),
            py::arg("max_num_blocks") = 1000000u,
            py::arg("lease_ttl_ms") = 100000,
@@ -706,7 +710,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("idle_sleep_ms") = 10,
            py::arg("safety_ttl_ms") = 100,
            py::arg("swap_block_threshold") = 1024,
-           py::arg("hit_reward_seconds") = 0)
+           py::arg("hit_reward_seconds") = 0,
+           py::arg("eviction_policy") = "lru")
       .def("set_meta_channel", &flexkv::LocalRadixTree::set_meta_channel, py::arg("channel"))
       .def("start", &flexkv::LocalRadixTree::start, py::arg("channel"))
       .def("stop", &flexkv::LocalRadixTree::stop)
@@ -718,7 +723,13 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("num_insert_blocks"), py::arg("ready") = true, py::arg("node") = nullptr,
            py::arg("num_matched_blocks") = -1, py::arg("last_node_matched_length") = -1,
            py::call_guard<py::gil_scoped_release>())
-      .def("evict", &flexkv::LocalRadixTree::evict, py::arg("evicted_blocks"), py::arg("num_evicted"),
+      .def("evict",
+           py::overload_cast<torch::Tensor &, int>(&flexkv::LocalRadixTree::evict),
+           py::arg("evicted_blocks"), py::arg("num_evicted"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("evict",
+           py::overload_cast<torch::Tensor &, torch::Tensor &, int>(&flexkv::LocalRadixTree::evict),
+           py::arg("evicted_blocks"), py::arg("evicted_block_hashes"), py::arg("num_evicted"),
            py::call_guard<py::gil_scoped_release>())
       // Mirror CRadixTreeIndex APIs explicitly on LocalRadixTree
       .def("match_prefix", &flexkv::LocalRadixTree::match_prefix,

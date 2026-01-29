@@ -71,6 +71,7 @@ private:
     int last_node_matched_length = -1) override;
 
   int evict(torch::Tensor &evicted_blocks, int num_evicted) override;
+  int evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted_block_hashes, int num_evicted) override;
   std::atomic<uint32_t> ref_cnt;
   uint32_t lease_renew_ms_;
   uint32_t hit_reward_seconds_;

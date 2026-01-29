@@ -43,6 +43,7 @@ For more details, see [CHANGELOG](CHANGELOG.md)
 ```bash
 apt install liburing-dev
 apt install libxxhash-dev
+apt install libhiredis-dev
 ```
 
 ### Build FlexKV
