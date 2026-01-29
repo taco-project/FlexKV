@@ -4,6 +4,7 @@
 #include <vector>
 #include <map>
 #include <list>
+#include <string>
 
 #include <torch/extension.h>
 #include <pthread.h>
@@ -82,7 +83,8 @@ public:
                  uint32_t idle_sleep_ms = 10,
                  uint32_t safety_ttl_ms = 100,
                  uint32_t swap_block_threshold = 1024,
-                 uint32_t hit_reward_seconds = 0);
+                 uint32_t hit_reward_seconds = 0,
+                 std::string eviction_policy = "lru");
   ~LocalRadixTree();
 
   void set_meta_channel(RedisMetaChannel *ch);

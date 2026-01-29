@@ -1,4 +1,5 @@
 import random
+import time
 
 import pytest
 import numpy as np
@@ -24,6 +25,8 @@ def cache_engine(request: pytest.FixtureRequest) -> CacheEngine:
     "config, should_raise",
     [
         ({'evict_ratio': 0.05, 'num_total_blocks': 64, 'tokens_per_block': 4, 'device_type': DeviceType.CPU}, False),
+        ({'evict_ratio': 0.05, 'num_total_blocks': 64, 'tokens_per_block': 4, 'device_type': DeviceType.CPU, 'eviction_policy': 'lru'}, False),
+        ({'evict_ratio': 0.05, 'num_total_blocks': 64, 'tokens_per_block': 4, 'device_type': DeviceType.CPU, 'eviction_policy': 'lfu'}, False),
         ({'evict_ratio': 0.05, 'num_total_blocks': 0, 'tokens_per_block': 4, 'device_type': DeviceType.GPU}, True),
         ({'evict_ratio': 0.05, 'num_total_blocks': 64, 'tokens_per_block': 0, 'device_type': DeviceType.SSD}, True),
         ({'evict_ratio': 0.05, 'num_total_blocks': 64, 'tokens_per_block': 4, 'device_type': 'Unknown'}, True),
@@ -74,8 +77,11 @@ def test_mempool():
 
     with pytest.raises(ValueError):
         mempool.recycle_blocks(np.array([1, 2, 3], dtype=np.int32))
-    with pytest.raises(ValueError):
-        mempool.recycle_blocks(np.array([1, 2, 3], dtype=np.int64))
+    
+    # recycle_blocks no longer raises ValueError for already free blocks
+    mempool.recycle_blocks(np.array([1, 2, 3], dtype=np.int64))
+    assert mempool.num_free_blocks == 64
+    
     with pytest.raises(ValueError):
         mempool.recycle_blocks(np.array([[1, 2, 3]], dtype=np.int64))
 
@@ -238,3 +244,90 @@ def test_cleanup(cache_engine: CacheEngine):
     cache_engine.unlock(radixnode0)
     cache_engine.set_ready(radixnode0, True, radixnode0_size)
     assert cache_engine.index.total_ready_blocks() == num_insert_blocks0 + num_insert_blocks1 + num_insert_blocks2
+
+def test_eviction_policy():
+    # Common setup
+    tokens_per_block = 1
+    num_total_blocks = 4
+    evict_ratio = 0.25 # Evict 1 block when full
+    
+    # Define sequences
+    # A: [0], B: [1], C: [2], D: [3], E: [4]
+    seq_a = SequenceMeta(token_ids=np.array([0]), tokens_per_block=1)
+    seq_b = SequenceMeta(token_ids=np.array([1]), tokens_per_block=1)
+    seq_c = SequenceMeta(token_ids=np.array([2]), tokens_per_block=1)
+    seq_d = SequenceMeta(token_ids=np.array([3]), tokens_per_block=1)
+    seq_e = SequenceMeta(token_ids=np.array([4]), tokens_per_block=1)
+    
+    def run_test(policy):
+        engine = CacheEngine(
+            device_type=DeviceType.CPU,
+            num_total_blocks=num_total_blocks,
+            tokens_per_block=tokens_per_block,
+            evict_ratio=evict_ratio,
+            eviction_policy=policy
+        )
+        
+        # 1. Insert A, B, C, D
+        for seq in [seq_a, seq_b, seq_c, seq_d]:
+            engine.insert(seq, engine.take(1), is_ready=True)
+            
+        # 2. Access pattern
+        # Access B 4 times
+        for _ in range(4): 
+            engine.match(seq_b)
+            time.sleep(0.001)
+        # Access C 3 times
+        for _ in range(3): 
+            engine.match(seq_c)
+            time.sleep(0.001)
+        # Access D 2 times
+        for _ in range(2): 
+            engine.match(seq_d)
+            time.sleep(0.001)
+        # Access A 5 times
+        for _ in range(5): 
+            engine.match(seq_a)
+            time.sleep(0.001)
+        
+        # Current state:
+        # A: hit=5, time=Latest
+        # D: hit=2, time=2nd Latest
+        # C: hit=3, time=3rd Latest
+        # B: hit=4, time=Oldest
+        
+        # 3. Insert E -> triggers eviction
+        engine.insert(seq_e, engine.take(1), is_ready=True)
+        
+        # Check what remains
+        res_a = engine.match(seq_a).num_matched_blocks
+        res_b = engine.match(seq_b).num_matched_blocks
+        res_c = engine.match(seq_c).num_matched_blocks
+        res_d = engine.match(seq_d).num_matched_blocks
+        res_e = engine.match(seq_e).num_matched_blocks
+        
+        return {
+            'A': res_a,
+            'B': res_b,
+            'C': res_c,
+            'D': res_d,
+            'E': res_e
+        }
+
+    # Test LRU
+    # Expect B to be evicted (Oldest)
+    res_lru = run_test('lru')
+    assert res_lru['B'] == 0, f"LRU should evict B, but got {res_lru}"
+    assert res_lru['A'] == 1
+    assert res_lru['C'] == 1
+    assert res_lru['D'] == 1
+    assert res_lru['E'] == 1
+    
+    # Test LFU
+    # Expect D to be evicted (Lowest hit count: D=2)
+    res_lfu = run_test('lfu')
+    assert res_lfu['D'] == 0, f"LFU should evict D, but got {res_lfu}"
+    assert res_lfu['A'] == 1
+    assert res_lfu['B'] == 1
+    assert res_lfu['C'] == 1
+    assert res_lfu['E'] == 1
