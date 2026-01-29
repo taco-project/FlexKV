@@ -1,6 +1,6 @@
 import os
 import time
-from typing import TYPE_CHECKING, Optional, Literal, Any
+from typing import TYPE_CHECKING, Optional, Literal, Any, List
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 
@@ -196,6 +196,30 @@ class FlexKVSchedulerConnector:
 
         return num_new_matched_tokens, True
 
+    def _extract_namespace(self, request: "Request") -> Optional[List[str]]:
+        namespace_info = []
+        
+        if hasattr(request, 'lora_request') and request.lora_request is not None:
+            lora_id = request.lora_request.lora_name
+            if lora_id is not None:
+                namespace_info.append(str(lora_id))
+
+        if hasattr(request, 'cache_salt') and request.cache_salt is not None:
+            cache_salt = request.cache_salt
+            if cache_salt is not None:
+                namespace_info.append(str(cache_salt))
+
+        if hasattr(request, 'namespace_info') and request.namespace_info is not None:
+            user_namespace = request.namespace_info
+            if isinstance(user_namespace, list):
+                namespace_info.extend([str(item) for item in user_namespace])
+            else:
+                namespace_info.append(str(user_namespace))
+
+        if len(namespace_info) == 0:
+            return None
+        
+        return namespace_info
 
     def _get_match(
         self,
@@ -226,8 +250,12 @@ class FlexKVSchedulerConnector:
         np_token_ids = np.array(token_ids)
         np_token_mask = np.ones_like(np_token_ids, dtype=bool)
         np_token_mask[:num_computed_tokens] = False
-        task_id, matched_mask = self.flexkv_manager.get_match(token_ids=np_token_ids,
-                                                         token_mask=np_token_mask)
+        namespace = self._extract_namespace(request)
+        task_id, matched_mask = self.flexkv_manager.get_match(
+            token_ids=np_token_ids,
+            token_mask=np_token_mask,
+            namespace=namespace,
+        )
         num_new_matched_tokens = matched_mask.sum().item()
 
         # Auto cancel if not call update_state_after_alloc()
@@ -367,7 +395,11 @@ class FlexKVSchedulerConnector:
             return -1, 0, 0
 
         np_token_ids = np.array(token_ids)
-        task_id, unmatched_mask = self.flexkv_manager.put_match(token_ids=np_token_ids)
+        namespace = self._extract_namespace(request)
+        task_id, unmatched_mask = self.flexkv_manager.put_match(
+            token_ids=np_token_ids,
+            namespace=namespace,
+        )
 
         num_unmatched_tokens = unmatched_mask.sum().item()
         num_matched_tokens = num_tokens_to_put - num_unmatched_tokens

@@ -94,12 +94,14 @@ class KVDPClient:
         token_ids: np.ndarray,
         slot_mapping: np.ndarray,
         token_mask: Optional[np.ndarray],
+        namespace: Optional[List[str]] = None,
     ) -> int:
         req = PutRequest(self.dp_client_id,
                          token_ids,
                          slot_mapping,
                          token_mask if token_mask is not None else None,
-                         self._get_task_id())
+                         self._get_task_id(),
+                         namespace)
         self.send_to_server.send_pyobj(req)
         return req.task_id
 
@@ -107,11 +109,13 @@ class KVDPClient:
         self,
         token_ids: np.ndarray,
         token_mask: Optional[np.ndarray],
+        namespace: Optional[List[str]] = None,
     ) -> Optional[Tuple[int, np.ndarray]]:
         req = PutMatchRequest(self.dp_client_id,
                               token_ids,
                               token_mask if token_mask is not None else None,
-                              self._get_task_id())
+                              self._get_task_id(),
+                              namespace)
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
         if response.error_msg is None:
@@ -123,8 +127,9 @@ class KVDPClient:
     def prefetch_async(
         self,
         token_ids: np.ndarray,
+        namespace: Optional[List[str]] = None,
     ) -> int:
-        req = PrefetchRequest(self.dp_client_id, token_ids, self._get_task_id())
+        req = PrefetchRequest(self.dp_client_id, token_ids, self._get_task_id(), namespace)
         self.send_to_server.send_pyobj(req)
         return req.task_id
 
@@ -134,13 +139,15 @@ class KVDPClient:
         slot_mapping: np.ndarray,
         token_mask: Optional[np.ndarray],
         layer_granularity: int,
+        namespace: Optional[List[str]] = None,
     ) -> int:
         req = GetRequest(self.dp_client_id,
                          token_ids,
                          slot_mapping,
                          token_mask if token_mask is not None else None,
                          self._get_task_id(),
-                         layer_granularity)
+                         layer_granularity,
+                         namespace)
         self.send_to_server.send_pyobj(req)
         return req.task_id
 
@@ -149,12 +156,14 @@ class KVDPClient:
         token_ids: np.ndarray,
         token_mask: Optional[np.ndarray],
         layer_granularity: int,
+        namespace: Optional[List[str]] = None,
     ) -> Optional[Tuple[int, np.ndarray]]:
         req = GetMatchRequest(self.dp_client_id,
                               token_ids,
                               token_mask if token_mask is not None else None,
                               layer_granularity,
-                              self._get_task_id())
+                              self._get_task_id(),
+                              namespace)
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
         if response.error_msg is None:

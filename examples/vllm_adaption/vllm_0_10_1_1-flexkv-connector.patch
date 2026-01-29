@@ -1,9 +1,9 @@
 diff --git a/examples/offline_inference/prefix_caching_flexkv.py b/examples/offline_inference/prefix_caching_flexkv.py
 new file mode 100644
-index 000000000..a57328ffd
+index 000000000..35d7b3ba5
 --- /dev/null
 +++ b/examples/offline_inference/prefix_caching_flexkv.py
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,148 @@
 +# SPDX-License-Identifier: Apache-2.0
 +import os
 +import time
@@ -14,20 +14,6 @@ index 000000000..a57328ffd
 +
 +# NOTE: This is just a running example. For benchmarking purpose,
 +# please see benchmarks/benchmark_prefix_caching.py
-+
-+
-+flexkv_config = {
-+    "server_recv_port": "ipc:///tmp/flexkv_test",
-+    "cache_config": {
-+          "enable_cpu": True,
-+          "num_cpu_blocks": 10240,
-+    },
-+    "num_log_interval_requests": 200
-+}
-+flexkv_config_path = "./flexkv_config.json"
-+with open(flexkv_config_path, 'w') as f:
-+    json.dump(flexkv_config, f)
-+os.environ["FLEXKV_CONFIG_PATH"] = flexkv_config_path
 +
 +
 +# Common prefix.
@@ -166,7 +152,6 @@ index 000000000..a57328ffd
 +if __name__ == "__main__":
 +    main()
 +    # pass
-\ No newline at end of file
 diff --git a/vllm/distributed/kv_transfer/kv_connector/factory.py b/vllm/distributed/kv_transfer/kv_connector/factory.py
 index 584fc1d65..db1cfe36b 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/factory.py
@@ -182,7 +167,7 @@ index 584fc1d65..db1cfe36b 100644
 +    "FlexKVConnectorV1")
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 new file mode 100644
-index 000000000..bdfa9f321
+index 000000000..ea651a34a
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 @@ -0,0 +1,191 @@
@@ -377,35 +362,383 @@ index 000000000..bdfa9f321
 +            returned by the engine.
 +        """
 +        return self._flexkv_connector.request_finished(request, block_ids)
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 61f1a09d3..9784492cb 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -316,6 +316,12 @@ class ResponsesRequest(OpenAIBaseModel):
+             "access by 3rd parties, and long enough to be "
+             "unpredictable (e.g., 43 characters base64-encoded, corresponding "
+             "to 256 bit). Not supported by vLLM engine V0."))
++    namespace_info: Optional[Union[str, list[str]]] = Field(
++        default=None,
++        description=(
++            "Optional namespace information for KV cache isolation. "
++            "Can be a single string or a list of strings. "
++            "Not supported by vLLM engine V0."))
+     # --8<-- [end:responses-extra-params]
+ 
+     _DEFAULT_SAMPLING_PARAMS = {
+@@ -392,6 +398,27 @@ class ResponsesRequest(OpenAIBaseModel):
+                                  "non-empty string if provided.")
+         return data
+ 
++    @model_validator(mode="before")
++    def check_namespace_info_support(cls, data):
++        if data.get("namespace_info") is not None:
++            if not envs.VLLM_USE_V1:
++                raise ValueError(
++                    "Parameter 'namespace_info' is not supported with "
++                    "this instance of vLLM, which uses engine V0.")
++            namespace_info = data["namespace_info"]
++            if isinstance(namespace_info, str):
++                if not namespace_info:
++                    raise ValueError("Parameter 'namespace_info' must be a "
++                                     "non-empty string if provided as string.")
++            elif isinstance(namespace_info, list):
++                if not namespace_info or not all(isinstance(s, str) and s for s in namespace_info):
++                    raise ValueError("Parameter 'namespace_info' must be a "
++                                     "non-empty list of non-empty strings if provided as list.")
++            else:
++                raise ValueError("Parameter 'namespace_info' must be a "
++                                 "string or list of strings.")
++        return data
++
+ 
+ class ChatCompletionRequest(OpenAIBaseModel):
+     # Ordered by official OpenAI API documentation
+@@ -585,6 +612,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             "access by 3rd parties, and long enough to be "
+             "unpredictable (e.g., 43 characters base64-encoded, corresponding "
+             "to 256 bit). Not supported by vLLM engine V0."))
++    namespace_info: Optional[Union[str, list[str]]] = Field(
++        default=None,
++        description=(
++            "Optional namespace information for KV cache isolation. "
++            "Can be a single string or a list of strings. "
++            "Not supported by vLLM engine V0."))
+     kv_transfer_params: Optional[dict[str, Any]] = Field(
+         default=None,
+         description="KVTransfer parameters used for disaggregated serving.")
+@@ -942,6 +975,28 @@ class ChatCompletionRequest(OpenAIBaseModel):
+                                  "non-empty string if provided.")
+         return data
+ 
++    @model_validator(mode="before")
++    @classmethod
++    def check_namespace_info_support(cls, data):
++        if data.get("namespace_info") is not None:
++            if not envs.VLLM_USE_V1:
++                raise ValueError(
++                    "Parameter 'namespace_info' is not supported with "
++                    "this instance of vLLM, which uses engine V0.")
++            namespace_info = data["namespace_info"]
++            if isinstance(namespace_info, str):
++                if not namespace_info:
++                    raise ValueError("Parameter 'namespace_info' must be a "
++                                     "non-empty string if provided as string.")
++            elif isinstance(namespace_info, list):
++                if not namespace_info or not all(isinstance(s, str) and s for s in namespace_info):
++                    raise ValueError("Parameter 'namespace_info' must be a "
++                                     "non-empty list of non-empty strings if provided as list.")
++            else:
++                raise ValueError("Parameter 'namespace_info' must be a "
++                                 "string or list of strings.")
++        return data
++
+ 
+ class CompletionRequest(OpenAIBaseModel):
+     # Ordered by official OpenAI API documentation
+@@ -1073,6 +1128,13 @@ class CompletionRequest(OpenAIBaseModel):
+             "unpredictable (e.g., 43 characters base64-encoded, corresponding "
+             "to 256 bit). Not supported by vLLM engine V0."))
+ 
++    namespace_info: Optional[Union[str, list[str]]] = Field(
++        default=None,
++        description=(
++            "Optional namespace information for KV cache isolation. "
++            "Can be a single string or a list of strings. "
++            "Not supported by vLLM engine V0."))
++
+     kv_transfer_params: Optional[dict[str, Any]] = Field(
+         default=None,
+         description="KVTransfer parameters used for disaggregated serving.")
+@@ -1263,6 +1325,28 @@ class CompletionRequest(OpenAIBaseModel):
+                                  "non-empty string if provided.")
+         return data
+ 
++    @model_validator(mode="before")
++    @classmethod
++    def check_namespace_info_support(cls, data):
++        if data.get("namespace_info") is not None:
++            if not envs.VLLM_USE_V1:
++                raise ValueError(
++                    "Parameter 'namespace_info' is not supported with "
++                    "this instance of vLLM, which uses engine V0.")
++            namespace_info = data["namespace_info"]
++            if isinstance(namespace_info, str):
++                if not namespace_info:
++                    raise ValueError("Parameter 'namespace_info' must be a "
++                                     "non-empty string if provided as string.")
++            elif isinstance(namespace_info, list):
++                if not namespace_info or not all(isinstance(s, str) and s for s in namespace_info):
++                    raise ValueError("Parameter 'namespace_info' must be a "
++                                     "non-empty list of non-empty strings if provided as list.")
++            else:
++                raise ValueError("Parameter 'namespace_info' must be a "
++                                 "string or list of strings.")
++        return data
++
+ 
+ class EmbeddingCompletionRequest(OpenAIBaseModel):
+     # Ordered by official OpenAI API documentation
+diff --git a/vllm/entrypoints/openai/serving_engine.py b/vllm/entrypoints/openai/serving_engine.py
+index 0f4a7c018..df1ffdf9e 100644
+--- a/vllm/entrypoints/openai/serving_engine.py
++++ b/vllm/entrypoints/openai/serving_engine.py
+@@ -812,9 +812,15 @@ class OpenAIServing:
+         cache_salt = request.cache_salt if (
+             hasattr(request, "cache_salt")
+             and request.cache_salt is not None) else None
++        namespace_info = request.namespace_info if (
++            hasattr(request, "namespace_info")
++            and request.namespace_info is not None) else None
+         if cache_salt:
+             for prompt_text in engine_prompts_text:
+                 prompt_text["cache_salt"] = cache_salt
++        if namespace_info:
++            for prompt_text in engine_prompts_text:
++                prompt_text["namespace_info"] = namespace_info
+ 
+         # This check is equivalent to simply checking if
+         # `request_prompts_embeds` is empty, but it's difficult to propagate
+@@ -835,6 +841,9 @@ class OpenAIServing:
+         if cache_salt:
+             for prompt_embed in engine_prompts_embeds:
+                 prompt_embed["cache_salt"] = cache_salt
++        if namespace_info:
++            for prompt_embed in engine_prompts_embeds:
++                prompt_embed["namespace_info"] = namespace_info
+ 
+         request_prompts = request_prompts_embeds + request_prompts_text
+         engine_prompts = engine_prompts_embeds + engine_prompts_text
+@@ -948,6 +957,8 @@ class OpenAIServing:
+ 
+         if hasattr(request, "cache_salt") and request.cache_salt is not None:
+             engine_prompt["cache_salt"] = request.cache_salt
++        if hasattr(request, "namespace_info") and request.namespace_info is not None:
++            engine_prompt["namespace_info"] = request.namespace_info
+ 
+         return conversation, [request_prompt], [engine_prompt]
+ 
+diff --git a/vllm/inputs/data.py b/vllm/inputs/data.py
+index 23cb5e502..cd43bbc88 100644
+--- a/vllm/inputs/data.py
++++ b/vllm/inputs/data.py
+@@ -35,6 +35,12 @@ class TextPrompt(TypedDict):
+     Optional cache salt to be used for prefix caching.
+     """
+ 
++    namespace_info: NotRequired[Union[str, list[str]]]
++    """
++    Optional namespace information for KV cache isolation.
++    Can be a single string or a list of strings.
++    """
++
+ 
+ class TokensPrompt(TypedDict):
+     """Schema for a tokenized prompt."""
+@@ -64,6 +70,12 @@ class TokensPrompt(TypedDict):
+     Optional cache salt to be used for prefix caching.
+     """
+ 
++    namespace_info: NotRequired[Union[str, list[str]]]
++    """
++    Optional namespace information for KV cache isolation.
++    Can be a single string or a list of strings.
++    """
++
+ 
+ class EmbedsPrompt(TypedDict):
+     """Schema for a prompt provided via token embeddings."""
+@@ -76,6 +88,12 @@ class EmbedsPrompt(TypedDict):
+     Optional cache salt to be used for prefix caching.
+     """
+ 
++    namespace_info: NotRequired[Union[str, list[str]]]
++    """
++    Optional namespace information for KV cache isolation.
++    Can be a single string or a list of strings.
++    """
++
+ 
+ SingletonPrompt = Union[str, TextPrompt, TokensPrompt, EmbedsPrompt]
+ """
+@@ -187,12 +205,19 @@ class TokenInputs(TypedDict):
+     Optional cache salt to be used for prefix caching.
+     """
+ 
++    namespace_info: NotRequired[Union[str, list[str]]]
++    """
++    Optional namespace information for KV cache isolation.
++    Can be a single string or a list of strings.
++    """
++
+ 
+ def token_inputs(
+     prompt_token_ids: list[int],
+     token_type_ids: Optional[list[int]] = None,
+     prompt: Optional[str] = None,
+     cache_salt: Optional[str] = None,
++    namespace_info: Optional[Union[str, list[str]]] = None,
+ ) -> TokenInputs:
+     """Construct [`TokenInputs`][vllm.inputs.data.TokenInputs] from optional
+     values."""
+@@ -204,6 +229,8 @@ def token_inputs(
+         inputs["token_type_ids"] = token_type_ids
+     if cache_salt is not None:
+         inputs["cache_salt"] = cache_salt
++    if namespace_info is not None:
++        inputs["namespace_info"] = namespace_info
+ 
+     return inputs
+ 
+@@ -222,10 +249,17 @@ class EmbedsInputs(TypedDict):
+     Optional cache salt to be used for prefix caching.
+     """
+ 
++    namespace_info: NotRequired[Union[str, list[str]]]
++    """
++    Optional namespace information for KV cache isolation.
++    Can be a single string or a list of strings.
++    """
++
+ 
+ def embeds_inputs(
+     prompt_embeds: torch.Tensor,
+     cache_salt: Optional[str] = None,
++    namespace_info: Optional[Union[str, list[str]]] = None,
+ ) -> EmbedsInputs:
+     """Construct [`EmbedsInputs`][vllm.inputs.data.EmbedsInputs] from optional
+     values."""
+@@ -233,6 +267,8 @@ def embeds_inputs(
+ 
+     if cache_salt is not None:
+         inputs["cache_salt"] = cache_salt
++    if namespace_info is not None:
++        inputs["namespace_info"] = namespace_info
+ 
+     return inputs
+ 
+diff --git a/vllm/inputs/preprocess.py b/vllm/inputs/preprocess.py
+index de5dc0876..a5c933408 100644
+--- a/vllm/inputs/preprocess.py
++++ b/vllm/inputs/preprocess.py
+@@ -322,7 +322,8 @@ class InputPreprocessor:
+                 "prompt_embeds must be of shape (seq_len, hidden_size).")
+ 
+         return embeds_inputs(prompt_embeds=prompt_embeds,
+-                             cache_salt=parsed_content.get("cache_salt"))
++                             cache_salt=parsed_content.get("cache_salt"),
++                             namespace_info=parsed_content.get("namespace_info"))
+ 
+     async def _process_embeds_async(
+         self,
+@@ -358,6 +359,8 @@ class InputPreprocessor:
+ 
+         if cache_salt := parsed_content.get("cache_salt"):
+             inputs["cache_salt"] = cache_salt
++        if namespace_info := parsed_content.get("namespace_info"):
++            inputs["namespace_info"] = namespace_info
+ 
+         return inputs
+ 
+@@ -389,6 +392,8 @@ class InputPreprocessor:
+ 
+         if cache_salt := parsed_content.get("cache_salt"):
+             inputs["cache_salt"] = cache_salt
++        if namespace_info := parsed_content.get("namespace_info"):
++            inputs["namespace_info"] = namespace_info
+ 
+         return inputs
+ 
+@@ -424,6 +429,8 @@ class InputPreprocessor:
+ 
+         if cache_salt := parsed_content.get("cache_salt"):
+             inputs["cache_salt"] = cache_salt
++        if namespace_info := parsed_content.get("namespace_info"):
++            inputs["namespace_info"] = namespace_info
+ 
+         return inputs
+ 
+@@ -459,6 +466,8 @@ class InputPreprocessor:
+ 
+         if cache_salt := parsed_content.get("cache_salt"):
+             inputs["cache_salt"] = cache_salt
++        if namespace_info := parsed_content.get("namespace_info"):
++            inputs["namespace_info"] = namespace_info
+ 
+         return inputs
+ 
+@@ -639,6 +648,8 @@ class InputPreprocessor:
+             )
+             if cache_salt := inputs.get("cache_salt"):
+                 decoder_inputs["cache_salt"] = cache_salt
++            if namespace_info := inputs.get("namespace_info"):
++                decoder_inputs["namespace_info"] = namespace_info
+ 
+         elif inputs["type"] == "token":  # Text-only inputs
+             encoder_inputs = token_inputs(prompt="", prompt_token_ids=[])
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 6a62c55fb..6cb71c056 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -508,7 +508,15 @@ def generate_block_hash_extra_keys(
+     cache_salt_keys: list[str] = [request.cache_salt] if (
+         start_token_idx == 0 and request.cache_salt) else []
+ 
+-    extra_keys: list[Any] = lora_extra_keys + mm_extra_keys + cache_salt_keys
++    # Add namespace_info for KV cache isolation
++    namespace_keys: list[Any] = []
++    if start_token_idx == 0 and request.namespace_info:
++        if isinstance(request.namespace_info, str):
++            namespace_keys = [request.namespace_info]
++        else:
++            namespace_keys = list(request.namespace_info)
++
++    extra_keys: list[Any] = lora_extra_keys + mm_extra_keys + cache_salt_keys + namespace_keys
+ 
+     if not extra_keys:
+         return None, new_start_mm_idx
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
 index 981023409..a6c8fac38 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -118,6 +118,7 @@ class Scheduler(SchedulerInterface):
-
+ 
          # KV Connector: requests in process of async KV loading or recving
          self.finished_recving_kv_req_ids: set[str] = set()
 +        self.sending_kv_reqs: dict[str, Request] = {}
-
+ 
          # Encoder-related.
          # Calculate encoder cache size if applicable
 @@ -1029,7 +1030,8 @@ class Scheduler(SchedulerInterface):
-
+ 
          if not delay_free_blocks:
              self._free_blocks(request)
 -
 +        else:
 +            self.sending_kv_reqs[request.request_id] = request
          return kv_xfer_params
-
+ 
      def _free_blocks(self, request: Request):
 @@ -1041,7 +1043,7 @@ class Scheduler(SchedulerInterface):
          return len(self.waiting) + len(self.running)
-
+ 
      def has_finished_requests(self) -> bool:
 -        return len(self.finished_req_ids) > 0
 +        return len(self.finished_req_ids) > 0 or len(self.sending_kv_reqs) > 0
-
+ 
      def reset_prefix_cache(self) -> bool:
          return self.kv_cache_manager.reset_prefix_cache()
 @@ -1082,6 +1084,8 @@ class Scheduler(SchedulerInterface):
@@ -414,26 +747,78 @@ index 981023409..a6c8fac38 100644
              self.kv_event_publisher.shutdown()
 +        if self.connector and hasattr(self.connector, "shutdown"):
 +            self.connector.shutdown()
-
+ 
      ########################################################################
      # KV Connector Related Methods
 @@ -1149,6 +1153,10 @@ class Scheduler(SchedulerInterface):
              scheduler the request during the next step.
          """
-
+ 
 +        # avoid busy checking
 +        if len(self.running) == 0:
 +            time.sleep(0.01)
 +
          if self.connector is not None:
              self.connector.update_connector_output(kv_connector_output)
-
+ 
 @@ -1158,4 +1166,5 @@ class Scheduler(SchedulerInterface):
              self.finished_recving_kv_req_ids.add(req_id)
          for req_id in (kv_connector_output.finished_sending or ()):
              logger.debug("Finished sending KV transfer for request %s", req_id)
 +            del self.sending_kv_reqs[req_id]
              self._free_blocks(self.requests[req_id])
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+index f7ec982db..4f32819aa 100644
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -57,6 +57,7 @@ class EngineCoreRequest(
+     arrival_time: float
+     lora_request: Optional[LoRARequest]
+     cache_salt: Optional[str]
++    namespace_info: Optional[Union[str, list[str]]]
+     data_parallel_rank: Optional[int]
+ 
+     # Index of the client, used to ensure outputs are sent back to the same
+diff --git a/vllm/v1/engine/processor.py b/vllm/v1/engine/processor.py
+index c6a23cdbf..7bdc7d896 100644
+--- a/vllm/v1/engine/processor.py
++++ b/vllm/v1/engine/processor.py
+@@ -343,6 +343,7 @@ class Processor:
+             arrival_time=arrival_time,
+             lora_request=lora_request,
+             cache_salt=decoder_inputs.get("cache_salt"),
++            namespace_info=decoder_inputs.get("namespace_info"),
+             priority=priority,
+             data_parallel_rank=data_parallel_rank,
+         )
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 4e99a9cce..67842264d 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -37,6 +37,7 @@ class Request:
+         lora_request: Optional["LoRARequest"] = None,
+         structured_output_request: Optional["StructuredOutputRequest"] = None,
+         cache_salt: Optional[str] = None,
++        namespace_info: Optional[Union[str, list[str]]] = None,
+         priority: int = 0,
+         block_hasher: Optional[Callable[["Request"],
+                                         list["BlockHash"]]] = None,
+@@ -87,6 +88,7 @@ class Request:
+         self.spec_token_ids: list[int] = []
+         self.num_computed_tokens = 0
+         self.cache_salt: Optional[str] = cache_salt
++        self.namespace_info: Optional[Union[str, list[str]]] = namespace_info
+ 
+         # Multi-modal related
+         self.mm_positions = multi_modal_placeholders or []
+@@ -149,6 +151,7 @@ class Request:
+                 sampling_params=request.sampling_params) \
+                     if request.sampling_params else None,
+             cache_salt=request.cache_salt,
++            namespace_info=request.namespace_info,
+             priority=request.priority,
+             block_hasher=block_hasher,
+         )
 diff --git a/vllm/v1/worker/kv_connector_model_runner_mixin.py b/vllm/v1/worker/kv_connector_model_runner_mixin.py
 index a03ebe35d..8e4460957 100644
 --- a/vllm/v1/worker/kv_connector_model_runner_mixin.py
@@ -441,13 +826,13 @@ index a03ebe35d..8e4460957 100644
 @@ -66,9 +66,9 @@ class KVConnectorModelRunnerMixin:
                  scheduler_output, wait_for_save=False) as kv_connector_output:
              pass
-
+ 
 -        if (not kv_connector_output.finished_sending
 -                and not kv_connector_output.finished_recving):
 -            return EMPTY_MODEL_RUNNER_OUTPUT
 +        # if (not kv_connector_output.finished_sending
 +        #         and not kv_connector_output.finished_recving):
 +        #     return EMPTY_MODEL_RUNNER_OUTPUT
-
+ 
          output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
          output.kv_connector_output = kv_connector_output
