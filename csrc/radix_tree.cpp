@@ -42,6 +42,19 @@ static std::optional<HashType> get_hash_safe(
     return hasher.digest();
   }
 }
+
+bool CRadixNode::Compare::operator()(CRadixNode *a, CRadixNode *b) {
+  return a->get_priority() > b->get_priority();
+}
+
+double CRadixNode::get_priority() {
+  if (index->get_eviction_policy() == EvictionPolicy::LRU) {
+    return (double)grace_time;
+  } else {
+    return (double)hit_count;
+  }
+}
+
 CRadixNode::CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt, bool enable_block_node_ids) {
   assert(index != nullptr);
 
@@ -52,10 +65,11 @@ CRadixNode::CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt, bool en
   this->lock_cnt = lock_cnt;
   this->lease_meta = nullptr;
   this->block_node_ids = nullptr;
+  this->hit_count = 0;
 
   struct timeval now;
   gettimeofday(&now, nullptr);
-  grace_time = now.tv_sec * 1000 + now.tv_usec / 10000;
+  grace_time = (uint64_t)now.tv_sec * 1000000 + (uint64_t)now.tv_usec;
 
   if (enable_block_node_ids) {
     this->block_node_ids = new std::deque<uint32_t>();
@@ -87,6 +101,7 @@ CRadixNode *CRadixNode::split(int prefix_length) {
   bool enable_block_node_ids = (block_node_ids != nullptr);
   auto new_node = new CRadixNode(index, is_ready(), 0, enable_block_node_ids);
   new_node->set_time(get_time());
+  new_node->set_hit_count(get_hit_count());
   new_node->set_parent(parent);
   get_index()->add_node(new_node);
 
@@ -132,6 +147,7 @@ void CRadixNode::merge_child() {
                          child->get_physical_blocks().cend());
 
   set_time(std::max(get_time(), child->get_time()));
+  set_hit_count(std::max(get_hit_count(), child->get_hit_count()));
   if (block_node_ids != nullptr) {
     block_node_ids->insert(block_node_ids->end(), child->get_block_node_ids()->cbegin(),
            child->get_block_node_ids()->cend());
@@ -236,15 +252,19 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
 int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   int64_t *evicted_blocks_ptr = evicted_blocks.data_ptr<int64_t>();
   int has_evicted = 0;
-  std::priority_queue<CRadixNode *, std::vector<CRadixNode *>,
-                      CRadixNode::Compare>
-      candidate;
 
-  for (auto it = leaf_list.begin(); it != leaf_list.end(); it++) {
-    if ((*it)->evictable()) {
-      candidate.push(*it);
+  // Optimization: Batch build the priority queue to reduce overhead from O(N log N) to O(N)
+  std::vector<CRadixNode *> candidates;
+  candidates.reserve(leaf_list.size());
+  for (auto node : leaf_list) {
+    if (node->evictable()) {
+      candidates.push_back(node);
     }
   }
+
+  std::priority_queue<CRadixNode *, std::vector<CRadixNode *>,
+                      CRadixNode::Compare>
+      candidate(CRadixNode::Compare(), std::move(candidates));
 
   while ((has_evicted < num_evicted) && candidate.size()) {
     auto node = candidate.top();
