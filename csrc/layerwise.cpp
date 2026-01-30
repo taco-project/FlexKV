@@ -309,11 +309,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
     // Step 2: CPU -> GPU transfer
     // NVTX range for this batch was already started (by main thread for first batch,
     // or by previous batch's callback for subsequent batches)
-
-    cudaSetDevice(dp_group_id_ * num_gpus_ + 0);
+    
     for (int i = 0; i < num_gpus_; ++i) {
-      
-
+      // TODO: support multi-instance
+      cudaSetDevice(dp_group_id_ * num_gpus_ + i);
       int64_t cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i];
       if (is_mla) {
         cpu_startoff_inside_chunks = 0;
