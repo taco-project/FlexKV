@@ -1,13 +1,13 @@
 # Using FlexKV in TensorRT-LLM
 ## 1. Environment Setup
 
-### 1.1 Install TensorRT-LLM (Tag v1.1.0.rc2)
+### 1.1 Install TensorRT-LLM (Tag v1.3.0rc1)
 We are currently working with the community to merge TensorRT-LLM adaptation code. Before it is merged into the main branch, there are two methods:
 #### 1.1.1 Method 1
 You can use the patch we provide and recompile:
 ```bash
 cd TensorRT-LLM
-git apply FLEXKV_DIR/examples/trtllm_adaption/trtllm_v1.1.0rc2.patch
+git apply FLEXKV_DIR/examples/trtllm_adaption/trtllm_v1.3.0rc1.patch
 ```
 Note: For TensorRT-LLM compilation instructions, please refer to [here](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html#build-from-source-linux)
 
