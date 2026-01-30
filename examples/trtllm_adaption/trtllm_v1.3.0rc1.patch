@@ -1,0 +1,762 @@
+diff --git a/cpp/include/tensorrt_llm/batch_manager/llmRequest.h b/cpp/include/tensorrt_llm/batch_manager/llmRequest.h
+index 2d6e79228..639a6a3da 100644
+--- a/cpp/include/tensorrt_llm/batch_manager/llmRequest.h
++++ b/cpp/include/tensorrt_llm/batch_manager/llmRequest.h
+@@ -108,6 +108,7 @@ public:
+     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+     using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
+     using CacheSaltIDType = runtime::CacheSaltIDType;
++    using NamespaceInfoType = runtime::NamespaceInfoType;
+ 
+     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
+         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
+@@ -145,7 +146,7 @@ public:
+         std::optional<SizeType32> languageAdapterUid = std::nullopt,
+         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
+-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
++        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt, std::optional<NamespaceInfoType> namespaceInfo = std::nullopt)
+         : mRequestId(requestId)
+         , mPromptLen(inputTokens->size())
+         , mMaxNewTokens(maxNewTokens)
+@@ -203,6 +204,7 @@ public:
+         , mLanguageAdapterUid(languageAdapterUid)
+         , mAllottedTimeMs(allottedTimeMs)
+         , mCacheSaltID(cacheSaltID)
++        , mNamespaceInfo(namespaceInfo)
+     {
+         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
+         {
+@@ -230,7 +232,7 @@ public:
+         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
+         std::optional<SizeType32> languageAdapterUid = std::nullopt,
+         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
+-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
++        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<NamespaceInfoType> namespaceInfo = std::nullopt)
+         : mRequestId(requestId)
+         , mPromptLen(inputTokens.size())
+         , mMaxNewTokens(maxNewTokens)
+@@ -271,6 +273,7 @@ public:
+         , mNumReturnSequences(numReturnSequences)
+         , mLanguageAdapterUid(languageAdapterUid)
+         , mCacheSaltID(cacheSaltID)
++        , mNamespaceInfo(namespaceInfo)
+     {
+         if (mEncoderTokens.has_value())
+         {
+@@ -310,6 +313,7 @@ public:
+         , mLanguageAdapterUid(req.getLanguageAdapterUid())
+         , mAllottedTimeMs(req.getAllottedTimeMs())
+         , mCacheSaltID(req.getCacheSaltID())
++        , mNamespaceInfo(req.getNamespaceInfo())
+     {
+         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
+         {
+@@ -1081,6 +1085,16 @@ public:
+         return mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
+     }
+ 
++    [[nodiscard]] SizeType32 getNumConnectorMatchedTokens() const
++    {
++        return mNumConnectorMatchedTokens;
++    }
++
++    void setNumConnectorMatchedTokens(SizeType32 numConnectorMatchedTokens)
++    {
++        mNumConnectorMatchedTokens = numConnectorMatchedTokens;
++    }
++
+     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
+     {
+         // Add debug log for prepopulatedPromptLen
+@@ -1686,6 +1700,15 @@ public:
+             [](auto reason) { return reason == executor::FinishReason::kLENGTH; });
+     }
+ 
++    [[nodiscard]] bool isFinishedNormal() const noexcept
++    {
++        return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
++            [](auto reason) {
++                return  reason == executor::FinishReason::kEND_ID || \
++                        reason == executor::FinishReason::kSTOP_WORDS || \
++                        reason == executor::FinishReason::kLENGTH; });
++    }
++
+     [[nodiscard]] bool isFinishedDueToCancellation() const noexcept
+     {
+         return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
+@@ -1800,6 +1823,11 @@ public:
+         return mCacheSaltID;
+     }
+ 
++    [[nodiscard]] std::optional<NamespaceInfoType> getNamespaceInfo() const
++    {
++        return mNamespaceInfo;
++    }
++
+     std::vector<SizeType32> getLanguageAdapterRouting(
+         SizeType32 const reqNumLanguages, SizeType32 const inputLength) const
+     {
+@@ -1945,6 +1973,9 @@ protected:
+     SizeType32 mPrepopulatedPromptLenTarget{0};
+     SizeType32 mPrepopulatedPromptLenDraft{0};
+ 
++    // Number of tokens matched by KV cache connector for block reuse.
++    SizeType32 mNumConnectorMatchedTokens{0};
++
+     SizeType32 mMaxSentTokenLen;
+ 
+     std::optional<TensorPtr> mEmbeddingBias{std::nullopt};
+@@ -2078,6 +2109,9 @@ protected:
+     // Cache salt id for each request.
+     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
+ 
++    // Namespace info for KV cache isolation.
++    std::optional<NamespaceInfoType> mNamespaceInfo{std::nullopt};
++
+ private:
+     void initialize(
+         VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt)
+@@ -2270,7 +2304,7 @@ public:
+         std::optional<SizeType32> languageAdapterUid = std::nullopt,
+         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
+-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
++        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt, std::optional<NamespaceInfoType> namespaceInfo = std::nullopt)
+         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
+             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
+             std::move(stopWordsList),
+@@ -2301,7 +2335,7 @@ public:
+                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
+             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
+             std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID,
+-            arrivalTime)
++            arrivalTime，namespaceInfo)
+     {
+     }
+ 
+diff --git a/cpp/include/tensorrt_llm/executor/executor.h b/cpp/include/tensorrt_llm/executor/executor.h
+index 1e5cc16a0..49320e3b0 100644
+--- a/cpp/include/tensorrt_llm/executor/executor.h
++++ b/cpp/include/tensorrt_llm/executor/executor.h
+@@ -685,6 +685,7 @@ public:
+     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
+     /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
+     /// @param disaggRequestId Disaggregated request ID.
++    /// @param namespaceInfo Namespace information for KV cache isolation. Can be a string for hierarchical namespacing.
+     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
+         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
+         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
+@@ -713,7 +714,8 @@ public:
+         std::optional<SizeType32> languageAdapterUid = std::nullopt,
+         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+         std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
+-        std::optional<IdType> disaggRequestId = std::nullopt);
++        std::optional<IdType> disaggRequestId = std::nullopt,
++        std::optional<NamespaceInfoType> namespaceInfo = std::nullopt);
+ 
+     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
+     static auto constexpr kBatchedPostProcessorName = "batched";
+@@ -764,6 +766,7 @@ public:
+     [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
+     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
+     [[nodiscard]] std::optional<IdType> getDisaggRequestId() const;
++    [[nodiscard]] std::optional<NamespaceInfoType> getNamespaceInfo() const;
+ 
+     void setStreaming(bool streaming);
+     void setSamplingConfig(SamplingConfig const& config);
+@@ -800,6 +803,7 @@ public:
+     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
+     void setCacheSaltID(CacheSaltIDType cacheSaltID);
+     void setDisaggRequestId(IdType disaggRequestId);
++    void setNamespaceInfo(NamespaceInfoType const& namespaceInfo);
+ 
+ private:
+     friend class Serialization;
+diff --git a/cpp/include/tensorrt_llm/executor/types.h b/cpp/include/tensorrt_llm/executor/types.h
+index e248cb1c3..d1790fac4 100644
+--- a/cpp/include/tensorrt_llm/executor/types.h
++++ b/cpp/include/tensorrt_llm/executor/types.h
+@@ -59,6 +59,7 @@ using VecLogProbs = std::vector<FloatType>;
+ using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
+ using MillisecondsType = std::chrono::milliseconds;
+ using CacheSaltIDType = std::uint64_t;
++using NamespaceInfoType = std::string;
+ using LogitsPostProcessor
+     = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>;
+ using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
+diff --git a/cpp/include/tensorrt_llm/runtime/common.h b/cpp/include/tensorrt_llm/runtime/common.h
+index 7a3079d0b..ce02b7680 100644
+--- a/cpp/include/tensorrt_llm/runtime/common.h
++++ b/cpp/include/tensorrt_llm/runtime/common.h
+@@ -45,6 +45,7 @@ using LoraTaskIdType = std::uint64_t;
+ using TokenExtraIdType = std::uint64_t;
+ using VecTokenExtraIds = std::vector<TokenExtraIdType>;
+ using CacheSaltIDType = std::uint64_t;
++using NamespaceInfoType = std::string;
+ 
+ struct UniqueToken
+ {
+diff --git a/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp b/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp
+index f20019a0d..1aa33c820 100644
+--- a/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp
++++ b/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp
+@@ -1456,6 +1456,7 @@ void WindowBlockManager::addSequence(
+     if (mKvCacheConnectorManager && !llmRequest.isDummyRequest())
+     {
+         numConnectorMatchedTokens = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
++        llmRequest.setNumConnectorMatchedTokens(numConnectorMatchedTokens);
+     }
+ 
+     llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen + numConnectorMatchedTokens, getTokensPerBlock());
+diff --git a/cpp/tensorrt_llm/executor/request.cpp b/cpp/tensorrt_llm/executor/request.cpp
+index 5ac62d3fc..5e7f5e93e 100644
+--- a/cpp/tensorrt_llm/executor/request.cpp
++++ b/cpp/tensorrt_llm/executor/request.cpp
+@@ -259,6 +259,11 @@ std::optional<IdType> Request::getDisaggRequestId() const
+     return mImpl->getDisaggRequestId();
+ }
+ 
++std::optional<std::string> Request::getNamespaceInfo() const
++{
++    return mImpl->getNamespaceInfo();
++}
++
+ void Request::setStreaming(bool streaming)
+ {
+     mImpl->setStreaming(streaming);
+@@ -433,4 +438,9 @@ void Request::setDisaggRequestId(IdType disaggRequestId)
+ {
+     mImpl->setDisaggRequestId(disaggRequestId);
+ }
++
++void Request::setNamespaceInfo(std::string const& namespaceInfo)
++{
++    return mImpl->setNamespaceInfo(namespaceInfo);
++}
+ } // namespace tensorrt_llm::executor
+diff --git a/cpp/tensorrt_llm/executor/requestImpl.h b/cpp/tensorrt_llm/executor/requestImpl.h
+index 281f81d46..44871c3d2 100644
+--- a/cpp/tensorrt_llm/executor/requestImpl.h
++++ b/cpp/tensorrt_llm/executor/requestImpl.h
+@@ -308,6 +308,11 @@ public:
+         return mDisaggRequestId;
+     }
+ 
++    [[nodiscard]] std::optional<NamespaceInfoType> getNamespaceInfo() const
++    {
++        return mNamespaceInfo;
++    }
++
+     void setStreaming(bool streaming)
+     {
+         mStreaming = streaming;
+@@ -492,6 +497,11 @@ public:
+         mDisaggRequestId = disaggRequestId;
+     }
+ 
++    void setNamespaceInfo(NamespaceInfoType const& namespaceInfo)
++    {
++        mNamespaceInfo = namespaceInfo;
++    }
++
+ private:
+     void validate()
+     {
+@@ -567,6 +577,7 @@ private:
+         lambda(mAllottedTimeMs ? std::make_optional(mAllottedTimeMs->count()) : std::nullopt);
+         lambda(mCacheSaltID);
+         lambda(mDisaggRequestId);
++        lambda(mNamespaceInfo);
+     }
+ 
+     VecTokens mInputTokenIds;
+@@ -607,6 +618,7 @@ private:
+     std::optional<MillisecondsType> mAllottedTimeMs;
+     std::optional<CacheSaltIDType> mCacheSaltID;
+     std::optional<IdType> mDisaggRequestId;
++    std::optional<NamespaceInfoType> mNamespaceInfo;
+ };
+ 
+ } // namespace tensorrt_llm::executor
+diff --git a/cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp b/cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp
+index 72a94944d..83ce304c9 100644
+--- a/cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp
++++ b/cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp
+@@ -162,10 +162,12 @@ void initBindings(nb::module_& m)
+         .def("set_finished_reason", &GenLlmReq::setFinishedReason, nb::arg("finish_reason"), nb::arg("beam"))
+         .def_prop_ro("is_finished", &GenLlmReq::isFinished)
+         .def_prop_ro("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
++        .def_prop_ro("is_finished_normal", &GenLlmReq::isFinishedNormal)
+         .def_prop_ro("is_finished_due_to_cancellation", &GenLlmReq::isFinishedDueToCancellation)
+         .def_prop_rw(
+             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
+         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
++        .def_prop_ro("num_connector_matched_tokens", &GenLlmReq::getNumConnectorMatchedTokens)
+         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
+         .def_prop_ro("context_phase_params", &GenLlmReq::getContextPhaseParams)
+         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
+@@ -196,6 +198,7 @@ void initBindings(nb::module_& m)
+         .def_prop_ro("parent_request_id", &GenLlmReq::getParentRequestId)
+         .def_prop_ro("is_child", &GenLlmReq::isChild)
+         .def_prop_ro("cache_salt_id", &GenLlmReq::getCacheSaltID)
++        .def_prop_ro("namespace_info", &GenLlmReq::getNamespaceInfo)
+         .def_prop_ro("multimodal_hashes",
+             [](GenLlmReq& self)
+             {
+@@ -309,7 +312,8 @@ void initBindings(nb::module_& m)
+                 std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
+                 std::optional<executor::ContextPhaseParams> context_phase_params,
+                 std::optional<tb::LlmRequest::CacheSaltIDType> cache_salt_id,
+-                std::optional<tb::LlmRequest::TimePoint> arrival_time)
++                std::optional<tb::LlmRequest::TimePoint> arrival_time,
++                std::optional<NamespaceInfoType> namespace_info)
+             {
+                 auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
+                 {
+@@ -350,7 +354,7 @@ void initBindings(nb::module_& m)
+                     encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
+                     num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
+                     guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
+-                    arrival_time};
++                    arrival_time, namespace_info);
+             },
+             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
+             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
+@@ -376,7 +380,7 @@ void initBindings(nb::module_& m)
+             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
+             nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
+             nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
+-            nb::arg("arrival_time") = std::nullopt)
++            nb::arg("arrival_time") = std::nullopt, nb::arg("namespace_info") = std::nullopt)
+         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
+         .def(nb::init<tb::LlmRequest const&>())
+         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
+diff --git a/cpp/tensorrt_llm/nanobind/executor/request.cpp b/cpp/tensorrt_llm/nanobind/executor/request.cpp
+index 4a53516bf..da3dbb5bc 100644
+--- a/cpp/tensorrt_llm/nanobind/executor/request.cpp
++++ b/cpp/tensorrt_llm/nanobind/executor/request.cpp
+@@ -578,7 +578,7 @@ void initRequestBindings(nb::module_& m)
+             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
+             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
+             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
+-            self.getGuidedDecodingParams(), self.getCacheSaltID(), self.getDisaggRequestId());
++            self.getGuidedDecodingParams(), self.getCacheSaltID(), self.getDisaggRequestId(), self.getNamespaceInfo());
+     };
+     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
+     {
+@@ -607,7 +607,8 @@ void initRequestBindings(nb::module_& m)
+             nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
+             nb::cast<std::optional<tle::Tensor>>(state[31]),
+             nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]), std::nullopt, std::nullopt,
+-            nb::cast<std::optional<tle::CacheSaltIDType>>(state[33]), nb::cast<std::optional<tle::IdType>>(state[34]));
++            nb::cast<std::optional<tle::CacheSaltIDType>>(state[33]), nb::cast<std::optional<tle::IdType>>(state[34]),
++            nb::cast<std::optional<NamespaceInfoType>>(state[35]));
+     };
+ 
+     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
+@@ -649,7 +650,8 @@ void initRequestBindings(nb::module_& m)
+                  std::optional<tle::SizeType32>,                // languageAdapterUid
+                  std::optional<tle::MillisecondsType>,          // allottedTimeMs
+                  std::optional<tle::CacheSaltIDType>,           // cacheSaltID
+-                 std::optional<tle::IdType>                     // disaggRequestId
++                 std::optional<tle::IdType>,                    // disaggRequestId
++                 std::optional<tle::NamespaceInfoType>          // namespaceInfo
+                  >(),
+             // clang-format off
+         nb::arg("input_token_ids"),
+@@ -690,7 +692,8 @@ void initRequestBindings(nb::module_& m)
+         nb::arg("language_adapter_uid") = nb::none(),
+         nb::arg("allotted_time_ms") = nb::none(),
+         nb::arg("cache_salt_id") = nb::none(),
+-        nb::arg("disagg_request_id") = nb::none()
++        nb::arg("disagg_request_id") = nb::none(),
++        nb::arg("namespace_info") = nb::none()
+     )         // clang-format on
+         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
+         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
+@@ -736,6 +739,7 @@ void initRequestBindings(nb::module_& m)
+         .def_prop_rw("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
+         .def_prop_rw("context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
+         .def_prop_rw("disagg_request_id", &tle::Request::getDisaggRequestId, &tle::Request::setDisaggRequestId)
++        .def_prop_rw("namespace_info", &tle::Request::getNamespaceInfo, &tle::Request::setNamespaceInfo)
+         .def("__getstate__", requestGetstate)
+         .def("__setstate__", requestSetstate);
+     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
+diff --git a/cpp/tensorrt_llm/pybind/batch_manager/bindings.cpp b/cpp/tensorrt_llm/pybind/batch_manager/bindings.cpp
+index 657b7c6f3..dc0f07361 100644
+--- a/cpp/tensorrt_llm/pybind/batch_manager/bindings.cpp
++++ b/cpp/tensorrt_llm/pybind/batch_manager/bindings.cpp
+@@ -166,10 +166,12 @@ void initBindings(pybind11::module_& m)
+         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
+         .def_property_readonly("is_finished", &GenLlmReq::isFinished)
+         .def_property_readonly("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
++        .def_property_readonly("is_finished_normal", &GenLlmReq::isFinishedNormal)
+         .def_property_readonly("is_finished_due_to_cancellation", &GenLlmReq::isFinishedDueToCancellation)
+         .def_property(
+             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
+         .def_property_readonly("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
++        .def_property_readonly("num_connector_matched_tokens", &GenLlmReq::getNumConnectorMatchedTokens)
+         .def_property(
+             "guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
+         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
+diff --git a/tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py b/tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py
+index 380486e93..39b020ed9 100644
+--- a/tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py
++++ b/tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py
+@@ -413,6 +413,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
+ 
+     def get_num_new_matched_tokens(self, request: LlmRequest,
+                                    num_computed_tokens: int) -> int:
++        """ Called in C++:  KVCacheManager::addSequence
++        if (mKvCacheConnectorManager && !llmRequest.isDummyRequest())
++        {
++            numConnectorMatchedTokens = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
++        }
++        """
+         if request.is_generation_only_request:
+             raise RuntimeError(
+                 "Connector API is not supported for generation-only requests!")
+diff --git a/tensorrt_llm/_torch/pyexecutor/llm_request.py b/tensorrt_llm/_torch/pyexecutor/llm_request.py
+index 62a386d58..d81a52ef1 100644
+--- a/tensorrt_llm/_torch/pyexecutor/llm_request.py
++++ b/tensorrt_llm/_torch/pyexecutor/llm_request.py
+@@ -825,6 +825,7 @@ def executor_request_to_llm_request(
+         context_phase_params=executor_request.context_phase_params,
+         cache_salt_id=executor_request.cache_salt_id,
+         arrival_time=getattr(executor_request, "py_arrival_time", None),
++        namespace_info=getattr(executor_request, "namespace_info", None),
+         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
+                                    None),
+         kv_cache_retention_config=executor_request.kv_cache_retention_config,
+diff --git a/tensorrt_llm/_torch/pyexecutor/py_executor.py b/tensorrt_llm/_torch/pyexecutor/py_executor.py
+index 39f62285e..5dbf95059 100644
+--- a/tensorrt_llm/_torch/pyexecutor/py_executor.py
++++ b/tensorrt_llm/_torch/pyexecutor/py_executor.py
+@@ -467,6 +467,7 @@ class PyExecutor:
+         self.worker_started = False
+         self.worker_lock = threading.Lock()
+ 
++        self.use_flexkv = os.getenv("TENSORRT_LLM_USE_FLEXKV", "0") == "1"
+         self.kv_connector_manager = kv_connector_manager
+ 
+         self._maybe_init_kv_connector_manager()
+@@ -502,6 +503,15 @@ class PyExecutor:
+                     module.register_forward_hook(
+                         self.kv_connector_manager.layer_post_hook)
+ 
++            if self.use_flexkv:
++                self._wait_for_flexkv_manager()
++
++    def _wait_for_flexkv_manager(self):
++        if self.kv_connector_manager is not None and self.dist.rank == 0:
++            while not self.kv_connector_manager.scheduler.is_ready():
++                time.sleep(0.1)
++            logger.info("FlexKV manager is ready")
++
+     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
+         if self.async_transfer_manager.end_transfer(request):
+             self._terminate_request(request)
+@@ -766,7 +776,7 @@ class PyExecutor:
+                 if prev_device_step_time is None:
+                     prev_device_step_time = "N/A"  # Handle first iteration
+                 else:
+-                    prev_device_step_time = f"{prev_device_step_time}ms"
++                    prev_device_step_time = f"{prev_device_step_time:.3f} ms"
+                 host_step_time = (end_time - start_time) * 1000  # milliseconds
+                 formatted_timestamp = datetime.datetime.now().strftime(
+                     "%Y-%m-%d %H:%M:%S")
+@@ -776,7 +786,7 @@ class PyExecutor:
+                     f"rank = {self.dist.rank}, "
+                     f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
+                     f"{self.executor_request_queue.num_fetch_requests}, "
+-                    f"host_step_time = {host_step_time}ms, "
++                    f"host_step_time = {host_step_time:.3f} ms, "
+                     f"prev_device_step_time = {prev_device_step_time}, "
+                     f"timestamp = {formatted_timestamp}, "
+                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
+@@ -1472,6 +1482,17 @@ class PyExecutor:
+             self.kv_connector_manager.worker.start_load_kv(
+                 torch.cuda.current_stream())
+ 
++    def _kv_connector_refresh_unfinished_tasks(self):
++        if not self.use_flexkv:
++            return
++        if len(self.active_requests) == 0:
++            return
++        if not self.kv_connector_manager:
++            return
++        logger.warning(f"No scheduled requests, but flexkv have pending put requests")
++        self.kv_connector_manager.handle_metadata()
++        time.sleep(0.01)
++
+     def _kv_connector_terminate_requests(self):
+         if self.kv_connector_manager:
+             reqs_to_terminate = self.kv_connector_manager.get_finished()
+@@ -1503,6 +1524,9 @@ class PyExecutor:
+                 if scheduled_batch is None:
+                     break
+ 
++                if scheduled_batch.batch_size == 0:
++                    self._kv_connector_refresh_unfinished_tasks()
++
+                 self._pause_requests(scheduled_batch.paused_requests)
+ 
+                 finished_requests = []
+@@ -1724,6 +1748,9 @@ class PyExecutor:
+ 
+                 self._pause_requests(scheduled_batch.paused_requests)
+ 
++                if scheduled_batch.batch_size == 0:
++                    self._kv_connector_refresh_unfinished_tasks()
++
+                 can_queue, can_queue_this_rank = self._can_queue(
+                     scheduled_batch)
+                 if can_queue:
+@@ -2766,6 +2793,13 @@ class PyExecutor:
+                     new_responses.append((req_id, response))
+ 
+             if request_done:
++                # Release slot immediately when decode finishes, before put task completes
++                # This allows new requests to be scheduled earlier.
++                # Note: request_done is True when request.is_finished is True, which happens
++                # after the request state is set to GENERATION_COMPLETE in update_requests().
++                # We check both to be safe.
++                if self.use_flexkv and (request.is_finished or request.state == LlmRequestState.GENERATION_COMPLETE):
++                    self.resource_manager.free_slot_only(request)
+                 if (self.drafter is not None and getattr(
+                         self.model_engine, 'enable_spec_decode', False)
+                         and not self.speculation_permanently_disabled
+diff --git a/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py b/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
+index 50feb7194..2e5b5ab87 100644
+--- a/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
++++ b/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
+@@ -177,6 +177,7 @@ def _get_mapping(_mapping: Mapping) -> Mapping:
+                           tp_size=tensorrt_llm.mpi_world_size(),
+                           gpus_per_node=tensorrt_llm.default_gpus_per_node(),
+                           rank=tensorrt_llm.mpi_rank())
++        executor_config.mapping = mapping
+     else:
+         mapping = copy.deepcopy(_mapping)
+         mapping.rank = tensorrt_llm.mpi_rank()
+diff --git a/tensorrt_llm/_torch/pyexecutor/resource_manager.py b/tensorrt_llm/_torch/pyexecutor/resource_manager.py
+index bfdfb39af..3a6a046cb 100644
+--- a/tensorrt_llm/_torch/pyexecutor/resource_manager.py
++++ b/tensorrt_llm/_torch/pyexecutor/resource_manager.py
+@@ -1488,6 +1488,15 @@ class ResourceManager:
+             if hasattr(resource_manager, "free_resources"):
+                 resource_manager.free_resources(request)
+ 
++    def free_slot_only(self, request: LlmRequest):
++        """Only free the slot for the request, without freeing other resources.
++        This is used to release the slot early when decode finishes, before
++        the put task completes.
++        """
++        seq_slot_manager = self.get_resource_manager(ResourceManagerType.SEQ_SLOT_MANAGER)
++        if seq_slot_manager is not None:
++            seq_slot_manager.free_resources(request)
++
+     def reorder_pipeline(self,
+                          resource_manager_list: list[ResourceManagerType]):
+         assert set(resource_manager_list) == set(self.resource_managers.keys())
+diff --git a/tensorrt_llm/executor/base_worker.py b/tensorrt_llm/executor/base_worker.py
+index 0b6a41779..8d483e369 100644
+--- a/tensorrt_llm/executor/base_worker.py
++++ b/tensorrt_llm/executor/base_worker.py
+@@ -561,7 +561,8 @@ class BaseWorker(GenerationExecutor):
+                 context_phase_params=context_phase_params,
+                 type=request_type,
+                 cache_salt_id=request.cache_salt_id,
+-                disagg_request_id=disagg_request_id)
++                disagg_request_id=disagg_request_id,
++                namespace_info=request.namespace_info)
+             executor_request.py_num_logprobs = request.sampling_params.logprobs
+             executor_request.py_lora_path = py_lora_path
+             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
+diff --git a/tensorrt_llm/executor/executor.py b/tensorrt_llm/executor/executor.py
+index dc246f111..f425af705 100644
+--- a/tensorrt_llm/executor/executor.py
++++ b/tensorrt_llm/executor/executor.py
+@@ -127,6 +127,7 @@ class GenerationExecutor(ABC):
+         scheduling_params: Optional[SchedulingParams] = None,
+         cache_salt_id: Optional[int] = None,
+         arrival_time: Optional[float] = None,
++        namespace_info: Optional[str] = None,
+     ) -> GenerationResult:
+         """Generate output for the given prompt token ids in the asynchronous mode.
+         Asynchronous generation accepts single prompt only.
+@@ -153,7 +154,8 @@ class GenerationExecutor(ABC):
+             multimodal_params=multimodal_params,
+             scheduling_params=scheduling_params,
+             cache_salt_id=cache_salt_id,
+-            arrival_time=arrival_time)
++            arrival_time=arrival_time,
++            namespace_info=namespace_info)
+         result = self.submit(request)
+         # release memory in time
+         if hasattr(request, "multimodal_params"):
+diff --git a/tensorrt_llm/executor/request.py b/tensorrt_llm/executor/request.py
+index c7c7abea7..a9ba6013b 100644
+--- a/tensorrt_llm/executor/request.py
++++ b/tensorrt_llm/executor/request.py
+@@ -101,6 +101,7 @@ class GenerationRequest:
+         scheduling_params: Optional[SchedulingParams] = None,
+         cache_salt_id: Optional[int] = None,
+         arrival_time: Optional[float] = None,
++        namespace_info: Optional[str] = None,
+     ):
+         if isinstance(prompt_token_ids, list):
+             self.prompt_token_ids = prompt_token_ids
+@@ -129,6 +130,7 @@ class GenerationRequest:
+         self.scheduling_params = scheduling_params
+         self.cache_salt_id = cache_salt_id
+         self.arrival_time = arrival_time
++        self.namespace_info = namespace_info
+ 
+     def set_id(self, id):
+         assert self.id is None, f"Request ID is already set: {self.id}"
+diff --git a/tensorrt_llm/inputs/__init__.py b/tensorrt_llm/inputs/__init__.py
+index 4587d39f0..0e5d3c08c 100644
+--- a/tensorrt_llm/inputs/__init__.py
++++ b/tensorrt_llm/inputs/__init__.py
+@@ -16,7 +16,7 @@ from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
+                     async_load_audio, async_load_image, async_load_video,
+                     convert_image_mode, default_multimodal_input_loader,
+                     encode_base64_content_from_url, encode_base64_image,
+-                    get_cache_salt_id, load_base64_image_embeds, load_image,
++                    get_cache_salt_id, normalize_namespace_info, load_base64_image_embeds, load_image,
+                     load_video)
+ 
+ __all__ = [
+@@ -56,6 +56,7 @@ __all__ = [
+     "load_image",
+     "load_video",
+     "get_cache_salt_id",
++    "normalize_namespace_info",
+     "compute_retained_tokens_count",
+     "compute_retention_mask",
+     "load_base64_image_embeds",
+diff --git a/tensorrt_llm/inputs/utils.py b/tensorrt_llm/inputs/utils.py
+index 0dc09547b..b5a394f95 100644
+--- a/tensorrt_llm/inputs/utils.py
++++ b/tensorrt_llm/inputs/utils.py
+@@ -836,3 +836,19 @@ def get_cache_salt_id(cache_salt: str) -> int:
+             f"cache_salt_id must be in [0, 2**64 - 1], got {cache_salt_id}.")
+ 
+     return cache_salt_id
++
++
++def normalize_namespace_info(namespace_info: Union[str, List[str]]) -> str:
++    """Normalize namespace_info to a string for C++ layer.
++    
++    Args:
++        namespace_info: A string or list of strings representing namespace hierarchy.
++        
++    Returns:
++        A normalized string representation of the namespace.
++    """
++    if isinstance(namespace_info, str):
++        return namespace_info
++    else:
++        # For list of strings, join them with a separator
++        return "|".join(namespace_info)
+diff --git a/tensorrt_llm/llmapi/llm.py b/tensorrt_llm/llmapi/llm.py
+index 5ff6dc807..22d774577 100644
+--- a/tensorrt_llm/llmapi/llm.py
++++ b/tensorrt_llm/llmapi/llm.py
+@@ -35,7 +35,7 @@ from ..executor.utils import (RequestError, create_mpi_comm_session,
+                               get_spawn_proxy_process_env)
+ from ..inputs import (PromptInputs, create_input_processor,
+                       create_input_processor_with_hash, get_cache_salt_id,
+-                      prompt_inputs)
++                      normalize_namespace_info, prompt_inputs)
+ from ..logger import logger
+ from ..sampling_params import SamplingParams
+ from ..scheduling_params import SchedulingParams
+@@ -280,6 +280,7 @@ class BaseLLM:
+         scheduling_params: Optional[Union[SchedulingParams,
+                                           List[SchedulingParams]]] = None,
+         cache_salt: Optional[Union[str, Sequence[str]]] = None,
++        namespace_info: Optional[Union[str, List[str], Sequence[Union[str, List[str]]]]] = None,
+     ) -> Union[RequestOutput, List[RequestOutput]]:
+         """Generate output for the given prompts in the synchronous mode.
+         Synchronous generation accepts either single prompt or batched prompts.
+@@ -301,6 +302,7 @@ class BaseLLM:
+             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):
+                 Scheduling parameters. Defaults to None.
+             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
++            namespace_info (str, List[str], Sequence[Union[str, List[str]]], optional): If specified, provides namespace isolation for KV cache. Can be a single string or a list of strings for hierarchical namespacing. Defaults to None.
+         Returns:
+             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
+         """
+@@ -332,6 +334,7 @@ class BaseLLM:
+                 disaggregated_params=_item_at(disaggregated_params, i),
+                 scheduling_params=_item_at(scheduling_params, i),
+                 cache_salt=_item_at(cache_salt, i),
++                namespace_info=_item_at(namespace_info, i),
+                 streaming=False,
+             )
+             futures.append(future)
+@@ -361,6 +364,7 @@ class BaseLLM:
+         _postproc_params: Optional[PostprocParams] = None,
+         scheduling_params: Optional[SchedulingParams] = None,
+         cache_salt: Optional[str] = None,
++        namespace_info: Optional[Union[str, List[str]]] = None,
+     ) -> RequestOutput:
+         """Generate output for the given prompt in the asynchronous mode.
+         Asynchronous generation accepts single prompt only.
+@@ -377,6 +381,7 @@ class BaseLLM:
+             trace_headers (Mapping[str, str], optional): Trace headers. Defaults to None.
+             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
+             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
++            namespace_info (str, List[str], optional): If specified, provides namespace isolation for KV cache. Can be a single string or a list of strings for hierarchical namespacing. Defaults to None.
+         Returns:
+             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
+         """
+@@ -391,6 +396,8 @@ class BaseLLM:
+         sampling_params = self._prepare_sampling_params(sampling_params)
+         cache_salt_id = get_cache_salt_id(
+             cache_salt) if cache_salt is not None else None
++        namespace_info_str = normalize_namespace_info(
++            namespace_info) if namespace_info is not None else None
+         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
+         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
+         # TODO: Also support for trt backend
+@@ -541,6 +548,7 @@ class BaseLLM:
+             scheduling_params=scheduling_params,
+             cache_salt_id=cache_salt_id,
+             arrival_time=arrival_time,
++            namespace_info=namespace_info_str,
+         )
+ 
+         if sampling_params.return_perf_metrics:
+diff --git a/tensorrt_llm/serve/openai_protocol.py b/tensorrt_llm/serve/openai_protocol.py
+index a90921202..8281b3e0d 100644
+--- a/tensorrt_llm/serve/openai_protocol.py
++++ b/tensorrt_llm/serve/openai_protocol.py
+@@ -732,6 +732,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
+          "to limit the kv cache reuse on with the requests having the same string."
+          ))
+ 
++    namespace_info: Optional[Union[str, List[str]]] = Field(
++        default=None,
++        description=
++        ("If specified, provides namespace isolation for KV cache. "
++         "Can be a single string or a list of strings for hierarchical namespacing."
++         ))
++
+     # doc: end-chat-completion-extra-params
+ 
+     def to_sampling_params(self,
+diff --git a/tensorrt_llm/serve/openai_server.py b/tensorrt_llm/serve/openai_server.py
+index 524c7440a..6d211ac4e 100644
+--- a/tensorrt_llm/serve/openai_server.py
++++ b/tensorrt_llm/serve/openai_server.py
+@@ -594,6 +594,7 @@ class OpenAIServer:
+                 lora_request=request.lora_request,
+                 disaggregated_params=disaggregated_params,
+                 cache_salt=request.cache_salt,
++                namespace_info=request.namespace_info,
+                 trace_headers=trace_headers,
+             )
+             asyncio.create_task(self.await_disconnected(raw_request, promise))
