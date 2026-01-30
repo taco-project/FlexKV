@@ -374,7 +374,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
 
   // Calculate and print timing for each layer batch
   // chunk_size per GPU * num_gpus * 2 (K+V) * layers_this_batch * num_blocks
-  fprintf(stderr, "\n[LayerwiseTransfer] CPU->GPU Transfer Timing (num_blocks=%d):\n", num_blocks);
+  // fprintf(stderr, "\n[LayerwiseTransfer] CPU->GPU Transfer Timing (num_blocks=%d):\n", num_blocks);
   float total_time_ms = 0.0f;
   int64_t total_bytes = 0;
   
@@ -391,21 +391,21 @@ void LayerwiseTransferGroup::layerwise_transfer(
     
     double bandwidth_gbps = (bytes_this_batch / (1024.0 * 1024.0 * 1024.0)) / (elapsed_ms / 1000.0);
     
-    fprintf(stderr, "  Layers [%d, %d): time=%.3f ms, size=%.2f MB, bandwidth=%.2f GB/s\n",
-            batch_start_layers[i], 
-            batch_start_layers[i] + batch_layers_count[i],
-            elapsed_ms,
-            bytes_this_batch / (1024.0 * 1024.0),
-            bandwidth_gbps);
+    // fprintf(stderr, "  Layers [%d, %d): time=%.3f ms, size=%.2f MB, bandwidth=%.2f GB/s\n",
+    //         batch_start_layers[i], 
+    //         batch_start_layers[i] + batch_layers_count[i],
+    //         elapsed_ms,
+    //         bytes_this_batch / (1024.0 * 1024.0),
+    //         bandwidth_gbps);
     
     total_time_ms += elapsed_ms;
     total_bytes += bytes_this_batch;
   }
   
   double total_bandwidth_gbps = (total_bytes / (1024.0 * 1024.0 * 1024.0)) / (total_time_ms / 1000.0);
-  fprintf(stderr, "  Total: time=%.3f ms, size=%.2f MB, avg_bandwidth=%.2f GB/s\n\n",
-          total_time_ms, total_bytes / (1024.0 * 1024.0), total_bandwidth_gbps);
-  fflush(stderr);
+  // fprintf(stderr, "  Total: time=%.3f ms, size=%.2f MB, avg_bandwidth=%.2f GB/s\n\n",
+  //         total_time_ms, total_bytes / (1024.0 * 1024.0), total_bandwidth_gbps);
+  // fflush(stderr);
 
   // Cleanup timing events
   cudaSetDevice(dp_group_id_ * num_gpus_);
