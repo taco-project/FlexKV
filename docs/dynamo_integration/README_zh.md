@@ -64,7 +64,7 @@ nats-server -js -a 127.0.0.1 -p 4222 --store_dir $NATS_DIR &
 
 # 启动 etcd
 etcd --data-dir /tmp/etcd \
-  --listen-client-urls http://0.0.0.0:2379 \
+  --listen-client-urls http://127.0.0.1:2379 \
   --advertise-client-urls http://YOUR_IP:2379 & # YOUR_IP 是该节点的IP地址。
 
 sleep 3
@@ -109,7 +109,7 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
         FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" \
         KV_ENDPOINT="tcp://*:2008${i}" \
         KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")" \
-        CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} 
+        CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} \
         python3 -m dynamo.vllm \
         --model $YOUR_MODEL \
         --tensor-parallel-size 2 \

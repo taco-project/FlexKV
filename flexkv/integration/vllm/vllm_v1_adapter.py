@@ -15,6 +15,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
 from flexkv.integration.utils import cdiv
 from flexkv.integration.config import FlexKVConfig
+from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.transfer_manager import TransferManagerOnRemote
 
 # vllm
@@ -129,7 +130,6 @@ class FlexKVSchedulerConnector:
         self.cache_config = flexkv_config.cache_config
         
         if os.getenv('DYNAMO_USE_FLEXKV', '0') == '1':
-            from flexkv.integration.dynamo.collector import KVEventCollector
             self.collector = KVEventCollector()
         else:
             self.collector = None
@@ -167,6 +167,8 @@ class FlexKVSchedulerConnector:
 
     def shutdown(self) -> None:
         self.flexkv_manager.shutdown()
+        if self.collector is not None:
+            self.collector.close()
 
     @property
     def dp_client_id(self) -> int:
@@ -788,4 +790,7 @@ class FlexKVConnectorV1Impl:
         '''
         Collect buffered KV cache events.
         '''
-        return self.connector.collector.take_events()
+        collector: Optional[KVEventCollector] = getattr(self.connector, "collector", None)
+        if collector is None:
+            return []
+        return collector.take_events()
