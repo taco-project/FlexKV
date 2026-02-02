@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <iostream>
 #include <execinfo.h>
+#include <utility>
 
 #include "cache_utils.h"
 #include "dist/lease_meta_mempool.h"  // for flexkv::LeaseMeta
@@ -216,7 +217,7 @@ public:
   }
 
   CRadixNode *split(int prefix_length);
-  std::deque<int64_t> *shrink(int length);
+  std::pair<std::deque<int64_t>*, std::deque<HashType>*> shrink(int length);
   void merge_child();
 };
 
@@ -399,7 +400,7 @@ public:
     return total_cached_blocks() - total_ready_blocks();
   }
 
-  virtual int evict(torch::Tensor &evicted_blocks, int num_evicted);
+  virtual int evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted_block_hashes, int num_evicted);
   virtual std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,
     int num_blocks, bool update_cache_info = true);
   virtual CRadixNode *insert(torch::Tensor &physical_block_ids, torch::Tensor &block_hashes, int num_blocks,

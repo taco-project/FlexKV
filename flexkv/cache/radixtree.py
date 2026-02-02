@@ -15,7 +15,7 @@
 import heapq
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 import torch
@@ -105,16 +105,17 @@ class RadixNode:
         new_node.children[self.head_hash()] = self
         return new_node
 
-    def shrink(self, length: int) -> np.ndarray:
+    def shrink(self, length: int) -> Tuple[np.ndarray, np.ndarray]:
         assert length < self.size()
         assert length > 0
         assert self.is_leaf()
         assert not self.in_use()
         remaining_length = self.size() - length
         physical_blocks = self.physical_blocks[remaining_length:]
+        evicted_block_hashes = self.block_hashes[remaining_length:]
         self.block_hashes = self.block_hashes[:remaining_length]
         self.physical_blocks = self.physical_blocks[:remaining_length]
-        return physical_blocks
+        return physical_blocks, evicted_block_hashes
 
     def merge_child(self) -> None:  # ignore status
         assert self.num_children() == 1
@@ -264,17 +265,18 @@ class RadixTreeIndex:
 
         return new_node
 
-    def evict(self, num_evicted: int) -> np.ndarray:
+    def evict(self, num_evicted: int) -> Tuple[np.ndarray, np.ndarray]:
         candidates = []
         for node in self.leaf_nodes.values():
             if node.evictable():
                 candidates.append(node)
         heapq.heapify(candidates)
         evicted_blocks = np.array([], dtype=np.int64)
+        evicted_block_hashes = np.array([], dtype=np.int64)
         while len(evicted_blocks) < num_evicted and candidates:
             node = heapq.heappop(candidates)
             if node.size() > num_evicted - len(evicted_blocks):
-                physical_blocks = node.shrink(num_evicted - len(evicted_blocks))
+                physical_blocks, _block_hashes = node.shrink(num_evicted - len(evicted_blocks))
             else:
                 assert node.parent is not None  # node is not root
                 node.parent.children.pop(node.head_hash())
@@ -284,9 +286,13 @@ class RadixTreeIndex:
                 if node.parent.evictable():
                     heapq.heappush(candidates, node.parent)
                 physical_blocks = node.physical_blocks
+                _block_hashes = node.block_hashes
                 node.parent = None
+
             evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
-        return evicted_blocks
+            evicted_block_hashes = np.concatenate([evicted_block_hashes, _block_hashes])
+
+        return evicted_blocks, evicted_block_hashes
 
     def lock(self, node: RadixNode) -> None:
         assert node.lock_cnt >= 0

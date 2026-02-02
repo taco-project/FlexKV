@@ -164,15 +164,17 @@ class CacheEngineAccel:
             
             if evict_block_num > 0:
                 target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
-                num_evicted = self.index.evict(target_blocks, evict_block_num)
+                evicted_block_hashes = torch.zeros(evict_block_num, dtype=torch.int64)
+                num_evicted = self.index.evict(target_blocks, evicted_block_hashes, evict_block_num)
                 if num_evicted != evict_block_num:
                     target_blocks.resize_(num_evicted)
+                    evicted_block_hashes.resize_(num_evicted)
                 target_blocks = target_blocks.numpy()
                 self.mempool.recycle_blocks(target_blocks)
 
                 if self.event_collector is not None:
                     self.event_collector.publish_removed(
-                        block_hashes=target_blocks,
+                        block_hashes=evicted_block_hashes.numpy(),
                         medium=DEVICE_TYPE[self.device_type]
                     )
             if protected_node is not None:
@@ -278,10 +280,10 @@ class CacheEngine:
                 int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
             )
             if evict_block_num > 0:
-                evicted_blocks = self.index.evict(evict_block_num)
+                evicted_blocks, evicted_block_hashes = self.index.evict(evict_block_num)
                 self.mempool.recycle_blocks(evicted_blocks)
                 if self.event_collector is not None:
-                    self.event_collector.publish_removed(block_hashes=evicted_blocks,
+                    self.event_collector.publish_removed(block_hashes=evicted_block_hashes,
                                                          medium=DEVICE_TYPE[self.device_type])
             if protected_node is not None:
                 self.index.unlock(protected_node)
