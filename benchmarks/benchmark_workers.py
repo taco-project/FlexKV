@@ -30,6 +30,7 @@ class BenchmarkConfig:
     benchmark_round: int = 10
     bidirectional: bool = False
     gpu_layout_type: int = 0
+    enable_compression: bool = False
 
 def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]:
     config_file = args.config
@@ -49,7 +50,8 @@ def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]
             warmup_round=args.warmup_round,
             benchmark_round=args.benchmark_round,
             bidirectional=args.bi,
-            gpu_layout_type=args.gpu_layout_type
+            gpu_layout_type=args.gpu_layout_type,
+            enable_compression=args.enable_compression
         )
         cache_config.num_ssd_blocks = max(cache_config.num_ssd_blocks, bench_config.num_blocks_to_transfer)
         return model_config, cache_config, bench_config
@@ -60,7 +62,8 @@ def create_cpu_gpu_worker(
                   model_config: ModelConfig,
                   cache_config: CacheConfig,
                   num_gpu_blocks: int,
-                  gpu_layout_type: int = 0) -> Tuple[WorkerHandle, mp.Queue]:
+                  gpu_layout_type: int = 0,
+                  enable_compression: bool = False) -> Tuple[WorkerHandle, mp.Queue]:
     mp.set_start_method('spawn', force=True)
     cpu_layout = KVCacheLayout(
         type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
@@ -132,6 +135,7 @@ def create_cpu_gpu_worker(
             use_ce_transfer_d2h=False,
             transfer_sms_h2d=8,
             transfer_sms_d2h=8,
+            enable_compression=enable_compression,
         )
     else:
         worker_handle = tpGPUCPUTransferWorker.create_worker(
@@ -346,8 +350,9 @@ def bench_worker(args):
     bidirectional = bench_config.bidirectional
     gpu_layout_type = bench_config.gpu_layout_type
 
+    enable_compression = bench_config.enable_compression
     if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
-        worker_handle, finished_ops_queue = create_cpu_gpu_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type)
+        worker_handle, finished_ops_queue = create_cpu_gpu_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type, enable_compression)
     elif transfer_type == TransferType.H2DISK or transfer_type == TransferType.DISK2H:
         worker_handle, finished_ops_queue = create_cpu_ssd_worker(model_config, cache_config)
     elif transfer_type == TransferType.DISK2D or transfer_type == TransferType.D2DISK:
@@ -362,7 +367,7 @@ def bench_worker(args):
     if bidirectional:
         if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
             reverse_worker_handle, reverse_finished_ops_queue = \
-                create_cpu_gpu_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type)
+                create_cpu_gpu_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type, enable_compression)
         elif transfer_type == TransferType.H2DISK or transfer_type == TransferType.DISK2H:
             reverse_worker_handle, reverse_finished_ops_queue = \
                 create_cpu_ssd_worker(model_config, cache_config)
@@ -406,6 +411,17 @@ def bench_worker(args):
             successors=[],
             predecessors=[],
         )
+    # For H2D with compression, need to first do D2H to prepare compressed data on CPU
+    if transfer_type == TransferType.H2D and enable_compression:
+        print("Preparing compressed data on CPU via D2H...")
+        tmp_op = copy.deepcopy(transfer_op)
+        tmp_op.transfer_type = TransferType.D2H
+        tmp_op.src_block_ids = transfer_op.dst_block_ids  # GPU blocks
+        tmp_op.dst_block_ids = transfer_op.src_block_ids  # CPU blocks
+        launch_transfer(worker_handle, finished_ops_queue, tmp_op)
+        sync_all(finished_ops_queue, 1)
+        print("Compressed data prepared.")
+    
     if transfer_type == TransferType.DISK2H or transfer_type == TransferType.H2DISK:
         tmp_op = copy.deepcopy(transfer_op)
         tmp_op.transfer_type = TransferType.H2DISK
@@ -486,6 +502,9 @@ def parse_args():
                         default=0,
                         choices=[0, 1, 2],
                         help="GPU KV cache layout type")
+    parser.add_argument("--enable-compression",
+                        action="store_true",
+                        help="Enable nvCOMP LZ4 compression for transfer")
     return parser.parse_args()
 
 if __name__ == "__main__":

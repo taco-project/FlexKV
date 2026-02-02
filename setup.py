@@ -1,11 +1,16 @@
 import os
 import shutil
 import sys
+import sysconfig
+import subprocess
+import glob as glob_module
 
 
 from setuptools import find_packages, setup
 from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
+import torch
+from torch.utils.cpp_extension import CUDA_HOME
 
 def get_version():
     with open(os.path.join(os.path.dirname(__file__), "VERSION")) as f:
@@ -41,9 +46,29 @@ hpp_sources = [
     "csrc/layerwise.h",
 ]
 
+# nvCOMP paths for compression support
+nvcomp_root = os.environ.get("NVCOMP_ROOT", os.path.abspath("../cuda_test/nvcomp/nvcomp"))
+nvcomp_include = os.path.join(nvcomp_root, "include")
+nvcomp_lib = os.path.join(nvcomp_root, "lib")
+
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
+# Add nvCOMP library if available - link the full static library for device code
+if os.path.exists(nvcomp_lib):
+    nvcomp_device_static = os.path.join(nvcomp_lib, "libnvcomp_device_static.a")
+    extra_link_args.extend([
+        f"-L{nvcomp_lib}",
+        "-lnvcomp",
+        "-Wl,--whole-archive",
+        nvcomp_device_static,  # Link static library directly for device code
+        "-Wl,--no-whole-archive",
+        f"-Wl,-rpath,{nvcomp_lib}"
+    ])
+
 extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
+# Add nvCOMP include if available
+if os.path.exists(nvcomp_include):
+    include_dirs.append(nvcomp_include)
 
 # Add rpath to find libraries at runtime
 lib_dir = os.path.join(build_dir, "lib")
@@ -59,7 +84,12 @@ if enable_cfs:
     extra_link_args.append("-lhifs_client_sdk")
     extra_compile_args.append("-DFLEXKV_ENABLE_CFS")
 
-nvcc_compile_args = ["-O3"]
+nvcc_compile_args = ["-O3", "-Xcompiler", "-fPIC"]
+# Enable relocatable device code for nvCOMP device API linking
+enable_rdc = os.path.exists(nvcomp_lib)
+print(f"enable_rdc: {enable_rdc}; nvcomp_lib: {nvcomp_lib}")
+if enable_rdc:
+    nvcc_compile_args.extend(["-rdc=true", "--extended-lambda"])
 if enable_gds:
     print("ENABLE_GDS = true: Compiling and linking gds related content")
     cpp_sources.extend([
@@ -126,6 +156,203 @@ class CustomBuildExt(cpp_extension.BuildExtension):
         super().run()
         # Copy required shared libraries to the package directory after building
         self.copy_shared_libraries()
+
+    def build_extension(self, ext):
+        """Override to handle RDC device linking for nvCOMP"""
+        if not enable_rdc:
+            return super().build_extension(ext)
+        
+        # Find all .cu sources
+        cu_sources = [s for s in ext.sources if s.endswith('.cu')]
+        other_sources = [s for s in ext.sources if not s.endswith('.cu')]
+        
+        if not cu_sources:
+            return super().build_extension(ext)
+        
+        print(f"=== nvCOMP RDC build: performing device linking for {len(cu_sources)} CUDA files ===")
+        
+        # Get build directories
+        build_temp = self.build_temp
+        os.makedirs(build_temp, exist_ok=True)
+        
+        # Get nvcc path
+        nvcc = os.path.join(CUDA_HOME, 'bin', 'nvcc')
+        
+        # Get CUDA architecture from torch
+        cuda_arch = self._get_cuda_arch()
+        
+        # Compile .cu files to .o with RDC
+        cu_objects = []
+        for cu_src in cu_sources:
+            obj_name = os.path.splitext(os.path.basename(cu_src))[0] + '.o'
+            obj_path = os.path.join(build_temp, obj_name)
+            
+            compile_cmd = [
+                nvcc, '-c', cu_src, '-o', obj_path,
+                '-Xcompiler', '-fPIC',
+                '-rdc=true',
+                '--extended-lambda',
+                '-O3',
+                '-std=c++17',
+            ]
+            # Add architecture flags
+            for arch in cuda_arch:
+                compile_cmd.extend(['-gencode', arch])
+            # Add include directories
+            for inc_dir in ext.include_dirs:
+                compile_cmd.extend(['-I', inc_dir])
+            # Add Python include directory
+            python_include = sysconfig.get_path('include')
+            compile_cmd.extend(['-I', python_include])
+            # Add torch include directories
+            import torch
+            for path in torch.utils.cpp_extension.include_paths():
+                compile_cmd.extend(['-I', path])
+            
+            print(f"Compiling {cu_src} -> {obj_path}")
+            subprocess.check_call(compile_cmd)
+            cu_objects.append(obj_path)
+        
+        # Perform device linking (required for RDC)
+        dlink_obj = os.path.join(build_temp, 'dlink.o')
+        dlink_cmd = [
+            nvcc, '-dlink',
+            '-Xcompiler', '-fPIC',
+            '-o', dlink_obj,
+        ]
+        for arch in cuda_arch:
+            dlink_cmd.extend(['-gencode', arch])
+        dlink_cmd.extend(cu_objects)
+        # Include nvCOMP device static library in device linking
+        if os.path.exists(nvcomp_lib):
+            nvcomp_device_static = os.path.join(nvcomp_lib, "libnvcomp_device_static.a")
+            if os.path.exists(nvcomp_device_static):
+                dlink_cmd.append(nvcomp_device_static)
+        dlink_cmd.extend(['-lcudadevrt'])
+        
+        print(f"Device linking -> {dlink_obj}")
+        subprocess.check_call(dlink_cmd)
+        cu_objects.append(dlink_obj)
+        
+        # Compile C++ sources manually
+        print(f"=== Compiling {len(other_sources)} C++ files ===")
+        cpp_objects = []
+        # Use g++ for C++ files, not gcc
+        cpp_compiler = 'g++'
+        
+        cpp_dir = os.path.join(build_temp, 'csrc')
+        os.makedirs(cpp_dir, exist_ok=True)
+        
+        # Get include paths
+        inc_paths = []
+        for inc_dir in ext.include_dirs:
+            inc_paths.extend(['-I', inc_dir])
+        import torch
+        for path in torch.utils.cpp_extension.include_paths():
+            inc_paths.extend(['-I', path])
+        inc_paths.extend(['-I', sysconfig.get_path('include')])
+        
+        for cpp_src in other_sources:
+            obj_name = os.path.splitext(os.path.basename(cpp_src))[0] + '.o'
+            obj_path = os.path.join(cpp_dir, obj_name)
+            
+            compile_cmd = [
+                cpp_compiler, '-c', cpp_src, '-o', obj_path,
+                '-fPIC', '-O2', '-std=c++17',
+                '-DNDEBUG',
+                '-DTORCH_API_INCLUDE_EXTENSION_H',
+                '-DTORCH_EXTENSION_NAME=c_ext',
+                '-D_GLIBCXX_USE_CXX11_ABI=0',  # Match PyTorch's ABI
+            ]
+            compile_cmd.extend(inc_paths)
+            
+            print(f"Compiling {cpp_src} -> {obj_path}")
+            subprocess.check_call(compile_cmd)
+            cpp_objects.append(obj_path)
+        
+        # Now we do the final linking with nvcc to handle the non-PIC static library
+        ext_fullpath = self.get_ext_fullpath(ext.name)
+        os.makedirs(os.path.dirname(ext_fullpath), exist_ok=True)
+        
+        print(f"=== Final linking with nvcc for nvCOMP support ===")
+        
+        # Collect all object files
+        all_objects = cu_objects + cpp_objects
+        
+        # Build final shared library with nvcc
+        final_link_cmd = [
+            nvcc, '-shared',
+            '-Xcompiler', '-fPIC',
+            '-o', ext_fullpath,
+        ]
+        # Add architecture flags
+        for arch in cuda_arch:
+            final_link_cmd.extend(['-gencode', arch])
+        # Add all object files
+        final_link_cmd.extend(all_objects)
+        # Add nvCOMP device static library (nvcc can handle non-PIC)
+        if os.path.exists(nvcomp_lib):
+            nvcomp_device_static = os.path.join(nvcomp_lib, "libnvcomp_device_static.a")
+            if os.path.exists(nvcomp_device_static):
+                final_link_cmd.extend(['-Xlinker', '--whole-archive', nvcomp_device_static, '-Xlinker', '--no-whole-archive'])
+        # Add library paths
+        final_link_cmd.extend(['-L' + d for d in ext.library_dirs])
+        final_link_cmd.extend([f'-L{nvcomp_lib}'])
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), 'lib')
+        final_link_cmd.extend([f'-L{torch_lib}'])
+        cuda_lib = os.path.join(CUDA_HOME, 'lib64')
+        final_link_cmd.extend([f'-L{cuda_lib}'])
+        # Add build lib directory for xxhash
+        final_link_cmd.extend([f'-L{build_dir}/lib'])
+        # Add libraries
+        final_link_cmd.extend([
+            '-lnvcomp', '-lcudadevrt', '-lcudart',
+            '-lc10', '-ltorch', '-ltorch_cpu', '-ltorch_python', '-lc10_cuda', '-ltorch_cuda',
+            '-lcuda', '-lxxhash', '-lpthread', '-lrt', '-luring',
+        ])
+        # Add rpath
+        final_link_cmd.extend([
+            f'-Xlinker,-rpath,{nvcomp_lib}',
+            f'-Xlinker,-rpath,{torch_lib}',
+            f'-Xlinker,-rpath,{build_dir}/lib',
+            '-Xlinker,-rpath,$ORIGIN',
+            '-Xlinker,-rpath,$ORIGIN/../lib',
+        ])
+        
+        print(f"Final link: {ext_fullpath}")
+        subprocess.check_call(final_link_cmd)
+    
+    def _get_cuda_arch(self):
+        """Get CUDA architecture flags from torch or detect from current GPU"""
+        # Try to get from environment
+        cuda_arch_list = os.environ.get('TORCH_CUDA_ARCH_LIST', '')
+        if cuda_arch_list:
+            archs = []
+            for arch in cuda_arch_list.replace(' ', '').split(';'):
+                arch = arch.replace('.', '')
+                if '+PTX' in arch:
+                    arch = arch.replace('+PTX', '')
+                    archs.append(f'arch=compute_{arch},code=sm_{arch}')
+                    archs.append(f'arch=compute_{arch},code=compute_{arch}')
+                else:
+                    archs.append(f'arch=compute_{arch},code=sm_{arch}')
+            return archs
+        
+        # Default: detect from current GPU or use common architectures
+        try:
+            import torch
+            if torch.cuda.is_available():
+                major, minor = torch.cuda.get_device_capability()
+                arch = f'{major}{minor}'
+                return [f'arch=compute_{arch},code=sm_{arch}']
+        except:
+            pass
+        
+        # Fallback to common architectures (Ampere + Hopper)
+        return [
+            'arch=compute_80,code=sm_80',
+            'arch=compute_90,code=sm_90',
+        ]
 
     def copy_shared_libraries(self):
         """Copy shared libraries to the package lib directory"""

@@ -16,7 +16,7 @@ import torch
 
 from flexkv import c_ext
 
-from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
+from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup, get_compress_tmp_buffer_size
 
 # GDS imports are optional (only available when compiled with FLEXKV_ENABLE_GDS=1)
 try:
@@ -262,7 +262,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_sms_h2d: int = 8,
-                 transfer_sms_d2h: int = 8) -> None:
+                 transfer_sms_d2h: int = 8,
+                 enable_compression: bool = False) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         # Register CPU tensors with CUDA
@@ -306,6 +307,19 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.transfer_sms_d2h = transfer_sms_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
+        
+        # Compression support
+        self.enable_compression = enable_compression
+        self.compress_tmp_buffer = None
+        self.compress_tmp_buffer_ptr = 0
+        if enable_compression:
+            # Calculate number of warps: block_size=1024, so warps_per_block=32
+            # Use transfer_sms as grid size
+            num_warps = max(transfer_sms_h2d, transfer_sms_d2h) * 32
+            buffer_size = get_compress_tmp_buffer_size(num_warps)
+            self.compress_tmp_buffer = torch.empty(buffer_size, dtype=torch.uint8, device='cuda')
+            self.compress_tmp_buffer_ptr = self.compress_tmp_buffer.data_ptr()
+            flexkv_logger.info(f"Compression enabled, tmp buffer size: {buffer_size / 1024:.2f} KB")
 
     def _transfer_impl(
         self,
@@ -359,6 +373,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             use_ce_transfer,
             self.is_mla,
             self.gpu_block_type_,
+            sync=True,
+            enable_compression=self.enable_compression,
+            compress_tmp_buffer_ptr=self.compress_tmp_buffer_ptr,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:

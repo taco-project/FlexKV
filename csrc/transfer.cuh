@@ -21,6 +21,12 @@
 
 namespace flexkv {
 
+// Maximum uncompressed chunk size for nvCOMP LZ4
+constexpr size_t MAX_UNCOMP_CHUNK_SIZE = 64 * 1024;
+
+// Header size for compressed data
+constexpr size_t COMPRESS_HEADER_SIZE = sizeof(uint32_t);
+
 // Template function for transfer, specialized for each backend type
 template <BackendType Type>
 void transfer_kv_blocks(
@@ -31,6 +37,11 @@ void transfer_kv_blocks(
     int64_t cpu_block_stride_in_bytes, int64_t cpu_startoff_inside_chunks,
     int64_t chunk_size_in_bytes, cudaStream_t stream, int transfer_sms,
     bool is_host_to_device, bool use_ce_transfer, bool is_mla,
-    bool sync = true);
+    bool sync = true, bool enable_compression = false, 
+    void* compress_tmp_buffer = nullptr);
+
+// Helper function to get required temp buffer size for compression
+// num_warps = gridDim * (blockDim / 32)
+size_t get_compress_tmp_buffer_size(int num_warps);
 
 } // namespace flexkv

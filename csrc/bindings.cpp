@@ -33,7 +33,8 @@ void transfer_kv_blocks_binding(
     int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_block_stride_in_bytes, int64_t chunk_size_in_bytes,
     int start_layer_id, int num_layers, int transfer_sms = -1, bool is_host_to_device = true,
-    bool use_ce_transfer = false, bool is_mla = false, int gpu_block_type = 0, bool sync = true) {
+    bool use_ce_transfer = false, bool is_mla = false, int gpu_block_type = 0, bool sync = true,
+    bool enable_compression = false, int64_t compress_tmp_buffer_ptr = 0) {
   int num_blocks = gpu_block_id_tensor.numel();
 
   int64_t *gpu_block_ids =
@@ -43,6 +44,7 @@ void transfer_kv_blocks_binding(
   int64_t *cpu_block_ids =
       static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
   void *cpu_ptr = static_cast<void *>(cpu_tensor.data_ptr());
+  void *compress_tmp_buffer = reinterpret_cast<void*>(compress_tmp_buffer_ptr);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   
@@ -75,21 +77,24 @@ void transfer_kv_blocks_binding(
           num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
           cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
-          is_host_to_device, use_ce_transfer, is_mla, sync);
+          is_host_to_device, use_ce_transfer, is_mla, sync,
+          enable_compression, compress_tmp_buffer);
       break;
     case flexkv::BackendType::TRTLLM:
       flexkv::transfer_kv_blocks<flexkv::BackendType::TRTLLM>(
           num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
           cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
-          is_host_to_device, use_ce_transfer, is_mla, sync);
+          is_host_to_device, use_ce_transfer, is_mla, sync,
+          enable_compression, compress_tmp_buffer);
       break;
     case flexkv::BackendType::SGLANG:
       flexkv::transfer_kv_blocks<flexkv::BackendType::SGLANG>(
           num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
           cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
-          is_host_to_device, use_ce_transfer, is_mla, sync);
+          is_host_to_device, use_ce_transfer, is_mla, sync,
+          enable_compression, compress_tmp_buffer);
       break;
   }
   
@@ -97,6 +102,11 @@ void transfer_kv_blocks_binding(
   if (err != cudaSuccess) {
     throw std::runtime_error(cudaGetErrorString(err));
   }
+}
+
+// Helper to get compress temp buffer size
+int64_t get_compress_tmp_buffer_size_binding(int num_warps) {
+  return static_cast<int64_t>(flexkv::get_compress_tmp_buffer_size(num_warps));
 }
 
 void transfer_kv_blocks_ssd_binding(
@@ -352,7 +362,11 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("chunk_size_in_bytes"), py::arg("start_layer_id"),
         py::arg("num_layers"), py::arg("transfer_sms") = -1,
         py::arg("is_host_to_device") = true, py::arg("use_ce_transfer") = false,
-        py::arg("is_mla") = false, py::arg("gpu_block_type") = 0, py::arg("sync") = true);
+        py::arg("is_mla") = false, py::arg("gpu_block_type") = 0, py::arg("sync") = true,
+        py::arg("enable_compression") = false, py::arg("compress_tmp_buffer_ptr") = 0);
+  m.def("get_compress_tmp_buffer_size", &get_compress_tmp_buffer_size_binding,
+        "Get required temp buffer size for compression",
+        py::arg("num_warps"));
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory",
         py::arg("ioctx"), py::arg("cpu_layer_id_list"),
