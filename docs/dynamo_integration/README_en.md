@@ -119,7 +119,8 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
 done
 ```
 
-> [!NOTE] You can configure FlexKV using YAML or JSON files. The above configuration is provided as a simple example only. For full parameter options, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md)
+> [!NOTE]
+> You can configure FlexKV using YAML or JSON files. The above configuration is provided as a simple example only. For full parameter options, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md)
 
 ### Verification
 

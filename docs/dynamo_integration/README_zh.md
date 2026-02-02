@@ -119,7 +119,8 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
 done
 ```
 
-> [!NOTE] 可使用 YAML 或 JSON 文件配置，上述配置仅为简单示例，更多选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
+> [!NOTE]
+> 可使用 YAML 或 JSON 文件配置，上述配置仅为简单示例，更多选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
 
 ### 验证
 
