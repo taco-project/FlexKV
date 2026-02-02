@@ -30,6 +30,7 @@
 #include "dist/block_meta.h"
 #include "dist/distributed_radix_tree.h"
 #include "dist/lease_meta_mempool.h"
+#include "layerwise.h"
 #include "dist/local_radix_tree.h"
 #include "dist/lock_free_q.h"
 #include "dist/redis_meta_channel.h"

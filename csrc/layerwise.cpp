@@ -142,6 +142,12 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
 
   dp_group_id_ = dp_group_id;
 
+  // Get GPU device IDs from tensors (like tp_transfer_thread_group.cpp)
+  gpu_device_ids_.resize(num_gpus_);
+  for (int i = 0; i < num_gpus_; ++i) {
+    gpu_device_ids_[i] = gpu_blocks[i][0].device().index();
+  }
+
   // Create CUDA streams for each GPU
   streams_.resize(num_gpus_);
   events_.resize(num_gpus_);
@@ -151,7 +157,7 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
   cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority);
   
   for (int i = 0; i < num_gpus_; i++) {
-    cudaSetDevice(dp_group_id * num_gpus_ + i);
+    cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamCreateWithPriority(&streams_[i], cudaStreamNonBlocking, greatestPriority);
     cudaEventCreate(&events_[i]);
   }
@@ -166,7 +172,7 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
 
 LayerwiseTransferGroup::~LayerwiseTransferGroup() {
   for (int i = 0; i < num_gpus_; i++) {
-    cudaSetDevice(dp_group_id_ * num_gpus_ + i);
+    cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamDestroy(streams_[i]);
     cudaEventDestroy(events_[i]);
   }
@@ -240,7 +246,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
   std::vector<int> batch_start_layers(num_batches);
   std::vector<int> batch_layers_count(num_batches);
   
-  cudaSetDevice(dp_group_id_ * num_gpus_);
+  cudaSetDevice(gpu_device_ids_[0]);
   for (int i = 0; i <= num_batches; ++i) {
     cudaEventCreate(&timing_events[i]);
   }
@@ -311,8 +317,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
     // or by previous batch's callback for subsequent batches)
     
     for (int i = 0; i < num_gpus_; ++i) {
-      // TODO: support multi-instance
-      cudaSetDevice(dp_group_id_ * num_gpus_ + i);
+      cudaSetDevice(gpu_device_ids_[i]);
       int64_t cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i];
       if (is_mla) {
         cpu_startoff_inside_chunks = 0;
@@ -349,7 +354,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
     }
 
     // Record event after this batch on GPU 0
-    cudaSetDevice(dp_group_id_ * num_gpus_);
+    cudaSetDevice(gpu_device_ids_[0]);
     cudaEventRecord(timing_events[batch_idx + 1], streams_[0]);
 
     // NVTX: current range ends in callback, next range starts in callback
@@ -407,7 +412,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
   // fflush(stderr);
 
   // Cleanup timing events
-  cudaSetDevice(dp_group_id_ * num_gpus_);
+  cudaSetDevice(gpu_device_ids_[0]);
   for (int i = 0; i <= num_batches; ++i) {
     cudaEventDestroy(timing_events[i]);
   }

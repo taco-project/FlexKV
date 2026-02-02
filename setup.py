@@ -34,7 +34,7 @@ cpp_sources = [
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
-    "csrc/layerwise.cpp"
+    "csrc/layerwise.cpp",
     "csrc/monitoring/metrics_manager.cpp",  # Monitoring support
 ]
 
