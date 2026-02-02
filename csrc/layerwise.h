@@ -66,6 +66,7 @@ private:
   BackendType backend_type_;
   std::vector<GTensorHandler> gpu_tensor_handlers_;
 
+  std::vector<int> gpu_device_ids_;
   std::vector<cudaStream_t> streams_;
   std::vector<cudaEvent_t> events_;
 

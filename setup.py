@@ -30,7 +30,7 @@ cpp_sources = [
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
-    "csrc/layerwise.cpp"
+    "csrc/layerwise.cpp",
     "csrc/dist/distributed_radix_tree.cpp",
     "csrc/dist/local_radix_tree.cpp",
     "csrc/dist/redis_meta_channel.cpp",

@@ -117,7 +117,7 @@ class TransferEngine:
 
         # Create shutdown pipe for zero-latency selector
         self.shutdown_read_fd, self.shutdown_write_fd = os.pipe()
-        self.gpu_handles = gpu_handles
+        self.gpu_handle_groups = gpu_handles  # dp_client_id -> list of GPU handles for that TP group
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
@@ -128,9 +128,9 @@ class TransferEngine:
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
 
-        self.dp_size = model_config.dp_size
+        # self.dp_size = model_config.dp_size
         self.tp_size = model_config.tp_size
-        self.num_gpu_groups = len(self.gpu_handles)
+        self.num_gpu_groups = len(self.gpu_handle_groups)
         self._running = False
 
     def _init_workers(self) -> None:
@@ -158,7 +158,7 @@ class TransferEngine:
                     transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
                     transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
                 )
-                for _, gpu_handles in self.gpu_handles.items()
+                for _, gpu_handles in self.gpu_handle_groups.items()
             ]
         else:
             self.gpucpu_workers = [
@@ -178,7 +178,7 @@ class TransferEngine:
                     transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
                     transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
                 )
-                for dp_client_id, gpu_handles in self.gpu_handles.items()
+                for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
             ]
         self._worker_map[TransferType.H2D] = self.gpucpu_workers
         self._worker_map[TransferType.D2H] = self.gpucpu_workers
@@ -251,7 +251,7 @@ class TransferEngine:
                         dtype=self._ssd_handle.dtype,
                         gpu_device_id=gpu_handles[0].gpu_device_id,
                     )
-                    for _, gpu_handles in self.gpu_handles.items()
+                    for _, gpu_handles in self.gpu_handle_groups.items()
                 ]
             else:
                 self.gds_workers = [
@@ -268,7 +268,7 @@ class TransferEngine:
                         tp_group_size=self.tp_size,
                         dp_group_id=dp_client_id,
                     )
-                    for dp_client_id, gpu_handles in self.gpu_handles.items()
+                    for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
                 ]
             self._worker_map[TransferType.DISK2D] = self.gds_workers
             self._worker_map[TransferType.D2DISK] = self.gds_workers
@@ -281,24 +281,22 @@ class TransferEngine:
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
-                                for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                    gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
                     cpu_blocks=self._cpu_handle.get_tensor(),
                     ssd_files=ssd_files,
-                    gpu_kv_layouts=[self.gpu_handles[i].kv_layout \
-                                for i in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                    gpu_kv_layouts=[handle.kv_layout for handle in gpu_handles],
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     ssd_kv_layout=ssd_kv_layout,
-                    dtype=self.gpu_handles[i].dtype,
+                    dtype=gpu_handles[0].dtype,
                     tp_group_size=self.tp_size,
-                    dp_group_id=i,
+                    dp_group_id=dp_client_id,
                     num_blocks_per_file=num_blocks_per_file,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
                     transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
                 )
-                for i in range(self.dp_size)
+                for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
             ]
             self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
             

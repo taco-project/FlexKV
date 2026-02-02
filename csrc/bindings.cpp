@@ -30,6 +30,7 @@
 #include "dist/block_meta.h"
 #include "dist/lock_free_q.h"
 #include "dist/lease_meta_mempool.h"
+#include "layerwise.h"
 #include <deque>
 
 namespace py = pybind11;
