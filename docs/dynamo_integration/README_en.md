@@ -6,12 +6,29 @@ Dynamo is a framework designed by NVIDIA for large-scale distributed deployment,
 
 ## 1. Environment Setup
 
-### Dynamo Image
+### Install vLLM
 
-We use Dynamo 0.4.1 image with vLLM backend, which includes vLLM 0.10.1.1.
+Refer to vLLM adaptation [README](../vllm_adapter/README_en.md).
+
+### Install Dynamo
 
 ```bash
-docker pull nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.4.1
+# 1. Clone Dynamo repo
+git clone https://github.com/ai-dynamo/dynamo.git
+
+# 2. Apply PR #5858
+gh pr checkout 5858 # Make sure GitHub CLI is installed first
+
+# 3. Install NIXL
+uv pip install 'nixl[cu12]' # Or 'nixl[cu13]'
+
+# 4. Install Dynamo
+cd $DYNAMO_WORKSPACE/lib/bindings/python
+maturin develop --uv
+cd ../../..
+uv pip install -e . # No need to specify backend as vLLM is already installed
+
+# 5. Install nats-server and etcd
 ```
 
 ### FlexKV Code Preparation
@@ -28,66 +45,46 @@ apt update && apt install liburing-dev
 cd FlexKV && ./build.sh
 ```
 
-### vLLM Apply Patch
-
-```bash
-# Navigate to vLLM directory
-cd /opt/vllm
-# apply patch
-git apply /your/path/to/FlexKV/examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
-```
+- Refer to GPUDirect Storage (GDS) [README](../gds/README_en.md) to enable GDS.
+- Refer to KV cache reuse [README](../dist_reuse/README_en.md) to enable KV cache sharing between peer nodes in a distributed setup.
 
 ### FlexKV Verification
 
 Please refer to the test scripts in [vLLM online serving](../../docs/vllm_adapter/README_zh.md#%E7%A4%BA%E4%BE%8B).
 
-## 2. Dynamo Modifications
-
-### kv_transfer_config
-
-To integrate with FlexKV, you need to modify the kv_transfer_config in the Dynamo image. Change lines 245-248 in /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/vllm/args.py to:
-
-```python
-kv_transfer_config = KVTransferConfig(
-    kv_connector="FlexKVConnectorV1", kv_role="kv_both"
-)
-logger.info("Using FlexKVConnectorV1 configuration")
-```
-
-### CPU Offloading
-
-In Dynamo, the KV router updates its KV index by receiving events sent from workers, allowing it to track the KV cache status on each worker. When CPU offloading is enabled in FlexKV, we remove [BlockRemove](https://github.com/vllm-project/vllm/blob/v0.10.1.1/vllm/v1/core/block_pool.py#L221) in vLLM, allowing FlexKV to cache all KV blocks through CPU during the serving process. This ensures that the index maintained by the KV router accurately reflects the actual index in FlexKV.
-
-## 3. Starting and Verifying Dynamo Services
+## 2. Starting and Verifying Dynamo Services
 
 ### Starting Dynamo + FlexKV
 
+The following example starts 4 Dynamo vLLM workers on an 8-GPU compute node with KV router enabled.
+
 ```bash
-#!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-set -e
-trap 'echo Cleaning up...; kill 0' EXIT
+# Start NATS with JetStream
+nats-server -js -a 127.0.0.1 -p 4222 --store_dir $NATS_DIR &
 
-# Start nats and etcd
-nats-server -js &
-
-etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://0.0.0.0:2379 --data-dir /tmp/etcd &
+# Start etcd
+etcd --data-dir /tmp/etcd \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls http://YOUR_IP:2379 & # YOUR_IP is the IP address of this node.
 
 sleep 3
 
-# run ingress, set routing mode with --router-mode, options include kv, round-robin, random
-python -m dynamo.frontend --router-mode kv --http-port 8000 &
+export NATS_SERVER="nats://127.0.0.1:4222"
+export ETCD_ENDPOINTS="http://127.0.0.1:2379"
+
+# Start Dynamo frontend
+python -m dynamo.frontend --router-mode kv &
 
 # Define number of worker nodes
 NUM_WORKERS=4
 
+# Enable collecting KV events in FlexKV
+export DYNAMO_USE_FLEXKV=1
 # Configure FlexKV using environment variables, disabling config file
 unset FLEXKV_CONFIG_PATH
 # Adjust CPU and SSD space sizes according to your server configuration
 export FLEXKV_CPU_CACHE_GB=32
 export FLEXKV_SSD_CACHE_GB=128
-export FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/"
 # Use a loop to start worker nodes
 for i in $(seq 0 $((NUM_WORKERS-1))); do
     # Calculate GPU device IDs
@@ -97,21 +94,42 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
     if [ $i -lt $((NUM_WORKERS-1)) ]; then
         # When using multiple workers, ensure FlexKV ports are different to avoid hanging at flexkv init
         # Set FlexKV port via the `FLEXKV_SERVER_RECV_PORT` environment variable
-        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310 &
+        FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/worker_${i}" \
+        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" \
+        KV_ENDPOINT="tcp://*:2008${i}" \
+        KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")" \
+        CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} \
+        python3 -m dynamo.vllm \
+        --model $YOUR_MODEL \
+        --tensor-parallel-size 2 \
+        --connector flexkv \
+        --kv-events-config "$KV_EVENTS_CONFIG" &
     else
-        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310
+        FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/worker_${i}" \
+        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" \
+        KV_ENDPOINT="tcp://*:2008${i}" \
+        KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")" \
+        CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} 
+        python3 -m dynamo.vllm \
+        --model $YOUR_MODEL \
+        --tensor-parallel-size 2 \
+        --connector flexkv \
+        --kv-events-config "$KV_EVENTS_CONFIG"
     fi
 done
 ```
 
-> Note: You can configure using YAML or JSON files. The above configuration is provided as a simple example only. For full parameter options, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md)
+> [!NOTE] You can configure FlexKV using YAML or JSON files. The above configuration is provided as a simple example only. For full parameter options, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md)
 
 ### Verification
 
 You can verify that the Dynamo service has started correctly with the following command:
+
 ```bash
-curl localhost:8000/v1/chat/completions   -H "Content-Type: application/json"   -d '{
-    "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+curl localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": YOUR MODEL,
     "messages": [
     {
         "role": "user",
@@ -125,12 +143,21 @@ curl localhost:8000/v1/chat/completions   -H "Content-Type: application/json"   
 
 ## 4. Benchmark
 
-We use [genai-perf](https://github.com/triton-inference-server/perf_analyzer/tree/main/genai-perf) as our benchmark tool and [mooncake trace](https://github.com/kvcache-ai/Mooncake?tab=readme-ov-file#-open-source-trace) as our dataset to evaluate the performance of Dynamo + FlexKV.
+We use [`aiperf`](https://github.com/ai-dynamo/aiperf) as our benchmarking tool and [mooncake trace](https://github.com/kvcache-ai/Mooncake?tab=readme-ov-file#-open-source-trace) as our dataset to evaluate the performance of Dynamo + FlexKV.
 
 Mooncake Trace is an open-source request file saved in jsonl format. It records timestamps of request arrivals, ISL, OSL, and KV cache-related hash IDs, containing 23,608 requests over a 1-hour period. For our experiment with 4 LLaMA-70B workers, the concurrency in the mooncake trace was too high, so we sampled every 6th request from the trace to build our benchmark dataset.
 
-genai-perf can send requests according to the timestamps in the trace file and calculate metrics such as TTFT (Time To First Token) and TPOT (Tokens Per Output Token) for the LLM service. The command is as follows. Please use genai-perf==0.0.13, as newer versions have a bug in timestamp parsing.
+`aiperf` can send requests according to the timestamps in the trace file and calculate metrics such as TTFT (Time To First Token) and TPOT (Tokens Per Output Token) for the LLM service. The command is as follows.
 
 ```bash
-genai-perf profile   --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B  --tokenizer deepseek-ai/DeepSeek-R1-Distill-Llama-70B  --endpoint-type chat   --endpoint /v1/chat/completions --streaming  --url http://localhost:8000  --input-file payload:mooncake_trace_1_6.jsonl --random-seed 100  -v  -H 'Authorization: Bearer NOT USED'  -H 'Accept: text/event-stream'   -- --stability-percentage 99
+aiperf profile \
+  --model $YOUR_MODEL \
+  --tokenizer $YOUR_TOKENIZER \
+  --endpoint-type 'chat' \
+  --endpoint '/v1/chat/completions' \
+  --streaming \
+  --url http://localhost:8000 \
+  --input-file $YOUR_TRACE \
+  --random-seed 100 \
+  -H 'Authorization: Bearer NOT USED'
 ```
