@@ -330,8 +330,8 @@ class TransferEngine:
                     num_blocks_per_file=num_blocks_per_file,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
-                    transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
+                    h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.h2d_cta_num,
+                    d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.d2h_cta_num,
                 )
                 for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
             ]
