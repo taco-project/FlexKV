@@ -225,7 +225,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t cpu_kv_stride_in_bytes,
     const int64_t cpu_layer_stride_in_bytes,
     const int64_t cpu_block_stride_in_bytes,
-    const int64_t cpu_chunk_size_in_bytes, const int transfer_sms,
+    const int64_t cpu_chunk_size_in_bytes, const int transfer_cta_num,
     const bool use_ce_transfer, const int num_layers,
     const int layer_granularity, const bool is_mla,
     const int counter_id) {
@@ -332,7 +332,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
             cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_sms, true, use_ce_transfer, is_mla, false);
+            streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
         break;
       case BackendType::TRTLLM:
         flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
@@ -340,7 +340,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
             cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_sms, true, use_ce_transfer, is_mla, false);
+            streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
         break;
       case BackendType::SGLANG:
         flexkv::transfer_kv_blocks<BackendType::SGLANG>(
@@ -348,7 +348,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
             cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_sms, true, use_ce_transfer, is_mla, false);
+            streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
         break;
       }
     }

@@ -102,7 +102,7 @@ class FlexKVReplayEngine:
             
             # Restore other configs
             for key in ['server_client_mode', 'index_accel', 'use_ce_transfer_h2d', 'use_ce_transfer_d2h',
-                       'transfer_sms_h2d', 'transfer_sms_d2h', 'iouring_entries', 'iouring_flags',
+                       'h2d_cta_num', 'd2h_cta_num', 'iouring_entries', 'iouring_flags',
                        'max_file_size_gb', 'evict_ratio', 'server_recv_port']:
                 if key in global_config_data:
                     setattr(GLOBAL_CONFIG_FROM_ENV, key, global_config_data[key])

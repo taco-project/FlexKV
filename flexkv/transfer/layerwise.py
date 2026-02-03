@@ -67,8 +67,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  num_blocks_per_file: int,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
-                 transfer_sms_h2d: int = 8,
-                 transfer_sms_d2h: int = 8) -> None:
+                 h2d_cta_num: int = 4,
+                 d2h_cta_num: int = 4) -> None:
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size, f"len(gpu_blocks) = {len(gpu_blocks)}, tp_group_size = {tp_group_size}"
         imported_gpu_blocks = []
@@ -120,8 +120,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
-        self.transfer_sms_h2d = transfer_sms_h2d
-        self.transfer_sms_d2h = transfer_sms_d2h
+        self.h2d_cta_num = h2d_cta_num
+        self.d2h_cta_num = d2h_cta_num
 
         # initialize SSD storage
         self.enable_ssd = len(ssd_files) > 0
@@ -272,7 +272,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.cpu_chunk_size_in_bytes,
-            self.transfer_sms_h2d,
+            self.h2d_cta_num,
             self.use_ce_transfer_h2d,
             self.num_layers,
             layer_granularity,

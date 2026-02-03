@@ -97,8 +97,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     use_ce_transfer_h2d=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0))),
     use_ce_transfer_d2h=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0))),
-    transfer_sms_h2d=int(os.getenv('FLEXKV_TRANSFER_SMS_H2D', 8)),
-    transfer_sms_d2h=int(os.getenv('FLEXKV_TRANSFER_SMS_D2H', 8)),
+    h2d_cta_num=int(os.getenv('FLEXKV_H2D_CTA_NUM', 4)),
+    d2h_cta_num=int(os.getenv('FLEXKV_D2H_CTA_NUM', 4)),
 
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),

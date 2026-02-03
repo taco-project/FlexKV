@@ -96,8 +96,8 @@ Some configurations can only be set through environment variables.
 |---------------------|------|---------|-------------|
 | `FLEXKV_USE_CE_TRANSFER_H2D` | bool | 0 | Whether to use cudaMemcpyAsync for Host→Device transfers. Can avoid occupying SM, but transfer speed will be reduced |
 | `FLEXKV_USE_CE_TRANSFER_D2H` | bool | 0 | Whether to use cudaMemcpyAsync for Device→Host transfers. Can avoid occupying SM, but transfer speed will be reduced |
-| `FLEXKV_TRANSFER_SMS_H2D` | int | 8 | Number of streaming multiprocessors used for H2D transfer, only effective when `FLEXKV_USE_CE_TRANSFER_H2D` is 0 |
-| `FLEXKV_TRANSFER_SMS_D2H` | int | 8 | Number of streaming multiprocessors used for D2H transfer, only effective when `FLEXKV_USE_CE_TRANSFER_D2H` is 0 |
+| `FLEXKV_H2D_CTA_NUM` | int | 4 | Number of CTAs launched for H2D kernel, only effective when `FLEXKV_USE_CE_TRANSFER_H2D` is 0 |
+| `FLEXKV_D2H_CTA_NUM` | int | 4 | Number of CTAs launched for D2H kernel, only effective when `FLEXKV_USE_CE_TRANSFER_D2H` is 0 |
 
 ---
 

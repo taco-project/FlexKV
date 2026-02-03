@@ -153,7 +153,7 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_kv_stride_in_bytes,
     const int64_t cpu_layer_stride_in_bytes,
     const int64_t cpu_block_stride_in_bytes,
-    const int64_t cpu_tp_stride_in_bytes, const int transfer_sms,
+    const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
     const bool is_host_to_device, const bool use_ce_transfer,
     const int layer_id, const int layer_granularity, const bool is_mla) {
 
@@ -199,7 +199,7 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_sms, is_host_to_device, use_ce_transfer, is_mla
+              transfer_cta_num, is_host_to_device, use_ce_transfer, is_mla
             );
             break;
           case BackendType::TRTLLM:
@@ -209,7 +209,7 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_sms, is_host_to_device, use_ce_transfer, is_mla
+              transfer_cta_num, is_host_to_device, use_ce_transfer, is_mla
             );
             break;
           case BackendType::SGLANG:
@@ -219,7 +219,7 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_sms, is_host_to_device, use_ce_transfer, is_mla
+              transfer_cta_num, is_host_to_device, use_ce_transfer, is_mla
             );
             break;
         }

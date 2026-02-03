@@ -130,8 +130,8 @@ def create_cpu_gpu_worker(
             gpu_device_id=0,
             use_ce_transfer_h2d=False,
             use_ce_transfer_d2h=False,
-            transfer_sms_h2d=8,
-            transfer_sms_d2h=8,
+            h2d_cta_num=4,
+            d2h_cta_num=4,
         )
     else:
         worker_handle = tpGPUCPUTransferWorker.create_worker(
@@ -147,8 +147,8 @@ def create_cpu_gpu_worker(
             dp_group_id=0,
             use_ce_transfer_h2d=False,
             use_ce_transfer_d2h=False,
-            transfer_sms_h2d=8,
-            transfer_sms_d2h=8,
+            h2d_cta_num=4,
+            d2h_cta_num=4,
         )
     return (
         worker_handle,

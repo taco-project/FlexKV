@@ -282,8 +282,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  gpu_device_id: int,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
-                 transfer_sms_h2d: int = 8,
-                 transfer_sms_d2h: int = 8) -> None:
+                 h2d_cta_num: int = 4,
+                 d2h_cta_num: int = 4) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         # Register CPU tensors with CUDA
@@ -323,8 +323,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         if gpu_device_id != -1:
             torch.cuda.set_device(gpu_device_id)
         self.transfer_stream = torch.cuda.Stream()
-        self.transfer_sms_h2d = transfer_sms_h2d
-        self.transfer_sms_d2h = transfer_sms_d2h
+        self.h2d_cta_num = h2d_cta_num
+        self.d2h_cta_num = d2h_cta_num
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
@@ -345,12 +345,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             gpu_block_id_list = dst_block_ids
             cpu_block_id_list = src_block_ids
             use_ce_transfer = self.use_ce_transfer_h2d
-            transfer_sms = self.transfer_sms_h2d
+            transfer_cta_num = self.h2d_cta_num
         elif transfer_type == TransferType.D2H:
             gpu_block_id_list = src_block_ids
             cpu_block_id_list = dst_block_ids
             use_ce_transfer = self.use_ce_transfer_d2h
-            transfer_sms = self.transfer_sms_d2h
+            transfer_cta_num = self.d2h_cta_num
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for GPUCPUTransferWorker")
 
@@ -375,7 +375,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.chunk_size_in_bytes,
             layer_id,
             layer_granularity,
-            transfer_sms,
+            transfer_cta_num,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
             self.is_mla,
@@ -434,8 +434,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  dp_group_id: int,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
-                 transfer_sms_h2d: int = 8,
-                 transfer_sms_d2h: int = 8):
+                 h2d_cta_num: int = 4,
+                 d2h_cta_num: int = 4):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
@@ -480,8 +480,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
 
-        self.transfer_sms_h2d = transfer_sms_h2d
-        self.transfer_sms_d2h = transfer_sms_d2h
+        self.h2d_cta_num = h2d_cta_num
+        self.d2h_cta_num = d2h_cta_num
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
@@ -511,12 +511,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             gpu_block_id_list = dst_block_ids
             cpu_block_id_list = src_block_ids
             use_ce_transfer = self.use_ce_transfer_h2d
-            transfer_sms = self.transfer_sms_h2d
+            transfer_cta_num = self.h2d_cta_num
         elif transfer_type == TransferType.D2H:
             gpu_block_id_list = src_block_ids
             cpu_block_id_list = dst_block_ids
             use_ce_transfer = self.use_ce_transfer_d2h
-            transfer_sms = self.transfer_sms_d2h
+            transfer_cta_num = self.d2h_cta_num
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for tpGPUCPUTransferWorker")
 
@@ -533,7 +533,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.cpu_tp_stride_in_bytes,
-            transfer_sms,
+            transfer_cta_num,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
             layer_id,

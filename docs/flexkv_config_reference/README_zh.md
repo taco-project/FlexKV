@@ -94,8 +94,8 @@ enable_gds: false
 |--------|------|--------|------|
 | `FLEXKV_USE_CE_TRANSFER_H2D` | bool | 0 | 是否使用 cudaMemcpyAsync 实现 Host→Device 传输，可以避免占用 SM，但是传输速度会降低 |
 | `FLEXKV_USE_CE_TRANSFER_D2H` | bool | 0 |  是否使用 cudaMemcpyAsync 实现 Device→Host 传输，可以避免占用 SM，但是传输速度会降低 |
-| `FLEXKV_TRANSFER_SMS_H2D` | int | 8 | H2D 传输使用的流处理器数量，仅在`FLEXKV_USE_CE_TRANSFER_H2D`为0时生效 |
-| `FLEXKV_TRANSFER_SMS_D2H` | int | 8 | D2H 传输使用的流处理器数量，仅在`FLEXKV_USE_CE_TRANSFER_D2H`为0时生效 |
+| `FLEXKV_H2D_CTA_NUM` | int | 4 | H2D kernel启动的线程块数量，仅在`FLEXKV_USE_CE_TRANSFER_H2D`为0时生效 |
+| `FLEXKV_D2H_CTA_NUM` | int | 4 | D2H kernel启动的线程块数量，仅在`FLEXKV_USE_CE_TRANSFER_D2H`为0时生效 |
 
 ---
 

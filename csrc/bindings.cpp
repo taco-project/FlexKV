@@ -41,7 +41,7 @@ void transfer_kv_blocks_binding(
     torch::Tensor &cpu_block_id_tensor, torch::Tensor &cpu_tensor,
     int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_block_stride_in_bytes, int64_t chunk_size_in_bytes,
-    int start_layer_id, int num_layers, int transfer_sms = -1, bool is_host_to_device = true,
+    int start_layer_id, int num_layers, int transfer_cta_num = -1, bool is_host_to_device = true,
     bool use_ce_transfer = false, bool is_mla = false, int gpu_block_type = 0, bool sync = true) {
   int num_blocks = gpu_block_id_tensor.numel();
 
@@ -83,21 +83,21 @@ void transfer_kv_blocks_binding(
       flexkv::transfer_kv_blocks<flexkv::BackendType::VLLM>(
           num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
-          cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
+          cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_cta_num,
           is_host_to_device, use_ce_transfer, is_mla, sync);
       break;
     case flexkv::BackendType::TRTLLM:
       flexkv::transfer_kv_blocks<flexkv::BackendType::TRTLLM>(
           num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
-          cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
+          cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_cta_num,
           is_host_to_device, use_ce_transfer, is_mla, sync);
       break;
     case flexkv::BackendType::SGLANG:
       flexkv::transfer_kv_blocks<flexkv::BackendType::SGLANG>(
           num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
-          cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_sms,
+          cpu_block_stride_in_bytes, 0, chunk_size_in_bytes, stream, transfer_cta_num,
           is_host_to_device, use_ce_transfer, is_mla, sync);
       break;
   }
@@ -410,7 +410,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("cpu_tensor"), py::arg("cpu_kv_stride_in_bytes"),
         py::arg("cpu_layer_stride_in_bytes"), py::arg("cpu_block_stride_in_bytes"),
         py::arg("chunk_size_in_bytes"), py::arg("start_layer_id"),
-        py::arg("num_layers"), py::arg("transfer_sms") = -1,
+        py::arg("num_layers"), py::arg("transfer_cta_num") = -1,
         py::arg("is_host_to_device") = true, py::arg("use_ce_transfer") = false,
         py::arg("is_mla") = false, py::arg("gpu_block_type") = 0, py::arg("sync") = true);
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
@@ -446,7 +446,7 @@ PYBIND11_MODULE(c_ext, m) {
              py::arg("cpu_kv_stride_in_bytes"),
              py::arg("cpu_layer_stride_in_bytes"),
              py::arg("cpu_block_stride_in_bytes"),
-             py::arg("cpu_chunk_size_in_bytes"), py::arg("transfer_sms"),
+             py::arg("cpu_chunk_size_in_bytes"), py::arg("transfer_cta_num"),
              py::arg("use_ce_transfer"), py::arg("num_layers"),
              py::arg("layer_granularity"), py::arg("is_mla"),
              py::arg("counter_id") = 0);
@@ -501,7 +501,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_kv_stride_in_bytes"),
            py::arg("cpu_layer_stride_in_bytes"),
            py::arg("cpu_block_stride_in_bytes"),
-           py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_sms"),
+           py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_cta_num"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"));

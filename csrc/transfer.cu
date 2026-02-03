@@ -86,21 +86,14 @@ void transfer_kv_blocks(
     int64_t *cpu_block_ids, void *cpu_ptr, int64_t cpu_kv_stride_in_bytes,
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_block_stride_in_bytes,
     int64_t cpu_startoff_inside_chunks, int64_t chunk_size_in_bytes,
-    cudaStream_t stream, int transfer_sms, bool is_host_to_device,
+    cudaStream_t stream, int transfer_cta_num, bool is_host_to_device,
     bool use_ce_transfer, bool is_mla, bool sync) {
 
   int block_size = 1024;
-  static int max_blocks_per_sm = -1;
-  if (max_blocks_per_sm == -1) {
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_blocks_per_sm, transfer_kv_blocks_kernel<Type>, block_size, 0);
+  if (transfer_cta_num == -1) {
+    transfer_cta_num = 4;
   }
-
-  // if (transfer_sms == -1) {
-  //   transfer_sms = 4;
-  // }
-
-  int block_count = transfer_sms; // transfer_sms * max_blocks_per_sm;
+  int block_count = transfer_cta_num;
 
   int64_t *cpu_ptr_int64 = reinterpret_cast<int64_t *>(cpu_ptr);
   int64_t cpu_kv_stride_int64 = cpu_kv_stride_in_bytes / sizeof(int64_t);
