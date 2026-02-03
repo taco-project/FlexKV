@@ -400,6 +400,7 @@ public:
     return total_cached_blocks() - total_ready_blocks();
   }
 
+  virtual int evict(torch::Tensor &evicted_blocks, int num_evicted);
   virtual int evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted_block_hashes, int num_evicted);
   virtual std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,
     int num_blocks, bool update_cache_info = true);
