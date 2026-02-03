@@ -43,17 +43,11 @@ class Mempool:
         if block_ids.ndim != 1 or block_ids.dtype != np.int64:
             raise ValueError("block_ids must be a 1D tensor of int64")
         
-        # Remove duplicates first (same block ID appearing multiple times)
         block_ids = np.unique(block_ids)
-        
-        # Filter out already-free blocks to avoid double-free errors
-        # This can happen due to race conditions or eviction edge cases
+
         already_free = self._free_mask[block_ids]
         if already_free.any():
-            # Only recycle blocks that are actually in use
-            block_ids = block_ids[~already_free]
-            if len(block_ids) == 0:
-                return  # Nothing to recycle
+            raise ValueError(f"block_ids {block_ids[already_free]} are already free")
         self._free_mask[block_ids] = True
         self._num_free += len(block_ids)
 
