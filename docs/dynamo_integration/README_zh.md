@@ -4,6 +4,10 @@
 
 Dynamo是NVIDIA专为大规模分离式部署而设计的框架，支持TensorRT-LLM, vLLM, SGLang等多个后端引擎。其中KV 路由器（KV Router）是一个智能的请求路由组件, 它能够追踪和管理存储在不同worker上的 KV cache，并根据请求与缓存的重叠程度和worker当前负载，智能地将请求分配给最合适的 GPU 节点，从而减少昂贵的 KV 缓存重新计算，提高推理效率。文档也介绍了如何在开启KV Router时，将FlexKV集成进Dynamo。
 
+> [!CAUTION]
+> - 该功能与[命名空间隔离](https://github.com/taco-project/FlexKV/pull/95)冲突。
+> - 该功能不建议与[分布式 KV 缓存复用](../dist_reuse/README_zh.md)一起使用。
+
 ## 1. 环境准备
 
 ### 安装 vLLM

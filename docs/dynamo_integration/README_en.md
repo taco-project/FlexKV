@@ -4,6 +4,10 @@ This document demonstrates how to integrate FlexKV with NVIDIA's [Dynamo](https:
 
 Dynamo is a framework designed by NVIDIA for large-scale distributed deployment, supporting multiple backend engines including TensorRT-LLM, vLLM, and SGLang. The KV Router is an intelligent request routing component that tracks and manages KV caches stored on different workers. It intelligently assigns requests to the most suitable worker based on the overlap between requests and KV cache, as well as the current worker load, thereby reducing expensive KV cache recomputations and improving inference efficiency. This document also explains how to integrate FlexKV into Dynamo when the KV Router is enabled.
 
+> [!CAUTION]
+> - This feature conflicts with [namespace isolation](https://github.com/taco-project/FlexKV/pull/95).
+> - This feature intends not to be used with [distributed KV cache reuse](../dist_reuse/README_en.md).
+
 ## 1. Environment Setup
 
 ### Install vLLM
