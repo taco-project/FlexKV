@@ -122,7 +122,7 @@ class CacheEngineAccel:
 
         if self.event_collector is not None:
             self.event_collector.publish_stored(
-                block_hashes=sequence_meta.block_hashes[:num_insert_blocks],
+                block_hashes=sequence_meta.block_hashes[:None if num_insert_blocks == -1 else num_insert_blocks],
                 block_size=self.tokens_per_block,
                 medium=DEVICE_TYPE[self.device_type]
             )
@@ -241,7 +241,7 @@ class CacheEngine:
                                  is_ready=is_ready,
                                  match_result=match_result)
         if self.event_collector is not None:
-            self.event_collector.publish_stored(block_hashes=sequence_meta.block_hashes[:num_insert_blocks],
+            self.event_collector.publish_stored(block_hashes=sequence_meta.block_hashes[:None if num_insert_blocks == -1 else num_insert_blocks],
                                                 block_size=self.tokens_per_block,
                                                 medium=DEVICE_TYPE[self.device_type])
         return node
