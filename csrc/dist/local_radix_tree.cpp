@@ -555,7 +555,7 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
       auto hashs = node->get_block_hashes();
       auto remaining = node->size() - need;
       evicted_q->insert(evicted_q->end(), hashs.begin() + remaining, hashs.end());
-      auto blocks = node->shrink(need);
+      auto [blocks, _] = node->shrink(need);
       for (auto it = blocks->begin(); it != blocks->end(); ++it) {
         evicted_blocks_ptr[has_evicted + done] = *it;
         done++;

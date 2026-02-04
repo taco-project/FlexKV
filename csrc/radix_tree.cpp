@@ -150,7 +150,7 @@ void CRadixNode::merge_child() {
   index->remove_node(child);
 }
 
-std::deque<int64_t> *CRadixNode::shrink(int length) {
+std::pair<std::deque<int64_t>*, std::deque<HashType>*> CRadixNode::shrink(int length) {
   assert(length < size());
   assert(length > 0);
   assert(is_leaf());
@@ -158,10 +158,14 @@ std::deque<int64_t> *CRadixNode::shrink(int length) {
 
   auto remaining_length = size() - length;
   auto shrink_blocks = new std::deque<int64_t>();
+  auto shrink_hashes = new std::deque<HashType>();
 
   shrink_blocks->insert(shrink_blocks->end(),
                         physical_blocks.begin() + remaining_length,
                         physical_blocks.end());
+  shrink_hashes->insert(shrink_hashes->end(),
+                        block_hashes.begin() + remaining_length,
+                        block_hashes.end());
 
   block_hashes.erase(block_hashes.begin() + remaining_length,
                      block_hashes.end());
@@ -171,7 +175,7 @@ std::deque<int64_t> *CRadixNode::shrink(int length) {
     block_node_ids->erase(block_node_ids->begin() + remaining_length, block_node_ids->end());
   }
 
-  return shrink_blocks;
+  return {shrink_blocks, shrink_hashes};
 }
 
 CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
@@ -233,8 +237,9 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
   return new_node;
 }
 
-int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, int num_evicted) {
+int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted_block_hashes, int num_evicted) {
   int64_t *evicted_blocks_ptr = evicted_blocks.data_ptr<int64_t>();
+  int64_t *evicted_block_hashes_ptr = evicted_block_hashes.data_ptr<int64_t>();
   int has_evicted = 0;
   std::priority_queue<CRadixNode *, std::vector<CRadixNode *>,
                       CRadixNode::Compare>
@@ -251,22 +256,30 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, int num_evicted) {
     candidate.pop();
 
     if (node->size() > num_evicted - has_evicted) {
-      auto blocks = node->shrink(num_evicted - has_evicted);
-      for (auto it = blocks->begin(); it != blocks->end(); it++) {
-        evicted_blocks_ptr[has_evicted] = *it;
-        has_evicted++;
+      auto [blocks, block_hashes] = node->shrink(num_evicted - has_evicted);
+      auto _has_evicted(has_evicted); // Shadow index
+      for (auto it = blocks->begin(); it != blocks->end(); it++, _has_evicted++) {
+        evicted_blocks_ptr[_has_evicted] = *it;
+      }
+      for (auto it = block_hashes->begin(); it != block_hashes->end(); it++, has_evicted++) {
+        evicted_block_hashes_ptr[has_evicted] = *it;
       }
       delete blocks;
+      delete block_hashes;
     } else {
       auto parent = node->get_parent();
       auto &blocks = node->get_physical_blocks();
+      auto &block_hashes = node->get_block_hashes();
 
       assert(parent != nullptr);
       parent->remove_child(node->get_head_hash());
 
-      for (auto it = blocks.begin(); it != blocks.end(); it++) {
-        evicted_blocks_ptr[has_evicted] = *it;
-        has_evicted++;
+      auto _has_evicted(has_evicted); // Shadow index
+      for (auto it = blocks.begin(); it != blocks.end(); it++, _has_evicted++) {
+        evicted_blocks_ptr[_has_evicted] = *it;
+      }
+      for (auto it = block_hashes.begin(); it != block_hashes.end(); it++, has_evicted++) {
+        evicted_block_hashes_ptr[has_evicted] = *it;
       }
 
       if (parent->is_leaf() && !is_root(parent)) {

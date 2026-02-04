@@ -571,8 +571,14 @@ PYBIND11_MODULE(c_ext, m) {
           py::arg("num_insert_blocks"), py::arg("ready") = true, py::arg("node") = nullptr,
           py::arg("num_matched_blocks") = -1, py::arg("last_node_matched_length") = -1,
           py::call_guard<py::gil_scoped_release>())
-      .def("evict", &flexkv::CRadixTreeIndex::evict, py::arg("evicted_blocks"), py::arg("num_evicted"),
-           py::call_guard<py::gil_scoped_release>())
+     .def("evict",
+          py::overload_cast<torch::Tensor &, int>(&flexkv::CRadixTreeIndex::evict),
+          py::arg("evicted_blocks"), py::arg("num_evicted"),
+          py::call_guard<py::gil_scoped_release>())
+     .def("evict",
+          py::overload_cast<torch::Tensor &, torch::Tensor &, int>(&flexkv::CRadixTreeIndex::evict),
+          py::arg("evicted_blocks"), py::arg("evicted_block_hashes"), py::arg("num_evicted"),
+          py::call_guard<py::gil_scoped_release>())
       .def("total_cached_blocks", &flexkv::CRadixTreeIndex::total_cached_blocks)
       .def("total_unready_blocks", &flexkv::CRadixTreeIndex::total_unready_blocks)
       .def("total_ready_blocks", &flexkv::CRadixTreeIndex::total_ready_blocks)

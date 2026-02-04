@@ -1,6 +1,6 @@
 import os
 import time
-from typing import TYPE_CHECKING, Optional, Literal, Any
+from typing import TYPE_CHECKING, Optional, Literal, Iterable, Any
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 
@@ -15,6 +15,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
 from flexkv.integration.utils import cdiv
 from flexkv.integration.config import FlexKVConfig
+from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.transfer_manager import TransferManagerOnRemote
 
 # vllm
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
@@ -126,10 +128,17 @@ class FlexKVSchedulerConnector:
         self.block_size = flexkv_config.cache_config.tokens_per_block
         self.model_config = flexkv_config.model_config
         self.cache_config = flexkv_config.cache_config
+        
+        if os.getenv('DYNAMO_USE_FLEXKV', '0') == '1':
+            self.collector = KVEventCollector()
+        else:
+            self.collector = None
+        
         self.flexkv_manager = KVManager(model_config=self.model_config,
                                         cache_config=self.cache_config,
                                         server_recv_port=flexkv_config.server_recv_port,
-                                        dp_client_id=dp_rank)
+                                        dp_client_id=dp_rank,
+                                        event_collector=self.collector)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
 
@@ -158,6 +167,8 @@ class FlexKVSchedulerConnector:
 
     def shutdown(self) -> None:
         self.flexkv_manager.shutdown()
+        if self.collector is not None:
+            self.collector.close()
 
     @property
     def dp_client_id(self) -> int:
@@ -774,3 +785,12 @@ class FlexKVConnectorV1Impl:
             returned by the engine.
         """
         return self.connector.request_finished(request, block_ids), None
+
+    def take_events(self) -> Iterable['KVCacheEvent']:
+        '''
+        Collect buffered KV cache events.
+        '''
+        collector: Optional[KVEventCollector] = getattr(self.connector, "collector", None)
+        if collector is None:
+            return []
+        return collector.take_events()

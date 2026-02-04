@@ -1,6 +1,6 @@
 import threading
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import ClassVar, List, Set, Dict, Callable, Tuple, Optional
 
 import numpy as np
@@ -26,7 +26,7 @@ class CompletedOp:
         return cls(graph_id=graph_id, op_id=-1)
 
 
-class DeviceType(Enum):
+class DeviceType(IntEnum):
     CPU = 0
     GPU = 1
     SSD = 2

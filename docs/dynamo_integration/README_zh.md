@@ -4,14 +4,35 @@
 
 Dynamo是NVIDIA专为大规模分离式部署而设计的框架，支持TensorRT-LLM, vLLM, SGLang等多个后端引擎。其中KV 路由器（KV Router）是一个智能的请求路由组件, 它能够追踪和管理存储在不同worker上的 KV cache，并根据请求与缓存的重叠程度和worker当前负载，智能地将请求分配给最合适的 GPU 节点，从而减少昂贵的 KV 缓存重新计算，提高推理效率。文档也介绍了如何在开启KV Router时，将FlexKV集成进Dynamo。
 
+> [!CAUTION]
+> - 该功能与[命名空间隔离](https://github.com/taco-project/FlexKV/pull/95)冲突。
+> - 该功能不建议与[分布式 KV 缓存复用](../dist_reuse/README_zh.md)一起使用。
+
 ## 1. 环境准备
 
-### Dynamo 镜像
+### 安装 vLLM
 
-该文档使用的是后端为vLLM的Dynamo 0.4.1 镜像，内置了vLLM 0.10.1.1。
+参考 vLLM 适配 [README](../vllm_adapter/README_zh.md)。
+
+### 安装 Dynamo
 
 ```bash
-docker pull nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.4.1
+# 1. 准备 Dynamo 代码
+git clone https://github.com/ai-dynamo/dynamo.git
+
+# 2. 按照 PR #5858 更新代码
+gh pr checkout 5858 # 确保已安装 GitHub CLI
+
+# 3. 安装 NIXL
+uv pip install 'nixl[cu12]' # 或 'nixl[cu13]'
+
+# 4. 安装 Dynamo
+cd $DYNAMO_WORKSPACE/lib/bindings/python
+maturin develop --uv
+cd ../../..
+uv pip install -e . # 因为 vLLM 已安装，所以无需指定后端
+
+# 5. 安装 nats-server 和 etcd
 ```
 
 ### FlexKV代码准备
@@ -28,67 +49,46 @@ apt update && apt install liburing-dev
 cd FlexKV && ./build.sh
 ```
 
-### vLLM Apply Patch
-
-```bash
-# 进入 vLLM 目录
-cd /opt/vllm
-# apply patch
-git apply /your/path/to/FlexKV/examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
-```
+- 参考 GPUDirect Storage（GDS）[README](../gds/README_zh.md) 来启用 GDS。
+- 参考 KV 缓存复用 [README](../dist_reuse/README_zh.md) 来启用分布式环境下的节点间 KV 缓存共享。
 
 ### FlexKV 验证
 
 请参考[vLLM online serving](../../docs/vllm_adapter/README_zh.md#%E7%A4%BA%E4%BE%8B)里的测试脚本。
 
-
-## 2. Dynamo 配置修改
-
-### kv_transfer_config
-
-为了和FlexKV集成，需要修改Dynamo镜像内的kv_transfer_config。将/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/vllm/args.py 的245-248行修改为:
-
-```python
-kv_transfer_config = KVTransferConfig(
-    kv_connector="FlexKVConnectorV1", kv_role="kv_both"
-)
-logger.info("Using FlexKVConnectorV1 configuration")
-```
-
-### CPU Offloading
-
-在Dynamo中，KV router通过接收worker发送的event来更新KV index，从而感知每个worker上的KV cache情况。当FlexKV开启CPU offloading时，我们删掉vLLM里[BlockRemove](https://github.com/vllm-project/vllm/blob/v0.10.1.1/vllm/v1/core/block_pool.py#L221)，让FlexKV通过CPU能够缓存住所有serving过程中的KV block，这样KV router维护的index就能反映FlexKV的真实index了。
-
-## 3. 启动和验证Dynamo服务
+## 2. 启动和验证Dynamo服务
 
 ### 启动Dynamo + FlexKV
 
+下面的示例展示了如何在一台8卡节点上启动4个 Dynamo vLLM worker，并开启KV路由。
+
 ```bash
-#!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-set -e
-trap 'echo Cleaning up...; kill 0' EXIT
+# 启动 NATS 并开启 JetStream
+nats-server -js -a 127.0.0.1 -p 4222 --store_dir $NATS_DIR &
 
-# 启动nats和etcd
-nats-server -js &
-
-etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://0.0.0.0:2379 --data-dir /tmp/etcd &
+# 启动 etcd
+etcd --data-dir /tmp/etcd \
+  --listen-client-urls http://127.0.0.1:2379 \
+  --advertise-client-urls http://YOUR_IP:2379 & # YOUR_IP 是该节点的IP地址。
 
 sleep 3
 
-# run ingress, 通过--router-mode设置路由方式，可选项为kv, round-robin, random
-python -m dynamo.frontend --router-mode kv --http-port 8000 &
+export NATS_SERVER="nats://127.0.0.1:4222"
+export ETCD_ENDPOINTS="http://127.0.0.1:2379"
 
-# 定义工作节点数量
+# 启动 Dynamo 前端（启用 KV 路由模式）
+python -m dynamo.frontend --router-mode kv &
+
+# 定义 worker 节点数量
 NUM_WORKERS=4
 
-# 使用环境变量配置Flexkv，禁用配置文件
+# 启用 FlexKV KV 事件收集
+export DYNAMO_USE_FLEXKV=1
+# 使用环境变量配置FlexKV，禁用配置文件
 unset FLEXKV_CONFIG_PATH
-# 请根据服务器的配置，调整CPU和SSD的空间大小
+# 根据服务器的配置，调整CPU和SSD的空间大小
 export FLEXKV_CPU_CACHE_GB=32
 export FLEXKV_SSD_CACHE_GB=128
-export FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/"
 # 使用for循环启动工作节点
 for i in $(seq 0 $((NUM_WORKERS-1))); do
     # 计算GPU设备ID
@@ -98,21 +98,43 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
     if [ $i -lt $((NUM_WORKERS-1)) ]; then
         # 多个worker时注意Flexkv的端口应不同，否则会卡在flexkv init这一步
         # 通过环境变量 `FLEXKV_SERVER_RECV_PORT` 设置Flexkv的端口
-        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310 &
+        FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/worker_${i}" \
+        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" \
+        KV_ENDPOINT="tcp://*:2008${i}" \
+        KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")" \
+        CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} \
+        python3 -m dynamo.vllm \
+        --model $YOUR_MODEL \
+        --tensor-parallel-size 2 \
+        --connector flexkv \
+        --kv-events-config "$KV_EVENTS_CONFIG" &
     else
-        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} python3 -m dynamo.vllm --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B --tensor_parallel_size 2  --block-size 64 --gpu-memory-utilization 0.9 --max-model-len 100310
+        FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/worker_${i}" \
+        FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" \
+        KV_ENDPOINT="tcp://*:2008${i}" \
+        KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")" \
+        CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} \
+        python3 -m dynamo.vllm \
+        --model $YOUR_MODEL \
+        --tensor-parallel-size 2 \
+        --connector flexkv \
+        --kv-events-config "$KV_EVENTS_CONFIG"
     fi
 done
 ```
 
-> 注：可使用 YAML 或 JSON 文件配置，上述配置仅为简单示例，更多选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
+> [!NOTE]
+> 可使用 YAML 或 JSON 文件配置，上述配置仅为简单示例，更多选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
 
 ### 验证
 
 可通过如下命令验证Dynamo服务是否正确启动：
+
 ```bash
-curl localhost:8000/v1/chat/completions   -H "Content-Type: application/json"   -d '{
-    "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+curl localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": 你的模型,
     "messages": [
     {
         "role": "user",
@@ -123,14 +145,24 @@ curl localhost:8000/v1/chat/completions   -H "Content-Type: application/json"   
     "max_tokens": 30
   }'
 ```
+
 ## 4. Benchmark
 
-我们使用[genai-perf](https://github.com/triton-inference-server/perf_analyzer/tree/main/genai-perf)作为benchmark工具、[mooncake trace](https://github.com/kvcache-ai/Mooncake?tab=readme-ov-file#-open-source-trace)作为数据集来评估Dynamo + FlexKV的性能。
+我们使用 [`aiperf`](https://github.com/ai-dynamo/aiperf) 作为benchmark工具、[mooncake trace](https://github.com/kvcache-ai/Mooncake?tab=readme-ov-file#-open-source-trace)作为数据集来评估Dynamo + FlexKV的性能。
 
 Mooncake Trace 是一个开源请求记录文件，以jsonl格式保存。它记录了请求到达的时间戳、输入文本长度、输出文本长度以及与缓存有关的hash id等信息，包含了1小时内的23608个请求。我们的实验资源是4个LLaMA-70B worker，mooncake trace对于该配置来说并发太高了，于是我们从mooncake trace里每6个抽取1个request，构建了用于benchmark的数据集。
 
-genai-perf可以根据trace文件里的时间戳来发送请求，统计LLM服务的TTFT、TPOT等指标，命令如下。请使用genai-perf==0.0.13，更新的版本存在解析时间戳的bug。
+`aiperf` 可以根据trace文件里的时间戳来发送请求，统计LLM服务的TTFT、TPOT等指标，命令如下。
 
 ```bash
- genai-perf profile   --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B  --tokenizer deepseek-ai/DeepSeek-R1-Distill-Llama-70B  --endpoint-type chat   --endpoint /v1/chat/completions --streaming  --url http://localhost:8000  --input-file payload:mooncake_trace_1_6.jsonl --random-seed 100  -v  -H 'Authorization: Bearer NOT USED'  -H 'Accept: text/event-stream'   -- --stability-percentage 99
+aiperf profile \
+  --model $YOUR_MODEL \
+  --tokenizer $YOUR_TOKENIZER \
+  --endpoint-type 'chat' \
+  --endpoint '/v1/chat/completions' \
+  --streaming \
+  --url http://localhost:8000 \
+  --input-file $YOUR_TRACE \
+  --random-seed 100 \
+  -H 'Authorization: Bearer NOT USED'
 ```
