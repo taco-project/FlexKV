@@ -1,7 +1,7 @@
 # 在 TensorRT-LLM 中使用 FlexKV
 ## 1. 环境准备
 
-### 1.1 安装 TensorRT-LLM（Tag 为 v1.1.0.rc2）
+### 1.1 安装 TensorRT-LLM（Tag 为 v1.1.0rc2）
 目前我们正在推动社区合入 TensorRT-LLM 侧的适配代码，在合入主分支之前，有如下两种方法：
 #### 1.1.1 方法一
 您可以使用我们提供的 patch，然后重新编译：

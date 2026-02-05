@@ -331,6 +331,7 @@ class KVServer:
             token_mask=req.token_mask,
             layer_granularity=req.layer_granularity,
             dp_id=req.dp_client_id,
+            namespace=req.namespace,
         )
 
     def _handle_put_request(self, req: PutRequest) -> None:
@@ -341,6 +342,7 @@ class KVServer:
             token_mask=req.token_mask,
             dp_id=req.dp_client_id,
             task_id=req.task_id,
+            namespace=req.namespace,
         )
 
     def _handle_get_match_request(self, req: GetMatchRequest) -> None:
@@ -351,6 +353,7 @@ class KVServer:
             layer_granularity=req.layer_granularity,
             dp_id=req.dp_client_id,
             task_id=req.task_id,
+            namespace=req.namespace,
         )
         response = Response(req.dp_client_id, task_id=req_id, mask=mask)
         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
@@ -363,6 +366,7 @@ class KVServer:
             token_mask=req.token_mask,
             dp_id=req.dp_client_id,
             task_id=req.task_id,
+            namespace=req.namespace,
         )
         response = Response(req.dp_client_id, task_id=req_id, mask=mask)
         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
@@ -373,7 +377,8 @@ class KVServer:
         task_id = self.kv_task_engine.prefetch_async(
             token_ids=req.token_ids,
             dp_id=req.dp_client_id,
-            task_id=req.task_id
+            task_id=req.task_id,
+            namespace=req.namespace,
         )
 
     def _handle_launch_task_request(self, req: LaunchTaskRequest) -> None:
