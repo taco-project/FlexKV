@@ -110,6 +110,56 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         return num_new_matched_tokens, True
 
+    def _extract_namespace(self, _request: "LlmRequest") -> Optional[List[str]]:
+        """
+        Extract namespace information from TensorRT-LLM LlmRequest for cache isolation.
+        
+        This method extracts namespace components from multiple sources in priority order:
+        1. lora_task_id: LoRA task identifier for multi-tenant LoRA serving
+        2. cache_salt_id: Explicit cache isolation identifier
+        3. namespace_info: User-defined namespace hierarchy (string with "|" separator)
+        
+        The namespace components are combined to form a hierarchical namespace path,
+        enabling fine-grained KV cache isolation across different tenants, users, or sessions.
+        
+        Args:
+            _request: LlmRequest object from TensorRT-LLM
+            
+        Returns:
+            Optional[List[str]]: Ordered list of namespace components forming the hierarchy,
+                                or None if no namespace information is available
+                                
+        Example:
+            If request has lora_task_id=123, cache_salt_id="session_1",
+            namespace_info="tenant_A|user_1", the result will be:
+            ["123", "session_1", "tenant_A", "user_1"]
+        """
+        namespace_info = []
+
+        if hasattr(_request, 'lora_task_id'):
+            lora_task_id = getattr(_request, 'lora_task_id', None)
+            if lora_task_id is not None:
+                namespace_info.append(str(lora_task_id))
+
+        if hasattr(_request, 'cache_salt_id') and _request.cache_salt_id is not None:
+            cache_salt_id = _request.cache_salt_id
+            if cache_salt_id is not None:
+                namespace_info.append(str(cache_salt_id))
+
+        if hasattr(_request, 'namespace_info') and _request.namespace_info is not None:
+            user_namespace = _request.namespace_info
+            # namespace_info in TensorRT-LLM is a string, potentially with "|" separator
+            if isinstance(user_namespace, str):
+                # Split by "|" to support hierarchical namespaces like "tenant_A|user_1"
+                namespace_components = user_namespace.split('|')
+                namespace_info.extend([comp.strip() for comp in namespace_components if comp.strip()])
+            else:
+                namespace_info.append(str(user_namespace))
+        
+        if len(namespace_info) == 0:
+            return None
+        
+        return namespace_info
 
     def _get_match(
         self,
@@ -152,9 +202,14 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         np_token_ids = np_all_token_ids[:num_tokens_to_get]
         np_token_mask = np.ones_like(np_token_ids, dtype=bool)
         np_token_mask[:num_computed_tokens] = False
+        
+        # Extract namespace info for cache isolation
+        namespace = self._extract_namespace(_request)
+        
         task_id, matched_mask = self.flexkv_manager.get_match(
             token_ids=np_token_ids,
             token_mask=np_token_mask,
+            namespace=namespace,
         )
         num_new_matched_tokens = matched_mask.sum().item()
 
@@ -305,7 +360,14 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
                 f"{np_all_token_ids.shape[0]=}, {num_tokens_to_put=}"
             )
         np_token_ids = np_all_token_ids[:num_tokens_to_put]
-        task_id, unmatched_mask = self.flexkv_manager.put_match(token_ids=np_token_ids)
+        
+        # Extract namespace info for cache isolation
+        namespace = self._extract_namespace(_request)
+        
+        task_id, unmatched_mask = self.flexkv_manager.put_match(
+            token_ids=np_token_ids,
+            namespace=namespace,
+        )
 
         num_unmatched_tokens = unmatched_mask.sum().item()
         num_matched_tokens = num_tokens_to_put - num_unmatched_tokens

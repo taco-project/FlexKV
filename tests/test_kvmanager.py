@@ -106,6 +106,7 @@ def shutdown_tp_client(tp_client_processes):
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
+    {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4, 'namespace': ['test_namespace']},
 ], indirect=True)
 @pytest.mark.parametrize("gpu_layout_type", [
     0,
@@ -128,6 +129,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     num_gpu_blocks = test_config["num_gpu_blocks"]
     block_per_request = test_config['requests_per_block']
     initial_write_ratio = test_config['initial_write_ratio']
+    namespace = test_config.get('namespace', None)
 
     num_requests = num_gpu_blocks // block_per_request
 
@@ -220,6 +222,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
             slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
             token_mask=None,
             dp_id=dp_id,
+            namespace=namespace,
         )
         kvmanager.wait([write_request], completely=True)
         if gpu_kv_verifier is not None:
@@ -231,6 +234,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
         slot_mapping=block_ids_2_slot_mapping(torch.arange(0,1, dtype=torch.int64), tokens_per_block, actual_length=8),
         token_mask=None,
         dp_id=0,
+        namespace=namespace,
     )
     kvmanager.wait([write_request], completely=True)
     #corner case: input token length is long enough, but the mask is less than tokens_per_block
@@ -264,6 +268,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
             layer_granularity=-1,
             token_mask=None,
             dp_id=dp_id,
+            namespace=namespace,
         )
         kvmanager.launch(request_id, slot_mapping)
         flexkv_id2req_id[request_id] = read_idx
@@ -278,6 +283,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
             slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
             token_mask=None,
             dp_id=dp_id,
+            namespace=namespace,
         )
         req_id2block_ids[request_id] = block_ids
         flexkv_id2req_id[request_id] = i
@@ -352,6 +358,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
                 layer_granularity=-1,
                 token_mask=None,
                 dp_id=dp_id,
+                namespace=namespace,
             )
             batched_get_task_ids.append(request_id)
             batched_slot_mappings.append(slot_mapping)

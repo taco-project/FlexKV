@@ -1,7 +1,7 @@
 # Using FlexKV in TensorRT-LLM
 ## 1. Environment Setup
 
-### 1.1 Install TensorRT-LLM (Tag v1.1.0.rc2)
+### 1.1 Install TensorRT-LLM (Tag v1.1.0rc2)
 We are currently working with the community to merge TensorRT-LLM adaptation code. Before it is merged into the main branch, there are two methods:
 #### 1.1.1 Method 1
 You can use the patch we provide and recompile:

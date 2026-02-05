@@ -428,7 +428,8 @@ class GlobalCacheEngine:
             layer_num: int = -1,
             layer_granularity: int = -1,
             dp_id: int = 0,
-            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
+            namespace: Optional[List[str]] = None) \
                  -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
@@ -459,7 +460,8 @@ class GlobalCacheEngine:
                                                        self.tokens_per_block)[:block_end_idx-block_start_idx]
 
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
-                                     tokens_per_block=self.cache_config.tokens_per_block)
+                                     tokens_per_block=self.cache_config.tokens_per_block,
+                                     namespace=namespace)
 
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             # from this entrance, we will also handle the case of peer_cpu and peer_ssd
@@ -907,7 +909,8 @@ class GlobalCacheEngine:
             slot_mapping: np.ndarray,
             layer_num : int = -1,
             dp_id: int = 0,
-            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
+            namespace: Optional[List[str]] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
@@ -926,7 +929,8 @@ class GlobalCacheEngine:
                                                        self.tokens_per_block)[:block_end_idx-block_start_idx]
 
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
-                                     tokens_per_block=self.cache_config.tokens_per_block)
+                                     tokens_per_block=self.cache_config.tokens_per_block,
+                                     namespace=namespace)
 
         assert not temp_cache_strategy.ignore_gpu
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
