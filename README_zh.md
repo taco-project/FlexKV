@@ -41,6 +41,7 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 ```bash
 apt install liburing-dev
 apt install libxxhash-dev
+apt install libhiredis-dev
 ```
 
 ### 编译 FlexKV

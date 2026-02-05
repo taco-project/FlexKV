@@ -154,4 +154,5 @@ enable_gds: false
 | 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `FLEXKV_INDEX_ACCEL` | bool | 1 | 0-启用Python版本RadixTree实现，1-启用C++版本RadixTree实现 |
+| `FLEXKV_EVICTION_POLICY` | str | "lru" | 缓存淘汰策略，可选 "lru" 和 "lfu"。 "lru" 表示最近最少使用，"lfu" 表示最不经常使用 |
 | `FLEXKV_EVICT_RATIO` | float | 0.05 | cpu，ssd一次evict主动淘汰比例（0.0 = 只淘汰最小的必要的block数）。建议保持 `0.05`，即每一次淘汰5%的最久未使用的block |

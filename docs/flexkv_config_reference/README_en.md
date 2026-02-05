@@ -159,4 +159,5 @@ Some configurations can only be set through environment variables.
 | Environment Variable | Type | Default | Description |
 |---------------------|------|---------|-------------|
 | `FLEXKV_INDEX_ACCEL` | bool | 1 | 0-Enable Python version RadixTree implementation, 1-Enable C++ version RadixTree implementation |
+| `FLEXKV_EVICTION_POLICY` | str | "lru" | Cache eviction policy, options: "lru" and "lfu". "lru" means Least Recently Used, "lfu" means Least Frequently Used |
 | `FLEXKV_EVICT_RATIO` | float | 0.05 | CPU and SSD eviction ratio for proactive eviction per cycle (0.0 = only evict the minimal necessary blocks). Recommended to keep at `0.05`, i.e., evict 5% of least recently used blocks per cycle |

@@ -50,6 +50,7 @@ class RadixNode:
     is_ready: bool
     lock_cnt: int
     grace_time: float
+    hit_count: int = 0
 
     parent: Optional['RadixNode'] = None
     children: Dict[Optional[HashType], 'RadixNode'] = field(default_factory=dict)
@@ -95,6 +96,7 @@ class RadixNode:
             is_ready=self.is_ready,
             lock_cnt=0,  # Note: only lock near-leaf node
             grace_time=self.grace_time,
+            hit_count=self.hit_count,
         )
         self.block_hashes = self.block_hashes[prefix_length:]
         self.physical_blocks = self.physical_blocks[prefix_length:]
@@ -123,10 +125,11 @@ class RadixNode:
         self.block_hashes = np.concatenate([self.block_hashes, child.block_hashes])
         self.physical_blocks = np.concatenate([self.physical_blocks, child.physical_blocks])
         self.grace_time = max(self.grace_time, child.grace_time)
+        self.hit_count = max(self.hit_count, child.hit_count)
         self.children.clear()
 
 class RadixTreeIndex:
-    def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000, hit_reward_seconds: int = 0):
+    def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000, hit_reward_seconds: int = 0, eviction_policy: str = "lru"):
         self.root_node: RadixNode = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                               physical_blocks=np.array([], dtype=np.int64),
                                               is_ready=True,
@@ -140,6 +143,7 @@ class RadixTreeIndex:
         self.max_num_blocks = max_num_blocks
 
         self.hit_reward_seconds = hit_reward_seconds
+        self.eviction_policy = eviction_policy
 
     def reset(self) -> None:
         self.root_node = RadixNode(block_hashes=np.array([], dtype=np.int64),
@@ -168,6 +172,7 @@ class RadixTreeIndex:
                     current_node.grace_time = time.time() + self.hit_reward_seconds
                 else:
                     current_node.grace_time += self.hit_reward_seconds
+                current_node.hit_count += 1
             child_hash = sequence.get_hash(prefix_blocks_num + current_node.size())
             if child_hash in current_node.children:
                 if current_node.is_ready:
@@ -269,12 +274,13 @@ class RadixTreeIndex:
         candidates = []
         for node in self.leaf_nodes.values():
             if node.evictable():
-                candidates.append(node)
+                priority = node.grace_time if self.eviction_policy == "lru" else node.hit_count
+                candidates.append((priority, node))
         heapq.heapify(candidates)
         evicted_blocks = np.array([], dtype=np.int64)
         evicted_block_hashes = np.array([], dtype=np.int64)
         while len(evicted_blocks) < num_evicted and candidates:
-            node = heapq.heappop(candidates)
+            priority, node = heapq.heappop(candidates)
             if node.size() > num_evicted - len(evicted_blocks):
                 physical_blocks, _block_hashes = node.shrink(num_evicted - len(evicted_blocks))
             else:
@@ -284,7 +290,8 @@ class RadixTreeIndex:
                 if node.parent.is_leaf():
                     self.leaf_nodes[node.parent.head_hash()] = node.parent
                 if node.parent.evictable():
-                    heapq.heappush(candidates, node.parent)
+                    priority = node.parent.grace_time if self.eviction_policy == "lru" else node.parent.hit_count
+                    heapq.heappush(candidates, (priority, node.parent))
                 physical_blocks = node.physical_blocks
                 _block_hashes = node.block_hashes
                 node.parent = None
