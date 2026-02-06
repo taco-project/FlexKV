@@ -21,6 +21,7 @@ from flexkv.transfer_manager import TransferManagerOnRemote
 # vllm
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata, KVConnectorRole)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.parallel_state import get_tp_group
 
 if TYPE_CHECKING:
@@ -52,6 +53,8 @@ class FlexKVTask(ABC):
 
     # slot mapping
     slot_mapping: Optional[np.ndarray] = None
+    # block ids for tracking errors
+    block_ids: list[int] = field(default_factory=list)
 
     # timer
     match_start_time: float = 0
@@ -152,6 +155,7 @@ class FlexKVSchedulerConnector:
         self.tasks_to_cancel: dict[int, FlexKVTask] = {}
 
         self.flexkv_stats = FlexKVStats(int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', '200')))
+        self.failed_block_ids: set[int] = set()
 
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")
@@ -350,6 +354,7 @@ class FlexKVSchedulerConnector:
         num_blocks_to_get = num_new_matched_tokens // self.block_size
         all_block_ids = blocks.get_block_ids()[0]
         block_ids_to_get = all_block_ids[num_computed_blocks:num_computed_blocks+num_blocks_to_get]
+        task.block_ids = block_ids_to_get
         task.slot_mapping = np.array(block_ids_to_get).repeat(self.block_size)*self.block_size
 
     def wait_for_all_get_tasks(self) -> list[FlexKVResponse]:
@@ -547,10 +552,38 @@ class FlexKVSchedulerConnector:
             else:
                 logger.error(f"{task} failed, status: {response.status}.")
                 num_failed_tasks += 1
+                if isinstance(task, FlexKVGetTask):
+                    self.failed_block_ids.update(task.block_ids)
             # responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
             #                                             request=task.request, success=success))
         self.flexkv_stats.record_faild(num_failed_requests=num_failed_tasks)
         return finished_sending, finished_recving
+
+    def get_and_clear_failed_block_ids(self) -> set[int]:
+        failed = self.failed_block_ids
+        self.failed_block_ids = set()
+        return failed
+
+    def handle_preemptions(self, preempted_req_ids: set[str]):
+        """
+        Handle preempted requests.
+        Cancel pending tasks for preempted requests to avoid unnecessary transfers
+        and potential race conditions with block reuse.
+        """
+        for req_id in preempted_req_ids:
+            if req_id in self.req_id_to_task_dict:
+                task_id = self.req_id_to_task_dict[req_id]
+                # If the task is waiting to be launched, we can safely cancel it.
+                if task_id in self.tasks_to_launch:
+                    # Move to tasks_to_cancel to ensure underlying resources are freed
+                    # by cancel_tasks() which is called right after this.
+                    task = self.tasks_to_launch.pop(task_id)
+                    self.tasks_to_cancel[task_id] = task
+                    logger.info(f"Moved pending task {task_id} for preempted request {req_id} to cancel list")
+                # If the task is already launched (in self.get_tasks or self.put_tasks),
+                # we currently cannot cancel the underlying transfer in FlexKV.
+                # However, since the request is preempted, vLLM might reuse these blocks.
+                # Ideally, FlexKV should support cancelling running tasks.
 
     def _blocking_waiting_for_tasks(self, task_dict: dict[int, FlexKVTask]) -> list[FlexKVResponse]:
         """
@@ -668,6 +701,8 @@ class FlexKVConnectorV1Impl:
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector = FlexKVSchedulerConnector(flexkv_config, dp_rank)
+            # Track scheduled requests to detect preemptions in build_connector_meta
+            self.previous_scheduled_req_ids: set[str] = set()
         elif role == KVConnectorRole.WORKER:
             self.connector = FlexKVWorkerConnector(flexkv_config, dp_rank)
         else:
@@ -806,8 +841,38 @@ class FlexKVConnectorV1Impl:
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
+        # Handle preemptions
+        # Try to get preempted_req_ids from scheduler_output (available in v2)
+        preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", None)
+
+        # Fallback for v1 or if not populated: calculate from state difference
+        if preempted_req_ids is None:
+            current_req_ids = set()
+            for req in scheduler_output.scheduled_new_reqs:
+                current_req_ids.add(req.req_id)
+            if scheduler_output.scheduled_cached_reqs:
+                current_req_ids.update(scheduler_output.scheduled_cached_reqs.req_ids)
+            
+            finished_req_ids = scheduler_output.finished_req_ids
+            
+            # Preempted = Previous - Current - Finished
+            preempted_req_ids = self.previous_scheduled_req_ids - current_req_ids - finished_req_ids
+            
+            # Update previous for next step
+            self.previous_scheduled_req_ids = current_req_ids
+
+        if preempted_req_ids:
+            self.connector.handle_preemptions(preempted_req_ids)
+
         self.connector.cancel_tasks()
         self.connector.launch_tasks()
+        
+        # Optional: Synchronous wait for get tasks to ensure data consistency.
+        # This is a safety fallback because currently FlexKV worker does not support 
+        # waiting for tasks in start_load_kv().
+        if os.getenv('FLEXKV_SYNC_GET', '0') == '1':
+            self.connector.wait_for_all_get_tasks()
+            
         return KVConnectorMetadata()
 
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
@@ -849,3 +914,30 @@ class FlexKVConnectorV1Impl:
         if collector is None:
             return []
         return collector.take_events()
+
+    def get_kv_connector_stats(self) -> Optional[KVConnectorStats]:
+        """
+        Get the KV connector stats collected during the last interval.
+        """
+        if self.role != KVConnectorRole.SCHEDULER:
+            return None
+
+        stats = self.connector.flexkv_stats
+        data = {
+            "num_get_requests": stats.num_get_requests,
+            "num_get_query_tokens": stats.num_get_query_tokens,
+            "num_gpu_matched_tokens": stats.num_gpu_matched_tokens,
+            "num_flexkv_matched_tokens": stats.num_flexkv_matched_tokens,
+            "num_put_requests": stats.num_put_requests,
+            "num_put_query_tokens": stats.num_put_query_tokens,
+            "num_put_unmatched_tokens": stats.num_put_unmatched_tokens,
+            "num_failed_requests": stats.num_failed_requests,
+            "get_gpu_match_ratio": stats.get_gpu_match_ratio,
+            "get_flexkv_match_ratio": stats.get_flexkv_match_ratio,
+        }
+        return KVConnectorStats(data=data)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if self.role == KVConnectorRole.SCHEDULER:
+            return self.connector.get_and_clear_failed_block_ids()
+        return set()
