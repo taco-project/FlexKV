@@ -736,6 +736,7 @@ class GlobalCacheEngine:
         enable_cpu = self.cache_config.enable_cpu
         enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
         enable_gds = self.cache_config.enable_gds and not temp_cache_strategy.ignore_gds
+        enable_bypass_cpu = self.cache_config.enable_bypass_cpu
         assert enable_cpu
         assert self.cpu_cache_engine is not None
 
@@ -799,7 +800,7 @@ class GlobalCacheEngine:
         )
         # NOTE: not enough space to allocate, skip the request
         # there might be a better way to handle this
-        if not enable_gds:
+        if not enable_bypass_cpu:
             if len(allocated_cpu_blocks) < allocated_cpu_block_num:
                 self.cpu_cache_engine.recycle(allocated_cpu_blocks)
                 return self._empty_get_return(request_id)
