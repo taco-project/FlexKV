@@ -136,7 +136,7 @@ def enable_nvmet() -> None:
         assert int(f.read().strip()) >= 1, \
             'num_p2p_queues must be at least 1 to enable NVMe-oF target offload.'
 
-    nvmet_list: List[str] = os.environ['FLEXKV_ENABLED_NVMET'].strip().split(',')
+    nvmet_list: List[str] = os.environ['FLEXKV_ENABLED_NVMET'].strip().split(';')
 
     # Step 3 in https://enterprise-support.nvidia.com/s/article/howto-configure-nvme-over-fabrics--nvme-of--target-offload
     # Steps 1 and 2 are done manually beforehand.
