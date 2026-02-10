@@ -77,6 +77,12 @@ sudo make install
 
 详细步骤请参考：[FlexKV vLLM 适配文档](https://github.com/taco-project/FlexKV/blob/main/docs/vllm_adapter/README_zh.md#%E8%BF%90%E8%A1%8C)
 
+**注意**：想要启动分布式重用的功能，编译/安装 FlexKV 之前需设置环境变量：
+
+```bash
+export FLEXKV_ENABLE_P2P=1
+```
+
 ## 运行
 
 ### 1. 启动 Redis 服务

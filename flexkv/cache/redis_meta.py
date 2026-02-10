@@ -12,15 +12,15 @@ try:  # redis-py
 except Exception:  # pragma: no cover
     _redis = None  # type: ignore
 
-# Import C++ extensions with explicit error handling
+# Import C++ dist extensions (RedisMetaChannel, BlockMeta). Optional when built without FLEXKV_ENABLE_P2P=1.
+_CRedisMetaChannel = None  # type: ignore
+_CBlockMeta = None  # type: ignore
 try:
-    # Ensure flexkv.c_ext is loaded first
     import flexkv.c_ext
-    from flexkv.c_ext import RedisMetaChannel as _CRedisMetaChannel, BlockMeta as _CBlockMeta
-except Exception as e:  # pragma: no cover
-    raise ImportError(f"Failed to import C++ extensions: {e}")
-    _CRedisMetaChannel = None  # type: ignore
-    _CBlockMeta = None  # type: ignore
+    from flexkv.c_ext import RedisMetaChannel as _CRedisMetaChannel, BlockMeta as _CBlockMeta  # type: ignore
+except (ImportError, AttributeError):
+    # c_ext built without FLEXKV_ENABLE_P2P=1: no Redis/distributed KV cache support
+    pass
 
 
 class NodeState(IntEnum):
@@ -39,6 +39,11 @@ class BlockMeta:
     state: NodeState = NodeState.NODE_STATE_NORMAL
 
     def to_c(self) -> "_CBlockMeta":
+        if _CBlockMeta is None:
+            raise RuntimeError(
+                "Distributed KV cache (P2P/Redis) is not built. "
+                "Rebuild FlexKV with FLEXKV_ENABLE_P2P=1 and install Redis dependencies (e.g. libhiredis-dev)."
+            )
         cm = _CBlockMeta()
         cm.ph = int(self.ph)
         cm.pb = int(self.pb)
@@ -50,6 +55,11 @@ class BlockMeta:
 
     @staticmethod
     def from_c(cm: "_CBlockMeta") -> "BlockMeta":
+        if _CBlockMeta is None:
+            raise RuntimeError(
+                "Distributed KV cache (P2P/Redis) is not built. "
+                "Rebuild FlexKV with FLEXKV_ENABLE_P2P=1 and install Redis dependencies (e.g. libhiredis-dev)."
+            )
         return BlockMeta(
             ph=int(cm.ph),
             pb=int(cm.pb),
@@ -60,10 +70,18 @@ class BlockMeta:
         )
 
 
+def dist_available() -> bool:
+    """Return True if distributed (P2P/Redis) KV cache C++ extension is built (FLEXKV_ENABLE_P2P=1)."""
+    return _CRedisMetaChannel is not None
+
+
 class RedisMetaChannel:
     def __init__(self, host: str, port: int, node_id: int, local_ip: str, blocks_key: str = "blocks", password: str = "") -> None:
         if _CRedisMetaChannel is None:
-            raise ImportError("c_ext.RedisMetaChannel is not available")
+            raise ImportError(
+                "Distributed KV cache (P2P/Redis) is not built. "
+                "Rebuild FlexKV with FLEXKV_ENABLE_P2P=1 and install Redis dependencies (e.g. libhiredis-dev, redis-tools)."
+            )
         self._c = _CRedisMetaChannel(host, int(port), int(node_id), str(local_ip), str(blocks_key), str(password))
 
     def connect(self) -> bool:

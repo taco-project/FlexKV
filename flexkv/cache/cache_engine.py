@@ -26,7 +26,7 @@ import nvtx
 import torch
 from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
 from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
-from flexkv.cache.redis_meta import RedisMeta
+from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
@@ -326,7 +326,7 @@ class GlobalCacheEngine:
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
         if cache_config.enable_kv_sharing:
-            assert redis_meta != None
+            assert redis_meta is not None
             self.redis_meta = redis_meta
             self.node_id = self.redis_meta.get_node_id()
             self.enable_kv_sharing = True
@@ -338,6 +338,18 @@ class GlobalCacheEngine:
         self.evict_start_threshold = GLOBAL_CONFIG_FROM_ENV.evict_start_threshold
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
         self.eviction_policy = GLOBAL_CONFIG_FROM_ENV.eviction_policy
+
+        need_dist = (
+            (cache_config.enable_cpu and cache_config.enable_p2p_cpu)
+            or (cache_config.enable_ssd and cache_config.enable_p2p_ssd)
+            or (cache_config.enable_remote and cache_config.enable_kv_sharing)
+        )
+        if need_dist and not dist_available():
+            raise RuntimeError(
+                "Config enables distributed KV cache (P2P/Redis), but FlexKV was built without it. "
+                "Rebuild with FLEXKV_ENABLE_P2P=1 and install Redis dependencies "
+                "(e.g. libhiredis-dev, redis-tools). See README for full list."
+            )
 
         if cache_config.enable_cpu:
             if cache_config.enable_p2p_cpu:
