@@ -4,12 +4,17 @@ from typing import Optional, Any
 from flexkv.cache.redis_meta import RedisMetaChannel as _PyRedisMetaChannel
 import torch
 
-from flexkv.c_ext import DistributedRadixTree as _CDistributedRadixTree
-from flexkv.c_ext import LocalRadixTree as _CLocalRadixTree
-from flexkv.c_ext import RedisMetaChannel as _CRedisMetaChannel
 from flexkv.c_ext import CMatchResult
 from flexkv.c_ext import CRadixNode
-from flexkv.c_ext import RefRadixTree
+# Distributed (P2P/Redis) classes; optional when built without FLEXKV_ENABLE_P2P=1
+try:
+    from flexkv.c_ext import DistributedRadixTree as _CDistributedRadixTree
+    from flexkv.c_ext import LocalRadixTree as _CLocalRadixTree
+    from flexkv.c_ext import RefRadixTree
+except (ImportError, AttributeError):
+    _CDistributedRadixTree = None  # type: ignore
+    _CLocalRadixTree = None  # type: ignore
+    RefRadixTree = None  # type: ignore
 
 
 class DistributedRadixTree:
@@ -23,7 +28,10 @@ class DistributedRadixTree:
                  lease_renew_ms: int = 5000,
                  hit_reward_seconds: int = 0) -> None:
         if _CDistributedRadixTree is None:
-            raise ImportError("c_ext.DistributedRadixTree is not available")
+            raise ImportError(
+                "Distributed KV cache (P2P/Redis) is not built. "
+                "Rebuild FlexKV with FLEXKV_ENABLE_P2P=1 and install Redis dependencies (e.g. libhiredis-dev)."
+            )
         self._c = _CDistributedRadixTree(int(tokens_per_block), int(max_num_blocks), int(node_id),
                                          int(refresh_batch_size), int(rebuild_interval_ms), int(idle_sleep_ms), int(lease_renew_ms), int(hit_reward_seconds))
         self._started = False
@@ -97,9 +105,13 @@ class LocalRadixTree:
                  idle_sleep_ms: int = 10,
                  safety_ttl_ms: int = 100,
                  swap_block_threshold: int = 1024,
-                 hit_reward_seconds: int = 0) -> None:
+                 hit_reward_seconds: int = 0,
+                 eviction_policy: str = "lru") -> None:
         if _CLocalRadixTree is None:
-            raise ImportError("c_ext.LocalRadixTree is not available")
+            raise ImportError(
+                "Distributed KV cache (P2P/Redis) is not built. "
+                "Rebuild FlexKV with FLEXKV_ENABLE_P2P=1 and install Redis dependencies (e.g. libhiredis-dev)."
+            )
         self._c = _CLocalRadixTree(
             int(tokens_per_block),
             int(max_num_blocks),
@@ -109,7 +121,8 @@ class LocalRadixTree:
             int(idle_sleep_ms),
             int(safety_ttl_ms),
             int(swap_block_threshold),
-            int(hit_reward_seconds)
+            int(hit_reward_seconds),
+            str(eviction_policy),
         )
         self._started = False
 

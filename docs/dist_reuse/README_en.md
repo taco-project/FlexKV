@@ -77,6 +77,12 @@ Clone vLLM, checkout version v0.10.1.1, apply the FlexKV patch, then build vLLM 
 
 For detailed instructions, please refer to: [FlexKV vLLM Adapter Documentation](https://github.com/taco-project/FlexKV/blob/main/docs/vllm_adapter/README_en.md)
 
+**Note**: Set the following environment variable before building/installing FlexKV:
+
+```bash
+export FLEXKV_ENABLE_P2P=1
+```
+
 ## Running
 
 ### 1. Start Redis Services

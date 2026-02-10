@@ -21,9 +21,10 @@ if debug:
 
 enable_cfs = os.environ.get("FLEXKV_ENABLE_CFS", "0") == "1"
 enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
+enable_p2p = os.environ.get("FLEXKV_ENABLE_P2P", "0") == "1"
 enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
- 
-# Define C++ extensions
+
+# Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
     "csrc/bindings.cpp",
     "csrc/transfer.cu",  # Skip CUDA file for now
@@ -31,10 +32,6 @@ cpp_sources = [
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
-    "csrc/dist/distributed_radix_tree.cpp",
-    "csrc/dist/local_radix_tree.cpp",
-    "csrc/dist/redis_meta_channel.cpp",
-    "csrc/dist/lease_meta_mempool.cpp",
 ]
 
 hpp_sources = [
@@ -44,8 +41,10 @@ hpp_sources = [
     "csrc/radix_tree.h",
 ]
 
-#extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
-extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring", "-lhiredis"]
+# extra_link_args: dist/Redis (libhiredis) only when FLEXKV_ENABLE_P2P=1
+extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
+if enable_p2p:
+    extra_link_args.append("-lhiredis")
 
 if enable_cputest:
     extra_link_args.remove("-lcuda")
@@ -72,7 +71,7 @@ extra_compile_args.append("-DCUDA_AVAILABLE")
 
 nvcc_compile_args = ["-O3"]
 if enable_gds:
-    print("ENABLE_GDS = true: Compiling and linking gds related content")
+    print("ENABLE_GDS = true: Compiling and linking GDS content")
     cpp_sources.extend([
         "csrc/gds/gds_manager.cpp",
         "csrc/gds/tp_gds_transfer_thread_group.cpp",
@@ -86,6 +85,19 @@ if enable_gds:
     extra_link_args.append("-lcufile")
     extra_compile_args.append("-DFLEXKV_ENABLE_GDS")
     nvcc_compile_args.append("-DFLEXKV_ENABLE_GDS")
+if enable_p2p:
+    print("ENABLE_P2P = true: Compiling and linking distributed (P2P/Redis) content")
+    cpp_sources.extend([
+        "csrc/dist/distributed_radix_tree.cpp",
+        "csrc/dist/local_radix_tree.cpp",
+        "csrc/dist/redis_meta_channel.cpp",
+        "csrc/dist/lease_meta_mempool.cpp",
+    ])
+    extra_compile_args.append("-DFLEXKV_ENABLE_P2P")
+if not enable_gds:
+    print("ENABLE_GDS = false: Skipping GDS code")
+if not enable_p2p:
+    print("ENABLE_P2P = false: Skipping distributed (P2P/Redis) code; no libhiredis or Redis deps required")
 
 cpp_extensions = [
     cpp_extension.CUDAExtension(
