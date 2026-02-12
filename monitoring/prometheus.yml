@@ -1,0 +1,62 @@
+# Prometheus Configuration for FlexKV Monitoring
+#
+# This configuration file defines:
+# - Global settings (scrape interval, evaluation interval)
+# - Scrape targets (FlexKV application)
+# - Alerting rules (optional)
+
+global:
+  scrape_interval: 15s          # How often to scrape targets
+  evaluation_interval: 15s      # How often to evaluate rules
+  scrape_timeout: 10s           # Timeout for scrape requests
+
+  # Attach these labels to all scraped metrics
+  external_labels:
+    monitor: 'flexkv-monitor'
+    environment: 'development'
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# Rule files (for recording rules and alerting rules)
+# rule_files:
+#   - "rules/*.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          instance: 'prometheus'
+
+  # FlexKV Python runtime metrics (port 8080)
+  - job_name: 'flexkv-python'
+    static_configs:
+      - targets: ['localhost:8080']
+        labels:
+          service: 'flexkv'
+          runtime: 'python'
+
+  # FlexKV C++ metrics (port 8081)
+  - job_name: 'flexkv-cpp'
+    static_configs:
+      - targets: ['localhost:8081']
+        labels:
+          service: 'flexkv'
+          runtime: 'cpp'
+
+  # Add more FlexKV instances here for multi-instance monitoring
+  # - job_name: 'flexkv-cluster'
+  #   static_configs:
+  #     - targets:
+  #       - 'node1:8080'  # Python metrics
+  #       - 'node2:8080'
+  #       - 'node3:8080'
+  #       labels:
+  #         cluster: 'production'
