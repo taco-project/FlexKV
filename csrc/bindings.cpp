@@ -493,13 +493,16 @@ PYBIND11_MODULE(c_ext, m) {
 
 #ifdef FLEXKV_ENABLE_GDS
   py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")
-      .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
+      .def(py::init<int, const std::vector<int64_t> &, int,
                     std::map<int, std::vector<std::string>> &, int, int,
-                    torch::Tensor &, torch::Tensor &, torch::Tensor &, torch::Tensor &>(),
-           py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("ssd_files"),
-           py::arg("dp_group_id"), py::arg("num_layers"),
-           py::arg("gpu_kv_strides_tensor"), py::arg("gpu_block_strides_tensor"),
-           py::arg("gpu_layer_strides_tensor"), py::arg("gpu_chunk_sizes_tensor"))
+                    const std::vector<int64_t> &, const std::vector<int64_t> &,
+                    const std::vector<int64_t> &, const std::vector<int64_t> &,
+                    const std::vector<int64_t> &>(),
+           py::arg("num_gpus"), py::arg("gpu_block_ptrs_flat"), py::arg("num_tensors_per_gpu"),
+           py::arg("ssd_files"), py::arg("dp_group_id"), py::arg("num_layers"),
+           py::arg("gpu_kv_strides_in_bytes"), py::arg("gpu_block_strides_in_bytes"),
+           py::arg("gpu_layer_strides_in_bytes"), py::arg("gpu_chunk_sizes_in_bytes"),
+           py::arg("gpu_device_ids"))
       .def("tp_group_transfer",
            &flexkv::TPGDSTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("ssd_block_id_tensor"),
