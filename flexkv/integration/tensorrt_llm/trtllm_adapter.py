@@ -1,4 +1,5 @@
 import os
+from typing import Any, Optional, Tuple
 import time
 from typing import TYPE_CHECKING, Optional, Literal, Any, List, Tuple
 from dataclasses import dataclass, field
@@ -20,7 +21,7 @@ from flexkv.integration.tensorrt_llm.meta import(
     FlexKVResponse, FlexKVTask, FlexKVGetTask, FlexKVPutTask, FlexKVConnectorMetadata)
 from flexkv.transfer_manager import TransferManagerOnRemote
 
-from flexkv.integration.tensorrt_llm.utils import RequestWrapper
+from flexkv.integration.tensorrt_llm.utils import RequestWrapper, get_mapping_from_config
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
@@ -61,7 +62,15 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.flexkv_stats = FlexKVStats(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200))
 
         flexkv_logger.info("Finish init FlexKVSchedulerConnector")
-        
+
+    def wait_for_initialization(self):
+        """
+        Wait for the FlexKV manager to be initialized.
+        """
+        while not self.flexkv_manager.is_ready():
+            time.sleep(0.1)
+        flexkv_logger.info("FlexKV manager is ready")
+
     def is_ready(
         self,
     ) -> bool:
@@ -264,8 +273,8 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             None.
         """
         request = RequestWrapper(_request)
-        if request.num_new_matched_tokens == 0:
-            flexkv_logger.info(f"No new matched tokens, skip update state after alloc.")
+        if request.req_id not in self.req_id_to_task_dict:
+            flexkv_logger.info(f"Request {request.req_id} didn't launch task, skip update state after alloc.")
             return
 
         # prepare to launch task
@@ -275,7 +284,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         # compute slot_mapping
         num_computed_blocks = task.num_computed_tokens // self.block_size
-        num_blocks_to_get = request.num_new_matched_tokens // self.block_size
+        num_blocks_to_get = task.num_new_matched_tokens // self.block_size
         block_ids_to_get = block_ids[num_computed_blocks:num_computed_blocks+num_blocks_to_get]
         task.slot_mapping = np.array(block_ids_to_get).repeat(self.block_size)*self.block_size
 
@@ -678,14 +687,12 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         """Cleanup on deletion."""
         if hasattr(self, 'remote_process') and self.remote_process is not None:
             self.shutdown()
-    
-def get_rank_info_from_trt_config(config: ExecutorConfig):
-    if config.mapping.enable_attention_dp:
-        node_rank = config.mapping.node_rank
-        tp_rank = config.mapping.tp_rank
-        dp_rank = config.mapping.rank
-    else:
-        node_rank = config.mapping.node_rank
-        tp_rank = config.mapping.tp_rank
-        dp_rank = 0
+
+def get_rank_info_from_trt_config(config: Any) -> Tuple[int, int, int]:
+    mapping = get_mapping_from_config(config)
+
+    enable_attention_dp = bool(getattr(mapping, "enable_attention_dp", False))
+    node_rank = int(getattr(mapping, "node_rank", 0))
+    tp_rank = int(getattr(mapping, "tp_rank", 0)) if not enable_attention_dp else 0
+    dp_rank = int(getattr(mapping, "rank", 0)) if enable_attention_dp else 0
     return node_rank, tp_rank, dp_rank

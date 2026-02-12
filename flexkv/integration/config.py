@@ -3,7 +3,7 @@ import json
 import os
 import torch
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
@@ -119,37 +119,26 @@ class FlexKVConfig:
     def post_init_from_trt_config(
         self,
         config,
-    ):
-        self.cache_config.tokens_per_block = config.tokens_per_block
-        # Convert dtype string to torch.dtype
-        dtype_str = config.pytorch_backend_config.kv_cache_dtype
-        if dtype_str == "auto":
-            self.model_config.dtype = torch.bfloat16
-        elif isinstance(dtype_str, str):
-            # Convert string to torch.dtype
-            dtype_map = {
-                "float16": torch.float16,
-                "float32": torch.float32,
-                "bfloat16": torch.bfloat16,
-                "fp16": torch.float16,
-                "fp32": torch.float32,
-                "bf16": torch.bfloat16,
-            }
-            self.model_config.dtype = dtype_map.get(dtype_str, torch.bfloat16)
-        else:
-            self.model_config.dtype = dtype_str
+    ):  
+        from flexkv.integration.tensorrt_llm.utils import (get_kv_cache_dtype_from_config,
+                                                          get_mapping_from_config,
+                                                          get_model_path_from_config,
+                                                          get_tokens_per_block_from_config)
+
+        self.cache_config.tokens_per_block = get_tokens_per_block_from_config(config)
+        self.model_config.dtype = get_kv_cache_dtype_from_config(config)
         
-        # Set model config (parallel configs part)
-        if config.mapping.enable_attention_dp:
+        mapping = get_mapping_from_config(config)
+        if mapping.enable_attention_dp:
             self.model_config.tp_size = 1
-            self.model_config.dp_size = config.mapping.tp_size
+            self.model_config.dp_size = mapping.tp_size
         else:
-            self.model_config.tp_size = config.mapping.tp_size
+            self.model_config.tp_size = mapping.tp_size
             self.model_config.dp_size = 1
             
         # self.model_config (model configs part)
         try:
-            model_path = getattr(config, 'hf_model_dir', None)
+            model_path = get_model_path_from_config(config)
             from transformers import AutoConfig as HFAutoConfig
             hf_config = HFAutoConfig.from_pretrained(
                 str(model_path), 
