@@ -123,10 +123,10 @@ class FlexKVConfig:
         self.cache_config.tokens_per_block = config.tokens_per_block
         # Convert dtype string to torch.dtype
         dtype_str = config.pytorch_backend_config.kv_cache_dtype
-        if dtype_str == "auto":
-            self.model_config.dtype = torch.bfloat16
-        elif isinstance(dtype_str, str):
-            # Convert string to torch.dtype
+        flexkv_logger.info(f"[FlexKVConfig] dtype_str from TRT config: {dtype_str}")
+        
+        # Helper function to convert dtype string to torch.dtype
+        def _parse_dtype_str(dtype_str: str) -> torch.dtype:
             dtype_map = {
                 "float16": torch.float16,
                 "float32": torch.float32,
@@ -134,8 +134,32 @@ class FlexKVConfig:
                 "fp16": torch.float16,
                 "fp32": torch.float32,
                 "bf16": torch.bfloat16,
+                "fp8": torch.float8_e4m3fn, 
+                "float8": torch.float8_e4m3fn,
+                "e4m3": torch.float8_e4m3fn,                
             }
-            self.model_config.dtype = dtype_map.get(dtype_str, torch.bfloat16)
+            return dtype_map.get(dtype_str.lower(), torch.bfloat16)
+        
+        if dtype_str == "auto":
+            # When dtype_str is "auto", try to get kv_cache_dtype from user_config first
+            # This allows users to specify kv_cache_dtype in flexkv_config.json or via environment variable
+            user_dtype_str = self.user_config.kv_cache_dtype
+            if user_dtype_str is not None:
+                parsed_dtype = _parse_dtype_str(user_dtype_str)
+                self.model_config.dtype = parsed_dtype
+                flexkv_logger.info(f"[FlexKVConfig] dtype_str='auto', but found kv_cache_dtype='{user_dtype_str}' in user_config, using it -> {parsed_dtype}")
+            else:
+                # Try to infer from TRT config if possible (e.g., from actual tensor dtype)
+                # Note: This might not be available at initialization time
+                self.model_config.dtype = torch.bfloat16
+                flexkv_logger.warning(
+                    f"[FlexKVConfig] dtype_str='auto' and no kv_cache_dtype in user_config. "
+                    f"Falling back to {self.model_config.dtype}. To specify a different dtype, add 'kv_cache_dtype' "
+                    f"to your flexkv_config.json file (e.g., {{\"kv_cache_dtype\": \"fp8\"}}) "
+                    f"or set FLEXKV_KV_CACHE_DTYPE environment variable."
+                )
+        elif isinstance(dtype_str, str):
+            self.model_config.dtype = _parse_dtype_str(dtype_str)
         else:
             self.model_config.dtype = dtype_str
         
