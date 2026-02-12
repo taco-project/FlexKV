@@ -1,5 +1,6 @@
 #include "gds_manager.h"
 #include "layout_transform.cuh"
+#include "monitoring/metrics_manager.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
@@ -612,6 +613,8 @@ void transfer_kv_blocks_gds(
     bool verbose,
     bool is_mla
 ) {
+    const int num_transfers = ssd_block_ids.size(0);
+    
     if (!gds_manager.is_ready()) {
         throw std::runtime_error("GDS Manager not ready: " + gds_manager.get_last_error());
     }
@@ -627,7 +630,6 @@ void transfer_kv_blocks_gds(
     
     const int num_layers = gpu_layer_id_list.size(0);
     const int32_t* gpu_layer_id_list_ptr = gpu_layer_id_list.data_ptr<int32_t>();
-    const int num_transfers = ssd_block_ids.size(0);
     
     if (num_transfers == 0) return;
     
@@ -723,6 +725,10 @@ void transfer_kv_blocks_gds(
                     // READ: SSD -> buffer_slot -> GPU
                     gds_manager.read(filename.c_str(), buffer_slot_ptr, gpu_buffer_size_in_bytes, ssd_block_offset);
                     
+                    // Record transfer metrics after successful GDS read
+                    // Direction: is_read=true means data flows INTO GPU (GPU reads from SSD)
+                    FLEXKV_GPU_GDS_TRANSFER(true, gpu_buffer_size_in_bytes);
+                    
                     launch_layout_transform_kernel<Type>(
                         reinterpret_cast<int64_t*>(buffer_slot_ptr),
                         buffer_layer_stride,
@@ -757,6 +763,10 @@ void transfer_kv_blocks_gds(
                     cudaStreamSynchronize(slot_stream);
                     
                     gds_manager.write(filename.c_str(), buffer_slot_ptr, gpu_buffer_size_in_bytes, ssd_block_offset);
+                    
+                    // Record transfer metrics after successful GDS write
+                    // Direction: is_read=false means data flows OUT of GPU (GPU writes to SSD)
+                    FLEXKV_GPU_GDS_TRANSFER(false, gpu_buffer_size_in_bytes);
                 }
                 
                 if (verbose) {

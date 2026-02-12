@@ -32,6 +32,7 @@ cpp_sources = [
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/monitoring/metrics_manager.cpp",  # Monitoring support
 ]
 
 hpp_sources = [
@@ -39,6 +40,7 @@ hpp_sources = [
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
+    "csrc/monitoring/metrics_manager.h",  # Monitoring support
 ]
 
 # extra_link_args: dist/Redis (libhiredis) only when FLEXKV_ENABLE_P2P=1
@@ -50,6 +52,10 @@ if enable_cputest:
     extra_link_args.remove("-lcuda")
     # Set TORCH_CUDA_ARCH_LIST to avoid IndexError when no GPU is available
     os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
+
+
+# Add prometheus-cpp libraries for monitoring (static linking, order matters)
+extra_link_args.extend(["-lprometheus-cpp-pull", "-lprometheus-cpp-core"])
 
 extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]

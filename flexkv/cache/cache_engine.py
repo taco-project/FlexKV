@@ -39,6 +39,7 @@ from flexkv.common.transfer import (
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.type import MatchResultAccel
 from flexkv.integration.dynamo.collector import KVEventCollector
+from flexkv.metrics import FlexKVMetricsCollector, init_global_collector, get_global_collector
 
 DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
 
@@ -51,7 +52,8 @@ class CacheEngineAccel:
                  hit_reward_seconds: int = 0,
                  evict_start_threshold: float = 1.0,
                  eviction_policy: str = "lru",
-                 event_collector: Optional[KVEventCollector] = None):
+                 event_collector: Optional[KVEventCollector] = None,
+                 metrics_collector = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -72,6 +74,7 @@ class CacheEngineAccel:
         self.evict_start_threshold = evict_start_threshold
         
         self.event_collector = event_collector
+        self._metrics_collector = metrics_collector
 
     def reset(self) -> None:
         self.index.reset()
@@ -173,6 +176,10 @@ class CacheEngineAccel:
                 target_blocks = target_blocks.numpy()
                 self.mempool.recycle_blocks(target_blocks)
 
+                # Record eviction metrics
+                if self._metrics_collector is not None and num_evicted > 0:
+                    self._metrics_collector.record_eviction(DEVICE_TYPE[self.device_type].lower(), num_evicted)
+
                 if self.event_collector is not None:
                     self.event_collector.publish_removed(
                         block_hashes=evicted_block_hashes.numpy(),
@@ -186,7 +193,13 @@ class CacheEngineAccel:
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        return self.mempool.allocate_blocks(num_allocated_blocks)
+        allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
+        
+        # Record allocation metrics
+        if self._metrics_collector is not None and num_allocated_blocks > 0:
+            self._metrics_collector.record_allocation(DEVICE_TYPE[self.device_type].lower(), num_allocated_blocks)
+        
+        return allocated_blocks
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
@@ -200,7 +213,8 @@ class CacheEngine:
                  hit_reward_seconds: int = 0,
                  evict_start_threshold: float = 1.0,
                  eviction_policy: str = "lru",
-                 event_collector: Optional[KVEventCollector] = None):
+                 event_collector: Optional[KVEventCollector] = None,
+                 metrics_collector = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -221,6 +235,7 @@ class CacheEngine:
         self.evict_start_threshold = evict_start_threshold
 
         self.event_collector = event_collector
+        self._metrics_collector = metrics_collector
 
     def reset(self) -> None:
         self.index.reset()
@@ -284,6 +299,11 @@ class CacheEngine:
             if evict_block_num > 0:
                 evicted_blocks, evicted_block_hashes = self.index.evict(evict_block_num)
                 self.mempool.recycle_blocks(evicted_blocks)
+                
+                # Record eviction metrics
+                if self._metrics_collector is not None and len(evicted_blocks) > 0:
+                    self._metrics_collector.record_eviction(DEVICE_TYPE[self.device_type].lower(), len(evicted_blocks))
+                
                 if self.event_collector is not None:
                     self.event_collector.publish_removed(block_hashes=evicted_block_hashes,
                                                          medium=DEVICE_TYPE[self.device_type])
@@ -295,7 +315,13 @@ class CacheEngine:
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        return self.mempool.allocate_blocks(num_allocated_blocks)
+        allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
+        
+        # Record allocation metrics
+        if self._metrics_collector is not None and num_allocated_blocks > 0:
+            self._metrics_collector.record_allocation(DEVICE_TYPE[self.device_type].lower(), num_allocated_blocks)
+        
+        return allocated_blocks
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
@@ -339,6 +365,11 @@ class GlobalCacheEngine:
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
         self.eviction_policy = GLOBAL_CONFIG_FROM_ENV.eviction_policy
 
+        # Initialize metrics collector for cache engine monitoring (before creating CacheEngines)
+        self._metrics_collector = get_global_collector()
+        if self._metrics_collector is None:
+            self._metrics_collector = init_global_collector()
+
         need_dist = (
             (cache_config.enable_cpu and cache_config.enable_p2p_cpu)
             or (cache_config.enable_ssd and cache_config.enable_p2p_ssd)
@@ -362,7 +393,8 @@ class GlobalCacheEngine:
                                                 self.hit_reward_seconds,
                                                 self.evict_start_threshold,
                                                 self.eviction_policy,
-                                                event_collector)
+                                                event_collector,
+                                                self._metrics_collector)
             else:
                 self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
@@ -371,7 +403,8 @@ class GlobalCacheEngine:
                                                 self.hit_reward_seconds,
                                                 self.evict_start_threshold,
                                                 self.eviction_policy,
-                                                event_collector)
+                                                event_collector,
+                                                self._metrics_collector)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
@@ -384,7 +417,8 @@ class GlobalCacheEngine:
                                                 self.hit_reward_seconds,
                                                 self.evict_start_threshold,
                                                 self.eviction_policy,
-                                                event_collector)
+                                                event_collector,
+                                                self._metrics_collector)
             else:
                 self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
@@ -393,7 +427,8 @@ class GlobalCacheEngine:
                                                 self.hit_reward_seconds,
                                                 self.evict_start_threshold,
                                                 self.eviction_policy,
-                                                event_collector)
+                                                event_collector,
+                                                self._metrics_collector)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
@@ -406,7 +441,9 @@ class GlobalCacheEngine:
                                                    self.evict_ratio,
                                                    self.hit_reward_seconds,
                                                    self.evict_start_threshold,
-                                                   self.eviction_policy)
+                                                   self.eviction_policy,
+                                                   None,
+                                                   self._metrics_collector)
             else:
                 self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
@@ -414,7 +451,9 @@ class GlobalCacheEngine:
                                                    self.evict_ratio,
                                                    self.hit_reward_seconds,
                                                    self.evict_start_threshold,
-                                                   self.eviction_policy)
+                                                   self.eviction_policy,
+                                                   None,
+                                                   self._metrics_collector)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
         #TODO move this to kvmanager.start()
@@ -424,6 +463,9 @@ class GlobalCacheEngine:
             lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0)
         self._empty_put_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]] = \
             lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0, 0)
+        
+        # Update initial mempool stats
+        self._update_mempool_metrics()
 
     def start(self) -> None:
         if self.cpu_cache_engine and self.cache_config.enable_p2p_cpu:
@@ -440,6 +482,34 @@ class GlobalCacheEngine:
             self.ssd_cache_engine.reset()
         if self.remote_cache_engine:
             self.remote_cache_engine.reset()
+
+    def _update_mempool_metrics(self) -> None:
+        """Update memory pool metrics for all cache engines."""
+        if self._metrics_collector is None:
+            return
+        for device_type, engine in self.cache_engines.items():
+            if hasattr(engine, 'mempool'):
+                device_label = DEVICE_TYPE[device_type].lower()
+                self._metrics_collector.update_mempool_stats(
+                    device_label,
+                    engine.mempool.num_total_blocks,
+                    engine.mempool.num_free_blocks
+                )
+    
+    def _record_transfer_ops(self, transfer_graph: TransferOpGraph, operation: str) -> None:
+        """Record metrics for all transfer operations in the graph.
+        
+        Args:
+            transfer_graph: The transfer operation graph
+            operation: Operation type ("get" or "put")
+        """
+        if self._metrics_collector is None:
+            return
+        for op in transfer_graph._op_map.values():
+            if op.transfer_type != TransferType.VIRTUAL:
+                transfer_type_str = op.transfer_type.value
+                num_blocks = len(op.src_block_ids) if op.src_block_ids is not None else 0
+                self._metrics_collector.record_transfer(transfer_type_str, num_blocks, operation)
 
     def get(self,
             request_id: int,
@@ -540,6 +610,12 @@ class GlobalCacheEngine:
                                               device_type=op_node_to_ready[op_id][0],
                                               node_to_ready=op_node_to_ready[op_id][1],
                                               ready_length=op_node_to_ready[op_id][2])
+        
+        # Record metrics for GET operation
+        if self._metrics_collector is not None:
+            self._record_transfer_ops(transfer_graph, "get")
+            self._update_mempool_metrics()
+        
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
     def _get_impl_global(self,
@@ -585,6 +661,11 @@ class GlobalCacheEngine:
         fragment123_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks), len(remote_matched_blocks))
         #early return if no blocks to transfer
         if fragment123_num_blocks == 0:
+            # All cache levels missed - record miss for all requested blocks
+            if self._metrics_collector is not None:
+                total_query_blocks = block_mask_end - block_mask_start
+                if total_query_blocks > 0:
+                    self._metrics_collector.record_cache_miss(total_query_blocks)
             return self._empty_get_return(request_id)
         assert fragment123_num_blocks <= len(gpu_block_ids)
 
@@ -618,6 +699,9 @@ class GlobalCacheEngine:
             )
             if len(fragment23_cpu_blocks) < num_extra_required_blocks:
                 self.cpu_cache_engine.recycle(fragment23_cpu_blocks)
+                # Record allocation failure (resource unavailable, not cache miss)
+                if self._metrics_collector is not None:
+                    self._metrics_collector.record_allocation_failure("global")
                 return self._empty_get_return(request_id)
             fragment123_cpu_blocks = np.concatenate([fragment123_cpu_blocks, fragment23_cpu_blocks])
             # we only insert the buffer blocks to cpu cache engine only:
@@ -633,6 +717,21 @@ class GlobalCacheEngine:
                                                                   match_result=cpu_matched_result)
             else:
                 cpu_blocks_to_free = fragment23_cpu_blocks
+
+        # Record cache hit/miss metrics after confirming successful allocation
+        if self._metrics_collector is not None:
+            total_query_blocks = block_mask_end - block_mask_start
+            # CPU hit blocks (directly from CPU cache)
+            self._metrics_collector.record_cache_hit("cpu", fragment1_num_blocks)
+            # SSD hit blocks (blocks loaded from SSD)
+            self._metrics_collector.record_cache_hit("ssd", fragment2_num_blocks)
+            # Remote hit blocks (blocks loaded from remote)
+            self._metrics_collector.record_cache_hit("remote", fragment3_num_blocks)
+            # Miss blocks (not in any cache)
+            miss_blocks = total_query_blocks - fragment123_num_blocks
+            if miss_blocks > 0:
+                self._metrics_collector.record_cache_miss(miss_blocks)
+
         op_disk2h = None
         if fragment2_num_blocks > 0:
             op_disk2h = TransferOp(
@@ -778,6 +877,11 @@ class GlobalCacheEngine:
         fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
         #early return if no blocks to transfer
         if fragment12_num_blocks == 0:
+            # All cache levels missed - record miss for all requested blocks
+            if self._metrics_collector is not None:
+                total_query_blocks = block_mask_end - block_mask_start
+                if total_query_blocks > 0:
+                    self._metrics_collector.record_cache_miss(total_query_blocks)
             return self._empty_get_return(request_id)
         assert fragment12_num_blocks <= len(gpu_block_ids)
 
@@ -813,7 +917,22 @@ class GlobalCacheEngine:
         # there might be a better way to handle this
         if len(allocated_cpu_blocks) < allocated_cpu_block_num:
             self.cpu_cache_engine.recycle(allocated_cpu_blocks)
+            # Record allocation failure (resource unavailable, not cache miss)
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_allocation_failure("local")
             return self._empty_get_return(request_id)
+
+        # Record cache hit/miss metrics after confirming successful allocation
+        if self._metrics_collector is not None:
+            total_query_blocks = block_mask_end - block_mask_start
+            # CPU hit blocks (directly from CPU cache)
+            self._metrics_collector.record_cache_hit("cpu", fragment1_num_blocks)
+            # SSD hit blocks (blocks loaded from SSD to CPU)
+            self._metrics_collector.record_cache_hit("ssd", fragment2_num_blocks)
+            # Miss blocks (not in any cache)
+            miss_blocks = total_query_blocks - fragment12_num_blocks
+            if miss_blocks > 0:
+                self._metrics_collector.record_cache_miss(miss_blocks)
 
         if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
             fragment1_cpu_blocks_local = allocated_cpu_blocks[-fragment1_num_blocks:]
@@ -1003,6 +1122,11 @@ class GlobalCacheEngine:
                                               device_type=op_node_to_ready[op_id][0],
                                               node_to_ready=op_node_to_ready[op_id][1],
                                               ready_length=op_node_to_ready[op_id][2])
+
+        # Record metrics for PUT operation
+        if self._metrics_collector is not None:
+            self._record_transfer_ops(transfer_graph, "put")
+            self._update_mempool_metrics()
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 

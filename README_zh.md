@@ -125,6 +125,12 @@ FlexKV 支持分布式 KVCache 复用，实现多节点间的高效共享。
 - **Upload & Rebuild**：本地索引定期上传到全局元数据存储 (GMS，通常是 Redis 服务)，并通过拉取其他节点的元数据重建分布式索引。
 - **Mooncake Transfer Engine**：我们使用 [Mooncake Transfer Engine](https://github.com/kvcache-ai/Mooncake) 这一基于 RDMA 的传输引擎，实现节点间高性能 KVCache 传输。
 
+## Prometheus 监控
+
+FlexKV 原生集成了基于 Prometheus 的运行时监控框架，覆盖 Python 和 C++ 两层关键路径。采用**零侵入**设计——只需设置环境变量 `FLEXKV_ENABLE_METRICS=1`，即可自动收集缓存命中/未命中、内存池状态、数据传输等核心指标，并通过标准 HTTP 端点暴露给 Prometheus 采集和 Grafana 可视化。
+
+完整的指标列表、环境变量配置、监控栈（Prometheus + Grafana）部署指南，请参阅 [docs/monitoring/README_zh.md](docs/monitoring/README_zh.md)。
+
 ## 分支策略
 
 本项目的分支管理策略如下：

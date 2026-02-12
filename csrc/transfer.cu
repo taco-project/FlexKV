@@ -18,6 +18,7 @@
 #include <torch/extension.h>
 
 #include "transfer.cuh"
+#include "monitoring/metrics_manager.h"
 
 namespace flexkv {
 
@@ -129,6 +130,11 @@ void transfer_kv_blocks(
             cudaMemcpyAsync(cpu_chunk_ptr, gpu_chunk_ptr, chunk_size_in_bytes,
                             cudaMemcpyDeviceToHost, stream);
           }
+          // Record transfer metrics after each cudaMemcpyAsync submission
+          // Direction convention (from GPU perspective):
+          //   - is_host_to_device=true  -> read (CPU->GPU, data flows INTO GPU)
+          //   - is_host_to_device=false -> write (GPU->CPU, data flows OUT of GPU)
+          FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, chunk_size_in_bytes);
         }
       }
     }
@@ -141,6 +147,19 @@ void transfer_kv_blocks(
         cpu_layer_stride_int64, cpu_block_stride_int64,
         cpu_startoff_inside_chunks_int64, chunk_size_in_int64, is_mla,
         is_host_to_device);
+
+    // Record transfer metrics after kernel launch (cannot record inside kernel)
+    // Total bytes = actual_chunk_bytes * num_layers * kv_dim * num_blocks
+    // Note: Kernel transfers in float4 units, so we calculate aligned bytes to match
+    // Direction convention (from GPU perspective):
+    //   - is_host_to_device=true  -> read (CPU->GPU, data flows INTO GPU)
+    //   - is_host_to_device=false -> write (GPU->CPU, data flows OUT of GPU)
+    int kv_dim = is_mla ? 1 : 2;
+    // Calculate actual bytes transferred (aligned to float4, matching kernel logic)
+    int64_t actual_chunk_bytes = (chunk_size_in_int64 * sizeof(int64_t) / sizeof(float4)) * sizeof(float4);
+    FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, 
+        actual_chunk_bytes * static_cast<int64_t>(num_layers) * 
+        static_cast<int64_t>(kv_dim) * static_cast<int64_t>(num_blocks));
   }
   cudaStreamSynchronize(stream);
 }

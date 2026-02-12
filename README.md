@@ -127,6 +127,12 @@ Key features include:
 - **Upload & Rebuild**: Local indexes are periodically uploaded to a Global Meta Store (GMS, typically a Redis service), and distributed indexes are rebuilt by pulling metadata from other nodes.
 - **Mooncake Transfer Engine**: We use [Mooncake Transfer Engine](https://github.com/kvcache-ai/Mooncake), an RDMA-based transfer engine, to achieve high-performance KVCache transfer between nodes.
 
+## Prometheus Monitoring
+
+FlexKV natively integrates a Prometheus-based runtime monitoring framework that covers key paths in both the Python and C++ layers. It is designed to be **zero-intrusion** — simply set the environment variable `FLEXKV_ENABLE_METRICS=1` to automatically collect core metrics such as cache hit/miss, memory pool status, and data transfer statistics, which are then exposed via standard HTTP endpoints for Prometheus scraping and Grafana visualization.
+
+For the full list of supported metrics, environment variable configuration, deployment guide for the monitoring stack (Prometheus + Grafana), see [docs/monitoring/README_en.md](docs/monitoring/README_en.md).
+
 ## Branching Strategy
 
 The branch management strategy of this project is as follows:

@@ -32,6 +32,7 @@
 #include "dist/lock_free_q.h"
 #include "dist/lease_meta_mempool.h"
 #endif
+#include "monitoring/metrics_manager.h"
 #include <deque>
 
 namespace py = pybind11;
@@ -403,6 +404,12 @@ bool create_gds_file_binding(GDSManager& manager,
 #endif
 
 PYBIND11_MODULE(c_ext, m) {
+  // Metrics configuration function - allows Python to configure C++ metrics
+  m.def("configure_cpp_metrics", [](bool enabled, int port) {
+    flexkv::monitoring::MetricsManager::Instance().Configure(enabled, port);
+  }, "Configure C++ metrics from Python",
+     py::arg("enabled"), py::arg("port"));
+
   m.def("transfer_kv_blocks", &transfer_kv_blocks_binding,
         "Transfer multi-layer KV-cache between CPU and GPU",
         py::arg("gpu_block_id_tensor"), py::arg("gpu_tensor_ptrs_tensor"),
