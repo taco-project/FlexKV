@@ -64,6 +64,7 @@ class KVEventCollector:
                 block_size=block_size,
                 lora_id=lora_id,
                 medium=medium,
+                lora_name=None,
             )
         elif event_type == 'BlockRemoved':
             return BlockRemoved(
