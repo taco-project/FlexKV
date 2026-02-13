@@ -36,6 +36,7 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_gds: bool = False # Requires enable_ssd=True
+    enable_bypass_cpu: bool = False
     enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
                                 # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
     enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
@@ -130,6 +131,7 @@ class UserConfig:
     ssd_cache_gb: int = 0  # 0 means disable ssd
     ssd_cache_dir: Union[str, List[str]] = "./ssd_cache"
     enable_gds: bool = False
+    enable_bypass_cpu: bool = False
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
@@ -212,6 +214,7 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds
+    cache_config.enable_bypass_cpu = user_config.enable_bypass_cpu
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote

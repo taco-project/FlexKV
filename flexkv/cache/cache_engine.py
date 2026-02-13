@@ -748,6 +748,7 @@ class GlobalCacheEngine:
         enable_cpu = self.cache_config.enable_cpu
         enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
         enable_gds = self.cache_config.enable_gds and not temp_cache_strategy.ignore_gds
+        enable_bypass_cpu = self.cache_config.enable_bypass_cpu
         assert enable_cpu
         assert self.cpu_cache_engine is not None
 
@@ -811,9 +812,10 @@ class GlobalCacheEngine:
         )
         # NOTE: not enough space to allocate, skip the request
         # there might be a better way to handle this
-        if len(allocated_cpu_blocks) < allocated_cpu_block_num:
-            self.cpu_cache_engine.recycle(allocated_cpu_blocks)
-            return self._empty_get_return(request_id)
+        if not enable_bypass_cpu:
+            if len(allocated_cpu_blocks) < allocated_cpu_block_num:
+                self.cpu_cache_engine.recycle(allocated_cpu_blocks)
+                return self._empty_get_return(request_id)
 
         if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
             fragment1_cpu_blocks_local = allocated_cpu_blocks[-fragment1_num_blocks:]
@@ -1203,6 +1205,7 @@ class GlobalCacheEngine:
         enable_cpu = self.cache_config.enable_cpu
         enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
         enable_gds = self.cache_config.enable_gds and not temp_cache_strategy.ignore_gds
+        enable_bypass_cpu = self.cache_config.enable_bypass_cpu
         assert enable_gpu
         assert enable_cpu
         assert self.cpu_cache_engine is not None
@@ -1223,103 +1226,159 @@ class GlobalCacheEngine:
         #if len(cpu_matched_blocks) > len(ssd_matched_blocks):
         #    print(f"[PUT_LOCAL] CPU matched blocks are greater than SSD matched blocks, skipping")
         #    return self._empty_put_return(request_id)
-        
+        if enable_bypass_cpu:
+            num_skipped_blocks = len(ssd_matched_blocks)
+            fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
+            if fragment12_num_blocks == 0:
+                return self._empty_put_return(request_id)
+            fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
+            if not enable_ssd:
+                fragment2_num_blocks = 0
 
-        num_skipped_blocks = len(cpu_matched_blocks)
-        fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
-        if fragment12_num_blocks == 0:
-            return self._empty_put_return(request_id)
-        fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
-        if not enable_ssd:
-            fragment2_num_blocks = 0
+            fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
 
-        fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
-
-        fragment12_cpu_blocks = self.cpu_cache_engine.take(
-            num_required_blocks=fragment12_num_blocks,
-            protected_node = cpu_matched_result.last_node,
-            strict=False
-        )
-
-        if enable_ssd:
-            fragment2_ssd_blocks = self.ssd_cache_engine.take(
-                num_required_blocks=fragment2_num_blocks,
-                protected_node = ssd_matched_result.last_node,
-                strict=False
-            )
-        else:
-            fragment2_ssd_blocks = np.array([], dtype=np.int64)
-
-        if len(fragment12_cpu_blocks) < fragment12_num_blocks or \
-            len(fragment2_ssd_blocks) < fragment2_num_blocks:
-            print(f"[WARNING] PUT request {request_id} FAILED: CPU={len(fragment12_cpu_blocks)}/{fragment12_num_blocks}, SSD={len(fragment2_ssd_blocks)}/{fragment2_num_blocks}")
-            self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
             if enable_ssd:
-                self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
-            return self._empty_put_return(request_id)
-
-        transfer_graph = TransferOpGraph()
-        finished_ops_ids = []
-        op_node_to_ready = {}
-
-        op_d2h = TransferOp(
-            graph_id = transfer_graph.graph_id,
-            transfer_type = TransferType.D2H,
-            src_block_ids = fragment12_gpu_blocks,
-            dst_block_ids = fragment12_cpu_blocks,
-            layer_id = 0,
-            layer_granularity = layer_num
-        )
-        transfer_graph.add_transfer_op(op_d2h)
-        finished_ops_ids.append(op_d2h.op_id)
-
-        if fragment2_num_blocks > 0:
-            if len(fragment12_cpu_blocks) < fragment2_num_blocks:
-                flexkv_logger.warning(f"fragment12_cpu_blocks: {len(fragment12_cpu_blocks)}, "
-                                      f"fragment2_num_blocks: {fragment2_num_blocks}, "
-                                      f"cpu match blocks are bigger than SSD match blocks number. "
-                                      f"This should not often happen if CPU cache size is smaller than SSD cache size.")
-                num_needed_from_cpu_matched = fragment2_num_blocks - len(fragment12_cpu_blocks)
-                fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[-num_needed_from_cpu_matched:], \
-                    fragment12_cpu_blocks])
+                fragment2_ssd_blocks = self.ssd_cache_engine.take(
+                    num_required_blocks=fragment2_num_blocks,
+                    protected_node = ssd_matched_result.last_node,
+                    strict=False
+                )
             else:
-                fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
-            op_h2disk = TransferOp(
+                fragment2_ssd_blocks = np.array([], dtype=np.int64)
+            if len(fragment2_ssd_blocks) < fragment2_num_blocks:
+                print(f"[WARNING] PUT request {request_id} FAILED: SSD={len(fragment2_ssd_blocks)}/{fragment2_num_blocks}")
+                if enable_ssd:
+                    self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
+                return self._empty_put_return(request_id)
+
+            transfer_graph = TransferOpGraph()
+            finished_ops_ids = []
+            op_node_to_ready = {}
+
+            op_d2disk = TransferOp(
                 graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.H2DISK,
-                src_block_ids = fragment2_cpu_blocks,
+                transfer_type = TransferType.D2DISK,
+                src_block_ids = fragment12_gpu_blocks,
                 dst_block_ids = fragment2_ssd_blocks,
                 layer_id = 0,
                 layer_granularity = layer_num
             )
-            transfer_graph.add_transfer_op(op_h2disk)
+            transfer_graph.add_transfer_op(op_d2disk)
+            finished_ops_ids.append(op_d2disk.op_id)
+            """insert and lock"""
+            ssd_node_to_unlock = None
+            if len(fragment2_ssd_blocks) > 0:
+                ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
+                                                                fragment2_ssd_blocks,
+                                                                is_ready=False,
+                                                                match_result=ssd_matched_result)
+                op_node_to_ready[op_d2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+            node_to_unlock = {}
+            if ssd_node_to_unlock is not None:
+                node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
 
-            transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
+            skipped_gpu_blocks = len(ssd_matched_blocks)
+            return (
+                transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready, {},
+                len(fragment12_gpu_blocks), skipped_gpu_blocks
+            )
 
-        """insert and lock"""
-        cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
-                                                          fragment12_cpu_blocks,
-                                                          is_ready=False,
-                                                          match_result=cpu_matched_result)
-        op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
-        ssd_node_to_unlock = None
-        if len(fragment2_ssd_blocks) > 0:
-            ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
-                                                            fragment2_ssd_blocks,
-                                                            is_ready=False,
-                                                            match_result=ssd_matched_result)
-            op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
-        node_to_unlock = {}
-        if cpu_node_to_unlock is not None:
-            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
-        if ssd_node_to_unlock is not None:
-            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+        else:
+            num_skipped_blocks = len(cpu_matched_blocks)
+            fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
+            if fragment12_num_blocks == 0:
+                return self._empty_put_return(request_id)
+            fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
+            if not enable_ssd:
+                fragment2_num_blocks = 0
 
-        skipped_gpu_blocks = len(cpu_matched_blocks)
-        return (
-            transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready, {},
-            len(fragment12_gpu_blocks), skipped_gpu_blocks
-        )
+            fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
+
+            fragment12_cpu_blocks = self.cpu_cache_engine.take(
+                num_required_blocks=fragment12_num_blocks,
+                protected_node = cpu_matched_result.last_node,
+                strict=False
+            )
+
+            if enable_ssd:
+                fragment2_ssd_blocks = self.ssd_cache_engine.take(
+                    num_required_blocks=fragment2_num_blocks,
+                    protected_node = ssd_matched_result.last_node,
+                    strict=False
+                )
+            else:
+                fragment2_ssd_blocks = np.array([], dtype=np.int64)
+
+            if len(fragment12_cpu_blocks) < fragment12_num_blocks or \
+                len(fragment2_ssd_blocks) < fragment2_num_blocks:
+                print(f"[WARNING] PUT request {request_id} FAILED: CPU={len(fragment12_cpu_blocks)}/{fragment12_num_blocks}, SSD={len(fragment2_ssd_blocks)}/{fragment2_num_blocks}")
+                self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
+                if enable_ssd:
+                    self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
+                return self._empty_put_return(request_id)
+
+            transfer_graph = TransferOpGraph()
+            finished_ops_ids = []
+            op_node_to_ready = {}
+
+            op_d2h = TransferOp(
+                graph_id = transfer_graph.graph_id,
+                transfer_type = TransferType.D2H,
+                src_block_ids = fragment12_gpu_blocks,
+                dst_block_ids = fragment12_cpu_blocks,
+                layer_id = 0,
+                layer_granularity = layer_num
+            )
+            transfer_graph.add_transfer_op(op_d2h)
+            finished_ops_ids.append(op_d2h.op_id)
+
+            if fragment2_num_blocks > 0:
+                if len(fragment12_cpu_blocks) < fragment2_num_blocks:
+                    flexkv_logger.warning(f"fragment12_cpu_blocks: {len(fragment12_cpu_blocks)}, "
+                                      f"fragment2_num_blocks: {fragment2_num_blocks}, "
+                                      f"cpu match blocks are bigger than SSD match blocks number. "
+                                      f"This should not often happen if CPU cache size is smaller than SSD cache size.")
+                    num_needed_from_cpu_matched = fragment2_num_blocks - len(fragment12_cpu_blocks)
+                    fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[-num_needed_from_cpu_matched:], \
+                        fragment12_cpu_blocks])
+                else:
+                    fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
+                op_h2disk = TransferOp(
+                    graph_id = transfer_graph.graph_id,
+                    transfer_type = TransferType.H2DISK,
+                    src_block_ids = fragment2_cpu_blocks,
+                    dst_block_ids = fragment2_ssd_blocks,
+                    layer_id = 0,
+                    layer_granularity = layer_num
+                )
+                transfer_graph.add_transfer_op(op_h2disk)
+
+                transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
+
+            """insert and lock"""
+            cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
+                                                             fragment12_cpu_blocks,
+                                                             is_ready=False,
+                                                             match_result=cpu_matched_result)
+            op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+            ssd_node_to_unlock = None
+            if len(fragment2_ssd_blocks) > 0:
+                ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
+                                                                  fragment2_ssd_blocks,
+                                                                  is_ready=False,
+                                                                  match_result=ssd_matched_result)
+                op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+            node_to_unlock = {}
+            if cpu_node_to_unlock is not None:
+                node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+            if ssd_node_to_unlock is not None:
+                node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+
+            skipped_gpu_blocks = len(cpu_matched_blocks)
+            return (
+                transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready, {},
+                len(fragment12_gpu_blocks), skipped_gpu_blocks
+            )
 
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
