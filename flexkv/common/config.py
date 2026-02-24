@@ -83,6 +83,14 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
     instance_num=int(os.getenv('FLEXKV_INSTANCE_NUM', 1)),
     instance_id=int(os.getenv('FLEXKV_INSTANCE_ID', 0)),
+
+    # Metrics configuration
+    ## Enable/disable metrics collection and HTTP server (shared by C++ and Python)
+    enable_metrics=bool(int(os.getenv('FLEXKV_ENABLE_METRICS', 0))),
+    ## Port for C++ metrics HTTP server (default: 8081)
+    cpp_metrics_port=int(os.getenv('FLEXKV_CPP_METRICS_PORT', 8081)),
+    ## Port for Python metrics HTTP server (default: 8080)
+    py_metrics_port=int(os.getenv('FLEXKV_PY_METRICS_PORT', 8080)),
     
     # Server-client mode configuration
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),

@@ -8,6 +8,7 @@
 
 #include "cache_utils.h"
 #include "radix_tree.h"
+#include "monitoring/metrics_manager.h"
 
 namespace flexkv {
 
@@ -273,6 +274,10 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
                                physical_block_ids_ptr[i]);
   }
 
+  // Record cache insert operation metrics after actual insertion
+  FLEXKV_CACHE_INSERT();
+  FLEXKV_BLOCKS_INSERTED(num_insert_blocks - num_matched_blocks);
+
   if (last_node_matched_length < last_node->size()) {
     last_node->split(last_node_matched_length);
     last_node = last_node->get_parent();
@@ -358,6 +363,12 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted
       remove_node(node);
     }
   }
+  // Record eviction metrics
+  if (has_evicted > 0) {
+    FLEXKV_CACHE_EVICT();
+    FLEXKV_BLOCKS_EVICTED(has_evicted);
+  }
+
   return has_evicted;
 }
 
@@ -470,6 +481,23 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
       prefix_blocks_num += matched_length;
       break;
     }
+  }
+
+  // Record cache match metrics (HIT/MISS/MATCH are mutually exclusive)
+  // - HIT: Full match, all requested blocks found in cache (prefix_blocks_num == num_blocks)
+  // - MATCH: Partial match, some blocks found but not all (0 < prefix_blocks_num < num_blocks)
+  // - MISS: No match, no blocks found in cache (prefix_blocks_num == 0)
+  if (prefix_blocks_num == num_blocks) {
+    // Full match - all requested blocks are in cache
+    FLEXKV_CACHE_HIT();
+    FLEXKV_BLOCKS_MATCHED(prefix_blocks_num);
+  } else if (prefix_blocks_num > 0) {
+    // Partial match - some blocks found, but not all
+    FLEXKV_CACHE_MATCH();
+    FLEXKV_BLOCKS_MATCHED(prefix_blocks_num);
+  } else {
+    // No match - no blocks found in cache
+    FLEXKV_CACHE_MISS();
   }
 
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);

@@ -99,10 +99,13 @@ def main(args):
     stats.sort_stats('cumulative')
     for func in stats.stats:
         if func[2] in dir(cache_engine) and not func[2].startswith('__'):
+            total_calls = stats.stats[func][0]
+            if total_calls == 0:
+                continue
             print(f"function: {func[2]:<25} "
                   f"total time: {stats.stats[func][3]:.3f}s  "
-                  f"total calls: {stats.stats[func][0]:<7}"
-                  f"avg time: {1000 * stats.stats[func][3] / stats.stats[func][0]:.3f}ms")
+                  f"total calls: {total_calls:<7}"
+                  f"avg time: {1000 * stats.stats[func][3] / total_calls:.3f}ms")
 
 def parse_args():
     parser = ArgumentParser()
