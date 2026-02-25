@@ -37,13 +37,18 @@ namespace flexkv {
 class TPTransferThreadGroup {
 public:
   TPTransferThreadGroup(
-      int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-      torch::Tensor &cpu_blocks, int dp_group_id,
+      int num_gpus,
+      const std::vector<int64_t> &gpu_block_ptrs_flat,
+      int num_tensors_per_gpu,
+      int64_t cpu_blocks_ptr,
+      int dp_group_id,
       int num_layers,
-      torch::Tensor &gpu_kv_strides_tensor,
-      torch::Tensor &gpu_block_strides_tensor,
-      torch::Tensor &gpu_layer_strides_tensor,
-      torch::Tensor &gpu_chunk_sizes_tensor);
+      const std::vector<int64_t> &gpu_kv_strides_in_bytes,
+      const std::vector<int64_t> &gpu_block_strides_in_bytes,
+      const std::vector<int64_t> &gpu_layer_strides_in_bytes,
+      const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
+      const std::vector<int64_t> &gpu_device_ids);
+
   ~TPTransferThreadGroup();
 
   void tp_group_transfer(const torch::Tensor &gpu_block_id_tensor,

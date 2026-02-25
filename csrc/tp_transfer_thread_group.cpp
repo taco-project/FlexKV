@@ -21,44 +21,40 @@
 namespace flexkv {
 
 TPTransferThreadGroup::TPTransferThreadGroup(
-    int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-    torch::Tensor &cpu_blocks, int dp_group_id,
+    int num_gpus,
+    const std::vector<int64_t> &gpu_block_ptrs_flat,
+    int num_tensors_per_gpu,
+    int64_t cpu_blocks_ptr,
+    int dp_group_id,
     int num_layers,
-    torch::Tensor &gpu_kv_strides_tensor,
-    torch::Tensor &gpu_block_strides_tensor,
-    torch::Tensor &gpu_layer_strides_tensor,
-    torch::Tensor &gpu_chunk_sizes_tensor) {
-
+    const std::vector<int64_t> &gpu_kv_strides_in_bytes,
+    const std::vector<int64_t> &gpu_block_strides_in_bytes,
+    const std::vector<int64_t> &gpu_layer_strides_in_bytes,
+    const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
+    const std::vector<int64_t> &gpu_device_ids) {
   num_gpus_ = num_gpus;
-  
+  num_tensors_per_gpu_ = num_tensors_per_gpu;
+  dp_group_id_ = dp_group_id;
+
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_layer_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_chunk_sizes_in_bytes_ = new int64_t[num_gpus];
-  
-  int64_t* kv_strides_ptr = gpu_kv_strides_tensor.data_ptr<int64_t>();
-  int64_t* block_strides_ptr = gpu_block_strides_tensor.data_ptr<int64_t>();
-  int64_t* layer_strides_ptr = gpu_layer_strides_tensor.data_ptr<int64_t>();
-  int64_t* chunk_sizes_ptr = gpu_chunk_sizes_tensor.data_ptr<int64_t>();
-  
   for (int i = 0; i < num_gpus; i++) {
-    gpu_kv_strides_in_bytes_[i] = kv_strides_ptr[i];
-    gpu_block_strides_in_bytes_[i] = block_strides_ptr[i];
-    gpu_chunk_sizes_in_bytes_[i] = chunk_sizes_ptr[i];
-    gpu_layer_strides_in_bytes_[i] = layer_strides_ptr[i];
+    gpu_kv_strides_in_bytes_[i] = gpu_kv_strides_in_bytes[i];
+    gpu_block_strides_in_bytes_[i] = gpu_block_strides_in_bytes[i];
+    gpu_layer_strides_in_bytes_[i] = gpu_layer_strides_in_bytes[i];
+    gpu_chunk_sizes_in_bytes_[i] = gpu_chunk_sizes_in_bytes[i];
   }
 
   queues_.resize(num_gpus_);
-  mtxs_   = std::vector<std::mutex>(num_gpus_);
-  cvs_    = std::vector<std::condition_variable>(num_gpus_);
+  mtxs_ = std::vector<std::mutex>(num_gpus_);
+  cvs_ = std::vector<std::condition_variable>(num_gpus_);
 
-  num_tensors_per_gpu_ = gpu_blocks[0].size();
   cudaMallocHost((void **)&gpu_blocks_,
                  num_gpus_ * num_tensors_per_gpu_ * sizeof(void *));
-  for (int i = 0; i < num_gpus_; ++i) {
-    for (int j = 0; j < num_tensors_per_gpu_; ++j) {
-      gpu_blocks_[i * num_tensors_per_gpu_ + j] = gpu_blocks[i][j].data_ptr();
-    }
+  for (size_t i = 0; i < gpu_block_ptrs_flat.size(); ++i) {
+    gpu_blocks_[i] = reinterpret_cast<void *>(gpu_block_ptrs_flat[i]);
   }
 
   if (num_tensors_per_gpu_ == 1) {
@@ -73,26 +69,23 @@ TPTransferThreadGroup::TPTransferThreadGroup(
 
   gpu_tensor_handlers_.reserve(num_gpus_);
   for (int i = 0; i < num_gpus_; i++) {
-    int64_t **gpu_blocks_ptr = reinterpret_cast<int64_t**>(gpu_blocks_ + i * num_tensors_per_gpu_);
+    int64_t **gpu_blocks_ptr = reinterpret_cast<int64_t **>(gpu_blocks_ + i * num_tensors_per_gpu_);
     gpu_tensor_handlers_.emplace_back(
         backend_type_,
         gpu_blocks_ptr,
         num_layers,
         gpu_kv_strides_in_bytes_[i],
         gpu_block_strides_in_bytes_[i],
-        gpu_layer_strides_in_bytes_[i]
-    );
+        gpu_layer_strides_in_bytes_[i]);
   }
 
-  cpu_blocks_ = cpu_blocks.data_ptr();
+  cpu_blocks_ = reinterpret_cast<void *>(cpu_blocks_ptr);
 
-  dp_group_id_ = dp_group_id;
-  
   gpu_device_ids_.resize(num_gpus_);
   for (int i = 0; i < num_gpus_; ++i) {
-    gpu_device_ids_[i] = gpu_blocks[i][0].device().index();
+    gpu_device_ids_[i] = static_cast<int>(gpu_device_ids[i]);
   }
-  
+
   streams_.resize(num_gpus_);
   for (int i = 0; i < num_gpus_; i += 1) {
     cudaSetDevice(gpu_device_ids_[i]);

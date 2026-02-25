@@ -514,14 +514,31 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
-        gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
-        gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
-        gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
-        gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
-        self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
-                                                              self.num_layers, gpu_kv_strides_tensor,
-                                                              gpu_block_strides_tensor, gpu_layer_strides_tensor,
-                                                              gpu_chunk_sizes_tensor)
+        # Resolve pointers in Python (where storage is valid); pass them to C++ so we avoid
+        # "Tensor that doesn't have storage" when C++ calls .data_ptr() on tensors passed
+        # across the pybind11 boundary from a spawn'd subprocess (shared memory / CUDA IPC).
+        gpu_block_ptrs_flat = [
+            self.gpu_blocks[i][j].data_ptr()
+            for i in range(self.num_gpus)
+            for j in range(len(self.gpu_blocks[i]))
+        ]
+        cpu_blocks_ptr = cpu_blocks.data_ptr()
+        gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
+        num_tensors_per_gpu = len(self.gpu_blocks[0])
+
+        self.tp_transfer_thread_group = TPTransferThreadGroup(
+            self.num_gpus,
+            gpu_block_ptrs_flat,
+            num_tensors_per_gpu,
+            cpu_blocks_ptr,
+            dp_group_id,
+            self.num_layers,
+            self.gpu_kv_strides_in_bytes,
+            self.gpu_block_strides_in_bytes,
+            self.gpu_layer_strides_in_bytes,
+            self.gpu_chunk_sizes_in_bytes,
+            gpu_device_ids,
+        )
 
 
     def _transfer_impl(self,
@@ -1220,14 +1237,31 @@ class tpGDSTransferWorker(TransferWorkerBase):
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
         self.ssd_tp_stride_in_bytes = self.ssd_block_stride_in_bytes // self.tp_group_size if not self.is_mla else self.ssd_block_stride_in_bytes
 
+        # Resolve pointers in Python (where storage is valid); pass them to C++ so we avoid
+        # "Tensor that doesn't have storage" when C++ calls .data_ptr() on tensors passed
+        # across the pybind11 boundary from a spawn'd subprocess (shared memory / CUDA IPC).
+        gpu_block_ptrs_flat = [
+            self.gpu_blocks[i][j].data_ptr()
+            for i in range(self.num_gpus)
+            for j in range(len(self.gpu_blocks[i]))
+        ]
+        gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
+        num_tensors_per_gpu = len(self.gpu_blocks[0])
+
         # Create TP GDS Transfer Thread Group
-        gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
-        gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
-        gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
-        gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
         self.tp_gds_transfer_thread_group = TPGDSTransferThreadGroup(
-            self.num_gpus, self.gpu_blocks, ssd_files, dp_group_id, self.num_layers,
-            gpu_kv_strides_tensor, gpu_block_strides_tensor, gpu_layer_strides_tensor, gpu_chunk_sizes_tensor)
+            self.num_gpus,
+            gpu_block_ptrs_flat,
+            num_tensors_per_gpu,
+            ssd_files,
+            dp_group_id,
+            self.num_layers,
+            self.gpu_kv_strides_in_bytes,
+            self.gpu_block_strides_in_bytes,
+            self.gpu_layer_strides_in_bytes,
+            self.gpu_chunk_sizes_in_bytes,
+            gpu_device_ids,
+        )
 
     def _transfer_impl(self,
                        src_block_ids: torch.Tensor,
