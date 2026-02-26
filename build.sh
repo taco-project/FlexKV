@@ -30,7 +30,13 @@ mkdir -p build
 cd build
 
 echo "=== Running CMake configuration ==="
-cmake ..
+# Respect FLEXKV_ENABLE_METRICS=0 to disable Prometheus (avoids needing third_party/prometheus-cpp)
+CMAKE_EXTRA=""
+if [ -n "$FLEXKV_ENABLE_METRICS" ] && [ "$FLEXKV_ENABLE_METRICS" = "0" ]; then
+  CMAKE_EXTRA="-DFLEXKV_ENABLE_MONITORING=OFF"
+  echo "FLEXKV_ENABLE_METRICS=0: building without Prometheus monitoring"
+fi
+cmake .. $CMAKE_EXTRA
 
 echo "=== Building third-party libraries ==="
 cmake --build .

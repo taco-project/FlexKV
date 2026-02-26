@@ -4,6 +4,8 @@
  * 
  * This file provides a MetricsManager singleton class for Prometheus metrics
  * integration in FlexKV. It supports auto-initialization on first use.
+ * When FLEXKV_ENABLE_MONITORING is not defined (e.g. FLEXKV_ENABLE_METRICS=0),
+ * Prometheus includes and related members are excluded so the code compiles without prometheus-cpp.
  * 
  * Metrics:
  * - Counter:   flexkv_cpp_transfer_ops_total (total transfer operations)
@@ -18,17 +20,19 @@
 
 #pragma once
 
-#include <prometheus/counter.h>
-#include <prometheus/gauge.h>
-#include <prometheus/registry.h>
-#include <prometheus/exposer.h>
-
 #include <atomic>
 #include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+
+#ifdef FLEXKV_ENABLE_MONITORING
+#include <prometheus/counter.h>
+#include <prometheus/gauge.h>
+#include <prometheus/registry.h>
+#include <prometheus/exposer.h>
+#endif
 
 namespace flexkv {
 namespace monitoring {
@@ -134,7 +138,7 @@ public:
 
     /**
      * @brief Manually initialize with specific address
- * @param bind_address Address and port (e.g., "172.0.0.1:8081")
+     * @param bind_address Address and port (e.g., "172.0.0.1:8081")
      * @return true if initialization succeeded
      */
     bool Initialize(const std::string& bind_address);
@@ -204,23 +208,23 @@ private:
     int port_{8081};
     bool configured_{false};  // Whether Configure() has been called
     
-    // Core components
-    std::shared_ptr<prometheus::Registry> registry_;
-    std::unique_ptr<prometheus::Exposer> exposer_;
     std::atomic<bool> running_{false};
     std::atomic<bool> init_attempted_{false};
     mutable std::mutex init_mutex_;
 
+#ifdef FLEXKV_ENABLE_MONITORING
+    // Core components (Prometheus)
+    std::shared_ptr<prometheus::Registry> registry_;
+    std::unique_ptr<prometheus::Exposer> exposer_;
     // Transfer metric families
     prometheus::Family<prometheus::Counter>* transfer_ops_family_{nullptr};
     prometheus::Family<prometheus::Counter>* transfer_bytes_family_{nullptr};
-
     // Cache operation metric families
     prometheus::Family<prometheus::Counter>* cache_ops_family_{nullptr};
     prometheus::Family<prometheus::Counter>* cache_blocks_family_{nullptr};
-
     // Helper to merge labels
     static Labels MergeLabels(const Labels& base, const Labels& extra);
+#endif
 };
 
 // ==================== Convenience Macros ====================
