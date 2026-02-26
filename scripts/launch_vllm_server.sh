@@ -148,7 +148,6 @@ CMD="env VLLM_USE_V1=1 python3 -m vllm.entrypoints.cli.main serve \"$MODEL_PATH\
     --max-num-seqs $MAX_NUM_SEQS \
     --max-num-batched-tokens $MAX_MODEL_LEN \
     --max-model-len $MAX_MODEL_LEN \
-    --max-seq-len-to-capture $MAX_MODEL_LEN \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --enable-chunked-prefill \
     --enable-prefix-caching"

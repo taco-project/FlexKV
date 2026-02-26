@@ -23,6 +23,8 @@ enable_cfs = os.environ.get("FLEXKV_ENABLE_CFS", "0") == "1"
 enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
 enable_p2p = os.environ.get("FLEXKV_ENABLE_P2P", "0") == "1"
 enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
+# FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
+enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "1") != "0"
 
 # Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
@@ -54,10 +56,15 @@ if enable_cputest:
     os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
 
 
-# Add prometheus-cpp libraries for monitoring (static linking, order matters)
-extra_link_args.extend(["-lprometheus-cpp-pull", "-lprometheus-cpp-core"])
+# Prometheus libraries only when metrics enabled
+if enable_metrics:
+    extra_link_args.extend(["-lprometheus-cpp-pull", "-lprometheus-cpp-core"])
+else:
+    print("FLEXKV_ENABLE_METRICS=0: building without Prometheus monitoring")
 
 extra_compile_args = ["-std=c++17"]
+if enable_metrics:
+    extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
 
 # Add rpath to find libraries at runtime
@@ -76,6 +83,8 @@ if enable_cfs:
 extra_compile_args.append("-DCUDA_AVAILABLE")
 
 nvcc_compile_args = ["-O3"]
+if enable_metrics:
+    nvcc_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
 if enable_gds:
     print("ENABLE_GDS = true: Compiling and linking GDS content")
     cpp_sources.extend([
@@ -112,7 +121,7 @@ cpp_extensions = [
         library_dirs=[os.path.join(build_dir, "lib")],
         include_dirs=include_dirs,
         depends=hpp_sources,
-        extra_compile_args={"nvcc": ["-O3"], "cxx": extra_compile_args},
+        extra_compile_args={"nvcc": nvcc_compile_args, "cxx": extra_compile_args},
         extra_link_args=extra_link_args,
     ),
 ]

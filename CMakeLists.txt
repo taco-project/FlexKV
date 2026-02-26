@@ -30,8 +30,15 @@ target_include_directories(xxhash PUBLIC
 install(FILES ${XXHASH_HEADERS} DESTINATION include)
 
 # ==================== prometheus-cpp Library ====================
-# Option to enable/disable monitoring
-option(FLEXKV_ENABLE_MONITORING "Enable Prometheus monitoring support" ON)
+# Option to enable/disable monitoring (env FLEXKV_ENABLE_METRICS=0 or -DFLEXKV_ENABLE_MONITORING=OFF)
+set(_FLEXKV_MONITORING_DEFAULT ON)
+if(DEFINED ENV{FLEXKV_ENABLE_METRICS})
+  if("$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "0" OR "$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "OFF"
+      OR "$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "NO" OR "$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "FALSE")
+    set(_FLEXKV_MONITORING_DEFAULT OFF)
+  endif()
+endif()
+option(FLEXKV_ENABLE_MONITORING "Enable Prometheus monitoring support" ${_FLEXKV_MONITORING_DEFAULT})
 
 if(FLEXKV_ENABLE_MONITORING)
     message(STATUS "Prometheus monitoring: ENABLED")

@@ -44,6 +44,7 @@ void MetricsManager::Configure(bool enabled, int port) {
 }
 
 bool MetricsManager::EnsureInitialized() {
+#ifdef FLEXKV_ENABLE_MONITORING
     // Must call Configure() from Python first to enable metrics
     if (!configured_ || !enabled_) return false;
     if (running_.load()) return true;
@@ -63,9 +64,13 @@ bool MetricsManager::EnsureInitialized() {
     std::string bind_address = "127.0.0.1:" + std::to_string(port_);
     Initialize(bind_address);
     return running_.load();
+#else
+    return false;
+#endif
 }
 
 bool MetricsManager::Initialize(const std::string& bind_address) {
+#ifdef FLEXKV_ENABLE_MONITORING
     std::lock_guard<std::mutex> lock(init_mutex_);
     
     if (running_.load()) {
@@ -120,9 +125,14 @@ bool MetricsManager::Initialize(const std::string& bind_address) {
         exposer_.reset();
         return false;
     }
+#else
+    (void)bind_address;
+    return false;
+#endif
 }
 
 void MetricsManager::Shutdown() {
+#ifdef FLEXKV_ENABLE_MONITORING
     std::lock_guard<std::mutex> lock(init_mutex_);
     
     if (!running_.load()) {
@@ -136,8 +146,10 @@ void MetricsManager::Shutdown() {
     registry_.reset();
 
     std::cout << "[FlexKV CppMetrics] Shutdown completed" << std::endl;
+#endif
 }
 
+#ifdef FLEXKV_ENABLE_MONITORING
 // Helper to merge labels
 Labels MetricsManager::MergeLabels(const Labels& base, const Labels& extra) {
     Labels result = base;
@@ -146,10 +158,12 @@ Labels MetricsManager::MergeLabels(const Labels& base, const Labels& extra) {
     }
     return result;
 }
+#endif
 
 // ==================== Counter: Transfer Operations ====================
 
 void MetricsManager::RecordTransfer(TransferType type, const std::string& direction, size_t bytes) {
+#ifdef FLEXKV_ENABLE_MONITORING
     if (!EnsureInitialized()) return;
     
     // Increment transfer ops counter
@@ -169,46 +183,67 @@ void MetricsManager::RecordTransfer(TransferType type, const std::string& direct
         });
         bytes_counter.Increment(static_cast<double>(bytes));
     }
+#else
+    (void)type;
+    (void)direction;
+    (void)bytes;
+#endif
 }
 
 // ==================== Counter: Cache Operations ====================
 
 void MetricsManager::IncrementCacheOps(CacheOperation op) {
+#ifdef FLEXKV_ENABLE_MONITORING
     if (!EnsureInitialized() || !cache_ops_family_) return;
     
     auto& counter = cache_ops_family_->Add({
         {"operation", CacheOperationToString(op)}
     });
     counter.Increment();
+#else
+    (void)op;
+#endif
 }
 
 // ==================== Counter: Block Operations ====================
 
 void MetricsManager::IncrementBlocksMatched(int64_t num_blocks) {
+#ifdef FLEXKV_ENABLE_MONITORING
     if (!EnsureInitialized() || !cache_blocks_family_ || num_blocks <= 0) return;
     
     auto& counter = cache_blocks_family_->Add({
         {"operation", "matched"}
     });
     counter.Increment(static_cast<double>(num_blocks));
+#else
+    (void)num_blocks;
+#endif
 }
 
 void MetricsManager::IncrementBlocksInserted(int64_t num_blocks) {
+#ifdef FLEXKV_ENABLE_MONITORING
     if (!EnsureInitialized() || !cache_blocks_family_ || num_blocks <= 0) return;
     
     auto& counter = cache_blocks_family_->Add({
         {"operation", "inserted"}
     });
     counter.Increment(static_cast<double>(num_blocks));
+#else
+    (void)num_blocks;
+#endif
 }
 
 void MetricsManager::IncrementBlocksEvicted(int64_t num_blocks) {
+#ifdef FLEXKV_ENABLE_MONITORING
     if (!EnsureInitialized() || !cache_blocks_family_ || num_blocks <= 0) return;
     
     auto& counter = cache_blocks_family_->Add({
         {"operation", "evicted"}
     });
     counter.Increment(static_cast<double>(num_blocks));
+#else
+    (void)num_blocks;
+#endif
 }
 
 }  // namespace monitoring

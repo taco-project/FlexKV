@@ -24,6 +24,20 @@ from common_utils import (
     skip_if_insufficient_gpus,create_gpu_kv_layout, GPUKVCacheVerifier
 )
 
+
+def _fp8_cuda_ops_unavailable():
+    """True if fp8 dtype exists but CUDA ops (e.g. mul_cuda) are not implemented."""
+    if not hasattr(torch, "float8_e4m3fn"):
+        return True
+    if not torch.cuda.is_available():
+        return False
+    try:
+        t = torch.tensor([1.0], dtype=torch.float8_e4m3fn, device="cuda")
+        t.mul(1.0)
+        return False
+    except NotImplementedError:
+        return True
+
 def run_tp_client(dp_client_id,
                   tp_rank,
                   server_recv_port,
@@ -89,14 +103,6 @@ def shutdown_tp_client(tp_client_processes):
                 tp_process.kill()
                 tp_process.join(timeout=2)
 
-@pytest.mark.parametrize("model_config", [
-    {'tp_size': 1, 'dp_size': 1},
-    {'tp_size': 2, 'dp_size': 2},
-    {'dtype': torch.float32},
-    {'use_mla': True},
-    {'tp_size': 4, 'dp_size': 1, 'use_mla': True},
-    {'tp_size': 4, 'dp_size': 1},
-], indirect=True)
 @pytest.mark.parametrize(
     "model_config",
     [
@@ -105,12 +111,13 @@ def shutdown_tp_client(tp_client_processes):
         {"dtype": torch.float32},
         {"use_mla": True},
         {"tp_size": 4, "dp_size": 1, "use_mla": True},
-        # fp8 端到端流程覆盖（仅在当前 PyTorch 支持 float8_e4m3fn 时启用）
+        {"tp_size": 4, "dp_size": 1},
+        # fp8 端到端流程覆盖（仅在当前 PyTorch 支持 float8_e4m3fn 且 CUDA 具备 mul 等算子时启用）
         pytest.param(
             {"dtype": torch.float8_e4m3fn},
             marks=pytest.mark.skipif(
-                not hasattr(torch, "float8_e4m3fn"),
-                reason="fp8 not supported in this torch build",
+                _fp8_cuda_ops_unavailable(),
+                reason="fp8 dtype or CUDA ops (e.g. mul_cuda) not available in this PyTorch build",
             ),
         ),
     ],
