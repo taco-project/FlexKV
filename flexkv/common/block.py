@@ -12,7 +12,9 @@ def _get_namespace_hash_key(namespace: Optional[List[str]]) -> Optional[np.ndarr
     if not namespace or len(namespace) == 0:
         return None
     
-    namespace_key = ":".join(namespace)
+    # Use null character as delimiter to prevent ambiguity
+    # e.g. ["a:b", "c"] → "a:b\x00c" != ["a", "b:c"] → "a\x00b:c"
+    namespace_key = "\x00".join(namespace)
     namespace_bytes = namespace_key.encode('utf-8')
     namespace_array = np.frombuffer(namespace_bytes, dtype=np.uint8).astype(np.int64)
     return namespace_array

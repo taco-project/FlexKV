@@ -35,7 +35,10 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
   }
   
   // Allocate and copy GPU block pointers (already extracted in Python)
-  cudaMallocHost((void **)&gpu_blocks_, num_gpus_ * num_tensors_per_gpu_ * sizeof(void *));
+  cudaError_t malloc_err = cudaMallocHost((void **)&gpu_blocks_, num_gpus_ * num_tensors_per_gpu_ * sizeof(void *));
+  if (malloc_err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMallocHost failed: ") + cudaGetErrorString(malloc_err));
+  }
   for (size_t i = 0; i < gpu_block_ptrs_flat.size(); ++i) {
     gpu_blocks_[i] = reinterpret_cast<void *>(gpu_block_ptrs_flat[i]);
   }
@@ -87,8 +90,12 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
   // Create CUDA streams for each GPU
   streams_.resize(num_gpus_);
   for (int i = 0; i < num_gpus_; ++i) {
-    cudaSetDevice(gpu_device_ids_[i]);
-    cudaStreamCreate(&streams_[i]);
+    cudaError_t err = cudaSetDevice(gpu_device_ids_[i]);
+    if (err != cudaSuccess)
+      throw std::runtime_error(std::string("cudaSetDevice failed: ") + cudaGetErrorString(err));
+    err = cudaStreamCreate(&streams_[i]);
+    if (err != cudaSuccess)
+      throw std::runtime_error(std::string("cudaStreamCreate failed: ") + cudaGetErrorString(err));
   }
 
   // Create the thread pool
@@ -126,7 +133,7 @@ TPGDSTransferThreadGroup::~TPGDSTransferThreadGroup() {
   
   // Clean up CUDA streams
   for (int i = 0; i < streams_.size(); ++i) {
-    cudaSetDevice(dp_group_id_ * num_gpus_ + i);
+    cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamDestroy(streams_[i]);
   }
   

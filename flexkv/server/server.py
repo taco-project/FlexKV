@@ -73,7 +73,7 @@ class ClientManager:
         if client_id is None:
             if len(self.free_client_ids) == 0:
                 flexkv_logger.error("Client full. DP client registration failed.")
-                raise
+                raise RuntimeError("Client full. DP client registration failed.")
             client_id = self.free_client_ids.popleft()
         send_to_client = get_zmq_socket(
             context, zmq.SocketType.PUSH, client_recv_port, False
@@ -90,7 +90,7 @@ class ClientManager:
     def delete_dp_client(self, client_id: int) -> None:
         if client_id not in self.client_dict:
             flexkv_logger.error(f"DP client: {client_id} dosen't exist. Delete failed.")
-            raise
+            raise KeyError(f"DP client: {client_id} doesn't exist. Delete failed.")
         self.client_dict.pop(client_id)
         self.free_client_ids.appendleft(client_id)
         flexkv_logger.info(f"Delete DP client: {client_id} succeeded.")

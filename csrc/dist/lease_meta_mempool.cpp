@@ -14,11 +14,13 @@ LeaseMetaMemPool::LeaseMetaMemPool(size_t initial_capacity)
 }
 
 LeaseMetaMemPool::~LeaseMetaMemPool() {
-  // Reclaim allocated raw buffer. Requires quiescence (no concurrent access).
-  if (allocated_block.raw) {
-    ::operator delete[](allocated_block.raw);
-    allocated_block = {nullptr, 0};
+  // Reclaim all allocated raw buffers. Requires quiescence (no concurrent access).
+  for (auto& block : allocated_blocks) {
+    if (block.raw) {
+      ::operator delete[](block.raw);
+    }
   }
+  allocated_blocks.clear();
 }
 
 void LeaseMetaMemPool::allocate_block(size_t count) {
@@ -36,8 +38,8 @@ void LeaseMetaMemPool::allocate_block(size_t count) {
       free_queue.push_back(obj);
     }
   }
-  // record the single allocated block for reclamation
-  allocated_block = {raw, bytes};
+  // record the allocated block for reclamation
+  allocated_blocks.push_back({raw, bytes});
   total_capacity.fetch_add(count, std::memory_order_relaxed);
   free_count.fetch_add(count, std::memory_order_relaxed);
 }

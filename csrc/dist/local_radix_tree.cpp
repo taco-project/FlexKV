@@ -131,10 +131,6 @@ CRadixNode *LocalRadixTree::insert(torch::Tensor &physical_block_ids,
     LeaseMeta *org_lm = last_node->get_lease_meta();
     if (is_root(last_node)) {
       // root node's lease meta is nullptr
-      LeaseMeta *newlm = lease_pool.alloc();
-      assert(newlm != nullptr);
-      newlm->state = NODE_STATE_NORMAL;
-      newlm->lease_time = get_now_ms() + lease_ttl_ms + safety_ttl_ms;
       new_parent->set_lease_meta(nullptr);
     } else if (org_lm != nullptr) {
       // copy the lease meta to the new parent node
@@ -740,6 +736,3 @@ size_t LocalRadixTree::drain_pending_queues() {
 }
 
 } // namespace flexkv
-
-
-
