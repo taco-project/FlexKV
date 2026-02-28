@@ -154,5 +154,7 @@ enable_gds: false
 | 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `FLEXKV_INDEX_ACCEL` | bool | 1 | 0-启用Python版本RadixTree实现，1-启用C++版本RadixTree实现 |
-| `FLEXKV_EVICTION_POLICY` | str | "lru" | 缓存淘汰策略，可选 "lru" 和 "lfu"。 "lru" 表示最近最少使用，"lfu" 表示最不经常使用 |
+| `FLEXKV_EVICTION_POLICY` | str | "lru" | 缓存淘汰策略，可选 "lru"、"lfu"、"fifo"、"mru" 和 "filo"。 "lru" 表示最近最少使用，"lfu" 表示最不经常使用，"fifo" 表示先进先出，"mru" 表示最近最多使用，"filo" 表示先进后出 |
 | `FLEXKV_EVICT_RATIO` | float | 0.05 | cpu，ssd一次evict主动淘汰比例（0.0 = 只淘汰最小的必要的block数）。建议保持 `0.05`，即每一次淘汰5%的最久未使用的block |
+| `FLEXKV_EVICT_START_THRESHOLD` | float | 0.7 | 触发主动淘汰的内存利用率阈值。当缓存利用率达到该比例时，FlexKV 开始主动淘汰节点。例如 `0.7` 表示缓存占用达到 70% 时即开始淘汰。设为 `1.0` 则仅在缓存满时才淘汰 |
+| `FLEXKV_HIT_REWARD_SECONDS` | int | 0 | 每次缓存命中时向节点的有效访问时间叠加的额外秒数，为 LRU 增加频率感知能力。设为 `0`（默认值）时为标准 LRU 行为。设为正数时，频繁命中的节点会累积额外的保护时间，使其更难被驱逐。详见[驱逐策略指南](../eviction_policy/README_zh.md) |

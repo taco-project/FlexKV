@@ -170,7 +170,6 @@ void TPTransferThreadGroup::tp_group_transfer(
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
         int num_blocks = gpu_block_id_tensor.numel();
-        int num_layers = layer_granularity;
 
         int64_t *gpu_block_ids =
             static_cast<int64_t *>(gpu_block_id_tensor.data_ptr());
