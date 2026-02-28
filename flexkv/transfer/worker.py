@@ -247,6 +247,7 @@ class TransferWorkerBase(ABC):
                             break
                         batch_ops.append(op)
                     for op in batch_ops:
+                        transfer_status = False
                         try:
                             nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
                                                 f"graph_id: {op.transfer_graph_id}, "

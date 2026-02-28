@@ -30,8 +30,8 @@ private:
     size_t bytes;
   };
 
-  // Single allocated block info
-  BlockInfo allocated_block{nullptr, 0};
+  // All allocated blocks for reclamation
+  std::vector<BlockInfo> allocated_blocks;
   // Free pool of individual LeaseMeta pointers.
   std::deque<LeaseMeta*> free_queue;
   // Block growth size when pool needs to expand.
