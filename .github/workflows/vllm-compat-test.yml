@@ -1,0 +1,288 @@
+# This workflow tests FlexKV's compatibility with the latest vLLM release.
+# It verifies that all vLLM internal APIs used by FlexKVConnectorV1 are still
+# importable and structurally compatible, so we can detect breaking changes
+# in vLLM as early as possible.
+name: vLLM Compatibility Test
+
+on:
+  push:
+    branches: ["main", "dev"]
+    paths:
+      - "flexkv/integration/vllm/**"
+  pull_request:
+    branches: ["main", "dev"]
+    paths:
+      - "flexkv/integration/vllm/**"
+  schedule:
+    # Run every day at 02:00 UTC to catch upstream vLLM changes early
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      vllm_version:
+        description: "vLLM version to test against (e.g. 0.8.0), leave empty for latest"
+        required: false
+        default: ""
+
+jobs:
+  vllm-compat-test:
+    name: vLLM API Compatibility Check (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - name: Checkout FlexKV
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install vLLM (CPU-only, no CUDA needed for import checks)
+        run: |
+          pip install --upgrade pip
+          if [ -n "${{ github.event.inputs.vllm_version }}" ]; then
+            echo "Installing vLLM==${{ github.event.inputs.vllm_version }}"
+            pip install "vllm==${{ github.event.inputs.vllm_version }}" --extra-index-url https://download.pytorch.org/whl/cpu
+          else
+            echo "Installing latest vLLM"
+            pip install vllm --extra-index-url https://download.pytorch.org/whl/cpu
+          fi
+          python -c "import vllm; print(f'vLLM version: {vllm.__version__}')"
+
+      - name: Check 1 - vLLM internal API imports
+        # Verifies that all vLLM internal symbols imported by flexkv_connector.py
+        # are still accessible. Catches module renames, class deletions, etc.
+        run: |
+          python - <<'EOF'
+          import sys
+
+          failed = []
+
+          def check_import(module_path, symbol=None):
+              try:
+                  mod = __import__(module_path, fromlist=[symbol] if symbol else [])
+                  if symbol:
+                      getattr(mod, symbol)
+                  print(f"  OK   {module_path}" + (f".{symbol}" if symbol else ""))
+              except (ImportError, AttributeError) as e:
+                  print(f"  FAIL {module_path}" + (f".{symbol}" if symbol else "") + f": {e}")
+                  failed.append(f"{module_path}" + (f".{symbol}" if symbol else ""))
+
+          print("=== Check 1: vLLM API imports used by FlexKVConnectorV1 ===\n")
+
+          # Core connector base classes
+          check_import("vllm.distributed.kv_transfer.kv_connector.v1.base", "KVConnectorBase_V1")
+          check_import("vllm.distributed.kv_transfer.kv_connector.v1.base", "KVConnectorMetadata")
+          check_import("vllm.distributed.kv_transfer.kv_connector.v1.base", "KVConnectorRole")
+
+          # Metrics
+          check_import("vllm.distributed.kv_transfer.kv_connector.v1.metrics", "KVConnectorStats")
+
+          # Config
+          check_import("vllm.config", "VllmConfig")
+
+          # Logger
+          check_import("vllm.logger", "init_logger")
+
+          # Scheduler output
+          check_import("vllm.v1.core.sched.output", "SchedulerOutput")
+
+          # KV connector output
+          check_import("vllm.v1.outputs", "KVConnectorOutput")
+
+          # TYPE_CHECKING-only imports (verify they still exist)
+          check_import("vllm.attention.backends.abstract", "AttentionMetadata")
+          check_import("vllm.distributed.kv_events", "KVCacheEvent")
+          check_import("vllm.forward_context", "ForwardContext")
+          check_import("vllm.v1.core.kv_cache_manager", "KVCacheBlocks")
+          check_import("vllm.v1.kv_cache_interface", "KVCacheConfig")
+          check_import("vllm.v1.request", "Request")
+
+          print()
+          if failed:
+              print(f"FAILED: {len(failed)} API(s) are no longer available:")
+              for f in failed:
+                  print(f"  - {f}")
+              sys.exit(1)
+          else:
+              print("All imports OK.\n")
+          EOF
+
+      - name: Check 2 - KVConnectorBase_V1 abstract methods are all implemented
+        # Verifies that FlexKVConnectorV1 implements every abstract method
+        # required by the base class. Catches cases where vLLM adds new
+        # abstract methods that the connector has not yet implemented.
+        run: |
+          python - <<'EOF'
+          import sys
+          import inspect
+
+          print("=== Check 2: Abstract method coverage ===\n")
+
+          from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+
+          # Collect all abstract methods declared in the base class
+          abstract_methods = {
+              name
+              for name, method in inspect.getmembers(KVConnectorBase_V1, predicate=inspect.isfunction)
+              if getattr(method, "__isabstractmethod__", False)
+          }
+          print(f"Base class abstract methods ({len(abstract_methods)}):")
+          for m in sorted(abstract_methods):
+              print(f"  - {m}")
+
+          # Import the connector class definition (not instantiated, no GPU needed)
+          # We check the class dict directly to avoid triggering __init__
+          import importlib, ast, pathlib
+          connector_path = pathlib.Path("vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py")
+          if not connector_path.exists():
+              # Try to locate it from the installed vllm package
+              import vllm
+              vllm_root = pathlib.Path(vllm.__file__).parent
+              connector_path = vllm_root / "distributed/kv_transfer/kv_connector/v1/flexkv_connector.py"
+
+          tree = ast.parse(connector_path.read_text())
+          implemented = set()
+          for node in ast.walk(tree):
+              if isinstance(node, ast.ClassDef) and node.name == "FlexKVConnectorV1":
+                  for item in node.body:
+                      if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                          implemented.add(item.name)
+
+          print(f"\nFlexKVConnectorV1 implemented methods ({len(implemented)}):")
+          for m in sorted(implemented):
+              print(f"  - {m}")
+
+          missing = abstract_methods - implemented
+          print()
+          if missing:
+              print(f"FAILED: FlexKVConnectorV1 is missing {len(missing)} abstract method(s):")
+              for m in sorted(missing):
+                  print(f"  - {m}")
+              print("\nvLLM may have added new abstract methods to KVConnectorBase_V1.")
+              print("Please implement the missing methods in FlexKVConnectorV1.")
+              sys.exit(1)
+          else:
+              print("All abstract methods are implemented.\n")
+          EOF
+
+      - name: Check 3 - Key method signatures are compatible
+        # Verifies that the signatures of key methods in KVConnectorBase_V1
+        # have not changed in a way that would break FlexKVConnectorV1.
+        # Catches parameter additions/removals/renames in the base class.
+        run: |
+          python - <<'EOF'
+          import sys
+          import inspect
+
+          print("=== Check 3: Key method signature compatibility ===\n")
+
+          from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+
+          # Methods that FlexKVConnectorV1 overrides - check their base signatures
+          methods_to_check = [
+              "start_load_kv",
+              "wait_for_layer_load",
+              "save_kv_layer",
+              "wait_for_save",
+              "get_finished",
+              "register_kv_caches",
+              "get_num_new_matched_tokens",
+              "update_state_after_alloc",
+              "build_connector_meta",
+              "update_connector_output",
+              "request_finished",
+              "take_events",
+              "get_kv_connector_stats",
+              "get_block_ids_with_load_errors",
+              "shutdown",
+          ]
+
+          failed = []
+          for method_name in methods_to_check:
+              method = getattr(KVConnectorBase_V1, method_name, None)
+              if method is None:
+                  print(f"  FAIL {method_name}: method no longer exists in KVConnectorBase_V1")
+                  failed.append(method_name)
+              else:
+                  sig = inspect.signature(method)
+                  params = list(sig.parameters.keys())
+                  print(f"  OK   {method_name}{sig}")
+
+          print()
+          if failed:
+              print(f"FAILED: {len(failed)} method(s) no longer exist in KVConnectorBase_V1:")
+              for f in failed:
+                  print(f"  - {f}")
+              print("\nThe base class interface has changed. Please update FlexKVConnectorV1.")
+              sys.exit(1)
+          else:
+              print("All method signatures are present.\n")
+          EOF
+
+      - name: Check 4 - Install FlexKV and verify connector import
+        # This step actually installs FlexKV (in debug/cpu-test mode to skip
+        # CUDA compilation) and verifies that FlexKVConnectorV1Impl can be
+        # imported successfully. This catches any import-time errors in
+        # FlexKV's own integration code (e.g. missing vLLM symbols that are
+        # only discovered at import time inside flexkv package itself).
+        run: |
+          # Install system dependencies required for building FlexKV
+          sudo apt-get install -y libxxhash-dev liburing-dev || true
+
+          # Install FlexKV in debug mode (skips Cython compilation) with
+          # CPUTEST mode (removes -lcuda link dependency) and without
+          # Prometheus (removes -lprometheus-cpp dependency).
+          # This allows installation in a CPU-only CI environment.
+          FLEXKV_DEBUG=1 \
+          FLEXKV_ENABLE_CPUTEST=1 \
+          FLEXKV_ENABLE_METRICS=0 \
+          pip install -e . --no-build-isolation
+
+          python - <<'EOF'
+          import sys
+
+          print("=== Check 4: FlexKV install and connector import ===\n")
+
+          # Verify FlexKV itself is importable
+          try:
+              import flexkv
+              print(f"  OK   flexkv imported (version: {getattr(flexkv, '__version__', 'unknown')})")
+          except ImportError as e:
+              print(f"  FAIL flexkv import failed: {e}")
+              sys.exit(1)
+
+          # Verify the vLLM v1 adapter (the actual implementation class) is importable
+          try:
+              from flexkv.integration.vllm.vllm_v1_adapter import FlexKVConnectorV1Impl
+              print(f"  OK   FlexKVConnectorV1Impl imported from flexkv.integration.vllm.vllm_v1_adapter")
+          except ImportError as e:
+              print(f"  FAIL FlexKVConnectorV1Impl import failed: {e}")
+              print()
+              print("This means FlexKV's integration code references a vLLM symbol that no longer exists.")
+              print("Please update flexkv/integration/vllm/vllm_v1_adapter.py to match the new vLLM API.")
+              sys.exit(1)
+
+          print()
+          print("FlexKV installation and connector import OK.\n")
+          EOF
+
+      - name: Report details on failure
+        if: failure()
+        run: |
+          echo "=========================================="
+          echo "Compatibility check failed!"
+          echo "=========================================="
+          python -c "import vllm; print(f'Tested against vLLM {vllm.__version__}')" || true
+          pip show vllm | grep -E "^(Name|Version|Home-page)" || true
+          echo ""
+          echo "Please check the vLLM changelog for breaking changes:"
+          echo "  https://github.com/vllm-project/vllm/blob/main/CHANGELOG.md"
+          echo "  https://github.com/vllm-project/vllm/releases"
