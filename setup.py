@@ -61,6 +61,10 @@ if enable_metrics:
     extra_link_args.extend(["-lprometheus-cpp-pull", "-lprometheus-cpp-core"])
 else:
     print("FLEXKV_ENABLE_METRICS=0: building without Prometheus monitoring")
+# If TORCH_CUDA_ARCH_LIST is not set, default to known supported archs
+# to avoid auto-detection failure on newer GPUs (e.g. Blackwell sm_100)
+if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6;9.0"
 
 extra_compile_args = ["-std=c++17"]
 if enable_metrics:
