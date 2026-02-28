@@ -6,6 +6,8 @@
 #include <iostream>
 #include <execinfo.h>
 #include <utility>
+#include <stdexcept>
+#include <string>
 
 #include "cache_utils.h"
 #include "dist/lease_meta_mempool.h"  // for flexkv::LeaseMeta
@@ -14,8 +16,22 @@ namespace flexkv {
 
 enum class EvictionPolicy {
   LRU,
-  LFU
+  LFU,
+  FIFO,
+  MRU,
+  FILO
 };
+
+inline EvictionPolicy parse_eviction_policy(const std::string &name) {
+  if (name == "lru")  return EvictionPolicy::LRU;
+  if (name == "lfu")  return EvictionPolicy::LFU;
+  if (name == "fifo") return EvictionPolicy::FIFO;
+  if (name == "mru")  return EvictionPolicy::MRU;
+  if (name == "filo") return EvictionPolicy::FILO;
+  throw std::invalid_argument(
+      "Unknown eviction policy: '" + name + "'. "
+      "Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'.");
+}
 
 class CRadixTreeIndex;
 
@@ -25,6 +41,8 @@ private:
   bool ready;
   int lock_cnt;
   uint64_t grace_time;
+  uint64_t last_access_time;
+  uint64_t creation_time;
   int hit_count;
   int leaf_vector_index = -1;
 
@@ -96,6 +114,22 @@ public:
     return grace_time;
   }
 
+  void set_last_access_time(uint64_t time) {
+    last_access_time = time;
+  }
+
+  uint64_t get_last_access_time() {
+    return last_access_time;
+  }
+
+  void set_creation_time(uint64_t time) {
+    creation_time = time;
+  }
+
+  uint64_t get_creation_time() {
+    return creation_time;
+  }
+
   void set_hit_count(int count) {
     hit_count = count;
   }
@@ -118,6 +152,7 @@ public:
 
     gettimeofday(&now, nullptr);
     now_time = (uint64_t)now.tv_sec * 1000000 + (uint64_t)now.tv_usec;
+    last_access_time = now_time;
     uint64_t reward_us = (uint64_t)hit_reward_seconds * 1000000;
 
     if (grace_time > now_time) {
@@ -350,7 +385,7 @@ public:
     }
 
     int idx = node->get_leaf_vector_index();
-    if (idx >= 0 && idx < leaf_list.size()) {
+    if (idx >= 0 && static_cast<size_t>(idx) < leaf_list.size()) {
       CRadixNode* last = leaf_list.back();
       if (node != last) {
         leaf_list[idx] = last;

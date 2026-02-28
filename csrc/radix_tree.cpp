@@ -45,28 +45,41 @@ static std::optional<HashType> get_hash_safe(
 }
 
 bool CRadixNode::Compare::operator()(CRadixNode *a, CRadixNode *b) {
-  if (a->get_index()->get_eviction_policy() == EvictionPolicy::LRU) {
-    return a->get_time() > b->get_time();
-  } else {
-    // LFU
-    if (a->get_hit_count() != b->get_hit_count()) {
-      return a->get_hit_count() > b->get_hit_count();
-    }
-    // Tie-breaker: LRU (evict older node first)
-    // In max-heap, we want the victim (older node) to be at the top.
-    // Compare(a, b) returns true means a < b (a is below b).
-    // We want older node to be "larger" (at top).
-    // If a is newer (larger time) than b, a should be "smaller" (below).
-    // So if a->time > b->time, return true.
-    return a->get_time() > b->get_time();
+  auto policy = a->get_index()->get_eviction_policy();
+  switch (policy) {
+    case EvictionPolicy::LRU:
+      return a->get_time() > b->get_time();
+    case EvictionPolicy::LFU:
+      if (a->get_hit_count() != b->get_hit_count()) {
+        return a->get_hit_count() > b->get_hit_count();
+      }
+      return a->get_last_access_time() > b->get_last_access_time();
+    case EvictionPolicy::FIFO:
+      return a->get_creation_time() > b->get_creation_time();
+    case EvictionPolicy::MRU:
+      return a->get_last_access_time() < b->get_last_access_time();
+    case EvictionPolicy::FILO:
+      return a->get_creation_time() < b->get_creation_time();
+    default:
+      return a->get_time() > b->get_time();
   }
 }
 
 double CRadixNode::get_priority() {
-  if (index->get_eviction_policy() == EvictionPolicy::LRU) {
-    return (double)grace_time;
-  } else {
-    return (double)hit_count;
+  auto policy = index->get_eviction_policy();
+  switch (policy) {
+    case EvictionPolicy::LRU:
+      return (double)grace_time;
+    case EvictionPolicy::LFU:
+      return (double)hit_count;
+    case EvictionPolicy::FIFO:
+      return (double)creation_time;
+    case EvictionPolicy::MRU:
+      return -(double)last_access_time;
+    case EvictionPolicy::FILO:
+      return -(double)creation_time;
+    default:
+      return (double)grace_time;
   }
 }
 
@@ -85,6 +98,8 @@ CRadixNode::CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt, bool en
   struct timeval now;
   gettimeofday(&now, nullptr);
   grace_time = (uint64_t)now.tv_sec * 1000000 + (uint64_t)now.tv_usec;
+  last_access_time = grace_time;
+  creation_time = grace_time;
 
   if (enable_block_node_ids) {
     this->block_node_ids = new std::deque<uint32_t>();
@@ -116,6 +131,8 @@ CRadixNode *CRadixNode::split(int prefix_length) {
   bool enable_block_node_ids = (block_node_ids != nullptr);
   auto new_node = new CRadixNode(index, is_ready(), 0, enable_block_node_ids);
   new_node->set_time(get_time());
+  new_node->set_last_access_time(get_last_access_time());
+  new_node->set_creation_time(get_creation_time());
   new_node->set_hit_count(get_hit_count());
   new_node->set_parent(parent);
   get_index()->add_node(new_node);
@@ -162,6 +179,8 @@ void CRadixNode::merge_child() {
                          child->get_physical_blocks().cend());
 
   set_time(std::max(get_time(), child->get_time()));
+  set_last_access_time(std::max(get_last_access_time(), child->get_last_access_time()));
+  set_creation_time(std::min(get_creation_time(), child->get_creation_time()));
   set_hit_count(std::max(get_hit_count(), child->get_hit_count()));
   if (block_node_ids != nullptr) {
     block_node_ids->insert(block_node_ids->end(), child->get_block_node_ids()->cbegin(),
