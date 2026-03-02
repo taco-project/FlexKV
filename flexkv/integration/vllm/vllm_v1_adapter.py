@@ -27,7 +27,11 @@ from vllm.distributed.parallel_state import get_tp_group
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.attention.backends.abstract import AttentionMetadata
+    try:
+        from vllm.v1.attention.backend import AttentionMetadata
+    except ImportError:
+        # vllm <= 0.8.x used the old path
+        from vllm.attention.backends.abstract import AttentionMetadata  # type: ignore[no-redef]
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks

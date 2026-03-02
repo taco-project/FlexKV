@@ -98,7 +98,7 @@ jobs:
           check_import("vllm.v1.outputs", "KVConnectorOutput")
 
           # TYPE_CHECKING-only imports (verify they still exist)
-          check_import("vllm.attention.backends.abstract", "AttentionMetadata")
+          check_import("vllm.v1.attention.backend", "AttentionMetadata")
           check_import("vllm.distributed.kv_events", "KVCacheEvent")
           check_import("vllm.forward_context", "ForwardContext")
           check_import("vllm.v1.core.kv_cache_manager", "KVCacheBlocks")
@@ -138,36 +138,34 @@ jobs:
           for m in sorted(abstract_methods):
               print(f"  - {m}")
 
-          # Import the connector class definition (not instantiated, no GPU needed)
-          # We check the class dict directly to avoid triggering __init__
-          import importlib, ast, pathlib
-          connector_path = pathlib.Path("vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py")
-          if not connector_path.exists():
-              # Try to locate it from the installed vllm package
-              import vllm
-              vllm_root = pathlib.Path(vllm.__file__).parent
-              connector_path = vllm_root / "distributed/kv_transfer/kv_connector/v1/flexkv_connector.py"
+          # Parse FlexKVConnectorV1Impl from FlexKV's own adapter file
+          # (no GPU / C++ extension needed — pure AST analysis)
+          import ast, pathlib
+          adapter_path = pathlib.Path("flexkv/integration/vllm/vllm_v1_adapter.py")
+          if not adapter_path.exists():
+              print(f"FAILED: Cannot find adapter file at {adapter_path}")
+              sys.exit(1)
 
-          tree = ast.parse(connector_path.read_text())
+          tree = ast.parse(adapter_path.read_text())
           implemented = set()
           for node in ast.walk(tree):
-              if isinstance(node, ast.ClassDef) and node.name == "FlexKVConnectorV1":
+              if isinstance(node, ast.ClassDef) and node.name == "FlexKVConnectorV1Impl":
                   for item in node.body:
                       if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                           implemented.add(item.name)
 
-          print(f"\nFlexKVConnectorV1 implemented methods ({len(implemented)}):")
+          print(f"\nFlexKVConnectorV1Impl implemented methods ({len(implemented)}):")
           for m in sorted(implemented):
               print(f"  - {m}")
 
           missing = abstract_methods - implemented
           print()
           if missing:
-              print(f"FAILED: FlexKVConnectorV1 is missing {len(missing)} abstract method(s):")
+              print(f"FAILED: FlexKVConnectorV1Impl is missing {len(missing)} abstract method(s):")
               for m in sorted(missing):
                   print(f"  - {m}")
               print("\nvLLM may have added new abstract methods to KVConnectorBase_V1.")
-              print("Please implement the missing methods in FlexKVConnectorV1.")
+              print("Please implement the missing methods in FlexKVConnectorV1Impl.")
               sys.exit(1)
           else:
               print("All abstract methods are implemented.\n")
@@ -227,24 +225,31 @@ jobs:
               print("All method signatures are present.\n")
           EOF
 
+      - name: Detect CUDA availability
+        id: cuda_check
+        run: |
+          if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+            echo "cuda_available=true" >> "$GITHUB_OUTPUT"
+            echo "CUDA detected: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+          else
+            echo "cuda_available=false" >> "$GITHUB_OUTPUT"
+            echo "No CUDA detected — Check 4 will be skipped."
+          fi
+
       - name: Check 4 - Install FlexKV and verify connector import
-        # This step actually installs FlexKV (in debug/cpu-test mode to skip
-        # CUDA compilation) and verifies that FlexKVConnectorV1Impl can be
-        # imported successfully. This catches any import-time errors in
-        # FlexKV's own integration code (e.g. missing vLLM symbols that are
-        # only discovered at import time inside flexkv package itself).
+        if: steps.cuda_check.outputs.cuda_available == 'true'
+        # This step actually installs FlexKV and verifies that
+        # FlexKVConnectorV1Impl can be imported successfully. This catches
+        # any import-time errors in FlexKV's own integration code (e.g.
+        # missing vLLM symbols that are only discovered at import time
+        # inside flexkv package itself).
+        # Requires CUDA environment to build C++ extensions properly.
         run: |
           # Install system dependencies required for building FlexKV
           sudo apt-get install -y libxxhash-dev liburing-dev || true
 
-          # Install FlexKV in debug mode (skips Cython compilation) with
-          # CPUTEST mode (removes -lcuda link dependency) and without
-          # Prometheus (removes -lprometheus-cpp dependency).
-          # This allows installation in a CPU-only CI environment.
-          FLEXKV_DEBUG=1 \
-          FLEXKV_ENABLE_CPUTEST=1 \
-          FLEXKV_ENABLE_METRICS=0 \
-          pip install -e . --no-build-isolation
+          # Install FlexKV (disable metrics to avoid prometheus-cpp dependency in CI)
+          FLEXKV_ENABLE_METRICS=0 pip install -e . --no-build-isolation
 
           python - <<'EOF'
           import sys
