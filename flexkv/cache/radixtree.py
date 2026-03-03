@@ -51,6 +51,8 @@ class RadixNode:
     lock_cnt: int
     grace_time: float
     hit_count: int = 0
+    creation_time: float = 0.0
+    last_access_time: float = 0.0
 
     parent: Optional['RadixNode'] = None
     children: Dict[Optional[HashType], 'RadixNode'] = field(default_factory=dict)
@@ -97,6 +99,8 @@ class RadixNode:
             lock_cnt=0,  # Note: only lock near-leaf node
             grace_time=self.grace_time,
             hit_count=self.hit_count,
+            creation_time=self.creation_time,
+            last_access_time=self.last_access_time,
         )
         self.block_hashes = self.block_hashes[prefix_length:]
         self.physical_blocks = self.physical_blocks[prefix_length:]
@@ -125,6 +129,8 @@ class RadixNode:
         self.block_hashes = np.concatenate([self.block_hashes, child.block_hashes])
         self.physical_blocks = np.concatenate([self.physical_blocks, child.physical_blocks])
         self.grace_time = max(self.grace_time, child.grace_time)
+        self.last_access_time = max(self.last_access_time, child.last_access_time)
+        self.creation_time = min(self.creation_time, child.creation_time)
         self.hit_count = max(self.hit_count, child.hit_count)
         self.children.clear()
 
@@ -168,8 +174,10 @@ class RadixTreeIndex:
         physical_blocks = np.array([], dtype=np.int64)
         while prefix_blocks_num < sequence.num_blocks:
             if update_cache_info:
-                if current_node.grace_time < time.time():
-                    current_node.grace_time = time.time() + self.hit_reward_seconds
+                now = time.time()
+                current_node.last_access_time = now
+                if current_node.grace_time < now:
+                    current_node.grace_time = now + self.hit_reward_seconds
                 else:
                     current_node.grace_time += self.hit_reward_seconds
                 current_node.hit_count += 1
@@ -245,12 +253,15 @@ class RadixTreeIndex:
             # not insert any new blocks
             return None
 
+        now = time.time()
         new_node = RadixNode(
             block_hashes=sequence_meta.block_hashes[num_matched_blocks:num_insert_blocks],
             physical_blocks=physical_block_ids,
             is_ready=is_ready,
             lock_cnt=0,
-            grace_time=time.time()
+            grace_time=now,
+            creation_time=now,
+            last_access_time=now,
         )
 
         last_node_leaf = last_node.is_leaf() and not last_node.is_root()
@@ -274,7 +285,7 @@ class RadixTreeIndex:
         candidates = []
         for node in self.leaf_nodes.values():
             if node.evictable():
-                priority = node.grace_time if self.eviction_policy == "lru" else node.hit_count
+                priority = self._get_eviction_priority(node)
                 candidates.append((priority, node))
         heapq.heapify(candidates)
         evicted_blocks = np.array([], dtype=np.int64)
@@ -290,7 +301,7 @@ class RadixTreeIndex:
                 if node.parent.is_leaf():
                     self.leaf_nodes[node.parent.head_hash()] = node.parent
                 if node.parent.evictable():
-                    priority = node.parent.grace_time if self.eviction_policy == "lru" else node.parent.hit_count
+                    priority = self._get_eviction_priority(node.parent)
                     heapq.heappush(candidates, (priority, node.parent))
                 physical_blocks = node.physical_blocks
                 _block_hashes = node.block_hashes
@@ -300,6 +311,27 @@ class RadixTreeIndex:
             evicted_block_hashes = np.concatenate([evicted_block_hashes, _block_hashes])
 
         return evicted_blocks, evicted_block_hashes
+
+    def _get_eviction_priority(self, node: RadixNode):
+        """Get the eviction priority for a node based on the configured policy.
+
+        Lower priority values are evicted first (min-heap).
+        """
+        if self.eviction_policy == "lru":
+            return node.grace_time
+        elif self.eviction_policy == "lfu":
+            return (node.hit_count, node.last_access_time)
+        elif self.eviction_policy == "fifo":
+            return node.creation_time
+        elif self.eviction_policy == "mru":
+            return -node.last_access_time
+        elif self.eviction_policy == "filo":
+            return -node.creation_time
+        else:
+            raise ValueError(
+                f"Unknown eviction policy: {self.eviction_policy}. "
+                f"Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
+            )
 
     def lock(self, node: RadixNode) -> None:
         assert node.lock_cnt >= 0

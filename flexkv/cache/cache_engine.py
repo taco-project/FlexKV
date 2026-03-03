@@ -42,6 +42,7 @@ from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics import FlexKVMetricsCollector, init_global_collector, get_global_collector
 
 DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
+_VALID_EVICTION_POLICIES = {'lru', 'lfu', 'fifo', 'mru', 'filo'}
 
 class CacheEngineAccel:
     def __init__(self,
@@ -61,6 +62,9 @@ class CacheEngineAccel:
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
             raise ValueError(f"Invalid tokens_per_block: {tokens_per_block}, "
                               f"tokens_per_block must be a power of 2")
+        if eviction_policy not in _VALID_EVICTION_POLICIES:
+            raise ValueError(f"Invalid eviction_policy: '{eviction_policy}'. "
+                              f"Supported policies: {sorted(_VALID_EVICTION_POLICIES)}")
 
         self.device_type = device_type
 
@@ -222,6 +226,9 @@ class CacheEngine:
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
             raise ValueError(f"Invalid tokens_per_block: {tokens_per_block}, "
                               f"tokens_per_block must be a power of 2")
+        if eviction_policy not in _VALID_EVICTION_POLICIES:
+            raise ValueError(f"Invalid eviction_policy: '{eviction_policy}'. "
+                              f"Supported policies: {sorted(_VALID_EVICTION_POLICIES)}")
 
         self.device_type = device_type
 

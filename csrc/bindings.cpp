@@ -572,7 +572,7 @@ PYBIND11_MODULE(c_ext, m) {
 
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
       .def(py::init([](int tokens_per_block, unsigned int max_num_blocks, int hit_reward_seconds, std::string eviction_policy) {
-           flexkv::EvictionPolicy policy = (eviction_policy == "lfu") ? flexkv::EvictionPolicy::LFU : flexkv::EvictionPolicy::LRU;
+           auto policy = flexkv::parse_eviction_policy(eviction_policy);
            return new flexkv::CRadixTreeIndex(tokens_per_block, max_num_blocks, hit_reward_seconds, policy);
       }),
            py::arg("tokens_per_block"),
@@ -609,7 +609,8 @@ PYBIND11_MODULE(c_ext, m) {
       .def(py::init<flexkv::CRadixTreeIndex *, bool, int>())
       .def(py::init<flexkv::CRadixTreeIndex *, bool, int, bool>())
       .def("size", &flexkv::CRadixNode::size)
-      .def("has_block_node_ids", &flexkv::CRadixNode::has_block_node_ids);
+      .def("has_block_node_ids", &flexkv::CRadixNode::has_block_node_ids)
+      .def_property_readonly("parent", &flexkv::CRadixNode::get_parent, py::return_value_policy::reference);
 
   py::class_<flexkv::CMatchResult, std::shared_ptr<flexkv::CMatchResult>>(m, "CMatchResult")
       .def(py::init<int, int, int, flexkv::CRadixNode *, flexkv::CRadixNode *, torch::Tensor, torch::Tensor>())
