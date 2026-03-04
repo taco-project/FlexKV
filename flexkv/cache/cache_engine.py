@@ -40,6 +40,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.type import MatchResultAccel
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics import FlexKVMetricsCollector, init_global_collector, get_global_collector
+from flexkv.external.simm_utils import SimmCacheEngine
 
 DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
 _VALID_EVICTION_POLICIES = {'lru', 'lfu', 'fifo', 'mru', 'filo'}
@@ -372,6 +373,10 @@ class GlobalCacheEngine:
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
         self.eviction_policy = GLOBAL_CONFIG_FROM_ENV.eviction_policy
 
+        self.use_simm_backend = GLOBAL_CONFIG_FROM_ENV.use_simm_backend
+        if self.use_simm_backend:
+            self.enable_remote = True
+
         # Initialize metrics collector for cache engine monitoring (before creating CacheEngines)
         self._metrics_collector = get_global_collector()
         if self._metrics_collector is None:
@@ -441,6 +446,8 @@ class GlobalCacheEngine:
             if cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
                 self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
+            elif self.use_simm_backend:
+                self.remote_cache_engine = SimmCacheEngine(cache_config)
             elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
@@ -661,7 +668,7 @@ class GlobalCacheEngine:
             :ssd_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         remote_matched_blocks = remote_matched_result.physical_blocks[
             :remote_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-        shared_pcfs_read = self.cache_config.enable_kv_sharing and self.index_accel
+        shared_pcfs_read = (self.cache_config.enable_kv_sharing and self.index_accel) and not self.use_simm_backend
         remote_file_nodeids = None
         if shared_pcfs_read:
             remote_file_nodeids = remote_matched_result.block_node_ids
@@ -753,6 +760,12 @@ class GlobalCacheEngine:
 
         op_remote2h = None
         if fragment3_num_blocks > 0:
+            if self.use_simm_backend:
+                simm_block_hashes_start = fragment3_remote_blocks[0] * self.tokens_per_block + self.tokens_per_block - 1
+                simm_block_hashes = sequence_meta.block_hashes[simm_block_hashes_start :: self.tokens_per_block]
+                assert len(simm_block_hashes) == len(fragment3_remote_blocks)
+            else:
+                simm_block_hashes = None
             op_remote2h = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.REMOTE2H,
@@ -760,7 +773,8 @@ class GlobalCacheEngine:
                 dst_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
                 layer_id = 0,
                 layer_granularity = layer_num,
-                src_block_node_ids = fragment3_remote_file_nodeids
+                src_block_node_ids = fragment3_remote_file_nodeids,
+                simm_block_hashes = simm_block_hashes
             )
             transfer_graph.add_transfer_op(op_remote2h)
 
@@ -865,7 +879,10 @@ class GlobalCacheEngine:
 
         # DEBUG: Log GET operation with hash info
         #if len(sequence_meta.block_hashes) > 0:
-        #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
+        #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, ",
+        #          "CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, ",
+        #          "SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, ",
+        #          "pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
 
         # tailor the blocks to assure:
         # the blocks are needed by the mask & the blocks are ready
@@ -1270,13 +1287,22 @@ class GlobalCacheEngine:
                                                   cpu_matched_blocks[-extra_num_cpu_blocks:]])
             else:
                 fragment3_cpu_blocks = fragment12_cpu_blocks[-fragment3_num_blocks:]
+            if self.use_simm_backend:
+                # here for a prefix aware per-token hash [h1, h2, h3, h4, ...] with token_per_block = 2,
+                # we just use [h2, h4, h6 ...] as the simm block hashes.
+                simm_block_hashes_start = remote_matched_result.num_matched_blocks * self.tokens_per_block + self.tokens_per_block - 1
+                simm_block_hashes = sequence_meta.block_hashes[simm_block_hashes_start :: self.token_per_block]
+                assert len(simm_block_hashes) == len(fragment3_cpu_blocks)
+            else:
+                simm_block_hashes = None
             op_h2remote = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2REMOTE,
                 src_block_ids = fragment3_cpu_blocks,
                 dst_block_ids = fragment3_remote_blocks,
                 layer_id = 0,
-                layer_granularity = layer_num
+                layer_granularity = layer_num,
+                simm_block_hashes = simm_block_hashes
             )
             transfer_graph.add_transfer_op(op_h2remote)
             transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)

@@ -91,6 +91,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     cpp_metrics_port=int(os.getenv('FLEXKV_CPP_METRICS_PORT', 8081)),
     ## Port for Python metrics HTTP server (default: 8080)
     py_metrics_port=int(os.getenv('FLEXKV_PY_METRICS_PORT', 8080)),
+
+    use_simm_backend=bool(int(os.getenv('FLEXKV_USE_SIMM_BACKEND', 0))),
     
     # Server-client mode configuration
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),

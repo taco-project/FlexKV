@@ -37,6 +37,7 @@ from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTr
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
+from flexkv.external.simm_utils import SiMMClient
 from flexkv.transfer.utils import group_blocks_by_node_and_segment, group_blocks_by_node, split_contiguous_blocks, RemoteSSD2HMetaInfo, NodeMetaInfo, RDMATaskInfo
 try:
     from flexkv.c_ext import (
@@ -77,6 +78,7 @@ class WorkerTransferOp:
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
     src_block_node_ids: Optional[np.ndarray]
+    simm_block_hashes: Optional[np.ndarray]
     # successors: List[int]
 
     def __init__(self, transfer_op: TransferOp):
@@ -90,7 +92,7 @@ class WorkerTransferOp:
         self.valid_block_num = transfer_op.valid_block_num
         # Always preserve optional src_block_node_ids from TransferOp
         self.src_block_node_ids = transfer_op.src_block_node_ids
-
+        self.simm_block_hashes = transfer_op.simm_block_hashes
         if self.src_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
             self.dst_block_ids = transfer_op.dst_block_ids
@@ -1342,6 +1344,98 @@ class tpGDSTransferWorker(TransferWorkerBase):
             end_time,
         )
 
+        return True
+
+class SiMMTransferWorker(TransferWorkerBase):
+    def __init__(self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        cpu_blocks: torch.Tensor,
+        cpu_kv_layout: KVCacheLayout,
+        dtype: torch.dtype,
+        cache_config: CacheConfig,
+    ):
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+        self.num_layers = cpu_kv_layout.num_layer
+        self.num_cpu_blocks = cpu_kv_layout.num_block
+        self.block_size = cpu_kv_layout.get_chunk_size()
+        self.dtype = dtype
+        self.cpu_kv_layout = cpu_kv_layout
+        #to simplify, only blockfirst/pagefirst is supported for simm now
+        assert self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
+
+        self.is_mla = cpu_kv_layout.is_mla
+        self.kv_dim = 2 if not self.is_mla else 1
+
+        self.cpu_blocks = cpu_blocks  ## shared memory
+        self.cache_config = cache_config
+
+        self.simm_client = SiMMClient(cache_config.simm_manager_address)
+        cpu_memory_size = self.cpu_kv_layout.get_total_elements() * self.dtype.itemsize
+
+        #register the cpu blocks to simm to support zero copy transfer
+        self.simm_client.register_mr(self.cpu_blocks.data_ptr(), cpu_memory_size)
+
+    def _transfer_impl(self,
+        cpu_ptrs: List[int],
+        block_sizes: List[int],
+        keys: List[str],
+        transfer_type: TransferType,
+    ):
+        if transfer_type == TransferType.CPU2SIMM:
+            self.simm_client.batch_set_v1(cpu_ptrs, block_sizes, keys)
+        elif transfer_type == TransferType.SIMM2CPU:
+            self.simm_client.batch_get_v1(cpu_ptrs, block_sizes, keys)
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_type} for SiMMTransferWorker. "
+                             f"Expected CPU2SIMM or SIMM2CPU.")
+
+    def _preprocess(self,
+        transfer_op: WorkerTransferOp,
+    ):
+        # parse the op, get the cpu pointers and block sizes of each block and keys for each block
+        # in simm. Note that the PAGEFIRST or BLOCKFISRT block layout for flexkv is 
+        # [num_blocks, num_layers, 2, num_heads, head_size], so each block always has continuous kv data,
+        # therefore, we don't have to care about it's mla or not when generating keys.
+        cpu_ptrs = []
+        block_sizes = []
+        keys = []
+        cpu_block_ids = transfer_op.src_block_ids \
+            if transfer_op.transfer_type == TransferType.CPU2SIMM else transfer_op.dst_block_ids
+        
+        for i, block_id in enumerate(cpu_block_ids):
+            cpu_ptr = self.cpu_blocks.data_ptr() + block_id * self.cpu_kv_layout.get_block_size() * self.dtype.itemsize
+            block_size = self.cpu_kv_layout.get_block_size()
+            # note that for flexkv, only token hash as the key is enough
+            # and orginally in flexkv, transfer op doesn;t include token keys, but we will
+            # add them to tranfer op for simm transfer.
+            key = f"{transfer_op.token_block_keys[i]}"
+            cpu_ptrs.append(cpu_ptr)
+            block_sizes.append(block_size)
+            keys.append(key)
+        return cpu_ptrs, block_sizes, keys
+
+    def _postprocess(self):
+        pass
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        cpu_ptrs, block_sizes, keys = self._preprocess(transfer_op)
+        assert transfer_op.layer_id == 0
+        assert transfer_op.layer_granularity == self.num_layers
+        start_time = time.time()
+        self._transfer_impl(cpu_ptrs, block_sizes, keys, transfer_op.transfer_type)
+        end_time = time.time()
+        transfer_size = sum(block_sizes)
+        self._log_transfer_performance(
+            transfer_op,
+            transfer_size,
+            start_time,
+            end_time,
+        )
+        #to be added: postprocess to make sure the transfer is correctly finished
         return True
 
 class PEER2CPUTransferWorker(TransferWorkerBase):

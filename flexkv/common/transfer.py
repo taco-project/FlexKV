@@ -93,6 +93,7 @@ class TransferOp:
     remote_node_ids: Optional[np.ndarray] = None
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
+    simm_block_hashes: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
