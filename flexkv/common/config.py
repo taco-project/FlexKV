@@ -74,10 +74,19 @@ class CacheConfig:
     local_ip: str = "127.0.0.1"
     redis_password: Optional[str] = None
 
+    # SIMM backend (when use_simm_backend=True, remote uses SIMM store)
+    use_simm_backend: bool = False
+    simm_manager_address: str = ""  # e.g. "ip:port", or set via FLEXKV_SIMM_MANAGER_ADDRESS
+
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
         self.enable_remote = self.enable_3rd_remote
+        self.use_simm_backend = self.use_simm_backend or bool(int(os.getenv("FLEXKV_USE_SIMM_BACKEND", 0)))
+        if self.use_simm_backend:
+            self.enable_remote = True
+        if not self.simm_manager_address and self.use_simm_backend:
+            self.simm_manager_address = os.environ.get("FLEXKV_SIMM_MANAGER_ADDRESS", "")
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration

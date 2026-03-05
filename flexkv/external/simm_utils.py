@@ -7,10 +7,10 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from typing import Any, Dict, List, Optional
+    from flexkv.common.config import CacheConfig
 
 import torch
 
@@ -28,11 +28,13 @@ DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 
 from flexkv.common.debug import flexkv_logger as logger
-from flexkv.cache.cache_engine import CacheEngine
 from flexkv.common.block import SequenceMeta
 from flexkv.common.type import MatchResultAccel
 import numpy as np
-from flexkv.common.radix import RadixNode
+
+# Avoid circular import: CacheEngine and RadixNode imported where needed
+FLEXKV_SIMM_JSON_ENV_VAR = "FLEXKV_SIMM_CONFIG_PATH"
+
 
 @dataclass
 class SiMMConfig:
@@ -130,26 +132,87 @@ def get_numa_nic_mapping() -> Dict[int, List[str]]:
     return device_map
 
 class SiMMClient:
-    def __init__(self, manager_address: str):
-        self.manager_address = manager_address
+    """
+    SiMM client. Initialization follows SGLang hicache_simm.py:
+    config from extra_config (if manager_address) or from JSON file, then
+    NUMA-aware NIC, set_flag, Store(), warmup. MR is registered later via register_mr().
+    """
+
+    def __init__(
+        self,
+        manager_address: Optional[str] = None,
+        extra_config: Optional[Dict[str, Any]] = None,
+    ):
         self.store = None
-        self.create_simm_store(manager_address)
         self.mr_ext = None
         self.extra_backend_tag = None
         self.config = None
-        self.warmup_simm_client()
 
-    def register_mr(self, ptr: int, size: int):
-        """
-        Register a memory region with SiMM.
-        """
+        # 1) Load config: extra_config (with manager_address) > from_file() > manager_address only
+        if extra_config is not None and extra_config.get("manager_address") is not None:
+            self.config = SiMMConfig.load_from_extra_config(extra_config)
+            logger.info("SiMM configuration loaded from extra_config.")
+        else:
+            try:
+                self.config = SiMMConfig.from_file()
+                logger.info("SiMM configuration loaded from file.")
+            except (RuntimeError, ValueError):
+                if manager_address:
+                    self.config = SiMMConfig(
+                        manager_address=manager_address,
+                        clnt_threadpool_size=10,
+                        enable_profile=False,
+                    )
+                    logger.info("SiMM configuration from manager_address.")
+                else:
+                    raise ValueError(
+                        "SiMM config: set {} or pass manager_address or extra_config with manager_address".format(
+                        FLEXKV_SIMM_JSON_ENV_VAR
+                    )
+                    ) from None
+
+        if extra_config and "extra_backend_tag" in extra_config:
+            self.extra_backend_tag = extra_config["extra_backend_tag"]
+            logger.info("Using extra_backend_tag: %s", self.extra_backend_tag)
+
+        # 2) NUMA-aware NIC (same as hicache_simm.py)
+        nic_mapping = get_numa_nic_mapping()
+        logger.info("SiMM NUMA-aware allocation: %s", nic_mapping)
+        current_numa = get_current_process_numa()
+        if current_numa >= 0:
+            rdma_devices = nic_mapping.get(current_numa)
+            if rdma_devices is not None and len(rdma_devices) > 0:
+                rdma_device_str = ",".join(rdma_devices)
+                os.environ["SICL_NET_DEVICES"] = rdma_device_str
+                logger.info("SiMM using rdma %s", rdma_device_str)
+
+        # 3) Log path and set_flag before Store() (same as hicache_simm.py)
+        filename_ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_file_path = f"/var/log/simm/{filename_ts}-{os.getpid()}/simm_clnt.log"
+        parts = self.config.manager_address.split(":")
+        cm_ip = parts[0] if parts else "127.0.0.1"
+        cm_port = parts[1] if len(parts) > 1 else "9400"
+        set_flag("cm_primary_node_ip", cm_ip)
+        set_flag("cm_primary_node_port", cm_port)
+        set_flag("clnt_log_file", log_file_path)
+        set_flag("clnt_thread_pool_size", str(self.config.clnt_threadpool_size))
+
+        self.store = Store()
+        logger.info("SiMM store setup successfully.")
+        self.mr_ext = None
+
+        self.warmup_simm_client()
+        logger.info("SiMM store warmup successfully.")
+
+    def register_mr(self, ptr: int, size: int) -> None:
+        """Register a memory region with SiMM (zero-copy). Call after __init__ when buffer is ready."""
         self.mr_ext = register_mr(ptr, size)
 
-    def warmup_simm_client(self,store: Store):
-        """Dryrun a key to warmup SiMM client"""
+    def warmup_simm_client(self) -> None:
+        """Dry run a key to warmup SiMM client (same as hicache_simm.py warmup())."""
         logger.info("begin warm up SiMM client")
-       
-        warmup_key = "sglang_simm_warmup_key" + uuid.uuid4().hex
+        start_time = time.perf_counter_ns()
+        warmup_key = "flexkv_simm_warmup_key" + uuid.uuid4().hex
         warmup_tensor = torch.frombuffer(
             bytearray(warmup_key.encode()), dtype=torch.uint8
         )
@@ -158,74 +221,18 @@ class SiMMClient:
         block_ = block.as_ref()
         block_[: len(warmup_key)] = warmup_tensor
         if self.store.put(warmup_key, block.view()) != 0:
-            logger.warning(f"SiMM client warmup put key {warmup_key} failed")
+            logger.warning("SiMM client warmup put key %s failed", warmup_key)
         if not self.store.exists(warmup_key):
-            logger.warning(f"SiMM client warmup key {warmup_key} not exists")
+            logger.warning("SiMM client warmup key %s not exists", warmup_key)
         got_block = self.store.allocate(warmup_size)
         if self.store.get(warmup_key, got_block.view()) < 0:
-            logger.warning(f"SiMM client warmup get key {warmup_key} failed")
+            logger.warning("SiMM client warmup get key %s failed", warmup_key)
         if not all(got_block.as_ref()[: len(warmup_key)] == warmup_tensor):
-            logger.warning(f"SiMM client warmup key {warmup_key} data wrong")
+            logger.warning("SiMM client warmup key %s data wrong", warmup_key)
         logger.info(
-            f"finish SiMM client warm up, cost {(time.perf_counter_ns() - start_time)/1000:.2f} us"
-        )
-
-    def create_simm_store(self, manager_address: str) -> Store:
-        """
-        Create a SiMM store.
-        """
-        extra_config = (
-            getattr(storage_config, "extra_config", None)
-            if storage_config
-            else None
-        )
-        # Load configuration with manager_address prioritized from extra_config if available
-        if (
-            extra_config is not None
-            and extra_config.get("manager_address") is not None
-        ):
-            # Load from extra_config
-            self.config = SiMMConfig.load_from_extra_config(extra_config)
-            logger.info("SiMM Configuration loaded from extra_config successfully.")
-        else:
-            # Load from config file
-            self.config = SiMMConfig.from_file()
-            logger.info("SiMM Configuration loaded from file successfully.")
-
-        # Check if extra_backend_tag should be passed to SiMM data server
-        self.extra_backend_tag = None
-        if extra_config and "extra_backend_tag" in extra_config:
-            self.extra_backend_tag = extra_config["extra_backend_tag"]
-            logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
-
-        # Set nic device according to current process numa node
-        nic_mapping = get_numa_nic_mapping()
-        logger.info(f"SiMM NUMA-awared allocation: {nic_mapping}")
-        current_numa = get_current_process_numa()
-        if current_numa >= 0:
-            rdma_devices = nic_mapping.get(current_numa)
-            if rdma_devices is not None and len(rdma_devices) > 0:
-                rdma_device_str = ",".join(rdma_devices)
-                os.environ["SICL_NET_DEVICES"] = rdma_device_str
-                logger.info(f"SiMM using rdma {rdma_device_str}")
-
-        # Set simm log path: /var/log/simm/{filename_ts}-{pid}/simm_clnt.log
-        filename_ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_file_path: str = (
-            f"/var/log/simm/{filename_ts}-{os.getpid()}/simm_clnt.log"
-        )
-
-        cm_ip = self.config.manager_address.split(":")[0]
-        cm_port = self.config.manager_address.split(":")[1]
-        set_flag("cm_primary_node_ip", cm_ip)
-        set_flag("cm_primary_node_port", cm_port)
-        set_flag("clnt_log_file", log_file_path)
-        set_flag("clnt_thread_pool_size", str(self.config.clnt_threadpool_size))
-
-        self.store = Store()
-        logger.info("SiMM store setup successfully.")
-
-        return 
+            "finish SiMM client warm up, cost %.2f us",
+            (time.perf_counter_ns() - start_time) / 1000,
+        ) 
 
     def exists(self, key) -> bool:
         exist_result = self._batch_exist_impl([key])
@@ -250,11 +257,8 @@ class SiMMClient:
         keys: List[str],
         extra_info: Optional[Dict[str, Any]] = None,
     ) -> List[bool]:
-        # Apply extra_backend_tag prefix if available
-        #if self.extra_backend_tag is not None:
-        #    prefix = self.extra_backend_tag
-        #    keys = [f"{prefix}_{key}" for key in keys]
-
+        if self.extra_backend_tag is not None:
+            keys = [f"{self.extra_backend_tag}_{key}" for key in keys]
         get_results = self._get_batch_zero_copy_impl(
             keys, cpu_ptrs, block_sizes
         )
@@ -266,12 +270,9 @@ class SiMMClient:
         block_sizes_list: List[int],
         keys_strs: List[str],
         extra_info: Optional[Dict[str, Any]] = None,
-    ) -> List[bool]:
-        # Apply extra_backend_tag prefix if available
-        # if self.extra_backend_tag is not None:
-        #    prefix = self.extra_backend_tag
-        #    keys = [f"{prefix}_{key}" for key in keys]
-
+        ) -> List[bool]:
+        if self.extra_backend_tag is not None:
+            keys_strs = [f"{self.extra_backend_tag}_{k}" for k in keys_strs]
         exist_result = self._batch_exist_impl(keys_strs)
         # maybe we don't need to check again, since flexkv cache engine will check this
         set_keys = []
@@ -284,9 +285,9 @@ class SiMMClient:
             if not exist_result[i]:
                 set_keys.append(keys_strs[i])
                 set_buffer_ptrs.append(cpu_ptrs[i])
-                set_buffer_sizes.append(cpu_ptrs[i])
+                set_buffer_sizes.append(block_sizes_list[i])
                 set_indices.append(i)
-                total_size += cpu_ptrs[i]
+                total_size += block_sizes_list[i]
             else:
                 set_results[i] = 0
 
@@ -308,9 +309,8 @@ class SiMMClient:
         delete_results = self._batch_delete_impl(keys_strs)
         return self._check_success(delete_results, is_set_operate=False)
 
-    # is this true?
-    def _check_success(self, results: List[int], is_set_operate: bool) -> bool:
-        return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results]
+    def _check_success(self, results: List[int], is_set_operate: bool) -> List[bool]:
+        return [k_res > 0 if is_set_operate else k_res == 0 for k_res in results] 
 
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
@@ -337,29 +337,45 @@ class SiMMClient:
     def _batch_exist_impl(self, key_strs: List[str]) -> List[bool]:
         return self.store.mexists(key_strs)
 
-    # is this supported?
-    # do we have async delete APIs ? deletion is done in cacheengine, and need to be fast
-    def _batch_delete_impl(self, key_strs: List[str]) -> List[int]:
-        return self.store.mdelete(key_strs)
+
     
 
-class SimmCacheEngine(CacheEngine):
-    def __init__(self, config: SiMMConfig):
-        super().__init__(config)
-        # TODO how to assure that the simm client is the same one as 
-        # that in the transfer worker?
-        self.simm_client = SiMMClient(config.manager_address)
+class SimmCacheEngine:
+    """Minimal cache engine for SIMM backend: match via batch_exists, no local index."""
 
-    def reset(self):
-        #to be implemented
+    def __init__(self, cache_config: "CacheConfig"):
+        self.tokens_per_block = cache_config.tokens_per_block
+        manager_address = (
+            getattr(cache_config, "simm_manager_address", None)
+            or os.environ.get("FLEXKV_SIMM_MANAGER_ADDRESS", "")
+        )
+        extra_config = None
+        if manager_address:
+            extra_config = {
+                "manager_address": manager_address,
+                "clnt_threadpool_size": getattr(
+                    cache_config, "simm_clnt_threadpool_size", 10
+                ),
+                "enable_profile": getattr(
+                    cache_config, "simm_enable_profile", False
+                ),
+            }
+            if getattr(cache_config, "simm_extra_backend_tag", None) is not None:
+                extra_config["extra_backend_tag"] = cache_config.simm_extra_backend_tag
+        self.simm_client = SiMMClient(
+            manager_address=manager_address or None,
+            extra_config=extra_config,
+        )
+
+    def reset(self) -> None:
         pass
 
-    def start(self):
+    def start(self) -> None:
         pass
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
-        keys = [f"{sequence_meta.block_hashes[i*self.tokens_per_block]}" \
-            for i in range(sequence_meta.num_blocks//self.tokens_per_block)]
+        # block_hashes has length num_blocks; one key per block
+        keys = [str(sequence_meta.block_hashes[i]) for i in range(sequence_meta.num_blocks)]
         matched_length = self.simm_client.batch_exists(keys)
         return MatchResultAccel(num_matched_blocks=matched_length,
                                 num_ready_matched_blocks=matched_length,
@@ -373,22 +389,20 @@ class SimmCacheEngine(CacheEngine):
     def insert(self, sequence_meta: SequenceMeta, physical_block_ids: np.ndarray) -> np.ndarray:
         return np.array([], dtype=np.int64)
 
-    # here I think simm doesn't support locking nodes, but in the long term, we need to support it
-    # to assure consistancy: the nodes need to be locked between flexkv look up (in cache engine) and access (in transfer engine).
-    def lock_node(self, node: RadixNode) -> None:
-        pass
-    
-    # same as lock_node
-    def unlock(self, node: RadixNode) -> None:
+    def lock_node(self, node: Any) -> None:
         pass
 
-    # same as lock_node
-    def set_ready(self, node: RadixNode, ready: bool, ready_length: int) -> None:
+    def unlock(self, node: Any) -> None:
         pass
 
-    # TAKE is skiped as the real index is managed by simm itself
-    # but we can evict here if we need to delete simm memory manually
-    # now we just assume we can always get enough blocks, use all zeros as dummy returns.
-    def take(self, num_required_blocks: int, protected_node: Optional[RadixNode] = None, strict: bool = True) -> np.ndarray:
+    def set_ready(self, node: Any, ready: bool, ready_length: int) -> None:
+        pass
+
+    # TAKE is skipped as the real index is managed by simm itself
+    def take(
+        self,
+        num_required_blocks: int,
+        protected_node: Optional[Any] = None,
+        strict: bool = True,
+    ) -> np.ndarray:
         return np.zeros(num_required_blocks, dtype=np.int64)
-    

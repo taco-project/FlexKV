@@ -447,6 +447,7 @@ class GlobalCacheEngine:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
                 self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
             elif self.use_simm_backend:
+                from flexkv.external.simm_utils import SimmCacheEngine
                 self.remote_cache_engine = SimmCacheEngine(cache_config)
             elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
@@ -761,8 +762,10 @@ class GlobalCacheEngine:
         op_remote2h = None
         if fragment3_num_blocks > 0:
             if self.use_simm_backend:
-                simm_block_hashes_start = fragment3_remote_blocks[0] * self.tokens_per_block + self.tokens_per_block - 1
-                simm_block_hashes = sequence_meta.block_hashes[simm_block_hashes_start :: self.tokens_per_block]
+                # Logical block indices for fragment3 are [fragment12_num_blocks, ...)
+                simm_block_hashes = sequence_meta.block_hashes[
+                    fragment12_num_blocks : fragment12_num_blocks + fragment3_num_blocks
+                ]
                 assert len(simm_block_hashes) == len(fragment3_remote_blocks)
             else:
                 simm_block_hashes = None
@@ -1288,10 +1291,8 @@ class GlobalCacheEngine:
             else:
                 fragment3_cpu_blocks = fragment12_cpu_blocks[-fragment3_num_blocks:]
             if self.use_simm_backend:
-                # here for a prefix aware per-token hash [h1, h2, h3, h4, ...] with token_per_block = 2,
-                # we just use [h2, h4, h6 ...] as the simm block hashes.
-                simm_block_hashes_start = remote_matched_result.num_matched_blocks * self.tokens_per_block + self.tokens_per_block - 1
-                simm_block_hashes = sequence_meta.block_hashes[simm_block_hashes_start :: self.token_per_block]
+                # Last fragment3_num_blocks logical blocks being written to remote
+                simm_block_hashes = sequence_meta.block_hashes[-fragment3_num_blocks:]
                 assert len(simm_block_hashes) == len(fragment3_cpu_blocks)
             else:
                 simm_block_hashes = None

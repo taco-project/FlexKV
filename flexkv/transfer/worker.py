@@ -1370,51 +1370,73 @@ class SiMMTransferWorker(TransferWorkerBase):
         self.is_mla = cpu_kv_layout.is_mla
         self.kv_dim = 2 if not self.is_mla else 1
 
-        self.cpu_blocks = cpu_blocks  ## shared memory
+        self.cpu_blocks = cpu_blocks
         self.cache_config = cache_config
-
-        self.simm_client = SiMMClient(cache_config.simm_manager_address)
+        self._cpu_buffer = cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks
         cpu_memory_size = self.cpu_kv_layout.get_total_elements() * self.dtype.itemsize
+        manager_address = getattr(
+            cache_config, "simm_manager_address", None
+        ) or os.environ.get("FLEXKV_SIMM_MANAGER_ADDRESS", "")
+        extra_config = None
+        if manager_address:
+            extra_config = {
+                "manager_address": manager_address,
+                "clnt_threadpool_size": getattr(
+                    cache_config, "simm_clnt_threadpool_size", 10
+                ),
+                "enable_profile": getattr(
+                    cache_config, "simm_enable_profile", False
+                ),
+            }
+            if getattr(cache_config, "simm_extra_backend_tag", None) is not None:
+                extra_config["extra_backend_tag"] = (
+                    cache_config.simm_extra_backend_tag
+                )
+        self.simm_client = SiMMClient(
+            manager_address=manager_address or None,
+            extra_config=extra_config,
+        )
+        self.simm_client.register_mr(self._cpu_buffer.data_ptr(), cpu_memory_size)
 
-        #register the cpu blocks to simm to support zero copy transfer
-        self.simm_client.register_mr(self.cpu_blocks.data_ptr(), cpu_memory_size)
-
-    def _transfer_impl(self,
+    def _transfer_impl(
+        self,
         cpu_ptrs: List[int],
         block_sizes: List[int],
         keys: List[str],
         transfer_type: TransferType,
-    ):
-        if transfer_type == TransferType.CPU2SIMM:
+    ) -> None:
+        if transfer_type == TransferType.H2REMOTE:
             self.simm_client.batch_set_v1(cpu_ptrs, block_sizes, keys)
-        elif transfer_type == TransferType.SIMM2CPU:
+        elif transfer_type == TransferType.REMOTE2H:
             self.simm_client.batch_get_v1(cpu_ptrs, block_sizes, keys)
         else:
-            raise ValueError(f"Invalid transfer type: {transfer_type} for SiMMTransferWorker. "
-                             f"Expected CPU2SIMM or SIMM2CPU.")
+            raise ValueError(
+                f"Invalid transfer type: {transfer_type} for SiMMTransferWorker. "
+                f"Expected REMOTE2H or H2REMOTE."
+            )
 
-    def _preprocess(self,
-        transfer_op: WorkerTransferOp,
-    ):
-        # parse the op, get the cpu pointers and block sizes of each block and keys for each block
-        # in simm. Note that the PAGEFIRST or BLOCKFISRT block layout for flexkv is 
-        # [num_blocks, num_layers, 2, num_heads, head_size], so each block always has continuous kv data,
-        # therefore, we don't have to care about it's mla or not when generating keys.
+    def _preprocess(self, transfer_op: WorkerTransferOp):
+        # REMOTE2H: fill CPU (dst); H2REMOTE: read from CPU (src)
+        cpu_block_ids = (
+            transfer_op.dst_block_ids
+            if transfer_op.transfer_type == TransferType.REMOTE2H
+            else transfer_op.src_block_ids
+        )
+        assert transfer_op.simm_block_hashes is not None
+        elements_per_block = self.cpu_kv_layout.get_elements_per_block()
+        block_size_bytes = elements_per_block * self.dtype.itemsize
         cpu_ptrs = []
         block_sizes = []
         keys = []
-        cpu_block_ids = transfer_op.src_block_ids \
-            if transfer_op.transfer_type == TransferType.CPU2SIMM else transfer_op.dst_block_ids
-        
+        base_ptr = self._cpu_buffer.data_ptr()
         for i, block_id in enumerate(cpu_block_ids):
-            cpu_ptr = self.cpu_blocks.data_ptr() + block_id * self.cpu_kv_layout.get_block_size() * self.dtype.itemsize
-            block_size = self.cpu_kv_layout.get_block_size()
-            # note that for flexkv, only token hash as the key is enough
-            # and orginally in flexkv, transfer op doesn;t include token keys, but we will
-            # add them to tranfer op for simm transfer.
-            key = f"{transfer_op.token_block_keys[i]}"
-            cpu_ptrs.append(cpu_ptr)
-            block_sizes.append(block_size)
+            cpu_ptr = (
+                base_ptr
+                + block_id * elements_per_block * self.dtype.itemsize
+            )
+            key = str(transfer_op.simm_block_hashes[i])
+            cpu_ptrs.append(int(cpu_ptr))
+            block_sizes.append(int(block_size_bytes))
             keys.append(key)
         return cpu_ptrs, block_sizes, keys
 
