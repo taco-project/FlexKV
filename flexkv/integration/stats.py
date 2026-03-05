@@ -1,8 +1,10 @@
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import deque
+from typing import Optional
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.metrics import FlexKVMetricsCollector, get_global_collector
 
 logger = flexkv_logger
 
@@ -10,6 +12,8 @@ logger = flexkv_logger
 @dataclass
 class FlexKVStats:
     num_log_interval_requests: int
+    _metrics_collector: Optional[FlexKVMetricsCollector] = field(
+        default=None, init=False, repr=False)
     
     # get info
     num_get_requests: int = 0
@@ -46,6 +50,11 @@ class FlexKVStats:
             return 0.0
         return self.num_flexkv_matched_tokens / self.num_put_unmatched_tokens
     
+    def _get_collector(self) -> Optional[FlexKVMetricsCollector]:
+        if self._metrics_collector is None:
+            self._metrics_collector = get_global_collector()
+        return self._metrics_collector
+
     def record_get(
         self,
         num_prompt_tokens: int,
@@ -56,6 +65,13 @@ class FlexKVStats:
         self.num_get_query_tokens += num_prompt_tokens
         self.num_gpu_matched_tokens += num_gpu_matched_tokens
         self.num_flexkv_matched_tokens += num_flexkv_matched_tokens
+
+        collector = self._get_collector()
+        if collector is not None:
+            collector.record_get_query_tokens(num_prompt_tokens)
+            collector.record_matched_tokens("gpu", num_gpu_matched_tokens)
+            collector.record_matched_tokens("flexkv", num_flexkv_matched_tokens)
+
         if self.num_get_requests == self.num_log_interval_requests:
             self.log()
             self.clear()
@@ -74,6 +90,9 @@ class FlexKVStats:
         num_failed_requests: int
     ):
         self.num_failed_requests += num_failed_requests
+        collector = self._get_collector()
+        if collector is not None and num_failed_requests > 0:
+            collector.record_failed_request(num_failed_requests)
         
     def clear(self):
         self.num_get_requests = 0
@@ -97,4 +116,12 @@ class FlexKVStats:
             f"GPU Hit Ratio: {self.get_gpu_match_ratio*100:.2f}%, "
             f"FlexKV Hit Ratio: {self.get_flexkv_match_ratio*100:.2f}%, "
             f"Get/Put Token Ratio: {get_put_token_ratio_str}.")
+
+        collector = self._get_collector()
+        if collector is not None:
+            collector.update_periodic_stats(
+                gpu_hit_ratio=self.get_gpu_match_ratio,
+                flexkv_hit_ratio=self.get_flexkv_match_ratio,
+                get_put_token_ratio=self.get_put_token_ratio,
+            )
         

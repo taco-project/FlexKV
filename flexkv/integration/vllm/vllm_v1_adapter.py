@@ -16,6 +16,7 @@ from flexkv.integration.stats import FlexKVStats
 from flexkv.integration.utils import cdiv
 from flexkv.integration.config import FlexKVConfig
 from flexkv.integration.dynamo.collector import KVEventCollector
+from flexkv.metrics import get_global_collector
 from flexkv.transfer_manager import TransferManagerOnRemote
 
 # vllm
@@ -160,6 +161,7 @@ class FlexKVSchedulerConnector:
 
         self.flexkv_stats = FlexKVStats(int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', '200')))
         self.failed_block_ids: set[int] = set()
+        self._metrics_collector = get_global_collector()
 
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")
@@ -302,7 +304,10 @@ class FlexKVSchedulerConnector:
 
         # Auto cancel if not call update_state_after_alloc()
         match_end_time = time.perf_counter()
-        logger.debug(f"Get match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
+        match_duration = match_end_time - match_start_time
+        logger.debug(f"Get match cost {match_duration*1000:.2f} ms.")
+        if self._metrics_collector is not None:
+            self._metrics_collector.observe_match_duration("get", match_duration)
         if num_new_matched_tokens > 0:
             self.req_id_to_task_dict[request.request_id] = task_id
             self.tasks_to_cancel[task_id] = FlexKVGetTask(task_id=task_id,
@@ -449,7 +454,10 @@ class FlexKVSchedulerConnector:
 
         # Auto cancel if not need to put.
         match_end_time = time.perf_counter()
-        logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
+        match_duration = match_end_time - match_start_time
+        logger.debug(f"Put match cost {match_duration*1000:.2f} ms.")
+        if self._metrics_collector is not None:
+            self._metrics_collector.observe_match_duration("put", match_duration)
 
         if num_unmatched_tokens > 0:
             self.req_id_to_task_dict[request.request_id] = task_id
@@ -558,8 +566,10 @@ class FlexKVSchedulerConnector:
                 num_failed_tasks += 1
                 if isinstance(task, FlexKVGetTask):
                     self.failed_block_ids.update(task.block_ids)
-            # responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
-            #                                             request=task.request, success=success))
+            if self._metrics_collector is not None:
+                self._metrics_collector.observe_task_execute_duration(
+                    task.task_type, task.task_execute_cost)
+                self._metrics_collector.record_request_op(task.task_type, success)
         self.flexkv_stats.record_faild(num_failed_requests=num_failed_tasks)
         return finished_sending, finished_recving
 
@@ -611,6 +621,10 @@ class FlexKVSchedulerConnector:
                 logger.info(f"{task} finished successfully.")
             else:
                 logger.error(f"{task} failed, status: {response.status}.")
+            if self._metrics_collector is not None:
+                self._metrics_collector.observe_task_execute_duration(
+                    task.task_type, task.task_execute_cost)
+                self._metrics_collector.record_request_op(task.task_type, success)
             responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
                                                       request=task.request, success=success))
         return responses_to_return

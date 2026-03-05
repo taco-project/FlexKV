@@ -16,12 +16,13 @@ from typing import Dict, Optional
 
 # Optional import for prometheus_client
 try:
-    from prometheus_client import Counter, Gauge
+    from prometheus_client import Counter, Gauge, Histogram
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
     Counter = None
     Gauge = None
+    Histogram = None
 
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
@@ -212,6 +213,90 @@ class FlexKVMetricsCollector:
             labelnames=["device"],
         )
         
+        # ========== Request-Level Latency Histograms ==========
+        _latency_buckets = [
+            0.0001, 0.0002, 0.0005,
+            0.001, 0.002, 0.005,
+            0.01, 0.02, 0.05,
+            0.1, 0.2, 0.5,
+            1.0, 2.0, 5.0, 10.0, 30.0,
+        ]
+
+        self.match_duration_seconds = Histogram(
+            name="flexkv_py_match_duration_seconds",
+            documentation="Duration of match_prefix operations in seconds",
+            labelnames=["task_type"],
+            buckets=_latency_buckets,
+        )
+
+        self.task_execute_duration_seconds = Histogram(
+            name="flexkv_py_task_execute_duration_seconds",
+            documentation="Duration of task execution (launch to finish) in seconds",
+            labelnames=["task_type"],
+            buckets=_latency_buckets,
+        )
+
+        # ========== Transfer Performance Histograms ==========
+        self.transfer_duration_seconds = Histogram(
+            name="flexkv_py_transfer_duration_seconds",
+            documentation="Duration of data transfer operations in seconds",
+            labelnames=["transfer_type"],
+            buckets=_latency_buckets,
+        )
+
+        self.transfer_bandwidth_gbps = Histogram(
+            name="flexkv_py_transfer_bandwidth_gbps",
+            documentation="Transfer bandwidth in GB/s",
+            labelnames=["transfer_type"],
+            buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0],
+        )
+
+        self.transfer_size_bytes = Histogram(
+            name="flexkv_py_transfer_size_bytes",
+            documentation="Transfer data size in bytes",
+            labelnames=["transfer_type"],
+            buckets=[1e6, 1e7, 5e7, 1e8, 5e8, 1e9, 2e9, 5e9, 1e10],
+        )
+
+        # ========== Periodic Stats Gauges ==========
+        self.gpu_hit_ratio = Gauge(
+            name="flexkv_py_gpu_hit_ratio",
+            documentation="GPU cache hit ratio (0.0~1.0) over recent request window",
+        )
+
+        self.flexkv_hit_ratio = Gauge(
+            name="flexkv_py_flexkv_hit_ratio",
+            documentation="FlexKV cache hit ratio (0.0~1.0) over recent request window",
+        )
+
+        self.get_put_token_ratio = Gauge(
+            name="flexkv_py_get_put_token_ratio",
+            documentation="Ratio of FlexKV matched tokens to put unmatched tokens over recent window",
+        )
+
+        self.failed_requests_total = Counter(
+            name="flexkv_py_failed_requests_total",
+            documentation="Total number of failed requests",
+        )
+
+        # ========== Per-Request Token Counters ==========
+        self.get_query_tokens_total = Counter(
+            name="flexkv_py_get_query_tokens_total",
+            documentation="Total number of get query tokens",
+        )
+
+        self.matched_tokens_total = Counter(
+            name="flexkv_py_matched_tokens_total",
+            documentation="Total number of matched tokens by source",
+            labelnames=["source"],
+        )
+
+        self.request_ops_total = Counter(
+            name="flexkv_py_request_ops_total",
+            documentation="Total number of request operations by type",
+            labelnames=["task_type", "status"],
+        )
+
         logger.info("[FlexKV PyMetrics] Prometheus metrics collector initialized")
     
     def _init_dummy_metrics(self):
@@ -222,6 +307,8 @@ class FlexKVMetricsCollector:
             def inc(self, *args, **kwargs):
                 pass
             def set(self, *args, **kwargs):
+                pass
+            def observe(self, *args, **kwargs):
                 pass
         
         dummy = DummyMetric()
@@ -236,6 +323,22 @@ class FlexKVMetricsCollector:
         self.mempool_free_blocks = dummy
         self.evicted_blocks_total = dummy
         self.allocated_blocks_total = dummy
+
+        # Request-level latency dummy metrics
+        self.match_duration_seconds = dummy
+        self.task_execute_duration_seconds = dummy
+        self.transfer_duration_seconds = dummy
+        self.transfer_bandwidth_gbps = dummy
+        self.transfer_size_bytes = dummy
+
+        # Periodic stats dummy metrics
+        self.gpu_hit_ratio = dummy
+        self.flexkv_hit_ratio = dummy
+        self.get_put_token_ratio = dummy
+        self.failed_requests_total = dummy
+        self.get_query_tokens_total = dummy
+        self.matched_tokens_total = dummy
+        self.request_ops_total = dummy
     
 
     
@@ -327,7 +430,70 @@ class FlexKVMetricsCollector:
         if not self.enabled or num_blocks <= 0:
             return
         self.allocated_blocks_total.labels(device=device).inc(num_blocks)
-    
+
+    # ========== Request-Level Latency Methods ==========
+
+    def observe_match_duration(self, task_type: str, duration_seconds: float):
+        if not self.enabled or duration_seconds <= 0:
+            return
+        self.match_duration_seconds.labels(task_type=task_type).observe(duration_seconds)
+
+    def observe_task_execute_duration(self, task_type: str, duration_seconds: float):
+        if not self.enabled or duration_seconds <= 0:
+            return
+        self.task_execute_duration_seconds.labels(task_type=task_type).observe(duration_seconds)
+
+    def observe_transfer(self, transfer_type: str, size_bytes: float,
+                         duration_seconds: float):
+        if not self.enabled or duration_seconds <= 0:
+            return
+        self.transfer_duration_seconds.labels(transfer_type=transfer_type).observe(duration_seconds)
+        self.transfer_size_bytes.labels(transfer_type=transfer_type).observe(size_bytes)
+        if duration_seconds > 0:
+            bandwidth_gbps = size_bytes / duration_seconds / 1e9
+            self.transfer_bandwidth_gbps.labels(transfer_type=transfer_type).observe(bandwidth_gbps)
+
+    # ========== Periodic Stats Methods ==========
+
+    def update_periodic_stats(self, gpu_hit_ratio: float, flexkv_hit_ratio: float,
+                              get_put_token_ratio: float):
+        if not self.enabled:
+            return
+        self.gpu_hit_ratio.set(gpu_hit_ratio)
+        self.flexkv_hit_ratio.set(flexkv_hit_ratio)
+        self.get_put_token_ratio.set(get_put_token_ratio)
+
+    def record_failed_request(self, count: int = 1):
+        if not self.enabled or count <= 0:
+            return
+        self.failed_requests_total.inc(count)
+
+    def record_get_query_tokens(self, num_tokens: int):
+        if not self.enabled or num_tokens <= 0:
+            return
+        self.get_query_tokens_total.inc(num_tokens)
+
+    def record_matched_tokens(self, source: str, num_tokens: int):
+        """
+        Args:
+            source: "gpu" or "flexkv"
+            num_tokens: Number of matched tokens
+        """
+        if not self.enabled or num_tokens <= 0:
+            return
+        self.matched_tokens_total.labels(source=source).inc(num_tokens)
+
+    def record_request_op(self, task_type: str, success: bool):
+        """
+        Args:
+            task_type: "get" or "put"
+            success: Whether the task finished successfully
+        """
+        if not self.enabled:
+            return
+        status = "success" if success else "failed"
+        self.request_ops_total.labels(task_type=task_type, status=status).inc()
+
 # Global collector instance
 _global_collector: Optional[FlexKVMetricsCollector] = None
 

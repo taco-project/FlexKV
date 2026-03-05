@@ -18,6 +18,7 @@ from flexkv.integration.utils import cdiv
 from flexkv.integration.config import FlexKVConfig
 from flexkv.integration.tensorrt_llm.meta import(
     FlexKVResponse, FlexKVTask, FlexKVGetTask, FlexKVPutTask, FlexKVConnectorMetadata)
+from flexkv.metrics import get_global_collector
 from flexkv.transfer_manager import TransferManagerOnRemote
 
 from flexkv.integration.tensorrt_llm.utils import RequestWrapper
@@ -59,6 +60,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.tasks_to_cancel: dict[int, FlexKVTask] = {}
 
         self.flexkv_stats = FlexKVStats(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200))
+        self._metrics_collector = get_global_collector()
 
         flexkv_logger.info("Finish init FlexKVSchedulerConnector")
         
@@ -215,7 +217,10 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         # Auto cancel if not call update_state_after_alloc()
         match_end_time = time.perf_counter()
-        flexkv_logger.debug(f"Get match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
+        match_duration = match_end_time - match_start_time
+        flexkv_logger.debug(f"Get match cost {match_duration*1000:.2f} ms.")
+        if self._metrics_collector is not None:
+            self._metrics_collector.observe_match_duration("get", match_duration)
         if num_new_matched_tokens > 0:
             self.req_id_to_task_dict[request.req_id] = task_id
             self.tasks_to_cancel[task_id] = FlexKVGetTask(task_id=task_id,
@@ -374,7 +379,10 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
 
         # Auto cancel if not need to put.
         match_end_time = time.perf_counter()
-        flexkv_logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms. {num_unmatched_tokens=}")
+        match_duration = match_end_time - match_start_time
+        flexkv_logger.debug(f"Put match cost {match_duration*1000:.2f} ms. {num_unmatched_tokens=}")
+        if self._metrics_collector is not None:
+            self._metrics_collector.observe_match_duration("put", match_duration)
         
         if num_unmatched_tokens > 0:
             self.req_id_to_task_dict[request.req_id] = task_id
@@ -478,6 +486,10 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             else:
                 flexkv_logger.error(f"{task} failed, status: {response.status}.")
                 num_failed_tasks += 1
+            if self._metrics_collector is not None:
+                self._metrics_collector.observe_task_execute_duration(
+                    task.task_type, task.task_execute_cost)
+                self._metrics_collector.record_request_op(task.task_type, success)
         flexkv_logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
         self.flexkv_stats.record_faild(num_failed_requests=num_failed_tasks)
         return finished_sending, finished_recving
@@ -504,6 +516,10 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
                 flexkv_logger.info(f"{task} finished successfully.")
             else:
                 flexkv_logger.error(f"{task} failed, status: {response.status}.")
+            if self._metrics_collector is not None:
+                self._metrics_collector.observe_task_execute_duration(
+                    task.task_type, task.task_execute_cost)
+                self._metrics_collector.record_request_op(task.task_type, success)
             responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
                                                       request=task.request, success=success))
         return responses_to_return

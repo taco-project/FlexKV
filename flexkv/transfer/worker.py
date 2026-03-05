@@ -215,12 +215,21 @@ class TransferWorkerBase(ABC):
                                   start_time: float,
                                   end_time: float) -> None:
         """Common method to log transfer performance"""
+        duration = end_time - start_time
         flexkv_logger.info(
             f"{transfer_op.transfer_type.name} transfer request: {transfer_op.transfer_op_id} finished "
             f"transfer data size: {transfer_size / (1024 * 1024 * 1024)} GB "
-            f"transfer time: {end_time - start_time:.4f} s "
-            f"transfer bandwidth: {transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+            f"transfer time: {duration:.4f} s "
+            f"transfer bandwidth: {transfer_size / duration / 1e9:.2f} GB/s"
         )
+        try:
+            from flexkv.metrics import get_global_collector
+            collector = get_global_collector()
+            if collector is not None:
+                collector.observe_transfer(
+                    transfer_op.transfer_type.name, float(transfer_size), duration)
+        except Exception:
+            pass
 
     @abstractmethod
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
