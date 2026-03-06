@@ -21,8 +21,20 @@ from flexkv.transfer_manager import TransferManagerOnRemote
 # vllm
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata, KVConnectorRole)
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.parallel_state import get_tp_group
+
+# KVConnectorStats: available since v0.11.0
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+except ImportError:
+    KVConnectorStats = None  # type: ignore[misc,assignment]
+
+# KVConnectorOutput: available since v0.10.1
+try:
+    from vllm.v1.outputs import KVConnectorOutput as _KVConnectorOutput
+    _HAS_KV_CONNECTOR_OUTPUT = True
+except ImportError:
+    _HAS_KV_CONNECTOR_OUTPUT = False
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -30,13 +42,14 @@ if TYPE_CHECKING:
     try:
         from vllm.v1.attention.backend import AttentionMetadata
     except ImportError:
-        # vllm <= 0.8.x used the old path
+        # vllm <= 0.13.x used the old path
         from vllm.attention.backends.abstract import AttentionMetadata  # type: ignore[no-redef]
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
-    from vllm.v1.outputs import KVConnectorOutput
+    if _HAS_KV_CONNECTOR_OUTPUT:
+        from vllm.v1.outputs import KVConnectorOutput
 
 
 logger = flexkv_logger
@@ -882,11 +895,14 @@ class FlexKVConnectorV1Impl:
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
         """
         Update KVConnector state from worker-side connectors output.
+        Available since vLLM v0.10.1.
 
         Args:
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        if not _HAS_KV_CONNECTOR_OUTPUT:
+            return
 
         finished_sending, finished_recving = self.connector.query_finished_task()
         connector_output.finished_sending = finished_sending
@@ -919,10 +935,14 @@ class FlexKVConnectorV1Impl:
             return []
         return collector.take_events()
 
-    def get_kv_connector_stats(self) -> Optional[KVConnectorStats]:
+    def get_kv_connector_stats(self) -> Optional["KVConnectorStats"]:
         """
         Get the KV connector stats collected during the last interval.
+        Available since vLLM v0.11.0.
         """
+        if KVConnectorStats is None:
+            return None
+
         if self.role != KVConnectorRole.SCHEDULER:
             return None
 
