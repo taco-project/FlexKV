@@ -37,6 +37,7 @@ from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTr
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
+from flexkv.external.simm_utils import SiMMClient
 from flexkv.transfer.utils import group_blocks_by_node_and_segment, group_blocks_by_node, split_contiguous_blocks, RemoteSSD2HMetaInfo, NodeMetaInfo, RDMATaskInfo
 try:
     from flexkv.c_ext import (
@@ -77,6 +78,7 @@ class WorkerTransferOp:
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
     src_block_node_ids: Optional[np.ndarray]
+    simm_block_hashes: Optional[np.ndarray]
     # successors: List[int]
 
     def __init__(self, transfer_op: TransferOp):
@@ -90,7 +92,7 @@ class WorkerTransferOp:
         self.valid_block_num = transfer_op.valid_block_num
         # Always preserve optional src_block_node_ids from TransferOp
         self.src_block_node_ids = transfer_op.src_block_node_ids
-
+        self.simm_block_hashes = transfer_op.simm_block_hashes
         if self.src_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
             self.dst_block_ids = transfer_op.dst_block_ids
@@ -1342,6 +1344,120 @@ class tpGDSTransferWorker(TransferWorkerBase):
             end_time,
         )
 
+        return True
+
+class SiMMTransferWorker(TransferWorkerBase):
+    def __init__(self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        cpu_blocks: torch.Tensor,
+        cpu_kv_layout: KVCacheLayout,
+        dtype: torch.dtype,
+        cache_config: CacheConfig,
+    ):
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+        self.num_layers = cpu_kv_layout.num_layer
+        self.num_cpu_blocks = cpu_kv_layout.num_block
+        self.block_size = cpu_kv_layout.get_chunk_size()
+        self.dtype = dtype
+        self.cpu_kv_layout = cpu_kv_layout
+        #to simplify, only blockfirst/pagefirst is supported for simm now
+        assert self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
+
+        self.is_mla = cpu_kv_layout.is_mla
+        self.kv_dim = 2 if not self.is_mla else 1
+
+        self.cpu_blocks = cpu_blocks
+        self.cache_config = cache_config
+        self._cpu_buffer = cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks
+        cpu_memory_size = self.cpu_kv_layout.get_total_elements() * self.dtype.itemsize
+        manager_address = getattr(
+            cache_config, "simm_manager_address", None
+        ) or os.environ.get("FLEXKV_SIMM_MANAGER_ADDRESS", "")
+        extra_config = None
+        if manager_address:
+            extra_config = {
+                "manager_address": manager_address,
+                "clnt_threadpool_size": getattr(
+                    cache_config, "simm_clnt_threadpool_size", 10
+                ),
+                "enable_profile": getattr(
+                    cache_config, "simm_enable_profile", False
+                ),
+            }
+            if getattr(cache_config, "simm_extra_backend_tag", None) is not None:
+                extra_config["extra_backend_tag"] = (
+                    cache_config.simm_extra_backend_tag
+                )
+        self.simm_client = SiMMClient(
+            manager_address=manager_address or None,
+            extra_config=extra_config,
+        )
+        self.simm_client.register_mr(self._cpu_buffer.data_ptr(), cpu_memory_size)
+
+    def _transfer_impl(
+        self,
+        cpu_ptrs: List[int],
+        block_sizes: List[int],
+        keys: List[str],
+        transfer_type: TransferType,
+    ) -> None:
+        if transfer_type == TransferType.H2REMOTE:
+            self.simm_client.batch_set_v1(cpu_ptrs, block_sizes, keys)
+        elif transfer_type == TransferType.REMOTE2H:
+            self.simm_client.batch_get_v1(cpu_ptrs, block_sizes, keys)
+        else:
+            raise ValueError(
+                f"Invalid transfer type: {transfer_type} for SiMMTransferWorker. "
+                f"Expected REMOTE2H or H2REMOTE."
+            )
+
+    def _preprocess(self, transfer_op: WorkerTransferOp):
+        # REMOTE2H: fill CPU (dst); H2REMOTE: read from CPU (src)
+        cpu_block_ids = (
+            transfer_op.dst_block_ids
+            if transfer_op.transfer_type == TransferType.REMOTE2H
+            else transfer_op.src_block_ids
+        )
+        assert transfer_op.simm_block_hashes is not None
+        elements_per_block = self.cpu_kv_layout.get_elements_per_block()
+        block_size_bytes = elements_per_block * self.dtype.itemsize
+        cpu_ptrs = []
+        block_sizes = []
+        keys = []
+        base_ptr = self._cpu_buffer.data_ptr()
+        for i, block_id in enumerate(cpu_block_ids):
+            cpu_ptr = (
+                base_ptr
+                + block_id * elements_per_block * self.dtype.itemsize
+            )
+            key = str(transfer_op.simm_block_hashes[i])
+            cpu_ptrs.append(int(cpu_ptr))
+            block_sizes.append(int(block_size_bytes))
+            keys.append(key)
+        return cpu_ptrs, block_sizes, keys
+
+    def _postprocess(self):
+        pass
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        cpu_ptrs, block_sizes, keys = self._preprocess(transfer_op)
+        assert transfer_op.layer_id == 0
+        assert transfer_op.layer_granularity == self.num_layers
+        start_time = time.time()
+        self._transfer_impl(cpu_ptrs, block_sizes, keys, transfer_op.transfer_type)
+        end_time = time.time()
+        transfer_size = sum(block_sizes)
+        self._log_transfer_performance(
+            transfer_op,
+            transfer_size,
+            start_time,
+            end_time,
+        )
+        #to be added: postprocess to make sure the transfer is correctly finished
         return True
 
 class PEER2CPUTransferWorker(TransferWorkerBase):

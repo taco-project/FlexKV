@@ -40,6 +40,7 @@ from flexkv.transfer.worker import (
     GDSTransferWorker,
     tpGDSTransferWorker,
     PEER2CPUTransferWorker,
+    SiMMTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
@@ -295,7 +296,19 @@ class TransferEngine:
                 self._worker_map[TransferType.PEERH2H] = self.cpu_remote_cpu_worker
             if self.cache_config.enable_p2p_ssd:
                 self._worker_map[TransferType.PEERSSD2H] = self.cpu_remote_cpu_worker
-
+        
+        if getattr(self.cache_config, "use_simm_backend", False):
+            self.simm_workers: WorkerHandle = SiMMTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._cpu_handle.get_tensor(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
+                cache_config=self.cache_config,
+            )
+            self._worker_map[TransferType.H2REMOTE] = self.simm_workers
+            self._worker_map[TransferType.REMOTE2H] = self.simm_workers
             
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
