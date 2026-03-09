@@ -91,7 +91,7 @@ class WorkerTransferOp:
         # Always preserve optional src_block_node_ids from TransferOp
         self.src_block_node_ids = transfer_op.src_block_node_ids
 
-        if self.src_slot_id == -1:
+        if self.src_slot_id == -1 or self.dst_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
             self.dst_block_ids = transfer_op.dst_block_ids
         else:
