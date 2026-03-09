@@ -70,7 +70,7 @@ class WorkerTransferOp:
         self.src_slot_id = transfer_op.src_slot_id
         self.dst_slot_id = transfer_op.dst_slot_id
         self.valid_block_num = transfer_op.valid_block_num
-        if self.src_slot_id == -1:
+        if self.src_slot_id == -1 or self.dst_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
             self.dst_block_ids = transfer_op.dst_block_ids
         else:
