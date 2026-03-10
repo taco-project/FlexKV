@@ -35,6 +35,18 @@ import numpy as np
 # Avoid circular import: CacheEngine and RadixNode imported where needed
 FLEXKV_SIMM_JSON_ENV_VAR = "FLEXKV_SIMM_CONFIG_PATH"
 
+# Debug: log first/last few keys for SIMM key consistency check (main process match vs worker set/get)
+def _log_keys(label: str, keys: List[str], max_head: int = 3, max_tail: int = 1) -> None:
+    if not keys:
+        return
+    n = len(keys)
+    if n <= max_head + max_tail:
+        logger.info("[SIMM DEBUG] %s n=%s keys=%s", label, n, keys)
+    else:
+        head = keys[:max_head]
+        tail = keys[-max_tail:] if max_tail else []
+        logger.info("[SIMM DEBUG] %s n=%s head=%s ... tail=%s", label, n, head, tail)
+
 
 @dataclass
 class SiMMConfig:
@@ -175,16 +187,21 @@ class SiMMClient:
             self.extra_backend_tag = extra_config["extra_backend_tag"]
             logger.info("Using extra_backend_tag: %s", self.extra_backend_tag)
 
-        # 2) NUMA-aware NIC (same as hicache_simm.py)
-        nic_mapping = get_numa_nic_mapping()
-        logger.info("SiMM NUMA-aware allocation: %s", nic_mapping)
-        current_numa = get_current_process_numa()
-        if current_numa >= 0:
-            rdma_devices = nic_mapping.get(current_numa)
-            if rdma_devices is not None and len(rdma_devices) > 0:
-                rdma_device_str = ",".join(rdma_devices)
-                os.environ["SICL_NET_DEVICES"] = rdma_device_str
-                logger.info("SiMM using rdma %s", rdma_device_str)
+        # 2) NUMA-aware NIC (same as hicache_simm.py). Skip if FLEXKV_SIMM_SKIP_NUMA_DEVICES=1
+        #    so that connection behavior matches minimal test (set_flag only, no SICL_NET_DEVICES).
+        skip_numa = os.environ.get("FLEXKV_SIMM_SKIP_NUMA_DEVICES", "").strip() in ("1", "true", "yes")
+        if not skip_numa:
+            nic_mapping = get_numa_nic_mapping()
+            logger.info("SiMM NUMA-aware allocation: %s", nic_mapping)
+            current_numa = get_current_process_numa()
+            if current_numa >= 0:
+                rdma_devices = nic_mapping.get(current_numa)
+                if rdma_devices is not None and len(rdma_devices) > 0:
+                    rdma_device_str = ",".join(rdma_devices)
+                    os.environ["SICL_NET_DEVICES"] = rdma_device_str
+                    logger.info("SiMM using rdma %s", rdma_device_str)
+        else:
+            logger.info("SiMM skipping NUMA device pinning (FLEXKV_SIMM_SKIP_NUMA_DEVICES=1)")
 
         # 3) Log path and set_flag before Store() (same as hicache_simm.py)
         filename_ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -204,9 +221,9 @@ class SiMMClient:
         self.warmup_simm_client()
         logger.info("SiMM store warmup successfully.")
 
-    def register_mr(self, ptr: int, size: int) -> None:
+    def register_mr(self, tensor: torch.Tensor) -> None:
         """Register a memory region with SiMM (zero-copy). Call after __init__ when buffer is ready."""
-        self.mr_ext = register_mr(ptr, size)
+        self.mr_ext = register_mr(tensor)
 
     def warmup_simm_client(self) -> None:
         """Dry run a key to warmup SiMM client (same as hicache_simm.py warmup())."""
@@ -243,7 +260,11 @@ class SiMMClient:
         keys_strs: List[str], 
         extra_info: Optional[Dict[str, Any]] = None
     ) -> int:
-
+        # Use same key prefix as batch_set_v1/batch_get_v1 so main process (match) and worker (put/get) see the same keys
+        if self.extra_backend_tag is not None:
+            keys_strs = [f"{self.extra_backend_tag}_{k}" for k in keys_strs]
+        if os.environ.get("FLEXKV_DEBUG_SIMM") and keys_strs:
+            _log_keys("batch_exists query keys", keys_strs)
         exist_result = self._batch_exist_impl(keys_strs)
         for i in range(len(keys_strs)):
             if not exist_result[i]:
@@ -259,6 +280,8 @@ class SiMMClient:
     ) -> List[bool]:
         if self.extra_backend_tag is not None:
             keys = [f"{self.extra_backend_tag}_{key}" for key in keys]
+        if os.environ.get("FLEXKV_DEBUG_SIMM") and keys:
+            _log_keys("batch_get_v1 read keys", keys)
         get_results = self._get_batch_zero_copy_impl(
             keys, cpu_ptrs, block_sizes
         )
@@ -292,6 +315,8 @@ class SiMMClient:
                 set_results[i] = 0
 
         # Only set non-existing keys to storage
+        if len(set_keys) > 0 and os.environ.get("FLEXKV_DEBUG_SIMM"):
+            _log_keys("batch_set_v1 write keys", set_keys)
         if len(set_keys) > 0:
             put_results = self._put_batch_zero_copy_impl(
                 set_keys, set_buffer_ptrs, set_buffer_sizes
@@ -306,11 +331,14 @@ class SiMMClient:
         keys_strs: List[str],
         extra_info: Optional[Dict[str, Any]] = None,
     ) -> List[bool]:
+        if self.extra_backend_tag is not None:
+            keys_strs = [f"{self.extra_backend_tag}_{k}" for k in keys_strs]
         delete_results = self._batch_delete_impl(keys_strs)
         return self._check_success(delete_results, is_set_operate=False)
 
     def _check_success(self, results: List[int], is_set_operate: bool) -> List[bool]:
-        return [k_res > 0 if is_set_operate else k_res == 0 for k_res in results] 
+        # put: success when return == 0; get: success when return > 0 (bytes read)
+        return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results] 
 
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
@@ -339,6 +367,13 @@ class SiMMClient:
 
 
     
+
+class _SimmDummyNode:
+    """Placeholder node for SimmCacheEngine.insert(); unlock/set_ready are no-ops."""
+
+    def size(self) -> int:
+        return 0
+
 
 class SimmCacheEngine:
     """Minimal cache engine for SIMM backend: match via batch_exists, no local index."""
@@ -376,7 +411,13 @@ class SimmCacheEngine:
     def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
         # block_hashes has length num_blocks; one key per block
         keys = [str(sequence_meta.block_hashes[i]) for i in range(sequence_meta.num_blocks)]
+        if os.environ.get("FLEXKV_DEBUG_SIMM") and keys:
+            _log_keys("match (main process) raw keys", keys)
         matched_length = self.simm_client.batch_exists(keys)
+        if os.environ.get("FLEXKV_DEBUG_SIMM") and sequence_meta.num_blocks > 0:
+            logger.info(
+                f"[SIMM DEBUG] match num_blocks={sequence_meta.num_blocks} matched={matched_length}"
+            )
         return MatchResultAccel(num_matched_blocks=matched_length,
                                 num_ready_matched_blocks=matched_length,
                                 last_ready_node=None,
@@ -385,9 +426,15 @@ class SimmCacheEngine:
                                 physical_blocks=np.arange(matched_length, dtype=np.int64),
                                 matched_pos="global")
 
-    # insert is skiped as the real index is managed by simm itself
-    def insert(self, sequence_meta: SequenceMeta, physical_block_ids: np.ndarray) -> np.ndarray:
-        return np.array([], dtype=np.int64)
+    # insert is skipped as the real index is managed by simm itself
+    def insert(
+        self,
+        sequence_meta: SequenceMeta,
+        physical_block_ids: np.ndarray,
+        is_ready: bool = False,
+        match_result: Optional[Any] = None,
+    ) -> _SimmDummyNode:
+        return _SimmDummyNode()
 
     def lock_node(self, node: Any) -> None:
         pass
@@ -397,6 +444,9 @@ class SimmCacheEngine:
 
     def set_ready(self, node: Any, ready: bool, ready_length: int) -> None:
         pass
+
+    def insert_and_publish(self, node: Any) -> bool:
+        return True
 
     # TAKE is skipped as the real index is managed by simm itself
     def take(

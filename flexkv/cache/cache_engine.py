@@ -373,7 +373,10 @@ class GlobalCacheEngine:
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
         self.eviction_policy = GLOBAL_CONFIG_FROM_ENV.eviction_policy
 
-        self.use_simm_backend = GLOBAL_CONFIG_FROM_ENV.use_simm_backend
+        self.use_simm_backend = (
+            GLOBAL_CONFIG_FROM_ENV.use_simm_backend
+            or getattr(cache_config, "use_simm_backend", False)
+        )
         if self.use_simm_backend:
             self.enable_remote = True
 

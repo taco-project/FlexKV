@@ -55,24 +55,37 @@ class StorageEngine:
                 max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
         if self._cache_config.enable_remote:
-            if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
-                raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
-            self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
-                num_layer=self._model_config.num_layers,
-                num_block=self._cache_config.num_remote_blocks,
-                tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads,
-                head_size=self._model_config.head_size,
-                is_mla=self._model_config.use_mla
-            )
-            self.allocate(
-                device_type=DeviceType.REMOTE,
-                layout=self._remote_layout,
-                dtype=self._model_config.dtype,
-                file_path=self._cache_config.remote_cache_path,
-                remote_config_custom = self._cache_config.remote_config_custom
-            )
+            # SIMM backend uses SiMMClient, not RemoteAllocator (PCFS); skip REMOTE allocation
+            use_simm = getattr(self._cache_config, "use_simm_backend", False)
+            if not use_simm:
+                if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
+                    raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
+                self._remote_layout = KVCacheLayout(
+                    type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                    num_layer=self._model_config.num_layers,
+                    num_block=self._cache_config.num_remote_blocks,
+                    tokens_per_block=self._cache_config.tokens_per_block,
+                    num_head=self._model_config.num_kv_heads,
+                    head_size=self._model_config.head_size,
+                    is_mla=self._model_config.use_mla
+                )
+                self.allocate(
+                    device_type=DeviceType.REMOTE,
+                    layout=self._remote_layout,
+                    dtype=self._model_config.dtype,
+                    file_path=self._cache_config.remote_cache_path,
+                    remote_config_custom=self._cache_config.remote_config_custom,
+                )
+            else:
+                self._remote_layout = KVCacheLayout(
+                    type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                    num_layer=self._model_config.num_layers,
+                    num_block=self._cache_config.num_remote_blocks,
+                    tokens_per_block=self._cache_config.tokens_per_block,
+                    num_head=self._model_config.num_kv_heads,
+                    head_size=self._model_config.head_size,
+                    is_mla=self._model_config.use_mla
+                )
 
     def register_gpu_blocks(self,
                             gpu_blocks: List[TensorSharedHandle],

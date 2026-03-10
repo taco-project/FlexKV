@@ -310,12 +310,11 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
     """
     Merge multiple TransferOpGraphs into a single batch graph.
 
-    Simplified assumption: each graph has at most two ops - DISK2H and H2D.
-    - All DISK2H ops are merged into one (if any exist)
-    - All H2D ops are merged into one
-    - Dependency: DISK2H -> H2D
-    - H2D becomes the task_end_op_id
-    - For other transfer types (REMOTE, GDS, etc.), raise error
+    Supported transfer types: DISK2H, H2D, REMOTE2H (e.g. SIMM remote read), H2DISK (CPU->SSD).
+    - All DISK2H / REMOTE2H / H2D / H2DISK ops are merged into one each (if any exist)
+    - Dependencies: DISK2H -> H2D, REMOTE2H -> H2D, REMOTE2H -> H2DISK (when present)
+    - batch_end_op_id: H2D if exists, else REMOTE2H, else DISK2H
+    - For other transfer types (GDS, etc.), raise error
 
     Args:
         batch_id: ID for the new batch graph
@@ -334,13 +333,17 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
     merged_graph = TransferOpGraph()
     merged_graph.set_graph_id(batch_id)
 
-    # Collect DISK2H and H2D ops separately
+    # Collect DISK2H, H2D, REMOTE2H, H2DISK ops separately
     disk2h_ops: List[TransferOp] = []
     h2d_ops: List[TransferOp] = []
+    remote2h_ops: List[TransferOp] = []
+    h2disk_ops: List[TransferOp] = []
 
     # New callback dict: merged_op_id -> list of callbacks
     disk2h_callbacks: List[Callable] = []
     h2d_callbacks: List[Callable] = []
+    remote2h_callbacks: List[Callable] = []
+    h2disk_callbacks: List[Callable] = []
 
     for graph in transfer_graphs:
         for op_id, op in graph._op_map.items():
@@ -355,17 +358,27 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
                 h2d_ops.append(op)
                 if op.op_id in op_callback_dict:
                     h2d_callbacks.append(op_callback_dict[op.op_id])
+            elif op.transfer_type == TransferType.REMOTE2H:
+                remote2h_ops.append(op)
+                if op.op_id in op_callback_dict:
+                    remote2h_callbacks.append(op_callback_dict[op.op_id])
+            elif op.transfer_type == TransferType.H2DISK:
+                h2disk_ops.append(op)
+                if op.op_id in op_callback_dict:
+                    h2disk_callbacks.append(op_callback_dict[op.op_id])
             else:
                 # Unsupported transfer type for batch merge
                 raise NotImplementedError(
                     f"Batch merge does not support transfer type: {op.transfer_type}. "
-                    f"Only DISK2H and H2D are supported. "
-                    f"Remote access and GDS are not yet supported for batch merge."
+                    f"Only DISK2H, H2D, REMOTE2H, and H2DISK are supported. "
+                    f"GDS and other remote types are not yet supported for batch merge."
                 )
 
     new_op_callback_dict: Dict[int, Callable] = {}
     merged_disk2h_op = None
     merged_h2d_op = None
+    merged_remote2h_op = None
+    merged_h2disk_op = None
 
     # Merge all DISK2H ops into one
     if disk2h_ops:
@@ -424,14 +437,91 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
                     return combined_callback
                 new_op_callback_dict[merged_h2d_op.op_id] = make_combined_callback(h2d_callbacks)
 
-    # Add dependency: DISK2H -> H2D
+    # Merge all REMOTE2H ops into one (e.g. SIMM remote read)
+    if remote2h_ops:
+        src_blocks = np.concatenate([op.src_block_ids for op in remote2h_ops])
+        dst_blocks = np.concatenate([op.dst_block_ids for op in remote2h_ops])
+        simm_hashes = None
+        if all(op.simm_block_hashes is not None for op in remote2h_ops):
+            simm_hashes = np.concatenate([op.simm_block_hashes for op in remote2h_ops])
+        src_node_ids = None
+        if all(op.src_block_node_ids is not None for op in remote2h_ops):
+            src_node_ids = np.concatenate([op.src_block_node_ids for op in remote2h_ops])
+
+        merged_remote2h_op = TransferOp(
+            graph_id=merged_graph.graph_id,
+            transfer_type=TransferType.REMOTE2H,
+            src_block_ids=src_blocks,
+            dst_block_ids=dst_blocks,
+            layer_id=remote2h_ops[0].layer_id,
+            layer_granularity=remote2h_ops[0].layer_granularity,
+            dp_id=remote2h_ops[0].dp_id,
+            src_block_node_ids=src_node_ids,
+            simm_block_hashes=simm_hashes,
+        )
+        merged_graph.add_transfer_op(merged_remote2h_op)
+
+        if remote2h_callbacks:
+            if len(remote2h_callbacks) == 1:
+                new_op_callback_dict[merged_remote2h_op.op_id] = remote2h_callbacks[0]
+            else:
+
+                def make_combined_callback(callbacks):
+                    def combined_callback(*args, **kwargs):
+                        for cb in callbacks:
+                            cb(*args, **kwargs)
+                    return combined_callback
+
+                new_op_callback_dict[merged_remote2h_op.op_id] = make_combined_callback(
+                    remote2h_callbacks
+                )
+
+    # Merge all H2DISK ops into one (e.g. write from CPU to SSD after REMOTE2H)
+    if h2disk_ops:
+        src_blocks = np.concatenate([op.src_block_ids for op in h2disk_ops])
+        dst_blocks = np.concatenate([op.dst_block_ids for op in h2disk_ops])
+
+        merged_h2disk_op = TransferOp(
+            graph_id=merged_graph.graph_id,
+            transfer_type=TransferType.H2DISK,
+            src_block_ids=src_blocks,
+            dst_block_ids=dst_blocks,
+            layer_id=h2disk_ops[0].layer_id,
+            layer_granularity=h2disk_ops[0].layer_granularity,
+            dp_id=h2disk_ops[0].dp_id,
+        )
+        merged_graph.add_transfer_op(merged_h2disk_op)
+
+        if h2disk_callbacks:
+            if len(h2disk_callbacks) == 1:
+                new_op_callback_dict[merged_h2disk_op.op_id] = h2disk_callbacks[0]
+            else:
+
+                def make_combined_callback_h2disk(callbacks):
+                    def combined_callback(*args, **kwargs):
+                        for cb in callbacks:
+                            cb(*args, **kwargs)
+                    return combined_callback
+
+                new_op_callback_dict[merged_h2disk_op.op_id] = make_combined_callback_h2disk(
+                    h2disk_callbacks
+                )
+
+    # Add dependencies: DISK2H -> H2D, REMOTE2H -> H2D (H2D waits for both if present)
+    # REMOTE2H -> H2DISK when both present (H2DISK writes CPU to SSD after remote read)
     if merged_disk2h_op is not None and merged_h2d_op is not None:
         merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
+    if merged_remote2h_op is not None and merged_h2d_op is not None:
+        merged_graph.add_dependency(merged_h2d_op.op_id, merged_remote2h_op.op_id)
+    if merged_remote2h_op is not None and merged_h2disk_op is not None:
+        merged_graph.add_dependency(merged_h2disk_op.op_id, merged_remote2h_op.op_id)
 
     # Determine the batch_end_op_id
-    # Priority: H2D (if exists) -> DISK2H (if exists) -> -1
+    # Priority: H2D (if exists) -> REMOTE2H (if exists) -> DISK2H (if exists) -> -1
     if merged_h2d_op is not None:
         batch_end_op_id = merged_h2d_op.op_id
+    elif merged_remote2h_op is not None:
+        batch_end_op_id = merged_remote2h_op.op_id
     elif merged_disk2h_op is not None:
         batch_end_op_id = merged_disk2h_op.op_id
     else:

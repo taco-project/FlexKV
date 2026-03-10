@@ -96,6 +96,10 @@ class WorkerTransferOp:
         if self.src_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
             self.dst_block_ids = transfer_op.dst_block_ids
+        elif transfer_op.simm_block_hashes is not None:
+            # SiMM worker needs CPU block ids to compute ptrs; keep them
+            self.src_block_ids = transfer_op.src_block_ids
+            self.dst_block_ids = transfer_op.dst_block_ids
         else:
             self.src_block_ids = np.empty(0)
             self.dst_block_ids = np.empty(0)
@@ -1396,7 +1400,7 @@ class SiMMTransferWorker(TransferWorkerBase):
             manager_address=manager_address or None,
             extra_config=extra_config,
         )
-        self.simm_client.register_mr(self._cpu_buffer.data_ptr(), cpu_memory_size)
+        self.simm_client.register_mr(self._cpu_buffer)
 
     def _transfer_impl(
         self,
@@ -1406,9 +1410,17 @@ class SiMMTransferWorker(TransferWorkerBase):
         transfer_type: TransferType,
     ) -> None:
         if transfer_type == TransferType.H2REMOTE:
-            self.simm_client.batch_set_v1(cpu_ptrs, block_sizes, keys)
+            set_ok = self.simm_client.batch_set_v1(cpu_ptrs, block_sizes, keys)
+            if os.environ.get("FLEXKV_DEBUG_SIMM"):
+                flexkv_logger.info(
+                    f"[SIMM DEBUG] H2REMOTE set_v1 keys={len(keys)} ok={sum(set_ok)} fail={len(set_ok) - sum(set_ok)}"
+                )
         elif transfer_type == TransferType.REMOTE2H:
-            self.simm_client.batch_get_v1(cpu_ptrs, block_sizes, keys)
+            get_ok = self.simm_client.batch_get_v1(cpu_ptrs, block_sizes, keys)
+            if os.environ.get("FLEXKV_DEBUG_SIMM"):
+                flexkv_logger.info(
+                    f"[SIMM DEBUG] REMOTE2H get_v1 keys={len(keys)} ok={sum(get_ok)} fail={len(get_ok) - sum(get_ok)}"
+                )
         else:
             raise ValueError(
                 f"Invalid transfer type: {transfer_type} for SiMMTransferWorker. "

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Iterable, List, Tuple, Optional, Union, Dict
 from dataclasses import dataclass
 from enum import IntEnum

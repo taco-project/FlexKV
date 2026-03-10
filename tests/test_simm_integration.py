@@ -92,7 +92,7 @@ def test_simm_client_query(simm_client):
     total_bytes = layout.num_block * block_size_bytes
 
     buffer = torch.zeros(total_bytes // dtype.itemsize, dtype=dtype)
-    simm_client.register_mr(buffer.data_ptr(), total_bytes)
+    simm_client.register_mr(buffer)
 
     keys = ["test_query_key_1", "test_query_key_2", "test_query_key_3"]
     ptrs = [
@@ -124,7 +124,7 @@ def test_simm_client_transfer(simm_client):
     total_bytes = layout.num_block * block_size_bytes
 
     buffer = torch.zeros(total_bytes // dtype.itemsize, dtype=dtype)
-    simm_client.register_mr(buffer.data_ptr(), total_bytes)
+    simm_client.register_mr(buffer)
 
     keys = ["test_transfer_key_1", "test_transfer_key_2"]
     ptrs = [
@@ -171,7 +171,7 @@ def test_simm_cache_engine_match(simm_client):
     total_bytes = layout.num_block * block_size_bytes
 
     buffer = torch.zeros(total_bytes // dtype.itemsize, dtype=dtype)
-    simm_client.register_mr(buffer.data_ptr(), total_bytes)
+    simm_client.register_mr(buffer)
 
     keys = [str(sequence_meta.block_hashes[i]) for i in range(sequence_meta.num_blocks)]
     ptrs = [
@@ -216,7 +216,7 @@ def test_simm_integration_e2e(simm_client):
     total_bytes = layout.num_block * block_size_bytes
 
     buffer = torch.zeros(total_bytes // dtype.itemsize, dtype=dtype)
-    simm_client.register_mr(buffer.data_ptr(), total_bytes)
+    simm_client.register_mr(buffer)
 
     # Fill with pattern
     for i in range(num_blocks):

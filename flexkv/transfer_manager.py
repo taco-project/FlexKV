@@ -133,9 +133,11 @@ class TransferManager:
             if self.cache_config.enable_cpu else None
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
             if self.cache_config.enable_ssd else None
+        # SIMM backend does not use RemoteAllocator; remote is handled by SiMMTransferWorker
+        use_simm = getattr(self.cache_config, "use_simm_backend", False)
         remote_handle = (
-            self.storage_engine.get_storage_handle(DeviceType.REMOTE) \
-            if self.cache_config.enable_remote \
+            self.storage_engine.get_storage_handle(DeviceType.REMOTE)
+            if self.cache_config.enable_remote and not use_simm
             else None
         )
         self.transfer_engine = TransferEngine(gpu_handles=grouped_gpu_handles,
