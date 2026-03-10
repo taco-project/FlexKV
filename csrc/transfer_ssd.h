@@ -2,7 +2,9 @@
 #include <errno.h>
 #include <liburing.h>
 #include <linux/ioprio.h>
+#include <sys/syscall.h>
 #include <torch/extension.h>
+#include <unistd.h>
 #include <vector>
 
 #ifndef IOPRIO_CLASS_SHIFT
@@ -37,6 +39,19 @@ public:
                 this, _entries, flags, errno);
       }
     }
+
+    rt_supported = (syscall(SYS_ioprio_set, 1, 0,
+                            IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 0)) == 0);
+    if (rt_supported) {
+      syscall(SYS_ioprio_set, 1, 0, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4));
+      read_ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 0);
+    } else {
+      read_ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 0);
+    }
+    write_ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4);
+
+    fprintf(stdout, "IOUring(%p) : RT ioprio %s\n", this,
+            rt_supported ? "supported" : "not supported, using BE");
   }
 
   ~IOUring() {
@@ -113,7 +128,7 @@ public:
     iov->iov_len = size;
     io_uring_prep_readv(sqe, fd, iov, 1, offset);
 
-    sqe->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 0);
+    sqe->ioprio = read_ioprio;
 
     io_uring_sqe_set_data(sqe, iov);
     prepared++;
@@ -136,7 +151,7 @@ public:
     iov->iov_len = size;
     io_uring_prep_writev(sqe, fd, iov, 1, offset);
 
-    sqe->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4);
+    sqe->ioprio = write_ioprio;
 
     io_uring_sqe_set_data(sqe, iov);
     prepared++;
@@ -182,6 +197,10 @@ private:
   io_uring ring;
   io_uring_sqe *sqe;
   io_uring_cqe *cqe;
+
+  bool rt_supported;
+  uint16_t read_ioprio;
+  uint16_t write_ioprio;
 
   int cqe_err;
   int entries;
