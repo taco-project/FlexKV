@@ -26,8 +26,28 @@ from vllm.distributed.parallel_state import get_tp_group
 # KVConnectorStats: available since v0.11.0
 try:
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+
+    class _FlexKVWorkerSentinelStats(KVConnectorStats):
+        """Sentinel stats returned from the worker side so that
+        KVConnectorOutput.is_empty() returns False.  The scheduler
+        aggregates worker stats with its own; this implementation
+        simply forwards to the other side so no real data is lost."""
+
+        def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
+            return other
+
+        def reduce(self) -> dict[str, int | float]:
+            return {}
+
+        def reset(self):
+            pass
+
+        def is_empty(self) -> bool:
+            return True
+
 except ImportError:
     KVConnectorStats = None  # type: ignore[misc,assignment]
+    _FlexKVWorkerSentinelStats = None  # type: ignore[misc,assignment]
 
 # KVConnectorOutput: available since v0.10.1
 try:
@@ -944,7 +964,14 @@ class FlexKVConnectorV1Impl:
             return None
 
         if self.role != KVConnectorRole.SCHEDULER:
-            return None
+            # Must return non-None so KVConnectorOutput.is_empty() returns
+            # False on the worker side.  Otherwise, when
+            # total_num_scheduled_tokens == 0, no_forward() discards the
+            # output and the scheduler never polls query_finished_task(),
+            # causing requests in WAITING_FOR_REMOTE_KVS to hang forever.
+            # Use sentinel subclass whose aggregate() delegates to the
+            # scheduler's stats, avoiding NotImplementedError.
+            return _FlexKVWorkerSentinelStats(data={})
 
         stats = self.connector.flexkv_stats
         data = {

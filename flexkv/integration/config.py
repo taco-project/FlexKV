@@ -73,6 +73,8 @@ class FlexKVConfig:
         else:
             self.model_config.num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
+        self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
+        self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
 
     def post_init_from_sglang_config(
