@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 import torch
 
+from flexkv.common import gpu_runtime
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -676,7 +677,7 @@ class FlexKVWorkerConnector:
         self.launch_remote_transfer_manager = get_tp_group().local_rank == 0 and \
             get_tp_group().rank_in_group != 0
 
-        local_device = torch.cuda.current_device()
+        local_device = gpu_runtime.current_device()
 
         # Determine if server_client_mode (same logic as KVManager)
         server_client_mode = (GLOBAL_CONFIG_FROM_ENV.instance_num > 1 or
@@ -684,7 +685,6 @@ class FlexKVWorkerConnector:
                               GLOBAL_CONFIG_FROM_ENV.server_client_mode)
 
         if server_client_mode:
-            # Assuming Server can see all GPUs, use global device ID
             cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
             if cuda_visible:
                 visible_ids = [int(x.strip()) for x in cuda_visible.split(',') if x.strip()]

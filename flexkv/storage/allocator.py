@@ -12,6 +12,7 @@ import torch
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
+from flexkv.common import gpu_runtime
 
 
 class BaseStorageAllocator(ABC):
@@ -44,8 +45,8 @@ class GPUAllocator(BaseStorageAllocator):
                  layout: KVCacheLayout,
                  dtype: torch.dtype,
                  **kwargs: Any) -> StorageHandle:
-        device_id = kwargs.get("device_id", torch.cuda.current_device())
-        device = f"cuda:{device_id}"
+        device_id = kwargs.get("device_id", gpu_runtime.current_device())
+        device = gpu_runtime.get_device_string(device_id)
         num_chunks = kwargs.get("num_chunks", 1)
 
         total_size = layout.get_total_elements()
