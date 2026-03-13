@@ -10,23 +10,41 @@ from multiprocessing.connection import Connection
 from threading import Thread
 from typing import List, Any, Dict, Union, Optional, Tuple
 
-import ctypes
 import numpy as np
 import nvtx
 import torch
 import zmq
 import json
 
+from flexkv.common.gpu_backend import get_gpu_backend, get_transfer_kv_blocks_module
+from flexkv.common import gpu_runtime
+
+_transfer_module = get_transfer_kv_blocks_module()
+transfer_kv_blocks = _transfer_module.transfer_kv_blocks
+transfer_kv_blocks_ssd = _transfer_module.transfer_kv_blocks_ssd
+
+if get_gpu_backend() == "musa":
+    try:
+        from flexkv.c_ext_musa import TPTransferThreadGroupMusa as TPTransferThreadGroup
+    except ImportError:
+        from flexkv.c_ext import TPTransferThreadGroup
+    try:
+        from flexkv.c_ext_musa import transfer_kv_blocks_gds, TPGDSTransferThreadGroupMusa as TPGDSTransferThreadGroup
+    except ImportError:
+        try:
+            from flexkv.c_ext import transfer_kv_blocks_gds, TPGDSTransferThreadGroup
+        except ImportError:
+            transfer_kv_blocks_gds = None
+            TPGDSTransferThreadGroup = None
+else:
+    from flexkv.c_ext import TPTransferThreadGroup
+    try:
+        from flexkv.c_ext import transfer_kv_blocks_gds, TPGDSTransferThreadGroup
+    except ImportError:
+        transfer_kv_blocks_gds = None
+        TPGDSTransferThreadGroup = None
+
 from flexkv import c_ext
-
-from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
-
-# GDS imports are optional (only available when compiled with FLEXKV_ENABLE_GDS=1)
-try:
-    from flexkv.c_ext import transfer_kv_blocks_gds, TPGDSTransferThreadGroup
-except ImportError:
-    transfer_kv_blocks_gds = None
-    TPGDSTransferThreadGroup = None
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
@@ -48,21 +66,13 @@ except ImportError:
     shared_transfer_kv_blocks_remote_read = None
 
 
-cudart = ctypes.CDLL('libcudart.so')
-
 def cudaHostRegister(tensor: torch.Tensor) -> None:
-    """Register a CPU tensor with CUDA for pinned memory access"""
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 1) # 1 means cudaHostRegisterPortable
-    if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+    """Register a CPU tensor for pinned memory access (works with CUDA and MUSA)."""
+    gpu_runtime.host_register(tensor)
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
-    """Unregister a CPU tensor from CUDA for pinned memory access"""
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
+    """Unregister a CPU tensor from pinned memory (works with CUDA and MUSA)."""
+    gpu_runtime.host_unregister(tensor)
 
 @dataclass
 class WorkerTransferOp:
@@ -349,10 +359,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.gpu_block_type_ = 2
         else:
             raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
-        # set GPU device
         if gpu_device_id != -1:
-            torch.cuda.set_device(gpu_device_id)
-        self.transfer_stream = torch.cuda.Stream()
+            gpu_runtime.set_device(gpu_device_id)
+        self.transfer_stream = gpu_runtime.create_stream()
         self.transfer_sms_h2d = transfer_sms_h2d
         self.transfer_sms_d2h = transfer_sms_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
@@ -425,7 +434,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
-        with torch.cuda.stream(self.transfer_stream):
+        with gpu_runtime.stream_context(self.transfer_stream):
             start_time = time.time()
             self._transfer_impl(
                 src_block_ids,
@@ -1050,11 +1059,10 @@ class GDSTransferWorker(TransferWorkerBase):
         else:
             raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
 
-        # Set GPU device and create stream
         self.gpu_device_id = gpu_device_id
         if gpu_device_id != -1:
-            torch.cuda.set_device(gpu_device_id)
-        self.transfer_stream = torch.cuda.Stream()
+            gpu_runtime.set_device(gpu_device_id)
+        self.transfer_stream = gpu_runtime.create_stream()
 
     def _transfer_impl(
         self,
@@ -1139,7 +1147,7 @@ class GDSTransferWorker(TransferWorkerBase):
             
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
-        with torch.cuda.stream(self.transfer_stream):
+        with gpu_runtime.stream_context(self.transfer_stream):
             start_time = time.time()
             self._transfer_impl(
                 src_block_ids,

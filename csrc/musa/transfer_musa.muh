@@ -1,0 +1,23 @@
+/*
+ * MUSA transfer API - mirrors csrc/transfer.cuh with musaStream_t.
+ * Header for MUSA kernel/host code (.mu); used with torch_musa when available.
+ */
+#pragma once
+
+#include <musa_runtime.h>
+#include "gtensor_handler_musa.h"
+
+namespace flexkv {
+
+template<BackendType Type>
+void transfer_kv_blocks(
+    int num_blocks, int start_layer_id, int num_layers, int64_t *gpu_block_ids,
+    GTensorHandler gpu_tensor_handler,
+    int64_t gpu_startoff_inside_chunks,
+    int64_t *cpu_block_ids, void *cpu_ptr,
+    int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
+    int64_t cpu_block_stride_in_bytes, int64_t cpu_startoff_inside_chunks,
+    int64_t chunk_size_in_bytes, musaStream_t stream, int transfer_sms,
+    bool is_host_to_device, bool use_ce_transfer, bool is_mla);
+
+}  // namespace flexkv

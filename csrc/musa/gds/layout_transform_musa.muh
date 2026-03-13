@@ -1,0 +1,27 @@
+/*
+ * MUSA layout transform kernel — mirrors csrc/gds/layout_transform.cuh.
+ * Uses musa_runtime.h and musaStream_t.
+ */
+#pragma once
+
+#include <musa_runtime.h>
+#include "../gtensor_handler_musa.h"
+
+namespace flexkv {
+
+template<BackendType Type>
+void launch_layout_transform_kernel_musa(
+    int64_t* buffer_base,
+    int64_t buffer_layer_stride,
+    int64_t buffer_kv_stride,
+    int64_t buffer_block_stride,
+    int64_t chunk_size,
+    GTensorHandler gpu_handler,
+    int64_t* gpu_block_ids,
+    int num_blocks,
+    int num_layers,
+    bool is_mla,
+    bool buffer_to_target,
+    musaStream_t stream);
+
+} // namespace flexkv
