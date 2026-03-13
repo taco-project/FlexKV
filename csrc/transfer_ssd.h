@@ -1,6 +1,7 @@
 #pragma once
 #include <errno.h>
 #include <liburing.h>
+#include <fcntl.h>
 #include <linux/ioprio.h>
 #include <sys/syscall.h>
 #include <torch/extension.h>

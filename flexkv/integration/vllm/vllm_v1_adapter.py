@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 import torch
 
+from flexkv.common import gpu_runtime
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -660,28 +661,26 @@ class FlexKVWorkerConnector:
         self.is_local_leader = get_tp_group().local_rank == 0
         self.launch_remote_transfer_manager = get_tp_group().local_rank == 0 and \
             get_tp_group().rank_in_group != 0
-        
-        local_device = torch.cuda.current_device()
-        
-        # Determine if server_client_mode (same logic as KVManager)
-        server_client_mode = (GLOBAL_CONFIG_FROM_ENV.instance_num > 1 or 
-                              flexkv_config.model_config.dp_size > 1 or 
+
+        local_device = gpu_runtime.current_device()
+
+        server_client_mode = (GLOBAL_CONFIG_FROM_ENV.instance_num > 1 or
+                              flexkv_config.model_config.dp_size > 1 or
                               GLOBAL_CONFIG_FROM_ENV.server_client_mode)
-        
+
         if server_client_mode:
-            # Assuming Server can see all GPUs, use global device ID
             cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
             if cuda_visible:
                 visible_ids = [int(x.strip()) for x in cuda_visible.split(',') if x.strip()]
                 device_id = visible_ids[local_device] if local_device < len(visible_ids) else local_device
             else:
                 device_id = local_device
-            
+
             client_id = GLOBAL_CONFIG_FROM_ENV.instance_id * flexkv_config.model_config.dp_size + dp_client_id
         else:
             device_id = local_device
             client_id = dp_client_id
-        
+
         self.flexkv_config = flexkv_config
         if self.launch_remote_transfer_manager:
             self.remote_transfer_manager_process = TransferManagerOnRemote.create_process()
