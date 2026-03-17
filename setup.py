@@ -23,6 +23,7 @@ enable_cfs = os.environ.get("FLEXKV_ENABLE_CFS", "0") == "1"
 enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
 enable_p2p = os.environ.get("FLEXKV_ENABLE_P2P", "0") == "1"
 enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
+enable_nvcomp = os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") == "1"
 # FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
 enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 
@@ -113,6 +114,20 @@ if enable_p2p:
         "csrc/dist/lease_meta_mempool.cpp",
     ])
     extra_compile_args.append("-DFLEXKV_ENABLE_P2P")
+if enable_nvcomp:
+    NVCOMP_ROOT = os.environ.get(
+        "NVCOMP_ROOT",
+        "/workspace/develop/llm/kvtc-sglang/nvcomp_perf/nvcomp-sglang")
+    print(f"ENABLE_NVCOMP = true: Compiling with nvcomp ANS support (root={NVCOMP_ROOT})")
+    cpp_sources.append("csrc/ans_transfer.cu")
+    hpp_sources.append("csrc/ans_transfer.h")
+    include_dirs.append(os.path.join(NVCOMP_ROOT, "include"))
+    nvcomp_lib_dir = os.path.join(NVCOMP_ROOT, "build", "lib")
+    extra_link_args.extend(["-lnvcomp", f"-L{nvcomp_lib_dir}", f"-Wl,-rpath,{nvcomp_lib_dir}"])
+    extra_compile_args.append("-DFLEXKV_ENABLE_NVCOMP")
+    nvcc_compile_args.append("-DFLEXKV_ENABLE_NVCOMP")
+else:
+    print("ENABLE_NVCOMP = false: Skipping nvcomp ANS compression")
 if not enable_gds:
     print("ENABLE_GDS = false: Skipping GDS code")
 if not enable_p2p:
