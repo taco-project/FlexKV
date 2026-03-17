@@ -6,6 +6,18 @@ FlexKV是腾讯云TACO团队和社区合作开发推出的面向超大规模 LLM
 
 FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICENSE) 文件。
 
+## Updates
+
+- **2026 年 3 月 17 日**：🎉 FlexKV 正式合并进入 [vLLM](https://github.com/vllm-project/vllm) 官方主干（[PR #34328](https://github.com/vllm-project/vllm/pull/34328)）！从 **vLLM v0.17.2** 起，`FlexKVConnectorV1` 已内置，**无需再手动打 patch**。详见 [docs/vllm_adapter/README_zh.md](docs/vllm_adapter/README_zh.md)。
+
+- **2026 年 1 月 28 日**：集成 [Mooncake Transfer Engine](https://github.com/kvcache-ai/Mooncake)，FlexKV 支持基于 RDMA 的高性能跨节点 [分布式 KVCache 复用](docs/dist_reuse/README_zh.md)。
+
+- **2026 年 1 月**：新增 TensorRT-LLM 支持（[#48](https://github.com/taco-project/FlexKV/pull/48)），vLLM 和 TRT-LLM 均支持 TP16（[#53](https://github.com/taco-project/FlexKV/pull/53)、[#59](https://github.com/taco-project/FlexKV/pull/59)）。
+
+- **2025 年 12 月**：新增 GPU Direct Storage（GDS）支持（[#25](https://github.com/taco-project/FlexKV/pull/25)），实现 SSD 到 GPU 的直接传输，绕过 CPU。
+
+- **2025 年 11 月**：FlexKV 从 client-server 模式升级为**可直接调用的库函数**（commit [0290841](https://github.com/taco-project/FlexKV/commit/0290841dce65ae9b036a23d733cf94e47e814934)），消除进程间通信开销，即 v1.0.0 API。
+
 ## 最新版本主要变更
 ### 功能
 通用功能:
