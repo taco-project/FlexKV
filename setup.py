@@ -24,7 +24,7 @@ enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
 enable_p2p = os.environ.get("FLEXKV_ENABLE_P2P", "0") == "1"
 enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
 # FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
-enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "1") != "0"
+enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 
 # Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
