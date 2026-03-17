@@ -24,25 +24,36 @@ struct ANSTransferContext {
 
     // GPU buffers: compression I/O (sized for max_num_chunks)
     void*    d_comp_temp;
-    uint8_t* d_comp_staging;    // strided by max_comp_chunk_bytes
+    uint8_t* d_comp_staging[2];  // double-buffered, strided by max_comp_chunk_bytes
     void**   d_uncomp_ptrs;
     size_t*  d_uncomp_sizes;
-    void**   d_comp_ptrs;
-    size_t*  d_comp_sizes;
+    void**   d_comp_ptrs[2];     // double-buffered (point into respective d_comp_staging)
+    size_t*  d_comp_sizes[2];    // double-buffered
+
+    // Double-buffer pipeline resources (shared by D2H and H2D)
+    // D2H: scatter_stream runs scatter, compress_done/scatter_done sync
+    // H2D: scatter_stream runs gather, compress_done/scatter_done sync
+    cudaStream_t scatter_stream;
+    cudaEvent_t  compress_done[2];
+    cudaEvent_t  scatter_done[2];
 
     // GPU buffers: decompression I/O
     void*           d_decomp_temp;
-    void**          d_decomp_ptrs;
-    size_t*         d_decomp_buf_sizes;
+    void**          d_decomp_ptrs[2];       // double-buffered for H2D pipeline
+    size_t*         d_decomp_buf_sizes[2];  // double-buffered, pre-filled
     size_t*         d_decomp_act_sizes;
     nvcompStatus_t* d_statuses;
 
-    // Host pinned buffer for compressed sizes metadata
-    size_t*  h_comp_sizes;
+    // Host pinned buffer for compressed sizes metadata (double-buffered for H2D pipeline)
+    size_t*  h_comp_sizes[2];
 
     // Host scratch (reused across calls)
     std::vector<void*>  h_ptr_scratch;
     std::vector<size_t> h_size_scratch;
+
+    // Kernel launch config (computed once via occupancy API)
+    int scatter_grid;   // grid size for scatter/gather kernels
+    int gather_grid;
 
     int log_level;
 };

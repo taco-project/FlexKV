@@ -37,6 +37,8 @@ namespace flexkv {
 // pack/unpack + cudaMemcpy + CPU scatter/gather stages.
 // ---------------------------------------------------------------------------
 
+static const int ANS_KERNEL_BLOCK_SIZE = 128;
+
 __global__ void ans_d2h_scatter_kernel(
     const uint8_t* __restrict__ d_comp_staging,
     size_t staging_stride,
@@ -48,7 +50,8 @@ __global__ void ans_d2h_scatter_kernel(
     const int64_t* __restrict__ cpu_block_ids,
     int start_layer_id,
     int kv_dim, int num_blocks,
-    int batch_start, int bsz)
+    int batch_start, int bsz,
+    int64_t* __restrict__ h_comp_sizes_out)
 {
     for (int i = blockIdx.x; i < bsz; i += gridDim.x) {
         int g = batch_start + i;
@@ -57,19 +60,26 @@ __global__ void ans_d2h_scatter_kernel(
         int b = g % num_blocks;
 
         size_t sz = d_comp_sizes[i];
-        const uint8_t* src = d_comp_staging + (size_t)i * staging_stride;
-        uint8_t* dst = cpu_ptr
-                     + (int64_t)(layer + start_layer_id) * cpu_layer_stride
-                     + (int64_t)kv * cpu_kv_stride
-                     + cpu_block_ids[b] * cpu_block_stride;
+        const float4* src = reinterpret_cast<const float4*>(
+            d_comp_staging + (size_t)i * staging_stride);
+        float4* dst = reinterpret_cast<float4*>(
+            cpu_ptr
+            + (int64_t)(layer + start_layer_id) * cpu_layer_stride
+            + (int64_t)kv * cpu_kv_stride
+            + cpu_block_ids[b] * cpu_block_stride);
 
-        size_t n_f4 = sz / sizeof(float4);
-        for (size_t j = threadIdx.x; j < n_f4; j += blockDim.x)
-            reinterpret_cast<float4*>(dst)[j] =
-                reinterpret_cast<const float4*>(src)[j];
+        int64_t n_f4 = sz / sizeof(float4);
+        for (int64_t j = threadIdx.x; j < n_f4; j += blockDim.x)
+            dst[j] = __ldg(&src[j]);
+
         size_t tail = n_f4 * sizeof(float4);
-        for (size_t j = tail + threadIdx.x; j < sz; j += blockDim.x)
-            dst[j] = src[j];
+        const uint8_t* src_tail = reinterpret_cast<const uint8_t*>(src) + tail;
+        uint8_t* dst_tail = reinterpret_cast<uint8_t*>(dst) + tail;
+        for (size_t j = threadIdx.x; j < sz - tail; j += blockDim.x)
+            dst_tail[j] = src_tail[j];
+
+        if (threadIdx.x == 0)
+            h_comp_sizes_out[g] = static_cast<int64_t>(sz);
     }
 }
 
@@ -93,19 +103,23 @@ __global__ void ans_h2d_gather_kernel(
         int b = g % num_blocks;
 
         size_t sz = d_comp_sizes[i];
-        uint8_t* dst = d_comp_staging + (size_t)i * staging_stride;
-        const uint8_t* src = cpu_ptr
-                           + (int64_t)(layer + start_layer_id) * cpu_layer_stride
-                           + (int64_t)kv * cpu_kv_stride
-                           + cpu_block_ids[b] * cpu_block_stride;
+        float4* dst = reinterpret_cast<float4*>(
+            d_comp_staging + (size_t)i * staging_stride);
+        const float4* src = reinterpret_cast<const float4*>(
+            cpu_ptr
+            + (int64_t)(layer + start_layer_id) * cpu_layer_stride
+            + (int64_t)kv * cpu_kv_stride
+            + cpu_block_ids[b] * cpu_block_stride);
 
-        size_t n_f4 = sz / sizeof(float4);
-        for (size_t j = threadIdx.x; j < n_f4; j += blockDim.x)
-            reinterpret_cast<float4*>(dst)[j] =
-                reinterpret_cast<const float4*>(src)[j];
+        int64_t n_f4 = sz / sizeof(float4);
+        for (int64_t j = threadIdx.x; j < n_f4; j += blockDim.x)
+            dst[j] = __ldg(&src[j]);
+
         size_t tail = n_f4 * sizeof(float4);
-        for (size_t j = tail + threadIdx.x; j < sz; j += blockDim.x)
-            dst[j] = src[j];
+        const uint8_t* src_tail = reinterpret_cast<const uint8_t*>(src) + tail;
+        uint8_t* dst_tail = reinterpret_cast<uint8_t*>(dst) + tail;
+        for (size_t j = threadIdx.x; j < sz - tail; j += blockDim.x)
+            dst_tail[j] = src_tail[j];
     }
 }
 
@@ -185,45 +199,76 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
   const size_t ptr_bytes  = max_num_chunks * sizeof(void*);
   const size_t size_bytes = max_num_chunks * sizeof(size_t);
 
-  // GPU compression buffers
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_temp,    ctx->comp_temp_bytes));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_staging, comp_staging_total));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_uncomp_ptrs,  ptr_bytes));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_uncomp_sizes, size_bytes));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_ptrs,    ptr_bytes));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_sizes,   size_bytes));
+  // GPU compression buffers (double-buffered where needed for D2H pipeline)
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_temp,       ctx->comp_temp_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_staging[0], comp_staging_total));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_staging[1], comp_staging_total));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_uncomp_ptrs,     ptr_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_uncomp_sizes,    size_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_ptrs[0],    ptr_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_ptrs[1],    ptr_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_sizes[0],   size_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_sizes[1],   size_bytes));
 
-  // GPU decompression buffers
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_temp,      ctx->decomp_temp_bytes));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_ptrs,      ptr_bytes));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_buf_sizes, size_bytes));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_act_sizes, size_bytes));
+  // GPU decompression buffers (double-buffered for H2D pipeline)
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_temp,         ctx->decomp_temp_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_ptrs[0],      ptr_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_ptrs[1],      ptr_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_buf_sizes[0], size_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_buf_sizes[1], size_bytes));
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_act_sizes,    size_bytes));
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_statuses,
       max_num_chunks * sizeof(nvcompStatus_t)));
 
-  // Host pinned buffer for compressed sizes metadata + fallback flag
-  ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_sizes,    size_bytes));
+  // Host pinned buffers for compressed sizes metadata (double-buffered)
+  ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_sizes[0], size_bytes));
+  ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_sizes[1], size_bytes));
 
   // Host scratch vectors
   ctx->h_ptr_scratch.resize(max_num_chunks);
   ctx->h_size_scratch.resize(max_num_chunks);
 
-  // Pre-fill d_comp_ptrs: each points into d_comp_staging at stride
-  for (size_t i = 0; i < max_num_chunks; i++)
-    ctx->h_ptr_scratch[i] = ctx->d_comp_staging + i * ctx->max_comp_chunk_bytes;
-  ANS_CUDA_CHECK(cudaMemcpy(ctx->d_comp_ptrs, ctx->h_ptr_scratch.data(),
-                             ptr_bytes, cudaMemcpyHostToDevice));
+  // Pre-fill d_comp_ptrs for both slots
+  for (int slot = 0; slot < 2; slot++) {
+    for (size_t i = 0; i < max_num_chunks; i++)
+      ctx->h_ptr_scratch[i] = ctx->d_comp_staging[slot] + i * ctx->max_comp_chunk_bytes;
+    ANS_CUDA_CHECK(cudaMemcpy(ctx->d_comp_ptrs[slot], ctx->h_ptr_scratch.data(),
+                               ptr_bytes, cudaMemcpyHostToDevice));
+  }
 
-  // Pre-fill d_uncomp_sizes: all chunks have the same uncompressed size
+  // Pre-fill size arrays: all chunks have the same uncompressed size
   for (size_t i = 0; i < max_num_chunks; i++)
     ctx->h_size_scratch[i] = max_chunk_size;
   ANS_CUDA_CHECK(cudaMemcpy(ctx->d_uncomp_sizes, ctx->h_size_scratch.data(),
                              size_bytes, cudaMemcpyHostToDevice));
+  ANS_CUDA_CHECK(cudaMemcpy(ctx->d_decomp_buf_sizes[0], ctx->h_size_scratch.data(),
+                             size_bytes, cudaMemcpyHostToDevice));
+  ANS_CUDA_CHECK(cudaMemcpy(ctx->d_decomp_buf_sizes[1], ctx->h_size_scratch.data(),
+                             size_bytes, cudaMemcpyHostToDevice));
+
+  // Create scatter stream and events for double-buffer pipeline
+  ANS_CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->scatter_stream, cudaStreamNonBlocking));
+  for (int i = 0; i < 2; i++) {
+    ANS_CUDA_CHECK(cudaEventCreateWithFlags(&ctx->compress_done[i], cudaEventDisableTiming));
+    ANS_CUDA_CHECK(cudaEventCreateWithFlags(&ctx->scatter_done[i],  cudaEventDisableTiming));
+  }
+
+  // Compute kernel grid sizes via occupancy API (matching baseline transfer_kv_blocks_kernel)
+  {
+    int scatter_bpsm = 0, gather_bpsm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &scatter_bpsm, ans_d2h_scatter_kernel, ANS_KERNEL_BLOCK_SIZE, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &gather_bpsm, ans_h2d_gather_kernel, ANS_KERNEL_BLOCK_SIZE, 0);
+    ctx->scatter_grid = ANS_TRANSFER_SMS * std::max(scatter_bpsm, 1);
+    ctx->gather_grid  = ANS_TRANSFER_SMS * std::max(gather_bpsm, 1);
+  }
 
   if (log_level >= 1) {
-    size_t total_gpu = ctx->comp_temp_bytes + comp_staging_total +
+    size_t total_gpu = ctx->comp_temp_bytes + 2 * comp_staging_total +
                        ctx->decomp_temp_bytes +
                        4 * ptr_bytes + 5 * size_bytes +
+                       2 * ptr_bytes + 2 * size_bytes +
                        max_num_chunks * sizeof(nvcompStatus_t);
     size_t total_host = size_bytes;
     printf("[nvcomp] ANSTransferContext created: max_chunks=%zu, chunk_size=%zu, "
@@ -236,23 +281,32 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
 
 void ans_ctx_destroy(ANSTransferContext* ctx) {
   cudaFree(ctx->d_comp_temp);
-  cudaFree(ctx->d_comp_staging);
+  for (int i = 0; i < 2; i++) {
+    cudaFree(ctx->d_comp_staging[i]);
+    cudaFree(ctx->d_comp_ptrs[i]);
+    cudaFree(ctx->d_comp_sizes[i]);
+    cudaEventDestroy(ctx->compress_done[i]);
+    cudaEventDestroy(ctx->scatter_done[i]);
+  }
+  cudaStreamDestroy(ctx->scatter_stream);
   cudaFree(ctx->d_uncomp_ptrs);
   cudaFree(ctx->d_uncomp_sizes);
-  cudaFree(ctx->d_comp_ptrs);
-  cudaFree(ctx->d_comp_sizes);
   cudaFree(ctx->d_decomp_temp);
-  cudaFree(ctx->d_decomp_ptrs);
-  cudaFree(ctx->d_decomp_buf_sizes);
+  cudaFree(ctx->d_decomp_ptrs[0]);
+  cudaFree(ctx->d_decomp_ptrs[1]);
+  cudaFree(ctx->d_decomp_buf_sizes[0]);
+  cudaFree(ctx->d_decomp_buf_sizes[1]);
   cudaFree(ctx->d_decomp_act_sizes);
   cudaFree(ctx->d_statuses);
-  cudaFreeHost(ctx->h_comp_sizes);
+  cudaFreeHost(ctx->h_comp_sizes[0]);
+  cudaFreeHost(ctx->h_comp_sizes[1]);
 }
 
 // ---------------------------------------------------------------------------
-// D2H: build_ptrs(GPU) → compress → scatter(GPU→CPU) → read_sizes
-// compress → scatter are back-to-back on stream (no intermediate sync).
-// 1 sync per batch (after scatter + read_sizes).
+// D2H: double-buffer pipeline.
+// compress stream (caller's): build_ptrs → compress  (slot alternates 0/1)
+// scatter stream (internal):  scatter → write sizes   (slot alternates 0/1)
+// compress(N) overlaps with scatter(N-1) on different slots/streams.
 // ---------------------------------------------------------------------------
 
 template<BackendType Type>
@@ -272,17 +326,22 @@ void ans_compress_and_d2h(
   const int kv_dim = is_mla ? 1 : 2;
   const int total_chunks = num_layers * kv_dim * num_blocks;
   const int batch_cap = static_cast<int>(ctx->max_num_chunks);
+  const int num_batches = (total_chunks + batch_cap - 1) / batch_cap;
 
   assert(static_cast<size_t>(chunk_size_in_bytes) <= ctx->max_chunk_size);
 
   nvtxRangePush("ANS:D2H_total");
 
-  for (int bs = 0; bs < total_chunks; bs += batch_cap) {
+  for (int bi = 0; bi < num_batches; bi++) {
+    const int bs  = bi * batch_cap;
     const int bsz = std::min(batch_cap, total_chunks - bs);
-    const size_t size_bytes = bsz * sizeof(size_t);
+    const int cur = bi % 2;
 
-    // 1. Build GPU source pointer array (entirely on GPU)
-    nvtxRangePush("ANS:D2H:build_ptrs");
+    // Wait for previous scatter on this slot to finish before reusing buffers
+    if (bi >= 2)
+      ANS_CUDA_CHECK(cudaStreamWaitEvent(stream, ctx->scatter_done[cur], 0));
+
+    // 1. Build GPU source pointer array (on compress stream)
     {
       int threads = 256;
       int blocks = std::min((bsz + threads - 1) / threads, ANS_TRANSFER_SMS);
@@ -290,10 +349,8 @@ void ans_compress_and_d2h(
           ctx->d_uncomp_ptrs, gpu_handler, gpu_block_ids,
           kv_dim, num_blocks, bs, bsz);
     }
-    nvtxRangePop();
 
-    // 2. ANS compress (stream ordering ensures build_ptrs completes first)
-    nvtxRangePush("ANS:D2H:compress");
+    // 2. ANS compress into slot[cur]
     ANS_NVCOMP_CHECK(nvcompBatchedANSCompressAsync(
         (const void* const*)ctx->d_uncomp_ptrs,
         ctx->d_uncomp_sizes,
@@ -301,36 +358,30 @@ void ans_compress_and_d2h(
         bsz,
         ctx->d_comp_temp,
         ctx->comp_temp_bytes,
-        ctx->d_comp_ptrs,
-        ctx->d_comp_sizes,
+        ctx->d_comp_ptrs[cur],
+        ctx->d_comp_sizes[cur],
         ctx->comp_opts,
         nullptr,
         stream));
-    nvtxRangePop();
+    ANS_CUDA_CHECK(cudaEventRecord(ctx->compress_done[cur], stream));
 
-    // 3. Scatter kernel: compress → scatter back-to-back, no intermediate sync
-    nvtxRangePush("ANS:D2H:scatter_kernel");
+    // 3. Scatter from slot[cur] on scatter_stream (overlaps with next compress)
+    ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->compress_done[cur], 0));
     {
-      int grid = std::min(bsz, ANS_TRANSFER_SMS);
-      ans_d2h_scatter_kernel<<<grid, 256, 0, stream>>>(
-          ctx->d_comp_staging, ctx->max_comp_chunk_bytes, ctx->d_comp_sizes,
+      int grid = std::min(bsz, ctx->scatter_grid);
+      ans_d2h_scatter_kernel<<<grid, ANS_KERNEL_BLOCK_SIZE, 0, ctx->scatter_stream>>>(
+          ctx->d_comp_staging[cur], ctx->max_comp_chunk_bytes, ctx->d_comp_sizes[cur],
           static_cast<uint8_t*>(cpu_ptr),
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-          cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz);
+          cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz,
+          h_comp_sizes_out);
     }
-    nvtxRangePop();
-
-    // 4. Read comp_sizes (after scatter on same stream, no extra sync point)
-    nvtxRangePush("ANS:D2H:read_sizes");
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->h_comp_sizes, ctx->d_comp_sizes,
-                                    size_bytes, cudaMemcpyDeviceToHost, stream));
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-    nvtxRangePop();
-
-    // 5. Record compressed sizes on host
-    for (int i = 0; i < bsz; i++)
-      h_comp_sizes_out[bs + i] = static_cast<int64_t>(ctx->h_comp_sizes[i]);
+    ANS_CUDA_CHECK(cudaEventRecord(ctx->scatter_done[cur], ctx->scatter_stream));
   }
+
+  // Wait for all work to complete
+  ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
+  ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->scatter_stream));
 
   nvtxRangePop(); // D2H_total
 
@@ -339,7 +390,6 @@ void ans_compress_and_d2h(
     for (int i = 0; i < total_chunks; i++)
       grand_total_comp += static_cast<size_t>(h_comp_sizes_out[i]);
     size_t grand_total_uncomp = static_cast<size_t>(total_chunks) * chunk_size_in_bytes;
-    int num_batches = (total_chunks + batch_cap - 1) / batch_cap;
     printf("[nvcomp] D2H: %d chunks in %d batch(es), %.2f MB -> %.2f MB (ratio %.2fx)\n",
            total_chunks, num_batches,
            grand_total_uncomp / (1024.0 * 1024.0),
@@ -349,9 +399,10 @@ void ans_compress_and_d2h(
 }
 
 // ---------------------------------------------------------------------------
-// H2D: GPU gather kernel (CPU pinned → d_comp_staging via PCIe) → decompress
-// Internally batched by ctx->max_num_chunks.
-// Mixed compressed/uncompressed chunks handled via slow path.
+// H2D: double-buffer pipeline.
+// gather stream (scatter_stream): upload_sizes + build_ptrs + gather  (slot 0/1)
+// decomp stream (caller's):      decompress                           (slot 0/1)
+// gather(N) overlaps with decompress(N-1) on different slots/streams.
 // ---------------------------------------------------------------------------
 
 template<BackendType Type>
@@ -371,6 +422,7 @@ void ans_h2d_and_decompress(
   const int kv_dim = is_mla ? 1 : 2;
   const int total_chunks = num_layers * kv_dim * num_blocks;
   const int batch_cap = static_cast<int>(ctx->max_num_chunks);
+  const int num_batches = (total_chunks + batch_cap - 1) / batch_cap;
 
   assert(static_cast<size_t>(chunk_size_in_bytes) <= ctx->max_chunk_size);
 
@@ -378,160 +430,87 @@ void ans_h2d_and_decompress(
 
   nvtxRangePush("ANS:H2D_total");
 
-  for (int bs = 0; bs < total_chunks; bs += batch_cap) {
+  for (int bi = 0; bi < num_batches; bi++) {
+    const int bs  = bi * batch_cap;
     const int bsz = std::min(batch_cap, total_chunks - bs);
+    const int cur = bi % 2;
 
-    // Check if all chunks in this batch are compressed
-    bool all_compressed = true;
-    for (int i = 0; i < bsz; i++) {
-      if (h_comp_sizes_in[bs + i] >= chunk_size_in_bytes) {
-        all_compressed = false;
-        break;
-      }
+    if (bi >= 2) {
+      // GPU stream wait: previous decompress on this slot must finish before reusing buffers
+      ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->scatter_done[cur], 0));
+      // Host sync: ensure previous cudaMemcpyAsync from h_comp_sizes[cur] has finished
+      // reading the pinned buffer before we overwrite it.  compress_done[cur] fires
+      // after upload+build_ptrs+gather on scatter_stream, so memcpy is certainly done.
+      ANS_CUDA_CHECK(cudaEventSynchronize(ctx->compress_done[cur]));
     }
 
-    if (!all_compressed) {
-      // --- Slow path: mixed compressed/uncompressed ---
-      nvtxRangePush("ANS:H2D:slow_path");
-      int comp_slot = 0;
-      for (int i = 0; i < bsz; i++) {
-        int flat = bs + i;
-        int layer, kv, b;
-        decode_chunk_idx(flat, kv_dim, num_blocks, layer, kv, b);
-        size_t comp_size = static_cast<size_t>(h_comp_sizes_in[flat]);
-
-        uint8_t* cpu_src = cpu_chunk_addr(cpu_ptr, layer, start_layer_id, kv,
-                                           cpu_block_ids[b],
-                                           cpu_layer_stride_in_bytes,
-                                           cpu_kv_stride_in_bytes,
-                                           cpu_block_stride_in_bytes);
-
-        if (comp_size >= static_cast<size_t>(chunk_size_in_bytes)) {
-          int64_t* gpu_dst = ptr_at<Type>(gpu_handler, layer, kv, gpu_block_ids[b]);
-          ANS_CUDA_CHECK(cudaMemcpyAsync(gpu_dst, cpu_src, chunk_size_in_bytes,
-                                          cudaMemcpyHostToDevice, stream));
-        } else {
-          uint8_t* staging = ctx->d_comp_staging +
-                             comp_slot * ctx->max_comp_chunk_bytes;
-          ANS_CUDA_CHECK(cudaMemcpyAsync(staging, cpu_src, comp_size,
-                                          cudaMemcpyHostToDevice, stream));
-          ctx->h_comp_sizes[comp_slot] = comp_size;
-          ctx->h_ptr_scratch[comp_slot] = static_cast<void*>(
-              ptr_at<Type>(gpu_handler, layer, kv, gpu_block_ids[b]));
-          ctx->h_size_scratch[comp_slot] = static_cast<size_t>(chunk_size_in_bytes);
-          grand_total_comp += comp_size;
-          comp_slot++;
-        }
-      }
-
-      if (comp_slot > 0) {
-        const size_t sub_ptr_bytes  = comp_slot * sizeof(void*);
-        const size_t sub_size_bytes = comp_slot * sizeof(size_t);
-
-        ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_comp_sizes, ctx->h_comp_sizes,
-                                        sub_size_bytes, cudaMemcpyHostToDevice, stream));
-        ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_decomp_ptrs, ctx->h_ptr_scratch.data(),
-                                        sub_ptr_bytes, cudaMemcpyHostToDevice, stream));
-        ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_decomp_buf_sizes, ctx->h_size_scratch.data(),
-                                        sub_size_bytes, cudaMemcpyHostToDevice, stream));
-        ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        ANS_NVCOMP_CHECK(nvcompBatchedANSDecompressAsync(
-            (const void* const*)ctx->d_comp_ptrs,
-            ctx->d_comp_sizes,
-            ctx->d_decomp_buf_sizes,
-            ctx->d_decomp_act_sizes,
-            comp_slot,
-            ctx->d_decomp_temp,
-            ctx->decomp_temp_bytes,
-            ctx->d_decomp_ptrs,
-            ctx->decomp_opts,
-            ctx->d_statuses,
-            stream));
-        ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-      } else {
-        ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-      }
-      nvtxRangePop();
-      continue;
-    }
-
-    // --- Fast path: all compressed ---
-
-    // 1. Upload comp_sizes to GPU + gather kernel (CPU → d_comp_staging via PCIe)
-    nvtxRangePush("ANS:H2D:gather_kernel");
+    // 1. Upload comp_sizes (on gather stream)
+    nvtxRangePush("ANS:H2D:upload_sizes");
     {
       const size_t size_bytes = bsz * sizeof(size_t);
       for (int i = 0; i < bsz; i++) {
-        ctx->h_comp_sizes[i] = static_cast<size_t>(h_comp_sizes_in[bs + i]);
-        grand_total_comp += ctx->h_comp_sizes[i];
+        ctx->h_comp_sizes[cur][i] = static_cast<size_t>(h_comp_sizes_in[bs + i]);
+        grand_total_comp += ctx->h_comp_sizes[cur][i];
       }
-      ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_comp_sizes, ctx->h_comp_sizes,
-                                      size_bytes, cudaMemcpyHostToDevice, stream));
+      ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_comp_sizes[cur], ctx->h_comp_sizes[cur],
+                                      size_bytes, cudaMemcpyHostToDevice,
+                                      ctx->scatter_stream));
+    }
+    nvtxRangePop();
 
-      int grid = std::min(bsz, ANS_TRANSFER_SMS);
-      ans_h2d_gather_kernel<<<grid, 256, 0, stream>>>(
-          ctx->d_comp_staging, ctx->max_comp_chunk_bytes, ctx->d_comp_sizes,
+    // 2. Build decompress output pointer array (GPU kernel on gather stream)
+    nvtxRangePush("ANS:H2D:build_ptrs");
+    {
+      int threads = 256;
+      int blocks = std::min((bsz + threads - 1) / threads, ANS_TRANSFER_SMS);
+      ans_build_ptrs_kernel<Type><<<blocks, threads, 0, ctx->scatter_stream>>>(
+          ctx->d_decomp_ptrs[cur], gpu_handler, gpu_block_ids,
+          kv_dim, num_blocks, bs, bsz);
+    }
+    nvtxRangePop();
+
+    // 3. Gather kernel: CPU pinned → GPU staging (on gather stream)
+    nvtxRangePush("ANS:H2D:gather_kernel");
+    {
+      int grid = std::min(bsz, ctx->gather_grid);
+      ans_h2d_gather_kernel<<<grid, ANS_KERNEL_BLOCK_SIZE, 0, ctx->scatter_stream>>>(
+          ctx->d_comp_staging[cur], ctx->max_comp_chunk_bytes, ctx->d_comp_sizes[cur],
           static_cast<const uint8_t*>(cpu_ptr),
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
           cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz);
     }
     nvtxRangePop();
 
-    // 2. Build decompress output pointers (CPU, overlaps with gather kernel)
-    nvtxRangePush("ANS:H2D:build_ptrs");
-    for (int i = 0; i < bsz; i++) {
-      int layer, kv, b;
-      decode_chunk_idx(bs + i, kv_dim, num_blocks, layer, kv, b);
-      ctx->h_ptr_scratch[i] = static_cast<void*>(
-          ptr_at<Type>(gpu_handler, layer, kv, gpu_block_ids[b]));
-      ctx->h_size_scratch[i] = static_cast<size_t>(chunk_size_in_bytes);
-    }
-    {
-      const size_t size_bytes = bsz * sizeof(size_t);
-      const size_t ptr_bytes = bsz * sizeof(void*);
-      ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_decomp_ptrs, ctx->h_ptr_scratch.data(),
-                                      ptr_bytes, cudaMemcpyHostToDevice, stream));
-      ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_decomp_buf_sizes, ctx->h_size_scratch.data(),
-                                      size_bytes, cudaMemcpyHostToDevice, stream));
-      ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
-    nvtxRangePop();
+    ANS_CUDA_CHECK(cudaEventRecord(ctx->compress_done[cur], ctx->scatter_stream));
 
-    // 3. ANS decompress
+    // 4. ANS decompress (on caller stream, overlaps with next gather)
     nvtxRangePush("ANS:H2D:decompress");
+    ANS_CUDA_CHECK(cudaStreamWaitEvent(stream, ctx->compress_done[cur], 0));
     ANS_NVCOMP_CHECK(nvcompBatchedANSDecompressAsync(
-        (const void* const*)ctx->d_comp_ptrs,
-        ctx->d_comp_sizes,
-        ctx->d_decomp_buf_sizes,
+        (const void* const*)ctx->d_comp_ptrs[cur],
+        ctx->d_comp_sizes[cur],
+        ctx->d_decomp_buf_sizes[cur],
         ctx->d_decomp_act_sizes,
         bsz,
         ctx->d_decomp_temp,
         ctx->decomp_temp_bytes,
-        ctx->d_decomp_ptrs,
+        ctx->d_decomp_ptrs[cur],
         ctx->decomp_opts,
         ctx->d_statuses,
         stream));
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
     nvtxRangePop();
 
-    if (ctx->log_level >= 2) {
-      std::vector<nvcompStatus_t> h_statuses(bsz);
-      ANS_CUDA_CHECK(cudaMemcpy(h_statuses.data(), ctx->d_statuses,
-          bsz * sizeof(nvcompStatus_t), cudaMemcpyDeviceToHost));
-      for (int i = 0; i < bsz; i++) {
-        if (h_statuses[i] != nvcompSuccess)
-          fprintf(stderr, "[nvcomp] ERROR: batch chunk %d decompress status = %d\n",
-                  i, (int)h_statuses[i]);
-      }
-    }
+    ANS_CUDA_CHECK(cudaEventRecord(ctx->scatter_done[cur], stream));
   }
+
+  // Wait for all work to complete
+  ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
+  ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->scatter_stream));
 
   nvtxRangePop(); // H2D_total
 
   if (ctx->log_level >= 1) {
     size_t total_uncomp = static_cast<size_t>(total_chunks) * chunk_size_in_bytes;
-    int num_batches = (total_chunks + batch_cap - 1) / batch_cap;
     printf("[nvcomp] H2D: %d chunks in %d batch(es), %.2f MB compressed -> %.2f MB (ratio %.2fx)\n",
            total_chunks, num_batches,
            grand_total_comp / (1024.0 * 1024.0),

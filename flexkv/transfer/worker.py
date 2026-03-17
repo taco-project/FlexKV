@@ -448,6 +448,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         layer_id: int,
         layer_granularity: int,
     ) -> None:
+        nvtx_range = nvtx.start_range(
+            message=f"GPUCPUWorker.transfer_impl_nvcomp[{transfer_type.name}]",
+            color="purple")
         num_blocks = len(gpu_block_id_list)
         kv_dim = 1 if self.is_mla else 2
         num_chunks = layer_granularity * kv_dim * num_blocks
@@ -547,6 +550,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 self.gpu_block_type_,
                 comp_sizes_in,
             )
+        nvtx.end_range(nvtx_range)
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         nvtx_range = nvtx.start_range(

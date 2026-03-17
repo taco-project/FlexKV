@@ -2,13 +2,16 @@
 Test nvcomp ANS compression integrated with FlexKV GPU-CPU transfer.
 
 Aligned with real FlexKV configuration:
-  - GPU: LAYERFIRST (per-layer tensors, VLLM backend)
-  - CPU: BLOCKFIRST [num_blocks, num_layers, 2, tpb, nh, hs]
+  - GPU: LAYERFIRST (num_layers, 2, num_blocks, tpb, nh, hs)
+  - CPU: configurable via FLEXKV_CPU_LAYOUT env var
+    - BLOCKFIRST (default): [num_blocks, num_layers, 2, tpb, nh, hs]
+    - LAYERFIRST:           [num_layers, 2, num_blocks, tpb, nh, hs]
   - Baseline: kernel mode (transfer_sms=8, use_ce_transfer=False)
 
 Usage:
   FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py
-  FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_skip_pack --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
+  FLEXKV_CPU_LAYOUT=LAYERFIRST FLEXKV_ENABLE_NVCOMP=1 python test_nvcomp.py
+  FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_double_buffer_ldg --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
 
 """
 
@@ -30,21 +33,29 @@ except ImportError:
 
 BATCH_SIZE = int(os.environ.get("FLEXKV_NVCOMP_BATCH_SIZE", "4096"))
 TRANSFER_SMS = int(os.environ.get("FLEXKV_TRANSFER_SMS", "8"))
+CPU_LAYOUT = os.environ.get("FLEXKV_CPU_LAYOUT", "BLOCKFIRST").upper()
+assert CPU_LAYOUT in ("BLOCKFIRST", "LAYERFIRST"), \
+    f"FLEXKV_CPU_LAYOUT must be BLOCKFIRST or LAYERFIRST, got {CPU_LAYOUT}"
 
 
 def make_kv_cache(num_layers, num_blocks, tokens_per_block, num_heads, head_size,
                   dtype=torch.bfloat16, device="cuda:0"):
-    """Create GPU (LAYERFIRST) and CPU (BLOCKFIRST) KV cache tensors.
+    """Create GPU (LAYERFIRST) and CPU KV cache tensors.
 
     GPU: list of per-layer tensors, each [2, num_blocks, tpb, nh, hs]
-    CPU: single tensor [num_blocks, num_layers, 2, tpb, nh, hs]  (BLOCKFIRST)
+    CPU shape depends on CPU_LAYOUT:
+      BLOCKFIRST: [num_blocks, num_layers, 2, tpb, nh, hs]
+      LAYERFIRST: [num_layers, 2, num_blocks, tpb, nh, hs]
     """
     shape_per_layer = (2, num_blocks, tokens_per_block, num_heads, head_size)
     gpu_blocks = [
         torch.randn(shape_per_layer, dtype=dtype, device=device)
         for _ in range(num_layers)
     ]
-    cpu_shape = (num_blocks, num_layers, 2, tokens_per_block, num_heads, head_size)
+    if CPU_LAYOUT == "BLOCKFIRST":
+        cpu_shape = (num_blocks, num_layers, 2, tokens_per_block, num_heads, head_size)
+    else:
+        cpu_shape = (num_layers, 2, num_blocks, tokens_per_block, num_heads, head_size)
     cpu_blocks = torch.zeros(cpu_shape, dtype=dtype, device="cpu").pin_memory()
     return gpu_blocks, cpu_blocks
 
@@ -58,22 +69,29 @@ def get_gpu_tensor_ptrs(gpu_blocks):
 
 
 def compute_strides(num_layers, num_blocks, tokens_per_block, num_heads, head_size, dtype):
-    """Compute byte strides for GPU (LAYERFIRST) and CPU (BLOCKFIRST)."""
+    """Compute byte strides for GPU (LAYERFIRST) and CPU (configurable)."""
     elem = dtype.itemsize if hasattr(dtype, 'itemsize') else torch.tensor([], dtype=dtype).element_size()
-    chunk_size = tokens_per_block * num_heads * head_size * elem
+    chunk = tokens_per_block * num_heads * head_size  # elements per chunk
+    if CPU_LAYOUT == "LAYERFIRST":
+        print(f"[DEBUG] CPU layout is LAYERFIRST, chunk size is {chunk}")
+        # TODO
+    chunk_size = chunk * elem
 
     # GPU LAYERFIRST: per-layer tensor [2, num_blocks, tpb, nh, hs]
-    gpu_kv_stride = num_blocks * tokens_per_block * num_heads * head_size * elem
-    gpu_block_stride = tokens_per_block * num_heads * head_size * elem
-    gpu_layer_stride = 2 * num_blocks * tokens_per_block * num_heads * head_size * elem
+    gpu_kv_stride = num_blocks * chunk * elem
+    gpu_block_stride = chunk_size
+    gpu_layer_stride = 2 * num_blocks * chunk * elem
 
-    # CPU BLOCKFIRST: [num_blocks, num_layers, 2, tpb, nh, hs]
-    # layer_stride = kv_shape[2:].numel() = 2 * tpb * nh * hs
-    # block_stride = kv_shape[1:].numel() = num_layers * 2 * tpb * nh * hs
-    # kv_stride    = kv_shape[3:].numel() = tpb * nh * hs
-    cpu_kv_stride = tokens_per_block * num_heads * head_size * elem
-    cpu_layer_stride = 2 * tokens_per_block * num_heads * head_size * elem
-    cpu_block_stride = num_layers * 2 * tokens_per_block * num_heads * head_size * elem
+    if CPU_LAYOUT == "BLOCKFIRST":
+        # [num_blocks, num_layers, 2, tpb, nh, hs]
+        cpu_kv_stride = chunk_size
+        cpu_layer_stride = 2 * chunk_size
+        cpu_block_stride = num_layers * 2 * chunk_size
+    else:
+        # LAYERFIRST: [num_layers, 2, num_blocks, tpb, nh, hs]
+        cpu_kv_stride = num_blocks * chunk_size
+        cpu_layer_stride = 2 * num_blocks * chunk_size
+        cpu_block_stride = chunk_size
 
     return (chunk_size,
             gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
@@ -91,7 +109,7 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
     print(f"\n{'='*60}")
     print(f"Roundtrip test: layers={num_layers}, blocks={num_blocks}, "
           f"tpb={tokens_per_block}, heads={num_heads}, head_size={head_size}, dtype={dtype}")
-    print(f"  ANS batch_size={BATCH_SIZE}, CPU layout=BLOCKFIRST")
+    print(f"  ANS batch_size={BATCH_SIZE}, CPU layout={CPU_LAYOUT}")
     print(f"{'='*60}")
 
     gpu_blocks, cpu_blocks = make_kv_cache(
@@ -107,6 +125,7 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
 
     kv_dim = 2
     num_chunks = num_layers * kv_dim * num_blocks
+    # TODO
     log_level = int(os.environ.get("FLEXKV_NVCOMP_LOG_LEVEL", "1"))
 
     original_data = [block.clone() for block in gpu_blocks]
@@ -193,12 +212,12 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
 def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
                              num_heads=8, head_size=128, dtype=torch.bfloat16,
                              num_warmup=3, num_iters=10):
-    """Compare baseline (kernel mode, BLOCKFIRST CPU) vs nvcomp."""
+    """Compare baseline (kernel mode) vs nvcomp."""
     device = "cuda:0"
     print(f"\n{'='*60}")
     print(f"Baseline comparison: layers={num_layers}, blocks={num_blocks}, "
           f"batch_size={BATCH_SIZE}")
-    print(f"  CPU layout=BLOCKFIRST, baseline: kernel mode (transfer_sms={TRANSFER_SMS})")
+    print(f"  CPU layout={CPU_LAYOUT}, baseline: kernel mode (transfer_sms={TRANSFER_SMS})")
     print(f"{'='*60}")
 
     gpu_blocks, cpu_blocks = make_kv_cache(
