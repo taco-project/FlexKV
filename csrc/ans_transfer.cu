@@ -109,6 +109,25 @@ __global__ void ans_h2d_gather_kernel(
     }
 }
 
+// GPU kernel to build d_uncomp_ptrs directly on device (replaces CPU loop + H2D upload)
+template<BackendType Type>
+__global__ void ans_build_ptrs_kernel(
+    void** __restrict__ d_uncomp_ptrs,
+    GTensorHandler gpu_handler,
+    const int64_t* __restrict__ gpu_block_ids,
+    int kv_dim, int num_blocks,
+    int batch_start, int bsz)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < bsz; i += gridDim.x * blockDim.x) {
+        int g = batch_start + i;
+        int layer = g / (kv_dim * num_blocks);
+        int kv = (g % (kv_dim * num_blocks)) / num_blocks;
+        int b = g % num_blocks;
+        d_uncomp_ptrs[i] = static_cast<void*>(
+            ptr_at<Type>(gpu_handler, layer, kv, gpu_block_ids[b]));
+    }
+}
+
 static const int ANS_TRANSFER_SMS = 8;
 
 // ---------------------------------------------------------------------------
@@ -182,8 +201,8 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_statuses,
       max_num_chunks * sizeof(nvcompStatus_t)));
 
-  // Host pinned buffer for compressed sizes metadata
-  ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_sizes,   size_bytes));
+  // Host pinned buffer for compressed sizes metadata + fallback flag
+  ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_sizes,    size_bytes));
 
   // Host scratch vectors
   ctx->h_ptr_scratch.resize(max_num_chunks);
@@ -194,6 +213,12 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
     ctx->h_ptr_scratch[i] = ctx->d_comp_staging + i * ctx->max_comp_chunk_bytes;
   ANS_CUDA_CHECK(cudaMemcpy(ctx->d_comp_ptrs, ctx->h_ptr_scratch.data(),
                              ptr_bytes, cudaMemcpyHostToDevice));
+
+  // Pre-fill d_uncomp_sizes: all chunks have the same uncompressed size
+  for (size_t i = 0; i < max_num_chunks; i++)
+    ctx->h_size_scratch[i] = max_chunk_size;
+  ANS_CUDA_CHECK(cudaMemcpy(ctx->d_uncomp_sizes, ctx->h_size_scratch.data(),
+                             size_bytes, cudaMemcpyHostToDevice));
 
   if (log_level >= 1) {
     size_t total_gpu = ctx->comp_temp_bytes + comp_staging_total +
@@ -225,8 +250,9 @@ void ans_ctx_destroy(ANSTransferContext* ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// D2H: compress on GPU → pack → single D2H → CPU scatter
-// Internally batched by ctx->max_num_chunks.
+// D2H: build_ptrs(GPU) → compress → scatter(GPU→CPU) → read_sizes
+// compress → scatter are back-to-back on stream (no intermediate sync).
+// 1 sync per batch (after scatter + read_sizes).
 // ---------------------------------------------------------------------------
 
 template<BackendType Type>
@@ -249,39 +275,24 @@ void ans_compress_and_d2h(
 
   assert(static_cast<size_t>(chunk_size_in_bytes) <= ctx->max_chunk_size);
 
-  size_t grand_total_comp = 0;
-  size_t grand_total_uncomp = 0;
-
   nvtxRangePush("ANS:D2H_total");
 
   for (int bs = 0; bs < total_chunks; bs += batch_cap) {
     const int bsz = std::min(batch_cap, total_chunks - bs);
-    const size_t ptr_bytes  = bsz * sizeof(void*);
     const size_t size_bytes = bsz * sizeof(size_t);
 
-    // 1. Build GPU source pointer array: given gpu block ids, get the gpu address and upload to GPU
-    // TODO: build_uncomp_ptrs_kernel
+    // 1. Build GPU source pointer array (entirely on GPU)
     nvtxRangePush("ANS:D2H:build_ptrs");
-    for (int i = 0; i < bsz; i++) {
-      int layer, kv, b;
-      decode_chunk_idx(bs + i, kv_dim, num_blocks, layer, kv, b);
-      ctx->h_ptr_scratch[i] = static_cast<void*>(
-          ptr_at<Type>(gpu_handler, layer, kv, gpu_block_ids[b]));
+    {
+      int threads = 256;
+      int blocks = std::min((bsz + threads - 1) / threads, ANS_TRANSFER_SMS);
+      ans_build_ptrs_kernel<Type><<<blocks, threads, 0, stream>>>(
+          ctx->d_uncomp_ptrs, gpu_handler, gpu_block_ids,
+          kv_dim, num_blocks, bs, bsz);
     }
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_uncomp_ptrs, ctx->h_ptr_scratch.data(),
-                                    ptr_bytes, cudaMemcpyHostToDevice, stream));
     nvtxRangePop();
 
-    nvtxRangePush("ANS:D2H:set_uniform_chunk_sizes");
-    // 2. Set uniform chunk sizes
-    for (int i = 0; i < bsz; i++)
-      ctx->h_size_scratch[i] = static_cast<size_t>(chunk_size_in_bytes);
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_uncomp_sizes, ctx->h_size_scratch.data(),
-                                    size_bytes, cudaMemcpyHostToDevice, stream));
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-    nvtxRangePop();
-
-    // 3. ANS compress
+    // 2. ANS compress (stream ordering ensures build_ptrs completes first)
     nvtxRangePush("ANS:D2H:compress");
     ANS_NVCOMP_CHECK(nvcompBatchedANSCompressAsync(
         (const void* const*)ctx->d_uncomp_ptrs,
@@ -295,33 +306,9 @@ void ans_compress_and_d2h(
         ctx->comp_opts,
         nullptr,
         stream));
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
     nvtxRangePop();
 
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    // 4. Read back compressed sizes
-    nvtxRangePush("ANS:D2H:read_sizes");
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->h_comp_sizes, ctx->d_comp_sizes,
-                                    size_bytes, cudaMemcpyDeviceToHost, stream));
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-    nvtxRangePop();
-
-    // 5. Fallback check: if any chunk doesn't compress smaller, abort
-    for (int i = 0; i < bsz; i++) {
-      if (ctx->h_comp_sizes[i] >= static_cast<size_t>(chunk_size_in_bytes)) {
-        if (ctx->log_level >= 1) {
-          printf("[nvcomp] D2H batch %d: chunk %d comp_size=%zu >= chunk_size=%lld, "
-                 "signaling fallback\n",
-                 bs / batch_cap, i, ctx->h_comp_sizes[i],
-                 (long long)chunk_size_in_bytes);
-        }
-        h_comp_sizes_out[0] = -1;
-        nvtxRangePop(); // D2H_total
-        return;
-      }
-    }
-
-    // 6. GPU scatter kernel: d_comp_staging → CPU block slots (direct PCIe write)
+    // 3. Scatter kernel: compress → scatter back-to-back, no intermediate sync
     nvtxRangePush("ANS:D2H:scatter_kernel");
     {
       int grid = std::min(bsz, ANS_TRANSFER_SMS);
@@ -330,22 +317,28 @@ void ans_compress_and_d2h(
           static_cast<uint8_t*>(cpu_ptr),
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
           cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz);
-      ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     nvtxRangePop();
 
-    // 7. Record compressed sizes on host (already in h_comp_sizes from step 4)
-    for (int i = 0; i < bsz; i++) {
+    // 4. Read comp_sizes (after scatter on same stream, no extra sync point)
+    nvtxRangePush("ANS:D2H:read_sizes");
+    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->h_comp_sizes, ctx->d_comp_sizes,
+                                    size_bytes, cudaMemcpyDeviceToHost, stream));
+    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
+    nvtxRangePop();
+
+    // 5. Record compressed sizes on host
+    for (int i = 0; i < bsz; i++)
       h_comp_sizes_out[bs + i] = static_cast<int64_t>(ctx->h_comp_sizes[i]);
-      grand_total_comp += ctx->h_comp_sizes[i];
-    }
-    grand_total_uncomp += static_cast<size_t>(bsz) * chunk_size_in_bytes;
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   }
 
   nvtxRangePop(); // D2H_total
 
   if (ctx->log_level >= 1) {
+    size_t grand_total_comp = 0;
+    for (int i = 0; i < total_chunks; i++)
+      grand_total_comp += static_cast<size_t>(h_comp_sizes_out[i]);
+    size_t grand_total_uncomp = static_cast<size_t>(total_chunks) * chunk_size_in_bytes;
     int num_batches = (total_chunks + batch_cap - 1) / batch_cap;
     printf("[nvcomp] D2H: %d chunks in %d batch(es), %.2f MB -> %.2f MB (ratio %.2fx)\n",
            total_chunks, num_batches,
