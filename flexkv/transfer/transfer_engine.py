@@ -139,7 +139,25 @@ class TransferEngine:
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
         if self.tp_size == 1:
-            self.gpucpu_workers: List[WorkerHandle] = [
+            self.h2d_workers: List[WorkerHandle] = [
+                GPUCPUTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
+                    cpu_blocks=self._cpu_handle.get_tensor(),
+                    gpu_kv_layout=gpu_handles[0].kv_layout,
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    dtype=gpu_handles[0].dtype,
+                    gpu_device_id=gpu_handles[0].gpu_device_id,
+                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                    transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
+                    transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
+                )
+                for _, gpu_handles in self.gpu_handles.items()
+            ]
+            self.d2h_workers: List[WorkerHandle] = [
                 GPUCPUTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
@@ -158,7 +176,7 @@ class TransferEngine:
                 for _, gpu_handles in self.gpu_handles.items()
             ]
         else:
-            self.gpucpu_workers = [
+            self.h2d_workers = [
                 tpGPUCPUTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
@@ -177,8 +195,27 @@ class TransferEngine:
                 )
                 for dp_client_id, gpu_handles in self.gpu_handles.items()
             ]
-        self._worker_map[TransferType.H2D] = self.gpucpu_workers
-        self._worker_map[TransferType.D2H] = self.gpucpu_workers
+            self.d2h_workers = [
+                tpGPUCPUTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
+                    cpu_blocks=self._cpu_handle.get_tensor(),
+                    gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    dtype=gpu_handles[0].dtype,
+                    tp_group_size=self.tp_size,
+                    dp_group_id=dp_client_id,
+                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                    transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
+                    transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
+                )
+                for dp_client_id, gpu_handles in self.gpu_handles.items()
+            ]
+        self._worker_map[TransferType.H2D] = self.h2d_workers
+        self._worker_map[TransferType.D2H] = self.d2h_workers
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
             self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
