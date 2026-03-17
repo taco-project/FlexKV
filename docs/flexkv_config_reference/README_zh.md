@@ -99,6 +99,14 @@ enable_gds: false
 
 ---
 
+### CUDA MPS（Multi-Process Service）
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `FLEXKV_ENABLE_MPS` | bool | 1 | 是否自动管理 CUDA MPS 的启停。设为 0 可禁用 |
+
+---
+
 ### SSD I/O优化
 
 > 注：`iouring_entries`设置为0即禁用iouring，不推荐设置为0。

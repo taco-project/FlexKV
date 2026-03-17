@@ -101,6 +101,14 @@ Some configurations can only be set through environment variables.
 
 ---
 
+### CUDA MPS (Multi-Process Service)
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_ENABLE_MPS` | bool | 1 | Whether to automatically manage CUDA MPS startup and shutdown. Set to 0 to disable |
+
+---
+
 ### SSD I/O Optimization
 
 > Note: Setting `iouring_entries` to 0 disables iouring. Not recommended to set to 0.
