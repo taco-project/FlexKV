@@ -8,7 +8,7 @@ Aligned with real FlexKV configuration:
 
 Usage:
   FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py
-  FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_baseline --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
+  FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_skip_pack --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
 
 """
 
@@ -323,6 +323,8 @@ if __name__ == "__main__":
     TOKENS_PER_BLOCK = 16
     TOTAL_TOKENS = 32768
     NUM_BLOCKS = TOTAL_TOKENS // TOKENS_PER_BLOCK  # 2048
+    # nvcomp total chunks = 28 * 2 * 2048 = 114688
+    # nvcomp total batch = 114688 // 4096 = 28
 
     passed = test_roundtrip(num_layers=NUM_LAYERS, num_blocks=NUM_BLOCKS,
                             tokens_per_block=TOKENS_PER_BLOCK,

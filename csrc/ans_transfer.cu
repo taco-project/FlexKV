@@ -32,42 +32,84 @@ namespace flexkv {
   } while (0)
 
 // ---------------------------------------------------------------------------
-// GPU kernels: pack (strided → contiguous) and unpack (contiguous → strided)
+// GPU kernels: direct scatter D2H / gather H2D via PCIe
+// GPU threads read/write CPU pinned memory directly, eliminating intermediate
+// pack/unpack + cudaMemcpy + CPU scatter/gather stages.
 // ---------------------------------------------------------------------------
 
-__global__ void ans_pack_kernel(
-    const uint8_t* __restrict__ src,
-    uint8_t* __restrict__ dst,
-    const size_t* __restrict__ comp_sizes,
-    const size_t* __restrict__ packed_offsets,
-    size_t stride,
-    size_t num_chunks)
+__global__ void ans_d2h_scatter_kernel(
+    const uint8_t* __restrict__ d_comp_staging,
+    size_t staging_stride,
+    const size_t* __restrict__ d_comp_sizes,
+    uint8_t* __restrict__ cpu_ptr,
+    int64_t cpu_kv_stride,
+    int64_t cpu_layer_stride,
+    int64_t cpu_block_stride,
+    const int64_t* __restrict__ cpu_block_ids,
+    int start_layer_id,
+    int kv_dim, int num_blocks,
+    int batch_start, int bsz)
 {
-    const size_t idx = blockIdx.x;
-    if (idx >= num_chunks) return;
-    const size_t sz = comp_sizes[idx];
-    const uint8_t* s = src + idx * stride;
-    uint8_t* d = dst + packed_offsets[idx];
-    for (size_t i = threadIdx.x; i < sz; i += blockDim.x)
-        d[i] = s[i];
+    for (int i = blockIdx.x; i < bsz; i += gridDim.x) {
+        int g = batch_start + i;
+        int layer = g / (kv_dim * num_blocks);
+        int kv = (g % (kv_dim * num_blocks)) / num_blocks;
+        int b = g % num_blocks;
+
+        size_t sz = d_comp_sizes[i];
+        const uint8_t* src = d_comp_staging + (size_t)i * staging_stride;
+        uint8_t* dst = cpu_ptr
+                     + (int64_t)(layer + start_layer_id) * cpu_layer_stride
+                     + (int64_t)kv * cpu_kv_stride
+                     + cpu_block_ids[b] * cpu_block_stride;
+
+        size_t n_f4 = sz / sizeof(float4);
+        for (size_t j = threadIdx.x; j < n_f4; j += blockDim.x)
+            reinterpret_cast<float4*>(dst)[j] =
+                reinterpret_cast<const float4*>(src)[j];
+        size_t tail = n_f4 * sizeof(float4);
+        for (size_t j = tail + threadIdx.x; j < sz; j += blockDim.x)
+            dst[j] = src[j];
+    }
 }
 
-__global__ void ans_unpack_kernel(
-    const uint8_t* __restrict__ src,
-    uint8_t* __restrict__ dst,
-    const size_t* __restrict__ comp_sizes,
-    const size_t* __restrict__ packed_offsets,
-    size_t stride,
-    size_t num_chunks)
+__global__ void ans_h2d_gather_kernel(
+    uint8_t* __restrict__ d_comp_staging,
+    size_t staging_stride,
+    const size_t* __restrict__ d_comp_sizes,
+    const uint8_t* __restrict__ cpu_ptr,
+    int64_t cpu_kv_stride,
+    int64_t cpu_layer_stride,
+    int64_t cpu_block_stride,
+    const int64_t* __restrict__ cpu_block_ids,
+    int start_layer_id,
+    int kv_dim, int num_blocks,
+    int batch_start, int bsz)
 {
-    const size_t idx = blockIdx.x;
-    if (idx >= num_chunks) return;
-    const size_t sz = comp_sizes[idx];
-    const uint8_t* s = src + packed_offsets[idx];
-    uint8_t* d = dst + idx * stride;
-    for (size_t i = threadIdx.x; i < sz; i += blockDim.x)
-        d[i] = s[i];
+    for (int i = blockIdx.x; i < bsz; i += gridDim.x) {
+        int g = batch_start + i;
+        int layer = g / (kv_dim * num_blocks);
+        int kv = (g % (kv_dim * num_blocks)) / num_blocks;
+        int b = g % num_blocks;
+
+        size_t sz = d_comp_sizes[i];
+        uint8_t* dst = d_comp_staging + (size_t)i * staging_stride;
+        const uint8_t* src = cpu_ptr
+                           + (int64_t)(layer + start_layer_id) * cpu_layer_stride
+                           + (int64_t)kv * cpu_kv_stride
+                           + cpu_block_ids[b] * cpu_block_stride;
+
+        size_t n_f4 = sz / sizeof(float4);
+        for (size_t j = threadIdx.x; j < n_f4; j += blockDim.x)
+            reinterpret_cast<float4*>(dst)[j] =
+                reinterpret_cast<const float4*>(src)[j];
+        size_t tail = n_f4 * sizeof(float4);
+        for (size_t j = tail + threadIdx.x; j < sz; j += blockDim.x)
+            dst[j] = src[j];
+    }
 }
+
+static const int ANS_TRANSFER_SMS = 8;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -121,7 +163,6 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
       &ctx->decomp_temp_bytes, max_total));
 
   const size_t comp_staging_total = max_num_chunks * ctx->max_comp_chunk_bytes;
-  const size_t packed_buf_size    = max_num_chunks * max_chunk_size;
   const size_t ptr_bytes  = max_num_chunks * sizeof(void*);
   const size_t size_bytes = max_num_chunks * sizeof(size_t);
 
@@ -141,18 +182,12 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_statuses,
       max_num_chunks * sizeof(nvcompStatus_t)));
 
-  // GPU packed transfer buffers
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_packed,         packed_buf_size));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_packed_offsets,  size_bytes));
-
-  // Host pinned buffers (sized for packed data, not padded staging)
-  ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_staging, packed_buf_size));
+  // Host pinned buffer for compressed sizes metadata
   ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_sizes,   size_bytes));
 
   // Host scratch vectors
   ctx->h_ptr_scratch.resize(max_num_chunks);
   ctx->h_size_scratch.resize(max_num_chunks);
-  ctx->h_packed_offsets.resize(max_num_chunks);
 
   // Pre-fill d_comp_ptrs: each points into d_comp_staging at stride
   for (size_t i = 0; i < max_num_chunks; i++)
@@ -162,10 +197,10 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
 
   if (log_level >= 1) {
     size_t total_gpu = ctx->comp_temp_bytes + comp_staging_total +
-                       ctx->decomp_temp_bytes + packed_buf_size +
+                       ctx->decomp_temp_bytes +
                        4 * ptr_bytes + 5 * size_bytes +
                        max_num_chunks * sizeof(nvcompStatus_t);
-    size_t total_host = packed_buf_size + size_bytes;
+    size_t total_host = size_bytes;
     printf("[nvcomp] ANSTransferContext created: max_chunks=%zu, chunk_size=%zu, "
            "max_comp_chunk=%zu, extra_gpu=%.2f MB, extra_host=%.2f MB\n",
            max_num_chunks, max_chunk_size, ctx->max_comp_chunk_bytes,
@@ -186,9 +221,6 @@ void ans_ctx_destroy(ANSTransferContext* ctx) {
   cudaFree(ctx->d_decomp_buf_sizes);
   cudaFree(ctx->d_decomp_act_sizes);
   cudaFree(ctx->d_statuses);
-  cudaFree(ctx->d_packed);
-  cudaFree(ctx->d_packed_offsets);
-  cudaFreeHost(ctx->h_comp_staging);
   cudaFreeHost(ctx->h_comp_sizes);
 }
 
@@ -227,7 +259,8 @@ void ans_compress_and_d2h(
     const size_t ptr_bytes  = bsz * sizeof(void*);
     const size_t size_bytes = bsz * sizeof(size_t);
 
-    // 1. Build GPU source pointer array
+    // 1. Build GPU source pointer array: given gpu block ids, get the gpu address and upload to GPU
+    // TODO: build_uncomp_ptrs_kernel
     nvtxRangePush("ANS:D2H:build_ptrs");
     for (int i = 0; i < bsz; i++) {
       int layer, kv, b;
@@ -237,7 +270,9 @@ void ans_compress_and_d2h(
     }
     ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_uncomp_ptrs, ctx->h_ptr_scratch.data(),
                                     ptr_bytes, cudaMemcpyHostToDevice, stream));
+    nvtxRangePop();
 
+    nvtxRangePush("ANS:D2H:set_uniform_chunk_sizes");
     // 2. Set uniform chunk sizes
     for (int i = 0; i < bsz; i++)
       ctx->h_size_scratch[i] = static_cast<size_t>(chunk_size_in_bytes);
@@ -263,6 +298,7 @@ void ans_compress_and_d2h(
     ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
     nvtxRangePop();
 
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     // 4. Read back compressed sizes
     nvtxRangePush("ANS:D2H:read_sizes");
     ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->h_comp_sizes, ctx->d_comp_sizes,
@@ -285,49 +321,26 @@ void ans_compress_and_d2h(
       }
     }
 
-    // 6. Prefix sum for packing
-    nvtxRangePush("ANS:D2H:pack");
-    ctx->h_packed_offsets[0] = 0;
-    for (int i = 1; i < bsz; i++)
-      ctx->h_packed_offsets[i] = ctx->h_packed_offsets[i-1] + ctx->h_comp_sizes[i-1];
-    size_t total_packed = ctx->h_packed_offsets[bsz-1] + ctx->h_comp_sizes[bsz-1];
-
-    // 7. Upload packed offsets
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_packed_offsets, ctx->h_packed_offsets.data(),
-                                    size_bytes, cudaMemcpyHostToDevice, stream));
-
-    // 8. GPU pack: d_comp_staging (strided) → d_packed (contiguous)
-    ans_pack_kernel<<<bsz, 256, 0, stream>>>(
-        ctx->d_comp_staging, ctx->d_packed,
-        ctx->d_comp_sizes, ctx->d_packed_offsets,
-        ctx->max_comp_chunk_bytes, bsz);
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
+    // 6. GPU scatter kernel: d_comp_staging → CPU block slots (direct PCIe write)
+    nvtxRangePush("ANS:D2H:scatter_kernel");
+    {
+      int grid = std::min(bsz, ANS_TRANSFER_SMS);
+      ans_d2h_scatter_kernel<<<grid, 256, 0, stream>>>(
+          ctx->d_comp_staging, ctx->max_comp_chunk_bytes, ctx->d_comp_sizes,
+          static_cast<uint8_t*>(cpu_ptr),
+          cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+          cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz);
+      ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
     nvtxRangePop();
 
-    // 9. Single D2H: d_packed → h_comp_staging
-    nvtxRangePush("ANS:D2H:transfer");
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->h_comp_staging, ctx->d_packed,
-                                    total_packed, cudaMemcpyDeviceToHost, stream));
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-    nvtxRangePop();
-
-    // 10. CPU scatter: h_comp_staging → individual CPU block slots
-    nvtxRangePush("ANS:D2H:cpu_scatter");
+    // 7. Record compressed sizes on host (already in h_comp_sizes from step 4)
     for (int i = 0; i < bsz; i++) {
-      int layer, kv, b;
-      decode_chunk_idx(bs + i, kv_dim, num_blocks, layer, kv, b);
-      uint8_t* dst = cpu_chunk_addr(cpu_ptr, layer, start_layer_id, kv,
-                                     cpu_block_ids[b],
-                                     cpu_layer_stride_in_bytes,
-                                     cpu_kv_stride_in_bytes,
-                                     cpu_block_stride_in_bytes);
-      std::memcpy(dst, ctx->h_comp_staging + ctx->h_packed_offsets[i],
-                  ctx->h_comp_sizes[i]);
       h_comp_sizes_out[bs + i] = static_cast<int64_t>(ctx->h_comp_sizes[i]);
       grand_total_comp += ctx->h_comp_sizes[i];
     }
     grand_total_uncomp += static_cast<size_t>(bsz) * chunk_size_in_bytes;
-    nvtxRangePop();
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   }
 
   nvtxRangePop(); // D2H_total
@@ -343,9 +356,9 @@ void ans_compress_and_d2h(
 }
 
 // ---------------------------------------------------------------------------
-// H2D: CPU gather → single H2D → unpack → decompress on GPU
+// H2D: GPU gather kernel (CPU pinned → d_comp_staging via PCIe) → decompress
 // Internally batched by ctx->max_num_chunks.
-// Mixed compressed/uncompressed chunks are handled correctly.
+// Mixed compressed/uncompressed chunks handled via slow path.
 // ---------------------------------------------------------------------------
 
 template<BackendType Type>
@@ -452,51 +465,28 @@ void ans_h2d_and_decompress(
 
     // --- Fast path: all compressed ---
 
-    // 1. CPU gather
-    nvtxRangePush("ANS:H2D:cpu_gather");
-    ctx->h_packed_offsets[0] = 0;
-    for (int i = 0; i < bsz; i++) {
-      ctx->h_comp_sizes[i] = static_cast<size_t>(h_comp_sizes_in[bs + i]);
-      if (i > 0)
-        ctx->h_packed_offsets[i] = ctx->h_packed_offsets[i-1] + ctx->h_comp_sizes[i-1];
-    }
-    size_t total_packed = ctx->h_packed_offsets[bsz-1] + ctx->h_comp_sizes[bsz-1];
+    // 1. Upload comp_sizes to GPU + gather kernel (CPU → d_comp_staging via PCIe)
+    nvtxRangePush("ANS:H2D:gather_kernel");
+    {
+      const size_t size_bytes = bsz * sizeof(size_t);
+      for (int i = 0; i < bsz; i++) {
+        ctx->h_comp_sizes[i] = static_cast<size_t>(h_comp_sizes_in[bs + i]);
+        grand_total_comp += ctx->h_comp_sizes[i];
+      }
+      ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_comp_sizes, ctx->h_comp_sizes,
+                                      size_bytes, cudaMemcpyHostToDevice, stream));
 
-    for (int i = 0; i < bsz; i++) {
-      int layer, kv, b;
-      decode_chunk_idx(bs + i, kv_dim, num_blocks, layer, kv, b);
-      uint8_t* cpu_src = cpu_chunk_addr(cpu_ptr, layer, start_layer_id, kv,
-                                         cpu_block_ids[b],
-                                         cpu_layer_stride_in_bytes,
-                                         cpu_kv_stride_in_bytes,
-                                         cpu_block_stride_in_bytes);
-      std::memcpy(ctx->h_comp_staging + ctx->h_packed_offsets[i],
-                  cpu_src, ctx->h_comp_sizes[i]);
+      int grid = std::min(bsz, ANS_TRANSFER_SMS);
+      ans_h2d_gather_kernel<<<grid, 256, 0, stream>>>(
+          ctx->d_comp_staging, ctx->max_comp_chunk_bytes, ctx->d_comp_sizes,
+          static_cast<const uint8_t*>(cpu_ptr),
+          cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+          cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz);
     }
-    grand_total_comp += total_packed;
     nvtxRangePop();
 
-    // 2. Single H2D transfer
-    nvtxRangePush("ANS:H2D:transfer");
-    const size_t size_bytes = bsz * sizeof(size_t);
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_packed, ctx->h_comp_staging,
-                                    total_packed, cudaMemcpyHostToDevice, stream));
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-    nvtxRangePop();
-
-    // 3. Upload sizes/offsets + GPU unpack
-    nvtxRangePush("ANS:H2D:unpack");
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_comp_sizes, ctx->h_comp_sizes,
-                                    size_bytes, cudaMemcpyHostToDevice, stream));
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_packed_offsets, ctx->h_packed_offsets.data(),
-                                    size_bytes, cudaMemcpyHostToDevice, stream));
-
-    ans_unpack_kernel<<<bsz, 256, 0, stream>>>(
-        ctx->d_packed, ctx->d_comp_staging,
-        ctx->d_comp_sizes, ctx->d_packed_offsets,
-        ctx->max_comp_chunk_bytes, bsz);
-
-    // Build decompress output pointers (CPU in parallel with GPU)
+    // 2. Build decompress output pointers (CPU, overlaps with gather kernel)
+    nvtxRangePush("ANS:H2D:build_ptrs");
     for (int i = 0; i < bsz; i++) {
       int layer, kv, b;
       decode_chunk_idx(bs + i, kv_dim, num_blocks, layer, kv, b);
@@ -504,15 +494,18 @@ void ans_h2d_and_decompress(
           ptr_at<Type>(gpu_handler, layer, kv, gpu_block_ids[b]));
       ctx->h_size_scratch[i] = static_cast<size_t>(chunk_size_in_bytes);
     }
-    const size_t ptr_bytes = bsz * sizeof(void*);
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_decomp_ptrs, ctx->h_ptr_scratch.data(),
-                                    ptr_bytes, cudaMemcpyHostToDevice, stream));
-    ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_decomp_buf_sizes, ctx->h_size_scratch.data(),
-                                    size_bytes, cudaMemcpyHostToDevice, stream));
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
+    {
+      const size_t size_bytes = bsz * sizeof(size_t);
+      const size_t ptr_bytes = bsz * sizeof(void*);
+      ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_decomp_ptrs, ctx->h_ptr_scratch.data(),
+                                      ptr_bytes, cudaMemcpyHostToDevice, stream));
+      ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_decomp_buf_sizes, ctx->h_size_scratch.data(),
+                                      size_bytes, cudaMemcpyHostToDevice, stream));
+      ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
     nvtxRangePop();
 
-    // 4. ANS decompress
+    // 3. ANS decompress
     nvtxRangePush("ANS:H2D:decompress");
     ANS_NVCOMP_CHECK(nvcompBatchedANSDecompressAsync(
         (const void* const*)ctx->d_comp_ptrs,

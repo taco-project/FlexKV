@@ -37,18 +37,12 @@ struct ANSTransferContext {
     size_t*         d_decomp_act_sizes;
     nvcompStatus_t* d_statuses;
 
-    // GPU packed transfer buffers (contiguous compressed data)
-    uint8_t* d_packed;
-    size_t*  d_packed_offsets;
-
-    // Host pinned staging
-    uint8_t* h_comp_staging;    // packed compressed data for D2H/H2D
+    // Host pinned buffer for compressed sizes metadata
     size_t*  h_comp_sizes;
 
     // Host scratch (reused across calls)
     std::vector<void*>  h_ptr_scratch;
     std::vector<size_t> h_size_scratch;
-    std::vector<size_t> h_packed_offsets;
 
     int log_level;
 };
@@ -58,7 +52,7 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
 
 void ans_ctx_destroy(ANSTransferContext* ctx);
 
-// D2H: compress on GPU → pack → single D2H → CPU scatter (internally batched)
+// D2H: compress on GPU → GPU scatter kernel to CPU pinned (internally batched)
 template<BackendType Type>
 void ans_compress_and_d2h(
     ANSTransferContext* ctx,
@@ -73,7 +67,7 @@ void ans_compress_and_d2h(
     int64_t* h_comp_sizes_out,
     cudaStream_t stream);
 
-// H2D: CPU gather → single H2D → unpack → decompress on GPU (internally batched)
+// H2D: GPU gather kernel from CPU pinned → decompress on GPU (internally batched)
 template<BackendType Type>
 void ans_h2d_and_decompress(
     ANSTransferContext* ctx,
