@@ -48,7 +48,7 @@ from flexkv.common.ring_buffer import SharedOpPool
 def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
     """
     Register transfer operation to buffer with device type prefixes.
-    
+
     Device type prefixes prevent hash collisions when different device types
     use the same block ID values (e.g., CPU block 0 vs SSD block 0).
     """
@@ -68,9 +68,9 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
         TransferType.PEERSSD2H: (6, 2),# PEER_SSD -> CPU
         TransferType.H2PEERSSD: (2, 6),# CPU -> PEER_SSD
     }
-    
+
     src_device, dst_device = transfer_type_to_devices.get(op.transfer_type, (0, 0))
-    
+
     op.src_slot_id = pin_buffer.allocate_slot(op.src_block_ids, device_type_prefix=src_device)
     op.dst_slot_id = pin_buffer.allocate_slot(op.dst_block_ids, device_type_prefix=dst_device)
 
@@ -152,8 +152,8 @@ class TransferEngine:
                     gpu_device_id=gpu_handles[0].gpu_device_id,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
-                    transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
+                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                 )
                 for _, gpu_handles in self.gpu_handles.items()
             ]
@@ -170,8 +170,8 @@ class TransferEngine:
                     gpu_device_id=gpu_handles[0].gpu_device_id,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
-                    transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
+                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                 )
                 for _, gpu_handles in self.gpu_handles.items()
             ]
@@ -190,8 +190,8 @@ class TransferEngine:
                     dp_group_id=dp_client_id,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
-                    transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
+                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                 )
                 for dp_client_id, gpu_handles in self.gpu_handles.items()
             ]
@@ -209,8 +209,8 @@ class TransferEngine:
                     dp_group_id=dp_client_id,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
-                    transfer_sms_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
+                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                 )
                 for dp_client_id, gpu_handles in self.gpu_handles.items()
             ]
@@ -306,13 +306,13 @@ class TransferEngine:
                 ]
             self._worker_map[TransferType.DISK2D] = self.gds_workers
             self._worker_map[TransferType.D2DISK] = self.gds_workers
-            
+
         if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
             or (self._ssd_handle and self.cache_config.enable_p2p_ssd)):
-            ## NOTE:if we have the cpu handle and enable p2p cpu transfer we need this worker 
+            ## NOTE:if we have the cpu handle and enable p2p cpu transfer we need this worker
             ## (currently we inplement cpu and ssd distributed transfer in one worker)
 
-            flexkv_logger.info(f"[transfer_engine] initializing the PEER2CPUTransferWorker!")
+            flexkv_logger.info("[transfer_engine] initializing the PEER2CPUTransferWorker!")
             self.cpu_remote_cpu_worker: WorkerHandle = PEER2CPUTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
@@ -320,7 +320,7 @@ class TransferEngine:
                 cpu_blocks=self._cpu_handle.get_tensor(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
                 # TODO: get remote kv_layout, now we can assume that remote kv layout is same as current node
-                remote_kv_layout=self._cpu_handle.kv_layout, 
+                remote_kv_layout=self._cpu_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
                 cache_config = self.cache_config,
                 ssd_kv_layout = self._ssd_handle.kv_layout if self._ssd_handle else None,
@@ -333,7 +333,7 @@ class TransferEngine:
             if self.cache_config.enable_p2p_ssd:
                 self._worker_map[TransferType.PEERSSD2H] = self.cpu_remote_cpu_worker
 
-            
+
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
         # Wait for all workers to ready

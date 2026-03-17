@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, List, Union, Dict, Any
 from argparse import Namespace
-import os
 import copy
 
 import torch
@@ -91,7 +90,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     cpp_metrics_port=int(os.getenv('FLEXKV_CPP_METRICS_PORT', 8081)),
     ## Port for Python metrics HTTP server (default: 8080)
     py_metrics_port=int(os.getenv('FLEXKV_PY_METRICS_PORT', 8080)),
-    
+
     # Server-client mode configuration
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
@@ -104,8 +103,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     use_ce_transfer_h2d=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0))),
     use_ce_transfer_d2h=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0))),
-    transfer_sms_h2d=int(os.getenv('FLEXKV_TRANSFER_SMS_H2D', 8)),
-    transfer_sms_d2h=int(os.getenv('FLEXKV_TRANSFER_SMS_D2H', 8)),
+    transfer_num_cta_h2d=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_H2D', 4)),
+    transfer_num_cta_d2h=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_D2H', 4)),
 
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),
@@ -141,7 +140,7 @@ class UserConfig:
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
-    
+
     # distributed zmq configs
     local_zmq_ip: Optional[str] = None
     local_zmq_port: Optional[int] = None
@@ -223,10 +222,10 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote
-    
+
     # Update derived flags after setting p2p and remote configs
-    cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or 
-                                      cache_config.enable_p2p_ssd or 
+    cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or
+                                      cache_config.enable_p2p_ssd or
                                       cache_config.enable_3rd_remote)
     cache_config.enable_remote = cache_config.enable_3rd_remote
 
@@ -283,7 +282,7 @@ def update_default_config_from_user_config(model_config: ModelConfig,
             else:
                 raise ValueError(f"Unknown config name: {global_attr_name} in config file, "
                                  f"available config names: {global_config_attrs}")
-        
+
 @dataclass
 class MooncakeTransferEngineConfig:
     engine_ip: str

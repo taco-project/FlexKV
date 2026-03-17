@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,13 +21,9 @@
 namespace flexkv {
 
 TPTransferThreadGroup::TPTransferThreadGroup(
-    int num_gpus,
-    const std::vector<int64_t> &gpu_block_ptrs_flat,
-    int num_tensors_per_gpu,
-    int64_t cpu_blocks_ptr,
-    int dp_group_id,
-    int num_layers,
-    const std::vector<int64_t> &gpu_kv_strides_in_bytes,
+    int num_gpus, const std::vector<int64_t> &gpu_block_ptrs_flat,
+    int num_tensors_per_gpu, int64_t cpu_blocks_ptr, int dp_group_id,
+    int num_layers, const std::vector<int64_t> &gpu_kv_strides_in_bytes,
     const std::vector<int64_t> &gpu_block_strides_in_bytes,
     const std::vector<int64_t> &gpu_layer_strides_in_bytes,
     const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
@@ -51,10 +47,11 @@ TPTransferThreadGroup::TPTransferThreadGroup(
   mtxs_ = std::vector<std::mutex>(num_gpus_);
   cvs_ = std::vector<std::condition_variable>(num_gpus_);
 
-  cudaError_t malloc_err = cudaMallocHost((void **)&gpu_blocks_,
-                 num_gpus_ * num_tensors_per_gpu_ * sizeof(void *));
+  cudaError_t malloc_err = cudaMallocHost(
+      (void **)&gpu_blocks_, num_gpus_ * num_tensors_per_gpu_ * sizeof(void *));
   if (malloc_err != cudaSuccess) {
-    throw std::runtime_error(std::string("cudaMallocHost failed: ") + cudaGetErrorString(malloc_err));
+    throw std::runtime_error(std::string("cudaMallocHost failed: ") +
+                             cudaGetErrorString(malloc_err));
   }
   for (size_t i = 0; i < gpu_block_ptrs_flat.size(); ++i) {
     gpu_blocks_[i] = reinterpret_cast<void *>(gpu_block_ptrs_flat[i]);
@@ -67,19 +64,17 @@ TPTransferThreadGroup::TPTransferThreadGroup(
   } else if (num_tensors_per_gpu_ == num_layers * 2) {
     backend_type_ = BackendType::SGLANG;
   } else {
-    throw std::runtime_error("Unsupported GPU block type: " + std::to_string(num_tensors_per_gpu_));
+    throw std::runtime_error("Unsupported GPU block type: " +
+                             std::to_string(num_tensors_per_gpu_));
   }
 
   gpu_tensor_handlers_.reserve(num_gpus_);
   for (int i = 0; i < num_gpus_; i++) {
-    int64_t **gpu_blocks_ptr = reinterpret_cast<int64_t **>(gpu_blocks_ + i * num_tensors_per_gpu_);
+    int64_t **gpu_blocks_ptr =
+        reinterpret_cast<int64_t **>(gpu_blocks_ + i * num_tensors_per_gpu_);
     gpu_tensor_handlers_.emplace_back(
-        backend_type_,
-        gpu_blocks_ptr,
-        num_layers,
-        gpu_kv_strides_in_bytes_[i],
-        gpu_block_strides_in_bytes_[i],
-        gpu_layer_strides_in_bytes_[i]);
+        backend_type_, gpu_blocks_ptr, num_layers, gpu_kv_strides_in_bytes_[i],
+        gpu_block_strides_in_bytes_[i], gpu_layer_strides_in_bytes_[i]);
   }
 
   cpu_blocks_ = reinterpret_cast<void *>(cpu_blocks_ptr);
@@ -93,42 +88,47 @@ TPTransferThreadGroup::TPTransferThreadGroup(
   for (int i = 0; i < num_gpus_; i += 1) {
     cudaError_t err = cudaSetDevice(gpu_device_ids_[i]);
     if (err != cudaSuccess)
-      throw std::runtime_error(std::string("cudaSetDevice failed: ") + cudaGetErrorString(err));
+      throw std::runtime_error(std::string("cudaSetDevice failed: ") +
+                               cudaGetErrorString(err));
     err = cudaStreamCreate(&streams_[i]);
     if (err != cudaSuccess)
-      throw std::runtime_error(std::string("cudaStreamCreate failed: ") + cudaGetErrorString(err));
+      throw std::runtime_error(std::string("cudaStreamCreate failed: ") +
+                               cudaGetErrorString(err));
   }
   // create the thread pool
-  stop_pool_=false;
+  stop_pool_ = false;
   for (int i = 0; i < num_gpus_; ++i) {
     threads_.emplace_back([this, i]() {
       int device_id = gpu_device_ids_[i];
-      cudaSetDevice(device_id);  // only once
+      cudaSetDevice(device_id); // only once
 
       while (true) {
         Task task;
         {
           std::unique_lock<std::mutex> lk(mtxs_[i]);
-          cvs_[i].wait(lk, [&]{ return stop_pool_ || !queues_[i].empty(); });
-          if (stop_pool_ && queues_[i].empty()) return;
+          cvs_[i].wait(lk, [&] { return stop_pool_ || !queues_[i].empty(); });
+          if (stop_pool_ && queues_[i].empty())
+            return;
 
           task = std::move(queues_[i].front());
           queues_[i].pop();
         }
-        task();  // 
+        task(); //
       }
     });
   }
-
 }
 
 TPTransferThreadGroup::~TPTransferThreadGroup() {
   stop_pool_ = true;
-  for (auto& cv : cvs_) cv.notify_all();
-  for (auto& t : threads_) if (t.joinable()) t.join();
+  for (auto &cv : cvs_)
+    cv.notify_all();
+  for (auto &t : threads_)
+    if (t.joinable())
+      t.join();
 
   cudaFreeHost(gpu_blocks_);
-  
+
   gpu_tensor_handlers_.clear();
   delete[] gpu_kv_strides_in_bytes_;
   delete[] gpu_block_strides_in_bytes_;
@@ -136,12 +136,13 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
   delete[] gpu_chunk_sizes_in_bytes_;
 }
 
-std::future<void> TPTransferThreadGroup::enqueue_for_gpu(int gpu_idx, Task task) {
+std::future<void> TPTransferThreadGroup::enqueue_for_gpu(int gpu_idx,
+                                                         Task task) {
   auto pkg = std::make_shared<std::packaged_task<void()>>(std::move(task));
   auto fut = pkg->get_future();
   {
-      std::lock_guard<std::mutex> lk(mtxs_[gpu_idx]);
-      queues_[gpu_idx].emplace([pkg]{ (*pkg)(); });
+    std::lock_guard<std::mutex> lk(mtxs_[gpu_idx]);
+    queues_[gpu_idx].emplace([pkg] { (*pkg)(); });
   }
   cvs_[gpu_idx].notify_one();
   return fut;
@@ -153,7 +154,7 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_kv_stride_in_bytes,
     const int64_t cpu_layer_stride_in_bytes,
     const int64_t cpu_block_stride_in_bytes,
-    const int64_t cpu_tp_stride_in_bytes, const int transfer_sms,
+    const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
     const int layer_id, const int layer_granularity, const bool is_mla) {
 
@@ -166,7 +167,7 @@ void TPTransferThreadGroup::tp_group_transfer(
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
-  for (int i=0; i<num_gpus_; ++i){
+  for (int i = 0; i < num_gpus_; ++i) {
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
         int num_blocks = gpu_block_id_tensor.numel();
@@ -178,49 +179,50 @@ void TPTransferThreadGroup::tp_group_transfer(
         void *cpu_ptr = cpu_blocks_;
         int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
         if (is_mla && !is_host_to_device) {
-          cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
+          cpu_startoff_inside_chunks =
+              i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
         } else if (is_mla && is_host_to_device) {
           cpu_startoff_inside_chunks = 0;
         }
-        int64_t gpu_startoff_inside_chunks = 
-            is_mla && !is_host_to_device ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_ : 0;
+        int64_t gpu_startoff_inside_chunks =
+            is_mla && !is_host_to_device
+                ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_
+                : 0;
         // we assume that the chunk size is the same for all gpus,
         // even if they have different number of gpu_blocks
-        int64_t chunk_size = is_mla && !is_host_to_device ? 
-            gpu_chunk_sizes_in_bytes_[i] / num_gpus_ : gpu_chunk_sizes_in_bytes_[i];
-      
+        int64_t chunk_size = is_mla && !is_host_to_device
+                                 ? gpu_chunk_sizes_in_bytes_[i] / num_gpus_
+                                 : gpu_chunk_sizes_in_bytes_[i];
+
         // Dispatch to the appropriate template based on backend type
         switch (backend_type_) {
-          case BackendType::VLLM:
-            flexkv::transfer_kv_blocks<BackendType::VLLM>(
+        case BackendType::VLLM:
+          flexkv::transfer_kv_blocks<BackendType::VLLM>(
               num_blocks, layer_id, layer_granularity, gpu_block_ids,
               gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_sms, is_host_to_device, use_ce_transfer, is_mla
-            );
-            break;
-          case BackendType::TRTLLM:
-            flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+          break;
+        case BackendType::TRTLLM:
+          flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
               num_blocks, layer_id, layer_granularity, gpu_block_ids,
               gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_sms, is_host_to_device, use_ce_transfer, is_mla
-            );
-            break;
-          case BackendType::SGLANG:
-            flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+          break;
+        case BackendType::SGLANG:
+          flexkv::transfer_kv_blocks<BackendType::SGLANG>(
               num_blocks, layer_id, layer_granularity, gpu_block_ids,
               gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_sms, is_host_to_device, use_ce_transfer, is_mla
-            );
-            break;
+              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+          break;
         }
 
         cudaError_t err = cudaGetLastError();
@@ -232,11 +234,10 @@ void TPTransferThreadGroup::tp_group_transfer(
         failed = true;
         error_msg = e.what();
       }
-
     }));
   }
 
-  for (auto &f : futures){
+  for (auto &f : futures) {
     f.get();
   }
 

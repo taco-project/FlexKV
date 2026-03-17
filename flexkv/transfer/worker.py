@@ -113,7 +113,7 @@ class TransferWorkerBase(ABC):
         self.finished_ops_queue: MPQueue[int] = finished_ops_queue
 
         self.op_buffer_tensor = op_buffer_tensor
-        cudaHostRegister(self.op_buffer_tensor) 
+        cudaHostRegister(self.op_buffer_tensor)
 
     @classmethod
     def _get_worker_id(cls) -> int:
@@ -192,14 +192,14 @@ class TransferWorkerBase(ABC):
         src_slot_id = transfer_op.src_slot_id
         dst_slot_id = transfer_op.dst_slot_id
         valid_block_num = transfer_op.valid_block_num
-        
+
         if src_slot_id == -1:
             src_block_ids = torch.from_numpy(transfer_op.src_block_ids).to(dtype=torch.int64)
             if pinned:
                 src_block_ids = src_block_ids.pin_memory()
         else:
             src_block_ids = self.op_buffer_tensor[src_slot_id, :valid_block_num]
-            
+
         if dst_slot_id == -1:
             dst_block_ids = torch.from_numpy(transfer_op.dst_block_ids).to(dtype=torch.int64)
             if pinned:
@@ -234,7 +234,7 @@ class TransferWorkerBase(ABC):
                     op = self.transfer_conn.recv()
                     if op is None:
                         # shut down zmq listening server of peer2cpuTransferWorker
-                        if hasattr(self, "shutdown") and callable(getattr(self, "shutdown")):
+                        if hasattr(self, "shutdown") and callable(self.shutdown):
                             try:
                                 self.shutdown()
                             except Exception as e:
@@ -260,7 +260,7 @@ class TransferWorkerBase(ABC):
                                         f"Failed transfer op: {op}")
                         if transfer_status:
                             ## only put the op when transfer success
-                            self.finished_ops_queue.put(op.transfer_op_id)                
+                            self.finished_ops_queue.put(op.transfer_op_id)
                 else:
                     continue
             except EOFError:
@@ -312,8 +312,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  gpu_device_id: int,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
-                 transfer_sms_h2d: int = 8,
-                 transfer_sms_d2h: int = 8) -> None:
+                 transfer_num_cta_h2d: int = 4,
+                 transfer_num_cta_d2h: int = 4) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         # Register CPU tensors with CUDA
@@ -353,8 +353,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         if gpu_device_id != -1:
             torch.cuda.set_device(gpu_device_id)
         self.transfer_stream = torch.cuda.Stream()
-        self.transfer_sms_h2d = transfer_sms_h2d
-        self.transfer_sms_d2h = transfer_sms_d2h
+        self.transfer_num_cta_h2d = transfer_num_cta_h2d
+        self.transfer_num_cta_d2h = transfer_num_cta_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
@@ -375,12 +375,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             gpu_block_id_list = dst_block_ids
             cpu_block_id_list = src_block_ids
             use_ce_transfer = self.use_ce_transfer_h2d
-            transfer_sms = self.transfer_sms_h2d
+            transfer_num_cta = self.transfer_num_cta_h2d
         elif transfer_type == TransferType.D2H:
             gpu_block_id_list = src_block_ids
             cpu_block_id_list = dst_block_ids
             use_ce_transfer = self.use_ce_transfer_d2h
-            transfer_sms = self.transfer_sms_d2h
+            transfer_num_cta = self.transfer_num_cta_d2h
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for GPUCPUTransferWorker")
 
@@ -405,7 +405,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.chunk_size_in_bytes,
             layer_id,
             layer_granularity,
-            transfer_sms,
+            transfer_num_cta,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
             self.is_mla,
@@ -448,7 +448,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         nvtx.end_range(nvtx_range)
 
         return True
-        
+
 class tpGPUCPUTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
@@ -464,8 +464,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  dp_group_id: int,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
-                 transfer_sms_h2d: int = 8,
-                 transfer_sms_d2h: int = 8):
+                 transfer_num_cta_h2d: int = 4,
+                 transfer_num_cta_d2h: int = 4):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
@@ -510,8 +510,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
 
-        self.transfer_sms_h2d = transfer_sms_h2d
-        self.transfer_sms_d2h = transfer_sms_d2h
+        self.transfer_num_cta_h2d = transfer_num_cta_h2d
+        self.transfer_num_cta_d2h = transfer_num_cta_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
@@ -558,12 +558,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             gpu_block_id_list = dst_block_ids
             cpu_block_id_list = src_block_ids
             use_ce_transfer = self.use_ce_transfer_h2d
-            transfer_sms = self.transfer_sms_h2d
+            transfer_num_cta = self.transfer_num_cta_h2d
         elif transfer_type == TransferType.D2H:
             gpu_block_id_list = src_block_ids
             cpu_block_id_list = dst_block_ids
             use_ce_transfer = self.use_ce_transfer_d2h
-            transfer_sms = self.transfer_sms_d2h
+            transfer_num_cta = self.transfer_num_cta_d2h
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for tpGPUCPUTransferWorker")
 
@@ -580,7 +580,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.cpu_tp_stride_in_bytes,
-            transfer_sms,
+            transfer_num_cta,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
             layer_id,
@@ -743,7 +743,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         )
 
         return True
-    
+
 class CPURemoteTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
@@ -870,20 +870,20 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             src_block_node_ids = kwargs.get("src_block_node_ids")
             if src_block_node_ids is not None and not isinstance(src_block_node_ids, np.ndarray):
                 raise TypeError("src_block_node_ids must be a numpy.ndarray if provided")
-            
+
             assert len(src_block_node_ids) == len(remote_block_id_list)
-            
+
             # Construct cfs_blocks_partition and cpu_blocks_partition
             # This is a simplified implementation - in practice, you might need more sophisticated logic
-            
+
             # Group blocks by file_nodeid (simplified grouping logic)
             files_set = set(src_block_node_ids)
             file_nodeids_list = list(files_set)
-            
+
             # Initialize partitions with proper size
             cfs_blocks_partition = [[] for _ in range(len(file_nodeids_list))]
             cpu_blocks_partition = [[] for _ in range(len(file_nodeids_list))]
-            
+
             # Create mapping from file_nodeid to partition index
             file2fid_dict = {file_nodeid: fid for fid, file_nodeid in enumerate(file_nodeids_list)}
             #因为每个flexkv的文件数量是相同的，所以total_file_num是相同的，后面用全局block_id计算block_id_in_file时，需要除以total_file_num
@@ -891,14 +891,14 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             for i in range(len(remote_block_id_list)):
                 file_nodeid = src_block_node_ids[i]
                 fid = file2fid_dict[file_nodeid]
-                
+
                 # Calculate block_id_in_file using the same logic as C++
                 # This should match the C++ implementation in pcfs.cpp
                 block_id_in_file = int(((remote_block_id_list[i] / self.round_robin) / total_file_num) * self.round_robin + (remote_block_id_list[i] % self.round_robin))
-                
+
                 cfs_blocks_partition[fid].append(block_id_in_file)
                 cpu_blocks_partition[fid].append(cpu_block_id_list[i].item())
-            
+
             # Use the new shared transfer function
             shared_transfer_kv_blocks_remote_read(
                 file_nodeid_list=file_nodeids_list,
@@ -1136,7 +1136,7 @@ class GDSTransferWorker(TransferWorkerBase):
             layer_id = 0
         if layer_granularity == -1:
             layer_granularity = self.num_layers
-            
+
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         with torch.cuda.stream(self.transfer_stream):
@@ -1393,7 +1393,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             )
             self.redis_meta_client.set_node_id(self.cache_config.distributed_node_id)
 
-            # Persistent NodeMetaInfo Pool for skip redis operation when getting 
+            # Persistent NodeMetaInfo Pool for skip redis operation when getting
             # NodeMetaInfo according to node_id
             # assuming that every flexkv progress has unique node id
             self.node_metas: Dict[int, NodeMetaInfo] = {}
@@ -1431,7 +1431,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.zmq_listen_addr,
             )
 
-        ## when enable p2p ssd, we need start a zmq server to recive the meta info from remote node, 
+        ## when enable p2p ssd, we need start a zmq server to recive the meta info from remote node,
         # and allocate a cpu buffer for ssd to cpu copy
         if self.cache_config.enable_p2p_ssd:
             assert ssd_kv_layout is not None, "Invalid ssd kv layout!"
@@ -1461,7 +1461,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             ## start the zmq server and client
             self.zmq_server = SSDZMQServer(cache_config.local_zmq_ip, cache_config.local_zmq_port, self.ssd_handle_loop)
             self.zmq_client = SSDZMQClient(cache_config.local_zmq_ip, cache_config.local_zmq_port+1)
-            
+
             ## ssd copy to temp cpu buffer related
             self.ssd_files = ssd_files
             self.num_blocks_per_file = num_blocks_per_file
@@ -1487,8 +1487,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             self.ssd_layer_stride_in_bytes = (
                 ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
             )
-            
-       
+
+
             self.round_robin = 1
             # initialize ssd ioctx
             try:
@@ -1542,7 +1542,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         transfer_finished = True
 
         for task_info in task_info_list:
-            # NOTE: here one task_info represent data transfer from one node 
+            # NOTE: here one task_info represent data transfer from one node
             ret = self._batch_transfer_impl(
                 task_info,
                 transfer_op.transfer_type,
@@ -1568,9 +1568,9 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             end_time,
         )
         return transfer_finished
-    
-    def _batch_transfer_impl(self, 
-        task_info: RDMATaskInfo,    
+
+    def _batch_transfer_impl(self,
+        task_info: RDMATaskInfo,
         transfer_type: TransferType,
         layer_id: int,
         layer_granularity: int,
@@ -1634,7 +1634,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         if transfer_type == TransferType.PEERH2H:
             # remote cpu to local cpu transfer by one-side rdma read
             for i in range(len(task_info.src_ptrs)):
-                ret = self.mooncake_transfer_engine.transfer_sync_read(task_info.peer_zmq_addr, task_info.src_ptrs[i], 
+                ret = self.mooncake_transfer_engine.transfer_sync_read(task_info.peer_zmq_addr, task_info.src_ptrs[i],
                                                                        task_info.dst_ptrs[i], task_info.data_lens[i])
                 if ret != 0:
                     flexkv_logger.error(f"transfer_sync_write failed with error code: {ret}")
@@ -1681,7 +1681,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             )
 
         return True
-    
+
     def op_parser(
         self, transfer_op: WorkerTransferOp, layer_id: int, layer_granularity: int
     ) -> List[RDMATaskInfo]:
@@ -1761,11 +1761,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             assert (
                 peer_zmq_addr != ""
             ), f"Node {node_id} zmq addr not found in redis server"
-            
+
             src_blocks = segment["src"]
             dst_blocks = segment["dst"]
             assert len(src_blocks) == len(dst_blocks)
-            
+
             data_size = self.cpu_kv_layout.get_block_stride() * self.dtype.itemsize * len(src_blocks)
             ssd_task_id = self.gen_task_id()
             task_info_list.append(
@@ -1786,7 +1786,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
 
     #=============================remote behaviors
-    
+
     def meta_info_parser(self, recv_msg: str):
         recv_dict = json.loads(recv_msg)
         return RemoteSSD2HMetaInfo.from_dict(recv_dict)
@@ -1804,30 +1804,30 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     time.sleep(0.001)
                     continue
                 if not message:
-                    self.zmq_server.listen_socket.send(b"ERROR")  
+                    self.zmq_server.listen_socket.send(b"ERROR")
                     continue
 
                 recv_meta = self.meta_info_parser(message)
                 if not recv_meta:
-                    self.zmq_server.listen_socket.send(b"ERROR")  
+                    self.zmq_server.listen_socket.send(b"ERROR")
                     flexkv_logger.warning("Can not parse RemoteSSD2HMetaInfo using recieved message")
                     continue
-                
+
                 flexkv_logger.info(
                     f"[ssd_handle_loop] Received task_id={recv_meta.task_id}, "
                     f"ssd_block_ids={recv_meta.ssd_block_ids}, "
                     f"cpu_block_ids={recv_meta.cpu_block_ids}"
                 )
-                
-                self.zmq_server.listen_socket.send(b"OK")  
-                
+
+                self.zmq_server.listen_socket.send(b"OK")
+
                 failure_msg = NotifyMsg(mooncake_engine_addr=self.mooncake_transfer_engine.get_engine_addr(),
                                                 task_id=recv_meta.task_id, status = NotifyStatus.FAIL) ## used when transfer fails
                 success_msg = NotifyMsg(mooncake_engine_addr=self.mooncake_transfer_engine.get_engine_addr(),
                                                 task_id=recv_meta.task_id, status = NotifyStatus.SUCCESS) ## used when transfer fails
-                
+
                 # step2: ckeck the recieved info, early return if check error
-                nvtx_range = nvtx.start_range(message=f"ssd_handle_loop. check and load_data", color="orange")
+                nvtx_range = nvtx.start_range(message="ssd_handle_loop. check and load_data", color="orange")
                 if len(recv_meta.ssd_block_ids) == 0 or len(recv_meta.cpu_block_ids) == 0 \
                     or len(recv_meta.cpu_block_ids)!=len(recv_meta.ssd_block_ids):
                         flexkv_logger.warning(
@@ -1835,7 +1835,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                         )
                         self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                         continue
-                    
+
                 # TODO: we need to support dynamic temp buffer or split the ssd transfer request if number of ssd blocks is larger than num_tmp_cpu_blocks
                 # now we just refuse this transfer by returning a failure status
                 if len(recv_meta.ssd_block_ids)>self.cache_config.num_tmp_cpu_blocks:
@@ -1844,12 +1844,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                         )
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                     continue
-                
+
                 ## step3: do copy data from ssd to cpu
                 # NOTE: this block ids is a corresponding relationship with self.tmp_cpu_buffer, for every transfer req we reuse the local cpu buffer
                 local_cpu_buffer_block_ids = torch.arange(0, len(recv_meta.ssd_block_ids), dtype = torch.int64)
                 local_cpu_start_idx = 0
-                
+
                 # seperate the blocks to get the longest continuous blocks
                 groups = split_contiguous_blocks(recv_meta.ssd_block_ids, recv_meta.cpu_block_ids)
 
@@ -1857,21 +1857,21 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 src_ptr_list = []
                 dst_ptr_list = []
                 data_size_list = []
-                
+
                 for item in groups:
                     # in this loop we do two things:
                     # 1. copy ssd data to cpu for each segment
                     # 2. calculate the start ptr of local cpu blocks and dst cpu blocks for each segment and record them
                     ssd_block_ids_per_seg = torch.tensor(item["src"], dtype=torch.int64)
                     dst_cpu_block_ids_per_seg = torch.tensor(item["dst"], dtype=torch.int64)
-                    
+
                     if len(ssd_block_ids_per_seg) == 0:
-                        all_copy_complete = False                     
+                        all_copy_complete = False
                         break
                     # get corresponding temp cpu block ids
                     local_cpu_buffer_block_ids_per_seg = local_cpu_buffer_block_ids[local_cpu_start_idx: local_cpu_start_idx+len(ssd_block_ids_per_seg)]
                     local_cpu_start_idx += len(ssd_block_ids_per_seg)
-                    
+
                     layer_id = recv_meta.layer_id
                     layer_granularity = recv_meta.layer_granularity
                     layer_id_list = torch.arange(
@@ -1906,17 +1906,17 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     assert len(src_ptr_list) == len(data_size_list) and len(dst_ptr_list) == len(data_size_list)
 
                 nvtx.end_range(nvtx_range)
-                nvtx_range = nvtx.start_range(message=f"ssd_handle_loop. write_data_back_to_peer", color="orange")
+                nvtx_range = nvtx.start_range(message="ssd_handle_loop. write_data_back_to_peer", color="orange")
                 ## step4: do rdma transfer and send notify
                 if not all_copy_complete:
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                     continue
-                
+
                 if not self.write_data_back_to_peer(recv_meta.peer_engine_addr, src_ptr_list, dst_ptr_list, data_size_list):
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
-                    flexkv_logger.error(f"Failed to write data back to peer")
+                    flexkv_logger.error("Failed to write data back to peer")
                     continue
-                    
+
                 self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, success_msg)
                 nvtx.end_range(nvtx_range)
             except Exception as e:
@@ -1925,7 +1925,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
     def copy_ssd_data_to_dram(
         self, layer_id_list: torch.Tensor, ssd_block_id_list: torch.Tensor, cpu_block_id_list: torch.Tensor
-    ):  
+    ):
         assert len(ssd_block_id_list) == len(cpu_block_id_list)
         flexkv_logger.info(f"copy ssd blocks:{ssd_block_id_list} to cpu blocks: {cpu_block_id_list}" )
         try:
@@ -1951,19 +1951,19 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.error(f"Copy data from ssd to cpu failed: {e}")
             return False
         return True
-    
+
     def write_data_back_to_peer(
-        self, 
-        peer_address: str, 
-        src_ptr_list: List[int], 
-        dst_ptr_list: List[int], 
+        self,
+        peer_address: str,
+        src_ptr_list: List[int],
+        dst_ptr_list: List[int],
         data_size_list: List[int]
     ):
         flexkv_logger.info(f"Write data back to peer from src: {src_ptr_list} to {dst_ptr_list}")
         ret = self.mooncake_transfer_engine.batch_transfer_sync_write(peer_address, src_ptr_list, dst_ptr_list, data_size_list)
         return True if ret == 0 else False
 
-        
+
     #============================== distrbuted cpu related ==========================
 
     def _dist_cpu_op_parser(
@@ -2020,19 +2020,19 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                         layer_granularity,
                     )
                 )
- 
+
                 assert (
                     src_data_size_per_block == dst_data_size_per_block
                 ), "src and dst blocks have different layout"
-                
-                
+
+
                 for _ in range(len(src_block_start_ptrs)):
                     data_size = src_data_size_per_block * len(src_blocks)
                     data_size_list.append(data_size)
                 src_ptr_list.extend(src_block_start_ptrs)
                 dst_ptr_list.extend(dst_block_start_ptrs)
                 assert len(data_size_list) == len(src_ptr_list) and len(data_size_list) == len(dst_ptr_list)
-                
+
             flexkv_logger.info(
                 f"[PEER2CPUTransferWorker]: remote cpu op parser src_ptr_list: {src_ptr_list}, dst_ptr_list: {dst_ptr_list} "
             )
@@ -2054,7 +2054,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     data_size = sum(data_size_list)
                 )
             )
-            
+
         return task_info_list
 
     #================================== utils =================================
@@ -2086,7 +2086,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         # assuming that remote cpu buffer layout is the same as local cpu buffer layout
         assert self.cpu_kv_layout.type == self.remote_kv_layout.type
         src_block_ptrs = []
-        
+
         # Get the first block ID and handle different input types
         if isinstance(cpu_blocks, torch.Tensor):
             block_id_int = int(cpu_blocks[0].item())
@@ -2098,7 +2098,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 block_id_int = int(first_elem)
         else:
             raise ValueError(f"Invalid cpu_blocks type: {type(cpu_blocks)}")
-        
+
         if self.cpu_kv_layout.type == KVCacheLayoutType.LAYERFIRST:
             for layer_id in range(layer_start_id, layer_start_id + layer_granularity):
                 for kv_id in range(self.kv_dim):
@@ -2120,12 +2120,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.cpu_kv_layout.type}")
         data_size_per_block = self.cpu_kv_layout.get_block_stride() * self.dtype.itemsize
-        
+
         return  src_block_ptrs, data_size_per_block
 
     ### redis client helper functions
     def regist_node_meta(self, cpu_buffer_base_ptr: int, ssd_buffer_base_ptr: int, zmq_addr: str):
-        self.redis_meta_client.regist_node_meta(self.redis_meta_client.get_node_id(), self.mooncake_transfer_engine.get_engine_addr(), 
+        self.redis_meta_client.regist_node_meta(self.redis_meta_client.get_node_id(), self.mooncake_transfer_engine.get_engine_addr(),
                                                 zmq_addr, cpu_buffer_base_ptr, ssd_buffer_base_ptr)
         #NOTE: maybe useless
         node_meta_info = NodeMetaInfo(
@@ -2137,7 +2137,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         )
         self.node_metas[self.redis_meta_client.get_node_id()] = node_meta_info
         flexkv_logger.info(f"Registered node {self.redis_meta_client.get_node_id()} to Redis.")
-    
+
     def unregist_node_meta(self, node_id: int = None) -> None:
         self.redis_meta_client.unregist_node_meta(self.redis_meta_client.get_node_id())
         flexkv_logger.info(f"Unregistered node {self.redis_meta_client.get_node_id()} from Redis.")
@@ -2145,7 +2145,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
     def get_node_meta(self, node_id: int) -> Optional[NodeMetaInfo]:
         # TODO: how to remove the invalid node meta info in node_metas
         """Get the node meta info by node id."""
-        if not node_id in self.node_metas:
+        if node_id not in self.node_metas:
             ## fetch from redis
             node_redis_data = self.redis_meta_client.get_node_meta(node_id)
             if not node_redis_data:

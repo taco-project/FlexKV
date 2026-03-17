@@ -74,7 +74,7 @@ class TransferOp:
 
     op_id: int = field(init=False)
     graph_id: int
-    transfer_type: TransferType 
+    transfer_type: TransferType
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
     layer_id: int = 0
@@ -304,17 +304,47 @@ class TransferOpGraph:
         print(result)
         return result
 
+def _make_combined_callback(callbacks: List[Callable]) -> Callable:
+    def combined_callback(*args, **kwargs):
+        for cb in callbacks:
+            cb(*args, **kwargs)
+    return combined_callback
+
+
+def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
+               graph: TransferOpGraph, callbacks: List[Callable],
+               op_callback_dict: Dict[int, Callable]) -> Optional[TransferOp]:
+    if not ops:
+        return None
+    src_blocks = np.concatenate([op.src_block_ids for op in ops])
+    dst_blocks = np.concatenate([op.dst_block_ids for op in ops])
+    merged_op = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=transfer_type,
+        src_block_ids=src_blocks,
+        dst_block_ids=dst_blocks,
+        layer_id=ops[0].layer_id,
+        layer_granularity=ops[0].layer_granularity,
+        dp_id=ops[0].dp_id,
+    )
+    graph.add_transfer_op(merged_op)
+    if callbacks:
+        if len(callbacks) == 1:
+            op_callback_dict[merged_op.op_id] = callbacks[0]
+        else:
+            op_callback_dict[merged_op.op_id] = _make_combined_callback(callbacks)
+    return merged_op
+
+
 def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], task_end_op_ids: List[int],
                          op_callback_dict: Dict[int, Callable]) -> Tuple[TransferOpGraph, int, Dict[int, Callable]]:
     """
     Merge multiple TransferOpGraphs into a single batch graph.
 
-    Simplified assumption: each graph has at most two ops - DISK2H and H2D.
-    - All DISK2H ops are merged into one (if any exist)
-    - All H2D ops are merged into one
-    - Dependency: DISK2H -> H2D
-    - H2D becomes the task_end_op_id
-    - For other transfer types (REMOTE, GDS, etc.), raise error
+    Supported patterns:
+      GET: DISK2H (optional) -> H2D
+      PUT: D2H -> H2DISK (optional)
+    For other transfer types (REMOTE, GDS, etc.), raise error.
 
     Args:
         batch_id: ID for the new batch graph
@@ -333,106 +363,55 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
     merged_graph = TransferOpGraph()
     merged_graph.set_graph_id(batch_id)
 
-    # Collect DISK2H and H2D ops separately
-    disk2h_ops: List[TransferOp] = []
-    h2d_ops: List[TransferOp] = []
+    ops_by_type: Dict[TransferType, List[TransferOp]] = {}
+    callbacks_by_type: Dict[TransferType, List[Callable]] = {}
+    supported_types = {TransferType.DISK2H, TransferType.H2D,
+                       TransferType.D2H, TransferType.H2DISK}
 
-    # New callback dict: merged_op_id -> list of callbacks
-    disk2h_callbacks: List[Callable] = []
-    h2d_callbacks: List[Callable] = []
+    for tt in supported_types:
+        ops_by_type[tt] = []
+        callbacks_by_type[tt] = []
 
     for graph in transfer_graphs:
         for op_id, op in graph._op_map.items():
             if op.transfer_type == TransferType.VIRTUAL:
-                # Skip VIRTUAL ops
                 continue
-            elif op.transfer_type == TransferType.DISK2H:
-                disk2h_ops.append(op)
-                if op.op_id in op_callback_dict:
-                    disk2h_callbacks.append(op_callback_dict[op.op_id])
-            elif op.transfer_type == TransferType.H2D:
-                h2d_ops.append(op)
-                if op.op_id in op_callback_dict:
-                    h2d_callbacks.append(op_callback_dict[op.op_id])
-            else:
-                # Unsupported transfer type for batch merge
+            if op.transfer_type not in supported_types:
                 raise NotImplementedError(
                     f"Batch merge does not support transfer type: {op.transfer_type}. "
-                    f"Only DISK2H and H2D are supported. "
-                    f"Remote access and GDS are not yet supported for batch merge."
+                    f"Only DISK2H, H2D, D2H, and H2DISK are supported."
                 )
+            ops_by_type[op.transfer_type].append(op)
+            if op.op_id in op_callback_dict:
+                callbacks_by_type[op.transfer_type].append(op_callback_dict[op.op_id])
 
     new_op_callback_dict: Dict[int, Callable] = {}
-    merged_disk2h_op = None
-    merged_h2d_op = None
 
-    # Merge all DISK2H ops into one
-    if disk2h_ops:
-        src_blocks = np.concatenate([op.src_block_ids for op in disk2h_ops])
-        dst_blocks = np.concatenate([op.dst_block_ids for op in disk2h_ops])
-
-        merged_disk2h_op = TransferOp(
-            graph_id=merged_graph.graph_id,
-            transfer_type=TransferType.DISK2H,
-            src_block_ids=src_blocks,
-            dst_block_ids=dst_blocks,
-            layer_id=disk2h_ops[0].layer_id,
-            layer_granularity=disk2h_ops[0].layer_granularity,
-            dp_id=disk2h_ops[0].dp_id,
-        )
-        merged_graph.add_transfer_op(merged_disk2h_op)
-
-        # Attach callbacks - create a combined callback if multiple
-        if disk2h_callbacks:
-            if len(disk2h_callbacks) == 1:
-                new_op_callback_dict[merged_disk2h_op.op_id] = disk2h_callbacks[0]
-            else:
-                # Create a combined callback that calls all original callbacks
-                def make_combined_callback(callbacks):
-                    def combined_callback(*args, **kwargs):
-                        for cb in callbacks:
-                            cb(*args, **kwargs)
-                    return combined_callback
-                new_op_callback_dict[merged_disk2h_op.op_id] = make_combined_callback(disk2h_callbacks)
-
-    # Merge all H2D ops into one
-    if h2d_ops:
-        src_blocks = np.concatenate([op.src_block_ids for op in h2d_ops])
-        dst_blocks = np.concatenate([op.dst_block_ids for op in h2d_ops])
-
-        merged_h2d_op = TransferOp(
-            graph_id=merged_graph.graph_id,
-            transfer_type=TransferType.H2D,
-            src_block_ids=src_blocks,
-            dst_block_ids=dst_blocks,
-            layer_id=h2d_ops[0].layer_id,
-            layer_granularity=h2d_ops[0].layer_granularity,
-            dp_id=h2d_ops[0].dp_id,
-        )
-        merged_graph.add_transfer_op(merged_h2d_op)
-
-        # Attach callbacks - create a combined callback if multiple
-        if h2d_callbacks:
-            if len(h2d_callbacks) == 1:
-                new_op_callback_dict[merged_h2d_op.op_id] = h2d_callbacks[0]
-            else:
-                def make_combined_callback(callbacks):
-                    def combined_callback(*args, **kwargs):
-                        for cb in callbacks:
-                            cb(*args, **kwargs)
-                    return combined_callback
-                new_op_callback_dict[merged_h2d_op.op_id] = make_combined_callback(h2d_callbacks)
-
-    # Add dependency: DISK2H -> H2D
+    # GET path: DISK2H -> H2D
+    merged_disk2h_op = _merge_ops(ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
+                                  merged_graph, callbacks_by_type[TransferType.DISK2H], new_op_callback_dict)
+    merged_h2d_op = _merge_ops(ops_by_type[TransferType.H2D], TransferType.H2D,
+                               merged_graph, callbacks_by_type[TransferType.H2D], new_op_callback_dict)
     if merged_disk2h_op is not None and merged_h2d_op is not None:
         merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
 
-    # Determine the batch_end_op_id
-    # Priority: H2D (if exists) -> DISK2H (if exists) -> -1
+    # PUT path: D2H -> H2DISK
+    merged_d2h_op = _merge_ops(ops_by_type[TransferType.D2H], TransferType.D2H,
+                               merged_graph, callbacks_by_type[TransferType.D2H], new_op_callback_dict)
+    merged_h2disk_op = _merge_ops(ops_by_type[TransferType.H2DISK], TransferType.H2DISK,
+                                  merged_graph, callbacks_by_type[TransferType.H2DISK], new_op_callback_dict)
+    if merged_d2h_op is not None and merged_h2disk_op is not None:
+        merged_graph.add_dependency(merged_h2disk_op.op_id, merged_d2h_op.op_id)
+
+    # batch_end_op_id: GET: H2D > DISK2H; PUT: H2DISK > D2H
     if merged_h2d_op is not None:
         batch_end_op_id = merged_h2d_op.op_id
     elif merged_disk2h_op is not None:
         batch_end_op_id = merged_disk2h_op.op_id
+    elif merged_h2disk_op is not None:
+        batch_end_op_id = merged_h2disk_op.op_id
+    elif merged_d2h_op is not None:
+        batch_end_op_id = merged_d2h_op.op_id
     else:
         batch_end_op_id = -1
 
