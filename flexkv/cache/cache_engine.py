@@ -99,11 +99,16 @@ class CacheEngineAccel:
                 bnids_np = None
         except Exception:
             bnids_np = None
-        return MatchResultAccel(match_result.num_ready_matched_blocks, match_result.num_matched_blocks,
-                            match_result.last_ready_node, match_result.last_node,
-                            match_result.last_node_matched_length,
-                            phys,
-                            bnids_np)
+        return MatchResultAccel(
+            num_ready_matched_blocks=match_result.num_ready_matched_blocks,
+            num_matched_blocks=match_result.num_matched_blocks,
+            last_ready_node=match_result.last_ready_node,
+            last_node=match_result.last_node,
+            last_node_matched_length=match_result.last_node_matched_length,
+            physical_blocks=phys,
+            block_node_ids=bnids_np,
+            matched_pos="remote" if self.device_type == DeviceType.REMOTE else "local",
+        )
 
     def insert(self,
                sequence_meta: SequenceMeta,
