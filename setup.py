@@ -66,7 +66,7 @@ else:
 if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6;9.0"
 
-extra_compile_args = ["-std=c++17"]
+extra_compile_args = ["-std=c++17", "-O3"]
 if enable_metrics:
     extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]

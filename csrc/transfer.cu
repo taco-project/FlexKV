@@ -37,13 +37,11 @@ __global__ void transfer_kv_blocks_kernel(
   int num_chunks = num_layers * kv_dim * num_blocks;
   int64_t copy_size_in_float4 = copy_size * sizeof(int64_t) / sizeof(float4);
 
-  // 计算warp信息
   int warp_id = threadIdx.x / 32;
   int lane_id = threadIdx.x % 32;
   int warps_per_block = blockDim.x / 32;
   int total_warps = gridDim.x * warps_per_block;
 
-  // 每个warp处理一个chunk
   for (int chunk_idx = blockIdx.x * warps_per_block + warp_id;
        chunk_idx < num_chunks; chunk_idx += total_warps) {
     int layer_idx = start_layer_id + chunk_idx / (num_blocks * kv_dim);
@@ -64,7 +62,6 @@ __global__ void transfer_kv_blocks_kernel(
     int64_t *src_chunk_ptr = is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
     int64_t *dst_chunk_ptr = is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
 
-    // warp内的线程协作拷贝数据
     for (int64_t idx = lane_id; idx < copy_size_in_float4; idx += 32) {
       float4 element;
       asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3},[%4];"
