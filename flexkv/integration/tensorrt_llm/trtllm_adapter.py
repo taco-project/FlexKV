@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 import torch
 import traceback
+from flexkv.common import gpu_runtime
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -528,7 +529,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         flexkv_config.post_init_from_trt_config(config)
         dp_client_id = self.dp_rank
         
-        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
+        current_device_id = gpu_runtime.current_device() + dp_client_id * flexkv_config.model_config.tp_size
         self.flexkv_config = flexkv_config
         
         # For multi-node TP on remote node (node B), worker0 needs to create TransferManagerOnRemote process
@@ -556,7 +557,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         try:
             is_master_node = self.node_rank == 0
             is_first_worker = self.tp_rank % 8 == 0
-            is_multinode_tp = self.flexkv_config.model_config.tp_size > torch.cuda.device_count()
+            is_multinode_tp = self.flexkv_config.model_config.tp_size > gpu_runtime.device_count()
             flexkv_logger.info(f"{is_master_node=}, {is_first_worker=}, {is_multinode_tp=}")
             
             return is_multinode_tp and not is_master_node and is_first_worker

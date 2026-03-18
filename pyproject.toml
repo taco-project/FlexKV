@@ -75,3 +75,8 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "flexkv.c_ext.*"
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+    "musa: marks tests for MUSA backend (deselect with '-m \"not musa\"')",
+]
