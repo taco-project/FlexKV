@@ -194,6 +194,8 @@ class FlexKVSchedulerConnector:
         self.flexkv_stats = FlexKVStats(int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', '200')))
         self.failed_block_ids: set[int] = set()
 
+        self.maybe_skip_put = os.getenv('FLEXKV_MAYBE_SKIP_PUT', '0') == '1'
+
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")
             time.sleep(5)
@@ -428,7 +430,7 @@ class FlexKVSchedulerConnector:
         if not (request.is_finished() and request.get_finished_reason() < 2):
             return False
 
-        if os.path.exists('/tmp/flexkv_skip_put'):
+        if self.maybe_skip_put and os.path.exists('/tmp/flexkv_skip_put'):
             return False
 
         task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(request=request)
