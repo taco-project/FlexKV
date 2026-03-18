@@ -894,6 +894,7 @@ class GlobalCacheEngine:
                 total_query_blocks = block_mask_end - block_mask_start
                 if total_query_blocks > 0:
                     self._metrics_collector.record_cache_miss(total_query_blocks)
+            nvtx.end_range(nvtx_range)
             return self._empty_get_return(request_id)
         assert fragment12_num_blocks <= len(gpu_block_ids)
 
@@ -920,11 +921,13 @@ class GlobalCacheEngine:
         # to receive the data, regardless of whether we insert to local index or not
         if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
             allocated_cpu_block_num += fragment1_num_blocks
+        nvtx.push_range(f"take {allocated_cpu_block_num} cpu blocks", color="green")
         allocated_cpu_blocks = self.cpu_cache_engine.take(
             num_required_blocks=allocated_cpu_block_num,
             protected_node=cpu_matched_result.last_node,
             strict=False
         )
+        nvtx.pop_range()
         # NOTE: not enough space to allocate, skip the request
         # there might be a better way to handle this
         if len(allocated_cpu_blocks) < allocated_cpu_block_num:
@@ -932,6 +935,7 @@ class GlobalCacheEngine:
             # Record allocation failure (resource unavailable, not cache miss)
             if self._metrics_collector is not None:
                 self._metrics_collector.record_allocation_failure("local")
+            nvtx.end_range(nvtx_range)
             return self._empty_get_return(request_id)
 
         # Record cache hit/miss metrics after confirming successful allocation

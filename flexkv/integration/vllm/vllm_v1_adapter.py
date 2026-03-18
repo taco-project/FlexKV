@@ -335,7 +335,7 @@ class FlexKVSchedulerConnector:
 
         # Auto cancel if not call update_state_after_alloc()
         match_end_time = time.perf_counter()
-        logger.debug(f"Get match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
+        # logger.debug(f"Get match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
         if num_new_matched_tokens > 0:
             self.req_id_to_task_dict[request.request_id] = task_id
             self.tasks_to_cancel[task_id] = FlexKVGetTask(task_id=task_id,
@@ -345,7 +345,7 @@ class FlexKVSchedulerConnector:
                                                         match_start_time=match_start_time,
                                                         match_end_time=match_end_time)
 
-            logger.debug(f"FlexKV create get task: {self.tasks_to_cancel[task_id]}")
+            # logger.debug(f"FlexKV create get task: {self.tasks_to_cancel[task_id]}")
 
         return task_id, num_new_matched_tokens
 
@@ -482,7 +482,7 @@ class FlexKVSchedulerConnector:
 
         # Auto cancel if not need to put.
         match_end_time = time.perf_counter()
-        logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
+        # logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
 
         if num_unmatched_tokens > 0:
             self.req_id_to_task_dict[request.request_id] = task_id
@@ -492,7 +492,7 @@ class FlexKVSchedulerConnector:
                                                         num_unmatched_tokens=num_unmatched_tokens,
                                                         match_start_time=match_start_time,
                                                         match_end_time=match_end_time)
-            logger.debug(f"FlexKV create put task: {self.tasks_to_cancel[task_id]}")
+            # logger.debug(f"FlexKV create put task: {self.tasks_to_cancel[task_id]}")
 
         return task_id, num_matched_tokens, num_unmatched_tokens
 
@@ -547,7 +547,6 @@ class FlexKVSchedulerConnector:
         put_slot_mappings: list[np.ndarray] = []
 
         for task_id, task in self.tasks_to_launch.items():
-            logger.info(f"FlexKV Launch task: {task}")
             task.task_launch_time = task_launch_time
             if isinstance(task, FlexKVGetTask):
                 get_task_ids.append(task_id)
@@ -576,7 +575,7 @@ class FlexKVSchedulerConnector:
         """
         if len(self.req_id_to_task_dict) == 0:
             return set(), set()
-        logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
+        # logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
         task_ids = list(self.get_tasks.keys()) + list(self.put_tasks.keys())
         responses_from_manager = self.flexkv_manager.try_wait(task_ids)
         task_finished_time = time.perf_counter()
@@ -594,9 +593,7 @@ class FlexKVSchedulerConnector:
                 finished_sending.add(task.request.request_id)
             del self.req_id_to_task_dict[task.request.request_id]
             task.task_finished_time = task_finished_time
-            if success:
-                logger.info(f"{task} finished successfully.")
-            else:
+            if not success:
                 logger.error(f"{task} failed, status: {response.status}.")
                 num_failed_tasks += 1
                 if isinstance(task, FlexKVGetTask):
@@ -650,9 +647,7 @@ class FlexKVSchedulerConnector:
             success = (response.status == KVResponseStatus.SUCCESS)
             task = task_dict.pop(task_id)
             task.task_finished_time = task_finished_time
-            if success:
-                logger.info(f"{task} finished successfully.")
-            else:
+            if not success:
                 logger.error(f"{task} failed, status: {response.status}.")
             responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
                                                       request=task.request, success=success))
