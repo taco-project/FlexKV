@@ -378,9 +378,20 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.ans_ctx = ANSTransferContext(
                 nvcomp_batch_size, self.chunk_size_in_bytes, data_type, nvcomp_log_level)
             num_cpu_blocks = cpu_kv_layout.num_block
+            # Layout: [num_layers * kv_dim, num_cpu_blocks] — layer-major so H2D read
+            # is already in the right order without transpose
             self.comp_sizes_meta = torch.zeros(
-                num_cpu_blocks, self.num_layers * kv_dim,
+                self.num_layers * kv_dim, num_cpu_blocks,
                 dtype=torch.int64).pin_memory()
+            max_chunks = self.num_layers * kv_dim * num_cpu_blocks
+            # Pre-allocate pinned buffer for D2H comp_sizes output (GPU kernel writes here)
+            self._d2h_comp_sizes_buf = torch.zeros(
+                max_chunks, dtype=torch.int64).pin_memory()
+            # Pre-allocate pinned buffer for H2D comp_sizes input — pinned so C++ can
+            # cudaMemcpyAsync directly from it, eliminating h_comp_sizes double-buffer
+            # and the cudaEventSynchronize host-blocking in the batch loop
+            self._h2d_comp_sizes_buf = torch.zeros(
+                max_chunks, dtype=torch.int64).pin_memory()
             flexkv_logger.info(
                 f"[nvcomp] Enabled: batch_size={nvcomp_batch_size}, "
                 f"chunk_size={self.chunk_size_in_bytes}, "
@@ -455,10 +466,14 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         kv_dim = 1 if self.is_mla else 2
         num_chunks = layer_granularity * kv_dim * num_blocks
 
-        gpu_tensor_ptrs = self.gpu_blocks_ptrs.contiguous().pin_memory()
+        gpu_tensor_ptrs = self.gpu_blocks_ptrs
+
+        col_start = layer_id * kv_dim
+        col_end = (layer_id + layer_granularity) * kv_dim
+        cpu_bids = cpu_block_id_list.cpu()
 
         if transfer_type == TransferType.D2H:
-            comp_sizes_out = torch.zeros(num_chunks, dtype=torch.int64).pin_memory()
+            comp_sizes_out = self._d2h_comp_sizes_buf[:num_chunks]
             ans_compress_and_d2h(
                 self.ans_ctx,
                 gpu_block_id_list,
@@ -478,7 +493,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 self.gpu_block_type_,
                 comp_sizes_out,
             )
-            # comp_sizes_out[0] == -1 means fallback: compression didn't save space
             if comp_sizes_out[0].item() == -1:
                 flexkv_logger.info("[nvcomp] Fallback to uncompressed D2H transfer")
                 transfer_kv_blocks(
@@ -491,31 +505,21 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     layer_id, layer_granularity, self.transfer_sms_d2h,
                     False, self.use_ce_transfer_d2h, self.is_mla, self.gpu_block_type_,
                 )
-                # Mark as uncompressed in metadata (comp_size = chunk_size)
-                col_start = layer_id * kv_dim
-                col_end = (layer_id + layer_granularity) * kv_dim
-                cpu_bids = cpu_block_id_list.cpu()
-                self.comp_sizes_meta[cpu_bids, col_start:col_end] = self.chunk_size_in_bytes
+                self.comp_sizes_meta[col_start:col_end, cpu_bids] = self.chunk_size_in_bytes
                 return
 
-            # Store compressed sizes in per-block metadata
-            # comp_sizes_out: [layer_granularity * kv_dim * num_blocks]
-            # Reshape to [layer_granularity * kv_dim, num_blocks] then transpose
-            comp_2d = comp_sizes_out.reshape(layer_granularity * kv_dim, num_blocks).T
-            col_start = layer_id * kv_dim
-            col_end = (layer_id + layer_granularity) * kv_dim
-            cpu_bids = cpu_block_id_list.cpu()
-            self.comp_sizes_meta[cpu_bids, col_start:col_end] = comp_2d
+            # comp_sizes_out: [layer_granularity * kv_dim * num_blocks] in C order
+            # (layer_gran * kv_dim, num_blocks) — matches meta layout directly
+            comp_2d = comp_sizes_out.reshape(layer_granularity * kv_dim, num_blocks)
+            self.comp_sizes_meta[col_start:col_end, cpu_bids] = comp_2d
 
         elif transfer_type == TransferType.H2D:
-            # Read compressed sizes from metadata
-            col_start = layer_id * kv_dim
-            col_end = (layer_id + layer_granularity) * kv_dim
-            cpu_bids = cpu_block_id_list.cpu()
-            comp_per_block = self.comp_sizes_meta[cpu_bids, col_start:col_end]
+            # meta layout: [num_layers * kv_dim, num_cpu_blocks]
+            # Slicing [col_start:col_end, cpu_bids] gives [layer_gran*kv_dim, num_blocks]
+            # — already the right order, no transpose needed.
+            comp_sizes_tmp = self.comp_sizes_meta[col_start:col_end, cpu_bids].reshape(-1)
 
-            # If all comp_sizes == chunk_size, this data was stored uncompressed
-            if (comp_per_block == self.chunk_size_in_bytes).all():
+            if (comp_sizes_tmp == self.chunk_size_in_bytes).all():
                 transfer_kv_blocks(
                     gpu_block_id_list, gpu_tensor_ptrs,
                     self.gpu_kv_stride_in_bytes, self.gpu_block_stride_in_bytes,
@@ -528,9 +532,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 )
                 return
 
-            # Transpose [num_blocks, layer_granularity * kv_dim] → [layer_gran * kv_dim, num_blocks]
-            # then flatten to [num_chunks]
-            comp_sizes_in = comp_per_block.T.contiguous().reshape(-1).pin_memory()
+            # Copy into pre-allocated pinned buffer so C++ can cudaMemcpyAsync
+            # directly from it — eliminates h_comp_sizes double-buffer and
+            # the per-batch cudaEventSynchronize host-blocking
+            comp_sizes_in = self._h2d_comp_sizes_buf[:num_chunks]
+            comp_sizes_in.copy_(comp_sizes_tmp)
             ans_h2d_and_decompress(
                 self.ans_ctx,
                 gpu_block_id_list,

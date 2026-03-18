@@ -31,13 +31,9 @@ namespace flexkv {
     }                                                                   \
   } while (0)
 
-// ---------------------------------------------------------------------------
-// GPU kernels: direct scatter D2H / gather H2D via PCIe
-// GPU threads read/write CPU pinned memory directly, eliminating intermediate
-// pack/unpack + cudaMemcpy + CPU scatter/gather stages.
-// ---------------------------------------------------------------------------
 
 static const int ANS_KERNEL_BLOCK_SIZE = 128;
+static const int ANS_TRANSFER_SMS = 8;
 
 __global__ void ans_d2h_scatter_kernel(
     const uint8_t* __restrict__ d_comp_staging,
@@ -142,34 +138,10 @@ __global__ void ans_build_ptrs_kernel(
     }
 }
 
-static const int ANS_TRANSFER_SMS = 8;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-static inline void decode_chunk_idx(int flat, int kv_dim, int num_blocks,
-                                     int& layer, int& kv, int& b) {
-    layer = flat / (kv_dim * num_blocks);
-    int rem = flat % (kv_dim * num_blocks);
-    kv = rem / num_blocks;
-    b = rem % num_blocks;
-}
-
-static inline uint8_t* cpu_chunk_addr(
-    void* cpu_ptr, int layer, int start_layer_id, int kv, int64_t cpu_block_id,
-    int64_t layer_stride, int64_t kv_stride, int64_t block_stride)
-{
-    return static_cast<uint8_t*>(cpu_ptr) +
-           static_cast<size_t>(layer + start_layer_id) * layer_stride +
-           static_cast<size_t>(kv) * kv_stride +
-           static_cast<size_t>(cpu_block_id) * block_stride;
-}
 
 // ---------------------------------------------------------------------------
 // Context lifecycle
 // ---------------------------------------------------------------------------
-
 void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
                     size_t max_chunk_size, int data_type, int log_level) {
   ctx->max_num_chunks = max_num_chunks;
@@ -426,8 +398,6 @@ void ans_h2d_and_decompress(
 
   assert(static_cast<size_t>(chunk_size_in_bytes) <= ctx->max_chunk_size);
 
-  size_t grand_total_comp = 0;
-
   nvtxRangePush("ANS:H2D_total");
 
   for (int bi = 0; bi < num_batches; bi++) {
@@ -438,21 +408,18 @@ void ans_h2d_and_decompress(
     if (bi >= 2) {
       // GPU stream wait: previous decompress on this slot must finish before reusing buffers
       ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->scatter_done[cur], 0));
-      // Host sync: ensure previous cudaMemcpyAsync from h_comp_sizes[cur] has finished
-      // reading the pinned buffer before we overwrite it.  compress_done[cur] fires
-      // after upload+build_ptrs+gather on scatter_stream, so memcpy is certainly done.
-      ANS_CUDA_CHECK(cudaEventSynchronize(ctx->compress_done[cur]));
+      // No cudaEventSynchronize needed: h_comp_sizes_in is a pinned read-only buffer
+      // (immutable during this call), so cudaMemcpyAsync reads directly from it
+      // without any CPU-side write/read race on intermediate h_comp_sizes buffers.
     }
 
-    // 1. Upload comp_sizes (on gather stream)
+    // 1. Upload comp_sizes directly from pinned input (on gather stream)
     nvtxRangePush("ANS:H2D:upload_sizes");
     {
       const size_t size_bytes = bsz * sizeof(size_t);
-      for (int i = 0; i < bsz; i++) {
-        ctx->h_comp_sizes[cur][i] = static_cast<size_t>(h_comp_sizes_in[bs + i]);
-        grand_total_comp += ctx->h_comp_sizes[cur][i];
-      }
-      ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_comp_sizes[cur], ctx->h_comp_sizes[cur],
+      static_assert(sizeof(size_t) == sizeof(int64_t), "size_t must be 64-bit");
+      ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_comp_sizes[cur],
+                                      h_comp_sizes_in + bs,
                                       size_bytes, cudaMemcpyHostToDevice,
                                       ctx->scatter_stream));
     }
@@ -510,6 +477,9 @@ void ans_h2d_and_decompress(
   nvtxRangePop(); // H2D_total
 
   if (ctx->log_level >= 1) {
+    size_t grand_total_comp = 0;
+    for (int i = 0; i < total_chunks; i++)
+      grand_total_comp += static_cast<size_t>(h_comp_sizes_in[i]);
     size_t total_uncomp = static_cast<size_t>(total_chunks) * chunk_size_in_bytes;
     printf("[nvcomp] H2D: %d chunks in %d batch(es), %.2f MB compressed -> %.2f MB (ratio %.2fx)\n",
            total_chunks, num_batches,

@@ -9,8 +9,8 @@ Aligned with real FlexKV configuration:
   - Baseline: kernel mode (transfer_sms=8, use_ce_transfer=False)
 
 Usage:
-  FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py
-  FLEXKV_CPU_LAYOUT=LAYERFIRST FLEXKV_ENABLE_NVCOMP=1 python test_nvcomp.py
+  FLEXKV_NVCOMP_BATCH_SIZE=8192 FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py
+  FLEXKV_NVCOMP_BATCH_SIZE=4096 FLEXKV_CPU_LAYOUT=LAYERFIRST FLEXKV_ENABLE_NVCOMP=1 python test_nvcomp.py
   FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_double_buffer_ldg --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
 
 """
@@ -339,11 +339,11 @@ if __name__ == "__main__":
     NUM_LAYERS = 28
     NUM_KV_HEADS = 4
     HEAD_SIZE = 128
-    TOKENS_PER_BLOCK = 16
-    TOTAL_TOKENS = 32768
+    TOKENS_PER_BLOCK = 32
+    TOTAL_TOKENS = 32768 # total blocks = total tokens / 16 tokens_per_block
     NUM_BLOCKS = TOTAL_TOKENS // TOKENS_PER_BLOCK  # 2048
-    # nvcomp total chunks = 28 * 2 * 2048 = 114688
-    # nvcomp total batch = 114688 // 4096 = 28
+    # nvcomp total chunks = 28 * 2 * 2048 = 114688 | [num_blocks, num_layers, 2, tpb, nh, hs]
+    # nvcomp total batch = 114688 // 4096 = 28     | 16 KB * 4096 * 2.6x * 2 = 300MB
 
     passed = test_roundtrip(num_layers=NUM_LAYERS, num_blocks=NUM_BLOCKS,
                             tokens_per_block=TOKENS_PER_BLOCK,
