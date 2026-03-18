@@ -10,6 +10,8 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 - **2026 年 3 月 17 日**：🎉 FlexKV 正式合并进入 [vLLM](https://github.com/vllm-project/vllm) 官方主干（[PR #34328](https://github.com/vllm-project/vllm/pull/34328)）！从 **vLLM v0.17.2** 起，`FlexKVConnectorV1` 已内置，**无需再手动打 patch**。详见 [docs/vllm_adapter/README_zh.md](docs/vllm_adapter/README_zh.md)。
 
+- **2026 年 3 月 3 日**：🎉 FlexKV 正式合并进入 [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo)（[PR #5858](https://github.com/ai-dynamo/dynamo/pull/5858)）！FlexKV 成为 Dynamo 原生支持的 KV Cache Offloading 方案，实现 KV 感知路由与多级缓存卸载联合部署。详见 [docs/dynamo_integration/README_zh.md](docs/dynamo_integration/README_zh.md)。
+
 - **2026 年 1 月 28 日**：集成 [Mooncake Transfer Engine](https://github.com/kvcache-ai/Mooncake)，FlexKV 支持基于 RDMA 的高性能跨节点 [分布式 KVCache 复用](docs/dist_reuse/README_zh.md)。
 
 - **2026 年 1 月**：新增 TensorRT-LLM 支持（[#48](https://github.com/taco-project/FlexKV/pull/48)），vLLM 和 TRT-LLM 均支持 TP16（[#53](https://github.com/taco-project/FlexKV/pull/53)、[#59](https://github.com/taco-project/FlexKV/pull/59)）。
