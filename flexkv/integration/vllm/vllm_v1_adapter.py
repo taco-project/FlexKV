@@ -428,6 +428,9 @@ class FlexKVSchedulerConnector:
         if not (request.is_finished() and request.get_finished_reason() < 2):
             return False
 
+        if os.path.exists('/tmp/flexkv_skip_put'):
+            return False
+
         task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(request=request)
 
         self.flexkv_stats.record_put(num_all_tokens=request.num_tokens,
