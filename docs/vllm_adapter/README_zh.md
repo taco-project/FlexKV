@@ -1,11 +1,22 @@
 # 在 vLLM 中使用 FlexKV
 
+## 🎉 重要更新（2026年3月17日）
+
+**FlexKV 已于 2026 年 3 月 17 日正式合并进入 vLLM 官方主干（PR [#34328](https://github.com/vllm-project/vllm/pull/34328)）。**
+
+从 **vLLM v0.17.2rc0**（commit [`8cb24d3`](https://github.com/vllm-project/vllm/commit/8cb24d3aedb9f431fb15a636a3e11a00262f5991)）起，`FlexKVConnectorV1` 已内置于 vLLM，**无需再手动打 patch**。
+
+> **推荐做法**：直接安装 vLLM >= v0.17.2 正式版（或当前 main 分支），不再需要使用 `examples/vllm_adaption/` 下的 patch 文件。  
+> 旧版 patch 仍保留于 `examples/vllm_adaption/` 目录，供需要使用 vLLM < 0.17.2 的用户参考。
+
+---
+
 ## 当前版本与 Legacy 版本说明
 在 commit [`0290841dce65ae9b036a23d733cf94e47e814934`](https://github.com/taco-project/FlexKV/commit/0290841dce65ae9b036a23d733cf94e47e814934)，我们更新了一个重要功能：
  **FlexKV 从 client-server 模式，变为推理加速引擎（如 vLLM）可直接调用的库函数**，以减少进程间消息传递的开销。
 这一变更引发了较大的 API 调整。因此，请注意：
 
-- **版本 >= `1.0.0`**：应使用 **当前版本 API**，vLLM patch位于 `examples/vllm_adaption/`。
+- **版本 >= `1.0.0`**：应使用 **当前版本 API**。
 - **版本 == `0.1.0`**：仅支持 **Legacy 版本 API**, vLLM patch位于`examples/vllm_adaption_legacy/`。
 
 ---
@@ -14,7 +25,8 @@
 
 ### 适用版本
 - FlexKV >= `1.0.0`
-- vLLM 原则上>= `0.8.5`版本均可参考示例代码进行修改
+- **vLLM >= `0.17.2`（推荐）**：内置 FlexKVConnectorV1，无需打 patch，直接使用
+- vLLM `0.10.1` ~ `0.17.1`：需手动 apply patch，参见[使用旧版 vLLM（需 patch）](#使用旧版-vllm需-patch)
 
 ### 配置
 
@@ -39,23 +51,27 @@ export FLEXKV_CONFIG_PATH="./flexkv_config.yml"
 
 > 注：`flexkv_config.yml`配置仅为简单示例，选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
 
-### 运行
-我们提供了基于 **vLLM 0.10.1.1** 的适配示例：
+### 运行（推荐：vLLM >= 0.17.2，无需 patch）
 
-1. apply patch && installation
+1. 安装 vLLM（>= 0.17.2 正式版，或从官方 main 分支源码安装）
 ```bash
-cd vllm
-git apply FLEXKV_DIR/examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch
-pip install -e . # build and install vllm from source
+pip install vllm>=0.17.2
+# 或从源码安装最新 main 分支：
+# git clone https://github.com/vllm-project/vllm.git && cd vllm && pip install -e .
 ```
 
-2. offline test
+2. 安装 FlexKV
 ```bash
-# VLLM_DIR/examples/offline_inference/prefix_caching_flexkv.py
+pip install flexkv  # 或从源码编译：./build.sh
+```
+
+3. offline test
+```bash
+# 参考 VLLM_DIR/examples/offline_inference/prefix_caching_flexkv.py
 python examples/offline_inference/prefix_caching_flexkv.py
 ```
 
-3. online serving
+4. online serving
 ```bash
 VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
      --tensor-parallel-size 8 \
@@ -70,10 +86,27 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
      --enable-prefix-caching \
      --kv-transfer-config \
         '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}'
-
 ```
 
-## Legacy版本（<= 0.1.0）,目前的版本尽量不要使用
+### 使用旧版 vLLM（需 patch）
+
+如需在 vLLM < 0.17.2 上使用 FlexKV，请手动 apply 对应版本的 patch：
+
+| vLLM 版本 | patch 文件 |
+|---|---|
+| 0.10.1.1 | `examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch` |
+| 0.14.1+ | `examples/vllm_adaption/vllm_up_0_14_1-flexkv-connector.patch` |
+| 0.16.0 | `examples/vllm_adaption/vllm_0_16_0-flexkv-connector.patch` |
+
+```bash
+cd vllm
+git apply FLEXKV_DIR/examples/vllm_adaption/<对应patch文件>
+pip install -e .
+```
+
+---
+
+## Legacy版本（<= 0.1.0），目前的版本尽量不要使用
 
 ### 适用版本
 - FlexKV <= `0.1.0`

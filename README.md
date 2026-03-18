@@ -6,6 +6,19 @@ FlexKV is a distributed KV store and multi-level cache management system develop
 
 FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) file for details.
 
+## Updates
+
+- **Mar 17, 2026**: 🎉 FlexKV has been officially merged into [vLLM](https://github.com/vllm-project/vllm) mainline ([PR #34328](https://github.com/vllm-project/vllm/pull/34328))! Starting from **vLLM v0.17.2**, `FlexKVConnectorV1` is built in — no patch required. See [docs/vllm_adapter/README_en.md](docs/vllm_adapter/README_en.md) for updated usage.
+
+- **Mar 3, 2026**: 🎉 FlexKV has been officially merged into [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) ([PR #5858](https://github.com/ai-dynamo/dynamo/pull/5858))! FlexKV is now a native KV Cache Offloading option in Dynamo, enabling KV-aware routing + multi-level cache offloading in a unified pipeline. See [docs/dynamo_integration/README_en.md](docs/dynamo_integration/README_en.md).
+
+- **Jan 28, 2026**: [Mooncake Transfer Engine](https://github.com/kvcache-ai/Mooncake) integration is now available — FlexKV supports [distributed KVCache reuse](docs/dist_reuse/README_en.md) with high-performance RDMA-based cross-node transfer.
+
+- **Jan 2026**: TensorRT-LLM support added ([#48](https://github.com/taco-project/FlexKV/pull/48)), enabling FlexKV multi-level caching in TRT-LLM inference pipelines. TP16 support for both vLLM and TRT-LLM ([#53](https://github.com/taco-project/FlexKV/pull/53), [#59](https://github.com/taco-project/FlexKV/pull/59)).
+
+- **Dec 2025**: GPU Direct Storage (GDS) support added ([#25](https://github.com/taco-project/FlexKV/pull/25)), enabling direct SSD-to-GPU transfers without CPU involvement.
+
+- **Nov 2025**: FlexKV transitioned from client-server mode to a **directly-callable library** (commit [0290841](https://github.com/taco-project/FlexKV/commit/0290841dce65ae9b036a23d733cf94e47e814934)), eliminating inter-process communication overhead. This is the v1.0.0 API.
 
 ## Main Change for latest version
 ### Feature
