@@ -16,7 +16,7 @@ GPU_MEMORY_UTIL=0.8
 # Default values for FlexKV configuration
 ENABLE_FLEXKV=1
 FLEXKV_CPU_CACHE_GB=64
-FLEXKV_SSD_CACHE_GB=1024
+FLEXKV_SSD_CACHE_GB=0
 FLEXKV_SSD_CACHE_DIR="$CACHE_DIR/flexkv_ssd_cache/"
 FLEXKV_ENABLE_GDS=0
 
@@ -301,7 +301,7 @@ info "vLLM Server process started with PID: $SERVER_PID"
 
 # Wait for server to be ready
 info "Waiting for vLLM Server to be ready (it may take a few minutes)..."
-MAX_WAIT=300  # Maximum wait time: 5 minutes
+MAX_WAIT=600  # Maximum wait time: 10 minutes
 ELAPSED=0
 
 while [ $ELAPSED -lt $MAX_WAIT ]; do

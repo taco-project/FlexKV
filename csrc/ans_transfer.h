@@ -24,7 +24,8 @@ struct ANSTransferContext {
 
     // GPU buffers: compression I/O (sized for max_num_chunks)
     void*    d_comp_temp;
-    uint8_t* d_comp_staging[2];  // double-buffered, strided by max_comp_chunk_bytes
+    uint8_t* d_comp_staging_base; // single contiguous allocation for both slots
+    uint8_t* d_comp_staging[2];   // double-buffered, pointing into d_comp_staging_base
     void**   d_uncomp_ptrs;
     size_t*  d_uncomp_sizes;
     void**   d_comp_ptrs[2];     // double-buffered (point into respective d_comp_staging)

@@ -9,9 +9,18 @@ Aligned with real FlexKV configuration:
   - Baseline: kernel mode (transfer_sms=8, use_ce_transfer=False)
 
 Usage:
-  FLEXKV_NVCOMP_BATCH_SIZE=8192 FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py
-  FLEXKV_NVCOMP_BATCH_SIZE=4096 FLEXKV_CPU_LAYOUT=LAYERFIRST FLEXKV_ENABLE_NVCOMP=1 python test_nvcomp.py
+  FLEXKV_NVCOMP_BATCH_SIZE=-1 FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py
+  FLEXKV_NVCOMP_BATCH_SIZE=4096 FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py # FLEXKV_CPU_LAYOUT=LAYERFIRST
   FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_double_buffer_ldg --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
+  FLEXKV_NVCOMP_BATCH_SIZE=-1 FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_double_buffer_ldg_bsz-1 --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
+
+
+  FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 ncu --kernel-name "regex:ans_d2h_scatter" --launch-skip 30 --launch-count 3 --set full --force-overwrite -o ../.misc/profile/ans_d2h_scatter_kernel python test_nvcomp.py
+  ncu --kernel-name "regex:transfer_kv_blocks" \
+    --launch-skip 3 --launch-count 3 \
+    --set full --force-overwrite \
+    -o ../.misc/profile/transfer_kv_blocks_kernel \
+    python test_nvcomp.py
 
 """
 
@@ -43,15 +52,16 @@ def make_kv_cache(num_layers, num_blocks, tokens_per_block, num_heads, head_size
     """Create GPU (LAYERFIRST) and CPU KV cache tensors.
 
     GPU: list of per-layer tensors, each [2, num_blocks, tpb, nh, hs]
+         Allocated as a single contiguous tensor (like vllm's KV cache pool)
+         to avoid HBM partition imbalance from scattered allocations.
     CPU shape depends on CPU_LAYOUT:
       BLOCKFIRST: [num_blocks, num_layers, 2, tpb, nh, hs]
       LAYERFIRST: [num_layers, 2, num_blocks, tpb, nh, hs]
     """
     shape_per_layer = (2, num_blocks, tokens_per_block, num_heads, head_size)
-    gpu_blocks = [
-        torch.randn(shape_per_layer, dtype=dtype, device=device)
-        for _ in range(num_layers)
-    ]
+    gpu_cache = torch.randn(
+        (num_layers,) + shape_per_layer, dtype=dtype, device=device)
+    gpu_blocks = [gpu_cache[i] for i in range(num_layers)]
     if CPU_LAYOUT == "BLOCKFIRST":
         cpu_shape = (num_blocks, num_layers, 2, tokens_per_block, num_heads, head_size)
     else:
@@ -106,6 +116,7 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
         return True
 
     device = "cuda:0"
+    transfer_stream = torch.cuda.Stream()
     print(f"\n{'='*60}")
     print(f"Roundtrip test: layers={num_layers}, blocks={num_blocks}, "
           f"tpb={tokens_per_block}, heads={num_heads}, head_size={head_size}, dtype={dtype}")
@@ -125,7 +136,6 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
 
     kv_dim = 2
     num_chunks = num_layers * kv_dim * num_blocks
-    # TODO
     log_level = int(os.environ.get("FLEXKV_NVCOMP_LOG_LEVEL", "1"))
 
     original_data = [block.clone() for block in gpu_blocks]
@@ -142,18 +152,19 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
 
     torch.cuda.synchronize()
     t0 = time.time()
-    ans_compress_and_d2h(
-        ctx,
-        gpu_block_ids, gpu_ptrs,
-        gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
-        cpu_block_ids, cpu_blocks,
-        cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
-        chunk_size,
-        0, num_layers,
-        False, 0,
-        comp_sizes_out,
-    )
-    torch.cuda.synchronize()
+    with torch.cuda.stream(transfer_stream):
+        ans_compress_and_d2h(
+            ctx,
+            gpu_block_ids, gpu_ptrs,
+            gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
+            cpu_block_ids, cpu_blocks,
+            cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
+            chunk_size,
+            0, num_layers,
+            False, 0,
+            comp_sizes_out,
+        )
+    transfer_stream.synchronize()
     t1 = time.time()
 
     if comp_sizes_out[0].item() == -1:
@@ -168,25 +179,39 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
     print(f"  Compressed:   {total_comp / 1024 / 1024:.2f} MB")
     print(f"  Ratio:        {total_uncomp / total_comp:.2f}x")
 
+    # Per-chunk compression stats
+    chunk_ratios = chunk_size / comp_sizes_out.float()
+    print(f"\n  Per-chunk compression ratio stats (n={num_chunks}):")
+    print(f"    min={chunk_ratios.min().item():.3f}x  max={chunk_ratios.max().item():.3f}x  "
+          f"mean={chunk_ratios.mean().item():.3f}x  std={chunk_ratios.std().item():.4f}")
+    # Per-layer breakdown: chunks are ordered [layer0_kv0_block0..N, layer0_kv1_block0..N, layer1_kv0_block0..N, ...]
+    chunk_ratios_2d = chunk_ratios.reshape(num_layers, kv_dim * num_blocks)
+    print(f"    Per-layer mean ratio (across kv*blocks):")
+    # for li in range(num_layers):
+    #     lr = chunk_ratios_2d[li]
+    #     print(f"      layer {li:2d}: {lr.mean().item():.3f}x  "
+    #           f"(min={lr.min().item():.3f}x, max={lr.max().item():.3f}x, std={lr.std().item():.4f})")
+
     for block in gpu_blocks:
         block.zero_()
+    torch.cuda.synchronize()
 
     # --- H2D ---
     print("\n--- H2D (gather + transfer + unpack + decompress) ---")
-    torch.cuda.synchronize()
     t2 = time.time()
-    ans_h2d_and_decompress(
-        ctx,
-        gpu_block_ids, gpu_ptrs,
-        gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
-        cpu_block_ids, cpu_blocks,
-        cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
-        chunk_size,
-        0, num_layers,
-        False, 0,
-        comp_sizes_out,
-    )
-    torch.cuda.synchronize()
+    with torch.cuda.stream(transfer_stream):
+        ans_h2d_and_decompress(
+            ctx,
+            gpu_block_ids, gpu_ptrs,
+            gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
+            cpu_block_ids, cpu_blocks,
+            cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
+            chunk_size,
+            0, num_layers,
+            False, 0,
+            comp_sizes_out,
+        )
+    transfer_stream.synchronize()
     t3 = time.time()
     print(f"  H2D time: {(t3-t2)*1000:.2f} ms")
 
@@ -214,6 +239,7 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
                              num_warmup=3, num_iters=10):
     """Compare baseline (kernel mode) vs nvcomp."""
     device = "cuda:0"
+    transfer_stream = torch.cuda.Stream()
     print(f"\n{'='*60}")
     print(f"Baseline comparison: layers={num_layers}, blocks={num_blocks}, "
           f"batch_size={BATCH_SIZE}")
@@ -242,31 +268,32 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
     print(f"\n  Baseline (kernel mode, sms={TRANSFER_SMS}, no compression):")
 
     def run_baseline(is_h2d):
-        transfer_kv_blocks(
-            gpu_block_ids, gpu_ptrs,
-            gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
-            cpu_block_ids, cpu_blocks,
-            cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
-            chunk_size, 0, num_layers,
-            TRANSFER_SMS, is_h2d, False, False, 0)
+        with torch.cuda.stream(transfer_stream):
+            transfer_kv_blocks(
+                gpu_block_ids, gpu_ptrs,
+                gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
+                cpu_block_ids, cpu_blocks,
+                cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
+                chunk_size, 0, num_layers,
+                TRANSFER_SMS, is_h2d, False, False, 0)
 
     for _ in range(num_warmup):
         run_baseline(is_h2d=False)
-    torch.cuda.synchronize()
+    transfer_stream.synchronize()
     t0 = time.time()
     for _ in range(num_iters):
         run_baseline(is_h2d=False)
-    torch.cuda.synchronize()
+    transfer_stream.synchronize()
     t1 = time.time()
     baseline_d2h_ms = (t1 - t0) / num_iters * 1000
 
     for _ in range(num_warmup):
         run_baseline(is_h2d=True)
-    torch.cuda.synchronize()
+    transfer_stream.synchronize()
     t2 = time.time()
     for _ in range(num_iters):
         run_baseline(is_h2d=True)
-    torch.cuda.synchronize()
+    transfer_stream.synchronize()
     t3 = time.time()
     baseline_h2d_ms = (t3 - t2) / num_iters * 1000
 
@@ -285,38 +312,40 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
     comp_sizes = torch.zeros(num_chunks, dtype=torch.int64).pin_memory()
 
     def run_nvcomp_d2h():
-        ans_compress_and_d2h(
-            ctx, gpu_block_ids, gpu_ptrs,
-            gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
-            cpu_block_ids, cpu_blocks,
-            cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
-            chunk_size, 0, num_layers, False, 0, comp_sizes)
+        with torch.cuda.stream(transfer_stream):
+            ans_compress_and_d2h(
+                ctx, gpu_block_ids, gpu_ptrs,
+                gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
+                cpu_block_ids, cpu_blocks,
+                cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
+                chunk_size, 0, num_layers, False, 0, comp_sizes)
 
     def run_nvcomp_h2d():
-        ans_h2d_and_decompress(
-            ctx, gpu_block_ids, gpu_ptrs,
-            gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
-            cpu_block_ids, cpu_blocks,
-            cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
-            chunk_size, 0, num_layers, False, 0, comp_sizes)
+        with torch.cuda.stream(transfer_stream):
+            ans_h2d_and_decompress(
+                ctx, gpu_block_ids, gpu_ptrs,
+                gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
+                cpu_block_ids, cpu_blocks,
+                cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
+                chunk_size, 0, num_layers, False, 0, comp_sizes)
 
     for _ in range(num_warmup):
         run_nvcomp_d2h()
-    torch.cuda.synchronize()
+    transfer_stream.synchronize()
     t0 = time.time()
     for _ in range(num_iters):
         run_nvcomp_d2h()
-    torch.cuda.synchronize()
+    transfer_stream.synchronize()
     t1 = time.time()
     nvcomp_d2h_ms = (t1 - t0) / num_iters * 1000
 
     for _ in range(num_warmup):
         run_nvcomp_h2d()
-    torch.cuda.synchronize()
+    transfer_stream.synchronize()
     t2 = time.time()
     for _ in range(num_iters):
         run_nvcomp_h2d()
-    torch.cuda.synchronize()
+    transfer_stream.synchronize()
     t3 = time.time()
     nvcomp_h2d_ms = (t3 - t2) / num_iters * 1000
 
@@ -324,6 +353,17 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
     print(f"    Compression ratio: {total_bytes / total_comp:.2f}x")
     print(f"    D2H: {nvcomp_d2h_ms:.2f} ms  (speedup {baseline_d2h_ms / nvcomp_d2h_ms:.2f}x)")
     print(f"    H2D: {nvcomp_h2d_ms:.2f} ms  (speedup {baseline_h2d_ms / nvcomp_h2d_ms:.2f}x)")
+
+    chunk_ratios = chunk_size / comp_sizes.float()
+    print(f"\n    Per-chunk compression ratio stats (n={num_chunks}):")
+    print(f"      min={chunk_ratios.min().item():.3f}x  max={chunk_ratios.max().item():.3f}x  "
+          f"mean={chunk_ratios.mean().item():.3f}x  std={chunk_ratios.std().item():.4f}")
+    chunk_ratios_2d = chunk_ratios.reshape(num_layers, kv_dim * num_blocks)
+    # print(f"      Per-layer mean ratio (across kv*blocks):")
+    # for li in range(num_layers):
+    #     lr = chunk_ratios_2d[li]
+    #     print(f"        layer {li:2d}: {lr.mean().item():.3f}x  "
+    #           f"(min={lr.min().item():.3f}x, max={lr.max().item():.3f}x, std={lr.std().item():.4f})")
 
     ctx.destroy()
 
@@ -339,12 +379,14 @@ if __name__ == "__main__":
     NUM_LAYERS = 28
     NUM_KV_HEADS = 4
     HEAD_SIZE = 128
-    TOKENS_PER_BLOCK = 32
+    TOKENS_PER_BLOCK = 16
     TOTAL_TOKENS = 32768 # total blocks = total tokens / 16 tokens_per_block
     NUM_BLOCKS = TOTAL_TOKENS // TOKENS_PER_BLOCK  # 2048
-    # nvcomp total chunks = 28 * 2 * 2048 = 114688 | [num_blocks, num_layers, 2, tpb, nh, hs]
+    # nvcomp total chunks = 28 * 2 * 2048 = 114,688 | [num_blocks, num_layers, 2, tpb, nh, hs]
     # nvcomp total batch = 114688 // 4096 = 28     | 16 KB * 4096 * 2.6x * 2 = 300MB
 
+    if BATCH_SIZE == -1:
+        BATCH_SIZE = NUM_LAYERS * 2 * NUM_BLOCKS
     passed = test_roundtrip(num_layers=NUM_LAYERS, num_blocks=NUM_BLOCKS,
                             tokens_per_block=TOKENS_PER_BLOCK,
                             num_heads=NUM_KV_HEADS, head_size=HEAD_SIZE)

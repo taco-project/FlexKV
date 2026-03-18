@@ -173,8 +173,11 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
 
   // GPU compression buffers (double-buffered where needed for D2H pipeline)
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_temp,       ctx->comp_temp_bytes));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_staging[0], comp_staging_total));
-  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_staging[1], comp_staging_total));
+  // Single contiguous allocation for both staging slots to ensure symmetric
+  // GPU memory partition mapping, avoiding bandwidth asymmetry between slots.
+  ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_staging_base, 2 * comp_staging_total));
+  ctx->d_comp_staging[0] = ctx->d_comp_staging_base;
+  ctx->d_comp_staging[1] = ctx->d_comp_staging_base + comp_staging_total;
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_uncomp_ptrs,     ptr_bytes));
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_uncomp_sizes,    size_bytes));
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_ptrs[0],    ptr_bytes));
@@ -244,17 +247,19 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
                        max_num_chunks * sizeof(nvcompStatus_t);
     size_t total_host = size_bytes;
     printf("[nvcomp] ANSTransferContext created: max_chunks=%zu, chunk_size=%zu, "
-           "max_comp_chunk=%zu, extra_gpu=%.2f MB, extra_host=%.2f MB\n",
+           "max_comp_chunk=%zu, extra_gpu=%.2f MB, extra_host=%.2f MB, "
+           "scatter_grid=%d, gather_grid=%d\n",
            max_num_chunks, max_chunk_size, ctx->max_comp_chunk_bytes,
            total_gpu / (1024.0 * 1024.0),
-           total_host / (1024.0 * 1024.0));
+           total_host / (1024.0 * 1024.0),
+           ctx->scatter_grid, ctx->gather_grid);
   }
 }
 
 void ans_ctx_destroy(ANSTransferContext* ctx) {
   cudaFree(ctx->d_comp_temp);
+  cudaFree(ctx->d_comp_staging_base);
   for (int i = 0; i < 2; i++) {
-    cudaFree(ctx->d_comp_staging[i]);
     cudaFree(ctx->d_comp_ptrs[i]);
     cudaFree(ctx->d_comp_sizes[i]);
     cudaEventDestroy(ctx->compress_done[i]);
