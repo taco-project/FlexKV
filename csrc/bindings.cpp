@@ -537,14 +537,16 @@ PYBIND11_MODULE(c_ext, m) {
 #ifdef FLEXKV_ENABLE_NVCOMP
   py::class_<flexkv::ANSTransferContext>(m, "ANSTransferContext")
       .def(py::init([](size_t max_num_chunks, size_t max_chunk_size,
-                       int data_type, int log_level) {
+                       int data_type, int log_level,
+                       int pipeline_batch_size) {
         auto* ctx = new flexkv::ANSTransferContext();
         flexkv::ans_ctx_create(ctx, max_num_chunks, max_chunk_size,
-                               data_type, log_level);
+                               data_type, log_level, pipeline_batch_size);
         return ctx;
       }),
       py::arg("max_num_chunks"), py::arg("max_chunk_size"),
-      py::arg("data_type") = 0, py::arg("log_level") = 0)
+      py::arg("data_type") = 0, py::arg("log_level") = 0,
+      py::arg("pipeline_batch_size") = 0)
       .def("destroy", [](flexkv::ANSTransferContext& ctx) {
         flexkv::ans_ctx_destroy(&ctx);
       })

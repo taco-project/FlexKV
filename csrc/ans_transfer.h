@@ -56,11 +56,14 @@ struct ANSTransferContext {
     int scatter_grid;   // grid size for scatter/gather kernels
     int gather_grid;
 
+    int pipeline_batch_size;  // chunks per pipeline stage (≤ max_num_chunks)
+
     int log_level;
 };
 
 void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
-                    size_t max_chunk_size, int data_type, int log_level);
+                    size_t max_chunk_size, int data_type, int log_level,
+                    int pipeline_batch_size = 0);
 
 void ans_ctx_destroy(ANSTransferContext* ctx);
 

@@ -9,11 +9,9 @@ Aligned with real FlexKV configuration:
   - Baseline: kernel mode (transfer_sms=8, use_ce_transfer=False)
 
 Usage:
-  FLEXKV_NVCOMP_BATCH_SIZE=-1 FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py
-  FLEXKV_NVCOMP_BATCH_SIZE=4096 FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py # FLEXKV_CPU_LAYOUT=LAYERFIRST
+  FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py
+  FLEXKV_NVCOMP_BATCH_SIZE=4096 ...
   FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_double_buffer_ldg --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
-  FLEXKV_NVCOMP_BATCH_SIZE=-1 FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_double_buffer_ldg_bsz-1 --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
-
 
   FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 ncu --kernel-name "regex:ans_d2h_scatter" --launch-skip 30 --launch-count 3 --set full --force-overwrite -o ../.misc/profile/ans_d2h_scatter_kernel python test_nvcomp.py
   ncu --kernel-name "regex:transfer_kv_blocks" \
@@ -40,7 +38,7 @@ except ImportError:
     NVCOMP_AVAILABLE = False
     print("WARNING: nvcomp not available. Build with FLEXKV_ENABLE_NVCOMP=1")
 
-BATCH_SIZE = int(os.environ.get("FLEXKV_NVCOMP_BATCH_SIZE", "4096"))
+BATCH_SIZE = int(os.environ.get("FLEXKV_NVCOMP_BATCH_SIZE", "0"))
 TRANSFER_SMS = int(os.environ.get("FLEXKV_TRANSFER_SMS", "8"))
 CPU_LAYOUT = os.environ.get("FLEXKV_CPU_LAYOUT", "BLOCKFIRST").upper()
 assert CPU_LAYOUT in ("BLOCKFIRST", "LAYERFIRST"), \
@@ -120,7 +118,6 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
     print(f"\n{'='*60}")
     print(f"Roundtrip test: layers={num_layers}, blocks={num_blocks}, "
           f"tpb={tokens_per_block}, heads={num_heads}, head_size={head_size}, dtype={dtype}")
-    print(f"  ANS batch_size={BATCH_SIZE}, CPU layout={CPU_LAYOUT}")
     print(f"{'='*60}")
 
     gpu_blocks, cpu_blocks = make_kv_cache(
@@ -143,7 +140,7 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
     ctx = ANSTransferContext(BATCH_SIZE, chunk_size, 0, log_level)
     print(f"  ANS context: max_chunks={ctx.max_num_chunks}, "
           f"chunk_size={ctx.max_chunk_size}, max_comp_chunk={ctx.max_comp_chunk_bytes}")
-    num_batches = (num_chunks + BATCH_SIZE - 1) // BATCH_SIZE
+    num_batches = (num_chunks + ctx.max_num_chunks - 1) // ctx.max_num_chunks
     print(f"  Total chunks={num_chunks}, will use {num_batches} batch(es)")
 
     # --- D2H ---
@@ -179,14 +176,14 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
     print(f"  Compressed:   {total_comp / 1024 / 1024:.2f} MB")
     print(f"  Ratio:        {total_uncomp / total_comp:.2f}x")
 
-    # Per-chunk compression stats
-    chunk_ratios = chunk_size / comp_sizes_out.float()
-    print(f"\n  Per-chunk compression ratio stats (n={num_chunks}):")
-    print(f"    min={chunk_ratios.min().item():.3f}x  max={chunk_ratios.max().item():.3f}x  "
-          f"mean={chunk_ratios.mean().item():.3f}x  std={chunk_ratios.std().item():.4f}")
-    # Per-layer breakdown: chunks are ordered [layer0_kv0_block0..N, layer0_kv1_block0..N, layer1_kv0_block0..N, ...]
-    chunk_ratios_2d = chunk_ratios.reshape(num_layers, kv_dim * num_blocks)
-    print(f"    Per-layer mean ratio (across kv*blocks):")
+    # # Per-chunk compression stats
+    # chunk_ratios = chunk_size / comp_sizes_out.float()
+    # print(f"\n  Per-chunk compression ratio stats (n={num_chunks}):")
+    # print(f"    min={chunk_ratios.min().item():.3f}x  max={chunk_ratios.max().item():.3f}x  "
+    #       f"mean={chunk_ratios.mean().item():.3f}x  std={chunk_ratios.std().item():.4f}")
+    # # Per-layer breakdown: chunks are ordered [layer0_kv0_block0..N, layer0_kv1_block0..N, layer1_kv0_block0..N, ...]
+    # chunk_ratios_2d = chunk_ratios.reshape(num_layers, kv_dim * num_blocks)
+    # print(f"    Per-layer mean ratio (across kv*blocks):")
     # for li in range(num_layers):
     #     lr = chunk_ratios_2d[li]
     #     print(f"      layer {li:2d}: {lr.mean().item():.3f}x  "
@@ -241,8 +238,7 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
     device = "cuda:0"
     transfer_stream = torch.cuda.Stream()
     print(f"\n{'='*60}")
-    print(f"Baseline comparison: layers={num_layers}, blocks={num_blocks}, "
-          f"batch_size={BATCH_SIZE}")
+    print(f"Baseline comparison: layers={num_layers}, blocks={num_blocks}")
     print(f"  CPU layout={CPU_LAYOUT}, baseline: kernel mode (transfer_sms={TRANSFER_SMS})")
     print(f"{'='*60}")
 
@@ -261,8 +257,7 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
     total_bytes = num_chunks * chunk_size
 
     print(f"\n  Total data per direction: {total_bytes / 1024 / 1024:.2f} MB")
-    num_batches = (num_chunks + BATCH_SIZE - 1) // BATCH_SIZE
-    print(f"  Total chunks={num_chunks}, nvcomp batches={num_batches}")
+    print(f"  Total chunks={num_chunks}")
 
     # --- Baseline: kernel mode (use_ce_transfer=False, transfer_sms=TRANSFER_SMS) ---
     print(f"\n  Baseline (kernel mode, sms={TRANSFER_SMS}, no compression):")
@@ -307,9 +302,12 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
         return
 
     # --- nvcomp ---
-    print(f"\n  nvcomp ANS (batch_size={BATCH_SIZE}):")
     ctx = ANSTransferContext(BATCH_SIZE, chunk_size, 0, 0)
     comp_sizes = torch.zeros(num_chunks, dtype=torch.int64).pin_memory()
+
+    num_batches = (num_chunks + ctx.max_num_chunks - 1) // ctx.max_num_chunks
+    print(f"  Total chunks={num_chunks}, nvcomp batches={num_batches}")
+
 
     def run_nvcomp_d2h():
         with torch.cuda.stream(transfer_stream):
@@ -354,11 +352,11 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
     print(f"    D2H: {nvcomp_d2h_ms:.2f} ms  (speedup {baseline_d2h_ms / nvcomp_d2h_ms:.2f}x)")
     print(f"    H2D: {nvcomp_h2d_ms:.2f} ms  (speedup {baseline_h2d_ms / nvcomp_h2d_ms:.2f}x)")
 
-    chunk_ratios = chunk_size / comp_sizes.float()
-    print(f"\n    Per-chunk compression ratio stats (n={num_chunks}):")
-    print(f"      min={chunk_ratios.min().item():.3f}x  max={chunk_ratios.max().item():.3f}x  "
-          f"mean={chunk_ratios.mean().item():.3f}x  std={chunk_ratios.std().item():.4f}")
-    chunk_ratios_2d = chunk_ratios.reshape(num_layers, kv_dim * num_blocks)
+    # chunk_ratios = chunk_size / comp_sizes.float()
+    # print(f"\n    Per-chunk compression ratio stats (n={num_chunks}):")
+    # print(f"      min={chunk_ratios.min().item():.3f}x  max={chunk_ratios.max().item():.3f}x  "
+    #       f"mean={chunk_ratios.mean().item():.3f}x  std={chunk_ratios.std().item():.4f}")
+    # chunk_ratios_2d = chunk_ratios.reshape(num_layers, kv_dim * num_blocks)
     # print(f"      Per-layer mean ratio (across kv*blocks):")
     # for li in range(num_layers):
     #     lr = chunk_ratios_2d[li]
@@ -385,8 +383,6 @@ if __name__ == "__main__":
     # nvcomp total chunks = 28 * 2 * 2048 = 114,688 | [num_blocks, num_layers, 2, tpb, nh, hs]
     # nvcomp total batch = 114688 // 4096 = 28     | 16 KB * 4096 * 2.6x * 2 = 300MB
 
-    if BATCH_SIZE == -1:
-        BATCH_SIZE = NUM_LAYERS * 2 * NUM_BLOCKS
     passed = test_roundtrip(num_layers=NUM_LAYERS, num_blocks=NUM_BLOCKS,
                             tokens_per_block=TOKENS_PER_BLOCK,
                             num_heads=NUM_KV_HEADS, head_size=HEAD_SIZE)

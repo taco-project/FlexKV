@@ -233,6 +233,23 @@ class TransferWorkerBase(ABC):
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         pass
 
+    def _run_batch(self, batch_ops: list) -> None:
+        """Process a batch of transfer ops. Subclasses may override to add batch-level context (e.g. nvcomp stream)."""
+        for op in batch_ops:
+            transfer_status = False
+            try:
+                nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
+                                    f"graph_id: {op.transfer_graph_id}, "
+                                    f"num_blocks: {op.valid_block_num}",
+                                    color=get_nvtx_range_color(op.transfer_graph_id))
+                transfer_status = self.launch_transfer(op)
+                nvtx.pop_range()
+            except Exception as e:
+                flexkv_logger.error(f"Error launching transfer: {e}\n"
+                            f"Failed transfer op: {op}")
+            if transfer_status:
+                self.finished_ops_queue.put(op.transfer_op_id)
+
     def run(self) -> None:
         """main loop for worker process"""
         while True:
@@ -253,21 +270,7 @@ class TransferWorkerBase(ABC):
                         if op is None:
                             break
                         batch_ops.append(op)
-                    for op in batch_ops:
-                        transfer_status = False
-                        try:
-                            nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
-                                                f"graph_id: {op.transfer_graph_id}, "
-                                                f"num_blocks: {op.valid_block_num}",
-                                                color=get_nvtx_range_color(op.transfer_graph_id))
-                            transfer_status = self.launch_transfer(op)
-                            nvtx.pop_range()
-                        except Exception as e:
-                            flexkv_logger.error(f"Error launching transfer: {e}\n"
-                                        f"Failed transfer op: {op}")
-                        if transfer_status:
-                            ## only put the op when transfer success
-                            self.finished_ops_queue.put(op.transfer_op_id)
+                    self._run_batch(batch_ops)
                 else:
                     continue
             except EOFError:
@@ -372,11 +375,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         )
         if self.enable_nvcomp:
             nvcomp_log_level = int(os.environ.get("FLEXKV_NVCOMP_LOG_LEVEL", "0"))
-            nvcomp_batch_size = int(os.environ.get("FLEXKV_NVCOMP_BATCH_SIZE", "4096"))
+            nvcomp_batch_size = int(os.environ.get("FLEXKV_NVCOMP_BATCH_SIZE", "0"))
             kv_dim = 1 if self.is_mla else 2
             data_type = 0  # FLOAT16 for bf16/fp16
             self.ans_ctx = ANSTransferContext(
                 nvcomp_batch_size, self.chunk_size_in_bytes, data_type, nvcomp_log_level)
+            nvcomp_batch_size = self.ans_ctx.max_num_chunks
+            
             num_cpu_blocks = cpu_kv_layout.num_block
             # Layout: [num_layers * kv_dim, num_cpu_blocks] — layer-major so H2D read
             # is already in the right order without transpose
@@ -396,6 +401,14 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 f"[nvcomp] Enabled: batch_size={nvcomp_batch_size}, "
                 f"chunk_size={self.chunk_size_in_bytes}, "
                 f"meta_size={self.comp_sizes_meta.numel() * 8 / 1024 / 1024:.2f} MB")
+
+    def _run_batch(self, batch_ops: list) -> None:
+        # nvcomp: one stream for whole batch (saves ~93µs per op)
+        if self.enable_nvcomp:
+            with torch.cuda.stream(self.transfer_stream):
+                super()._run_batch(batch_ops)
+        else:
+            super()._run_batch(batch_ops)
 
     def _transfer_impl(
         self,
@@ -517,26 +530,43 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             # meta layout: [num_layers * kv_dim, num_cpu_blocks]
             # Slicing [col_start:col_end, cpu_bids] gives [layer_gran*kv_dim, num_blocks]
             # — already the right order, no transpose needed.
-            comp_sizes_tmp = self.comp_sizes_meta[col_start:col_end, cpu_bids].reshape(-1)
+            _r_meta = nvtx.start_range(message="H2D_nvcomp:meta_slice", color="orange")
+            # Fast path 1: contiguous [0, 1, ..., num_blocks-1] → contiguous slice (no gather)
+            if torch.equal(cpu_bids, torch.arange(num_blocks, device=cpu_bids.device, dtype=cpu_bids.dtype)):
+                comp_sizes_tmp = self.comp_sizes_meta[col_start:col_end, :num_blocks].reshape(-1)
+            # Fast path 2: contiguous [a, a+1, ..., a+num_blocks-1] → contiguous slice (no gather)
+            elif num_blocks >= 2 and (cpu_bids[1:] - cpu_bids[:-1] == 1).all():
+                start_col = int(cpu_bids[0].item())
+                comp_sizes_tmp = self.comp_sizes_meta[col_start:col_end, start_col : start_col + num_blocks].reshape(-1)
+            else:
+                comp_sizes_tmp = self.comp_sizes_meta[col_start:col_end, cpu_bids].reshape(-1)
+            nvtx.end_range(_r_meta)
 
-            if (comp_sizes_tmp == self.chunk_size_in_bytes).all():
-                transfer_kv_blocks(
-                    gpu_block_id_list, gpu_tensor_ptrs,
-                    self.gpu_kv_stride_in_bytes, self.gpu_block_stride_in_bytes,
-                    self.gpu_layer_stride_in_bytes,
-                    cpu_block_id_list, self.cpu_tensor,
-                    self.cpu_kv_stride_in_bytes, self.cpu_layer_stride_in_bytes,
-                    self.cpu_block_stride_in_bytes, self.chunk_size_in_bytes,
-                    layer_id, layer_granularity, self.transfer_sms_h2d,
-                    True, self.use_ce_transfer_h2d, self.is_mla, self.gpu_block_type_,
-                )
-                return
+
+            # TODO: now assume CR > 1.0
+            # # All uncompressed? (max/min check avoids allocating a boolean tensor from .all())
+            # chunk_sz = self.chunk_size_in_bytes
+            # if comp_sizes_tmp.max().item() == chunk_sz and comp_sizes_tmp.min().item() == chunk_sz:
+            #     transfer_kv_blocks(
+            #         gpu_block_id_list, gpu_tensor_ptrs,
+            #         self.gpu_kv_stride_in_bytes, self.gpu_block_stride_in_bytes,
+            #         self.gpu_layer_stride_in_bytes,
+            #         cpu_block_id_list, self.cpu_tensor,
+            #         self.cpu_kv_stride_in_bytes, self.cpu_layer_stride_in_bytes,
+            #         self.cpu_block_stride_in_bytes, self.chunk_size_in_bytes,
+            #         layer_id, layer_granularity, self.transfer_sms_h2d,
+            #         True, self.use_ce_transfer_h2d, self.is_mla, self.gpu_block_type_,
+            #     )
+            #     return
 
             # Copy into pre-allocated pinned buffer so C++ can cudaMemcpyAsync
             # directly from it — eliminates h_comp_sizes double-buffer and
             # the per-batch cudaEventSynchronize host-blocking
             comp_sizes_in = self._h2d_comp_sizes_buf[:num_chunks]
+            _r_copy = nvtx.start_range(message="H2D_nvcomp:copy_comp_sizes", color="orange")
             comp_sizes_in.copy_(comp_sizes_tmp)
+            nvtx.end_range(_r_copy)
+            _r_ans = nvtx.start_range(message="H2D_nvcomp:ans_h2d_and_decompress_call", color="orange")
             ans_h2d_and_decompress(
                 self.ans_ctx,
                 gpu_block_id_list,
@@ -556,23 +586,29 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 self.gpu_block_type_,
                 comp_sizes_in,
             )
+            nvtx.end_range(_r_ans)
         nvtx.end_range(nvtx_range)
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         nvtx_range = nvtx.start_range(
             message=f"GPUCPUWorker.launch_transfer[{transfer_op.transfer_op_id}]",
             color="purple")
+        _r_setup = nvtx.start_range(message="H2D_launch:setup", color="orange")
         layer_id = transfer_op.layer_id
         layer_granularity = transfer_op.layer_granularity
         if layer_id == -1:
             layer_id = 0
         if layer_granularity == -1:
             layer_granularity = self.num_layers
+        nvtx.end_range(_r_setup)
 
+        _r_get_ids = nvtx.start_range(message="H2D_launch:get_transfer_block_ids", color="orange")
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+        nvtx.end_range(_r_get_ids)
 
-        with torch.cuda.stream(self.transfer_stream):
+        def _do_transfer():
             start_time = time.time()
+            _r_impl = nvtx.start_range(message="H2D_launch:transfer_impl", color="orange")
             self._transfer_impl(
                 src_block_ids,
                 dst_block_ids,
@@ -580,17 +616,23 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 layer_id,
                 layer_granularity,
             )
+            nvtx.end_range(_r_impl)
             end_time = time.time()
-
             kv_dim = 2 if not self.is_mla else 1
             transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
-
             self._log_transfer_performance(
                 transfer_op,
                 transfer_size,
                 start_time,
                 end_time,
             )
+
+        if self.enable_nvcomp:
+            # Stream already set in run() for the whole batch
+            _do_transfer()
+        else:
+            with torch.cuda.stream(self.transfer_stream):
+                _do_transfer()
         nvtx.end_range(nvtx_range)
 
         return True

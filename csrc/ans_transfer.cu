@@ -140,10 +140,97 @@ __global__ void ans_build_ptrs_kernel(
 
 
 // ---------------------------------------------------------------------------
+// Auto-tune pipeline_batch_size for minimal SM occupancy
+// ---------------------------------------------------------------------------
+
+// Replicate nvcomp's get_sub_chunking_config (pure arithmetic + device attrs).
+// Returns num_ctas_per_chunk for a given (chunk_size, batch_size, device).
+static int compute_num_ctas_per_chunk(
+    size_t max_chunk_size, int batch_size,
+    int num_sms, int max_threads_per_sm)
+{
+  constexpr int WARP_SZ             = 32;
+  constexpr int ANS_NUM_WARPS_CTA   = 4;
+  constexpr int ANS_MAX_SUB_CHUNKS  = 64;
+  constexpr int ANS_MIN_SUB_CHUNK   = 2048;
+
+  int num_warps = num_sms * (max_threads_per_sm / WARP_SZ);
+  int target = (num_warps + batch_size - 1) / batch_size;
+  target = std::min(target, ANS_MAX_SUB_CHUNKS);
+  target = std::max(target, ANS_NUM_WARPS_CTA);
+
+  int chunk = static_cast<int>(max_chunk_size);
+  int unrounded = (chunk + target - 1) / target;
+
+  uint32_t power = 0;
+  { int tmp = unrounded; while (tmp >>= 1) power++; }
+  int lower  = 1 << power;
+  int higher = 1 << (power + 1);
+
+  int sub_chunk_size = ((chunk + lower - 1) / lower <= ANS_MAX_SUB_CHUNKS)
+                       ? lower : higher;
+  sub_chunk_size = std::max(ANS_MIN_SUB_CHUNK, sub_chunk_size);
+
+  int warps_per_chunk = (chunk + sub_chunk_size - 1) / sub_chunk_size;
+  int ctas = (warps_per_chunk + ANS_NUM_WARPS_CTA - 1) / ANS_NUM_WARPS_CTA;
+  return std::max(ctas, 1);
+}
+
+// Find the optimal pipeline_batch_size for minimal SM occupancy while
+// preserving the best possible compression ratio.
+//
+// Strategy:
+// 1. Compute global best ctas (at very large batch_size → target=4, fewest CTAs).
+// 2. Binary search for the minimum batch_size that achieves this best ctas.
+//    This is the "compression threshold" — below it, ctas jumps up.
+// 3. Return min(max_num_chunks, threshold).  If max_num_chunks is already
+//    below the threshold, no point splitting further (compression is already
+//    degraded, splitting only adds kernel launch overhead).
+static int compute_auto_pipeline_batch(
+    size_t max_chunk_size, size_t max_num_chunks)
+{
+  int device_id, num_sms, max_threads_per_sm;
+  cudaGetDevice(&device_id);
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id);
+  cudaDeviceGetAttribute(&max_threads_per_sm,
+                         cudaDevAttrMaxThreadsPerMultiProcessor, device_id);
+
+  // Global best ctas: use a large sentinel batch_size so target clamps to
+  // NUM_WARPS_PER_CTA=4, giving the fewest CTAs and best compression ratio.
+  int large_batch = num_sms * (max_threads_per_sm / 32);
+  int best_ctas = compute_num_ctas_per_chunk(
+      max_chunk_size, large_batch, num_sms, max_threads_per_sm);
+
+  // Binary search: find min batch_size where ctas == best_ctas.
+  int lo = 64, hi = large_batch;
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (compute_num_ctas_per_chunk(
+            max_chunk_size, mid, num_sms, max_threads_per_sm) <= best_ctas)
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  int threshold = lo;
+
+  if (max_num_chunks == 0)
+    return threshold;
+  return std::min(static_cast<int>(max_num_chunks), threshold);
+}
+
+// ---------------------------------------------------------------------------
 // Context lifecycle
 // ---------------------------------------------------------------------------
 void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
-                    size_t max_chunk_size, int data_type, int log_level) {
+                    size_t max_chunk_size, int data_type, int log_level,
+                    int pipeline_batch_size) {
+  // Auto-compute max_num_chunks when caller passes 0: use the minimum value
+  // that achieves the best compression ratio (lowest num_ctas_per_chunk).
+  if (max_num_chunks == 0 && max_chunk_size > 0) {
+    max_num_chunks = static_cast<size_t>(
+        compute_auto_pipeline_batch(max_chunk_size, 0));
+  }
+
   ctx->max_num_chunks = max_num_chunks;
   ctx->max_chunk_size = max_chunk_size;
   ctx->log_level      = log_level;
@@ -155,6 +242,7 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
     default: ctx->comp_opts.data_type = NVCOMP_TYPE_FLOAT16; break;
   }
   ctx->decomp_opts = nvcompBatchedANSDecompressDefaultOpts;
+  ctx->decomp_opts.max_uncompressed_chunk_size = ctx->max_chunk_size;
 
   const size_t max_total = max_num_chunks * max_chunk_size;
 
@@ -221,8 +309,14 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
   ANS_CUDA_CHECK(cudaMemcpy(ctx->d_decomp_buf_sizes[1], ctx->h_size_scratch.data(),
                              size_bytes, cudaMemcpyHostToDevice));
 
-  // Create scatter stream and events for double-buffer pipeline
-  ANS_CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->scatter_stream, cudaStreamNonBlocking));
+  // Create scatter stream with highest priority so gather/scatter blocks
+  // are scheduled ahead of decompress/compress blocks when SMs become free.
+  {
+    int least_priority, greatest_priority;
+    cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
+    ANS_CUDA_CHECK(cudaStreamCreateWithPriority(
+        &ctx->scatter_stream, cudaStreamNonBlocking, greatest_priority));
+  }
   for (int i = 0; i < 2; i++) {
     ANS_CUDA_CHECK(cudaEventCreateWithFlags(&ctx->compress_done[i], cudaEventDisableTiming));
     ANS_CUDA_CHECK(cudaEventCreateWithFlags(&ctx->scatter_done[i],  cudaEventDisableTiming));
@@ -239,7 +333,24 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
     ctx->gather_grid  = ANS_TRANSFER_SMS * std::max(gather_bpsm, 1);
   }
 
+  // Set pipeline_batch_size: explicit value or auto-tuned for minimal SM usage.
+  if (pipeline_batch_size > 0) {
+    ctx->pipeline_batch_size = std::min(
+        pipeline_batch_size, static_cast<int>(max_num_chunks));
+  } else if (max_num_chunks > 0 && max_chunk_size > 0) {
+    ctx->pipeline_batch_size = compute_auto_pipeline_batch(
+        max_chunk_size, max_num_chunks);
+  } else {
+    ctx->pipeline_batch_size = static_cast<int>(max_num_chunks);
+  }
+
   if (log_level >= 1) {
+    int device_id, num_sms_log, max_tps_log;
+    cudaGetDevice(&device_id);
+    cudaDeviceGetAttribute(&num_sms_log, cudaDevAttrMultiProcessorCount, device_id);
+    cudaDeviceGetAttribute(&max_tps_log, cudaDevAttrMaxThreadsPerMultiProcessor, device_id);
+    int ctas_log = compute_num_ctas_per_chunk(
+        max_chunk_size, ctx->pipeline_batch_size, num_sms_log, max_tps_log);
     size_t total_gpu = ctx->comp_temp_bytes + 2 * comp_staging_total +
                        ctx->decomp_temp_bytes +
                        4 * ptr_bytes + 5 * size_bytes +
@@ -248,11 +359,16 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
     size_t total_host = size_bytes;
     printf("[nvcomp] ANSTransferContext created: max_chunks=%zu, chunk_size=%zu, "
            "max_comp_chunk=%zu, extra_gpu=%.2f MB, extra_host=%.2f MB, "
-           "scatter_grid=%d, gather_grid=%d\n",
+           "scatter_grid=%d, gather_grid=%d, pipeline_batch_size=%d%s, "
+           "num_ctas_per_chunk=%d, blocks_per_batch=%d\n",
            max_num_chunks, max_chunk_size, ctx->max_comp_chunk_bytes,
            total_gpu / (1024.0 * 1024.0),
            total_host / (1024.0 * 1024.0),
-           ctx->scatter_grid, ctx->gather_grid);
+           ctx->scatter_grid, ctx->gather_grid,
+           ctx->pipeline_batch_size,
+           (pipeline_batch_size > 0) ? "" : "(auto)",
+           ctas_log,
+           ctx->pipeline_batch_size * ctas_log);
   }
 }
 
@@ -302,7 +418,7 @@ void ans_compress_and_d2h(
 
   const int kv_dim = is_mla ? 1 : 2;
   const int total_chunks = num_layers * kv_dim * num_blocks;
-  const int batch_cap = static_cast<int>(ctx->max_num_chunks);
+  const int batch_cap = ctx->pipeline_batch_size;
   const int num_batches = (total_chunks + batch_cap - 1) / batch_cap;
 
   assert(static_cast<size_t>(chunk_size_in_bytes) <= ctx->max_chunk_size);
@@ -398,7 +514,7 @@ void ans_h2d_and_decompress(
 
   const int kv_dim = is_mla ? 1 : 2;
   const int total_chunks = num_layers * kv_dim * num_blocks;
-  const int batch_cap = static_cast<int>(ctx->max_num_chunks);
+  const int batch_cap = ctx->pipeline_batch_size;
   const int num_batches = (total_chunks + batch_cap - 1) / batch_cap;
 
   assert(static_cast<size_t>(chunk_size_in_bytes) <= ctx->max_chunk_size);
