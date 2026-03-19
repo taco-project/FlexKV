@@ -131,12 +131,10 @@ class KVManager:
             self.kv_task_engine.shutdown()
 
         if self.enable_mps:
-            try:
-                subprocess.run('echo quit | nvidia-cuda-mps-control',
-                               shell=True, check=False, timeout=5)
-                flexkv_logger.debug("MPS stopped")
-            except subprocess.TimeoutExpired:
-                flexkv_logger.warning("MPS quit timed out")
+            flexkv_logger.info(
+                "MPS is enabled. To stop MPS daemon manually, run: "
+                "'echo quit | nvidia-cuda-mps-control'"
+            )
 
     def get_async(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
