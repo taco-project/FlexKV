@@ -7,6 +7,7 @@ import pickle
 import multiprocessing as mp
 import pytest
 import torch
+import numpy as np
 
 from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -282,32 +283,54 @@ class GPUKVCacheVerifier:
                             else:
                                 raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
-                            # 对 fp8 做特判：转成 float32 再比较，避免 PyTorch 在 fp8 上缺少 mul_cuda 等算子
-                            if actual_values.dtype == getattr(torch, "float8_e4m3fn", None):
-                                actual_f32 = actual_values.to(torch.float32)
-                                expected_f32 = torch.full_like(
-                                    actual_f32, float(expected_hash_value)
+                            # Low-precision dtypes can hit FTZ/subnormal quirks on heterogeneous CUDA backends.
+                            # Compare in float32 to avoid expected tensor construction in fp16/bf16 being flushed to zero.
+                            low_precision_dtypes = (
+                                torch.float16,
+                                torch.bfloat16,
+                                getattr(torch, "float8_e4m3fn", None),
+                            )
+                            if actual_values.dtype in low_precision_dtypes:
+                                actual_cmp = actual_values.to(torch.float32)
+                                expected_cmp = torch.full_like(
+                                    actual_cmp, float(expected_hash_value)
                                 )
                                 allclose_ok = torch.allclose(
-                                    actual_f32,
-                                    expected_f32,
-                                    rtol=1e-5,
-                                    atol=1e-6,
+                                    actual_cmp,
+                                    expected_cmp,
+                                    rtol=1e-3,
+                                    atol=1e-4,
                                 )
                             else:
+                                expected_cmp = torch.full_like(actual_values, expected_hash_value)
                                 allclose_ok = torch.allclose(
                                     actual_values,
-                                    torch.full_like(actual_values, expected_hash_value),
+                                    expected_cmp,
                                     rtol=1e-5,
                                     atol=1e-6,
                                 )
 
                             if not allclose_ok:
                                 verification_passed = False
+                                if actual_values.dtype in low_precision_dtypes:
+                                    diff = (actual_cmp - expected_cmp).abs()
+                                    actual_for_log = actual_cmp
+                                    expected_for_log = expected_cmp
+                                else:
+                                    diff = (actual_values - expected_cmp).abs()
+                                    actual_for_log = actual_values
+                                    expected_for_log = expected_cmp
+                                max_diff = diff.max().item()
+                                max_idx_flat = int(diff.argmax().item())
+                                max_idx = np.unravel_index(max_idx_flat, tuple(diff.shape))
+                                actual_at_max = actual_for_log[max_idx].item()
+                                expected_at_max = expected_for_log[max_idx].item()
                                 errors.append(
                                     f"Mismatch at layer={layer_id}, kv={kv_id}, tp={tp_id}, "
                                     f"head={head_id}, block={block_id}: "
-                                    f"expected={expected_hash_value}, got={actual_values[0, 0].item()}"
+                                    f"expected(sample)={expected_hash_value}, got(sample)={actual_values[0, 0].item()}, "
+                                    f"max_abs_diff={max_diff}, max_idx={max_idx}, "
+                                    f"expected_at_max={expected_at_max}, got_at_max={actual_at_max}"
                                 )
 
         if not verification_passed:

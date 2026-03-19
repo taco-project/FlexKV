@@ -1,4 +1,5 @@
 import copy
+import os
 import torch.multiprocessing as mp
 import threading
 import time
@@ -292,6 +293,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.gpu_tensor_ptrs = self.gpu_blocks_ptrs
 
         self.cpu_tensor = cpu_blocks
+        self.cpu_kv_layout = cpu_kv_layout
+        self.use_torch_copy_fallback = os.getenv("FLEXKV_USE_TORCH_COPY", "0") == "1"
 
         self.dtype = dtype
         self.is_mla = gpu_kv_layout.is_mla
@@ -325,6 +328,47 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
+    def _get_cpu_chunk(self, cpu_view: torch.Tensor, cpu_block_id: int, layer_id: int) -> torch.Tensor:
+        if self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST:
+            return cpu_view[cpu_block_id, layer_id, ...]
+        return cpu_view[layer_id, :, cpu_block_id, ...]
+
+    def _torch_copy_fallback_impl(
+        self,
+        gpu_block_id_list: torch.Tensor,
+        cpu_block_id_list: torch.Tensor,
+        transfer_type: TransferType,
+        layer_id: int,
+        layer_granularity: int,
+    ) -> None:
+        cpu_view = self.cpu_tensor.view(tuple(self.cpu_kv_layout.kv_shape))
+        layer_end = layer_id + layer_granularity
+        for gpu_bid_t, cpu_bid_t in zip(gpu_block_id_list, cpu_block_id_list):
+            gpu_bid = int(gpu_bid_t.item())
+            cpu_bid = int(cpu_bid_t.item())
+            for lay in range(layer_id, layer_end):
+                cpu_chunk = self._get_cpu_chunk(cpu_view, cpu_bid, lay)
+                if self.gpu_block_type_ == 0:
+                    gpu_chunk = self.gpu_blocks[lay][:, gpu_bid, ...]
+                    if transfer_type == TransferType.H2D:
+                        gpu_chunk.copy_(cpu_chunk, non_blocking=False)
+                    else:
+                        cpu_chunk.copy_(gpu_chunk, non_blocking=False)
+                elif self.gpu_block_type_ == 1:
+                    gpu_chunk = self.gpu_blocks[0][gpu_bid, lay, ...]
+                    if transfer_type == TransferType.H2D:
+                        gpu_chunk.copy_(cpu_chunk, non_blocking=False)
+                    else:
+                        cpu_chunk.copy_(gpu_chunk, non_blocking=False)
+                else:
+                    kv_dim = 1 if self.is_mla else 2
+                    for kv_id in range(kv_dim):
+                        gpu_chunk = self.gpu_blocks[lay + self.num_layers * kv_id][gpu_bid, ...]
+                        if transfer_type == TransferType.H2D:
+                            gpu_chunk.copy_(cpu_chunk[kv_id, ...], non_blocking=False)
+                        else:
+                            cpu_chunk[kv_id, ...].copy_(gpu_chunk, non_blocking=False)
+
     def _transfer_impl(
         self,
         src_block_ids: torch.Tensor,
@@ -356,28 +400,56 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         if len(gpu_block_id_list) == 0:
             return
 
+        if self.use_torch_copy_fallback:
+            self._torch_copy_fallback_impl(
+                gpu_block_id_list=gpu_block_id_list,
+                cpu_block_id_list=cpu_block_id_list,
+                transfer_type=transfer_type,
+                layer_id=layer_id,
+                layer_granularity=layer_granularity,
+            )
+            return
+
         gpu_tensor_ptrs = self.gpu_blocks_ptrs.contiguous().pin_memory()
 
-        transfer_kv_blocks(
-            gpu_block_id_list,
-            gpu_tensor_ptrs,
-            self.gpu_kv_stride_in_bytes,
-            self.gpu_block_stride_in_bytes,
-            self.gpu_layer_stride_in_bytes,
-            cpu_block_id_list,
-            self.cpu_tensor,
-            self.cpu_kv_stride_in_bytes,
-            self.cpu_layer_stride_in_bytes,
-            self.cpu_block_stride_in_bytes,
-            self.chunk_size_in_bytes,
-            layer_id,
-            layer_granularity,
-            transfer_sms,
-            transfer_type == TransferType.H2D,
-            use_ce_transfer,
-            self.is_mla,
-            self.gpu_block_type_,
-        )
+        try:
+            transfer_kv_blocks(
+                gpu_block_id_list,
+                gpu_tensor_ptrs,
+                self.gpu_kv_stride_in_bytes,
+                self.gpu_block_stride_in_bytes,
+                self.gpu_layer_stride_in_bytes,
+                cpu_block_id_list,
+                self.cpu_tensor,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.chunk_size_in_bytes,
+                layer_id,
+                layer_granularity,
+                transfer_sms,
+                transfer_type == TransferType.H2D,
+                use_ce_transfer,
+                self.is_mla,
+                self.gpu_block_type_,
+            )
+        except RuntimeError as e:
+            current_device = torch.cuda.current_device() if torch.cuda.is_available() else -1
+            flexkv_logger.error(
+                "transfer_kv_blocks failed in GPUCPUTransferWorker._transfer_impl: "
+                "transfer_type=%s layer_id=%s layer_granularity=%s num_blocks=%s "
+                "gpu_block_type=%s is_mla=%s transfer_sms=%s current_device=%s error=%s",
+                transfer_type,
+                layer_id,
+                layer_granularity,
+                len(gpu_block_id_list),
+                self.gpu_block_type_,
+                self.is_mla,
+                transfer_sms,
+                current_device,
+                str(e),
+            )
+            raise
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
         nvtx_range = nvtx.start_range(
@@ -401,6 +473,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 layer_id,
                 layer_granularity,
             )
+            if self.use_torch_copy_fallback:
+                # Diagnostic mode: ensure copies are fully visible before marking op finished.
+                torch.cuda.current_stream().synchronize()
             end_time = time.time()
 
             kv_dim = 2 if not self.is_mla else 1
