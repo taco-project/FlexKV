@@ -333,6 +333,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             return cpu_view[cpu_block_id, layer_id, ...]
         return cpu_view[layer_id, :, cpu_block_id, ...]
 
+    @staticmethod
+    def _do_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
+        """Unified copy helper: dst.copy_(src) with non_blocking for pipelined transfers."""
+        dst.copy_(src, non_blocking=True)
+
     def _torch_copy_fallback_impl(
         self,
         gpu_block_id_list: torch.Tensor,
@@ -341,8 +346,15 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         layer_id: int,
         layer_granularity: int,
     ) -> None:
+        """Pure-PyTorch fallback for GPU⇄CPU KV block transfer.
+
+        Used on hardware where the custom CUDA kernel (transfer_kv_blocks) is
+        not functional.  Activated by setting FLEXKV_USE_TORCH_COPY=1.
+        """
         cpu_view = self.cpu_tensor.view(tuple(self.cpu_kv_layout.kv_shape))
+        is_h2d = transfer_type == TransferType.H2D
         layer_end = layer_id + layer_granularity
+
         for gpu_bid_t, cpu_bid_t in zip(gpu_block_id_list, cpu_block_id_list):
             gpu_bid = int(gpu_bid_t.item())
             cpu_bid = int(cpu_bid_t.item())
@@ -350,24 +362,24 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 cpu_chunk = self._get_cpu_chunk(cpu_view, cpu_bid, lay)
                 if self.gpu_block_type_ == 0:
                     gpu_chunk = self.gpu_blocks[lay][:, gpu_bid, ...]
-                    if transfer_type == TransferType.H2D:
-                        gpu_chunk.copy_(cpu_chunk, non_blocking=False)
+                    if is_h2d:
+                        self._do_copy(gpu_chunk, cpu_chunk)
                     else:
-                        cpu_chunk.copy_(gpu_chunk, non_blocking=False)
+                        self._do_copy(cpu_chunk, gpu_chunk)
                 elif self.gpu_block_type_ == 1:
                     gpu_chunk = self.gpu_blocks[0][gpu_bid, lay, ...]
-                    if transfer_type == TransferType.H2D:
-                        gpu_chunk.copy_(cpu_chunk, non_blocking=False)
+                    if is_h2d:
+                        self._do_copy(gpu_chunk, cpu_chunk)
                     else:
-                        cpu_chunk.copy_(gpu_chunk, non_blocking=False)
+                        self._do_copy(cpu_chunk, gpu_chunk)
                 else:
                     kv_dim = 1 if self.is_mla else 2
                     for kv_id in range(kv_dim):
                         gpu_chunk = self.gpu_blocks[lay + self.num_layers * kv_id][gpu_bid, ...]
-                        if transfer_type == TransferType.H2D:
-                            gpu_chunk.copy_(cpu_chunk[kv_id, ...], non_blocking=False)
+                        if is_h2d:
+                            self._do_copy(gpu_chunk, cpu_chunk[kv_id, ...])
                         else:
-                            cpu_chunk[kv_id, ...].copy_(gpu_chunk, non_blocking=False)
+                            self._do_copy(cpu_chunk[kv_id, ...], gpu_chunk)
 
     def _transfer_impl(
         self,
@@ -474,7 +486,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 layer_granularity,
             )
             if self.use_torch_copy_fallback:
-                # Diagnostic mode: ensure copies are fully visible before marking op finished.
+                # Mandatory barrier: the PyTorch copy_ path uses non_blocking=True,
+                # so we must synchronize the transfer_stream to ensure all copies are
+                # visible before the op is marked finished.
                 torch.cuda.current_stream().synchronize()
             end_time = time.time()
 
@@ -525,7 +539,26 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         cudaHostRegister(cpu_blocks)
 
+        # Store references needed by the PyTorch copy fallback path
+        self.cpu_blocks = cpu_blocks
+        self.cpu_tensor = cpu_blocks  # alias used by _torch_copy_fallback_impl
+        self.cpu_kv_layout = cpu_kv_layout
+        self.gpu_kv_layouts = gpu_kv_layouts
+        self.use_torch_copy_fallback = os.getenv("FLEXKV_USE_TORCH_COPY", "0") == "1"
+
         self.num_layers = gpu_kv_layouts[0].num_layer
+
+        # Determine gpu_block_type_ from tensor count per GPU
+        num_tensors_per_gpu = len(self.gpu_blocks[0])
+        if num_tensors_per_gpu == 1:
+            self.gpu_block_type_ = 1   # TRTLLM / BLOCKFIRST
+        elif num_tensors_per_gpu == self.num_layers:
+            self.gpu_block_type_ = 0   # VLLM / LAYERFIRST
+        elif num_tensors_per_gpu == self.num_layers * 2:
+            self.gpu_block_type_ = 2   # SGLANG / KV-split
+        else:
+            raise ValueError(f"Invalid GPU block type for TP worker: {num_tensors_per_gpu}")
+
         # here the chunk size doesn't include the layer info
         self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
                                 for gpu_kv_layout in gpu_kv_layouts]
@@ -554,6 +587,114 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                                                               self.num_layers, gpu_kv_strides_tensor,
                                                               gpu_block_strides_tensor, gpu_layer_strides_tensor,
                                                               gpu_chunk_sizes_tensor)
+
+    def _get_cpu_chunk(self, cpu_view: torch.Tensor, cpu_block_id: int, layer_id: int) -> torch.Tensor:
+        """Return a single (layer, block) slice from the CPU buffer."""
+        if self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST:
+            return cpu_view[cpu_block_id, layer_id, ...]
+        return cpu_view[layer_id, :, cpu_block_id, ...]
+
+    def _torch_copy_fallback_impl(
+        self,
+        gpu_block_id_list: torch.Tensor,
+        cpu_block_id_list: torch.Tensor,
+        transfer_type: TransferType,
+        layer_id: int,
+        layer_granularity: int,
+    ) -> None:
+        """Pure-PyTorch TP fallback for GPU⇄CPU KV block transfer.
+
+        Mirrors the per-GPU head-slicing logic in TPTransferThreadGroup C++ code.
+        Each GPU rank i handles its own head partition within the shared CPU buffer.
+        Activated by setting FLEXKV_USE_TORCH_COPY=1.
+        """
+        cpu_view = self.cpu_tensor.view(tuple(self.cpu_kv_layout.kv_shape))
+        is_h2d = transfer_type == TransferType.H2D
+        layer_end = layer_id + layer_granularity
+
+        for gpu_bid_t, cpu_bid_t in zip(gpu_block_id_list, cpu_block_id_list):
+            gpu_bid = int(gpu_bid_t.item())
+            cpu_bid = int(cpu_bid_t.item())
+            for lay in range(layer_id, layer_end):
+                # cpu_chunk shape depends on layout:
+                #   LAYERFIRST: [kv_dim, tokens_per_block, num_head_total, head_size]
+                #   BLOCKFIRST: [kv_dim, tokens_per_block, num_head_total, head_size]
+                cpu_chunk = self._get_cpu_chunk(cpu_view, cpu_bid, lay)
+
+                for gpu_idx in range(self.num_gpus):
+                    gpu_blocks_for_rank = self.gpu_blocks[gpu_idx]
+                    gpu_kv_layout = self.gpu_kv_layouts[gpu_idx]
+                    heads_per_rank = gpu_kv_layout.num_head
+                    head_start = gpu_idx * heads_per_rank
+                    head_end = head_start + heads_per_rank
+
+                    if self.is_mla:
+                        # MLA: no K/V split, head dim is not split across TP ranks in the
+                        # same way; each rank has a full copy.  The C++ code uses a
+                        # sub-chunk offset strategy, but at the tensor level we can slice
+                        # on the *flat head dimension* which for MLA equals head_size
+                        # directly.  For H2D every rank copies the whole CPU chunk; for
+                        # D2H each rank writes a distinct 1/num_gpus slice.
+                        if self.gpu_block_type_ == 0:
+                            gpu_chunk = gpu_blocks_for_rank[lay][:, gpu_bid, ...]  # [kv_dim, tok, head, hs]
+                        elif self.gpu_block_type_ == 1:
+                            gpu_chunk = gpu_blocks_for_rank[0][gpu_bid, lay, ...]  # [kv_dim, tok, head, hs]
+                        else:
+                            # gpu_block_type_ == 2 (SGLANG), iterate kv_dim
+                            for kv_id in range(1):  # MLA has kv_dim=1
+                                g = gpu_blocks_for_rank[lay + self.num_layers * kv_id][gpu_bid, ...]
+                                if is_h2d:
+                                    g.copy_(cpu_chunk[kv_id, ...], non_blocking=True)
+                                else:
+                                    hs = g.shape[-1]
+                                    flat_start = gpu_idx * (hs // self.num_gpus)
+                                    flat_end = flat_start + (hs // self.num_gpus)
+                                    cpu_chunk[kv_id, ..., flat_start:flat_end].copy_(
+                                        g[..., flat_start:flat_end], non_blocking=True)
+                            continue
+
+                        if is_h2d:
+                            gpu_chunk.copy_(cpu_chunk, non_blocking=True)
+                        else:
+                            # D2H for MLA: each rank writes a 1/num_gpus slice
+                            hs = gpu_chunk.shape[-1]
+                            flat_start = gpu_idx * (hs // self.num_gpus)
+                            flat_end = flat_start + (hs // self.num_gpus)
+                            cpu_chunk[..., flat_start:flat_end].copy_(
+                                gpu_chunk[..., flat_start:flat_end], non_blocking=True)
+                    else:
+                        # Non-MLA: each TP rank owns a contiguous head slice
+                        # cpu_chunk has the full head dim; we pick the per-rank slice.
+                        # cpu_chunk layout: [..., num_head_total, head_size]
+                        # The head dimension is the second-to-last dim.
+                        cpu_head_slice = cpu_chunk[..., head_start:head_end, :]
+
+                        if self.gpu_block_type_ == 0:
+                            # [kv_dim, tokens_per_block, num_head_per_rank, head_size]
+                            gpu_chunk = gpu_blocks_for_rank[lay][:, gpu_bid, ...]
+                            if is_h2d:
+                                gpu_chunk.copy_(cpu_head_slice, non_blocking=True)
+                            else:
+                                cpu_head_slice.copy_(gpu_chunk, non_blocking=True)
+                        elif self.gpu_block_type_ == 1:
+                            # [kv_dim, tokens_per_block, num_head_per_rank, head_size]
+                            gpu_chunk = gpu_blocks_for_rank[0][gpu_bid, lay, ...]
+                            if is_h2d:
+                                gpu_chunk.copy_(cpu_head_slice, non_blocking=True)
+                            else:
+                                cpu_head_slice.copy_(gpu_chunk, non_blocking=True)
+                        else:
+                            # gpu_block_type_ == 2, separate K/V tensors
+                            kv_dim = 2
+                            for kv_id in range(kv_dim):
+                                gpu_chunk = gpu_blocks_for_rank[
+                                    lay + self.num_layers * kv_id][gpu_bid, ...]
+                                if is_h2d:
+                                    gpu_chunk.copy_(
+                                        cpu_head_slice[kv_id, ...], non_blocking=True)
+                                else:
+                                    cpu_head_slice[kv_id, ...].copy_(
+                                        gpu_chunk, non_blocking=True)
 
 
     def _transfer_impl(self,
@@ -587,20 +728,46 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         if len(gpu_block_id_list) == 0:
             return
 
-        self.tp_transfer_thread_group.tp_group_transfer(
-            gpu_block_id_list,
-            cpu_block_id_list,
-            self.cpu_kv_stride_in_bytes,
-            self.cpu_layer_stride_in_bytes,
-            self.cpu_block_stride_in_bytes,
-            self.cpu_chunk_size_in_bytes,
-            transfer_sms,
-            transfer_type == TransferType.H2D,
-            use_ce_transfer,
-            layer_id,
-            layer_granularity,
-            self.is_mla,
-        )
+        if self.use_torch_copy_fallback:
+            self._torch_copy_fallback_impl(
+                gpu_block_id_list=gpu_block_id_list,
+                cpu_block_id_list=cpu_block_id_list,
+                transfer_type=transfer_type,
+                layer_id=layer_id,
+                layer_granularity=layer_granularity,
+            )
+            return
+
+        try:
+            self.tp_transfer_thread_group.tp_group_transfer(
+                gpu_block_id_list,
+                cpu_block_id_list,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.cpu_chunk_size_in_bytes,
+                transfer_sms,
+                transfer_type == TransferType.H2D,
+                use_ce_transfer,
+                layer_id,
+                layer_granularity,
+                self.is_mla,
+            )
+        except RuntimeError as e:
+            flexkv_logger.error(
+                "tp_group_transfer failed in tpGPUCPUTransferWorker._transfer_impl: "
+                "transfer_type=%s layer_id=%s layer_granularity=%s num_blocks=%s "
+                "gpu_block_type=%s is_mla=%s num_gpus=%s error=%s",
+                transfer_type,
+                layer_id,
+                layer_granularity,
+                len(gpu_block_id_list),
+                self.gpu_block_type_,
+                self.is_mla,
+                self.num_gpus,
+                str(e),
+            )
+            raise
 
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> None:
@@ -621,6 +788,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             layer_id,
             layer_granularity,
         )
+        if self.use_torch_copy_fallback:
+            # Mandatory barrier: ensure all non_blocking copies across all TP ranks
+            # are visible before marking the op finished.
+            for gpu_idx in range(self.num_gpus):
+                device_id = self.dp_group_id * self.num_gpus + gpu_idx
+                torch.cuda.synchronize(device_id)
         end_time = time.time()
 
         kv_dim = 2 if not self.is_mla else 1
