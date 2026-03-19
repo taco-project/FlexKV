@@ -196,6 +196,11 @@ class FlexKVSchedulerConnector:
 
         self.maybe_skip_put = os.getenv('FLEXKV_MAYBE_SKIP_PUT', '0') == '1'
 
+        # only support local batching for now
+        self.enable_batch = (not self.cache_config.enable_kv_sharing
+                             and not self.cache_config.enable_remote
+                             and not self.cache_config.enable_gds)
+
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")
             time.sleep(5)
@@ -564,11 +569,11 @@ class FlexKVSchedulerConnector:
         if get_task_ids:
             self.flexkv_manager.launch(task_ids=get_task_ids,
                                        slot_mappings=get_slot_mappings,
-                                       as_batch=True)
+                                       as_batch=self.enable_batch)
         if put_task_ids:
             self.flexkv_manager.launch(task_ids=put_task_ids,
                                        slot_mappings=put_slot_mappings,
-                                       as_batch=True)
+                                       as_batch=self.enable_batch)
         self.tasks_to_launch.clear()
 
     def query_finished_task(self) -> tuple[set[str], set[str]]:
