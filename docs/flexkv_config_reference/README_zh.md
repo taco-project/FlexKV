@@ -94,8 +94,16 @@ enable_gds: false
 |--------|------|--------|------|
 | `FLEXKV_USE_CE_TRANSFER_H2D` | bool | 0 | 是否使用 cudaMemcpyAsync 实现 Host→Device 传输，可以避免占用 SM，但是传输速度会降低 |
 | `FLEXKV_USE_CE_TRANSFER_D2H` | bool | 0 |  是否使用 cudaMemcpyAsync 实现 Device→Host 传输，可以避免占用 SM，但是传输速度会降低 |
-| `FLEXKV_TRANSFER_SMS_H2D` | int | 8 | H2D 传输使用的流处理器数量，仅在`FLEXKV_USE_CE_TRANSFER_H2D`为0时生效 |
-| `FLEXKV_TRANSFER_SMS_D2H` | int | 8 | D2H 传输使用的流处理器数量，仅在`FLEXKV_USE_CE_TRANSFER_D2H`为0时生效 |
+| `FLEXKV_TRANSFER_NUM_CTA_H2D` | int | 4 | H2D 传输使用的 CUDA thread block (CTA) 数量，仅在`FLEXKV_USE_CE_TRANSFER_H2D`为0时生效 |
+| `FLEXKV_TRANSFER_NUM_CTA_D2H` | int | 4 | D2H 传输使用的 CUDA thread block (CTA) 数量，仅在`FLEXKV_USE_CE_TRANSFER_D2H`为0时生效 |
+
+---
+
+### CUDA MPS（Multi-Process Service）
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `FLEXKV_ENABLE_MPS` | bool | 1 | 是否自动管理 CUDA MPS 的启停。设为 0 可禁用 |
 
 ---
 

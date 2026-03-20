@@ -109,9 +109,9 @@ class TensorSharedHandle:
                     tmp_list = list(self.rebuild_args)
                     tmp_list[6] = device_id
                     self.rebuild_args = tuple(tmp_list)
-                flexkv_logger.debug(
-                    f"Tensor exported via PyTorch CUDA IPC for device {self.device}"
-                )
+                # flexkv_logger.debug(
+                #     f"Tensor exported via PyTorch CUDA IPC for device {self.device}"
+                # )
                 return
             except RuntimeError as e:
                 flexkv_logger.warning(f"PyTorch CUDA IPC export failed: {e}")

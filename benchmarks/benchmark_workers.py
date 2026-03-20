@@ -77,7 +77,7 @@ def create_cpu_gpu_worker(
         layout_type = KVCacheLayoutType.BLOCKFIRST
     else:
         raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
-    
+
     if gpu_layout_type == 0:
         num_chunks = model_config.num_layers
     elif gpu_layout_type == 1:
@@ -86,7 +86,7 @@ def create_cpu_gpu_worker(
         num_chunks = model_config.num_layers * 2
     else:
         raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
-    
+
     gpu_layout = KVCacheLayout(
         type=layout_type,
         num_layer=model_config.num_layers,
@@ -130,8 +130,8 @@ def create_cpu_gpu_worker(
             gpu_device_id=0,
             use_ce_transfer_h2d=False,
             use_ce_transfer_d2h=False,
-            transfer_sms_h2d=8,
-            transfer_sms_d2h=8,
+            transfer_num_cta_h2d=4,
+            transfer_num_cta_d2h=4,
         )
     else:
         worker_handle = tpGPUCPUTransferWorker.create_worker(
@@ -147,8 +147,8 @@ def create_cpu_gpu_worker(
             dp_group_id=0,
             use_ce_transfer_h2d=False,
             use_ce_transfer_d2h=False,
-            transfer_sms_h2d=8,
-            transfer_sms_d2h=8,
+            transfer_num_cta_h2d=4,
+            transfer_num_cta_d2h=4,
         )
     return (
         worker_handle,
@@ -218,23 +218,23 @@ def create_gpu_ssd_worker(
                   num_gpu_blocks: int,
                   gpu_layout_type: int = 0) -> Tuple[WorkerHandle, mp.Queue]:
     mp.set_start_method('spawn', force=True)
-    
+
     if gpu_layout_type == 0 or gpu_layout_type == 2:
         layout_type = KVCacheLayoutType.LAYERFIRST
     elif gpu_layout_type == 1:
         layout_type = KVCacheLayoutType.BLOCKFIRST
     else:
         raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
-    
+
     if gpu_layout_type == 0:
         num_chunks = model_config.num_layers
     elif gpu_layout_type == 1:
         num_chunks = 1
     elif gpu_layout_type == 2:
-        num_chunks = model_config.num_layers * 2 
+        num_chunks = model_config.num_layers * 2
     else:
         raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
-    
+
     gpu_layout = KVCacheLayout(
         type=layout_type,
         num_layer=model_config.num_layers,
@@ -254,7 +254,7 @@ def create_gpu_ssd_worker(
         is_mla=model_config.use_mla,
     )
     gpu_layout = gpu_layout.div_head(model_config.tp_size) if not model_config.use_mla else gpu_layout
-    
+
     gpu_handles = []
     for tp_id in range(model_config.tp_size):
         torch.cuda.set_device(tp_id)
@@ -264,7 +264,7 @@ def create_gpu_ssd_worker(
             num_chunks=num_chunks,
             device_id=tp_id,
         ))
-    
+
     ssd_handle = SSDAllocator.allocate(
         layout=ssd_layout,
         dtype=model_config.dtype,
@@ -272,7 +272,7 @@ def create_gpu_ssd_worker(
         cache_dir=cache_config.ssd_cache_dir,
         max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
     )
-    
+
     finished_ops_queue = mp.Queue()
     max_block_num = max(1024, cache_config.num_ssd_blocks)
     op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()

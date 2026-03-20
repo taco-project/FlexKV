@@ -24,7 +24,7 @@ enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
 enable_p2p = os.environ.get("FLEXKV_ENABLE_P2P", "0") == "1"
 enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
 # FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
-enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "1") != "0"
+enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 
 # Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
@@ -66,7 +66,7 @@ else:
 if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6;9.0"
 
-extra_compile_args = ["-std=c++17"]
+extra_compile_args = ["-std=c++17", "-O3"]
 if enable_metrics:
     extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]

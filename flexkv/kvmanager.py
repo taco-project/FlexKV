@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import subprocess
 from typing import Optional, Tuple, List, Dict, Union, Iterable
 import time
 
@@ -55,21 +56,21 @@ class KVManager:
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
         # Multi-instance mode also requires server_client_mode
-        self.server_client_mode = (model_config.dp_size > 1 or 
-                                   self.instance_num > 1 or 
+        self.server_client_mode = (model_config.dp_size > 1 or
+                                   self.instance_num > 1 or
                                    GLOBAL_CONFIG_FROM_ENV.server_client_mode)
         self.dp_client_id = dp_client_id
-        
+
         # Calculate global_client_id for multi-instance mode
         self.global_client_id = self.instance_id * model_config.dp_size + dp_client_id
-        
+
         flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
-        
+
         self.redis_meta_client = None
         if self.cache_config.enable_kv_sharing:
             flexkv_logger.info(f"[kv manager] initializing RedisMeta and connection to \
                         {self.cache_config.redis_host}:{self.cache_config.redis_port}")
-            # initialize redis Meta obj 
+            # initialize redis Meta obj
             self.redis_meta_client = RedisMeta(
                 self.cache_config.redis_host,
                 self.cache_config.redis_port,
@@ -79,7 +80,9 @@ class KVManager:
             self.redis_meta_client.init_meta()
             # update distributed_node_id
             self.cache_config.distributed_node_id = self.redis_meta_client.get_node_id() # update distributed_node_id of current node
-            
+
+
+        self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
 
         if self.server_client_mode:
             # Server should only be created once across all instances and dp ranks
@@ -98,12 +101,17 @@ class KVManager:
         else:
             self.server_handle = None
             self.kv_task_engine = KVTaskEngine(self.model_config, self.cache_config, self.gpu_register_port, redis_meta=self.redis_meta_client, event_collector=event_collector)
-    
+
     @property
     def dpclient_id(self) -> int:
         return self.dp_client_id
 
     def start(self) -> None:
+        if self.enable_mps:
+            # try to start MPS
+            subprocess.run(['nvidia-cuda-mps-control', '-d'], check=False)
+            flexkv_logger.debug("MPS started")
+
         if not self.server_client_mode:
             self.kv_task_engine.start()
         else:
@@ -121,6 +129,12 @@ class KVManager:
             self.dp_client.shutdown()
         else:
             self.kv_task_engine.shutdown()
+
+        if self.enable_mps:
+            flexkv_logger.info(
+                "MPS is enabled. To stop MPS daemon manually, run: "
+                "'echo quit | nvidia-cuda-mps-control'"
+            )
 
     def get_async(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
@@ -236,7 +250,7 @@ class KVManager:
             return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch)
         else:
             return self.kv_task_engine.launch_tasks(task_ids, slot_mappings, as_batch)
-            
+
     def cancel(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):
             task_ids = [task_ids]

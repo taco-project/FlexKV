@@ -46,6 +46,7 @@ class TaskType(Enum):
     PUT = "put"
     PREFETCH = "prefetch"
     BATCH_GET = "batch_get"
+    BATCH_PUT = "batch_put"
 
 @dataclass
 class KVTask:
@@ -67,6 +68,9 @@ class KVTask:
     return_mask: Union[np.ndarray, list[np.ndarray]]
     callback: Optional[Union[Callable, List[Callable]]]
     op_callback_dict: Dict[int, Callable]
+
+    # batch: points to the batch task id if this task was merged into a batch
+    batch_task_id: Optional[int] = None
 
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
@@ -346,8 +350,10 @@ class KVTaskManager:
         self.graph_to_task.pop(task.graph.graph_id, None)
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
-        self._process_empty_graph(task_id)
         task = self.tasks[task_id]
+        if task.batch_task_id is not None:
+            return self.check_completed(task.batch_task_id, completely)
+        self._process_empty_graph(task_id)
         if completely:
             return task.is_completed()
         # For tasks with callback (e.g., PUT tasks that need to call insert_and_publish),
@@ -571,8 +577,9 @@ class KVTaskEngine(KVTaskManager):
                     )
                     break
                 elif self.check_completed(task_id, completely=completely):
+                    effective_id = self.tasks[task_id].batch_task_id or task_id
                     return_responses[task_id] = KVResponse(
-                        status=convert_to_response_status(self.tasks[task_id].status),
+                        status=convert_to_response_status(self.tasks[effective_id].status),
                         task_id=task_id,
                         return_mask=self.tasks[task_id].return_mask
                     )
@@ -769,14 +776,19 @@ class KVTaskEngine(KVTaskManager):
         self._launch_task(task_id)
         return task_id
 
-    def merge_to_batch_kvtask(self, batch_id: int, task_ids: List[int]) -> TransferOpGraph:
+    def merge_to_batch_kvtask(self,
+                              batch_id: int,
+                              task_ids: List[int],
+                              batch_task_type: TaskType) -> TransferOpGraph:
         op_callback_dict = {}
         task_end_op_ids = []
         callbacks = []
         transfer_graphs = []
         return_masks = []
+        expected_type = TaskType.GET if batch_task_type == TaskType.BATCH_GET else TaskType.PUT
         for task_id in task_ids:
-            assert self.tasks[task_id].task_type == TaskType.GET, "only get task can be launched as batch"
+            assert self.tasks[task_id].task_type == expected_type, \
+                f"only {expected_type.value} task can be launched as {batch_task_type.value}"
             transfer_graph = self.check_task_ready(task_id)
             if transfer_graph is not None and transfer_graph.num_ops > 0:
                 transfer_graphs.append(transfer_graph)
@@ -794,21 +806,20 @@ class KVTaskEngine(KVTaskManager):
             token_ids=np.concatenate([self.tasks[task_id].token_ids for task_id in task_ids]),
             slot_mapping=np.concatenate([self.tasks[task_id].slot_mapping for task_id in task_ids]),
             token_mask=np.concatenate([self.tasks[task_id].token_mask for task_id in task_ids]),
-            task_type=TaskType.BATCH_GET,
+            task_type=batch_task_type,
             task_end_op_id=task_end_op_id,
             task_end_op_finished=False,
             status=TaskStatus.READY,
             dp_id=self.tasks[task_ids[0]].dp_id,
             graph=batch_task_graph,
             return_mask=return_masks,
-            callback=callbacks, # this is a list now
+            callback=callbacks,
             op_callback_dict=op_callback_dict,
         )
         self.graph_to_task[batch_task_graph.graph_id] = batch_id
-        # pop those tasks which are merged into batch
         for task_id in task_ids:
             self.graph_to_task.pop(self.tasks[task_id].graph.graph_id, None)
-            self.tasks.pop(task_id, None)
+            self.tasks[task_id].batch_task_id = batch_id
         return batch_task_graph
 
     def launch_tasks(self,
@@ -824,10 +835,14 @@ class KVTaskEngine(KVTaskManager):
         # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
 
-        if len(task_ids) > 1 and as_batch:
+        all_get = all(self.tasks[tid].task_type == TaskType.GET for tid in task_ids)
+        all_put = all(self.tasks[tid].task_type == TaskType.PUT for tid in task_ids)
+        if len(task_ids) > 1 and as_batch and (all_get or all_put):
             if batch_id == -1:
                 batch_id = self._gen_task_id()
-            transfer_graphs = [self.merge_to_batch_kvtask(batch_id, task_ids)]
+            batch_task_type = TaskType.BATCH_GET if all_get else TaskType.BATCH_PUT
+            transfer_graphs = [self.merge_to_batch_kvtask(batch_id, task_ids, batch_task_type)]
+            self.tasks[batch_id].status = TaskStatus.RUNNING
             task_ids = [batch_id]
         else:
             transfer_graphs = []

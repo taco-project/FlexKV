@@ -144,8 +144,8 @@ class FlexKVTracer:
             "gds_layout_type": str(GLOBAL_CONFIG_FROM_ENV.gds_layout_type),
             "use_ce_transfer_h2d": GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
             "use_ce_transfer_d2h": GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-            "transfer_sms_h2d": GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
-            "transfer_sms_d2h": GLOBAL_CONFIG_FROM_ENV.transfer_sms_d2h,
+            "transfer_num_cta_h2d": GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+            "transfer_num_cta_d2h": GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
             "iouring_entries": GLOBAL_CONFIG_FROM_ENV.iouring_entries,
             "iouring_flags": GLOBAL_CONFIG_FROM_ENV.iouring_flags,
             "max_file_size_gb": GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
@@ -302,7 +302,7 @@ class FlexKVTracer:
             "as_batch": as_batch,
             "batch_id": batch_id,
         }
-        
+
         record = {
             "timestamp": timestamp,
             "event_type": "launch_tasks",

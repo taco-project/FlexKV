@@ -89,7 +89,7 @@ class FlexKVReplayEngine:
         if global_config_data:
             self.log("Restoring global config from trace...")
             from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
-            
+
             # Restore layout types
             if 'cpu_layout_type' in global_config_data:
                 GLOBAL_CONFIG_FROM_ENV.cpu_layout_type = self._parse_layout_type(global_config_data['cpu_layout_type'])
@@ -99,10 +99,10 @@ class FlexKVReplayEngine:
                 GLOBAL_CONFIG_FROM_ENV.remote_layout_type = self._parse_layout_type(global_config_data['remote_layout_type'])
             if 'gds_layout_type' in global_config_data:
                 GLOBAL_CONFIG_FROM_ENV.gds_layout_type = self._parse_layout_type(global_config_data['gds_layout_type'])
-            
+
             # Restore other configs
             for key in ['server_client_mode', 'index_accel', 'use_ce_transfer_h2d', 'use_ce_transfer_d2h',
-                       'transfer_sms_h2d', 'transfer_sms_d2h', 'iouring_entries', 'iouring_flags',
+                       'transfer_num_cta_h2d', 'transfer_num_cta_d2h', 'iouring_entries', 'iouring_flags',
                        'max_file_size_gb', 'evict_ratio', 'server_recv_port']:
                 if key in global_config_data:
                     setattr(GLOBAL_CONFIG_FROM_ENV, key, global_config_data[key])
@@ -215,15 +215,15 @@ class FlexKVReplayEngine:
     def register_gpu_blocks_to_kvmanager(self, gpu_register_port: str):
         """Register GPU blocks to KVManager via socket"""
         self.log("Registering GPU blocks via socket...")
-        
+
         total_gpus = self.model_config.tp_size * self.model_config.dp_size
-        
+
         # Create zmq socket to send GPU blocks
         context = zmq.Context(2)
         send_socket = get_zmq_socket(
             context, zmq.SocketType.PUSH, gpu_register_port, False
         )
-        
+
         # Register each GPU's blocks
         for gpu_id in range(total_gpus):
             # Convert torch tensors to TensorSharedHandle
@@ -231,7 +231,7 @@ class FlexKVReplayEngine:
             for layer_tensor in self.gpu_blocks[gpu_id]:
                 handle = TensorSharedHandle(layer_tensor, gpu_id)
                 handles.append(handle)
-            
+
             # Create registration request
             register_req = RegisterTPClientRequest(
                 dp_client_id=gpu_id // self.model_config.tp_size,  # DP client ID
@@ -239,14 +239,14 @@ class FlexKVReplayEngine:
                 handles=handles,
                 gpu_layout=self.gpu_layout
             )
-            
+
             # Send registration request
             send_socket.send_pyobj(register_req)
             self.log(f"Registered GPU {gpu_id} blocks")
-        
+
         # Wait a bit to ensure all registration requests are sent
         time.sleep(0.1)
-        
+
         # Close socket
         send_socket.close()
         context.term()
@@ -271,7 +271,7 @@ class FlexKVReplayEngine:
         # Create KVTaskEngine with gpu_register_port
         import tempfile
         gpu_register_port = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        
+
         self.kvmanager = KVTaskEngine(
             model_config=self.model_config,
             cache_config=self.cache_config,
@@ -283,7 +283,7 @@ class FlexKVReplayEngine:
 
         # Register GPU blocks via socket after KVManager is started
         self.register_gpu_blocks_to_kvmanager(gpu_register_port)
-        
+
         # Wait for KVManager to be ready
         max_wait_time = 30  # seconds
         start_time = time.time()
@@ -291,7 +291,7 @@ class FlexKVReplayEngine:
             if time.time() - start_time > max_wait_time:
                 raise RuntimeError("KVManager failed to become ready within timeout")
             time.sleep(0.1)
-        
+
         self.log("KVManager started successfully")
 
     def replay_request_event(self, event: Dict[str, Any]) -> int:
@@ -366,19 +366,19 @@ class FlexKVReplayEngine:
         as_batch = data.get('as_batch', False)
         batch_id = data.get('batch_id', -1)
         self.log(f"🚀🚀🚀Replaying launch_tasks for task_ids: {task_ids}")
-        
+
         try:
             # Convert lists back to numpy arrays
             import numpy as np
             slot_mappings = [np.array(sm, dtype=np.int64) for sm in slot_mappings_list]
-            
+
             print(f"Launching {len(task_ids)} tasks with slot_mappings")
-            
+
             # Call launch_tasks
             self.kvmanager.launch_tasks(task_ids, slot_mappings, as_batch, batch_id)
-            
+
             self.log(f"launch_tasks completed successfully for {len(task_ids)} tasks")
-            
+
         except Exception as e:
             self.log(f"Warning: launch_tasks operation failed: {e}")
             import traceback
@@ -403,7 +403,7 @@ class FlexKVReplayEngine:
                 result = self.kvmanager.try_wait(task_ids)
             else:
                 raise ValueError(f"Unknown wait type: {wait_type}")
-            
+
             # process result: result is Dict[int, KVResponse]
             successed_elements = []
             statuses = []
@@ -418,7 +418,7 @@ class FlexKVReplayEngine:
                 else:
                     successed_elements.append(0)
                     statuses.append("NOT_FOUND")
-            
+
             print(f"✅ {wait_type} result: task_ids={task_ids}, successed_elements={successed_elements}, statuses={statuses}")
             self.log(f"Wait completed successfully for {wait_type}")
             return result
