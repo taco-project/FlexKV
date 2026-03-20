@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "nvcomp/ans.h"
+#include "nvcomp/green_context.h"
 #include "gtensor_handler.cuh"
 
 namespace flexkv {
@@ -57,6 +58,8 @@ struct ANSTransferContext {
     int gather_grid;
 
     int pipeline_batch_size;  // chunks per pipeline stage (≤ max_num_chunks)
+
+    nvcompGreenContext_t green_ctx;
 
     int log_level;
 };

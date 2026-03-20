@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <stdexcept>
@@ -344,6 +345,32 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
     ctx->pipeline_batch_size = static_cast<int>(max_num_chunks);
   }
 
+  // Green Context: partition SMs so decompress runs in isolation from gather.
+  ctx->green_ctx = NVCOMP_GREEN_CONTEXT_INIT;
+  {
+    const char* env = std::getenv("FLEXKV_NVCOMP_GREEN_SMS");
+    if (env && nvcompGreenContextIsSupported()) {
+      int green_sms = std::atoi(env);
+      if (green_sms > 0) {
+        nvcompStatus_t gs = nvcompGreenContextCreate(&ctx->green_ctx, green_sms);
+        if (gs == nvcompSuccess) {
+          // SM isolation guarantees overlap — no need to split batches.
+          // Use full buffer as batch size for fewest kernel launches.
+          ctx->pipeline_batch_size = static_cast<int>(max_num_chunks);
+          if (log_level >= 1)
+            printf("[nvcomp] Green Context: requested %d SMs, allocated %d / %d, "
+                   "pipeline_batch_size=%d (no split)\n",
+                   green_sms, ctx->green_ctx.num_sms,
+                   ctx->green_ctx.total_device_sms,
+                   ctx->pipeline_batch_size);
+        } else {
+          fprintf(stderr, "[nvcomp] Green Context creation failed (status=%d), "
+                  "falling back to default scheduling\n", (int)gs);
+        }
+      }
+    }
+  }
+
   if (log_level >= 1) {
     int device_id, num_sms_log, max_tps_log;
     cudaGetDevice(&device_id);
@@ -366,13 +393,15 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
            total_host / (1024.0 * 1024.0),
            ctx->scatter_grid, ctx->gather_grid,
            ctx->pipeline_batch_size,
-           (pipeline_batch_size > 0) ? "" : "(auto)",
+           ctx->green_ctx.valid ? "(green, no split)" :
+               (pipeline_batch_size > 0) ? "" : "(auto)",
            ctas_log,
            ctx->pipeline_batch_size * ctas_log);
   }
 }
 
 void ans_ctx_destroy(ANSTransferContext* ctx) {
+  nvcompGreenContextDestroy(&ctx->green_ctx);
   cudaFree(ctx->d_comp_temp);
   cudaFree(ctx->d_comp_staging_base);
   for (int i = 0; i < 2; i++) {
@@ -397,9 +426,12 @@ void ans_ctx_destroy(ANSTransferContext* ctx) {
 
 // ---------------------------------------------------------------------------
 // D2H: double-buffer pipeline.
-// compress stream (caller's): build_ptrs → compress  (slot alternates 0/1)
-// scatter stream (internal):  scatter → write sizes   (slot alternates 0/1)
+// compress stream (green / caller's): build_ptrs → compress             (slot 0/1)
+// scatter stream:                     scatter → write sizes              (slot 0/1)
 // compress(N) overlaps with scatter(N-1) on different slots/streams.
+// NOTE: compress is compute-heavy (histogram + normalize + encode).
+//       When using Green Context, allocate enough SMs to avoid compress
+//       becoming the bottleneck (recommend ≥ 30 SMs on H100).
 // ---------------------------------------------------------------------------
 
 template<BackendType Type>
@@ -423,6 +455,9 @@ void ans_compress_and_d2h(
 
   assert(static_cast<size_t>(chunk_size_in_bytes) <= ctx->max_chunk_size);
 
+  const bool use_green = ctx->green_ctx.valid;
+  cudaStream_t comp_stream = use_green ? ctx->green_ctx.stream : stream;
+
   nvtxRangePush("ANS:D2H_total");
 
   for (int bi = 0; bi < num_batches; bi++) {
@@ -432,33 +467,39 @@ void ans_compress_and_d2h(
 
     // Wait for previous scatter on this slot to finish before reusing buffers
     if (bi >= 2)
-      ANS_CUDA_CHECK(cudaStreamWaitEvent(stream, ctx->scatter_done[cur], 0));
+      ANS_CUDA_CHECK(cudaStreamWaitEvent(comp_stream, ctx->scatter_done[cur], 0));
 
-    // 1. Build GPU source pointer array (on compress stream)
+    // 1. Build GPU source pointer array + compress (on comp stream / green context)
+    nvtxRangePush("ANS:D2H:compress");
     {
+      if (use_green) nvcompGreenContextPush(&ctx->green_ctx);
+
       int threads = 256;
       int blocks = std::min((bsz + threads - 1) / threads, ANS_TRANSFER_SMS);
-      ans_build_ptrs_kernel<Type><<<blocks, threads, 0, stream>>>(
+      ans_build_ptrs_kernel<Type><<<blocks, threads, 0, comp_stream>>>(
           ctx->d_uncomp_ptrs, gpu_handler, gpu_block_ids,
           kv_dim, num_blocks, bs, bsz);
+
+      ANS_NVCOMP_CHECK(nvcompBatchedANSCompressAsync(
+          (const void* const*)ctx->d_uncomp_ptrs,
+          ctx->d_uncomp_sizes,
+          chunk_size_in_bytes,
+          bsz,
+          ctx->d_comp_temp,
+          ctx->comp_temp_bytes,
+          ctx->d_comp_ptrs[cur],
+          ctx->d_comp_sizes[cur],
+          ctx->comp_opts,
+          nullptr,
+          comp_stream));
+      ANS_CUDA_CHECK(cudaEventRecord(ctx->compress_done[cur], comp_stream));
+
+      if (use_green) nvcompGreenContextPop(&ctx->green_ctx);
     }
+    nvtxRangePop();
 
-    // 2. ANS compress into slot[cur]
-    ANS_NVCOMP_CHECK(nvcompBatchedANSCompressAsync(
-        (const void* const*)ctx->d_uncomp_ptrs,
-        ctx->d_uncomp_sizes,
-        chunk_size_in_bytes,
-        bsz,
-        ctx->d_comp_temp,
-        ctx->comp_temp_bytes,
-        ctx->d_comp_ptrs[cur],
-        ctx->d_comp_sizes[cur],
-        ctx->comp_opts,
-        nullptr,
-        stream));
-    ANS_CUDA_CHECK(cudaEventRecord(ctx->compress_done[cur], stream));
-
-    // 3. Scatter from slot[cur] on scatter_stream (overlaps with next compress)
+    // 2. Scatter from slot[cur] on scatter_stream (overlaps with next compress)
+    nvtxRangePush("ANS:D2H:scatter");
     ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->compress_done[cur], 0));
     {
       int grid = std::min(bsz, ctx->scatter_grid);
@@ -470,10 +511,14 @@ void ans_compress_and_d2h(
           h_comp_sizes_out);
     }
     ANS_CUDA_CHECK(cudaEventRecord(ctx->scatter_done[cur], ctx->scatter_stream));
+    nvtxRangePop();
   }
 
   // Wait for all work to complete
-  ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
+  if (use_green)
+    ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->green_ctx.stream));
+  else
+    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
   ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->scatter_stream));
 
   nvtxRangePop(); // D2H_total
@@ -493,8 +538,8 @@ void ans_compress_and_d2h(
 
 // ---------------------------------------------------------------------------
 // H2D: double-buffer pipeline.
-// gather stream (scatter_stream): upload_sizes + build_ptrs + gather  (slot 0/1)
-// decomp stream (caller's):      decompress                           (slot 0/1)
+// scatter stream: upload_sizes(DMA) + gather                            (slot 0/1)
+// decomp stream:  build_ptrs + decompress                               (slot 0/1)
 // gather(N) overlaps with decompress(N-1) on different slots/streams.
 // ---------------------------------------------------------------------------
 
@@ -519,6 +564,11 @@ void ans_h2d_and_decompress(
 
   assert(static_cast<size_t>(chunk_size_in_bytes) <= ctx->max_chunk_size);
 
+  static_assert(sizeof(size_t) == sizeof(int64_t), "size_t must be 64-bit");
+
+  const bool use_green = ctx->green_ctx.valid;
+  cudaStream_t decomp_stream = use_green ? ctx->green_ctx.stream : stream;
+
   nvtxRangePush("ANS:H2D_total");
 
   for (int bi = 0; bi < num_batches; bi++) {
@@ -527,18 +577,13 @@ void ans_h2d_and_decompress(
     const int cur = bi % 2;
 
     if (bi >= 2) {
-      // GPU stream wait: previous decompress on this slot must finish before reusing buffers
       ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->scatter_done[cur], 0));
-      // No cudaEventSynchronize needed: h_comp_sizes_in is a pinned read-only buffer
-      // (immutable during this call), so cudaMemcpyAsync reads directly from it
-      // without any CPU-side write/read race on intermediate h_comp_sizes buffers.
     }
 
-    // 1. Upload comp_sizes directly from pinned input (on gather stream)
+    // 1. Upload comp_sizes (DMA on scatter stream, before gather)
     nvtxRangePush("ANS:H2D:upload_sizes");
     {
       const size_t size_bytes = bsz * sizeof(size_t);
-      static_assert(sizeof(size_t) == sizeof(int64_t), "size_t must be 64-bit");
       ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_comp_sizes[cur],
                                       h_comp_sizes_in + bs,
                                       size_bytes, cudaMemcpyHostToDevice,
@@ -546,18 +591,21 @@ void ans_h2d_and_decompress(
     }
     nvtxRangePop();
 
-    // 2. Build decompress output pointer array (GPU kernel on gather stream)
+    // 2. Build decompress output pointer array (on decomp stream / green context)
+    //    Runs in parallel with upload_sizes + gather on scatter stream.
     nvtxRangePush("ANS:H2D:build_ptrs");
     {
+      if (use_green) nvcompGreenContextPush(&ctx->green_ctx);
       int threads = 256;
       int blocks = std::min((bsz + threads - 1) / threads, ANS_TRANSFER_SMS);
-      ans_build_ptrs_kernel<Type><<<blocks, threads, 0, ctx->scatter_stream>>>(
+      ans_build_ptrs_kernel<Type><<<blocks, threads, 0, decomp_stream>>>(
           ctx->d_decomp_ptrs[cur], gpu_handler, gpu_block_ids,
           kv_dim, num_blocks, bs, bsz);
+      if (use_green) nvcompGreenContextPop(&ctx->green_ctx);
     }
     nvtxRangePop();
 
-    // 3. Gather kernel: CPU pinned → GPU staging (on gather stream)
+    // 3. Gather kernel: CPU pinned → GPU staging (on scatter stream, primary context)
     nvtxRangePush("ANS:H2D:gather_kernel");
     {
       int grid = std::min(bsz, ctx->gather_grid);
@@ -571,28 +619,34 @@ void ans_h2d_and_decompress(
 
     ANS_CUDA_CHECK(cudaEventRecord(ctx->compress_done[cur], ctx->scatter_stream));
 
-    // 4. ANS decompress (on caller stream, overlaps with next gather)
+    // 4. ANS decompress (confined to green context SMs when available)
     nvtxRangePush("ANS:H2D:decompress");
-    ANS_CUDA_CHECK(cudaStreamWaitEvent(stream, ctx->compress_done[cur], 0));
-    ANS_NVCOMP_CHECK(nvcompBatchedANSDecompressAsync(
-        (const void* const*)ctx->d_comp_ptrs[cur],
-        ctx->d_comp_sizes[cur],
-        ctx->d_decomp_buf_sizes[cur],
-        ctx->d_decomp_act_sizes,
-        bsz,
-        ctx->d_decomp_temp,
-        ctx->decomp_temp_bytes,
-        ctx->d_decomp_ptrs[cur],
-        ctx->decomp_opts,
-        ctx->d_statuses,
-        stream));
+    {
+      if (use_green) nvcompGreenContextPush(&ctx->green_ctx);
+      ANS_CUDA_CHECK(cudaStreamWaitEvent(decomp_stream, ctx->compress_done[cur], 0));
+      ANS_NVCOMP_CHECK(nvcompBatchedANSDecompressAsync(
+          (const void* const*)ctx->d_comp_ptrs[cur],
+          ctx->d_comp_sizes[cur],
+          ctx->d_decomp_buf_sizes[cur],
+          ctx->d_decomp_act_sizes,
+          bsz,
+          ctx->d_decomp_temp,
+          ctx->decomp_temp_bytes,
+          ctx->d_decomp_ptrs[cur],
+          ctx->decomp_opts,
+          ctx->d_statuses,
+          decomp_stream));
+      ANS_CUDA_CHECK(cudaEventRecord(ctx->scatter_done[cur], decomp_stream));
+      if (use_green) nvcompGreenContextPop(&ctx->green_ctx);
+    }
     nvtxRangePop();
-
-    ANS_CUDA_CHECK(cudaEventRecord(ctx->scatter_done[cur], stream));
   }
 
   // Wait for all work to complete
-  ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
+  if (ctx->green_ctx.valid)
+    ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->green_ctx.stream));
+  else
+    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
   ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->scatter_stream));
 
   nvtxRangePop(); // H2D_total
