@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig, FullAttentionSpec
     from vllm.config import VllmConfig
 
+from transformers import AutoConfig as HFAutoConfig
 
 logger = flexkv_logger
 
@@ -120,11 +121,12 @@ class FlexKVConfig:
 
     def post_init_from_trt_config(
         self,
-        config,
-    ):
-        self.cache_config.tokens_per_block = config.tokens_per_block
+        torch_llm_args,
+    ):  
+        kv_cache_config = torch_llm_args.kv_cache_config
+        self.cache_config.tokens_per_block = kv_cache_config.tokens_per_block
         # Convert dtype string to torch.dtype
-        dtype_str = config.pytorch_backend_config.kv_cache_dtype
+        dtype_str = torch_llm_args.dtype
         flexkv_logger.info(f"[FlexKVConfig] dtype_str from TRT config: {dtype_str}")
         
         # Helper function to convert dtype string to torch.dtype
@@ -166,39 +168,39 @@ class FlexKVConfig:
             self.model_config.dtype = dtype_str
         
         # Set model config (parallel configs part)
-        if config.mapping.enable_attention_dp:
+        if torch_llm_args.enable_attention_dp:
             self.model_config.tp_size = 1
-            self.model_config.dp_size = config.mapping.tp_size
+            self.model_config.dp_size = torch_llm_args.tensor_parallel_size
         else:
-            self.model_config.tp_size = config.mapping.tp_size
+            self.model_config.tp_size = torch_llm_args.tensor_parallel_size
             self.model_config.dp_size = 1
             
         # self.model_config (model configs part)
-        try:
-            model_path = getattr(config, 'hf_model_dir', None)
-            from transformers import AutoConfig as HFAutoConfig
-            hf_config = HFAutoConfig.from_pretrained(
-                str(model_path), 
-                trust_remote_code=True
-            )
-            self.model_config.num_layers = hf_config.num_hidden_layers
-            self.model_config.use_mla = (hasattr(hf_config, 'kv_lora_rank') and 
-                            hf_config.kv_lora_rank is not None and
-                            hasattr(hf_config, 'qk_rope_head_dim') and 
-                            hf_config.qk_rope_head_dim is not None)
-            if self.model_config.use_mla:
-                self.model_config.head_size = hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
-                self.model_config.num_kv_heads = 1
-            else:
-                if hasattr(hf_config, 'num_key_value_heads'):
-                    assert hf_config.num_attention_heads != hf_config.num_key_value_heads, f"{hf_config.num_attention_heads=}, {hf_config.num_key_value_heads=}"
+        model_path = torch_llm_args.model
+        
+        hf_config = HFAutoConfig.from_pretrained(
+            str(model_path), 
+            trust_remote_code=True
+        )
+        self.model_config.num_layers = hf_config.num_hidden_layers
+        self.model_config.use_mla = (hasattr(hf_config, 'kv_lora_rank') and 
+                        hf_config.kv_lora_rank is not None and
+                        hasattr(hf_config, 'qk_rope_head_dim') and 
+                        hf_config.qk_rope_head_dim is not None)
+        if self.model_config.use_mla:
+            self.model_config.head_size = hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
+            self.model_config.num_kv_heads = 1
+        else:
+            if hasattr(hf_config, 'num_key_value_heads'):
+                assert hf_config.num_attention_heads != hf_config.num_key_value_heads, f"{hf_config.num_attention_heads=}, {hf_config.num_key_value_heads=}"
+                if hasattr(hf_config, 'head_dim'):
                     self.model_config.head_size = hf_config.head_dim
-                    self.model_config.num_kv_heads = hf_config.num_key_value_heads
                 else:
                     self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
-                    self.model_config.num_kv_heads = hf_config.num_attention_heads
-            
-        except Exception as e:
-            flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
+                self.model_config.num_kv_heads = hf_config.num_key_value_heads
+            else:
+                self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
+                self.model_config.num_kv_heads = hf_config.num_attention_heads
+                
         # Update cache config with user config after model config is initialized
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)

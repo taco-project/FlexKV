@@ -52,21 +52,14 @@ class RequestWrapper:
 
     @property
     def num_new_matched_tokens(self):
-        return self._request.num_connector_matched_tokens
+        return getattr(self._request, 'py_num_connector_matched_tokens', "nan")
         # return self._request.local_prepopulated_prompt_len
 
     def is_finished(self):
         return self._request.is_finished
     
-    def is_finished_normal(self):
-        # NORMAL = 0
-        # ABNORMAL = 3
-        
-        # if self._request.is_finished_normal():        
-        #     return NORMAL
-        # else:
-        #     return ABNORMAL
-        return self._request.is_finished_normal
+    def is_finished_without_error(self):
+        return self._request.is_finished_without_error
 
     def __repr__(self):
         return f"RequestWrapper(req_id={self.req_id}, " \

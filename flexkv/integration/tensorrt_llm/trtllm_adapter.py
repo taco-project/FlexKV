@@ -22,18 +22,19 @@ from flexkv.transfer_manager import TransferManagerOnRemote
 
 from flexkv.integration.tensorrt_llm.utils import RequestWrapper
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker,
     SchedulerOutput)
 
 class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
-    def __init__(self, config: ExecutorConfig):
+    def __init__(self, torch_llm_args: TorchLlmArgs):
         # Set environment variable for FlexKV with TensorRT-LLM，this must before KVManager initialization
         os.environ['FLEXKV_WITH_TRTLLM'] = '1'
         flexkv_config = FlexKVConfig.from_env() 
-        flexkv_config.post_init_from_trt_config(config)
-        self.node_rank, self.tp_rank, self.dp_rank = get_rank_info_from_trt_config(config)
+        flexkv_config.post_init_from_trt_config(torch_llm_args)
+        self.node_rank, self.tp_rank, self.dp_rank = get_rank_info_from_trt_config(torch_llm_args)
 
         flexkv_logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
         self.server_recv_port = flexkv_config.server_recv_port
@@ -181,6 +182,8 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         
         match_start_time = time.perf_counter()
         num_tokens_to_get = (request.num_prompt_tokens // self.block_size) * self.block_size
+        effective_length = ((num_tokens_to_get - 1) // self.block_size) * self.block_size
+        
         if num_tokens_to_get == 0:
             return -1, 0
 
@@ -189,7 +192,8 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         assert num_computed_tokens % self.block_size == 0,(
             f"{num_computed_tokens=}, {self.block_size=}")
 
-        if num_tokens_to_get == num_computed_tokens:
+        # if num_tokens_to_get == num_computed_tokens:
+        if num_computed_tokens >= effective_length:
             return -1, 0
 
         # Use cached numpy token sequence to avoid repeated list->numpy conversion in hot path
@@ -306,7 +310,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             return True
 
         # Abnormal finished, don't put
-        if not (request.is_finished() and request.is_finished_normal()):
+        if not (request.is_finished() and request.is_finished_without_error()):
             return False
 
         task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(_request=_request)
@@ -522,10 +526,10 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         return self.flexkv_manager.dp_client_id
 
 class FlexKVWorkerConnector(KvCacheConnectorWorker):
-    def __init__(self, config: ExecutorConfig):
+    def __init__(self, torch_llm_args: TorchLlmArgs):
         flexkv_config = FlexKVConfig.from_env()
-        self.node_rank, self.tp_rank, self.dp_rank = get_rank_info_from_trt_config(config)
-        flexkv_config.post_init_from_trt_config(config)
+        self.node_rank, self.tp_rank, self.dp_rank = get_rank_info_from_trt_config(torch_llm_args)
+        flexkv_config.post_init_from_trt_config(torch_llm_args)
         dp_client_id = self.dp_rank
         
         current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
@@ -679,13 +683,10 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         if hasattr(self, 'remote_process') and self.remote_process is not None:
             self.shutdown()
     
-def get_rank_info_from_trt_config(config: ExecutorConfig):
-    if config.mapping.enable_attention_dp:
-        node_rank = config.mapping.node_rank
-        tp_rank = config.mapping.tp_rank
-        dp_rank = config.mapping.rank
-    else:
-        node_rank = config.mapping.node_rank
-        tp_rank = config.mapping.tp_rank
-        dp_rank = 0
+def get_rank_info_from_trt_config(torch_llm_args: TorchLlmArgs):
+    # TorchLlmArgs has no .mapping; Mapping is built from parallel_config.to_mapping()
+    mapping = torch_llm_args.parallel_config.to_mapping()
+    node_rank = mapping.node_rank
+    tp_rank = mapping.tp_rank
+    dp_rank = mapping.rank if mapping.enable_attention_dp else 0
     return node_rank, tp_rank, dp_rank
