@@ -378,7 +378,6 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
         layer_granularity=ops[0].layer_granularity,
         dp_id=ops[0].dp_id,
     )
-    graph.add_transfer_op(merged_op)
     if callbacks:
         if len(callbacks) == 1:
             op_callback_dict[merged_op.op_id] = callbacks[0]
@@ -448,9 +447,8 @@ def merge_to_batch_graph(batch_id: int,
                                   merged_graph, callbacks_by_type[TransferType.DISK2H], new_op_callback_dict)
     merged_h2d_op = _merge_ops(ops_by_type[TransferType.H2D], TransferType.H2D,
                                merged_graph, callbacks_by_type[TransferType.H2D], new_op_callback_dict)
-    if merged_disk2h_op is not None and merged_h2d_op is not None:
-        merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
-    if layerwise_transfer:  # FIXME: rebase issue
+
+    if layerwise_transfer:
         if merged_h2d_op is not None:
             layerwise_transfer_op = LayerwiseTransferOp(
                 graph_id=merged_graph.graph_id,
@@ -464,34 +462,43 @@ def merge_to_batch_graph(batch_id: int,
                     else np.array([], dtype=np.int64),
                 layer_id=0,
                 layer_granularity=1,
-                dp_id=h2d_ops[0].dp_id,
+                dp_id=ops_by_type[TransferType.H2D][0].dp_id,
                 counter_id=counter_id,
             )
             merged_graph.add_transfer_op(layerwise_transfer_op)
         batch_end_op_id = -1
-        # layerwise transfer op does not need callbacks
         new_op_callback_dict.clear()
-
-    # PUT path: D2H -> H2DISK
-    merged_d2h_op = _merge_ops(ops_by_type[TransferType.D2H], TransferType.D2H,
-                               merged_graph, callbacks_by_type[TransferType.D2H], new_op_callback_dict)
-    merged_h2disk_op = _merge_ops(ops_by_type[TransferType.H2DISK], TransferType.H2DISK,
-                                  merged_graph, callbacks_by_type[TransferType.H2DISK], new_op_callback_dict)
-    if merged_d2h_op is not None and merged_h2disk_op is not None:
-        merged_graph.add_dependency(merged_h2disk_op.op_id, merged_d2h_op.op_id)
-
-    # batch_end_op_id: GET: H2D > DISK2H; PUT: H2DISK > D2H
-    if merged_h2d_op is not None:
-        batch_end_op_id = merged_h2d_op.op_id
-    elif merged_disk2h_op is not None:
-        batch_end_op_id = merged_disk2h_op.op_id
-    elif merged_h2disk_op is not None:
-        batch_end_op_id = merged_h2disk_op.op_id
-    elif merged_d2h_op is not None:
-        batch_end_op_id = merged_d2h_op.op_id
     else:
-        batch_end_op_id = -1
+        if merged_disk2h_op is not None:
+            merged_graph.add_transfer_op(merged_disk2h_op)
+        if merged_h2d_op is not None:
+            merged_graph.add_transfer_op(merged_h2d_op)
+        if merged_disk2h_op is not None and merged_h2d_op is not None:
+            merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
 
+        # PUT path: D2H -> H2DISK
+        merged_d2h_op = _merge_ops(ops_by_type[TransferType.D2H], TransferType.D2H,
+                                   merged_graph, callbacks_by_type[TransferType.D2H], new_op_callback_dict)
+        merged_h2disk_op = _merge_ops(ops_by_type[TransferType.H2DISK], TransferType.H2DISK,
+                                      merged_graph, callbacks_by_type[TransferType.H2DISK], new_op_callback_dict)
+        if merged_d2h_op is not None:
+            merged_graph.add_transfer_op(merged_d2h_op)
+        if merged_h2disk_op is not None:
+            merged_graph.add_transfer_op(merged_h2disk_op)
+        if merged_d2h_op is not None and merged_h2disk_op is not None:
+            merged_graph.add_dependency(merged_h2disk_op.op_id, merged_d2h_op.op_id)
+
+        # batch_end_op_id: GET: H2D > DISK2H; PUT: H2DISK > D2H
+        if merged_h2d_op is not None:
+            batch_end_op_id = merged_h2d_op.op_id
+        elif merged_disk2h_op is not None:
+            batch_end_op_id = merged_disk2h_op.op_id
+        elif merged_h2disk_op is not None:
+            batch_end_op_id = merged_h2disk_op.op_id
+        elif merged_d2h_op is not None:
+            batch_end_op_id = merged_d2h_op.op_id
+        else:
+            batch_end_op_id = -1
 
     return merged_graph, batch_end_op_id, new_op_callback_dict
 
