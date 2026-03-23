@@ -124,7 +124,7 @@ class KVServer:
             self.context, zmq.SocketType.PULL, server_recv_port, True)
 
         self.client_manager = ClientManager(max_num_dp_client=model_config.dp_size)
-        self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port, False)
+        self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port)
 
         self.req_counter = 0
         self._is_ready = False
