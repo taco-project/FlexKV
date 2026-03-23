@@ -135,7 +135,27 @@ __global__ void ans_h2d_gather_kernel(
     }
 }
 
-// GPU kernel to build d_uncomp_ptrs directly on device (replaces CPU loop + H2D upload)
+// GPU kernel to gather compressed sizes from 2D pinned metadata buffer into
+// d_comp_sizes, replacing Python-side meta_slice + cudaMemcpyAsync.
+// comp_sizes_meta layout: [num_layers * kv_dim, num_cpu_blocks] (pinned host)
+__global__ void ans_gather_comp_sizes_kernel(
+    size_t* __restrict__ d_comp_sizes_out,
+    const int64_t* __restrict__ comp_sizes_meta,
+    int meta_stride,
+    const int64_t* __restrict__ cpu_block_ids,
+    int kv_dim, int num_blocks,
+    int start_layer_id,
+    int batch_start, int bsz)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < bsz; i += gridDim.x * blockDim.x) {
+        int g = batch_start + i;
+        int meta_row = start_layer_id * kv_dim + g / num_blocks;
+        int b = g % num_blocks;
+        d_comp_sizes_out[i] = static_cast<size_t>(
+            comp_sizes_meta[meta_row * meta_stride + cpu_block_ids[b]]);
+    }
+}
+
 template<BackendType Type>
 __global__ void ans_build_ptrs_kernel(
     void** __restrict__ d_uncomp_ptrs,
@@ -458,7 +478,7 @@ void ans_h2d_and_decompress(
     int64_t cpu_block_stride_in_bytes,
     int64_t chunk_size_in_bytes,
     bool is_mla,
-    const int64_t* h_comp_sizes_in,
+    const int64_t* comp_sizes_meta, int meta_stride,
     cudaStream_t stream) {
 
   const int kv_dim = is_mla ? 1 : 2;
@@ -481,11 +501,12 @@ void ans_h2d_and_decompress(
     if (bi >= 2)
       ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->scatter_done[cur], 0));
 
-    { NvtxScope _nvtx("ANS:H2D:upload_sizes");
-      ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_comp_sizes[cur],
-                                      h_comp_sizes_in + bs,
-                                      bsz * sizeof(size_t), cudaMemcpyHostToDevice,
-                                      ctx->scatter_stream));
+    { NvtxScope _nvtx("ANS:H2D:gather_comp_sizes");
+      int threads = 256;
+      int blocks = std::min((bsz + threads - 1) / threads, ctx->transfer_sms);
+      ans_gather_comp_sizes_kernel<<<blocks, threads, 0, ctx->scatter_stream>>>(
+          ctx->d_comp_sizes[cur], comp_sizes_meta, meta_stride,
+          cpu_block_ids, kv_dim, num_blocks, start_layer_id, bs, bsz);
     }
 
     { NvtxScope _nvtx("ANS:H2D:build_ptrs");
@@ -532,8 +553,12 @@ void ans_h2d_and_decompress(
 
   if (ctx->log_level >= 1) {
     size_t grand_total_comp = 0;
-    for (int i = 0; i < total_chunks; i++)
-      grand_total_comp += static_cast<size_t>(h_comp_sizes_in[i]);
+    for (int g = 0; g < total_chunks; g++) {
+      int meta_row = start_layer_id * kv_dim + g / num_blocks;
+      int b = g % num_blocks;
+      grand_total_comp += static_cast<size_t>(
+          comp_sizes_meta[meta_row * meta_stride + cpu_block_ids[b]]);
+    }
     size_t total_uncomp = static_cast<size_t>(total_chunks) * chunk_size_in_bytes;
     printf("[FlexKV ans_h2d_and_decompress] H2D: %d chunks in %d batch(es), %.2f MB compressed -> %.2f MB (ratio %.2fx)\n",
            total_chunks, num_batches,
@@ -560,15 +585,15 @@ template void ans_compress_and_d2h<BackendType::SGLANG>(
 template void ans_h2d_and_decompress<BackendType::VLLM>(
     ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
     int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    const int64_t*, cudaStream_t);
+    const int64_t*, int, cudaStream_t);
 template void ans_h2d_and_decompress<BackendType::TRTLLM>(
     ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
     int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    const int64_t*, cudaStream_t);
+    const int64_t*, int, cudaStream_t);
 template void ans_h2d_and_decompress<BackendType::SGLANG>(
     ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
     int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    const int64_t*, cudaStream_t);
+    const int64_t*, int, cudaStream_t);
 
 } // namespace flexkv
 

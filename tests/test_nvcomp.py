@@ -175,21 +175,9 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
     print(f"  Compressed:   {total_comp / 1024 / 1024:.2f} MB")
     print(f"  Ratio:        {total_uncomp / total_comp:.2f}x")
 
-    # # Per-chunk compression stats
-    # chunk_ratios = chunk_size / comp_sizes_out.float()
-    # print(f"\n  Per-chunk compression ratio stats (n={num_chunks}):")
-    # print(f"    min={chunk_ratios.min().item():.3f}x  max={chunk_ratios.max().item():.3f}x  "
-    #       f"mean={chunk_ratios.mean().item():.3f}x  std={chunk_ratios.std().item():.4f}")
-    # # Per-layer breakdown: chunks are ordered [layer0_kv0_block0..N, layer0_kv1_block0..N, layer1_kv0_block0..N, ...]
-    # chunk_ratios_2d = chunk_ratios.reshape(num_layers, kv_dim * num_blocks)
-    # print(f"    Per-layer mean ratio (across kv*blocks):")
-    # for li in range(num_layers):
-    #     lr = chunk_ratios_2d[li]
-    #     print(f"      layer {li:2d}: {lr.mean().item():.3f}x  "
-    #           f"(min={lr.min().item():.3f}x, max={lr.max().item():.3f}x, std={lr.std().item():.4f})")
-
     # --- H2D ---
     print("\n--- H2D (gather + transfer + unpack + decompress) ---")
+    comp_sizes_meta = comp_sizes_out.reshape(num_layers * kv_dim, num_blocks)
     t2 = time.time()
     with torch.cuda.stream(transfer_stream):
         ans_h2d_and_decompress(
@@ -201,7 +189,7 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
             chunk_size,
             0, num_layers,
             False, 0,
-            comp_sizes_out,
+            comp_sizes_meta,
         )
     transfer_stream.synchronize()
     t3 = time.time()
@@ -309,6 +297,8 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
                 cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
                 chunk_size, 0, num_layers, False, 0, comp_sizes)
 
+    comp_sizes_meta = comp_sizes.reshape(num_layers * kv_dim, num_blocks)
+
     def run_nvcomp_h2d():
         with torch.cuda.stream(transfer_stream):
             ans_h2d_and_decompress(
@@ -316,7 +306,7 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
                 gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
                 cpu_block_ids, cpu_blocks,
                 cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
-                chunk_size, 0, num_layers, False, 0, comp_sizes)
+                chunk_size, 0, num_layers, False, 0, comp_sizes_meta)
 
     for _ in range(num_warmup):
         run_nvcomp_d2h()
@@ -342,17 +332,6 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
     print(f"    Compression ratio: {total_bytes / total_comp:.2f}x")
     print(f"    D2H: {nvcomp_d2h_ms:.2f} ms  (speedup {baseline_d2h_ms / nvcomp_d2h_ms:.2f}x)")
     print(f"    H2D: {nvcomp_h2d_ms:.2f} ms  (speedup {baseline_h2d_ms / nvcomp_h2d_ms:.2f}x)")
-
-    # chunk_ratios = chunk_size / comp_sizes.float()
-    # print(f"\n    Per-chunk compression ratio stats (n={num_chunks}):")
-    # print(f"      min={chunk_ratios.min().item():.3f}x  max={chunk_ratios.max().item():.3f}x  "
-    #       f"mean={chunk_ratios.mean().item():.3f}x  std={chunk_ratios.std().item():.4f}")
-    # chunk_ratios_2d = chunk_ratios.reshape(num_layers, kv_dim * num_blocks)
-    # print(f"      Per-layer mean ratio (across kv*blocks):")
-    # for li in range(num_layers):
-    #     lr = chunk_ratios_2d[li]
-    #     print(f"        layer {li:2d}: {lr.mean().item():.3f}x  "
-    #           f"(min={lr.min().item():.3f}x, max={lr.max().item():.3f}x, std={lr.std().item():.4f})")
 
     ctx.destroy()
 

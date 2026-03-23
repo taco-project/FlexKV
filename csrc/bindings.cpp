@@ -190,14 +190,18 @@ void ans_h2d_and_decompress_binding(
     int64_t cpu_block_stride_in_bytes, int64_t chunk_size_in_bytes,
     int start_layer_id, int num_layers,
     bool is_mla, int gpu_block_type,
-    torch::Tensor &comp_sizes_in) {
+    torch::Tensor &comp_sizes_meta) {
+
+  TORCH_CHECK(comp_sizes_meta.dim() == 2, "comp_sizes_meta must be 2D [num_layers*kv_dim, num_cpu_blocks]");
+  TORCH_CHECK(comp_sizes_meta.is_pinned(), "comp_sizes_meta must be pinned memory");
 
   int num_blocks = gpu_block_id_tensor.numel();
   int64_t *gpu_block_ids = static_cast<int64_t*>(gpu_block_id_tensor.data_ptr());
   void **gpu_tensor_ptrs = static_cast<void**>(gpu_tensor_ptrs_tensor.data_ptr());
   int64_t *cpu_block_ids = static_cast<int64_t*>(cpu_block_id_tensor.data_ptr());
   void *cpu_ptr = static_cast<void*>(cpu_tensor.data_ptr());
-  const int64_t *comp_sizes_ptr = static_cast<const int64_t*>(comp_sizes_in.data_ptr());
+  const int64_t *comp_sizes_meta_ptr = static_cast<const int64_t*>(comp_sizes_meta.data_ptr());
+  int meta_stride = static_cast<int>(comp_sizes_meta.stride(0));
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -222,7 +226,7 @@ void ans_h2d_and_decompress_binding(
           gpu_block_ids, handler, cpu_block_ids, cpu_ptr,
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
           cpu_block_stride_in_bytes, chunk_size_in_bytes, is_mla,
-          comp_sizes_ptr, stream);
+          comp_sizes_meta_ptr, meta_stride, stream);
       break;
     case flexkv::BackendType::TRTLLM:
       flexkv::ans_h2d_and_decompress<flexkv::BackendType::TRTLLM>(
@@ -230,7 +234,7 @@ void ans_h2d_and_decompress_binding(
           gpu_block_ids, handler, cpu_block_ids, cpu_ptr,
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
           cpu_block_stride_in_bytes, chunk_size_in_bytes, is_mla,
-          comp_sizes_ptr, stream);
+          comp_sizes_meta_ptr, meta_stride, stream);
       break;
     case flexkv::BackendType::SGLANG:
       flexkv::ans_h2d_and_decompress<flexkv::BackendType::SGLANG>(
@@ -238,7 +242,7 @@ void ans_h2d_and_decompress_binding(
           gpu_block_ids, handler, cpu_block_ids, cpu_ptr,
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
           cpu_block_stride_in_bytes, chunk_size_in_bytes, is_mla,
-          comp_sizes_ptr, stream);
+          comp_sizes_meta_ptr, meta_stride, stream);
       break;
   }
   cudaError_t err = cudaGetLastError();
@@ -578,7 +582,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("comp_sizes_out"));
 
   m.def("ans_h2d_and_decompress", &ans_h2d_and_decompress_binding,
-        "H2D transfer then ANS decompress on GPU",
+        "H2D transfer then ANS decompress on GPU (gathers comp_sizes from 2D pinned meta)",
         py::arg("ctx"),
         py::arg("gpu_block_id_tensor"), py::arg("gpu_tensor_ptrs_tensor"),
         py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
@@ -589,7 +593,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("chunk_size_in_bytes"),
         py::arg("start_layer_id"), py::arg("num_layers"),
         py::arg("is_mla"), py::arg("gpu_block_type"),
-        py::arg("comp_sizes_in"));
+        py::arg("comp_sizes_meta"));
 #endif // FLEXKV_ENABLE_NVCOMP
 
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,

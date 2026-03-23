@@ -390,9 +390,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             # Pre-allocate pinned buffer for D2H comp_sizes output (GPU kernel writes here)
             self._d2h_comp_sizes_buf = torch.zeros(
                 max_chunks, dtype=torch.int64).pin_memory()
-            # Pre-allocate pinned buffer for H2D comp_sizes input
-            self._h2d_comp_sizes_buf = torch.zeros(
-                max_chunks, dtype=torch.int64).pin_memory()
             flexkv_logger.info(
                 f"[nvcomp] Enabled: batch_size={nvcomp_batch_size}, "
                 f"chunk_size={self.chunk_size_in_bytes}, "
@@ -487,6 +484,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         cpu_bids = cpu_block_id_list.cpu()
 
         if transfer_type == TransferType.D2H:
+            _r_ans = nvtx.start_range(message="D2H_nvcomp:ans_compress_and_d2h_call", color="orange")
             comp_sizes_out = self._d2h_comp_sizes_buf[:num_chunks]
             ans_compress_and_d2h(
                 self.ans_ctx,
@@ -507,36 +505,15 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 self.gpu_block_type_,
                 comp_sizes_out,
             )
-
+            nvtx.end_range(_r_ans)
             # TODO: now assume CR > 1.0 and compression always succeeds
             comp_2d = comp_sizes_out.reshape(layer_granularity * kv_dim, num_blocks)
             self.comp_sizes_meta[col_start:col_end, cpu_bids] = comp_2d
 
         elif transfer_type == TransferType.H2D:
-            # meta layout: [num_layers * kv_dim, num_cpu_blocks]
-            # Slicing [col_start:col_end, cpu_bids] gives [layer_gran*kv_dim, num_blocks]
-            # — already the right order, no transpose needed.
-            _r_meta = nvtx.start_range(message="H2D_nvcomp:meta_slice", color="orange")
-            # Fast path 1: contiguous [0, 1, ..., num_blocks-1] → contiguous slice (no gather)
-            if torch.equal(cpu_bids, torch.arange(num_blocks, device=cpu_bids.device, dtype=cpu_bids.dtype)):
-                comp_sizes_tmp = self.comp_sizes_meta[col_start:col_end, :num_blocks].reshape(-1)
-            # Fast path 2: contiguous [a, a+1, ..., a+num_blocks-1] → contiguous slice (no gather)
-            elif num_blocks >= 2 and (cpu_bids[1:] - cpu_bids[:-1] == 1).all():
-                start_col = int(cpu_bids[0].item())
-                comp_sizes_tmp = self.comp_sizes_meta[col_start:col_end, start_col : start_col + num_blocks].reshape(-1)
-            else:
-                comp_sizes_tmp = self.comp_sizes_meta[col_start:col_end, cpu_bids].reshape(-1)
-            nvtx.end_range(_r_meta)
-
-            # Copy into pre-allocated pinned buffer so C++ can cudaMemcpyAsync
-            # directly from it — eliminates h_comp_sizes double-buffer and
-            # the per-batch cudaEventSynchronize host-blocking
-            comp_sizes_in = self._h2d_comp_sizes_buf[:num_chunks]
-            _r_copy = nvtx.start_range(message="H2D_nvcomp:copy_comp_sizes", color="orange")
-            comp_sizes_in.copy_(comp_sizes_tmp)
-            nvtx.end_range(_r_copy)
-
-            # TODO: now assume CR > 1.0
+            # comp_sizes_meta is [num_layers*kv_dim, num_cpu_blocks] pinned.
+            # The C++ kernel gathers from it directly on GPU — no Python-side
+            # meta_slice or copy needed.
             _r_ans = nvtx.start_range(message="H2D_nvcomp:ans_h2d_and_decompress_call", color="orange")
             ans_h2d_and_decompress(
                 self.ans_ctx,
@@ -555,7 +532,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 layer_granularity,
                 self.is_mla,
                 self.gpu_block_type_,
-                comp_sizes_in,
+                self.comp_sizes_meta,
             )
             nvtx.end_range(_r_ans)
         nvtx.end_range(nvtx_range)

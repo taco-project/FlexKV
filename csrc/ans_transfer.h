@@ -130,7 +130,7 @@ void ans_h2d_and_decompress(
     int64_t cpu_block_stride_in_bytes,
     int64_t chunk_size_in_bytes,
     bool is_mla,
-    const int64_t* h_comp_sizes_in,
+    const int64_t* comp_sizes_meta, int meta_stride,
     cudaStream_t stream);
 
 } // namespace flexkv
