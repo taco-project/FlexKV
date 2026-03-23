@@ -53,9 +53,6 @@ class TransferManager:
 
         if device_id in self.all_gpu_blocks:
             flexkv_logger.error(f"GPU {device_id} has already registered.")
-        elif device_id >= self.model_config.tp_size:
-            flexkv_logger.error(f"GPU {device_id} is larger than TP size: "
-                                f"{self.model_config.tp_size}.")
         else:
             try:
                 self.all_gpu_blocks[device_id] = req.handles
@@ -108,8 +105,8 @@ class TransferManager:
                                                     device_id,
                                                     dtype=self.model_config.dtype)
         self.gpu_handles = [
-            self.storage_engine.get_storage_handle(DeviceType.GPU, i)
-            for i in range(self.model_config.tp_size)
+            self.storage_engine.get_storage_handle(DeviceType.GPU, device_id)
+            for device_id in sorted(self.all_gpu_blocks.keys())
         ]
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None

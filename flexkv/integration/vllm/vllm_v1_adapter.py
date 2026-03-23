@@ -523,10 +523,6 @@ class FlexKVWorkerConnector:
         self.is_local_leader = get_tp_group().local_rank == 0
         self.launch_remote_transfer_manager = get_tp_group().local_rank == 0 and \
             get_tp_group().rank_in_group != 0
-        # Use local device index directly. With CUDA_VISIBLE_DEVICES isolation
-        # (set by vLLM per DP rank), torch.cuda.current_device() already returns
-        # the correct local index (0..tp_size-1). The TransferManager subprocess
-        # inherits the same CUDA_VISIBLE_DEVICES, so it also sees local indices.
         current_device_id = torch.cuda.current_device()
         self.flexkv_config = flexkv_config
         if self.launch_remote_transfer_manager:
