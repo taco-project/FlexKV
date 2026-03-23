@@ -231,6 +231,8 @@ class TransferWorkerBase(ABC):
                         except Exception as e:
                             flexkv_logger.error(f"Error launching transfer: {e}\n"
                                         f"Failed transfer op: {op}")
+                            import traceback
+                            flexkv_logger.error(traceback.format_exc())
                         self.finished_ops_queue.put(op.transfer_op_id)
                 else:
                     continue
@@ -363,17 +365,37 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             for lay in range(layer_id, layer_end):
                 cpu_chunk = self._get_cpu_chunk(cpu_view, cpu_bid, lay)
                 if self.gpu_block_type_ == 0:
-                    gpu_chunk = self.gpu_blocks[lay][:, gpu_bid, ...]
-                    if is_h2d:
-                        self._do_copy(gpu_chunk, cpu_chunk)
+                    # LAYERFIRST: gpu_blocks[lay] is per-layer tensor
+                    # MLA: shape [num_blocks, tokens_per_block, head_size] (3D)
+                    # non-MLA: shape [kv_dim, num_blocks, tokens_per_block, num_heads, head_size] (5D)
+                    if self.is_mla:
+                        gpu_chunk = self.gpu_blocks[lay][gpu_bid]  # [tokens_per_block, head_size]
+                        # cpu_chunk: [kv_dim=1, tokens_per_block, num_head=1, head_size]
+                        # reshape to match gpu_chunk
+                        cpu_flat = cpu_chunk.view(gpu_chunk.shape)
+                        if is_h2d:
+                            self._do_copy(gpu_chunk, cpu_flat)
+                        else:
+                            self._do_copy(cpu_flat, gpu_chunk)
                     else:
-                        self._do_copy(cpu_chunk, gpu_chunk)
+                        gpu_chunk = self.gpu_blocks[lay][:, gpu_bid, ...]
+                        if is_h2d:
+                            self._do_copy(gpu_chunk, cpu_chunk)
+                        else:
+                            self._do_copy(cpu_chunk, gpu_chunk)
                 elif self.gpu_block_type_ == 1:
                     gpu_chunk = self.gpu_blocks[0][gpu_bid, lay, ...]
-                    if is_h2d:
-                        self._do_copy(gpu_chunk, cpu_chunk)
+                    if self.is_mla:
+                        cpu_flat = cpu_chunk.view(gpu_chunk.shape)
+                        if is_h2d:
+                            self._do_copy(gpu_chunk, cpu_flat)
+                        else:
+                            self._do_copy(cpu_flat, gpu_chunk)
                     else:
-                        self._do_copy(cpu_chunk, gpu_chunk)
+                        if is_h2d:
+                            self._do_copy(gpu_chunk, cpu_chunk)
+                        else:
+                            self._do_copy(cpu_chunk, gpu_chunk)
                 else:
                     kv_dim = 1 if self.is_mla else 2
                     for kv_id in range(kv_dim):
@@ -642,39 +664,33 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                     head_end = head_start + heads_per_rank
 
                     if self.is_mla:
-                        # MLA: no K/V split, head dim is not split across TP ranks in the
-                        # same way; each rank has a full copy.  The C++ code uses a
-                        # sub-chunk offset strategy, but at the tensor level we can slice
-                        # on the *flat head dimension* which for MLA equals head_size
-                        # directly.  For H2D every rank copies the whole CPU chunk; for
-                        # D2H each rank writes a distinct 1/num_gpus slice.
+                        # MLA: each TP rank has a full copy (no head splitting).
+                        # GPU tensor is 3D: [num_blocks, tokens_per_block, head_size]
+                        # CPU chunk:  [kv_dim=1, tokens_per_block, num_head=1, head_size]
+                        # We reshape cpu_chunk to match gpu_chunk shape.
+                        # For D2H, all ranks have identical data; only rank 0 writes to CPU.
                         if self.gpu_block_type_ == 0:
-                            gpu_chunk = gpu_blocks_for_rank[lay][:, gpu_bid, ...]  # [kv_dim, tok, head, hs]
+                            gpu_chunk = gpu_blocks_for_rank[lay][gpu_bid]  # [tokens_per_block, head_size]
                         elif self.gpu_block_type_ == 1:
-                            gpu_chunk = gpu_blocks_for_rank[0][gpu_bid, lay, ...]  # [kv_dim, tok, head, hs]
+                            gpu_chunk = gpu_blocks_for_rank[0][gpu_bid, lay, ...]
                         else:
                             # gpu_block_type_ == 2 (SGLANG), iterate kv_dim
                             for kv_id in range(1):  # MLA has kv_dim=1
                                 g = gpu_blocks_for_rank[lay + self.num_layers * kv_id][gpu_bid, ...]
+                                cpu_sub = cpu_chunk[kv_id, ...]
+                                cpu_flat = cpu_sub.view(g.shape)
                                 if is_h2d:
-                                    g.copy_(cpu_chunk[kv_id, ...], non_blocking=True)
-                                else:
-                                    hs = g.shape[-1]
-                                    flat_start = gpu_idx * (hs // self.num_gpus)
-                                    flat_end = flat_start + (hs // self.num_gpus)
-                                    cpu_chunk[kv_id, ..., flat_start:flat_end].copy_(
-                                        g[..., flat_start:flat_end], non_blocking=True)
+                                    g.copy_(cpu_flat, non_blocking=True)
+                                elif gpu_idx == 0:
+                                    cpu_flat.copy_(g, non_blocking=True)
                             continue
 
+                        cpu_flat = cpu_chunk.view(gpu_chunk.shape)
                         if is_h2d:
-                            gpu_chunk.copy_(cpu_chunk, non_blocking=True)
-                        else:
-                            # D2H for MLA: each rank writes a 1/num_gpus slice
-                            hs = gpu_chunk.shape[-1]
-                            flat_start = gpu_idx * (hs // self.num_gpus)
-                            flat_end = flat_start + (hs // self.num_gpus)
-                            cpu_chunk[..., flat_start:flat_end].copy_(
-                                gpu_chunk[..., flat_start:flat_end], non_blocking=True)
+                            gpu_chunk.copy_(cpu_flat, non_blocking=True)
+                        elif gpu_idx == 0:
+                            # D2H for MLA: all ranks have identical data, only rank 0 writes
+                            cpu_flat.copy_(gpu_chunk, non_blocking=True)
                     else:
                         # Non-MLA: each TP rank owns a contiguous head slice
                         # cpu_chunk has the full head dim; we pick the per-rank slice.
