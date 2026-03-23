@@ -26,6 +26,7 @@ from flexkv.transfer_manager import (
 )
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.integration.dynamo.collector import KVEventCollector
+from flexkv.metrics.collector import get_global_collector
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -323,11 +324,28 @@ class KVTaskManager:
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
         completed_ops = self._get_completed_ops(timeout)
+        metrics_collector = get_global_collector()
         for completed_op in completed_ops:
             if completed_op.graph_id not in self.graph_to_task:
                 continue
             task_id = self.graph_to_task[completed_op.graph_id]
             task = self.tasks[task_id]
+            # Record transfer metrics for completed ops (post-completion statistics)
+            # All three counters (ops_total, blocks_total, bytes_total) are updated
+            # here after transfer completion, providing accurate post-transfer metrics.
+            if metrics_collector is not None and completed_op.transfer_type is not None:
+                if task.task_type in (TaskType.GET, TaskType.PREFETCH, TaskType.BATCH_GET):
+                    operation = "get"
+                elif task.task_type == TaskType.PUT:
+                    operation = "put"
+                else:
+                    operation = "unknown"
+                metrics_collector.record_transfer_completed(
+                    completed_op.transfer_type,
+                    completed_op.num_blocks,
+                    completed_op.num_bytes,
+                    operation,
+                )
             if completed_op.is_graph_completed():
                 self._mark_completed(task_id)
             elif completed_op.op_id == task.task_end_op_id:

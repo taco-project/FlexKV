@@ -508,21 +508,6 @@ class GlobalCacheEngine:
                     engine.mempool.num_free_blocks
                 )
     
-    def _record_transfer_ops(self, transfer_graph: TransferOpGraph, operation: str) -> None:
-        """Record metrics for all transfer operations in the graph.
-        
-        Args:
-            transfer_graph: The transfer operation graph
-            operation: Operation type ("get" or "put")
-        """
-        if self._metrics_collector is None:
-            return
-        for op in transfer_graph._op_map.values():
-            if op.transfer_type != TransferType.VIRTUAL:
-                transfer_type_str = op.transfer_type.value
-                num_blocks = len(op.src_block_ids) if op.src_block_ids is not None else 0
-                self._metrics_collector.record_transfer(transfer_type_str, num_blocks, operation)
-
     def get(self,
             request_id: int,
             token_ids: np.ndarray,
@@ -623,9 +608,8 @@ class GlobalCacheEngine:
                                               node_to_ready=op_node_to_ready[op_id][1],
                                               ready_length=op_node_to_ready[op_id][2])
         
-        # Record metrics for GET operation
+        # Update mempool metrics after GET operation
         if self._metrics_collector is not None:
-            self._record_transfer_ops(transfer_graph, "get")
             self._update_mempool_metrics()
         
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
@@ -1139,9 +1123,8 @@ class GlobalCacheEngine:
                                               node_to_ready=op_node_to_ready[op_id][1],
                                               ready_length=op_node_to_ready[op_id][2])
 
-        # Record metrics for PUT operation
+        # Update mempool metrics after PUT operation
         if self._metrics_collector is not None:
-            self._record_transfer_ops(transfer_graph, "put")
             self._update_mempool_metrics()
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id

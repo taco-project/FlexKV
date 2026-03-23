@@ -11,7 +11,6 @@
 #include <unistd.h>
 
 #include "transfer_ssd.h"
-#include "monitoring/metrics_manager.h"
 
 namespace flexkv {
 
@@ -85,8 +84,6 @@ static void _transfer_iouring_impl(
       if (bytes_transfer && (bytes_transfer != layers_chunk_size_in_bytes)) {
         throw std::runtime_error("Failed to transfer block");
       }
-      // Record bytes: io_uring submitted (rc >= 0) or fallback pread/pwrite succeeded
-      FLEXKV_CPU_SSD_TRANSFER(is_read, layers_chunk_size_in_bytes);
       continue;
     }
 
@@ -123,8 +120,6 @@ static void _transfer_iouring_impl(
       if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
         throw std::runtime_error("Failed to transfer K block");
       }
-      // Record bytes: io_uring submitted (rc >= 0) or fallback pread/pwrite succeeded
-      FLEXKV_CPU_SSD_TRANSFER(is_read, chunk_size_in_bytes);
 
       if (is_mla) {
         continue;
@@ -150,8 +145,6 @@ static void _transfer_iouring_impl(
       if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
         throw std::runtime_error("Failed to transfer K block");
       }
-      // Record bytes: io_uring submitted (rc >= 0) or fallback pread/pwrite succeeded
-      FLEXKV_CPU_SSD_TRANSFER(is_read, chunk_size_in_bytes);
     } // end layer loop
   } // end block loop
 
@@ -205,8 +198,6 @@ static void _transfer_single_thread_impl(
       if (bytes_transfer != chunk_size_in_bytes) {
         throw std::runtime_error("Failed to transfer K block");
       }
-      // Record transfer bytes immediately after completion
-      FLEXKV_CPU_SSD_TRANSFER(is_read, bytes_transfer);
 
       if (is_mla) {
         continue;
@@ -222,8 +213,6 @@ static void _transfer_single_thread_impl(
       if (bytes_transfer != chunk_size_in_bytes) {
         throw std::runtime_error("Failed to transfer V block");
       }
-      // Record transfer bytes immediately after completion
-      FLEXKV_CPU_SSD_TRANSFER(is_read, bytes_transfer);
 
     } // end layer loop
   } // end block loop
