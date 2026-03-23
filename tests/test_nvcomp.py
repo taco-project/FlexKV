@@ -14,7 +14,7 @@ Usage:
   FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_double_buffer_ldg --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
   
   FLEXKV_NVCOMP_GREEN_SMS=112 FLEXKV_NVCOMP_BATCH_SIZE=4096 FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py
-
+  FLEXKV_NVCOMP_GREEN_SMS=112 FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 nsys profile -o ../.misc/profile/flexkv_nvcomp_double_buffer_ldg_gc=112 --force-overwrite true --trace=cuda,nvtx python test_nvcomp.py
 
 
   FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 ncu --kernel-name "regex:ans_d2h_scatter" --launch-skip 30 --launch-count 3 --set full --force-overwrite -o ../.misc/profile/ans_d2h_scatter_kernel python test_nvcomp.py
@@ -376,7 +376,7 @@ if __name__ == "__main__":
 
     passed = test_roundtrip(num_layers=NUM_LAYERS, num_blocks=NUM_BLOCKS,
                             tokens_per_block=TOKENS_PER_BLOCK,
-                            num_heads=NUM_KV_HEADS, head_size=HEAD_SIZE)
+                            num_heads=NUM_KV_HEADS, head_size=HEAD_SIZE,)
     if not passed:
         print("\nRoundtrip test FAILED!")
         sys.exit(1)

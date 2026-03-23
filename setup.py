@@ -115,9 +115,11 @@ if enable_p2p:
     ])
     extra_compile_args.append("-DFLEXKV_ENABLE_P2P")
 if enable_nvcomp:
-    NVCOMP_ROOT = os.environ.get(
-        "NVCOMP_ROOT",
-        "/workspace/develop/llm/kvtc-sglang/nvcomp_perf/nvcomp-sglang")
+    NVCOMP_ROOT = os.environ.get("NVCOMP_ROOT")
+    if not NVCOMP_ROOT:
+        raise ValueError("NVCOMP_ROOT is not set")
+    if not os.path.exists(NVCOMP_ROOT):
+        raise ValueError(f"NVCOMP_ROOT {NVCOMP_ROOT} does not exist, please set NVCOMP_ROOT by export NVCOMP_ROOT=/path/to/nvcomp")
     print(f"ENABLE_NVCOMP = true: Compiling with nvcomp ANS support (root={NVCOMP_ROOT})")
     cpp_sources.append("csrc/ans_transfer.cu")
     hpp_sources.append("csrc/ans_transfer.h")

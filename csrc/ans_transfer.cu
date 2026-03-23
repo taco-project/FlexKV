@@ -32,9 +32,24 @@ namespace flexkv {
     }                                                                   \
   } while (0)
 
+struct NvtxScope {
+    NvtxScope(const char* name) { nvtxRangePush(name); }
+    ~NvtxScope() { nvtxRangePop(); }
+    NvtxScope(const NvtxScope&) = delete;
+    NvtxScope& operator=(const NvtxScope&) = delete;
+};
+
+struct GreenScope {
+    nvcompGreenContext_t* ctx_;
+    GreenScope(nvcompGreenContext_t* ctx) : ctx_(ctx->valid ? ctx : nullptr) {
+        if (ctx_) nvcompGreenContextPush(ctx_);
+    }
+    ~GreenScope() { if (ctx_) nvcompGreenContextPop(ctx_); }
+    GreenScope(const GreenScope&) = delete;
+    GreenScope& operator=(const GreenScope&) = delete;
+};
 
 static const int ANS_KERNEL_BLOCK_SIZE = 128;
-static const int ANS_TRANSFER_SMS = 8;
 
 __global__ void ans_d2h_scatter_kernel(
     const uint8_t* __restrict__ d_comp_staging,
@@ -141,90 +156,15 @@ __global__ void ans_build_ptrs_kernel(
 
 
 // ---------------------------------------------------------------------------
-// Auto-tune pipeline_batch_size for minimal SM occupancy
-// ---------------------------------------------------------------------------
-
-// Replicate nvcomp's get_sub_chunking_config (pure arithmetic + device attrs).
-// Returns num_ctas_per_chunk for a given (chunk_size, batch_size, device).
-static int compute_num_ctas_per_chunk(
-    size_t max_chunk_size, int batch_size,
-    int num_sms, int max_threads_per_sm)
-{
-  constexpr int WARP_SZ             = 32;
-  constexpr int ANS_NUM_WARPS_CTA   = 4;
-  constexpr int ANS_MAX_SUB_CHUNKS  = 64;
-  constexpr int ANS_MIN_SUB_CHUNK   = 2048;
-
-  int num_warps = num_sms * (max_threads_per_sm / WARP_SZ);
-  int target = (num_warps + batch_size - 1) / batch_size;
-  target = std::min(target, ANS_MAX_SUB_CHUNKS);
-  target = std::max(target, ANS_NUM_WARPS_CTA);
-
-  int chunk = static_cast<int>(max_chunk_size);
-  int unrounded = (chunk + target - 1) / target;
-
-  uint32_t power = 0;
-  { int tmp = unrounded; while (tmp >>= 1) power++; }
-  int lower  = 1 << power;
-  int higher = 1 << (power + 1);
-
-  int sub_chunk_size = ((chunk + lower - 1) / lower <= ANS_MAX_SUB_CHUNKS)
-                       ? lower : higher;
-  sub_chunk_size = std::max(ANS_MIN_SUB_CHUNK, sub_chunk_size);
-
-  int warps_per_chunk = (chunk + sub_chunk_size - 1) / sub_chunk_size;
-  int ctas = (warps_per_chunk + ANS_NUM_WARPS_CTA - 1) / ANS_NUM_WARPS_CTA;
-  return std::max(ctas, 1);
-}
-
-// Find the optimal pipeline_batch_size for minimal SM occupancy while
-// preserving the best possible compression ratio.
-//
-// Strategy:
-// 1. Compute global best ctas (at very large batch_size → target=4, fewest CTAs).
-// 2. Binary search for the minimum batch_size that achieves this best ctas.
-//    This is the "compression threshold" — below it, ctas jumps up.
-// 3. Return min(max_num_chunks, threshold).  If max_num_chunks is already
-//    below the threshold, no point splitting further (compression is already
-//    degraded, splitting only adds kernel launch overhead).
-static int compute_auto_pipeline_batch(
-    size_t max_chunk_size, size_t max_num_chunks)
-{
-  int device_id, num_sms, max_threads_per_sm;
-  cudaGetDevice(&device_id);
-  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id);
-  cudaDeviceGetAttribute(&max_threads_per_sm,
-                         cudaDevAttrMaxThreadsPerMultiProcessor, device_id);
-
-  // Global best ctas: use a large sentinel batch_size so target clamps to
-  // NUM_WARPS_PER_CTA=4, giving the fewest CTAs and best compression ratio.
-  int large_batch = num_sms * (max_threads_per_sm / 32);
-  int best_ctas = compute_num_ctas_per_chunk(
-      max_chunk_size, large_batch, num_sms, max_threads_per_sm);
-
-  // Binary search: find min batch_size where ctas == best_ctas.
-  int lo = 64, hi = large_batch;
-  while (lo < hi) {
-    int mid = lo + (hi - lo) / 2;
-    if (compute_num_ctas_per_chunk(
-            max_chunk_size, mid, num_sms, max_threads_per_sm) <= best_ctas)
-      hi = mid;
-    else
-      lo = mid + 1;
-  }
-  int threshold = lo;
-
-  if (max_num_chunks == 0)
-    return threshold;
-  return std::min(static_cast<int>(max_num_chunks), threshold);
-}
-
-// ---------------------------------------------------------------------------
 // Context lifecycle
 // ---------------------------------------------------------------------------
 void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
                     size_t max_chunk_size, int data_type, int log_level,
-                    int pipeline_batch_size) {
+                    int pipeline_batch_size, int transfer_sms) {
+  if (transfer_sms == -1) {
+    transfer_sms = 4;
+  }
+  ctx->transfer_sms = transfer_sms;
   // Auto-compute max_num_chunks when caller passes 0: use the minimum value
   // that achieves the best compression ratio (lowest num_ctas_per_chunk).
   if (max_num_chunks == 0 && max_chunk_size > 0) {
@@ -237,11 +177,7 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
   ctx->log_level      = log_level;
 
   ctx->comp_opts = nvcompBatchedANSCompressDefaultOpts;
-  switch (data_type) {
-    case 0:  ctx->comp_opts.data_type = NVCOMP_TYPE_FLOAT16; break;
-    case 1:  ctx->comp_opts.data_type = NVCOMP_TYPE_FLOAT16; break;
-    default: ctx->comp_opts.data_type = NVCOMP_TYPE_FLOAT16; break;
-  }
+  ctx->comp_opts.data_type = NVCOMP_TYPE_FLOAT16; // hardcoded
   ctx->decomp_opts = nvcompBatchedANSDecompressDefaultOpts;
   ctx->decomp_opts.max_uncompressed_chunk_size = ctx->max_chunk_size;
 
@@ -262,8 +198,6 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
 
   // GPU compression buffers (double-buffered where needed for D2H pipeline)
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_temp,       ctx->comp_temp_bytes));
-  // Single contiguous allocation for both staging slots to ensure symmetric
-  // GPU memory partition mapping, avoiding bandwidth asymmetry between slots.
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_comp_staging_base, 2 * comp_staging_total));
   ctx->d_comp_staging[0] = ctx->d_comp_staging_base;
   ctx->d_comp_staging[1] = ctx->d_comp_staging_base + comp_staging_total;
@@ -284,11 +218,9 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_statuses,
       max_num_chunks * sizeof(nvcompStatus_t)));
 
-  // Host pinned buffers for compressed sizes metadata (double-buffered)
   ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_sizes[0], size_bytes));
   ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_sizes[1], size_bytes));
 
-  // Host scratch vectors
   ctx->h_ptr_scratch.resize(max_num_chunks);
   ctx->h_size_scratch.resize(max_num_chunks);
 
@@ -330,22 +262,10 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
         &scatter_bpsm, ans_d2h_scatter_kernel, ANS_KERNEL_BLOCK_SIZE, 0);
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &gather_bpsm, ans_h2d_gather_kernel, ANS_KERNEL_BLOCK_SIZE, 0);
-    ctx->scatter_grid = ANS_TRANSFER_SMS * std::max(scatter_bpsm, 1);
-    ctx->gather_grid  = ANS_TRANSFER_SMS * std::max(gather_bpsm, 1);
+    ctx->scatter_grid = ctx->transfer_sms * std::max(scatter_bpsm, 1);
+    ctx->gather_grid  = ctx->transfer_sms * std::max(gather_bpsm, 1);
   }
 
-  // Set pipeline_batch_size: explicit value or auto-tuned for minimal SM usage.
-  if (pipeline_batch_size > 0) {
-    ctx->pipeline_batch_size = std::min(
-        pipeline_batch_size, static_cast<int>(max_num_chunks));
-  } else if (max_num_chunks > 0 && max_chunk_size > 0) {
-    ctx->pipeline_batch_size = compute_auto_pipeline_batch(
-        max_chunk_size, max_num_chunks);
-  } else {
-    ctx->pipeline_batch_size = static_cast<int>(max_num_chunks);
-  }
-
-  // Green Context: partition SMs so decompress runs in isolation from gather.
   ctx->green_ctx = NVCOMP_GREEN_CONTEXT_INIT;
   {
     const char* env = std::getenv("FLEXKV_NVCOMP_GREEN_SMS");
@@ -354,8 +274,6 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
       if (green_sms > 0) {
         nvcompStatus_t gs = nvcompGreenContextCreate(&ctx->green_ctx, green_sms);
         if (gs == nvcompSuccess) {
-          // SM isolation guarantees overlap — no need to split batches.
-          // Use full buffer as batch size for fewest kernel launches.
           ctx->pipeline_batch_size = static_cast<int>(max_num_chunks);
           if (log_level >= 1)
             printf("[nvcomp] Green Context: requested %d SMs, allocated %d / %d, "
@@ -371,13 +289,24 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
     }
   }
 
+  // Fallback: auto-tune pipeline_batch_size when green context is unavailable.
+  // Split batches so compress/decompress occupies fewer SMs, leaving room for
+  // scatter/gather to overlap on the remaining SMs.
+  if (!ctx->green_ctx.valid) {
+    if (pipeline_batch_size > 0) {
+      ctx->pipeline_batch_size = std::min(
+          pipeline_batch_size, static_cast<int>(max_num_chunks));
+    } else if (max_num_chunks > 0 && max_chunk_size > 0) {
+      ctx->pipeline_batch_size = compute_auto_pipeline_batch(
+          max_chunk_size, max_num_chunks);
+    } else {
+      ctx->pipeline_batch_size = static_cast<int>(max_num_chunks);
+    }
+  }
+
   if (log_level >= 1) {
-    int device_id, num_sms_log, max_tps_log;
-    cudaGetDevice(&device_id);
-    cudaDeviceGetAttribute(&num_sms_log, cudaDevAttrMultiProcessorCount, device_id);
-    cudaDeviceGetAttribute(&max_tps_log, cudaDevAttrMaxThreadsPerMultiProcessor, device_id);
     int ctas_log = compute_num_ctas_per_chunk(
-        max_chunk_size, ctx->pipeline_batch_size, num_sms_log, max_tps_log);
+        max_chunk_size, ctx->pipeline_batch_size);
     size_t total_gpu = ctx->comp_temp_bytes + 2 * comp_staging_total +
                        ctx->decomp_temp_bytes +
                        4 * ptr_bytes + 5 * size_bytes +
@@ -424,15 +353,13 @@ void ans_ctx_destroy(ANSTransferContext* ctx) {
   cudaFreeHost(ctx->h_comp_sizes[1]);
 }
 
-// ---------------------------------------------------------------------------
-// D2H: double-buffer pipeline.
-// compress stream (green / caller's): build_ptrs → compress             (slot 0/1)
-// scatter stream:                     scatter → write sizes              (slot 0/1)
-// compress(N) overlaps with scatter(N-1) on different slots/streams.
-// NOTE: compress is compute-heavy (histogram + normalize + encode).
-//       When using Green Context, allocate enough SMs to avoid compress
-//       becoming the bottleneck (recommend ≥ 30 SMs on H100).
-// ---------------------------------------------------------------------------
+static void ans_sync_streams(ANSTransferContext* ctx, cudaStream_t stream) {
+  if (ctx->green_ctx.valid)
+    ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->green_ctx.stream));
+  else
+    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
+  ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->scatter_stream));
+}
 
 template<BackendType Type>
 void ans_compress_and_d2h(
@@ -455,8 +382,7 @@ void ans_compress_and_d2h(
 
   assert(static_cast<size_t>(chunk_size_in_bytes) <= ctx->max_chunk_size);
 
-  const bool use_green = ctx->green_ctx.valid;
-  cudaStream_t comp_stream = use_green ? ctx->green_ctx.stream : stream;
+  cudaStream_t comp_stream = ctx->green_ctx.valid ? ctx->green_ctx.stream : stream;
 
   nvtxRangePush("ANS:D2H_total");
 
@@ -465,17 +391,14 @@ void ans_compress_and_d2h(
     const int bsz = std::min(batch_cap, total_chunks - bs);
     const int cur = bi % 2;
 
-    // Wait for previous scatter on this slot to finish before reusing buffers
     if (bi >= 2)
       ANS_CUDA_CHECK(cudaStreamWaitEvent(comp_stream, ctx->scatter_done[cur], 0));
 
-    // 1. Build GPU source pointer array + compress (on comp stream / green context)
-    nvtxRangePush("ANS:D2H:compress");
-    {
-      if (use_green) nvcompGreenContextPush(&ctx->green_ctx);
+    { NvtxScope _nvtx("ANS:D2H:compress");
+      GreenScope _green(&ctx->green_ctx);
 
       int threads = 256;
-      int blocks = std::min((bsz + threads - 1) / threads, ANS_TRANSFER_SMS);
+      int blocks = std::min((bsz + threads - 1) / threads, ctx->transfer_sms);
       ans_build_ptrs_kernel<Type><<<blocks, threads, 0, comp_stream>>>(
           ctx->d_uncomp_ptrs, gpu_handler, gpu_block_ids,
           kv_dim, num_blocks, bs, bsz);
@@ -493,15 +416,10 @@ void ans_compress_and_d2h(
           nullptr,
           comp_stream));
       ANS_CUDA_CHECK(cudaEventRecord(ctx->compress_done[cur], comp_stream));
-
-      if (use_green) nvcompGreenContextPop(&ctx->green_ctx);
     }
-    nvtxRangePop();
 
-    // 2. Scatter from slot[cur] on scatter_stream (overlaps with next compress)
-    nvtxRangePush("ANS:D2H:scatter");
-    ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->compress_done[cur], 0));
-    {
+    { NvtxScope _nvtx("ANS:D2H:scatter");
+      ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->compress_done[cur], 0));
       int grid = std::min(bsz, ctx->scatter_grid);
       ans_d2h_scatter_kernel<<<grid, ANS_KERNEL_BLOCK_SIZE, 0, ctx->scatter_stream>>>(
           ctx->d_comp_staging[cur], ctx->max_comp_chunk_bytes, ctx->d_comp_sizes[cur],
@@ -509,18 +427,11 @@ void ans_compress_and_d2h(
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
           cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz,
           h_comp_sizes_out);
+      ANS_CUDA_CHECK(cudaEventRecord(ctx->scatter_done[cur], ctx->scatter_stream));
     }
-    ANS_CUDA_CHECK(cudaEventRecord(ctx->scatter_done[cur], ctx->scatter_stream));
-    nvtxRangePop();
   }
 
-  // Wait for all work to complete
-  if (use_green)
-    ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->green_ctx.stream));
-  else
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-  ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->scatter_stream));
-
+  ans_sync_streams(ctx, stream);
   nvtxRangePop(); // D2H_total
 
   if (ctx->log_level >= 1) {
@@ -528,20 +439,13 @@ void ans_compress_and_d2h(
     for (int i = 0; i < total_chunks; i++)
       grand_total_comp += static_cast<size_t>(h_comp_sizes_out[i]);
     size_t grand_total_uncomp = static_cast<size_t>(total_chunks) * chunk_size_in_bytes;
-    printf("[nvcomp] D2H: %d chunks in %d batch(es), %.2f MB -> %.2f MB (ratio %.2fx)\n",
+    printf("[FlexKV ans_compress_and_d2h] D2H: %d chunks in %d batch(es), %.2f MB -> %.2f MB (ratio %.2fx)\n",
            total_chunks, num_batches,
            grand_total_uncomp / (1024.0 * 1024.0),
            grand_total_comp   / (1024.0 * 1024.0),
            (double)grand_total_uncomp / grand_total_comp);
   }
 }
-
-// ---------------------------------------------------------------------------
-// H2D: double-buffer pipeline.
-// scatter stream: upload_sizes(DMA) + gather                            (slot 0/1)
-// decomp stream:  build_ptrs + decompress                               (slot 0/1)
-// gather(N) overlaps with decompress(N-1) on different slots/streams.
-// ---------------------------------------------------------------------------
 
 template<BackendType Type>
 void ans_h2d_and_decompress(
@@ -563,11 +467,9 @@ void ans_h2d_and_decompress(
   const int num_batches = (total_chunks + batch_cap - 1) / batch_cap;
 
   assert(static_cast<size_t>(chunk_size_in_bytes) <= ctx->max_chunk_size);
-
   static_assert(sizeof(size_t) == sizeof(int64_t), "size_t must be 64-bit");
 
-  const bool use_green = ctx->green_ctx.valid;
-  cudaStream_t decomp_stream = use_green ? ctx->green_ctx.stream : stream;
+  cudaStream_t decomp_stream = ctx->green_ctx.valid ? ctx->green_ctx.stream : stream;
 
   nvtxRangePush("ANS:H2D_total");
 
@@ -576,38 +478,26 @@ void ans_h2d_and_decompress(
     const int bsz = std::min(batch_cap, total_chunks - bs);
     const int cur = bi % 2;
 
-    if (bi >= 2) {
+    if (bi >= 2)
       ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->scatter_done[cur], 0));
-    }
 
-    // 1. Upload comp_sizes (DMA on scatter stream, before gather)
-    nvtxRangePush("ANS:H2D:upload_sizes");
-    {
-      const size_t size_bytes = bsz * sizeof(size_t);
+    { NvtxScope _nvtx("ANS:H2D:upload_sizes");
       ANS_CUDA_CHECK(cudaMemcpyAsync(ctx->d_comp_sizes[cur],
                                       h_comp_sizes_in + bs,
-                                      size_bytes, cudaMemcpyHostToDevice,
+                                      bsz * sizeof(size_t), cudaMemcpyHostToDevice,
                                       ctx->scatter_stream));
     }
-    nvtxRangePop();
 
-    // 2. Build decompress output pointer array (on decomp stream / green context)
-    //    Runs in parallel with upload_sizes + gather on scatter stream.
-    nvtxRangePush("ANS:H2D:build_ptrs");
-    {
-      if (use_green) nvcompGreenContextPush(&ctx->green_ctx);
+    { NvtxScope _nvtx("ANS:H2D:build_ptrs");
+      GreenScope _green(&ctx->green_ctx);
       int threads = 256;
-      int blocks = std::min((bsz + threads - 1) / threads, ANS_TRANSFER_SMS);
+      int blocks = std::min((bsz + threads - 1) / threads, ctx->transfer_sms);
       ans_build_ptrs_kernel<Type><<<blocks, threads, 0, decomp_stream>>>(
           ctx->d_decomp_ptrs[cur], gpu_handler, gpu_block_ids,
           kv_dim, num_blocks, bs, bsz);
-      if (use_green) nvcompGreenContextPop(&ctx->green_ctx);
     }
-    nvtxRangePop();
 
-    // 3. Gather kernel: CPU pinned → GPU staging (on scatter stream, primary context)
-    nvtxRangePush("ANS:H2D:gather_kernel");
-    {
+    { NvtxScope _nvtx("ANS:H2D:gather_kernel");
       int grid = std::min(bsz, ctx->gather_grid);
       ans_h2d_gather_kernel<<<grid, ANS_KERNEL_BLOCK_SIZE, 0, ctx->scatter_stream>>>(
           ctx->d_comp_staging[cur], ctx->max_comp_chunk_bytes, ctx->d_comp_sizes[cur],
@@ -615,14 +505,11 @@ void ans_h2d_and_decompress(
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
           cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz);
     }
-    nvtxRangePop();
 
     ANS_CUDA_CHECK(cudaEventRecord(ctx->compress_done[cur], ctx->scatter_stream));
 
-    // 4. ANS decompress (confined to green context SMs when available)
-    nvtxRangePush("ANS:H2D:decompress");
-    {
-      if (use_green) nvcompGreenContextPush(&ctx->green_ctx);
+    { NvtxScope _nvtx("ANS:H2D:decompress");
+      GreenScope _green(&ctx->green_ctx);
       ANS_CUDA_CHECK(cudaStreamWaitEvent(decomp_stream, ctx->compress_done[cur], 0));
       ANS_NVCOMP_CHECK(nvcompBatchedANSDecompressAsync(
           (const void* const*)ctx->d_comp_ptrs[cur],
@@ -637,18 +524,10 @@ void ans_h2d_and_decompress(
           ctx->d_statuses,
           decomp_stream));
       ANS_CUDA_CHECK(cudaEventRecord(ctx->scatter_done[cur], decomp_stream));
-      if (use_green) nvcompGreenContextPop(&ctx->green_ctx);
     }
-    nvtxRangePop();
   }
 
-  // Wait for all work to complete
-  if (ctx->green_ctx.valid)
-    ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->green_ctx.stream));
-  else
-    ANS_CUDA_CHECK(cudaStreamSynchronize(stream));
-  ANS_CUDA_CHECK(cudaStreamSynchronize(ctx->scatter_stream));
-
+  ans_sync_streams(ctx, stream);
   nvtxRangePop(); // H2D_total
 
   if (ctx->log_level >= 1) {
@@ -656,7 +535,7 @@ void ans_h2d_and_decompress(
     for (int i = 0; i < total_chunks; i++)
       grand_total_comp += static_cast<size_t>(h_comp_sizes_in[i]);
     size_t total_uncomp = static_cast<size_t>(total_chunks) * chunk_size_in_bytes;
-    printf("[nvcomp] H2D: %d chunks in %d batch(es), %.2f MB compressed -> %.2f MB (ratio %.2fx)\n",
+    printf("[FlexKV ans_h2d_and_decompress] H2D: %d chunks in %d batch(es), %.2f MB compressed -> %.2f MB (ratio %.2fx)\n",
            total_chunks, num_batches,
            grand_total_comp / (1024.0 * 1024.0),
            total_uncomp     / (1024.0 * 1024.0),
@@ -664,25 +543,32 @@ void ans_h2d_and_decompress(
   }
 }
 
-// ---------------------------------------------------------------------------
 // Explicit template instantiations
-// ---------------------------------------------------------------------------
+template void ans_compress_and_d2h<BackendType::VLLM>(
+    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
+    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
+    int64_t*, cudaStream_t);
+template void ans_compress_and_d2h<BackendType::TRTLLM>(
+    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
+    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
+    int64_t*, cudaStream_t);
+template void ans_compress_and_d2h<BackendType::SGLANG>(
+    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
+    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
+    int64_t*, cudaStream_t);
 
-#define INSTANTIATE_ANS(TYPE) \
-  template void ans_compress_and_d2h<TYPE>( \
-      ANSTransferContext*, int, int, int, int64_t*, GTensorHandler, \
-      int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool, \
-      int64_t*, cudaStream_t); \
-  template void ans_h2d_and_decompress<TYPE>( \
-      ANSTransferContext*, int, int, int, int64_t*, GTensorHandler, \
-      int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool, \
-      const int64_t*, cudaStream_t);
-
-INSTANTIATE_ANS(BackendType::VLLM)
-INSTANTIATE_ANS(BackendType::TRTLLM)
-INSTANTIATE_ANS(BackendType::SGLANG)
-
-#undef INSTANTIATE_ANS
+template void ans_h2d_and_decompress<BackendType::VLLM>(
+    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
+    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
+    const int64_t*, cudaStream_t);
+template void ans_h2d_and_decompress<BackendType::TRTLLM>(
+    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
+    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
+    const int64_t*, cudaStream_t);
+template void ans_h2d_and_decompress<BackendType::SGLANG>(
+    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
+    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
+    const int64_t*, cudaStream_t);
 
 } // namespace flexkv
 

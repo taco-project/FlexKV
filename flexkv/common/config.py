@@ -131,6 +131,10 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     lease_ttl_ms=int(os.getenv('FLEXKV_LEASE_TTL_MS', 30000)),
     safety_ttl_ms=int(os.getenv('FLEXKV_SAFETY_TTL_MS', 100)),
     renew_lease_ms=int(os.getenv('FLEXKV_RENEW_LEASE_MS', 4000)),
+
+    # nvcomp ANS (with FLEXKV_ENABLE_NVCOMP=1)
+    nvcomp_log_level=int(os.getenv('FLEXKV_NVCOMP_LOG_LEVEL', '0')),
+    nvcomp_batch_size=int(os.getenv('FLEXKV_NVCOMP_BATCH_SIZE', '4096')),
 )
 
 @dataclass

@@ -175,6 +175,10 @@ void ans_compress_and_d2h_binding(
           comp_sizes_ptr, stream);
       break;
   }
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(cudaGetErrorString(err));
+  }
 }
 
 void ans_h2d_and_decompress_binding(
@@ -236,6 +240,10 @@ void ans_h2d_and_decompress_binding(
           cpu_block_stride_in_bytes, chunk_size_in_bytes, is_mla,
           comp_sizes_ptr, stream);
       break;
+  }
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(cudaGetErrorString(err));
   }
 }
 #endif // FLEXKV_ENABLE_NVCOMP
@@ -538,15 +546,16 @@ PYBIND11_MODULE(c_ext, m) {
   py::class_<flexkv::ANSTransferContext>(m, "ANSTransferContext")
       .def(py::init([](size_t max_num_chunks, size_t max_chunk_size,
                        int data_type, int log_level,
-                       int pipeline_batch_size) {
+                       int pipeline_batch_size, int transfer_sms) {
         auto* ctx = new flexkv::ANSTransferContext();
         flexkv::ans_ctx_create(ctx, max_num_chunks, max_chunk_size,
-                               data_type, log_level, pipeline_batch_size);
+                               data_type, log_level, pipeline_batch_size,
+                               transfer_sms);
         return ctx;
       }),
       py::arg("max_num_chunks"), py::arg("max_chunk_size"),
       py::arg("data_type") = 0, py::arg("log_level") = 0,
-      py::arg("pipeline_batch_size") = 0)
+      py::arg("pipeline_batch_size") = 0, py::arg("transfer_sms") = -1)
       .def("destroy", [](flexkv::ANSTransferContext& ctx) {
         flexkv::ans_ctx_destroy(&ctx);
       })
