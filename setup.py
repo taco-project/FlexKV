@@ -124,6 +124,7 @@ if enable_nvcomp:
     cpp_sources.append("csrc/ans_transfer.cu")
     hpp_sources.append("csrc/ans_transfer.h")
     include_dirs.append(os.path.join(NVCOMP_ROOT, "include"))
+    include_dirs.append(os.path.join(NVCOMP_ROOT, "build", "include"))
     nvcomp_lib_dir = os.path.join(NVCOMP_ROOT, "build", "lib")
     extra_link_args.extend(["-lnvcomp", f"-L{nvcomp_lib_dir}", f"-Wl,-rpath,{nvcomp_lib_dir}"])
     extra_compile_args.append("-DFLEXKV_ENABLE_NVCOMP")
