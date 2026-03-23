@@ -57,6 +57,50 @@ class FlexKVConfig:
             return cls(enable_flexkv=enable_flexkv,
                        user_config=user_config)
 
+    def _parse_dtype_str(self, dtype_str: str) -> torch.dtype:
+        """Convert dtype string to torch.dtype. Shared by vLLM / TRT / sglang init paths."""
+        dtype_map = {
+            "float16": torch.float16,
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "half": torch.float16,
+            "fp8": torch.float8_e4m3fn,
+            "float8": torch.float8_e4m3fn,
+            "e4m3": torch.float8_e4m3fn,
+        }
+        return dtype_map.get(dtype_str.lower(), torch.bfloat16)
+
+    def _resolve_kv_cache_dtype(self,
+                                engine_dtype_str: str,
+                                model_dtype: torch.dtype) -> torch.dtype:
+        """Resolve the actual KV cache dtype with the following priority:
+
+        1. user_config.kv_cache_dtype  (flexkv_config.yml / FLEXKV_KV_CACHE_DTYPE env)
+        2. engine_dtype_str            (from vLLM / TRT / sglang cache config)
+        3. model_dtype                 (fallback when engine says "auto")
+        """
+        # Priority 1: user explicit override
+        user_dtype_str = self.user_config.kv_cache_dtype
+        if user_dtype_str is not None:
+            resolved = self._parse_dtype_str(user_dtype_str)
+            logger.info(f"[FlexKVConfig] KV cache dtype from user_config: "
+                        f"kv_cache_dtype='{user_dtype_str}' -> {resolved}")
+            return resolved
+
+        # Priority 2: engine-reported dtype
+        if engine_dtype_str is not None and engine_dtype_str != "auto":
+            resolved = self._parse_dtype_str(engine_dtype_str)
+            logger.info(f"[FlexKVConfig] KV cache dtype from engine config: "
+                        f"'{engine_dtype_str}' -> {resolved}")
+            return resolved
+
+        # Priority 3: fallback to model weight dtype
+        logger.info(f"[FlexKVConfig] KV cache dtype using model dtype: {model_dtype}")
+        return model_dtype
+
     def post_init_from_vllm_config(
         self,
         vllm_config: "VllmConfig",
@@ -65,7 +109,14 @@ class FlexKVConfig:
 
         self.model_config.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.model_config.head_size = vllm_config.model_config.get_head_size()
-        self.model_config.dtype = vllm_config.model_config.dtype
+
+        # Resolve KV cache dtype: user_config override > vllm cache_dtype > model dtype
+        cache_dtype_str = getattr(vllm_config.cache_config, 'cache_dtype', 'auto')
+        self.model_config.dtype = self._resolve_kv_cache_dtype(
+            engine_dtype_str=cache_dtype_str,
+            model_dtype=vllm_config.model_config.dtype,
+        )
+
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -126,44 +177,12 @@ class FlexKVConfig:
         # Convert dtype string to torch.dtype
         dtype_str = config.pytorch_backend_config.kv_cache_dtype
         flexkv_logger.info(f"[FlexKVConfig] dtype_str from TRT config: {dtype_str}")
-        
-        # Helper function to convert dtype string to torch.dtype
-        def _parse_dtype_str(dtype_str: str) -> torch.dtype:
-            dtype_map = {
-                "float16": torch.float16,
-                "float32": torch.float32,
-                "bfloat16": torch.bfloat16,
-                "fp16": torch.float16,
-                "fp32": torch.float32,
-                "bf16": torch.bfloat16,
-                "fp8": torch.float8_e4m3fn, 
-                "float8": torch.float8_e4m3fn,
-                "e4m3": torch.float8_e4m3fn,                
-            }
-            return dtype_map.get(dtype_str.lower(), torch.bfloat16)
-        
-        if dtype_str == "auto":
-            # When dtype_str is "auto", try to get kv_cache_dtype from user_config first
-            # This allows users to specify kv_cache_dtype in flexkv_config.json or via environment variable
-            user_dtype_str = self.user_config.kv_cache_dtype
-            if user_dtype_str is not None:
-                parsed_dtype = _parse_dtype_str(user_dtype_str)
-                self.model_config.dtype = parsed_dtype
-                flexkv_logger.info(f"[FlexKVConfig] dtype_str='auto', but found kv_cache_dtype='{user_dtype_str}' in user_config, using it -> {parsed_dtype}")
-            else:
-                # Try to infer from TRT config if possible (e.g., from actual tensor dtype)
-                # Note: This might not be available at initialization time
-                self.model_config.dtype = torch.bfloat16
-                flexkv_logger.warning(
-                    f"[FlexKVConfig] dtype_str='auto' and no kv_cache_dtype in user_config. "
-                    f"Falling back to {self.model_config.dtype}. To specify a different dtype, add 'kv_cache_dtype' "
-                    f"to your flexkv_config.json file (e.g., {{\"kv_cache_dtype\": \"fp8\"}}) "
-                    f"or set FLEXKV_KV_CACHE_DTYPE environment variable."
-                )
-        elif isinstance(dtype_str, str):
-            self.model_config.dtype = _parse_dtype_str(dtype_str)
-        else:
-            self.model_config.dtype = dtype_str
+
+        # Resolve KV cache dtype: user_config override > trt cache_dtype > fallback bfloat16
+        self.model_config.dtype = self._resolve_kv_cache_dtype(
+            engine_dtype_str=dtype_str,
+            model_dtype=torch.bfloat16,  # TRT fallback default
+        )
         
         # Set model config (parallel configs part)
         if config.mapping.enable_attention_dp:
