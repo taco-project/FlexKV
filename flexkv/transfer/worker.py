@@ -40,7 +40,9 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
     size = tensor.numel() * tensor.element_size()
     ret = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 1) # 1 means cudaHostRegisterPortable
     if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+        flexkv_logger.warning(f"cudaHostRegister failed with error code {ret}, "
+                              f"size={size/(1024**3):.2f} GB. "
+                              f"Falling back to unpinned memory (may reduce transfer performance).")
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
     """Unregister a CPU tensor from CUDA for pinned memory access"""
@@ -537,14 +539,20 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.tp_group_size = tp_group_size
         self.dp_group_id = dp_group_id
 
-        cudaHostRegister(cpu_blocks)
+        # Check torch copy fallback early so we can skip pinning & C++ init
+        self.use_torch_copy_fallback = os.getenv("FLEXKV_USE_TORCH_COPY", "0") == "1"
+
+        if not self.use_torch_copy_fallback:
+            cudaHostRegister(cpu_blocks)
+        else:
+            flexkv_logger.info("FLEXKV_USE_TORCH_COPY=1: skipping cudaHostRegister, "
+                               "using PyTorch copy fallback path.")
 
         # Store references needed by the PyTorch copy fallback path
         self.cpu_blocks = cpu_blocks
         self.cpu_tensor = cpu_blocks  # alias used by _torch_copy_fallback_impl
         self.cpu_kv_layout = cpu_kv_layout
         self.gpu_kv_layouts = gpu_kv_layouts
-        self.use_torch_copy_fallback = os.getenv("FLEXKV_USE_TORCH_COPY", "0") == "1"
 
         self.num_layers = gpu_kv_layouts[0].num_layer
 
@@ -579,14 +587,19 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
-        gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
-        gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
-        gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
-        gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
-        self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
-                                                              self.num_layers, gpu_kv_strides_tensor,
-                                                              gpu_block_strides_tensor, gpu_layer_strides_tensor,
-                                                              gpu_chunk_sizes_tensor)
+        # Only create C++ TPTransferThreadGroup when NOT using torch copy fallback.
+        # The C++ code may depend on pinned (cudaHostRegister'd) memory internally.
+        if not self.use_torch_copy_fallback:
+            gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
+            gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
+            gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
+            gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
+            self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
+                                                                  self.num_layers, gpu_kv_strides_tensor,
+                                                                  gpu_block_strides_tensor, gpu_layer_strides_tensor,
+                                                                  gpu_chunk_sizes_tensor)
+        else:
+            self.tp_transfer_thread_group = None
 
     def _get_cpu_chunk(self, cpu_view: torch.Tensor, cpu_block_id: int, layer_id: int) -> torch.Tensor:
         """Return a single (layer, block) slice from the CPU buffer."""
