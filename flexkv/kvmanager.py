@@ -48,7 +48,7 @@ class KVManager:
         else:
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
-        self.server_client_mode = model_config.dp_size > 1 or GLOBAL_CONFIG_FROM_ENV.server_client_mode
+        self.server_client_mode = GLOBAL_CONFIG_FROM_ENV.server_client_mode
         self.dp_client_id = dp_client_id
         flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
         if self.server_client_mode:

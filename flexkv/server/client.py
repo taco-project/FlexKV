@@ -162,7 +162,7 @@ class KVDPClient:
         req = LaunchTaskRequest(self.dp_client_id, task_ids, slot_mappings)
         self.send_to_server.send_pyobj(req)
 
-    def cancel_task(
+    def cancel_tasks(
         self,
         task_ids: List[int],
     ) -> None:

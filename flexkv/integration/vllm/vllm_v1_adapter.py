@@ -129,6 +129,7 @@ class FlexKVSchedulerConnector:
         self.flexkv_manager = KVManager(model_config=self.model_config,
                                         cache_config=self.cache_config,
                                         server_recv_port=flexkv_config.server_recv_port,
+                                        gpu_register_port=flexkv_config.gpu_register_port,
                                         dp_client_id=dp_rank)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
@@ -522,7 +523,11 @@ class FlexKVWorkerConnector:
         self.is_local_leader = get_tp_group().local_rank == 0
         self.launch_remote_transfer_manager = get_tp_group().local_rank == 0 and \
             get_tp_group().rank_in_group != 0
-        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
+        # Use local device index directly. With CUDA_VISIBLE_DEVICES isolation
+        # (set by vLLM per DP rank), torch.cuda.current_device() already returns
+        # the correct local index (0..tp_size-1). The TransferManager subprocess
+        # inherits the same CUDA_VISIBLE_DEVICES, so it also sees local indices.
+        current_device_id = torch.cuda.current_device()
         self.flexkv_config = flexkv_config
         if self.launch_remote_transfer_manager:
             self.remote_transfer_manager_process = TransferManagerOnRemote.create_process()
@@ -575,6 +580,12 @@ class FlexKVConnectorV1Impl:
         flexkv_config = FlexKVConfig.from_env()
         flexkv_config.post_init_from_vllm_config(vllm_config)
         dp_rank = vllm_config.parallel_config.data_parallel_rank
+
+        # Each DP rank runs its own KVTaskEngine, so gpu_register_port
+        # must be unique per DP rank to avoid IPC socket conflicts.
+        if dp_rank > 0:
+            flexkv_config.gpu_register_port = (
+                flexkv_config.gpu_register_port + f"_dp{dp_rank}")
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector = FlexKVSchedulerConnector(flexkv_config, dp_rank)

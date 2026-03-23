@@ -91,10 +91,10 @@ class TransferEngine:
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
 
-        self.dp_size = model_config.dp_size
+        self.dp_size = 1  # Each TransferEngine instance serves a single DP rank
         self.tp_size = model_config.tp_size
 
-        assert len(gpu_handles) == self.dp_size * self.tp_size
+        assert len(gpu_handles) == self.tp_size
         self._running = False
 
     def _init_workers(self) -> None:

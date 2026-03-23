@@ -53,9 +53,9 @@ class TransferManager:
 
         if device_id in self.all_gpu_blocks:
             flexkv_logger.error(f"GPU {device_id} has already registered.")
-        elif device_id >= self.model_config.tp_size * self.model_config.dp_size:
+        elif device_id >= self.model_config.tp_size:
             flexkv_logger.error(f"GPU {device_id} is larger than TP size: "
-                                f"{self.model_config.tp_size * self.model_config.dp_size}.")
+                                f"{self.model_config.tp_size}.")
         else:
             try:
                 self.all_gpu_blocks[device_id] = req.handles
@@ -67,7 +67,7 @@ class TransferManager:
         try:
             flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port}")
 
-            expected_gpus = self.model_config.tp_size * self.model_config.dp_size
+            expected_gpus = self.model_config.tp_size
             flexkv_logger.info(f"{self.model_config.tp_size=}, {self.model_config.dp_size=}, {expected_gpus=}")
             while len(self.all_gpu_blocks) < expected_gpus:
                 try:
@@ -100,8 +100,8 @@ class TransferManager:
         flexkv_logger.info(f"Initializing TransferEngine...")
         self._register_gpu_blocks_via_socket()
 
-        assert len(self.all_gpu_layouts) == self.model_config.tp_size * self.model_config.dp_size
-        assert len(self.all_gpu_blocks) == self.model_config.tp_size * self.model_config.dp_size
+        assert len(self.all_gpu_layouts) == self.model_config.tp_size
+        assert len(self.all_gpu_blocks) == self.model_config.tp_size
         for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
             self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper,
                                                     self.all_gpu_layouts[device_id],
@@ -109,7 +109,7 @@ class TransferManager:
                                                     dtype=self.model_config.dtype)
         self.gpu_handles = [
             self.storage_engine.get_storage_handle(DeviceType.GPU, i)
-            for i in range(self.model_config.tp_size * self.model_config.dp_size)
+            for i in range(self.model_config.tp_size)
         ]
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None
