@@ -84,6 +84,35 @@ def _worker_test_tensor_from_tensor_direct_ipc(conn, device_id):
         raise
 
 
+def _worker_test_fp8_tensor_from_bytes(conn, device_id):
+    """Test construction from bytes with fp8 dtype"""
+    try:
+        handle = conn.recv()
+        assert isinstance(handle, TensorSharedHandle)
+        assert handle.use_direct_ipc
+        assert handle.tensor_dtype == torch.float8_e4m3fn
+        assert handle.tensor_shape == (10, 20)
+
+        tensor = handle.get_tensor()
+        assert isinstance(tensor, torch.Tensor)
+        assert tensor.is_cuda
+        assert tensor.device.index == device_id
+        assert tensor.shape == (10, 20)
+        assert tensor.dtype == torch.float8_e4m3fn
+
+        expected = (
+            torch.arange(200, dtype=torch.float32)
+            .reshape(10, 20)
+            .cuda(device_id)
+            .to(torch.float8_e4m3fn)
+        )
+        max_diff = (tensor.to(torch.float32) - expected.to(torch.float32)).abs().max().item()
+        conn.send(max_diff)
+    except Exception as e:
+        conn.send(f"Error: {e}")
+        raise
+
+
 def _worker_test_tensor_from_bytes(conn, device_id):
     """Test construction from bytes (IPC handle)"""
     try:
