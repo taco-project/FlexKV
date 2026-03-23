@@ -150,8 +150,8 @@ class RedisNodeInfo:
         self._running = False
         self._listener_thread: Optional[threading.Thread] = None
         self.current_node_id_set: set = set()
-        self._client: Optional[_redis.Redis] = None
-        self._sub_client: Optional[_redis.Redis] = None
+        self._client: Optional["_redis.Redis"] = None
+        self._sub_client: Optional["_redis.Redis"] = None
         self._cleanup_done = False
         
         # register cleanup function on exit
@@ -167,7 +167,7 @@ class RedisNodeInfo:
             # ignore exceptions in destructor, avoid affecting program exit
             pass
     
-    def _get_client(self) -> _redis.Redis:
+    def _get_client(self) -> "_redis.Redis":
         """Get Redis client with connection settings"""
         return _redis.Redis(
             host=self.host,

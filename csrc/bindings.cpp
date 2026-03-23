@@ -17,8 +17,6 @@
 #include <unistd.h>
 
 #include "cache_utils.h"
-#include "pcfs/pcfs.h"
-#include "tp_transfer_thread_group.h"
 #include "gds/gds_manager.h"
 #include "gds/tp_gds_transfer_thread_group.h"
 #include "pcfs/pcfs.h"
@@ -30,11 +28,11 @@
 #include "dist/block_meta.h"
 #include "dist/distributed_radix_tree.h"
 #include "dist/lease_meta_mempool.h"
-#include "layerwise.h"
 #include "dist/local_radix_tree.h"
 #include "dist/lock_free_q.h"
 #include "dist/redis_meta_channel.h"
 #endif
+#include "layerwise.h"
 #include "monitoring/metrics_manager.h"
 #include <deque>
 
@@ -423,7 +421,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("is_read"), py::arg("num_blocks_per_file"),
         py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
         py::arg("is_mla") = false);
-        py::class_<flexkv::LayerwiseTransferGroup>(m, "LayerwiseTransferGroup")
+  py::class_<flexkv::LayerwiseTransferGroup>(m, "LayerwiseTransferGroup")
         .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
                       torch::Tensor &, std::map<int, std::vector<std::string>> &,
                       int, int, torch::Tensor &, torch::Tensor &, torch::Tensor &,
@@ -536,32 +534,6 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("is_read"), py::arg("layer_id"),
            py::arg("layer_granularity"), py::arg("is_mla"));
 #endif
-
-  py::class_<flexkv::LayerwiseTransferGroup>(m, "LayerwiseTransferGroup")
-      .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
-                    torch::Tensor &, std::map<int, std::vector<std::string>> &,
-                    int, int, torch::Tensor &, torch::Tensor &, torch::Tensor &,
-                    torch::Tensor &, int, int>(),
-           py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("cpu_blocks"),
-           py::arg("ssd_files"), py::arg("dp_group_id"), py::arg("num_layers"),
-           py::arg("gpu_kv_strides_tensor"),
-           py::arg("gpu_block_strides_tensor"),
-           py::arg("gpu_layer_strides_tensor"),
-           py::arg("gpu_chunk_sizes_tensor"), py::arg("iouring_entries"),
-           py::arg("iouring_flags"))
-      .def("layerwise_transfer",
-           &flexkv::LayerwiseTransferGroup::layerwise_transfer,
-           py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
-           py::arg("ssd_layer_stride_in_bytes"),
-           py::arg("ssd_kv_stride_in_bytes"), py::arg("num_blocks_per_file"),
-           py::arg("round_robin"), py::arg("num_threads_per_device"),
-           py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),
-           py::arg("cpu_kv_stride_in_bytes"),
-           py::arg("cpu_layer_stride_in_bytes"),
-           py::arg("cpu_block_stride_in_bytes"),
-           py::arg("cpu_chunk_size_in_bytes"), py::arg("transfer_sms"),
-           py::arg("use_ce_transfer"), py::arg("num_layers"),
-           py::arg("layer_granularity"), py::arg("is_mla"));
 
   // Add Hasher class binding
   py::class_<flexkv::Hasher>(m, "Hasher")

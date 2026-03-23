@@ -176,8 +176,9 @@ def test_mempool():
     with pytest.raises(ValueError):
         mempool.recycle_blocks(np.array([1, 2, 3], dtype=np.int32))
 
-    # recycle_blocks no longer raises ValueError for already free blocks
-    mempool.recycle_blocks(np.array([1, 2, 3], dtype=np.int64))
+    # Recycle already free blocks raises
+    with pytest.raises(ValueError):
+        mempool.recycle_blocks(np.array([1, 2, 3], dtype=np.int64))
     assert mempool.num_free_blocks == DEFAULT_NUM_TOTAL_BLOCKS
 
     # Recycle wrong ndim raises

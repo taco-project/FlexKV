@@ -158,7 +158,7 @@ class TransferEngine:
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                 )
-                for _, gpu_handles in self.gpu_handles.items()
+                for _, gpu_handles in self.gpu_handle_groups.items()
             ]
             self.d2h_workers: List[WorkerHandle] = [
                 GPUCPUTransferWorker.create_worker(
@@ -215,7 +215,7 @@ class TransferEngine:
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                 )
-                for dp_client_id, gpu_handles in self.gpu_handles.items()
+                for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
             ]
         self._worker_map[TransferType.H2D] = self.h2d_workers
         self._worker_map[TransferType.D2H] = self.d2h_workers
