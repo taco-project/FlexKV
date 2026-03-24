@@ -350,10 +350,12 @@ class KVTaskManager:
                 self._mark_completed(task_id)
             elif completed_op.op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
-            if completed_op.op_id in task.op_callback_dict:
+            if task.op_callback_dict and completed_op.op_id in task.op_callback_dict:
                 task.op_callback_dict[completed_op.op_id]()
 
     def _cancel_task(self, task_id: int) -> None:
+        if task_id not in self.tasks:
+            return
         task = self.tasks[task_id]
         if task.is_completed():
             flexkv_logger.warning(f"Task {task_id} is already completed, cannot cancel")
@@ -366,6 +368,7 @@ class KVTaskManager:
             return
         task.status = TaskStatus.CANCELLED
         self.graph_to_task.pop(task.graph.graph_id, None)
+        self.tasks.pop(task_id, None)
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
         task = self.tasks[task_id]
@@ -424,10 +427,13 @@ class KVTaskManager:
         task.status = TaskStatus.COMPLETED
         task.task_end_op_finished = True
         self.graph_to_task.pop(task.graph.graph_id)
+        task.callback = None
+        task.op_callback_dict = None
+        task.graph = None
 
     def _process_empty_graph(self, task_id: int) -> None:
         task = self.tasks[task_id]
-        if task.graph.num_ops == 0:
+        if task.graph is not None and task.graph.num_ops == 0:
             self._mark_completed(task_id)
 
     def _get_completed_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
@@ -601,6 +607,8 @@ class KVTaskEngine(KVTaskManager):
                         task_id=task_id,
                         return_mask=self.tasks[task_id].return_mask
                     )
+                    if self.tasks[effective_id].is_completed():
+                        self.tasks.pop(task_id, None)
                     break
                 elif only_return_finished:
                     break
@@ -836,7 +844,9 @@ class KVTaskEngine(KVTaskManager):
         )
         self.graph_to_task[batch_task_graph.graph_id] = batch_id
         for task_id in task_ids:
-            self.graph_to_task.pop(self.tasks[task_id].graph.graph_id, None)
+            task_graph = self.tasks[task_id].graph
+            if task_graph is not None:
+                self.graph_to_task.pop(task_graph.graph_id, None)
             self.tasks[task_id].batch_task_id = batch_id
         return batch_task_graph
 
