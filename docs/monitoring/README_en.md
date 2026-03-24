@@ -39,6 +39,7 @@ Python metrics are recorded by `GlobalCacheEngine` in `cache_engine.py` and coll
 | `flexkv_py_cache_miss_blocks_total` | Counter | - | Total number of cache-miss blocks (missed at all levels) |
 | `flexkv_py_transfer_blocks_total` | Counter | `transfer_type`, `operation` | Total number of transferred blocks |
 | `flexkv_py_transfer_ops_total` | Counter | `transfer_type`, `operation` | Number of transfer operations |
+| `flexkv_py_transfer_bytes_total` | Counter | `transfer_type`, `operation` | Total bytes transferred |
 | `flexkv_py_mempool_total_blocks` | Gauge | `device` | Total blocks in memory pool |
 | `flexkv_py_mempool_free_blocks` | Gauge | `device` | Free blocks in memory pool |
 | `flexkv_py_evicted_blocks_total` | Counter | `device` | Total number of evicted blocks |
@@ -53,8 +54,6 @@ C++ metrics are managed by the `MetricsManager` singleton, primarily instrumente
 
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
-| `flexkv_cpp_transfer_ops_total` | Counter | `type`, `direction` | C++ layer data transfer operation count |
-| `flexkv_cpp_transfer_bytes_total` | Counter | `type`, `direction` | C++ layer total transferred bytes |
 | `flexkv_cpp_cache_ops_total` | Counter | `operation` | RadixTree cache operation count |
 | `flexkv_cpp_cache_blocks_total` | Counter | `operation` | Blocks involved in RadixTree cache operations |
 
@@ -128,11 +127,12 @@ curl -s http://localhost:8081/metrics | grep flexkv_cpp_
 
 **Pre-built dashboard panels:**
 
-| Panel | Description |
-|---|---|
-| Cache Hit/Miss Rate | Python layer cache hit/miss rate |
-| Memory Pool Blocks | Python layer memory pool block statistics |
-| C++ Cache Operations Rate | C++ layer cache operation rate |
-| C++ Transfer Throughput | C++ layer data transfer throughput |
+| Section | Panel | Description |
+|---|---|---|
+| Python Runtime Metrics | Cache Hit/Miss Rate | Cache hit/miss rate |
+| Python Runtime Metrics | Memory Pool Blocks | Memory pool block statistics |
+| Python Runtime Metrics | Transfer Throughput | Data transfer throughput |
+| C++ Runtime Metrics | Cache Operations Rate | Cache operation rate |
+| C++ Runtime Metrics | Cache Blocks Rate | Cache blocks operation rate |
 
 > Users can create custom panels and configure PromQL queries as needed.

@@ -106,6 +106,7 @@ class FlexKVMetricsCollector:
     - flexkv_py_cache_miss_blocks_total: Cache miss block counts (not found in any cache level)
     - flexkv_py_transfer_blocks_total: Transfer block counts by transfer type and operation
     - flexkv_py_transfer_ops_total: Transfer operation counts by transfer type and operation
+    - flexkv_py_transfer_bytes_total: Transfer byte counts by transfer type and operation
     - flexkv_py_mempool_total_blocks: Memory pool total blocks by device
     - flexkv_py_mempool_free_blocks: Memory pool free blocks by device
     - flexkv_py_evicted_blocks_total: Evicted block counts by device
@@ -115,7 +116,7 @@ class FlexKVMetricsCollector:
     Usage:
         collector = FlexKVMetricsCollector()
         collector.record_cache_hit("cpu", 10)
-        collector.record_transfer("H2D", 5, "get")
+        collector.record_transfer_completed("H2D", 5, 1048576, "get")
     """
     
     def __init__(self):
@@ -180,6 +181,12 @@ class FlexKVMetricsCollector:
             labelnames=["transfer_type", "operation"],
         )
         
+        self.transfer_bytes_total = Counter(
+            name="flexkv_py_transfer_bytes_total",
+            documentation="Total number of bytes transferred by transfer type and operation",
+            labelnames=["transfer_type", "operation"],
+        )
+        
         # Memory pool gauges by device
         mempool_gauge_kwargs = {
             "labelnames": ["device"],
@@ -232,6 +239,7 @@ class FlexKVMetricsCollector:
         self.allocation_failures_total = dummy
         self.transfer_blocks_total = dummy
         self.transfer_ops_total = dummy
+        self.transfer_bytes_total = dummy
         self.mempool_total_blocks = dummy
         self.mempool_free_blocks = dummy
         self.evicted_blocks_total = dummy
@@ -275,13 +283,18 @@ class FlexKVMetricsCollector:
             return
         self.allocation_failures_total.labels(mode=mode).inc()
     
-    def record_transfer(self, transfer_type: str, num_blocks: int, operation: str = "unknown"):
+    def record_transfer_completed(self, transfer_type: str, num_blocks: int, num_bytes: int, operation: str = "unknown"):
         """
-        Record a transfer operation.
+        Record metrics for a completed transfer operation (post-completion).
+        
+        Called from KVTaskManager._update_tasks() when a CompletedOp is consumed.
+        Updates ops_total, blocks_total, and bytes_total counters.
+        All three transfer metrics are unified here, updated only after transfer completion.
         
         Args:
             transfer_type: Transfer type (e.g., "H2D", "D2H", "DISK2H", etc.)
             num_blocks: Number of blocks transferred
+            num_bytes: Number of bytes transferred
             operation: Operation type ("get" or "put")
         """
         if not self.enabled:
@@ -289,6 +302,8 @@ class FlexKVMetricsCollector:
         self.transfer_ops_total.labels(transfer_type=transfer_type, operation=operation).inc()
         if num_blocks > 0:
             self.transfer_blocks_total.labels(transfer_type=transfer_type, operation=operation).inc(num_blocks)
+        if num_bytes > 0:
+            self.transfer_bytes_total.labels(transfer_type=transfer_type, operation=operation).inc(num_bytes)
     
     def update_mempool_stats(self, device: str, total_blocks: int, free_blocks: int):
         """

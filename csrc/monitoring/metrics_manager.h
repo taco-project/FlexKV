@@ -8,8 +8,6 @@
  * Prometheus includes and related members are excluded so the code compiles without prometheus-cpp.
  * 
  * Metrics:
- * - Counter:   flexkv_cpp_transfer_ops_total (total transfer operations)
- * - Counter:   flexkv_cpp_transfer_bytes_total (total bytes transferred)
  * - Counter:   flexkv_cpp_cache_ops_total (cache operations)
  * - Counter:   flexkv_cpp_cache_blocks_total (cache block operations)
  * 
@@ -36,27 +34,6 @@
 
 namespace flexkv {
 namespace monitoring {
-
-/**
- * @brief Transfer operation types
- */
-enum class TransferType {
-    GPU_CPU,    // GPU <-> CPU transfer
-    CPU_SSD,    // CPU <-> SSD transfer
-    GPU_GDS     // GPU <-> GDS (GPU Direct Storage)
-};
-
-/**
- * @brief Convert TransferType to string
- */
-inline const char* TransferTypeToString(TransferType type) {
-    switch (type) {
-        case TransferType::GPU_CPU: return "gpu_cpu";
-        case TransferType::CPU_SSD: return "cpu_ssd";
-        case TransferType::GPU_GDS: return "gpu_gds";
-        default: return "unknown";
-    }
-}
 
 /**
  * @brief Cache operation types
@@ -160,16 +137,6 @@ public:
 
 
 
-    // ==================== Counter: Transfer Operations ====================
-    
-    /**
-     * @brief Increment transfer operation counter and record bytes
-     * @param type Transfer type (GPU_CPU, CPU_SSD, etc.)
-     * @param direction "read" or "write"
-     * @param bytes Number of bytes transferred
-     */
-    void RecordTransfer(TransferType type, const std::string& direction, size_t bytes);
-
     // ==================== Counter: Cache Operations ====================
 
     /**
@@ -216,9 +183,6 @@ private:
     // Core components (Prometheus)
     std::shared_ptr<prometheus::Registry> registry_;
     std::unique_ptr<prometheus::Exposer> exposer_;
-    // Transfer metric families
-    prometheus::Family<prometheus::Counter>* transfer_ops_family_{nullptr};
-    prometheus::Family<prometheus::Counter>* transfer_bytes_family_{nullptr};
     // Cache operation metric families
     prometheus::Family<prometheus::Counter>* cache_ops_family_{nullptr};
     prometheus::Family<prometheus::Counter>* cache_blocks_family_{nullptr};
@@ -236,21 +200,6 @@ private:
 // Shutdown metrics
 #define FLEXKV_METRICS_SHUTDOWN() \
     flexkv::monitoring::MetricsManager::Instance().Shutdown()
-
-// ==================== Transfer Operation Macros ====================
-
-// Convenience macros for specific transfer types (record ops + bytes)
-#define FLEXKV_GPU_CPU_TRANSFER(is_read, bytes) \
-    flexkv::monitoring::MetricsManager::Instance().RecordTransfer( \
-        flexkv::monitoring::TransferType::GPU_CPU, (is_read) ? "read" : "write", bytes)
-
-#define FLEXKV_CPU_SSD_TRANSFER(is_read, bytes) \
-    flexkv::monitoring::MetricsManager::Instance().RecordTransfer( \
-        flexkv::monitoring::TransferType::CPU_SSD, (is_read) ? "read" : "write", bytes)
-
-#define FLEXKV_GPU_GDS_TRANSFER(is_read, bytes) \
-    flexkv::monitoring::MetricsManager::Instance().RecordTransfer( \
-        flexkv::monitoring::TransferType::GPU_GDS, (is_read) ? "read" : "write", bytes)
 
 // ==================== Cache Operation Macros ====================
 

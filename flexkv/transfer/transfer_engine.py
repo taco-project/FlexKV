@@ -414,7 +414,17 @@ class TransferEngine:
                                 op_id = self.finished_ops_queue.get_nowait()
                                 op = self.op_id_to_op[op_id]
                                 free_op_from_buffer(op, self.pin_buffer)
-                                self.completed_queue.put(CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
+                                # Compute transfer metrics for this completed op
+                                num_blocks = len(op.src_block_ids) if op.src_block_ids is not None else 0
+                                num_bytes = num_blocks * self.cache_config.tokens_per_block * self.model_config.token_size_in_bytes
+                                transfer_type_str = op.transfer_type.value if op.transfer_type != TransferType.VIRTUAL else None
+                                self.completed_queue.put(CompletedOp(
+                                    graph_id=op.graph_id,
+                                    op_id=op.op_id,
+                                    transfer_type=transfer_type_str,
+                                    num_blocks=num_blocks,
+                                    num_bytes=num_bytes,
+                                ))
                                 finished_ops.append(op)
                                 del self.op_id_to_op[op_id]
                             except queue.Empty:
