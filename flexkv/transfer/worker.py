@@ -297,6 +297,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.cpu_tensor = cpu_blocks
         self.cpu_kv_layout = cpu_kv_layout
         self.use_torch_copy_fallback = os.getenv("FLEXKV_USE_TORCH_COPY", "0") == "1"
+        print(f"============== {self.use_torch_copy_fallback=} ===============")
 
         self.dtype = dtype
         self.is_mla = gpu_kv_layout.is_mla
@@ -649,9 +650,11 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                         # directly.  For H2D every rank copies the whole CPU chunk; for
                         # D2H each rank writes a distinct 1/num_gpus slice.
                         if self.gpu_block_type_ == 0:
-                            gpu_chunk = gpu_blocks_for_rank[lay][:, gpu_bid, ...]  # [kv_dim, tok, head, hs]
+                            # GPU MLA tensor: (num_blocks, block_size, head_size)
+                            # gpu_chunk: (block_size, head_size)
+                            gpu_chunk = gpu_blocks_for_rank[lay][gpu_bid]
                         elif self.gpu_block_type_ == 1:
-                            gpu_chunk = gpu_blocks_for_rank[0][gpu_bid, lay, ...]  # [kv_dim, tok, head, hs]
+                            gpu_chunk = gpu_blocks_for_rank[0][gpu_bid, lay, ...]
                         else:
                             # gpu_block_type_ == 2 (SGLANG), iterate kv_dim
                             for kv_id in range(1):  # MLA has kv_dim=1
@@ -666,14 +669,18 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                                         g[..., flat_start:flat_end], non_blocking=True)
                             continue
 
+                        # cpu_chunk shape: (kv_dim=1, block_size, num_head=1, head_size)
+                        # gpu_chunk shape: (block_size, head_size)
+                        # Squeeze cpu_chunk to (block_size, head_size) for copy
+                        cpu_chunk_squeezed = cpu_chunk.squeeze(0).squeeze(-2)  # (block_size, head_size)
                         if is_h2d:
-                            gpu_chunk.copy_(cpu_chunk, non_blocking=True)
+                            gpu_chunk.copy_(cpu_chunk_squeezed, non_blocking=True)
                         else:
                             # D2H for MLA: each rank writes a 1/num_gpus slice
                             hs = gpu_chunk.shape[-1]
                             flat_start = gpu_idx * (hs // self.num_gpus)
                             flat_end = flat_start + (hs // self.num_gpus)
-                            cpu_chunk[..., flat_start:flat_end].copy_(
+                            cpu_chunk_squeezed[..., flat_start:flat_end].copy_(
                                 gpu_chunk[..., flat_start:flat_end], non_blocking=True)
                     else:
                         # Non-MLA: each TP rank owns a contiguous head slice
