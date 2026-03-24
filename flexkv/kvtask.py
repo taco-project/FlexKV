@@ -428,7 +428,7 @@ class KVTaskManager:
         return results
 
     def _check_config(self, model_config: ModelConfig, cache_config: CacheConfig) -> None:
-        if cache_config.enable_remote:
+        if cache_config.enable_remote and not cache_config.use_simm_backend:
             if cache_config.remote_cache_path is None:
 
                 if cache_config.remote_file_prefix is None:
