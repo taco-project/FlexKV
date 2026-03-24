@@ -6,7 +6,7 @@ Aligned with real FlexKV configuration:
   - CPU: configurable via FLEXKV_CPU_LAYOUT env var
     - BLOCKFIRST (default): [num_blocks, num_layers, 2, tpb, nh, hs]
     - LAYERFIRST:           [num_layers, 2, num_blocks, tpb, nh, hs]
-  - Baseline: kernel mode (transfer_sms=8, use_ce_transfer=False)
+  - Baseline: kernel mode (transfer_num_cta=4, use_ce_transfer=False)
 
 Usage:
   FLEXKV_ENABLE_NVCOMP=1 FLEXKV_NVCOMP_LOG_LEVEL=1 python test_nvcomp.py
@@ -43,7 +43,7 @@ except ImportError:
     print("WARNING: nvcomp not available. Build with FLEXKV_ENABLE_NVCOMP=1")
 
 BATCH_SIZE = int(os.environ.get("FLEXKV_NVCOMP_BATCH_SIZE", "0"))
-TRANSFER_SMS = int(os.environ.get("FLEXKV_TRANSFER_SMS", "8"))
+TRANSFER_NUM_CTA = int(os.environ.get("FLEXKV_TRANSFER_NUM_CTA", "4"))
 CPU_LAYOUT = os.environ.get("FLEXKV_CPU_LAYOUT", "BLOCKFIRST").upper()
 assert CPU_LAYOUT in ("BLOCKFIRST", "LAYERFIRST"), \
     f"FLEXKV_CPU_LAYOUT must be BLOCKFIRST or LAYERFIRST, got {CPU_LAYOUT}"
@@ -222,7 +222,7 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
     transfer_stream = torch.cuda.Stream()
     print(f"\n{'='*60}")
     print(f"Baseline comparison: layers={num_layers}, blocks={num_blocks}")
-    print(f"  CPU layout={CPU_LAYOUT}, baseline: kernel mode (transfer_sms={TRANSFER_SMS})")
+    print(f"  CPU layout={CPU_LAYOUT}, baseline: kernel mode (transfer_num_cta={TRANSFER_NUM_CTA})")
     print(f"{'='*60}")
 
     gpu_blocks, cpu_blocks = make_kv_cache(
@@ -242,8 +242,8 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
     print(f"\n  Total data per direction: {total_bytes / 1024 / 1024:.2f} MB")
     print(f"  Total chunks={num_chunks}")
 
-    # --- Baseline: kernel mode (use_ce_transfer=False, transfer_sms=TRANSFER_SMS) ---
-    print(f"\n  Baseline (kernel mode, sms={TRANSFER_SMS}, no compression):")
+    # --- Baseline: kernel mode (use_ce_transfer=False, transfer_num_cta=TRANSFER_NUM_CTA) ---
+    print(f"\n  Baseline (kernel mode, num_cta={TRANSFER_NUM_CTA}, no compression):")
 
     def run_baseline(is_h2d):
         with torch.cuda.stream(transfer_stream):
@@ -253,7 +253,7 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
                 cpu_block_ids, cpu_blocks,
                 cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
                 chunk_size, 0, num_layers,
-                TRANSFER_SMS, is_h2d, False, False, 0)
+                TRANSFER_NUM_CTA, is_h2d, False, False, 0)
 
     for _ in range(num_warmup):
         run_baseline(is_h2d=False)
@@ -347,11 +347,11 @@ if __name__ == "__main__":
     NUM_LAYERS = 28
     NUM_KV_HEADS = 4
     HEAD_SIZE = 128
-    TOKENS_PER_BLOCK = 16
+    TOKENS_PER_BLOCK = 64
     TOTAL_TOKENS = 32768 # total blocks = total tokens / 16 tokens_per_block
     NUM_BLOCKS = TOTAL_TOKENS // TOKENS_PER_BLOCK  # 2048
     # nvcomp total chunks = 28 * 2 * 2048 = 114,688 | [num_blocks, num_layers, 2, tpb, nh, hs]
-    # nvcomp total batch = 114688 // 4096 = 28     | 16 KB * 4096 * 2.6x * 2 = 300MB
+    # nvcomp total batch = 114688 // 4096 = 28
 
     passed = test_roundtrip(num_layers=NUM_LAYERS, num_blocks=NUM_BLOCKS,
                             tokens_per_block=TOKENS_PER_BLOCK,

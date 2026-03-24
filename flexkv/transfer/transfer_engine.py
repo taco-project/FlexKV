@@ -136,6 +136,18 @@ class TransferEngine:
         self._worker_map: Dict[TransferType, Union[WorkerHandle, List[WorkerHandle]]] = {}
 
         assert self._cpu_handle is not None
+
+        # Pre-allocate shared nvcomp comp_sizes_meta for H2D/D2H worker pairs.
+        # Uses POSIX shared memory so both processes see the same data; each
+        # worker registers it as CUDA pinned via cudaHostRegister.
+        nvcomp_comp_sizes_meta = None
+        if os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") == "1":
+            kv_dim = 1 if self.model_config.use_mla else 2
+            num_cpu_blocks = self._cpu_handle.kv_layout.num_block
+            nvcomp_comp_sizes_meta = torch.zeros(
+                self.model_config.num_layers * kv_dim, num_cpu_blocks,
+                dtype=torch.int64).share_memory_()
+
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
         if self.tp_size == 1:
@@ -154,6 +166,7 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    nvcomp_comp_sizes_meta=nvcomp_comp_sizes_meta,
                 )
                 for _, gpu_handles in self.gpu_handles.items()
             ]
@@ -172,6 +185,7 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    nvcomp_comp_sizes_meta=nvcomp_comp_sizes_meta,
                 )
                 for _, gpu_handles in self.gpu_handles.items()
             ]

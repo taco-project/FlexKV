@@ -205,6 +205,10 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
 
   ANS_NVCOMP_CHECK(nvcompBatchedANSCompressGetMaxOutputChunkSize(
       max_chunk_size, ctx->comp_opts, &ctx->max_comp_chunk_bytes));
+  // Round up to 16-byte alignment so that scatter/gather kernels can use
+  // float4 (16-byte) loads/stores on d_comp_staging + i * max_comp_chunk_bytes.
+  // nvcomp only guarantees 8-byte alignment for output chunk pointers.
+  ctx->max_comp_chunk_bytes = (ctx->max_comp_chunk_bytes + 15) & ~size_t(15);
   ANS_NVCOMP_CHECK(nvcompBatchedANSCompressGetTempSizeAsync(
       max_num_chunks, max_chunk_size, ctx->comp_opts,
       &ctx->comp_temp_bytes, max_total));

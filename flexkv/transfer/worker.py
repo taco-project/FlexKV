@@ -323,7 +323,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
-                 transfer_num_cta_d2h: int = 4) -> None:
+                 transfer_num_cta_d2h: int = 4,
+                 nvcomp_comp_sizes_meta: Optional[torch.Tensor] = None) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         # Register CPU tensors with CUDA
@@ -383,9 +384,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             nvcomp_batch_size = self.ans_ctx.max_num_chunks
             
             num_cpu_blocks = cpu_kv_layout.num_block
-            self.comp_sizes_meta = torch.zeros(
-                self.num_layers * kv_dim, num_cpu_blocks,
-                dtype=torch.int64).pin_memory()      # global metadata for cpu blocks
+            if nvcomp_comp_sizes_meta is not None:
+                self.comp_sizes_meta = nvcomp_comp_sizes_meta
+                cudaHostRegister(self.comp_sizes_meta)
+            else:
+                self.comp_sizes_meta = None
             max_chunks = self.num_layers * kv_dim * num_cpu_blocks
             # Pre-allocate pinned buffer for D2H comp_sizes output (GPU kernel writes here)
             self._d2h_comp_sizes_buf = torch.zeros(
