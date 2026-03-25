@@ -72,6 +72,8 @@ class KVTask:
 
     # batch: points to the batch task id if this task was merged into a batch
     batch_task_id: Optional[int] = None
+    # ref count: number of sub-tasks referencing this batch task
+    pending_sub_count: int = 0
 
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
@@ -350,7 +352,7 @@ class KVTaskManager:
                 self._mark_completed(task_id)
             elif completed_op.op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
-            if task.op_callback_dict and completed_op.op_id in task.op_callback_dict:
+            if completed_op.op_id in task.op_callback_dict:
                 task.op_callback_dict[completed_op.op_id]()
 
     def _cancel_task(self, task_id: int) -> None:
@@ -367,8 +369,7 @@ class KVTaskManager:
             flexkv_logger.warning(f"Task {task_id} is already cancelled, cannot cancel")
             return
         task.status = TaskStatus.CANCELLED
-        self.graph_to_task.pop(task.graph.graph_id, None)
-        self.tasks.pop(task_id, None)
+        self._release_task(task_id)
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
         task = self.tasks[task_id]
@@ -414,6 +415,19 @@ class KVTaskManager:
         task.status = TaskStatus.RUNNING
         return task.graph
 
+    def _release_task(self, task_id: int) -> None:
+        """clean up task resources."""
+        if task_id not in self.tasks:
+            return
+        task = self.tasks[task_id]
+        batch_id = task.batch_task_id
+        self.graph_to_task.pop(task.graph.graph_id, None)
+        self.tasks.pop(task_id, None)
+        if batch_id is not None and batch_id in self.tasks:
+            self.tasks[batch_id].pending_sub_count -= 1
+            if self.tasks[batch_id].pending_sub_count <= 0:
+                self._release_task(batch_id)
+
     def _mark_completed(self, task_id: int) -> None:
         task = self.tasks[task_id]
         if task.is_completed():
@@ -427,13 +441,10 @@ class KVTaskManager:
         task.status = TaskStatus.COMPLETED
         task.task_end_op_finished = True
         self.graph_to_task.pop(task.graph.graph_id)
-        task.callback = None
-        task.op_callback_dict = None
-        task.graph = None
 
     def _process_empty_graph(self, task_id: int) -> None:
         task = self.tasks[task_id]
-        if task.graph is not None and task.graph.num_ops == 0:
+        if task.graph.num_ops == 0:
             self._mark_completed(task_id)
 
     def _get_completed_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
@@ -608,7 +619,7 @@ class KVTaskEngine(KVTaskManager):
                         return_mask=self.tasks[task_id].return_mask
                     )
                     if self.tasks[effective_id].is_completed():
-                        self.tasks.pop(task_id, None)
+                        self._release_task(task_id)
                     break
                 elif only_return_finished:
                     break
@@ -843,10 +854,9 @@ class KVTaskEngine(KVTaskManager):
             op_callback_dict=op_callback_dict,
         )
         self.graph_to_task[batch_task_graph.graph_id] = batch_id
+        self.tasks[batch_id].pending_sub_count = len(task_ids)
         for task_id in task_ids:
-            task_graph = self.tasks[task_id].graph
-            if task_graph is not None:
-                self.graph_to_task.pop(task_graph.graph_id, None)
+            self.graph_to_task.pop(self.tasks[task_id].graph.graph_id, None)
             self.tasks[task_id].batch_task_id = batch_id
         return batch_task_graph
 
