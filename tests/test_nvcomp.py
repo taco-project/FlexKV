@@ -42,7 +42,7 @@ except ImportError:
     NVCOMP_AVAILABLE = False
     print("WARNING: nvcomp not available. Build with FLEXKV_ENABLE_NVCOMP=1")
 
-BATCH_SIZE = int(os.environ.get("FLEXKV_NVCOMP_BATCH_SIZE", "0"))
+BATCH_SIZE = int(os.environ.get("FLEXKV_NVCOMP_BATCH_SIZE", "4096"))
 TRANSFER_NUM_CTA = int(os.environ.get("FLEXKV_TRANSFER_NUM_CTA", "4"))
 CPU_LAYOUT = os.environ.get("FLEXKV_CPU_LAYOUT", "BLOCKFIRST").upper()
 assert CPU_LAYOUT in ("BLOCKFIRST", "LAYERFIRST"), \
@@ -347,7 +347,7 @@ if __name__ == "__main__":
     NUM_LAYERS = 28
     NUM_KV_HEADS = 4
     HEAD_SIZE = 128
-    TOKENS_PER_BLOCK = 64
+    TOKENS_PER_BLOCK = 16
     TOTAL_TOKENS = 32768 # total blocks = total tokens / 16 tokens_per_block
     NUM_BLOCKS = TOTAL_TOKENS // TOKENS_PER_BLOCK  # 2048
     # nvcomp total chunks = 28 * 2 * 2048 = 114,688 | [num_blocks, num_layers, 2, tpb, nh, hs]

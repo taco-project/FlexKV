@@ -514,9 +514,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.comp_sizes_meta[col_start:col_end, cpu_bids] = comp_2d
 
         elif transfer_type == TransferType.H2D:
-            # comp_sizes_meta is [num_layers*kv_dim, num_cpu_blocks] pinned.
-            # The C++ kernel gathers from it directly on GPU — no Python-side
-            # meta_slice or copy needed.
             _r_ans = nvtx.start_range(message="H2D_nvcomp:ans_h2d_and_decompress_call", color="orange")
             ans_h2d_and_decompress(
                 self.ans_ctx,

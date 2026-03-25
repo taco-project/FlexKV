@@ -185,6 +185,9 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
     transfer_sms = 4;
   }
   ctx->transfer_sms = transfer_sms;
+  assert(max_num_chunks > 0 && max_chunk_size > 0);
+  
+  // TODO: never used `compute_auto_pipeline_batch`
   // Auto-compute max_num_chunks when caller passes 0: use the minimum value
   // that achieves the best compression ratio (lowest num_ctas_per_chunk).
   if (max_num_chunks == 0 && max_chunk_size > 0) {
@@ -199,7 +202,7 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
   ctx->comp_opts = nvcompBatchedANSCompressDefaultOpts;
   ctx->comp_opts.data_type = NVCOMP_TYPE_FLOAT16; // hardcoded
   ctx->decomp_opts = nvcompBatchedANSDecompressDefaultOpts;
-  ctx->decomp_opts.max_uncompressed_chunk_size = ctx->max_chunk_size;
+  ctx->decomp_opts.max_uncompressed_chunk_size = 0;   // TODO: for now force decompress kernel launch num_ctas_per_chunk=16
 
   const size_t max_total = max_num_chunks * max_chunk_size;
 
@@ -564,11 +567,11 @@ void ans_h2d_and_decompress(
           comp_sizes_meta[meta_row * meta_stride + cpu_block_ids[b]]);
     }
     size_t total_uncomp = static_cast<size_t>(total_chunks) * chunk_size_in_bytes;
-    printf("[FlexKV ans_h2d_and_decompress] H2D: %d chunks in %d batch(es), %.2f MB compressed -> %.2f MB (ratio %.2fx)\n",
-           total_chunks, num_batches,
-           grand_total_comp / (1024.0 * 1024.0),
-           total_uncomp     / (1024.0 * 1024.0),
-           (double)total_uncomp / grand_total_comp);
+    fprintf(stderr, "[FlexKV ans_h2d_and_decompress] H2D: %d chunks in %d batch(es), %.2f MB compressed -> %.2f MB (ratio %.2fx)\n",
+            total_chunks, num_batches,
+            grand_total_comp / (1024.0 * 1024.0),
+            total_uncomp     / (1024.0 * 1024.0),
+            (double)total_uncomp / grand_total_comp);
   }
 }
 
