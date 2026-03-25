@@ -14,6 +14,8 @@
 
 namespace flexkv {
 
+static constexpr int COMP_HEADER_SIZE = 16;
+
 struct ANSTransferContext {
     size_t max_num_chunks;                  // max number of chunks in a batch
     size_t max_chunk_size;                  // max uncompressed chunk size, equal to tpb * nhead * head_size * sizeof(data_type)
@@ -40,8 +42,6 @@ struct ANSTransferContext {
     size_t*         d_decomp_act_sizes;
     nvcompStatus_t* d_statuses;
 
-    
-    size_t*  h_comp_sizes[2];
     std::vector<void*>  h_ptr_scratch;
     std::vector<size_t> h_size_scratch;
     
@@ -116,7 +116,6 @@ void ans_compress_and_d2h(
     int64_t cpu_block_stride_in_bytes,
     int64_t chunk_size_in_bytes,
     bool is_mla,
-    int64_t* h_comp_sizes_out,
     cudaStream_t stream);
 
 template<BackendType Type>
@@ -130,7 +129,6 @@ void ans_h2d_and_decompress(
     int64_t cpu_block_stride_in_bytes,
     int64_t chunk_size_in_bytes,
     bool is_mla,
-    const int64_t* comp_sizes_meta, int meta_stride,
     cudaStream_t stream);
 
 } // namespace flexkv

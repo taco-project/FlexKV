@@ -149,7 +149,6 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
 
     # --- D2H ---
     print("\n--- D2H (compress + pack + transfer + scatter) ---")
-    comp_sizes_out = torch.zeros(num_chunks, dtype=torch.int64).pin_memory()
 
     torch.cuda.synchronize()
     t0 = time.time()
@@ -163,21 +162,16 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
             chunk_size,
             0, num_layers,
             False, 0,
-            comp_sizes_out,
         )
     transfer_stream.synchronize()
     t1 = time.time()
 
     total_uncomp = num_chunks * chunk_size
-    total_comp = comp_sizes_out.sum().item()
     print(f"  D2H time: {(t1-t0)*1000:.2f} ms")
     print(f"  Uncompressed: {total_uncomp / 1024 / 1024:.2f} MB")
-    print(f"  Compressed:   {total_comp / 1024 / 1024:.2f} MB")
-    print(f"  Ratio:        {total_uncomp / total_comp:.2f}x")
 
     # --- H2D ---
     print("\n--- H2D (gather + transfer + unpack + decompress) ---")
-    comp_sizes_meta = comp_sizes_out.reshape(num_layers * kv_dim, num_blocks)
     t2 = time.time()
     with torch.cuda.stream(transfer_stream):
         ans_h2d_and_decompress(
@@ -189,7 +183,6 @@ def test_roundtrip(num_layers=4, num_blocks=2, tokens_per_block=16,
             chunk_size,
             0, num_layers,
             False, 0,
-            comp_sizes_meta,
         )
     transfer_stream.synchronize()
     t3 = time.time()
@@ -282,8 +275,6 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
 
     # --- nvcomp ---
     ctx = ANSTransferContext(BATCH_SIZE, chunk_size, 0, 0)
-    comp_sizes = torch.zeros(num_chunks, dtype=torch.int64).pin_memory()
-
     num_batches = (num_chunks + ctx.max_num_chunks - 1) // ctx.max_num_chunks
     print(f"  Total chunks={num_chunks}, nvcomp batches={num_batches}")
 
@@ -295,9 +286,7 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
                 gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
                 cpu_block_ids, cpu_blocks,
                 cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
-                chunk_size, 0, num_layers, False, 0, comp_sizes)
-
-    comp_sizes_meta = comp_sizes.reshape(num_layers * kv_dim, num_blocks)
+                chunk_size, 0, num_layers, False, 0)
 
     def run_nvcomp_h2d():
         with torch.cuda.stream(transfer_stream):
@@ -306,7 +295,7 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
                 gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
                 cpu_block_ids, cpu_blocks,
                 cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
-                chunk_size, 0, num_layers, False, 0, comp_sizes_meta)
+                chunk_size, 0, num_layers, False, 0)
 
     for _ in range(num_warmup):
         run_nvcomp_d2h()
@@ -328,8 +317,7 @@ def test_baseline_comparison(num_layers=4, num_blocks=4, tokens_per_block=16,
     t3 = time.time()
     nvcomp_h2d_ms = (t3 - t2) / num_iters * 1000
 
-    total_comp = comp_sizes.sum().item()
-    print(f"    Compression ratio: {total_bytes / total_comp:.2f}x")
+    print(f"    Compression ratio: (see roundtrip test above)")
     print(f"    D2H: {nvcomp_d2h_ms:.2f} ms  (speedup {baseline_d2h_ms / nvcomp_d2h_ms:.2f}x)")
     print(f"    H2D: {nvcomp_h2d_ms:.2f} ms  (speedup {baseline_h2d_ms / nvcomp_h2d_ms:.2f}x)")
 

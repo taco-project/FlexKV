@@ -62,8 +62,7 @@ __global__ void ans_d2h_scatter_kernel(
     const int64_t* __restrict__ cpu_block_ids,
     int start_layer_id,
     int kv_dim, int num_blocks,
-    int batch_start, int bsz,
-    int64_t* __restrict__ h_comp_sizes_out)
+    int batch_start, int bsz)
 {
     for (int i = blockIdx.x; i < bsz; i += gridDim.x) {
         int g = batch_start + i;
@@ -74,11 +73,16 @@ __global__ void ans_d2h_scatter_kernel(
         size_t sz = d_comp_sizes[i];
         const float4* src = reinterpret_cast<const float4*>(
             d_comp_staging + (size_t)i * staging_stride);
-        float4* dst = reinterpret_cast<float4*>(
+        uint8_t* chunk_base =
             cpu_ptr
             + (int64_t)(layer + start_layer_id) * cpu_layer_stride
             + (int64_t)kv * cpu_kv_stride
-            + cpu_block_ids[b] * cpu_block_stride);
+            + cpu_block_ids[b] * cpu_block_stride;
+
+        if (threadIdx.x == 0)
+            *reinterpret_cast<int64_t*>(chunk_base) = static_cast<int64_t>(sz);
+
+        float4* dst = reinterpret_cast<float4*>(chunk_base + COMP_HEADER_SIZE);
 
         int64_t n_f4 = sz / sizeof(float4);
         for (int64_t j = threadIdx.x; j < n_f4; j += blockDim.x)
@@ -89,16 +93,13 @@ __global__ void ans_d2h_scatter_kernel(
         uint8_t* dst_tail = reinterpret_cast<uint8_t*>(dst) + tail;
         for (size_t j = threadIdx.x; j < sz - tail; j += blockDim.x)
             dst_tail[j] = src_tail[j];
-
-        if (threadIdx.x == 0)
-            h_comp_sizes_out[g] = static_cast<int64_t>(sz);
     }
 }
 
 __global__ void ans_h2d_gather_kernel(
     uint8_t* __restrict__ d_comp_staging,
     size_t staging_stride,
-    const size_t* __restrict__ d_comp_sizes,
+    size_t* __restrict__ d_comp_sizes_out,
     const uint8_t* __restrict__ cpu_ptr,
     int64_t cpu_kv_stride,
     int64_t cpu_layer_stride,
@@ -114,14 +115,21 @@ __global__ void ans_h2d_gather_kernel(
         int kv = (g % (kv_dim * num_blocks)) / num_blocks;
         int b = g % num_blocks;
 
-        size_t sz = d_comp_sizes[i];
-        float4* dst = reinterpret_cast<float4*>(
-            d_comp_staging + (size_t)i * staging_stride);
-        const float4* src = reinterpret_cast<const float4*>(
+        const uint8_t* chunk_base =
             cpu_ptr
             + (int64_t)(layer + start_layer_id) * cpu_layer_stride
             + (int64_t)kv * cpu_kv_stride
-            + cpu_block_ids[b] * cpu_block_stride);
+            + cpu_block_ids[b] * cpu_block_stride;
+
+        size_t sz = static_cast<size_t>(
+            *reinterpret_cast<const int64_t*>(chunk_base));
+        if (threadIdx.x == 0)
+            d_comp_sizes_out[i] = sz;
+
+        float4* dst = reinterpret_cast<float4*>(
+            d_comp_staging + (size_t)i * staging_stride);
+        const float4* src = reinterpret_cast<const float4*>(
+            chunk_base + COMP_HEADER_SIZE);
 
         int64_t n_f4 = sz / sizeof(float4);
         for (int64_t j = threadIdx.x; j < n_f4; j += blockDim.x)
@@ -132,27 +140,6 @@ __global__ void ans_h2d_gather_kernel(
         uint8_t* dst_tail = reinterpret_cast<uint8_t*>(dst) + tail;
         for (size_t j = threadIdx.x; j < sz - tail; j += blockDim.x)
             dst_tail[j] = src_tail[j];
-    }
-}
-
-// GPU kernel to gather compressed sizes from 2D pinned metadata buffer into
-// d_comp_sizes, replacing Python-side meta_slice + cudaMemcpyAsync.
-// comp_sizes_meta layout: [num_layers * kv_dim, num_cpu_blocks] (pinned host)
-__global__ void ans_gather_comp_sizes_kernel(
-    size_t* __restrict__ d_comp_sizes_out,
-    const int64_t* __restrict__ comp_sizes_meta,
-    int meta_stride,
-    const int64_t* __restrict__ cpu_block_ids,
-    int kv_dim, int num_blocks,
-    int start_layer_id,
-    int batch_start, int bsz)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < bsz; i += gridDim.x * blockDim.x) {
-        int g = batch_start + i;
-        int meta_row = start_layer_id * kv_dim + g / num_blocks;
-        int b = g % num_blocks;
-        d_comp_sizes_out[i] = static_cast<size_t>(
-            comp_sizes_meta[meta_row * meta_stride + cpu_block_ids[b]]);
     }
 }
 
@@ -244,9 +231,6 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_decomp_act_sizes,    size_bytes));
   ANS_CUDA_CHECK(cudaMalloc(&ctx->d_statuses,
       max_num_chunks * sizeof(nvcompStatus_t)));
-
-  ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_sizes[0], size_bytes));
-  ANS_CUDA_CHECK(cudaMallocHost(&ctx->h_comp_sizes[1], size_bytes));
 
   ctx->h_ptr_scratch.resize(max_num_chunks);
   ctx->h_size_scratch.resize(max_num_chunks);
@@ -376,8 +360,6 @@ void ans_ctx_destroy(ANSTransferContext* ctx) {
   cudaFree(ctx->d_decomp_buf_sizes[1]);
   cudaFree(ctx->d_decomp_act_sizes);
   cudaFree(ctx->d_statuses);
-  cudaFreeHost(ctx->h_comp_sizes[0]);
-  cudaFreeHost(ctx->h_comp_sizes[1]);
 }
 
 static void ans_sync_streams(ANSTransferContext* ctx, cudaStream_t stream) {
@@ -399,7 +381,6 @@ void ans_compress_and_d2h(
     int64_t cpu_block_stride_in_bytes,
     int64_t chunk_size_in_bytes,
     bool is_mla,
-    int64_t* h_comp_sizes_out,
     cudaStream_t stream) {
 
   const int kv_dim = is_mla ? 1 : 2;
@@ -452,8 +433,7 @@ void ans_compress_and_d2h(
           ctx->d_comp_staging[cur], ctx->max_comp_chunk_bytes, ctx->d_comp_sizes[cur],
           static_cast<uint8_t*>(cpu_ptr),
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-          cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz,
-          h_comp_sizes_out);
+          cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz);
       ANS_CUDA_CHECK(cudaEventRecord(ctx->scatter_done[cur], ctx->scatter_stream));
     }
   }
@@ -463,8 +443,18 @@ void ans_compress_and_d2h(
 
   if (ctx->log_level >= 1) {
     size_t grand_total_comp = 0;
-    for (int i = 0; i < total_chunks; i++)
-      grand_total_comp += static_cast<size_t>(h_comp_sizes_out[i]);
+    const uint8_t* cpu = static_cast<const uint8_t*>(cpu_ptr);
+    for (int g = 0; g < total_chunks; g++) {
+      int layer = g / (kv_dim * num_blocks);
+      int kv = (g % (kv_dim * num_blocks)) / num_blocks;
+      int b = g % num_blocks;
+      const uint8_t* chunk = cpu
+          + (int64_t)(layer + start_layer_id) * cpu_layer_stride_in_bytes
+          + (int64_t)kv * cpu_kv_stride_in_bytes
+          + cpu_block_ids[b] * cpu_block_stride_in_bytes;
+      grand_total_comp += static_cast<size_t>(
+          *reinterpret_cast<const int64_t*>(chunk));
+    }
     size_t grand_total_uncomp = static_cast<size_t>(total_chunks) * chunk_size_in_bytes;
     printf("[FlexKV ans_compress_and_d2h] D2H: %d chunks in %d batch(es), %.2f MB -> %.2f MB (ratio %.2fx)\n",
            total_chunks, num_batches,
@@ -485,7 +475,6 @@ void ans_h2d_and_decompress(
     int64_t cpu_block_stride_in_bytes,
     int64_t chunk_size_in_bytes,
     bool is_mla,
-    const int64_t* comp_sizes_meta, int meta_stride,
     cudaStream_t stream) {
 
   const int kv_dim = is_mla ? 1 : 2;
@@ -507,14 +496,6 @@ void ans_h2d_and_decompress(
 
     if (bi >= 2)
       ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->scatter_done[cur], 0));
-
-    { NvtxScope _nvtx("ANS:H2D:gather_comp_sizes");
-      int threads = 256;
-      int blocks = std::min((bsz + threads - 1) / threads, ctx->transfer_sms);
-      ans_gather_comp_sizes_kernel<<<blocks, threads, 0, ctx->scatter_stream>>>(
-          ctx->d_comp_sizes[cur], comp_sizes_meta, meta_stride,
-          cpu_block_ids, kv_dim, num_blocks, start_layer_id, bs, bsz);
-    }
 
     { NvtxScope _nvtx("ANS:H2D:build_ptrs");
       GreenScope _green(&ctx->green_ctx);
@@ -559,19 +540,10 @@ void ans_h2d_and_decompress(
   nvtxRangePop(); // H2D_total
 
   if (ctx->log_level >= 1) {
-    size_t grand_total_comp = 0;
-    for (int g = 0; g < total_chunks; g++) {
-      int meta_row = start_layer_id * kv_dim + g / num_blocks;
-      int b = g % num_blocks;
-      grand_total_comp += static_cast<size_t>(
-          comp_sizes_meta[meta_row * meta_stride + cpu_block_ids[b]]);
-    }
     size_t total_uncomp = static_cast<size_t>(total_chunks) * chunk_size_in_bytes;
-    fprintf(stderr, "[FlexKV ans_h2d_and_decompress] H2D: %d chunks in %d batch(es), %.2f MB compressed -> %.2f MB (ratio %.2fx)\n",
-            total_chunks, num_batches,
-            grand_total_comp / (1024.0 * 1024.0),
-            total_uncomp     / (1024.0 * 1024.0),
-            (double)total_uncomp / grand_total_comp);
+    printf("[FlexKV ans_h2d_and_decompress] H2D: %d chunks in %d batch(es), %.2f MB uncompressed\n",
+           total_chunks, num_batches,
+           total_uncomp / (1024.0 * 1024.0));
   }
 }
 
@@ -579,28 +551,28 @@ void ans_h2d_and_decompress(
 template void ans_compress_and_d2h<BackendType::VLLM>(
     ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
     int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    int64_t*, cudaStream_t);
+    cudaStream_t);
 template void ans_compress_and_d2h<BackendType::TRTLLM>(
     ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
     int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    int64_t*, cudaStream_t);
+    cudaStream_t);
 template void ans_compress_and_d2h<BackendType::SGLANG>(
     ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
     int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    int64_t*, cudaStream_t);
+    cudaStream_t);
 
 template void ans_h2d_and_decompress<BackendType::VLLM>(
     ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
     int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    const int64_t*, int, cudaStream_t);
+    cudaStream_t);
 template void ans_h2d_and_decompress<BackendType::TRTLLM>(
     ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
     int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    const int64_t*, int, cudaStream_t);
+    cudaStream_t);
 template void ans_h2d_and_decompress<BackendType::SGLANG>(
     ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
     int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    const int64_t*, int, cudaStream_t);
+    cudaStream_t);
 
 } // namespace flexkv
 
