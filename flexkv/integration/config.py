@@ -65,7 +65,7 @@ class FlexKVConfig:
 
         self.model_config.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.model_config.head_size = vllm_config.model_config.get_head_size()
-        self.model_config.dtype = vllm_config.model_config.dtype
+        self.model_config.dtype = self.get_dtype_from_vllm_config(vllm_config)
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -202,3 +202,16 @@ class FlexKVConfig:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
 
         self.__post_init__()
+
+    def get_dtype_from_vllm_config(self, vllm_config: "VllmConfig") -> torch.dtype:
+        # Use KV cache dtype, not model weight dtype.
+        # vLLM's cache_config.cache_dtype can be "auto" (use model dtype),
+        # "half", "fp8", etc.  We must match the actual GPU KV cache dtype.
+        return torch.float16           
+        
+        # cache_dtype_str = vllm_config.cache_config.cache_dtype
+        # if cache_dtype_str == "auto":
+        #     return vllm_config.model_config.dtype
+        # else:
+        #     from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
+        #     return STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
