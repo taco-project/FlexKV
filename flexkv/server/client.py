@@ -11,6 +11,7 @@ import numpy as np
 
 from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.debug import flexkv_logger
+from flexkv.gpu_backend import current_backend as _gpu
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
 from flexkv.common.request import KVResponseStatus, KVResponse
@@ -255,7 +256,7 @@ class KVTPClient:
         kv_layout: KVCacheLayout,
         override_device_id: Optional[int] = None,
     ) -> None:
-        if not kv_caches or not kv_caches[0].is_cuda:
+        if not kv_caches or not _gpu.is_gpu_tensor(kv_caches[0]):
             raise ValueError("GPU blocks must be CUDA tensors")
 
         # Use override_device_id if provided, otherwise use self.device_id
