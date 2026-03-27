@@ -104,10 +104,20 @@ class TransferManager:
                                                     self.all_gpu_layouts[device_id],
                                                     device_id,
                                                     dtype=self.model_config.dtype)
+        sorted_device_ids = sorted(self.all_gpu_blocks.keys())
         self.gpu_handles = [
             self.storage_engine.get_storage_handle(DeviceType.GPU, device_id)
-            for device_id in sorted(self.all_gpu_blocks.keys())
+            for device_id in sorted_device_ids
         ]
+        # Compute the DP-local rank from actual GPU device IDs.
+        # E.g. if this DP rank owns GPUs [4,5,6,7] with tp_size=4,
+        # dp_local_rank = 4 // 4 = 1, so C++ sets cudaSetDevice(1*4+i).
+        dp_local_rank = sorted_device_ids[0] // self.model_config.tp_size
+        flexkv_logger.info(
+            f"TransferManager: sorted_device_ids={sorted_device_ids}, "
+            f"tp_size={self.model_config.tp_size}, dp_local_rank={dp_local_rank}"
+        )
+
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
@@ -122,7 +132,8 @@ class TransferManager:
                                               cache_config=self.cache_config,
                                               cpu_handle=cpu_handle,
                                               ssd_handle=ssd_handle,
-                                              remote_handle=remote_handle)
+                                              remote_handle=remote_handle,
+                                              dp_local_rank=dp_local_rank)
         flexkv_logger.info(f"Initialized TransferEngine successfully")
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:

@@ -145,7 +145,7 @@ class SSDAllocator(BaseStorageAllocator):
             cache_dir = [cache_dir]
         for dir in cache_dir:
             if not os.path.exists(dir):
-                os.makedirs(dir)
+                os.makedirs(dir, exist_ok=True)
             if not os.path.isdir(dir):
                 raise ValueError("cache_dir must be a directory")
         if not isinstance(file_prefix, str):

@@ -59,7 +59,8 @@ class TransferEngine:
         cache_config: CacheConfig,
         cpu_handle: Optional[StorageHandle] = None,
         ssd_handle: Optional[StorageHandle] = None,
-        remote_handle: Optional[StorageHandle] = None):
+        remote_handle: Optional[StorageHandle] = None,
+        dp_local_rank: int = 0):
         """
         Initialize transfer engine
 
@@ -92,6 +93,7 @@ class TransferEngine:
         self.op_id_to_nvtx_range: Dict[int, str] = {}
 
         self.dp_size = 1  # Each TransferEngine instance serves a single DP rank
+        self.dp_local_rank = dp_local_rank  # Local DP rank on this node (e.g. 0 for GPU 0-3, 1 for GPU 4-7)
         self.tp_size = model_config.tp_size
 
         assert len(gpu_handles) == self.tp_size
@@ -131,12 +133,12 @@ class TransferEngine:
                     gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
                                 for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
                     cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layouts=[self.gpu_handles[i].kv_layout \
-                        for i in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                    gpu_kv_layouts=[self.gpu_handles[k].kv_layout \
+                        for k in range(i * self.tp_size, (i + 1) * self.tp_size)],
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=self.gpu_handles[i].dtype,
                     tp_group_size=self.tp_size,
-                    dp_group_id=i,
+                    dp_group_id=self.dp_local_rank + i,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_sms_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_sms_h2d,
@@ -231,7 +233,7 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         tp_group_size=self.tp_size,
-                        dp_group_id=i,
+                        dp_group_id=self.dp_local_rank + i,
                     )
                     for i in range(self.dp_size)
                 ]
