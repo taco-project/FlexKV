@@ -214,14 +214,19 @@ class FlexKVSchedulerConnector:
                             the task_id and number of new matched tokens.
         """
         match_start_time = time.perf_counter()
-        num_tokens_to_get = (request.num_tokens//self.block_size)*self.block_size
+        # Reserve at least one block for the scheduler to compute
+        # (avoid assert num_new_tokens > 0 in scheduler.py:444).
+        num_aligned_blocks = request.num_tokens // self.block_size
+        if num_aligned_blocks <= 1:
+            return -1, 0
+        num_tokens_to_get = (num_aligned_blocks - 1) * self.block_size
         token_ids = request.all_token_ids[:num_tokens_to_get]
 
         assert num_computed_tokens <= num_tokens_to_get, (
             f"{num_computed_tokens=} must less equal to {num_tokens_to_get=}")
         assert num_computed_tokens % self.block_size == 0
 
-        if num_tokens_to_get == num_computed_tokens:
+        if num_tokens_to_get <= num_computed_tokens:
             return -1, 0
 
         np_token_ids = np.array(token_ids)
@@ -342,8 +347,8 @@ class FlexKVSchedulerConnector:
         # compute slot mapping
         # num_blocks_to_put = (num_matched_tokens+num_unmatched_tokens) // self.block_size
         num_matched_blocks = num_matched_tokens // self.block_size
-        num_unmatched_tokens = num_unmatched_tokens // self.block_size
-        block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_tokens]
+        num_unmatched_blocks = num_unmatched_tokens // self.block_size
+        block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_blocks]
         task.slot_mapping = np.array(block_ids_to_put).repeat(self.block_size)*self.block_size
 
         return True
