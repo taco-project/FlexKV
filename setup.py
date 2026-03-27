@@ -152,6 +152,10 @@ setup(
     },
     include_package_data=True,
     install_requires=install_requires,
+    extras_require={
+        "release": ["Cython>=3.0.10"],
+        "test": ["pytest==8.4.0", "pytest-benchmark==5.1.0"],
+    },
     ext_modules=ext_modules,  # Now contains both C++ and Cython modules as needed
     cmdclass={
         "build_ext": CustomBuildExt.with_options(
