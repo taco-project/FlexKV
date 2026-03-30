@@ -85,6 +85,8 @@ class CacheConfig:
         self.use_simm_backend = self.use_simm_backend or bool(int(os.getenv("FLEXKV_USE_SIMM_BACKEND", 0)))
         if self.use_simm_backend:
             self.enable_remote = True
+            if self.num_remote_blocks is None:
+                self.num_remote_blocks = 1
         if not self.simm_manager_address and self.use_simm_backend:
             self.simm_manager_address = os.environ.get("FLEXKV_SIMM_MANAGER_ADDRESS", "")
 
@@ -239,7 +241,7 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or 
                                       cache_config.enable_p2p_ssd or 
                                       cache_config.enable_3rd_remote)
-    cache_config.enable_remote = cache_config.enable_3rd_remote
+    cache_config.enable_remote = cache_config.enable_3rd_remote or cache_config.use_simm_backend
 
     if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
         cache_config.num_ssd_blocks = \
