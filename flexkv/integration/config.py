@@ -1,9 +1,9 @@
-
+import copy
 import json
 import os
 import torch
 import tempfile
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
@@ -34,11 +34,49 @@ class FlexKVConfig:
     # user config
     user_config: UserConfig = field(default_factory=UserConfig)
 
+    # Indexer config
+    indexer_model_config: Optional[ModelConfig] = None
+    indexer_cache_config: Optional[CacheConfig] = None
+    indexer_server_recv_port: str = ""
+    indexer_gpu_register_port: str = ""
+
     def __post_init__(self):
         if self.server_recv_port == "":
             self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         if self.gpu_register_port == "":
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
+        if self.indexer_model_config is not None:
+            if self.indexer_server_recv_port == "":
+                self.indexer_server_recv_port = self.server_recv_port + "_indexer"
+            if self.indexer_gpu_register_port == "":
+                self.indexer_gpu_register_port = self.indexer_server_recv_port + "_gpu_register"
+
+    def _detect_indexer_config_from_hf(self, hf_config, source: str = "") -> None:
+        """Detect and populate indexer config for sparse attention (e.g. NSA/DSA)."""
+        if hf_config is None:
+            return
+
+        try:
+            qk_rope_head_dim = getattr(hf_config, 'qk_rope_head_dim', None)
+            if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
+                return
+
+            indexer_model = copy.deepcopy(self.model_config)
+            indexer_model.head_size = qk_rope_head_dim
+            indexer_model.num_kv_heads = 1
+            indexer_model.use_mla = True
+            indexer_model.dtype = torch.uint8
+            self.indexer_model_config = indexer_model
+            self.indexer_cache_config = copy.deepcopy(self.cache_config)
+            self.indexer_server_recv_port = self.server_recv_port + "_indexer"
+            self.indexer_gpu_register_port = self.indexer_server_recv_port + "_gpu_register"
+            source_label = f" ({source})" if source else ""
+            logger.info(
+                f"Detected sparse attention indexer config{source_label}: "
+                f"head_size={qk_rope_head_dim}, dtype=uint8, "
+                f"indexer_port={self.indexer_server_recv_port}")
+        except Exception as e:
+            logger.debug(f"Could not detect indexer config ({source}): {e}")
 
     @classmethod
     def from_env(cls) -> 'FlexKVConfig':
@@ -76,12 +114,15 @@ class FlexKVConfig:
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
+        hf_config = getattr(vllm_config.model_config, 'hf_config', None)
+        self._detect_indexer_config_from_hf(hf_config, source="vllm")
 
     def post_init_from_sglang_config(
         self,
         sglang_config,
         tp_size: int,
         page_size: int,
+        num_local_layers: int = 0,
     ):
         """
         Initialize FlexKVConfig fields from sglang config.
@@ -89,11 +130,13 @@ class FlexKVConfig:
             sglang_config: sglang.srt.configs.model_config.ModelConfig-like object
             tp_size: tensor parallel size used by sglang
             page_size: KV block size (tokens per block) used by sglang
+            num_local_layers: number of layers on this PP rank (0 means no PP, use total layers)
         """
         # cache config
         self.cache_config.tokens_per_block = int(page_size)
 
-        self.model_config.num_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
+        total_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
+        self.model_config.num_layers = int(num_local_layers) if num_local_layers > 0 else total_layers
 
         if hasattr(sglang_config, "get_num_kv_heads"):
             try:
@@ -117,6 +160,9 @@ class FlexKVConfig:
         self.model_config.tp_size = int(tp_size)
         self.model_config.dp_size = int(getattr(sglang_config, "dp_size", 1))
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
+        
+        hf_config = getattr(sglang_config, 'hf_config', None)
+        self._detect_indexer_config_from_hf(hf_config, source="sglang")
 
     def post_init_from_trt_config(
         self,
@@ -197,7 +243,8 @@ class FlexKVConfig:
                 else:
                     self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
                     self.model_config.num_kv_heads = hf_config.num_attention_heads
-            
+
+            self._detect_indexer_config_from_hf(hf_config, source="TRT-LLM")
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
         # Update cache config with user config after model config is initialized

@@ -455,3 +455,300 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
         return
     elif total_cache_miss > 0:
         print(f"verify skipped, because of total_cache_miss={total_cache_miss} > 0")
+
+
+def run_tp_client_with_indexer(dp_client_id,
+                               tp_rank,
+                               server_recv_port,
+                               model_config,
+                               cache_config,
+                               num_gpu_blocks,
+                               child_conn,
+                               gpu_layout_type,
+                               indexer_gpu_register_port,
+                               indexer_model_config,
+                               indexer_cache_config):
+    """Run tp_client process with indexer support."""
+    try:
+        from flexkv.kv_group import KVTPClientGroup
+        device_id = tp_rank + dp_client_id * model_config.tp_size
+
+        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
+
+        # Create main GPU blocks
+        gpu_blocks_for_tp = []
+        if gpu_layout_type == 0:
+            for _ in range(model_config.num_layers):
+                gpu_blocks_for_tp.append(
+                    torch.empty(size=tuple(gpu_kv_layout.kv_shape[1:]), dtype=model_config.dtype).cuda(device_id)
+                )
+        elif gpu_layout_type == 2:
+            kv_dim = 1 if model_config.use_mla else 2
+            for _ in range(model_config.num_layers * kv_dim):
+                gpu_blocks_for_tp.append(
+                    torch.empty(size=tuple(gpu_kv_layout.kv_shape[2:]), dtype=model_config.dtype).cuda(device_id)
+                )
+        else:
+            raise ValueError(f"Invalid GPU layout type for indexer test: {gpu_layout_type}")
+
+        # Create indexer GPU blocks (MLA-style: 3D tensors)
+        indexer_blocks = []
+        indexer_tokens_per_block = indexer_cache_config.tokens_per_block
+        for _ in range(indexer_model_config.num_layers):
+            indexer_blocks.append(
+                torch.empty(
+                    num_gpu_blocks,
+                    indexer_tokens_per_block,
+                    indexer_model_config.head_size,
+                    dtype=indexer_model_config.dtype,
+                ).cuda(device_id)
+            )
+
+        from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+        indexer_layout = KVCacheLayout(
+            type=KVCacheLayoutType.LAYERFIRST,
+            num_layer=indexer_model_config.num_layers,
+            num_block=num_gpu_blocks,
+            tokens_per_block=indexer_tokens_per_block,
+            num_head=1,
+            head_size=indexer_model_config.head_size,
+            is_mla=True,
+        )
+
+        # Use KVTPClientGroup to register both main and indexer
+        tp_client_group = KVTPClientGroup(
+            gpu_register_port=server_recv_port + "_gpu_register",
+            client_id=dp_client_id,
+            device_id=device_id,
+            indexer_gpu_register_port=indexer_gpu_register_port,
+        )
+        tp_client_group.register_to_server(
+            kv_caches=gpu_blocks_for_tp,
+            gpu_layout=gpu_kv_layout,
+            indexer_buffers=indexer_blocks,
+            indexer_layout=indexer_layout,
+        )
+
+        # Send GPU blocks back to main process via pipe
+        if child_conn is not None:
+            shared_gpu_blocks = [TensorSharedHandle(tensor) for tensor in gpu_blocks_for_tp]
+            child_conn.send(shared_gpu_blocks)
+            child_conn.close()
+
+        # Keep the process running
+        while True:
+            time.sleep(1)
+    except Exception as e:
+        print(f"[TP Client {tp_rank}] Exception occurred: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        if child_conn is not None:
+            child_conn.send(None)
+            child_conn.close()
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1},
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("cache_config", [
+    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
+], indirect=True)
+@pytest.mark.parametrize("test_config", [
+    {'num_gpu_blocks': 256, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
+], indirect=True)
+@pytest.mark.parametrize("gpu_layout_type", [0])
+def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_layout_type):
+    """Test KVManager with internal indexer sub-KVManager for sparse attention models."""
+    tp_size = model_config.tp_size
+    tokens_per_block = cache_config.tokens_per_block
+    num_gpu_blocks = test_config["num_gpu_blocks"]
+    block_per_request = test_config['requests_per_block']
+    initial_write_ratio = test_config['initial_write_ratio']
+    num_requests = num_gpu_blocks // block_per_request
+
+    skip_if_insufficient_gpus(tp_size)
+
+    # Create indexer config (simulating rope key cache for NSA/DSA)
+    indexer_model_config = ModelConfig(
+        num_layers=model_config.num_layers,
+        num_kv_heads=1,
+        head_size=64,  # qk_rope_head_dim
+        use_mla=True,
+        dtype=torch.uint8,
+        tp_size=model_config.tp_size,
+        dp_size=model_config.dp_size,
+    )
+    indexer_cache_config = CacheConfig(
+        tokens_per_block=cache_config.tokens_per_block,
+        enable_cpu=cache_config.enable_cpu,
+        enable_ssd=cache_config.enable_ssd,
+        num_cpu_blocks=cache_config.num_cpu_blocks,
+    )
+
+    # Create KVManagerGroup with indexer params
+    indexer_server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port + "_indexer"
+    indexer_gpu_register_port = indexer_server_recv_port + "_gpu_register"
+
+    from flexkv.kv_group import KVManagerGroup
+    kv_manager_group = KVManagerGroup(
+        model_config,
+        cache_config,
+        indexer_model_config=indexer_model_config,
+        indexer_cache_config=indexer_cache_config,
+        indexer_server_recv_port=indexer_server_recv_port,
+        indexer_gpu_register_port=indexer_gpu_register_port,
+    )
+    kv_manager_group.start()
+
+    # Verify indexer_kv_manager was created
+    assert kv_manager_group.indexer_kv_manager is not None, "Indexer KVManager should be created"
+    print("[Test] Indexer KVManager created successfully")
+
+    # Create tp_client processes with indexer support
+    mp_ctx = mp.get_context('spawn')
+    pipe_connections = []
+    tp_client_processes = []
+
+    for tp_rank in range(tp_size):
+        parent_conn, child_conn = mp_ctx.Pipe()
+        pipe_connections.append(parent_conn)
+
+        tp_client_process = mp_ctx.Process(
+            target=run_tp_client_with_indexer,
+            args=(0, tp_rank, GLOBAL_CONFIG_FROM_ENV.server_recv_port,
+                  model_config, cache_config, num_gpu_blocks, child_conn,
+                  gpu_layout_type, indexer_gpu_register_port,
+                  indexer_model_config, indexer_cache_config),
+            daemon=True
+        )
+        tp_client_processes.append(tp_client_process)
+        tp_client_process.start()
+
+    # Collect GPU blocks from tp_client processes
+    all_gpu_blocks = []
+    for tp_rank, parent_conn in enumerate(pipe_connections):
+        try:
+            shared_gpu_blocks = parent_conn.recv()
+            if shared_gpu_blocks is not None:
+                all_gpu_blocks.append(shared_gpu_blocks)
+                print(f"[Main Process] Received GPU blocks from TP client {tp_rank}")
+            parent_conn.close()
+        except Exception as e:
+            print(f"[Main Process] Error receiving from TP client {tp_rank}: {e}")
+
+    # Create GPUKVCacheVerifier
+    gpu_kv_verifier = None
+    if all_gpu_blocks and len(all_gpu_blocks) == tp_size:
+        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
+        gpu_kv_verifier = GPUKVCacheVerifier(
+            shared_gpu_blocks=all_gpu_blocks,
+            gpu_kv_layout=gpu_kv_layout,
+            tp_size=model_config.tp_size,
+            tokens_per_block=cache_config.tokens_per_block,
+            dtype=model_config.dtype,
+            gpu_layout_type=gpu_layout_type,
+        )
+
+    # Wait for both main and indexer to be ready
+    while not kv_manager_group.is_ready():
+        time.sleep(1)
+        flexkv_logger.info("waiting for flexkv (with indexer) to be ready")
+    print("[Test] KVManagerGroup (with indexer) is ready")
+
+    # Generate request pairs
+    request_pairs = [generate_request_pair(i, block_per_request, num_gpu_blocks, tokens_per_block, 1)
+                     for i in range(num_requests)]
+    initial_write_num = int(num_requests * initial_write_ratio)
+
+    # ===== Test put flow (with automatic indexer sync) =====
+    print("[Test] Testing put flow with indexer auto-sync...")
+    for token_ids, block_ids, dp_id in request_pairs[:initial_write_num]:
+        if gpu_kv_verifier is not None:
+            gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
+        write_request = kv_manager_group.put_async(
+            token_ids=token_ids,
+            slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
+            token_mask=None,
+            dp_id=dp_id,
+        )
+        kv_manager_group.wait([write_request], completely=True)
+        if gpu_kv_verifier is not None:
+            gpu_kv_verifier.clear_gpu_blocks(block_ids)
+    print(f"[Test] Initial {initial_write_num} put operations completed with indexer sync")
+
+    # Verify no pending indexer tasks after wait
+    assert len(kv_manager_group._indexer_task_map) == 0, \
+        f"Expected 0 pending indexer tasks after wait, got {len(kv_manager_group._indexer_task_map)}"
+
+    # ===== Test get flow (with automatic indexer sync) =====
+    print("[Test] Testing get flow with indexer auto-sync...")
+    total_cache_hit = 0
+    total_cache_miss = 0
+    running_get_requests = []
+    req_id2block_ids = {}
+    req_id2token_ids = {}
+
+    for i in range(min(initial_write_num, num_requests)):
+        token_ids, block_ids, dp_id = request_pairs[i]
+        slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
+        request_id, _ = kv_manager_group.get_match(
+            token_ids=token_ids,
+            layer_granularity=-1,
+            token_mask=None,
+            dp_id=dp_id,
+        )
+        kv_manager_group.launch(request_id, slot_mapping)
+        running_get_requests.append(request_id)
+        req_id2block_ids[request_id] = block_ids
+        req_id2token_ids[request_id] = token_ids
+
+    if running_get_requests:
+        return_results = kv_manager_group.wait(running_get_requests, completely=True)
+        for kvresponse in return_results.values():
+            assert kvresponse.status == KVResponseStatus.SUCCESS
+            total_cache_hit += kvresponse.return_mask.sum().item()
+            total_cache_miss += len(kvresponse.return_mask) - kvresponse.return_mask.sum().item()
+
+    # Verify no pending indexer tasks after wait
+    assert len(kv_manager_group._indexer_task_map) == 0, \
+        f"Expected 0 pending indexer tasks after get wait, got {len(kv_manager_group._indexer_task_map)}"
+
+    print(f"[Test] Get flow completed: hit={total_cache_hit}, miss={total_cache_miss}")
+
+    # ===== Test try_wait flow =====
+    print("[Test] Testing try_wait flow with indexer auto-sync...")
+    if initial_write_num < num_requests:
+        token_ids, block_ids, dp_id = request_pairs[initial_write_num]
+        if gpu_kv_verifier is not None:
+            gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
+        write_request = kv_manager_group.put_async(
+            token_ids=token_ids,
+            slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
+            token_mask=None,
+            dp_id=dp_id,
+        )
+        # Use try_wait in a loop
+        finished = {}
+        for _ in range(200):
+            finished = kv_manager_group.try_wait([write_request])
+            if write_request in finished:
+                break
+            time.sleep(0.1)
+        assert write_request in finished, "try_wait should eventually return the completed task"
+        if gpu_kv_verifier is not None:
+            gpu_kv_verifier.clear_gpu_blocks(block_ids)
+    print("[Test] try_wait flow completed")
+
+    # ===== Test shutdown =====
+    print("[Test] Testing shutdown with indexer...")
+    if cache_config.enable_cpu and cache_config.num_cpu_blocks >= num_gpu_blocks:
+        assert total_cache_miss == 0, f"Expected 0 cache miss, got {total_cache_miss}"
+
+    shutdown_tp_client(tp_client_processes)
+    kv_manager_group.shutdown()
+    print("[Test] Shutdown completed successfully (both main and indexer)")
+    print("[Test] test_kvmanager_with_indexer PASSED")

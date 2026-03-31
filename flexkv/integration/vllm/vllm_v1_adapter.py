@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from flexkv.kvmanager import KVManager
-from flexkv.server.client import KVTPClient
+from flexkv.kv_group import KVManagerGroup, KVTPClientGroup
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.debug import flexkv_logger
@@ -174,11 +174,15 @@ class FlexKVSchedulerConnector:
         else:
             self.collector = None
 
-        self.flexkv_manager = KVManager(model_config=self.model_config,
-                                        cache_config=self.cache_config,
-                                        server_recv_port=flexkv_config.server_recv_port,
-                                        dp_client_id=dp_rank,
-                                        event_collector=self.collector)
+        self.flexkv_manager = KVManagerGroup(model_config=self.model_config,
+                                                cache_config=self.cache_config,
+                                                server_recv_port=flexkv_config.server_recv_port,
+                                                dp_client_id=dp_rank,
+                                                event_collector=self.collector,
+                                                indexer_model_config=flexkv_config.indexer_model_config,
+                                                indexer_cache_config=flexkv_config.indexer_cache_config,
+                                                indexer_server_recv_port=flexkv_config.indexer_server_recv_port,
+                                                indexer_gpu_register_port=flexkv_config.indexer_gpu_register_port)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
 
@@ -704,13 +708,29 @@ class FlexKVWorkerConnector:
         logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, "
                     f"server_client_mode={server_client_mode}, dp_client_id={dp_client_id}, "
                     f"client_id={client_id}, device_id={device_id}")
-        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, client_id, device_id)
+        self._tp_client_group = KVTPClientGroup(
+            gpu_register_port=flexkv_config.gpu_register_port,
+            client_id=client_id,
+            device_id=device_id,
+            indexer_gpu_register_port=flexkv_config.indexer_gpu_register_port,
+        )
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
         logger.info("Start register kv_caches")
-        gpu_blocks = list(kv_caches.values())
-        num_layer = len(kv_caches)
+
+        # Separate main KV caches from indexer caches by layer name.
+        main_kv_caches: dict[str, torch.Tensor] = {}
+        indexer_kv_caches: dict[str, torch.Tensor] = {}
+        for layer_name, tensor in kv_caches.items():
+            if ".k_cache" in layer_name:
+                indexer_kv_caches[layer_name] = tensor
+            else:
+                main_kv_caches[layer_name] = tensor
+
+        # Build main KV cache layout
+        gpu_blocks = list(main_kv_caches.values())
+        num_layer = len(main_kv_caches)
         if self.flexkv_config.model_config.use_mla:
             assert gpu_blocks[0].ndim == 3, (
                 f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
@@ -734,7 +754,32 @@ class FlexKVWorkerConnector:
             head_size=head_size,
             is_mla=self.flexkv_config.model_config.use_mla,
         )
-        self.tp_client.register_to_server(gpu_blocks, gpu_layout)
+
+        # Build indexer layout if indexer caches are present
+        indexer_buffers = None
+        indexer_layout = None
+        if indexer_kv_caches:
+            indexer_buffers = list(indexer_kv_caches.values())
+            t0 = indexer_buffers[0]
+            assert t0.ndim == 3, (
+                f"expect indexer cache tensor has 3 dim but get shape={t0.shape}.")
+            indexer_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(indexer_buffers),
+                num_block=t0.shape[0],
+                tokens_per_block=t0.shape[1],
+                num_head=1,
+                head_size=t0.shape[2],
+                is_mla=True,
+            )
+
+        self._tp_client_group.register_to_server(
+            kv_caches=gpu_blocks,
+            gpu_layout=gpu_layout,
+            indexer_buffers=indexer_buffers,
+            indexer_layout=indexer_layout,
+        )
+
         logger.info("Finish register kv_caches")
 
     def __del__(self):
