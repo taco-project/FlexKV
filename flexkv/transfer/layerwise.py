@@ -35,7 +35,7 @@ def _recv_fds(sock: socket.socket, num_fds: int) -> Tuple[List[int], bytes]:
     """Receive multiple fds + extra_data via Unix domain socket (SCM_RIGHTS)."""
     data_buf = bytearray(256)
     anc_buf_size = socket.CMSG_SPACE(num_fds * struct.calcsize("i"))
-    
+
     nbytes, ancdata, flags, addr = sock.recvmsg_into([data_buf], anc_buf_size, anc_buf_size)
     data = bytes(data_buf[:nbytes])
 
@@ -159,23 +159,23 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             GLOBAL_CONFIG_FROM_ENV.iouring_flags,
             layer_eventfds_tensor, tp_group_size)
 
-    def _receive_eventfds_from_sglang(self, tp_group_size: int, 
-                                       max_retries: int = 180, 
+    def _receive_eventfds_from_sglang(self, tp_group_size: int,
+                                       max_retries: int = 180,
                                        retry_interval: float = 1.0) -> torch.Tensor:
         """Receive eventfds from SGLang via Unix socket (FlexKV as server)."""
         socket_path = os.environ.get('FLEXKV_LAYERWISE_EVENTFD_SOCKET', '/tmp/flexkv_layerwise_eventfd.sock')
-        
+
         def cleanup_socket():
             try:
                 if os.path.exists(socket_path):
                     os.unlink(socket_path)
             except OSError:
                 pass
-        
+
         cleanup_socket()
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
+
         try:
             server_sock.bind(socket_path)
             server_sock.listen(tp_group_size)
@@ -185,11 +185,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             flexkv_logger.error(f"[LayerwiseWorker] Failed to bind/listen: {e}")
             server_sock.close()
             return torch.empty(0, dtype=torch.int32)
-        
+
         server_sock.settimeout(max_retries * retry_interval)
         all_rank_eventfds: Dict[int, Dict[int, List[int]]] = {}
         num_layers, num_counters = self.num_layers, 3
-        
+
         try:
             for conn_idx in range(tp_group_size):
                 try:
@@ -197,23 +197,23 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 except socket.timeout:
                     flexkv_logger.warning(f"[LayerwiseWorker] Timeout, received {conn_idx}/{tp_group_size}")
                     break
-                
+
                 with conn:
                     metadata = conn.recv(16)
                     if len(metadata) < 16:
                         flexkv_logger.error(f"[LayerwiseWorker] Incomplete metadata: {len(metadata)} bytes")
                         continue
-                    
+
                     tp_rank, _, recv_num_layers, recv_num_counters = struct.unpack("iiii", metadata)
                     if conn_idx == 0:
                         num_layers, num_counters = recv_num_layers, recv_num_counters
-                    
+
                     rank_eventfds = {}
                     for _ in range(recv_num_counters):
                         fds, extra_data = _recv_fds(conn, recv_num_layers)
                         counter_id = struct.unpack("i", extra_data[:4])[0]
                         rank_eventfds[counter_id] = fds
-                    
+
                     all_rank_eventfds[tp_rank] = rank_eventfds
                     flexkv_logger.info(f"[LayerwiseWorker] Received eventfds from tp_rank={tp_rank}")
         except Exception as e:
@@ -221,20 +221,23 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         finally:
             server_sock.close()
             cleanup_socket()
-        
+
         if not all_rank_eventfds:
             flexkv_logger.warning("[LayerwiseWorker] No connections received")
             return torch.empty(0, dtype=torch.int32)
-        
+
         # Build tensor: [num_counters, tp_size, num_layers]
         eventfds_list = []
         for counter_id in range(num_counters):
             for tp_rank in range(tp_group_size):
                 fds = all_rank_eventfds.get(tp_rank, {}).get(counter_id, [-1] * num_layers)
                 eventfds_list.extend(fds)
-        
+
         tensor = torch.tensor(eventfds_list, dtype=torch.int32)
-        flexkv_logger.info(f"[LayerwiseWorker] Eventfds tensor: {tensor.shape}, counters={num_counters}, tp={tp_group_size}, layers={num_layers}")
+        flexkv_logger.info(
+            f"[LayerwiseWorker] Eventfds tensor: {tensor.shape}, "
+            f"counters={num_counters}, tp={tp_group_size}, layers={num_layers}"
+        )
         return tensor
 
     def _transfer_impl(self,
@@ -280,7 +283,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             counter_id,
         )
 
-    def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> None:
+    def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
         layer_granularity = transfer_op.layer_granularity
         if layer_granularity == -1:
             layer_granularity = self.num_layers
@@ -295,6 +298,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             src_block_ids_disk2h = None
             dst_block_ids_disk2h = None
 
+        num_h2d_blocks = len(src_block_ids_h2d)
+
+        start_time = time.time()
         self._transfer_impl(
             src_block_ids_h2d,
             dst_block_ids_h2d,
@@ -303,3 +309,16 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             layer_granularity,
             transfer_op.counter_id,
         )
+        end_time = time.time()
+
+        kv_dim = 2 if not self.is_mla else 1
+        transfer_size = self.cpu_chunk_size_in_bytes * layer_granularity * num_h2d_blocks * kv_dim
+
+        self._log_transfer_performance(
+            transfer_op,
+            transfer_size,
+            start_time,
+            end_time,
+        )
+
+        return True
