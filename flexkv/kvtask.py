@@ -777,9 +777,9 @@ class KVTaskEngine(KVTaskManager):
         return task_id
 
     def merge_to_batch_kvtask(self,
-                             
+
                               batch_id: int,
-                             
+
                               task_ids: List[int],
                               batch_task_type: TaskType,
                               layerwise_transfer: bool = False,
@@ -844,7 +844,7 @@ class KVTaskEngine(KVTaskManager):
 
         all_get = all(self.tasks[tid].task_type == TaskType.GET for tid in task_ids)
         all_put = all(self.tasks[tid].task_type == TaskType.PUT for tid in task_ids)
-        if len(task_ids) > 1 and as_batch and (all_get or all_put):
+        if (len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put):
             if batch_id == -1:
                 batch_id = self._gen_task_id()
             if layerwise_transfer:
@@ -855,7 +855,9 @@ class KVTaskEngine(KVTaskManager):
                     flexkv_logger.warning("only support layerwise get")
                     layerwise_transfer = False
             batch_task_type = TaskType.BATCH_GET if all_get else TaskType.BATCH_PUT
-            batch_task_graph = self.merge_to_batch_kvtask(batch_id, task_ids, batch_task_type, layerwise_transfer, counter_id)
+            batch_task_graph = self.merge_to_batch_kvtask(
+                batch_id, task_ids, batch_task_type, layerwise_transfer, counter_id
+            )
             transfer_graphs = [batch_task_graph]
             self.tasks[batch_id].status = TaskStatus.RUNNING
             task_ids = [batch_id]

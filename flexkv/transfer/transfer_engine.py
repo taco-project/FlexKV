@@ -122,7 +122,10 @@ class TransferEngine:
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
         self._cache_config = cache_config
-        self._enable_pcfs_sharing = GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing # TODO: is this correct?
+        # TODO: is this correct?
+        self._enable_pcfs_sharing = (
+            GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing
+        )
 
         self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 
@@ -330,13 +333,13 @@ class TransferEngine:
                     num_blocks_per_file=num_blocks_per_file,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.h2d_cta_num,
-                    d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.d2h_cta_num,
+                    h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                    d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                 )
                 for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
             ]
             self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
-            
+
         if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
             or (self._ssd_handle and self.cache_config.enable_p2p_ssd)):
             ## NOTE:if we have the cpu handle and enable p2p cpu transfer we need this worker
