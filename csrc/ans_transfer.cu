@@ -51,10 +51,14 @@ struct GreenScope {
 
 static const int ANS_KERNEL_BLOCK_SIZE = 128;
 
-__global__ void ans_d2h_scatter_kernel(
-    const uint8_t* __restrict__ d_comp_staging,
+// Unified scatter (D2H) / gather (H2D) kernel.
+// is_scatter=true:  staging -> CPU (writes header + compressed data)
+// is_scatter=false: CPU -> staging (reads header + compressed data)
+template<bool is_scatter>
+__global__ void ans_transfer_kernel(
+    uint8_t* __restrict__ d_comp_staging,
     size_t staging_stride,
-    const size_t* __restrict__ d_comp_sizes,
+    size_t* __restrict__ d_comp_sizes,      // scatter: read; gather: write
     uint8_t* __restrict__ cpu_ptr,
     int64_t cpu_kv_stride,
     int64_t cpu_layer_stride,
@@ -70,66 +74,27 @@ __global__ void ans_d2h_scatter_kernel(
         int kv = (g % (kv_dim * num_blocks)) / num_blocks;
         int b = g % num_blocks;
 
-        size_t sz = d_comp_sizes[i];
-        const float4* src = reinterpret_cast<const float4*>(
-            d_comp_staging + (size_t)i * staging_stride);
         uint8_t* chunk_base =
             cpu_ptr
             + (int64_t)(layer + start_layer_id) * cpu_layer_stride
             + (int64_t)kv * cpu_kv_stride
             + cpu_block_ids[b] * cpu_block_stride;
 
-        if (threadIdx.x == 0)
-            *reinterpret_cast<int64_t*>(chunk_base) = static_cast<int64_t>(sz);
+        size_t sz;
+        if constexpr (is_scatter) {
+            sz = d_comp_sizes[i];
+            if (threadIdx.x == 0)
+                *reinterpret_cast<int64_t*>(chunk_base) = static_cast<int64_t>(sz);
+        } else {
+            sz = static_cast<size_t>(*reinterpret_cast<const int64_t*>(chunk_base));
+            if (threadIdx.x == 0)
+                d_comp_sizes[i] = sz;
+        }
 
-        float4* dst = reinterpret_cast<float4*>(chunk_base + COMP_HEADER_SIZE);
-
-        int64_t n_f4 = sz / sizeof(float4);
-        for (int64_t j = threadIdx.x; j < n_f4; j += blockDim.x)
-            dst[j] = __ldg(&src[j]);
-
-        size_t tail = n_f4 * sizeof(float4);
-        const uint8_t* src_tail = reinterpret_cast<const uint8_t*>(src) + tail;
-        uint8_t* dst_tail = reinterpret_cast<uint8_t*>(dst) + tail;
-        for (size_t j = threadIdx.x; j < sz - tail; j += blockDim.x)
-            dst_tail[j] = src_tail[j];
-    }
-}
-
-__global__ void ans_h2d_gather_kernel(
-    uint8_t* __restrict__ d_comp_staging,
-    size_t staging_stride,
-    size_t* __restrict__ d_comp_sizes_out,
-    const uint8_t* __restrict__ cpu_ptr,
-    int64_t cpu_kv_stride,
-    int64_t cpu_layer_stride,
-    int64_t cpu_block_stride,
-    const int64_t* __restrict__ cpu_block_ids,
-    int start_layer_id,
-    int kv_dim, int num_blocks,
-    int batch_start, int bsz)
-{
-    for (int i = blockIdx.x; i < bsz; i += gridDim.x) {
-        int g = batch_start + i;
-        int layer = g / (kv_dim * num_blocks);
-        int kv = (g % (kv_dim * num_blocks)) / num_blocks;
-        int b = g % num_blocks;
-
-        const uint8_t* chunk_base =
-            cpu_ptr
-            + (int64_t)(layer + start_layer_id) * cpu_layer_stride
-            + (int64_t)kv * cpu_kv_stride
-            + cpu_block_ids[b] * cpu_block_stride;
-
-        size_t sz = static_cast<size_t>(
-            *reinterpret_cast<const int64_t*>(chunk_base));
-        if (threadIdx.x == 0)
-            d_comp_sizes_out[i] = sz;
-
-        float4* dst = reinterpret_cast<float4*>(
-            d_comp_staging + (size_t)i * staging_stride);
-        const float4* src = reinterpret_cast<const float4*>(
-            chunk_base + COMP_HEADER_SIZE);
+        uint8_t* staging = d_comp_staging + (size_t)i * staging_stride;
+        uint8_t* cpu_data = chunk_base + COMP_HEADER_SIZE;
+        const float4* src = reinterpret_cast<const float4*>(is_scatter ? staging : cpu_data);
+        float4* dst = reinterpret_cast<float4*>(is_scatter ? cpu_data : staging);
 
         int64_t n_f4 = sz / sizeof(float4);
         for (int64_t j = threadIdx.x; j < n_f4; j += blockDim.x)
@@ -266,13 +231,13 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
     ANS_CUDA_CHECK(cudaEventCreateWithFlags(&ctx->scatter_done[i],  cudaEventDisableTiming));
   }
 
-  // Compute kernel grid sizes via occupancy API (matching baseline transfer_kv_blocks_kernel)
+  // Compute kernel grid sizes via occupancy API
   {
     int scatter_bpsm = 0, gather_bpsm = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &scatter_bpsm, ans_d2h_scatter_kernel, ANS_KERNEL_BLOCK_SIZE, 0);
+        &scatter_bpsm, ans_transfer_kernel<true>, ANS_KERNEL_BLOCK_SIZE, 0);
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &gather_bpsm, ans_h2d_gather_kernel, ANS_KERNEL_BLOCK_SIZE, 0);
+        &gather_bpsm, ans_transfer_kernel<false>, ANS_KERNEL_BLOCK_SIZE, 0);
     ctx->scatter_grid = ctx->transfer_sms * std::max(scatter_bpsm, 1);
     ctx->gather_grid  = ctx->transfer_sms * std::max(gather_bpsm, 1);
   }
@@ -429,7 +394,7 @@ void ans_compress_and_d2h(
     { NvtxScope _nvtx("ANS:D2H:scatter");
       ANS_CUDA_CHECK(cudaStreamWaitEvent(ctx->scatter_stream, ctx->compress_done[cur], 0));
       int grid = std::min(bsz, ctx->scatter_grid);
-      ans_d2h_scatter_kernel<<<grid, ANS_KERNEL_BLOCK_SIZE, 0, ctx->scatter_stream>>>(
+      ans_transfer_kernel<true><<<grid, ANS_KERNEL_BLOCK_SIZE, 0, ctx->scatter_stream>>>(
           ctx->d_comp_staging[cur], ctx->max_comp_chunk_bytes, ctx->d_comp_sizes[cur],
           static_cast<uint8_t*>(cpu_ptr),
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
@@ -506,11 +471,12 @@ void ans_h2d_and_decompress(
           kv_dim, num_blocks, bs, bsz);
     }
 
-    { NvtxScope _nvtx("ANS:H2D:gather_kernel");
+    { NvtxScope _nvtx("ANS:H2D:gather");
       int grid = std::min(bsz, ctx->gather_grid);
-      ans_h2d_gather_kernel<<<grid, ANS_KERNEL_BLOCK_SIZE, 0, ctx->scatter_stream>>>(
+      ans_transfer_kernel<false><<<grid, ANS_KERNEL_BLOCK_SIZE, 0, ctx->scatter_stream>>>(
           ctx->d_comp_staging[cur], ctx->max_comp_chunk_bytes, ctx->d_comp_sizes[cur],
-          static_cast<const uint8_t*>(cpu_ptr),
+          // const_cast is safe: gather only reads from cpu_ptr
+          const_cast<uint8_t*>(static_cast<const uint8_t*>(cpu_ptr)),
           cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
           cpu_block_ids, start_layer_id, kv_dim, num_blocks, bs, bsz);
     }
@@ -548,31 +514,20 @@ void ans_h2d_and_decompress(
 }
 
 // Explicit template instantiations
-template void ans_compress_and_d2h<BackendType::VLLM>(
-    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
-    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    cudaStream_t);
-template void ans_compress_and_d2h<BackendType::TRTLLM>(
-    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
-    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    cudaStream_t);
-template void ans_compress_and_d2h<BackendType::SGLANG>(
-    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
-    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    cudaStream_t);
+#define ANS_INSTANTIATE(Type)                                                  \
+  template void ans_compress_and_d2h<Type>(                                    \
+      ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,            \
+      int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,              \
+      cudaStream_t);                                                           \
+  template void ans_h2d_and_decompress<Type>(                                  \
+      ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,            \
+      int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,              \
+      cudaStream_t);
 
-template void ans_h2d_and_decompress<BackendType::VLLM>(
-    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
-    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    cudaStream_t);
-template void ans_h2d_and_decompress<BackendType::TRTLLM>(
-    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
-    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    cudaStream_t);
-template void ans_h2d_and_decompress<BackendType::SGLANG>(
-    ANSTransferContext*, int, int, int, int64_t*, GTensorHandler,
-    int64_t*, void*, int64_t, int64_t, int64_t, int64_t, bool,
-    cudaStream_t);
+ANS_INSTANTIATE(BackendType::VLLM)
+ANS_INSTANTIATE(BackendType::TRTLLM)
+ANS_INSTANTIATE(BackendType::SGLANG)
+#undef ANS_INSTANTIATE
 
 } // namespace flexkv
 

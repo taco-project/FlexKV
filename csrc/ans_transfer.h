@@ -17,47 +17,49 @@ namespace flexkv {
 static constexpr int COMP_HEADER_SIZE = 16;
 
 struct ANSTransferContext {
-    size_t max_num_chunks;                  // max number of chunks in a batch
-    size_t max_chunk_size;                  // max uncompressed chunk size, equal to tpb * nhead * head_size * sizeof(data_type)
-    size_t max_comp_chunk_bytes;            // max compressed chunk size, equal to nvcompBatchedANSCompressGetMaxOutputChunkSize(max_chunk_size, comp_opts)
-    size_t comp_temp_bytes;                 // temporary memory size for compression, equal to nvcompBatchedANSCompressGetTempSizeAsync(max_num_chunks, max_chunk_size, comp_opts)
-    size_t decomp_temp_bytes;               // temporary memory size for decompression, equal to nvcompBatchedANSDecompressGetTempSizeAsync(max_num_chunks, max_chunk_size, decomp_opts)
+    // Chunk geometry
+    size_t max_num_chunks;
+    size_t max_chunk_size;          // uncompressed chunk bytes
+    size_t max_comp_chunk_bytes;    // max compressed chunk bytes (16-byte aligned)
+    size_t comp_temp_bytes;
+    size_t decomp_temp_bytes;
 
     nvcompBatchedANSCompressOpts_t   comp_opts;
     nvcompBatchedANSDecompressOpts_t decomp_opts;
 
-    // GPU buffers
-    // compress
-    void*    d_comp_temp;                   // compression temporary memory
-    uint8_t* d_comp_staging_base;           // single contiguous allocation for both slots, equal to 2 * max_num_chunks * max_comp_chunk_bytes
-    uint8_t* d_comp_staging[2];             // double-buffered, pointing into d_comp_staging_base
+    // GPU buffers — compression
+    void*    d_comp_temp;
+    uint8_t* d_comp_staging_base;   // contiguous alloc backing both slots
+    uint8_t* d_comp_staging[2];     // double-buffered staging
     void**   d_uncomp_ptrs;
     size_t*  d_uncomp_sizes;
     void**   d_comp_ptrs[2];
-    size_t*  d_comp_sizes[2];  
-    // decompress
+    size_t*  d_comp_sizes[2];
+
+    // GPU buffers — decompression
     void*           d_decomp_temp;
-    void**          d_decomp_ptrs[2];       // double-buffered for H2D pipeline
-    size_t*         d_decomp_buf_sizes[2];  // double-buffered, pre-filled
+    void**          d_decomp_ptrs[2];
+    size_t*         d_decomp_buf_sizes[2];
     size_t*         d_decomp_act_sizes;
     nvcompStatus_t* d_statuses;
 
+    // Host scratch (for ctx_create pointer setup)
     std::vector<void*>  h_ptr_scratch;
     std::vector<size_t> h_size_scratch;
-    
-    // Kernel launch config (computed once via occupancy API)
-    int scatter_grid;   // grid size for scatter/gather kernels
+
+    // Kernel launch config
+    int scatter_grid;
     int gather_grid;
-    int transfer_sms;   // number of SMs for scatter/gather kernels (-1 → default 8)
-    
+    int transfer_sms;
+
     // Double-buffer pipeline
-    cudaStream_t scatter_stream;            // scatter stream for D2H and H2D transfer
+    cudaStream_t scatter_stream;
     cudaEvent_t  compress_done[2];
     cudaEvent_t  scatter_done[2];
-    int pipeline_batch_size;                // when green context failed, use this to auto tune
+    int pipeline_batch_size;
     nvcompGreenContext_t green_ctx;
 
-    int log_level;                          // log level for nvcomp: 0: no log, 1: log compression ratio, 2: log detailed info
+    int log_level;
 };
 
 // Wrapper around nvcompBatchedANSGetSubChunkingConfig.
