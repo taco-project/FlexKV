@@ -30,7 +30,8 @@ except ImportError:
 
 # nvcomp ANS imports are optional (only available when compiled with FLEXKV_ENABLE_NVCOMP=1)
 try:
-    from flexkv.c_ext import ANSTransferContext, ans_compress_and_d2h, ans_h2d_and_decompress
+    from flexkv.c_ext import (ANSTransferContext, ans_compress_and_d2h,
+                               ans_h2d_and_decompress, ans_transfer_kv_blocks_ssd)
     _NVCOMP_AVAILABLE = True
 except ImportError:
     _NVCOMP_AVAILABLE = False
@@ -777,6 +778,9 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
 
+        self._use_nvcomp_ssd = (_NVCOMP_AVAILABLE and
+                                os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") == "1")
+
         try:
             self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), GLOBAL_CONFIG_FROM_ENV.iouring_entries,
                 GLOBAL_CONFIG_FROM_ENV.iouring_flags)
@@ -809,7 +813,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
 
         layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
 
-        transfer_kv_blocks_ssd(
+        ssd_kwargs = dict(
             ioctx=self.ioctx,
             cpu_layer_id_list=layer_id_list,
             cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
@@ -827,6 +831,11 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             num_threads_per_device=32,
             is_mla=self.is_mla,
         )
+        if self._use_nvcomp_ssd:
+            ssd_kwargs["compressed_io"] = GLOBAL_CONFIG_FROM_ENV.nvcomp_ssd_compressed_io
+            ans_transfer_kv_blocks_ssd(**ssd_kwargs)
+        else:
+            transfer_kv_blocks_ssd(**ssd_kwargs)
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         layer_id = transfer_op.layer_id

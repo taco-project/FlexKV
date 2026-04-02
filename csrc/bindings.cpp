@@ -35,6 +35,7 @@
 #include "monitoring/metrics_manager.h"
 #ifdef FLEXKV_ENABLE_NVCOMP
 #include "ans_transfer.h"
+#include "ans_transfer_ssd.h"
 #endif
 #include <deque>
 
@@ -168,6 +169,7 @@ static void ans_transfer_binding(
   if (err != cudaSuccess)
     throw std::runtime_error(cudaGetErrorString(err));
 }
+
 #endif // FLEXKV_ENABLE_NVCOMP
 
 void transfer_kv_blocks_ssd_binding(
@@ -530,6 +532,18 @@ PYBIND11_MODULE(c_ext, m) {
   #undef ANS_BINDING_PARAMS
   #undef ANS_BINDING_FWD
   #undef ANS_BINDING_ARGS
+
+  m.def("ans_transfer_kv_blocks_ssd", &flexkv::ans_transfer_kv_blocks_ssd,
+        "Transfer compressed KV blocks between SSD and CPU (nvcomp ANS)",
+        py::arg("ioctx"),
+        py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),
+        py::arg("ssd_block_ids"), py::arg("cpu_block_ids"),
+        py::arg("cpu_layer_stride_in_bytes"), py::arg("cpu_kv_stride_in_bytes"),
+        py::arg("ssd_layer_stride_in_bytes"), py::arg("ssd_kv_stride_in_bytes"),
+        py::arg("chunk_size_in_bytes"), py::arg("block_stride_in_bytes"),
+        py::arg("is_read"), py::arg("num_blocks_per_file"),
+        py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
+        py::arg("is_mla") = false, py::arg("compressed_io") = false);
 #endif // FLEXKV_ENABLE_NVCOMP
 
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
