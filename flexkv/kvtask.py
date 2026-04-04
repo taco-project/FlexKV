@@ -126,11 +126,13 @@ class KVTaskManager:
                 model_config_for_transfer.num_kv_heads //= self.tp_node_count
 
         combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
+        cpu_only_mode = os.getenv("FLEXKV_CPU_ONLY", "0") == "1"
         if not combine_with_trtllm:
+            transfer_mode = "thread" if cpu_only_mode else "process"
             self.transfer_handles = [TransferManagerHandle(
                 model_config_for_transfer,
                 self.cache_config,
-                mode="process",
+                mode=transfer_mode,
                 gpu_register_port=gpu_register_port
             )]
         else:
@@ -745,6 +747,52 @@ class KVTaskEngine(KVTaskManager):
             dp_id=dp_id
         )
         return result_task_id, return_mask
+
+    def put_cpu_match(self,
+                      token_ids: np.ndarray,
+                      token_mask: Optional[np.ndarray] = None,
+                      dp_id: int = 0,
+                      task_id: int = -1,
+                      namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray, np.ndarray]:
+        """CPU-only PUT: allocate CPU cache blocks and return them for data filling.
+
+        Returns:
+            (task_id, cpu_block_ids, return_mask)
+            Caller must fill data into cpu_block_ids, then call launch().
+        """
+        if token_mask is None:
+            token_mask = np.ones_like(token_ids, dtype=np.bool_)
+        if task_id == -1:
+            task_id = self._gen_task_id()
+
+        graph, cpu_block_ids, return_mask, callback, op_callback_dict, task_end_op_id = \
+            self.cache_engine.put_cpu(
+                request_id=task_id,
+                token_ids=token_ids,
+                token_mask=token_mask,
+                dp_id=dp_id,
+                namespace=namespace,
+            )
+
+        self.tasks[task_id] = KVTask(
+            task_id=task_id,
+            task_type=TaskType.PUT,
+            task_end_op_id=task_end_op_id,
+            task_end_op_finished=False,
+            status=TaskStatus.READY,  # no GPU slots needed
+            token_ids=token_ids,
+            slot_mapping=np.zeros_like(token_ids, dtype=np.int64),
+            token_mask=token_mask,
+            dp_id=dp_id,
+            graph=graph,
+            return_mask=return_mask,
+            callback=callback,
+            op_callback_dict=op_callback_dict,
+        )
+        self.graph_to_task[graph.graph_id] = task_id
+        self._process_empty_graph(task_id)
+
+        return task_id, cpu_block_ids, return_mask
 
     def _put_match_impl(self,
                         token_ids: np.ndarray,
