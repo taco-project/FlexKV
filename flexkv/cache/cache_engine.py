@@ -1594,8 +1594,6 @@ class GlobalCacheEngine:
         op_node_to_ready = {}
         op_h2disk = None
 
-        # No D2H op — caller fills CPU cache blocks directly
-
         # H2DISK op (CPU→SSD, async)
         if put_to_ssd and fragment2_num_blocks > 0:
             # Use the new CPU blocks as source for SSD write

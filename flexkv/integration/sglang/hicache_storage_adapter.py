@@ -506,14 +506,14 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         if blocks are on a remote node, fetches them via P2P transfer
         into the local CPU cache first, then reads locally.
         """
-        with self._stats._lock:
-            self._stats.get_calls += 1
-
         token_ids = _get_token_ids(extra_info)
         if not token_ids or self._kv_manager is None:
+            with self._stats._lock:
+                self._stats.get_calls += 1
             return [False] * len(keys)
 
         with self._stats._lock:
+            self._stats.get_calls += 1
             self._stats.get_tokens_requested += len(token_ids)
 
         try:
@@ -532,31 +532,26 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                                     tokens_per_block=page_size)
 
             # In distributed mode, query both local and remote trees
+            remote_fetched = False
+            remote_fetch_failed = False
             if (self._mode == "distributed"
                     and hasattr(cache_engine.cpu_cache_engine, 'match_all')):
                 match_result = cache_engine.cpu_cache_engine.match_all(seq_meta)
 
                 if match_result.matched_pos == "remote":
-                    # Remote blocks found -- fetch them into local CPU cache
-                    with self._stats._lock:
-                        self._stats.get_remote_fetches += 1
-
                     if not self._fetch_remote_blocks(arr):
-                        with self._stats._lock:
-                            self._stats.get_remote_fetch_failures += 1
+                        remote_fetch_failed = True
                         logger.debug("batch_get_v1: remote fetch failed, "
                                      "treating as miss")
+                        with self._stats._lock:
+                            self._stats.get_remote_fetches += 1
+                            self._stats.get_remote_fetch_failures += 1
                         return [False] * num_pages
 
-                    with self._stats._lock:
-                        self._stats.get_remote_fetch_successes += 1
-
+                    remote_fetched = True
                     # Blocks are now local -- re-query the local tree
-                    seq_meta_local = SequenceMeta(
-                        token_ids=arr[:aligned_len],
-                        tokens_per_block=page_size)
                     match_result = cache_engine.cpu_cache_engine.match(
-                        seq_meta_local)
+                        seq_meta)
             else:
                 match_result = cache_engine.cpu_cache_engine.match(seq_meta)
 
@@ -567,7 +562,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                 if page_idx < matched_pages:
                     block_id = match_result.physical_blocks[page_idx]
                     try:
-                        block_data = self._get_block_shaped(block_id).clone()
+                        block_data = self._get_block_shaped(block_id)
                         transformed = self._flexkv_to_sglang(block_data)
                         host_token_start = host_indices[page_idx * page_size].item()
                         self._mem_pool_host.set_from_flat_data_page(
@@ -583,6 +578,9 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             hit_count = sum(results)
             with self._stats._lock:
                 self._stats.get_tokens_hit += hit_count * page_size
+                if remote_fetched:
+                    self._stats.get_remote_fetches += 1
+                    self._stats.get_remote_fetch_successes += 1
 
             if hit_count > 0:
                 logger.debug("batch_get_v1: %d/%d pages loaded", hit_count, num_pages)
@@ -634,15 +632,11 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                     return [True] * num_pages
                 return [False] * num_pages
 
-            # Fill data into CPU cache tensor for each new block
+            # Fill data into CPU cache tensor for each new block.
+            # Deduped blocks are always the prefix (radix tree matches from
+            # start), so new blocks start at index num_deduped.
+            num_deduped = num_pages - len(cpu_block_ids)
             for i, block_id in enumerate(cpu_block_ids):
-                # Determine which page this block corresponds to.
-                # cpu_block_ids are for the non-deduped (new) pages.
-                # ASSUMPTION: deduped blocks are always the prefix of the
-                # token sequence, because FlexKV's radix tree matches from
-                # the start and returns the longest matched prefix. Therefore
-                # new (non-deduped) blocks start at index num_deduped.
-                num_deduped = num_pages - len(cpu_block_ids)
                 page_idx = num_deduped + i
 
                 host_token_start = host_indices[page_idx * page_size].item()
@@ -650,10 +644,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                     host_token_start, flat=False
                 )
 
-                # Layout transform: SGLang -> FlexKV BLOCKFIRST
                 transformed = self._sglang_to_flexkv(data_page)
-
-                # Direct memcpy to FlexKV CPU cache tensor
                 dst = self._get_block_view(block_id)
                 dst.copy_(transformed.flatten())
 
@@ -662,7 +653,6 @@ class FlexKVHiCacheStorage(HiCacheStorage):
 
             with self._stats._lock:
                 self._stats.set_tokens_written += len(cpu_block_ids) * page_size
-                num_deduped = num_pages - len(cpu_block_ids)
                 self._stats.set_tokens_deduped += num_deduped * page_size
 
             logger.debug("batch_set_v1: wrote %d new pages, %d deduped (total %d)",
