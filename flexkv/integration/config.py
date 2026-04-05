@@ -40,6 +40,28 @@ class FlexKVConfig:
         if self.gpu_register_port == "":
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
+    def _detect_indexer_config_from_hf(self, hf_config, source: str = "", page_size: int = 1) -> None:
+        if hf_config is None:
+            return
+
+        try:
+            qk_rope_head_dim = getattr(hf_config, 'qk_rope_head_dim', None)
+            if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
+                return
+
+            self.cache_config.indexer = IndexerCacheConfig(
+                head_size=qk_rope_head_dim,
+                num_kv_heads=1,
+                dtype=torch.uint8,
+                page_size=page_size,
+            )
+            source_label = f" ({source})" if source else ""
+            logger.info(
+                f"Detected sparse attention indexer config{source_label}: "
+                f"head_size={qk_rope_head_dim}, dtype=uint8, page_size={page_size}")
+        except Exception as e:
+            logger.debug(f"Could not detect indexer config ({source}): {e}")
+
     @classmethod
     def from_env(cls) -> 'FlexKVConfig':
         enable_flexkv = bool(int(os.getenv('ENABLE_FLEXKV', 1)))
@@ -68,6 +90,8 @@ class FlexKVConfig:
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
+        self.model_config.pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        self.model_config.pp_rank = getattr(vllm_config.parallel_config, 'pipeline_parallel_rank', 0)
         if self.model_config.use_mla:
             self.model_config.num_kv_heads = 1
         else:
@@ -76,12 +100,17 @@ class FlexKVConfig:
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
+        hf_config = getattr(vllm_config.model_config, 'hf_config', None)
+        self._detect_indexer_config_from_hf(hf_config, source="vllm")
 
     def post_init_from_sglang_config(
         self,
         sglang_config,
         tp_size: int,
         page_size: int,
+        num_local_layers: int = 0,
+        pp_size: int = 1,
+        pp_rank: int = 0,
     ):
         """
         Initialize FlexKVConfig fields from sglang config.
@@ -89,15 +118,25 @@ class FlexKVConfig:
             sglang_config: sglang.srt.configs.model_config.ModelConfig-like object
             tp_size: tensor parallel size used by sglang
             page_size: KV block size (tokens per block) used by sglang
+            num_local_layers: number of layers on this PP rank (0 means no PP, use total layers)
+            pp_size: pipeline parallel size (default 1, no PP)
+            pp_rank: pipeline parallel rank (default 0)
         """
         # cache config
-        self.cache_config.tokens_per_block = int(page_size)
+        self.cache_config.tokens_per_block = 1
 
-        self.model_config.num_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
+        total_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
+        self.model_config.num_layers = int(num_local_layers) if num_local_layers > 0 else total_layers
 
-        if hasattr(sglang_config, "get_num_kv_heads"):
+        if hasattr(sglang_config, "get_total_num_kv_heads"):
             try:
-                self.model_config.num_kv_heads = int(sglang_config.get_num_kv_heads(tp_size))
+                self.model_config.num_kv_heads = int(sglang_config.get_total_num_kv_heads())
+            except Exception:
+                self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
+        elif hasattr(sglang_config, "get_num_kv_heads"):
+            try:
+                per_rank = int(sglang_config.get_num_kv_heads(tp_size))
+                self.model_config.num_kv_heads = per_rank * tp_size
             except Exception:
                 self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
         else:
@@ -116,7 +155,22 @@ class FlexKVConfig:
 
         self.model_config.tp_size = int(tp_size)
         self.model_config.dp_size = int(getattr(sglang_config, "dp_size", 1))
+        self.model_config.pp_size = int(pp_size)
+        self.model_config.pp_rank = int(pp_rank)
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
+        
+        hf_config = getattr(sglang_config, 'hf_config', None)
+        self._detect_indexer_config_from_hf(hf_config, source="sglang", page_size=page_size)
+
+        if self.cache_config.indexer is not None:
+            logger.info(
+                f"[FlexKV] Complete indexer config (sglang): "
+                f"page_size={self.cache_config.indexer.page_size}, "
+                f"head_size={self.cache_config.indexer.head_size}, "
+                f"dtype={self.cache_config.indexer.dtype}, "
+                f"num_layers={self.model_config.num_layers}, "
+                f"tokens_per_block={self.cache_config.tokens_per_block}"
+            )
 
     def post_init_from_trt_config(
         self,
@@ -172,6 +226,8 @@ class FlexKVConfig:
         else:
             self.model_config.tp_size = config.mapping.tp_size
             self.model_config.dp_size = 1
+        self.model_config.pp_size = getattr(config.mapping, 'pp_size', 1)
+        self.model_config.pp_rank = getattr(config.mapping, 'pp_rank', 0)
             
         # self.model_config (model configs part)
         try:
@@ -197,7 +253,8 @@ class FlexKVConfig:
                 else:
                     self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
                     self.model_config.num_kv_heads = hf_config.num_attention_heads
-            
+
+            self._detect_indexer_config_from_hf(hf_config, source="TRT-LLM")
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
         # Update cache config with user config after model config is initialized

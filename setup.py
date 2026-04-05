@@ -8,8 +8,26 @@ from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
 
 def get_version():
-    with open(os.path.join(os.path.dirname(__file__), "VERSION")) as f:
-        return f.read().strip()
+    import subprocess
+    try:
+        # e.g. "v1.0.0-0-gabc1234" or "v1.0.0-3-gabc1234"
+        raw = subprocess.check_output(
+            ["git", "describe", "--tags", "--long", "--match", "v*"],
+            stderr=subprocess.PIPE,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        ).decode().strip()
+        # parse: v1.0.0-<distance>-g<hash>
+        parts = raw.rsplit("-", 2)
+        if len(parts) != 3:
+            raise ValueError(f"Unexpected git describe output format: {raw!r}")
+        tag, distance, git_hash = parts
+        tag = tag.lstrip("v")
+        if distance == "0":
+            return tag  # clean release
+        else:
+            return f"{tag}+git{git_hash[1:]}"  # dev build
+    except Exception:
+        return "0.0.0+unknown"
 
 build_dir = "build"
 os.makedirs(build_dir, exist_ok=True)
