@@ -3,6 +3,7 @@ Unit tests for FlexKVHiCacheStorage (SGLang HiCacheStorage adapter).
 
 Tests are split into:
 - Pure logic tests (_get_token_ids, init, MLA skip) that don't need KVManager
+- Mode configuration tests (local/distributed) that verify config generation
 - Integration tests (set/get/exists round-trip) that use real KVManager in thread mode
 
 Test Coverage
@@ -11,11 +12,18 @@ Test Coverage
 2. test_adapter_init: Adapter construction with deferred KVManager
 3. test_mla_non_rank0_skip: MLA non-rank-0 returns all True (skip backup)
 4. test_no_token_ids_degradation: All methods return safe defaults when token_ids missing
-5. test_set_exists_roundtrip: Basic set -> exists pipeline
-6. test_set_exists_get_roundtrip: Full round-trip with data integrity validation
-   - Tests layout transform (SGLang layer_first <-> FlexKV BLOCKFIRST)
-   - Validates that data written via batch_set_v1 can be read back exactly
-7. test_set_with_deduplication: Edge case - set same tokens twice, verify dedup + get
+5. test_default_local_mode: Default mode is "local"
+6. test_explicit_local_mode: Explicit mode="local" config
+7. test_distributed_mode_config: Distributed mode with redis config
+8. test_invalid_mode_raises: Invalid mode raises ValueError
+9. test_distributed_missing_redis_raises: Distributed without redis_host raises ValueError
+10. test_distributed_redis_password: Optional redis_password handling
+11. test_mode_in_cache_keys: mode/redis keys present in _CACHE_KEYS
+12. test_set_exists_roundtrip: Basic set -> exists pipeline
+13. test_set_exists_get_roundtrip: Full round-trip with data integrity validation
+    - Tests layout transform (SGLang layer_first <-> FlexKV BLOCKFIRST)
+    - Validates that data written via batch_set_v1 can be read back exactly
+14. test_set_with_deduplication: Edge case - set same tokens twice, verify dedup + get
 
 Known Issues Being Tested
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -148,6 +156,120 @@ def test_no_token_ids_degradation():
     assert backend.batch_exists(keys, empty_extra) == 0
     assert backend.batch_get_v1(keys, host_indices, empty_extra) == [False, False]
     assert backend.batch_set_v1(keys, host_indices, empty_extra) == [False, False]
+
+
+# ---------------------------------------------------------------------------
+# Mode configuration tests (no KVManager needed)
+# ---------------------------------------------------------------------------
+
+def test_default_local_mode():
+    """Default mode is 'local' when not specified."""
+    backend = FlexKVHiCacheStorage(_make_config())
+    assert backend._mode == "local", f"Expected 'local', got '{backend._mode}'"
+
+
+def test_explicit_local_mode():
+    """Explicit mode='local' works correctly."""
+    config = HiCacheStorageConfig(
+        tp_rank=0, tp_size=1, is_mla_model=False,
+        is_page_first_layout=False, model_name="test",
+        extra_config={
+            "mode": "local",
+            "num_layers": 4, "num_kv_heads": 2,
+            "head_size": 64, "tokens_per_block": 4,
+            "enable_cpu": True, "enable_ssd": False,
+            "num_cpu_blocks": 1000,
+        }
+    )
+    backend = FlexKVHiCacheStorage(config)
+    assert backend._mode == "local"
+
+
+def test_distributed_mode_config():
+    """Distributed mode stores redis config correctly."""
+    config = HiCacheStorageConfig(
+        tp_rank=0, tp_size=1, is_mla_model=False,
+        is_page_first_layout=False, model_name="test",
+        extra_config={
+            "mode": "distributed",
+            "redis_host": "redis.example.com",
+            "redis_port": 6380,
+            "redis_password": "test_password",
+            "num_layers": 4, "num_kv_heads": 2,
+            "head_size": 64, "tokens_per_block": 4,
+            "enable_cpu": True, "enable_ssd": False,
+            "num_cpu_blocks": 1000,
+        }
+    )
+    backend = FlexKVHiCacheStorage(config)
+    assert backend._mode == "distributed"
+    assert backend._redis_host == "redis.example.com"
+    assert backend._redis_port == 6380
+    assert backend._redis_password == "test_password"
+
+
+def test_invalid_mode_raises():
+    """Invalid mode value raises ValueError."""
+    config = HiCacheStorageConfig(
+        tp_rank=0, tp_size=1, is_mla_model=False,
+        is_page_first_layout=False, model_name="test",
+        extra_config={
+            "mode": "invalid_mode",
+            "num_layers": 4, "num_kv_heads": 2,
+            "head_size": 64, "tokens_per_block": 4,
+            "enable_cpu": True, "num_cpu_blocks": 1000,
+        }
+    )
+    try:
+        FlexKVHiCacheStorage(config)
+        raise AssertionError("Should have raised ValueError for invalid mode")
+    except ValueError as e:
+        assert "Invalid mode" in str(e)
+
+
+def test_distributed_missing_redis_raises():
+    """Distributed mode without redis_host raises ValueError."""
+    config = HiCacheStorageConfig(
+        tp_rank=0, tp_size=1, is_mla_model=False,
+        is_page_first_layout=False, model_name="test",
+        extra_config={
+            "mode": "distributed",
+            "redis_host": "",
+            "num_layers": 4, "num_kv_heads": 2,
+            "head_size": 64, "tokens_per_block": 4,
+            "enable_cpu": True, "num_cpu_blocks": 1000,
+        }
+    )
+    try:
+        FlexKVHiCacheStorage(config)
+        raise AssertionError("Should have raised ValueError for empty redis_host")
+    except ValueError as e:
+        assert "redis_host" in str(e)
+
+
+def test_distributed_redis_password():
+    """Distributed mode without password defaults to None."""
+    config = HiCacheStorageConfig(
+        tp_rank=0, tp_size=1, is_mla_model=False,
+        is_page_first_layout=False, model_name="test",
+        extra_config={
+            "mode": "distributed",
+            "redis_host": "redis-server",
+            "num_layers": 4, "num_kv_heads": 2,
+            "head_size": 64, "tokens_per_block": 4,
+            "enable_cpu": True, "num_cpu_blocks": 1000,
+        }
+    )
+    backend = FlexKVHiCacheStorage(config)
+    assert backend._redis_password is None
+
+
+def test_mode_in_cache_keys():
+    """mode and redis configs are in _CACHE_KEYS."""
+    assert "mode" in FlexKVHiCacheStorage._CACHE_KEYS
+    assert "redis_host" in FlexKVHiCacheStorage._CACHE_KEYS
+    assert "redis_port" in FlexKVHiCacheStorage._CACHE_KEYS
+    assert "redis_password" in FlexKVHiCacheStorage._CACHE_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +464,13 @@ ALL_TESTS = [
     ("adapter initialization", test_adapter_init),
     ("MLA non-rank-0 skip", test_mla_non_rank0_skip),
     ("no token_ids degradation", test_no_token_ids_degradation),
+    ("default local mode", test_default_local_mode),
+    ("explicit local mode", test_explicit_local_mode),
+    ("distributed mode config", test_distributed_mode_config),
+    ("invalid mode raises", test_invalid_mode_raises),
+    ("distributed missing redis raises", test_distributed_missing_redis_raises),
+    ("distributed redis password", test_distributed_redis_password),
+    ("mode in cache keys", test_mode_in_cache_keys),
     ("set -> exists round-trip", test_set_exists_roundtrip),
     ("set -> exists -> get round-trip", test_set_exists_get_roundtrip),
     ("set with deduplication", test_set_with_deduplication),

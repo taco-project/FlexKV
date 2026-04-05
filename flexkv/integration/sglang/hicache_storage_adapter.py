@@ -61,6 +61,9 @@ class _Stats:
     get_calls: int = 0
     get_tokens_requested: int = 0
     get_tokens_hit: int = 0
+    get_remote_fetches: int = 0
+    get_remote_fetch_successes: int = 0
+    get_remote_fetch_failures: int = 0
     set_calls: int = 0
     set_tokens_written: int = 0
     set_tokens_deduped: int = 0
@@ -79,6 +82,9 @@ class _Stats:
                 "get_tokens_requested": self.get_tokens_requested,
                 "get_tokens_hit": self.get_tokens_hit,
                 "get_hit_rate": round(get_rate, 4),
+                "get_remote_fetches": self.get_remote_fetches,
+                "get_remote_fetch_successes": self.get_remote_fetch_successes,
+                "get_remote_fetch_failures": self.get_remote_fetch_failures,
                 "set_calls": self.set_calls,
                 "set_tokens_written": self.set_tokens_written,
                 "set_tokens_deduped": self.set_tokens_deduped,
@@ -124,9 +130,16 @@ class FlexKVHiCacheStorage(HiCacheStorage):
     Uses KVManager in thread mode (CPU-only) with direct CPU cache tensor
     access for data filling. Supports CPU cache + optional SSD persistence.
 
+    Two Modes
+    ~~~~~~~~~
+    **Local mode** (default): Single-node isolated cache, no cross-node sharing.
+    **Distributed mode**: Multi-node KV Cache sharing via Distributed RadixTree + Redis GMS.
+
     Configuration
     ~~~~~~~~~~~~~
     Pass JSON via ``--hicache-storage-backend-extra-config``:
+
+    **Local mode (default)**:
 
     .. code-block:: json
 
@@ -136,7 +149,25 @@ class FlexKVHiCacheStorage(HiCacheStorage):
           "head_size": 128,
           "enable_cpu": true,
           "enable_ssd": false,
-          "num_cpu_blocks": 100000
+          "num_cpu_blocks": 100000,
+          "mode": "local"
+        }
+
+    **Distributed mode** (multi-Prefill sharing):
+
+    .. code-block:: json
+
+        {
+          "num_layers": 32,
+          "num_kv_heads": 8,
+          "head_size": 128,
+          "enable_cpu": true,
+          "enable_ssd": false,
+          "num_cpu_blocks": 100000,
+          "mode": "distributed",
+          "redis_host": "<redis-server-ip>",
+          "redis_port": 6379,
+          "redis_password": "optional_password"
         }
 
     Note: ``tokens_per_block`` is overridden at runtime by SGLang's
@@ -147,7 +178,12 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                    "dtype", "tp_size", "dp_size"}
     _CACHE_KEYS = {"tokens_per_block", "eviction_policy", "enable_cpu",
                    "enable_ssd", "enable_gds", "enable_remote",
-                   "num_cpu_blocks", "num_ssd_blocks", "ssd_cache_dir"}
+                   "num_cpu_blocks", "num_ssd_blocks", "ssd_cache_dir",
+                   "mode", "redis_host", "redis_port", "redis_password",
+                   "prefetch_timeout"}
+    # Keys accepted in extra_config but NOT passed to CacheConfig
+    _ADAPTER_ONLY_KEYS = {"mode", "redis_host", "redis_port", "redis_password",
+                          "prefetch_timeout"}
 
     def __init__(
         self,
@@ -166,12 +202,27 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         self._model_config = ModelConfig(**model_kwargs)
 
         cache_kwargs: Dict[str, Any] = {
-            k: extra[k] for k in self._CACHE_KEYS if k in extra
+            k: extra[k] for k in self._CACHE_KEYS - self._ADAPTER_ONLY_KEYS
+            if k in extra
         }
         self._cache_config = CacheConfig(**cache_kwargs)
 
-        logger.info("Initializing  model=%s  cache=%s",
-                     self._model_config, self._cache_config)
+        # Extract distributed mode configuration
+        self._mode: str = extra.get("mode", "local")
+        if self._mode not in ("local", "distributed"):
+            raise ValueError(f"Invalid mode: {self._mode}. Must be 'local' or 'distributed'")
+        
+        self._redis_host: str = extra.get("redis_host", "127.0.0.1")
+        self._redis_port: int = extra.get("redis_port", 6379)
+        self._redis_password: Optional[str] = extra.get("redis_password", None)
+        
+        self._prefetch_timeout: float = float(extra.get("prefetch_timeout", 5.0))
+
+        if self._mode == "distributed" and not self._redis_host:
+            raise ValueError("redis_host is required when mode='distributed'")
+
+        logger.info("Initializing  model=%s  cache=%s  mode=%s",
+                     self._model_config, self._cache_config, self._mode)
 
         self._should_backup: bool = (
             not storage_config.is_mla_model
@@ -197,24 +248,56 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         return np.array(token_ids, dtype=np.int64)
 
     def _init_kv_manager(self):
-        """Create KVManager in thread mode with CPU-only configuration."""
+        """Create KVManager in thread mode with CPU-only configuration.
+        
+        Supports two modes:
+        - local: single-node, isolated cache (default)
+        - distributed: multi-node with Redis GMS + Mooncake P2P transfers
+        """
         from flexkv.kvmanager import KVManager
         from flexkv.common.config import CacheConfig
 
-        # Override tokens_per_block to match SGLang's page_size
-        cache_config = CacheConfig(
-            tokens_per_block=self._page_size,
-            eviction_policy=self._cache_config.eviction_policy,
-            enable_cpu=True,
-            enable_ssd=self._cache_config.enable_ssd,
-            enable_gds=False,
-            enable_remote=False,
-            num_cpu_blocks=self._cache_config.num_cpu_blocks,
-            num_ssd_blocks=self._cache_config.num_ssd_blocks,
-            ssd_cache_dir=self._cache_config.ssd_cache_dir,
-        )
+        # Build base cache config (common to both modes)
+        cache_config_kwargs = {
+            "tokens_per_block": self._page_size,
+            "eviction_policy": self._cache_config.eviction_policy,
+            "enable_cpu": True,
+            "enable_ssd": self._cache_config.enable_ssd,
+            "enable_gds": False,
+            "num_cpu_blocks": self._cache_config.num_cpu_blocks,
+            "num_ssd_blocks": self._cache_config.num_ssd_blocks,
+            "ssd_cache_dir": self._cache_config.ssd_cache_dir,
+        }
 
-        # Set env vars for thread mode before creating KVManager
+        # Branch on mode: local vs distributed
+        if self._mode == "distributed":
+            # Distributed mode: enable cross-node KV Cache sharing
+            cache_config_kwargs.update({
+                "enable_remote": True,
+                "enable_kv_sharing": True,
+                "enable_p2p_cpu": True,
+                "enable_p2p_ssd": self._cache_config.enable_ssd,
+                "redis_host": self._redis_host,
+                "redis_port": self._redis_port,
+                "redis_password": self._redis_password,
+            })
+            logger.info("Distributed mode enabled: Redis=%s:%d, P2P CPU, P2P SSD=%s",
+                       self._redis_host, self._redis_port, self._cache_config.enable_ssd)
+        else:
+            # Local mode (default): isolated single-node cache
+            cache_config_kwargs.update({
+                "enable_remote": False,
+                "enable_kv_sharing": False,
+                "enable_p2p_cpu": False,
+                "enable_p2p_ssd": False,
+            })
+            logger.info("Local mode enabled: isolated node, no cross-node sharing")
+
+        cache_config = CacheConfig(**cache_config_kwargs)
+
+        # Set env vars for thread mode before creating KVManager.
+        # WARNING: These modify process-global state. Only one
+        # FlexKVHiCacheStorage instance is supported per process.
         os.environ["FLEXKV_CPU_ONLY"] = "1"
         os.environ["FLEXKV_INSTANCE_NUM"] = "0"
 
@@ -238,15 +321,9 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         )
 
         logger.info("KVManager started (thread mode, page_size=%d, "
-                     "cpu_blocks=%d, ssd=%s, elements_per_block=%d)",
+                     "cpu_blocks=%d, ssd=%s, elements_per_block=%d, mode=%s)",
                      self._page_size, cache_config.num_cpu_blocks,
-                     cache_config.enable_ssd, self._elements_per_block)
-
-    def _ensure_started(self):
-        if not self._started and self._kv_manager is not None:
-            self._kv_manager.start()
-            self._cpu_cache_tensor = self._kv_manager.get_cpu_cache_tensor()
-            self._started = True
+                     cache_config.enable_ssd, self._elements_per_block, self._mode)
 
     def _sglang_to_flexkv(self, data_page: torch.Tensor) -> torch.Tensor:
         """Convert SGLang data page to FlexKV BLOCKFIRST layout."""
@@ -290,6 +367,42 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             self._page_size, self._model_config.num_kv_heads,
             self._model_config.head_size
         )
+
+    def _fetch_remote_blocks(self, token_ids: np.ndarray) -> bool:
+        """Fetch remote blocks into local CPU cache via prefetch_async.
+
+        Uses KVManager.prefetch_async() which internally discovers remote
+        blocks via the distributed radix tree and pulls them over P2P
+        (Mooncake Transfer Engine) into the local CPU cache tensor.
+
+        Args:
+            token_ids: Full token ID array for the sequence.
+
+        Returns:
+            True if fetch succeeded, False otherwise.
+        """
+        from flexkv.common.request import KVResponseStatus
+
+        try:
+            task_id = self._kv_manager.prefetch_async(token_ids=token_ids)
+            responses = self._kv_manager.wait([task_id], timeout=self._prefetch_timeout)
+
+            if not responses or task_id not in responses:
+                logger.warning("_fetch_remote_blocks: prefetch timeout")
+                return False
+
+            resp = responses[task_id]
+            if resp.status != KVResponseStatus.SUCCESS:
+                logger.warning("_fetch_remote_blocks: prefetch status=%s",
+                               resp.status.value)
+                return False
+
+            logger.debug("_fetch_remote_blocks: success (task_id=%d)", task_id)
+            return True
+
+        except Exception:
+            logger.exception("_fetch_remote_blocks failed")
+            return False
 
     # ------------------------------------------------------------------
     # HiCacheStorage interface
@@ -340,7 +453,11 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         keys: List[str],
         extra_info: Optional[Any] = None,
     ) -> int:
-        """Return consecutive matched page count from the start."""
+        """Return consecutive matched page count from the start.
+
+        In distributed mode, also reports remote hits so that SGLang
+        proceeds to batch_get_v1 where remote blocks will be fetched.
+        """
         with self._stats._lock:
             self._stats.exists_calls += 1
 
@@ -357,11 +474,16 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             if aligned_len == 0:
                 return 0
 
-            # Query the CPU cache engine's radix tree directly
             cache_engine = self._kv_manager.kv_task_engine.cache_engine
             seq_meta = SequenceMeta(token_ids=arr[:aligned_len],
                                     tokens_per_block=page_size)
-            match_result = cache_engine.cpu_cache_engine.match(seq_meta)
+
+            # In distributed mode, query both local and remote trees
+            if (self._mode == "distributed"
+                    and hasattr(cache_engine.cpu_cache_engine, 'match_all')):
+                match_result = cache_engine.cpu_cache_engine.match_all(seq_meta)
+            else:
+                match_result = cache_engine.cpu_cache_engine.match(seq_meta)
 
             return min(match_result.num_ready_matched_blocks, len(keys))
 
@@ -377,7 +499,13 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[Any] = None,
     ) -> List[bool]:
-        """Load KV blocks from FlexKV into SGLang's Host memory pool."""
+        """Load KV blocks from FlexKV into SGLang's Host memory pool.
+
+        In local mode: fetches from local CPU cache only.
+        In distributed mode: discovers blocks via distributed radix tree;
+        if blocks are on a remote node, fetches them via P2P transfer
+        into the local CPU cache first, then reads locally.
+        """
         with self._stats._lock:
             self._stats.get_calls += 1
 
@@ -399,11 +527,39 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             if aligned_len == 0:
                 return [False] * num_pages
 
-            # Query the CPU cache engine's radix tree directly for physical blocks
             cache_engine = self._kv_manager.kv_task_engine.cache_engine
             seq_meta = SequenceMeta(token_ids=arr[:aligned_len],
                                     tokens_per_block=page_size)
-            match_result = cache_engine.cpu_cache_engine.match(seq_meta)
+
+            # In distributed mode, query both local and remote trees
+            if (self._mode == "distributed"
+                    and hasattr(cache_engine.cpu_cache_engine, 'match_all')):
+                match_result = cache_engine.cpu_cache_engine.match_all(seq_meta)
+
+                if match_result.matched_pos == "remote":
+                    # Remote blocks found -- fetch them into local CPU cache
+                    with self._stats._lock:
+                        self._stats.get_remote_fetches += 1
+
+                    if not self._fetch_remote_blocks(arr):
+                        with self._stats._lock:
+                            self._stats.get_remote_fetch_failures += 1
+                        logger.debug("batch_get_v1: remote fetch failed, "
+                                     "treating as miss")
+                        return [False] * num_pages
+
+                    with self._stats._lock:
+                        self._stats.get_remote_fetch_successes += 1
+
+                    # Blocks are now local -- re-query the local tree
+                    seq_meta_local = SequenceMeta(
+                        token_ids=arr[:aligned_len],
+                        tokens_per_block=page_size)
+                    match_result = cache_engine.cpu_cache_engine.match(
+                        seq_meta_local)
+            else:
+                match_result = cache_engine.cpu_cache_engine.match(seq_meta)
+
             matched_pages = match_result.num_ready_matched_blocks
 
             results: List[bool] = []
@@ -480,8 +636,12 @@ class FlexKVHiCacheStorage(HiCacheStorage):
 
             # Fill data into CPU cache tensor for each new block
             for i, block_id in enumerate(cpu_block_ids):
-                # Determine which page this block corresponds to
-                # cpu_block_ids are for the non-deduped (new) pages
+                # Determine which page this block corresponds to.
+                # cpu_block_ids are for the non-deduped (new) pages.
+                # ASSUMPTION: deduped blocks are always the prefix of the
+                # token sequence, because FlexKV's radix tree matches from
+                # the start and returns the longest matched prefix. Therefore
+                # new (non-deduped) blocks start at index num_deduped.
                 num_deduped = num_pages - len(cpu_block_ids)
                 page_idx = num_deduped + i
 
@@ -540,9 +700,12 @@ class FlexKVHiCacheStorage(HiCacheStorage):
 
     def clear(self) -> None:
         try:
-            # TODO: clear KVManager's cache engine
+            # TODO: implement KVManager cache engine clear when supported.
+            # Currently only stats are reset; cached blocks remain in the
+            # radix tree and CPU cache tensor.
+            logger.warning("clear() called but KVManager cache clear is not yet "
+                           "implemented — only stats are reset, cached data persists")
             self._stats = _Stats()
-            logger.info("Cache cleared")
         except Exception:
             logger.exception("clear() failed")
 

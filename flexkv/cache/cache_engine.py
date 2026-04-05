@@ -1592,6 +1592,7 @@ class GlobalCacheEngine:
         transfer_graph = TransferOpGraph()
         finished_ops_ids = []
         op_node_to_ready = {}
+        op_h2disk = None
 
         # No D2H op — caller fills CPU cache blocks directly
 
