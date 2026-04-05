@@ -256,6 +256,8 @@ class KVTPClient:
         kv_caches: List[torch.Tensor],
         kv_layout: KVCacheLayout,
         override_device_id: Optional[int] = None,
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+        indexer_layout: Optional[KVCacheLayout] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
@@ -268,11 +270,20 @@ class KVTPClient:
             handle = TensorSharedHandle(tensor, device_id)
             handles.append(handle)
 
+        # Build optional indexer handles
+        indexer_handles = None
+        if indexer_buffers is not None and len(indexer_buffers) > 0:
+            indexer_handles = []
+            for tensor in indexer_buffers:
+                indexer_handles.append(TensorSharedHandle(tensor, device_id))
+
         register_req = RegisterTPClientRequest(
             self.dp_client_id,
             device_id,
             handles,
-            kv_layout
+            kv_layout,
+            indexer_handles=indexer_handles,
+            indexer_gpu_layout=indexer_layout,
         )
 
         self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)

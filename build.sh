@@ -15,11 +15,53 @@ for arg in "$@"; do
       BUILD_TYPE="release"
       shift
       ;;
+    --clean)
+      BUILD_TYPE="clean"
+      shift
+      ;;
     *)
       # Unknown option
       ;;
   esac
 done
+
+# Handle clean
+if [ "$BUILD_TYPE" = "clean" ]; then
+  echo "=== Cleaning all build artifacts ==="
+
+  # Remove CMake build directory
+  if [ -d "build" ]; then
+    rm -rf build
+    echo "Removed build/"
+  fi
+
+  # Remove compiled .so files in package directory
+  find flexkv -name "*.so" -type f -delete -print | sed 's/^/Removed /'
+
+  # Remove copied libs directory
+  if [ -d "flexkv/lib" ]; then
+    rm -rf flexkv/lib
+    echo "Removed flexkv/lib/"
+  fi
+
+  # Remove Python build artifacts
+  find . -maxdepth 2 -name "*.egg-info" -type d | while read d; do
+    rm -rf "$d"
+    echo "Removed $d"
+  done
+  # Only remove top-level dist/ (Python build output), not csrc/dist/ source directory
+  if [ -d "dist" ]; then
+    rm -rf dist
+    echo "Removed dist/"
+  fi
+  find . -name "__pycache__" -type d | while read d; do
+    rm -rf "$d"
+    echo "Removed $d"
+  done
+
+  echo "=== Clean completed ==="
+  exit 0
+fi
 
 echo "=== Building in ${BUILD_TYPE} mode ==="
 

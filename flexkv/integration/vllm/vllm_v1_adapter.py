@@ -709,8 +709,19 @@ class FlexKVWorkerConnector:
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
         logger.info("Start register kv_caches")
-        gpu_blocks = list(kv_caches.values())
-        num_layer = len(kv_caches)
+
+        # Separate main KV caches from indexer caches by layer name.
+        main_kv_caches: dict[str, torch.Tensor] = {}
+        indexer_kv_caches: dict[str, torch.Tensor] = {}
+        for layer_name, tensor in kv_caches.items():
+            if ".k_cache" in layer_name:
+                indexer_kv_caches[layer_name] = tensor
+            else:
+                main_kv_caches[layer_name] = tensor
+
+        # Build main KV cache layout
+        gpu_blocks = list(main_kv_caches.values())
+        num_layer = len(main_kv_caches)
         if self.flexkv_config.model_config.use_mla:
             assert gpu_blocks[0].ndim == 3, (
                 f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
@@ -734,7 +745,32 @@ class FlexKVWorkerConnector:
             head_size=head_size,
             is_mla=self.flexkv_config.model_config.use_mla,
         )
-        self.tp_client.register_to_server(gpu_blocks, gpu_layout)
+
+        # Build indexer layout if indexer caches are present
+        indexer_buffers = None
+        indexer_layout = None
+        if indexer_kv_caches:
+            indexer_buffers = list(indexer_kv_caches.values())
+            first_indexer_buffer = indexer_buffers[0]
+            assert first_indexer_buffer.ndim == 3, (
+                f"expect indexer cache tensor has 3 dim but get shape={first_indexer_buffer.shape}.")
+            indexer_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(indexer_buffers),
+                num_block=first_indexer_buffer.shape[0],
+                tokens_per_block=first_indexer_buffer.shape[1],
+                num_head=1,
+                head_size=first_indexer_buffer.shape[2],
+                is_mla=True,
+            )
+
+        self.tp_client.register_to_server(
+            kv_caches=gpu_blocks,
+            kv_layout=gpu_layout,
+            indexer_buffers=indexer_buffers,
+            indexer_layout=indexer_layout,
+        )
+
         logger.info("Finish register kv_caches")
 
     def __del__(self):
