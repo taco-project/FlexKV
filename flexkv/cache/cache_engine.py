@@ -396,7 +396,7 @@ class GlobalCacheEngine:
 
         if cache_config.enable_cpu:
             if cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
+                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size) #TODO
             elif self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
@@ -420,7 +420,7 @@ class GlobalCacheEngine:
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
-                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
+                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size) #TODO
             elif self.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
@@ -445,7 +445,7 @@ class GlobalCacheEngine:
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
-                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
+                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size)
             elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,

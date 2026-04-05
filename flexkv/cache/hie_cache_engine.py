@@ -37,7 +37,9 @@ class HierarchyLRCacheEngine:
                  evict_start_threshold: float = 1.0,
                  hit_reward_seconds: int = 0,
                  eviction_policy: str = "lru",
-                 meta: Optional[RedisMeta] = None) -> None:
+                 meta: Optional[RedisMeta] = None,
+                 pp_rank: int = 0,
+                 pp_size: int = 1) -> None:
         if num_total_blocks <= 0:
             raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
@@ -90,6 +92,8 @@ class HierarchyLRCacheEngine:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
         
         # cumulative statistics: for analyzing distributed KV reuse benefits
         self._stats_total_queried_tokens = 0       # total tokens queried
@@ -102,17 +106,22 @@ class HierarchyLRCacheEngine:
         if self._meta is None:
             raise ValueError("RedisMeta is not provided; ensure from_cache_config stores it or pass it to start().")
         #TODO can we use like this to distinguish the different tree pairs?
+        # Determine base block key prefix by device type
         if self.device_type == DeviceType.REMOTE:
-            local_ch_block_key = "PCFSB"
-            remote_ch_block_key = "PCFSB"
+            base_key = "PCFSB"
         elif self.device_type == DeviceType.CPU:
-            local_ch_block_key = "CPUB"
-            remote_ch_block_key = "CPUB"
+            base_key = "CPUB"
         elif self.device_type == DeviceType.SSD:
-            local_ch_block_key = "SSDB"
-            remote_ch_block_key = "SSDB"
+            base_key = "SSDB"
         else:
             raise ValueError(f"Invalid device type: {self.device_type}")
+
+        if self.pp_size > 1:
+            local_ch_block_key = f"{base_key}:pp{self.pp_rank}"
+            remote_ch_block_key = f"{base_key}:pp{self.pp_rank}"
+        else:
+            local_ch_block_key = base_key
+            remote_ch_block_key = base_key
         self.remote_ch = self._meta.get_redis_meta_channel(remote_ch_block_key)
         self.local_ch = self._meta.get_redis_meta_channel(local_ch_block_key)
                 # Load and store mapping of node_id -> file_nodeids from Redis
@@ -443,7 +452,7 @@ class HierarchyLRCacheEngine:
 
     #TODO pfcs may not work now
     @classmethod
-    def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
+    def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None, pp_rank: int = 0, pp_size: int = 1) -> "HierarchyLRCacheEngine":
         """Create a PCFSCacheEngine from CacheConfig.
 
         This replaces RemotePCFSCacheEngine. It wires both local and remote
@@ -522,14 +531,16 @@ class HierarchyLRCacheEngine:
             local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
             eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
             meta=meta,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
         )
 
     #TODO is this enough for peercpu and peerssd?
     @classmethod
-    def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, device_type: DeviceType, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
+    def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, device_type: DeviceType, meta: Optional[RedisMeta] = None, pp_rank: int = 0, pp_size: int = 1) -> "HierarchyLRCacheEngine":
 
         if device_type == DeviceType.REMOTE:
-            return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta)
+            return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta, pp_rank=pp_rank, pp_size=pp_size)
         else:
             # select correct blocks configuration based on device_type
             if device_type == DeviceType.CPU:
@@ -563,6 +574,7 @@ class HierarchyLRCacheEngine:
                 hit_reward_seconds=int(GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds),
                 eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
                 meta=meta,
+                pp_rank=pp_rank,
+                pp_size=pp_size,
             )
             raise ValueError("Invalid device type: {cache_config.device_type}")
-

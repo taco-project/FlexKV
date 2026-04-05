@@ -22,6 +22,9 @@ class RegisterTPClientRequest:
     device_id: int
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
+    # --- Indexer shadow transfer fields ---
+    indexer_handles: Optional[List[TensorSharedHandle]] = None
+    indexer_gpu_layout: Optional[KVCacheLayout] = None
 
 @dataclass
 class IsReadyRequest:

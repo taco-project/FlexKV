@@ -11,6 +11,17 @@ import torch
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
 
+
+@dataclass
+class IndexerCacheConfig:
+    """Indexer-specific cache configuration, embedded inside CacheConfig."""
+    # Indexer head layout
+    head_size: int = 0          # qk_rope_head_dim for DSA/NSA models
+    num_kv_heads: int = 1       # typically 1 for MLA-style indexer
+    dtype: torch.dtype = torch.uint8  # indexer storage dtype (fp8 quantized)
+    page_size: int = 1
+
+
 @dataclass
 class ModelConfig:
     num_layers: int = 1
@@ -22,6 +33,8 @@ class ModelConfig:
     # parallel configs
     tp_size: int = 1
     dp_size: int = 1
+    pp_size: int = 1
+    pp_rank: int = 0
 
     @property
     def token_size_in_bytes(self) -> int:
@@ -45,6 +58,9 @@ class CacheConfig:
     distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
     num_tmp_cpu_blocks: int = 500 # only used when distributed ssd p2p, it controls the number blocks of temp cpu buffer which used for copy data from ssd to cpu
 
+
+    # Indexer configuration
+    indexer: Optional[IndexerCacheConfig] = None
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000

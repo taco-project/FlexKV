@@ -12,6 +12,9 @@ from flexkv.common.debug import flexkv_logger
 class CompletedOp:
     graph_id: int
     op_id: int
+    transfer_type: Optional[str] = None
+    num_blocks: int = 0
+    num_bytes: int = 0
 
     def is_graph_completed(self) -> bool:
         return self.op_id == -1
@@ -96,6 +99,10 @@ class TransferOp:
     remote_node_ids: Optional[np.ndarray] = None
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
+    # pending_count tracks how many workers (main KV + indexer) have not yet completed this op.
+    # Initialized to 1; incremented before submitting to indexer worker.
+    # _scheduler_loop decrements it on each worker completion; finalization happens only when it reaches 0.
+    pending_count: int = 1
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \

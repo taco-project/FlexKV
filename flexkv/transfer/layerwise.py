@@ -68,7 +68,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  h2d_cta_num: int = 4,
-                 d2h_cta_num: int = 4) -> None:
+                 d2h_cta_num: int = 4,
+                 enable_eventfd: bool = True) -> None:
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size, f"len(gpu_blocks) = {len(gpu_blocks)}, tp_group_size = {tp_group_size}"
         imported_gpu_blocks = []
@@ -147,7 +148,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
         gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
 
-        layer_eventfds_tensor = self._receive_eventfds_from_sglang(tp_group_size)
+        if enable_eventfd:
+            layer_eventfds_tensor = self._receive_eventfds_from_sglang(tp_group_size)
+        else:
+            layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
 
         # Create LayerwiseTransferGroup which handles both SSD->CPU and CPU->GPU transfers
         self.layerwise_transfer_group = LayerwiseTransferGroup(
