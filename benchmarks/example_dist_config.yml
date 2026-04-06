@@ -1,0 +1,25 @@
+# Distributed KVCache benchmark config (server_client_mode)
+# Model config
+num_layers: 4
+num_kv_heads: 8
+head_size: 128
+dtype: bfloat16
+use_mla: false
+tp_size: 1
+dp_size: 1
+tokens_per_block: 16
+
+# Cache config
+cpu_cache_gb: 4
+ssd_cache_gb: 0
+
+# Distributed KVCache config
+enable_p2p_cpu: true
+
+# Redis config (for KV sharing metadata)
+redis_host: "127.0.0.1"
+redis_port: 6379
+local_ip: "127.0.0.1"
+
+# Force server_client_mode
+server_client_mode: true
