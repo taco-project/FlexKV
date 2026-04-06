@@ -323,7 +323,7 @@ RUNTIME_DEPS="numpy pyzmq psutil nvtx pyyaml expiring-dict"
 
 # Additional dependencies for P2P/distributed mode
 if [ "$ENABLE_P2P" -eq 1 ]; then
-    RUNTIME_DEPS="$RUNTIME_DEPS redis"
+    RUNTIME_DEPS="$RUNTIME_DEPS redis mooncake-transfer-engine"
 fi
 
 info "Installing runtime dependencies: $RUNTIME_DEPS"
