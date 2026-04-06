@@ -323,7 +323,23 @@ RUNTIME_DEPS="numpy pyzmq psutil nvtx pyyaml expiring-dict"
 
 # Additional dependencies for P2P/distributed mode
 if [ "$ENABLE_P2P" -eq 1 ]; then
-    RUNTIME_DEPS="$RUNTIME_DEPS redis mooncake-transfer-engine"
+    # Detect CUDA major version to choose the correct mooncake package
+    CUDA_MAJOR_VERSION=""
+    if command -v nvcc &>/dev/null; then
+        CUDA_MAJOR_VERSION=$(nvcc --version | grep -oP 'release \K[0-9]+')
+    elif [ -n "$CUDA_HOME" ] && [ -f "$CUDA_HOME/bin/nvcc" ]; then
+        CUDA_MAJOR_VERSION=$("$CUDA_HOME/bin/nvcc" --version | grep -oP 'release \K[0-9]+')
+    fi
+
+    if [ -n "$CUDA_MAJOR_VERSION" ] && [ "$CUDA_MAJOR_VERSION" -ge 13 ] 2>/dev/null; then
+        info "Detected CUDA major version >= 13, using mooncake-transfer-engine-cuda13"
+        MOONCAKE_PKG="mooncake-transfer-engine-cuda13"
+    else
+        info "Using default mooncake-transfer-engine (CUDA 12)"
+        MOONCAKE_PKG="mooncake-transfer-engine"
+    fi
+
+    RUNTIME_DEPS="$RUNTIME_DEPS redis $MOONCAKE_PKG"
 fi
 
 info "Installing runtime dependencies: $RUNTIME_DEPS"

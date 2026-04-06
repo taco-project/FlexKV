@@ -56,13 +56,18 @@ class MoonCakeTransferEngineWrapper:
         # transfer engine initialize
         self.engine = TransferEngine()
 
+        # Set Redis auth env vars for mooncake engine (it reads MC_REDIS_PASSWORD internally)
+        if self.config.metadata_server_auth:
+            os.environ["MC_REDIS_PASSWORD"] = self.config.metadata_server_auth
+            flexkv_logger.info("Set MC_REDIS_PASSWORD environment variable for mooncake Redis authentication")
+
         self.engine.initialize_ext(
             self.mooncake_addr,
             self.config.metadata_server,
             self.config.protocol,
             self.config.device_name,
             self.metadata_backend,
-        )         
+        )
 
     # mooncake operations
     def regist_buffer(self, buffer_ptr: int, buffer_size: int) -> int:
