@@ -16,6 +16,7 @@ import textwrap
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
+from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.kvtask import KVTaskEngine
@@ -141,7 +142,23 @@ class KVServer:
         # Use total_clients if provided (multi-instance mode), otherwise use dp_size
         max_clients = total_clients if total_clients > 0 else model_config.dp_size
         self.client_manager = ClientManager(max_num_dp_client=max_clients)
-        self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port)
+
+        # Initialize RedisMeta in KVServer for server_client_mode
+        self.redis_meta_client = None
+        if cache_config.enable_kv_sharing:
+            flexkv_logger.info(f"[kv server] initializing RedisMeta and connection to "
+                               f"{cache_config.redis_host}:{cache_config.redis_port}")
+            self.redis_meta_client = RedisMeta(
+                cache_config.redis_host,
+                cache_config.redis_port,
+                cache_config.redis_password,
+                cache_config.local_ip,
+            )
+            self.redis_meta_client.init_meta()
+            # update distributed_node_id
+            cache_config.distributed_node_id = self.redis_meta_client.get_node_id()
+
+        self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port, redis_meta=self.redis_meta_client)
 
         self.req_counter = 0
         self._is_ready = False
