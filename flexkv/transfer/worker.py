@@ -1329,6 +1329,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout = None,
         ssd_files: Dict[int, List[str]] = None,  # ssd_device_id -> file_paths
         num_blocks_per_file: int = 0,
+        mooncake_config_path: str = None,
     ):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
@@ -1372,8 +1373,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
 
             # step2: initialize mooncake transfer engine for the whole flexkv
-            # NOTE:now we read the config file by env paras
-            mooncake_config_path = os.environ["MOONCAKE_CONFIG_PATH"]
+            # NOTE: prefer explicit parameter over env variable (spawn subprocesses may lose env vars)
+            if mooncake_config_path is None:
+                mooncake_config_path = os.environ.get("MOONCAKE_CONFIG_PATH")
+            if mooncake_config_path is None:
+                raise RuntimeError(
+                    "MOONCAKE_CONFIG_PATH is not set. Please either pass mooncake_config_path "
+                    "parameter or set the MOONCAKE_CONFIG_PATH environment variable."
+                )
             self.mooncake_config = MooncakeTransferEngineConfig.from_file(
                 mooncake_config_path
             )

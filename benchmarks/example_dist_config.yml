@@ -19,7 +19,17 @@ enable_p2p_cpu: true
 # Redis config (for KV sharing metadata)
 redis_host: "127.0.0.1"
 redis_port: 6379
+redis_password: ""  # Set your Redis password here, leave empty if no auth
 local_ip: "127.0.0.1"
+
+# Mooncake Transfer Engine config (required for P2P)
+mooncake_engine_ip: "127.0.0.1"
+mooncake_engine_port: 5555
+mooncake_metadata_backend: "redis"
+mooncake_metadata_server: "redis://127.0.0.1:6379"
+mooncake_metadata_server_auth: ""
+mooncake_protocol: "tcp"        # "tcp" or "rdma"
+mooncake_device_name: ""        # RDMA device name, e.g. "mlx5_0"; leave empty for tcp
 
 # Force server_client_mode
 server_client_mode: true

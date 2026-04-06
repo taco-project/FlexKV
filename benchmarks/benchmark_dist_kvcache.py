@@ -32,6 +32,8 @@ Usage:
 
 import os
 import argparse
+import json
+import tempfile
 import time
 from multiprocessing import Process
 from dataclasses import dataclass
@@ -110,6 +112,32 @@ def load_dist_config(config_path: str):
         user_config.local_ip = config["local_ip"]
     if "redis_password" in config:
         user_config.redis_password = config["redis_password"]
+
+    # Auto-generate mooncake config JSON and set MOONCAKE_CONFIG_PATH if P2P is enabled
+    if config.get("enable_p2p_cpu", False) or config.get("enable_p2p_ssd", False):
+        if "MOONCAKE_CONFIG_PATH" not in os.environ:
+            mooncake_config = {
+                "engine_ip": config.get("mooncake_engine_ip", config.get("local_ip", "127.0.0.1")),
+                "engine_port": config.get("mooncake_engine_port", 5555),
+                "metadata_backend": config.get("mooncake_metadata_backend", "redis"),
+                "metadata_server": config.get("mooncake_metadata_server",
+                    f"redis://{config.get('redis_host', '127.0.0.1')}:{config.get('redis_port', 6379)}"),
+                "metadata_server_auth": config.get("mooncake_metadata_server_auth",
+                    config.get("redis_password", "")),
+                "protocol": config.get("mooncake_protocol", "tcp"),
+                "device_name": config.get("mooncake_device_name", ""),
+            }
+            # Write to a temp file that persists until process exits
+            mooncake_config_fd, mooncake_config_path = tempfile.mkstemp(
+                suffix=".json", prefix="mooncake_config_"
+            )
+            with os.fdopen(mooncake_config_fd, "w") as f:
+                json.dump(mooncake_config, f, indent=2)
+            os.environ["MOONCAKE_CONFIG_PATH"] = mooncake_config_path
+            print(f"[INFO] Auto-generated mooncake config at: {mooncake_config_path}")
+            print(f"[INFO] Mooncake config: {json.dumps(mooncake_config, indent=2)}")
+        else:
+            print(f"[INFO] Using existing MOONCAKE_CONFIG_PATH: {os.environ['MOONCAKE_CONFIG_PATH']}")
 
     update_default_config_from_user_config(model_config, cache_config, user_config)
 

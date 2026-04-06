@@ -31,7 +31,12 @@ class MoonCakeTransferEngineWrapper:
             )
         
         if config is None:
-            mooncake_config_path = os.environ["MOONCAKE_CONFIG_PATH"]
+            mooncake_config_path = os.environ.get("MOONCAKE_CONFIG_PATH")
+            if mooncake_config_path is None:
+                raise RuntimeError(
+                    "MOONCAKE_CONFIG_PATH is not set. Please set the MOONCAKE_CONFIG_PATH "
+                    "environment variable or pass a MooncakeTransferEngineConfig object."
+                )
             self.config = MooncakeTransferEngineConfig.from_file(mooncake_config_path)
         else:
             self.config = config
