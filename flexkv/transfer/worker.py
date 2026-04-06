@@ -1373,13 +1373,17 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
 
             # step2: initialize mooncake transfer engine for the whole flexkv
-            # NOTE: prefer explicit parameter over env variable (spawn subprocesses may lose env vars)
+            # NOTE: prefer explicit parameter > cache_config > env variable
+            # (spawn subprocesses may lose env vars, but cache_config is pickle-serialized)
+            if mooncake_config_path is None:
+                mooncake_config_path = getattr(self.cache_config, 'mooncake_config_path', None)
             if mooncake_config_path is None:
                 mooncake_config_path = os.environ.get("MOONCAKE_CONFIG_PATH")
             if mooncake_config_path is None:
                 raise RuntimeError(
                     "MOONCAKE_CONFIG_PATH is not set. Please either pass mooncake_config_path "
-                    "parameter or set the MOONCAKE_CONFIG_PATH environment variable."
+                    "parameter, set cache_config.mooncake_config_path, or set the "
+                    "MOONCAKE_CONFIG_PATH environment variable."
                 )
             self.mooncake_config = MooncakeTransferEngineConfig.from_file(
                 mooncake_config_path

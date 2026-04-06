@@ -137,7 +137,11 @@ def load_dist_config(config_path: str):
             print(f"[INFO] Auto-generated mooncake config at: {mooncake_config_path}")
             print(f"[INFO] Mooncake config: {json.dumps(mooncake_config, indent=2)}")
         else:
-            print(f"[INFO] Using existing MOONCAKE_CONFIG_PATH: {os.environ['MOONCAKE_CONFIG_PATH']}")
+            mooncake_config_path = os.environ['MOONCAKE_CONFIG_PATH']
+            print(f"[INFO] Using existing MOONCAKE_CONFIG_PATH: {mooncake_config_path}")
+
+        # Store mooncake_config_path in cache_config so it survives spawn subprocesses via pickle
+        cache_config.mooncake_config_path = mooncake_config_path
 
     update_default_config_from_user_config(model_config, cache_config, user_config)
 

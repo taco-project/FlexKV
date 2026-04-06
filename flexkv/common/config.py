@@ -89,6 +89,9 @@ class CacheConfig:
     local_ip: str = "127.0.0.1"
     redis_password: Optional[str] = None
 
+    # Mooncake transfer engine config path (serialized via pickle to survive spawn subprocesses)
+    mooncake_config_path: Optional[str] = None
+
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
