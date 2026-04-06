@@ -65,15 +65,28 @@ info "============================================"
 info "Step 1: Parsing configuration"
 info "============================================"
 
-# Simple YAML parser for redis config
-REDIS_HOST=$(grep -E "^redis_host:" "$CONFIG_FILE" 2>/dev/null | sed 's/redis_host:\s*"\?\([^"]*\)"\?/\1/' | tr -d ' ' || echo "127.0.0.1")
-REDIS_PORT=$(grep -E "^redis_port:" "$CONFIG_FILE" 2>/dev/null | sed 's/redis_port:\s*//' | tr -d ' ' || echo "6379")
-REDIS_PASSWORD=$(grep -E "^redis_password:" "$CONFIG_FILE" 2>/dev/null | sed 's/redis_password:\s*"\?\([^"]*\)"\?/\1/' | tr -d ' ' || echo "")
+# Helper function to parse a YAML value using Python (handles comments, quotes, etc. correctly)
+# Usage: parse_yaml_value <key> <file> [default]
+parse_yaml_value() {
+    local key="$1" file="$2" default="${3:-}"
+    local val
+    val=$(python3 -c "
+import yaml, sys
+with open('$file') as f:
+    d = yaml.safe_load(f)
+v = d.get('$key')
+if v is None:
+    print('$default')
+else:
+    print(v)
+" 2>/dev/null) || val="$default"
+    echo "$val"
+}
 
-# Handle empty password (YAML empty string "")
-if [[ "$REDIS_PASSWORD" == '""' ]] || [[ "$REDIS_PASSWORD" == "''" ]]; then
-    REDIS_PASSWORD=""
-fi
+# Simple YAML parser for redis config
+REDIS_HOST=$(parse_yaml_value "redis_host" "$CONFIG_FILE" "127.0.0.1")
+REDIS_PORT=$(parse_yaml_value "redis_port" "$CONFIG_FILE" "6379")
+REDIS_PASSWORD=$(parse_yaml_value "redis_password" "$CONFIG_FILE" "")
 
 info "Config file: ${CONFIG_FILE}"
 info "Redis: ${REDIS_HOST}:${REDIS_PORT}"
@@ -164,15 +177,15 @@ if [[ "$ENABLE_P2P_CPU" == "true" ]] || [[ "$ENABLE_P2P_SSD" == "true" ]]; then
     if [[ -z "${MOONCAKE_CONFIG_PATH:-}" ]]; then
         info "P2P enabled, generating mooncake config..."
 
-        # Parse mooncake config from YAML
-        MC_ENGINE_IP=$(grep -E "^mooncake_engine_ip:" "$CONFIG_FILE" 2>/dev/null | sed 's/mooncake_engine_ip:\s*"\?\([^"]*\)"\?/\1/' | tr -d ' ' || echo "")
-        MC_ENGINE_PORT=$(grep -E "^mooncake_engine_port:" "$CONFIG_FILE" 2>/dev/null | sed 's/mooncake_engine_port:\s*//' | tr -d ' ' || echo "")
-        MC_METADATA_BACKEND=$(grep -E "^mooncake_metadata_backend:" "$CONFIG_FILE" 2>/dev/null | sed 's/mooncake_metadata_backend:\s*"\?\([^"]*\)"\?/\1/' | tr -d ' ' || echo "")
-        MC_METADATA_SERVER=$(grep -E "^mooncake_metadata_server:" "$CONFIG_FILE" 2>/dev/null | sed 's/mooncake_metadata_server:\s*"\?\([^"]*\)"\?/\1/' | tr -d ' ' || echo "")
-        MC_METADATA_SERVER_AUTH=$(grep -E "^mooncake_metadata_server_auth:" "$CONFIG_FILE" 2>/dev/null | sed 's/mooncake_metadata_server_auth:\s*"\?\([^"]*\)"\?/\1/' | tr -d ' ' || echo "")
-        MC_PROTOCOL=$(grep -E "^mooncake_protocol:" "$CONFIG_FILE" 2>/dev/null | sed 's/mooncake_protocol:\s*"\?\([^"]*\)"\?/\1/' | tr -d ' ' || echo "")
-        MC_DEVICE_NAME=$(grep -E "^mooncake_device_name:" "$CONFIG_FILE" 2>/dev/null | sed 's/mooncake_device_name:\s*"\?\([^"]*\)"\?/\1/' | tr -d ' ' || echo "")
-        LOCAL_IP=$(grep -E "^local_ip:" "$CONFIG_FILE" 2>/dev/null | sed 's/local_ip:\s*"\?\([^"]*\)"\?/\1/' | tr -d ' ' || echo "127.0.0.1")
+        # Parse mooncake config from YAML using helper function
+        MC_ENGINE_IP=$(parse_yaml_value "mooncake_engine_ip" "$CONFIG_FILE")
+        MC_ENGINE_PORT=$(parse_yaml_value "mooncake_engine_port" "$CONFIG_FILE")
+        MC_METADATA_BACKEND=$(parse_yaml_value "mooncake_metadata_backend" "$CONFIG_FILE")
+        MC_METADATA_SERVER=$(parse_yaml_value "mooncake_metadata_server" "$CONFIG_FILE")
+        MC_METADATA_SERVER_AUTH=$(parse_yaml_value "mooncake_metadata_server_auth" "$CONFIG_FILE")
+        MC_PROTOCOL=$(parse_yaml_value "mooncake_protocol" "$CONFIG_FILE")
+        MC_DEVICE_NAME=$(parse_yaml_value "mooncake_device_name" "$CONFIG_FILE")
+        LOCAL_IP=$(parse_yaml_value "local_ip" "$CONFIG_FILE" "127.0.0.1")
 
         # Use defaults if not specified
         MC_ENGINE_IP="${MC_ENGINE_IP:-$LOCAL_IP}"
@@ -181,11 +194,6 @@ if [[ "$ENABLE_P2P_CPU" == "true" ]] || [[ "$ENABLE_P2P_SSD" == "true" ]]; then
         MC_METADATA_SERVER="${MC_METADATA_SERVER:-redis://${REDIS_HOST}:${REDIS_PORT}}"
         MC_PROTOCOL="${MC_PROTOCOL:-tcp}"
         MC_DEVICE_NAME="${MC_DEVICE_NAME:-}"
-
-        # Handle empty auth (YAML empty string "")
-        if [[ "$MC_METADATA_SERVER_AUTH" == '""' ]] || [[ "$MC_METADATA_SERVER_AUTH" == "''" ]]; then
-            MC_METADATA_SERVER_AUTH=""
-        fi
 
         # Generate JSON config file
         MOONCAKE_CONFIG_FILE=$(mktemp /tmp/mooncake_config_XXXXXX.json)
