@@ -46,6 +46,19 @@ try:
 except ImportError:
     from sglang.srt.observability.metrics_collector import StorageMetrics
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MODE_LOCAL = "local"
+MODE_DISTRIBUTED = "distributed"
+_VALID_MODES = (MODE_LOCAL, MODE_DISTRIBUTED)
+
+# Error operation labels (used in metrics recording)
+_OP_GET = "get"
+_OP_SET = "set"
+_OP_EXISTS = "exists"
+
 
 # ---------------------------------------------------------------------------
 # Helper: extract token_ids from extra_info
@@ -162,9 +175,9 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         self._cache_config = CacheConfig(**cache_kwargs)
 
         # Extract distributed mode configuration
-        self._mode: str = extra.get("mode", "local")
-        if self._mode not in ("local", "distributed"):
-            raise ValueError(f"Invalid mode: {self._mode}. Must be 'local' or 'distributed'")
+        self._mode: str = extra.get("mode", MODE_LOCAL)
+        if self._mode not in _VALID_MODES:
+            raise ValueError(f"Invalid mode: {self._mode}. Must be one of {_VALID_MODES}")
         
         self._redis_host: str = extra.get("redis_host", "127.0.0.1")
         self._redis_port: int = extra.get("redis_port", 6379)
@@ -172,7 +185,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         
         self._prefetch_timeout: float = float(extra.get("prefetch_timeout", 5.0))
 
-        if self._mode == "distributed" and not self._redis_host:
+        if self._mode == MODE_DISTRIBUTED and not self._redis_host:
             raise ValueError("redis_host is required when mode='distributed'")
 
         self._should_backup: bool = (
@@ -184,9 +197,9 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         self._kv_manager = None
         self._cpu_cache_tensor = None  # direct access to CPU cache (thread mode)
         self._elements_per_block: int = 0
+        self._block_shape: tuple = ()  # set after KVManager init
         self._page_size: int = self._cache_config.tokens_per_block
         self._mem_pool_host = mem_pool_host
-        self._started = False
         self._bytes_per_page: int = 0
         self._gb_per_page: float = 0.0
 
@@ -231,8 +244,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         }
 
         # Branch on mode: local vs distributed
-        if self._mode == "distributed":
-            # Distributed mode: enable cross-node KV Cache sharing
+        if self._mode == MODE_DISTRIBUTED:
             cache_config_kwargs.update({
                 "enable_remote": True,
                 "enable_kv_sharing": True,
@@ -273,11 +285,16 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         # Get direct access to CPU cache tensor (thread mode only)
         self._cpu_cache_tensor = self._kv_manager.get_cpu_cache_tensor()
 
-        # Compute elements per block for indexing
+        # Compute elements per block and cache the block shape for indexing
         kv_dim = 1 if self._model_config.use_mla else 2
         self._elements_per_block = (
             self._model_config.num_layers * kv_dim *
             self._page_size * self._model_config.num_kv_heads *
+            self._model_config.head_size
+        )
+        self._block_shape = (
+            self._model_config.num_layers, kv_dim,
+            self._page_size, self._model_config.num_kv_heads,
             self._model_config.head_size
         )
 
@@ -346,12 +363,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
 
     def _get_block_shaped(self, block_id: int) -> torch.Tensor:
         """Get a CPU cache block reshaped to BLOCKFIRST: [L, kv_dim, T, H, D]."""
-        kv_dim = 1 if self._model_config.use_mla else 2
-        return self._get_block_view(block_id).view(
-            self._model_config.num_layers, kv_dim,
-            self._page_size, self._model_config.num_kv_heads,
-            self._model_config.head_size
-        )
+        return self._get_block_view(block_id).view(self._block_shape)
 
     def _fetch_remote_blocks(self, token_ids: np.ndarray) -> bool:
         """Fetch remote blocks into local CPU cache via prefetch_async.
@@ -411,7 +423,6 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             self._page_size = sglang_page_size
 
         self._init_kv_manager()
-        self._started = True
 
         # KVManager has started — global collector is now initialized
         try:
@@ -499,7 +510,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                                     tokens_per_block=page_size)
 
             # In distributed mode, query both local and remote trees
-            if (self._mode == "distributed"
+            if (self._mode == MODE_DISTRIBUTED
                     and hasattr(cache_engine.cpu_cache_engine, 'match_all')):
                 match_result = cache_engine.cpu_cache_engine.match_all(seq_meta)
             else:
@@ -510,7 +521,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         except Exception:
             logger.exception("batch_exists failed")
             if self._metrics:
-                self._metrics.record_sglang_error("exists")
+                self._metrics.record_sglang_error(_OP_EXISTS)
             return 0
 
     def batch_get_v1(
@@ -550,7 +561,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                                     tokens_per_block=page_size)
 
             # In distributed mode, query both local and remote trees
-            if (self._mode == "distributed"
+            if (self._mode == MODE_DISTRIBUTED
                     and hasattr(cache_engine.cpu_cache_engine, 'match_all')):
                 match_result = cache_engine.cpu_cache_engine.match_all(seq_meta)
 
@@ -610,7 +621,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         except Exception:
             logger.exception("batch_get_v1 failed")
             if self._metrics:
-                self._metrics.record_sglang_error("get")
+                self._metrics.record_sglang_error(_OP_GET)
             return [False] * len(keys)
 
     def batch_set_v1(
@@ -694,7 +705,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         except Exception:
             logger.exception("batch_set_v1 failed")
             if self._metrics:
-                self._metrics.record_sglang_error("set")
+                self._metrics.record_sglang_error(_OP_SET)
             return [False] * len(keys)
 
     # Legacy abstract methods

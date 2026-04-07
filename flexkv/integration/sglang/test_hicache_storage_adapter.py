@@ -49,7 +49,7 @@ import torch
 from unittest.mock import MagicMock
 
 from flexkv.integration.sglang.hicache_storage_adapter import (
-    FlexKVHiCacheStorage, _get_token_ids,
+    FlexKVHiCacheStorage, _get_token_ids, MODE_LOCAL, MODE_DISTRIBUTED,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig, HiCacheStorageExtraInfo,
@@ -230,7 +230,7 @@ def test_no_token_ids_degradation():
 def test_default_local_mode():
     """Default mode is 'local' when not specified."""
     backend = FlexKVHiCacheStorage(_make_config())
-    assert backend._mode == "local", f"Expected 'local', got '{backend._mode}'"
+    assert backend._mode == MODE_LOCAL, f"Expected '{MODE_LOCAL}', got '{backend._mode}'"
 
 
 def test_explicit_local_mode():
@@ -247,8 +247,7 @@ def test_explicit_local_mode():
         }
     )
     backend = FlexKVHiCacheStorage(config)
-    assert backend._mode == "local"
-
+    assert backend._mode == MODE_LOCAL
 
 def test_distributed_mode_config():
     """Distributed mode stores redis config correctly."""
@@ -267,7 +266,7 @@ def test_distributed_mode_config():
         }
     )
     backend = FlexKVHiCacheStorage(config)
-    assert backend._mode == "distributed"
+    assert backend._mode == MODE_DISTRIBUTED
     assert backend._redis_host == "redis.example.com"
     assert backend._redis_port == 6380
     assert backend._redis_password == "test_password"
