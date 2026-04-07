@@ -229,6 +229,8 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         self._started = False
         self._stats = _Stats()
 
+        self._metrics = None  # resolved after KVManager starts in register_mem_pool_host()
+
         logger.info("Ready (KVManager deferred until register_mem_pool_host)")
 
     # ------------------------------------------------------------------
@@ -416,6 +418,13 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         self._init_kv_manager()
         self._started = True
 
+        # KVManager has started — global collector is now initialized
+        try:
+            from flexkv.metrics import get_global_collector
+            self._metrics = get_global_collector()
+        except Exception:
+            self._metrics = None
+
     def _auto_detect_model_params(self, mem_pool_host: Any) -> None:
         """Fill missing model parameters from SGLang's mem_pool_host.
 
@@ -451,6 +460,8 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         """
         with self._stats._lock:
             self._stats.exists_calls += 1
+        if self._metrics:
+            self._metrics.record_sglang_batch_exists()
 
         token_ids = _get_token_ids(extra_info)
         if not token_ids or self._kv_manager is None:
@@ -482,6 +493,8 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             logger.exception("batch_exists failed")
             with self._stats._lock:
                 self._stats.errors += 1
+            if self._metrics:
+                self._metrics.record_sglang_error("exists")
             return 0
 
     def batch_get_v1(
@@ -501,6 +514,9 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         if not token_ids or self._kv_manager is None:
             with self._stats._lock:
                 self._stats.get_calls += 1
+            if self._metrics:
+                self._metrics.record_sglang_batch_get(
+                    blocks_hit=0, blocks_missed=len(keys))
             return [False] * len(keys)
 
         with self._stats._lock:
@@ -537,6 +553,9 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                         with self._stats._lock:
                             self._stats.get_remote_fetches += 1
                             self._stats.get_remote_fetch_failures += 1
+                        if self._metrics:
+                            self._metrics.record_sglang_remote_fetch(
+                                success=False)
                         return [False] * num_pages
 
                     remote_fetched = True
@@ -567,11 +586,18 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                     results.append(False)
 
             hit_count = sum(results)
+            miss_count = num_pages - hit_count
             with self._stats._lock:
                 self._stats.get_tokens_hit += hit_count * page_size
                 if remote_fetched:
                     self._stats.get_remote_fetches += 1
                     self._stats.get_remote_fetch_successes += 1
+
+            if self._metrics:
+                self._metrics.record_sglang_batch_get(hit_count, miss_count)
+                if remote_fetched:
+                    self._metrics.record_sglang_remote_fetch(
+                        success=True, num_blocks=hit_count)
 
             if hit_count > 0:
                 logger.debug("batch_get_v1: %d/%d pages loaded", hit_count, num_pages)
@@ -581,6 +607,8 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             logger.exception("batch_get_v1 failed")
             with self._stats._lock:
                 self._stats.errors += 1
+            if self._metrics:
+                self._metrics.record_sglang_error("get")
             return [False] * len(keys)
 
     def batch_set_v1(
@@ -620,6 +648,9 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                 if _mr.num_ready_matched_blocks > 0:
                     with self._stats._lock:
                         self._stats.set_tokens_deduped += len(token_ids)
+                    if self._metrics:
+                        self._metrics.record_sglang_batch_set(
+                            blocks_written=0, blocks_deduped=num_pages)
                     return [True] * num_pages
                 return [False] * num_pages
 
@@ -646,6 +677,11 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                 self._stats.set_tokens_written += len(cpu_block_ids) * page_size
                 self._stats.set_tokens_deduped += num_deduped * page_size
 
+            if self._metrics:
+                self._metrics.record_sglang_batch_set(
+                    blocks_written=len(cpu_block_ids),
+                    blocks_deduped=num_deduped)
+
             logger.debug("batch_set_v1: wrote %d new pages, %d deduped (total %d)",
                          len(cpu_block_ids), num_deduped, num_pages)
             return [True] * num_pages
@@ -654,6 +690,8 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             logger.exception("batch_set_v1 failed")
             with self._stats._lock:
                 self._stats.errors += 1
+            if self._metrics:
+                self._metrics.record_sglang_error("set")
             return [False] * len(keys)
 
     # Legacy abstract methods
