@@ -40,7 +40,7 @@ class FlexKVConfig:
         if self.gpu_register_port == "":
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
-    def _detect_indexer_config_from_hf(self, hf_config, source: str = "", page_size: int = 1) -> None:
+    def _detect_indexer_config_from_hf(self, hf_config, source: str = "") -> None:
         if hf_config is None:
             return
 
@@ -49,16 +49,19 @@ class FlexKVConfig:
             if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
                 return
 
+            # tokens_per_block is already set to sglang page_size before this
+            # call, so each FlexKV block = 1 sglang page.  The indexer maps
+            # 1:1 with blocks — no extra page_size grouping is needed.
             self.cache_config.indexer = IndexerCacheConfig(
                 head_size=qk_rope_head_dim,
                 num_kv_heads=1,
                 dtype=torch.uint8,
-                page_size=page_size,
             )
             source_label = f" ({source})" if source else ""
             logger.info(
                 f"Detected sparse attention indexer config{source_label}: "
-                f"head_size={qk_rope_head_dim}, dtype=uint8, page_size={page_size}")
+                f"head_size={qk_rope_head_dim}, dtype=uint8, "
+                f"tokens_per_block={self.cache_config.tokens_per_block}")
         except Exception as e:
             logger.debug(f"Could not detect indexer config ({source}): {e}")
 
@@ -122,8 +125,10 @@ class FlexKVConfig:
             pp_size: pipeline parallel size (default 1, no PP)
             pp_rank: pipeline parallel rank (default 0)
         """
-        # cache config
-        self.cache_config.tokens_per_block = 1
+        # cache config: use page_size as tokens_per_block so that FlexKV's
+        # CPU radix tree manages blocks at page granularity, ensuring that
+        # hash generation, matching, insertion and eviction are all page-aligned.
+        self.cache_config.tokens_per_block = page_size
 
         total_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
         self.model_config.num_layers = int(num_local_layers) if num_local_layers > 0 else total_layers
@@ -160,12 +165,11 @@ class FlexKVConfig:
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
         
         hf_config = getattr(sglang_config, 'hf_config', None)
-        self._detect_indexer_config_from_hf(hf_config, source="sglang", page_size=page_size)
+        self._detect_indexer_config_from_hf(hf_config, source="sglang")
 
         if self.cache_config.indexer is not None:
             logger.info(
                 f"[FlexKV] Complete indexer config (sglang): "
-                f"page_size={self.cache_config.indexer.page_size}, "
                 f"head_size={self.cache_config.indexer.head_size}, "
                 f"dtype={self.cache_config.indexer.dtype}, "
                 f"num_layers={self.model_config.num_layers}, "

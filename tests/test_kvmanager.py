@@ -624,7 +624,7 @@ def run_tp_client_with_indexer(dp_client_id,
             tokens_per_block=indexer_tokens_per_block,
             num_head=indexer_cfg.num_kv_heads,
             head_size=indexer_cfg.head_size,
-            is_mla=indexer_cfg.use_mla,
+            is_mla=True,
         )
 
         # Use KVTPClient directly with indexer buffers (shadow transfer mode)
@@ -692,7 +692,6 @@ def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_lay
     cache_config.indexer = IndexerCacheConfig(
         head_size=64,
         num_kv_heads=1,
-        use_mla=True,
         dtype=torch.uint8,
     )
 
@@ -763,7 +762,7 @@ def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_lay
             tokens_per_block=cache_config.tokens_per_block,
             num_head=indexer_cfg.num_kv_heads,
             head_size=indexer_cfg.head_size,
-            is_mla=indexer_cfg.use_mla,
+            is_mla=True,
         )
         indexer_kv_verifier = GPUIndexerCacheVerifier(
             shared_indexer_blocks=all_indexer_blocks,

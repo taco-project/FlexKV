@@ -146,10 +146,8 @@ class TransferEngine:
         self._running = False
         self._has_indexer = False
 
-        self._indexer_page_size = 1
-        if cache_config.indexer is not None:
-            self._indexer_page_size = cache_config.indexer.page_size
         self._indexer_op_to_parent_op: Dict[int, int] = {}
+        self._indexer_op_map: Dict[int, TransferOp] = {}
 
     def _init_workers(self) -> None:
         if self._running:
@@ -725,7 +723,7 @@ class TransferEngine:
                                     f"_indexer_op_to_parent_op. All indexer ops must be "
                                     f"registered with a parent op."
                                 )
-                                indexer_op = self.op_id_to_op.pop(op_id)
+                                indexer_op = self._indexer_op_map.pop(op_id)
                                 free_op_from_buffer(indexer_op, self.pin_buffer)
                                 parent_op_id = self._indexer_op_to_parent_op.pop(op_id)
                                 parent_op = self.op_id_to_op[parent_op_id]
@@ -792,38 +790,6 @@ class TransferEngine:
         finished_ops.append(op)
         del self.op_id_to_op[op.op_id]
 
-    def _convert_to_page_level_block_ids(self, block_ids: np.ndarray) -> np.ndarray:
-        """Convert block-level IDs to page-level IDs by dividing by page_size.
-
-        Input block_ids are guaranteed to be page-aligned by the sglang caller
-        (e.g. flexkv_radix_cache), so we only do a defensive assert here.
-        """
-        page_size = self._indexer_page_size
-        if block_ids.size == 0:
-            return block_ids.copy()
-
-        assert block_ids.size % page_size == 0, (
-            f"[TransferEngine] block_ids size {block_ids.size} is not a multiple "
-            f"of indexer page_size {page_size}. "
-            f"Caller must page-align block_ids before reaching transfer engine."
-        )
-
-        reshaped = block_ids.reshape(-1, page_size)
-        page_block_ids = reshaped[:, 0] // page_size
-
-        # Validate: all block_ids in each group must map to the same indexer page.
-        # sglang's PagedTokenToKVPoolAllocator guarantees page-aligned allocation,
-        # so this should never fail in practice.
-        last_in_group = reshaped[:, -1] // page_size
-        assert np.array_equal(page_block_ids, last_in_group), (
-            f"[TransferEngine] Indexer page group(s) have block_ids spanning multiple pages "
-            f"(page_size={page_size}). This indicates slot indices are not page-aligned. "
-            f"First mismatch: first_block={reshaped[page_block_ids != last_in_group][0, 0]}, "
-            f"last_block={reshaped[page_block_ids != last_in_group][0, -1]}"
-        )
-
-        return page_block_ids.astype(np.int64)
-
     def _assign_op_to_worker(self, op: TransferOp) -> None:
         self.op_id_to_nvtx_range[op.op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
                                                                        f"op_id: {op.op_id}, "
@@ -837,17 +803,9 @@ class TransferEngine:
             raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
 
         if self._has_indexer and op.transfer_type in self._indexer_worker_map:
-            # Convert block_ids to indexer page-level IDs.
-            # _convert_to_page_level_block_ids handles all page_size values uniformly
-            src_page_ids = self._convert_to_page_level_block_ids(op.src_block_ids)
-            dst_page_ids = self._convert_to_page_level_block_ids(op.dst_block_ids)
-
-            # Ensure both sides have the same number of pages after conversion
-            assert src_page_ids.size == dst_page_ids.size, (
-                f"[TransferEngine] src_page_ids size {src_page_ids.size} != "
-                f"dst_page_ids size {dst_page_ids.size} for op {op.op_id}. "
-                f"Both sides must have the same number of pages."
-            )
+            # Indexer maps 1:1 with main KV blocks, use block_ids directly.
+            src_page_ids = op.src_block_ids
+            dst_page_ids = op.dst_block_ids
             num_pages = src_page_ids.size
 
             if num_pages > 0:
@@ -864,13 +822,12 @@ class TransferEngine:
                 )
                 register_op_to_buffer(indexer_op, self.pin_buffer)
                 self._indexer_op_to_parent_op[indexer_op.op_id] = op.op_id
-                self.op_id_to_op[indexer_op.op_id] = indexer_op
+                self._indexer_op_map[indexer_op.op_id] = indexer_op
                 op.pending_count += 1
 
                 flexkv_logger.debug(
                     f"[TransferEngine] Created indexer op {indexer_op.op_id} "
                     f"for parent op {op.op_id}: {num_pages} pages, "
-                    f"page_size={self._indexer_page_size}, "
                     f"type={op.transfer_type.name}"
                 )
 
