@@ -28,8 +28,8 @@ Data flow
 
 import os
 import threading
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -41,47 +41,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-
-
-# ---------------------------------------------------------------------------
-# Statistics
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _Stats:
-    get_calls: int = 0
-    get_tokens_requested: int = 0
-    get_tokens_hit: int = 0
-    get_remote_fetches: int = 0
-    get_remote_fetch_successes: int = 0
-    get_remote_fetch_failures: int = 0
-    set_calls: int = 0
-    set_tokens_written: int = 0
-    set_tokens_deduped: int = 0
-    exists_calls: int = 0
-    errors: int = 0
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
-
-    def to_dict(self) -> Dict[str, Any]:
-        with self._lock:
-            get_rate = (
-                self.get_tokens_hit / self.get_tokens_requested
-                if self.get_tokens_requested > 0 else 0.0
-            )
-            return {
-                "get_calls": self.get_calls,
-                "get_tokens_requested": self.get_tokens_requested,
-                "get_tokens_hit": self.get_tokens_hit,
-                "get_hit_rate": round(get_rate, 4),
-                "get_remote_fetches": self.get_remote_fetches,
-                "get_remote_fetch_successes": self.get_remote_fetch_successes,
-                "get_remote_fetch_failures": self.get_remote_fetch_failures,
-                "set_calls": self.set_calls,
-                "set_tokens_written": self.set_tokens_written,
-                "set_tokens_deduped": self.set_tokens_deduped,
-                "exists_calls": self.exists_calls,
-                "errors": self.errors,
-            }
+try:
+    from sglang.srt.metrics.collector import StorageMetrics
+except ImportError:
+    from sglang.srt.observability.metrics_collector import StorageMetrics
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +187,15 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         self._page_size: int = self._cache_config.tokens_per_block
         self._mem_pool_host = mem_pool_host
         self._started = False
-        self._stats = _Stats()
+        self._bytes_per_page: int = 0
+        self._gb_per_page: float = 0.0
+
+        # SGLang-compatible metrics buffers (sliding window, cleared on get_stats)
+        self._metrics_lock = threading.Lock()
+        self._prefetch_pgs: List[int] = []
+        self._backup_pgs: List[int] = []
+        self._prefetch_bandwidth: List[float] = []
+        self._backup_bandwidth: List[float] = []
 
         self._metrics = None  # resolved after KVManager starts in register_mem_pool_host()
 
@@ -310,10 +281,20 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             self._model_config.head_size
         )
 
+        # Compute bytes_per_page for bandwidth reporting
+        dtype = getattr(self._model_config, 'dtype', None) or torch.float16
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype, torch.float16)
+        bytes_per_element = torch.tensor([], dtype=dtype).element_size()
+        self._bytes_per_page = self._elements_per_block * bytes_per_element
+        self._gb_per_page = self._bytes_per_page / (1 << 30)
+
         logger.info("KVManager started (thread mode, page_size=%d, "
-                     "cpu_blocks=%d, ssd=%s, elements_per_block=%d, mode=%s)",
+                     "cpu_blocks=%d, ssd=%s, elements_per_block=%d, "
+                     "bytes_per_page=%d, mode=%s)",
                      self._page_size, cache_config.num_cpu_blocks,
-                     cache_config.enable_ssd, self._elements_per_block, self._mode)
+                     cache_config.enable_ssd, self._elements_per_block,
+                     self._bytes_per_page, self._mode)
 
     def _sglang_to_flexkv(self, data_page: torch.Tensor) -> torch.Tensor:
         """Convert SGLang data page to FlexKV BLOCKFIRST layout.
@@ -497,8 +478,6 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         In distributed mode, also reports remote hits so that SGLang
         proceeds to batch_get_v1 where remote blocks will be fetched.
         """
-        with self._stats._lock:
-            self._stats.exists_calls += 1
         if self._metrics:
             self._metrics.record_sglang_batch_exists()
 
@@ -530,8 +509,6 @@ class FlexKVHiCacheStorage(HiCacheStorage):
 
         except Exception:
             logger.exception("batch_exists failed")
-            with self._stats._lock:
-                self._stats.errors += 1
             if self._metrics:
                 self._metrics.record_sglang_error("exists")
             return 0
@@ -551,20 +528,15 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         """
         token_ids = _get_token_ids(extra_info)
         if not token_ids or self._kv_manager is None:
-            with self._stats._lock:
-                self._stats.get_calls += 1
             if self._metrics:
                 self._metrics.record_sglang_batch_get(
                     blocks_hit=0, blocks_missed=len(keys))
             return [False] * len(keys)
 
-        with self._stats._lock:
-            self._stats.get_calls += 1
-            self._stats.get_tokens_requested += len(token_ids)
-
         try:
             from flexkv.common.block import SequenceMeta
 
+            start_time = time.perf_counter()
             arr = self._token_ids_to_numpy(token_ids)
             page_size = self._page_size
             num_pages = len(keys)
@@ -578,26 +550,19 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                                     tokens_per_block=page_size)
 
             # In distributed mode, query both local and remote trees
-            remote_fetched = False
-            remote_fetch_failed = False
             if (self._mode == "distributed"
                     and hasattr(cache_engine.cpu_cache_engine, 'match_all')):
                 match_result = cache_engine.cpu_cache_engine.match_all(seq_meta)
 
                 if match_result.matched_pos == "remote":
                     if not self._fetch_remote_blocks(arr):
-                        remote_fetch_failed = True
                         logger.debug("batch_get_v1: remote fetch failed, "
                                      "treating as miss")
-                        with self._stats._lock:
-                            self._stats.get_remote_fetches += 1
-                            self._stats.get_remote_fetch_failures += 1
                         if self._metrics:
                             self._metrics.record_sglang_remote_fetch(
                                 success=False)
                         return [False] * num_pages
 
-                    remote_fetched = True
                     # Blocks are now local -- re-query the local tree
                     match_result = cache_engine.cpu_cache_engine.match(
                         seq_meta)
@@ -625,27 +590,25 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                     results.append(False)
 
             hit_count = sum(results)
+            end_time = time.perf_counter()
             miss_count = num_pages - hit_count
-            with self._stats._lock:
-                self._stats.get_tokens_hit += hit_count * page_size
-                if remote_fetched:
-                    self._stats.get_remote_fetches += 1
-                    self._stats.get_remote_fetch_successes += 1
 
             if self._metrics:
                 self._metrics.record_sglang_batch_get(hit_count, miss_count)
-                if remote_fetched:
-                    self._metrics.record_sglang_remote_fetch(
-                        success=True, num_blocks=hit_count)
 
             if hit_count > 0:
+                elapsed = end_time - start_time
+                with self._metrics_lock:
+                    self._prefetch_pgs.append(hit_count)
+                    if elapsed > 0:
+                        self._prefetch_bandwidth.append(
+                            hit_count / elapsed * self._gb_per_page
+                        )
                 logger.debug("batch_get_v1: %d/%d pages loaded", hit_count, num_pages)
             return results
 
         except Exception:
             logger.exception("batch_get_v1 failed")
-            with self._stats._lock:
-                self._stats.errors += 1
             if self._metrics:
                 self._metrics.record_sglang_error("get")
             return [False] * len(keys)
@@ -660,14 +623,12 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         if not self._should_backup:
             return [True] * len(keys)
 
-        with self._stats._lock:
-            self._stats.set_calls += 1
-
         token_ids = _get_token_ids(extra_info)
         if not token_ids or self._kv_manager is None:
             return [False] * len(keys)
 
         try:
+            start_time = time.perf_counter()
             page_size = self._page_size
             num_pages = len(keys)
             arr = self._token_ids_to_numpy(token_ids)
@@ -685,8 +646,6 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                 cache_engine = self._kv_manager.kv_task_engine.cache_engine
                 _mr = cache_engine.cpu_cache_engine.match(_seq)
                 if _mr.num_ready_matched_blocks > 0:
-                    with self._stats._lock:
-                        self._stats.set_tokens_deduped += len(token_ids)
                     if self._metrics:
                         self._metrics.record_sglang_batch_set(
                             blocks_written=0, blocks_deduped=num_pages)
@@ -712,9 +671,16 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             # Launch H2DISK transfer (async, if SSD enabled)
             self._kv_manager.launch_cpu([task_id])
 
-            with self._stats._lock:
-                self._stats.set_tokens_written += len(cpu_block_ids) * page_size
-                self._stats.set_tokens_deduped += num_deduped * page_size
+            end_time = time.perf_counter()
+            num_written = len(cpu_block_ids)
+            if num_written > 0:
+                elapsed = end_time - start_time
+                with self._metrics_lock:
+                    self._backup_pgs.append(num_written)
+                    if elapsed > 0:
+                        self._backup_bandwidth.append(
+                            num_written / elapsed * self._gb_per_page
+                        )
 
             if self._metrics:
                 self._metrics.record_sglang_batch_set(
@@ -722,13 +688,11 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                     blocks_deduped=num_deduped)
 
             logger.debug("batch_set_v1: wrote %d new pages, %d deduped (total %d)",
-                         len(cpu_block_ids), num_deduped, num_pages)
+                         num_written, num_deduped, num_pages)
             return [True] * num_pages
 
         except Exception:
             logger.exception("batch_set_v1 failed")
-            with self._stats._lock:
-                self._stats.errors += 1
             if self._metrics:
                 self._metrics.record_sglang_error("set")
             return [False] * len(keys)
@@ -753,17 +717,31 @@ class FlexKVHiCacheStorage(HiCacheStorage):
     # Utility
     # ------------------------------------------------------------------
 
-    def get_stats(self) -> Dict[str, Any]:
-        return self._stats.to_dict()
+    def get_stats(self) -> StorageMetrics:
+        metrics = StorageMetrics()
+        with self._metrics_lock:
+            metrics.prefetch_pgs.extend(self._prefetch_pgs)
+            metrics.backup_pgs.extend(self._backup_pgs)
+            metrics.prefetch_bandwidth.extend(self._prefetch_bandwidth)
+            metrics.backup_bandwidth.extend(self._backup_bandwidth)
+            self._prefetch_pgs.clear()
+            self._backup_pgs.clear()
+            self._prefetch_bandwidth.clear()
+            self._backup_bandwidth.clear()
+        return metrics
 
     def clear(self) -> None:
         try:
             # TODO: implement KVManager cache engine clear when supported.
-            # Currently only stats are reset; cached blocks remain in the
+            # Currently only metrics are reset; cached blocks remain in the
             # radix tree and CPU cache tensor.
             logger.warning("clear() called but KVManager cache clear is not yet "
-                           "implemented — only stats are reset, cached data persists")
-            self._stats = _Stats()
+                           "implemented — only metrics are reset, cached data persists")
+            with self._metrics_lock:
+                self._prefetch_pgs.clear()
+                self._backup_pgs.clear()
+                self._prefetch_bandwidth.clear()
+                self._backup_bandwidth.clear()
         except Exception:
             logger.exception("clear() failed")
 
