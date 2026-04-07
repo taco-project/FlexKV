@@ -212,9 +212,6 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         if self._mode == "distributed" and not self._redis_host:
             raise ValueError("redis_host is required when mode='distributed'")
 
-        logger.info("Initializing  model=%s  cache=%s  mode=%s",
-                     self._model_config, self._cache_config, self._mode)
-
         self._should_backup: bool = (
             not storage_config.is_mla_model
             or storage_config.tp_rank == 0
@@ -319,8 +316,15 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                      cache_config.enable_ssd, self._elements_per_block, self._mode)
 
     def _sglang_to_flexkv(self, data_page: torch.Tensor) -> torch.Tensor:
-        """Convert SGLang data page to FlexKV BLOCKFIRST layout."""
+        """Convert SGLang data page to FlexKV BLOCKFIRST layout.
+
+        MHA (5D): SGLang (2, L, T, H, D) -> FlexKV (L, 2, T, H, D)
+        MLA (4D): SGLang (L, T, 1, D)    -> FlexKV (L, 1, T, 1, D)
+        """
         layout = getattr(self._mem_pool_host, 'layout', 'layer_first')
+        if self._model_config.use_mla:
+            # MLA: data_page is 4D (L, T, 1, D) -> (L, 1, T, 1, D)
+            return data_page.unsqueeze(1).contiguous()
         if layout == "layer_first":
             return data_page.permute(1, 0, 2, 3, 4).contiguous()
         elif layout == "page_first":
@@ -333,8 +337,15 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             raise ValueError(f"Unsupported SGLang host pool layout: {layout}")
 
     def _flexkv_to_sglang(self, block_data: torch.Tensor) -> torch.Tensor:
-        """Convert FlexKV BLOCKFIRST to SGLang layout."""
+        """Convert FlexKV BLOCKFIRST to SGLang layout.
+
+        MHA (5D): FlexKV (L, 2, T, H, D) -> SGLang (2, L, T, H, D)
+        MLA (5D): FlexKV (L, 1, T, 1, D) -> SGLang (L, T, 1, D)
+        """
         layout = getattr(self._mem_pool_host, 'layout', 'layer_first')
+        if self._model_config.use_mla:
+            # MLA: block_data is (L, 1, T, 1, D) -> (L, T, 1, D)
+            return block_data.squeeze(1).contiguous()
         if layout == "layer_first":
             return block_data.permute(1, 0, 2, 3, 4).contiguous()
         elif layout == "page_first":
@@ -409,6 +420,9 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         # explicitly provided via extra_config.
         self._auto_detect_model_params(mem_pool_host)
 
+        logger.info("Initializing  model=%s  cache=%s  mode=%s",
+                     self._model_config, self._cache_config, self._mode)
+
         sglang_page_size = getattr(mem_pool_host, 'page_size', None)
         if sglang_page_size is not None and sglang_page_size != self._page_size:
             logger.info("SGLang page_size=%d overrides configured tokens_per_block=%d",
@@ -428,22 +442,47 @@ class FlexKVHiCacheStorage(HiCacheStorage):
     def _auto_detect_model_params(self, mem_pool_host: Any) -> None:
         """Fill missing model parameters from SGLang's mem_pool_host.
 
-        SGLang's MHATokenToKVPoolHost exposes layer_num, head_num,
-        head_dim which map directly to FlexKV's ModelConfig fields.
+        SGLang uses two host pool types:
+        - MHATokenToKVPoolHost: exposes layer_num, head_num, head_dim
+        - MLATokenToKVPoolHost: exposes layer_num, kv_lora_rank, qk_rope_head_dim
         """
-        _MAP = [
-            ("num_layers", "layer_num"),
-            ("num_kv_heads", "head_num"),
-            ("head_size", "head_dim"),
-        ]
         detected = []
-        for flexkv_attr, sglang_attr in _MAP:
-            cur = getattr(self._model_config, flexkv_attr, 0)
-            if cur <= 1:  # default / not set
-                pool_val = getattr(mem_pool_host, sglang_attr, None)
-                if pool_val is not None and pool_val > 1:
-                    setattr(self._model_config, flexkv_attr, pool_val)
-                    detected.append(f"{flexkv_attr}={pool_val}")
+
+        # num_layers: common to both MHA and MLA
+        cur_layers = getattr(self._model_config, 'num_layers', 0)
+        if cur_layers <= 1:
+            pool_val = getattr(mem_pool_host, 'layer_num', None)
+            if pool_val is not None and pool_val > 1:
+                self._model_config.num_layers = pool_val
+                detected.append(f"num_layers={pool_val}")
+
+        if self._model_config.use_mla:
+            # MLA: num_kv_heads=1 (unified KV), head_size = kv_lora_rank + qk_rope_head_dim
+            kv_lora_rank = getattr(mem_pool_host, 'kv_lora_rank', None)
+            qk_rope_head_dim = getattr(mem_pool_host, 'qk_rope_head_dim', None)
+            if kv_lora_rank is not None and qk_rope_head_dim is not None:
+                self._model_config.num_kv_heads = 1
+                mla_head_size = kv_lora_rank + qk_rope_head_dim
+                if getattr(self._model_config, 'head_size', 0) <= 1:
+                    self._model_config.head_size = mla_head_size
+                    detected.append(f"head_size={mla_head_size} "
+                                    f"(kv_lora_rank={kv_lora_rank}+"
+                                    f"qk_rope_head_dim={qk_rope_head_dim})")
+                detected.append("num_kv_heads=1 (MLA)")
+        else:
+            # MHA: head_num, head_dim
+            _MAP = [
+                ("num_kv_heads", "head_num"),
+                ("head_size", "head_dim"),
+            ]
+            for flexkv_attr, sglang_attr in _MAP:
+                cur = getattr(self._model_config, flexkv_attr, 0)
+                if cur <= 1:
+                    pool_val = getattr(mem_pool_host, sglang_attr, None)
+                    if pool_val is not None and pool_val > 1:
+                        setattr(self._model_config, flexkv_attr, pool_val)
+                        detected.append(f"{flexkv_attr}={pool_val}")
+
         if detected:
             logger.info("Auto-detected from mem_pool_host: %s",
                         ", ".join(detected))

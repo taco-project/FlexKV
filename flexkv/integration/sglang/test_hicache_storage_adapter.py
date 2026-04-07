@@ -24,6 +24,10 @@ Test Coverage
     - Tests layout transform (SGLang layer_first <-> FlexKV BLOCKFIRST)
     - Validates that data written via batch_set_v1 can be read back exactly
 14. test_set_with_deduplication: Edge case - set same tokens twice, verify dedup + get
+15. test_mla_auto_detect: MLA model param auto-detection from MLATokenToKVPoolHost
+16. test_mla_layout_transform: MLA 4D layout transform (unsqueeze/squeeze)
+17. test_mla_set_exists_get_roundtrip: Full MLA round-trip with data validation
+18. test_mla_set_with_deduplication: MLA dedup + get with data validation
 
 Known Issues Being Tested
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -71,6 +75,23 @@ def _make_config(tp_rank=0, tp_size=1, is_mla=False, num_cpu_blocks=1000,
     )
 
 
+def _make_mla_config(tp_rank=0, tp_size=1, num_cpu_blocks=1000, page_size=4):
+    """Create a HiCacheStorageConfig for MLA model testing.
+
+    MLA models use unified KV (num_kv_heads=1, head_size=kv_lora_rank+qk_rope_head_dim).
+    We leave num_kv_heads/head_size unset so auto-detect can fill them.
+    """
+    return HiCacheStorageConfig(
+        tp_rank=tp_rank, tp_size=tp_size, is_mla_model=True,
+        is_page_first_layout=False, model_name="test-mla",
+        extra_config={
+            "num_layers": 4, "tokens_per_block": page_size,
+            "enable_cpu": True, "enable_ssd": False,
+            "num_cpu_blocks": num_cpu_blocks,
+        }
+    )
+
+
 def _make_mock_pool(page_size=4, num_layers=4, num_kv_heads=2,
                     head_size=64, num_host_tokens=64):
     """Create a mock mem_pool_host simulating SGLang's MHATokenToKVPoolHost."""
@@ -88,6 +109,50 @@ def _make_mock_pool(page_size=4, num_layers=4, num_kv_heads=2,
 
     def get_data_page(index, flat=True):
         page = kv_buffer[:, :, index:index + page_size, :, :]
+        return page.flatten() if flat else page
+
+    def set_from_flat_data_page(index, data_page):
+        written_pages[index] = data_page.clone()
+
+    pool.get_data_page = get_data_page
+    pool.set_from_flat_data_page = set_from_flat_data_page
+    pool._written_pages = written_pages
+    pool._kv_buffer = kv_buffer
+
+    return pool
+
+
+# MLA model constants (mimicking DeepSeek V2 with small dimensions for testing)
+_MLA_KV_LORA_RANK = 48
+_MLA_QK_ROPE_HEAD_DIM = 16
+_MLA_HEAD_SIZE = _MLA_KV_LORA_RANK + _MLA_QK_ROPE_HEAD_DIM  # 64
+
+
+def _make_mla_mock_pool(page_size=4, num_layers=4, num_host_tokens=64):
+    """Create a mock mem_pool_host simulating SGLang's MLATokenToKVPoolHost.
+
+    MLA stores KV as a single unified tensor: (L, T, 1, kv_lora_rank+qk_rope_head_dim).
+    No K/V split (no leading dimension of 2).
+    """
+    pool = MagicMock()
+    pool.layout = "layer_first"
+    pool.page_size = page_size
+    pool.layer_num = num_layers
+    pool.kv_lora_rank = _MLA_KV_LORA_RANK
+    pool.qk_rope_head_dim = _MLA_QK_ROPE_HEAD_DIM
+    # MLA pools do NOT have head_num / head_dim
+    pool.head_num = None
+    pool.head_dim = None
+
+    # MLA kv_buffer: (L, T, 1, D)
+    kv_buffer = torch.randn(
+        num_layers, num_host_tokens, 1, _MLA_HEAD_SIZE,
+        dtype=torch.bfloat16)
+
+    written_pages = {}
+
+    def get_data_page(index, flat=True):
+        page = kv_buffer[:, index:index + page_size, :, :]
         return page.flatten() if flat else page
 
     def set_from_flat_data_page(index, data_page):
@@ -273,6 +338,57 @@ def test_mode_in_cache_keys():
 
 
 # ---------------------------------------------------------------------------
+# MLA-specific pure logic tests
+# ---------------------------------------------------------------------------
+
+def test_mla_auto_detect():
+    """MLA model param auto-detection from MLATokenToKVPoolHost."""
+    config = _make_mla_config()
+    backend = FlexKVHiCacheStorage(config)
+
+    # Before register: defaults (head_size=1, num_kv_heads=1)
+    assert backend._model_config.use_mla is True
+    assert backend._model_config.num_kv_heads == 1  # default
+    assert backend._model_config.head_size == 1     # not yet detected
+
+    # Simulate auto-detect without actually starting KVManager
+    pool = _make_mla_mock_pool()
+    backend._auto_detect_model_params(pool)
+
+    assert backend._model_config.num_layers == 4
+    assert backend._model_config.num_kv_heads == 1
+    assert backend._model_config.head_size == _MLA_HEAD_SIZE, \
+        f"Expected head_size={_MLA_HEAD_SIZE}, got {backend._model_config.head_size}"
+
+
+def test_mla_layout_transform():
+    """MLA 4D tensor layout transform round-trip."""
+    config = _make_mla_config()
+    backend = FlexKVHiCacheStorage(config)
+    backend._mem_pool_host = _make_mla_mock_pool()
+    backend._model_config.head_size = _MLA_HEAD_SIZE
+
+    # SGLang MLA data page: (L, T, 1, D)
+    num_layers, page_size = 4, 4
+    sglang_page = torch.randn(num_layers, page_size, 1, _MLA_HEAD_SIZE,
+                              dtype=torch.bfloat16)
+
+    # SGLang -> FlexKV: (L, T, 1, D) -> (L, 1, T, 1, D)
+    flexkv_block = backend._sglang_to_flexkv(sglang_page)
+    assert flexkv_block.shape == (num_layers, 1, page_size, 1, _MLA_HEAD_SIZE), \
+        f"Expected (4,1,4,1,{_MLA_HEAD_SIZE}), got {flexkv_block.shape}"
+
+    # FlexKV -> SGLang: (L, 1, T, 1, D) -> (L, T, 1, D)
+    roundtrip_page = backend._flexkv_to_sglang(flexkv_block)
+    assert roundtrip_page.shape == sglang_page.shape, \
+        f"Expected {sglang_page.shape}, got {roundtrip_page.shape}"
+
+    # Data integrity: round-trip should be lossless
+    assert torch.equal(roundtrip_page, sglang_page), \
+        "MLA layout transform round-trip data mismatch"
+
+
+# ---------------------------------------------------------------------------
 # Integration tests (real KVManager in thread mode)
 # ---------------------------------------------------------------------------
 
@@ -428,6 +544,118 @@ def test_set_with_deduplication():
                 f"Page {page_idx}: expected {float(page_idx + 1)}, got something else"
 
 
+def test_mla_set_exists_get_roundtrip():
+    """Full MLA set -> exists -> get cycle with data validation."""
+    os.environ["FLEXKV_CPU_ONLY"] = "1"
+    os.environ["FLEXKV_INSTANCE_NUM"] = "0"
+
+    config = _make_mla_config(page_size=4)
+    backend = FlexKVHiCacheStorage(config)
+    write_pool = _make_mla_mock_pool(page_size=4)
+    backend.register_mem_pool_host(write_pool)
+
+    # Verify auto-detect worked
+    assert backend._model_config.use_mla is True
+    assert backend._model_config.num_kv_heads == 1
+    assert backend._model_config.head_size == _MLA_HEAD_SIZE
+
+    token_ids = list(range(100, 116))  # 16 tokens = 4 pages
+    keys = ["key0", "key1", "key2", "key3"]
+    write_host_indices = torch.arange(0, 16, dtype=torch.int64)
+
+    # Seed write pool with distinct values per page
+    for page_idx in range(4):
+        start = page_idx * 4
+        end = start + 4
+        write_pool._kv_buffer[:, start:end, :, :] = float(page_idx + 1)
+
+    extra = HiCacheStorageExtraInfo(
+        prefix_keys=None, extra_info={"token_ids": token_ids})
+
+    # Before set: nothing exists
+    assert backend.batch_exists(keys, extra) == 0
+
+    # Set
+    set_results = backend.batch_set_v1(keys, write_host_indices, extra)
+    assert all(set_results), f"batch_set_v1 failed: {set_results}"
+
+    # After set: all exist
+    exists_count = backend.batch_exists(keys, extra)
+    assert exists_count == 4, f"Expected 4, got {exists_count}"
+
+    # Read back with a fresh pool
+    read_pool = _make_mla_mock_pool(page_size=4)
+    read_host_indices = torch.arange(0, 16, dtype=torch.int64)
+    old_pool = backend._mem_pool_host
+    backend._mem_pool_host = read_pool
+
+    read_results = backend.batch_get_v1(keys, read_host_indices, extra)
+    assert all(read_results), f"batch_get_v1 failed: {read_results}"
+
+    # Verify data integrity
+    for page_idx in range(4):
+        host_token_start = page_idx * 4
+        if host_token_start in read_pool._written_pages:
+            read_data = read_pool._written_pages[host_token_start]
+            # MLA shape: (L, T, 1, D)
+            expected_shape = (4, 4, 1, _MLA_HEAD_SIZE)
+            read_data_shaped = read_data.reshape(expected_shape)
+            expected_data = write_pool._kv_buffer[:, page_idx*4:(page_idx+1)*4, :, :]
+            assert torch.allclose(read_data_shaped, expected_data, rtol=1e-3, atol=1e-4), \
+                f"MLA page {page_idx} data mismatch after get"
+
+    backend._mem_pool_host = old_pool
+
+
+def test_mla_set_with_deduplication():
+    """MLA dedup: set same tokens twice, verify original data preserved."""
+    os.environ["FLEXKV_CPU_ONLY"] = "1"
+    os.environ["FLEXKV_INSTANCE_NUM"] = "0"
+
+    config = _make_mla_config(page_size=4)
+    backend = FlexKVHiCacheStorage(config)
+    pool = _make_mla_mock_pool(page_size=4)
+    backend.register_mem_pool_host(pool)
+
+    token_ids = list(range(100, 116))
+    keys = ["key0", "key1", "key2", "key3"]
+    host_indices = torch.arange(0, 16, dtype=torch.int64)
+
+    # Seed with distinct values
+    for page_idx in range(4):
+        pool._kv_buffer[:, page_idx*4:(page_idx+1)*4, :, :] = float(page_idx + 1)
+
+    extra = HiCacheStorageExtraInfo(
+        prefix_keys=None, extra_info={"token_ids": token_ids})
+
+    # First set
+    assert all(backend.batch_set_v1(keys, host_indices, extra))
+
+    # Change pool values
+    for page_idx in range(4):
+        pool._kv_buffer[:, page_idx*4:(page_idx+1)*4, :, :] = float(page_idx + 10)
+
+    # Second set (should dedup)
+    assert all(backend.batch_set_v1(keys, host_indices, extra))
+
+    # Read back: should get original data (1.0, 2.0, ...)
+    read_pool = _make_mla_mock_pool(page_size=4)
+    backend._mem_pool_host = read_pool
+
+    assert all(backend.batch_get_v1(keys, host_indices, extra))
+
+    for page_idx in range(4):
+        host_token_start = page_idx * 4
+        if host_token_start in read_pool._written_pages:
+            read_data = read_pool._written_pages[host_token_start]
+            read_data_shaped = read_data.reshape(4, 4, 1, _MLA_HEAD_SIZE)
+            assert torch.allclose(
+                read_data_shaped,
+                torch.full_like(read_data_shaped, float(page_idx + 1)),
+                rtol=1e-3, atol=1e-4), \
+                f"MLA page {page_idx}: expected {float(page_idx + 1)}, got different"
+
+
 def test_stats():
     """Statistics are collected correctly."""
     os.environ["FLEXKV_CPU_ONLY"] = "1"
@@ -447,12 +675,14 @@ def test_stats():
     backend.batch_exists(keys, extra)
 
     stats = backend.get_stats()
-    expected_keys = {'get_calls', 'set_calls', 'get_tokens_requested',
-                     'get_tokens_hit', 'get_hit_rate', 'set_tokens_written',
-                     'set_tokens_deduped', 'exists_calls', 'errors'}
-    assert expected_keys.issubset(stats.keys())
-    assert stats['set_tokens_written'] > 0
-    assert stats['errors'] == 0
+    # get_stats() now returns SGLang's StorageMetrics dataclass
+    assert hasattr(stats, 'prefetch_pgs'), "Missing prefetch_pgs"
+    assert hasattr(stats, 'backup_pgs'), "Missing backup_pgs"
+    assert hasattr(stats, 'prefetch_bandwidth'), "Missing prefetch_bandwidth"
+    assert hasattr(stats, 'backup_bandwidth'), "Missing backup_bandwidth"
+    assert isinstance(stats.backup_pgs, list)
+    assert len(stats.backup_pgs) > 0, "Expected backup_pgs after batch_set_v1"
+    assert stats.backup_pgs[0] > 0, "Expected positive backup page count"
 
 
 # ---------------------------------------------------------------------------
@@ -471,9 +701,13 @@ ALL_TESTS = [
     ("distributed missing redis raises", test_distributed_missing_redis_raises),
     ("distributed redis password", test_distributed_redis_password),
     ("mode in cache keys", test_mode_in_cache_keys),
+    ("MLA auto-detect", test_mla_auto_detect),
+    ("MLA layout transform", test_mla_layout_transform),
     ("set -> exists round-trip", test_set_exists_roundtrip),
     ("set -> exists -> get round-trip", test_set_exists_get_roundtrip),
     ("set with deduplication", test_set_with_deduplication),
+    ("MLA set -> exists -> get round-trip", test_mla_set_exists_get_roundtrip),
+    ("MLA set with deduplication", test_mla_set_with_deduplication),
     ("stats collection", test_stats),
 ]
 
