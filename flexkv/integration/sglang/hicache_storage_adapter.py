@@ -26,9 +26,7 @@ Data flow
       KVManager.get_match()  ->  radix tree prefix match  ->  consecutive page count
 """
 
-import logging
 import os
-import sys
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,14 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-# Configure logger with stderr handler for visibility in SGLang
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    _handler = logging.StreamHandler(sys.stderr)
-    _handler.setFormatter(logging.Formatter("[FlexKV] %(levelname)s %(message)s"))
-    logger.addHandler(_handler)
-    _log_level = os.environ.get("FLEXKV_LOG_LEVEL", "INFO").upper()
-    logger.setLevel(getattr(logging, _log_level, logging.INFO))
+from flexkv.common.debug import flexkv_logger as logger
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
