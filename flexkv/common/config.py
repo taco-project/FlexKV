@@ -19,7 +19,6 @@ class IndexerCacheConfig:
     head_size: int = 0          # qk_rope_head_dim for DSA/NSA models
     num_kv_heads: int = 1       # typically 1 for MLA-style indexer
     dtype: torch.dtype = torch.uint8  # indexer storage dtype (fp8 quantized)
-    page_size: int = 1
 
 
 @dataclass

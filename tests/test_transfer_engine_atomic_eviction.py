@@ -245,8 +245,8 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         engine._has_indexer = True
         engine._worker_map = {}
         engine._indexer_worker_map = {}
-        engine._indexer_page_size = 1
         engine._indexer_op_to_parent_op = {}
+        engine._indexer_op_map = {}
         engine.op_id_to_op = {}
         engine.op_id_to_nvtx_range = {}
         engine.completed_queue = MagicMock()
