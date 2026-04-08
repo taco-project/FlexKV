@@ -361,10 +361,20 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         """Get a flat view of a CPU cache block for direct memcpy."""
         start = int(block_id) * self._elements_per_block
         end = start + self._elements_per_block
+        if end > len(self._cpu_cache_tensor):
+            raise ValueError(
+                f"block_id {block_id} out of bounds "
+                f"(offset {end} > tensor size {len(self._cpu_cache_tensor)})")
         return self._cpu_cache_tensor[start:end]
 
     def _get_block_shaped(self, block_id: int) -> torch.Tensor:
-        """Get a CPU cache block reshaped to BLOCKFIRST: [L, kv_dim, T, H, D]."""
+        """Get a CPU cache block reshaped to BLOCKFIRST: [L, kv_dim, T, H, D].
+
+        Returns a **view** into the CPU cache tensor.  Callers that need
+        isolation from concurrent writes (e.g. batch_get_v1) must ``.clone()``
+        the result themselves; callers that write *into* the block
+        (e.g. batch_set_v1) must use the view directly.
+        """
         return self._get_block_view(block_id).view(self._block_shape)
 
     def _write_layer_to_host(self, block_data: torch.Tensor, layer_id: int,
@@ -375,24 +385,30 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         copying directly at layer granularity (layer_first layout).
         """
         end = host_start + self._page_size
+        kv_buf = self._mem_pool_host.kv_buffer
+        if host_start < 0 or end > kv_buf.shape[2]:
+            logger.error("_write_layer_to_host: OOB host_start=%d end=%d "
+                         "kv_buffer.shape=%s", host_start, end, kv_buf.shape)
+            return
         layer_slice = block_data[layer_id]
         if use_mla:
-            self._mem_pool_host.kv_buffer[layer_id, host_start:end, :, :] = (
-                layer_slice[0])
+            kv_buf[layer_id, host_start:end, :, :] = layer_slice[0]
         else:
-            self._mem_pool_host.kv_buffer[:, layer_id, host_start:end, :, :] = (
-                layer_slice)
+            kv_buf[:, layer_id, host_start:end, :, :] = layer_slice
 
     def _read_layer_from_host(self, block_data: torch.Tensor, layer_id: int,
                               host_start: int, use_mla: bool) -> None:
         """Read one layer from SGLang Host kv_buffer into a FlexKV block."""
         end = host_start + self._page_size
+        kv_buf = self._mem_pool_host.kv_buffer
+        if host_start < 0 or end > kv_buf.shape[2]:
+            logger.error("_read_layer_from_host: OOB host_start=%d end=%d "
+                         "kv_buffer.shape=%s", host_start, end, kv_buf.shape)
+            return
         if use_mla:
-            block_data[layer_id, 0] = self._mem_pool_host.kv_buffer[
-                layer_id, host_start:end, :, :]
+            block_data[layer_id, 0] = kv_buf[layer_id, host_start:end, :, :]
         else:
-            block_data[layer_id] = self._mem_pool_host.kv_buffer[
-                :, layer_id, host_start:end, :, :]
+            block_data[layer_id] = kv_buf[:, layer_id, host_start:end, :, :]
 
     def _fetch_remote_blocks(self, token_ids: np.ndarray) -> bool:
         """Fetch remote blocks into local CPU cache via prefetch_async.
@@ -633,7 +649,8 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                 host_starts = []
                 for page_idx in range(matched_pages):
                     bid = match_result.physical_blocks[page_idx]
-                    block_views.append(self._get_block_shaped(bid))
+                    # Clone to isolate from concurrent batch_set_v1 writes
+                    block_views.append(self._get_block_shaped(bid).clone())
                     host_starts.append(
                         host_indices[page_idx * page_size].item())
 
@@ -662,7 +679,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                     if page_idx < matched_pages:
                         block_id = match_result.physical_blocks[page_idx]
                         try:
-                            block_data = self._get_block_shaped(block_id)
+                            block_data = self._get_block_shaped(block_id).clone()
                             transformed = self._flexkv_to_sglang(block_data)
                             host_token_start = host_indices[
                                 page_idx * page_size].item()
