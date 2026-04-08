@@ -125,6 +125,8 @@ proceeds with normal prefill computation.
 |------|---------|
 | `flexkv/integration/sglang/__init__.py` | Package marker |
 | `flexkv/integration/sglang/hicache_storage_adapter.py` | Main adapter: `FlexKVHiCacheStorage` class |
+| `flexkv/integration/sglang/patch_sglang.py` | One-click SGLang patch tool (`flexkv-patch-sglang` CLI) |
+| `flexkv/integration/sglang/patches/sglang_flexkv.patch` | Unified diff for SGLang (3 source files) |
 | `flexkv/integration/sglang/test_hicache_storage_adapter.py` | Unit tests (15 test cases) |
 
 ### SGLang Side (separate repo/branch)
@@ -133,6 +135,52 @@ proceeds with normal prefill computation.
 |------|---------|
 | `sglang/srt/managers/cache_controller.py` | Add `"flexkv"` to zero-copy whitelist; pass `token_ids` via `extra_info` in 3 places (`_page_backup`, `_page_transfer`, `_storage_hit_query`) |
 | `sglang/srt/mem_cache/storage/backend_factory.py` | Register `"flexkv"` backend pointing to `FlexKVHiCacheStorage` |
+
+## Quick Start
+
+### 1. Install FlexKV
+
+```bash
+# Debug mode (development)
+FLEXKV_DEBUG=1 pip install -e /path/to/FlexKV
+
+# Release mode
+pip install -e /path/to/FlexKV --no-build-isolation
+```
+
+### 2. Patch SGLang (one-click)
+
+FlexKV requires a small patch to SGLang (3 files, ~40 lines). A CLI tool is
+provided to apply it automatically:
+
+```bash
+# Auto-detect SGLang location and apply patch
+flexkv-patch-sglang
+
+# Check if patch is already applied
+flexkv-patch-sglang --check
+
+# Revert the patch
+flexkv-patch-sglang --revert
+
+# Manually specify SGLang source path
+flexkv-patch-sglang --sglang-path /path/to/sglang
+```
+
+The tool tries `git apply` first (for editable installs), then falls back to
+`patch -p1`. The patch is bundled at
+`flexkv/integration/sglang/patches/sglang_flexkv.patch`.
+
+### 3. Launch SGLang with FlexKV
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path /path/to/model \
+    --enable-hierarchical-cache \
+    --page-size 16 \
+    --hicache-storage-backend flexkv \
+    --hicache-storage-backend-extra-config '{"enable_cpu": true, "num_cpu_blocks": 100000}'
+```
 
 ## Configuration
 
