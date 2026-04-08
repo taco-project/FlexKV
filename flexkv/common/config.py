@@ -35,6 +35,10 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_gds: bool = False # Requires enable_ssd=True
+    # With nixl_backend=UCX: TransferEngine uses NixlTransferWorker for H2D/D2H (tp_size==1 only).
+    enable_nixl: bool = False
+    # Must be "UCX" (case-insensitive) for NixlTransferWorker; other values keep GPUCPUTransferWorker.
+    nixl_backend: str = "UCX"
     enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
                                 # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
     enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
