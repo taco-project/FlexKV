@@ -59,6 +59,8 @@ _OP_GET = "get"
 _OP_SET = "set"
 _OP_EXISTS = "exists"
 
+_LAYOUT_LAYER_FIRST = "layer_first"
+
 
 # ---------------------------------------------------------------------------
 # Helper: extract token_ids from extra_info
@@ -319,11 +321,11 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         MHA (5D): SGLang (2, L, T, H, D) -> FlexKV (L, 2, T, H, D)
         MLA (4D): SGLang (L, T, 1, D)    -> FlexKV (L, 1, T, 1, D)
         """
-        layout = getattr(self._mem_pool_host, 'layout', 'layer_first')
+        layout = getattr(self._mem_pool_host, 'layout', _LAYOUT_LAYER_FIRST)
         if self._model_config.use_mla:
             # MLA: data_page is 4D (L, T, 1, D) -> (L, 1, T, 1, D)
             return data_page.unsqueeze(1).contiguous()
-        if layout == "layer_first":
+        if layout == _LAYOUT_LAYER_FIRST:
             return data_page.permute(1, 0, 2, 3, 4).contiguous()
         elif layout == "page_first":
             return data_page.permute(2, 0, 1, 3, 4).contiguous()
@@ -340,11 +342,11 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         MHA (5D): FlexKV (L, 2, T, H, D) -> SGLang (2, L, T, H, D)
         MLA (5D): FlexKV (L, 1, T, 1, D) -> SGLang (L, T, 1, D)
         """
-        layout = getattr(self._mem_pool_host, 'layout', 'layer_first')
+        layout = getattr(self._mem_pool_host, 'layout', _LAYOUT_LAYER_FIRST)
         if self._model_config.use_mla:
             # MLA: block_data is (L, 1, T, 1, D) -> (L, T, 1, D)
             return block_data.squeeze(1).contiguous()
-        if layout == "layer_first":
+        if layout == _LAYOUT_LAYER_FIRST:
             return block_data.permute(1, 0, 2, 3, 4).contiguous()
         elif layout == "page_first":
             return block_data.permute(1, 2, 0, 3, 4).contiguous()
@@ -364,6 +366,33 @@ class FlexKVHiCacheStorage(HiCacheStorage):
     def _get_block_shaped(self, block_id: int) -> torch.Tensor:
         """Get a CPU cache block reshaped to BLOCKFIRST: [L, kv_dim, T, H, D]."""
         return self._get_block_view(block_id).view(self._block_shape)
+
+    def _write_layer_to_host(self, block_data: torch.Tensor, layer_id: int,
+                             host_start: int, use_mla: bool) -> None:
+        """Write one layer of a FlexKV block into SGLang Host kv_buffer.
+
+        Avoids the permute+contiguous overhead of the whole-page path by
+        copying directly at layer granularity (layer_first layout).
+        """
+        end = host_start + self._page_size
+        layer_slice = block_data[layer_id]
+        if use_mla:
+            self._mem_pool_host.kv_buffer[layer_id, host_start:end, :, :] = (
+                layer_slice[0])
+        else:
+            self._mem_pool_host.kv_buffer[:, layer_id, host_start:end, :, :] = (
+                layer_slice)
+
+    def _read_layer_from_host(self, block_data: torch.Tensor, layer_id: int,
+                              host_start: int, use_mla: bool) -> None:
+        """Read one layer from SGLang Host kv_buffer into a FlexKV block."""
+        end = host_start + self._page_size
+        if use_mla:
+            block_data[layer_id, 0] = self._mem_pool_host.kv_buffer[
+                layer_id, host_start:end, :, :]
+        else:
+            block_data[layer_id] = self._mem_pool_host.kv_buffer[
+                :, layer_id, host_start:end, :, :]
 
     def _fetch_remote_blocks(self, token_ids: np.ndarray) -> bool:
         """Fetch remote blocks into local CPU cache via prefetch_async.
@@ -532,10 +561,12 @@ class FlexKVHiCacheStorage(HiCacheStorage):
     ) -> List[bool]:
         """Load KV blocks from FlexKV into SGLang's Host memory pool.
 
-        In local mode: fetches from local CPU cache only.
-        In distributed mode: discovers blocks via distributed radix tree;
-        if blocks are on a remote node, fetches them via P2P transfer
-        into the local CPU cache first, then reads locally.
+        For layer_first layout, copies data layer-by-layer to enable future
+        pipelining with Host-to-GPU transfers.  An optional callback
+        ``extra_info.extra_info["layer_ready_callback"]`` is invoked after
+        each layer completes, allowing the caller to overlap work.
+
+        Other layouts fall back to whole-page copy via permute+flatten.
         """
         token_ids = _get_token_ids(extra_info)
         if not token_ids or self._kv_manager is None:
@@ -561,6 +592,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                                     tokens_per_block=page_size)
 
             # In distributed mode, query both local and remote trees
+            remote_fetched = False
             if (self._mode == MODE_DISTRIBUTED
                     and hasattr(cache_engine.cpu_cache_engine, 'match_all')):
                 match_result = cache_engine.cpu_cache_engine.match_all(seq_meta)
@@ -574,7 +606,7 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                                 success=False)
                         return [False] * num_pages
 
-                    # Blocks are now local -- re-query the local tree
+                    remote_fetched = True
                     match_result = cache_engine.cpu_cache_engine.match(
                         seq_meta)
             else:
@@ -582,23 +614,69 @@ class FlexKVHiCacheStorage(HiCacheStorage):
 
             matched_pages = match_result.num_ready_matched_blocks
 
-            results: List[bool] = []
-            for page_idx in range(num_pages):
-                if page_idx < matched_pages:
-                    block_id = match_result.physical_blocks[page_idx]
-                    try:
-                        block_data = self._get_block_shaped(block_id)
-                        transformed = self._flexkv_to_sglang(block_data)
-                        host_token_start = host_indices[page_idx * page_size].item()
-                        self._mem_pool_host.set_from_flat_data_page(
-                            host_token_start, transformed.flatten()
-                        )
-                        results.append(True)
-                    except Exception:
-                        logger.exception("batch_get_v1: failed to read block %d", block_id)
+            # Extract optional layer-ready callback
+            layer_ready_cb = None
+            if (extra_info and hasattr(extra_info, 'extra_info')
+                    and isinstance(extra_info.extra_info, dict)):
+                layer_ready_cb = extra_info.extra_info.get(
+                    "layer_ready_callback")
+
+            layout = getattr(self._mem_pool_host, 'layout', _LAYOUT_LAYER_FIRST)
+
+            if layout == _LAYOUT_LAYER_FIRST and matched_pages > 0:
+                # Layerwise path: outer loop = layer, inner loop = page.
+                # Precompute invariants to avoid repeated work in O(layers*pages) loop.
+                results = [False] * num_pages
+                num_layers = self._model_config.num_layers
+                use_mla = self._model_config.use_mla
+                block_views = []
+                host_starts = []
+                for page_idx in range(matched_pages):
+                    bid = match_result.physical_blocks[page_idx]
+                    block_views.append(self._get_block_shaped(bid))
+                    host_starts.append(
+                        host_indices[page_idx * page_size].item())
+
+                try:
+                    for layer_id in range(num_layers):
+                        for page_idx in range(matched_pages):
+                            self._write_layer_to_host(
+                                block_views[page_idx], layer_id,
+                                host_starts[page_idx], use_mla)
+
+                        if layer_ready_cb:
+                            layer_ready_cb(layer_id)
+                except Exception:
+                    logger.exception(
+                        "batch_get_v1: layerwise read failed at layer %d",
+                        layer_id)
+                    return [False] * num_pages
+
+                # Mark matched pages as successful
+                for page_idx in range(matched_pages):
+                    results[page_idx] = True
+            else:
+                # Whole-page fallback for non-layer_first layouts
+                results = []
+                for page_idx in range(num_pages):
+                    if page_idx < matched_pages:
+                        block_id = match_result.physical_blocks[page_idx]
+                        try:
+                            block_data = self._get_block_shaped(block_id)
+                            transformed = self._flexkv_to_sglang(block_data)
+                            host_token_start = host_indices[
+                                page_idx * page_size].item()
+                            self._mem_pool_host.set_from_flat_data_page(
+                                host_token_start, transformed.flatten()
+                            )
+                            results.append(True)
+                        except Exception:
+                            logger.exception(
+                                "batch_get_v1: failed to read block %d",
+                                block_id)
+                            results.append(False)
+                    else:
                         results.append(False)
-                else:
-                    results.append(False)
 
             hit_count = sum(results)
             end_time = time.perf_counter()
@@ -606,6 +684,9 @@ class FlexKVHiCacheStorage(HiCacheStorage):
 
             if self._metrics:
                 self._metrics.record_sglang_batch_get(hit_count, miss_count)
+                if remote_fetched:
+                    self._metrics.record_sglang_remote_fetch(
+                        success=True, num_blocks=hit_count)
 
             if hit_count > 0:
                 elapsed = end_time - start_time
@@ -615,7 +696,9 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                         self._prefetch_bandwidth.append(
                             hit_count / elapsed * self._gb_per_page
                         )
-                logger.debug("batch_get_v1: %d/%d pages loaded", hit_count, num_pages)
+                logger.debug("batch_get_v1: %d/%d pages loaded (layerwise=%s)",
+                             hit_count, num_pages,
+                             layout == _LAYOUT_LAYER_FIRST)
             return results
 
         except Exception:
@@ -667,17 +750,38 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             # Deduped blocks are always the prefix (radix tree matches from
             # start), so new blocks start at index num_deduped.
             num_deduped = num_pages - len(cpu_block_ids)
-            for i, block_id in enumerate(cpu_block_ids):
-                page_idx = num_deduped + i
+            layout = getattr(self._mem_pool_host, 'layout', _LAYOUT_LAYER_FIRST)
 
-                host_token_start = host_indices[page_idx * page_size].item()
-                data_page = self._mem_pool_host.get_data_page(
-                    host_token_start, flat=False
-                )
+            if layout == _LAYOUT_LAYER_FIRST:
+                # Layerwise path: copy layer-by-layer directly from kv_buffer.
+                # Precompute invariants to avoid repeated work in O(layers*blocks) loop.
+                num_layers = self._model_config.num_layers
+                use_mla = self._model_config.use_mla
+                block_views = []
+                host_starts = []
+                for i, block_id in enumerate(cpu_block_ids):
+                    page_idx = num_deduped + i
+                    block_views.append(self._get_block_shaped(block_id))
+                    host_starts.append(
+                        host_indices[page_idx * page_size].item())
 
-                transformed = self._sglang_to_flexkv(data_page)
-                dst = self._get_block_view(block_id)
-                dst.copy_(transformed.flatten())
+                for layer_id in range(num_layers):
+                    for i in range(len(cpu_block_ids)):
+                        self._read_layer_from_host(
+                            block_views[i], layer_id,
+                            host_starts[i], use_mla)
+            else:
+                # Whole-page fallback for non-layer_first layouts
+                for i, block_id in enumerate(cpu_block_ids):
+                    page_idx = num_deduped + i
+                    host_token_start = host_indices[
+                        page_idx * page_size].item()
+                    data_page = self._mem_pool_host.get_data_page(
+                        host_token_start, flat=False
+                    )
+                    transformed = self._sglang_to_flexkv(data_page)
+                    dst = self._get_block_view(block_id)
+                    dst.copy_(transformed.flatten())
 
             # Launch H2DISK transfer (async, if SSD enabled)
             self._kv_manager.launch_cpu([task_id])

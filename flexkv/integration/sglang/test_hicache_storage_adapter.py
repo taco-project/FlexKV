@@ -28,6 +28,9 @@ Test Coverage
 16. test_mla_layout_transform: MLA 4D layout transform (unsqueeze/squeeze)
 17. test_mla_set_exists_get_roundtrip: Full MLA round-trip with data validation
 18. test_mla_set_with_deduplication: MLA dedup + get with data validation
+19. test_layerwise_get_data_integrity: Layerwise get produces bit-exact data vs whole-page
+20. test_layerwise_callback: layer_ready_callback invoked num_layers times in order
+21. test_mla_layerwise_roundtrip: MLA layerwise set->get round-trip
 
 Known Issues Being Tested
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -118,6 +121,7 @@ def _make_mock_pool(page_size=4, num_layers=4, num_kv_heads=2,
     pool.set_from_flat_data_page = set_from_flat_data_page
     pool._written_pages = written_pages
     pool._kv_buffer = kv_buffer
+    pool.kv_buffer = kv_buffer  # layerwise path writes directly here
 
     return pool
 
@@ -162,6 +166,7 @@ def _make_mla_mock_pool(page_size=4, num_layers=4, num_host_tokens=64):
     pool.set_from_flat_data_page = set_from_flat_data_page
     pool._written_pages = written_pages
     pool._kv_buffer = kv_buffer
+    pool.kv_buffer = kv_buffer  # layerwise path writes directly here
 
     return pool
 
@@ -685,6 +690,127 @@ def test_stats():
 
 
 # ---------------------------------------------------------------------------
+# Layerwise tests
+# ---------------------------------------------------------------------------
+
+def test_layerwise_get_data_integrity():
+    """Layerwise get produces identical data to whole-page get."""
+    os.environ["FLEXKV_CPU_ONLY"] = "1"
+    os.environ["FLEXKV_INSTANCE_NUM"] = "0"
+
+    backend = FlexKVHiCacheStorage(_make_config(page_size=4))
+    pool = _make_mock_pool(page_size=4)
+    backend.register_mem_pool_host(pool)
+
+    token_ids = list(range(100, 116))  # 4 pages
+    keys = ["key0", "key1", "key2", "key3"]
+    host_indices = torch.arange(0, 16, dtype=torch.int64)
+
+    # Seed with distinct values per page
+    for page_idx in range(4):
+        pool._kv_buffer[:, :, page_idx*4:(page_idx+1)*4, :, :] = float(page_idx + 1)
+
+    extra = HiCacheStorageExtraInfo(
+        prefix_keys=None, extra_info={"token_ids": token_ids})
+
+    # Write to FlexKV
+    assert all(backend.batch_set_v1(keys, host_indices, extra))
+
+    # Read back into a fresh pool (layerwise path, layout=layer_first)
+    read_pool = _make_mock_pool(page_size=4)
+    assert read_pool.layout == "layer_first"  # confirms layerwise path
+    backend._mem_pool_host = read_pool
+
+    results = backend.batch_get_v1(keys, host_indices, extra)
+    assert all(results), f"batch_get_v1 failed: {results}"
+
+    # Verify data: layerwise writes directly to kv_buffer, check it
+    for page_idx in range(4):
+        start = page_idx * 4
+        end = start + 4
+        actual = read_pool._kv_buffer[:, :, start:end, :, :]
+        expected = pool._kv_buffer[:, :, start:end, :, :]
+        assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-4), \
+            f"Page {page_idx} data mismatch in layerwise get"
+
+
+def test_layerwise_callback():
+    """layer_ready_callback is invoked num_layers times in order."""
+    os.environ["FLEXKV_CPU_ONLY"] = "1"
+    os.environ["FLEXKV_INSTANCE_NUM"] = "0"
+
+    backend = FlexKVHiCacheStorage(_make_config(page_size=4))
+    pool = _make_mock_pool(page_size=4)
+    backend.register_mem_pool_host(pool)
+
+    token_ids = list(range(100, 116))
+    keys = ["key0", "key1", "key2", "key3"]
+    host_indices = torch.arange(0, 16, dtype=torch.int64)
+    extra_set = HiCacheStorageExtraInfo(
+        prefix_keys=None, extra_info={"token_ids": token_ids})
+
+    assert all(backend.batch_set_v1(keys, host_indices, extra_set))
+
+    # Track callback invocations
+    callback_layers = []
+    def on_layer_ready(layer_id):
+        callback_layers.append(layer_id)
+
+    read_pool = _make_mock_pool(page_size=4)
+    backend._mem_pool_host = read_pool
+
+    extra_get = HiCacheStorageExtraInfo(
+        prefix_keys=None,
+        extra_info={"token_ids": token_ids, "layer_ready_callback": on_layer_ready})
+
+    results = backend.batch_get_v1(keys, host_indices, extra_get)
+    assert all(results)
+
+    num_layers = backend._model_config.num_layers
+    assert callback_layers == list(range(num_layers)), \
+        f"Expected callback for layers 0..{num_layers-1}, got {callback_layers}"
+
+
+def test_mla_layerwise_roundtrip():
+    """MLA layerwise set -> get round-trip with data validation."""
+    os.environ["FLEXKV_CPU_ONLY"] = "1"
+    os.environ["FLEXKV_INSTANCE_NUM"] = "0"
+
+    config = _make_mla_config(page_size=4)
+    backend = FlexKVHiCacheStorage(config)
+    write_pool = _make_mla_mock_pool(page_size=4)
+    backend.register_mem_pool_host(write_pool)
+
+    token_ids = list(range(100, 116))
+    keys = ["key0", "key1", "key2", "key3"]
+    host_indices = torch.arange(0, 16, dtype=torch.int64)
+
+    for page_idx in range(4):
+        write_pool._kv_buffer[:, page_idx*4:(page_idx+1)*4, :, :] = float(page_idx + 1)
+
+    extra = HiCacheStorageExtraInfo(
+        prefix_keys=None, extra_info={"token_ids": token_ids})
+
+    assert all(backend.batch_set_v1(keys, host_indices, extra))
+
+    # Read back (layerwise path)
+    read_pool = _make_mla_mock_pool(page_size=4)
+    backend._mem_pool_host = read_pool
+
+    results = backend.batch_get_v1(keys, host_indices, extra)
+    assert all(results), f"MLA layerwise get failed: {results}"
+
+    # Verify: layerwise writes directly to kv_buffer
+    for page_idx in range(4):
+        start = page_idx * 4
+        end = start + 4
+        actual = read_pool._kv_buffer[:, start:end, :, :]
+        expected = write_pool._kv_buffer[:, start:end, :, :]
+        assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-4), \
+            f"MLA page {page_idx} data mismatch in layerwise get"
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -707,6 +833,9 @@ ALL_TESTS = [
     ("set with deduplication", test_set_with_deduplication),
     ("MLA set -> exists -> get round-trip", test_mla_set_exists_get_roundtrip),
     ("MLA set with deduplication", test_mla_set_with_deduplication),
+    ("layerwise get data integrity", test_layerwise_get_data_integrity),
+    ("layerwise callback", test_layerwise_callback),
+    ("MLA layerwise roundtrip", test_mla_layerwise_roundtrip),
     ("stats collection", test_stats),
 ]
 
