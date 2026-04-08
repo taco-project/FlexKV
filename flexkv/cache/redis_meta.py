@@ -136,8 +136,12 @@ class RedisMetaChannel:
 
 class RedisNodeInfo:
     """Redis node information management class implemented in Python"""
+
+    # Default TTL for node:<id> key in seconds. Active nodes renew before expiry.
+    # If a process crashes (kill -9), the key auto-expires after this period.
+    DEFAULT_NODE_TTL_SECONDS: int = 30
     
-    def __init__(self, host: str, port: int, local_ip: str, password: str = "") -> None:
+    def __init__(self, host: str, port: int, local_ip: str, password: str = "", node_ttl_seconds: int = 0) -> None:
         if _redis is None:
             raise ImportError("redis-py is required: pip install redis")
         self.host = host
@@ -145,9 +149,14 @@ class RedisNodeInfo:
         self.local_ip = str(local_ip)
         self.password = str(password)
         self.uuid = str(uuid1())
+        # Use provided TTL or fall back to default
+        self.node_ttl_seconds: int = node_ttl_seconds if node_ttl_seconds > 0 else self.DEFAULT_NODE_TTL_SECONDS
+        # Heartbeat interval – renew TTL at roughly 1/3 of the TTL period
+        self.heartbeat_interval_seconds: float = max(1.0, self.node_ttl_seconds / 3.0)
         self._node_id: Optional[int] = None
         self._running = False
         self._listener_thread: Optional[threading.Thread] = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
         self.current_node_id_set: set = set()
         self._client: Optional[_redis.Redis] = None
         self._sub_client: Optional[_redis.Redis] = None
@@ -178,7 +187,7 @@ class RedisNodeInfo:
         )
     
     def connect(self) -> bool:
-        """Connect to Redis and start listener thread"""
+        """Connect to Redis and start listener + heartbeat threads"""
         try:
             self._client = self._get_client()
             # Test connection
@@ -192,17 +201,29 @@ class RedisNodeInfo:
                 daemon=True
             )
             self._listener_thread.start()
+
+            # Start heartbeat thread for TTL renewal
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_worker,
+                name="redis-node-heartbeat",
+                daemon=True
+            )
+            self._heartbeat_thread.start()
             
             return True
         except Exception:
             return False
     
     def disconnect(self) -> None:
-        """Disconnect from Redis and stop listener thread"""
+        """Disconnect from Redis and stop listener + heartbeat threads"""
         self._running = False
         if self._listener_thread and self._listener_thread.is_alive():
             self._listener_thread.join(timeout=2.0)
         self._listener_thread = None
+
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=2.0)
+        self._heartbeat_thread = None
         
         if self._client:
             self._client.close()
@@ -240,11 +261,14 @@ class RedisNodeInfo:
             pass
     
     def register_node(self) -> Optional[int]:
-        """Register a new node and get node_id"""
+        """Register a new node and get node_id, with TTL for automatic expiry on crash"""
         if not self._client:
             return None
         
         try:
+            # Clean up stale nodes from the same IP before registering
+            self._cleanup_stale_nodes_by_ip()
+
             # Atomically increment global:node_id to get new node_id
             node_id = self._client.incr("global:node_id")
             self._node_id = node_id
@@ -259,6 +283,9 @@ class RedisNodeInfo:
                 "status": "active",
                 "timestamp": str(int(time.time()))
             })
+
+            # Set TTL so the key auto-expires if the process crashes
+            self._client.expire(node_key, self.node_ttl_seconds)
             
             # Publish node update event
             self._client.publish("flexkv_node_id_updated", str(node_id))
@@ -268,17 +295,22 @@ class RedisNodeInfo:
             return None
     
     def unregister_node(self) -> bool:
-        """Unregister current node"""
+        """Unregister current node and clean up associated meta/block data"""
         if not self._client or self._node_id is None:
             return False
         
         try:
+            node_id = self._node_id
+
             # Delete node:node_id key
-            node_key = f"node:{self._node_id}"
+            node_key = f"node:{node_id}"
             self._client.delete(node_key)
+
+            # Also clean up meta:<node_id> to prevent stale RDMA addresses
+            self._cleanup_node_data(node_id)
             
             # Publish node update event
-            self._client.publish("flexkv_node_id_updated", str(self._node_id))
+            self._client.publish("flexkv_node_id_updated", str(node_id))
             
             self._node_id = None
             return True
@@ -302,6 +334,48 @@ class RedisNodeInfo:
         """Check if a node_id is active - lock-free RCU check"""
         return node_id in self.current_node_id_set
     
+    def _heartbeat_worker(self) -> None:
+        """Background thread that periodically renews the TTL of node:<id> key.
+        
+        This ensures that if the process is alive, the node key never expires.
+        If the process crashes (kill -9), the TTL will not be renewed and the
+        key will auto-expire after NODE_TTL_SECONDS, allowing other nodes to
+        detect the crash and stop using stale meta/block data.
+        """
+        heartbeat_client: Optional["_redis.Redis"] = None
+        while self._running:
+            try:
+                if heartbeat_client is None:
+                    heartbeat_client = self._get_client()
+
+                if self._node_id is not None:
+                    node_key = f"node:{self._node_id}"
+                    # Renew TTL
+                    heartbeat_client.expire(node_key, self.node_ttl_seconds)
+                    # Also update the timestamp field
+                    heartbeat_client.hset(node_key, "timestamp", str(int(time.time())))
+
+            except Exception:
+                # Connection lost, reset client so it reconnects next iteration
+                if heartbeat_client:
+                    try:
+                        heartbeat_client.close()
+                    except Exception:
+                        pass
+                    heartbeat_client = None
+
+            # Sleep in small increments so we can exit quickly when _running becomes False
+            for _ in range(int(self.heartbeat_interval_seconds * 10)):
+                if not self._running:
+                    break
+                time.sleep(0.1)
+
+        if heartbeat_client:
+            try:
+                heartbeat_client.close()
+            except Exception:
+                pass
+
     def _listener_worker(self) -> None:
         """Background thread that listens for node updates"""
         backoff = 0.5
@@ -343,6 +417,10 @@ class RedisNodeInfo:
         
         This method can be called externally to manually refresh the active nodes list.
         It uses SCAN to avoid blocking Redis server.
+        
+        Because node:<id> keys now have a TTL (heartbeat), expired keys are
+        automatically removed by Redis.  SCAN will only return keys that are
+        still alive, so stale/crashed nodes are naturally excluded.
         """
         if not self._client:
             return
@@ -366,6 +444,15 @@ class RedisNodeInfo:
                 if cursor == 0:
                     break
             
+            # Detect nodes that disappeared (TTL expired or unregistered)
+            disappeared = self.current_node_id_set - new_active_nodes
+            if disappeared:
+                # Clean up meta and block data for disappeared nodes
+                for stale_nid in disappeared:
+                    if stale_nid == self._node_id:
+                        continue  # Don't clean up ourselves
+                    self._cleanup_node_data(stale_nid)
+
             # lock-free RCU switch: atomic assignment
             self.current_node_id_set = new_active_nodes
                 
@@ -373,10 +460,97 @@ class RedisNodeInfo:
             # If scan fails, continue with current active nodes
             pass
 
+    def _cleanup_stale_nodes_by_ip(self) -> None:
+        """Clean up stale node registrations from the same IP.
+        
+        On startup, scan all node:* keys and remove those that have the same
+        local_ip but a different UUID (i.e. leftover from a previous crashed process).
+        """
+        if not self._client:
+            return
+
+        try:
+            cursor = 0
+            stale_node_ids = []
+
+            while True:
+                cursor, keys = self._client.scan(cursor=cursor, match="node:*", count=100)
+                for key in keys:
+                    if not key.startswith("node:"):
+                        continue
+                    try:
+                        nid = int(key[5:])
+                    except (ValueError, IndexError):
+                        continue
+
+                    data = self._client.hgetall(key)
+                    node_ip = data.get("ip", "") or data.get("local_ip", "")
+                    node_uuid = data.get("uuid", "")
+
+                    # Same IP but different UUID → stale node from a previous process
+                    if node_ip == self.local_ip and node_uuid != self.uuid:
+                        stale_node_ids.append(nid)
+
+                if cursor == 0:
+                    break
+
+            for stale_nid in stale_node_ids:
+                print(f"[RedisNodeInfo] Cleaning up stale node:{stale_nid} (same IP={self.local_ip}, different UUID)")
+                self._client.delete(f"node:{stale_nid}")
+                self._cleanup_node_data(stale_nid)
+
+            if stale_node_ids:
+                # Notify other nodes about the cleanup
+                self._client.publish("flexkv_node_id_updated", "cleanup")
+
+        except Exception:
+            pass
+
+    def _cleanup_node_data(self, node_id: int) -> None:
+        """Clean up meta:<node_id> and CPUB/SSDB/PCFSB block keys for a given node.
+        
+        This is called when:
+        1. A node is unregistered (graceful shutdown)
+        2. A stale node is detected (TTL expired / startup cleanup)
+        """
+        if not self._client:
+            return
+
+        try:
+            # Delete meta:<node_id> (and meta:<node_id>:pp* for pipeline parallel)
+            cursor = 0
+            meta_keys = []
+            while True:
+                cursor, keys = self._client.scan(cursor=cursor, match=f"meta:{node_id}*", count=100)
+                meta_keys.extend(keys)
+                if cursor == 0:
+                    break
+            if meta_keys:
+                self._client.delete(*meta_keys)
+                print(f"[RedisNodeInfo] Deleted {len(meta_keys)} meta key(s) for node {node_id}")
+
+            # Delete CPUB:block:<node_id>:* / SSDB:block:<node_id>:* / PCFSB:block:<node_id>:* keys
+            for prefix in ("CPUB", "SSDB", "PCFSB"):
+                cursor = 0
+                block_keys = []
+                while True:
+                    cursor, keys = self._client.scan(cursor=cursor, match=f"{prefix}:block:{node_id}:*", count=500)
+                    block_keys.extend(keys)
+                    if cursor == 0:
+                        break
+                if block_keys:
+                    # Delete in batches to avoid blocking Redis
+                    batch_size = 500
+                    for i in range(0, len(block_keys), batch_size):
+                        self._client.delete(*block_keys[i:i + batch_size])
+                    print(f"[RedisNodeInfo] Deleted {len(block_keys)} {prefix}:block key(s) for node {node_id}")
+
+        except Exception as e:
+            print(f"[RedisNodeInfo] Warning: failed to clean up data for node {node_id}: {e}")
 
 
 class RedisMeta:
-    def __init__(self, host: str, port: int, password: Optional[str] = None, local_ip: str = "127.0.0.1", decode_responses: bool = True) -> None:
+    def __init__(self, host: str, port: int, password: Optional[str] = None, local_ip: str = "127.0.0.1", decode_responses: bool = True, node_ttl_seconds: int = 0) -> None:
         if _redis is None:  # pragma: no cover
             raise ImportError("redis-py is required: pip install redis")
         self.host = host
@@ -393,7 +567,7 @@ class RedisMeta:
         self._init_error: Optional[Exception] = None
         
         # create RedisNodeInfo object
-        self.nodeinfo = RedisNodeInfo(host, port, local_ip, password or "")
+        self.nodeinfo = RedisNodeInfo(host, port, local_ip, password or "", node_ttl_seconds=node_ttl_seconds)
         # get UUID via nodeinfo
         self._uuid = self.nodeinfo.get_uuid()
 
