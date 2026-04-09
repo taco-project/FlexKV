@@ -88,11 +88,22 @@ class TransferManager:
                                f"expected {self.expected_gpus} GPUs to register "
                                f"(instance_num={self.instance_num}, tp={self.model_config.tp_size}, "
                                f"dp={self.model_config.dp_size})")
+            last_log_time = time.time()
             while len(self.all_gpu_blocks) < self.expected_gpus:
                 try:
                     # Recv from: flexkv.server.client.KVTPClient.register_to_server
                     req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
                 except zmq.Again:
+                    # Periodically log waiting status for debugging
+                    now = time.time()
+                    if now - last_log_time >= 5.0:
+                        registered_ids = sorted(self.all_gpu_blocks.keys())
+                        flexkv_logger.info(
+                            f"Still waiting for GPU registrations: "
+                            f"{len(self.all_gpu_blocks)}/{self.expected_gpus} registered "
+                            f"(registered_device_ids={registered_ids}, "
+                            f"port={self.gpu_register_port})")
+                        last_log_time = now
                     time.sleep(0.001)
                     continue
 

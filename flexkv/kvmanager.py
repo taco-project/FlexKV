@@ -55,6 +55,11 @@ class KVManager:
         else:
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
+        flexkv_logger.info(
+            f"[KVManager] IPC ports: server_recv_port={self.server_recv_port}, "
+            f"gpu_register_port={self.gpu_register_port}"
+        )
+
         # Multi-instance mode also requires server_client_mode
         self.server_client_mode = (model_config.dp_size > 1 or
                                    self.instance_num > 1 or

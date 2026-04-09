@@ -154,6 +154,10 @@ class KVServer:
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
             self.context, zmq.SocketType.PULL, server_recv_port, True)
+        flexkv_logger.info(
+            f"[KVServer] IPC ports bound: server_recv_port={server_recv_port}, "
+            f"gpu_register_port={gpu_register_port}"
+        )
 
         # Use total_clients if provided (multi-instance mode), otherwise use dp_size
         max_clients = total_clients if total_clients > 0 else model_config.dp_size
@@ -332,7 +336,10 @@ class KVServer:
 
     def _verify_model_config(self, model_config: ModelConfig) -> None:
         """Verify that client's model config matches server's config."""
+        skip_fields = {"dp_rank"}
         for field in fields(ModelConfig):
+            if field.name in skip_fields:
+                continue
             client_val = getattr(model_config, field.name)
             server_val = getattr(self.model_config, field.name)
             assert client_val == server_val, \
