@@ -386,7 +386,10 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         """
         end = host_start + self._page_size
         kv_buf = self._mem_pool_host.kv_buffer
-        if host_start < 0 or end > kv_buf.shape[2]:
+        # MHA kv_buffer: (2, L, T, H, D) -> token axis is 2
+        # MLA kv_buffer: (L, T, 1, D)    -> token axis is 1
+        token_dim = 1 if use_mla else 2
+        if host_start < 0 or end > kv_buf.shape[token_dim]:
             logger.error("_write_layer_to_host: OOB host_start=%d end=%d "
                          "kv_buffer.shape=%s", host_start, end, kv_buf.shape)
             return
@@ -401,7 +404,8 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         """Read one layer from SGLang Host kv_buffer into a FlexKV block."""
         end = host_start + self._page_size
         kv_buf = self._mem_pool_host.kv_buffer
-        if host_start < 0 or end > kv_buf.shape[2]:
+        token_dim = 1 if use_mla else 2
+        if host_start < 0 or end > kv_buf.shape[token_dim]:
             logger.error("_read_layer_from_host: OOB host_start=%d end=%d "
                          "kv_buffer.shape=%s", host_start, end, kv_buf.shape)
             return
