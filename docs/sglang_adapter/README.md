@@ -32,8 +32,9 @@ FlexKV capabilities: radix tree index, CPU cache, and optional SSD persistence v
 ```
 PUT (batch_set_v1 - backup from Host to FlexKV):
   SGLang Host mem
-    -> mem_pool_host.get_data_page(index, flat=False)
-    -> layout transform: SGLang (2,L,T,H,D) -> FlexKV (L,2,T,H,D)
+    -> layer_first: per-layer read from kv_buffer[:, layer_id, ...] (zero-copy view)
+       MLA layer_first: per-layer read from kv_buffer[layer_id, ...]
+       other layouts: mem_pool_host.get_data_page(index, flat=False) + permute
     -> direct memcpy to FlexKV CPU cache tensor (via put_cpu)
     -> KVManager radix tree insert
     -> TransferEngine H2DISK async (if SSD enabled)
@@ -42,8 +43,9 @@ GET (batch_get_v1 - prefetch from FlexKV to Host):
   CPU cache engine radix tree match (local + remote in distributed mode)
     -> if remote: prefetch_async + wait (P2P transfer to local CPU cache)
     -> read FlexKV CPU cache tensor block
-    -> layout transform: FlexKV (L,2,T,H,D) -> SGLang (2,L,T,H,D)
-    -> mem_pool_host.set_from_flat_data_page(index, data)
+    -> layer_first: per-layer write to kv_buffer[:, layer_id, ...] (zero-copy view)
+       MLA layer_first: per-layer write to kv_buffer[layer_id, ...]
+       other layouts: permute + mem_pool_host.set_from_flat_data_page(index, data)
 
 EXISTS (batch_exists - query):
   CPU cache engine radix tree match (local + remote in distributed mode)
@@ -52,11 +54,52 @@ EXISTS (batch_exists - query):
 
 ### Layout Transform
 
+**MHA (standard multi-head attention):**
+
 SGLang `layer_first` layout per page: `(2, num_layers, page_size, num_kv_heads, head_size)`
 FlexKV `BLOCKFIRST` layout per block: `(num_layers, 2, tokens_per_block, num_kv_heads, head_size)`
 
 Transform is a single `permute(1,0,2,3,4).contiguous()` in both directions.
 Other SGLang layouts (`page_first`, `page_first_direct`, `page_head`) are also supported.
+
+**MLA (multi-head latent attention, e.g. DeepSeek-V2/V3):**
+
+SGLang MLA layout per page: `(num_layers, page_size, 1, kv_lora_rank + qk_rope_head_dim)`
+FlexKV MLA layout per block: `(num_layers, 1, tokens_per_block, 1, kv_lora_rank + qk_rope_head_dim)`
+
+Transform is `unsqueeze(1)` / `squeeze(1)`. MLA uses `num_kv_heads=1` and
+`head_size = kv_lora_rank + qk_rope_head_dim`, both auto-detected from `mem_pool_host`.
+
+### Layerwise Prefetch
+
+For `layer_first` layout (the default), the adapter uses a **per-layer copy** strategy instead
+of whole-page permute+flatten. This avoids expensive temporary tensor allocations:
+
+```
+Whole-page path (non-layer_first layouts):
+  block_data = cpu_cache[block_id]                 # (L, 2, T, H, D)
+  transformed = block_data.permute(1,0,2,3,4)      # (2, L, T, H, D) -- allocates ~18MB temp
+      .contiguous()
+  mem_pool_host.set_from_flat_data_page(start, transformed.flatten())
+
+Layerwise path (layer_first layout):
+  block_data = cpu_cache[block_id]                 # (L, 2, T, H, D)
+  for layer_id in range(num_layers):
+    kv_buffer[:, layer_id, start:end, :, :] = block_data[layer_id]   # zero-copy view
+```
+
+**Benefits:**
+- Eliminates `permute(1,0,2,3,4).contiguous()` temp allocation (~18MB per page for typical models)
+- Per-layer view via `block_data[layer_id]` avoids the additional `permute` + `flatten` copies
+- Direct `kv_buffer` slice write bypasses `set_from_flat_data_page` overhead
+- Enables future **pipeline integration**: an optional `layer_ready_callback` can be invoked
+  after each layer completes, allowing the caller to overlap Host-to-GPU transfer with
+  remaining layer copies
+
+**Key methods:** `_write_layer_to_host()` (GET path), `_read_layer_from_host()` (SET path)
+
+Non-`layer_first` layouts (`page_first`, `page_first_direct`, `page_head`) fall back to the
+original whole-page permute path.
 
 ### Distributed Mode Architecture
 
@@ -127,7 +170,7 @@ proceeds with normal prefill computation.
 | `flexkv/integration/sglang/hicache_storage_adapter.py` | Main adapter: `FlexKVHiCacheStorage` class |
 | `flexkv/integration/sglang/patch_sglang.py` | One-click SGLang patch tool (`flexkv-patch-sglang` CLI) |
 | `flexkv/integration/sglang/patches/sglang_flexkv.patch` | Unified diff for SGLang (3 source files) |
-| `flexkv/integration/sglang/test_hicache_storage_adapter.py` | Unit tests (15 test cases) |
+| `flexkv/integration/sglang/test_hicache_storage_adapter.py` | Unit tests (22 test cases) |
 
 ### SGLang Side (separate repo/branch)
 
@@ -135,6 +178,7 @@ proceeds with normal prefill computation.
 |------|---------|
 | `sglang/srt/managers/cache_controller.py` | Add `"flexkv"` to zero-copy whitelist; pass `token_ids` via `extra_info` in 3 places (`_page_backup`, `_page_transfer`, `_storage_hit_query`) |
 | `sglang/srt/mem_cache/storage/backend_factory.py` | Register `"flexkv"` backend pointing to `FlexKVHiCacheStorage` |
+| `sglang/srt/server_args.py` | Add `"flexkv"` to `--hicache-storage-backend` choices |
 
 ## Quick Start
 
@@ -150,7 +194,7 @@ pip install -e /path/to/FlexKV --no-build-isolation
 
 ### 2. Patch SGLang (one-click)
 
-FlexKV requires a small patch to SGLang (3 files, ~40 lines). A CLI tool is
+FlexKV requires a small patch to SGLang (3 files, ~60 lines). A CLI tool is
 provided to apply it automatically:
 
 ```bash
@@ -236,6 +280,9 @@ export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
 | `num_cpu_blocks` | extra_config | CPU cache block count. Memory = num_cpu_blocks * block_size_bytes |
 | `enable_cpu` | extra_config | Must be `true` |
 | `enable_ssd` | extra_config | Enable SSD persistence via io_uring (default `false`) |
+| `num_ssd_blocks` | extra_config | SSD cache block count (default `0`) |
+| `ssd_cache_dir` | extra_config | Directory for SSD cache files (default system-dependent) |
+| `eviction_policy` | extra_config | Cache eviction policy (default `"lru"`) |
 | `mode` | extra_config | `"local"` (default) or `"distributed"` |
 | `redis_host` | extra_config | Redis server address (distributed mode, default `127.0.0.1`) |
 | `redis_port` | extra_config | Redis server port (distributed mode, default `6379`) |
@@ -244,6 +291,10 @@ export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
 | `num_layers` | extra_config | (Optional) Model layer count -- auto-detected from SGLang |
 | `num_kv_heads` | extra_config | (Optional) KV head count -- auto-detected from SGLang |
 | `head_size` | extra_config | (Optional) Head dimension -- auto-detected from SGLang |
+| `use_mla` | extra_config | (Optional) MLA model flag -- auto-detected from SGLang |
+| `dtype` | extra_config | (Optional) KV cache dtype -- auto-detected from SGLang |
+| `tp_size` | extra_config | (Optional) Tensor parallel size -- auto-detected from SGLang |
+| `dp_size` | extra_config | (Optional) Data parallel size -- auto-detected from SGLang |
 
 ### Build for Development
 
@@ -276,6 +327,8 @@ pytest test/srt/hicache/test_hicache_storage_flexkv_backend.py -v -s
 
 2. **Two memcpy per page**: Data flows Host -> FlexKV CPU cache -> Host (read path). This is
    inherent to the HiCacheStorage interface design which separates Host memory from storage.
+   The layerwise path does not reduce the copy count, but eliminates the `permute().contiguous()`
+   temporary tensor allocation (~18MB per page) and the `flatten()` overhead.
 
 3. **No dynamic mode switching**: Mode is set at adapter init time. Restart required to change.
 
@@ -306,6 +359,7 @@ pytest test/srt/hicache/test_hicache_storage_flexkv_backend.py -v -s
 - [x] Round-trip data correctness: set -> get produces identical data
 - [x] SGLang E2E: backup/prefetch cycle verified (816/832 tokens cached)
 - [x] SGLang E2E: GSM8K accuracy consistent across cache flushes
-- [x] Unit tests: 15 test cases pass (including 7 mode configuration tests)
+- [x] Unit tests: 22 test cases pass (including mode configuration, MLA, layerwise tests)
 - [x] Distributed mode: single-node with Redis GMS verified
 - [x] Distributed mode: cross-node GET via P2P transfer (prefetch_async + wait)
+- [x] Layerwise prefetch: per-layer copy for layer_first layout (zero-copy view, no permute temp)
