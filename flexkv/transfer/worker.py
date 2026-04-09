@@ -28,6 +28,13 @@ except ImportError:
     transfer_kv_blocks_gds = None
     TPGDSTransferThreadGroup = None
 
+try:
+    from nixl._api import nixl_agent as _nixl_agent_cls
+    from nixl._api import nixl_agent_config as _nixl_agent_config_cls
+except ImportError:
+    _nixl_agent_cls = None  # type: ignore[misc, assignment]
+    _nixl_agent_config_cls = None  # type: ignore[misc, assignment]
+
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -91,7 +98,7 @@ class WorkerTransferOp:
         # Always preserve optional src_block_node_ids from TransferOp
         self.src_block_node_ids = transfer_op.src_block_node_ids
 
-        if self.src_slot_id == -1:
+        if self.src_slot_id == -1 or self.dst_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
             self.dst_block_ids = transfer_op.dst_block_ids
         else:
@@ -113,7 +120,7 @@ class TransferWorkerBase(ABC):
         self.finished_ops_queue: MPQueue[int] = finished_ops_queue
 
         self.op_buffer_tensor = op_buffer_tensor
-        cudaHostRegister(self.op_buffer_tensor) 
+        cudaHostRegister(self.op_buffer_tensor)
 
     @classmethod
     def _get_worker_id(cls) -> int:
@@ -192,14 +199,14 @@ class TransferWorkerBase(ABC):
         src_slot_id = transfer_op.src_slot_id
         dst_slot_id = transfer_op.dst_slot_id
         valid_block_num = transfer_op.valid_block_num
-        
+
         if src_slot_id == -1:
             src_block_ids = torch.from_numpy(transfer_op.src_block_ids).to(dtype=torch.int64)
             if pinned:
                 src_block_ids = src_block_ids.pin_memory()
         else:
             src_block_ids = self.op_buffer_tensor[src_slot_id, :valid_block_num]
-            
+
         if dst_slot_id == -1:
             dst_block_ids = torch.from_numpy(transfer_op.dst_block_ids).to(dtype=torch.int64)
             if pinned:
@@ -234,7 +241,7 @@ class TransferWorkerBase(ABC):
                     op = self.transfer_conn.recv()
                     if op is None:
                         # shut down zmq listening server of peer2cpuTransferWorker
-                        if hasattr(self, "shutdown") and callable(getattr(self, "shutdown")):
+                        if hasattr(self, "shutdown") and callable(self.shutdown):
                             try:
                                 self.shutdown()
                             except Exception as e:
@@ -247,6 +254,7 @@ class TransferWorkerBase(ABC):
                             break
                         batch_ops.append(op)
                     for op in batch_ops:
+                        transfer_status = False
                         try:
                             nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
                                                 f"graph_id: {op.transfer_graph_id}, "
@@ -259,7 +267,7 @@ class TransferWorkerBase(ABC):
                                         f"Failed transfer op: {op}")
                         if transfer_status:
                             ## only put the op when transfer success
-                            self.finished_ops_queue.put(op.transfer_op_id)                
+                            self.finished_ops_queue.put(op.transfer_op_id)
                 else:
                     continue
             except EOFError:
@@ -311,8 +319,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  gpu_device_id: int,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
-                 transfer_sms_h2d: int = 8,
-                 transfer_sms_d2h: int = 8) -> None:
+                 transfer_num_cta_h2d: int = 4,
+                 transfer_num_cta_d2h: int = 4) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         # Register CPU tensors with CUDA
@@ -352,8 +360,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         if gpu_device_id != -1:
             torch.cuda.set_device(gpu_device_id)
         self.transfer_stream = torch.cuda.Stream()
-        self.transfer_sms_h2d = transfer_sms_h2d
-        self.transfer_sms_d2h = transfer_sms_d2h
+        self.transfer_num_cta_h2d = transfer_num_cta_h2d
+        self.transfer_num_cta_d2h = transfer_num_cta_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
@@ -374,12 +382,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             gpu_block_id_list = dst_block_ids
             cpu_block_id_list = src_block_ids
             use_ce_transfer = self.use_ce_transfer_h2d
-            transfer_sms = self.transfer_sms_h2d
+            transfer_num_cta = self.transfer_num_cta_h2d
         elif transfer_type == TransferType.D2H:
             gpu_block_id_list = src_block_ids
             cpu_block_id_list = dst_block_ids
             use_ce_transfer = self.use_ce_transfer_d2h
-            transfer_sms = self.transfer_sms_d2h
+            transfer_num_cta = self.transfer_num_cta_d2h
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for GPUCPUTransferWorker")
 
@@ -404,7 +412,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.chunk_size_in_bytes,
             layer_id,
             layer_granularity,
-            transfer_sms,
+            transfer_num_cta,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
             self.is_mla,
@@ -447,7 +455,301 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         nvtx.end_range(nvtx_range)
 
         return True
-        
+
+
+# NIXL GPU<->CPU backends implemented vs reserved (see https://github.com/ai-dynamo/nixl )
+_NIXL_GPU_CPU_BACKENDS_IMPL = frozenset({"UCX"})
+# TODO: GPU <-> SSD via NIXL (e.g. GDS: VRAM_SEG <-> FILE_SEG)
+# TODO: CPU <-> SSD via NIXL (e.g. POSIX: DRAM_SEG <-> FILE_SEG)
+# TODO: 3FS / HF3FS <-> CPU via NIXL object or HF3FS plugins
+
+
+def _nixl_gpu_chunk_byte_offset(
+    gpu_blocks: List[torch.Tensor],
+    gpu_block_type_: int,
+    layer_idx: int,
+    kv_idx: int,
+    block_id: int,
+    gpu_kv_stride_in_bytes: int,
+    gpu_block_stride_in_bytes: int,
+    gpu_layer_stride_in_bytes: int,
+    num_layers: int,
+) -> Tuple[torch.Tensor, int]:
+    """Return (tensor owning storage, byte offset within that tensor) for one KV chunk (matches csrc/gtensor_handler.cuh)."""
+    if gpu_block_type_ == 0:
+        t = gpu_blocks[layer_idx]
+        off = kv_idx * gpu_kv_stride_in_bytes + block_id * gpu_block_stride_in_bytes
+        return t, off
+    if gpu_block_type_ == 1:
+        t = gpu_blocks[0]
+        off = (
+            block_id * gpu_block_stride_in_bytes
+            + layer_idx * gpu_layer_stride_in_bytes
+            + kv_idx * gpu_kv_stride_in_bytes
+        )
+        return t, off
+    if gpu_block_type_ == 2:
+        t = gpu_blocks[kv_idx * num_layers + layer_idx]
+        off = block_id * gpu_block_stride_in_bytes
+        return t, off
+    raise ValueError(f"Invalid gpu_block_type_: {gpu_block_type_}")
+
+
+class NixlTransferWorker(TransferWorkerBase):
+    """
+    FlexKV transfer worker backed by the NVIDIA NIXL Python API (`nixl._api`). This class is
+    intended to grow: additional memory/storage paths and NIXL plugins should be added here
+    behind the same ``backend`` (and related) parameters.
+
+    **Current scope — GPU <-> CPU:** same KV layout behavior as :class:`GPUCPUTransferWorker`,
+    but using a selectable NIXL **backend** instead of the CUDA ``transfer_kv_blocks`` path.
+    Implemented: ``backend="UCX"`` (loopback DRAM/VRAM on one agent).
+
+    **Planned in this class (not implemented yet):**
+
+    - GPU <-> SSD (e.g. NIXL **GDS**)
+    - CPU <-> SSD (e.g. NIXL **POSIX**)
+    - 3FS <-> CPU (e.g. NIXL **HF3FS** / object plugins)
+
+    Requires ``pip install nixl[cu12]`` or ``nixl[cu13]`` and a Linux environment; see
+    `NIXL <https://github.com/ai-dynamo/nixl>`_.
+    """
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        gpu_blocks: List[TensorSharedHandle],
+        cpu_blocks: torch.Tensor,
+        gpu_kv_layout: KVCacheLayout,
+        cpu_kv_layout: KVCacheLayout,
+        dtype: torch.dtype,
+        gpu_device_id: int,
+        backend: str = "UCX",
+        *,
+        nixl_enable_prog_thread: bool = True,
+        nixl_enable_listen_thread: bool = False,
+        nixl_listen_port: int = 0,
+    ) -> None:
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+
+        if _nixl_agent_cls is None or _nixl_agent_config_cls is None:
+            raise ImportError(
+                "NixlTransferWorker requires the `nixl` package "
+                "(e.g. pip install 'nixl[cu12]')."
+            ) from None
+
+        self.backend = backend.upper()
+        if self.backend not in _NIXL_GPU_CPU_BACKENDS_IMPL:
+            if self.backend in ("GDS", "POSIX", "HF3FS", "OBJ"):
+                raise NotImplementedError(
+                    f"NIXL backend {self.backend!r} is not wired in this worker yet "
+                    "(GPU-SSD, CPU-SSD, and 3FS-CPU paths are TODO)."
+                )
+            raise ValueError(
+                f"Unsupported NIXL backend {self.backend!r} for GPU-CPU; "
+                f"implemented: {sorted(_NIXL_GPU_CPU_BACKENDS_IMPL)}"
+            )
+
+        flexkv_logger.info(
+            f"NixlTransferWorker: pinning CPU, NIXL backend={self.backend}, "
+            f"size_gb={cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f}"
+        )
+        cudaHostRegister(cpu_blocks)
+        self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
+        self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
+        self.cpu_tensor = cpu_blocks
+        self.dtype = dtype
+        self.is_mla = gpu_kv_layout.is_mla
+        self.num_layers = gpu_kv_layout.num_layer
+
+        self.chunk_size_in_bytes = gpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+        self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+        self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
+        self.gpu_layer_stride_in_bytes = gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+
+        self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+        self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+        self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+
+        if len(self.gpu_blocks) == 1:
+            self.gpu_block_type_ = 1
+        elif len(self.gpu_blocks) == self.num_layers:
+            self.gpu_block_type_ = 0
+        elif len(self.gpu_blocks) == self.num_layers * 2:
+            self.gpu_block_type_ = 2
+        else:
+            raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
+
+        if gpu_device_id != -1:
+            torch.cuda.set_device(gpu_device_id)
+        self._gpu_device_id = int(self.gpu_blocks[0].device.index) if self.gpu_blocks[0].is_cuda else 0
+
+        agent_name = f"flexkv-nixl-gpu-cpu-{worker_id}"
+        nixl_conf = _nixl_agent_config_cls(
+            enable_prog_thread=nixl_enable_prog_thread,
+            enable_listen_thread=nixl_enable_listen_thread,
+            listen_port=nixl_listen_port,
+            backends=[self.backend],
+        )
+        self._nixl = _nixl_agent_cls(agent_name, nixl_conf)
+        if self.backend not in self._nixl.plugin_list:
+            raise RuntimeError(
+                f"NIXL plugin {self.backend!r} not available; plugins={self._nixl.plugin_list}"
+            )
+
+        self._nixl_regs: List[Any] = []
+        for t in self.gpu_blocks:
+            self._nixl_regs.append(self._nixl.register_memory(t, backends=[self.backend]))
+        self._nixl_regs.append(self._nixl.register_memory(self.cpu_tensor, backends=[self.backend]))
+
+    def _nixl_xfer_dram_vram(
+        self,
+        src_ptr: int,
+        dst_ptr: int,
+        nbytes: int,
+        src_is_dram: bool,
+    ) -> None:
+        dram_dev = 0
+        vram_dev = self._gpu_device_id
+        if src_is_dram:
+            src_xfer = self._nixl.get_xfer_descs(
+                [(src_ptr, nbytes, dram_dev)], mem_type="DRAM"
+            )
+            dst_xfer = self._nixl.get_xfer_descs(
+                [(dst_ptr, nbytes, vram_dev)], mem_type="cuda"
+            )
+        else:
+            src_xfer = self._nixl.get_xfer_descs(
+                [(src_ptr, nbytes, vram_dev)], mem_type="cuda"
+            )
+            dst_xfer = self._nixl.get_xfer_descs(
+                [(dst_ptr, nbytes, dram_dev)], mem_type="DRAM"
+            )
+        if src_xfer is None or dst_xfer is None:
+            raise RuntimeError("NIXL get_xfer_descs failed")
+
+        if self.backend == "UCX":
+            handle = self._nixl.initialize_xfer(
+                "WRITE",
+                src_xfer,
+                dst_xfer,
+                self._nixl.name,
+                b"",
+                backends=[self.backend],
+            )
+        else:
+            raise NotImplementedError(f"NIXL xfer path not implemented for {self.backend!r}")
+
+        if handle is None or getattr(handle, "_handle", 1) == 0:
+            raise RuntimeError("NIXL initialize_xfer failed")
+        try:
+            state = self._nixl.transfer(handle)
+            while state == "PROC":
+                state = self._nixl.check_xfer_state(handle)
+            if state != "DONE":
+                raise RuntimeError(f"NIXL transfer failed with state {state!r}")
+        finally:
+            self._nixl.release_xfer_handle(handle)
+
+    def _transfer_impl(
+        self,
+        src_block_ids: torch.Tensor,
+        dst_block_ids: torch.Tensor,
+        transfer_type: TransferType,
+        layer_id: int,
+        layer_granularity: int,
+        **kwargs: Any,
+    ) -> None:
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
+        assert len(src_block_ids) == len(dst_block_ids)
+
+        if transfer_type == TransferType.H2D:
+            gpu_block_id_list = dst_block_ids
+            cpu_block_id_list = src_block_ids
+            is_h2d = True
+        elif transfer_type == TransferType.D2H:
+            gpu_block_id_list = src_block_ids
+            cpu_block_id_list = dst_block_ids
+            is_h2d = False
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_type} for NixlTransferWorker")
+
+        nblk = len(gpu_block_id_list)
+        if nblk == 0:
+            return
+
+        kv_dim = 1 if self.is_mla else 2
+        end_layer = layer_id + layer_granularity
+
+        # Copy chunk-by-chunk to match FlexKV layout (same pattern as transfer.cu CE path).
+        for li in range(layer_id, end_layer):
+            for kv_i in range(kv_dim):
+                for k in range(nblk):
+                    gpu_b = int(gpu_block_id_list[k].item())
+                    cpu_b = int(cpu_block_id_list[k].item())
+                    gpu_t, gpu_off = _nixl_gpu_chunk_byte_offset(
+                        self.gpu_blocks,
+                        self.gpu_block_type_,
+                        li,
+                        kv_i,
+                        gpu_b,
+                        self.gpu_kv_stride_in_bytes,
+                        self.gpu_block_stride_in_bytes,
+                        self.gpu_layer_stride_in_bytes,
+                        self.num_layers,
+                    )
+                    cpu_off = (
+                        li * self.cpu_layer_stride_in_bytes
+                        + kv_i * self.cpu_kv_stride_in_bytes
+                        + cpu_b * self.cpu_block_stride_in_bytes
+                    )
+                    gpu_ptr = gpu_t.data_ptr() + gpu_off
+                    cpu_ptr = self.cpu_tensor.data_ptr() + cpu_off
+                    if is_h2d:
+                        self._nixl_xfer_dram_vram(cpu_ptr, gpu_ptr, self.chunk_size_in_bytes, True)
+                    else:
+                        self._nixl_xfer_dram_vram(gpu_ptr, cpu_ptr, self.chunk_size_in_bytes, False)
+
+        if self.gpu_blocks[0].is_cuda:
+            torch.cuda.synchronize()
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        nvtx_range = nvtx.start_range(
+            message=f"NixlTransferWorker.launch_transfer[{transfer_op.transfer_op_id}]",
+            color="purple",
+        )
+        layer_id = transfer_op.layer_id
+        layer_granularity = transfer_op.layer_granularity
+        if layer_id == -1:
+            layer_id = 0
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
+
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+
+        start_time = time.time()
+        self._transfer_impl(
+            src_block_ids,
+            dst_block_ids,
+            transfer_op.transfer_type,
+            layer_id,
+            layer_granularity,
+        )
+        end_time = time.time()
+
+        kv_dim = 2 if not self.is_mla else 1
+        transfer_size = (
+            self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
+        )
+        self._log_transfer_performance(transfer_op, transfer_size, start_time, end_time)
+        nvtx.end_range(nvtx_range)
+        return True
+
+
 class tpGPUCPUTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
@@ -463,8 +765,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  dp_group_id: int,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
-                 transfer_sms_h2d: int = 8,
-                 transfer_sms_d2h: int = 8):
+                 transfer_num_cta_h2d: int = 4,
+                 transfer_num_cta_d2h: int = 4):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
@@ -509,19 +811,36 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
 
-        self.transfer_sms_h2d = transfer_sms_h2d
-        self.transfer_sms_d2h = transfer_sms_d2h
+        self.transfer_num_cta_h2d = transfer_num_cta_h2d
+        self.transfer_num_cta_d2h = transfer_num_cta_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
-        gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
-        gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
-        gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
-        gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
-        self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
-                                                              self.num_layers, gpu_kv_strides_tensor,
-                                                              gpu_block_strides_tensor, gpu_layer_strides_tensor,
-                                                              gpu_chunk_sizes_tensor)
+        # Resolve pointers in Python (where storage is valid); pass them to C++ so we avoid
+        # "Tensor that doesn't have storage" when C++ calls .data_ptr() on tensors passed
+        # across the pybind11 boundary from a spawn'd subprocess (shared memory / CUDA IPC).
+        gpu_block_ptrs_flat = [
+            self.gpu_blocks[i][j].data_ptr()
+            for i in range(self.num_gpus)
+            for j in range(len(self.gpu_blocks[i]))
+        ]
+        cpu_blocks_ptr = cpu_blocks.data_ptr()
+        gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
+        num_tensors_per_gpu = len(self.gpu_blocks[0])
+
+        self.tp_transfer_thread_group = TPTransferThreadGroup(
+            self.num_gpus,
+            gpu_block_ptrs_flat,
+            num_tensors_per_gpu,
+            cpu_blocks_ptr,
+            dp_group_id,
+            self.num_layers,
+            self.gpu_kv_strides_in_bytes,
+            self.gpu_block_strides_in_bytes,
+            self.gpu_layer_strides_in_bytes,
+            self.gpu_chunk_sizes_in_bytes,
+            gpu_device_ids,
+        )
 
 
     def _transfer_impl(self,
@@ -540,12 +859,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             gpu_block_id_list = dst_block_ids
             cpu_block_id_list = src_block_ids
             use_ce_transfer = self.use_ce_transfer_h2d
-            transfer_sms = self.transfer_sms_h2d
+            transfer_num_cta = self.transfer_num_cta_h2d
         elif transfer_type == TransferType.D2H:
             gpu_block_id_list = src_block_ids
             cpu_block_id_list = dst_block_ids
             use_ce_transfer = self.use_ce_transfer_d2h
-            transfer_sms = self.transfer_sms_d2h
+            transfer_num_cta = self.transfer_num_cta_d2h
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for tpGPUCPUTransferWorker")
 
@@ -562,7 +881,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.cpu_tp_stride_in_bytes,
-            transfer_sms,
+            transfer_num_cta,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
             layer_id,
@@ -725,7 +1044,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         )
 
         return True
-    
+
 class CPURemoteTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
@@ -852,20 +1171,20 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             src_block_node_ids = kwargs.get("src_block_node_ids")
             if src_block_node_ids is not None and not isinstance(src_block_node_ids, np.ndarray):
                 raise TypeError("src_block_node_ids must be a numpy.ndarray if provided")
-            
+
             assert len(src_block_node_ids) == len(remote_block_id_list)
-            
+
             # Construct cfs_blocks_partition and cpu_blocks_partition
             # This is a simplified implementation - in practice, you might need more sophisticated logic
-            
+
             # Group blocks by file_nodeid (simplified grouping logic)
             files_set = set(src_block_node_ids)
             file_nodeids_list = list(files_set)
-            
+
             # Initialize partitions with proper size
             cfs_blocks_partition = [[] for _ in range(len(file_nodeids_list))]
             cpu_blocks_partition = [[] for _ in range(len(file_nodeids_list))]
-            
+
             # Create mapping from file_nodeid to partition index
             file2fid_dict = {file_nodeid: fid for fid, file_nodeid in enumerate(file_nodeids_list)}
             #因为每个flexkv的文件数量是相同的，所以total_file_num是相同的，后面用全局block_id计算block_id_in_file时，需要除以total_file_num
@@ -873,14 +1192,14 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             for i in range(len(remote_block_id_list)):
                 file_nodeid = src_block_node_ids[i]
                 fid = file2fid_dict[file_nodeid]
-                
+
                 # Calculate block_id_in_file using the same logic as C++
                 # This should match the C++ implementation in pcfs.cpp
                 block_id_in_file = int(((remote_block_id_list[i] / self.round_robin) / total_file_num) * self.round_robin + (remote_block_id_list[i] % self.round_robin))
-                
+
                 cfs_blocks_partition[fid].append(block_id_in_file)
                 cpu_blocks_partition[fid].append(cpu_block_id_list[i].item())
-            
+
             # Use the new shared transfer function
             shared_transfer_kv_blocks_remote_read(
                 file_nodeid_list=file_nodeids_list,
@@ -1118,7 +1437,7 @@ class GDSTransferWorker(TransferWorkerBase):
             layer_id = 0
         if layer_granularity == -1:
             layer_granularity = self.num_layers
-            
+
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         with torch.cuda.stream(self.transfer_stream):
@@ -1220,14 +1539,31 @@ class tpGDSTransferWorker(TransferWorkerBase):
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
         self.ssd_tp_stride_in_bytes = self.ssd_block_stride_in_bytes // self.tp_group_size if not self.is_mla else self.ssd_block_stride_in_bytes
 
+        # Resolve pointers in Python (where storage is valid); pass them to C++ so we avoid
+        # "Tensor that doesn't have storage" when C++ calls .data_ptr() on tensors passed
+        # across the pybind11 boundary from a spawn'd subprocess (shared memory / CUDA IPC).
+        gpu_block_ptrs_flat = [
+            self.gpu_blocks[i][j].data_ptr()
+            for i in range(self.num_gpus)
+            for j in range(len(self.gpu_blocks[i]))
+        ]
+        gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
+        num_tensors_per_gpu = len(self.gpu_blocks[0])
+
         # Create TP GDS Transfer Thread Group
-        gpu_kv_strides_tensor = torch.tensor(self.gpu_kv_strides_in_bytes, dtype=torch.int64)
-        gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
-        gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
-        gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
         self.tp_gds_transfer_thread_group = TPGDSTransferThreadGroup(
-            self.num_gpus, self.gpu_blocks, ssd_files, dp_group_id, self.num_layers,
-            gpu_kv_strides_tensor, gpu_block_strides_tensor, gpu_layer_strides_tensor, gpu_chunk_sizes_tensor)
+            self.num_gpus,
+            gpu_block_ptrs_flat,
+            num_tensors_per_gpu,
+            ssd_files,
+            dp_group_id,
+            self.num_layers,
+            self.gpu_kv_strides_in_bytes,
+            self.gpu_block_strides_in_bytes,
+            self.gpu_layer_strides_in_bytes,
+            self.gpu_chunk_sizes_in_bytes,
+            gpu_device_ids,
+        )
 
     def _transfer_impl(self,
                        src_block_ids: torch.Tensor,
@@ -1358,7 +1694,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             )
             self.redis_meta_client.set_node_id(self.cache_config.distributed_node_id)
 
-            # Persistent NodeMetaInfo Pool for skip redis operation when getting 
+            # Persistent NodeMetaInfo Pool for skip redis operation when getting
             # NodeMetaInfo according to node_id
             # assuming that every flexkv progress has unique node id
             self.node_metas: Dict[int, NodeMetaInfo] = {}
@@ -1396,7 +1732,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.zmq_listen_addr,
             )
 
-        ## when enable p2p ssd, we need start a zmq server to recive the meta info from remote node, 
+        ## when enable p2p ssd, we need start a zmq server to recive the meta info from remote node,
         # and allocate a cpu buffer for ssd to cpu copy
         if self.cache_config.enable_p2p_ssd:
             assert ssd_kv_layout is not None, "Invalid ssd kv layout!"
@@ -1426,7 +1762,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             ## start the zmq server and client
             self.zmq_server = SSDZMQServer(cache_config.local_zmq_ip, cache_config.local_zmq_port, self.ssd_handle_loop)
             self.zmq_client = SSDZMQClient(cache_config.local_zmq_ip, cache_config.local_zmq_port+1)
-            
+
             ## ssd copy to temp cpu buffer related
             self.ssd_files = ssd_files
             self.num_blocks_per_file = num_blocks_per_file
@@ -1452,8 +1788,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             self.ssd_layer_stride_in_bytes = (
                 ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
             )
-            
-       
+
+
             self.round_robin = 1
             # initialize ssd ioctx
             try:
@@ -1507,7 +1843,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         transfer_finished = True
 
         for task_info in task_info_list:
-            # NOTE: here one task_info represent data transfer from one node 
+            # NOTE: here one task_info represent data transfer from one node
             ret = self._batch_transfer_impl(
                 task_info,
                 transfer_op.transfer_type,
@@ -1533,9 +1869,9 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             end_time,
         )
         return transfer_finished
-    
-    def _batch_transfer_impl(self, 
-        task_info: RDMATaskInfo,    
+
+    def _batch_transfer_impl(self,
+        task_info: RDMATaskInfo,
         transfer_type: TransferType,
         layer_id: int,
         layer_granularity: int,
@@ -1599,7 +1935,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         if transfer_type == TransferType.PEERH2H:
             # remote cpu to local cpu transfer by one-side rdma read
             for i in range(len(task_info.src_ptrs)):
-                ret = self.mooncake_transfer_engine.transfer_sync_read(task_info.peer_zmq_addr, task_info.src_ptrs[i], 
+                ret = self.mooncake_transfer_engine.transfer_sync_read(task_info.peer_zmq_addr, task_info.src_ptrs[i],
                                                                        task_info.dst_ptrs[i], task_info.data_lens[i])
                 if ret != 0:
                     flexkv_logger.error(f"transfer_sync_write failed with error code: {ret}")
@@ -1646,7 +1982,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             )
 
         return True
-    
+
     def op_parser(
         self, transfer_op: WorkerTransferOp, layer_id: int, layer_granularity: int
     ) -> List[RDMATaskInfo]:
@@ -1726,11 +2062,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             assert (
                 peer_zmq_addr != ""
             ), f"Node {node_id} zmq addr not found in redis server"
-            
+
             src_blocks = segment["src"]
             dst_blocks = segment["dst"]
             assert len(src_blocks) == len(dst_blocks)
-            
+
             data_size = self.cpu_kv_layout.get_block_stride() * self.dtype.itemsize * len(src_blocks)
             ssd_task_id = self.gen_task_id()
             task_info_list.append(
@@ -1751,7 +2087,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
 
     #=============================remote behaviors
-    
+
     def meta_info_parser(self, recv_msg: str):
         recv_dict = json.loads(recv_msg)
         return RemoteSSD2HMetaInfo.from_dict(recv_dict)
@@ -1769,30 +2105,30 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     time.sleep(0.001)
                     continue
                 if not message:
-                    self.zmq_server.listen_socket.send(b"ERROR")  
+                    self.zmq_server.listen_socket.send(b"ERROR")
                     continue
 
                 recv_meta = self.meta_info_parser(message)
                 if not recv_meta:
-                    self.zmq_server.listen_socket.send(b"ERROR")  
+                    self.zmq_server.listen_socket.send(b"ERROR")
                     flexkv_logger.warning("Can not parse RemoteSSD2HMetaInfo using recieved message")
                     continue
-                
+
                 flexkv_logger.info(
                     f"[ssd_handle_loop] Received task_id={recv_meta.task_id}, "
                     f"ssd_block_ids={recv_meta.ssd_block_ids}, "
                     f"cpu_block_ids={recv_meta.cpu_block_ids}"
                 )
-                
-                self.zmq_server.listen_socket.send(b"OK")  
-                
+
+                self.zmq_server.listen_socket.send(b"OK")
+
                 failure_msg = NotifyMsg(mooncake_engine_addr=self.mooncake_transfer_engine.get_engine_addr(),
                                                 task_id=recv_meta.task_id, status = NotifyStatus.FAIL) ## used when transfer fails
                 success_msg = NotifyMsg(mooncake_engine_addr=self.mooncake_transfer_engine.get_engine_addr(),
                                                 task_id=recv_meta.task_id, status = NotifyStatus.SUCCESS) ## used when transfer fails
-                
+
                 # step2: ckeck the recieved info, early return if check error
-                nvtx_range = nvtx.start_range(message=f"ssd_handle_loop. check and load_data", color="orange")
+                nvtx_range = nvtx.start_range(message="ssd_handle_loop. check and load_data", color="orange")
                 if len(recv_meta.ssd_block_ids) == 0 or len(recv_meta.cpu_block_ids) == 0 \
                     or len(recv_meta.cpu_block_ids)!=len(recv_meta.ssd_block_ids):
                         flexkv_logger.warning(
@@ -1800,7 +2136,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                         )
                         self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                         continue
-                    
+
                 # TODO: we need to support dynamic temp buffer or split the ssd transfer request if number of ssd blocks is larger than num_tmp_cpu_blocks
                 # now we just refuse this transfer by returning a failure status
                 if len(recv_meta.ssd_block_ids)>self.cache_config.num_tmp_cpu_blocks:
@@ -1809,12 +2145,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                         )
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                     continue
-                
+
                 ## step3: do copy data from ssd to cpu
                 # NOTE: this block ids is a corresponding relationship with self.tmp_cpu_buffer, for every transfer req we reuse the local cpu buffer
                 local_cpu_buffer_block_ids = torch.arange(0, len(recv_meta.ssd_block_ids), dtype = torch.int64)
                 local_cpu_start_idx = 0
-                
+
                 # seperate the blocks to get the longest continuous blocks
                 groups = split_contiguous_blocks(recv_meta.ssd_block_ids, recv_meta.cpu_block_ids)
 
@@ -1822,21 +2158,21 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 src_ptr_list = []
                 dst_ptr_list = []
                 data_size_list = []
-                
+
                 for item in groups:
                     # in this loop we do two things:
                     # 1. copy ssd data to cpu for each segment
                     # 2. calculate the start ptr of local cpu blocks and dst cpu blocks for each segment and record them
                     ssd_block_ids_per_seg = torch.tensor(item["src"], dtype=torch.int64)
                     dst_cpu_block_ids_per_seg = torch.tensor(item["dst"], dtype=torch.int64)
-                    
+
                     if len(ssd_block_ids_per_seg) == 0:
-                        all_copy_complete = False                     
+                        all_copy_complete = False
                         break
                     # get corresponding temp cpu block ids
                     local_cpu_buffer_block_ids_per_seg = local_cpu_buffer_block_ids[local_cpu_start_idx: local_cpu_start_idx+len(ssd_block_ids_per_seg)]
                     local_cpu_start_idx += len(ssd_block_ids_per_seg)
-                    
+
                     layer_id = recv_meta.layer_id
                     layer_granularity = recv_meta.layer_granularity
                     layer_id_list = torch.arange(
@@ -1871,17 +2207,17 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     assert len(src_ptr_list) == len(data_size_list) and len(dst_ptr_list) == len(data_size_list)
 
                 nvtx.end_range(nvtx_range)
-                nvtx_range = nvtx.start_range(message=f"ssd_handle_loop. write_data_back_to_peer", color="orange")
+                nvtx_range = nvtx.start_range(message="ssd_handle_loop. write_data_back_to_peer", color="orange")
                 ## step4: do rdma transfer and send notify
                 if not all_copy_complete:
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                     continue
-                
+
                 if not self.write_data_back_to_peer(recv_meta.peer_engine_addr, src_ptr_list, dst_ptr_list, data_size_list):
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
-                    flexkv_logger.error(f"Failed to write data back to peer")
+                    flexkv_logger.error("Failed to write data back to peer")
                     continue
-                    
+
                 self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, success_msg)
                 nvtx.end_range(nvtx_range)
             except Exception as e:
@@ -1890,7 +2226,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
     def copy_ssd_data_to_dram(
         self, layer_id_list: torch.Tensor, ssd_block_id_list: torch.Tensor, cpu_block_id_list: torch.Tensor
-    ):  
+    ):
         assert len(ssd_block_id_list) == len(cpu_block_id_list)
         flexkv_logger.info(f"copy ssd blocks:{ssd_block_id_list} to cpu blocks: {cpu_block_id_list}" )
         try:
@@ -1916,19 +2252,19 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.error(f"Copy data from ssd to cpu failed: {e}")
             return False
         return True
-    
+
     def write_data_back_to_peer(
-        self, 
-        peer_address: str, 
-        src_ptr_list: List[int], 
-        dst_ptr_list: List[int], 
+        self,
+        peer_address: str,
+        src_ptr_list: List[int],
+        dst_ptr_list: List[int],
         data_size_list: List[int]
     ):
         flexkv_logger.info(f"Write data back to peer from src: {src_ptr_list} to {dst_ptr_list}")
         ret = self.mooncake_transfer_engine.batch_transfer_sync_write(peer_address, src_ptr_list, dst_ptr_list, data_size_list)
         return True if ret == 0 else False
 
-        
+
     #============================== distrbuted cpu related ==========================
 
     def _dist_cpu_op_parser(
@@ -1985,19 +2321,19 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                         layer_granularity,
                     )
                 )
- 
+
                 assert (
                     src_data_size_per_block == dst_data_size_per_block
                 ), "src and dst blocks have different layout"
-                
-                
+
+
                 for _ in range(len(src_block_start_ptrs)):
                     data_size = src_data_size_per_block * len(src_blocks)
                     data_size_list.append(data_size)
                 src_ptr_list.extend(src_block_start_ptrs)
                 dst_ptr_list.extend(dst_block_start_ptrs)
                 assert len(data_size_list) == len(src_ptr_list) and len(data_size_list) == len(dst_ptr_list)
-                
+
             flexkv_logger.info(
                 f"[PEER2CPUTransferWorker]: remote cpu op parser src_ptr_list: {src_ptr_list}, dst_ptr_list: {dst_ptr_list} "
             )
@@ -2019,7 +2355,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     data_size = sum(data_size_list)
                 )
             )
-            
+
         return task_info_list
 
     #================================== utils =================================
@@ -2051,7 +2387,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         # assuming that remote cpu buffer layout is the same as local cpu buffer layout
         assert self.cpu_kv_layout.type == self.remote_kv_layout.type
         src_block_ptrs = []
-        
+
         # Get the first block ID and handle different input types
         if isinstance(cpu_blocks, torch.Tensor):
             block_id_int = int(cpu_blocks[0].item())
@@ -2063,7 +2399,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 block_id_int = int(first_elem)
         else:
             raise ValueError(f"Invalid cpu_blocks type: {type(cpu_blocks)}")
-        
+
         if self.cpu_kv_layout.type == KVCacheLayoutType.LAYERFIRST:
             for layer_id in range(layer_start_id, layer_start_id + layer_granularity):
                 for kv_id in range(self.kv_dim):
@@ -2085,12 +2421,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.cpu_kv_layout.type}")
         data_size_per_block = self.cpu_kv_layout.get_block_stride() * self.dtype.itemsize
-        
+
         return  src_block_ptrs, data_size_per_block
 
     ### redis client helper functions
     def regist_node_meta(self, cpu_buffer_base_ptr: int, ssd_buffer_base_ptr: int, zmq_addr: str):
-        self.redis_meta_client.regist_node_meta(self.redis_meta_client.get_node_id(), self.mooncake_transfer_engine.get_engine_addr(), 
+        self.redis_meta_client.regist_node_meta(self.redis_meta_client.get_node_id(), self.mooncake_transfer_engine.get_engine_addr(),
                                                 zmq_addr, cpu_buffer_base_ptr, ssd_buffer_base_ptr)
         #NOTE: maybe useless
         node_meta_info = NodeMetaInfo(
@@ -2102,7 +2438,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         )
         self.node_metas[self.redis_meta_client.get_node_id()] = node_meta_info
         flexkv_logger.info(f"Registered node {self.redis_meta_client.get_node_id()} to Redis.")
-    
+
     def unregist_node_meta(self, node_id: int = None) -> None:
         self.redis_meta_client.unregist_node_meta(self.redis_meta_client.get_node_id())
         flexkv_logger.info(f"Unregistered node {self.redis_meta_client.get_node_id()} from Redis.")
@@ -2110,7 +2446,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
     def get_node_meta(self, node_id: int) -> Optional[NodeMetaInfo]:
         # TODO: how to remove the invalid node meta info in node_metas
         """Get the node meta info by node id."""
-        if not node_id in self.node_metas:
+        if node_id not in self.node_metas:
             ## fetch from redis
             node_redis_data = self.redis_meta_client.get_node_meta(node_id)
             if not node_redis_data:
