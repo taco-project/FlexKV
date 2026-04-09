@@ -114,6 +114,8 @@ class FlexKVConfig:
         num_local_layers: int = 0,
         pp_size: int = 1,
         pp_rank: int = 0,
+        dp_size: int = 1,
+        dp_rank: int = 0,
     ):
         """
         Initialize FlexKVConfig fields from sglang config.
@@ -124,6 +126,8 @@ class FlexKVConfig:
             num_local_layers: number of layers on this PP rank (0 means no PP, use total layers)
             pp_size: pipeline parallel size (default 1, no PP)
             pp_rank: pipeline parallel rank (default 0)
+            dp_size: data parallel size (default 1, no DP)
+            dp_rank: data parallel rank (default 0)
         """
         # cache config: use page_size as tokens_per_block so that FlexKV's
         # CPU radix tree manages blocks at page granularity, ensuring that
@@ -159,11 +163,38 @@ class FlexKVConfig:
         self.model_config.use_mla = use_mla
 
         self.model_config.tp_size = int(tp_size)
-        self.model_config.dp_size = int(getattr(sglang_config, "dp_size", 1))
+        self.model_config.dp_size = int(dp_size if dp_size is not None else 1)
+        self.model_config.dp_rank = int(dp_rank if dp_rank is not None else 0)
         self.model_config.pp_size = int(pp_size)
         self.model_config.pp_rank = int(pp_rank)
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
-        
+
+        # Each PP rank needs its own IPC ports so that their
+        # KVManager / TransferManager instances do not collide on the same
+        # ZMQ endpoint.  DP ranks share the same KVServer (only DP0 creates
+        # it), so they must use the same IPC port.
+        _dp_rank = int(dp_rank if dp_rank is not None else 0)
+        port_suffix = ""
+        if int(pp_size) > 1:
+            port_suffix += f"_pp{int(pp_rank)}"
+        if port_suffix:
+            self.server_recv_port = f"{self.server_recv_port}{port_suffix}"
+            self.gpu_register_port = f"{self.server_recv_port}_gpu_register"
+
+        rank_parts = []
+        if int(tp_size) > 1:
+            rank_parts.append(f"tp_rank=0")
+        if int(pp_size) > 1:
+            rank_parts.append(f"pp_rank={int(pp_rank)}")
+        if int(self.model_config.dp_size) > 1:
+            rank_parts.append(f"dp_rank={_dp_rank}")
+        rank_label = f" [{', '.join(rank_parts)}]" if rank_parts else ""
+        logger.info(
+            f"[FlexKV] IPC ports configured{rank_label}: "
+            f"server_recv_port={self.server_recv_port}, "
+            f"gpu_register_port={self.gpu_register_port}"
+        )
+
         hf_config = getattr(sglang_config, 'hf_config', None)
         self._detect_indexer_config_from_hf(hf_config, source="sglang")
 

@@ -249,7 +249,8 @@ class KVTPClient:
         self.dp_client_id = dp_client_id
         self.device_id = device_id
 
-        flexkv_logger.info(f"KVTPClient {device_id} of KVDPClient {self.dp_client_id} Initialized!")
+        flexkv_logger.info(f"KVTPClient {device_id} of KVDPClient {self.dp_client_id} Initialized! "
+                           f"(gpu_register_port={gpu_register_port})")
 
     def register_to_server(
         self,
@@ -286,7 +287,17 @@ class KVTPClient:
             indexer_gpu_layout=indexer_layout,
         )
 
-        self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
+        try:
+            self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
+            flexkv_logger.info(
+                f"KVTPClient {device_id}: registration message sent "
+                f"(dp_client_id={self.dp_client_id}, num_kv_caches={len(kv_caches)})")
+        except zmq.Again:
+            flexkv_logger.error(
+                f"KVTPClient {device_id}: zmq.Again when sending registration "
+                f"(send buffer full or no connection). Retrying with blocking send...")
+            self.send_to_server.send_pyobj(register_req)
+            flexkv_logger.info(f"KVTPClient {device_id}: registration message sent (blocking retry)")
 
 
 if __name__ == "__main__":
