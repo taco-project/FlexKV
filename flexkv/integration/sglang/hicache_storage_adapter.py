@@ -749,8 +749,8 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             arr = self._token_ids_to_numpy(token_ids)
 
             # CPU-only PUT: allocate blocks, get their IDs
-            task_id, cpu_block_ids, return_mask = self._kv_manager.put_cpu(
-                token_ids=arr)
+            task_id, cpu_block_ids, return_mask, data_ready_cb = \
+                self._kv_manager.put_cpu(token_ids=arr)
 
             if len(cpu_block_ids) == 0:
                 # No new blocks allocated — either fully deduped or alloc failed.
@@ -803,6 +803,11 @@ class FlexKVHiCacheStorage(HiCacheStorage):
                     transformed = self._sglang_to_flexkv(data_page)
                     dst = self._get_block_view(block_id)
                     dst.copy_(transformed.flatten())
+
+            # Mark CPU blocks as ready for reads now that data is filled.
+            # This must happen BEFORE launch_cpu so that concurrent
+            # batch_get_v1 callers see fully-written data.
+            data_ready_cb()
 
             # Launch H2DISK transfer (async, if SSD enabled)
             self._kv_manager.launch_cpu([task_id])

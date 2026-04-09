@@ -1451,7 +1451,7 @@ class GlobalCacheEngine:
                 layer_num: int = -1,
                 dp_id: int = 0,
                 namespace: Optional[List[str]] = None) \
-                    -> Tuple[TransferOpGraph, np.ndarray, np.ndarray, Callable, Dict, int]:
+                    -> Tuple[TransferOpGraph, np.ndarray, np.ndarray, Callable, Callable, Dict, int]:
         """CPU-only PUT: allocate CPU cache blocks and optionally write to SSD.
 
         Unlike put(), this does NOT require GPU blocks or slot_mapping.
@@ -1459,9 +1459,13 @@ class GlobalCacheEngine:
         cpu_block_ids before launching the transfer graph.
 
         Returns:
-            (transfer_graph, cpu_block_ids, return_mask, callback, op_callback_dict, task_end_op_id)
+            (transfer_graph, cpu_block_ids, return_mask, callback,
+             data_ready_callback, op_callback_dict, task_end_op_id)
             where cpu_block_ids are the allocated CPU cache block indices
-            that the caller should fill with KV data.
+            that the caller should fill with KV data.  The caller MUST
+            invoke data_ready_callback() after filling data to mark the
+            CPU blocks as ready for reads; failing to do so will cause
+            batch_get_v1 to miss these blocks.
         """
         if layer_num == -1:
             layer_num = self.model_config.num_layers
@@ -1516,10 +1520,22 @@ class GlobalCacheEngine:
                                               node_to_ready=op_node_to_ready[op_id][1],
                                               ready_length=op_node_to_ready[op_id][2])
 
+        # Build a callback the caller MUST invoke after filling CPU block
+        # data.  This marks the CPU radix-tree nodes as ready so that
+        # concurrent batch_get_v1 can see them.
+        if DeviceType.CPU in node_to_unlock:
+            cpu_node, cpu_ready_len = node_to_unlock[DeviceType.CPU]
+            data_ready_callback = partial(
+                self.cpu_cache_engine.set_ready,
+                cpu_node, True, cpu_ready_len)
+        else:
+            data_ready_callback = lambda: None  # noqa: E731 — no-op
+
         if self._metrics_collector is not None:
             self._update_mempool_metrics()
 
-        return transfer_graph, cpu_block_ids, return_mask, callback, op_callback_dict, task_end_op_id
+        return (transfer_graph, cpu_block_ids, return_mask, callback,
+                data_ready_callback, op_callback_dict, task_end_op_id)
 
     def _put_impl_local_cpu_only(self,
             request_id: int,
@@ -1616,11 +1632,14 @@ class GlobalCacheEngine:
             transfer_graph.add_transfer_op(op_h2disk)
             finished_ops_ids.append(op_h2disk.op_id)
 
-        # Insert into radix tree with is_ready=True (data filled by caller before launch)
+        # Insert into radix tree with is_ready=False; the caller MUST invoke
+        # the returned data_ready_callback after filling data into the CPU
+        # blocks.  Setting is_ready=True here would expose partially-written
+        # blocks to concurrent batch_get_v1 readers.
         cpu_node_to_unlock = self.cpu_cache_engine.insert(
             sequence_meta,
             new_cpu_blocks,
-            is_ready=True,
+            is_ready=False,
             match_result=cpu_matched_result
         )
 

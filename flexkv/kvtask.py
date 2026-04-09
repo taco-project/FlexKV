@@ -753,19 +753,21 @@ class KVTaskEngine(KVTaskManager):
                       token_mask: Optional[np.ndarray] = None,
                       dp_id: int = 0,
                       task_id: int = -1,
-                      namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray, np.ndarray]:
+                      namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray, np.ndarray, Callable]:
         """CPU-only PUT: allocate CPU cache blocks and return them for data filling.
 
         Returns:
-            (task_id, cpu_block_ids, return_mask)
-            Caller must fill data into cpu_block_ids, then call launch().
+            (task_id, cpu_block_ids, return_mask, data_ready_callback)
+            Caller must fill data into cpu_block_ids, invoke
+            data_ready_callback() to mark blocks visible, then call launch().
         """
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=np.bool_)
         if task_id == -1:
             task_id = self._gen_task_id()
 
-        graph, cpu_block_ids, return_mask, callback, op_callback_dict, task_end_op_id = \
+        (graph, cpu_block_ids, return_mask, callback,
+         data_ready_callback, op_callback_dict, task_end_op_id) = \
             self.cache_engine.put_cpu(
                 request_id=task_id,
                 token_ids=token_ids,
@@ -790,9 +792,11 @@ class KVTaskEngine(KVTaskManager):
             op_callback_dict=op_callback_dict,
         )
         self.graph_to_task[graph.graph_id] = task_id
-        self._process_empty_graph(task_id)
+        # NOTE: do NOT call _process_empty_graph here — the caller has not
+        # yet filled data into the CPU blocks.  The graph will be processed
+        # when launch_cpu() is called after data filling + data_ready_callback().
 
-        return task_id, cpu_block_ids, return_mask
+        return task_id, cpu_block_ids, return_mask, data_ready_callback
 
     def _put_match_impl(self,
                         token_ids: np.ndarray,

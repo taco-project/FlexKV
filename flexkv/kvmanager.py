@@ -15,7 +15,7 @@
 
 import os
 import subprocess
-from typing import Optional, Tuple, List, Dict, Union, Iterable
+from typing import Optional, Tuple, List, Dict, Union, Iterable, Callable
 import time
 
 import numpy as np
@@ -229,29 +229,40 @@ class KVManager:
                 token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                 dp_id: int = 0,
                 namespace: Optional[List[str]] = None,
-                ) -> Tuple[int, np.ndarray, np.ndarray]:
+                ) -> Tuple[int, np.ndarray, np.ndarray, Callable]:
         """CPU-only PUT: allocate CPU cache blocks for external data filling.
 
         Returns:
-            (task_id, cpu_block_ids, return_mask)
+            (task_id, cpu_block_ids, return_mask, data_ready_callback)
             Caller fills data into the CPU cache tensor at cpu_block_ids,
-            then calls launch_cpu(task_id) to trigger async SSD write.
+            then calls data_ready_callback() to mark blocks visible to
+            readers, and finally calls launch_cpu(task_id) to trigger
+            async SSD write.
         """
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
-        task_id, cpu_block_ids, mask = self.kv_task_engine.put_cpu_match(
-            token_ids, token_mask, dp_id, namespace=namespace)
-        return task_id, cpu_block_ids, mask
+        task_id, cpu_block_ids, mask, data_ready_callback = \
+            self.kv_task_engine.put_cpu_match(
+                token_ids, token_mask, dp_id, namespace=namespace)
+        return task_id, cpu_block_ids, mask, data_ready_callback
 
     def launch_cpu(self, task_ids: Union[int, List[int]]) -> List[int]:
-        """Launch CPU-only tasks (H2DISK only, no slot_mapping needed)."""
+        """Launch CPU-only tasks (H2DISK only, no slot_mapping needed).
+
+        The caller must have already invoked data_ready_callback() before
+        this call so that CPU blocks are marked ready for concurrent readers.
+        """
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         launched = []
         for task_id in task_ids:
             self.kv_task_engine._launch_task(task_id)
+            # Handle empty-graph tasks (no SSD ops) that were deferred
+            # from put_cpu_match to avoid premature completion before
+            # data filling.
+            self.kv_task_engine._process_empty_graph(task_id)
             launched.append(task_id)
         return launched
 
