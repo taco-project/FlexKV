@@ -36,6 +36,7 @@ PUT (batch_set_v1 - backup from Host to FlexKV):
        MLA layer_first: per-layer read from kv_buffer[layer_id, ...]
        other layouts: mem_pool_host.get_data_page(index, flat=False) + permute
     -> direct memcpy to FlexKV CPU cache tensor (via put_cpu)
+    -> data_ready_callback() marks blocks visible to concurrent readers
     -> KVManager radix tree insert
     -> TransferEngine H2DISK async (if SSD enabled)
 
@@ -170,7 +171,7 @@ proceeds with normal prefill computation.
 | `flexkv/integration/sglang/hicache_storage_adapter.py` | Main adapter: `FlexKVHiCacheStorage` class |
 | `flexkv/integration/sglang/patch_sglang.py` | One-click SGLang patch tool (`flexkv-patch-sglang` CLI) |
 | `flexkv/integration/sglang/patches/sglang_flexkv.patch` | Unified diff for SGLang (3 source files) |
-| `flexkv/integration/sglang/test_hicache_storage_adapter.py` | Unit tests (22 test cases) |
+| `flexkv/integration/sglang/test_hicache_storage_adapter.py` | Unit tests (26 test cases) |
 
 ### SGLang Side (separate repo/branch)
 
@@ -359,7 +360,8 @@ pytest test/srt/hicache/test_hicache_storage_flexkv_backend.py -v -s
 - [x] Round-trip data correctness: set -> get produces identical data
 - [x] SGLang E2E: backup/prefetch cycle verified (816/832 tokens cached)
 - [x] SGLang E2E: GSM8K accuracy consistent across cache flushes
-- [x] Unit tests: 22 test cases pass (including mode configuration, MLA, layerwise tests)
+- [x] Unit tests: 26 test cases pass (including mode configuration, MLA, layerwise, concurrency tests)
 - [x] Distributed mode: single-node with Redis GMS verified
 - [x] Distributed mode: cross-node GET via P2P transfer (prefetch_async + wait)
 - [x] Layerwise prefetch: per-layer copy for layer_first layout (zero-copy view, no permute temp)
+- [x] CPU-PUT deferred visibility: blocks not readable until data_ready_callback() after fill
