@@ -280,42 +280,44 @@ void LayerwiseTransferGroup::layerwise_transfer(
     h2d_range_ids[0] = nvtxRangeStartA(h2d_range_names[0].c_str());
   }
 
+  // Step 0: SSD -> CPU transfer for ALL layers at once (before layerwise loop).
+  // This is required because the CPU memory uses TP-divided layout where each rank's
+  // data occupies a contiguous region [rank*tp_stride, (rank+1)*tp_stride). Per-layer-batch
+  // SSD reads with full strides would land at wrong CPU positions for TP > 1.
+  if (enable_ssd_ && ssd_block_ids.numel() > 0) {
+    int num_ssd_blocks = ssd_block_ids.numel();
+    int64_t ssd_bytes = cpu_chunk_size_in_bytes * 2 * num_layers * num_ssd_blocks;
+    double ssd_mb = ssd_bytes / (1024.0 * 1024.0);
+    char ssd_range_name[128];
+    snprintf(ssd_range_name, sizeof(ssd_range_name),
+             "SSD->CPU AllLayers[0,%d) %.2fMB", num_layers, ssd_mb);
+    nvtxRangePushA(ssd_range_name);
+
+    torch::Tensor all_layer_ids =
+        torch::arange(0, num_layers,
+                      torch::TensorOptions().dtype(torch::kInt32));
+    transfer_kv_blocks_ssd(
+        *ioctx_, all_layer_ids, reinterpret_cast<int64_t>(cpu_blocks_),
+        ssd_block_ids, cpu_block_ids_d2h, cpu_layer_stride_in_bytes,
+        cpu_kv_stride_in_bytes, ssd_layer_stride_in_bytes,
+        ssd_kv_stride_in_bytes, cpu_chunk_size_in_bytes,
+        cpu_block_stride_in_bytes,
+        true, // is_read: SSD -> CPU
+        num_blocks_per_file, round_robin, num_threads_per_device, is_mla);
+
+    nvtxRangePop();
+  }
+
   int batch_idx = 0;
   for (int start_layer = 0; start_layer < num_layers;
        start_layer += layer_granularity) {
     int layers_this_batch =
         std::min(layer_granularity, num_layers - start_layer);
-    
+
     batch_start_layers[batch_idx] = start_layer;
     batch_layers_count[batch_idx] = layers_this_batch;
-    
-    // Step 1: SSD -> CPU transfer
-    if (enable_ssd_ && ssd_block_ids.numel() > 0) {
-      // Calculate SSD->CPU data size: cpu_chunk_size * 2 (K+V) * layers * num_ssd_blocks
-      int num_ssd_blocks = ssd_block_ids.numel();
-      int64_t ssd_bytes = cpu_chunk_size_in_bytes * 2 * layers_this_batch * num_ssd_blocks;
-      double ssd_mb = ssd_bytes / (1024.0 * 1024.0);
-      char ssd_range_name[128];
-      snprintf(ssd_range_name, sizeof(ssd_range_name),
-               "SSD->CPU Layer[%d,%d) %.2fMB", start_layer, start_layer + layers_this_batch, ssd_mb);
-      nvtxRangePushA(ssd_range_name);
 
-      torch::Tensor layer_id_list =
-          torch::arange(start_layer, start_layer + layers_this_batch,
-                        torch::TensorOptions().dtype(torch::kInt32));
-      transfer_kv_blocks_ssd(
-          *ioctx_, layer_id_list, reinterpret_cast<int64_t>(cpu_blocks_),
-          ssd_block_ids, cpu_block_ids_d2h, cpu_layer_stride_in_bytes,
-          cpu_kv_stride_in_bytes, ssd_layer_stride_in_bytes,
-          ssd_kv_stride_in_bytes, cpu_chunk_size_in_bytes,
-          cpu_block_stride_in_bytes,
-          true, // is_read: SSD -> CPU
-          num_blocks_per_file, round_robin, num_threads_per_device, is_mla);
-
-      nvtxRangePop();
-    }
-
-    // Step 2: CPU -> GPU transfer
+    // Step 1: CPU -> GPU transfer
     // NVTX range for this batch was already started (by main thread for first batch,
     // or by previous batch's callback for subsequent batches)
     
