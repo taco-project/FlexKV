@@ -444,7 +444,8 @@ PYBIND11_MODULE(c_ext, m) {
              py::arg("cpu_kv_stride_in_bytes"),
              py::arg("cpu_layer_stride_in_bytes"),
              py::arg("cpu_block_stride_in_bytes"),
-             py::arg("cpu_chunk_size_in_bytes"), py::arg("transfer_cta_num"),
+             py::arg("cpu_chunk_size_in_bytes"),
+             py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_cta_num"),
              py::arg("use_ce_transfer"), py::arg("num_layers"),
              py::arg("layer_granularity"), py::arg("is_mla"),
              py::arg("counter_id") = 0);

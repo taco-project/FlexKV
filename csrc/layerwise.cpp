@@ -225,7 +225,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t cpu_kv_stride_in_bytes,
     const int64_t cpu_layer_stride_in_bytes,
     const int64_t cpu_block_stride_in_bytes,
-    const int64_t cpu_chunk_size_in_bytes, const int transfer_cta_num,
+    const int64_t cpu_chunk_size_in_bytes,
+    const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
     const bool use_ce_transfer, const int num_layers,
     const int layer_granularity, const bool is_mla,
     const int counter_id) {
@@ -318,7 +319,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
     
     for (int i = 0; i < num_gpus_; ++i) {
       cudaSetDevice(gpu_device_ids_[i]);
-      int64_t cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i];
+      int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
       if (is_mla) {
         cpu_startoff_inside_chunks = 0;
       }

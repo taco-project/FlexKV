@@ -115,9 +115,14 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.cpu_blocks = cpu_blocks
 
         self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
-        self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+        # tp has effect on the layout of the cpu tensor
+        # the tp dim should always be right after the block dim
+        if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and not self.is_mla:
+            cpu_kv_layout = cpu_kv_layout.div_head(self.tp_group_size)
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+        self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+        self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
 
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
@@ -279,6 +284,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.cpu_chunk_size_in_bytes,
+            self.cpu_tp_stride_in_bytes,
             self.h2d_cta_num,
             self.use_ce_transfer_h2d,
             self.num_layers,
