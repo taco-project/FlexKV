@@ -48,6 +48,8 @@ public:
       const int64_t cpu_layer_stride_in_bytes,
       const int64_t cpu_block_stride_in_bytes,
       const int64_t cpu_chunk_size_in_bytes,
+      const int64_t h2d_cpu_kv_stride_in_bytes,
+      const int64_t h2d_cpu_layer_stride_in_bytes,
       const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
       const bool use_ce_transfer, const int num_layers,
       const int layer_granularity, const bool is_mla,

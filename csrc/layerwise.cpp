@@ -226,6 +226,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t cpu_layer_stride_in_bytes,
     const int64_t cpu_block_stride_in_bytes,
     const int64_t cpu_chunk_size_in_bytes,
+    const int64_t h2d_cpu_kv_stride_in_bytes,
+    const int64_t h2d_cpu_layer_stride_in_bytes,
     const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
     const bool use_ce_transfer, const int num_layers,
     const int layer_granularity, const bool is_mla,
@@ -331,7 +333,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
         flexkv::transfer_kv_blocks<BackendType::VLLM>(
             num_blocks, start_layer, layers_this_batch, gpu_block_ids,
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
-            cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+            cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
             streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
         break;
@@ -339,7 +341,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
         flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
             num_blocks, start_layer, layers_this_batch, gpu_block_ids,
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
-            cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+            cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
             streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
         break;
@@ -347,7 +349,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
         flexkv::transfer_kv_blocks<BackendType::SGLANG>(
             num_blocks, start_layer, layers_this_batch, gpu_block_ids,
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
-            cpu_ptr, cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+            cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
             streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
         break;
