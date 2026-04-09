@@ -32,6 +32,12 @@ Test Coverage
 20. test_layerwise_callback: layer_ready_callback invoked num_layers times in order
 21. test_mla_layerwise_roundtrip: MLA layerwise set->get round-trip
 
+21. test_stats: Statistics collection after set/exists operations
+22. test_cpu_put_blocks_not_ready_before_data_fill: Blocks invisible until data_ready_callback
+23. test_cpu_put_visibility_after_data_ready_callback: Manual put_cpu -> fill -> ready -> get roundtrip
+24. test_batch_set_v1_makes_blocks_ready: batch_set_v1 leaves blocks in ready state
+25. test_concurrent_get_during_put_sees_no_partial_data: Reader mid-fill sees nothing
+
 Known Issues Being Tested
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 - batch_set_v1 page_idx computation when cpu_block_ids < num_pages (dedup case)
@@ -811,6 +817,253 @@ def test_mla_layerwise_roundtrip():
 
 
 # ---------------------------------------------------------------------------
+# CPU-PUT is_ready race condition tests (fix for commit 6452176)
+#
+# These tests verify that CPU blocks allocated by put_cpu() are NOT visible
+# to concurrent readers (batch_get_v1 / batch_exists) until the caller
+# explicitly invokes data_ready_callback() after filling data.
+# ---------------------------------------------------------------------------
+
+def _query_radix_tree(backend, token_ids):
+    """Helper: query CPU radix tree for the given token_ids, return MatchResult."""
+    from flexkv.common.block import SequenceMeta
+    arr = backend._token_ids_to_numpy(token_ids)
+    page_size = backend._page_size
+    aligned_len = (len(arr) // page_size) * page_size
+    seq_meta = SequenceMeta(token_ids=arr[:aligned_len],
+                            tokens_per_block=page_size)
+    cache_engine = backend._kv_manager.kv_task_engine.cache_engine
+    return cache_engine.cpu_cache_engine.match(seq_meta)
+
+
+def test_cpu_put_blocks_not_ready_before_data_fill():
+    """Blocks are in tree but invisible to readers until data_ready_callback().
+
+    This is the core regression test for the is_ready race condition.
+    After put_cpu() the radix tree contains the blocks (num_matched_blocks > 0)
+    but they are NOT ready (num_ready_matched_blocks == 0).  Only after
+    data_ready_callback() do they become visible.
+    """
+    os.environ["FLEXKV_CPU_ONLY"] = "1"
+    os.environ["FLEXKV_INSTANCE_NUM"] = "0"
+
+    backend = FlexKVHiCacheStorage(_make_config(page_size=4))
+    pool = _make_mock_pool(page_size=4)
+    backend.register_mem_pool_host(pool)
+
+    token_ids = list(range(200, 216))  # 16 tokens = 4 pages
+    arr = backend._token_ids_to_numpy(token_ids)
+
+    # --- Phase 1: put_cpu() allocates blocks with is_ready=False ---
+    task_id, cpu_block_ids, return_mask, data_ready_cb = \
+        backend._kv_manager.put_cpu(token_ids=arr)
+
+    assert len(cpu_block_ids) > 0, "Expected new blocks to be allocated"
+
+    # Query the radix tree directly
+    mr = _query_radix_tree(backend, token_ids)
+
+    # Blocks ARE in the tree...
+    assert mr.num_matched_blocks > 0, \
+        f"Expected blocks in tree, got num_matched_blocks={mr.num_matched_blocks}"
+    # ...but NOT ready for readers
+    assert mr.num_ready_matched_blocks == 0, \
+        (f"RACE BUG: blocks visible before data fill! "
+         f"num_ready_matched_blocks={mr.num_ready_matched_blocks}")
+
+    # High-level APIs should also see nothing
+    keys = [f"key{i}" for i in range(4)]
+    host_indices = torch.arange(0, 16, dtype=torch.int64)
+    extra = HiCacheStorageExtraInfo(
+        prefix_keys=None, extra_info={"token_ids": token_ids})
+
+    assert backend.batch_exists(keys, extra) == 0, \
+        "batch_exists should return 0 before data_ready_callback"
+    get_results = backend.batch_get_v1(keys, host_indices, extra)
+    assert not any(get_results), \
+        "batch_get_v1 should return all False before data_ready_callback"
+
+    # --- Phase 2: invoke data_ready_callback ---
+    data_ready_cb()
+
+    mr_after = _query_radix_tree(backend, token_ids)
+    assert mr_after.num_ready_matched_blocks > 0, \
+        "Blocks should be ready after data_ready_callback"
+    assert mr_after.num_ready_matched_blocks == mr_after.num_matched_blocks, \
+        "All matched blocks should now be ready"
+
+    # High-level APIs now see the blocks
+    assert backend.batch_exists(keys, extra) == 4, \
+        "batch_exists should return 4 after data_ready_callback"
+
+    # Clean up: launch to complete the task
+    backend._kv_manager.launch_cpu([task_id])
+
+
+def test_cpu_put_visibility_after_data_ready_callback():
+    """End-to-end: manually drive put_cpu -> fill -> data_ready_cb -> launch,
+    then verify batch_get_v1 reads back correct data."""
+    os.environ["FLEXKV_CPU_ONLY"] = "1"
+    os.environ["FLEXKV_INSTANCE_NUM"] = "0"
+
+    backend = FlexKVHiCacheStorage(_make_config(page_size=4))
+    write_pool = _make_mock_pool(page_size=4)
+    backend.register_mem_pool_host(write_pool)
+
+    token_ids = list(range(300, 316))  # 4 pages
+    arr = backend._token_ids_to_numpy(token_ids)
+    page_size = 4
+    num_pages = 4
+
+    # Seed pool with known values
+    for page_idx in range(num_pages):
+        s, e = page_idx * page_size, (page_idx + 1) * page_size
+        write_pool._kv_buffer[:, :, s:e, :, :] = float(page_idx + 1)
+
+    # Step 1: put_cpu
+    task_id, cpu_block_ids, return_mask, data_ready_cb = \
+        backend._kv_manager.put_cpu(token_ids=arr)
+    assert len(cpu_block_ids) == num_pages
+
+    # Step 2: fill data (replicate batch_set_v1 logic)
+    num_deduped = num_pages - len(cpu_block_ids)  # should be 0
+    num_layers = backend._model_config.num_layers
+    use_mla = backend._model_config.use_mla
+    for i, block_id in enumerate(cpu_block_ids):
+        page_idx = num_deduped + i
+        block_view = backend._get_block_shaped(block_id)
+        host_start = page_idx * page_size
+        for layer_id in range(num_layers):
+            backend._read_layer_from_host(block_view, layer_id, host_start, use_mla)
+
+    # Step 3: mark ready
+    data_ready_cb()
+
+    # Step 4: launch (H2DISK if SSD enabled; here it's a no-op)
+    backend._kv_manager.launch_cpu([task_id])
+
+    # Step 5: verify via batch_get_v1
+    read_pool = _make_mock_pool(page_size=4)
+    backend._mem_pool_host = read_pool
+    keys = [f"key{i}" for i in range(num_pages)]
+    host_indices = torch.arange(0, 16, dtype=torch.int64)
+    extra = HiCacheStorageExtraInfo(
+        prefix_keys=None, extra_info={"token_ids": token_ids})
+
+    get_results = backend.batch_get_v1(keys, host_indices, extra)
+    assert all(get_results), f"batch_get_v1 failed: {get_results}"
+
+    # Verify data integrity (layerwise writes to kv_buffer directly)
+    for page_idx in range(num_pages):
+        s, e = page_idx * page_size, (page_idx + 1) * page_size
+        actual = read_pool._kv_buffer[:, :, s:e, :, :]
+        expected = write_pool._kv_buffer[:, :, s:e, :, :]
+        assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-4), \
+            f"Page {page_idx} data mismatch"
+
+
+def test_batch_set_v1_makes_blocks_ready():
+    """batch_set_v1 calls data_ready_callback internally — verify blocks
+    are fully ready in the radix tree after the call returns."""
+    os.environ["FLEXKV_CPU_ONLY"] = "1"
+    os.environ["FLEXKV_INSTANCE_NUM"] = "0"
+
+    backend = FlexKVHiCacheStorage(_make_config(page_size=4))
+    pool = _make_mock_pool(page_size=4)
+    backend.register_mem_pool_host(pool)
+
+    token_ids = list(range(400, 416))
+    keys = [f"key{i}" for i in range(4)]
+    host_indices = torch.arange(0, 16, dtype=torch.int64)
+    extra = HiCacheStorageExtraInfo(
+        prefix_keys=None, extra_info={"token_ids": token_ids})
+
+    # Before set: tree is empty
+    mr_before = _query_radix_tree(backend, token_ids)
+    assert mr_before.num_matched_blocks == 0
+
+    # Set via high-level API
+    assert all(backend.batch_set_v1(keys, host_indices, extra))
+
+    # After set: all blocks matched AND ready
+    mr_after = _query_radix_tree(backend, token_ids)
+    assert mr_after.num_matched_blocks == 4, \
+        f"Expected 4 matched blocks, got {mr_after.num_matched_blocks}"
+    assert mr_after.num_ready_matched_blocks == 4, \
+        (f"Expected 4 ready blocks after batch_set_v1, "
+         f"got {mr_after.num_ready_matched_blocks}")
+
+
+def test_concurrent_get_during_put_sees_no_partial_data():
+    """Simulate reader arriving while writer is mid-fill.
+
+    Timeline:
+        Writer: put_cpu() -> [filling data...] -> data_ready_cb() -> launch_cpu()
+        Reader:                  ^-- batch_get_v1 here (should see NOTHING)
+                                                          ^-- batch_get_v1 here (should see data)
+    """
+    os.environ["FLEXKV_CPU_ONLY"] = "1"
+    os.environ["FLEXKV_INSTANCE_NUM"] = "0"
+
+    backend = FlexKVHiCacheStorage(_make_config(page_size=4))
+    pool = _make_mock_pool(page_size=4)
+    backend.register_mem_pool_host(pool)
+
+    token_ids = list(range(500, 516))
+    arr = backend._token_ids_to_numpy(token_ids)
+    keys = [f"key{i}" for i in range(4)]
+    host_indices = torch.arange(0, 16, dtype=torch.int64)
+    extra = HiCacheStorageExtraInfo(
+        prefix_keys=None, extra_info={"token_ids": token_ids})
+
+    # Seed with known pattern
+    for page_idx in range(4):
+        s, e = page_idx * 4, (page_idx + 1) * 4
+        pool._kv_buffer[:, :, s:e, :, :] = float(page_idx + 1)
+
+    # Writer: allocate blocks (is_ready=False)
+    task_id, cpu_block_ids, _, data_ready_cb = \
+        backend._kv_manager.put_cpu(token_ids=arr)
+
+    # Reader: arrives mid-fill — should see nothing
+    read_pool_early = _make_mock_pool(page_size=4)
+    old_pool = backend._mem_pool_host
+    backend._mem_pool_host = read_pool_early
+
+    early_results = backend.batch_get_v1(keys, host_indices, extra)
+    assert not any(early_results), \
+        f"Reader saw data during write! results={early_results}"
+
+    # Writer: fill data
+    backend._mem_pool_host = old_pool
+    num_layers = backend._model_config.num_layers
+    use_mla = backend._model_config.use_mla
+    for i, bid in enumerate(cpu_block_ids):
+        bv = backend._get_block_shaped(bid)
+        for layer_id in range(num_layers):
+            backend._read_layer_from_host(bv, layer_id, i * 4, use_mla)
+
+    # Writer: mark ready + launch
+    data_ready_cb()
+    backend._kv_manager.launch_cpu([task_id])
+
+    # Reader: arrives after fill — should see correct data
+    read_pool_late = _make_mock_pool(page_size=4)
+    backend._mem_pool_host = read_pool_late
+
+    late_results = backend.batch_get_v1(keys, host_indices, extra)
+    assert all(late_results), f"Reader missed data after fill: {late_results}"
+
+    # Verify data integrity
+    for page_idx in range(4):
+        s, e = page_idx * 4, (page_idx + 1) * 4
+        actual = read_pool_late._kv_buffer[:, :, s:e, :, :]
+        expected = old_pool._kv_buffer[:, :, s:e, :, :]
+        assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-4), \
+            f"Page {page_idx} data mismatch after concurrent scenario"
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -837,6 +1090,11 @@ ALL_TESTS = [
     ("layerwise callback", test_layerwise_callback),
     ("MLA layerwise roundtrip", test_mla_layerwise_roundtrip),
     ("stats collection", test_stats),
+    # CPU-PUT is_ready race condition tests
+    ("cpu_put blocks not ready before data fill", test_cpu_put_blocks_not_ready_before_data_fill),
+    ("cpu_put visibility after data_ready_callback", test_cpu_put_visibility_after_data_ready_callback),
+    ("batch_set_v1 makes blocks ready", test_batch_set_v1_makes_blocks_ready),
+    ("concurrent get during put sees no partial data", test_concurrent_get_during_put_sees_no_partial_data),
 ]
 
 
