@@ -496,7 +496,7 @@ class KVTaskEngine(KVTaskManager):
                   dp_id: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
-        self._sync_prefetch(token_ids, namespace)
+        # self._sync_prefetch(token_ids, namespace)
         task_id, return_mask = self._get_match_impl(token_ids,
                                                     slot_mapping,
                                                     is_fake_slot_mapping=False,
@@ -649,7 +649,7 @@ class KVTaskEngine(KVTaskManager):
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
-        self._sync_prefetch(token_ids, namespace)
+        # self._sync_prefetch(token_ids, namespace)
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
         fake_slot_mapping = np.zeros_like(token_ids[token_mask])
