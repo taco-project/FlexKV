@@ -35,10 +35,6 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_gds: bool = False # Requires enable_ssd=True
-    # With nixl_backend=UCX: TransferEngine uses NixlTransferWorker for H2D/D2H (tp_size==1 only).
-    enable_nixl: bool = False
-    # Must be "UCX" (case-insensitive) for NixlTransferWorker; other values keep GPUCPUTransferWorker.
-    nixl_backend: str = "UCX"
     enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
                                 # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
     enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
@@ -110,9 +106,6 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_num_cta_h2d=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_H2D', 4)),
     transfer_num_cta_d2h=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_D2H', 4)),
 
-    enable_nixl=bool(int(os.getenv('FLEXKV_ENABLE_NIXL', 0))),
-    nixl_backend=os.getenv('FLEXKV_NIXL_BACKEND', 'UCX'),
-
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),
 
@@ -146,8 +139,6 @@ class UserConfig:
     ssd_cache_gb: int = 0  # 0 means disable ssd
     ssd_cache_dir: Union[str, List[str]] = "./ssd_cache"
     enable_gds: bool = False
-    enable_nixl: bool = False
-    nixl_backend: str = "UCX"
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
@@ -210,8 +201,6 @@ def load_user_config_from_env() -> UserConfig:
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
         ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./flexkv_ssd")),
         enable_gds=bool(int(os.getenv('FLEXKV_ENABLE_GDS', 0))),
-        enable_nixl=bool(int(os.getenv('FLEXKV_ENABLE_NIXL', 0))),
-        nixl_backend=os.getenv('FLEXKV_NIXL_BACKEND', 'UCX'),
         kv_cache_dtype=os.getenv('FLEXKV_KV_CACHE_DTYPE', None),
     )
 
@@ -232,8 +221,6 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds
-    cache_config.enable_nixl = user_config.enable_nixl
-    cache_config.nixl_backend = user_config.nixl_backend
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote
@@ -263,10 +250,6 @@ def update_default_config_from_user_config(model_config: ModelConfig,
         cache_config.local_ip = user_config.local_ip
     if user_config.redis_password is not None:
         cache_config.redis_password = user_config.redis_password
-
-    # Let override_* in the config file update these globals; keep in sync with UserConfig first.
-    GLOBAL_CONFIG_FROM_ENV.enable_nixl = user_config.enable_nixl
-    GLOBAL_CONFIG_FROM_ENV.nixl_backend = user_config.nixl_backend
 
     global_config_attrs = set(vars(GLOBAL_CONFIG_FROM_ENV).keys())
     for attr_name in dir(user_config):
@@ -301,9 +284,6 @@ def update_default_config_from_user_config(model_config: ModelConfig,
             else:
                 raise ValueError(f"Unknown config name: {global_attr_name} in config file, "
                                  f"available config names: {global_config_attrs}")
-
-    cache_config.enable_nixl = GLOBAL_CONFIG_FROM_ENV.enable_nixl
-    cache_config.nixl_backend = GLOBAL_CONFIG_FROM_ENV.nixl_backend
 
 @dataclass
 class MooncakeTransferEngineConfig:
