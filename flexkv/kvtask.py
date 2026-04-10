@@ -17,7 +17,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.block import hash_token
 from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
 from flexkv.common.tracer import FlexKVTracer
-from flexkv.cache.cache_engine import GlobalCacheEngine, DEFAULT_CACHE_STRATEGY
+from flexkv.cache.cache_engine import GlobalCacheEngine, DEFAULT_CACHE_STRATEGY, CPUONLY_CACHE_STRATEGY
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
 from flexkv.transfer_manager import (
@@ -208,6 +208,7 @@ class KVTaskManager:
                         layer_granularity: int = -1,
                         dp_id: int = 0,
                         is_fake_slot_mapping: bool = False,
+                        temp_cache_strategy=DEFAULT_CACHE_STRATEGY,
                         namespace: Optional[List[str]] = None,
                         ) -> None:
         if task_id in self.tasks:
@@ -220,6 +221,7 @@ class KVTaskManager:
             layer_num=self.model_config.num_layers,
             layer_granularity=layer_granularity,
             dp_id=dp_id,
+            temp_cache_strategy=temp_cache_strategy,
             namespace=namespace)
         self.tasks[task_id] = KVTask(
             task_id=task_id,
@@ -646,6 +648,7 @@ class KVTaskEngine(KVTaskManager):
                   token_mask: Optional[np.ndarray] = None,
                   layer_granularity: int = -1,
                   dp_id: int = 0,
+                  cpu_only: bool = False,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
@@ -659,6 +662,7 @@ class KVTaskEngine(KVTaskManager):
                                                            token_mask=token_mask,
                                                            layer_granularity=layer_granularity,
                                                            dp_id=dp_id,
+                                                           cpu_only=cpu_only,
                                                            task_id=task_id,
                                                            namespace=namespace)
         # trace get match request
@@ -681,6 +685,7 @@ class KVTaskEngine(KVTaskManager):
                   token_mask: Optional[np.ndarray] = None,
                   layer_granularity: int = -1,
                   dp_id: int = 0,
+                  cpu_only: bool = False,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         if token_mask is None:
@@ -689,6 +694,9 @@ class KVTaskEngine(KVTaskManager):
             layer_granularity = self.model_config.num_layers
         if task_id == -1:
             task_id = self._gen_task_id()
+        temp_cache_strategy = DEFAULT_CACHE_STRATEGY
+        if cpu_only:
+            temp_cache_strategy = CPUONLY_CACHE_STRATEGY
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
         self.create_get_task(task_id,
                              token_ids,
@@ -697,6 +705,7 @@ class KVTaskEngine(KVTaskManager):
                              layer_granularity,
                              dp_id,
                              is_fake_slot_mapping=is_fake_slot_mapping,
+                             temp_cache_strategy=temp_cache_strategy,
                              namespace=namespace)
         self._process_empty_graph(task_id)
         nvtx.pop_range()

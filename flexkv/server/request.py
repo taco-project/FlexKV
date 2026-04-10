@@ -71,6 +71,7 @@ class GetMatchRequest:
     token_ids: np.ndarray
     token_mask: Optional[np.ndarray]
     layer_granularity: int
+    cpu_only: bool = False
     task_id: int = -1
     namespace: Optional[List[str]] = None
 

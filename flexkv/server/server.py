@@ -398,6 +398,7 @@ class KVServer:
             token_mask=req.token_mask,
             layer_granularity=req.layer_granularity,
             dp_id=req.dp_client_id,
+            cpu_only=req.cpu_only,
             task_id=req.task_id,
             namespace=req.namespace,
         )

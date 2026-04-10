@@ -180,6 +180,7 @@ class KVManager:
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   layer_granularity: int = -1,
                   dp_id: int = 0,
+                  cpu_only: bool = False,
                   namespace: Optional[List[str]] = None,
                   ) -> Tuple[int, np.ndarray]:
         if isinstance(token_ids, torch.Tensor):
@@ -190,12 +191,14 @@ class KVManager:
             task_id, mask = self.dp_client.get_match(token_ids,
                                                      token_mask,
                                                      layer_granularity,
+                                                     cpu_only=cpu_only,
                                                      namespace=namespace)
         else:
             task_id, mask = self.kv_task_engine.get_match(token_ids,
                                                           token_mask,
                                                           layer_granularity,
                                                           dp_id,
+                                                          cpu_only=cpu_only,
                                                           namespace=namespace)
         return task_id, mask
 
