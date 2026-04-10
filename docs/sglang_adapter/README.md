@@ -27,28 +27,54 @@ the process address space and allows direct access to the CPU cache tensor. This
 block registration (which is unavailable in the HiCacheStorage context) while retaining full
 FlexKV capabilities: radix tree index, CPU cache, and optional SSD persistence via io_uring.
 
+### Thread Safety
+
+SGLang's HiCacheController calls the storage backend from **3 independent threads**:
+
+| Thread | Method | Operation |
+|--------|--------|-----------|
+| `backup_thread` | `batch_set_v1()` | Write KV data to FlexKV |
+| `prefetch_thread` | `batch_exists()` | Query cached pages |
+| `prefetch_io_aux` | `batch_get_v1()` | Read KV data from FlexKV |
+
+FlexKV's internal radix tree, mempool, and CPU cache tensor are **not thread-safe** (they
+were designed for single-threaded access in process mode). The adapter therefore uses a
+`threading.Lock` (`_engine_lock`) to serialise all cache-engine operations:
+
+- `batch_set_v1`: Holds the lock during `put_cpu()` (which may trigger LRU eviction via
+  `take()`), data filling, `data_ready_callback()`, and `launch_cpu()`.
+- `batch_get_v1`: Holds the lock during `match()` and block data reads (direct tensor
+  views, no `.clone()` needed under lock protection).
+- `batch_exists`: Holds the lock during `match()` / `match_all()` queries.
+
+The `is_ready` flag on radix tree nodes provides an additional layer of protection at the
+FlexKV internal level: blocks inserted by `put_cpu()` are not visible to readers until
+`data_ready_callback()` sets `is_ready=True`. This prevents eviction of partially-written
+blocks and maintains correctness for FlexKV's internal state machine independently of the
+adapter-level lock.
+
 ### Data Flow
 
 ```
-PUT (batch_set_v1 - backup from Host to FlexKV):
+PUT (batch_set_v1 - backup from Host to FlexKV):  [holds _engine_lock]
   SGLang Host mem
     -> layer_first: per-layer read from kv_buffer[:, layer_id, ...] (zero-copy view)
        MLA layer_first: per-layer read from kv_buffer[layer_id, ...]
        other layouts: mem_pool_host.get_data_page(index, flat=False) + permute
     -> direct memcpy to FlexKV CPU cache tensor (via put_cpu)
-    -> data_ready_callback() marks blocks visible to concurrent readers
+    -> data_ready_callback() marks blocks visible to readers
     -> KVManager radix tree insert
     -> TransferEngine H2DISK async (if SSD enabled)
 
-GET (batch_get_v1 - prefetch from FlexKV to Host):
+GET (batch_get_v1 - prefetch from FlexKV to Host):  [holds _engine_lock]
   CPU cache engine radix tree match (local + remote in distributed mode)
     -> if remote: prefetch_async + wait (P2P transfer to local CPU cache)
-    -> read FlexKV CPU cache tensor block
+    -> read FlexKV CPU cache tensor block (direct view, no clone)
     -> layer_first: per-layer write to kv_buffer[:, layer_id, ...] (zero-copy view)
        MLA layer_first: per-layer write to kv_buffer[layer_id, ...]
        other layouts: permute + mem_pool_host.set_from_flat_data_page(index, data)
 
-EXISTS (batch_exists - query):
+EXISTS (batch_exists - query):  [holds _engine_lock]
   CPU cache engine radix tree match (local + remote in distributed mode)
     -> count consecutive ready pages from start
 ```
@@ -365,3 +391,4 @@ pytest test/srt/hicache/test_hicache_storage_flexkv_backend.py -v -s
 - [x] Distributed mode: cross-node GET via P2P transfer (prefetch_async + wait)
 - [x] Layerwise prefetch: per-layer copy for layer_first layout (zero-copy view, no permute temp)
 - [x] CPU-PUT deferred visibility: blocks not readable until data_ready_callback() after fill
+- [x] Thread safety: `_engine_lock` serialises concurrent SGLang threads (backup/prefetch/query)
