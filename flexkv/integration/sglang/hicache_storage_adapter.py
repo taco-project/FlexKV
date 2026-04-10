@@ -99,6 +99,11 @@ class FlexKVHiCacheStorage(HiCacheStorage):
     Uses KVManager in thread mode (CPU-only) with direct CPU cache tensor
     access for data filling. Supports CPU cache + optional SSD persistence.
 
+    Only one instance per process is supported because ``_init_kv_manager``
+    mutates process-global state (``FLEXKV_CPU_ONLY`` / ``FLEXKV_INSTANCE_NUM``
+    env vars and ``GLOBAL_CONFIG_FROM_ENV``).  Creating a second instance
+    raises ``RuntimeError``.
+
     Two Modes
     ~~~~~~~~~
     **Local mode** (default): Single-node isolated cache, no cross-node sharing.
@@ -153,6 +158,11 @@ class FlexKVHiCacheStorage(HiCacheStorage):
     # Keys accepted in extra_config but NOT passed to CacheConfig
     _ADAPTER_ONLY_KEYS = {"mode", "redis_host", "redis_port", "redis_password",
                           "prefetch_timeout"}
+
+    # Singleton guard: only one *started* instance per process is allowed
+    # because _init_kv_manager mutates process-global env vars and config.
+    _instance_lock = threading.Lock()
+    _instance_active = False
 
     def __init__(
         self,
@@ -231,11 +241,23 @@ class FlexKVHiCacheStorage(HiCacheStorage):
 
     def _init_kv_manager(self):
         """Create KVManager in thread mode with CPU-only configuration.
-        
+
         Supports two modes:
         - local: single-node, isolated cache (default)
         - distributed: multi-node with Redis GMS + Mooncake P2P transfers
+
+        Raises ``RuntimeError`` if another instance has already started a
+        KVManager in this process (env vars are process-global).
         """
+        with FlexKVHiCacheStorage._instance_lock:
+            if FlexKVHiCacheStorage._instance_active:
+                raise RuntimeError(
+                    "Only one FlexKVHiCacheStorage KVManager per process is "
+                    "supported (env vars FLEXKV_CPU_ONLY / FLEXKV_INSTANCE_NUM "
+                    "are process-global). Shut down the existing instance first."
+                )
+            FlexKVHiCacheStorage._instance_active = True
+
         from flexkv.kvmanager import KVManager
         from flexkv.common.config import CacheConfig
 
@@ -615,31 +637,40 @@ class FlexKVHiCacheStorage(HiCacheStorage):
             if aligned_len == 0:
                 return [False] * num_pages
 
+            # --- Phase 1: distributed discovery (lock held briefly) ---
+            need_remote_fetch = False
+            if self._mode == MODE_DISTRIBUTED:
+                with self._engine_lock:
+                    cache_engine = self._kv_manager.kv_task_engine.cache_engine
+                    seq_meta = SequenceMeta(token_ids=arr[:aligned_len],
+                                            tokens_per_block=page_size)
+                    if hasattr(cache_engine.cpu_cache_engine, 'match_all'):
+                        match_result = cache_engine.cpu_cache_engine.match_all(
+                            seq_meta)
+                        need_remote_fetch = (
+                            match_result.matched_pos == "remote")
+
+            # --- Phase 2: remote fetch WITHOUT holding _engine_lock ---
+            # This avoids blocking backup_thread / prefetch_thread for the
+            # entire P2P transfer duration (potentially seconds).
+            remote_fetched = False
+            if need_remote_fetch:
+                if not self._fetch_remote_blocks(arr):
+                    logger.debug("batch_get_v1: remote fetch failed, "
+                                 "treating as miss")
+                    if self._metrics:
+                        self._metrics.record_sglang_remote_fetch(
+                            success=False)
+                    return [False] * num_pages
+                remote_fetched = True
+
+            # --- Phase 3: local read (lock held for tree query + data copy) ---
             with self._engine_lock:
                 cache_engine = self._kv_manager.kv_task_engine.cache_engine
                 seq_meta = SequenceMeta(token_ids=arr[:aligned_len],
                                         tokens_per_block=page_size)
 
-                # In distributed mode, query both local and remote trees
-                remote_fetched = False
-                if (self._mode == MODE_DISTRIBUTED
-                        and hasattr(cache_engine.cpu_cache_engine, 'match_all')):
-                    match_result = cache_engine.cpu_cache_engine.match_all(seq_meta)
-
-                    if match_result.matched_pos == "remote":
-                        if not self._fetch_remote_blocks(arr):
-                            logger.debug("batch_get_v1: remote fetch failed, "
-                                         "treating as miss")
-                            if self._metrics:
-                                self._metrics.record_sglang_remote_fetch(
-                                    success=False)
-                            return [False] * num_pages
-
-                        remote_fetched = True
-                        match_result = cache_engine.cpu_cache_engine.match(
-                            seq_meta)
-                else:
-                    match_result = cache_engine.cpu_cache_engine.match(seq_meta)
+                match_result = cache_engine.cpu_cache_engine.match(seq_meta)
 
                 matched_pages = match_result.num_ready_matched_blocks
 
@@ -891,9 +922,25 @@ class FlexKVHiCacheStorage(HiCacheStorage):
         except Exception:
             logger.exception("clear() failed")
 
-    def __del__(self):
+    def shutdown(self) -> None:
+        """Shut down the KVManager and release the singleton guard.
+
+        Call this explicitly when the adapter is no longer needed.
+        After shutdown, a new ``FlexKVHiCacheStorage`` instance may be
+        created in the same process.
+        """
         try:
             if self._kv_manager is not None:
                 self._kv_manager.shutdown()
+                self._kv_manager = None
+        except Exception:
+            logger.exception("shutdown failed")
+        finally:
+            with FlexKVHiCacheStorage._instance_lock:
+                FlexKVHiCacheStorage._instance_active = False
+
+    def __del__(self):
+        try:
+            self.shutdown()
         except Exception:
             pass

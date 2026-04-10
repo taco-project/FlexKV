@@ -23,6 +23,7 @@ import importlib
 import subprocess
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 # Patch file bundled alongside this module
 _PATCH_DIR = Path(__file__).parent / "patches"
@@ -37,7 +38,7 @@ _PROBE_MARKER = '"flexkv"'
 # Helpers
 # ------------------------------------------------------------------
 
-def _find_sglang_root(manual_path: str | None = None) -> Path:
+def _find_sglang_root(manual_path: Optional[str] = None) -> Path:
     """Locate the SGLang source root directory.
 
     Resolution order:
@@ -109,7 +110,7 @@ def _has_git(sglang_root: Path) -> bool:
     return (sglang_root / ".git").exists()
 
 
-def _run(cmd: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
+def _run(cmd: List[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
     """Run a command, printing it first."""
     print(f"  $ {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
