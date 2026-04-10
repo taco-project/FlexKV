@@ -1,3 +1,4 @@
+import contextlib
 import os
 import copy
 import torch.multiprocessing as mp
@@ -28,13 +29,6 @@ except ImportError:
     transfer_kv_blocks_gds = None
     TPGDSTransferThreadGroup = None
 
-try:
-    from nixl._api import nixl_agent as _nixl_agent_cls
-    from nixl._api import nixl_agent_config as _nixl_agent_config_cls
-except ImportError:
-    _nixl_agent_cls = None  # type: ignore[misc, assignment]
-    _nixl_agent_config_cls = None  # type: ignore[misc, assignment]
-
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -45,6 +39,15 @@ from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.transfer.utils import group_blocks_by_node_and_segment, group_blocks_by_node, split_contiguous_blocks, RemoteSSD2HMetaInfo, NodeMetaInfo, RDMATaskInfo
+from flexkv.transfer.nixlutil import (
+    NIXL_CPU_FILE_BACKENDS,
+    NIXL_GPU_FILE_BACKENDS,
+    NixlAgentSession,
+    file_path_for_ssd_block,
+    gpu_chunk_u8_view,
+    kv_chunk_byte_offset_in_block,
+    ssd_chunk_byte_offset_in_file,
+)
 try:
     from flexkv.c_ext import (
         transfer_kv_blocks_remote,
@@ -455,300 +458,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         nvtx.end_range(nvtx_range)
 
         return True
-
-
-# NIXL GPU<->CPU backends implemented vs reserved (see https://github.com/ai-dynamo/nixl )
-_NIXL_GPU_CPU_BACKENDS_IMPL = frozenset({"UCX"})
-# TODO: GPU <-> SSD via NIXL (e.g. GDS: VRAM_SEG <-> FILE_SEG)
-# TODO: CPU <-> SSD via NIXL (e.g. POSIX: DRAM_SEG <-> FILE_SEG)
-# TODO: 3FS / HF3FS <-> CPU via NIXL object or HF3FS plugins
-
-
-def _nixl_gpu_chunk_byte_offset(
-    gpu_blocks: List[torch.Tensor],
-    gpu_block_type_: int,
-    layer_idx: int,
-    kv_idx: int,
-    block_id: int,
-    gpu_kv_stride_in_bytes: int,
-    gpu_block_stride_in_bytes: int,
-    gpu_layer_stride_in_bytes: int,
-    num_layers: int,
-) -> Tuple[torch.Tensor, int]:
-    """Return (tensor owning storage, byte offset within that tensor) for one KV chunk (matches csrc/gtensor_handler.cuh)."""
-    if gpu_block_type_ == 0:
-        t = gpu_blocks[layer_idx]
-        off = kv_idx * gpu_kv_stride_in_bytes + block_id * gpu_block_stride_in_bytes
-        return t, off
-    if gpu_block_type_ == 1:
-        t = gpu_blocks[0]
-        off = (
-            block_id * gpu_block_stride_in_bytes
-            + layer_idx * gpu_layer_stride_in_bytes
-            + kv_idx * gpu_kv_stride_in_bytes
-        )
-        return t, off
-    if gpu_block_type_ == 2:
-        t = gpu_blocks[kv_idx * num_layers + layer_idx]
-        off = block_id * gpu_block_stride_in_bytes
-        return t, off
-    raise ValueError(f"Invalid gpu_block_type_: {gpu_block_type_}")
-
-
-class NixlTransferWorker(TransferWorkerBase):
-    """
-    FlexKV transfer worker backed by the NVIDIA NIXL Python API (`nixl._api`). This class is
-    intended to grow: additional memory/storage paths and NIXL plugins should be added here
-    behind the same ``backend`` (and related) parameters.
-
-    **Current scope — GPU <-> CPU:** same KV layout behavior as :class:`GPUCPUTransferWorker`,
-    but using a selectable NIXL **backend** instead of the CUDA ``transfer_kv_blocks`` path.
-    Implemented: ``backend="UCX"`` (loopback DRAM/VRAM on one agent).
-
-    **Planned in this class (not implemented yet):**
-
-    - GPU <-> SSD (e.g. NIXL **GDS**)
-    - CPU <-> SSD (e.g. NIXL **POSIX**)
-    - 3FS <-> CPU (e.g. NIXL **HF3FS** / object plugins)
-
-    Requires ``pip install nixl[cu12]`` or ``nixl[cu13]`` and a Linux environment; see
-    `NIXL <https://github.com/ai-dynamo/nixl>`_.
-    """
-
-    def __init__(
-        self,
-        worker_id: int,
-        transfer_conn: Connection,
-        finished_ops_queue: MPQueue,
-        op_buffer_tensor: torch.Tensor,
-        gpu_blocks: List[TensorSharedHandle],
-        cpu_blocks: torch.Tensor,
-        gpu_kv_layout: KVCacheLayout,
-        cpu_kv_layout: KVCacheLayout,
-        dtype: torch.dtype,
-        gpu_device_id: int,
-        backend: str = "UCX",
-        *,
-        nixl_enable_prog_thread: bool = True,
-        nixl_enable_listen_thread: bool = False,
-        nixl_listen_port: int = 0,
-    ) -> None:
-        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
-
-        if _nixl_agent_cls is None or _nixl_agent_config_cls is None:
-            raise ImportError(
-                "NixlTransferWorker requires the `nixl` package "
-                "(e.g. pip install 'nixl[cu12]')."
-            ) from None
-
-        self.backend = backend.upper()
-        if self.backend not in _NIXL_GPU_CPU_BACKENDS_IMPL:
-            if self.backend in ("GDS", "POSIX", "HF3FS", "OBJ"):
-                raise NotImplementedError(
-                    f"NIXL backend {self.backend!r} is not wired in this worker yet "
-                    "(GPU-SSD, CPU-SSD, and 3FS-CPU paths are TODO)."
-                )
-            raise ValueError(
-                f"Unsupported NIXL backend {self.backend!r} for GPU-CPU; "
-                f"implemented: {sorted(_NIXL_GPU_CPU_BACKENDS_IMPL)}"
-            )
-
-        flexkv_logger.info(
-            f"NixlTransferWorker: pinning CPU, NIXL backend={self.backend}, "
-            f"size_gb={cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f}"
-        )
-        cudaHostRegister(cpu_blocks)
-        self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
-        self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
-        self.cpu_tensor = cpu_blocks
-        self.dtype = dtype
-        self.is_mla = gpu_kv_layout.is_mla
-        self.num_layers = gpu_kv_layout.num_layer
-
-        self.chunk_size_in_bytes = gpu_kv_layout.get_chunk_size() * self.dtype.itemsize
-        self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
-        self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
-        self.gpu_layer_stride_in_bytes = gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
-
-        self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
-        self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
-        self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
-
-        if len(self.gpu_blocks) == 1:
-            self.gpu_block_type_ = 1
-        elif len(self.gpu_blocks) == self.num_layers:
-            self.gpu_block_type_ = 0
-        elif len(self.gpu_blocks) == self.num_layers * 2:
-            self.gpu_block_type_ = 2
-        else:
-            raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
-
-        if gpu_device_id != -1:
-            torch.cuda.set_device(gpu_device_id)
-        self._gpu_device_id = int(self.gpu_blocks[0].device.index) if self.gpu_blocks[0].is_cuda else 0
-
-        agent_name = f"flexkv-nixl-gpu-cpu-{worker_id}"
-        nixl_conf = _nixl_agent_config_cls(
-            enable_prog_thread=nixl_enable_prog_thread,
-            enable_listen_thread=nixl_enable_listen_thread,
-            listen_port=nixl_listen_port,
-            backends=[self.backend],
-        )
-        self._nixl = _nixl_agent_cls(agent_name, nixl_conf)
-        if self.backend not in self._nixl.plugin_list:
-            raise RuntimeError(
-                f"NIXL plugin {self.backend!r} not available; plugins={self._nixl.plugin_list}"
-            )
-
-        self._nixl_regs: List[Any] = []
-        for t in self.gpu_blocks:
-            self._nixl_regs.append(self._nixl.register_memory(t, backends=[self.backend]))
-        self._nixl_regs.append(self._nixl.register_memory(self.cpu_tensor, backends=[self.backend]))
-
-    def _nixl_xfer_dram_vram(
-        self,
-        src_ptr: int,
-        dst_ptr: int,
-        nbytes: int,
-        src_is_dram: bool,
-    ) -> None:
-        dram_dev = 0
-        vram_dev = self._gpu_device_id
-        if src_is_dram:
-            src_xfer = self._nixl.get_xfer_descs(
-                [(src_ptr, nbytes, dram_dev)], mem_type="DRAM"
-            )
-            dst_xfer = self._nixl.get_xfer_descs(
-                [(dst_ptr, nbytes, vram_dev)], mem_type="cuda"
-            )
-        else:
-            src_xfer = self._nixl.get_xfer_descs(
-                [(src_ptr, nbytes, vram_dev)], mem_type="cuda"
-            )
-            dst_xfer = self._nixl.get_xfer_descs(
-                [(dst_ptr, nbytes, dram_dev)], mem_type="DRAM"
-            )
-        if src_xfer is None or dst_xfer is None:
-            raise RuntimeError("NIXL get_xfer_descs failed")
-
-        if self.backend == "UCX":
-            handle = self._nixl.initialize_xfer(
-                "WRITE",
-                src_xfer,
-                dst_xfer,
-                self._nixl.name,
-                b"",
-                backends=[self.backend],
-            )
-        else:
-            raise NotImplementedError(f"NIXL xfer path not implemented for {self.backend!r}")
-
-        if handle is None or getattr(handle, "_handle", 1) == 0:
-            raise RuntimeError("NIXL initialize_xfer failed")
-        try:
-            state = self._nixl.transfer(handle)
-            while state == "PROC":
-                state = self._nixl.check_xfer_state(handle)
-            if state != "DONE":
-                raise RuntimeError(f"NIXL transfer failed with state {state!r}")
-        finally:
-            self._nixl.release_xfer_handle(handle)
-
-    def _transfer_impl(
-        self,
-        src_block_ids: torch.Tensor,
-        dst_block_ids: torch.Tensor,
-        transfer_type: TransferType,
-        layer_id: int,
-        layer_granularity: int,
-        **kwargs: Any,
-    ) -> None:
-        assert src_block_ids.dtype == torch.int64
-        assert dst_block_ids.dtype == torch.int64
-        assert len(src_block_ids) == len(dst_block_ids)
-
-        if transfer_type == TransferType.H2D:
-            gpu_block_id_list = dst_block_ids
-            cpu_block_id_list = src_block_ids
-            is_h2d = True
-        elif transfer_type == TransferType.D2H:
-            gpu_block_id_list = src_block_ids
-            cpu_block_id_list = dst_block_ids
-            is_h2d = False
-        else:
-            raise ValueError(f"Invalid transfer type: {transfer_type} for NixlTransferWorker")
-
-        nblk = len(gpu_block_id_list)
-        if nblk == 0:
-            return
-
-        kv_dim = 1 if self.is_mla else 2
-        end_layer = layer_id + layer_granularity
-
-        # Copy chunk-by-chunk to match FlexKV layout (same pattern as transfer.cu CE path).
-        for li in range(layer_id, end_layer):
-            for kv_i in range(kv_dim):
-                for k in range(nblk):
-                    gpu_b = int(gpu_block_id_list[k].item())
-                    cpu_b = int(cpu_block_id_list[k].item())
-                    gpu_t, gpu_off = _nixl_gpu_chunk_byte_offset(
-                        self.gpu_blocks,
-                        self.gpu_block_type_,
-                        li,
-                        kv_i,
-                        gpu_b,
-                        self.gpu_kv_stride_in_bytes,
-                        self.gpu_block_stride_in_bytes,
-                        self.gpu_layer_stride_in_bytes,
-                        self.num_layers,
-                    )
-                    cpu_off = (
-                        li * self.cpu_layer_stride_in_bytes
-                        + kv_i * self.cpu_kv_stride_in_bytes
-                        + cpu_b * self.cpu_block_stride_in_bytes
-                    )
-                    gpu_ptr = gpu_t.data_ptr() + gpu_off
-                    cpu_ptr = self.cpu_tensor.data_ptr() + cpu_off
-                    if is_h2d:
-                        self._nixl_xfer_dram_vram(cpu_ptr, gpu_ptr, self.chunk_size_in_bytes, True)
-                    else:
-                        self._nixl_xfer_dram_vram(gpu_ptr, cpu_ptr, self.chunk_size_in_bytes, False)
-
-        if self.gpu_blocks[0].is_cuda:
-            torch.cuda.synchronize()
-
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
-        nvtx_range = nvtx.start_range(
-            message=f"NixlTransferWorker.launch_transfer[{transfer_op.transfer_op_id}]",
-            color="purple",
-        )
-        layer_id = transfer_op.layer_id
-        layer_granularity = transfer_op.layer_granularity
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-
-        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
-
-        start_time = time.time()
-        self._transfer_impl(
-            src_block_ids,
-            dst_block_ids,
-            transfer_op.transfer_type,
-            layer_id,
-            layer_granularity,
-        )
-        end_time = time.time()
-
-        kv_dim = 2 if not self.is_mla else 1
-        transfer_size = (
-            self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
-        )
-        self._log_transfer_performance(transfer_op, transfer_size, start_time, end_time)
-        nvtx.end_range(nvtx_range)
-        return True
-
 
 class tpGPUCPUTransferWorker(TransferWorkerBase):
     def __init__(self,
@@ -1644,6 +1353,312 @@ class tpGDSTransferWorker(TransferWorkerBase):
         )
 
         return True
+
+
+class NixlTransferWorker(TransferWorkerBase):
+    """KV cache transfer via NIXL FILE backends: GDS_MT (GPU↔file) or POSIX / 3FS (CPU↔file).
+
+    Both ``gpu_kv_layout`` and ``cpu_kv_layout`` are required so GPU, CPU, and SSD (per-file)
+    byte strides are always defined; only the tensors needed for the chosen backend must be
+    provided (``gpu_blocks`` for GDS_MT, ``cpu_blocks`` for POSIX/3FS).
+    """
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        nixl_backend: str,
+        ssd_files: Dict[int, List[str]],
+        num_blocks_per_file: int,
+        dtype: torch.dtype,
+        ssd_kv_layout: KVCacheLayout,
+        gpu_kv_layout: KVCacheLayout,
+        cpu_kv_layout: KVCacheLayout,
+        nixl_extra_config: Optional[Dict[str, Any]] = None,
+        gpu_blocks: Optional[List[TensorSharedHandle]] = None,
+        cpu_blocks: Optional[torch.Tensor] = None,
+        gpu_device_id: int = 0,
+    ) -> None:
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+
+        be = nixl_backend.upper()
+        if be not in NIXL_GPU_FILE_BACKENDS and be not in NIXL_CPU_FILE_BACKENDS:
+            raise ValueError(
+                f"nixl_backend must be one of {sorted(NIXL_GPU_FILE_BACKENDS | NIXL_CPU_FILE_BACKENDS)}, got {nixl_backend}"
+            )
+        if be in NIXL_GPU_FILE_BACKENDS and gpu_blocks is None:
+            raise ValueError("GDS_MT requires gpu_blocks")
+        if be in NIXL_CPU_FILE_BACKENDS and cpu_blocks is None:
+            raise ValueError("POSIX/3FS require cpu_blocks")
+        if (
+            gpu_kv_layout.num_layer != cpu_kv_layout.num_layer
+            or gpu_kv_layout.is_mla != cpu_kv_layout.is_mla
+        ):
+            raise ValueError(
+                "gpu_kv_layout and cpu_kv_layout must match on num_layer and is_mla"
+            )
+
+        self.nixl_backend = be
+        self.ssd_files = ssd_files
+        self.num_blocks_per_file = num_blocks_per_file
+        self.num_files = sum(len(fl) for fl in ssd_files.values())
+        self.num_devices = len(ssd_files)
+        self.num_files_per_device = len(ssd_files[0])
+        self.round_robin = 1
+        self.dtype = dtype
+
+        self.num_layers = gpu_kv_layout.num_layer
+        self.is_mla = gpu_kv_layout.is_mla
+
+        # SSD / file-side layout (same for every NIXL FILE backend).
+        ssd_pf = ssd_kv_layout.div_block(self.num_files, padding=True)
+        self.ssd_layer_stride_in_bytes = (
+            ssd_pf.get_layer_stride() * self.dtype.itemsize
+        )
+        self.ssd_kv_stride_in_bytes = ssd_pf.get_kv_stride() * self.dtype.itemsize
+        self.ssd_block_stride_in_bytes = (
+            ssd_pf.get_block_stride() * self.dtype.itemsize
+        )
+
+        # GPU pool strides (per tensor layout).
+        gpu_pl = gpu_kv_layout.div_layer(self.num_layers)
+        self.gpu_chunk_size_in_bytes = gpu_pl.get_chunk_size() * self.dtype.itemsize
+        self.gpu_kv_stride_in_bytes = (
+            gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+        )
+        self.gpu_block_stride_in_bytes = (
+            gpu_kv_layout.get_block_stride() * self.dtype.itemsize
+        )
+        self.gpu_layer_stride_in_bytes = (
+            gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+        )
+
+        # CPU pool strides (DRAM side for POSIX / 3FS).
+        self.cpu_chunk_size_in_bytes = (
+            cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+        )
+        self.mem_block_stride_in_bytes = (
+            cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+        )
+        self.mem_kv_stride_in_bytes = (
+            cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+        )
+        self.mem_layer_stride_in_bytes = (
+            cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+        )
+
+        self._session = NixlAgentSession(be, nixl_extra_config or {})
+
+        if be in NIXL_GPU_FILE_BACKENDS:
+            self.gpu_blocks = [h.get_tensor() for h in gpu_blocks]  # type: ignore[union-attr, arg-type]
+            if len(self.gpu_blocks) == 1:
+                self.gpu_block_type_ = 1
+            elif len(self.gpu_blocks) == self.num_layers:
+                self.gpu_block_type_ = 0
+            elif len(self.gpu_blocks) == self.num_layers * 2:
+                self.gpu_block_type_ = 2
+            else:
+                raise ValueError(
+                    f"Invalid GPU block count for NIXL: {len(self.gpu_blocks)}"
+                )
+            self.chunk_size_in_bytes = self.gpu_chunk_size_in_bytes
+            self.gpu_device_id = gpu_device_id
+            if gpu_device_id != -1:
+                torch.cuda.set_device(gpu_device_id)
+            self.transfer_stream = torch.cuda.Stream()
+        else:
+            self.cpu_blocks = cpu_blocks  # type: ignore[assignment]
+            flexkv_logger.info(
+                f"NixlTransferWorker ({be}): pinning CPU pool "
+                f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GiB"
+            )
+            cudaHostRegister(cpu_blocks)  # type: ignore[arg-type]
+            if cpu_kv_layout.type != ssd_kv_layout.type:
+                raise ValueError(
+                    "CPU and SSD KV layout types must match for NIXL FILE transfer"
+                )
+            self.chunk_size_in_bytes = self.cpu_chunk_size_in_bytes
+
+    def _transfer_impl(
+        self,
+        src_block_ids: torch.Tensor,
+        dst_block_ids: torch.Tensor,
+        transfer_type: TransferType,
+        layer_id: int,
+        layer_granularity: int,
+        **kwargs: Any,
+    ) -> None:
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
+        assert len(src_block_ids) == len(dst_block_ids)
+
+        if layer_id == -1:
+            layer_id = 0
+        if layer_granularity == -1:
+            layer_granularity = self.num_layers
+
+        if self.nixl_backend in NIXL_GPU_FILE_BACKENDS:
+            if transfer_type == TransferType.DISK2D:
+                ssd_block_ids, mem_block_ids = src_block_ids, dst_block_ids
+                direction = "READ"
+            elif transfer_type == TransferType.D2DISK:
+                mem_block_ids, ssd_block_ids = src_block_ids, dst_block_ids
+                direction = "WRITE"
+            else:
+                raise ValueError(
+                    f"GDS_MT NixlTransferWorker expects DISK2D or D2DISK, got {transfer_type}"
+                )
+        else:
+            if transfer_type == TransferType.DISK2H:
+                ssd_block_ids, mem_block_ids = src_block_ids, dst_block_ids
+                direction = "READ"
+            elif transfer_type == TransferType.H2DISK:
+                mem_block_ids, ssd_block_ids = src_block_ids, dst_block_ids
+                direction = "WRITE"
+            else:
+                raise ValueError(
+                    f"POSIX/3FS NixlTransferWorker expects DISK2H or H2DISK, got {transfer_type}"
+                )
+
+        n = ssd_block_ids.numel()
+        if n == 0:
+            return
+
+        kv_dim = 1 if self.is_mla else 2
+        layer_end = layer_id + layer_granularity
+
+        file_paths: List[str] = []
+        region_offsets: List[int] = []
+        region_lens: List[int] = []
+
+        if self.nixl_backend in NIXL_GPU_FILE_BACKENDS:
+            gpu_tensors: List[torch.Tensor] = []
+            for i in range(n):
+                ssd_b = int(ssd_block_ids[i].item())
+                mem_b = int(mem_block_ids[i].item())
+                path, block_in_file = file_path_for_ssd_block(
+                    self.ssd_files,
+                    ssd_b,
+                    self.num_devices,
+                    self.num_files_per_device,
+                    self.round_robin,
+                )
+                for lid in range(layer_id, layer_end):
+                    for kv in range(kv_dim):
+                        sob = ssd_chunk_byte_offset_in_file(
+                            lid,
+                            kv,
+                            block_in_file,
+                            self.ssd_layer_stride_in_bytes,
+                            self.ssd_kv_stride_in_bytes,
+                            self.ssd_block_stride_in_bytes,
+                            self.is_mla,
+                        )
+                        gview = gpu_chunk_u8_view(
+                            self.gpu_blocks,
+                            self.gpu_block_type_,
+                            self.num_layers,
+                            mem_b,
+                            lid,
+                            kv,
+                            self.gpu_kv_stride_in_bytes,
+                            self.gpu_block_stride_in_bytes,
+                            self.gpu_layer_stride_in_bytes,
+                            self.chunk_size_in_bytes,
+                            self.is_mla,
+                        )
+                        gpu_tensors.append(gview)
+                        file_paths.append(path)
+                        region_offsets.append(sob)
+                        region_lens.append(self.chunk_size_in_bytes)
+
+            ok = self._session.xfer_vram_file(
+                direction, gpu_tensors, file_paths, region_lens, region_offsets
+            )
+            if not ok:
+                raise RuntimeError("NIXL GDS_MT transfer failed")
+            torch.cuda.synchronize()
+        else:
+            base = self.cpu_blocks.data_ptr()
+            dram_ptr_len: List[Tuple[int, int]] = []
+            for i in range(n):
+                ssd_b = int(ssd_block_ids[i].item())
+                mem_b = int(mem_block_ids[i].item())
+                path, block_in_file = file_path_for_ssd_block(
+                    self.ssd_files,
+                    ssd_b,
+                    self.num_devices,
+                    self.num_files_per_device,
+                    self.round_robin,
+                )
+                for lid in range(layer_id, layer_end):
+                    for kv in range(kv_dim):
+                        cob = kv_chunk_byte_offset_in_block(
+                            lid,
+                            kv,
+                            mem_b,
+                            self.mem_layer_stride_in_bytes,
+                            self.mem_kv_stride_in_bytes,
+                            self.mem_block_stride_in_bytes,
+                            self.is_mla,
+                        )
+                        sob = ssd_chunk_byte_offset_in_file(
+                            lid,
+                            kv,
+                            block_in_file,
+                            self.ssd_layer_stride_in_bytes,
+                            self.ssd_kv_stride_in_bytes,
+                            self.ssd_block_stride_in_bytes,
+                            self.is_mla,
+                        )
+                        dram_ptr_len.append((base + cob, self.chunk_size_in_bytes))
+                        file_paths.append(path)
+                        region_offsets.append(sob)
+                        region_lens.append(self.chunk_size_in_bytes)
+
+            ok = self._session.xfer_dram_file(
+                direction, dram_ptr_len, file_paths, region_lens, region_offsets
+            )
+            if not ok:
+                raise RuntimeError(f"NIXL {self.nixl_backend} CPU↔file transfer failed")
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        lid = transfer_op.layer_id
+        lg = transfer_op.layer_granularity
+        if lid == -1:
+            lid = 0
+        if lg == -1:
+            lg = self.num_layers
+
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+
+        # GDS_MT runs NIXL VRAM xfers on a dedicated stream; POSIX/3FS are CPU-only.
+        stream_ctx = (
+            torch.cuda.stream(self.transfer_stream)
+            if self.nixl_backend in NIXL_GPU_FILE_BACKENDS
+            else contextlib.nullcontext()
+        )
+        with stream_ctx:
+            start_time = time.time()
+            self._transfer_impl(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type,
+                lid,
+                lg,
+            )
+            end_time = time.time()
+            kv_dim = 2 if not self.is_mla else 1
+            transfer_size = (
+                self.chunk_size_in_bytes * lg * transfer_op.valid_block_num * kv_dim
+            )
+            self._log_transfer_performance(
+                transfer_op, transfer_size, start_time, end_time
+            )
+        return True
+
 
 class PEER2CPUTransferWorker(TransferWorkerBase):
     def __init__(self,
