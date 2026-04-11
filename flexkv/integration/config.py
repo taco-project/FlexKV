@@ -152,7 +152,41 @@ class FlexKVConfig:
             self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
         self.model_config.head_size = int(getattr(sglang_config, "head_dim", 0))
 
-        self.model_config.dtype = getattr(sglang_config, "dtype", torch.bfloat16)
+        # Determine KV cache dtype: prioritize user_config.kv_cache_dtype (from
+        # flexkv_config.yaml or FLEXKV_KV_CACHE_DTYPE env var), then fall back
+        # to the sglang model dtype.  sglang's ModelConfig.dtype is the *model
+        # weight* dtype (e.g. bfloat16), which may differ from the KV cache
+        # dtype (e.g. fp8_e4m3 when --kv-cache-dtype fp8_e4m3 is used).
+        def _parse_dtype_str(dtype_str: str) -> torch.dtype:
+            dtype_map = {
+                "float16": torch.float16,
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+                "fp16": torch.float16,
+                "fp32": torch.float32,
+                "bf16": torch.bfloat16,
+                "fp8": torch.float8_e4m3fn,
+                "float8": torch.float8_e4m3fn,
+                "e4m3": torch.float8_e4m3fn,
+                "fp8_e4m3": torch.float8_e4m3fn,
+            }
+            return dtype_map.get(dtype_str.lower(), torch.bfloat16)
+
+        user_dtype_str = self.user_config.kv_cache_dtype
+        if user_dtype_str is not None:
+            self.model_config.dtype = _parse_dtype_str(user_dtype_str)
+            logger.info(
+                f"[FlexKV] Using kv_cache_dtype from user_config: "
+                f"'{user_dtype_str}' -> {self.model_config.dtype}"
+            )
+        else:
+            self.model_config.dtype = getattr(sglang_config, "dtype", torch.bfloat16)
+            logger.warning(
+                f"[FlexKV] No kv_cache_dtype in user_config, falling back to sglang "
+                f"model dtype: {self.model_config.dtype}. If your KV cache uses a "
+                f"different dtype (e.g. fp8), add 'kv_cache_dtype: fp8' to your "
+                f"flexkv_config.yaml or set FLEXKV_KV_CACHE_DTYPE=fp8 environment variable."
+            )
 
         attn_arch = getattr(sglang_config, "attention_arch", None)
         use_mla = False
