@@ -73,7 +73,21 @@ class FlexKVConfig:
         else:
             self.model_config.num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
-        self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
+        base_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
+        if not GLOBAL_CONFIG_FROM_ENV.server_client_mode and GLOBAL_CONFIG_FROM_ENV.instance_num <= 1:
+            # In non-server-client mode, make IPC paths unique per DP instance
+            # to avoid collisions when vLLM v1 runs multiple DP instances as
+            # independent processes (each reporting dp_size=1).
+            # Use engine_id suffix (e.g. "_dp0") which is consistent across
+            # EngineCore and Worker processes of the same DP instance.
+            try:
+                engine_id = vllm_config.kv_transfer_config.engine_id
+                if engine_id and '_dp' in engine_id:
+                    dp_part = engine_id.rsplit('_dp', 1)[-1]
+                    base_port = base_port + f"_dp{dp_part}"
+            except (AttributeError, TypeError):
+                pass
+        self.server_recv_port = base_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
 

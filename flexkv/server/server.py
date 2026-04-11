@@ -304,6 +304,12 @@ class KVServer:
                 req = self.recv_from_client.recv_pyobj()
                 flexkv_logger.info(f"recv req: {type(req)} from DP client {req.dp_client_id}")
 
+                # Flush any pending transfer completions before handling
+                # the request. This ensures D2H set_ready callbacks are
+                # processed so that subsequent get_match sees up-to-date
+                # num_ready_matched_blocks.
+                self.kv_task_engine._update_tasks(timeout=0)
+
                 # Use dispatch table for request handling
                 req_type = type(req)
                 handler = self.request_handlers.get(req_type)
