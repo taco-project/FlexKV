@@ -21,7 +21,7 @@ import time
 import numpy as np
 import torch
 
-from flexkv.server.client import KVDPClient
+from flexkv.server.client import KVDPClient, ShmKVDPClient
 from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
@@ -83,6 +83,7 @@ class KVManager:
 
 
         self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
+        self.shm_ipc = GLOBAL_CONFIG_FROM_ENV.shm_ipc and self.server_client_mode
 
         if self.server_client_mode:
             # Server should only be created once across all instances and dp ranks
@@ -93,11 +94,17 @@ class KVManager:
                                                             gpu_register_port=self.gpu_register_port,
                                                             server_recv_port=self.server_recv_port,
                                                             total_clients=total_clients,
-                                                            inherit_env=False)
+                                                            inherit_env=False,
+                                                            shm_mode=self.shm_ipc)
 
             else:
                 self.server_handle = None
-            self.dp_client = KVDPClient(self.server_recv_port, self.model_config, self.global_client_id)
+
+            if self.shm_ipc:
+                flexkv_logger.info(f"Using SHM IPC for server-client communication")
+                self.dp_client = ShmKVDPClient(self.server_recv_port, self.model_config, self.global_client_id)
+            else:
+                self.dp_client = KVDPClient(self.server_recv_port, self.model_config, self.global_client_id)
         else:
             self.server_handle = None
             self.kv_task_engine = KVTaskEngine(self.model_config, self.cache_config, self.gpu_register_port, redis_meta=self.redis_meta_client, event_collector=event_collector)

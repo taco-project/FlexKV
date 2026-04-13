@@ -276,6 +276,227 @@ class KVTPClient:
         self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
 
 
+class ShmKVDPClient:
+    """
+    KVDPClient using shared memory IPC instead of ZMQ.
+    Same public API as KVDPClient — drop-in replacement.
+    """
+
+    def __init__(
+        self,
+        server_id: str,
+        model_config: ModelConfig,
+        dp_client_id: int,
+    ):
+        from flexkv.server.shm_channel import ShmChannel, ShmControlBlock, ShmMsgType
+
+        self.server_id = server_id
+        self.dp_client_id = dp_client_id
+        self.model_config = model_config
+        self._ShmMsgType = ShmMsgType
+
+        # Open shared memory control block and channel (created by server)
+        self.ctrl = ShmControlBlock(server_id, create=False)
+        self.ch = ShmChannel(server_id, dp_client_id, create=False)
+
+        self._task_id_range = (self.dp_client_id * 10000000, (self.dp_client_id + 1) * 10000000)
+        self._task_id_counter = self._task_id_range[0]
+        self._task_id_lock = Lock()
+        flexkv_logger.info(f"ShmKVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
+
+    def _get_task_id(self) -> int:
+        with self._task_id_lock:
+            old_value = self._task_id_counter
+            self._task_id_counter += 1
+            if self._task_id_counter >= self._task_id_range[1]:
+                self._task_id_counter = self._task_id_range[0]
+            return old_value
+
+    def _async_send(self, msg_type, **kwargs) -> None:
+        """Send fire-and-forget message via ring buffer + wake server."""
+        self.ch.async_send(msg_type, self.dp_client_id, **kwargs)
+        self.ctrl.notify_server()
+
+    def _sync_request(self, msg_type, **kwargs) -> dict:
+        """Send sync message via dedicated slot + wake server + spin-wait response."""
+        self.ch.sync_send_request(msg_type, self.dp_client_id, **kwargs)
+        self.ctrl.notify_server()
+        return self.ch.sync_wait_response()
+
+    def start_server_and_register(self) -> None:
+        MT = self._ShmMsgType
+        # Wait for server to create SHM files
+        self.ctrl.wait_server_ready(timeout_s=120.0)
+
+        # Send start request
+        self._sync_request(MT.START)
+
+        # Send register request with model config
+        import pickle
+        cfg_bytes = pickle.dumps(self.model_config)
+        self._sync_request(MT.REGISTER, model_config_bytes=cfg_bytes)
+
+        flexkv_logger.info(f"ShmKVDPClient {self.dp_client_id} registered to server")
+
+    def is_ready(self) -> bool:
+        resp = self._sync_request(self._ShmMsgType.IS_READY)
+        return resp["is_ready"]
+
+    def put_async(
+        self,
+        token_ids: np.ndarray,
+        slot_mapping: np.ndarray,
+        token_mask: Optional[np.ndarray],
+        namespace: Optional[List[str]] = None,
+    ) -> int:
+        task_id = self._get_task_id()
+        self._async_send(
+            self._ShmMsgType.PUT_ASYNC,
+            task_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask if token_mask is not None else None,
+            namespace=namespace)
+        return task_id
+
+    def put_match(
+        self,
+        token_ids: np.ndarray,
+        token_mask: Optional[np.ndarray],
+        namespace: Optional[List[str]] = None,
+    ) -> Optional[Tuple[int, np.ndarray]]:
+        task_id = self._get_task_id()
+        resp = self._sync_request(
+            self._ShmMsgType.PUT_MATCH,
+            task_id=task_id,
+            token_ids=token_ids,
+            token_mask=token_mask if token_mask is not None else None,
+            namespace=namespace)
+        if resp["error_msg"] is None:
+            return resp["task_id"], resp["mask"]
+        else:
+            flexkv_logger.error(f"put_match failed, error_msg: {resp['error_msg']}")
+            return None
+
+    def prefetch_async(
+        self,
+        token_ids: np.ndarray,
+        namespace: Optional[List[str]] = None,
+    ) -> int:
+        task_id = self._get_task_id()
+        self._async_send(
+            self._ShmMsgType.PREFETCH_ASYNC,
+            task_id=task_id,
+            token_ids=token_ids,
+            namespace=namespace)
+        return task_id
+
+    def get_async(
+        self,
+        token_ids: np.ndarray,
+        slot_mapping: np.ndarray,
+        token_mask: Optional[np.ndarray],
+        layer_granularity: int,
+        namespace: Optional[List[str]] = None,
+    ) -> int:
+        task_id = self._get_task_id()
+        self._async_send(
+            self._ShmMsgType.GET_ASYNC,
+            task_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask if token_mask is not None else None,
+            layer_granularity=layer_granularity,
+            namespace=namespace)
+        return task_id
+
+    def get_match(
+        self,
+        token_ids: np.ndarray,
+        token_mask: Optional[np.ndarray],
+        layer_granularity: int,
+        namespace: Optional[List[str]] = None,
+    ) -> Optional[Tuple[int, np.ndarray]]:
+        task_id = self._get_task_id()
+        resp = self._sync_request(
+            self._ShmMsgType.GET_MATCH,
+            task_id=task_id,
+            token_ids=token_ids,
+            token_mask=token_mask if token_mask is not None else None,
+            layer_granularity=layer_granularity,
+            namespace=namespace)
+        if resp["error_msg"] is None:
+            return task_id, resp["mask"]
+        else:
+            flexkv_logger.error(f"get_match failed, error_msg: {resp['error_msg']}")
+            return None
+
+    def launch_tasks(
+        self,
+        task_ids: List[int],
+        slot_mappings: List[np.ndarray],
+        as_batch: bool = False,
+    ) -> List[int]:
+        batch_id = -1
+        if as_batch:
+            batch_id = self._get_task_id()
+        self._async_send(
+            self._ShmMsgType.LAUNCH_TASKS,
+            task_id=batch_id,
+            task_ids=task_ids,
+            slot_mappings=slot_mappings,
+            as_batch=as_batch,
+            batch_id=batch_id)
+        return [batch_id] if as_batch else task_ids
+
+    def cancel_task(
+        self,
+        task_ids: List[int],
+    ) -> None:
+        self._async_send(
+            self._ShmMsgType.CANCEL_TASKS,
+            task_ids=task_ids)
+
+    def wait(
+        self,
+        wait_task_ids: List[int],
+        wait_timeout: float = 20.0,
+        completely: bool = False,
+    ) -> Optional[Dict[int, KVResponse]]:
+        resp = self._sync_request(
+            self._ShmMsgType.WAIT,
+            task_ids=wait_task_ids,
+            wait_timeout=wait_timeout,
+            completely=completely)
+        if resp["kv_responses"] is not None:
+            for k, v in resp["kv_responses"].items():
+                if v.status != KVResponseStatus.SUCCESS:
+                    flexkv_logger.error(f"wait task {k} failed: {v.status}")
+            return resp["kv_responses"]
+        else:
+            flexkv_logger.error(f"wait tasks: {wait_task_ids} in DP {self.dp_client_id} failed.")
+            return None
+
+    def try_wait(
+        self,
+        try_wait_task_ids: List[int],
+    ) -> Optional[Dict[int, KVResponse]]:
+        resp = self._sync_request(
+            self._ShmMsgType.TRY_WAIT,
+            task_ids=try_wait_task_ids)
+        if resp["kv_responses"] is not None:
+            for k, v in resp["kv_responses"].items():
+                if v.status != KVResponseStatus.SUCCESS:
+                    flexkv_logger.error(f"try_wait task {k} failed: {v.status}")
+            return resp["kv_responses"]
+        else:
+            flexkv_logger.error(f"try_wait tasks: {try_wait_task_ids} in DP {self.dp_client_id} failed.")
+            return None
+
+    def shutdown(self) -> None:
+        self._sync_request(self._ShmMsgType.SHUTDOWN)
+
+
 if __name__ == "__main__":
     num_layers = 32
     num_kv_heads = 8
