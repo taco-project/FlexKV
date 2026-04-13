@@ -39,6 +39,7 @@ from flexkv.transfer.worker import (
     tpGPUCPUTransferWorker,
     GDSTransferWorker,
     tpGDSTransferWorker,
+    NixlTransferWorker,
     PEER2CPUTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
@@ -271,7 +272,35 @@ class TransferEngine:
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
         if self.cache_config.enable_gds:
-            if self.tp_size == 1:
+            assert self._ssd_handle is not None
+            if self.cache_config.enable_nixl:
+                flexkv_logger.info(
+                    "[transfer_engine] GDS path using NixlTransferWorker (NIXL GDS_MT)"
+                )
+                if self.tp_size != 1:
+                    raise RuntimeError(
+                        "enable_nixl requires tp_size==1 (validated in KVTaskManager)"
+                    )
+                self.gds_workers = [
+                    NixlTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        nixl_backend="GDS_MT",
+                        ssd_files=self._ssd_handle.get_file_list(),
+                        num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                        dtype=self._ssd_handle.dtype,
+                        ssd_kv_layout=self._ssd_handle.kv_layout,
+                        gpu_kv_layout=gpu_handles[0].kv_layout,
+                        cpu_kv_layout=self._cpu_handle.kv_layout,
+                        nixl_extra_config=self.cache_config.nixl_extra_config,
+                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
+                        cpu_blocks=None,
+                        gpu_device_id=gpu_handles[0].gpu_device_id,
+                    )
+                    for _, gpu_handles in self.gpu_handles.items()
+                ]
+            elif self.tp_size == 1:
                 self.gds_workers = [
                     GDSTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
