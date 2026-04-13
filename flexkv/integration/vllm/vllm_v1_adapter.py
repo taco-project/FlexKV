@@ -320,6 +320,14 @@ class FlexKVSchedulerConnector:
         """
         match_start_time = time.perf_counter()
         num_tokens_to_get = (request.num_tokens//self.block_size)*self.block_size
+        # Never match ALL tokens: the scheduler requires num_new_tokens > 0,
+        # which means num_computed_tokens must be strictly less than
+        # request.num_tokens.  When the prompt length is an exact multiple of
+        # block_size, a full match would leave zero tokens for prefill.
+        if num_tokens_to_get == request.num_tokens:
+            num_tokens_to_get -= self.block_size
+        if num_tokens_to_get <= 0:
+            return -1, 0
         token_ids = request.all_token_ids[:num_tokens_to_get]
 
         assert num_computed_tokens <= num_tokens_to_get, (
