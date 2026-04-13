@@ -181,6 +181,7 @@ class KVTaskManager:
         self.task_id_lock = threading.Lock()
 
         self.running_tasks: int = 0
+        self._pending_release_tasks: set = set()
 
     def start(self) -> None:
         for transfer_handle in self.transfer_handles:
@@ -325,6 +326,11 @@ class KVTaskManager:
                 transfer_handle.submit(transfer_graph)
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
+        if self._pending_release_tasks:
+            for tid in list(self._pending_release_tasks):
+                self._release_task(tid)
+            self._pending_release_tasks.clear()
+
         completed_ops = self._get_completed_ops(timeout)
         metrics_collector = get_global_collector()
         for completed_op in completed_ops:
@@ -359,16 +365,8 @@ class KVTaskManager:
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]
-        if task.is_completed():
-            flexkv_logger.warning(f"Task {task_id} is already completed, cannot cancel")
-            return
-        if task.status == TaskStatus.RUNNING:
-            flexkv_logger.warning(f"Task {task_id} is running, cannot cancel")
-            return
-        if task.status == TaskStatus.CANCELLED:
-            flexkv_logger.warning(f"Task {task_id} is already cancelled, cannot cancel")
-            return
-        task.status = TaskStatus.CANCELLED
+        if not task.is_completed():
+            task.status = TaskStatus.CANCELLED
         self._release_task(task_id)
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
@@ -441,6 +439,8 @@ class KVTaskManager:
         task.status = TaskStatus.COMPLETED
         task.task_end_op_finished = True
         self.graph_to_task.pop(task.graph.graph_id)
+        if task.batch_task_id is None and task.pending_sub_count == 0:
+            self._pending_release_tasks.add(task_id)
 
     def _process_empty_graph(self, task_id: int) -> None:
         task = self.tasks[task_id]
