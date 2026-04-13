@@ -95,29 +95,6 @@ def _nixl_register(
         return False
 
 
-def _open_xfer_files(
-    file_paths: List[str],
-    region_offsets: List[int],
-    region_lens: List[int],
-) -> Tuple[Optional[Dict[str, int]], List[Tuple[int, int, int]]]:
-    path_to_fd: Dict[str, int] = {}
-    xfer: List[Tuple[int, int, int]] = []
-    for path, off, ln in zip(file_paths, region_offsets, region_lens):
-        if path not in path_to_fd:
-            try:
-                path_to_fd[path] = os.open(path, os.O_RDWR)
-            except OSError as e:
-                flexkv_logger.error(f"NIXL: open {path} failed: {e}")
-                for fd in path_to_fd.values():
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                return None, []
-        xfer.append((off, ln, path_to_fd[path]))
-    return path_to_fd, xfer
-
-
 def _close_xfer_files(path_to_fd: Dict[str, int]) -> None:
     for fd in path_to_fd.values():
         try:
@@ -192,6 +169,46 @@ class NixlAgentSession:
             ) from e
         self.backend_name = name
         flexkv_logger.info(f"NIXL backend {name} initparams={params}")
+        # Opened at prepare_all_ssd_files; DRAM/VRAM registered at prepare_dram_cpu /
+        # prepare_vram_gpu. xfer_* only runs initialize_xfer + transfer.
+        self._path_to_fd: Optional[Dict[str, int]] = None
+
+    def prepare_all_ssd_files(self, ssd_files: Dict[int, List[str]]) -> bool:
+        """Open every unique backing file and register FILE memory once (worker init)."""
+        paths: List[str] = []
+        for fl in ssd_files.values():
+            paths.extend(fl)
+        unique = sorted(set(paths))
+        if not unique:
+            self._path_to_fd = {}
+            return True
+        path_to_fd: Dict[str, int] = {}
+        for path in unique:
+            try:
+                path_to_fd[path] = os.open(path, os.O_RDWR)
+            except OSError as e:
+                flexkv_logger.error(f"NIXL: open {path} failed: {e}")
+                _close_xfer_files(path_to_fd)
+                return False
+        reg_file = [(0, 0, path_to_fd[p], p) for p in path_to_fd]
+        if not _nixl_register(self.agent, reg_file, "FILE"):
+            _close_xfer_files(path_to_fd)
+            return False
+        self._path_to_fd = path_to_fd
+        return True
+
+    def prepare_dram_cpu(self, cpu_tensor: torch.Tensor) -> bool:
+        """Register the full pinned CPU pool as DRAM once (after cudaHostRegister)."""
+        sz = int(cpu_tensor.numel() * cpu_tensor.element_size())
+        ptr = int(cpu_tensor.data_ptr())
+        dram_reg = [(ptr, sz, 0, "")]
+        return _nixl_register(self.agent, dram_reg, "DRAM")
+
+    def prepare_vram_gpu(self, gpu_tensors: List[torch.Tensor]) -> bool:
+        """Register GPU KV tensors once (POSIX path does not use this)."""
+        if not gpu_tensors:
+            return False
+        return _nixl_register(self.agent, gpu_tensors)
 
     def xfer_dram_file(
         self,
@@ -203,30 +220,28 @@ class NixlAgentSession:
     ) -> bool:
         if not dram_ptr_len or not file_paths:
             return True
-        path_to_fd, xfer_tuples = _open_xfer_files(
-            file_paths, region_offsets, region_lens
-        )
-        if path_to_fd is None:
+        if self._path_to_fd is None:
+            flexkv_logger.error("NIXL: xfer_dram_file called without prepare_all_ssd_files")
             return False
-        try:
-            reg_file = [(0, 0, path_to_fd[p], p) for p in path_to_fd]
-            if not _nixl_register(self.agent, reg_file, "FILE"):
+        xfer_tuples: List[Tuple[int, int, int]] = []
+        for path, off, ln in zip(file_paths, region_offsets, region_lens):
+            fd = self._path_to_fd.get(path)
+            if fd is None:
+                flexkv_logger.error(
+                    f"NIXL: file {path!r} not in session (not opened at init)"
+                )
                 return False
-            dram_reg = [(p, ln, 0, "") for p, ln in dram_ptr_len]
-            if not _nixl_register(self.agent, dram_reg, "DRAM"):
-                return False
-            dram_descs = self.agent.get_xfer_descs(
-                [(p, ln, 0) for p, ln in dram_ptr_len], "DRAM"
-            )
-            return _nixl_run_xfer(
-                self.agent,
-                self.agent_name,
-                direction,
-                dram_descs,
-                xfer_tuples,
-            )
-        finally:
-            _close_xfer_files(path_to_fd)
+            xfer_tuples.append((off, ln, fd))
+        dram_descs = self.agent.get_xfer_descs(
+            [(p, ln, 0) for p, ln in dram_ptr_len], "DRAM"
+        )
+        return _nixl_run_xfer(
+            self.agent,
+            self.agent_name,
+            direction,
+            dram_descs,
+            xfer_tuples,
+        )
 
     def xfer_vram_file(
         self,
@@ -238,30 +253,29 @@ class NixlAgentSession:
     ) -> bool:
         if not gpu_tensors or not file_paths:
             return True
-        path_to_fd, xfer_tuples = _open_xfer_files(
-            file_paths, region_offsets, region_lens
-        )
-        if path_to_fd is None:
+        if self._path_to_fd is None:
+            flexkv_logger.error("NIXL: xfer_vram_file called without prepare_all_ssd_files")
             return False
-        try:
-            reg_file = [(0, 0, path_to_fd[p], p) for p in path_to_fd]
-            if not _nixl_register(self.agent, reg_file, "FILE"):
+        xfer_tuples: List[Tuple[int, int, int]] = []
+        for path, off, ln in zip(file_paths, region_offsets, region_lens):
+            fd = self._path_to_fd.get(path)
+            if fd is None:
+                flexkv_logger.error(
+                    f"NIXL: file {path!r} not in session (not opened at init)"
+                )
                 return False
-            if not _nixl_register(self.agent, gpu_tensors):
-                return False
-            vram_descs = self.agent.get_xfer_descs(gpu_tensors)
-            if vram_descs is None:
-                flexkv_logger.error("NIXL: get_xfer_descs(VRAM) failed")
-                return False
-            return _nixl_run_xfer(
-                self.agent,
-                self.agent_name,
-                direction,
-                vram_descs,
-                xfer_tuples,
-            )
-        finally:
-            _close_xfer_files(path_to_fd)
+            xfer_tuples.append((off, ln, fd))
+        vram_descs = self.agent.get_xfer_descs(gpu_tensors)
+        if vram_descs is None:
+            flexkv_logger.error("NIXL: get_xfer_descs(VRAM) failed")
+            return False
+        return _nixl_run_xfer(
+            self.agent,
+            self.agent_name,
+            direction,
+            vram_descs,
+            xfer_tuples,
+        )
 
 
 def remap_ssd_block_id(

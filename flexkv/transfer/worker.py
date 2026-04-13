@@ -1468,6 +1468,10 @@ class NixlTransferWorker(TransferWorkerBase):
             if gpu_device_id != -1:
                 torch.cuda.set_device(gpu_device_id)
             self.transfer_stream = torch.cuda.Stream()
+            if not self._session.prepare_all_ssd_files(self.ssd_files):
+                raise RuntimeError("NIXL: prepare_all_ssd_files failed")
+            if not self._session.prepare_vram_gpu(self.gpu_blocks):
+                raise RuntimeError("NIXL: prepare_vram_gpu failed")
         else:
             self.cpu_blocks = cpu_blocks  # type: ignore[assignment]
             flexkv_logger.info(
@@ -1480,6 +1484,10 @@ class NixlTransferWorker(TransferWorkerBase):
                     "CPU and SSD KV layout types must match for NIXL FILE transfer"
                 )
             self.chunk_size_in_bytes = self.cpu_chunk_size_in_bytes
+            if not self._session.prepare_all_ssd_files(self.ssd_files):
+                raise RuntimeError("NIXL: prepare_all_ssd_files failed")
+            if not self._session.prepare_dram_cpu(self.cpu_blocks):
+                raise RuntimeError("NIXL: prepare_dram_cpu failed")
 
     def _transfer_impl(
         self,
