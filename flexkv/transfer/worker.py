@@ -43,6 +43,7 @@ from flexkv.transfer.nixlutil import (
     NIXL_CPU_FILE_BACKENDS,
     NIXL_GPU_FILE_BACKENDS,
     NixlAgentSession,
+    normalize_nixl_file_plugin_name,
     file_path_for_ssd_block,
     gpu_chunk_u8_view,
     kv_chunk_byte_offset_in_block,
@@ -1383,7 +1384,7 @@ class NixlTransferWorker(TransferWorkerBase):
     ) -> None:
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
 
-        be = nixl_backend.upper()
+        be = normalize_nixl_file_plugin_name(str(nixl_backend).upper())
         if be not in NIXL_GPU_FILE_BACKENDS and be not in NIXL_CPU_FILE_BACKENDS:
             raise ValueError(
                 f"nixl_backend must be one of {sorted(NIXL_GPU_FILE_BACKENDS | NIXL_CPU_FILE_BACKENDS)}, got {nixl_backend}"

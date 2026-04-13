@@ -24,10 +24,51 @@ else:
     _NIXL_IMPORT_ERROR = None
 
 NIXL_GPU_FILE_BACKENDS = frozenset({"GDS_MT"})
-NIXL_CPU_FILE_BACKENDS = frozenset({"POSIX", "3FS"})
+# Upstream NIXL registers 3FS as plugin "HF3FS"; "3FS" is accepted as an alias.
+NIXL_CPU_FILE_BACKENDS = frozenset({"POSIX", "HF3FS", "3FS"})
 
-# AUTO: try in this order
-_FILE_PLUGIN_ORDER = ("3FS", "POSIX", "GDS_MT")
+# AUTO: try in this order (HF3FS is the real plugin name in nixl.git)
+_FILE_PLUGIN_ORDER = ("HF3FS", "POSIX", "GDS_MT")
+
+
+def normalize_nixl_file_plugin_name(name: str) -> str:
+    """Map user-facing names to NIXL create_backend plugin names."""
+    u = str(name).upper()
+    if u == "3FS":
+        return "HF3FS"
+    return u
+
+
+def build_nixl_extra_config(cache_config: Any) -> Dict[str, Any]:
+    """Merge ``CacheConfig.nixl_*`` HF3FS fields into ``nixl_extra_config`` for ``NixlAgentSession``."""
+    out: Dict[str, Any] = dict(getattr(cache_config, "nixl_extra_config", None) or {})
+    mp = getattr(cache_config, "nixl_hf3fs_mount_point", None)
+    mc = getattr(cache_config, "nixl_hf3fs_mem_config", None)
+    ios = getattr(cache_config, "nixl_hf3fs_iopool_size", None)
+    if mp is None and mc is None and ios is None:
+        return out
+    pl = out.get("plugin")
+    if not isinstance(pl, dict):
+        pl = {}
+        out["plugin"] = pl
+    hf = pl.get("hf3fs")
+    if not isinstance(hf, dict):
+        hf = {}
+        pl["hf3fs"] = hf
+    if mp is not None and "mount_point" not in hf:
+        hf["mount_point"] = str(mp)
+    if mc is not None and "mem_config" not in hf:
+        hf["mem_config"] = str(mc)
+    if ios is not None and "iopool_size" not in hf:
+        hf["iopool_size"] = str(int(ios))
+    # Flat keys for NixlOpts.init_params HF3FS fallback
+    if mp is not None and "mount_point" not in out:
+        out["mount_point"] = str(mp)
+    if mc is not None and "mem_config" not in out:
+        out["mem_config"] = str(mc)
+    if ios is not None and "iopool_size" not in out:
+        out["iopool_size"] = str(int(ios))
+    return out
 
 
 def require_nixl() -> None:
@@ -53,8 +94,10 @@ class NixlOpts:
                     "true",
                     "True",
                 ):
-                    return str(name).upper()
-        return os.environ.get("FLEXKV_NIXL_BACKEND_PLUGIN", "auto").upper()
+                    return normalize_nixl_file_plugin_name(str(name).upper())
+        return normalize_nixl_file_plugin_name(
+            os.environ.get("FLEXKV_NIXL_BACKEND_PLUGIN", "auto").upper()
+        )
 
     def init_params(self, plugin_name: str) -> Dict[str, str]:
         pl = self.raw.get("plugin")
@@ -63,17 +106,24 @@ class NixlOpts:
             sec = sec if isinstance(sec, dict) else {}
         else:
             sec = {k: v for k, v in self.raw.items() if k != "plugin"}
-        return {k: str(v) for k, v in sec.items() if k != "active"}
+        base = {k: str(v) for k, v in sec.items() if k != "active"}
+        # HF3FS: allow flat mount_point / mem_config / iopool_size on the merged config dict.
+        if plugin_name.upper() == "HF3FS":
+            for k in ("mount_point", "mem_config", "iopool_size"):
+                if k not in base and k in self.raw:
+                    base[k] = str(self.raw[k])
+        return base
 
 
 def _pick_plugin(requested: str, available: List[str]) -> Optional[str]:
-    u = requested.upper()
+    avail = set(available)
+    u = normalize_nixl_file_plugin_name(requested)
     if u == "AUTO":
         for p in _FILE_PLUGIN_ORDER:
-            if p in available:
+            if p in avail:
                 return p
         return None
-    return u if u in available else None
+    return u if u in avail else None
 
 
 def _nixl_register(
@@ -148,11 +198,13 @@ class NixlAgentSession:
         require_nixl()
         self.agent_name = f"flexkv_nixl_{uuid.uuid4()}"
         opts = NixlOpts(extra_config)
-        req = (
-            backend_plugin
-            if str(backend_plugin).upper() != "AUTO"
-            else opts.resolve_plugin()
-        )
+        raw_req = str(backend_plugin).upper()
+        if raw_req != "AUTO":
+            req = normalize_nixl_file_plugin_name(backend_plugin)
+        else:
+            req = opts.resolve_plugin()
+            if str(req).upper() == "3FS":
+                req = "HF3FS"
         self.agent = nixl_agent(self.agent_name, nixl_agent_config(backends=[]))
         avail = list(self.agent.get_plugin_list())
         name = _pick_plugin(str(req).upper(), avail)
@@ -168,6 +220,7 @@ class NixlAgentSession:
                 f"NIXL: create_backend({name!r}) failed: {e}"
             ) from e
         self.backend_name = name
+        self._nixl_extra_config: Dict[str, Any] = dict(extra_config or {})
         flexkv_logger.info(f"NIXL backend {name} initparams={params}")
         # Opened at prepare_all_ssd_files; DRAM/VRAM registered at prepare_dram_cpu /
         # prepare_vram_gpu. xfer_* only runs initialize_xfer + transfer.
@@ -201,8 +254,35 @@ class NixlAgentSession:
         """Register the full pinned CPU pool as DRAM once (after cudaHostRegister)."""
         sz = int(cpu_tensor.numel() * cpu_tensor.element_size())
         ptr = int(cpu_tensor.data_ptr())
+        if self.backend_name == "HF3FS":
+            try:
+                page = int(os.sysconf("SC_PAGESIZE"))
+            except (AttributeError, OSError, ValueError):
+                page = 4096
+            if page > 0 and (ptr % page != 0 or sz % page != 0):
+                flexkv_logger.warning(
+                    "NIXL HF3FS: CPU pool not page-aligned (ptr %% page=%s, size %% page=%s); "
+                    "DRAM_ZC fast path may fall back to bounce buffers. "
+                    "Consider page-aligned allocation for the CPU KV pool.",
+                    ptr % page,
+                    sz % page,
+                )
         dram_reg = [(ptr, sz, 0, "")]
-        return _nixl_register(self.agent, dram_reg, "DRAM")
+        ok = _nixl_register(self.agent, dram_reg, "DRAM")
+        if ok and self.backend_name == "HF3FS":
+            ex = self._nixl_extra_config
+            plg = ex.get("plugin", {})
+            hf = plg.get("hf3fs", {}) if isinstance(plg, dict) else {}
+            flat_mp = ex.get("mount_point")
+            mount = hf.get("mount_point") if isinstance(hf, dict) else None
+            mount = mount or flat_mp
+            if not mount:
+                flexkv_logger.warning(
+                    "NIXL HF3FS: no mount_point in nixl_extra_config / "
+                    "CacheConfig.nixl_hf3fs_mount_point; backend default applies "
+                    "(see NIXL hf3fs_backend)."
+                )
+        return ok
 
     def prepare_vram_gpu(self, gpu_tensors: List[torch.Tensor]) -> bool:
         """Register GPU KV tensors once (POSIX path does not use this)."""
