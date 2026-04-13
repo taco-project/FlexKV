@@ -353,6 +353,8 @@ class FlexKVSchedulerConnector:
                                                         match_end_time=match_end_time)
 
             # logger.debug(f"FlexKV create get task: {self.tasks_to_cancel[task_id]}")
+        else:
+            self.flexkv_manager.cancel(task_ids=[task_id])
 
         return task_id, num_new_matched_tokens
 
