@@ -1828,6 +1828,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             f"Node {self.cache_config.distributed_node_id} Listening on {self.zmq_listen_addr}"
         )
         while not self.zmq_server.shutdown_event.is_set():
+            recv_meta = None
+            failure_msg = None
             try:
                 ## step1: recv and parse the message into meta info
                 try:
