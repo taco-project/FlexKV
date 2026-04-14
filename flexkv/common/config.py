@@ -36,6 +36,11 @@ class ModelConfig:
     pp_size: int = 1
     pp_rank: int = 0
 
+    # NSA context parallelism: when True, layerwise transfer sends full
+    # (unpartitioned) KV cache to every rank instead of head-sliced data.
+    is_nsa_cp: bool = False
+    cp_size: int = 1
+
     @property
     def token_size_in_bytes(self) -> int:
         kv_dim = 1 if self.use_mla else 2

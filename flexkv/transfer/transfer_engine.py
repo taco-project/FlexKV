@@ -207,6 +207,8 @@ class TransferEngine:
                     dtype=gpu_handles[0].dtype,
                     tp_group_size=self.tp_size,
                     dp_group_id=dp_client_id,
+                    is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
+                    cp_size=getattr(self.model_config, "cp_size", 1),
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -226,6 +228,8 @@ class TransferEngine:
                     dtype=gpu_handles[0].dtype,
                     tp_group_size=self.tp_size,
                     dp_group_id=dp_client_id,
+                    is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
+                    cp_size=getattr(self.model_config, "cp_size", 1),
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -329,6 +333,10 @@ class TransferEngine:
             ssd_files = {} if self._ssd_handle is None else self._ssd_handle.get_file_list()
             ssd_kv_layout = None if self._ssd_handle is None else self._ssd_handle.kv_layout
             num_blocks_per_file = 0 if self._ssd_handle is None else self._ssd_handle.num_blocks_per_file
+            _is_nsa_cp = getattr(self.model_config, 'is_nsa_cp', False)
+            _cp_size = getattr(self.model_config, 'cp_size', 1)
+            # For CP, each CP rank connects via eventfd; for TP, each TP rank connects.
+            _eventfd_group_size = _cp_size if _is_nsa_cp and _cp_size > 1 else self.tp_size
             self.layerwise_workers = [
                 LayerwiseTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
@@ -341,7 +349,7 @@ class TransferEngine:
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     ssd_kv_layout=ssd_kv_layout,
                     dtype=gpu_handles[0].dtype,
-                    tp_group_size=self.tp_size,
+                    tp_group_size=_eventfd_group_size,
                     dp_group_id=dp_client_id,
                     pp_rank=self.model_config.pp_rank,
                     pp_size=self.model_config.pp_size,
@@ -352,6 +360,7 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    is_nsa_cp=_is_nsa_cp,
                 )
                 for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
             ]
@@ -439,6 +448,8 @@ class TransferEngine:
                         dtype=indexer_gpu_handles_list[0].dtype,
                         tp_group_size=self.tp_size,
                         dp_group_id=dp_client_id,
+                        is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
+                        cp_size=getattr(self.model_config, "cp_size", 1),
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -458,6 +469,8 @@ class TransferEngine:
                         dtype=indexer_gpu_handles_list[0].dtype,
                         tp_group_size=self.tp_size,
                         dp_group_id=dp_client_id,
+                        is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
+                        cp_size=getattr(self.model_config, "cp_size", 1),
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,

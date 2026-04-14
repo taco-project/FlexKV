@@ -56,7 +56,8 @@ public:
                          const int transfer_num_cta,
                          const bool is_host_to_device,
                          const bool use_ce_transfer, const int layer_id,
-                         const int layer_granularity, const bool is_mla);
+                         const int layer_granularity, const bool is_mla,
+                         const bool use_sharded_d2h);
 
 private:
   using Task = std::function<void()>;

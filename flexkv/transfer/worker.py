@@ -433,6 +433,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  dtype: torch.dtype,
                  tp_group_size: int,
                  dp_group_id: int,
+                 is_nsa_cp: bool = False,
+                 cp_size: int = 1,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
@@ -454,6 +456,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
         self.dp_group_id = dp_group_id
+        self.use_cp_nsa_d2h_shard = bool(is_nsa_cp and cp_size > 1)
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
@@ -497,6 +500,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         cpu_blocks_ptr = cpu_blocks.data_ptr()
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
         num_tensors_per_gpu = len(self.gpu_blocks[0])
+
+        flexkv_logger.info(f"num_tensors_per_gpu: {num_tensors_per_gpu}")
 
         self.tp_transfer_thread_group = TPTransferThreadGroup(
             self.num_gpus,
@@ -557,6 +562,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             layer_id,
             layer_granularity,
             self.is_mla,
+            self.use_cp_nsa_d2h_shard,
         )
 
 
@@ -2127,7 +2133,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
     def get_node_meta(self, node_id: int) -> Optional[NodeMetaInfo]:
         """Get the node meta info by node id.
-        
+
         Before returning cached or freshly-fetched meta, we verify that the
         node is still active (its node:<id> key exists in Redis and has not
         expired).  This prevents RDMA transfers to stale addresses after a

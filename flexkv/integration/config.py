@@ -116,6 +116,9 @@ class FlexKVConfig:
         pp_rank: int = 0,
         dp_size: int = 1,
         dp_rank: int = 0,
+        is_nsa_cp: bool = False,
+        cp_size: int = 1,
+        cp_rank: int = 0,
     ):
         """
         Initialize FlexKVConfig fields from sglang config.
@@ -128,6 +131,9 @@ class FlexKVConfig:
             pp_rank: pipeline parallel rank (default 0)
             dp_size: data parallel size (default 1, no DP)
             dp_rank: data parallel rank (default 0)
+            is_nsa_cp: whether NSA context parallelism is enabled
+            cp_size: context parallel size (default 1, no CP)
+            cp_rank: context parallel rank (default 0)
         """
         # cache config: use page_size as tokens_per_block so that FlexKV's
         # CPU radix tree manages blocks at page granularity, ensuring that
@@ -201,6 +207,8 @@ class FlexKVConfig:
         self.model_config.dp_rank = int(dp_rank if dp_rank is not None else 0)
         self.model_config.pp_size = int(pp_size)
         self.model_config.pp_rank = int(pp_rank)
+        self.model_config.is_nsa_cp = is_nsa_cp
+        self.model_config.cp_size = int(cp_size if cp_size is not None else 1)
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
 
         # Each PP rank needs its own IPC ports so that their
@@ -217,7 +225,7 @@ class FlexKVConfig:
 
         rank_parts = []
         if int(tp_size) > 1:
-            rank_parts.append(f"tp_rank=0")
+            rank_parts.append("tp_rank=0")
         if int(pp_size) > 1:
             rank_parts.append(f"pp_rank={int(pp_rank)}")
         if int(self.model_config.dp_size) > 1:
@@ -249,7 +257,7 @@ class FlexKVConfig:
         # Convert dtype string to torch.dtype
         dtype_str = config.pytorch_backend_config.kv_cache_dtype
         flexkv_logger.info(f"[FlexKVConfig] dtype_str from TRT config: {dtype_str}")
-        
+
         # Helper function to convert dtype string to torch.dtype
         def _parse_dtype_str(dtype_str: str) -> torch.dtype:
             dtype_map = {
@@ -259,12 +267,12 @@ class FlexKVConfig:
                 "fp16": torch.float16,
                 "fp32": torch.float32,
                 "bf16": torch.bfloat16,
-                "fp8": torch.float8_e4m3fn, 
+                "fp8": torch.float8_e4m3fn,
                 "float8": torch.float8_e4m3fn,
-                "e4m3": torch.float8_e4m3fn,                
+                "e4m3": torch.float8_e4m3fn,
             }
             return dtype_map.get(dtype_str.lower(), torch.bfloat16)
-        
+
         if dtype_str == "auto":
             # When dtype_str is "auto", try to get kv_cache_dtype from user_config first
             # This allows users to specify kv_cache_dtype in flexkv_config.json or via environment variable
@@ -287,7 +295,7 @@ class FlexKVConfig:
             self.model_config.dtype = _parse_dtype_str(dtype_str)
         else:
             self.model_config.dtype = dtype_str
-        
+
         # Set model config (parallel configs part)
         if config.mapping.enable_attention_dp:
             self.model_config.tp_size = 1
@@ -297,19 +305,19 @@ class FlexKVConfig:
             self.model_config.dp_size = 1
         self.model_config.pp_size = getattr(config.mapping, 'pp_size', 1)
         self.model_config.pp_rank = getattr(config.mapping, 'pp_rank', 0)
-            
+
         # self.model_config (model configs part)
         try:
             model_path = getattr(config, 'hf_model_dir', None)
             from transformers import AutoConfig as HFAutoConfig
             hf_config = HFAutoConfig.from_pretrained(
-                str(model_path), 
+                str(model_path),
                 trust_remote_code=True
             )
             self.model_config.num_layers = hf_config.num_hidden_layers
-            self.model_config.use_mla = (hasattr(hf_config, 'kv_lora_rank') and 
+            self.model_config.use_mla = (hasattr(hf_config, 'kv_lora_rank') and
                             hf_config.kv_lora_rank is not None and
-                            hasattr(hf_config, 'qk_rope_head_dim') and 
+                            hasattr(hf_config, 'qk_rope_head_dim') and
                             hf_config.qk_rope_head_dim is not None)
             if self.model_config.use_mla:
                 self.model_config.head_size = hf_config.kv_lora_rank + hf_config.qk_rope_head_dim

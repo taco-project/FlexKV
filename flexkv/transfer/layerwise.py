@@ -73,7 +73,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  use_ce_transfer_d2h: bool = False,
                  h2d_cta_num: int = 4,
                  d2h_cta_num: int = 4,
-                 enable_eventfd: bool = True) -> None:
+                 enable_eventfd: bool = True,
+                 is_nsa_cp: bool = False) -> None:
         flexkv_logger.debug(
             f"[LayerwiseWorker] __init__ started: worker_id={worker_id}, "
             f"tp_group_size={tp_group_size}, dp_group_id={dp_group_id}, "
@@ -99,6 +100,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.dp_group_id = dp_group_id
         self.dp_size = dp_size if dp_size > 0 else 1
         self.dp_rank = dp_rank
+        self.is_nsa_cp = is_nsa_cp
 
         # initialize GPU storage
         self.num_layers = gpu_kv_layouts[0].num_layer
@@ -122,11 +124,18 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         else:
             raise ValueError(f"Invalid GPU block type: {num_blocks_first_gpu}")
 
+        flexkv_logger.debug(f"[LayerwiseWorker] About to receive eventfds, enable_eventfd={enable_eventfd}")
+        if enable_eventfd:
+            layer_eventfds_tensor = self._receive_eventfds_from_sglang(tp_group_size)
+        else:
+            layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
+        flexkv_logger.debug(f"[LayerwiseWorker] Eventfds received, tensor shape={layer_eventfds_tensor.shape}")
+
         # initialize CPU storage
         flexkv_logger.info(f"[LayerwiseWorker] Pinning CPU Memory: "
                            f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
-        flexkv_logger.debug(f"[LayerwiseWorker] CPU memory pinned successfully")
+        flexkv_logger.debug("[LayerwiseWorker] CPU memory pinned successfully")
         self.cpu_blocks = cpu_blocks
 
         self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
@@ -135,13 +144,19 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         # TP-divided CPU strides (for CPU->GPU, each rank reads its own portion)
-        if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and not self.is_mla:
-            cpu_kv_layout_tp = cpu_kv_layout.div_head(self.tp_group_size)
-        else:
+        if self.is_nsa_cp:
+            # CP: no head partitioning, every rank gets the full KV cache
             cpu_kv_layout_tp = cpu_kv_layout
+            self.cpu_tp_stride_in_bytes = 0
+        else:
+            # TP: partition by heads, each rank reads a different head slice
+            if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and not self.is_mla:
+                cpu_kv_layout_tp = cpu_kv_layout.div_head(self.tp_group_size)
+            else:
+                cpu_kv_layout_tp = cpu_kv_layout
+            self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
         self.h2d_cpu_kv_stride_in_bytes = cpu_kv_layout_tp.get_kv_stride() * self.dtype.itemsize
         self.h2d_cpu_layer_stride_in_bytes = cpu_kv_layout_tp.get_layer_stride() * self.dtype.itemsize
-        self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
 
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
@@ -172,15 +187,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
         gpu_layer_strides_tensor = torch.tensor(self.gpu_layer_strides_in_bytes, dtype=torch.int64)
 
-        flexkv_logger.debug(f"[LayerwiseWorker] About to receive eventfds, enable_eventfd={enable_eventfd}")
-        if enable_eventfd:
-            layer_eventfds_tensor = self._receive_eventfds_from_sglang(tp_group_size)
-        else:
-            layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
-        flexkv_logger.debug(f"[LayerwiseWorker] Eventfds received, tensor shape={layer_eventfds_tensor.shape}")
-
         # Create LayerwiseTransferGroup which handles both SSD->CPU and CPU->GPU transfers
-        flexkv_logger.debug(f"[LayerwiseWorker] Creating LayerwiseTransferGroup...")
+        flexkv_logger.debug("[LayerwiseWorker] Creating LayerwiseTransferGroup...")
         self.layerwise_transfer_group = LayerwiseTransferGroup(
             self.num_gpus, self.gpu_blocks, cpu_blocks, ssd_files,
             dp_group_id, self.num_layers,
@@ -261,20 +269,33 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                     break
 
                 with conn:
-                    metadata = conn.recv(16)
+                    # Accept both 16-byte (legacy: tp_rank, tp_size, num_layers, num_counters)
+                    # and 24-byte (new: tp_rank, tp_size, cp_rank, cp_size, num_layers, num_counters)
+                    metadata = conn.recv(24)
                     if len(metadata) < 16:
                         flexkv_logger.error(
                             f"[LayerwiseWorker] Incomplete metadata on {socket_path}{rank_label}: "
                             f"{len(metadata)} bytes")
                         continue
 
-                    tp_rank, _, recv_num_layers, recv_num_counters = struct.unpack("iiii", metadata)
+                    if len(metadata) >= 24:
+                        tp_rank, _, cp_rank, cp_size, recv_num_layers, recv_num_counters = \
+                            struct.unpack("iiiiii", metadata[:24])
+                    else:
+                        tp_rank, _, recv_num_layers, recv_num_counters = \
+                            struct.unpack("iiii", metadata[:16])
+                        cp_rank, cp_size = 0, 1
+
+                    # Use cp_rank as the connection key when CP is active,
+                    # otherwise use tp_rank
+                    rank_key = cp_rank if cp_size > 1 else tp_rank
                     if conn_idx == 0:
                         num_layers, num_counters = recv_num_layers, recv_num_counters
 
                     flexkv_logger.debug(
                         f"[LayerwiseWorker] Connection {conn_idx + 1}: "
-                        f"tp_rank={tp_rank}, num_layers={recv_num_layers}, "
+                        f"tp_rank={tp_rank}, cp_rank={cp_rank}, cp_size={cp_size}, "
+                        f"num_layers={recv_num_layers}, "
                         f"num_counters={recv_num_counters}")
 
                     rank_eventfds = {}
@@ -284,12 +305,12 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                         rank_eventfds[counter_id] = fds
                         flexkv_logger.debug(
                             f"[LayerwiseWorker] Received counter_id={counter_id}, "
-                            f"num_fds={len(fds)} from tp_rank={tp_rank}")
+                            f"num_fds={len(fds)} from rank_key={rank_key}")
 
-                    all_rank_eventfds[tp_rank] = rank_eventfds
+                    all_rank_eventfds[rank_key] = rank_eventfds
                     flexkv_logger.info(
-                        f"[LayerwiseWorker] Received all eventfds from tp_rank={tp_rank} "
-                        f"on {socket_path}")
+                        f"[LayerwiseWorker] Received all eventfds from rank_key={rank_key} "
+                        f"(tp_rank={tp_rank}, cp_rank={cp_rank}) on {socket_path}")
         except Exception as e:
             flexkv_logger.error(
                 f"[LayerwiseWorker] Error in accept loop on {socket_path}{rank_label}: {e}")
