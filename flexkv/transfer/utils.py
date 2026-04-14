@@ -217,16 +217,17 @@ class RDMATaskInfo:
             "data_size": self.data_size,
         }
 
-    def from_dict(self, data: dict) -> "RDMATaskInfo":
-        return RDMATaskInfo(
-            task_id = data.get("task_id", 0),
+    @classmethod
+    def from_dict(cls, data: dict) -> "RDMATaskInfo":
+        return cls(
+            task_id=data.get("task_id", 0),
             local_engine_addr=data.get("local_engine_addr", ""),
             peer_engine_addr=data.get("peer_engine_addr", ""),
-            peer_zmq_addr = data.get("peer_zmq_addr", ""),
-            src_ptr=data.get("src_ptrs", []),
-            dst_ptr=data.get("dst_ptrs", []),
+            peer_zmq_addr=data.get("peer_zmq_addr", ""),
+            src_ptrs=data.get("src_ptrs", []),
+            dst_ptrs=data.get("dst_ptrs", []),
             src_block_ids=data.get("src_block_ids"),
             dst_block_ids=data.get("dst_block_ids"),
-            data_lens = data.get("data_lens", []),
+            data_lens=data.get("data_lens", []),
             data_size=int(data.get("data_size", 0)),
         )
