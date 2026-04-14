@@ -1967,6 +1967,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 nvtx.end_range(nvtx_range)
             except Exception as e:
                 flexkv_logger.error(f"Unexpected error in ssd_handle_loop: {e}")
+                # Send failure notify so the peer doesn't block waiting forever
+                try:
+                    if recv_meta is not None:
+                        self.zmq_server.send_transfer_status(
+                            recv_meta.peer_zmq_status_addr, failure_msg
+                        )
+                except Exception:
+                    pass
                 time.sleep(0.001)
 
     def copy_ssd_data_to_dram(
