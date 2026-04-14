@@ -19,7 +19,7 @@ class NotifyMsg:
         self.mooncake_engine_addr = mooncake_engine_addr
         self.task_id = task_id
         self.status = status
-        
+
     def to_string(self):
         return json.dumps({
             "mooncake_engine_addr": self.mooncake_engine_addr,
@@ -29,7 +29,7 @@ class NotifyMsg:
     @classmethod
     def from_string(cls, s):
         data = json.loads(s)
-        status = NotifyStatus[data["status"]] 
+        status = NotifyStatus[data["status"]]
         return cls(mooncake_engine_addr = data["mooncake_engine_addr"], task_id = data["task_id"], status = status)
 
 
@@ -37,13 +37,13 @@ class SSDZMQServer:
     def __init__(self, ip: str, port: int, ssd_handle_loop = None):
         if ssd_handle_loop is None:
             raise ValueError("ssd_handle_loop must be provided externally")
-        
+
         self.zmq_context = zmq.Context()
         ## listening the ssd meta info
         self.meta_addr = f"tcp://{ip}:{port}"
         self.listen_socket = self.zmq_context.socket(zmq.REP)
         self.listen_socket.bind(self.meta_addr)
-        
+
         self.shutdown_event = threading.Event()
         self.ssd_handle_loop = ssd_handle_loop
         self.thread = threading.Thread(target=self.ssd_handle_loop, daemon=True)
@@ -52,7 +52,7 @@ class SSDZMQServer:
 
     def get_addr(self):
         return self.meta_addr
-    
+
     def start(self):
         self.thread.start()
 
@@ -62,9 +62,9 @@ class SSDZMQServer:
             self.listen_socket.close(0)
             self.zmq_context.term()
         except Exception as e:
-            flexkv_logger.error(f"Error when closing ZMQ: {e}")    
+            flexkv_logger.error(f"Error when closing ZMQ: {e}")
         self.thread.join()
-        
+
     def send_transfer_status(self, peer_status_addr: str, status_msg: NotifyMsg):
         req_socket = self.zmq_context.socket(zmq.PUSH)
         req_socket.setsockopt(zmq.SNDTIMEO, 1000)  ## time out 1s
@@ -87,27 +87,30 @@ class SSDZMQServer:
             # other exception
             req_socket.close()
             flexkv_logger.error(f"Error sending transfer status to {peer_status_addr}: {e}")
-            return False   
-    
-                
+            return False
+
+
 class SSDZMQClient:
+    RECV_TIMEOUT_MS = 5000  # timeout for receiving transfer notifications
+
     def __init__(self, ip: str, port: int):
         self.zmq_context = zmq.Context()
         self.zmq_status_addr = f"tcp://{ip}:{port}"
         self.status_socket = self.zmq_context.socket(zmq.PULL)
-        self.status_socket.bind(self.zmq_status_addr) 
-    
+        self.status_socket.setsockopt(zmq.RCVTIMEO, self.RECV_TIMEOUT_MS)
+        self.status_socket.bind(self.zmq_status_addr)
+
     def get_addr(self):
         return self.zmq_status_addr
-    
+
     def send_meta_info(self, meta_info: RemoteSSD2HMetaInfo, peer_zmq_addr: str):
         req_socket = self.zmq_context.socket(zmq.REQ)
         req_socket.setsockopt(zmq.SNDTIMEO, 1000)  ## time out 1s
         try:
             req_socket.connect(peer_zmq_addr)
             req_socket.send(json.dumps(meta_info.to_dict()).encode("utf-8"))
-            reply = req_socket.recv()  
-            
+            reply = req_socket.recv()
+
             if reply != b"OK":
                 return False
             flexkv_logger.info(f"Meta info sent to {peer_zmq_addr}, waiting for transfer status")
@@ -129,22 +132,26 @@ class SSDZMQClient:
             return False
 
     def wait_transfer_notify(self, peer_addr: str, task_id: int):
-        timeout = 5.0 # timeout after 5 seconds
+        timeout_s = self.RECV_TIMEOUT_MS / 1000.0
         start_time = time.time()
         transfer_status = False
         while True:
-            notify = self.status_socket.recv().decode("utf-8")
+            try:
+                # recv() blocks until a message arrives or RCVTIMEO expires, raising zmq.Again on timeout
+                notify = self.status_socket.recv().decode("utf-8")
+            except zmq.Again:
+                flexkv_logger.warning(f"Timeout waiting for notify: {peer_addr}, task={task_id}")
+                return False
             msg = NotifyMsg.from_string(notify)
-            
+
             if msg.mooncake_engine_addr == peer_addr and msg.task_id == task_id:
                 flexkv_logger.info(f"Received notify: {msg.mooncake_engine_addr}, {msg.task_id}, {msg.status}")
                 if msg.status == NotifyStatus.SUCCESS:
                     transfer_status = True
                 break
-            if time.time() - start_time > timeout:
+            if time.time() - start_time > timeout_s:
                 flexkv_logger.warning(f"Timeout waiting for notify: {peer_addr}, task={task_id}")
                 return False
-            time.sleep(0.01) # sleep for 10 ms to avoid busy waiting
         return transfer_status
 
     def shutdown(self):
@@ -152,4 +159,4 @@ class SSDZMQClient:
             self.status_socket.close(0)
             self.zmq_context.term()
         except Exception as e:
-            flexkv_logger.error(f"Error when closing ZMQ: {e}")    
+            flexkv_logger.error(f"Error when closing ZMQ: {e}")

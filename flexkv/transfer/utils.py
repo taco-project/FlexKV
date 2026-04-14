@@ -101,14 +101,19 @@ class RemoteSSD2HMetaInfo:
     task_id: int
     cpu_block_ids: List[int]
     ssd_block_ids: List[int]
-    peer_engine_addr: str # the mooncake engine address of the node that initiates the transfer, used for write data back to the node.
+    peer_engine_addr: str  # mooncake engine addr of the node that initiates the transfer,
+                           # used for write data back to the node.
     peer_cpu_base_ptr: int # the cpu buffer base ptr of the peer node, used for calculating the dst ptrs.
     peer_zmq_status_addr: str
     data_size: int
     layer_id: int
     layer_granularity: int
-    
-    def __init__(self, task_id, cpu_block_ids, ssd_block_ids, peer_engine_addr, peer_cpu_base_ptr, peer_zmq_status_addr, data_size, layer_id, layer_granularity):
+
+    def __init__(
+        self, task_id, cpu_block_ids, ssd_block_ids, peer_engine_addr,
+        peer_cpu_base_ptr, peer_zmq_status_addr, data_size, layer_id,
+        layer_granularity
+    ):
         self.task_id = task_id
         self.cpu_block_ids = cpu_block_ids
         self.ssd_block_ids = ssd_block_ids
@@ -144,7 +149,7 @@ class RemoteSSD2HMetaInfo:
             "layer_id": self.layer_id,
             "layer_granularity": self.layer_granularity,
         }
-        
+
 class NodeMetaInfo:
     """Node information for flexkv sub-nodes"""
 
@@ -181,10 +186,11 @@ class NodeMetaInfo:
             cpu_bufer_base_ptr=data.get("cpu_buffer_ptr"),
             ssd_bufer_base_ptr=data.get("ssd_buffer_ptr"),
         )
-        
+
 class RDMATaskInfo:
     def __init__(
-        self, task_id: int, local_engine_addr: str, peer_engine_addr: str, peer_zmq_addr: str, src_ptrs: List[int], dst_ptrs: List[int], 
+        self, task_id: int, local_engine_addr: str, peer_engine_addr: str,
+        peer_zmq_addr: str, src_ptrs: List[int], dst_ptrs: List[int],
         src_block_ids: List[int], dst_block_ids: List[int], data_lens: List[int], data_size: int
     ):
         self.task_id = task_id
@@ -200,8 +206,8 @@ class RDMATaskInfo:
     def to_dict(self) -> dict:
         return {
             "task_id": self.task_id,
-            "local_engine_addr": self.local_engine_addr,  
-            "peer_engine_addr": self.peer_engine_addr, 
+            "local_engine_addr": self.local_engine_addr,
+            "peer_engine_addr": self.peer_engine_addr,
             "peer_zmq_addr": self.peer_zmq_addr,
             "src_ptrs": self.src_ptrs,
             "dst_ptrs": self.dst_ptrs,
@@ -211,16 +217,17 @@ class RDMATaskInfo:
             "data_size": self.data_size,
         }
 
-    def from_dict(self, data: dict) -> "RDMATaskInfo":
-        return RDMATaskInfo(
-            task_id = data.get("task_id", 0),
+    @classmethod
+    def from_dict(cls, data: dict) -> "RDMATaskInfo":
+        return cls(
+            task_id=data.get("task_id", 0),
             local_engine_addr=data.get("local_engine_addr", ""),
             peer_engine_addr=data.get("peer_engine_addr", ""),
-            peer_zmq_addr = data.get("peer_zmq_addr", ""),
-            src_ptr=data.get("src_ptr", []),
-            dst_ptr=data.get("dst_ptr", []),
+            peer_zmq_addr=data.get("peer_zmq_addr", ""),
+            src_ptrs=data.get("src_ptrs", []),
+            dst_ptrs=data.get("dst_ptrs", []),
             src_block_ids=data.get("src_block_ids"),
             dst_block_ids=data.get("dst_block_ids"),
-            data_lens = data.get("data_lens", []),
+            data_lens=data.get("data_lens", []),
             data_size=int(data.get("data_size", 0)),
         )
