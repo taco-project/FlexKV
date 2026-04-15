@@ -237,7 +237,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
         try:
             server_sock.bind(socket_path)
-            server_sock.listen(tp_group_size)
+            # Use a larger backlog to accommodate client retries on failed connections
+            server_sock.listen(tp_group_size * 3)
             os.chmod(socket_path, 0o777)
             flexkv_logger.info(
                 f"[LayerwiseWorker] Eventfd server created{rank_label}: "
@@ -248,72 +249,94 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             server_sock.close()
             return torch.empty(0, dtype=torch.int32)
 
-        server_sock.settimeout(max_retries * retry_interval)
+        # Use a per-connection timeout instead of a global one so that
+        # failed connections can be retried by the client without the server
+        # giving up too early.  The total deadline is still bounded.
+        per_conn_timeout = 30  # seconds per accept() call
+        total_deadline = time.time() + max_retries * retry_interval
+        server_sock.settimeout(per_conn_timeout)
         all_rank_eventfds: Dict[int, Dict[int, List[int]]] = {}
         num_layers, num_counters = self.num_layers, 3
+        conn_idx = 0
 
         try:
-            for conn_idx in range(tp_group_size):
-                flexkv_logger.debug(
-                    f"[LayerwiseWorker] Waiting for connection "
-                    f"{conn_idx + 1}/{tp_group_size} on {socket_path}...")
-                try:
-                    conn, _ = server_sock.accept()
-                    flexkv_logger.info(
-                        f"[LayerwiseWorker] Accepted connection "
-                        f"{conn_idx + 1}/{tp_group_size} on {socket_path}{rank_label}")
-                except socket.timeout:
+            # Keep accepting until we have eventfds from all ranks or deadline.
+            while len(all_rank_eventfds) < tp_group_size:
+                if time.time() > total_deadline:
                     flexkv_logger.error(
-                        f"[LayerwiseWorker] Timeout waiting for connection on {socket_path}{rank_label}, "
-                        f"received {conn_idx}/{tp_group_size}")
+                        f"[LayerwiseWorker] Deadline exceeded on {socket_path}{rank_label}, "
+                        f"received {len(all_rank_eventfds)}/{tp_group_size} ranks")
                     break
 
-                with conn:
-                    # Accept both 16-byte (legacy: tp_rank, tp_size, num_layers, num_counters)
-                    # and 24-byte (new: tp_rank, tp_size, cp_rank, cp_size, num_layers, num_counters)
-                    metadata = conn.recv(24)
-                    if len(metadata) < 16:
-                        flexkv_logger.error(
-                            f"[LayerwiseWorker] Incomplete metadata on {socket_path}{rank_label}: "
-                            f"{len(metadata)} bytes")
-                        continue
+                remaining = total_deadline - time.time()
+                server_sock.settimeout(min(per_conn_timeout, max(remaining, 1)))
 
-                    if len(metadata) >= 24:
-                        tp_rank, _, cp_rank, cp_size, recv_num_layers, recv_num_counters = \
-                            struct.unpack("iiiiii", metadata[:24])
-                    else:
-                        tp_rank, _, recv_num_layers, recv_num_counters = \
-                            struct.unpack("iiii", metadata[:16])
-                        cp_rank, cp_size = 0, 1
-
-                    # Use cp_rank as the connection key when CP is active,
-                    # otherwise use tp_rank
-                    rank_key = cp_rank if cp_size > 1 else tp_rank
-                    if conn_idx == 0:
-                        num_layers, num_counters = recv_num_layers, recv_num_counters
-
-                    flexkv_logger.debug(
-                        f"[LayerwiseWorker] Connection {conn_idx + 1}: "
-                        f"tp_rank={tp_rank}, cp_rank={cp_rank}, cp_size={cp_size}, "
-                        f"num_layers={recv_num_layers}, "
-                        f"num_counters={recv_num_counters}")
-
-                    rank_eventfds = {}
-                    for _ in range(recv_num_counters):
-                        fds, extra_data = _recv_fds(conn, recv_num_layers)
-                        counter_id = struct.unpack("i", extra_data[:4])[0]
-                        rank_eventfds[counter_id] = fds
-                        flexkv_logger.debug(
-                            f"[LayerwiseWorker] Received counter_id={counter_id}, "
-                            f"num_fds={len(fds)} from rank_key={rank_key}")
-
-                    all_rank_eventfds[rank_key] = rank_eventfds
+                try:
+                    conn, _ = server_sock.accept()
+                    conn_idx += 1
                     flexkv_logger.info(
-                        f"[LayerwiseWorker] Received all eventfds from rank_key={rank_key} "
-                        f"(tp_rank={tp_rank}, cp_rank={cp_rank}) on {socket_path}")
+                        f"[LayerwiseWorker] Accepted connection "
+                        f"{conn_idx} (registered {len(all_rank_eventfds)}/{tp_group_size}) "
+                        f"on {socket_path}{rank_label}")
+                except socket.timeout:
+                    flexkv_logger.warning(
+                        f"[LayerwiseWorker] Timeout waiting for connection on {socket_path}{rank_label}, "
+                        f"registered {len(all_rank_eventfds)}/{tp_group_size}, retrying...")
+                    continue
+
+                try:
+                    with conn:
+                        # Accept both 16-byte (legacy: tp_rank, tp_size, num_layers, num_counters)
+                        # and 24-byte (new: tp_rank, tp_size, cp_rank, cp_size, num_layers, num_counters)
+                        metadata = conn.recv(24)
+                        if len(metadata) < 16:
+                            flexkv_logger.error(
+                                f"[LayerwiseWorker] Incomplete metadata on {socket_path}{rank_label}: "
+                                f"{len(metadata)} bytes")
+                            continue
+
+                        if len(metadata) >= 24:
+                            tp_rank, _, cp_rank, cp_size, recv_num_layers, recv_num_counters = \
+                                struct.unpack("iiiiii", metadata[:24])
+                        else:
+                            tp_rank, _, recv_num_layers, recv_num_counters = \
+                                struct.unpack("iiii", metadata[:16])
+                            cp_rank, cp_size = 0, 1
+
+                        # Use cp_rank as the connection key when CP is active,
+                        # otherwise use tp_rank
+                        rank_key = cp_rank if cp_size > 1 else tp_rank
+                        if not all_rank_eventfds:
+                            num_layers, num_counters = recv_num_layers, recv_num_counters
+
+                        flexkv_logger.debug(
+                            f"[LayerwiseWorker] Connection {conn_idx}: "
+                            f"tp_rank={tp_rank}, cp_rank={cp_rank}, cp_size={cp_size}, "
+                            f"num_layers={recv_num_layers}, "
+                            f"num_counters={recv_num_counters}")
+
+                        rank_eventfds = {}
+                        for _ in range(recv_num_counters):
+                            fds, extra_data = _recv_fds(conn, recv_num_layers)
+                            counter_id = struct.unpack("i", extra_data[:4])[0]
+                            rank_eventfds[counter_id] = fds
+                            flexkv_logger.debug(
+                                f"[LayerwiseWorker] Received counter_id={counter_id}, "
+                                f"num_fds={len(fds)} from rank_key={rank_key}")
+
+                        all_rank_eventfds[rank_key] = rank_eventfds
+                        flexkv_logger.info(
+                            f"[LayerwiseWorker] Received all eventfds from rank_key={rank_key} "
+                            f"(tp_rank={tp_rank}, cp_rank={cp_rank}) on {socket_path}")
+                except Exception as e:
+                    flexkv_logger.warning(
+                        f"[LayerwiseWorker] Failed to receive eventfds from connection {conn_idx} "
+                        f"on {socket_path}{rank_label}: {e}. "
+                        f"Client will retry, continuing accept loop...")
+                    continue
         except Exception as e:
             flexkv_logger.error(
-                f"[LayerwiseWorker] Error in accept loop on {socket_path}{rank_label}: {e}")
+                f"[LayerwiseWorker] Fatal error in accept loop on {socket_path}{rank_label}: {e}")
         finally:
             server_sock.close()
             cleanup_socket()
