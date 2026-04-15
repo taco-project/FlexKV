@@ -75,7 +75,7 @@ class MoonCakeTransferEngineWrapper:
         ret = self.engine.register_memory(buffer_ptr, buffer_size)
         return ret if ret == 0 else -1
 
-    def unregist_buffer(self, buffer_ptr: int) -> None:
+    def unregist_buffer(self, buffer_ptr: int) -> int:
         """Unregister the buffer to the mooncake engine."""
         ret = self.engine.unregister_memory(buffer_ptr)
         return ret if ret == 0 else -1
