@@ -507,7 +507,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"), py::arg("is_mla"),
-           py::arg("use_sharded_d2h") = false);
+           py::arg("is_nsa_cp") = false);
 
 #ifdef FLEXKV_ENABLE_GDS
   py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")

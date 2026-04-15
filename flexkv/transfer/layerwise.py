@@ -446,7 +446,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         end_time = time.time()
 
         kv_dim = 2 if not self.is_mla else 1
-        transfer_size = self.cpu_chunk_size_in_bytes * layer_granularity * num_h2d_blocks * kv_dim
+        transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * num_h2d_blocks * kv_dim
+
+        if self.is_nsa_cp or self.is_mla:
+            transfer_size *= self.tp_group_size
 
         self._log_transfer_performance(
             transfer_op,

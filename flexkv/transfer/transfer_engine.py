@@ -27,7 +27,7 @@ import numpy as np
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import StorageHandle
-from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp
+from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp, LayerwiseTransferOp
 from flexkv.common.transfer import get_nvtx_range_color
 from flexkv.common.storage import KVCacheLayoutType
 from flexkv.transfer.scheduler import TransferScheduler

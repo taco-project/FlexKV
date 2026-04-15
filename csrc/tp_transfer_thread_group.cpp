@@ -157,7 +157,7 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
     const int layer_id, const int layer_granularity, const bool is_mla,
-    const bool use_sharded_d2h) {
+    const bool is_nsa_cp) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -167,6 +167,8 @@ void TPTransferThreadGroup::tp_group_transfer(
   // Barrier sync_point(num_gpus_);
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
+
+  bool enable_sharded_d2h = is_mla && !is_host_to_device;
 
   for (int i = 0; i < num_gpus_; ++i) {
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
@@ -178,24 +180,20 @@ void TPTransferThreadGroup::tp_group_transfer(
         int64_t *cpu_block_ids =
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
         void *cpu_ptr = cpu_blocks_;
-        bool should_use_sharded_offsets = is_mla || use_sharded_d2h;
-        int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
-        if (should_use_sharded_offsets && !is_host_to_device) {
+        int64_t cpu_startoff_inside_chunks = 0;
+        if (enable_sharded_d2h)
           cpu_startoff_inside_chunks =
               i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
-        } else if (should_use_sharded_offsets && is_host_to_device) {
-          cpu_startoff_inside_chunks = 0;
-        }
+        else if (!is_mla)
+          cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
         int64_t gpu_startoff_inside_chunks =
-            should_use_sharded_offsets && !is_host_to_device
-                ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_
-                : 0;
+            enable_sharded_d2h ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_
+                               : 0;
         // we assume that the chunk size is the same for all gpus,
         // even if they have different number of gpu_blocks
-        int64_t chunk_size = should_use_sharded_offsets && !is_host_to_device
+        int64_t chunk_size = enable_sharded_d2h
                                  ? gpu_chunk_sizes_in_bytes_[i] / num_gpus_
                                  : gpu_chunk_sizes_in_bytes_[i];
-
         // Dispatch to the appropriate template based on backend type
         switch (backend_type_) {
         case BackendType::VLLM:

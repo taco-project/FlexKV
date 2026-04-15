@@ -452,11 +452,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
         self.is_mla = gpu_kv_layouts[0].is_mla
+        self.is_nsa_cp = is_nsa_cp
+        self.cp_size = cp_size
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
         self.dp_group_id = dp_group_id
-        self.use_cp_nsa_d2h_shard = bool(is_nsa_cp and cp_size > 1)
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
@@ -562,7 +563,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             layer_id,
             layer_granularity,
             self.is_mla,
-            self.use_cp_nsa_d2h_shard,
+            self.is_nsa_cp and self.cp_size > 1,
         )
 
 
