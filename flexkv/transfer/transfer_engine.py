@@ -560,5 +560,6 @@ class TransferEngine:
                 while not self.finished_ops_queue.empty():
                     self.finished_ops_queue.get_nowait()
 
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            from flexkv.common import gpu_runtime
+            gpu_runtime.empty_cache()
+            gpu_runtime.synchronize()
