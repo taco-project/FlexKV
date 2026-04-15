@@ -325,10 +325,20 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                                 f"num_fds={len(fds)} from rank_key={rank_key}")
 
                         all_rank_eventfds[rank_key] = rank_eventfds
+                        # Send ACK to client so it knows the fds were received
+                        try:
+                            conn.sendall(b"\x01")
+                        except Exception:
+                            pass
                         flexkv_logger.info(
                             f"[LayerwiseWorker] Received all eventfds from rank_key={rank_key} "
                             f"(tp_rank={tp_rank}, cp_rank={cp_rank}) on {socket_path}")
                 except Exception as e:
+                    # Send NACK so client knows to retry
+                    try:
+                        conn.sendall(b"\x00")
+                    except Exception:
+                        pass
                     flexkv_logger.warning(
                         f"[LayerwiseWorker] Failed to receive eventfds from connection {conn_idx} "
                         f"on {socket_path}{rank_label}: {e}. "

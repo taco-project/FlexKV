@@ -1,5 +1,6 @@
 import os
 import multiprocessing as mp
+import signal
 import time
 import queue
 import selectors
@@ -645,6 +646,19 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         gpu_register_port: str,
                         ready_event,
                         start_event) -> None:
+        # Automatically reap child processes (daemon transfer workers) to
+        # prevent zombie accumulation.  Use a handler that calls waitpid()
+        # with WNOHANG so that multiprocessing.Process.join() still works
+        # correctly (SIG_IGN would cause join() to raise ChildProcessError).
+        def _reap_children(signum, frame):
+            while True:
+                try:
+                    pid, _ = os.waitpid(-1, os.WNOHANG)
+                    if pid == 0:
+                        break
+                except ChildProcessError:
+                    break
+        signal.signal(signal.SIGCHLD, _reap_children)
         try:
             start_event.set()
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
@@ -720,6 +734,13 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     sel.close()
                 except Exception as e:
                     flexkv_logger.error(f"Error closing selector: {e}")
+
+            # Gracefully shut down transfer engine and its worker subprocesses
+            if 'transfer_manager' in locals():
+                try:
+                    transfer_manager.shutdown()
+                except Exception as e:
+                    flexkv_logger.error(f"Error shutting down transfer manager: {e}")
 
             command_conn.close()
             result_conn.close()
