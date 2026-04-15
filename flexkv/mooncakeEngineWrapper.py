@@ -40,9 +40,9 @@ class MoonCakeTransferEngineWrapper:
             self.config = MooncakeTransferEngineConfig.from_file(mooncake_config_path)
         else:
             self.config = config
-        self.engine_ip = config.engine_ip
-        self.engien_port = config.engine_port
-        self.mooncake_addr = f"{self.engine_ip}:{self.engien_port}"
+        self.engine_ip = self.config.engine_ip
+        self.engine_port = self.config.engine_port
+        self.mooncake_addr = f"{self.engine_ip}:{self.engine_port}"
         flexkv_logger.info(f"Mooncake listen on: {self.mooncake_addr}")
 
         supported_backend = ["redis"]
