@@ -38,6 +38,9 @@ class KVCacheLayout:
     # Multi-group support: when set, the layout represents a heterogeneous block
     # where different layer groups have different (num_kv_heads, head_size).
     layer_groups: Optional[List[LayerGroupSpec]] = None
+    # TP size: when > 1 and layer_groups is set, elements_per_block is scaled
+    # so that each CPU/SSD block can hold data for all TP ranks.
+    tp_size: int = 1
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, KVCacheLayout):
@@ -50,6 +53,7 @@ class KVCacheLayout:
                 self.head_size == other.head_size and
                 self.is_mla == other.is_mla and
                 self.layer_groups == other.layer_groups and
+                self.tp_size == other.tp_size and
                 self.kv_shape == other.kv_shape)
 
     @property
@@ -71,7 +75,9 @@ class KVCacheLayout:
             if self.layer_groups is not None and self.type == KVCacheLayoutType.BLOCKFIRST:
                 # Multi-group: elements per block = sum of per-group contributions
                 # Each group: num_layers * kv_dim * tokens_per_block * num_kv_heads * head_size
-                elements_per_block = sum(
+                # Note: layer_groups store per-GPU num_kv_heads (after TP split).
+                # Multiply by tp_size so each block holds data for ALL TP ranks.
+                elements_per_block = self.tp_size * sum(
                     g.num_layers * self._kv_dim * self.tokens_per_block * g.num_kv_heads * g.head_size
                     for g in self.layer_groups
                 )
@@ -109,6 +115,7 @@ class KVCacheLayout:
             head_size=self.head_size,
             is_mla=self.is_mla,
             layer_groups=self.layer_groups,
+            tp_size=self.tp_size,
         )
         return new_layout
 

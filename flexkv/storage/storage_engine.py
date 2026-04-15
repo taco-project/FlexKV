@@ -30,6 +30,7 @@ class StorageEngine:
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla,
                 layer_groups=self._model_config.layer_groups,
+                tp_size=self._model_config.tp_size,
             )
             self.allocate(
                 device_type=DeviceType.CPU,
@@ -48,6 +49,7 @@ class StorageEngine:
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla,
                 layer_groups=self._model_config.layer_groups,
+                tp_size=self._model_config.tp_size,
             )
             self.allocate(
                 device_type=DeviceType.SSD,
@@ -68,6 +70,7 @@ class StorageEngine:
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla,
                 layer_groups=self._model_config.layer_groups,
+                tp_size=self._model_config.tp_size,
             )
             self.allocate(
                 device_type=DeviceType.REMOTE,

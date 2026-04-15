@@ -18,6 +18,7 @@ class LayerGroupSpec:
     num_kv_heads: int
     head_size: int
     layer_indices: List[int]  # 0-based indices into the full layer list
+    sliding_window: Optional[int] = None  # Token count; None = full attention
 
 
 @dataclass
@@ -40,10 +41,12 @@ class ModelConfig:
     def token_size_in_bytes(self) -> int:
         kv_dim = 1 if self.use_mla else 2
         if self.layer_groups:
+            # layer_groups store per-GPU num_kv_heads; multiply by tp_size
+            # to get full model per-token size (matching CPU/SSD block sizing).
             return sum(
                 g.num_layers * g.num_kv_heads * g.head_size * kv_dim
                 for g in self.layer_groups
-            ) * self.dtype.itemsize
+            ) * self.dtype.itemsize * self.tp_size
         return self.num_layers * self.num_kv_heads * self.head_size * kv_dim * self.dtype.itemsize
 
 @dataclass

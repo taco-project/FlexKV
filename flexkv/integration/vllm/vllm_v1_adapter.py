@@ -815,6 +815,35 @@ class FlexKVWorkerConnector:
                     f"indices={group_indices}"
                 )
 
+            # Annotate SWA layer groups with sliding_window.
+            # layer_indices are positions within unique_layers (not original model
+            # layer IDs), so we extract original layer numbers from the kv_cache
+            # key names (e.g. "layers.5.self_attn") to match against layer_types.
+            hf_text_config = getattr(self.flexkv_config, '_hf_text_config', None)
+            if hf_text_config is not None:
+                layer_types = getattr(hf_text_config, 'layer_types', None)
+                sw = getattr(hf_text_config, 'sliding_window', None)
+                if layer_types and sw:
+                    import re
+                    # Build map: unique_layers idx -> original layer number
+                    idx_to_original = {}
+                    for idx, (name, _) in enumerate(unique_layers):
+                        m = re.search(r'layers\.(\d+)', name)
+                        if m:
+                            idx_to_original[idx] = int(m.group(1))
+
+                    for lg in layer_groups:
+                        orig_ids = [idx_to_original.get(i) for i in lg.layer_indices]
+                        if all(oid is not None and oid < len(layer_types)
+                               and layer_types[oid] == 'sliding_attention'
+                               for oid in orig_ids):
+                            lg.sliding_window = sw
+                            logger.info(
+                                f"Layer group ({lg.num_layers} layers, "
+                                f"kv_heads={lg.num_kv_heads}, head={lg.head_size}) "
+                                f"marked as SWA with sliding_window={sw}"
+                            )
+
             # Store layer_groups on model config for downstream use
             self.flexkv_config.model_config.layer_groups = layer_groups
             # Update num_layers to reflect deduplicated count
