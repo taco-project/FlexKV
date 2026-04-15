@@ -49,18 +49,29 @@ class FlexKVConfig:
             if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
                 return
 
+            index_head_dim = getattr(hf_config, 'index_head_dim', None)
+            if index_head_dim is not None and index_head_dim > 0:
+                quant_block_size = 128
+                head_size = self.cache_config.tokens_per_block * (
+                    index_head_dim + index_head_dim // quant_block_size * 4
+                )
+            else:
+                head_size = qk_rope_head_dim
+
             # tokens_per_block is already set to sglang page_size before this
             # call, so each FlexKV block = 1 sglang page.  The indexer maps
-            # 1:1 with blocks — no extra page_size grouping is needed.
+            # 1:1 with blocks — no extra page_size grouping is needed.  For
+            # NSA/DSA models, head_size stores the packed per-page buffer width
+            # so the CPU layout matches the GPU indexer tensor shape.
             self.cache_config.indexer = IndexerCacheConfig(
-                head_size=qk_rope_head_dim,
+                head_size=head_size,
                 num_kv_heads=1,
                 dtype=torch.uint8,
             )
             source_label = f" ({source})" if source else ""
             logger.info(
                 f"Detected sparse attention indexer config{source_label}: "
-                f"head_size={qk_rope_head_dim}, dtype=uint8, "
+                f"head_size={head_size}, dtype=uint8, "
                 f"tokens_per_block={self.cache_config.tokens_per_block}")
         except Exception as e:
             logger.debug(f"Could not detect indexer config ({source}): {e}")
@@ -143,20 +154,34 @@ class FlexKVConfig:
         total_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
         self.model_config.num_layers = int(num_local_layers) if num_local_layers > 0 else total_layers
 
-        if hasattr(sglang_config, "get_total_num_kv_heads"):
-            try:
-                self.model_config.num_kv_heads = int(sglang_config.get_total_num_kv_heads())
-            except Exception:
-                self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
-        elif hasattr(sglang_config, "get_num_kv_heads"):
-            try:
-                per_rank = int(sglang_config.get_num_kv_heads(tp_size))
-                self.model_config.num_kv_heads = per_rank * tp_size
-            except Exception:
-                self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
+        attn_arch = getattr(sglang_config, "attention_arch", None)
+        use_mla = False
+        if hasattr(attn_arch, "name"):
+            use_mla = (attn_arch.name.upper() == "MLA")
+        elif isinstance(attn_arch, str):
+            use_mla = (attn_arch.upper() == "MLA")
+
+        if use_mla:
+            kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
+            qk_rope_head_dim = int(getattr(sglang_config, "qk_rope_head_dim", 0))
+            mla_head_size = kv_lora_rank + qk_rope_head_dim
+            self.model_config.num_kv_heads = 1
+            self.model_config.head_size = int(mla_head_size)
         else:
-            self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
-        self.model_config.head_size = int(getattr(sglang_config, "head_dim", 0))
+            if hasattr(sglang_config, "get_total_num_kv_heads"):
+                try:
+                    self.model_config.num_kv_heads = int(sglang_config.get_total_num_kv_heads())
+                except Exception:
+                    self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
+            elif hasattr(sglang_config, "get_num_kv_heads"):
+                try:
+                    per_rank = int(sglang_config.get_num_kv_heads(tp_size))
+                    self.model_config.num_kv_heads = per_rank * tp_size
+                except Exception:
+                    self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
+            else:
+                self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
+            self.model_config.head_size = int(getattr(sglang_config, "head_dim", 0))
 
         # Determine KV cache dtype: prioritize user_config.kv_cache_dtype (from
         # flexkv_config.yaml or FLEXKV_KV_CACHE_DTYPE env var), then fall back
@@ -194,12 +219,20 @@ class FlexKVConfig:
                 f"flexkv_config.yaml or set FLEXKV_KV_CACHE_DTYPE=fp8 environment variable."
             )
 
-        attn_arch = getattr(sglang_config, "attention_arch", None)
-        use_mla = False
-        if hasattr(attn_arch, "name"):
-            use_mla = (attn_arch.name.upper() == "MLA")
-        elif isinstance(attn_arch, str):
-            use_mla = (attn_arch.upper() == "MLA")
+        if use_mla and getattr(sglang_config, "index_head_dim", None) is not None:
+            kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
+            qk_rope_head_dim = int(getattr(sglang_config, "qk_rope_head_dim", 0))
+            if self.model_config.dtype == torch.float8_e4m3fn:
+                assert kv_lora_rank % 128 == 0, (
+                    f"kv_lora_rank {kv_lora_rank} must be multiple of 128 "
+                    "for NSA FP8 KV cache layout"
+                )
+                self.model_config.head_size = int(
+                    kv_lora_rank
+                    + kv_lora_rank // 128 * 4
+                    + qk_rope_head_dim * torch.bfloat16.itemsize
+                )
+
         self.model_config.use_mla = use_mla
 
         self.model_config.tp_size = int(tp_size)
