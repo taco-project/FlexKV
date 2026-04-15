@@ -102,7 +102,7 @@ class MoonCakeTransferEngineWrapper:
         ret = self.engine.batch_transfer_sync_write(peer_engine_addr, src_ptr_list, dst_ptr_list, data_size_list)
         return ret if ret == 0 else -1
     
-    def transfer_sync_write_with_notify(self, peer_engine_addr: str, src_ptr: int, dst_ptr: int, data_size: int, notify_name: str, msg : NotifyMsg):
+    def transfer_sync_write_with_notify(self, peer_engine_addr: str, src_ptr: int, dst_ptr: int, data_size: int, notify_name: str, msg : NotifyMsg) -> int:
         if not MOONCAKE_AVAILABLE:
             raise RuntimeError("Mooncake engine is not available")
         notify = engine.TransferNotify(notify_name, msg.to_string())
