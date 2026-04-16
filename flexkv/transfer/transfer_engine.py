@@ -26,6 +26,7 @@ import nvtx
 import torch
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.gpu_backend import current_backend as _gpu
 from flexkv.common.storage import StorageHandle
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp
 from flexkv.common.transfer import get_nvtx_range_color
@@ -560,5 +561,5 @@ class TransferEngine:
                 while not self.finished_ops_queue.empty():
                     self.finished_ops_queue.get_nowait()
 
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            _gpu.empty_cache()
+            _gpu.synchronize()

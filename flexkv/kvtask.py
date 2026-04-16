@@ -14,6 +14,7 @@ import numpy as np
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
+from flexkv.gpu_backend import current_backend as _gpu
 from flexkv.common.block import hash_token
 from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
 from flexkv.common.tracer import FlexKVTracer
@@ -112,11 +113,11 @@ class KVTaskManager:
 
         self.is_multinode_tp = False
         self.tp_node_count = 1
-        if self.model_config.tp_size > torch.cuda.device_count():
-            if self.model_config.tp_size != torch.cuda.device_count() * 2:
+        if self.model_config.tp_size > _gpu.device_count():
+            if self.model_config.tp_size != _gpu.device_count() * 2:
                 raise ValueError("Only support 2 nodes TP for now")
             assert self.model_config.dp_size == 1
-            self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
+            self.tp_node_count = self.model_config.tp_size // _gpu.device_count()
             self.is_multinode_tp = True
 
         self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta, event_collector)

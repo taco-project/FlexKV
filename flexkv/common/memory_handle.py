@@ -10,6 +10,7 @@ import torch.multiprocessing.reductions as reductions
 import zmq
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.gpu_backend import current_backend as _gpu
 
 
 class cudaIpcMemHandle_t(ctypes.Structure):
@@ -24,6 +25,30 @@ except:
         cudart = ctypes.CDLL("libcudart.so.12")
     except:
         cudart = ctypes.CDLL("libcudart.so.11")
+
+
+def _get_ipc_runtime_lib():
+    """返回当前 backend 对应的 runtime lib（cudart 或 musart）。"""
+    try:
+        from flexkv.gpu_backend import current_backend as _gpu_be
+        backend_name = type(_gpu_be).__name__.lower()
+        if "musa" in backend_name:
+            return ctypes.CDLL("libmusart.so")
+    except Exception:
+        pass
+    return cudart
+
+
+def _get_ipc_fn_prefix():
+    """返回当前 backend 的 IPC 函数前缀（cuda 或 musa）。"""
+    try:
+        from flexkv.gpu_backend import current_backend as _gpu_be
+        backend_name = type(_gpu_be).__name__.lower()
+        if "musa" in backend_name:
+            return "musa"
+    except Exception:
+        pass
+    return "cuda"
 
 # CUDA IPC handle size (64 bytes on Linux)
 CUDA_IPC_HANDLE_SIZE = 64
@@ -347,14 +372,16 @@ class TensorSharedHandle:
         )
 
         # Ensure we're on the correct device
-        torch.cuda.set_device(device)
+        _gpu.set_device(device)
 
         # Create IPC handle buffer
         # ipc_handle = ctypes.create_string_buffer(CUDA_IPC_HANDLE_SIZE)
         ipc_handle = cudaIpcMemHandle_t()
 
-        # Call cudaIpcGetMemHandle
-        result = cudart.cudaIpcGetMemHandle(
+        # Call cudaIpcGetMemHandle (backend-aware: cuda or musa)
+        _rt = _get_ipc_runtime_lib()
+        _fn_prefix = _get_ipc_fn_prefix()
+        result = getattr(_rt, f"{_fn_prefix}IpcGetMemHandle")(
             ctypes.byref(ipc_handle), ctypes.c_void_p(data_ptr)
         )
 
@@ -391,13 +418,13 @@ class TensorSharedHandle:
             offset: Offset in bytes from the base pointer (for memory pool allocations)
         """
         # Ensure CUDA is initialized in this process
-        if not torch.cuda.is_initialized():
+        if not _gpu.is_initialized():
             flexkv_logger.info("Initializing CUDA in subprocess")
-            torch.cuda.init()
+            _gpu.init_runtime()
 
         # Set device and create a dummy tensor to ensure context is created
         device_id = device.index if device.index is not None else 0
-        torch.cuda.set_device(device_id)
+        _gpu.set_device(device_id)
 
         # Force CUDA context creation
         _ = torch.zeros(1, device=device)
@@ -411,10 +438,12 @@ class TensorSharedHandle:
 
         # Open IPC memory handle to get base pointer
         base_ptr = ctypes.c_void_p()
-        result = cudart.cudaIpcOpenMemHandle(
+        _rt = _get_ipc_runtime_lib()
+        _fn_prefix = _get_ipc_fn_prefix()
+        result = getattr(_rt, f"{_fn_prefix}IpcOpenMemHandle")(
             ctypes.byref(base_ptr),
             handle,
-            ctypes.c_int(1),  # cudaIpcMemLazyEnablePeerAccess = 1
+            ctypes.c_int(1),
         )
         # Print GPU memory address for comparison with C++ side
 
@@ -422,7 +451,7 @@ class TensorSharedHandle:
             error_msg = f"cudaIpcOpenMemHandle failed with error code {result} for device {device_id}"
             flexkv_logger.error(error_msg)
             flexkv_logger.error(f"IPC handle bytes (full): {ipc_handle.hex()}")
-            flexkv_logger.error(f"Current CUDA device: {torch.cuda.current_device()}")
+            flexkv_logger.error(f"Current device: {_gpu.current_device()}")
             flexkv_logger.error(f"Target device: {device_id}")
             raise RuntimeError(error_msg)
 

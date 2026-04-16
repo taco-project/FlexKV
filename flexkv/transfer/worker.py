@@ -29,6 +29,7 @@ except ImportError:
     TPGDSTransferThreadGroup = None
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.gpu_backend import current_backend as _gpu
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
@@ -358,8 +359,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
         # set GPU device
         if gpu_device_id != -1:
-            torch.cuda.set_device(gpu_device_id)
-        self.transfer_stream = torch.cuda.Stream()
+            _gpu.set_device(gpu_device_id)
+        self.transfer_stream = _gpu.create_stream()
         self.transfer_num_cta_h2d = transfer_num_cta_h2d
         self.transfer_num_cta_d2h = transfer_num_cta_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
@@ -432,7 +433,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
-        with torch.cuda.stream(self.transfer_stream):
+        with _gpu.stream_context(self.transfer_stream):
             start_time = time.time()
             self._transfer_impl(
                 src_block_ids,
@@ -1064,8 +1065,8 @@ class GDSTransferWorker(TransferWorkerBase):
         # Set GPU device and create stream
         self.gpu_device_id = gpu_device_id
         if gpu_device_id != -1:
-            torch.cuda.set_device(gpu_device_id)
-        self.transfer_stream = torch.cuda.Stream()
+            _gpu.set_device(gpu_device_id)
+        self.transfer_stream = _gpu.create_stream()
 
     def _transfer_impl(
         self,
@@ -1150,7 +1151,7 @@ class GDSTransferWorker(TransferWorkerBase):
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
-        with torch.cuda.stream(self.transfer_stream):
+        with _gpu.stream_context(self.transfer_stream):
             start_time = time.time()
             self._transfer_impl(
                 src_block_ids,
