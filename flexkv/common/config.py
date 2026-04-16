@@ -37,6 +37,7 @@ class CacheConfig:
     enable_gds: bool = False # Requires enable_ssd=True
     # When True with enable_gds, GPU<->SSD uses NIXL (GDS_MT) instead of cuFile GDS worker.
     enable_nixl: bool = False
+    enable_bypass_cpu: bool = False
     # Optional plugin dict for NixlAgentSession (see nixl README); only used if enable_nixl.
     nixl_extra_config: Optional[Dict[str, Any]] = None
     enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
@@ -81,6 +82,8 @@ class CacheConfig:
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
         self.enable_remote = self.enable_3rd_remote
+        if self.enable_gds:
+            self.enable_bypass_cpu = True
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
@@ -228,6 +231,8 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds
     cache_config.enable_nixl = user_config.enable_nixl
+    if cache_config.enable_gds:
+        cache_config.enable_bypass_cpu = True
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote

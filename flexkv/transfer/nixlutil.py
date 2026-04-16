@@ -160,6 +160,10 @@ def _nixl_run_xfer(
     mem_side_descs: Any,
     file_xfer_tuples: List[Tuple[int, int, int]],
 ) -> bool:
+    flexkv_logger.info(
+        f"NIXL: _nixl_run_xfer (direction={direction}, agent={agent_name}, "
+        f"file_regions={len(file_xfer_tuples)})"
+    )
     storage_descs = agent.get_xfer_descs(file_xfer_tuples, "FILE")
     if storage_descs is None or mem_side_descs is None:
         flexkv_logger.error("NIXL: get_xfer_descs returned None")

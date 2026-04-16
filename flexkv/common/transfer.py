@@ -10,6 +10,10 @@ import numpy as np
 class CompletedOp:
     graph_id: int
     op_id: int
+    # Optional metrics for completed real ops (VIRTUAL / graph-level completions omit these).
+    transfer_type: Optional[str] = None
+    num_blocks: int = 0
+    num_bytes: int = 0
 
     def is_graph_completed(self) -> bool:
         return self.op_id == -1
