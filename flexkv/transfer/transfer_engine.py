@@ -155,27 +155,57 @@ class TransferEngine:
         self._worker_map: Dict[TransferType, Union[WorkerHandle, List[WorkerHandle]]] = {}
 
         assert self._cpu_handle is not None
+        _enable_layerwise = GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
+        
+        # H2D worker
+        if not _enable_layerwise:
+            if self.tp_size == 1:
+                self.h2d_workers: List[WorkerHandle] = [
+                    GPUCPUTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
+                        cpu_blocks=self._cpu_handle.get_tensor(),
+                        gpu_kv_layout=gpu_handles[0].kv_layout,
+                        cpu_kv_layout=self._cpu_handle.kv_layout,
+                        dtype=gpu_handles[0].dtype,
+                        gpu_device_id=gpu_handles[0].gpu_device_id,
+                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                        transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                        transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    )
+                    for _, gpu_handles in self.gpu_handle_groups.items()
+                ]
+            else:
+                self.h2d_workers = [
+                    tpGPUCPUTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
+                        cpu_blocks=self._cpu_handle.get_tensor(),
+                        gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
+                        cpu_kv_layout=self._cpu_handle.kv_layout,
+                        dtype=gpu_handles[0].dtype,
+                        tp_group_size=self.tp_size,
+                        dp_group_id=dp_client_id,
+                        is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
+                        cp_size=getattr(self.model_config, "cp_size", 1),
+                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                        transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                        transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    )
+                    for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
+                ]
+            self._worker_map[TransferType.H2D] = self.h2d_workers
+
+        # D2H worker
         if self.tp_size == 1:
-            self.h2d_workers: List[WorkerHandle] = [
-                GPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layout=gpu_handles[0].kv_layout,
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    gpu_device_id=gpu_handles[0].gpu_device_id,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                )
-                for _, gpu_handles in self.gpu_handle_groups.items()
-            ]
             self.d2h_workers: List[WorkerHandle] = [
                 GPUCPUTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
@@ -195,27 +225,6 @@ class TransferEngine:
                 for _, gpu_handles in self.gpu_handle_groups.items()
             ]
         else:
-            self.h2d_workers = [
-                tpGPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    tp_group_size=self.tp_size,
-                    dp_group_id=dp_client_id,
-                    is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
-                    cp_size=getattr(self.model_config, "cp_size", 1),
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                )
-                for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
-            ]
             self.d2h_workers = [
                 tpGPUCPUTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
@@ -237,22 +246,26 @@ class TransferEngine:
                 )
                 for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
             ]
-        self._worker_map[TransferType.H2D] = self.h2d_workers
         self._worker_map[TransferType.D2H] = self.d2h_workers
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
-            self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
-                mp_ctx=self.mp_ctx,
-                finished_ops_queue=self.finished_ops_queue,
-                op_buffer_tensor = self.pin_buffer.get_buffer(),
-                cpu_blocks=self._cpu_handle.get_tensor(),
-                ssd_files=self._ssd_handle.get_file_list(),
-                cpu_kv_layout=self._cpu_handle.kv_layout,
-                ssd_kv_layout=self._ssd_handle.kv_layout,
-                dtype=self._cpu_handle.dtype,
-                num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
-                cache_config=self._cache_config,
-            )
+            # DISK2H worker
+            if not _enable_layerwise:
+                self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor = self.pin_buffer.get_buffer(),
+                    cpu_blocks=self._cpu_handle.get_tensor(),
+                    ssd_files=self._ssd_handle.get_file_list(),
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    ssd_kv_layout=self._ssd_handle.kv_layout,
+                    dtype=self._cpu_handle.dtype,
+                    num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                    cache_config=self._cache_config,
+                )
+                self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
+
+            # H2DISK worker
             self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
@@ -266,7 +279,6 @@ class TransferEngine:
                 cache_config=self._cache_config,
             )
             self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
-            self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
         if self._remote_handle is not None and self._cpu_handle is not None:
             self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
@@ -337,8 +349,21 @@ class TransferEngine:
             _cp_size = getattr(self.model_config, 'cp_size', 1)
             # For CP, each CP rank connects via eventfd; for TP, each TP rank connects.
             _eventfd_group_size = _cp_size if _is_nsa_cp and _cp_size > 1 else self.tp_size
-            self.layerwise_workers = [
-                LayerwiseTransferWorker.create_worker(
+
+            # Prepare indexer handles for fused layerwise transfer
+            has_indexer_for_layerwise = (
+                self._indexer_gpu_handles is not None and
+                self._indexer_cpu_handle is not None
+            )
+
+            self.layerwise_workers = []
+            for dp_client_id, gpu_handles in self.gpu_handle_groups.items():
+                # Resolve indexer handles for this dp_client_id
+                idx_handles = None
+                if has_indexer_for_layerwise:
+                    idx_handles = self._indexer_gpu_handles.get(dp_client_id)
+
+                worker = LayerwiseTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
@@ -361,9 +386,22 @@ class TransferEngine:
                     h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                     is_nsa_cp=_is_nsa_cp,
+                    indexer_gpu_blocks=[h.get_tensor_handle_list() for h in idx_handles] if idx_handles else None,
+                    indexer_cpu_blocks=self._indexer_cpu_handle.get_tensor() if idx_handles else None,
+                    indexer_gpu_kv_layouts=[h.kv_layout for h in idx_handles] if idx_handles else None,
+                    indexer_cpu_kv_layout=self._indexer_cpu_handle.kv_layout if idx_handles else None,
+                    indexer_dtype=idx_handles[0].dtype if idx_handles else None,
+                    indexer_ssd_files=self._indexer_ssd_handle.get_file_list() if (idx_handles and self._indexer_ssd_handle) else None,
+                    indexer_ssd_kv_layout=self._indexer_ssd_handle.kv_layout if (idx_handles and self._indexer_ssd_handle) else None,
+                    indexer_num_blocks_per_file=self._indexer_ssd_handle.num_blocks_per_file if (idx_handles and self._indexer_ssd_handle) else 0,
                 )
-                for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
-            ]
+                self.layerwise_workers.append(worker)
+
+                flexkv_logger.debug(
+                    f"[TransferEngine] Created layerwise worker for dp_client_id={dp_client_id}: "
+                    f"tp_size={self.tp_size}, has_indexer={idx_handles is not None}, "
+                    f"has_ssd={len(ssd_files) > 0}")
+
             self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
 
         if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
@@ -398,25 +436,53 @@ class TransferEngine:
                 and self._indexer_cpu_handle is not None):
             self._indexer_finished_ops_queue = self.mp_ctx.Queue()
             self._indexer_worker_map: Dict[TransferType, Union[WorkerHandle, List[WorkerHandle]]] = {}
+            # H2D indexer worker
+            if not _enable_layerwise:
+                if self.tp_size == 1:
+                    self._indexer_h2d_workers = [
+                        GPUCPUTransferWorker.create_worker(
+                            mp_ctx=self.mp_ctx,
+                            finished_ops_queue=self._indexer_finished_ops_queue,
+                            op_buffer_tensor=self.pin_buffer.get_buffer(),
+                            gpu_blocks=indexer_gpu_handles_list[0].get_tensor_handle_list(),
+                            cpu_blocks=self._indexer_cpu_handle.get_tensor(),
+                            gpu_kv_layout=indexer_gpu_handles_list[0].kv_layout,
+                            cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
+                            dtype=indexer_gpu_handles_list[0].dtype,
+                            gpu_device_id=indexer_gpu_handles_list[0].gpu_device_id,
+                            use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                            use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                            transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                            transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                        )
+                        for _, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
+                    ]
+                else:
+                    self._indexer_h2d_workers = [
+                        tpGPUCPUTransferWorker.create_worker(
+                            mp_ctx=self.mp_ctx,
+                            finished_ops_queue=self._indexer_finished_ops_queue,
+                            op_buffer_tensor=self.pin_buffer.get_buffer(),
+                            gpu_blocks=[h.get_tensor_handle_list() for h in indexer_gpu_handles_list],
+                            cpu_blocks=self._indexer_cpu_handle.get_tensor(),
+                            gpu_kv_layouts=[h.kv_layout for h in indexer_gpu_handles_list],
+                            cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
+                            dtype=indexer_gpu_handles_list[0].dtype,
+                            tp_group_size=self.tp_size,
+                            dp_group_id=dp_client_id,
+                            is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
+                            cp_size=getattr(self.model_config, "cp_size", 1),
+                            use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                            use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                            transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                            transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                        )
+                        for dp_client_id, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
+                    ]
+                self._indexer_worker_map[TransferType.H2D] = self._indexer_h2d_workers
+
+            # D2H indexer worker
             if self.tp_size == 1:
-                self._indexer_h2d_workers = [
-                    GPUCPUTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self._indexer_finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=indexer_gpu_handles_list[0].get_tensor_handle_list(),
-                        cpu_blocks=self._indexer_cpu_handle.get_tensor(),
-                        gpu_kv_layout=indexer_gpu_handles_list[0].kv_layout,
-                        cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
-                        dtype=indexer_gpu_handles_list[0].dtype,
-                        gpu_device_id=indexer_gpu_handles_list[0].gpu_device_id,
-                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                        transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                        transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                    )
-                    for _, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
-                ]
                 self._indexer_d2h_workers = [
                     GPUCPUTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
@@ -436,27 +502,6 @@ class TransferEngine:
                     for _, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
                 ]
             else:
-                self._indexer_h2d_workers = [
-                    tpGPUCPUTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self._indexer_finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=[h.get_tensor_handle_list() for h in indexer_gpu_handles_list],
-                        cpu_blocks=self._indexer_cpu_handle.get_tensor(),
-                        gpu_kv_layouts=[h.kv_layout for h in indexer_gpu_handles_list],
-                        cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
-                        dtype=indexer_gpu_handles_list[0].dtype,
-                        tp_group_size=self.tp_size,
-                        dp_group_id=dp_client_id,
-                        is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
-                        cp_size=getattr(self.model_config, "cp_size", 1),
-                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                        transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                        transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                    )
-                    for dp_client_id, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
-                ]
                 self._indexer_d2h_workers = [
                     tpGPUCPUTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
@@ -478,9 +523,9 @@ class TransferEngine:
                     )
                     for dp_client_id, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
                 ]
-            self._indexer_worker_map[TransferType.H2D] = self._indexer_h2d_workers
             self._indexer_worker_map[TransferType.D2H] = self._indexer_d2h_workers
             if self._indexer_ssd_handle is not None and self._indexer_cpu_handle is not None:
+                # H2DISK indexer worker
                 self._indexer_h2disk_worker = CPUSSDDiskTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self._indexer_finished_ops_queue,
@@ -493,20 +538,22 @@ class TransferEngine:
                     num_blocks_per_file=self._indexer_ssd_handle.num_blocks_per_file,
                     cache_config=self._cache_config,
                 )
-                self._indexer_disk2h_worker = CPUSSDDiskTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self._indexer_finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    cpu_blocks=self._indexer_cpu_handle.get_tensor(),
-                    ssd_files=self._indexer_ssd_handle.get_file_list(),
-                    cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
-                    ssd_kv_layout=self._indexer_ssd_handle.kv_layout,
-                    dtype=self._indexer_cpu_handle.dtype,
-                    num_blocks_per_file=self._indexer_ssd_handle.num_blocks_per_file,
-                    cache_config=self._cache_config,
-                )
                 self._indexer_worker_map[TransferType.H2DISK] = self._indexer_h2disk_worker
-                self._indexer_worker_map[TransferType.DISK2H] = self._indexer_disk2h_worker
+                # DISK2H indexer worker
+                if not _enable_layerwise:
+                    self._indexer_disk2h_worker = CPUSSDDiskTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self._indexer_finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        cpu_blocks=self._indexer_cpu_handle.get_tensor(),
+                        ssd_files=self._indexer_ssd_handle.get_file_list(),
+                        cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
+                        ssd_kv_layout=self._indexer_ssd_handle.kv_layout,
+                        dtype=self._indexer_cpu_handle.dtype,
+                        num_blocks_per_file=self._indexer_ssd_handle.num_blocks_per_file,
+                        cache_config=self._cache_config,
+                    )
+                    self._indexer_worker_map[TransferType.DISK2H] = self._indexer_disk2h_worker
                 flexkv_logger.info("TransferEngine: indexer SSD workers initialized")
             if self._indexer_remote_handle is not None and self._indexer_cpu_handle is not None:
                 self._indexer_h2remote_worker = CPURemoteTransferWorker.create_worker(
@@ -594,43 +641,15 @@ class TransferEngine:
                 if self.cache_config.enable_p2p_ssd:
                     self._indexer_worker_map[TransferType.PEERSSD2H] = self._indexer_cpu_remote_cpu_worker
                 flexkv_logger.info("TransferEngine: indexer P2P workers initialized")
-            if GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
-                indexer_ssd_files = {} if self._indexer_ssd_handle is None else self._indexer_ssd_handle.get_file_list()
-                indexer_ssd_kv_layout = None if self._indexer_ssd_handle is None else self._indexer_ssd_handle.kv_layout
-                indexer_num_blocks_per_file = 0 if self._indexer_ssd_handle is None else self._indexer_ssd_handle.num_blocks_per_file
-                self._indexer_layerwise_workers = [
-                    LayerwiseTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self._indexer_finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=[h.get_tensor_handle_list() for h in indexer_gpu_handles_list],
-                        cpu_blocks=self._indexer_cpu_handle.get_tensor(),
-                        ssd_files=indexer_ssd_files,
-                        gpu_kv_layouts=[h.kv_layout for h in indexer_gpu_handles_list],
-                        cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
-                        ssd_kv_layout=indexer_ssd_kv_layout,
-                        dtype=indexer_gpu_handles_list[0].dtype,
-                        tp_group_size=self.tp_size,
-                        dp_group_id=dp_client_id,
-                        pp_rank=self.model_config.pp_rank,
-                        pp_size=self.model_config.pp_size,
-                        dp_size=self.model_config.dp_size,
-                        dp_rank=dp_client_id,
-                        num_blocks_per_file=indexer_num_blocks_per_file,
-                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                        h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                        d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                        enable_eventfd=False,
-                    )
-                    for dp_client_id, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
-                ]
-                self._indexer_worker_map[TransferType.LAYERWISE] = self._indexer_layerwise_workers
-                flexkv_logger.info("TransferEngine: indexer Layerwise workers initialized")
             self._has_indexer = True
-            flexkv_logger.info(
-                f"TransferEngine: indexer inline workers initialized "
-                f"({len(self._indexer_h2d_workers)} H2D + {len(self._indexer_d2h_workers)} D2H)")
+            if not _enable_layerwise:
+                flexkv_logger.info(
+                    f"TransferEngine: indexer inline workers initialized "
+                    f"({len(self._indexer_h2d_workers)} H2D + {len(self._indexer_d2h_workers)} D2H)")
+            else:
+                flexkv_logger.info(
+                    f"TransferEngine: indexer inline workers initialized "
+                    f"(H2D fused into layerwise, {len(self._indexer_d2h_workers)} D2H)")
 
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
@@ -657,6 +676,14 @@ class TransferEngine:
                     flexkv_logger.info(f"waiting for indexer {transfer_type.name} worker {worker.worker_id} to ready")
                     worker.ready_event.wait()
                     flexkv_logger.info(f"indexer {transfer_type.name} worker {worker.worker_id} is ready")
+        # Startup assertions: verify layerwise mode worker map consistency
+        if _enable_layerwise:
+            assert TransferType.H2D not in self._worker_map, \
+                "H2D worker should not exist in layerwise mode (fused into layerwise worker)"
+            assert TransferType.DISK2H not in self._worker_map, \
+                "DISK2H worker should not exist in layerwise mode (fused into layerwise worker)"
+            assert TransferType.LAYERWISE in self._worker_map, \
+                "LAYERWISE worker must exist when layerwise transfer is enabled"
         # Start scheduler thread
         self._running = True
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
@@ -848,10 +875,10 @@ class TransferEngine:
                 op.pending_count += 1
 
                 flexkv_logger.debug(
-                    f"[TransferEngine] Created indexer op {indexer_op.op_id} "
-                    f"for parent op {op.op_id}: {num_pages} pages, "
-                    f"type={op.transfer_type.name}"
-                )
+                    f"[TransferEngine] === Indexer Op Dispatched (non-layerwise) ==="
+                    f"\n  parent_op_id={op.op_id}, indexer_op_id={indexer_op.op_id}"
+                    f"\n  type={op.transfer_type.name}, dp_id={op.dp_id}"
+                    f"\n  num_pages={num_pages}, pending_count={op.pending_count}")
 
                 indexer_worker = self._indexer_worker_map[op.transfer_type]
                 if isinstance(indexer_worker, List):
