@@ -130,16 +130,22 @@ class KVServer:
         gpu_register_port: str,
         server_recv_port: str,
         total_clients: int = 0,
+        shm_mode: bool = False,
     ):
 
         self.model_config = model_config
-        # Init inter-process communication
-        self.context = zmq.Context(2)
-        self.recv_from_client = get_zmq_socket(
-            self.context, zmq.SocketType.PULL, server_recv_port, True)
+        self.server_recv_port = server_recv_port
+        self.shm_mode = shm_mode
+
+        if not shm_mode:
+            # ZMQ mode: init inter-process communication
+            self.context = zmq.Context(2)
+            self.recv_from_client = get_zmq_socket(
+                self.context, zmq.SocketType.PULL, server_recv_port, True)
 
         # Use total_clients if provided (multi-instance mode), otherwise use dp_size
         max_clients = total_clients if total_clients > 0 else model_config.dp_size
+        self.total_clients = max_clients
         self.client_manager = ClientManager(max_num_dp_client=max_clients)
         self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port)
 
@@ -176,9 +182,10 @@ class KVServer:
                        cache_config: CacheConfig,
                        gpu_register_port: str,
                        server_recv_port: str,
-                       total_clients: int = 0) -> None:
+                       total_clients: int = 0,
+                       shm_mode: bool = False) -> None:
 
-        server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port, total_clients)
+        server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port, total_clients, shm_mode)
         server.run()
 
     @classmethod
@@ -189,7 +196,8 @@ class KVServer:
                       server_recv_port: Optional[str] = None,
                       total_clients: int = 0,
                       child_env: Optional[dict] = None,
-                      inherit_env: bool = True) -> 'KVServerHandle':
+                      inherit_env: bool = True,
+                      shm_mode: bool = False) -> 'KVServerHandle':
 
         # Set spawn method for CUDA compatibility
         with contextlib.suppress(RuntimeError):
@@ -214,7 +222,7 @@ class KVServer:
             env.pop('CUDA_VISIBLE_DEVICES', None)
             env.update({"FLEXKV_INSTANCE_NUM": str(total_clients // model_config.dp_size)})
             # Serialize arguments
-            args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port, total_clients))
+            args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port, total_clients, shm_mode))
 
             # Start subprocess
             flexkv_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -225,8 +233,8 @@ class KVServer:
                 from flexkv.server.server import KVServer
 
                 args_data = {args_data!r}
-                model_config, cache_config, gpu_register_port, server_recv_port, total_clients = pickle.loads(args_data)
-                server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port, total_clients)
+                model_config, cache_config, gpu_register_port, server_recv_port, total_clients, shm_mode = pickle.loads(args_data)
+                server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port, total_clients, shm_mode)
                 server.run()
             ''').strip()
             process = subprocess.Popen([
@@ -238,16 +246,21 @@ class KVServer:
         else:
             # Use multiprocessing as before
             process = mp.Process(target=cls._server_process,
-                                 args=(model_config, cache_config, gpu_register_port, server_recv_port, total_clients))
+                                 args=(model_config, cache_config, gpu_register_port, server_recv_port, total_clients, shm_mode))
             process.start()
-            flexkv_logger.info(f"KVServer process started, PID: {process.pid}, total_clients: {total_clients}")
+            flexkv_logger.info(f"KVServer process started, PID: {process.pid}, total_clients: {total_clients}, shm_mode: {shm_mode}")
             return KVServerHandle(process)
 
     def run(self) -> None:
-        """Main server loop"""
+        """Main server loop — dispatches to ZMQ or SHM event loop."""
+        if self.shm_mode:
+            self._run_shm()
+        else:
+            self._run_zmq()
 
-        # TODO: handle error and return error response
-        # TODO: support check finish
+    def _run_zmq(self) -> None:
+        """ZMQ-based server loop (original implementation)."""
+
         flexkv_logger.info("Servering waiting to be started")
         req = self.recv_from_client.recv_pyobj()
         if isinstance(req, StartRequest):
@@ -289,15 +302,207 @@ class KVServer:
             self.kvmanager.shutdown()
         flexkv_logger.info("Server shutdown complete")
 
+    def _run_shm(self) -> None:
+        """Shared memory IPC server loop — low-latency alternative to ZMQ."""
+        import pickle
+        from flexkv.server.shm_channel import (
+            ShmControlBlock, ShmChannel, ShmMsgType,
+            pack_response, unpack_request,
+            _STATUS_TO_INT,
+        )
+
+        server_id = self.server_recv_port
+
+        # Create control block and per-client channels
+        ctrl = ShmControlBlock(server_id, create=True)
+        channels: Dict[int, ShmChannel] = {}
+        for cid in range(self.total_clients):
+            channels[cid] = ShmChannel(server_id, cid, create=True)
+
+        # Signal clients that SHM is ready
+        ctrl.set_server_ready()
+        flexkv_logger.info(f"SHM server ready, {self.total_clients} channels created")
+
+        self._running = True
+        idle_spins = 0
+        MAX_IDLE_SPINS = 2000
+
+        try:
+            while self._running:
+                did_work = False
+
+                # Snapshot wake counter BEFORE checking for work.
+                # If a client notifies between this read and futex_wait,
+                # the counter will differ and futex_wait returns immediately.
+                wake_snapshot = ctrl.get_wake_counter()
+
+                # Phase 1: Check sync request flags (fast memory reads)
+                for cid, ch in channels.items():
+                    req = ch.check_sync_request()
+                    if req is not None:
+                        self._handle_shm_sync_request(cid, ch, req)
+                        did_work = True
+
+                # Phase 2: Drain async ring buffers
+                for cid, ch in channels.items():
+                    msg = ch.async_recv()
+                    while msg is not None:
+                        self._handle_shm_async_request(cid, msg)
+                        did_work = True
+                        msg = ch.async_recv()
+
+                if did_work:
+                    idle_spins = 0
+                else:
+                    idle_spins += 1
+                    if idle_spins >= MAX_IDLE_SPINS:
+                        ctrl.futex_wait_on_wake(wake_snapshot)
+                        idle_spins = 0
+
+        except Exception as e:
+            flexkv_logger.error(f"SHM server error: {e}", exc_info=True)
+        finally:
+            # Cleanup
+            for ch in channels.values():
+                ch.close()
+                ch.unlink()
+            ctrl.close()
+            ctrl.unlink()
+            flexkv_logger.info("SHM server shutdown complete")
+
+    def _handle_shm_sync_request(self, client_id: int, ch, req: dict) -> None:
+        """Handle a sync (round-trip) request from SHM channel."""
+        from flexkv.server.shm_channel import ShmMsgType, _STATUS_TO_INT
+        import pickle
+
+        msg_type = req["msg_type"]
+
+        try:
+            if msg_type == ShmMsgType.GET_MATCH:
+                req_id, mask = self.kv_task_engine.get_match(
+                    token_ids=req["token_ids"],
+                    token_mask=req["token_mask"],
+                    layer_granularity=req["layer_granularity"],
+                    dp_id=client_id,
+                    task_id=req["task_id"],
+                    namespace=req["namespace"],
+                )
+                ch.send_sync_response(task_id=req_id, mask=mask)
+
+            elif msg_type == ShmMsgType.PUT_MATCH:
+                req_id, mask = self.kv_task_engine.put_match(
+                    token_ids=req["token_ids"],
+                    token_mask=req["token_mask"],
+                    dp_id=client_id,
+                    task_id=req["task_id"],
+                    namespace=req["namespace"],
+                )
+                ch.send_sync_response(task_id=req_id, mask=mask)
+
+            elif msg_type == ShmMsgType.WAIT:
+                kv_responses = self.kv_task_engine.wait(
+                    req["task_ids"],
+                    timeout=req["wait_timeout"],
+                    completely=req["completely"],
+                )
+                ch.send_sync_response(kv_responses=kv_responses)
+
+            elif msg_type == ShmMsgType.TRY_WAIT:
+                kv_responses = self.kv_task_engine.try_wait(
+                    req["task_ids"],
+                )
+                ch.send_sync_response(kv_responses=kv_responses)
+
+            elif msg_type == ShmMsgType.IS_READY:
+                ch.send_sync_response(is_ready=self.kv_task_engine.is_ready())
+
+            elif msg_type == ShmMsgType.START:
+                flexkv_logger.info(f"SHM: Received start request from client {client_id}")
+                self.start_server()
+                ch.send_sync_response(status_code=0)
+
+            elif msg_type == ShmMsgType.REGISTER:
+                flexkv_logger.info(f"SHM: Received register request from client {client_id}")
+                if req.get("model_config_bytes"):
+                    client_model_config = pickle.loads(req["model_config_bytes"])
+                    self._verify_model_config(client_model_config)
+                ch.send_sync_response(status_code=0)
+
+            elif msg_type == ShmMsgType.SHUTDOWN:
+                flexkv_logger.info(f"SHM: Received shutdown request from client {client_id}")
+                self._running = False
+                ch.send_sync_response(status_code=0)
+
+            else:
+                flexkv_logger.error(f"SHM: Unknown sync msg_type: {msg_type}")
+                ch.send_sync_response(status_code=-1, error_msg=f"Unknown msg_type: {msg_type}")
+
+        except Exception as e:
+            flexkv_logger.error(f"SHM sync handler error: {e}", exc_info=True)
+            ch.send_sync_response(status_code=-1, error_msg=str(e))
+
+    def _handle_shm_async_request(self, client_id: int, req: dict) -> None:
+        """Handle an async (fire-and-forget) request from SHM channel."""
+        from flexkv.server.shm_channel import ShmMsgType
+
+        msg_type = req["msg_type"]
+
+        try:
+            if msg_type == ShmMsgType.PUT_ASYNC:
+                self.kv_task_engine.put_async(
+                    token_ids=req["token_ids"],
+                    slot_mapping=req["slot_mapping"],
+                    token_mask=req["token_mask"],
+                    dp_id=client_id,
+                    task_id=req["task_id"],
+                    namespace=req["namespace"],
+                )
+
+            elif msg_type == ShmMsgType.GET_ASYNC:
+                self.kv_task_engine.get_async(
+                    task_id=req["task_id"],
+                    token_ids=req["token_ids"],
+                    slot_mapping=req["slot_mapping"],
+                    token_mask=req["token_mask"],
+                    layer_granularity=req["layer_granularity"],
+                    dp_id=client_id,
+                    namespace=req["namespace"],
+                )
+
+            elif msg_type == ShmMsgType.PREFETCH_ASYNC:
+                self.kv_task_engine.prefetch_async(
+                    token_ids=req["token_ids"],
+                    dp_id=client_id,
+                    task_id=req["task_id"],
+                    namespace=req["namespace"],
+                )
+
+            elif msg_type == ShmMsgType.LAUNCH_TASKS:
+                self.kv_task_engine.launch_tasks(
+                    req["task_ids"],
+                    req["slot_mappings"] or [],
+                    req["as_batch"],
+                    req["batch_id"],
+                )
+
+            elif msg_type == ShmMsgType.CANCEL_TASKS:
+                self.kv_task_engine.cancel_tasks(req["task_ids"])
+
+            else:
+                flexkv_logger.error(f"SHM: Unknown async msg_type: {msg_type}")
+
+        except Exception as e:
+            flexkv_logger.error(f"SHM async handler error: {e}", exc_info=True)
+
 
     def _verify_model_config(self, model_config: ModelConfig) -> None:
         """Verify that client's model config matches server's config."""
         for field in fields(ModelConfig):
             client_val = getattr(model_config, field.name)
             server_val = getattr(self.model_config, field.name)
-            print(f"ModelConfig.{field.name} mismatch: client={client_val}, server={server_val}")
-            assert client_val == server_val, \
-                f"ModelConfig.{field.name} mismatch: client={client_val}, server={server_val}"
+            if client_val != server_val:
+                raise ValueError(
+                    f"ModelConfig.{field.name} mismatch: client={client_val}, server={server_val}")
 
     # Request Handler Methods
 
