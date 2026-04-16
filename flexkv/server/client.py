@@ -288,21 +288,40 @@ class ShmKVDPClient:
         model_config: ModelConfig,
         dp_client_id: int,
     ):
-        from flexkv.server.shm_channel import ShmChannel, ShmControlBlock, ShmMsgType
+        from flexkv.server.shm_channel import ShmMsgType
 
         self.server_id = server_id
         self.dp_client_id = dp_client_id
         self.model_config = model_config
         self._ShmMsgType = ShmMsgType
 
-        # Open shared memory control block and channel (created by server)
-        self.ctrl = ShmControlBlock(server_id, create=False)
-        self.ch = ShmChannel(server_id, dp_client_id, create=False)
+        # SHM channels are opened lazily in start_server_and_register()
+        # because the server subprocess may not have created the files yet.
+        self.ctrl = None
+        self.ch = None
 
         self._task_id_range = (self.dp_client_id * 10000000, (self.dp_client_id + 1) * 10000000)
         self._task_id_counter = self._task_id_range[0]
         self._task_id_lock = Lock()
         flexkv_logger.info(f"ShmKVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
+
+    def _open_shm_channels(self, timeout_s: float = 120.0) -> None:
+        """Wait for server to create SHM files, then open channels."""
+        from flexkv.server.shm_channel import ShmChannel, ShmControlBlock
+
+        deadline = time.monotonic() + timeout_s
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                self.ctrl = ShmControlBlock(self.server_id, create=False)
+                self.ch = ShmChannel(self.server_id, self.dp_client_id, create=False)
+                flexkv_logger.info(f"ShmKVDPClient {self.dp_client_id}: SHM channels opened")
+                return
+            except (FileNotFoundError, OSError) as e:
+                last_error = e
+                time.sleep(0.1)
+        raise TimeoutError(
+            f"Server SHM files not available after {timeout_s}s: {last_error}")
 
     def _get_task_id(self) -> int:
         with self._task_id_lock:
@@ -324,17 +343,21 @@ class ShmKVDPClient:
         return self.ch.sync_wait_response()
 
     def start_server_and_register(self) -> None:
-        MT = self._ShmMsgType
-        # Wait for server to create SHM files
+        MsgType = self._ShmMsgType
+
+        # Wait for server to create SHM files, then open channels
+        self._open_shm_channels(timeout_s=120.0)
+
+        # Wait for server to signal ready
         self.ctrl.wait_server_ready(timeout_s=120.0)
 
         # Send start request
-        self._sync_request(MT.START)
+        self._sync_request(MsgType.START)
 
         # Send register request with model config
         import pickle
-        cfg_bytes = pickle.dumps(self.model_config)
-        self._sync_request(MT.REGISTER, model_config_bytes=cfg_bytes)
+        model_config_bytes = pickle.dumps(self.model_config)
+        self._sync_request(MsgType.REGISTER, model_config_bytes=model_config_bytes)
 
         flexkv_logger.info(f"ShmKVDPClient {self.dp_client_id} registered to server")
 
@@ -355,7 +378,7 @@ class ShmKVDPClient:
             task_id=task_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
-            token_mask=token_mask if token_mask is not None else None,
+            token_mask=token_mask,
             namespace=namespace)
         return task_id
 
@@ -370,7 +393,7 @@ class ShmKVDPClient:
             self._ShmMsgType.PUT_MATCH,
             task_id=task_id,
             token_ids=token_ids,
-            token_mask=token_mask if token_mask is not None else None,
+            token_mask=token_mask,
             namespace=namespace)
         if resp["error_msg"] is None:
             return resp["task_id"], resp["mask"]
@@ -405,7 +428,7 @@ class ShmKVDPClient:
             task_id=task_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
-            token_mask=token_mask if token_mask is not None else None,
+            token_mask=token_mask,
             layer_granularity=layer_granularity,
             namespace=namespace)
         return task_id
@@ -422,7 +445,7 @@ class ShmKVDPClient:
             self._ShmMsgType.GET_MATCH,
             task_id=task_id,
             token_ids=token_ids,
-            token_mask=token_mask if token_mask is not None else None,
+            token_mask=token_mask,
             layer_granularity=layer_granularity,
             namespace=namespace)
         if resp["error_msg"] is None:

@@ -74,7 +74,7 @@ class ShmMsgType(IntEnum):
 
 # ── Shared memory layout constants ──────────────────────────────────────
 
-_CL = 64  # cache line size
+_CACHE_LINE_SIZE = 64
 
 # Async ring buffer
 ASYNC_RING_SLOTS = 4096         # power of 2
@@ -87,11 +87,11 @@ SYNC_RESP_SIZE = 256 * 1024     # 256KB
 
 # Header offsets (cache-line aligned)
 OFF_ASYNC_WRITE = 0             # uint64, client writes
-OFF_ASYNC_READ = _CL            # uint64, server writes
-OFF_SYNC_REQ_FLAG = 2 * _CL    # int32, client sets to 1
-OFF_SYNC_RESP_FLAG = 3 * _CL   # int32, server sets to 1
+OFF_ASYNC_READ = _CACHE_LINE_SIZE            # uint64, server writes
+OFF_SYNC_REQ_FLAG = 2 * _CACHE_LINE_SIZE    # int32, client sets to 1
+OFF_SYNC_RESP_FLAG = 3 * _CACHE_LINE_SIZE   # int32, server sets to 1
 
-HEADER_SIZE = 4 * _CL  # 256 bytes
+HEADER_SIZE = 4 * _CACHE_LINE_SIZE  # 256 bytes
 ASYNC_RING_OFFSET = HEADER_SIZE
 SYNC_REQ_OFFSET = HEADER_SIZE + ASYNC_RING_SIZE
 SYNC_RESP_OFFSET = SYNC_REQ_OFFSET + SYNC_REQ_SIZE
@@ -99,7 +99,7 @@ TOTAL_SHM_SIZE = SYNC_RESP_OFFSET + SYNC_RESP_SIZE
 
 # Control block layout
 CTRL_WAKE_COUNTER = 0       # int32, any client increments
-CTRL_SERVER_READY = _CL     # int32, server sets to 1
+CTRL_SERVER_READY = _CACHE_LINE_SIZE     # int32, server sets to 1
 CTRL_SIZE = 4096             # one page
 
 # Message header format
@@ -166,20 +166,18 @@ class ShmControlBlock:
         return self._base_addr + CTRL_SERVER_READY
 
     def notify_server(self) -> None:
-        """Client calls this to wake the server from idle sleep."""
-        # Atomic increment: read-modify-write (safe because each client
-        # only needs to signal "something changed", exact count doesn't matter)
+        """Client calls this to wake the server from idle sleep.
+
+        Note: the read-modify-write is NOT atomic across processes.
+        Two clients may read the same value and both write value+1,
+        losing one increment.  This is safe because the server uses
+        futex_wait(addr, snapshot) — any counter change (even a lost
+        increment) will differ from the snapshot and prevent sleeping
+        through pending work.
+        """
         val = struct.unpack_from("<i", self.buf, CTRL_WAKE_COUNTER)[0]
         struct.pack_into("<i", self.buf, CTRL_WAKE_COUNTER, val + 1)
         futex_wake(self._wake_addr, 1)
-
-    def wait_for_work(self, spin_threshold: int = 1000) -> None:
-        """Server calls this when idle — spins briefly, then futex sleeps."""
-        for _ in range(spin_threshold):
-            # Quick check: anything changed?
-            return  # in spin mode, just return immediately to re-check
-        cur = struct.unpack_from("<i", self.buf, CTRL_WAKE_COUNTER)[0]
-        futex_wait(self._wake_addr, cur)
 
     def get_wake_counter(self) -> int:
         return struct.unpack_from("<i", self.buf, CTRL_WAKE_COUNTER)[0]
@@ -279,12 +277,12 @@ def pack_request(buf, offset: int, msg_type: int, dp_client_id: int,
 
     # slot_mappings list (for launch_tasks)
     if slot_mappings is not None and n_task_ids > 0:
-        for sm in slot_mappings:
-            sm_len = len(sm)
-            struct.pack_into("<i", buf, pos, sm_len)
+        for slot_map in slot_mappings:
+            slot_map_len = len(slot_map)
+            struct.pack_into("<i", buf, pos, slot_map_len)
             pos += 4
-            nbytes = sm.nbytes
-            buf[pos:pos + nbytes] = sm.tobytes()
+            nbytes = slot_map.nbytes
+            buf[pos:pos + nbytes] = slot_map.tobytes()
             pos += nbytes
 
     # namespace
@@ -309,7 +307,7 @@ def pack_request(buf, offset: int, msg_type: int, dp_client_id: int,
 def unpack_request(buf, offset: int) -> dict:
     """Unpack a request message from buffer. Returns dict of fields."""
     (msg_type, dp_client_id, task_id, n_tokens,
-     flags, layer_gran, n_task_ids, batch_id,
+     flags, layer_granularity, n_task_ids, batch_id,
      wait_timeout, n_namespace) = struct.unpack_from(MSG_HEADER_FMT, buf, offset)
     pos = offset + MSG_HEADER_SIZE
 
@@ -319,7 +317,7 @@ def unpack_request(buf, offset: int) -> dict:
         "task_id": task_id,
         "n_tokens": n_tokens,
         "flags": flags,
-        "layer_granularity": layer_gran,
+        "layer_granularity": layer_granularity,
         "n_task_ids": n_task_ids,
         "batch_id": batch_id,
         "wait_timeout": wait_timeout,
@@ -363,24 +361,24 @@ def unpack_request(buf, offset: int) -> dict:
     # slot_mappings
     if n_task_ids > 0 and (flags & FLAG_HAS_SLOT_MAPPING) and result["token_ids"] is None:
         # slot_mappings for launch_tasks (when there are no token_ids)
-        sms = []
+        slot_maps = []
         for _ in range(n_task_ids):
-            sm_len = struct.unpack_from("<i", buf, pos)[0]
+            slot_map_len = struct.unpack_from("<i", buf, pos)[0]
             pos += 4
-            nbytes = sm_len * 8
-            sms.append(np.frombuffer(buf[pos:pos + nbytes], dtype=np.int64).copy())
+            nbytes = slot_map_len * 8
+            slot_maps.append(np.frombuffer(buf[pos:pos + nbytes], dtype=np.int64).copy())
             pos += nbytes
-        result["slot_mappings"] = sms
+        result["slot_mappings"] = slot_maps
     elif n_task_ids > 0 and msg_type == ShmMsgType.LAUNCH_TASKS:
         # launch_tasks always has slot_mappings
-        sms = []
+        slot_maps = []
         for _ in range(n_task_ids):
-            sm_len = struct.unpack_from("<i", buf, pos)[0]
+            slot_map_len = struct.unpack_from("<i", buf, pos)[0]
             pos += 4
-            nbytes = sm_len * 8
-            sms.append(np.frombuffer(buf[pos:pos + nbytes], dtype=np.int64).copy())
+            nbytes = slot_map_len * 8
+            slot_maps.append(np.frombuffer(buf[pos:pos + nbytes], dtype=np.int64).copy())
             pos += nbytes
-        result["slot_mappings"] = sms
+        result["slot_mappings"] = slot_maps
     else:
         result["slot_mappings"] = None
 
@@ -437,13 +435,13 @@ def pack_response(buf, offset: int,
     """Pack response into shared memory buffer. Returns bytes written."""
     has_mask = 1 if mask is not None else 0
     mask_len = len(mask) if mask is not None else 0
-    n_kv = len(kv_responses) if kv_responses is not None else 0
+    num_kv_responses = len(kv_responses) if kv_responses is not None else 0
     error_bytes = error_msg.encode("utf-8") if error_msg else b""
     error_len = len(error_bytes)
 
     struct.pack_into(RESP_HEADER_FMT, buf, offset,
                      status_code, task_id, int(is_ready),
-                     has_mask, mask_len, n_kv, error_len)
+                     has_mask, mask_len, num_kv_responses, error_len)
     pos = offset + RESP_HEADER_SIZE
 
     # Pack mask (np.ndarray, typically bool or uint8)
@@ -461,12 +459,12 @@ def pack_response(buf, offset: int,
             pos += 13  # 8 + 4 + 1
 
             if has_return_mask:
-                rm = resp.return_mask
-                if isinstance(rm, list):
+                return_mask_data = resp.return_mask
+                if isinstance(return_mask_data, list):
                     # Batched: list of np.ndarray
-                    struct.pack_into("<Bi", buf, pos, 1, len(rm))
+                    struct.pack_into("<Bi", buf, pos, 1, len(return_mask_data))
                     pos += 5
-                    for arr in rm:
+                    for arr in return_mask_data:
                         arr_uint8 = arr.astype(np.uint8) if arr.dtype != np.uint8 else arr
                         struct.pack_into("<i", buf, pos, len(arr_uint8))
                         pos += 4
@@ -474,11 +472,11 @@ def pack_response(buf, offset: int,
                         pos += arr_uint8.nbytes
                 else:
                     # Single np.ndarray
-                    rm_uint8 = rm.astype(np.uint8) if rm.dtype != np.uint8 else rm
-                    struct.pack_into("<Bi", buf, pos, 0, len(rm_uint8))
+                    return_mask_uint8 = return_mask_data.astype(np.uint8) if return_mask_data.dtype != np.uint8 else return_mask_data
+                    struct.pack_into("<Bi", buf, pos, 0, len(return_mask_uint8))
                     pos += 5
-                    buf[pos:pos + rm_uint8.nbytes] = rm_uint8.tobytes()
-                    pos += rm_uint8.nbytes
+                    buf[pos:pos + return_mask_uint8.nbytes] = return_mask_uint8.tobytes()
+                    pos += return_mask_uint8.nbytes
 
     # Pack error message
     if error_len > 0:
@@ -491,7 +489,7 @@ def pack_response(buf, offset: int,
 def unpack_response(buf, offset: int) -> dict:
     """Unpack response from shared memory buffer."""
     (status_code, task_id, is_ready, has_mask,
-     mask_len, n_kv, error_len) = struct.unpack_from(RESP_HEADER_FMT, buf, offset)
+     mask_len, num_kv_responses, error_len) = struct.unpack_from(RESP_HEADER_FMT, buf, offset)
     pos = offset + RESP_HEADER_SIZE
 
     result = {
@@ -509,15 +507,15 @@ def unpack_response(buf, offset: int) -> dict:
         pos += mask_len
 
     # Unpack kv_responses
-    if n_kv > 0:
+    if num_kv_responses > 0:
         kv_responses = {}
-        for _ in range(n_kv):
-            tid, status_int, has_rm = struct.unpack_from("<qiB", buf, pos)
+        for _ in range(num_kv_responses):
+            tid, status_int, has_return_mask = struct.unpack_from("<qiB", buf, pos)
             pos += 13
             status_enum = _INT_TO_STATUS.get(status_int, KVResponseStatus.FAILED)
             return_mask = None
 
-            if has_rm:
+            if has_return_mask:
                 is_list, count = struct.unpack_from("<Bi", buf, pos)
                 pos += 5
                 if is_list:
@@ -617,7 +615,11 @@ class ShmChannel:
             rp = self._get_read_pos()
 
         slot_offset = ASYNC_RING_OFFSET + wp * ASYNC_SLOT_SIZE
-        pack_request(self.buf, slot_offset, msg_type, dp_client_id, task_id, **kwargs)
+        nbytes = pack_request(self.buf, slot_offset, msg_type, dp_client_id, task_id, **kwargs)
+        if nbytes > ASYNC_SLOT_SIZE:
+            raise ValueError(
+                f"Packed message ({nbytes} bytes) exceeds async slot size "
+                f"({ASYNC_SLOT_SIZE} bytes). Reduce token count or increase ASYNC_SLOT_SIZE.")
         self._set_write_pos(next_wp)
 
     def async_recv(self) -> Optional[dict]:
@@ -641,8 +643,12 @@ class ShmChannel:
         """Write a sync request (client side). Must call sync_wait_response after."""
         # Clear response flag
         struct.pack_into("<i", self.buf, OFF_SYNC_RESP_FLAG, 0)
-        # Write request
-        pack_request(self.buf, SYNC_REQ_OFFSET, msg_type, dp_client_id, task_id, **kwargs)
+        # Write request and validate size
+        nbytes = pack_request(self.buf, SYNC_REQ_OFFSET, msg_type, dp_client_id, task_id, **kwargs)
+        if nbytes > SYNC_REQ_SIZE:
+            raise ValueError(
+                f"Packed message ({nbytes} bytes) exceeds sync request size "
+                f"({SYNC_REQ_SIZE} bytes). Reduce token count or increase SYNC_REQ_SIZE.")
         # Set request flag (signals server)
         struct.pack_into("<i", self.buf, OFF_SYNC_REQ_FLAG, 1)
 

@@ -500,9 +500,9 @@ class KVServer:
         for field in fields(ModelConfig):
             client_val = getattr(model_config, field.name)
             server_val = getattr(self.model_config, field.name)
-            print(f"ModelConfig.{field.name} mismatch: client={client_val}, server={server_val}")
-            assert client_val == server_val, \
-                f"ModelConfig.{field.name} mismatch: client={client_val}, server={server_val}"
+            if client_val != server_val:
+                raise ValueError(
+                    f"ModelConfig.{field.name} mismatch: client={client_val}, server={server_val}")
 
     # Request Handler Methods
 
