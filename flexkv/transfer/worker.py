@@ -1373,6 +1373,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout = None,
         ssd_files: Dict[int, List[str]] = None,  # ssd_device_id -> file_paths
         num_blocks_per_file: int = 0,
+        mooncake_config_path: str = None,
     ):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
@@ -1405,6 +1406,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.cache_config.redis_port,
                 self.cache_config.redis_password,
                 self.cache_config.local_ip,
+                node_ttl_seconds=self.cache_config.node_ttl_seconds,
             )
             self.redis_meta_client.set_node_id(self.cache_config.distributed_node_id)
 
@@ -1416,8 +1418,18 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
 
             # step2: initialize mooncake transfer engine for the whole flexkv
-            # NOTE:now we read the config file by env paras
-            mooncake_config_path = os.environ["MOONCAKE_CONFIG_PATH"]
+            # NOTE: prefer explicit parameter > cache_config > env variable
+            # (spawn subprocesses may lose env vars, but cache_config is pickle-serialized)
+            if mooncake_config_path is None:
+                mooncake_config_path = getattr(self.cache_config, 'mooncake_config_path', None)
+            if mooncake_config_path is None:
+                mooncake_config_path = os.environ.get("MOONCAKE_CONFIG_PATH")
+            if mooncake_config_path is None:
+                raise RuntimeError(
+                    "MOONCAKE_CONFIG_PATH is not set. Please either pass mooncake_config_path "
+                    "parameter, set cache_config.mooncake_config_path, or set the "
+                    "MOONCAKE_CONFIG_PATH environment variable."
+                )
             self.mooncake_config = MooncakeTransferEngineConfig.from_file(
                 mooncake_config_path
             )
@@ -2212,8 +2224,27 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         flexkv_logger.info(f"Unregistered node {self.redis_meta_client.get_node_id()} from Redis.")
 
     def get_node_meta(self, node_id: int) -> Optional[NodeMetaInfo]:
-        # TODO: how to remove the invalid node meta info in node_metas
-        """Get the node meta info by node id."""
+        """Get the node meta info by node id.
+        
+        Before returning cached or freshly-fetched meta, we verify that the
+        node is still active (its node:<id> key exists in Redis and has not
+        expired).  This prevents RDMA transfers to stale addresses after a
+        remote node has crashed.
+        """
+        # ===== Active-node validation (Scheme 4) =====
+        if not self.redis_meta_client.is_node_active(node_id):
+            # Node is no longer active – purge cached meta if any
+            if node_id in self.node_metas:
+                del self.node_metas[node_id]
+                flexkv_logger.warning(
+                    f"Node {node_id} is no longer active, removed cached meta."
+                )
+            else:
+                flexkv_logger.warning(
+                    f"Node {node_id} is not active, skipping meta fetch."
+                )
+            return None
+
         if node_id not in self.node_metas:
             ## fetch from redis
             node_redis_data = self.redis_meta_client.get_node_meta(node_id)

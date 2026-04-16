@@ -7,6 +7,28 @@ from setuptools import find_packages, setup
 from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
 
+
+def detect_cuda_arch():
+    """Auto-detect GPU compute capability. Returns a semicolon-separated arch list.
+    Falls back to a safe default when no GPU is available."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            archs = set()
+            for i in range(torch.cuda.device_count()):
+                major, minor = torch.cuda.get_device_capability(i)
+                archs.add(f"{major}.{minor}")
+            if archs:
+                arch_list = ";".join(sorted(archs))
+                print(f"Auto-detected GPU architectures: {arch_list}")
+                return arch_list
+    except Exception as e:
+        print(f"GPU architecture auto-detection failed: {e}")
+    # Fallback: common architectures (Ampere + Hopper)
+    fallback = "8.0;8.6;9.0"
+    print(f"No GPU detected, using fallback architectures: {fallback}")
+    return fallback
+
 def get_version():
     with open(os.path.join(os.path.dirname(__file__), "VERSION")) as f:
         return f.read().strip()
@@ -61,10 +83,10 @@ if enable_metrics:
     extra_link_args.extend(["-lprometheus-cpp-pull", "-lprometheus-cpp-core"])
 else:
     print("FLEXKV_ENABLE_METRICS=0: building without Prometheus monitoring")
-# If TORCH_CUDA_ARCH_LIST is not set, default to known supported archs
-# to avoid auto-detection failure on newer GPUs (e.g. Blackwell sm_100)
+# Auto-detect GPU architecture if TORCH_CUDA_ARCH_LIST is not explicitly set
 if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6;9.0"
+    os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
+print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
 
 extra_compile_args = ["-std=c++17", "-O3"]
 if enable_metrics:
