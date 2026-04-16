@@ -36,10 +36,10 @@ from flexkv.transfer.worker import (
     CPUSSDDiskTransferWorker,
     CPURemoteTransferWorker,
     GPUCPUTransferWorker,
-    NixlTransferWorker,
     tpGPUCPUTransferWorker,
     GDSTransferWorker,
     tpGDSTransferWorker,
+    NixlTransferWorker,
     PEER2CPUTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
@@ -139,96 +139,43 @@ class TransferEngine:
         assert self._cpu_handle is not None
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
-        _nixl_backend_norm = (self.cache_config.nixl_backend or "").strip().upper()
-        _use_nixl_ucx_worker = (
-            self.cache_config.enable_nixl and _nixl_backend_norm == "UCX"
-        )
-        if self.cache_config.enable_nixl and self.tp_size != 1:
-            flexkv_logger.warning(
-                "cache_config.enable_nixl is True but tensor-parallel size > 1; "
-                "NixlTransferWorker (UCX) is only used for tp_size==1. Using tpGPUCPUTransferWorker."
-            )
-        if (
-            self.cache_config.enable_nixl
-            and self.tp_size == 1
-            and not _use_nixl_ucx_worker
-        ):
-            flexkv_logger.info(
-                "cache_config.enable_nixl is True but nixl_backend is not UCX "
-                f"({self.cache_config.nixl_backend!r}); using GPUCPUTransferWorker for H2D/D2H."
-            )
         if self.tp_size == 1:
-            if _use_nixl_ucx_worker:
-                flexkv_logger.info(
-                    "Using NixlTransferWorker for H2D/D2H (nixl_backend=UCX)"
+            self.h2d_workers: List[WorkerHandle] = [
+                GPUCPUTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
+                    cpu_blocks=self._cpu_handle.get_tensor(),
+                    gpu_kv_layout=gpu_handles[0].kv_layout,
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    dtype=gpu_handles[0].dtype,
+                    gpu_device_id=gpu_handles[0].gpu_device_id,
+                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                 )
-                self.h2d_workers: List[WorkerHandle] = [
-                    NixlTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                        cpu_blocks=self._cpu_handle.get_tensor(),
-                        gpu_kv_layout=gpu_handles[0].kv_layout,
-                        cpu_kv_layout=self._cpu_handle.kv_layout,
-                        dtype=gpu_handles[0].dtype,
-                        gpu_device_id=gpu_handles[0].gpu_device_id,
-                        backend="UCX",
-                    )
-                    for _, gpu_handles in self.gpu_handles.items()
-                ]
-                self.d2h_workers: List[WorkerHandle] = [
-                    NixlTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                        cpu_blocks=self._cpu_handle.get_tensor(),
-                        gpu_kv_layout=gpu_handles[0].kv_layout,
-                        cpu_kv_layout=self._cpu_handle.kv_layout,
-                        dtype=gpu_handles[0].dtype,
-                        gpu_device_id=gpu_handles[0].gpu_device_id,
-                        backend="UCX",
-                    )
-                    for _, gpu_handles in self.gpu_handles.items()
-                ]
-            else:
-                self.h2d_workers: List[WorkerHandle] = [
-                    GPUCPUTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                        cpu_blocks=self._cpu_handle.get_tensor(),
-                        gpu_kv_layout=gpu_handles[0].kv_layout,
-                        cpu_kv_layout=self._cpu_handle.kv_layout,
-                        dtype=gpu_handles[0].dtype,
-                        gpu_device_id=gpu_handles[0].gpu_device_id,
-                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                        transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                        transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                    )
-                    for _, gpu_handles in self.gpu_handles.items()
-                ]
-                self.d2h_workers: List[WorkerHandle] = [
-                    GPUCPUTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                        cpu_blocks=self._cpu_handle.get_tensor(),
-                        gpu_kv_layout=gpu_handles[0].kv_layout,
-                        cpu_kv_layout=self._cpu_handle.kv_layout,
-                        dtype=gpu_handles[0].dtype,
-                        gpu_device_id=gpu_handles[0].gpu_device_id,
-                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                        transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                        transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                    )
-                    for _, gpu_handles in self.gpu_handles.items()
-                ]
+                for _, gpu_handles in self.gpu_handles.items()
+            ]
+            self.d2h_workers: List[WorkerHandle] = [
+                GPUCPUTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
+                    cpu_blocks=self._cpu_handle.get_tensor(),
+                    gpu_kv_layout=gpu_handles[0].kv_layout,
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    dtype=gpu_handles[0].dtype,
+                    gpu_device_id=gpu_handles[0].gpu_device_id,
+                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                )
+                for _, gpu_handles in self.gpu_handles.items()
+            ]
         else:
             self.h2d_workers = [
                 tpGPUCPUTransferWorker.create_worker(
@@ -325,7 +272,35 @@ class TransferEngine:
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
         if self.cache_config.enable_gds:
-            if self.tp_size == 1:
+            assert self._ssd_handle is not None
+            if self.cache_config.enable_nixl:
+                flexkv_logger.info(
+                    "[transfer_engine] GDS path using NixlTransferWorker (NIXL GDS_MT)"
+                )
+                if self.tp_size != 1:
+                    raise RuntimeError(
+                        "enable_nixl requires tp_size==1 (validated in KVTaskManager)"
+                    )
+                self.gds_workers = [
+                    NixlTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        nixl_backend="GDS_MT",
+                        ssd_files=self._ssd_handle.get_file_list(),
+                        num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                        dtype=self._ssd_handle.dtype,
+                        ssd_kv_layout=self._ssd_handle.kv_layout,
+                        gpu_kv_layout=gpu_handles[0].kv_layout,
+                        cpu_kv_layout=self._cpu_handle.kv_layout,
+                        nixl_extra_config=self.cache_config.nixl_extra_config,
+                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
+                        cpu_blocks=None,
+                        gpu_device_id=gpu_handles[0].gpu_device_id,
+                    )
+                    for _, gpu_handles in self.gpu_handles.items()
+                ]
+            elif self.tp_size == 1:
                 self.gds_workers = [
                     GDSTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,

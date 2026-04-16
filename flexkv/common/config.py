@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, List, Union, Dict, Any
 from argparse import Namespace
-import os
 import copy
 
 import torch
@@ -36,8 +35,10 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_gds: bool = False # Requires enable_ssd=True
-    enable_bypass_cpu: bool = False
+    # When True with enable_gds, GPU<->SSD uses NIXL (GDS_MT) instead of cuFile GDS worker.
     enable_nixl: bool = False
+    # Optional plugin dict for NixlAgentSession (see nixl README); only used if enable_nixl.
+    nixl_extra_config: Optional[Dict[str, Any]] = None
     enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
                                 # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
     enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
@@ -85,7 +86,15 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
     instance_num=int(os.getenv('FLEXKV_INSTANCE_NUM', 1)),
     instance_id=int(os.getenv('FLEXKV_INSTANCE_ID', 0)),
-    
+
+    # Metrics configuration
+    ## Enable/disable metrics collection and HTTP server (shared by C++ and Python)
+    enable_metrics=bool(int(os.getenv('FLEXKV_ENABLE_METRICS', 0))),
+    ## Port for C++ metrics HTTP server (default: 8081)
+    cpp_metrics_port=int(os.getenv('FLEXKV_CPP_METRICS_PORT', 8081)),
+    ## Port for Python metrics HTTP server (default: 8080)
+    py_metrics_port=int(os.getenv('FLEXKV_PY_METRICS_PORT', 8080)),
+
     # Server-client mode configuration
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
@@ -98,8 +107,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     use_ce_transfer_h2d=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0))),
     use_ce_transfer_d2h=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0))),
-    transfer_sms_h2d=int(os.getenv('FLEXKV_TRANSFER_SMS_H2D', 8)),
-    transfer_sms_d2h=int(os.getenv('FLEXKV_TRANSFER_SMS_D2H', 8)),
+    transfer_num_cta_h2d=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_H2D', 4)),
+    transfer_num_cta_d2h=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_D2H', 4)),
 
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),
@@ -110,6 +119,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     evict_start_threshold=float(os.getenv('FLEXKV_EVICT_START_THRESHOLD', 0.7)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
     eviction_policy=os.getenv('FLEXKV_EVICTION_POLICY', 'lru'),
+
+    enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
 
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),
@@ -132,12 +143,11 @@ class UserConfig:
     ssd_cache_gb: int = 0  # 0 means disable ssd
     ssd_cache_dir: Union[str, List[str]] = "./ssd_cache"
     enable_gds: bool = False
-    enable_bypass_cpu: bool = False
     enable_nixl: bool = False
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
-    
+
     # distributed zmq configs
     local_zmq_ip: Optional[str] = None
     local_zmq_port: Optional[int] = None
@@ -146,6 +156,7 @@ class UserConfig:
     redis_port: Optional[int] = None
     local_ip: Optional[str] = None
     redis_password: Optional[str] = None
+    kv_cache_dtype: Optional[str] = None  # Override kv_cache_dtype when TRT config uses "auto". Supported values: "fp8", "float8", "e4m3", "fp16", "float16", "bf16", "bfloat16", "fp32", "float32"
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
@@ -195,6 +206,8 @@ def load_user_config_from_env() -> UserConfig:
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
         ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./flexkv_ssd")),
         enable_gds=bool(int(os.getenv('FLEXKV_ENABLE_GDS', 0))),
+        enable_nixl=bool(int(os.getenv('FLEXKV_ENABLE_NIXL', 0))),
+        kv_cache_dtype=os.getenv('FLEXKV_KV_CACHE_DTYPE', None),
     )
 
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
@@ -214,15 +227,14 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds
-    cache_config.enable_bypass_cpu = user_config.enable_bypass_cpu
     cache_config.enable_nixl = user_config.enable_nixl
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote
-    
+
     # Update derived flags after setting p2p and remote configs
-    cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or 
-                                      cache_config.enable_p2p_ssd or 
+    cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or
+                                      cache_config.enable_p2p_ssd or
                                       cache_config.enable_3rd_remote)
     cache_config.enable_remote = cache_config.enable_3rd_remote
 
@@ -279,7 +291,7 @@ def update_default_config_from_user_config(model_config: ModelConfig,
             else:
                 raise ValueError(f"Unknown config name: {global_attr_name} in config file, "
                                  f"available config names: {global_config_attrs}")
-        
+
 @dataclass
 class MooncakeTransferEngineConfig:
     engine_ip: str
