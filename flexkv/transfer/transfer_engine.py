@@ -337,8 +337,21 @@ class TransferEngine:
             _cp_size = getattr(self.model_config, 'cp_size', 1)
             # For CP, each CP rank connects via eventfd; for TP, each TP rank connects.
             _eventfd_group_size = _cp_size if _is_nsa_cp and _cp_size > 1 else self.tp_size
-            self.layerwise_workers = [
-                LayerwiseTransferWorker.create_worker(
+
+            # Prepare indexer handles for fused layerwise transfer
+            has_indexer_for_layerwise = (
+                self._indexer_gpu_handles is not None and
+                self._indexer_cpu_handle is not None
+            )
+
+            self.layerwise_workers = []
+            for dp_client_id, gpu_handles in self.gpu_handle_groups.items():
+                # Resolve indexer handles for this dp_client_id
+                idx_handles = None
+                if has_indexer_for_layerwise:
+                    idx_handles = self._indexer_gpu_handles.get(dp_client_id)
+
+                worker = LayerwiseTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
@@ -361,9 +374,19 @@ class TransferEngine:
                     h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                     is_nsa_cp=_is_nsa_cp,
+                    indexer_gpu_blocks=[h.get_tensor_handle_list() for h in idx_handles] if idx_handles else None,
+                    indexer_cpu_blocks=self._indexer_cpu_handle.get_tensor() if idx_handles else None,
+                    indexer_gpu_kv_layouts=[h.kv_layout for h in idx_handles] if idx_handles else None,
+                    indexer_cpu_kv_layout=self._indexer_cpu_handle.kv_layout if idx_handles else None,
+                    indexer_dtype=idx_handles[0].dtype if idx_handles else None,
                 )
-                for dp_client_id, gpu_handles in self.gpu_handle_groups.items()
-            ]
+                self.layerwise_workers.append(worker)
+
+                flexkv_logger.debug(
+                    f"[TransferEngine] Created layerwise worker for dp_client_id={dp_client_id}: "
+                    f"tp_size={self.tp_size}, has_indexer={idx_handles is not None}, "
+                    f"has_ssd={len(ssd_files) > 0}")
+
             self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
 
         if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
@@ -594,39 +617,6 @@ class TransferEngine:
                 if self.cache_config.enable_p2p_ssd:
                     self._indexer_worker_map[TransferType.PEERSSD2H] = self._indexer_cpu_remote_cpu_worker
                 flexkv_logger.info("TransferEngine: indexer P2P workers initialized")
-            if GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
-                indexer_ssd_files = {} if self._indexer_ssd_handle is None else self._indexer_ssd_handle.get_file_list()
-                indexer_ssd_kv_layout = None if self._indexer_ssd_handle is None else self._indexer_ssd_handle.kv_layout
-                indexer_num_blocks_per_file = 0 if self._indexer_ssd_handle is None else self._indexer_ssd_handle.num_blocks_per_file
-                self._indexer_layerwise_workers = [
-                    LayerwiseTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self._indexer_finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=[h.get_tensor_handle_list() for h in indexer_gpu_handles_list],
-                        cpu_blocks=self._indexer_cpu_handle.get_tensor(),
-                        ssd_files=indexer_ssd_files,
-                        gpu_kv_layouts=[h.kv_layout for h in indexer_gpu_handles_list],
-                        cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
-                        ssd_kv_layout=indexer_ssd_kv_layout,
-                        dtype=indexer_gpu_handles_list[0].dtype,
-                        tp_group_size=self.tp_size,
-                        dp_group_id=dp_client_id,
-                        pp_rank=self.model_config.pp_rank,
-                        pp_size=self.model_config.pp_size,
-                        dp_size=self.model_config.dp_size,
-                        dp_rank=dp_client_id,
-                        num_blocks_per_file=indexer_num_blocks_per_file,
-                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                        h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                        d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                        enable_eventfd=False,
-                    )
-                    for dp_client_id, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
-                ]
-                self._indexer_worker_map[TransferType.LAYERWISE] = self._indexer_layerwise_workers
-                flexkv_logger.info("TransferEngine: indexer Layerwise workers initialized")
             self._has_indexer = True
             flexkv_logger.info(
                 f"TransferEngine: indexer inline workers initialized "
@@ -848,10 +838,10 @@ class TransferEngine:
                 op.pending_count += 1
 
                 flexkv_logger.debug(
-                    f"[TransferEngine] Created indexer op {indexer_op.op_id} "
-                    f"for parent op {op.op_id}: {num_pages} pages, "
-                    f"type={op.transfer_type.name}"
-                )
+                    f"[TransferEngine] === Indexer Op Dispatched (non-layerwise) ==="
+                    f"\n  parent_op_id={op.op_id}, indexer_op_id={indexer_op.op_id}"
+                    f"\n  type={op.transfer_type.name}, dp_id={op.dp_id}"
+                    f"\n  num_pages={num_pages}, pending_count={op.pending_count}")
 
                 indexer_worker = self._indexer_worker_map[op.transfer_type]
                 if isinstance(indexer_worker, List):
