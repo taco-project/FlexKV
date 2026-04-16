@@ -285,47 +285,58 @@ def compute_stats(latencies_ns):
     )
 
 
-def bench_get_match(get_match_fn, token_sizes, num_iters, warmup):
+def bench_get_match(get_match_fn, token_sizes, batch_size, warmup, num_rounds):
     results = {}
     for n in token_sizes:
         token_ids = np.random.randint(0, 32000, size=n, dtype=np.int64)
 
-        # warmup
         for _ in range(warmup):
             get_match_fn(token_ids, None, -1)
 
-        # measure
-        lats = []
-        for _ in range(num_iters):
+        batch_total_ns = []
+        for _ in range(num_rounds):
             t0 = time.perf_counter_ns()
-            get_match_fn(token_ids, None, -1)
+            for _ in range(batch_size):
+                get_match_fn(token_ids, None, -1)
             t1 = time.perf_counter_ns()
-            lats.append(t1 - t0)
+            batch_total_ns.append(t1 - t0)
 
-        results[n] = dict(stats=compute_stats(lats), raw_ns=lats)
-        s = results[n]["stats"]
+        results[n] = dict(
+            batch_stats=compute_stats(batch_total_ns),
+            per_req_stats=compute_stats(
+                (np.array(batch_total_ns, dtype=np.float64) / batch_size).astype(np.int64).tolist()
+            ),
+            raw_batch_ns=batch_total_ns,
+            batch_size=batch_size,
+        )
+        bs = results[n]["batch_stats"]
+        ps = results[n]["per_req_stats"]
         print(
-            f"  tokens={n:>5}  mean={s['mean']:.1f}us  "
-            f"p50={s['p50']:.1f}  p90={s['p90']:.1f}  p99={s['p99']:.1f}"
+            f"  tokens={n:>5}  batch({batch_size})="
+            f"mean {bs['mean']:.0f}us  p50 {bs['p50']:.0f}us  p99 {bs['p99']:.0f}us  |  "
+            f"per_req= mean {ps['mean']:.1f}us  p50 {ps['p50']:.1f}us"
         )
     return results
 
 
 def print_table(mode, results):
+    batch_size = next(iter(results.values()))["batch_size"]
     hdr = (
-        f"{'Tokens':>8}  {'Mean(us)':>10}  {'P50(us)':>10}  {'P90(us)':>10}  "
-        f"{'P99(us)':>10}  {'Min(us)':>10}  {'Max(us)':>10}  {'Req/s':>10}"
+        f"{'Tokens':>8}  {'Batch Mean':>12}  {'Batch P50':>12}  {'Batch P90':>12}  "
+        f"{'Batch P99':>12}  {'Per-Req Mean':>14}  {'Per-Req P50':>14}  {'Per-Req P99':>14}"
     )
     print(f"\n{'=' * len(hdr)}")
-    print(f"  Mode: {mode} | Operation: get_match")
+    print(f"  Mode: {mode} | Operation: get_match | Batch size: {batch_size}")
     print(f"{'=' * len(hdr)}")
+    print(f"  (all values in microseconds)")
     print(hdr)
     print("-" * len(hdr))
     for n in sorted(results):
-        s = results[n]["stats"]
+        bs = results[n]["batch_stats"]
+        ps = results[n]["per_req_stats"]
         print(
-            f"{n:>8}  {s['mean']:>10.1f}  {s['p50']:>10.1f}  {s['p90']:>10.1f}  "
-            f"{s['p99']:>10.1f}  {s['min']:>10.1f}  {s['max']:>10.1f}  {s['req_s']:>10.0f}"
+            f"{n:>8}  {bs['mean']:>12.0f}  {bs['p50']:>12.0f}  {bs['p90']:>12.0f}  "
+            f"{bs['p99']:>12.0f}  {ps['mean']:>14.1f}  {ps['p50']:>14.1f}  {ps['p99']:>14.1f}"
         )
 
 
@@ -367,8 +378,9 @@ def run_direct(args):
         return bench_get_match(
             lambda tid, tm, lg: km.get_match(tid, tm, lg),
             args.token_sizes,
-            args.num_iters,
+            args.batch_size,
             args.warmup,
+            args.num_rounds,
         )
     finally:
         if km is not None:
@@ -401,8 +413,9 @@ def run_zmq(args):
         return bench_get_match(
             lambda tid, tm, lg: client.get_match(tid, tm, lg),
             args.token_sizes,
-            args.num_iters,
+            args.batch_size,
             args.warmup,
+            args.num_rounds,
         )
     finally:
         if client is not None:
@@ -438,8 +451,9 @@ def run_shm(args):
         return bench_get_match(
             lambda tid, tm, lg: client.get_match(tid, tm, lg),
             args.token_sizes,
-            args.num_iters,
+            args.batch_size,
             args.warmup,
+            args.num_rounds,
         )
     finally:
         if client is not None:
@@ -458,7 +472,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="FlexKV IPC Round-Trip Benchmark")
     p.add_argument("--mode", choices=["direct", "zmq", "shm"], required=True)
     p.add_argument("--tp-size", type=int, default=1, help="Tensor parallel size (GPUs per dp rank)")
-    p.add_argument("--num-iters", type=int, default=1000, help="Measured iterations per token size")
+    p.add_argument("--batch-size", type=int, default=128, help="Number of get_match calls per batch")
+    p.add_argument("--num-rounds", type=int, default=10, help="Number of batch rounds for statistics")
     p.add_argument("--warmup", type=int, default=100, help="Warmup iterations per token size")
     p.add_argument(
         "--token-sizes",
@@ -481,7 +496,8 @@ def main():
     os.environ["FLEXKV_ENABLE_MPS"] = "0"
 
     print(f"FlexKV Round-Trip Benchmark")
-    print(f"  mode={args.mode}  tp_size={args.tp_size}  iters={args.num_iters}  warmup={args.warmup}")
+    print(f"  mode={args.mode}  tp_size={args.tp_size}")
+    print(f"  batch_size={args.batch_size}  num_rounds={args.num_rounds}  warmup={args.warmup}")
     print(f"  token_sizes={args.token_sizes}")
     print(f"  log_dir={args.log_dir}")
     print()
@@ -494,11 +510,11 @@ def main():
 
     print_table(args.mode, results)
 
-    # Save raw latency data
-    raw = {str(n): np.array(results[n]["raw_ns"]) for n in results}
+    # Save raw batch timing data
+    raw = {str(n): np.array(results[n]["raw_batch_ns"]) for n in results}
     out = os.path.join(args.log_dir, f"latencies_{args.mode}.npz")
     np.savez(out, **raw)
-    print(f"\nRaw latencies saved to {out}")
+    print(f"\nRaw batch latencies saved to {out}")
 
 
 if __name__ == "__main__":
