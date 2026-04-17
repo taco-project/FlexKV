@@ -122,6 +122,16 @@ FLAG_AS_BATCH = 0x10
 RESP_HEADER_FMT = "<iqBBiii"
 RESP_HEADER_SIZE = struct.calcsize(RESP_HEADER_FMT)
 
+# Pre-compiled struct objects. struct.Struct caches the compiled format code
+# so each pack/unpack is a single C call, instead of re-parsing the format
+# string on every invocation. 
+_MSG_HEADER = struct.Struct(MSG_HEADER_FMT)
+_RESP_HEADER = struct.Struct(RESP_HEADER_FMT)
+_I32 = struct.Struct("<i")
+_U64 = struct.Struct("<Q")
+_QIB = struct.Struct("<qiB")   # task_id + status_int + has_return_mask
+_BI = struct.Struct("<Bi")     # is_list + count
+
 
 # ── ShmControlBlock ─────────────────────────────────────────────────────
 
@@ -155,7 +165,14 @@ class ShmControlBlock:
             self.buf = mmap.mmap(fd, CTRL_SIZE)
             os.close(fd)
 
+        # Pin the buffer once and cache ctypes pointers at fixed offsets.
+        # Aligned 32-bit load/store on x86-64 is atomic, so these reads/writes
+        # are safe without additional locks.
         self._base_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.buf))
+        self._wake_ptr = ctypes.c_int32.from_address(
+            self._base_addr + CTRL_WAKE_COUNTER)
+        self._ready_ptr = ctypes.c_int32.from_address(
+            self._base_addr + CTRL_SERVER_READY)
 
     @property
     def _wake_addr(self) -> int:
@@ -175,18 +192,17 @@ class ShmControlBlock:
         increment) will differ from the snapshot and prevent sleeping
         through pending work.
         """
-        val = struct.unpack_from("<i", self.buf, CTRL_WAKE_COUNTER)[0]
-        struct.pack_into("<i", self.buf, CTRL_WAKE_COUNTER, val + 1)
+        self._wake_ptr.value += 1
         futex_wake(self._wake_addr, 1)
 
     def get_wake_counter(self) -> int:
-        return struct.unpack_from("<i", self.buf, CTRL_WAKE_COUNTER)[0]
+        return self._wake_ptr.value
 
     def futex_wait_on_wake(self, expected: int) -> None:
         futex_wait(self._wake_addr, expected)
 
     def set_server_ready(self) -> None:
-        struct.pack_into("<i", self.buf, CTRL_SERVER_READY, 1)
+        self._ready_ptr.value = 1
         futex_wake(self._ready_addr, 2147483647)  # wake all waiters
 
     def wait_server_ready(self, timeout_s: float = 60.0) -> bool:
@@ -194,7 +210,7 @@ class ShmControlBlock:
         import time
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if struct.unpack_from("<i", self.buf, CTRL_SERVER_READY)[0] != 0:
+            if self._ready_ptr.value != 0:
                 return True
             futex_wait(self._ready_addr, 0)
         return False
@@ -244,10 +260,10 @@ def pack_request(buf, offset: int, msg_type: int, dp_client_id: int,
     if as_batch:
         flags |= FLAG_AS_BATCH
 
-    struct.pack_into(MSG_HEADER_FMT, buf, offset,
-                     msg_type, dp_client_id, task_id, n_tokens,
-                     flags, layer_granularity, n_task_ids, batch_id,
-                     wait_timeout, n_namespace)
+    _MSG_HEADER.pack_into(buf, offset,
+                          msg_type, dp_client_id, task_id, n_tokens,
+                          flags, layer_granularity, n_task_ids, batch_id,
+                          wait_timeout, n_namespace)
     pos = offset + MSG_HEADER_SIZE
 
     # token_ids (int64)
@@ -279,7 +295,7 @@ def pack_request(buf, offset: int, msg_type: int, dp_client_id: int,
     if slot_mappings is not None and n_task_ids > 0:
         for slot_map in slot_mappings:
             slot_map_len = len(slot_map)
-            struct.pack_into("<i", buf, pos, slot_map_len)
+            _I32.pack_into(buf, pos, slot_map_len)
             pos += 4
             nbytes = slot_map.nbytes
             buf[pos:pos + nbytes] = slot_map.tobytes()
@@ -289,14 +305,14 @@ def pack_request(buf, offset: int, msg_type: int, dp_client_id: int,
     if namespace is not None and n_namespace > 0:
         for ns in namespace:
             ns_bytes = ns.encode("utf-8")
-            struct.pack_into("<i", buf, pos, len(ns_bytes))
+            _I32.pack_into(buf, pos, len(ns_bytes))
             pos += 4
             buf[pos:pos + len(ns_bytes)] = ns_bytes
             pos += len(ns_bytes)
 
     # model_config_bytes (for register request)
     if model_config_bytes is not None:
-        struct.pack_into("<i", buf, pos, len(model_config_bytes))
+        _I32.pack_into(buf, pos, len(model_config_bytes))
         pos += 4
         buf[pos:pos + len(model_config_bytes)] = model_config_bytes
         pos += len(model_config_bytes)
@@ -305,10 +321,17 @@ def pack_request(buf, offset: int, msg_type: int, dp_client_id: int,
 
 
 def unpack_request(buf, offset: int) -> dict:
-    """Unpack a request message from buffer. Returns dict of fields."""
+    """Unpack a request message from buffer. Returns dict of fields.
+
+    All numpy arrays are deep-copied so the caller may retain references
+    past the buffer's reuse window (e.g. KVTaskEngine stores token_ids in
+    self.tasks for minutes).  Do NOT change this to return views — silent
+    corruption will follow when the sync slot is overwritten by the next
+    request.
+    """
     (msg_type, dp_client_id, task_id, n_tokens,
      flags, layer_granularity, n_task_ids, batch_id,
-     wait_timeout, n_namespace) = struct.unpack_from(MSG_HEADER_FMT, buf, offset)
+     wait_timeout, n_namespace) = _MSG_HEADER.unpack_from(buf, offset)
     pos = offset + MSG_HEADER_SIZE
 
     result = {
@@ -325,36 +348,37 @@ def unpack_request(buf, offset: int) -> dict:
         "as_batch": bool(flags & FLAG_AS_BATCH),
     }
 
-    # token_ids
+    # token_ids — np.frombuffer(buf, offset=pos) avoids the intermediate
+    # bytes object created by buf[pos:pos+n] on mmap, saving one memcpy.
     if n_tokens > 0:
-        nbytes = n_tokens * 8
-        result["token_ids"] = np.frombuffer(buf[pos:pos + nbytes], dtype=np.int64).copy()
-        pos += nbytes
+        result["token_ids"] = np.frombuffer(
+            buf, dtype=np.int64, count=n_tokens, offset=pos).copy()
+        pos += n_tokens * 8
     else:
         result["token_ids"] = None
 
     # slot_mapping
     if (flags & FLAG_HAS_SLOT_MAPPING) and n_tokens > 0:
-        nbytes = n_tokens * 8
-        result["slot_mapping"] = np.frombuffer(buf[pos:pos + nbytes], dtype=np.int64).copy()
-        pos += nbytes
+        result["slot_mapping"] = np.frombuffer(
+            buf, dtype=np.int64, count=n_tokens, offset=pos).copy()
+        pos += n_tokens * 8
     else:
         result["slot_mapping"] = None
 
     # token_mask
     if (flags & FLAG_HAS_TOKEN_MASK) and n_tokens > 0:
-        nbytes = n_tokens
-        raw = np.frombuffer(buf[pos:pos + nbytes], dtype=np.uint8).copy()
+        raw = np.frombuffer(
+            buf, dtype=np.uint8, count=n_tokens, offset=pos).copy()
         result["token_mask"] = raw.astype(bool)
-        pos += nbytes
+        pos += n_tokens
     else:
         result["token_mask"] = None
 
     # task_ids
     if n_task_ids > 0:
-        nbytes = n_task_ids * 8
-        result["task_ids"] = np.frombuffer(buf[pos:pos + nbytes], dtype=np.int64).tolist()
-        pos += nbytes
+        result["task_ids"] = np.frombuffer(
+            buf, dtype=np.int64, count=n_task_ids, offset=pos).tolist()
+        pos += n_task_ids * 8
     else:
         result["task_ids"] = None
 
@@ -363,21 +387,21 @@ def unpack_request(buf, offset: int) -> dict:
         # slot_mappings for launch_tasks (when there are no token_ids)
         slot_maps = []
         for _ in range(n_task_ids):
-            slot_map_len = struct.unpack_from("<i", buf, pos)[0]
+            slot_map_len = _I32.unpack_from(buf, pos)[0]
             pos += 4
-            nbytes = slot_map_len * 8
-            slot_maps.append(np.frombuffer(buf[pos:pos + nbytes], dtype=np.int64).copy())
-            pos += nbytes
+            slot_maps.append(np.frombuffer(
+                buf, dtype=np.int64, count=slot_map_len, offset=pos).copy())
+            pos += slot_map_len * 8
         result["slot_mappings"] = slot_maps
     elif n_task_ids > 0 and msg_type == ShmMsgType.LAUNCH_TASKS:
         # launch_tasks always has slot_mappings
         slot_maps = []
         for _ in range(n_task_ids):
-            slot_map_len = struct.unpack_from("<i", buf, pos)[0]
+            slot_map_len = _I32.unpack_from(buf, pos)[0]
             pos += 4
-            nbytes = slot_map_len * 8
-            slot_maps.append(np.frombuffer(buf[pos:pos + nbytes], dtype=np.int64).copy())
-            pos += nbytes
+            slot_maps.append(np.frombuffer(
+                buf, dtype=np.int64, count=slot_map_len, offset=pos).copy())
+            pos += slot_map_len * 8
         result["slot_mappings"] = slot_maps
     else:
         result["slot_mappings"] = None
@@ -386,7 +410,7 @@ def unpack_request(buf, offset: int) -> dict:
     if (flags & FLAG_HAS_NAMESPACE) and n_namespace > 0:
         ns_list = []
         for _ in range(n_namespace):
-            ns_len = struct.unpack_from("<i", buf, pos)[0]
+            ns_len = _I32.unpack_from(buf, pos)[0]
             pos += 4
             ns_list.append(buf[pos:pos + ns_len].decode("utf-8") if isinstance(buf[pos:pos + ns_len], bytes)
                            else bytes(buf[pos:pos + ns_len]).decode("utf-8"))
@@ -399,7 +423,7 @@ def unpack_request(buf, offset: int) -> dict:
     if msg_type == ShmMsgType.REGISTER:
         if pos < len(buf):
             try:
-                cfg_len = struct.unpack_from("<i", buf, pos)[0]
+                cfg_len = _I32.unpack_from(buf, pos)[0]
                 pos += 4
                 result["model_config_bytes"] = bytes(buf[pos:pos + cfg_len])
                 pos += cfg_len
@@ -439,14 +463,15 @@ def pack_response(buf, offset: int,
     error_bytes = error_msg.encode("utf-8") if error_msg else b""
     error_len = len(error_bytes)
 
-    struct.pack_into(RESP_HEADER_FMT, buf, offset,
-                     status_code, task_id, int(is_ready),
-                     has_mask, mask_len, num_kv_responses, error_len)
+    _RESP_HEADER.pack_into(buf, offset,
+                           status_code, task_id, int(is_ready),
+                           has_mask, mask_len, num_kv_responses, error_len)
     pos = offset + RESP_HEADER_SIZE
 
     # Pack mask (np.ndarray, typically bool or uint8)
     if mask is not None:
-        mask_bytes = mask.astype(np.uint8).tobytes()
+        mask_u8 = mask if mask.dtype == np.uint8 else mask.astype(np.uint8)
+        mask_bytes = mask_u8.tobytes()
         buf[pos:pos + len(mask_bytes)] = mask_bytes
         pos += len(mask_bytes)
 
@@ -455,25 +480,25 @@ def pack_response(buf, offset: int,
         for tid, resp in kv_responses.items():
             status_int = _STATUS_TO_INT.get(resp.status, 5)
             has_return_mask = resp.return_mask is not None
-            struct.pack_into("<qiB", buf, pos, tid, status_int, int(has_return_mask))
+            _QIB.pack_into(buf, pos, tid, status_int, int(has_return_mask))
             pos += 13  # 8 + 4 + 1
 
             if has_return_mask:
                 return_mask_data = resp.return_mask
                 if isinstance(return_mask_data, list):
                     # Batched: list of np.ndarray
-                    struct.pack_into("<Bi", buf, pos, 1, len(return_mask_data))
+                    _BI.pack_into(buf, pos, 1, len(return_mask_data))
                     pos += 5
                     for arr in return_mask_data:
                         arr_uint8 = arr.astype(np.uint8) if arr.dtype != np.uint8 else arr
-                        struct.pack_into("<i", buf, pos, len(arr_uint8))
+                        _I32.pack_into(buf, pos, len(arr_uint8))
                         pos += 4
                         buf[pos:pos + arr_uint8.nbytes] = arr_uint8.tobytes()
                         pos += arr_uint8.nbytes
                 else:
                     # Single np.ndarray
                     return_mask_uint8 = return_mask_data.astype(np.uint8) if return_mask_data.dtype != np.uint8 else return_mask_data
-                    struct.pack_into("<Bi", buf, pos, 0, len(return_mask_uint8))
+                    _BI.pack_into(buf, pos, 0, len(return_mask_uint8))
                     pos += 5
                     buf[pos:pos + return_mask_uint8.nbytes] = return_mask_uint8.tobytes()
                     pos += return_mask_uint8.nbytes
@@ -489,7 +514,7 @@ def pack_response(buf, offset: int,
 def unpack_response(buf, offset: int) -> dict:
     """Unpack response from shared memory buffer."""
     (status_code, task_id, is_ready, has_mask,
-     mask_len, num_kv_responses, error_len) = struct.unpack_from(RESP_HEADER_FMT, buf, offset)
+     mask_len, num_kv_responses, error_len) = _RESP_HEADER.unpack_from(buf, offset)
     pos = offset + RESP_HEADER_SIZE
 
     result = {
@@ -503,32 +528,34 @@ def unpack_response(buf, offset: int) -> dict:
 
     # Unpack mask
     if has_mask and mask_len > 0:
-        result["mask"] = np.frombuffer(buf[pos:pos + mask_len], dtype=np.uint8).copy()
+        result["mask"] = np.frombuffer(
+            buf, dtype=np.uint8, count=mask_len, offset=pos).copy()
         pos += mask_len
 
     # Unpack kv_responses
     if num_kv_responses > 0:
         kv_responses = {}
         for _ in range(num_kv_responses):
-            tid, status_int, has_return_mask = struct.unpack_from("<qiB", buf, pos)
+            tid, status_int, has_return_mask = _QIB.unpack_from(buf, pos)
             pos += 13
             status_enum = _INT_TO_STATUS.get(status_int, KVResponseStatus.FAILED)
             return_mask = None
 
             if has_return_mask:
-                is_list, count = struct.unpack_from("<Bi", buf, pos)
+                is_list, count = _BI.unpack_from(buf, pos)
                 pos += 5
                 if is_list:
                     mask_list = []
                     for _ in range(count):
-                        arr_len = struct.unpack_from("<i", buf, pos)[0]
+                        arr_len = _I32.unpack_from(buf, pos)[0]
                         pos += 4
-                        mask_list.append(
-                            np.frombuffer(buf[pos:pos + arr_len], dtype=np.uint8).copy())
+                        mask_list.append(np.frombuffer(
+                            buf, dtype=np.uint8, count=arr_len, offset=pos).copy())
                         pos += arr_len
                     return_mask = mask_list
                 else:
-                    return_mask = np.frombuffer(buf[pos:pos + count], dtype=np.uint8).copy()
+                    return_mask = np.frombuffer(
+                        buf, dtype=np.uint8, count=count, offset=pos).copy()
                     pos += count
 
             kv_responses[tid] = KVResponse(
@@ -576,7 +603,19 @@ class ShmChannel:
             self.buf = mmap.mmap(fd, TOTAL_SHM_SIZE)
             os.close(fd)
 
+        # Pin the buffer once and cache ctypes pointers at fixed offsets.
+        # Flag reads/writes become a single load/store instead of a struct
+        # format-string parse, and aligned 32-bit ops on x86-64
+        # are naturally atomic, which is what the sync protocol needs.
         self._base_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.buf))
+        self._req_flag = ctypes.c_int32.from_address(
+            self._base_addr + OFF_SYNC_REQ_FLAG)
+        self._resp_flag = ctypes.c_int32.from_address(
+            self._base_addr + OFF_SYNC_RESP_FLAG)
+        self._async_write = ctypes.c_uint64.from_address(
+            self._base_addr + OFF_ASYNC_WRITE)
+        self._async_read = ctypes.c_uint64.from_address(
+            self._base_addr + OFF_ASYNC_READ)
 
     @property
     def _sync_req_flag_addr(self) -> int:
@@ -589,16 +628,16 @@ class ShmChannel:
     # ── Async ring buffer ───────────────────────────────────────────────
 
     def _get_write_pos(self) -> int:
-        return struct.unpack_from("<Q", self.buf, OFF_ASYNC_WRITE)[0]
+        return self._async_write.value
 
     def _set_write_pos(self, val: int) -> None:
-        struct.pack_into("<Q", self.buf, OFF_ASYNC_WRITE, val)
+        self._async_write.value = val
 
     def _get_read_pos(self) -> int:
-        return struct.unpack_from("<Q", self.buf, OFF_ASYNC_READ)[0]
+        return self._async_read.value
 
     def _set_read_pos(self, val: int) -> None:
-        struct.pack_into("<Q", self.buf, OFF_ASYNC_READ, val)
+        self._async_read.value = val
 
     def async_send(self, msg_type: int, dp_client_id: int, task_id: int = -1,
                    **kwargs) -> None:
@@ -641,30 +680,28 @@ class ShmChannel:
     def sync_send_request(self, msg_type: int, dp_client_id: int,
                           task_id: int = -1, **kwargs) -> None:
         """Write a sync request (client side). Must call sync_wait_response after."""
-        # Clear response flag
-        struct.pack_into("<i", self.buf, OFF_SYNC_RESP_FLAG, 0)
-        # Write request and validate size
+        self._resp_flag.value = 0
         nbytes = pack_request(self.buf, SYNC_REQ_OFFSET, msg_type, dp_client_id, task_id, **kwargs)
         if nbytes > SYNC_REQ_SIZE:
             raise ValueError(
                 f"Packed message ({nbytes} bytes) exceeds sync request size "
                 f"({SYNC_REQ_SIZE} bytes). Reduce token count or increase SYNC_REQ_SIZE.")
-        # Set request flag (signals server)
-        struct.pack_into("<i", self.buf, OFF_SYNC_REQ_FLAG, 1)
+        self._req_flag.value = 1
 
     def sync_wait_response(self, spin_iters: int = 10000) -> dict:
         """Spin-wait for sync response (client side)."""
-        resp_addr = self._sync_resp_flag_addr
+        resp_flag = self._resp_flag
         for _ in range(spin_iters):
-            if struct.unpack_from("<i", self.buf, OFF_SYNC_RESP_FLAG)[0] != 0:
+            if resp_flag.value != 0:
                 break
         else:
-            while struct.unpack_from("<i", self.buf, OFF_SYNC_RESP_FLAG)[0] == 0:
+            resp_addr = self._sync_resp_flag_addr
+            while resp_flag.value == 0:
                 futex_wait(resp_addr, 0)
 
         resp = unpack_response(self.buf, SYNC_RESP_OFFSET)
         # Only clear resp flag; server already cleared req flag after reading
-        struct.pack_into("<i", self.buf, OFF_SYNC_RESP_FLAG, 0)
+        resp_flag.value = 0
         return resp
 
     def sync_request(self, msg_type: int, dp_client_id: int,
@@ -676,17 +713,17 @@ class ShmChannel:
 
     def check_sync_request(self) -> Optional[dict]:
         """Non-blocking check for pending sync request (server side)."""
-        if struct.unpack_from("<i", self.buf, OFF_SYNC_REQ_FLAG)[0] == 0:
+        if self._req_flag.value == 0:
             return None
         req = unpack_request(self.buf, SYNC_REQ_OFFSET)
         # Clear request flag so we don't re-process on next loop iteration
-        struct.pack_into("<i", self.buf, OFF_SYNC_REQ_FLAG, 0)
+        self._req_flag.value = 0
         return req
 
     def send_sync_response(self, **kwargs) -> None:
         """Write response and signal client (server side)."""
         pack_response(self.buf, SYNC_RESP_OFFSET, **kwargs)
-        struct.pack_into("<i", self.buf, OFF_SYNC_RESP_FLAG, 1)
+        self._resp_flag.value = 1
         futex_wake(self._sync_resp_flag_addr)
 
     # ── Lifecycle ───────────────────────────────────────────────────────
