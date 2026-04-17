@@ -3,7 +3,7 @@ import json
 import os
 import torch
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
@@ -130,6 +130,7 @@ class FlexKVConfig:
         is_nsa_cp: bool = False,
         cp_size: int = 1,
         cp_rank: int = 0,
+        kv_cache_dtype: Optional[str] = None,
     ):
         """
         Initialize FlexKVConfig fields from sglang config.
@@ -210,10 +211,17 @@ class FlexKVConfig:
                 f"[FlexKV] Using kv_cache_dtype from user_config: "
                 f"'{user_dtype_str}' -> {self.model_config.dtype}"
             )
+        elif kv_cache_dtype is not None and kv_cache_dtype != "auto":
+            # Use the kv_cache_dtype from sglang server_args (e.g. "fp8_e4m3")
+            self.model_config.dtype = _parse_dtype_str(kv_cache_dtype)
+            logger.info(
+                f"[FlexKV] Using kv_cache_dtype from sglang server_args: "
+                f"'{kv_cache_dtype}' -> {self.model_config.dtype}"
+            )
         else:
             self.model_config.dtype = getattr(sglang_config, "dtype", torch.bfloat16)
             logger.warning(
-                f"[FlexKV] No kv_cache_dtype in user_config, falling back to sglang "
+                f"[FlexKV] No kv_cache_dtype in user_config or server_args, falling back to sglang "
                 f"model dtype: {self.model_config.dtype}. If your KV cache uses a "
                 f"different dtype (e.g. fp8), add 'kv_cache_dtype: fp8' to your "
                 f"flexkv_config.yaml or set FLEXKV_KV_CACHE_DTYPE=fp8 environment variable."

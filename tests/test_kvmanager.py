@@ -491,9 +491,19 @@ class GPUIndexerCacheVerifier:
             token_hash += int(token_id) * (i + 17)
         return torch.tensor(((layer_id + 1) * 29 + token_hash) % 251 + 1, dtype=self.dtype).item()
 
-    def fill_gpu_blocks(self, token_ids, block_ids):
-        assert len(token_ids) == len(block_ids) * self.tokens_per_block
+    def fill_gpu_blocks(self, block_ids, main_kv_tokens_per_block, token_ids):
+        """Fill indexer GPU blocks with deterministic hash values.
 
+        Indexer uses tokens_per_block=1 on CPU/SSD side.  Each indexer block
+        corresponds to one main-KV block (1:1 page mapping).  We hash the
+        *entire page* of token_ids from the main KV request to produce a
+        single deterministic value per (layer, block).
+
+        Args:
+            block_ids: block IDs to fill (same as main KV block_ids).
+            main_kv_tokens_per_block: tokens_per_block of main KV (e.g. 16).
+            token_ids: full token_ids tensor from the request.
+        """
         if not isinstance(token_ids, torch.Tensor):
             token_ids = torch.tensor(token_ids, dtype=torch.int64)
         if not isinstance(block_ids, torch.Tensor):
@@ -503,12 +513,13 @@ class GPUIndexerCacheVerifier:
             for layer_id in range(self.num_layers):
                 gpu_tensor = self.gpu_blocks[tp_id][layer_id]
                 for block_idx, block_id in enumerate(block_ids):
-                    start_token_idx = block_idx * self.tokens_per_block
-                    end_token_idx = start_token_idx + self.tokens_per_block
+                    start_token_idx = block_idx * main_kv_tokens_per_block
+                    end_token_idx = start_token_idx + main_kv_tokens_per_block
                     hash_value = self.hash_all_values(
                         layer_id,
                         token_ids[start_token_idx:end_token_idx],
                     )
+                    # gpu_tensor shape: (num_blocks, tokens_per_block=1, head_size)
                     gpu_tensor[block_id, :, :] = hash_value
 
     def clear_gpu_blocks(self, block_ids):
@@ -519,9 +530,14 @@ class GPUIndexerCacheVerifier:
             for layer_id in range(self.num_layers):
                 self.gpu_blocks[tp_id][layer_id][block_ids, :, :] = 0
 
-    def verify_gpu_blocks(self, token_ids, block_ids) -> bool:
-        assert len(token_ids) == len(block_ids) * self.tokens_per_block
+    def verify_gpu_blocks(self, block_ids, main_kv_tokens_per_block, token_ids) -> bool:
+        """Verify indexer GPU blocks after round-trip transfer.
 
+        Args:
+            block_ids: block IDs to verify.
+            main_kv_tokens_per_block: tokens_per_block of main KV.
+            token_ids: full token_ids tensor from the request.
+        """
         if not isinstance(token_ids, torch.Tensor):
             token_ids = torch.tensor(token_ids, dtype=torch.int64)
         if not isinstance(block_ids, torch.Tensor):
@@ -534,8 +550,8 @@ class GPUIndexerCacheVerifier:
             for layer_id in range(self.num_layers):
                 gpu_tensor = self.gpu_blocks[tp_id][layer_id]
                 for block_idx, block_id in enumerate(block_ids):
-                    start_token_idx = block_idx * self.tokens_per_block
-                    end_token_idx = start_token_idx + self.tokens_per_block
+                    start_token_idx = block_idx * main_kv_tokens_per_block
+                    end_token_idx = start_token_idx + main_kv_tokens_per_block
                     expected_hash_value = self.hash_all_values(
                         layer_id,
                         token_ids[start_token_idx:end_token_idx],
@@ -598,11 +614,12 @@ def run_tp_client_with_indexer(dp_client_id,
             raise ValueError(f"Invalid GPU layout type for indexer test: {gpu_layout_type}")
 
         # Derive indexer params from cache_config.indexer (IndexerCacheConfig).
-        # Shared fields (num_layers, tokens_per_block) come from main model_config / cache_config.
+        # Indexer uses tokens_per_block=1 (one indexer entry per page/block),
+        # matching the CPU/SSD layout in StorageEngine.
         indexer_cfg = cache_config.indexer
         assert indexer_cfg is not None, "cache_config.indexer must be set for indexer shadow transfer tests"
-        indexer_tokens_per_block = cache_config.tokens_per_block  # shared with main KV
-        indexer_num_layers = model_config.num_layers               # shared with main KV
+        indexer_tokens_per_block = 1  # indexer: 1 entry per page (not main KV tokens_per_block)
+        indexer_num_layers = model_config.num_layers
 
         # Create indexer GPU blocks (MLA-style: 3D tensors)
         indexer_blocks = []
@@ -661,21 +678,12 @@ def run_tp_client_with_indexer(dp_client_id,
             child_conn.close()
 
 
-@pytest.mark.parametrize(
-    "model_config",
-    [
-        {"tp_size": 1, "dp_size": 1},
-    ],    indirect=True,
-)
-@pytest.mark.parametrize("cache_config", [
-    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
-], indirect=True)
-@pytest.mark.parametrize("test_config", [
-    {'num_gpu_blocks': 256, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
-], indirect=True)
-@pytest.mark.parametrize("gpu_layout_type", [0])
-def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_layout_type):
-    """Test KVManager shadow transfer mode with attached indexer buffers."""
+def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, test_label="indexer", layerwise=False):
+    """Core test logic for KVManager with indexer shadow transfer.
+
+    Shared by test_kvmanager_with_indexer (non-layerwise) and
+    test_kvmanager_with_indexer_layerwise (layerwise mode).
+    """
     tp_size = model_config.tp_size
     tokens_per_block = cache_config.tokens_per_block
     num_gpu_blocks = test_config["num_gpu_blocks"]
@@ -685,9 +693,6 @@ def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_lay
 
     skip_if_insufficient_gpus(tp_size)
 
-    # Set indexer config inside cache_config.indexer (IndexerCacheConfig).
-    # Only indexer-unique fields are stored here; shared fields (num_layers,
-    # tokens_per_block, num_cpu_blocks) are read from model_config / cache_config.
     from flexkv.common.config import IndexerCacheConfig
     cache_config.indexer = IndexerCacheConfig(
         head_size=64,
@@ -759,7 +764,7 @@ def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_lay
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=model_config.num_layers,
             num_block=num_gpu_blocks,
-            tokens_per_block=cache_config.tokens_per_block,
+            tokens_per_block=1,  # indexer: 1 entry per page
             num_head=indexer_cfg.num_kv_heads,
             head_size=indexer_cfg.head_size,
             is_mla=True,
@@ -773,19 +778,19 @@ def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_lay
 
     while not kvmanager.is_ready():
         time.sleep(1)
-        flexkv_logger.info("waiting for flexkv (with indexer shadow transfer) to be ready")
-    print("[Test] KVManager (with indexer shadow transfer) is ready")
+        flexkv_logger.info(f"waiting for flexkv ({test_label}) to be ready")
+    print(f"[Test] KVManager ({test_label}) is ready")
 
     request_pairs = [generate_request_pair(i, block_per_request, num_gpu_blocks, tokens_per_block, 1)
                      for i in range(num_requests)]
     initial_write_num = int(num_requests * initial_write_ratio)
 
-    print("[Test] Testing put flow with indexer shadow transfer...")
+    print(f"[Test] Testing put flow ({test_label})...")
     for token_ids, block_ids, dp_id in request_pairs[:initial_write_num]:
         if gpu_kv_verifier is not None:
             gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
         if indexer_kv_verifier is not None:
-            indexer_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
+            indexer_kv_verifier.fill_gpu_blocks(block_ids, tokens_per_block, token_ids)
         write_request = kvmanager.put_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
@@ -798,14 +803,17 @@ def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_lay
             gpu_kv_verifier.clear_gpu_blocks(block_ids)
         if indexer_kv_verifier is not None:
             indexer_kv_verifier.clear_gpu_blocks(block_ids)
-    print(f"[Test] Initial {initial_write_num} put operations completed with indexer shadow transfer")
+    print(f"[Test] Initial {initial_write_num} put operations completed ({test_label})")
 
-    print("[Test] Testing get flow with indexer shadow transfer...")
+    print(f"[Test] Testing get flow ({test_label})...")
     total_cache_hit = 0
     total_cache_miss = 0
     running_get_requests = []
     req_id2block_ids = {}
     req_id2token_ids = {}
+
+    batch_task_ids = []
+    batch_slot_mappings = []
 
     for i in range(min(initial_write_num, num_requests)):
         token_ids, block_ids, dp_id = request_pairs[i]
@@ -816,38 +824,76 @@ def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_lay
             token_mask=None,
             dp_id=dp_id,
         )
-        kvmanager.launch(request_id, slot_mapping)
-        running_get_requests.append(request_id)
+        batch_task_ids.append(request_id)
+        batch_slot_mappings.append(slot_mapping)
         req_id2block_ids[request_id] = block_ids
         req_id2token_ids[request_id] = token_ids
 
-    if running_get_requests:
-        return_results = kvmanager.wait(running_get_requests, completely=True)
-        for req_id, kvresponse in return_results.items():
-            assert kvresponse.status == KVResponseStatus.SUCCESS
-            total_cache_hit += kvresponse.return_mask.sum().item()
-            total_cache_miss += len(kvresponse.return_mask) - kvresponse.return_mask.sum().item()
+    if layerwise:
+        # Layerwise mode: launch all GETs as a single batch so that
+        # merge_to_batch_graph produces a LAYERWISE op (fused DISK2H+H2D).
+        returned_ids = kvmanager.launch(
+            task_ids=batch_task_ids,
+            slot_mappings=batch_slot_mappings,
+            as_batch=True,
+            layerwise_transfer=True,
+        )
+        batch_id = returned_ids[0]
+        batch_results = kvmanager.wait(batch_id, completely=True)
+        kvresponse = batch_results[batch_id]
+        assert kvresponse.status == KVResponseStatus.SUCCESS, \
+            f"Layerwise batch GET failed: {kvresponse.status}"
+        for idx, orig_req_id in enumerate(batch_task_ids):
+            mask = kvresponse.return_mask[idx]
+            total_cache_hit += mask.sum().item()
+            total_cache_miss += len(mask) - mask.sum().item()
             if gpu_kv_verifier is not None:
-                valid_fetched_tokens = kvresponse.return_mask.sum().item() // tokens_per_block * tokens_per_block
+                valid_fetched_tokens = mask.sum().item() // tokens_per_block * tokens_per_block
                 if valid_fetched_tokens > 0:
                     assert gpu_kv_verifier.verify_kv_blocks(
-                        req_id2token_ids[req_id][:valid_fetched_tokens],
-                        req_id2block_ids[req_id][:valid_fetched_tokens // tokens_per_block])
+                        req_id2token_ids[orig_req_id][:valid_fetched_tokens],
+                        req_id2block_ids[orig_req_id][:valid_fetched_tokens // tokens_per_block])
             if indexer_kv_verifier is not None:
-                valid_fetched_blocks = kvresponse.return_mask.sum().item() // tokens_per_block
+                valid_fetched_blocks = mask.sum().item() // tokens_per_block
                 if valid_fetched_blocks > 0:
                     assert indexer_kv_verifier.verify_gpu_blocks(
-                        req_id2token_ids[req_id][:valid_fetched_blocks * tokens_per_block],
-                        req_id2block_ids[req_id][:valid_fetched_blocks])
-    print(f"[Test] Get flow completed: hit={total_cache_hit}, miss={total_cache_miss}")
+                        req_id2block_ids[orig_req_id][:valid_fetched_blocks],
+                        tokens_per_block,
+                        req_id2token_ids[orig_req_id][:valid_fetched_blocks * tokens_per_block])
+    else:
+        # Non-layerwise: launch each GET individually
+        for req_id in batch_task_ids:
+            kvmanager.launch(req_id, batch_slot_mappings[batch_task_ids.index(req_id)])
+            running_get_requests.append(req_id)
 
-    print("[Test] Testing try_wait flow with indexer shadow transfer...")
+        if running_get_requests:
+            return_results = kvmanager.wait(running_get_requests, completely=True)
+            for req_id, kvresponse in return_results.items():
+                assert kvresponse.status == KVResponseStatus.SUCCESS
+                total_cache_hit += kvresponse.return_mask.sum().item()
+                total_cache_miss += len(kvresponse.return_mask) - kvresponse.return_mask.sum().item()
+                if gpu_kv_verifier is not None:
+                    valid_fetched_tokens = kvresponse.return_mask.sum().item() // tokens_per_block * tokens_per_block
+                    if valid_fetched_tokens > 0:
+                        assert gpu_kv_verifier.verify_kv_blocks(
+                            req_id2token_ids[req_id][:valid_fetched_tokens],
+                            req_id2block_ids[req_id][:valid_fetched_tokens // tokens_per_block])
+                if indexer_kv_verifier is not None:
+                    valid_fetched_blocks = kvresponse.return_mask.sum().item() // tokens_per_block
+                    if valid_fetched_blocks > 0:
+                        assert indexer_kv_verifier.verify_gpu_blocks(
+                            req_id2block_ids[req_id][:valid_fetched_blocks],
+                            tokens_per_block,
+                            req_id2token_ids[req_id][:valid_fetched_blocks * tokens_per_block])
+    print(f"[Test] Get flow completed ({test_label}): hit={total_cache_hit}, miss={total_cache_miss}")
+
+    print(f"[Test] Testing try_wait flow ({test_label})...")
     if initial_write_num < num_requests:
         token_ids, block_ids, dp_id = request_pairs[initial_write_num]
         if gpu_kv_verifier is not None:
             gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
         if indexer_kv_verifier is not None:
-            indexer_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
+            indexer_kv_verifier.fill_gpu_blocks(block_ids, tokens_per_block, token_ids)
         write_request = kvmanager.put_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
@@ -866,13 +912,209 @@ def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_lay
             gpu_kv_verifier.clear_gpu_blocks(block_ids)
         if indexer_kv_verifier is not None:
             indexer_kv_verifier.clear_gpu_blocks(block_ids)
-    print("[Test] try_wait flow completed")
+    print(f"[Test] try_wait flow completed ({test_label})")
 
-    print("[Test] Testing shutdown with indexer shadow transfer...")
-    if cache_config.enable_cpu and cache_config.num_cpu_blocks >= num_gpu_blocks:
+    # Cache miss assertion: when total capacity >= GPU blocks, expect 0 miss
+    enable_cpu = cache_config.enable_cpu
+    enable_ssd = cache_config.enable_ssd
+    num_cpu_blocks = cache_config.num_cpu_blocks
+    num_ssd_blocks = cache_config.num_ssd_blocks
+    if (enable_cpu and num_cpu_blocks >= num_gpu_blocks) or \
+       (enable_ssd and num_ssd_blocks >= num_gpu_blocks):
         assert total_cache_miss == 0, f"Expected 0 cache miss, got {total_cache_miss}"
 
     shutdown_tp_client(tp_client_processes)
     kvmanager.shutdown()
-    print("[Test] Shutdown completed successfully")
-    print("[Test] test_kvmanager_with_indexer PASSED")
+    print(f"[Test] {test_label} PASSED")
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1},
+    ],    indirect=True,
+)
+@pytest.mark.parametrize("cache_config", [
+    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
+    {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 256, 'num_ssd_blocks': 2048},
+], indirect=True)
+@pytest.mark.parametrize("test_config", [
+    {'num_gpu_blocks': 256, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
+], indirect=True)
+@pytest.mark.parametrize("gpu_layout_type", [0])
+def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_layout_type):
+    """Test KVManager with indexer: GPU↔CPU (and optionally ↔SSD) data correctness."""
+    ssd_label = "+ssd" if cache_config.enable_ssd else ""
+    _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
+                      test_label=f"indexer{ssd_label}")
+
+
+import ctypes
+import socket
+import struct
+import threading
+
+# ---- Mock SGLang eventfd client for layerwise unit tests ----
+
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+
+def _sys_eventfd(initval: int = 0, flags: int = 0) -> int:
+    """Create an eventfd file descriptor via libc."""
+    fd = _libc.eventfd(ctypes.c_uint(initval), ctypes.c_int(flags))
+    if fd == -1:
+        err = ctypes.get_errno()
+        raise OSError(err, f"eventfd failed: {os.strerror(err)}")
+    return fd
+
+
+_EFD_SEMAPHORE = 0x1
+
+
+def _send_fds_via_scm(sock: socket.socket, fds: list, extra_data: bytes = b"x"):
+    """Send fds via SCM_RIGHTS (mirrors SGLang's send_fds)."""
+    fds_packed = struct.pack(f"{len(fds)}i", *fds)
+    ancdata = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds_packed)]
+    sock.sendmsg([extra_data], ancdata)
+
+
+def _mock_sglang_eventfd_client(socket_path: str,
+                                tp_rank: int,
+                                tp_size: int,
+                                num_layers: int,
+                                num_counters: int = 3,
+                                max_retries: int = 120,
+                                retry_interval: float = 0.5):
+    """Simulate SGLang sending eventfds to the LayerwiseTransferWorker.
+
+    Runs in a background thread.  Creates real eventfds so the C++
+    LayerwiseTransferGroup receives valid file descriptors.  The eventfds
+    are never read by anyone in the test, but that is fine: the C++
+    ``enable_eventfd_`` flag will be ``true`` and ``eventfd_write`` will
+    simply increment the counter without blocking.
+    """
+    created_fds = []
+    try:
+        # Create real eventfds
+        for _ in range(num_counters * num_layers):
+            created_fds.append(_sys_eventfd(0, _EFD_SEMAPHORE))
+
+        # Retry connecting until the worker process binds the socket
+        sock = None
+        for attempt in range(max_retries):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(socket_path)
+                print(f"[MockEventfdClient] Connected to {socket_path} "
+                      f"(attempt {attempt + 1})")
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                sock.close()
+                sock = None
+                time.sleep(retry_interval)
+
+        if sock is None:
+            print(f"[MockEventfdClient] FAILED to connect to {socket_path} "
+                  f"after {max_retries} attempts")
+            return
+
+        # Send 24-byte metadata: tp_rank, tp_size, cp_rank, cp_size,
+        #                         num_layers, num_counters
+        metadata = struct.pack("iiiiii",
+                               tp_rank, tp_size,
+                               0, 1,  # cp_rank=0, cp_size=1
+                               num_layers, num_counters)
+        sock.sendall(metadata)
+
+        # Send eventfds for each counter via SCM_RIGHTS
+        fd_idx = 0
+        for counter_id in range(num_counters):
+            fds = created_fds[fd_idx:fd_idx + num_layers]
+            fd_idx += num_layers
+            _send_fds_via_scm(sock, fds, struct.pack("i", counter_id))
+
+        # Wait for ACK
+        sock.settimeout(30.0)
+        ack = sock.recv(1)
+        if ack and ack[0] == 1:
+            print(f"[MockEventfdClient] Eventfd handshake OK "
+                  f"(counters={num_counters}, layers={num_layers})")
+        else:
+            print(f"[MockEventfdClient] Unexpected ACK: {ack!r}")
+        sock.close()
+    except Exception as e:
+        print(f"[MockEventfdClient] Error: {e}")
+        traceback.print_exc()
+    # Note: we intentionally do NOT close the eventfds here.
+    # They must remain valid for the lifetime of the LayerwiseTransferGroup
+    # in the worker subprocess.  They will be cleaned up when the worker
+    # process exits and the OS reclaims the file descriptors.
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1},
+    ],    indirect=True,
+)
+@pytest.mark.parametrize("cache_config", [
+    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
+    {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 256, 'num_ssd_blocks': 2048},
+], indirect=True)
+@pytest.mark.parametrize("test_config", [
+    {'num_gpu_blocks': 256, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
+], indirect=True)
+@pytest.mark.parametrize("gpu_layout_type", [0])
+def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_config, gpu_layout_type):
+    """Test KVManager with indexer in LAYERWISE mode.
+
+    Validates the full round-trip:
+      PUT: D2H + H2DISK (non-layerwise, same as normal)
+      GET: LAYERWISE (fused DISK2H + H2D)
+    Data correctness is verified for both the main KV cache and the
+    indexer (DSA) KV cache after the round-trip.
+
+    A background thread simulates the SGLang eventfd client so the
+    LayerwiseTransferWorker can complete its initialization handshake
+    without any source-code changes.
+    """
+    from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+
+    # Save original values
+    orig_layerwise_env = os.environ.get('FLEXKV_ENABLE_LAYERWISE_TRANSFER')
+    orig_layerwise_flag = GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
+
+    # Determine the socket path that the worker will listen on.
+    # For tp_size=1, pp_size=1, dp_size=1, there is no suffix.
+    socket_path = os.environ.get('FLEXKV_LAYERWISE_EVENTFD_SOCKET',
+                                 '/tmp/flexkv_layerwise_eventfd.sock')
+
+    try:
+        # Enable layerwise transfer
+        os.environ['FLEXKV_ENABLE_LAYERWISE_TRANSFER'] = '1'
+        GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = True
+
+        # Start mock SGLang eventfd client thread BEFORE kvmanager.start()
+        # so it is ready to connect once the worker process binds the socket.
+        eventfd_thread = threading.Thread(
+            target=_mock_sglang_eventfd_client,
+            args=(socket_path, 0, 1, model_config.num_layers),
+            daemon=True,
+        )
+        eventfd_thread.start()
+
+        ssd_label = "+ssd" if cache_config.enable_ssd else ""
+        _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
+                          test_label=f"layerwise+indexer{ssd_label}", layerwise=True)
+
+        eventfd_thread.join(timeout=10)
+    finally:
+        # Restore original environment and config
+        if orig_layerwise_env is None:
+            os.environ.pop('FLEXKV_ENABLE_LAYERWISE_TRANSFER', None)
+        else:
+            os.environ['FLEXKV_ENABLE_LAYERWISE_TRANSFER'] = orig_layerwise_env
+        GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = orig_layerwise_flag
+
+
+
