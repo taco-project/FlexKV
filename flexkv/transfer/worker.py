@@ -786,7 +786,13 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             raise ValueError(f"num_remote_blocks_per_file {self.num_remote_blocks_per_file} "
                              f"is not divisible by round_robin {self.round_robin}")
 
-        self.block_size = cpu_kv_layout.get_chunk_size()
+        # For multi-group layouts, get_chunk_size() is not valid.
+        # CPURemoteTransferWorker uses LAYERFIRST which is single-group only,
+        # but guard for safety.
+        if cpu_kv_layout.layer_groups is not None:
+            self.block_size = cpu_kv_layout.get_block_stride()
+        else:
+            self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
 
         self.is_mla = cpu_kv_layout.is_mla
@@ -1379,7 +1385,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.num_layers = cpu_kv_layout.num_layer
         self.num_cpu_blocks = cpu_kv_layout.num_block
-        self.block_size = cpu_kv_layout.get_chunk_size()
+        # For multi-group layouts (e.g. gemma4), get_chunk_size() is invalid;
+        # use get_block_stride() which works for both single and multi-group BLOCKFIRST.
+        if cpu_kv_layout.layer_groups is not None:
+            self.block_size = cpu_kv_layout.get_block_stride()
+        else:
+            self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
         self.cpu_kv_layout = cpu_kv_layout
         self.remote_kv_layout = remote_kv_layout
@@ -1406,9 +1417,19 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.cache_config.redis_port,
                 self.cache_config.redis_password,
                 self.cache_config.local_ip,
-                node_ttl_seconds=self.cache_config.node_ttl_seconds,
+                node_ttl_seconds=getattr(self.cache_config, 'node_ttl_seconds', 0),
             )
             self.redis_meta_client.set_node_id(self.cache_config.distributed_node_id)
+
+            # Connect nodeinfo so the listener/heartbeat threads start and
+            # current_node_id_set is populated — required for is_node_active()
+            # checks during P2P transfers.
+            if not self.redis_meta_client.nodeinfo.connect():
+                flexkv_logger.warning(
+                    "PEER2CPUTransferWorker: failed to connect RedisNodeInfo listener"
+                )
+            else:
+                self.redis_meta_client.nodeinfo.scan_active_nodes()
 
             # Persistent NodeMetaInfo Pool for skip redis operation when getting
             # NodeMetaInfo according to node_id
@@ -1604,6 +1625,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         )
         return transfer_finished
 
+    # Timeout for a single RDMA batch transfer (seconds).
+    # Prevents indefinite blocking when a remote node becomes unreachable
+    # but its node:<id> TTL hasn't expired yet.
+    RDMA_TRANSFER_TIMEOUT_SECONDS = 30
+
     def _batch_transfer_impl(self,
         task_info: RDMATaskInfo,
         transfer_type: TransferType,
@@ -1611,9 +1637,20 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         layer_granularity: int,
         **kwargs,):
         if transfer_type == TransferType.PEERH2H:
-            ret = self.mooncake_transfer_engine.batch_transfer_sync_read(
-                task_info.peer_engine_addr, task_info.src_ptrs, task_info.dst_ptrs, task_info.data_lens
-            )
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    self.mooncake_transfer_engine.batch_transfer_sync_read,
+                    task_info.peer_engine_addr, task_info.src_ptrs, task_info.dst_ptrs, task_info.data_lens
+                )
+                try:
+                    ret = future.result(timeout=self.RDMA_TRANSFER_TIMEOUT_SECONDS)
+                except concurrent.futures.TimeoutError:
+                    flexkv_logger.error(
+                        f"RDMA batch transfer to {task_info.peer_engine_addr} timed out "
+                        f"after {self.RDMA_TRANSFER_TIMEOUT_SECONDS}s"
+                    )
+                    return False
             if ret != 0:
                 flexkv_logger.error(f"RDMA transfer failed with error code: {ret}")
                 return False
@@ -2064,7 +2101,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             # step1: get the remote meta info
             src_meta = self.get_node_meta(node_id)
             if src_meta is None:
-                return [] # NOTE: if we miss part of meta data, then we should abort this request
+                # Skip this node's blocks instead of aborting all nodes.
+                # In multi-node P2P, one dead node should not prevent fetching
+                # blocks from other healthy nodes.
+                flexkv_logger.warning(
+                    f"[PEER2CPUTransferWorker] Skipping node {node_id}: "
+                    f"meta unavailable, will skip {len(segments)} segment(s)"
+                )
+                continue
             peer_engine_addr = src_meta.engine_addr
             src_ptr_list = []
             dst_ptr_list = []
