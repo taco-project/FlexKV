@@ -17,6 +17,7 @@ import ctypes
 import ctypes.util
 import mmap
 import os
+import platform
 import struct
 import numpy as np
 from enum import IntEnum
@@ -28,7 +29,16 @@ from flexkv.common.request import KVResponseStatus, KVResponse
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
-_SYS_FUTEX = 202  # x86_64
+_FUTEX_SYSCALL_NR = {
+    "x86_64": 202,
+    "aarch64": 98,
+}
+_machine = platform.machine()
+if _machine not in _FUTEX_SYSCALL_NR:
+    raise RuntimeError(
+        f"SHM IPC requires futex support — unsupported architecture: {_machine}. "
+        f"Supported: {list(_FUTEX_SYSCALL_NR)}")
+_SYS_FUTEX = _FUTEX_SYSCALL_NR[_machine]
 _FUTEX_WAIT = 0
 _FUTEX_WAKE = 1
 
@@ -380,21 +390,13 @@ def unpack_request(buf, offset: int) -> dict:
             buf, dtype=np.int64, count=n_task_ids, offset=pos).tolist()
         pos += n_task_ids * 8
     else:
-        result["task_ids"] = None
+        result["task_ids"] = []
 
-    # slot_mappings
-    if n_task_ids > 0 and (flags & FLAG_HAS_SLOT_MAPPING) and result["token_ids"] is None:
-        # slot_mappings for launch_tasks (when there are no token_ids)
-        slot_maps = []
-        for _ in range(n_task_ids):
-            slot_map_len = _I32.unpack_from(buf, pos)[0]
-            pos += 4
-            slot_maps.append(np.frombuffer(
-                buf, dtype=np.int64, count=slot_map_len, offset=pos).copy())
-            pos += slot_map_len * 8
-        result["slot_mappings"] = slot_maps
-    elif n_task_ids > 0 and msg_type == ShmMsgType.LAUNCH_TASKS:
-        # launch_tasks always has slot_mappings
+    # slot_mappings (for launch_tasks, or any msg with FLAG_HAS_SLOT_MAPPING and no token_ids)
+    has_slot_mappings = (n_task_ids > 0 and
+                         (msg_type == ShmMsgType.LAUNCH_TASKS or
+                          ((flags & FLAG_HAS_SLOT_MAPPING) and result["token_ids"] is None)))
+    if has_slot_mappings:
         slot_maps = []
         for _ in range(n_task_ids):
             slot_map_len = _I32.unpack_from(buf, pos)[0]
@@ -412,8 +414,7 @@ def unpack_request(buf, offset: int) -> dict:
         for _ in range(n_namespace):
             ns_len = _I32.unpack_from(buf, pos)[0]
             pos += 4
-            ns_list.append(buf[pos:pos + ns_len].decode("utf-8") if isinstance(buf[pos:pos + ns_len], bytes)
-                           else bytes(buf[pos:pos + ns_len]).decode("utf-8"))
+            ns_list.append(bytes(buf[pos:pos + ns_len]).decode("utf-8"))
             pos += ns_len
         result["namespace"] = ns_list
     else:
@@ -522,7 +523,7 @@ def unpack_response(buf, offset: int) -> dict:
         "task_id": task_id,
         "is_ready": bool(is_ready),
         "mask": None,
-        "kv_responses": None,
+        "kv_responses": {},
         "error_msg": None,
     }
 
@@ -567,8 +568,7 @@ def unpack_response(buf, offset: int) -> dict:
 
     # Unpack error message
     if error_len > 0:
-        raw = buf[pos:pos + error_len]
-        result["error_msg"] = raw.decode("utf-8") if isinstance(raw, bytes) else bytes(raw).decode("utf-8")
+        result["error_msg"] = bytes(buf[pos:pos + error_len]).decode("utf-8")
         pos += error_len
 
     return result

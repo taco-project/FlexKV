@@ -34,6 +34,9 @@ from flexkv.server.request import (
     Response
 )
 
+_TASK_ID_RANGE_PER_CLIENT = 10_000_000
+
+
 class KVDPClient:
     def __init__(
         self,
@@ -53,7 +56,7 @@ class KVDPClient:
         self.dp_client_id = dp_client_id
         self.model_config = model_config
 
-        self._task_id_range = (self.dp_client_id * 10000000, (self.dp_client_id + 1) * 10000000)
+        self._task_id_range = (self.dp_client_id * _TASK_ID_RANGE_PER_CLIENT, (self.dp_client_id + 1) * _TASK_ID_RANGE_PER_CLIENT)
         self._task_id_counter = self._task_id_range[0]
         self._task_id_lock = Lock()
         flexkv_logger.info(f"KVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
@@ -99,7 +102,7 @@ class KVDPClient:
         req = PutRequest(self.dp_client_id,
                          token_ids,
                          slot_mapping,
-                         token_mask if token_mask is not None else None,
+                         token_mask,
                          self._get_task_id(),
                          namespace)
         self.send_to_server.send_pyobj(req)
@@ -113,7 +116,7 @@ class KVDPClient:
     ) -> Optional[Tuple[int, np.ndarray]]:
         req = PutMatchRequest(self.dp_client_id,
                               token_ids,
-                              token_mask if token_mask is not None else None,
+                              token_mask,
                               self._get_task_id(),
                               namespace)
         self.send_to_server.send_pyobj(req)
@@ -144,7 +147,7 @@ class KVDPClient:
         req = GetRequest(self.dp_client_id,
                          token_ids,
                          slot_mapping,
-                         token_mask if token_mask is not None else None,
+                         token_mask,
                          self._get_task_id(),
                          layer_granularity,
                          namespace)
@@ -160,7 +163,7 @@ class KVDPClient:
     ) -> Optional[Tuple[int, np.ndarray]]:
         req = GetMatchRequest(self.dp_client_id,
                               token_ids,
-                              token_mask if token_mask is not None else None,
+                              token_mask,
                               layer_granularity,
                               self._get_task_id(),
                               namespace)
@@ -300,7 +303,7 @@ class ShmKVDPClient:
         self.ctrl = None
         self.ch = None
 
-        self._task_id_range = (self.dp_client_id * 10000000, (self.dp_client_id + 1) * 10000000)
+        self._task_id_range = (self.dp_client_id * _TASK_ID_RANGE_PER_CLIENT, (self.dp_client_id + 1) * _TASK_ID_RANGE_PER_CLIENT)
         self._task_id_counter = self._task_id_range[0]
         self._task_id_lock = Lock()
         flexkv_logger.info(f"ShmKVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
@@ -486,37 +489,42 @@ class ShmKVDPClient:
         wait_timeout: float = 20.0,
         completely: bool = False,
     ) -> Optional[Dict[int, KVResponse]]:
+        if not wait_task_ids:
+            return {}
         resp = self._sync_request(
             self._ShmMsgType.WAIT,
             task_ids=wait_task_ids,
             wait_timeout=wait_timeout,
             completely=completely)
-        if resp["kv_responses"] is not None:
-            for k, v in resp["kv_responses"].items():
-                if v.status != KVResponseStatus.SUCCESS:
-                    flexkv_logger.error(f"wait task {k} failed: {v.status}")
-            return resp["kv_responses"]
-        else:
-            flexkv_logger.error(f"wait tasks: {wait_task_ids} in DP {self.dp_client_id} failed.")
+        if resp.get("status_code", 0) != 0:
+            flexkv_logger.error(f"wait tasks: {wait_task_ids} in DP {self.dp_client_id} failed: {resp.get('error_msg')}")
             return None
+        kv_responses = resp["kv_responses"]
+        for k, v in kv_responses.items():
+            if v.status != KVResponseStatus.SUCCESS:
+                flexkv_logger.error(f"wait task {k} failed: {v.status}")
+        return kv_responses
 
     def try_wait(
         self,
         try_wait_task_ids: List[int],
     ) -> Optional[Dict[int, KVResponse]]:
+        if not try_wait_task_ids:
+            return {}
         resp = self._sync_request(
             self._ShmMsgType.TRY_WAIT,
             task_ids=try_wait_task_ids)
-        if resp["kv_responses"] is not None:
-            for k, v in resp["kv_responses"].items():
-                if v.status != KVResponseStatus.SUCCESS:
-                    flexkv_logger.error(f"try_wait task {k} failed: {v.status}")
-            return resp["kv_responses"]
-        else:
-            flexkv_logger.error(f"try_wait tasks: {try_wait_task_ids} in DP {self.dp_client_id} failed.")
+        if resp.get("status_code", 0) != 0:
+            flexkv_logger.error(f"try_wait tasks: {try_wait_task_ids} in DP {self.dp_client_id} failed: {resp.get('error_msg')}")
             return None
+        kv_responses = resp["kv_responses"]
+        for k, v in kv_responses.items():
+            if v.status != KVResponseStatus.SUCCESS:
+                flexkv_logger.error(f"try_wait task {k} failed: {v.status}")
+        return kv_responses
 
     def shutdown(self) -> None:
+        flexkv_logger.info(f"ShmKVDPClient {self.dp_client_id} shutting down")
         self._sync_request(self._ShmMsgType.SHUTDOWN)
 
 

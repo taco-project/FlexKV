@@ -261,7 +261,7 @@ class KVServer:
     def _run_zmq(self) -> None:
         """ZMQ-based server loop (original implementation)."""
 
-        flexkv_logger.info("Servering waiting to be started")
+        flexkv_logger.info("Server waiting to be started")
         req = self.recv_from_client.recv_pyobj()
         if isinstance(req, StartRequest):
             flexkv_logger.info(f"Received start request from DP client {req.dp_client_id}, "
@@ -312,6 +312,16 @@ class KVServer:
         )
 
         server_id = self.server_recv_port
+
+        # Clean up stale SHM files from a previous crash before creating new ones.
+        # Without this, a client could open a leftover file and read garbage data.
+        safe_id = server_id.replace("/", "_").replace(":", "_").strip("_")
+        for stale in [f"/dev/shm/flexkv_shm_ctrl_{safe_id}"] + \
+                     [f"/dev/shm/flexkv_shm_ch_{safe_id}_{cid}" for cid in range(self.total_clients)]:
+            try:
+                os.unlink(stale)
+            except FileNotFoundError:
+                pass
 
         # Create control block and per-client channels
         ctrl = ShmControlBlock(server_id, create=True)
@@ -376,6 +386,7 @@ class KVServer:
         import pickle
 
         msg_type = req["msg_type"]
+        flexkv_logger.info(f"SHM: recv sync req: {ShmMsgType(msg_type).name} from client {client_id}")
 
         try:
             if msg_type == ShmMsgType.GET_MATCH:
@@ -418,7 +429,8 @@ class KVServer:
 
             elif msg_type == ShmMsgType.START:
                 flexkv_logger.info(f"SHM: Received start request from client {client_id}")
-                self.start_server()
+                if not self._is_ready:
+                    self.start_server()
                 ch.send_sync_response(status_code=0)
 
             elif msg_type == ShmMsgType.REGISTER:
@@ -446,6 +458,7 @@ class KVServer:
         from flexkv.server.shm_channel import ShmMsgType
 
         msg_type = req["msg_type"]
+        flexkv_logger.info(f"SHM: recv async req: {ShmMsgType(msg_type).name} from client {client_id}")
 
         try:
             if msg_type == ShmMsgType.PUT_ASYNC:

@@ -749,7 +749,8 @@ class FlexKVConnectorV1Impl:
         self.role = role
         flexkv_config = FlexKVConfig.from_env()
         flexkv_config.post_init_from_vllm_config(vllm_config)
-        dp_rank = vllm_config.parallel_config.data_parallel_rank
+        # Fix: vLLM 0.19 resets data_parallel_rank to 0 for non-MoE DP, use data_parallel_index instead
+        dp_rank = getattr(vllm_config.parallel_config, "data_parallel_index", vllm_config.parallel_config.data_parallel_rank)
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector = FlexKVSchedulerConnector(flexkv_config, dp_rank)
