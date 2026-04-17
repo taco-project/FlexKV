@@ -27,7 +27,14 @@ public:
       torch::Tensor &gpu_block_strides_tensor,
       torch::Tensor &gpu_layer_strides_tensor,
       torch::Tensor &gpu_chunk_sizes_tensor, int iouring_entries,
-      int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size);
+      int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size,
+      const std::vector<std::vector<torch::Tensor>> &indexer_gpu_blocks = {},
+      torch::Tensor indexer_cpu_blocks = torch::Tensor(),
+      torch::Tensor indexer_gpu_kv_strides_tensor = torch::Tensor(),
+      torch::Tensor indexer_gpu_block_strides_tensor = torch::Tensor(),
+      torch::Tensor indexer_gpu_layer_strides_tensor = torch::Tensor(),
+      torch::Tensor indexer_gpu_chunk_sizes_tensor = torch::Tensor(),
+      std::map<int, std::vector<std::string>> indexer_ssd_files = {});
 
   ~LayerwiseTransferGroup();
 
@@ -53,7 +60,19 @@ public:
       const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
       const bool use_ce_transfer, const int num_layers,
       const int layer_granularity, const bool is_mla,
-      const int counter_id = 0);  // Counter set index for triple buffering
+      const int counter_id = 0,
+      const torch::Tensor &indexer_gpu_block_id_tensor = torch::Tensor(),
+      const torch::Tensor &indexer_cpu_block_id_tensor = torch::Tensor(),
+      const int64_t indexer_cpu_block_stride_in_bytes = 0,
+      const int64_t indexer_cpu_layer_stride_in_bytes = 0,
+      const int64_t indexer_h2d_cpu_kv_stride_in_bytes = 0,
+      const int64_t indexer_h2d_cpu_layer_stride_in_bytes = 0,
+      const torch::Tensor &indexer_ssd_block_ids = torch::Tensor(),
+      const torch::Tensor &indexer_cpu_block_ids_d2h = torch::Tensor(),
+      const int64_t indexer_ssd_layer_stride_in_bytes = 0,
+      const int64_t indexer_ssd_kv_stride_in_bytes = 0,
+      const int64_t indexer_cpu_chunk_size_in_bytes = 0,
+      const int indexer_num_blocks_per_file = 0);
 
 private:
   int num_gpus_;
@@ -76,6 +95,22 @@ private:
   // SSD IO context
   bool enable_ssd_;
   std::unique_ptr<SSDIOCTX> ioctx_;
+
+  // Indexer fuse support
+  bool enable_indexer_ = false;
+  void **indexer_gpu_blocks_ = nullptr;
+  void *indexer_cpu_blocks_ = nullptr;
+  int indexer_num_tensors_per_gpu_ = 0;
+  int64_t *indexer_gpu_kv_strides_in_bytes_ = nullptr;
+  int64_t *indexer_gpu_block_strides_in_bytes_ = nullptr;
+  int64_t *indexer_gpu_layer_strides_in_bytes_ = nullptr;
+  int64_t *indexer_gpu_chunk_sizes_in_bytes_ = nullptr;
+  BackendType indexer_backend_type_ = BackendType::SGLANG;
+  std::vector<GTensorHandler> indexer_gpu_tensor_handlers_;
+
+  // Indexer SSD IO context
+  bool enable_indexer_ssd_ = false;
+  std::unique_ptr<SSDIOCTX> indexer_ioctx_;
 
   // Layer eventfds for notification
   // Shape: [tp_size, num_counters, num_layers]

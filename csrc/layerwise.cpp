@@ -66,7 +66,14 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     torch::Tensor &gpu_block_strides_tensor,
     torch::Tensor &gpu_layer_strides_tensor,
     torch::Tensor &gpu_chunk_sizes_tensor, int iouring_entries,
-    int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size) {
+    int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size,
+    const std::vector<std::vector<torch::Tensor>> &indexer_gpu_blocks,
+    torch::Tensor indexer_cpu_blocks,
+    torch::Tensor indexer_gpu_kv_strides_tensor,
+    torch::Tensor indexer_gpu_block_strides_tensor,
+    torch::Tensor indexer_gpu_layer_strides_tensor,
+    torch::Tensor indexer_gpu_chunk_sizes_tensor,
+    std::map<int, std::vector<std::string>> indexer_ssd_files) {
 
   num_gpus_ = num_gpus;
   num_layers_ = num_layers;
@@ -168,6 +175,77 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     ioctx_ = std::make_unique<SSDIOCTX>(ssd_files, ssd_files.size(),
                                         iouring_entries, iouring_flags);
   }
+
+  // Initialize indexer fuse support
+  enable_indexer_ = !indexer_gpu_blocks.empty();
+  if (enable_indexer_) {
+    indexer_num_tensors_per_gpu_ = indexer_gpu_blocks[0].size();
+    cudaMallocHost((void **)&indexer_gpu_blocks_,
+                   num_gpus_ * indexer_num_tensors_per_gpu_ * sizeof(void *));
+    for (int i = 0; i < num_gpus_; ++i) {
+      for (int j = 0; j < indexer_num_tensors_per_gpu_; ++j) {
+        indexer_gpu_blocks_[i * indexer_num_tensors_per_gpu_ + j] =
+            indexer_gpu_blocks[i][j].data_ptr();
+      }
+    }
+
+    indexer_cpu_blocks_ = indexer_cpu_blocks.data_ptr();
+
+    indexer_gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
+    indexer_gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
+    indexer_gpu_layer_strides_in_bytes_ = new int64_t[num_gpus];
+    indexer_gpu_chunk_sizes_in_bytes_ = new int64_t[num_gpus];
+
+    int64_t *idx_kv_strides_ptr = indexer_gpu_kv_strides_tensor.data_ptr<int64_t>();
+    int64_t *idx_block_strides_ptr = indexer_gpu_block_strides_tensor.data_ptr<int64_t>();
+    int64_t *idx_layer_strides_ptr = indexer_gpu_layer_strides_tensor.data_ptr<int64_t>();
+    int64_t *idx_chunk_sizes_ptr = indexer_gpu_chunk_sizes_tensor.data_ptr<int64_t>();
+
+    for (int i = 0; i < num_gpus; i++) {
+      indexer_gpu_kv_strides_in_bytes_[i] = idx_kv_strides_ptr[i];
+      indexer_gpu_block_strides_in_bytes_[i] = idx_block_strides_ptr[i];
+      indexer_gpu_layer_strides_in_bytes_[i] = idx_layer_strides_ptr[i];
+      indexer_gpu_chunk_sizes_in_bytes_[i] = idx_chunk_sizes_ptr[i];
+    }
+
+    // Determine indexer backend type from tensor count (symmetric with main KV)
+    if (indexer_num_tensors_per_gpu_ == 1) {
+      indexer_backend_type_ = BackendType::TRTLLM;
+    } else if (indexer_num_tensors_per_gpu_ == num_layers) {
+      indexer_backend_type_ = BackendType::VLLM;
+    } else if (indexer_num_tensors_per_gpu_ == num_layers * 2) {
+      indexer_backend_type_ = BackendType::SGLANG;
+    } else {
+      throw std::runtime_error("Unsupported indexer GPU block type: " +
+                               std::to_string(indexer_num_tensors_per_gpu_));
+    }
+
+    // Build GTensorHandlers for indexer (symmetric with main KV)
+    indexer_gpu_tensor_handlers_.reserve(num_gpus_);
+    for (int i = 0; i < num_gpus_; i++) {
+      int64_t **idx_gpu_blocks_ptr = reinterpret_cast<int64_t **>(
+          indexer_gpu_blocks_ + i * indexer_num_tensors_per_gpu_);
+      indexer_gpu_tensor_handlers_.emplace_back(
+          indexer_backend_type_, idx_gpu_blocks_ptr, num_layers,
+          indexer_gpu_kv_strides_in_bytes_[i],
+          indexer_gpu_block_strides_in_bytes_[i],
+          indexer_gpu_layer_strides_in_bytes_[i]);
+    }
+
+    fprintf(stderr, "[LayerwiseTransferGroup] Indexer fuse: enabled=true, "
+           "num_tensors_per_gpu=%d, chunk_size=%ld bytes, backend=%s\n",
+           indexer_num_tensors_per_gpu_, indexer_gpu_chunk_sizes_in_bytes_[0],
+           indexer_backend_type_ == BackendType::SGLANG ? "SGLANG" :
+           indexer_backend_type_ == BackendType::VLLM ? "VLLM" : "TRTLLM");
+  }
+
+  // Initialize indexer SSD IO context if indexer_ssd_files is not empty
+  enable_indexer_ssd_ = !indexer_ssd_files.empty();
+  if (enable_indexer_ssd_) {
+    indexer_ioctx_ = std::make_unique<SSDIOCTX>(
+        indexer_ssd_files, indexer_ssd_files.size(),
+        iouring_entries, iouring_flags);
+  }
 }
 
 LayerwiseTransferGroup::~LayerwiseTransferGroup() {
@@ -184,6 +262,16 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
   delete[] gpu_block_strides_in_bytes_;
   delete[] gpu_layer_strides_in_bytes_;
   delete[] gpu_chunk_sizes_in_bytes_;
+
+  // Clean up indexer resources
+  if (enable_indexer_) {
+    cudaFreeHost(indexer_gpu_blocks_);
+    indexer_gpu_tensor_handlers_.clear();
+    delete[] indexer_gpu_kv_strides_in_bytes_;
+    delete[] indexer_gpu_block_strides_in_bytes_;
+    delete[] indexer_gpu_layer_strides_in_bytes_;
+    delete[] indexer_gpu_chunk_sizes_in_bytes_;
+  }
 }
 
 void LayerwiseTransferGroup::layer_done_callback(int start_layer,
@@ -231,7 +319,19 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
     const bool use_ce_transfer, const int num_layers,
     const int layer_granularity, const bool is_mla,
-    const int counter_id) {
+    const int counter_id,
+    const torch::Tensor &indexer_gpu_block_id_tensor,
+    const torch::Tensor &indexer_cpu_block_id_tensor,
+    const int64_t indexer_cpu_block_stride_in_bytes,
+    const int64_t indexer_cpu_layer_stride_in_bytes,
+    const int64_t indexer_h2d_cpu_kv_stride_in_bytes,
+    const int64_t indexer_h2d_cpu_layer_stride_in_bytes,
+    const torch::Tensor &indexer_ssd_block_ids,
+    const torch::Tensor &indexer_cpu_block_ids_d2h,
+    const int64_t indexer_ssd_layer_stride_in_bytes,
+    const int64_t indexer_ssd_kv_stride_in_bytes,
+    const int64_t indexer_cpu_chunk_size_in_bytes,
+    const int indexer_num_blocks_per_file) {
 
   // Set current counter ID for eventfd notification
   current_counter_id_ = counter_id;
@@ -242,6 +342,21 @@ void LayerwiseTransferGroup::layerwise_transfer(
   int64_t *cpu_block_ids =
       static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
   void *cpu_ptr = cpu_blocks_;
+
+  // Indexer block ids (may be empty if indexer is not enabled or not provided)
+  bool do_indexer_transfer = enable_indexer_ &&
+      indexer_gpu_block_id_tensor.defined() &&
+      indexer_gpu_block_id_tensor.numel() > 0;
+  int num_indexer_blocks = 0;
+  int64_t *indexer_gpu_block_ids = nullptr;
+  int64_t *indexer_cpu_block_ids = nullptr;
+  if (do_indexer_transfer) {
+    num_indexer_blocks = indexer_gpu_block_id_tensor.numel();
+    indexer_gpu_block_ids =
+        static_cast<int64_t *>(indexer_gpu_block_id_tensor.data_ptr());
+    indexer_cpu_block_ids =
+        static_cast<int64_t *>(indexer_cpu_block_id_tensor.data_ptr());
+  }
 
   // Create CUDA events for timing each layer batch (on GPU 0)
   int num_batches = (num_layers + layer_granularity - 1) / layer_granularity;
@@ -269,9 +384,23 @@ void LayerwiseTransferGroup::layerwise_transfer(
     for (int g = 0; g < num_gpus_; ++g) {
       bytes_this_batch += gpu_chunk_sizes_in_bytes_[g] * 2 * ltb * num_blocks;
     }
-    double mb_this_batch = bytes_this_batch / (1024.0 * 1024.0);
-    char name[128];
-    snprintf(name, sizeof(name), "CPU->GPU Layer[%d,%d) %.2fMB", sl, sl + ltb, mb_this_batch);
+    // Add indexer bytes if applicable
+    int64_t indexer_bytes_this_batch = 0;
+    if (do_indexer_transfer) {
+      for (int g = 0; g < num_gpus_; ++g) {
+        indexer_bytes_this_batch += indexer_gpu_chunk_sizes_in_bytes_[g] * ltb * num_indexer_blocks;
+      }
+    }
+    double mb_this_batch = (bytes_this_batch + indexer_bytes_this_batch) / (1024.0 * 1024.0);
+    char name[256];
+    if (do_indexer_transfer) {
+      snprintf(name, sizeof(name), "CPU->GPU Layer[%d,%d) KV:%.2fMB+Idx:%.2fMB",
+               sl, sl + ltb, bytes_this_batch / (1024.0 * 1024.0),
+               indexer_bytes_this_batch / (1024.0 * 1024.0));
+    } else {
+      snprintf(name, sizeof(name), "CPU->GPU Layer[%d,%d) %.2fMB", sl, sl + ltb,
+               bytes_this_batch / (1024.0 * 1024.0));
+    }
     h2d_range_names[b] = name;
   }
 
@@ -304,6 +433,37 @@ void LayerwiseTransferGroup::layerwise_transfer(
         cpu_block_stride_in_bytes,
         true, // is_read: SSD -> CPU
         num_blocks_per_file, round_robin, num_threads_per_device, is_mla);
+
+    nvtxRangePop();
+  }
+
+  // Indexer SSD -> CPU transfer for ALL layers at once.
+  if (enable_indexer_ssd_ && indexer_ssd_block_ids.defined() &&
+      indexer_ssd_block_ids.numel() > 0) {
+    int num_indexer_ssd_blocks = indexer_ssd_block_ids.numel();
+    int64_t indexer_ssd_bytes = indexer_cpu_chunk_size_in_bytes * num_layers * num_indexer_ssd_blocks;
+    double indexer_ssd_mb = indexer_ssd_bytes / (1024.0 * 1024.0);
+    char idx_ssd_range_name[128];
+    snprintf(idx_ssd_range_name, sizeof(idx_ssd_range_name),
+             "Indexer SSD->CPU AllLayers[0,%d) %.2fMB", num_layers, indexer_ssd_mb);
+    nvtxRangePushA(idx_ssd_range_name);
+
+    torch::Tensor all_layer_ids =
+        torch::arange(0, num_layers,
+                      torch::TensorOptions().dtype(torch::kInt32));
+    transfer_kv_blocks_ssd(
+        *indexer_ioctx_, all_layer_ids,
+        reinterpret_cast<int64_t>(indexer_cpu_blocks_),
+        indexer_ssd_block_ids, indexer_cpu_block_ids_d2h,
+        indexer_cpu_layer_stride_in_bytes,
+        indexer_ssd_kv_stride_in_bytes,
+        indexer_ssd_layer_stride_in_bytes,
+        indexer_ssd_kv_stride_in_bytes,
+        indexer_cpu_chunk_size_in_bytes,
+        indexer_cpu_block_stride_in_bytes,
+        true, // is_read: SSD -> CPU
+        indexer_num_blocks_per_file, round_robin, num_threads_per_device,
+        true /* is_mla: indexer always MLA */);
 
     nvtxRangePop();
   }
@@ -356,6 +516,60 @@ void LayerwiseTransferGroup::layerwise_transfer(
             streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
         break;
       }
+
+      // Fused indexer CPU -> GPU transfer on the same stream
+      // Uses transfer_kv_blocks (symmetric with main KV Step 2) instead of
+      // hand-written cudaMemcpyAsync loops for backend-agnostic support.
+      // Note: indexer uses ReplicatedLinear weights with 1 head (is_mla=true),
+      // so all TP ranks hold identical data. No TP head-partitioning needed,
+      // cpu_startoff is always 0 (unlike main KV which may offset by tp_stride).
+      if (do_indexer_transfer) {
+        int64_t idx_chunk_size = indexer_gpu_chunk_sizes_in_bytes_[i];
+        // idx_cpu_startoff = 0: indexer data is not partitioned across TP ranks
+        int64_t idx_cpu_startoff = 0;
+
+        switch (indexer_backend_type_) {
+        case BackendType::VLLM:
+          flexkv::transfer_kv_blocks<BackendType::VLLM>(
+              num_indexer_blocks, start_layer, layers_this_batch,
+              indexer_gpu_block_ids, indexer_gpu_tensor_handlers_[i],
+              0 /* gpu_startoff */, indexer_cpu_block_ids,
+              indexer_cpu_blocks_,
+              indexer_h2d_cpu_kv_stride_in_bytes,
+              indexer_h2d_cpu_layer_stride_in_bytes,
+              indexer_cpu_block_stride_in_bytes,
+              idx_cpu_startoff, idx_chunk_size,
+              streams_[i], transfer_cta_num, true /* h2d */,
+              use_ce_transfer, true /* is_mla */, false /* sync */);
+          break;
+        case BackendType::TRTLLM:
+          flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+              num_indexer_blocks, start_layer, layers_this_batch,
+              indexer_gpu_block_ids, indexer_gpu_tensor_handlers_[i],
+              0 /* gpu_startoff */, indexer_cpu_block_ids,
+              indexer_cpu_blocks_,
+              indexer_h2d_cpu_kv_stride_in_bytes,
+              indexer_h2d_cpu_layer_stride_in_bytes,
+              indexer_cpu_block_stride_in_bytes,
+              idx_cpu_startoff, idx_chunk_size,
+              streams_[i], transfer_cta_num, true /* h2d */,
+              use_ce_transfer, true /* is_mla */, false /* sync */);
+          break;
+        case BackendType::SGLANG:
+          flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+              num_indexer_blocks, start_layer, layers_this_batch,
+              indexer_gpu_block_ids, indexer_gpu_tensor_handlers_[i],
+              0 /* gpu_startoff */, indexer_cpu_block_ids,
+              indexer_cpu_blocks_,
+              indexer_h2d_cpu_kv_stride_in_bytes,
+              indexer_h2d_cpu_layer_stride_in_bytes,
+              indexer_cpu_block_stride_in_bytes,
+              idx_cpu_startoff, idx_chunk_size,
+              streams_[i], transfer_cta_num, true /* h2d */,
+              use_ce_transfer, true /* is_mla */, false /* sync */);
+          break;
+        }
+      }
     }
 
     // Record event after this batch on GPU 0
@@ -396,6 +610,14 @@ void LayerwiseTransferGroup::layerwise_transfer(
     int64_t bytes_this_batch = 0;
     for (int g = 0; g < num_gpus_; ++g) {
       bytes_this_batch += gpu_chunk_sizes_in_bytes_[g] * 2 * batch_layers_count[i] * num_blocks;
+    }
+    // Include indexer bytes
+    int64_t indexer_bytes_batch = 0;
+    if (do_indexer_transfer) {
+      for (int g = 0; g < num_gpus_; ++g) {
+        indexer_bytes_batch += indexer_gpu_chunk_sizes_in_bytes_[g] * batch_layers_count[i] * num_indexer_blocks;
+      }
+      bytes_this_batch += indexer_bytes_batch;
     }
     
     double bandwidth_gbps = (bytes_this_batch / (1024.0 * 1024.0 * 1024.0)) / (elapsed_ms / 1000.0);

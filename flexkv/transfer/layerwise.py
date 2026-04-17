@@ -74,7 +74,15 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  h2d_cta_num: int = 4,
                  d2h_cta_num: int = 4,
                  enable_eventfd: bool = True,
-                 is_nsa_cp: bool = False) -> None:
+                 is_nsa_cp: bool = False,
+                 indexer_gpu_blocks: Optional[List[List[TensorSharedHandle]]] = None,
+                 indexer_cpu_blocks: Optional[torch.Tensor] = None,
+                 indexer_gpu_kv_layouts: Optional[List[KVCacheLayout]] = None,
+                 indexer_cpu_kv_layout: Optional[KVCacheLayout] = None,
+                 indexer_dtype: Optional[torch.dtype] = None,
+                 indexer_ssd_files: Optional[Dict[int, List[str]]] = None,
+                 indexer_ssd_kv_layout: Optional[KVCacheLayout] = None,
+                 indexer_num_blocks_per_file: int = 0) -> None:
         flexkv_logger.debug(
             f"[LayerwiseWorker] __init__ started: worker_id={worker_id}, "
             f"tp_group_size={tp_group_size}, dp_group_id={dp_group_id}, "
@@ -189,6 +197,105 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
         # Create LayerwiseTransferGroup which handles both SSD->CPU and CPU->GPU transfers
         flexkv_logger.debug("[LayerwiseWorker] Creating LayerwiseTransferGroup...")
+
+        # Initialize indexer fuse support
+        self.enable_indexer = (indexer_gpu_blocks is not None and indexer_cpu_blocks is not None)
+        indexer_constructor_kwargs = {}
+        if self.enable_indexer:
+            assert indexer_gpu_kv_layouts is not None
+            assert indexer_cpu_kv_layout is not None
+            assert indexer_dtype is not None
+
+            # Import indexer GPU tensor handles
+            imported_indexer_gpu_blocks = []
+            for handles_in_one_gpu in indexer_gpu_blocks:
+                blocks_in_one_gpu = []
+                for handle in handles_in_one_gpu:
+                    blocks_in_one_gpu.append(handle.get_tensor())
+                imported_indexer_gpu_blocks.append(blocks_in_one_gpu)
+
+            # Pin indexer CPU memory
+            flexkv_logger.info(
+                f"[LayerwiseWorker] Pinning indexer CPU Memory: "
+                f"{indexer_cpu_blocks.numel() * indexer_cpu_blocks.element_size() / (1024 ** 3):.4f} GB")
+            cudaHostRegister(indexer_cpu_blocks)
+
+            # Compute indexer GPU stride tensors
+            indexer_gpu_kv_strides = [layout.get_kv_stride() * indexer_dtype.itemsize
+                                     for layout in indexer_gpu_kv_layouts]
+            indexer_gpu_block_strides = [layout.get_block_stride() * indexer_dtype.itemsize
+                                        for layout in indexer_gpu_kv_layouts]
+            indexer_gpu_layer_strides = [layout.get_layer_stride() * indexer_dtype.itemsize
+                                        for layout in indexer_gpu_kv_layouts]
+            indexer_gpu_chunk_sizes = [layout.get_chunk_size() * indexer_dtype.itemsize
+                                      for layout in indexer_gpu_kv_layouts]
+
+            # Compute indexer CPU strides.
+            # Indexer is always is_mla=True (1 head, ReplicatedLinear weights),
+            # so all TP ranks hold identical data and no head-partitioning is needed.
+            # Therefore indexer has no tp_stride — cpu_startoff is always 0.
+            self.indexer_cpu_block_stride_in_bytes = indexer_cpu_kv_layout.get_block_stride() * indexer_dtype.itemsize
+            self.indexer_cpu_layer_stride_in_bytes = indexer_cpu_kv_layout.get_layer_stride() * indexer_dtype.itemsize
+            self.indexer_h2d_cpu_kv_stride_in_bytes = indexer_cpu_kv_layout.get_kv_stride() * indexer_dtype.itemsize
+            self.indexer_h2d_cpu_layer_stride_in_bytes = indexer_cpu_kv_layout.get_layer_stride() * indexer_dtype.itemsize
+
+            self.indexer_gpu_blocks = imported_indexer_gpu_blocks
+            self.indexer_cpu_blocks = indexer_cpu_blocks
+            self.indexer_gpu_kv_strides_tensor = torch.tensor(indexer_gpu_kv_strides, dtype=torch.int64)
+            self.indexer_gpu_block_strides_tensor = torch.tensor(indexer_gpu_block_strides, dtype=torch.int64)
+            self.indexer_gpu_layer_strides_tensor = torch.tensor(indexer_gpu_layer_strides, dtype=torch.int64)
+            self.indexer_gpu_chunk_sizes_tensor = torch.tensor(indexer_gpu_chunk_sizes, dtype=torch.int64)
+
+            flexkv_logger.info(
+                f"[LayerwiseWorker] Indexer fuse enabled: "
+                f"gpu_blocks={len(imported_indexer_gpu_blocks)}, "
+                f"cpu_size={indexer_cpu_blocks.numel() * indexer_cpu_blocks.element_size() / (1024 ** 2):.2f} MB, "
+                f"chunk_size={indexer_gpu_chunk_sizes[0]} bytes, "
+                f"cpu_block_stride={self.indexer_cpu_block_stride_in_bytes} bytes, "
+                f"cpu_layer_stride={self.indexer_cpu_layer_stride_in_bytes} bytes")
+        else:
+            self.indexer_cpu_block_stride_in_bytes = 0
+            self.indexer_cpu_layer_stride_in_bytes = 0
+            self.indexer_h2d_cpu_kv_stride_in_bytes = 0
+            self.indexer_h2d_cpu_layer_stride_in_bytes = 0
+            self.indexer_gpu_blocks = []
+            self.indexer_cpu_blocks = torch.Tensor()
+            self.indexer_gpu_kv_strides_tensor = torch.empty(0, dtype=torch.int64)
+            self.indexer_gpu_block_strides_tensor = torch.empty(0, dtype=torch.int64)
+            self.indexer_gpu_layer_strides_tensor = torch.empty(0, dtype=torch.int64)
+            self.indexer_gpu_chunk_sizes_tensor = torch.empty(0, dtype=torch.int64)
+
+        # Initialize indexer SSD support
+        self.enable_indexer_ssd = (
+            self.enable_indexer and
+            indexer_ssd_files is not None and len(indexer_ssd_files) > 0 and
+            indexer_ssd_kv_layout is not None
+        )
+        if self.enable_indexer_ssd:
+            assert indexer_dtype is not None
+            self.indexer_ssd_files = indexer_ssd_files
+            self.indexer_num_blocks_per_file = indexer_num_blocks_per_file
+
+            indexer_ssd_kv_layout_per_file = indexer_ssd_kv_layout.div_block(
+                sum(len(fl) for fl in indexer_ssd_files.values()), padding=True)
+            self.indexer_ssd_kv_stride_in_bytes = indexer_ssd_kv_layout_per_file.get_kv_stride() * indexer_dtype.itemsize
+            self.indexer_ssd_layer_stride_in_bytes = indexer_ssd_kv_layout_per_file.get_layer_stride() * indexer_dtype.itemsize
+            self.indexer_cpu_chunk_size_in_bytes = indexer_cpu_kv_layout.get_chunk_size() * indexer_dtype.itemsize
+
+            flexkv_logger.info(
+                f"[LayerwiseWorker] Indexer SSD fuse enabled: "
+                f"num_files={sum(len(fl) for fl in indexer_ssd_files.values())}, "
+                f"num_blocks_per_file={indexer_num_blocks_per_file}, "
+                f"ssd_kv_stride={self.indexer_ssd_kv_stride_in_bytes}, "
+                f"ssd_layer_stride={self.indexer_ssd_layer_stride_in_bytes}, "
+                f"cpu_chunk_size={self.indexer_cpu_chunk_size_in_bytes}")
+        else:
+            self.indexer_ssd_files = {}
+            self.indexer_num_blocks_per_file = 0
+            self.indexer_ssd_kv_stride_in_bytes = 0
+            self.indexer_ssd_layer_stride_in_bytes = 0
+            self.indexer_cpu_chunk_size_in_bytes = 0
+
         self.layerwise_transfer_group = LayerwiseTransferGroup(
             self.num_gpus, self.gpu_blocks, cpu_blocks, ssd_files,
             dp_group_id, self.num_layers,
@@ -196,7 +303,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             gpu_layer_strides_tensor, gpu_chunk_sizes_tensor,
             GLOBAL_CONFIG_FROM_ENV.iouring_entries,
             GLOBAL_CONFIG_FROM_ENV.iouring_flags,
-            layer_eventfds_tensor, tp_group_size)
+            layer_eventfds_tensor, tp_group_size,
+            self.indexer_gpu_blocks, self.indexer_cpu_blocks,
+            self.indexer_gpu_kv_strides_tensor, self.indexer_gpu_block_strides_tensor,
+            self.indexer_gpu_layer_strides_tensor, self.indexer_gpu_chunk_sizes_tensor,
+            self.indexer_ssd_files)
         flexkv_logger.info(f"[LayerwiseWorker] __init__ completed successfully, worker_id={worker_id}")
 
     def _receive_eventfds_from_sglang(self, tp_group_size: int,
@@ -378,6 +489,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                       dst_block_ids_disk2h: Optional[torch.Tensor],
                       layer_granularity: int,
                       counter_id: int = 0,
+                      indexer_src_block_ids: Optional[torch.Tensor] = None,
+                      indexer_dst_block_ids: Optional[torch.Tensor] = None,
                       **kwargs: Any) -> None:
         assert src_block_ids_h2d.dtype == torch.int64
         assert dst_block_ids_h2d.dtype == torch.int64
@@ -391,6 +504,21 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         ssd_block_ids = src_block_ids_disk2h if src_block_ids_disk2h is not None else torch.empty(0, dtype=torch.int64)
         cpu_block_ids_d2h = dst_block_ids_disk2h if dst_block_ids_disk2h is not None \
             else torch.empty(0, dtype=torch.int64)
+
+        # Prepare indexer block_ids for fused transfer
+        indexer_gpu_block_id_tensor = torch.Tensor()
+        indexer_cpu_block_id_tensor = torch.Tensor()
+        if self.enable_indexer and indexer_dst_block_ids is not None and len(indexer_dst_block_ids) > 0:
+            indexer_gpu_block_id_tensor = indexer_dst_block_ids
+            indexer_cpu_block_id_tensor = indexer_src_block_ids
+
+        # Prepare indexer SSD block_ids for fused DISK2H transfer
+        indexer_ssd_block_ids_tensor = torch.Tensor()
+        indexer_cpu_block_ids_d2h_tensor = torch.Tensor()
+        if self.enable_indexer_ssd and src_block_ids_disk2h is not None:
+            # Indexer SSD block_ids mirror main KV's DISK2H block_ids (1:1 mapping)
+            indexer_ssd_block_ids_tensor = ssd_block_ids
+            indexer_cpu_block_ids_d2h_tensor = cpu_block_ids_d2h
 
         self.layerwise_transfer_group.layerwise_transfer(
             ssd_block_ids,
@@ -415,6 +543,18 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             layer_granularity,
             self.is_mla,
             counter_id,
+            indexer_gpu_block_id_tensor,
+            indexer_cpu_block_id_tensor,
+            self.indexer_cpu_block_stride_in_bytes,
+            self.indexer_cpu_layer_stride_in_bytes,
+            self.indexer_h2d_cpu_kv_stride_in_bytes,
+            self.indexer_h2d_cpu_layer_stride_in_bytes,
+            indexer_ssd_block_ids_tensor,
+            indexer_cpu_block_ids_d2h_tensor,
+            self.indexer_ssd_layer_stride_in_bytes,
+            self.indexer_ssd_kv_stride_in_bytes,
+            self.indexer_cpu_chunk_size_in_bytes,
+            self.indexer_num_blocks_per_file,
         )
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
@@ -432,6 +572,15 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             src_block_ids_disk2h = None
             dst_block_ids_disk2h = None
 
+        # Extract indexer block_ids if available
+        indexer_src_block_ids = None
+        indexer_dst_block_ids = None
+        if self.enable_indexer and transfer_op.indexer_src_block_ids.size > 0:
+            indexer_src_block_ids = torch.from_numpy(
+                transfer_op.indexer_src_block_ids).to(dtype=torch.int64).pin_memory()
+            indexer_dst_block_ids = torch.from_numpy(
+                transfer_op.indexer_dst_block_ids).to(dtype=torch.int64).pin_memory()
+
         num_h2d_blocks = len(src_block_ids_h2d)
 
         start_time = time.time()
@@ -442,6 +591,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             dst_block_ids_disk2h,
             layer_granularity,
             transfer_op.counter_id,
+            indexer_src_block_ids=indexer_src_block_ids,
+            indexer_dst_block_ids=indexer_dst_block_ids,
         )
         end_time = time.time()
 
