@@ -325,7 +325,7 @@ class TransferEngine:
                 cache_config = self.cache_config,
                 ssd_kv_layout = self._ssd_handle.kv_layout if self._ssd_handle else None,
                 ssd_files = self._ssd_handle.get_file_list() if self._ssd_handle else None,
-                num_blocks_per_file = self._ssd_handle.num_blocks_per_file if self._ssd_handle else None,
+                num_blocks_per_file = self._ssd_handle.num_blocks_per_file if self._ssd_handle else 0,
                 mooncake_config_path = getattr(self.cache_config, 'mooncake_config_path', None) or os.environ.get("MOONCAKE_CONFIG_PATH"),
             )
             # NOTE: now peerH2H and peerSSD2H op use the same worker

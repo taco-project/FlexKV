@@ -45,7 +45,7 @@ class MoonCakeTransferEngineWrapper:
         self.mooncake_addr = f"{self.engine_ip}:{self.engien_port}"
         flexkv_logger.info(f"Mooncake listen on: {self.mooncake_addr}")
 
-        supported_backend = ["redis"]
+        supported_backend = ["redis", "http"]
         self.metadata_backend = self.config.metadata_backend.lower()
         if self.metadata_backend not in supported_backend:
             raise ValueError(

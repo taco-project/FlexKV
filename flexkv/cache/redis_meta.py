@@ -164,8 +164,13 @@ class RedisNodeInfo:
         
         # register cleanup function on exit
         atexit.register(self._cleanup_on_exit)
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        # Only register signal handlers in the main process — in subprocess
+        # workers (e.g. PEER2CPUTransferWorker) this would override vLLM's
+        # process management signals and can cause shutdown hangs.
+        import multiprocessing
+        if multiprocessing.current_process().name == "MainProcess":
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
     
     def __del__(self) -> None:
         """destructor, ensure cleanup is performed when object is destroyed"""
@@ -350,10 +355,16 @@ class RedisNodeInfo:
 
                 if self._node_id is not None:
                     node_key = f"node:{self._node_id}"
-                    # Renew TTL
-                    heartbeat_client.expire(node_key, self.node_ttl_seconds)
-                    # Also update the timestamp field
-                    heartbeat_client.hset(node_key, "timestamp", str(int(time.time())))
+                    # Renew TTL; expire() returns 1 if the key exists, 0 if not.
+                    # Only update timestamp if the key still exists — otherwise
+                    # hset() would recreate an expired key WITHOUT a TTL, causing
+                    # other nodes to see a zombie node with stale RDMA addresses.
+                    ttl_renewed = heartbeat_client.expire(node_key, self.node_ttl_seconds)
+                    if ttl_renewed:
+                        heartbeat_client.hset(node_key, "timestamp", str(int(time.time())))
+                    else:
+                        print(f"[RedisNodeInfo] WARNING: node key {node_key} expired/missing, "
+                              f"skipping hset to avoid resurrection")
 
             except Exception:
                 # Connection lost, reset client so it reconnects next iteration
@@ -722,6 +733,10 @@ class RedisMeta:
             return True
         return False
 
+    # TTL for meta:<node_id> keys — set to 5x the node TTL so that meta
+    # survives normal heartbeat jitter but auto-expires after a crash.
+    META_TTL_MULTIPLIER: int = 5
+
     def regist_node_meta(self, node_id: int, addr: str, zmq_addr: str, cpu_buffer_ptr: int, ssd_buffer_ptr: int) -> None:
         """Register node meta information as a Redis hash.
 
@@ -737,6 +752,11 @@ class RedisMeta:
             "cpu_buffer_ptr": int(cpu_buffer_ptr),
             "ssd_buffer_ptr": int(ssd_buffer_ptr),
         })
+        # Set TTL on meta key so it auto-expires after node crash.
+        # The heartbeat in regist_node_meta_renew_ttl() will keep it alive.
+        meta_ttl = self.nodeinfo.node_ttl_seconds * self.META_TTL_MULTIPLIER
+        if meta_ttl > 0:
+            r.expire(key, meta_ttl)
 
     def get_node_meta(self, node_id: int) -> dict:
         """Get node meta information from Redis.
@@ -770,6 +790,11 @@ class RedisMeta:
 
     def set_node_id(self, node_id: int):
         self._node_id = int(node_id)
+        # Also propagate to nodeinfo so that its heartbeat thread can
+        # renew the node:<id> TTL (previously nodeinfo._node_id stayed None,
+        # making the heartbeat thread a no-op in worker subprocesses).
+        if self.nodeinfo is not None:
+            self.nodeinfo._node_id = int(node_id)
 
     def load_pcfs_file_nodeids(self) -> Dict[int, List[int]]:
         """Load all PCFS file node IDs grouped by node id from Redis.
