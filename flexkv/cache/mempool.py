@@ -42,10 +42,26 @@ class Mempool:
     def recycle_blocks(self, block_ids: np.ndarray) -> None:
         if block_ids.ndim != 1 or block_ids.dtype != np.int64:
             raise ValueError("block_ids must be a 1D tensor of int64")
-        
+
         # Remove duplicates first (same block ID appearing multiple times)
         block_ids = np.unique(block_ids)
-        
+
+        # Filter out-of-range block IDs (can happen when cache engine was
+        # initialized with a stale block count before layer_groups recomputation)
+        if len(block_ids) > 0:
+            out_of_range = block_ids >= self.num_total_blocks
+            if out_of_range.any():
+                import logging
+                logger = logging.getLogger("flexkv")
+                bad_ids = block_ids[out_of_range]
+                logger.error(
+                    f"[Mempool] recycle_blocks: {len(bad_ids)} block IDs out of range "
+                    f"(max={self.num_total_blocks}): {bad_ids[:10]}... "
+                    f"This indicates a block count mismatch. Filtering them out.")
+                block_ids = block_ids[~out_of_range]
+                if len(block_ids) == 0:
+                    return
+
         # Filter out already-free blocks to avoid double-free errors
         # This can happen due to race conditions or eviction edge cases
         already_free = self._free_mask[block_ids]
