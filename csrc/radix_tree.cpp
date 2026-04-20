@@ -45,42 +45,7 @@ static std::optional<HashType> get_hash_safe(
 }
 
 bool CRadixNode::Compare::operator()(CRadixNode *a, CRadixNode *b) {
-  auto policy = a->get_index()->get_eviction_policy();
-  switch (policy) {
-    case EvictionPolicy::LRU:
-      return a->get_time() > b->get_time();
-    case EvictionPolicy::LFU:
-      if (a->get_hit_count() != b->get_hit_count()) {
-        return a->get_hit_count() > b->get_hit_count();
-      }
-      return a->get_last_access_time() > b->get_last_access_time();
-    case EvictionPolicy::FIFO:
-      return a->get_creation_time() > b->get_creation_time();
-    case EvictionPolicy::MRU:
-      return a->get_last_access_time() < b->get_last_access_time();
-    case EvictionPolicy::FILO:
-      return a->get_creation_time() < b->get_creation_time();
-    default:
-      return a->get_time() > b->get_time();
-  }
-}
-
-double CRadixNode::get_priority() {
-  auto policy = index->get_eviction_policy();
-  switch (policy) {
-    case EvictionPolicy::LRU:
-      return (double)grace_time;
-    case EvictionPolicy::LFU:
-      return (double)hit_count;
-    case EvictionPolicy::FIFO:
-      return (double)creation_time;
-    case EvictionPolicy::MRU:
-      return -(double)last_access_time;
-    case EvictionPolicy::FILO:
-      return -(double)creation_time;
-    default:
-      return (double)grace_time;
-  }
+  return a->get_index()->get_strategy()->compare(a, b);
 }
 
 CRadixNode::CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt, bool enable_block_node_ids) {

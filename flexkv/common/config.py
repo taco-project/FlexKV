@@ -121,6 +121,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     evict_start_threshold=float(os.getenv('FLEXKV_EVICT_START_THRESHOLD', 0.7)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
     eviction_policy=os.getenv('FLEXKV_EVICTION_POLICY', 'lru'),
+    slru_protected_threshold=int(os.getenv('FLEXKV_SLRU_PROTECTED_THRESHOLD', 2)),
 
     enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
 

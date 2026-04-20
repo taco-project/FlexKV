@@ -135,7 +135,7 @@ class RadixNode:
         self.children.clear()
 
 class RadixTreeIndex:
-    def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000, hit_reward_seconds: int = 0, eviction_policy: str = "lru"):
+    def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000, hit_reward_seconds: int = 0, eviction_policy: str = "lru", protected_threshold: int = 2):
         self.root_node: RadixNode = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                               physical_blocks=np.array([], dtype=np.int64),
                                               is_ready=True,
@@ -150,6 +150,7 @@ class RadixTreeIndex:
 
         self.hit_reward_seconds = hit_reward_seconds
         self.eviction_policy = eviction_policy
+        self.protected_threshold = protected_threshold
 
     def reset(self) -> None:
         self.root_node = RadixNode(block_hashes=np.array([], dtype=np.int64),
@@ -180,6 +181,9 @@ class RadixTreeIndex:
                     current_node.grace_time = now + self.hit_reward_seconds
                 else:
                     current_node.grace_time += self.hit_reward_seconds
+                # Python int is unbounded, so no overflow concern here.
+                # For SLRU the value only matters via comparison against
+                # protected_threshold; for LFU it preserves monotonic ordering.
                 current_node.hit_count += 1
             child_hash = sequence.get_hash(prefix_blocks_num + current_node.size())
             if child_hash in current_node.children:
@@ -325,12 +329,15 @@ class RadixTreeIndex:
             return node.creation_time
         elif self.eviction_policy == "mru":
             return -node.last_access_time
+        elif self.eviction_policy == "slru":
+            is_protected = 1 if node.hit_count >= self.protected_threshold else 0
+            return (is_protected, node.last_access_time)
         elif self.eviction_policy == "filo":
             return -node.creation_time
         else:
             raise ValueError(
                 f"Unknown eviction policy: {self.eviction_policy}. "
-                f"Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
+                f"Supported policies: 'lru', 'lfu', 'slru', 'fifo', 'mru', 'filo'."
             )
 
     def lock(self, node: RadixNode) -> None:

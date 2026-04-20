@@ -16,6 +16,7 @@
 |------|------|----------|
 | `lru` | 最近最少使用 | 优先驱逐**最久未被访问**的节点 |
 | `lfu` | 最不经常使用 | 优先驱逐**命中次数最少**的节点；次数相同时按 LRU 排序 |
+| `slru` | 分段最近最少使用 | 将节点分为试用段和保护段，优先驱逐试用段中**最久未访问**的节点 |
 | `fifo` | 先进先出 | 优先驱逐**最早插入**的节点 |
 | `mru` | 最近最多使用 | 优先驱逐**最近刚被访问**的节点 |
 | `filo` | 先进后出 | 优先驱逐**最近插入**的节点 |
@@ -48,7 +49,7 @@ eviction_policy: lru
 export FLEXKV_EVICTION_POLICY=lru
 ```
 
-可选值：`lru`、`lfu`、`fifo`、`mru`、`filo`。
+可选值：`lru`、`lfu`、`slru`、`fifo`、`mru`、`filo`。
 
 ---
 
@@ -61,7 +62,8 @@ export FLEXKV_EVICTION_POLICY=lru
 | `eviction_policy` | `FLEXKV_EVICTION_POLICY` | str | `lru` | 驱逐策略，可选值见上方[支持的驱逐策略](#支持的驱逐策略) |
 | `evict_start_threshold` | `FLEXKV_EVICT_START_THRESHOLD` | float | `0.7` | 触发主动驱逐的缓存利用率阈值。当缓存占用比例达到该值时，FlexKV 开始主动驱逐节点。例如 `0.7` 表示缓存占用达到 70% 时即开始驱逐；设为 `1.0` 则仅在缓存满时才驱逐 |
 | `evict_ratio` | `FLEXKV_EVICT_RATIO` | float | `0.05` | 每次驱逐的最小淘汰比例。例如 `0.05` 表示每次至少淘汰总 block 数的 5%，以减少频繁小量驱逐带来的开销。设为 `0.0` 则仅淘汰满足当前需求所需的最少 block 数 |
-| `hit_reward_seconds` | `FLEXKV_HIT_REWARD_SECONDS` | int | `0` | 命中奖励秒数，仅对 LRU 策略生效。每次缓存命中时向节点的有效访问时间叠加指定秒数（可累积），使命中越多的节点越难被驱逐。设为 `0` 时为标准 LRU 行为 |
+| `hit_reward_seconds` | `FLEXKV_HIT_REWARD_SECONDS` | int | `0` | 命中奖励秒数，仅对 LRU 策略生效。每次缓存命中时向节点的有效访问时间叠加指定秒数（可累积），使命中越多的节点越难被驱逐。设为 `0` 时为标准 LRU 行为。注意：该参数对其他策略（LFU/SLRU/FIFO/MRU/FILO）不生效 |
+| `slru_protected_threshold` | `FLEXKV_SLRU_PROTECTED_THRESHOLD` | int | `2` | SLRU 策略的保护阈值。节点命中次数达到该值后进入保护段，不易被驱逐。仅对 SLRU 策略生效 |
 
 ### 配置示例
 
@@ -139,3 +141,25 @@ hit_reward_seconds: 10
 - **优先级值**：`-creation_time`
 - **行为**：最近插入的节点最先被驱逐，是 FIFO 的反向策略。
 - **适用场景**：较旧的缓存内容更有价值、需要更长时间保留的场景。
+
+### SLRU（分段最近最少使用）
+
+- **优先级值**：`(is_protected, last_access_time)`
+- **行为**：将缓存节点逻辑上分为两个段：
+  - **Probationary（试用段）**：`hit_count < protected_threshold`（默认 2）的节点。新插入的节点默认进入此段。
+  - **Protected（保护段）**：`hit_count >= protected_threshold` 的节点。被多次访问的节点自动晋升到此段。
+  
+  驱逐时优先淘汰 Probationary 段中的节点；同段内按 LRU 规则（最久未访问的先淘汰）。Protected 段的节点只有在 Probationary 段全部被淘汰后才会被驱逐。
+- **适用场景**：混合工作负载场景，既有高频复用的 system prompt，又有大量一次性查询。SLRU 能有效抵抗缓存扫描污染（cache scan pollution），避免大量一次性请求冲刷掉高频缓存。
+- **注意**：SLRU 同段内按 `last_access_time` 排序，因此 `hit_reward_seconds`（仅作用于 `grace_time`）对 SLRU 不生效。
+
+**配置方式**：
+```bash
+export FLEXKV_EVICTION_POLICY=slru
+export FLEXKV_SLRU_PROTECTED_THRESHOLD=2  # 可选，默认值为 2
+```
+或在配置文件中：
+```yml
+eviction_policy: slru
+slru_protected_threshold: 2
+```
