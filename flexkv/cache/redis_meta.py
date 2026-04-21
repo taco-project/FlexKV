@@ -473,9 +473,15 @@ class RedisNodeInfo:
 
     def _cleanup_stale_nodes_by_ip(self) -> None:
         """Clean up stale node registrations from the same IP.
-        
+
         On startup, scan all node:* keys and remove those that have the same
         local_ip but a different UUID (i.e. leftover from a previous crashed process).
+
+        To avoid deleting active instances on the same machine (single-node
+        multi-instance), we check the remaining TTL: if the key still has more
+        than half its TTL left, the heartbeat is actively renewing it and the
+        node is alive — skip it.  Only remove keys with low/no TTL (crashed or
+        legacy nodes).
         """
         if not self._client:
             return
@@ -498,15 +504,25 @@ class RedisNodeInfo:
                     node_ip = data.get("ip", "") or data.get("local_ip", "")
                     node_uuid = data.get("uuid", "")
 
-                    # Same IP but different UUID → stale node from a previous process
+                    # Same IP but different UUID → candidate for cleanup
                     if node_ip == self.local_ip and node_uuid != self.uuid:
+                        # Check if the node's heartbeat is still active by
+                        # inspecting the remaining TTL.  A healthy node renews
+                        # its TTL every ~1/3 of node_ttl_seconds, so if more
+                        # than half the TTL remains the node is alive.
+                        remaining_ttl = self._client.ttl(key)
+                        # ttl() returns -2 (key gone), -1 (no expiry/legacy), or seconds remaining
+                        if remaining_ttl is not None and remaining_ttl > self.node_ttl_seconds // 2:
+                            # Node is actively heartbeating — it's a live
+                            # instance on the same machine, not a stale one.
+                            continue
                         stale_node_ids.append(nid)
 
                 if cursor == 0:
                     break
 
             for stale_nid in stale_node_ids:
-                print(f"[RedisNodeInfo] Cleaning up stale node:{stale_nid} (same IP={self.local_ip}, different UUID)")
+                print(f"[RedisNodeInfo] Cleaning up stale node:{stale_nid} (same IP={self.local_ip}, different UUID, TTL expired)")
                 self._client.delete(f"node:{stale_nid}")
                 self._cleanup_node_data(stale_nid)
 
