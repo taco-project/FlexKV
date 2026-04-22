@@ -123,6 +123,11 @@ class KVTaskManager:
             model_config_for_transfer.tp_size //= self.tp_node_count
             if not self.model_config.use_mla:
                 model_config_for_transfer.num_kv_heads //= self.tp_node_count
+            # When NSA CP is active, cp_size mirrors tp_size and must also
+            # be divided so that TransferEngine's _eventfd_group_size matches
+            # the number of local GPUs on each node.
+            if model_config_for_transfer.is_nsa_cp and model_config_for_transfer.cp_size > 1:
+                model_config_for_transfer.cp_size //= self.tp_node_count
 
         combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
         if not combine_with_trtllm:

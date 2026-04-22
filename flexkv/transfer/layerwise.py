@@ -320,6 +320,12 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             sock_suffix += f"_pp{int(self.pp_rank)}"
         if int(self.dp_size) > 1:
             sock_suffix += f"_dp{int(self.dp_rank)}"
+        # Multi-node TP: add _node{id} suffix to match sglang connector's
+        # socket path.  The sglang connector sets FLEXKV_NODE_ID when it
+        # detects cross-node TP; the subprocess inherits this env var.
+        _node_id_str = os.environ.get("FLEXKV_NODE_ID")
+        if _node_id_str is not None:
+            sock_suffix += f"_node{_node_id_str}"
         if sock_suffix:
             root, ext = os.path.splitext(base_socket_path)
             socket_path = f"{root}{sock_suffix}{ext}"
