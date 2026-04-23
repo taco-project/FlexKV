@@ -1444,6 +1444,228 @@ class GlobalCacheEngine:
             len(fragment12_gpu_blocks), skipped_gpu_blocks
         )
 
+    def put_cpu(self,
+                request_id: int,
+                token_ids: np.ndarray,
+                token_mask: Optional[np.ndarray] = None,
+                layer_num: int = -1,
+                dp_id: int = 0,
+                namespace: Optional[List[str]] = None) \
+                    -> Tuple[TransferOpGraph, np.ndarray, np.ndarray, Callable, Callable, Dict, int]:
+        """CPU-only PUT: allocate CPU cache blocks and optionally write to SSD.
+
+        Unlike put(), this does NOT require GPU blocks or slot_mapping.
+        The caller is responsible for filling data into the returned
+        cpu_block_ids before launching the transfer graph.
+
+        Returns:
+            (transfer_graph, cpu_block_ids, return_mask, callback,
+             data_ready_callback, op_callback_dict, task_end_op_id)
+            where cpu_block_ids are the allocated CPU cache block indices
+            that the caller should fill with KV data.  The caller MUST
+            invoke data_ready_callback() after filling data to mark the
+            CPU blocks as ready for reads; failing to do so will cause
+            batch_get_v1 to miss these blocks.
+        """
+        if layer_num == -1:
+            layer_num = self.model_config.num_layers
+
+        if token_mask is None:
+            token_mask = np.ones_like(token_ids, dtype=np.bool_)
+
+        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
+        aligned_token_ids = token_ids[:aligned_length]
+        token_mask = token_mask.copy()
+        token_mask[aligned_length:] = False
+        block_start_idx, block_end_idx = self._get_block_range(token_mask)
+
+        sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
+                                     tokens_per_block=self.cache_config.tokens_per_block,
+                                     namespace=namespace)
+
+        temp_cache_strategy = CacheStrategy(ignore_gpu=True, ignore_gds=True)
+        (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
+         cpu_block_ids, num_new_blocks, skipped_blocks) = \
+            self._put_impl_local_cpu_only(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                layer_num,
+                temp_cache_strategy
+            )
+
+        transfer_graph, task_end_op_id = add_virtal_op_for_mutiple_finished_ops(
+            transfer_graph,
+            finished_ops_ids
+        )
+
+        return_mask = np.zeros_like(token_mask, dtype=np.bool_)
+        return_mask[(block_start_idx + skipped_blocks) * self.tokens_per_block:
+                    (block_start_idx + skipped_blocks + num_new_blocks) * self.tokens_per_block] = True
+        transfer_graph.bind_to_dp_group(dp_id)
+
+        for device_type in node_to_unlock:
+            self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
+
+        callback = partial(self._transfer_callback,
+                           node_to_unlock=node_to_unlock,
+                           buffer_to_free={},
+                           is_put=True)
+
+        op_callback_dict = {}
+        for op_id in op_node_to_ready:
+            op_callback_dict[op_id] = partial(self._op_callback,
+                                              device_type=op_node_to_ready[op_id][0],
+                                              node_to_ready=op_node_to_ready[op_id][1],
+                                              ready_length=op_node_to_ready[op_id][2])
+
+        # Build a callback the caller MUST invoke after filling CPU block
+        # data.  This marks the CPU radix-tree nodes as ready so that
+        # concurrent batch_get_v1 can see them.
+        if DeviceType.CPU in node_to_unlock:
+            cpu_node, cpu_ready_len = node_to_unlock[DeviceType.CPU]
+            data_ready_callback = partial(
+                self.cpu_cache_engine.set_ready,
+                cpu_node, True, cpu_ready_len)
+        else:
+            data_ready_callback = lambda: None  # noqa: E731 — no-op
+
+        if self._metrics_collector is not None:
+            self._update_mempool_metrics()
+
+        return (transfer_graph, cpu_block_ids, return_mask, callback,
+                data_ready_callback, op_callback_dict, task_end_op_id)
+
+    def _put_impl_local_cpu_only(self,
+            request_id: int,
+            sequence_meta: SequenceMeta,
+            block_mask_start: int,
+            block_mask_end: int,
+            layer_num: int,
+            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+                -> Tuple[TransferOpGraph, List[int], Dict, Dict, np.ndarray, int, int]:
+        """CPU-only PUT: like _put_impl_local but without D2H transfer.
+
+        Transfer pattern:
+            External CPU data  ->  CPU cache blocks  ->  SSD (async, if enabled)
+
+        The caller fills data into cpu_block_ids after this returns.
+        """
+        enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
+        assert self.cpu_cache_engine is not None
+
+        if self.index_accel:
+            cpu_matched_result, ssd_matched_result = self.match_local_accel(
+                sequence_meta, temp_cache_strategy=temp_cache_strategy, is_put=True)
+        else:
+            cpu_matched_result, ssd_matched_result = self.match_local(
+                sequence_meta, temp_cache_strategy=temp_cache_strategy, is_put=True)
+
+        cpu_matched_blocks = cpu_matched_result.physical_blocks[
+            :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
+        ssd_matched_blocks = ssd_matched_result.physical_blocks[
+            :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
+
+        num_total_blocks = block_mask_end - block_mask_start
+        num_skipped_blocks = len(cpu_matched_blocks)
+        num_new_blocks = num_total_blocks - num_skipped_blocks
+        if num_new_blocks == 0:
+            empty = self._empty_put_return(request_id)
+            return empty[0], empty[1], empty[2], empty[3], np.array([], dtype=np.int64), 0, num_skipped_blocks
+
+        # Allocate new CPU blocks
+        new_cpu_blocks = self.cpu_cache_engine.take(
+            num_required_blocks=num_new_blocks,
+            protected_node=cpu_matched_result.last_node,
+            strict=False
+        )
+        if not isinstance(new_cpu_blocks, np.ndarray):
+            new_cpu_blocks = np.array(new_cpu_blocks, dtype=np.int64)
+        if len(new_cpu_blocks) < num_new_blocks:
+            self.cpu_cache_engine.recycle(new_cpu_blocks)
+            empty = self._empty_put_return(request_id)
+            return empty[0], empty[1], empty[2], empty[3], np.array([], dtype=np.int64), 0, num_skipped_blocks
+
+        # Allocate SSD blocks if enabled
+        fragment2_num_blocks = num_total_blocks - len(ssd_matched_blocks)
+        if not enable_ssd:
+            fragment2_num_blocks = 0
+        put_to_ssd = False
+        fragment2_ssd_blocks = np.array([], dtype=np.int64)
+        if enable_ssd and fragment2_num_blocks > 0:
+            fragment2_ssd_blocks = self.ssd_cache_engine.take(
+                num_required_blocks=fragment2_num_blocks,
+                protected_node=ssd_matched_result.last_node,
+                strict=False
+            )
+            if len(fragment2_ssd_blocks) == fragment2_num_blocks:
+                put_to_ssd = True
+            else:
+                self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
+                fragment2_ssd_blocks = np.array([], dtype=np.int64)
+
+        transfer_graph = TransferOpGraph()
+        finished_ops_ids = []
+        op_node_to_ready = {}
+        op_h2disk = None
+
+        # H2DISK op (CPU→SSD, async)
+        if put_to_ssd and fragment2_num_blocks > 0:
+            # Use the new CPU blocks as source for SSD write
+            if len(new_cpu_blocks) >= fragment2_num_blocks:
+                fragment2_cpu_blocks = new_cpu_blocks[-fragment2_num_blocks:]
+            else:
+                num_needed_from_matched = fragment2_num_blocks - len(new_cpu_blocks)
+                fragment2_cpu_blocks = np.concatenate([
+                    cpu_matched_blocks[-num_needed_from_matched:],
+                    new_cpu_blocks
+                ])
+            op_h2disk = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=TransferType.H2DISK,
+                src_block_ids=fragment2_cpu_blocks,
+                dst_block_ids=fragment2_ssd_blocks,
+                layer_id=0,
+                layer_granularity=layer_num
+            )
+            transfer_graph.add_transfer_op(op_h2disk)
+            finished_ops_ids.append(op_h2disk.op_id)
+
+        # Insert into radix tree with is_ready=False; the caller MUST invoke
+        # the returned data_ready_callback after filling data into the CPU
+        # blocks.  Setting is_ready=True here would expose partially-written
+        # blocks to concurrent batch_get_v1 readers.
+        cpu_node_to_unlock = self.cpu_cache_engine.insert(
+            sequence_meta,
+            new_cpu_blocks,
+            is_ready=False,
+            match_result=cpu_matched_result
+        )
+
+        ssd_node_to_unlock = None
+        if put_to_ssd and len(fragment2_ssd_blocks) > 0:
+            ssd_node_to_unlock = self.ssd_cache_engine.insert(
+                sequence_meta,
+                fragment2_ssd_blocks,
+                is_ready=False,
+                match_result=ssd_matched_result
+            )
+            if op_h2disk is not None:
+                op_node_to_ready[op_h2disk.op_id] = (
+                    DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+
+        node_to_unlock = {}
+        if cpu_node_to_unlock is not None:
+            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+        if ssd_node_to_unlock is not None:
+            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+
+        return (
+            transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
+            new_cpu_blocks, num_new_blocks, num_skipped_blocks
+        )
+
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
                            buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,

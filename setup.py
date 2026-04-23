@@ -220,7 +220,10 @@ setup(
     version=get_version(),
     packages=find_packages(exclude=("benchmarks", "csrc", "examples", "tests")),
     package_data={
-        "flexkv": ["*.so", "lib/*.so", "lib/*.so.*"],
+        "flexkv": [
+            "*.so", "lib/*.so", "lib/*.so.*",
+            "integration/sglang/patches/*.patch",
+        ],
     },
     include_package_data=True,
     install_requires=install_requires,
@@ -231,6 +234,11 @@ setup(
             no_python_abi_suffix=True,
             build_temp=os.path.join(build_dir, "temp"),  # Temporary build files
         )
+    },
+    entry_points={
+        "console_scripts": [
+            "flexkv-patch-sglang=flexkv.integration.sglang.patch_sglang:main",
+        ],
     },
     #python_requires=">=3.8",
     python_requires=">=3.6",

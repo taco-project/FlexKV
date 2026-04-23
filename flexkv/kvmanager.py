@@ -15,7 +15,7 @@
 
 import os
 import subprocess
-from typing import Optional, Tuple, List, Dict, Union, Iterable
+from typing import Optional, Tuple, List, Dict, Union, Iterable, Callable
 import time
 
 import numpy as np
@@ -228,6 +228,62 @@ class KVManager:
         else:
             task_id, mask = self.kv_task_engine.put_match(token_ids, token_mask, dp_id, namespace=namespace)
         return task_id, mask
+
+    def put_cpu(self,
+                token_ids: Union[torch.Tensor, np.ndarray],
+                token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
+                dp_id: int = 0,
+                namespace: Optional[List[str]] = None,
+                ) -> Tuple[int, np.ndarray, np.ndarray, Callable]:
+        """CPU-only PUT: allocate CPU cache blocks for external data filling.
+
+        Returns:
+            (task_id, cpu_block_ids, return_mask, data_ready_callback)
+            Caller fills data into the CPU cache tensor at cpu_block_ids,
+            then calls data_ready_callback() to mark blocks visible to
+            readers, and finally calls launch_cpu(task_id) to trigger
+            async SSD write.
+        """
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+        if isinstance(token_mask, torch.Tensor):
+            token_mask = token_mask.numpy()
+        task_id, cpu_block_ids, mask, data_ready_callback = \
+            self.kv_task_engine.put_cpu_match(
+                token_ids, token_mask, dp_id, namespace=namespace)
+        return task_id, cpu_block_ids, mask, data_ready_callback
+
+    def launch_cpu(self, task_ids: Union[int, List[int]]) -> List[int]:
+        """Launch CPU-only tasks (H2DISK only, no slot_mapping needed).
+
+        The caller must have already invoked data_ready_callback() before
+        this call so that CPU blocks are marked ready for concurrent readers.
+        """
+        if isinstance(task_ids, int):
+            task_ids = [task_ids]
+        launched = []
+        for task_id in task_ids:
+            self.kv_task_engine._launch_task(task_id)
+            # Handle empty-graph tasks (no SSD ops) that were deferred
+            # from put_cpu_match to avoid premature completion before
+            # data filling.
+            self.kv_task_engine._process_empty_graph(task_id)
+            launched.append(task_id)
+        return launched
+
+    def get_cpu_cache_tensor(self) -> torch.Tensor:
+        """Return the CPU cache tensor for direct data filling.
+
+        Only available in thread mode (FLEXKV_CPU_ONLY=1) where the
+        TransferManager shares the same process address space.
+        """
+        from flexkv.transfer_manager import TransferManagerIntraProcessHandle
+        from flexkv.common.transfer import DeviceType
+        handle = self.kv_task_engine.transfer_handles[0]
+        if isinstance(handle._handle, TransferManagerIntraProcessHandle):
+            storage_handle = handle._handle.transfer_manager.storage_engine.get_storage_handle(DeviceType.CPU)
+            return storage_handle.data
+        raise RuntimeError("get_cpu_cache_tensor is only available in thread mode (FLEXKV_CPU_ONLY=1)")
 
     def prefetch_async(self,
                        token_ids: np.ndarray,
