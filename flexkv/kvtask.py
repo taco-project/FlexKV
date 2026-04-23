@@ -1,4 +1,5 @@
 import time
+import heapq
 from typing import Dict, Optional, List, Union, Tuple
 import threading
 from enum import Enum
@@ -183,6 +184,17 @@ class KVTaskManager:
         self.task_id_lock = threading.Lock()
 
         self.running_tasks: int = 0
+
+        # Prefetch priority queue
+        # Policy: "fifo" or "longest_match"
+        self._prefetch_queue_policy: str = GLOBAL_CONFIG_FROM_ENV.prefetch_queue_policy
+        self._prefetch_max_inflight: int = GLOBAL_CONFIG_FROM_ENV.prefetch_max_inflight
+        # heap entries: (priority_key, seq_counter, task_id)
+        #   fifo:           priority_key = seq_counter (smaller = earlier = higher priority)
+        #   longest_match:  priority_key = -match_length (smaller = longer match = higher priority)
+        self._prefetch_heap: List[Tuple[int, int, int]] = []
+        self._prefetch_seq_counter: int = 0  # monotonic counter for FIFO tie-breaking
+        self._prefetch_inflight: int = 0     # currently launched prefetch tasks
 
     def start(self) -> None:
         for transfer_handle in self.transfer_handles:
@@ -410,6 +422,10 @@ class KVTaskManager:
                     callback()
             else:
                 task.callback()
+        # Release prefetch inflight slot and try to launch queued tasks
+        if task.task_type == TaskType.PREFETCH:
+            self._prefetch_inflight = max(0, self._prefetch_inflight - 1)
+            self._drain_prefetch_queue()
         task.status = TaskStatus.COMPLETED
         task.task_end_op_finished = True
         self.graph_to_task.pop(task.graph.graph_id)
@@ -770,6 +786,7 @@ class KVTaskEngine(KVTaskManager):
                        token_ids: np.ndarray,
                        dp_id: int = 0,
                        task_id: int = -1,
+                       match_length: int = 0,
                        namespace: Optional[List[str]] = None) -> int:
         if task_id == -1:
             task_id = self._gen_task_id()
@@ -787,8 +804,36 @@ class KVTaskEngine(KVTaskManager):
             layer_granularity=-1,
             dp_id=dp_id
         )
-        self._launch_task(task_id)
+        # Enqueue into priority queue instead of launching immediately
+        self._enqueue_prefetch(task_id, match_length)
+        # Drain queue: launch tasks up to max_inflight
+        self._drain_prefetch_queue()
         return task_id
+
+    def _enqueue_prefetch(self, task_id: int, match_length: int = 0) -> None:
+        """Add a prefetch task to the priority queue."""
+        seq = self._prefetch_seq_counter
+        self._prefetch_seq_counter += 1
+        if self._prefetch_queue_policy == "longest_match":
+            # Larger match_length → higher priority → smaller key (negate)
+            priority_key = -match_length
+        else:
+            # FIFO: earlier enqueue → higher priority → smaller seq
+            priority_key = seq
+        heapq.heappush(self._prefetch_heap, (priority_key, seq, task_id))
+
+    def _drain_prefetch_queue(self) -> None:
+        """Launch queued prefetch tasks up to the inflight limit, in priority order."""
+        while (self._prefetch_heap
+               and self._prefetch_inflight < self._prefetch_max_inflight):
+            _, _, task_id = heapq.heappop(self._prefetch_heap)
+            # Task may have been cancelled while queued
+            if task_id not in self.tasks or self.tasks[task_id].is_completed():
+                continue
+            if self.tasks[task_id].status != TaskStatus.READY:
+                continue
+            self._launch_task(task_id)
+            self._prefetch_inflight += 1
 
     def merge_to_batch_kvtask(self,
 
