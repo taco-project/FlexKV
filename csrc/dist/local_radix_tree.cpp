@@ -47,9 +47,9 @@ LocalRadixTree::LocalRadixTree(int tokens_per_block, unsigned int max_num_blocks
   uint32_t ttl_ms, uint32_t renew_ms,
   uint32_t batch_sz, uint32_t idle_sleep_ms,
   uint32_t safety_ttl_ms, uint32_t swap_block_threshold, uint32_t hit_reward_seconds,
-  std::string eviction_policy)
+  std::string eviction_policy, int protected_threshold)
   : CRadixTreeIndex(tokens_per_block, max_num_blocks, hit_reward_seconds,
-      parse_eviction_policy(eviction_policy)), 
+      parse_eviction_policy(eviction_policy), protected_threshold), 
   channel(nullptr), node_id(0),
   lease_ttl_ms(ttl_ms), refresh_batch_size(batch_sz),
   lease_pool(max_num_blocks),

@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <torch/extension.h>
@@ -11,27 +12,9 @@
 
 #include "cache_utils.h"
 #include "dist/lease_meta_mempool.h" // for flexkv::LeaseMeta
+#include "eviction_strategy.h"
 
 namespace flexkv {
-
-enum class EvictionPolicy { LRU, LFU, FIFO, MRU, FILO };
-
-inline EvictionPolicy parse_eviction_policy(const std::string &name) {
-  if (name == "lru")
-    return EvictionPolicy::LRU;
-  if (name == "lfu")
-    return EvictionPolicy::LFU;
-  if (name == "fifo")
-    return EvictionPolicy::FIFO;
-  if (name == "mru")
-    return EvictionPolicy::MRU;
-  if (name == "filo")
-    return EvictionPolicy::FILO;
-  throw std::invalid_argument(
-      "Unknown eviction policy: '" + name +
-      "'. "
-      "Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'.");
-}
 
 class CRadixTreeIndex;
 
@@ -64,8 +47,6 @@ public:
   struct Compare {
     bool operator()(CRadixNode *a, CRadixNode *b);
   };
-
-  double get_priority();
 
   bool get_leaf_state() { return on_leaf; }
 
@@ -127,7 +108,13 @@ public:
     } else {
       grace_time = now_time + reward_us;
     }
-    hit_count++;
+    // Saturating increment: clamp at INT_MAX to prevent overflow into negatives.
+    // For SLRU the absolute value is irrelevant once >= protected_threshold,
+    // but wrapping around would incorrectly demote a long-lived hot node back
+    // to the Probationary segment. For LFU it preserves monotonic ordering.
+    if (hit_count < std::numeric_limits<int>::max()) {
+      hit_count++;
+    }
   }
 
   CRadixNode *get_parent() { return parent; }
@@ -252,24 +239,25 @@ protected:
   int tokens_per_block;
   int node_count;
   int hit_reward_seconds;
-  EvictionPolicy eviction_policy;
+  std::unique_ptr<IEvictionStrategy> strategy_;
 
 public:
   CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000,
                   int hit_reward_seconds = 0,
-                  EvictionPolicy eviction_policy = EvictionPolicy::LRU) {
+                  EvictionPolicy eviction_policy = EvictionPolicy::LRU,
+                  int protected_threshold = 2) {
     this->tokens_per_block = tokens_per_block;
     this->max_num_blocks = max_num_blocks;
     this->node_count = 0;
     this->hit_reward_seconds = hit_reward_seconds;
-    this->eviction_policy = eviction_policy;
+    this->strategy_ = create_eviction_strategy(eviction_policy, protected_threshold);
 
     root = new CRadixNode(this, true, 0);
     node_list.push_back(root);
     root->set_node_list_it(std::prev(node_list.end()));
   }
 
-  EvictionPolicy get_eviction_policy() { return eviction_policy; }
+  const IEvictionStrategy *get_strategy() const { return strategy_.get(); }
 
   virtual ~CRadixTreeIndex() {
     leaf_list.clear();

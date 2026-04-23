@@ -42,7 +42,7 @@ from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics import FlexKVMetricsCollector, init_global_collector, get_global_collector
 
 DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
-_VALID_EVICTION_POLICIES = {'lru', 'lfu', 'fifo', 'mru', 'filo'}
+_VALID_EVICTION_POLICIES = {'lru', 'lfu', 'slru', 'fifo', 'mru', 'filo'}
 
 class CacheEngineAccel:
     def __init__(self,
@@ -54,7 +54,8 @@ class CacheEngineAccel:
                  evict_start_threshold: float = 1.0,
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
-                 metrics_collector = None):
+                 metrics_collector = None,
+                 protected_threshold: int = 2):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -65,10 +66,14 @@ class CacheEngineAccel:
         if eviction_policy not in _VALID_EVICTION_POLICIES:
             raise ValueError(f"Invalid eviction_policy: '{eviction_policy}'. "
                               f"Supported policies: {sorted(_VALID_EVICTION_POLICIES)}")
+        if not isinstance(protected_threshold, int) or protected_threshold < 1:
+            raise ValueError(f"Invalid protected_threshold: {protected_threshold}. "
+                              f"protected_threshold must be an integer >= 1")
 
         self.device_type = device_type
 
-        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy)
+        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy,
+                                     protected_threshold)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
@@ -223,7 +228,8 @@ class CacheEngine:
                  evict_start_threshold: float = 1.0,
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
-                 metrics_collector = None):
+                 metrics_collector = None,
+                 protected_threshold: int = 2):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -234,10 +240,14 @@ class CacheEngine:
         if eviction_policy not in _VALID_EVICTION_POLICIES:
             raise ValueError(f"Invalid eviction_policy: '{eviction_policy}'. "
                               f"Supported policies: {sorted(_VALID_EVICTION_POLICIES)}")
+        if not isinstance(protected_threshold, int) or protected_threshold < 1:
+            raise ValueError(f"Invalid protected_threshold: {protected_threshold}. "
+                              f"protected_threshold must be an integer >= 1")
 
         self.device_type = device_type
 
-        self.index = RadixTreeIndex(tokens_per_block=tokens_per_block, hit_reward_seconds=hit_reward_seconds, eviction_policy=eviction_policy)
+        self.index = RadixTreeIndex(tokens_per_block=tokens_per_block, hit_reward_seconds=hit_reward_seconds, eviction_policy=eviction_policy,
+                                       protected_threshold=protected_threshold)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
@@ -376,6 +386,7 @@ class GlobalCacheEngine:
         self.evict_start_threshold = GLOBAL_CONFIG_FROM_ENV.evict_start_threshold
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
         self.eviction_policy = GLOBAL_CONFIG_FROM_ENV.eviction_policy
+        self.protected_threshold = GLOBAL_CONFIG_FROM_ENV.slru_protected_threshold
 
         # Initialize metrics collector for cache engine monitoring (before creating CacheEngines)
         self._metrics_collector = get_global_collector()
@@ -398,74 +409,92 @@ class GlobalCacheEngine:
             if cache_config.enable_p2p_cpu:
                 self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
             elif self.index_accel:
-                self.cpu_cache_engine = CacheEngineAccel(DeviceType.CPU,
-                                                cache_config.num_cpu_blocks,
-                                                cache_config.tokens_per_block,
-                                                self.evict_ratio,
-                                                self.hit_reward_seconds,
-                                                self.evict_start_threshold,
-                                                self.eviction_policy,
-                                                event_collector,
-                                                self._metrics_collector)
+                self.cpu_cache_engine = CacheEngineAccel(
+                    device_type=DeviceType.CPU,
+                    num_total_blocks=cache_config.num_cpu_blocks,
+                    tokens_per_block=cache_config.tokens_per_block,
+                    evict_ratio=self.evict_ratio,
+                    hit_reward_seconds=self.hit_reward_seconds,
+                    evict_start_threshold=self.evict_start_threshold,
+                    eviction_policy=self.eviction_policy,
+                    event_collector=event_collector,
+                    metrics_collector=self._metrics_collector,
+                    protected_threshold=self.protected_threshold,
+                )
             else:
-                self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
-                                                cache_config.num_cpu_blocks,
-                                                cache_config.tokens_per_block,
-                                                self.evict_ratio,
-                                                self.hit_reward_seconds,
-                                                self.evict_start_threshold,
-                                                self.eviction_policy,
-                                                event_collector,
-                                                self._metrics_collector)
+                self.cpu_cache_engine = CacheEngine(
+                    device_type=DeviceType.CPU,
+                    num_total_blocks=cache_config.num_cpu_blocks,
+                    tokens_per_block=cache_config.tokens_per_block,
+                    evict_ratio=self.evict_ratio,
+                    hit_reward_seconds=self.hit_reward_seconds,
+                    evict_start_threshold=self.evict_start_threshold,
+                    eviction_policy=self.eviction_policy,
+                    event_collector=event_collector,
+                    metrics_collector=self._metrics_collector,
+                    protected_threshold=self.protected_threshold,
+                )
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
                 self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
             elif self.index_accel:
-                self.ssd_cache_engine = CacheEngineAccel(DeviceType.SSD,
-                                                cache_config.num_ssd_blocks,
-                                                cache_config.tokens_per_block,
-                                                self.evict_ratio,
-                                                self.hit_reward_seconds,
-                                                self.evict_start_threshold,
-                                                self.eviction_policy,
-                                                event_collector,
-                                                self._metrics_collector)
+                self.ssd_cache_engine = CacheEngineAccel(
+                    device_type=DeviceType.SSD,
+                    num_total_blocks=cache_config.num_ssd_blocks,
+                    tokens_per_block=cache_config.tokens_per_block,
+                    evict_ratio=self.evict_ratio,
+                    hit_reward_seconds=self.hit_reward_seconds,
+                    evict_start_threshold=self.evict_start_threshold,
+                    eviction_policy=self.eviction_policy,
+                    event_collector=event_collector,
+                    metrics_collector=self._metrics_collector,
+                    protected_threshold=self.protected_threshold,
+                )
             else:
-                self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
-                                                cache_config.num_ssd_blocks,
-                                                cache_config.tokens_per_block,
-                                                self.evict_ratio,
-                                                self.hit_reward_seconds,
-                                                self.evict_start_threshold,
-                                                self.eviction_policy,
-                                                event_collector,
-                                                self._metrics_collector)
+                self.ssd_cache_engine = CacheEngine(
+                    device_type=DeviceType.SSD,
+                    num_total_blocks=cache_config.num_ssd_blocks,
+                    tokens_per_block=cache_config.tokens_per_block,
+                    evict_ratio=self.evict_ratio,
+                    hit_reward_seconds=self.hit_reward_seconds,
+                    evict_start_threshold=self.evict_start_threshold,
+                    eviction_policy=self.eviction_policy,
+                    event_collector=event_collector,
+                    metrics_collector=self._metrics_collector,
+                    protected_threshold=self.protected_threshold,
+                )
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
                 self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
             elif self.index_accel:
-                self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
-                                                   cache_config.num_remote_blocks,
-                                                   cache_config.tokens_per_block,
-                                                   self.evict_ratio,
-                                                   self.hit_reward_seconds,
-                                                   self.evict_start_threshold,
-                                                   self.eviction_policy,
-                                                   None,
-                                                   self._metrics_collector)
+                self.remote_cache_engine = CacheEngineAccel(
+                    device_type=DeviceType.REMOTE,
+                    num_total_blocks=cache_config.num_remote_blocks,
+                    tokens_per_block=cache_config.tokens_per_block,
+                    evict_ratio=self.evict_ratio,
+                    hit_reward_seconds=self.hit_reward_seconds,
+                    evict_start_threshold=self.evict_start_threshold,
+                    eviction_policy=self.eviction_policy,
+                    event_collector=None,
+                    metrics_collector=self._metrics_collector,
+                    protected_threshold=self.protected_threshold,
+                )
             else:
-                self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
-                                                   cache_config.num_remote_blocks,
-                                                   cache_config.tokens_per_block,
-                                                   self.evict_ratio,
-                                                   self.hit_reward_seconds,
-                                                   self.evict_start_threshold,
-                                                   self.eviction_policy,
-                                                   None,
-                                                   self._metrics_collector)
+                self.remote_cache_engine = CacheEngine(
+                    device_type=DeviceType.REMOTE,
+                    num_total_blocks=cache_config.num_remote_blocks,
+                    tokens_per_block=cache_config.tokens_per_block,
+                    evict_ratio=self.evict_ratio,
+                    hit_reward_seconds=self.hit_reward_seconds,
+                    evict_start_threshold=self.evict_start_threshold,
+                    eviction_policy=self.eviction_policy,
+                    event_collector=None,
+                    metrics_collector=self._metrics_collector,
+                    protected_threshold=self.protected_threshold,
+                )
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
         #TODO move this to kvmanager.start()

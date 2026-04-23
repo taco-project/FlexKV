@@ -56,6 +56,7 @@ cpp_sources = [
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/eviction_strategy.cpp",
     "csrc/monitoring/metrics_manager.cpp",  # Monitoring support
 ]
 
@@ -64,6 +65,7 @@ hpp_sources = [
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
+    "csrc/eviction_strategy.h",
     "csrc/monitoring/metrics_manager.h",  # Monitoring support
 ]
 

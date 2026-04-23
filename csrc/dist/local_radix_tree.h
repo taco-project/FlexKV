@@ -85,7 +85,8 @@ public:
                  uint32_t safety_ttl_ms = 100,
                  uint32_t swap_block_threshold = 1024,
                  uint32_t hit_reward_seconds = 0,
-                 std::string eviction_policy = "lru");
+                 std::string eviction_policy = "lru",
+                 int protected_threshold = 2);
   ~LocalRadixTree();
 
   void set_meta_channel(RedisMetaChannel *ch);
@@ -134,6 +135,3 @@ public:
 };
 
 } // namespace flexkv
-
-
-
