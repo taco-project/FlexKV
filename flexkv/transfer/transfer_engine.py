@@ -41,7 +41,7 @@ from flexkv.transfer.worker import (
     tpGDSTransferWorker,
     PEER2CPUTransferWorker,
 )
-from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.config import CacheConfig, ModelConfig, LayerGroupSpec, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
 
 
@@ -87,7 +87,9 @@ class TransferEngine:
         cache_config: CacheConfig,
         cpu_handle: Optional[StorageHandle] = None,
         ssd_handle: Optional[StorageHandle] = None,
-        remote_handle: Optional[StorageHandle] = None):
+        remote_handle: Optional[StorageHandle] = None,
+        gpu_blocks_per_group: Optional[Dict[int, List]] = None,
+        gpu_layouts_per_group: Optional[Dict[int, List]] = None):
         """
         Initialize transfer engine
 
@@ -96,6 +98,8 @@ class TransferEngine:
             cpu_handle: CPU handle
             ssd_handle: Optional SSD handle
             remote_handle: Optional remote handle
+            gpu_blocks_per_group: Per-group GPU handles, keyed by dp_client_id
+            gpu_layouts_per_group: Per-group GPU layouts, keyed by dp_client_id
         """
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
@@ -118,6 +122,8 @@ class TransferEngine:
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
+        self._gpu_blocks_per_group = gpu_blocks_per_group
+        self._gpu_layouts_per_group = gpu_layouts_per_group
         self._cache_config = cache_config
         self._enable_pcfs_sharing = GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing # TODO: is this correct?
 
@@ -129,6 +135,101 @@ class TransferEngine:
         self.tp_size = model_config.tp_size
         self.num_gpu_groups = len(self.gpu_handles)
         self._running = False
+
+    def _get_multi_group_kwargs_tp1(self, dp_client_id: int) -> dict:
+        """Get multi-group kwargs for GPUCPUTransferWorker (TP=1)."""
+        if (self.model_config.layer_groups is None or
+                self._gpu_blocks_per_group is None or
+                dp_client_id not in self._gpu_blocks_per_group):
+            return {}
+        # For TP=1, there's one device per dp_client_id
+        # _gpu_blocks_per_group[dp_client_id][0] = per-group handle lists for that device
+        per_device_group_blocks = self._gpu_blocks_per_group[dp_client_id][0]
+        per_device_group_layouts = self._gpu_layouts_per_group[dp_client_id][0]
+        if per_device_group_blocks is None or per_device_group_layouts is None:
+            return {}
+        return dict(
+            layer_groups=self.model_config.layer_groups,
+            gpu_blocks_per_group=per_device_group_blocks,
+            gpu_layouts_per_group=per_device_group_layouts,
+        )
+
+    def _get_multi_group_kwargs_tp(self, dp_client_id: int) -> dict:
+        """Get multi-group kwargs for tpGPUCPUTransferWorker (TP>1)."""
+        if (self.model_config.layer_groups is None or
+                self._gpu_blocks_per_group is None or
+                dp_client_id not in self._gpu_blocks_per_group):
+            return {}
+        # For TP>1, _gpu_blocks_per_group[dp_client_id] has tp_size entries (one per device)
+        # Each entry is List[List[TensorSharedHandle]] (per-group handle lists for that device)
+        per_device_data = self._gpu_blocks_per_group[dp_client_id]
+        per_device_layouts = self._gpu_layouts_per_group[dp_client_id]
+        if per_device_data[0] is None or per_device_layouts[0] is None:
+            return {}
+
+        num_groups = len(self.model_config.layer_groups)
+        num_devices = len(per_device_data)
+
+        # Restructure: from [device][group] -> [group][device]
+        # gpu_blocks_per_group[group_idx][device_idx] = handles for that group on that device
+        blocks_by_group = []
+        layouts_by_group = []
+        for gi in range(num_groups):
+            group_blocks_per_device = [per_device_data[di][gi] for di in range(num_devices)]
+            group_layouts_per_device = [per_device_layouts[di][gi] for di in range(num_devices)]
+            blocks_by_group.append(group_blocks_per_device)
+            layouts_by_group.append(group_layouts_per_device)
+
+        return dict(
+            layer_groups=self.model_config.layer_groups,
+            gpu_blocks_per_group=blocks_by_group,
+            gpu_layouts_per_group=layouts_by_group,
+        )
+
+    def _get_gds_multi_group_kwargs_tp1(self, dp_client_id: int) -> dict:
+        """Get multi-group kwargs for GDSTransferWorker (TP=1)."""
+        if (self.model_config.layer_groups is None or
+                self._gpu_blocks_per_group is None or
+                dp_client_id not in self._gpu_blocks_per_group):
+            return {}
+        per_device_group_blocks = self._gpu_blocks_per_group[dp_client_id][0]
+        per_device_group_layouts = self._gpu_layouts_per_group[dp_client_id][0]
+        if per_device_group_blocks is None or per_device_group_layouts is None:
+            return {}
+        return dict(
+            layer_groups=self.model_config.layer_groups,
+            gpu_blocks_per_group=per_device_group_blocks,
+            gpu_layouts_per_group=per_device_group_layouts,
+        )
+
+    def _get_gds_multi_group_kwargs_tp(self, dp_client_id: int) -> dict:
+        """Get multi-group kwargs for tpGDSTransferWorker (TP>1)."""
+        if (self.model_config.layer_groups is None or
+                self._gpu_blocks_per_group is None or
+                dp_client_id not in self._gpu_blocks_per_group):
+            return {}
+        per_device_data = self._gpu_blocks_per_group[dp_client_id]
+        per_device_layouts = self._gpu_layouts_per_group[dp_client_id]
+        if per_device_data[0] is None or per_device_layouts[0] is None:
+            return {}
+
+        num_groups = len(self.model_config.layer_groups)
+        num_devices = len(per_device_data)
+
+        # Restructure: from [device][group] -> [group][device]
+        blocks_by_group = []
+        layouts_by_group = []
+        for gi in range(num_groups):
+            group_blocks_per_device = [per_device_data[di][gi] for di in range(num_devices)]
+            group_layouts_per_device = [per_device_layouts[di][gi] for di in range(num_devices)]
+            blocks_by_group.append(group_blocks_per_device)
+            layouts_by_group.append(group_layouts_per_device)
+
+        return dict(
+            layer_groups=self.model_config.layer_groups,
+            gpu_blocks_per_group=blocks_by_group,
+            gpu_layouts_per_group=layouts_by_group,
+        )
 
     def _init_workers(self) -> None:
         if self._running:
@@ -154,8 +255,9 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    **self._get_multi_group_kwargs_tp1(dp_client_id),
                 )
-                for _, gpu_handles in self.gpu_handles.items()
+                for dp_client_id, gpu_handles in self.gpu_handles.items()
             ]
             self.d2h_workers: List[WorkerHandle] = [
                 GPUCPUTransferWorker.create_worker(
@@ -172,8 +274,9 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    **self._get_multi_group_kwargs_tp1(dp_client_id),
                 )
-                for _, gpu_handles in self.gpu_handles.items()
+                for dp_client_id, gpu_handles in self.gpu_handles.items()
             ]
         else:
             self.h2d_workers = [
@@ -192,6 +295,7 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    **self._get_multi_group_kwargs_tp(dp_client_id),
                 )
                 for dp_client_id, gpu_handles in self.gpu_handles.items()
             ]
@@ -211,6 +315,7 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    **self._get_multi_group_kwargs_tp(dp_client_id),
                 )
                 for dp_client_id, gpu_handles in self.gpu_handles.items()
             ]
@@ -218,6 +323,7 @@ class TransferEngine:
         self._worker_map[TransferType.D2H] = self.d2h_workers
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
+            ssd_layer_groups = self.model_config.layer_groups
             self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
@@ -229,6 +335,7 @@ class TransferEngine:
                 dtype=self._cpu_handle.dtype,
                 num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
                 cache_config=self._cache_config,
+                layer_groups=ssd_layer_groups,
             )
             self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
@@ -241,6 +348,7 @@ class TransferEngine:
                 dtype=self._cpu_handle.dtype,
                 num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
                 cache_config=self._cache_config,
+                layer_groups=ssd_layer_groups,
             )
             self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
             self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
@@ -284,8 +392,9 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         gpu_device_id=gpu_handles[0].gpu_device_id,
+                        **self._get_gds_multi_group_kwargs_tp1(dp_client_id),
                     )
-                    for _, gpu_handles in self.gpu_handles.items()
+                    for dp_client_id, gpu_handles in self.gpu_handles.items()
                 ]
             else:
                 self.gds_workers = [
@@ -301,6 +410,7 @@ class TransferEngine:
                         dtype=self._ssd_handle.dtype,
                         tp_group_size=self.tp_size,
                         dp_group_id=dp_client_id,
+                        **self._get_gds_multi_group_kwargs_tp(dp_client_id),
                     )
                     for dp_client_id, gpu_handles in self.gpu_handles.items()
                 ]

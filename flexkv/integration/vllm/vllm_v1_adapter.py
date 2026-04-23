@@ -253,7 +253,7 @@ class FlexKVSchedulerConnector:
                                    num_new_matched_tokens=num_new_matched_tokens):
             return 0, False
 
-        return num_new_matched_tokens, True
+        return num_new_matched_tokens, False
 
     def _extract_namespace(self, request: "Request") -> Optional[List[str]]:
         """
@@ -320,6 +320,14 @@ class FlexKVSchedulerConnector:
         """
         match_start_time = time.perf_counter()
         num_tokens_to_get = (request.num_tokens//self.block_size)*self.block_size
+        # Never match ALL tokens: the scheduler requires num_new_tokens > 0,
+        # which means num_computed_tokens must be strictly less than
+        # request.num_tokens.  When the prompt length is an exact multiple of
+        # block_size, a full match would leave zero tokens for prefill.
+        if num_tokens_to_get == request.num_tokens:
+            num_tokens_to_get -= self.block_size
+        if num_tokens_to_get <= 0:
+            return -1, 0
         token_ids = request.all_token_ids[:num_tokens_to_get]
 
         assert num_computed_tokens <= num_tokens_to_get, (
@@ -342,7 +350,6 @@ class FlexKVSchedulerConnector:
 
         # Auto cancel if not call update_state_after_alloc()
         match_end_time = time.perf_counter()
-        # logger.debug(f"Get match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
         if num_new_matched_tokens > 0:
             self.req_id_to_task_dict[request.request_id] = task_id
             self.tasks_to_cancel[task_id] = FlexKVGetTask(task_id=task_id,
@@ -457,8 +464,8 @@ class FlexKVSchedulerConnector:
         # compute slot mapping
         # num_blocks_to_put = (num_matched_tokens+num_unmatched_tokens) // self.block_size
         num_matched_blocks = num_matched_tokens // self.block_size
-        num_unmatched_tokens = num_unmatched_tokens // self.block_size
-        block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_tokens]
+        num_unmatched_blocks = num_unmatched_tokens // self.block_size
+        block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_blocks]
         task.slot_mapping = np.array(block_ids_to_put).repeat(self.block_size)*self.block_size
 
         return True
@@ -488,7 +495,6 @@ class FlexKVSchedulerConnector:
             token_ids=np_token_ids,
             namespace=namespace,
         )
-
         num_unmatched_tokens = unmatched_mask.sum().item()
         num_matched_tokens = num_tokens_to_put - num_unmatched_tokens
 
@@ -710,33 +716,156 @@ class FlexKVWorkerConnector:
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
+        from collections import OrderedDict
+        from flexkv.common.config import LayerGroupSpec
+
         logger.info("Start register kv_caches")
-        gpu_blocks = list(kv_caches.values())
-        num_layer = len(kv_caches)
-        if self.flexkv_config.model_config.use_mla:
-            assert gpu_blocks[0].ndim == 3, (
-                f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
-            num_blocks = gpu_blocks[0].shape[0]
-            block_size = gpu_blocks[0].shape[1]
-            num_kv_heads = 1
-            head_size = gpu_blocks[0].shape[2]
+        is_mla = self.flexkv_config.model_config.use_mla
+
+        # Step 1: Deduplicate shared-KV layers (same data_ptr = shared tensor)
+        seen_ptrs: dict[int, str] = {}
+        unique_layers: list[tuple[str, torch.Tensor]] = []
+        for name, tensor in kv_caches.items():
+            ptr = tensor.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs[ptr] = name
+                unique_layers.append((name, tensor))
+            else:
+                logger.info(f"Layer {name} shares KV tensor with {seen_ptrs[ptr]}, skipping")
+
+        # Step 2: Group by (num_kv_heads, head_size) shape
+        shape_groups: OrderedDict[tuple, list[tuple[int, str, torch.Tensor]]] = OrderedDict()
+        for idx, (name, tensor) in enumerate(unique_layers):
+            if is_mla:
+                assert tensor.ndim == 3, (
+                    f"expect MLA kv cached tensor has 3 dim but get shape={tensor.shape}.")
+                key = (1, tensor.shape[2])
+            else:
+                assert tensor.ndim == 5, (
+                    f"expect kv cached tensor has 5 dim but get shape={tensor.shape}.")
+                key = (tensor.shape[3], tensor.shape[4])  # (num_kv_heads, head_size)
+            shape_groups.setdefault(key, []).append((idx, name, tensor))
+
+        num_layer = len(unique_layers)
+        first_tensor = unique_layers[0][1]
+        if is_mla:
+            num_blocks = first_tensor.shape[0]
+            block_size = first_tensor.shape[1]
         else:
-            assert gpu_blocks[0].ndim == 5, (
-                f"expect kv cached tensor has 5 dim but get shape={gpu_blocks[0].shape}.")
-            num_blocks = gpu_blocks[0].shape[1]
-            block_size = gpu_blocks[0].shape[2]
-            num_kv_heads = gpu_blocks[0].shape[3]
-            head_size = gpu_blocks[0].shape[4]
-        gpu_layout = KVCacheLayout(
-            type=KVCacheLayoutType.LAYERFIRST,
-            num_layer=num_layer,
-            num_block=num_blocks,
-            tokens_per_block=block_size,
-            num_head=num_kv_heads,
-            head_size=head_size,
-            is_mla=self.flexkv_config.model_config.use_mla,
-        )
-        self.tp_client.register_to_server(gpu_blocks, gpu_layout)
+            # Different attention backends use different KV cache layouts:
+            #   flash_attn:        [2, num_blocks, block_size, num_kv_heads, head_size]
+            #   triton/flashinfer: [num_blocks, 2, block_size, num_kv_heads, head_size]
+            # Compute num_blocks from total elements to be layout-agnostic.
+            num_kv_heads_0 = first_tensor.shape[3]
+            head_size_0 = first_tensor.shape[4]
+            kv_dim = 2
+            # block_size is the tokens_per_block dim; it's always at shape[2] for
+            # both layouts since only dim 0 and 1 are swapped.
+            block_size = first_tensor.shape[2]
+            num_blocks = first_tensor.numel() // (
+                kv_dim * block_size * num_kv_heads_0 * head_size_0)
+
+        if len(shape_groups) == 1:
+            # Uniform case — existing code path
+            (num_kv_heads, head_size), = shape_groups.keys()
+            gpu_blocks = [t for _, t in unique_layers]
+            gpu_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=num_layer,
+                num_block=num_blocks,
+                tokens_per_block=block_size,
+                num_head=num_kv_heads,
+                head_size=head_size,
+                is_mla=is_mla,
+            )
+            self.tp_client.register_to_server(gpu_blocks, gpu_layout)
+        else:
+            # Mixed shapes — multi-group registration
+            layer_groups: list[LayerGroupSpec] = []
+            gpu_layouts: list[KVCacheLayout] = []
+            handles_per_group: list[list[torch.Tensor]] = []
+            all_gpu_blocks: list[torch.Tensor] = []
+
+            for (num_kv_heads, head_size), group_entries in shape_groups.items():
+                group_indices = [idx for idx, _, _ in group_entries]
+                group_tensors = [tensor for _, _, tensor in group_entries]
+                group_num_layers = len(group_entries)
+
+                layer_groups.append(LayerGroupSpec(
+                    num_layers=group_num_layers,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    layer_indices=group_indices,
+                ))
+                gpu_layouts.append(KVCacheLayout(
+                    type=KVCacheLayoutType.LAYERFIRST,
+                    num_layer=group_num_layers,
+                    num_block=num_blocks,
+                    tokens_per_block=block_size,
+                    num_head=num_kv_heads,
+                    head_size=head_size,
+                    is_mla=is_mla,
+                ))
+                handles_per_group.append(group_tensors)
+                all_gpu_blocks.extend(group_tensors)
+
+                logger.info(
+                    f"Layer group: {group_num_layers} layers, "
+                    f"num_kv_heads={num_kv_heads}, head_size={head_size}, "
+                    f"indices={group_indices}"
+                )
+
+            # Annotate SWA layer groups with sliding_window.
+            # layer_indices are positions within unique_layers (not original model
+            # layer IDs), so we extract original layer numbers from the kv_cache
+            # key names (e.g. "layers.5.self_attn") to match against layer_types.
+            hf_text_config = getattr(self.flexkv_config, '_hf_text_config', None)
+            if hf_text_config is not None:
+                layer_types = getattr(hf_text_config, 'layer_types', None)
+                sw = getattr(hf_text_config, 'sliding_window', None)
+                if layer_types and sw:
+                    import re
+                    # Build map: unique_layers idx -> original layer number
+                    idx_to_original = {}
+                    for idx, (name, _) in enumerate(unique_layers):
+                        m = re.search(r'layers\.(\d+)', name)
+                        if m:
+                            idx_to_original[idx] = int(m.group(1))
+
+                    for lg in layer_groups:
+                        orig_ids = [idx_to_original.get(i) for i in lg.layer_indices]
+                        if all(oid is not None and oid < len(layer_types)
+                               and layer_types[oid] == 'sliding_attention'
+                               for oid in orig_ids):
+                            lg.sliding_window = sw
+                            logger.info(
+                                f"Layer group ({lg.num_layers} layers, "
+                                f"kv_heads={lg.num_kv_heads}, head={lg.head_size}) "
+                                f"marked as SWA with sliding_window={sw}"
+                            )
+
+            # Store layer_groups on model config for downstream use
+            self.flexkv_config.model_config.layer_groups = layer_groups
+            # Update num_layers to reflect deduplicated count
+            self.flexkv_config.model_config.num_layers = num_layer
+
+            # Use the first group's layout as the "primary" for backward compat
+            primary_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=num_layer,
+                num_block=num_blocks,
+                tokens_per_block=block_size,
+                num_head=layer_groups[0].num_kv_heads,
+                head_size=layer_groups[0].head_size,
+                is_mla=is_mla,
+            )
+            self.tp_client.register_to_server(
+                all_gpu_blocks, primary_layout,
+                layer_groups=layer_groups,
+                gpu_layouts=gpu_layouts,
+                handles_per_group=handles_per_group,
+            )
+
         logger.info("Finish register kv_caches")
 
     def __del__(self):
@@ -921,11 +1050,17 @@ class FlexKVConnectorV1Impl:
         self.connector.cancel_tasks()
         self.connector.launch_tasks()
 
-        # Optional: Synchronous wait for get tasks to ensure data consistency.
-        # This is a safety fallback because currently FlexKV worker does not support
-        # waiting for tasks in start_load_kv().
-        if os.getenv('FLEXKV_SYNC_GET', '0') == '1':
-            self.connector.wait_for_all_get_tasks()
+        # Synchronous wait for H2D (get) tasks before the forward pass.
+        # FlexKV does not use the async start_load_kv/wait_for_layer_load
+        # interface, so the transfer must complete here.
+        # With load_kv_async=False, the request is already RUNNING —
+        # reporting finished_recving would hit a scheduler assert,
+        # so we clean up get tasks here instead of in query_finished_task().
+        if self.connector.get_tasks:
+            responses = self.connector.wait_for_all_get_tasks()
+            for resp in responses:
+                self.connector.req_id_to_task_dict.pop(
+                    resp.request.request_id, None)
 
         return KVConnectorMetadata()
 

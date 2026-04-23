@@ -881,10 +881,6 @@ class GlobalCacheEngine:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
 
 
-        # DEBUG: Log GET operation with hash info
-        #if len(sequence_meta.block_hashes) > 0:
-        #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
-
         # tailor the blocks to assure:
         # the blocks are needed by the mask & the blocks are ready
         cpu_matched_blocks = cpu_matched_result.physical_blocks[:cpu_matched_result.num_ready_matched_blocks]

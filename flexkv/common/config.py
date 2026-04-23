@@ -12,6 +12,16 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
 
 @dataclass
+class LayerGroupSpec:
+    """One group of layers sharing the same KV cache shape."""
+    num_layers: int
+    num_kv_heads: int
+    head_size: int
+    layer_indices: List[int]  # 0-based indices into the full layer list
+    sliding_window: Optional[int] = None  # Token count; None = full attention
+
+
+@dataclass
 class ModelConfig:
     num_layers: int = 1
     num_kv_heads: int = 1
@@ -23,9 +33,20 @@ class ModelConfig:
     tp_size: int = 1
     dp_size: int = 1
 
+    # Multi-group support for models with non-uniform KV cache shapes (e.g. Gemma4)
+    # When None, all layers share the same (num_kv_heads, head_size).
+    layer_groups: Optional[List[LayerGroupSpec]] = None
+
     @property
     def token_size_in_bytes(self) -> int:
         kv_dim = 1 if self.use_mla else 2
+        if self.layer_groups:
+            # layer_groups store per-GPU num_kv_heads; multiply by tp_size
+            # to get full model per-token size (matching CPU/SSD block sizing).
+            return sum(
+                g.num_layers * g.num_kv_heads * g.head_size * kv_dim
+                for g in self.layer_groups
+            ) * self.dtype.itemsize * self.tp_size
         return self.num_layers * self.num_kv_heads * self.head_size * kv_dim * self.dtype.itemsize
 
 @dataclass
@@ -78,6 +99,10 @@ class CacheConfig:
 
     # Mooncake transfer engine config path (serialized via pickle to survive spawn subprocesses)
     mooncake_config_path: Optional[str] = None
+
+    # Stored for deferred recomputation when layer_groups become known
+    _user_cpu_cache_gb: float = 0
+    _user_ssd_cache_gb: float = 0
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
@@ -222,6 +247,10 @@ def update_default_config_from_user_config(model_config: ModelConfig,
 
     assert user_config.cpu_cache_gb > 0
     assert user_config.ssd_cache_gb >= 0
+
+    # Store original GB values for deferred recomputation (when layer_groups become known)
+    cache_config._user_cpu_cache_gb = user_config.cpu_cache_gb
+    cache_config._user_ssd_cache_gb = user_config.ssd_cache_gb
 
     cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
     cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)

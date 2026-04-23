@@ -118,7 +118,8 @@ void transfer_kv_blocks_ssd_binding(
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_kv_stride_in_bytes, int64_t chunk_size_in_bytes,
     int64_t block_stride_in_bytes, bool is_read, int num_blocks_per_file,
-    int round_robin = 1, int num_threads_per_device = 8, bool is_mla = false) {
+    int round_robin = 1, int num_threads_per_device = 8, bool is_mla = false,
+    int64_t ssd_copy_offset = 0) {
   TORCH_CHECK(ssd_block_ids.dtype() == torch::kInt64,
               "ssd_block_ids must be int64");
   TORCH_CHECK(cpu_block_ids.dtype() == torch::kInt64,
@@ -129,7 +130,7 @@ void transfer_kv_blocks_ssd_binding(
       cpu_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
       ssd_layer_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size_in_bytes,
       block_stride_in_bytes, is_read, num_blocks_per_file, round_robin,
-      num_threads_per_device, is_mla);
+      num_threads_per_device, is_mla, ssd_copy_offset);
 }
 
 #ifdef FLEXKV_ENABLE_CFS
@@ -413,7 +414,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("chunk_size_in_bytes"), py::arg("block_stride_in_bytes"),
         py::arg("is_read"), py::arg("num_blocks_per_file"),
         py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
-        py::arg("is_mla") = false);
+        py::arg("is_mla") = false, py::arg("ssd_copy_offset") = 0);
 
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,

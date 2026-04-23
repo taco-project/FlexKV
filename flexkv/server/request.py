@@ -3,7 +3,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from flexkv.common.config import ModelConfig
+from flexkv.common.config import ModelConfig, LayerGroupSpec
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
 from flexkv.common.request import KVResponseStatus
@@ -22,6 +22,10 @@ class RegisterTPClientRequest:
     device_id: int
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
+    # Multi-group fields for models with non-uniform KV cache shapes (e.g. Gemma4)
+    layer_groups: Optional[List[LayerGroupSpec]] = None
+    gpu_layouts: Optional[List[KVCacheLayout]] = None
+    handles_per_group: Optional[List[List[TensorSharedHandle]]] = None
 
 @dataclass
 class IsReadyRequest:

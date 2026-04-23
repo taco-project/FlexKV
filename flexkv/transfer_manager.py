@@ -19,7 +19,7 @@ import pickle
 import sys
 
 from flexkv.common.transfer import TransferOpGraph, CompletedOp
-from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV, convert_to_block_num
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.transfer import DeviceType
@@ -48,13 +48,16 @@ class TransferManager:
         self.all_gpu_layouts: Dict[int, KVCacheLayout] = {}
         self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks
         self.gpu_client_mapping: Dict[int, int] = {}  # device_id -> dp_client_id
+        # Multi-group storage for models with non-uniform KV shapes
+        self.all_gpu_layouts_per_group: Dict[int, Optional[List[KVCacheLayout]]] = {}
+        self.all_gpu_blocks_per_group: Dict[int, Optional[List[List[TensorSharedHandle]]]] = {}
 
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
             self.context, zmq.SocketType.PULL, gpu_register_port, True)
 
         self.transfer_engine: Optional[TransferEngine] = None
-        self.storage_engine = StorageEngine(self.model_config, self.cache_config)
+        self.storage_engine: Optional[StorageEngine] = None
         flexkv_logger.info(f"Initialized TransferManager with config successfully, "
                            f"instance_num={self.instance_num}, expected_gpus={self.expected_gpus}")
 
@@ -68,6 +71,16 @@ class TransferManager:
                 self.all_gpu_blocks[device_id] = req.handles
                 self.all_gpu_layouts[device_id] = req.gpu_layout
                 self.gpu_client_mapping[device_id] = req.dp_client_id
+                # Store multi-group info if present
+                self.all_gpu_layouts_per_group[device_id] = req.gpu_layouts
+                self.all_gpu_blocks_per_group[device_id] = req.handles_per_group
+                # Propagate layer_groups to model_config (first registration wins)
+                if req.layer_groups is not None and self.model_config.layer_groups is None:
+                    self.model_config.layer_groups = req.layer_groups
+                    flexkv_logger.info(
+                        f"Set model_config.layer_groups from GPU {device_id}: "
+                        f"{[(g.num_layers, g.num_kv_heads, g.head_size) for g in req.layer_groups]}"
+                    )
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
 
@@ -112,7 +125,30 @@ class TransferManager:
             f"Expected {self.expected_gpus} GPU layouts, got {len(self.all_gpu_layouts)}"
         assert len(self.all_gpu_blocks) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
-        
+
+        # Recompute block counts if layer_groups changed token_size_in_bytes
+        if self.model_config.layer_groups is not None:
+            block_size_in_bytes = (self.model_config.token_size_in_bytes
+                                   * self.cache_config.tokens_per_block)
+            if self.cache_config._user_cpu_cache_gb > 0:
+                old_cpu = self.cache_config.num_cpu_blocks
+                self.cache_config.num_cpu_blocks = convert_to_block_num(
+                    self.cache_config._user_cpu_cache_gb, block_size_in_bytes)
+                flexkv_logger.info(
+                    f"Recomputed num_cpu_blocks with layer_groups: {old_cpu} -> "
+                    f"{self.cache_config.num_cpu_blocks}")
+            if self.cache_config._user_ssd_cache_gb > 0:
+                old_ssd = self.cache_config.num_ssd_blocks
+                self.cache_config.num_ssd_blocks = convert_to_block_num(
+                    self.cache_config._user_ssd_cache_gb, block_size_in_bytes)
+                flexkv_logger.info(
+                    f"Recomputed num_ssd_blocks with layer_groups: {old_ssd} -> "
+                    f"{self.cache_config.num_ssd_blocks}")
+
+        # Create StorageEngine AFTER GPU registration so layer_groups are known
+        # and block counts are correct
+        self.storage_engine = StorageEngine(self.model_config, self.cache_config)
+
         # Register GPU blocks with their global device IDs
         for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
             self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper,
@@ -122,13 +158,31 @@ class TransferManager:
         
         # Group GPU handles by dp_client_id
         grouped_gpu_handles: Dict[int, List] = {}
+        # Also group per-group data by dp_client_id for multi-group support
+        grouped_gpu_blocks_per_group: Optional[Dict[int, List]] = None
+        grouped_gpu_layouts_per_group: Optional[Dict[int, List]] = None
+        has_multi_group = self.model_config.layer_groups is not None
+
+        if has_multi_group:
+            grouped_gpu_blocks_per_group = {}
+            grouped_gpu_layouts_per_group = {}
+
         for device_id in sorted(self.all_gpu_blocks.keys()):
             dp_client_id = self.gpu_client_mapping[device_id]
             if dp_client_id not in grouped_gpu_handles:
                 grouped_gpu_handles[dp_client_id] = []
             grouped_gpu_handles[dp_client_id].append(
                 self.storage_engine.get_storage_handle(DeviceType.GPU, device_id))
-        
+
+            if has_multi_group:
+                if dp_client_id not in grouped_gpu_blocks_per_group:
+                    grouped_gpu_blocks_per_group[dp_client_id] = []
+                    grouped_gpu_layouts_per_group[dp_client_id] = []
+                grouped_gpu_blocks_per_group[dp_client_id].append(
+                    self.all_gpu_blocks_per_group[device_id])
+                grouped_gpu_layouts_per_group[dp_client_id].append(
+                    self.all_gpu_layouts_per_group[device_id])
+
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
@@ -143,7 +197,9 @@ class TransferManager:
                                               cache_config=self.cache_config,
                                               cpu_handle=cpu_handle,
                                               ssd_handle=ssd_handle,
-                                              remote_handle=remote_handle)
+                                              remote_handle=remote_handle,
+                                              gpu_blocks_per_group=grouped_gpu_blocks_per_group,
+                                              gpu_layouts_per_group=grouped_gpu_layouts_per_group)
         flexkv_logger.info("Initialized TransferEngine successfully")
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:

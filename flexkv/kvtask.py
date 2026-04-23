@@ -358,7 +358,8 @@ class KVTaskManager:
                 self._mark_completed(task_id)
             elif completed_op.op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
-            if completed_op.op_id in task.op_callback_dict:
+            has_callback = completed_op.op_id in task.op_callback_dict
+            if has_callback:
                 task.op_callback_dict[completed_op.op_id]()
 
     def _cancel_task(self, task_id: int) -> None:
@@ -687,6 +688,11 @@ class KVTaskEngine(KVTaskManager):
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
         self._sync_prefetch(token_ids, namespace)
+        # Flush pending D2H completions so set_ready callbacks run before
+        # we check the radix tree.  Without this, blocks offloaded between
+        # scheduler steps remain "not ready" until the next try_wait call,
+        # which comes too late (after get_match).
+        self._update_tasks(timeout=0)
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
         fake_slot_mapping = np.zeros_like(token_ids[token_mask])
@@ -745,6 +751,7 @@ class KVTaskEngine(KVTaskManager):
                   dp_id: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+        self._update_tasks(timeout=0)
         fake_slot_mapping = np.zeros_like(token_ids)
         result_task_id, return_mask = self._put_match_impl(token_ids,
                                                            fake_slot_mapping,
