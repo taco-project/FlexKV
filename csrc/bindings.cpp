@@ -33,6 +33,10 @@
 #include "dist/redis_meta_channel.h"
 #endif
 #include "monitoring/metrics_manager.h"
+#ifdef FLEXKV_ENABLE_NVCOMP
+#include "ans_transfer.h"
+#include "ans_transfer_ssd.h"
+#endif
 #include <deque>
 
 namespace py = pybind11;
@@ -110,6 +114,63 @@ void transfer_kv_blocks_binding(
     throw std::runtime_error(cudaGetErrorString(err));
   }
 }
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+// Unified binding for ans_compress_and_d2h / ans_h2d_and_decompress.
+// Both have identical parameter lists; is_d2h selects the direction.
+static void ans_transfer_binding(
+    bool is_d2h,
+    flexkv::ANSTransferContext& ctx,
+    torch::Tensor &gpu_block_id_tensor, torch::Tensor &gpu_tensor_ptrs_tensor,
+    int64_t gpu_kv_stride_in_bytes, int64_t gpu_block_stride_in_bytes,
+    int64_t gpu_layer_stride_in_bytes,
+    torch::Tensor &cpu_block_id_tensor, torch::Tensor &cpu_tensor,
+    int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
+    int64_t cpu_block_stride_in_bytes, int64_t chunk_size_in_bytes,
+    int start_layer_id, int num_layers,
+    bool is_mla, int gpu_block_type) {
+
+  int num_blocks = gpu_block_id_tensor.numel();
+  int64_t *gpu_block_ids = static_cast<int64_t*>(gpu_block_id_tensor.data_ptr());
+  void **gpu_tensor_ptrs = static_cast<void**>(gpu_tensor_ptrs_tensor.data_ptr());
+  int64_t *cpu_block_ids = static_cast<int64_t*>(cpu_block_id_tensor.data_ptr());
+  void *cpu_ptr = static_cast<void*>(cpu_tensor.data_ptr());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  flexkv::BackendType bt;
+  if (gpu_block_type == 0)      bt = flexkv::BackendType::VLLM;
+  else if (gpu_block_type == 1) bt = flexkv::BackendType::TRTLLM;
+  else if (gpu_block_type == 2) bt = flexkv::BackendType::SGLANG;
+  else throw std::runtime_error("Unsupported gpu_block_type: " + std::to_string(gpu_block_type));
+
+  flexkv::GTensorHandler handler(
+      bt, reinterpret_cast<int64_t**>(gpu_tensor_ptrs), num_layers,
+      gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes,
+      gpu_layer_stride_in_bytes);
+
+  // Dispatch by (direction, backend)
+  #define ANS_DISPATCH(func, Type) flexkv::func<Type>(        \
+      &ctx, num_blocks, start_layer_id, num_layers,            \
+      gpu_block_ids, handler, cpu_block_ids, cpu_ptr,          \
+      cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,       \
+      cpu_block_stride_in_bytes, chunk_size_in_bytes, is_mla, stream)
+  #define ANS_SWITCH(func)                                                     \
+    switch (bt) {                                                              \
+      case flexkv::BackendType::VLLM:   ANS_DISPATCH(func, flexkv::BackendType::VLLM);   break; \
+      case flexkv::BackendType::TRTLLM: ANS_DISPATCH(func, flexkv::BackendType::TRTLLM); break; \
+      case flexkv::BackendType::SGLANG: ANS_DISPATCH(func, flexkv::BackendType::SGLANG); break; \
+    }
+  if (is_d2h) { ANS_SWITCH(ans_compress_and_d2h); }
+  else        { ANS_SWITCH(ans_h2d_and_decompress); }
+  #undef ANS_SWITCH
+  #undef ANS_DISPATCH
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(err));
+}
+
+#endif // FLEXKV_ENABLE_NVCOMP
 
 void transfer_kv_blocks_ssd_binding(
     flexkv::SSDIOCTX &ioctx, const torch::Tensor &cpu_layer_id_list,
@@ -404,6 +465,87 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("transfer_num_cta") = 4, py::arg("is_host_to_device") = true,
         py::arg("use_ce_transfer") = false, py::arg("is_mla") = false,
         py::arg("gpu_block_type") = 0);
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  py::class_<flexkv::ANSTransferContext>(m, "ANSTransferContext")
+      .def(py::init([](size_t max_num_chunks, size_t max_chunk_size,
+                       int data_type, int log_level,
+                       int pipeline_batch_size, int transfer_sms) {
+        auto* ctx = new flexkv::ANSTransferContext();
+        flexkv::ans_ctx_create(ctx, max_num_chunks, max_chunk_size,
+                               data_type, log_level, pipeline_batch_size,
+                               transfer_sms);
+        return ctx;
+      }),
+      py::arg("max_num_chunks"), py::arg("max_chunk_size"),
+      py::arg("data_type") = 0, py::arg("log_level") = 0,
+      py::arg("pipeline_batch_size") = 0, py::arg("transfer_sms") = -1)
+      .def("destroy", [](flexkv::ANSTransferContext& ctx) {
+        flexkv::ans_ctx_destroy(&ctx);
+      })
+      .def_readonly("max_num_chunks", &flexkv::ANSTransferContext::max_num_chunks)
+      .def_readonly("max_chunk_size", &flexkv::ANSTransferContext::max_chunk_size)
+      .def_readonly("max_comp_chunk_bytes", &flexkv::ANSTransferContext::max_comp_chunk_bytes);
+
+  // Shared py::arg list for both D2H and H2D bindings
+  #define ANS_BINDING_PARAMS                                                   \
+        flexkv::ANSTransferContext& ctx,                                       \
+        torch::Tensor &gpu_block_id_tensor,                                    \
+        torch::Tensor &gpu_tensor_ptrs_tensor,                                 \
+        int64_t gpu_kv_stride_in_bytes,                                        \
+        int64_t gpu_block_stride_in_bytes,                                     \
+        int64_t gpu_layer_stride_in_bytes,                                     \
+        torch::Tensor &cpu_block_id_tensor,                                    \
+        torch::Tensor &cpu_tensor,                                             \
+        int64_t cpu_kv_stride_in_bytes,                                        \
+        int64_t cpu_layer_stride_in_bytes,                                     \
+        int64_t cpu_block_stride_in_bytes,                                     \
+        int64_t chunk_size_in_bytes,                                           \
+        int start_layer_id, int num_layers,                                    \
+        bool is_mla, int gpu_block_type
+  #define ANS_BINDING_FWD                                                      \
+        ctx, gpu_block_id_tensor, gpu_tensor_ptrs_tensor,                      \
+        gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes,                     \
+        gpu_layer_stride_in_bytes,                                             \
+        cpu_block_id_tensor, cpu_tensor,                                       \
+        cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,                     \
+        cpu_block_stride_in_bytes, chunk_size_in_bytes,                        \
+        start_layer_id, num_layers, is_mla, gpu_block_type
+  #define ANS_BINDING_ARGS                                                     \
+        py::arg("ctx"),                                                        \
+        py::arg("gpu_block_id_tensor"), py::arg("gpu_tensor_ptrs_tensor"),     \
+        py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"), \
+        py::arg("gpu_layer_stride_in_bytes"),                                  \
+        py::arg("cpu_block_id_tensor"), py::arg("cpu_tensor"),                 \
+        py::arg("cpu_kv_stride_in_bytes"), py::arg("cpu_layer_stride_in_bytes"), \
+        py::arg("cpu_block_stride_in_bytes"),                                  \
+        py::arg("chunk_size_in_bytes"),                                        \
+        py::arg("start_layer_id"), py::arg("num_layers"),                      \
+        py::arg("is_mla"), py::arg("gpu_block_type")
+
+  m.def("ans_compress_and_d2h",
+        [](ANS_BINDING_PARAMS) { ans_transfer_binding(true,  ANS_BINDING_FWD); },
+        "ANS compress on GPU then D2H transfer", ANS_BINDING_ARGS);
+  m.def("ans_h2d_and_decompress",
+        [](ANS_BINDING_PARAMS) { ans_transfer_binding(false, ANS_BINDING_FWD); },
+        "H2D transfer then ANS decompress on GPU", ANS_BINDING_ARGS);
+  #undef ANS_BINDING_PARAMS
+  #undef ANS_BINDING_FWD
+  #undef ANS_BINDING_ARGS
+
+  m.def("ans_transfer_kv_blocks_ssd", &flexkv::ans_transfer_kv_blocks_ssd,
+        "Transfer compressed KV blocks between SSD and CPU (nvcomp ANS)",
+        py::arg("ioctx"),
+        py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),
+        py::arg("ssd_block_ids"), py::arg("cpu_block_ids"),
+        py::arg("cpu_layer_stride_in_bytes"), py::arg("cpu_kv_stride_in_bytes"),
+        py::arg("ssd_layer_stride_in_bytes"), py::arg("ssd_kv_stride_in_bytes"),
+        py::arg("chunk_size_in_bytes"), py::arg("block_stride_in_bytes"),
+        py::arg("is_read"), py::arg("num_blocks_per_file"),
+        py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
+        py::arg("is_mla") = false, py::arg("compressed_io") = false);
+#endif // FLEXKV_ENABLE_NVCOMP
+
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory", py::arg("ioctx"),
         py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),

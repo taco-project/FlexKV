@@ -136,6 +136,7 @@ class TransferEngine:
         self._worker_map: Dict[TransferType, Union[WorkerHandle, List[WorkerHandle]]] = {}
 
         assert self._cpu_handle is not None
+
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
         if self.tp_size == 1:
