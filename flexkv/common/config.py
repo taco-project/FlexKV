@@ -36,6 +36,24 @@ class ModelConfig:
     pp_size: int = 1
     pp_rank: int = 0
 
+    # topology configs
+    #   nnodes        : number of physical machines spanned by one replica
+    #                   (== server_args.nnodes in SGLang)
+    #   node_rank     : index of this machine within ``nnodes``
+    #                   (== server_args.node_rank in SGLang).  Used by
+    #                   KVTaskEngine's multi-node topology derivation and
+    #                   for logging; NOT embedded in the layerwise UDS
+    #                   socket path (UDS endpoints are kernel-local).
+    nnodes: int = 1
+    node_rank: int = 0
+
+    # Multi-node bootstrap: master node's IP for TransferManager rendezvous.
+    # ``None`` falls back to ``FLEXKV_MASTER_HOST`` env var (default
+    # ``"localhost"``) inside ``resolve_master_host_and_ports``.  Set this
+    # from the framework's own launch config (e.g. sglang's
+    # ``--dist-init-addr``) to avoid exposing an extra env knob.
+    master_host: Optional[str] = None
+
     # NSA context parallelism: when True, layerwise transfer sends full
     # (unpartitioned) KV cache to every rank instead of head-sliced data.
     is_nsa_cp: bool = False
