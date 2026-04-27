@@ -821,7 +821,6 @@ class KVTaskEngine(KVTaskManager):
                        token_ids: np.ndarray,
                        dp_id: int = 0,
                        task_id: int = -1,
-                       match_length: int = 0,
                        namespace: Optional[List[str]] = None) -> int:
         if task_id == -1:
             task_id = self._gen_task_id()
@@ -840,18 +839,29 @@ class KVTaskEngine(KVTaskManager):
             dp_id=dp_id
         )
         # Enqueue into priority queue instead of launching immediately
-        self._enqueue_prefetch(task_id, match_length)
+        self._enqueue_prefetch(task_id)
         # Drain queue: launch tasks up to max_inflight
         self._drain_prefetch_queue()
         return task_id
 
-    def _enqueue_prefetch(self, task_id: int, match_length: int = 0) -> None:
-        """Add a prefetch task to the priority queue."""
+    def _enqueue_prefetch(self, task_id: int) -> None:
+        """Add a prefetch task to the priority queue.
+        
+        For 'longest_match' policy, priority is derived from the task's
+        return_mask (precise DISK2H token count from cache_engine.get()),
+        not from external input.
+        """
         seq = self._prefetch_seq_counter
         self._prefetch_seq_counter += 1
         if self._prefetch_queue_policy == "longest_match":
-            # Larger match_length → higher priority → smaller key (negate)
-            priority_key = -match_length
+            # Use the precise SSD→CPU loaded token count from return_mask
+            task = self.tasks.get(task_id)
+            if task is not None and task.return_mask is not None:
+                actual_match = int(np.sum(task.return_mask))
+            else:
+                actual_match = 0
+            # Larger match → higher priority → smaller key (negate)
+            priority_key = -actual_match
         else:
             # FIFO: earlier enqueue → higher priority → smaller seq
             priority_key = seq
