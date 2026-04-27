@@ -10,7 +10,6 @@ import copy
 import os
 from expiring_dict import ExpiringDict
 import nvtx
-import torch
 import numpy as np
 
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
@@ -22,7 +21,7 @@ from flexkv.cache.cache_engine import GlobalCacheEngine, DEFAULT_CACHE_STRATEGY,
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
 from flexkv.transfer_manager import (
-    get_master_host_and_ports_from_env,
+    resolve_master_host_and_ports,
     get_trtllm_subprocess_host_and_ports_from_env
 )
 from flexkv.cache.redis_meta import RedisMeta
@@ -108,27 +107,61 @@ class KVTaskManager:
         self.model_config = model_config
         self._check_config(model_config, cache_config)
 
-        self.is_multinode_tp = False
-        self.tp_node_count = 1
-        if self.model_config.tp_size > torch.cuda.device_count():
-            if self.model_config.tp_size != torch.cuda.device_count() * 2:
-                raise ValueError("Only support 2 nodes TP for now")
-            assert self.model_config.dp_size == 1
-            self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
-            self.is_multinode_tp = True
+        # ---- Multi-node topology ----
+        nnodes = self.model_config.nnodes
+        pp_size = self.model_config.pp_size
+        tp_size = self.model_config.tp_size
+
+        total_gpus = tp_size * pp_size
+        if total_gpus % nnodes != 0:
+            raise ValueError(
+                f"[KVTaskEngine] cannot derive gpus_per_node: "
+                f"tp*pp={total_gpus} not divisible by nnodes={nnodes}"
+            )
+        gpus_per_node = total_gpus // nnodes
+
+        self.nnodes_per_tp_group = max(
+            (tp_size + gpus_per_node - 1) // gpus_per_node, 1
+        )
+        if self.nnodes_per_tp_group > 2:
+            raise ValueError(
+                f"Only support 2-nodes TP for now, but got "
+                f"nnodes_per_tp_group={self.nnodes_per_tp_group} "
+                f"(tp_size={tp_size}, gpus_per_node={gpus_per_node})"
+            )
+
+        if tp_size % self.nnodes_per_tp_group != 0:
+            raise ValueError(
+                f"[KVTaskEngine] tp_size={tp_size} not divisible by "
+                f"nnodes_per_tp_group={self.nnodes_per_tp_group}"
+            )
+        tp_size_per_node = tp_size // self.nnodes_per_tp_group
+
+        flexkv_logger.info(
+            f"[KVTaskEngine] topology: "
+            f"nnodes={nnodes}, "
+            f"node_rank={self.model_config.node_rank}, "
+            f"gpus_per_node={gpus_per_node}, "
+            f"tp_size={tp_size}, "
+            f"pp_size={pp_size}, "
+            f"dp_size={self.model_config.dp_size}, "
+            f"nnodes_per_tp_group={self.nnodes_per_tp_group}, "
+            f"tp_size_per_node={tp_size_per_node}, "
+            f"master_host={self.model_config.master_host!r}"
+        )
 
         self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta, event_collector)
 
         model_config_for_transfer = copy.deepcopy(self.model_config)
-        if self.is_multinode_tp:
-            model_config_for_transfer.tp_size //= self.tp_node_count
+        if self.nnodes_per_tp_group > 1:
+            model_config_for_transfer.tp_size //= self.nnodes_per_tp_group
             if not self.model_config.use_mla:
-                model_config_for_transfer.num_kv_heads //= self.tp_node_count
+                model_config_for_transfer.num_kv_heads //= self.nnodes_per_tp_group
             # When NSA CP is active, cp_size mirrors tp_size and must also
             # be divided so that TransferEngine's _eventfd_group_size matches
             # the number of local GPUs on each node.
             if model_config_for_transfer.is_nsa_cp and model_config_for_transfer.cp_size > 1:
-                model_config_for_transfer.cp_size //= self.tp_node_count
+                model_config_for_transfer.cp_size //= self.nnodes_per_tp_group
 
         combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
         if not combine_with_trtllm:
@@ -156,8 +189,10 @@ class KVTaskManager:
             ]
             self.transfer_handles[0]._handle.send_config_to_remotes()
 
-        if self.is_multinode_tp:
-            master_host, master_ports = get_master_host_and_ports_from_env()
+        if self.nnodes_per_tp_group > 1:
+            master_host, master_ports = resolve_master_host_and_ports(
+                master_host=self.model_config.master_host
+            )
             self.transfer_handles.append(TransferManagerHandle(
                 model_config_for_transfer,
                 self.cache_config,

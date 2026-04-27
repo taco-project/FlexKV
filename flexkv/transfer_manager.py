@@ -228,10 +228,30 @@ class TransferManager:
         if hasattr(self, 'transfer_engine'):
             self.transfer_engine.shutdown()
 
-def get_master_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
-    master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
+def resolve_master_host_and_ports(
+    master_host: Optional[str] = None,
+) -> Tuple[str, Tuple[str, str, str]]:
+    """Resolve the (master_host, master_ports) tuple for multi-node transfer.
+
+    ``master_host`` resolution order:
+        1. explicit ``master_host`` argument (when provided by the caller,
+           e.g. via sglang ``--dist-init-addr``);
+        2. ``FLEXKV_MASTER_HOST`` env var (used by framework-agnostic
+           launchers such as TRT-LLM's ``multi_node_launch.sh``);
+        3. ``"localhost"`` default.
+
+    ``master_ports`` always comes from ``FLEXKV_MASTER_PORTS`` (or default),
+    because changing ports rarely warrants a host-aware plumbing change.
+    """
+    if master_host is None:
+        master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
     master_ports = os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558")
     master_ports = tuple(master_ports.split(","))
+    flexkv_logger.info(
+        f"[TransferManager] resolved master endpoint: "
+        f"host={master_host!r} (source={'arg' if master_host is not None else 'env/default'}), "
+        f"ports={master_ports}"
+    )
     return "tcp://" + master_host, master_ports
 
 def get_trtllm_subprocess_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
@@ -244,9 +264,11 @@ class TransferManagerOnRemote(TransferManager):
     """
     TransferManager for remote mode, used for multi-node tensor parallelism.
     """
-    def __init__(self, mode: str = "Default"):
+    def __init__(self, mode: str = "Default", master_host: Optional[str] = None):
         if mode == "Default":
-            self.master_host, self.master_ports = get_master_host_and_ports_from_env()
+            self.master_host, self.master_ports = resolve_master_host_and_ports(
+                master_host=master_host
+            )
         elif mode == "TrtllmSubprocess":
             self.master_host, self.master_ports = get_trtllm_subprocess_host_and_ports_from_env()
         else:
@@ -842,20 +864,20 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
         try:
             command_addr = f"{self.master_host}:{self.master_ports[0]}"
             self.command_socket.bind(command_addr)
-            flexkv_logger.debug(f"Master bound command port at {command_addr}")
+            flexkv_logger.info(f"Master bound command port at {command_addr}")
 
             result_addr = f"{self.master_host}:{self.master_ports[1]}"
             self.result_socket.bind(result_addr)
-            flexkv_logger.debug(f"Master bound result port at {result_addr}")
+            flexkv_logger.info(f"Master bound result port at {result_addr}")
 
             query_addr = f"{self.master_host}:{self.master_ports[2]}"
             self.query_socket.bind(query_addr)
-            flexkv_logger.debug(f"Master bound query port at {query_addr}")
+            flexkv_logger.info(f"Master bound query port at {query_addr}")
 
             self.result_socket.setsockopt(zmq.RCVTIMEO, 0)
 
             self._connected = True
-            flexkv_logger.debug("Master transfer manager ready for remote connections")
+            flexkv_logger.info("Master transfer manager ready for remote connections")
 
         except Exception as e:
             flexkv_logger.error(f"Master failed to bind ports: {e}")
