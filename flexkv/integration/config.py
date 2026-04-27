@@ -127,10 +127,13 @@ class FlexKVConfig:
         pp_rank: int = 0,
         dp_size: int = 1,
         dp_rank: int = 0,
+        nnodes: int = 1,
+        node_rank: int = 0,
         is_nsa_cp: bool = False,
         cp_size: int = 1,
         cp_rank: int = 0,
         kv_cache_dtype: Optional[str] = None,
+        master_host: Optional[str] = None,
     ):
         """
         Initialize FlexKVConfig fields from sglang config.
@@ -143,9 +146,13 @@ class FlexKVConfig:
             pp_rank: pipeline parallel rank (default 0)
             dp_size: data parallel size (default 1, no DP)
             dp_rank: data parallel rank (default 0)
+            nnodes: number of nodes (aligned with server_args.nnodes, default 1)
+            node_rank: index of this node (aligned with server_args.node_rank, default 0)
             is_nsa_cp: whether NSA context parallelism is enabled
             cp_size: context parallel size (default 1, no CP)
             cp_rank: context parallel rank (default 0)
+            kv_cache_dtype: KV cache dtype (default None, use model dtype)
+            master_host: master host for multi-node setup (default None, use localhost)
         """
         # cache config: use page_size as tokens_per_block so that FlexKV's
         # CPU radix tree manages blocks at page granularity, ensuring that
@@ -250,6 +257,14 @@ class FlexKVConfig:
         self.model_config.pp_rank = int(pp_rank)
         self.model_config.is_nsa_cp = is_nsa_cp
         self.model_config.cp_size = int(cp_size if cp_size is not None else 1)
+        # Topology: nnodes + node_rank (aligned with sglang server_args).
+        # ``gpus_per_node`` is no longer stored on model_config; KVTaskEngine
+        # derives it locally as (tp_size * pp_size) // nnodes.
+        self.model_config.nnodes = max(1, int(nnodes))
+        self.model_config.node_rank = int(node_rank)
+        # Multi-node bootstrap: master host (derived from sglang --dist-init-addr).
+        # ``None`` here falls back to FLEXKV_MASTER_HOST env var downstream.
+        self.model_config.master_host = master_host
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
 
         # Each PP rank needs its own IPC ports so that their

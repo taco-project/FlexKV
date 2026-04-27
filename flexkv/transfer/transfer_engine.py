@@ -18,18 +18,17 @@ import time
 import multiprocessing as mp
 import selectors
 import os
-from queue import Queue
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 
 import contextlib
 import nvtx
 import numpy as np
+import torch
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import StorageHandle
-from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp, LayerwiseTransferOp
+from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp
 from flexkv.common.transfer import get_nvtx_range_color
-from flexkv.common.storage import KVCacheLayoutType
 from flexkv.transfer.scheduler import TransferScheduler
 from flexkv.transfer.worker import (
     WorkerHandle,
@@ -41,7 +40,10 @@ from flexkv.transfer.worker import (
     tpGDSTransferWorker,
     PEER2CPUTransferWorker,
 )
-from flexkv.transfer.layerwise import LayerwiseTransferWorker
+from flexkv.transfer.layerwise import (
+    LayerwiseTransferWorker,
+    build_layerwise_eventfd_socket_path,
+)
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
 
@@ -193,8 +195,8 @@ class TransferEngine:
                         dtype=gpu_handles[0].dtype,
                         tp_group_size=self.tp_size,
                         dp_group_id=dp_client_id,
-                        is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
-                        cp_size=getattr(self.model_config, "cp_size", 1),
+                        is_nsa_cp=self.model_config.is_nsa_cp,
+                        cp_size=self.model_config.cp_size,
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -237,8 +239,8 @@ class TransferEngine:
                     dtype=gpu_handles[0].dtype,
                     tp_group_size=self.tp_size,
                     dp_group_id=dp_client_id,
-                    is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
-                    cp_size=getattr(self.model_config, "cp_size", 1),
+                    is_nsa_cp=self.model_config.is_nsa_cp,
+                    cp_size=self.model_config.cp_size,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -345,10 +347,14 @@ class TransferEngine:
             ssd_files = {} if self._ssd_handle is None else self._ssd_handle.get_file_list()
             ssd_kv_layout = None if self._ssd_handle is None else self._ssd_handle.kv_layout
             num_blocks_per_file = 0 if self._ssd_handle is None else self._ssd_handle.num_blocks_per_file
-            _is_nsa_cp = getattr(self.model_config, 'is_nsa_cp', False)
-            _cp_size = getattr(self.model_config, 'cp_size', 1)
+            _is_nsa_cp = self.model_config.is_nsa_cp
+            _cp_size = self.model_config.cp_size
             # For CP, each CP rank connects via eventfd; for TP, each TP rank connects.
             _eventfd_group_size = _cp_size if _is_nsa_cp and _cp_size > 1 else self.tp_size
+
+            _layerwise_eventfd_socket = build_layerwise_eventfd_socket_path(
+                self.model_config
+            )
 
             # Prepare indexer handles for fused layerwise transfer
             has_indexer_for_layerwise = (
@@ -380,6 +386,7 @@ class TransferEngine:
                     pp_size=self.model_config.pp_size,
                     dp_size=self.model_config.dp_size,
                     dp_rank=dp_client_id,
+                    layerwise_eventfd_socket=_layerwise_eventfd_socket,
                     num_blocks_per_file=num_blocks_per_file,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
@@ -470,8 +477,8 @@ class TransferEngine:
                             dtype=indexer_gpu_handles_list[0].dtype,
                             tp_group_size=self.tp_size,
                             dp_group_id=dp_client_id,
-                            is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
-                            cp_size=getattr(self.model_config, "cp_size", 1),
+                            is_nsa_cp=self.model_config.is_nsa_cp,
+                            cp_size=self.model_config.cp_size,
                             use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                             use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                             transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -514,8 +521,8 @@ class TransferEngine:
                         dtype=indexer_gpu_handles_list[0].dtype,
                         tp_group_size=self.tp_size,
                         dp_group_id=dp_client_id,
-                        is_nsa_cp=getattr(self.model_config, "is_nsa_cp", False),
-                        cp_size=getattr(self.model_config, "cp_size", 1),
+                        is_nsa_cp=self.model_config.is_nsa_cp,
+                        cp_size=self.model_config.cp_size,
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,

@@ -1,34 +1,57 @@
-import copy
-import torch.multiprocessing as mp
-import threading
 import time
 import os
 import socket
 import struct
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from torch.multiprocessing import Queue as MPQueue, Pipe as MPPipe
+from torch.multiprocessing import Queue as MPQueue
 from multiprocessing.connection import Connection
-from threading import Thread
 from typing import List, Any, Dict, Union, Optional, Tuple
 
-import ctypes
-import numpy as np
-import nvtx
 import torch
-
-from flexkv import c_ext
 
 from flexkv.c_ext import LayerwiseTransferGroup
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
-from flexkv.common.transfer import get_nvtx_range_color
-from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.config import ModelConfig, GLOBAL_CONFIG_FROM_ENV
 
-from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
+from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp
 from flexkv.transfer.worker import TransferWorkerBase, cudaHostRegister
+
+
+def build_layerwise_eventfd_socket_path(model_config: ModelConfig) -> str:
+    """Construct the LayerwiseWorker's UDS socket path.
+
+    Disambiguated by ``(pp_rank, dp_rank)`` so multiple PP stages and DP
+    replicas on the same host each get their own endpoint.
+
+    We deliberately do NOT embed ``node_rank`` in the path: Unix domain
+    sockets are kernel-local, so two FlexKV instances on different
+    physical hosts cannot collide even when ``/tmp`` happens to be on a
+    shared filesystem (NFS and friends propagate the inode, not the
+    socket endpoint).  Deployments that stack multiple containers on one
+    host with a shared ``/tmp`` should disambiguate via the
+    ``FLEXKV_LAYERWISE_EVENTFD_SOCKET`` env var (e.g. embed ``$HOSTNAME``
+    or the container id in the base path).
+
+    Must stay in sync with the sglang-side consumer at
+    ``sglang.srt.mem_cache.storage.flexkv.flexkv_connector``, which
+    imports this helper directly so the two ends cannot drift.  Both
+    sides derive the path from the same ``ModelConfig`` fields, so no
+    env-var plumbing between processes is required.
+    """
+    base = os.environ.get(
+        'FLEXKV_LAYERWISE_EVENTFD_SOCKET',
+        '/tmp/flexkv_layerwise_eventfd.sock',
+    )
+    suffix = ""
+    if model_config.pp_size > 1:
+        suffix += f"_pp{model_config.pp_rank}"
+    if model_config.dp_size > 1:
+        suffix += f"_dp{model_config.dp_rank}"
+    if not suffix:
+        return base
+    root, ext = os.path.splitext(base)
+    return f"{root}{suffix}{ext}"
 
 
 def _recv_fds(sock: socket.socket, num_fds: int) -> Tuple[List[int], bytes]:
@@ -68,6 +91,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  pp_size: int,
                  dp_size: int,
                  dp_rank: int,
+                 layerwise_eventfd_socket: str,
                  num_blocks_per_file: int,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
@@ -108,6 +132,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.dp_group_id = dp_group_id
         self.dp_size = dp_size if dp_size > 0 else 1
         self.dp_rank = dp_rank
+        # Pre-computed UDS socket path.  Both ends (this worker and the
+        # sglang connector) derive the path from the same ModelConfig
+        # fields (pp_rank / dp_rank / node_rank / is_multinode_tp), so no
+        # env-var plumbing between processes is required.
+        self.layerwise_eventfd_socket = layerwise_eventfd_socket
         self.is_nsa_cp = is_nsa_cp
 
         # initialize GPU storage
@@ -314,23 +343,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                                        max_retries: int = 180,
                                        retry_interval: float = 1.0) -> torch.Tensor:
         """Receive eventfds from SGLang via Unix socket (FlexKV as server)."""
-        base_socket_path = os.environ.get('FLEXKV_LAYERWISE_EVENTFD_SOCKET', '/tmp/flexkv_layerwise_eventfd.sock')
-        sock_suffix = ""
-        if int(self.pp_size) > 1:
-            sock_suffix += f"_pp{int(self.pp_rank)}"
-        if int(self.dp_size) > 1:
-            sock_suffix += f"_dp{int(self.dp_rank)}"
-        # Multi-node TP: add _node{id} suffix to match sglang connector's
-        # socket path.  The sglang connector sets FLEXKV_NODE_ID when it
-        # detects cross-node TP; the subprocess inherits this env var.
-        _node_id_str = os.environ.get("FLEXKV_NODE_ID")
-        if _node_id_str is not None:
-            sock_suffix += f"_node{_node_id_str}"
-        if sock_suffix:
-            root, ext = os.path.splitext(base_socket_path)
-            socket_path = f"{root}{sock_suffix}{ext}"
-        else:
-            socket_path = base_socket_path
+        socket_path = self.layerwise_eventfd_socket
 
         rank_parts = []
         if int(self.tp_group_size) > 1:
