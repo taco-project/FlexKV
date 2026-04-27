@@ -230,6 +230,27 @@ class KVTaskManager:
         self._prefetch_heap: List[Tuple[int, int, int]] = []
         self._prefetch_seq_counter: int = 0  # monotonic counter for FIFO tie-breaking
         self._prefetch_inflight: int = 0     # currently launched prefetch tasks
+        # Token-level flow control for prefetch.
+        # Capacity = cpu_total_tokens × ratio.  Prefetch tasks whose cumulative
+        # actual SSD→CPU token count would exceed this are discarded before enqueue.
+        if self.cache_engine.cpu_cache_engine is not None:
+            cpu_total_tokens = (
+                self.cache_engine.cpu_cache_engine.num_total_blocks
+                * self.cache_config.tokens_per_block
+            )
+            ratio = GLOBAL_CONFIG_FROM_ENV.prefetch_capacity_ratio
+            self._prefetch_token_capacity = max(0, int(cpu_total_tokens * ratio))
+        else:
+            self._prefetch_token_capacity = 0  # no CPU cache → no limit
+        self._prefetch_tokens_occupied: int = 0
+
+        flexkv_logger.info(
+            f"prefetch_capacity_ratio: {GLOBAL_CONFIG_FROM_ENV.prefetch_capacity_ratio}," 
+            f"prefetch_token_capacity: {self._prefetch_token_capacity},"
+            f"prefetch_queue_policy: {self._prefetch_queue_policy},"
+            f"prefetch_max_inflight: {self._prefetch_max_inflight}"
+        )
+
 
     def start(self) -> None:
         for transfer_handle in self.transfer_handles:
@@ -460,6 +481,10 @@ class KVTaskManager:
         # Release prefetch inflight slot and try to launch queued tasks
         if task.task_type == TaskType.PREFETCH:
             self._prefetch_inflight = max(0, self._prefetch_inflight - 1)
+            # Release token capacity occupied by this prefetch
+            if task.return_mask is not None:
+                released = int(np.sum(task.return_mask))
+                self._prefetch_tokens_occupied = max(0, self._prefetch_tokens_occupied - released)
             self._drain_prefetch_queue()
         task.status = TaskStatus.COMPLETED
         task.task_end_op_finished = True
@@ -821,13 +846,54 @@ class KVTaskEngine(KVTaskManager):
                        token_ids: np.ndarray,
                        dp_id: int = 0,
                        task_id: int = -1,
-                       namespace: Optional[List[str]] = None) -> int:
+                       namespace: Optional[List[str]] = None) -> Tuple[int, int]:
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
         self.create_prefetch_task(task_id, token_ids, namespace=namespace)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
+
+        # Precise SSD→CPU token count from return_mask (set by cache_engine.get
+        # during create_prefetch_task).
+        task = self.tasks.get(task_id)
+        actual_prefetch_tokens = 0
+        if task is not None and task.return_mask is not None:
+            actual_prefetch_tokens = int(np.sum(task.return_mask))
+
+        # ---- Token-level flow control (before enqueue/launch) ----
+        # If actual transfer would exceed capacity, discard the task immediately
+        # and release all resources allocated by create_prefetch_task
+        # (CPU blocks, radix tree locks, etc.).
+        discard = (
+            self._prefetch_token_capacity > 0
+            and actual_prefetch_tokens > 0
+            and self._prefetch_tokens_occupied + actual_prefetch_tokens > self._prefetch_token_capacity
+        )
+
+        if discard and task is not None and not task.is_completed():
+            # Execute callback to release CPU blocks and radix tree locks
+            if task.callback is not None:
+                try:
+                    task.callback()
+                except Exception:
+                    pass
+            # Clean up task bookkeeping
+            self.graph_to_task.pop(task.graph.graph_id, None)
+            self.prefetch_tasks.pop(self._gen_prefetch_key(token_ids, namespace), None)
+            del self.tasks[task_id]
+            # trace prefetch discard
+            self.tracer.trace_request(
+                request_type="PREFETCH_ASYNC",
+                request_id=task_id,
+                token_ids=token_ids,
+                slot_mapping=np.zeros_like(token_ids),
+                token_mask=np.ones_like(token_ids),
+                layer_granularity=-1,
+                dp_id=dp_id
+            )
+            return -1, actual_prefetch_tokens
+
         # trace prefetch async request
         self.tracer.trace_request(
             request_type="PREFETCH_ASYNC",
@@ -838,11 +904,16 @@ class KVTaskEngine(KVTaskManager):
             layer_granularity=-1,
             dp_id=dp_id
         )
+
+        # Track tokens occupied by this prefetch
+        if actual_prefetch_tokens > 0:
+            self._prefetch_tokens_occupied += actual_prefetch_tokens
+
         # Enqueue into priority queue instead of launching immediately
         self._enqueue_prefetch(task_id)
         # Drain queue: launch tasks up to max_inflight
         self._drain_prefetch_queue()
-        return task_id
+        return task_id, actual_prefetch_tokens
 
     def _enqueue_prefetch(self, task_id: int) -> None:
         """Add a prefetch task to the priority queue.
