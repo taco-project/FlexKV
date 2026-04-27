@@ -608,8 +608,19 @@ class GlobalCacheEngine:
             )
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
-        return_mask[block_start_idx* self.tokens_per_block:
-                    (block_start_idx + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
+        if temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
+            # Prefetch path: report SSD→CPU (DISK2H) loaded blocks in return_mask
+            # so callers can track precise loaded token count.
+            disk2h_blocks = 0
+            for op in transfer_graph._op_map.values():
+                if op.transfer_type == TransferType.DISK2H:
+                    disk2h_blocks += len(op.src_block_ids)
+            if disk2h_blocks > 0:
+                return_mask[block_start_idx * self.tokens_per_block:
+                            (block_start_idx + disk2h_blocks) * self.tokens_per_block] = True
+        else:
+            return_mask[block_start_idx * self.tokens_per_block:
+                        (block_start_idx + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 
         # if layer_num // layer_granularity != 1:
         #     transfer_graph, finished_ops_ids = convert_read_graph_to_layer_wise_graph(transfer_graph=transfer_graph,

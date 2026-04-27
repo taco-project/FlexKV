@@ -165,6 +165,18 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
 
+    # Prefetch queue configuration
+    ## Policy: "fifo" (first-in-first-out) or "longest_match" (prioritize largest SSD match)
+    prefetch_queue_policy=os.getenv('FLEXKV_PREFETCH_QUEUE_POLICY', 'fifo'),
+    ## Maximum number of prefetch tasks launched concurrently (IO in-flight).
+    ## Defaults to half of FLEXKV_MAX_CONCURRENT_PREFETCH.
+    prefetch_max_inflight=int(os.getenv('FLEXKV_PREFETCH_MAX_INFLIGHT',
+                                        str(int(os.getenv('FLEXKV_MAX_CONCURRENT_PREFETCH', '8')) // 2))),
+    ## Fraction of CPU block pool that prefetch may occupy.
+    ## capacity = cpu_total_tokens × ratio.  Prefetch tasks whose cumulative
+    ## token count would exceed this limit are discarded before enqueue.
+    prefetch_capacity_ratio=float(os.getenv('FLEXKV_PREFETCH_CAPACITY_RATIO', '0.5')),
+    
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),
     trace_max_file_size_mb=int(os.getenv('FLEXKV_TRACE_MAX_FILE_SIZE_MB', 100)),

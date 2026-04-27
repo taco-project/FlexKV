@@ -240,14 +240,16 @@ class KVManager:
     def prefetch_async(self,
                        token_ids: np.ndarray,
                        dp_id: int = 0,
-                       namespace: Optional[List[str]] = None) -> int:
+                       namespace: Optional[List[str]] = None) -> Tuple[int, int]:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if self.server_client_mode:
             task_id = self.dp_client.prefetch_async(token_ids, namespace=namespace)
+            # server_client_mode: actual_prefetch_tokens not yet available from server
+            return task_id, 0
         else:
-            task_id = self.kv_task_engine.prefetch_async(token_ids, dp_id=dp_id, namespace=namespace)
-        return task_id
+            task_id, actual_prefetch_tokens = self.kv_task_engine.prefetch_async(token_ids, dp_id=dp_id, namespace=namespace)
+            return task_id, actual_prefetch_tokens
 
     def launch(self,
                task_ids: Union[int, List[int]],
