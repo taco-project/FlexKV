@@ -90,15 +90,13 @@ class CacheEngineAccel:
                                               sequence_meta.num_blocks, True)
         # physical blocks (torch.Tensor -> numpy, zero-copy on CPU)
         phys = match_result.physical_blocks.cpu().numpy()
-        # optional block_node_ids
-        try:
-            bnis = getattr(match_result, "block_node_ids", None)
-            if isinstance(bnis, torch.Tensor) and bnis.numel() > 0:
-                bnids_np = bnis.cpu().numpy()
-            else:
-                bnids_np = None
-        except Exception:
-            bnids_np = None
+        # Extract single matched_node_id (single-node constraint)
+        raw_nid = getattr(match_result, "matched_node_id", -1)
+        single_node_id = int(raw_nid) if raw_nid is not None and raw_nid >= 0 else None
+        # Broadcast matched_node_id to per-block array for downstream compat
+        bnids_np = None
+        if single_node_id is not None and len(phys) > 0:
+            bnids_np = np.full(len(phys), single_node_id, dtype=np.uint32)
         return MatchResultAccel(
             num_ready_matched_blocks=match_result.num_ready_matched_blocks,
             num_matched_blocks=match_result.num_matched_blocks,
@@ -106,6 +104,7 @@ class CacheEngineAccel:
             last_node=match_result.last_node,
             last_node_matched_length=match_result.last_node_matched_length,
             physical_blocks=phys,
+            matched_node_id=single_node_id,
             block_node_ids=bnids_np,
             matched_pos="remote" if self.device_type == DeviceType.REMOTE else "local",
         )

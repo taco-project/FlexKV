@@ -520,9 +520,8 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
   }
 
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
-  auto empty_uint32 = torch::Tensor();
   return std::make_shared<CMatchResult>(ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
-    last_ready_node, current_node, physical_blocks, empty_uint32);
+    last_ready_node, current_node, physical_blocks);
 }
 
 } //  namespace flexkv

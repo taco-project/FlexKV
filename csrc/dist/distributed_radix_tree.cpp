@@ -354,8 +354,7 @@ std::shared_ptr<CMatchResult> DistributedRadixTree::match_prefix(
     if (idx == nullptr) {
       // Remote index not yet built - this is normal at startup
       auto empty_i64 = torch::empty({0}, torch::dtype(torch::kInt64));
-      auto empty_u32 = torch::empty({0}, torch::dtype(torch::kInt32));
-      return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
+      return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64);
     }
     
     // Safely increment reference count while holding the lock
@@ -563,8 +562,7 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   
   if (root == nullptr) {
     auto empty_i64 = torch::empty({0}, torch::dtype(torch::kInt64));
-    auto empty_u32 = torch::empty({0}, torch::dtype(torch::kInt32));
-    return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
+    return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64);
   }
   
   auto current_node = root;
@@ -578,10 +576,10 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   auto block_hashes_ptr = block_hashes.data_ptr<int64_t>();
   HashType child_hash;
   
-  // node ids stored as int32 tensor (PyTorch lacks uint32 dtype)
-  auto node_ids_tensor = torch::empty({num_blocks}, torch::dtype(torch::kInt32));
-  auto *ni_out = node_ids_tensor.data_ptr<int32_t>();
-  int32_t ni_write = 0;
+  // Single-node matching constraint: all matched blocks must come from the
+  // same peer node_id.  We lock the node_id on the first valid block and
+  // stop matching when a different node_id is encountered.
+  int32_t matched_node_id = -1;  // -1 = not yet determined
 
   // now in ms
   struct timeval now_tv; gettimeofday(&now_tv, nullptr);
@@ -638,9 +636,20 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
         
         if (bnis == nullptr || bnis->size() != pbs.size()) break;
         
+        // Single-node constraint: stop at the first block whose node_id
+        // differs from the already-locked matched_node_id.
+        int actually_copied = 0;
         for (int i = 0; i < matched; ++i) {
+          int32_t block_nid = static_cast<int32_t>((*bnis)[i]);
+          if (matched_node_id == -1) {
+            matched_node_id = block_nid;  // lock the first node_id
+          } else if (block_nid != matched_node_id) {
+            // Different node_id encountered - stop matching here
+            matched = actually_copied;
+            break;
+          }
           pb_out[pb_write++] = pbs[i];
-          ni_out[ni_write++] = (*bnis)[i];
+          actually_copied++;
         }
         
         if (current_node->is_ready()) {
@@ -672,10 +681,9 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   }
   
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
-  auto node_ids = node_ids_tensor.narrow(0, 0, ni_write);
   
   return std::make_shared<CMatchResult>(prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
-    last_ready_node, current_node, physical_blocks, node_ids);
+    last_ready_node, current_node, physical_blocks, matched_node_id);
 }
 
 // Helper function to clean up an orphan tree (not attached to main tree)

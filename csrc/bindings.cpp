@@ -660,11 +660,18 @@ PYBIND11_MODULE(c_ext, m) {
   py::class_<flexkv::CMatchResult, std::shared_ptr<flexkv::CMatchResult>>(
       m, "CMatchResult")
       .def(py::init<int, int, int, flexkv::CRadixNode *, flexkv::CRadixNode *,
-                    torch::Tensor, torch::Tensor>())
+                    torch::Tensor, int32_t>(),
+           py::arg("num_ready_matched_blocks"),
+           py::arg("num_matched_blocks"),
+           py::arg("last_node_matched_length"),
+           py::arg("last_ready_node"),
+           py::arg("last_node"),
+           py::arg("physical_blocks"),
+           py::arg("matched_node_id") = -1)
       .def_readonly("last_ready_node", &flexkv::CMatchResult::last_ready_node)
       .def_readonly("last_node", &flexkv::CMatchResult::last_node)
       .def_readonly("physical_blocks", &flexkv::CMatchResult::physical_blocks)
-      .def_readonly("block_node_ids", &flexkv::CMatchResult::block_node_ids)
+      .def_readonly("matched_node_id", &flexkv::CMatchResult::matched_node_id)
       .def_readonly("num_ready_matched_blocks",
                     &flexkv::CMatchResult::num_ready_matched_blocks)
       .def_readonly("num_matched_blocks",

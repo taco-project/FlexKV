@@ -201,37 +201,37 @@ class HierarchyLRCacheEngine:
         
         # physical blocks
         bnids_np = None
+        single_node_id = None
         if chosen is mr_remote:
-            #try to use DistributedRadixTree's block_node_ids
-            #if check fails, use LocalRadixTree's match result
-            nids = chosen.block_node_ids
-            nps = chosen.physical_blocks
-            # Convert tensors to numpy views (CPU) if present
-            if isinstance(nids, torch.Tensor) and nids.numel() > 0:
-                # For P2P mode (CPU/SSD), no PCFS conversion is needed
-                # Only convert to PCFS file_nodeids if device_type is REMOTE
-                if self.device_type == DeviceType.REMOTE:
-                    bnids_np = self.nodeids_to_file_nodeids(nids.cpu().numpy(), nps.cpu().numpy())
-                    if bnids_np is None:
-                        chosen = mr_local
-                        matched_pos = "local"  # Update matched_pos after fallback
-                else:
-                    # For P2P mode, use node_ids directly
-                    bnids_np = nids.cpu().numpy().astype(np.uint32)
-                    #print(f"[REMOTE_MATCH {self.device_type.name}] Using remote data: block_ids={nps.cpu().numpy()[:min(4, len(nps))]}, node_ids={bnids_np[:min(4, len(bnids_np))]}")
+            # Extract single matched_node_id from CMatchResult (single-node constraint)
+            raw_node_id = getattr(chosen, "matched_node_id", -1)
+            if raw_node_id is not None and raw_node_id >= 0:
+                single_node_id = int(raw_node_id)
+                nps = chosen.physical_blocks
+                num_blocks = nps.shape[0] if isinstance(nps, torch.Tensor) else len(nps)
+                if num_blocks > 0:
+                    # Broadcast single node_id to per-block array for downstream compat
+                    raw_nids = np.full(num_blocks, single_node_id, dtype=np.uint32)
+                    if self.device_type == DeviceType.REMOTE:
+                        bnids_np = self.nodeids_to_file_nodeids(raw_nids, nps.cpu().numpy())
+                        if bnids_np is None:
+                            chosen = mr_local
+                            matched_pos = "local"
+                            single_node_id = None
+                    else:
+                        bnids_np = raw_nids
             else:
-                bnids_np = None
+                # No valid matched_node_id → fall back to local
                 if mr_remote.num_matched_blocks > 0:
-                    #print(f"[REMOTE_MATCH {self.device_type.name}] Warning: remote matched but block_node_ids is empty, falling back to local")
                     chosen = mr_local
-                    matched_pos = "local"  # Update matched_pos after fallback
+                    matched_pos = "local"
+                    single_node_id = None
         phys_np = chosen.physical_blocks.cpu().numpy()
         #maybe we should always not insert
         if self.device_type == DeviceType.CPU and matched_pos == "remote" and mr_local.num_matched_blocks > 0:
             insert_to_local_cpu_index = False
         else:
             insert_to_local_cpu_index = True
-        #TODO A big question is how to get the node id for peer_cpu and peer_ssd?
         return MatchResultAccel(
             num_ready_matched_blocks=int(chosen.num_ready_matched_blocks),
             num_matched_blocks=int(chosen.num_matched_blocks),
@@ -239,9 +239,10 @@ class HierarchyLRCacheEngine:
             last_node=chosen.last_node,
             last_node_matched_length=int(chosen.last_node_matched_length),
             physical_blocks=phys_np,
+            matched_node_id=single_node_id,
             block_node_ids=bnids_np,
             matched_pos=matched_pos,
-            matched_node_ids=bnids_np,  # Set matched_node_ids for P2P transfer
+            matched_node_ids=bnids_np,  # deprecated: kept for backward compat
             insert_to_local_cpu_index=insert_to_local_cpu_index,
         )
 

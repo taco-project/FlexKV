@@ -227,17 +227,18 @@ public:
   CRadixNode *last_ready_node;
   CRadixNode *last_node;
   torch::Tensor physical_blocks;
-  torch::Tensor block_node_ids;
+  int32_t matched_node_id;       // single node_id for all matched blocks (-1 = no match)
 
   CMatchResult(int _num_ready_matched_blocks, int _num_matched_blocks,
                int _last_node_matched_length, CRadixNode *_last_ready_node,
                CRadixNode *_last_node, torch::Tensor blocks,
-               torch::Tensor block_node_ids = torch::Tensor())
+               int32_t matched_node_id = -1)
       : num_ready_matched_blocks(_num_ready_matched_blocks),
         num_matched_blocks(_num_matched_blocks),
         last_node_matched_length(_last_node_matched_length),
         last_ready_node(_last_ready_node), last_node(_last_node),
-        physical_blocks(blocks), block_node_ids(block_node_ids) {}
+        physical_blocks(blocks),
+        matched_node_id(matched_node_id) {}
 
   ~CMatchResult() {}
 };
