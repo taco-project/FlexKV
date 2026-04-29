@@ -42,3 +42,12 @@ def _setup_library_path() -> None:
 
 # Call the setup function when the package is imported
 _setup_library_path()
+
+# ``flexkv.c_ext`` is a PyTorch C++ extension and dynamically links against
+# ``libc10.so`` / ``libtorch*.so`` from the installed ``torch`` package. Those
+# libraries live under ``<site-packages>/torch/lib`` and are NOT on the system
+# linker search path. Importing ``torch`` here causes Python to ``dlopen`` them
+# (with RTLD_GLOBAL), so any subsequent ``import flexkv.c_ext`` can resolve
+# them without requiring the caller to ``import torch`` first or to set
+# ``LD_LIBRARY_PATH``.
+import torch  # noqa: E402,F401  (side-effect import: load libtorch/libc10)
