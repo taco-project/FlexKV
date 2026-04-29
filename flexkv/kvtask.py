@@ -188,6 +188,10 @@ class KVTaskManager:
 
         self.running_tasks: int = 0
         self._pending_release_tasks: set = set()
+        # Cache of KVResponse for tasks already released from self.tasks but not yet observed by wait().
+        self._completed_results: ExpiringDict[int, KVResponse] = ExpiringDict(
+            max_age_seconds=1800, max_len=100000
+        )
 
     def start(self) -> None:
         for transfer_handle in self.transfer_handles:
@@ -419,11 +423,19 @@ class KVTaskManager:
         task.status = TaskStatus.RUNNING
         return task.graph
 
-    def _release_task(self, task_id: int) -> None:
+    def _release_task(self, task_id: int, cache_response: bool = True) -> None:
         """clean up task resources."""
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]
+        # Cache the result so a future wait() that arrives after this auto-release
+        # can still retrieve status + return_mask. 
+        if cache_response and task.is_completed():
+            self._completed_results[task_id] = KVResponse(
+                status=convert_to_response_status(task.status),
+                task_id=task_id,
+                return_mask=task.return_mask,
+            )
         batch_id = task.batch_task_id
         self.graph_to_task.pop(task.graph.graph_id, None)
         self.tasks.pop(task_id, None)
@@ -602,6 +614,11 @@ class KVTaskEngine(KVTaskManager):
             nvtx_range = nvtx.start_range(message=f"KVTask.wait[{task_id}]", color="red")
             while True:
                 if task_id not in self.tasks:
+                    # Task may have been auto-released after completion
+                    if task_id in self._completed_results:
+                        return_responses[task_id] = self._completed_results[task_id]
+                        del self._completed_results[task_id]
+                        break
                     flexkv_logger.error(f"task_id {task_id} not submitted into flexKV")
                     return_responses[task_id] = KVResponse(
                         status=KVResponseStatus.NOTFOUND,
@@ -625,7 +642,8 @@ class KVTaskEngine(KVTaskManager):
                         return_mask=self.tasks[task_id].return_mask
                     )
                     if self.tasks[effective_id].is_completed():
-                        self._release_task(task_id)
+                        # User has observed; do not duplicate into cache.
+                        self._release_task(task_id, cache_response=False)
                     break
                 elif only_return_finished:
                     break
