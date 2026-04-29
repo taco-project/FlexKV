@@ -106,6 +106,12 @@ class KVTaskManager:
             raise ValueError("enable_ssd must be True if enable_gds is True")
         if cache_config.enable_kv_sharing and cache_config.enable_gds:
             raise ValueError("enable_kv_sharing and enable_gds cannot be used at the same time")
+        if cache_config.enable_nixl and not cache_config.enable_gds:
+            raise ValueError("enable_nixl requires enable_gds to be True")
+        if cache_config.enable_nixl and model_config.tp_size > 1:
+            raise ValueError(
+                "enable_nixl GPU-SSD path currently requires tp_size==1 (no tpNixlTransferWorker)"
+            )
         self.cache_config = cache_config
         self.model_config = model_config
         self._check_config(model_config, cache_config)
