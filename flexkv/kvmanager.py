@@ -67,24 +67,10 @@ class KVManager:
         flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
 
         self.redis_meta_client = None
-        if self.cache_config.enable_kv_sharing:
-            flexkv_logger.info(f"[kv manager] initializing RedisMeta and connection to \
-                        {self.cache_config.redis_host}:{self.cache_config.redis_port}")
-            # initialize redis Meta obj
-            self.redis_meta_client = RedisMeta(
-                self.cache_config.redis_host,
-                self.cache_config.redis_port,
-                self.cache_config.redis_password,
-                self.cache_config.local_ip,
-            )
-            self.redis_meta_client.init_meta()
-            # update distributed_node_id
-            self.cache_config.distributed_node_id = self.redis_meta_client.get_node_id() # update distributed_node_id of current node
-
-
         self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
 
         if self.server_client_mode:
+            # In server_client_mode, RedisMeta is created and initialized inside KVServer
             # Server should only be created once across all instances and dp ranks
             if self.instance_id == 0 and dp_client_id == 0:
                 total_clients = self.instance_num * model_config.dp_size
@@ -99,6 +85,21 @@ class KVManager:
                 self.server_handle = None
             self.dp_client = KVDPClient(self.server_recv_port, self.model_config, self.global_client_id)
         else:
+            # In non-server_client_mode, create RedisMeta here and pass to KVTaskEngine
+            if self.cache_config.enable_kv_sharing:
+                flexkv_logger.info(f"[kv manager] initializing RedisMeta and connection to "
+                                   f"{self.cache_config.redis_host}:{self.cache_config.redis_port}")
+                self.redis_meta_client = RedisMeta(
+                    self.cache_config.redis_host,
+                    self.cache_config.redis_port,
+                    self.cache_config.redis_password,
+                    self.cache_config.local_ip,
+                    node_ttl_seconds=self.cache_config.node_ttl_seconds,
+                )
+                self.redis_meta_client.init_meta()
+                # update distributed_node_id
+                self.cache_config.distributed_node_id = self.redis_meta_client.get_node_id()
+
             self.server_handle = None
             self.kv_task_engine = KVTaskEngine(self.model_config, self.cache_config, self.gpu_register_port, redis_meta=self.redis_meta_client, event_collector=event_collector)
 
@@ -127,6 +128,10 @@ class KVManager:
     def shutdown(self) -> None:
         if self.server_client_mode:
             self.dp_client.shutdown()
+            # Wait for the server process to exit after sending shutdown request
+            if self.server_handle is not None:
+                self.server_handle.shutdown()
+                self.server_handle = None
         else:
             self.kv_task_engine.shutdown()
 

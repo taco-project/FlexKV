@@ -329,6 +329,7 @@ class FlexKVTracer:
 
     def __del__(self):
         """Ensure all records are flushed when tracer is destroyed"""
-        from contextlib import suppress
-        with suppress(Exception):
+        try:
             self.flush()
+        except Exception:
+            pass

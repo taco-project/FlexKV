@@ -31,7 +31,7 @@ class HierarchyLRCacheEngine:
                  remote_max_num_blocks: int = 4000000,
                  redis_node_id: int = 0,
                  remote_refresh_batch_size: int = 1000,
-                 remote_rebuild_interval_ms: int = 10000,
+                 remote_rebuild_interval_ms: int = 100,
                  remote_idle_sleep_ms: int = 10,
                  local_safety_ttl_ms: int = 100,
                  evict_start_threshold: float = 1.0,

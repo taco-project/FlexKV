@@ -31,7 +31,12 @@ class MoonCakeTransferEngineWrapper:
             )
         
         if config is None:
-            mooncake_config_path = os.environ["MOONCAKE_CONFIG_PATH"]
+            mooncake_config_path = os.environ.get("MOONCAKE_CONFIG_PATH")
+            if mooncake_config_path is None:
+                raise RuntimeError(
+                    "MOONCAKE_CONFIG_PATH is not set. Please set the MOONCAKE_CONFIG_PATH "
+                    "environment variable or pass a MooncakeTransferEngineConfig object."
+                )
             self.config = MooncakeTransferEngineConfig.from_file(mooncake_config_path)
         else:
             self.config = config
@@ -40,7 +45,7 @@ class MoonCakeTransferEngineWrapper:
         self.mooncake_addr = f"{self.engine_ip}:{self.engien_port}"
         flexkv_logger.info(f"Mooncake listen on: {self.mooncake_addr}")
 
-        supported_backend = ["redis"]
+        supported_backend = ["redis", "http"]
         self.metadata_backend = self.config.metadata_backend.lower()
         if self.metadata_backend not in supported_backend:
             raise ValueError(
@@ -51,13 +56,18 @@ class MoonCakeTransferEngineWrapper:
         # transfer engine initialize
         self.engine = TransferEngine()
 
+        # Set Redis auth env vars for mooncake engine (it reads MC_REDIS_PASSWORD internally)
+        if self.config.metadata_server_auth:
+            os.environ["MC_REDIS_PASSWORD"] = self.config.metadata_server_auth
+            flexkv_logger.info("Set MC_REDIS_PASSWORD environment variable for mooncake Redis authentication")
+
         self.engine.initialize_ext(
             self.mooncake_addr,
             self.config.metadata_server,
             self.config.protocol,
             self.config.device_name,
             self.metadata_backend,
-        )         
+        )
 
     # mooncake operations
     def regist_buffer(self, buffer_ptr: int, buffer_size: int) -> int:

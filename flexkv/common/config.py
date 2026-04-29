@@ -76,6 +76,12 @@ class CacheConfig:
     redis_port: int = 6379
     local_ip: str = "127.0.0.1"
     redis_password: Optional[str] = None
+    # TTL (seconds) for node:<id> key in Redis. Active nodes renew via heartbeat.
+    # If a process crashes, the key auto-expires after this period.
+    node_ttl_seconds: int = 30
+
+    # Mooncake transfer engine config path (serialized via pickle to survive spawn subprocesses)
+    mooncake_config_path: Optional[str] = None
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
@@ -119,6 +125,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     evict_start_threshold=float(os.getenv('FLEXKV_EVICT_START_THRESHOLD', 0.7)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
     eviction_policy=os.getenv('FLEXKV_EVICTION_POLICY', 'lru'),
+    slru_protected_threshold=int(os.getenv('FLEXKV_SLRU_PROTECTED_THRESHOLD', 2)),
 
     enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
 
@@ -130,7 +137,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     lt_pool_initial_capacity=int(os.getenv('FLEXKV_LT_POOL_INITIAL_CAPACITY', 10000000)),
     refresh_batch_size=int(os.getenv('FLEXKV_REFRESH_BATCH_SIZE', 256)),
-    rebuild_interval_ms=int(os.getenv('FLEXKV_REBUILD_INTERVAL_MS', 10000)),
+    rebuild_interval_ms=int(os.getenv('FLEXKV_REBUILD_INTERVAL_MS', 2000)),
     idle_sleep_ms=int(os.getenv('FLEXKV_IDLE_SLEEP_MS', 10)),
     lease_ttl_ms=int(os.getenv('FLEXKV_LEASE_TTL_MS', 30000)),
     safety_ttl_ms=int(os.getenv('FLEXKV_SAFETY_TTL_MS', 100)),
@@ -156,6 +163,7 @@ class UserConfig:
     redis_port: Optional[int] = None
     local_ip: Optional[str] = None
     redis_password: Optional[str] = None
+    node_ttl_seconds: Optional[int] = None
     kv_cache_dtype: Optional[str] = None  # Override kv_cache_dtype when TRT config uses "auto". Supported values: "fp8", "float8", "e4m3", "fp16", "float16", "bf16", "bfloat16", "fp32", "float32"
 
     def __post_init__(self):
@@ -257,6 +265,8 @@ def update_default_config_from_user_config(model_config: ModelConfig,
         cache_config.local_ip = user_config.local_ip
     if user_config.redis_password is not None:
         cache_config.redis_password = user_config.redis_password
+    if user_config.node_ttl_seconds is not None:
+        cache_config.node_ttl_seconds = user_config.node_ttl_seconds
 
     global_config_attrs = set(vars(GLOBAL_CONFIG_FROM_ENV).keys())
     for attr_name in dir(user_config):

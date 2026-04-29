@@ -73,9 +73,10 @@ def _cfg(**overrides) -> dict:
         # --- Valid configurations ---
         # Default valid config
         (_cfg(), False),
-        # Explicit eviction policies – all 5 should be valid
+        # Explicit eviction policies – all 6 should be valid
         (_cfg(eviction_policy='lru'), False),
         (_cfg(eviction_policy='lfu'), False),
+        (_cfg(eviction_policy='slru'), False),
         (_cfg(eviction_policy='fifo'), False),
         (_cfg(eviction_policy='mru'), False),
         (_cfg(eviction_policy='filo'), False),
@@ -115,6 +116,16 @@ def _cfg(**overrides) -> dict:
         (_cfg(device_type='Unknown'), True),
         (_cfg(device_type=999), True),
         (_cfg(device_type=None), True),
+
+        # --- Valid: protected_threshold (only meaningful for SLRU, but accepted for all) ---
+        (_cfg(eviction_policy='slru', protected_threshold=1), False),
+        (_cfg(eviction_policy='slru', protected_threshold=5), False),
+
+        # --- Invalid: protected_threshold ---
+        (_cfg(protected_threshold=0), True),
+        (_cfg(protected_threshold=-1), True),
+        (_cfg(protected_threshold=1.5), True),
+        (_cfg(protected_threshold=None), True),
     ],
 )
 def test_config_init(engine_cls, config: dict, should_raise: bool):
@@ -499,6 +510,10 @@ def test_eviction_policy(engine_cls):
     # LFU: evict lowest hit count (D=2) → D
     _assert_only_evicted(run_test('lfu'), 'D')
 
+    # SLRU: with default protected_threshold=2, all nodes have hit_count>=2
+    # so all are in Protected segment; within same segment, LRU → B evicted
+    _assert_only_evicted(run_test('slru'), 'B')
+
     # FIFO: evict earliest inserted → A
     _assert_only_evicted(run_test('fifo'), 'A')
 
@@ -538,9 +553,9 @@ def test_eviction_policy_edge_cases(engine_cls):
 
 
 # ---- Verify all 5 policies are accepted without error ----
-@pytest.mark.parametrize("policy", ['lru', 'lfu', 'fifo', 'mru', 'filo'])
+@pytest.mark.parametrize("policy", ['lru', 'lfu', 'slru', 'fifo', 'mru', 'filo'])
 def test_eviction_policy_valid_creation(engine_cls, policy: str):
-    """All five policies should be accepted and produce a working engine."""
+    """All six policies should be accepted and produce a working engine."""
     engine = _create_engine(engine_cls, policy)
     seqs = _make_seqs(2)
     engine.insert(seqs[0], engine.take(1), is_ready=True)
@@ -581,6 +596,7 @@ def test_eviction_policy_consecutive(engine_cls):
     expected_eviction_order = {
         'lru':  ['B', 'C', 'D'],
         'lfu':  ['D', 'C', 'B'],
+        'slru': ['B', 'C', 'D'],  # all Protected (hit>=2), same-segment LRU
         'fifo': ['A', 'B', 'C'],
         'mru':  ['A', 'D', 'C'],
         'filo': ['D', 'C', 'B'],
@@ -665,6 +681,7 @@ def test_eviction_policy_batch(engine_cls):
     expected_evicted = {
         'lru':  {'B', 'C'},
         'lfu':  {'D', 'C'},
+        'slru': {'B', 'C'},  # all Protected (hit>=2), same-segment LRU
         'fifo': {'A', 'B'},
         'mru':  {'A', 'D'},
         'filo': {'D', 'C'},
@@ -756,3 +773,320 @@ def test_eviction_policy_reinsert_after_eviction(engine_cls):
     assert engine.match(seqs[2]).num_matched_blocks == 0, (
         "C should be evicted to make room for re-inserted B"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests – SLRU-specific eviction behavior
+# ---------------------------------------------------------------------------
+
+def _create_slru_engine(engine_cls, protected_threshold: int = 2,
+                        num_total_blocks: int = _EVICT_NUM_TOTAL_BLOCKS):
+    """Helper to create an SLRU engine with a given protected_threshold.
+
+    Passes protected_threshold directly as a constructor argument,
+    consistent with how hit_reward_seconds is passed.
+    """
+    return engine_cls(
+        device_type=DEFAULT_DEVICE_TYPE,
+        num_total_blocks=num_total_blocks,
+        tokens_per_block=_EVICT_TOKENS_PER_BLOCK,
+        evict_ratio=_EVICT_RATIO,
+        eviction_policy='slru',
+        protected_threshold=protected_threshold,
+    )
+
+
+def test_slru_protected_node_retained(engine_cls):
+    """SLRU: nodes in the Protected segment should be retained over
+    Probationary nodes, regardless of access time.
+
+    Setup (protected_threshold=5):
+      Insert A, B, C, D.
+      Access A×10 (Protected), B×1, C×1, D×1 (all Probationary).
+      Insert E → should evict a Probationary node (B, oldest access).
+      A must survive because it is in the Protected segment.
+    """
+    seqs = _make_seqs(5)
+    engine = _create_slru_engine(engine_cls, protected_threshold=5)
+
+    # Insert A, B, C, D
+    for seq in seqs[:4]:
+        engine.insert(seq, engine.take(1), is_ready=True)
+        time.sleep(0.002)
+
+    # Access A 10 times → hit_count >= 5 → Protected
+    for _ in range(10):
+        engine.match(seqs[0])
+    time.sleep(0.002)
+
+    # Access B, C, D once each → hit_count < 5 → Probationary
+    # B accessed first (oldest), then C, then D
+    engine.match(seqs[1])
+    time.sleep(0.002)
+    engine.match(seqs[2])
+    time.sleep(0.002)
+    engine.match(seqs[3])
+    time.sleep(0.002)
+
+    # Insert E → triggers eviction of 1 block
+    engine.insert(seqs[4], engine.take(1), is_ready=True)
+
+    labels = ['A', 'B', 'C', 'D', 'E']
+    result = {
+        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        for i in range(5)
+    }
+
+    # A (Protected) must survive
+    assert result['A'] == 1, (
+        f"A (Protected) should survive, got result: {result}"
+    )
+    # B (Probationary, oldest access) should be evicted
+    assert result['B'] == 0, (
+        f"B (Probationary, oldest access) should be evicted, got result: {result}"
+    )
+    # E should survive (just inserted)
+    assert result['E'] == 1, (
+        f"E should survive, got result: {result}"
+    )
+
+
+def test_slru_same_segment_lru_order(engine_cls):
+    """SLRU: within the same segment, nodes are evicted in LRU order
+    (oldest last_access_time first).
+
+    Setup (protected_threshold=100, so all nodes stay Probationary):
+      Insert A, B, C, D.
+      Access in order: A → B → C → D (D most recent).
+      Insert E → evicts A (oldest access in Probationary segment).
+    """
+    seqs = _make_seqs(5)
+    engine = _create_slru_engine(engine_cls, protected_threshold=100)
+
+    # Insert A, B, C, D
+    for seq in seqs[:4]:
+        engine.insert(seq, engine.take(1), is_ready=True)
+        time.sleep(0.002)
+
+    # Access in order: A, B, C, D
+    for i in range(4):
+        engine.match(seqs[i])
+        time.sleep(0.002)
+
+    # Insert E → triggers eviction
+    engine.insert(seqs[4], engine.take(1), is_ready=True)
+
+    labels = ['A', 'B', 'C', 'D', 'E']
+    result = {
+        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        for i in range(5)
+    }
+
+    # A (oldest access) should be evicted
+    _assert_only_evicted(result, 'A')
+
+
+def test_slru_custom_protected_threshold(engine_cls):
+    """SLRU: verify that a custom protected_threshold correctly determines
+    which nodes are in the Protected vs Probationary segment.
+
+    Setup (protected_threshold=3):
+      Insert A, B, C, D.
+      Access A×5, B×3, then D×1, then C×2 (D accessed before C so that D
+      has the oldest last_access_time among the Probationary nodes).
+      → A (hit=5>=3, Protected), B (hit=3>=3, Protected),
+        D (hit=1<3, Probationary, oldest access),
+        C (hit=2<3, Probationary, newer access).
+      Insert E → evicts D (Probationary with oldest last_access_time).
+    """
+    seqs = _make_seqs(5)
+    engine = _create_slru_engine(engine_cls, protected_threshold=3)
+
+    # Insert A, B, C, D
+    for seq in seqs[:4]:
+        engine.insert(seq, engine.take(1), is_ready=True)
+        time.sleep(0.002)
+
+    # Access pattern: A×5, B×3 → both Protected (hit >= 3).
+    for _ in range(5):
+        engine.match(seqs[0])
+    time.sleep(0.002)
+    for _ in range(3):
+        engine.match(seqs[1])
+    time.sleep(0.002)
+    # D is accessed first (older last_access_time), then C.
+    # Both remain Probationary since their hit_count stays < 3.
+    engine.match(seqs[3])
+    time.sleep(0.002)
+    for _ in range(2):
+        engine.match(seqs[2])
+    time.sleep(0.002)
+
+    # Insert E → triggers eviction
+    engine.insert(seqs[4], engine.take(1), is_ready=True)
+
+    labels = ['A', 'B', 'C', 'D', 'E']
+    result = {
+        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        for i in range(5)
+    }
+
+    # A and B are Protected → must survive
+    assert result['A'] == 1, f"A (Protected) should survive, got result: {result}"
+    assert result['B'] == 1, f"B (Protected) should survive, got result: {result}"
+    # D (Probationary, oldest access) should be evicted
+    assert result['D'] == 0, f"D (Probationary, oldest access) should be evicted, got result: {result}"
+    # C (Probationary, newer access) should survive
+    assert result['C'] == 1, f"C (Probationary, newer access) should survive, got result: {result}"
+    # E should survive
+    assert result['E'] == 1, f"E should survive, got result: {result}"
+
+
+def test_slru_batch_eviction_cross_segment(engine_cls):
+    """SLRU batch eviction: when evicting 2 blocks, both Probationary nodes
+    should be evicted before any Protected node.
+
+    Setup (protected_threshold=3, evict_ratio=0.5 → evict 2 blocks):
+      Insert A, B, C, D.
+      Access A×5, B×5 (Protected), C×1, D×1 (Probationary).
+      Insert E → evicts C and D (both Probationary).
+    """
+    seqs = _make_seqs(5)
+    engine = engine_cls(
+        device_type=DEFAULT_DEVICE_TYPE,
+        num_total_blocks=_EVICT_NUM_TOTAL_BLOCKS,
+        tokens_per_block=_EVICT_TOKENS_PER_BLOCK,
+        evict_ratio=0.5,  # Evict 2 blocks at once
+        eviction_policy='slru',
+        protected_threshold=3,
+    )
+
+    # Insert A, B, C, D
+    for seq in seqs[:4]:
+        engine.insert(seq, engine.take(1), is_ready=True)
+        time.sleep(0.002)
+
+    # Access A×5, B×5 → Protected; C×1, D×1 → Probationary
+    for _ in range(5):
+        engine.match(seqs[0])
+        engine.match(seqs[1])
+    time.sleep(0.002)
+    engine.match(seqs[2])
+    time.sleep(0.002)
+    engine.match(seqs[3])
+    time.sleep(0.002)
+
+    # Insert E → triggers eviction of 2 blocks
+    engine.insert(seqs[4], engine.take(1), is_ready=True)
+
+    labels = ['A', 'B', 'C', 'D', 'E']
+    result = {
+        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        for i in range(5)
+    }
+
+    # A and B (Protected) must survive
+    assert result['A'] == 1, f"A (Protected) should survive, got result: {result}"
+    assert result['B'] == 1, f"B (Protected) should survive, got result: {result}"
+    # C and D (Probationary) should be evicted
+    assert result['C'] == 0, f"C (Probationary) should be evicted, got result: {result}"
+    assert result['D'] == 0, f"D (Probationary) should be evicted, got result: {result}"
+    # E should survive
+    assert result['E'] == 1, f"E should survive, got result: {result}"
+
+
+def test_slru_threshold_one_promotes_on_first_hit(engine_cls):
+    """SLRU boundary: with protected_threshold=1, a single match should be
+    enough to promote a node to the Protected segment.
+
+    Setup (protected_threshold=1, num_total_blocks=4, evict_ratio=0.25):
+      Insert A, B, C, D (fills cache).
+      match A, B, C once each → A/B/C.hit_count = 1 → Protected.
+      D is never matched → D.hit_count = 0 → Probationary.
+      Insert E → triggers eviction; D (only Probationary) must be evicted.
+    """
+    seqs = _make_seqs(5)
+    engine = _create_slru_engine(engine_cls, protected_threshold=1)
+
+    # Insert A, B, C, D — fills cache (4/4)
+    for seq in seqs[:4]:
+        engine.insert(seq, engine.take(1), is_ready=True)
+        time.sleep(0.002)
+
+    # Match A, B, C once → their hit_count becomes 1 → Protected segment.
+    # D is intentionally not matched → stays in Probationary (hit_count=0).
+    engine.match(seqs[0])
+    time.sleep(0.002)
+    engine.match(seqs[1])
+    time.sleep(0.002)
+    engine.match(seqs[2])
+    time.sleep(0.002)
+
+    # Insert E → triggers eviction of 1 block; D (only Probationary) must go.
+    engine.insert(seqs[4], engine.take(1), is_ready=True)
+
+    labels = ['A', 'B', 'C', 'D', 'E']
+    result = {
+        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        for i in range(5)
+    }
+
+    # A, B, C are Protected (hit_count >= 1) → must survive.
+    assert result['A'] == 1, f"A (Protected) should survive, got result: {result}"
+    assert result['B'] == 1, f"B (Protected) should survive, got result: {result}"
+    assert result['C'] == 1, f"C (Protected) should survive, got result: {result}"
+    # D is the only Probationary node → evicted.
+    assert result['D'] == 0, f"D (Probationary) should be evicted, got result: {result}"
+    # E just inserted → survives.
+    assert result['E'] == 1, f"E should survive, got result: {result}"
+
+
+def test_slru_all_protected_falls_back_to_lru(engine_cls):
+    """SLRU: when every candidate is in the Protected segment, eviction
+    falls back to pure LRU within that segment — the least recently
+    accessed Protected node is evicted.
+
+    Setup (protected_threshold=1, num_total_blocks=4, evict_ratio=0.25):
+      Insert A, B, C, D.
+      match A, match B, match C, match D → all hit_count=1 → Protected.
+      Re-access A, C, D (fresher) but leave B as the oldest access.
+      Insert E → evicts B (oldest last_access_time among all-Protected).
+    """
+    seqs = _make_seqs(5)
+    engine = _create_slru_engine(engine_cls, protected_threshold=1)
+
+    # Insert A, B, C, D
+    for seq in seqs[:4]:
+        engine.insert(seq, engine.take(1), is_ready=True)
+        time.sleep(0.002)
+
+    # First-round match → all promote to Protected (hit_count >= 1)
+    for seq in seqs[:4]:
+        engine.match(seq)
+        time.sleep(0.002)
+
+    # Re-access A, C, D (in this order). B is left untouched → oldest
+    # last_access_time among the Protected segment.
+    engine.match(seqs[0])
+    time.sleep(0.002)
+    engine.match(seqs[2])
+    time.sleep(0.002)
+    engine.match(seqs[3])
+    time.sleep(0.002)
+
+    # Insert E → evicts the LRU-within-Protected node, which is B.
+    engine.insert(seqs[4], engine.take(1), is_ready=True)
+
+    labels = ['A', 'B', 'C', 'D', 'E']
+    result = {
+        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        for i in range(5)
+    }
+
+    # B must be evicted (oldest access among all-Protected → same-segment LRU).
+    assert result['B'] == 0, f"B should be evicted (same-segment LRU), got result: {result}"
+    # Others must survive.
+    assert result['A'] == 1, f"A should survive, got result: {result}"
+    assert result['C'] == 1, f"C should survive, got result: {result}"
+    assert result['D'] == 1, f"D should survive, got result: {result}"
+    assert result['E'] == 1, f"E should survive, got result: {result}"

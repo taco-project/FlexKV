@@ -797,7 +797,13 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             raise ValueError(f"num_remote_blocks_per_file {self.num_remote_blocks_per_file} "
                              f"is not divisible by round_robin {self.round_robin}")
 
-        self.block_size = cpu_kv_layout.get_chunk_size()
+        # For multi-group layouts, get_chunk_size() is not valid.
+        # CPURemoteTransferWorker uses LAYERFIRST which is single-group only,
+        # but guard for safety.
+        if cpu_kv_layout.layer_groups is not None:
+            self.block_size = cpu_kv_layout.get_block_stride()
+        else:
+            self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
 
         self.is_mla = cpu_kv_layout.is_mla
@@ -912,7 +918,11 @@ class CPURemoteTransferWorker(TransferWorkerBase):
 
                 # Calculate block_id_in_file using the same logic as C++
                 # This should match the C++ implementation in pcfs.cpp
-                block_id_in_file = int(((remote_block_id_list[i] / self.round_robin) / total_file_num) * self.round_robin + (remote_block_id_list[i] % self.round_robin))
+                block_id_in_file = int(
+                    ((remote_block_id_list[i] / self.round_robin) / total_file_num)
+                    * self.round_robin
+                    + (remote_block_id_list[i] % self.round_robin)
+                )
 
                 cfs_blocks_partition[fid].append(block_id_in_file)
                 cpu_blocks_partition[fid].append(cpu_block_id_list[i].item())
@@ -1254,7 +1264,11 @@ class tpGDSTransferWorker(TransferWorkerBase):
         # SSD layout calculations
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-        self.ssd_tp_stride_in_bytes = self.ssd_block_stride_in_bytes // self.tp_group_size if not self.is_mla else self.ssd_block_stride_in_bytes
+        self.ssd_tp_stride_in_bytes = (
+            self.ssd_block_stride_in_bytes // self.tp_group_size
+            if not self.is_mla
+            else self.ssd_block_stride_in_bytes
+        )
 
         # Resolve pointers in Python (where storage is valid); pass them to C++ so we avoid
         # "Tensor that doesn't have storage" when C++ calls .data_ptr() on tensors passed
@@ -1690,12 +1704,18 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout = None,
         ssd_files: Dict[int, List[str]] = None,  # ssd_device_id -> file_paths
         num_blocks_per_file: int = 0,
+        mooncake_config_path: str = None,
     ):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.num_layers = cpu_kv_layout.num_layer
         self.num_cpu_blocks = cpu_kv_layout.num_block
-        self.block_size = cpu_kv_layout.get_chunk_size()
+        # For multi-group layouts (e.g. gemma4), get_chunk_size() is invalid;
+        # use get_block_stride() which works for both single and multi-group BLOCKFIRST.
+        if cpu_kv_layout.layer_groups is not None:
+            self.block_size = cpu_kv_layout.get_block_stride()
+        else:
+            self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
         self.cpu_kv_layout = cpu_kv_layout
         self.remote_kv_layout = remote_kv_layout
@@ -1722,19 +1742,40 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.cache_config.redis_port,
                 self.cache_config.redis_password,
                 self.cache_config.local_ip,
+                node_ttl_seconds=getattr(self.cache_config, 'node_ttl_seconds', 0),
             )
             self.redis_meta_client.set_node_id(self.cache_config.distributed_node_id)
+
+            # Connect nodeinfo so the listener/heartbeat threads start and
+            # current_node_id_set is populated — required for is_node_active()
+            # checks during P2P transfers.
+            if not self.redis_meta_client.nodeinfo.connect():
+                flexkv_logger.warning(
+                    "PEER2CPUTransferWorker: failed to connect RedisNodeInfo listener"
+                )
+            else:
+                self.redis_meta_client.nodeinfo.scan_active_nodes()
 
             # Persistent NodeMetaInfo Pool for skip redis operation when getting
             # NodeMetaInfo according to node_id
             # assuming that every flexkv progress has unique node id
             self.node_metas: Dict[int, NodeMetaInfo] = {}
-            assert self.redis_meta_client != None
+            assert self.redis_meta_client is not None
 
 
             # step2: initialize mooncake transfer engine for the whole flexkv
-            # NOTE:now we read the config file by env paras
-            mooncake_config_path = os.environ["MOONCAKE_CONFIG_PATH"]
+            # NOTE: prefer explicit parameter > cache_config > env variable
+            # (spawn subprocesses may lose env vars, but cache_config is pickle-serialized)
+            if mooncake_config_path is None:
+                mooncake_config_path = getattr(self.cache_config, 'mooncake_config_path', None)
+            if mooncake_config_path is None:
+                mooncake_config_path = os.environ.get("MOONCAKE_CONFIG_PATH")
+            if mooncake_config_path is None:
+                raise RuntimeError(
+                    "MOONCAKE_CONFIG_PATH is not set. Please either pass mooncake_config_path "
+                    "parameter, set cache_config.mooncake_config_path, or set the "
+                    "MOONCAKE_CONFIG_PATH environment variable."
+                )
             self.mooncake_config = MooncakeTransferEngineConfig.from_file(
                 mooncake_config_path
             )
@@ -1742,7 +1783,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.mooncake_config
             )
             assert (
-                self.mooncake_transfer_engine != None
+                self.mooncake_transfer_engine is not None
             ), "PEER2CPUTransferWorker: initilaize mooncake transfer engine failed"
 
             # step3: register local cpu buffer to mooncake transfer engine
@@ -1755,13 +1796,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             assert (
                 regist_buffer_status == 0
             ), "PEER2CPUTransferWorker: regist cpu buffer to mooncake transfer engine"
-
-            # step4: regist node info into redis server
-            self.regist_node_meta(
-                self.cpu_blocks.data_ptr(),
-                self.cpu_blocks.data_ptr(),
-                self.zmq_listen_addr,
-            )
 
         ## when enable p2p ssd, we need start a zmq server to recive the meta info from remote node,
         # and allocate a cpu buffer for ssd to cpu copy
@@ -1834,6 +1868,21 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
                 raise RuntimeError("SSD Worker init failed") from e
 
+        ## step4: regist node info into redis server
+        ## Must be done after P2P SSD init so we can register the correct
+        ## ssd_buffer_base_ptr (tmp_cpu_buffer) when P2P SSD is enabled.
+        if self.cache_config.enable_kv_sharing:
+            ssd_buffer_ptr = (
+                self.tmp_cpu_buffer.data_ptr()
+                if self.cache_config.enable_p2p_ssd
+                else 0
+            )
+            self.regist_node_meta(
+                self.cpu_blocks.data_ptr(),
+                ssd_buffer_ptr,
+                self.zmq_listen_addr,
+            )
+
         ## unique task id counter for remote ssd to cpu transfer task
         self.remote_ssd_task_id_counter = 0
         self.task_id_lock = threading.Lock()
@@ -1901,6 +1950,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         )
         return transfer_finished
 
+    # Timeout for a single RDMA batch transfer (seconds).
+    # Prevents indefinite blocking when a remote node becomes unreachable
+    # but its node:<id> TTL hasn't expired yet.
+    RDMA_TRANSFER_TIMEOUT_SECONDS = 30
+
     def _batch_transfer_impl(self,
         task_info: RDMATaskInfo,
         transfer_type: TransferType,
@@ -1908,9 +1962,20 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         layer_granularity: int,
         **kwargs,):
         if transfer_type == TransferType.PEERH2H:
-            ret = self.mooncake_transfer_engine.batch_transfer_sync_read(
-                task_info.peer_engine_addr, task_info.src_ptrs, task_info.dst_ptrs, task_info.data_lens
-            )
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    self.mooncake_transfer_engine.batch_transfer_sync_read,
+                    task_info.peer_engine_addr, task_info.src_ptrs, task_info.dst_ptrs, task_info.data_lens
+                )
+                try:
+                    ret = future.result(timeout=self.RDMA_TRANSFER_TIMEOUT_SECONDS)
+                except concurrent.futures.TimeoutError:
+                    flexkv_logger.error(
+                        f"RDMA batch transfer to {task_info.peer_engine_addr} timed out "
+                        f"after {self.RDMA_TRANSFER_TIMEOUT_SECONDS}s"
+                    )
+                    return False
             if ret != 0:
                 flexkv_logger.error(f"RDMA transfer failed with error code: {ret}")
                 return False
@@ -1946,7 +2011,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             )
             if not ret:
                 flexkv_logger.error(
-                    f"Wait remote ssd to cpu transfer task {task_info.task_id} notify from {task_info.peer_engine_addr} failed with error code: {ret}"
+                    f"Wait remote ssd to cpu transfer task {task_info.task_id} "
+                    f"notify from {task_info.peer_engine_addr} failed with error code: {ret}"
                 )
                 return False
         else:
@@ -1966,8 +2032,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         if transfer_type == TransferType.PEERH2H:
             # remote cpu to local cpu transfer by one-side rdma read
             for i in range(len(task_info.src_ptrs)):
-                ret = self.mooncake_transfer_engine.transfer_sync_read(task_info.peer_zmq_addr, task_info.src_ptrs[i],
-                                                                       task_info.dst_ptrs[i], task_info.data_lens[i])
+                ret = self.mooncake_transfer_engine.transfer_sync_read(
+                    task_info.peer_engine_addr,
+                    task_info.src_ptrs[i],
+                    task_info.dst_ptrs[i],
+                    task_info.data_lens[i],
+                )
                 if ret != 0:
                     flexkv_logger.error(f"transfer_sync_write failed with error code: {ret}")
                     return False
@@ -2003,7 +2073,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             )
             if not ret:
                 flexkv_logger.error(
-                    f"Wait remote ssd to cpu transfer task {task_info.task_id} notify from {task_info.peer_engine_addr} failed with error code: {ret}"
+                    f"Wait remote ssd to cpu transfer task {task_info.task_id} "
+                    f"notify from {task_info.peer_engine_addr} failed with error code: {ret}"
                 )
                 return False
 
@@ -2019,7 +2090,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
     ) -> List[RDMATaskInfo]:
         """
         parse the transfer op to a list of RDMATaskInfo
-        1. group the blocks by remote node id, each segment is a list of continuous blocks (segment is the smallest transmission unit)
+        1. group the blocks by remote node id, each segment is a list of
+           continuous blocks (segment is the smallest transmission unit)
         2. using corresponding distributed op parser to parse the op and create RDMATaskInfo for each segment
         5. return the list of RDMATaskInfo
         Parameters:
@@ -2038,7 +2110,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         src_block_node_ids = transfer_op.src_block_node_ids
 
-        # step1: group the blocks by remote node id and remote block source type, each segment is a list of continuous blocks
+        # step1: group the blocks by remote node id and remote block source type,
+        # each segment is a list of continuous blocks
         #flexkv_logger.info(
         #    f"[PEER2CPUTransferWorker] src_block_ids: {src_block_ids} \n \
         #                        dst_block_ids: {dst_block_ids} \n \
@@ -2103,7 +2176,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             task_info_list.append(
                 RDMATaskInfo(
                     ssd_task_id,
-                    self.mooncake_transfer_engine.get_engine_addr(),  ## for ssd transfer, peer engine addr refers to local mooncake engine
+                    self.mooncake_transfer_engine.get_engine_addr(),
+                    # for ssd transfer, peer engine addr refers to local mooncake engine
                     peer_engine_addr,
                     peer_zmq_addr,
                     None,
@@ -2128,6 +2202,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             f"Node {self.cache_config.distributed_node_id} Listening on {self.zmq_listen_addr}"
         )
         while not self.zmq_server.shutdown_event.is_set():
+            recv_meta = None
+            failure_msg = None
             try:
                 ## step1: recv and parse the message into meta info
                 try:
@@ -2153,10 +2229,16 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
                 self.zmq_server.listen_socket.send(b"OK")
 
-                failure_msg = NotifyMsg(mooncake_engine_addr=self.mooncake_transfer_engine.get_engine_addr(),
-                                                task_id=recv_meta.task_id, status = NotifyStatus.FAIL) ## used when transfer fails
-                success_msg = NotifyMsg(mooncake_engine_addr=self.mooncake_transfer_engine.get_engine_addr(),
-                                                task_id=recv_meta.task_id, status = NotifyStatus.SUCCESS) ## used when transfer fails
+                failure_msg = NotifyMsg(
+                    mooncake_engine_addr=self.mooncake_transfer_engine.get_engine_addr(),
+                    task_id=recv_meta.task_id,
+                    status=NotifyStatus.FAIL,
+                )
+                success_msg = NotifyMsg(
+                    mooncake_engine_addr=self.mooncake_transfer_engine.get_engine_addr(),
+                    task_id=recv_meta.task_id,
+                    status=NotifyStatus.SUCCESS,
+                )
 
                 # step2: ckeck the recieved info, early return if check error
                 nvtx_range = nvtx.start_range(message="ssd_handle_loop. check and load_data", color="orange")
@@ -2168,17 +2250,21 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                         self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                         continue
 
-                # TODO: we need to support dynamic temp buffer or split the ssd transfer request if number of ssd blocks is larger than num_tmp_cpu_blocks
-                # now we just refuse this transfer by returning a failure status
+                # TODO: we need to support dynamic temp buffer or split the ssd
+                # transfer request if number of ssd blocks is larger than
+                # num_tmp_cpu_blocks. Now we just refuse this transfer by
+                # returning a failure status.
                 if len(recv_meta.ssd_block_ids)>self.cache_config.num_tmp_cpu_blocks:
                     flexkv_logger.warning(
-                            f"The number of ssd_block_ids is larger than {self.cache_config.num_tmp_cpu_blocks},  can not do transfer now"
+                            f"The number of ssd_block_ids is larger than "
+                            f"{self.cache_config.num_tmp_cpu_blocks}, can not do transfer now"
                         )
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                     continue
 
                 ## step3: do copy data from ssd to cpu
-                # NOTE: this block ids is a corresponding relationship with self.tmp_cpu_buffer, for every transfer req we reuse the local cpu buffer
+                # NOTE: this block ids is a corresponding relationship with
+                # self.tmp_cpu_buffer, for every transfer req we reuse the local cpu buffer
                 local_cpu_buffer_block_ids = torch.arange(0, len(recv_meta.ssd_block_ids), dtype = torch.int64)
                 local_cpu_start_idx = 0
 
@@ -2201,7 +2287,9 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                         all_copy_complete = False
                         break
                     # get corresponding temp cpu block ids
-                    local_cpu_buffer_block_ids_per_seg = local_cpu_buffer_block_ids[local_cpu_start_idx: local_cpu_start_idx+len(ssd_block_ids_per_seg)]
+                    local_cpu_buffer_block_ids_per_seg = local_cpu_buffer_block_ids[
+                        local_cpu_start_idx: local_cpu_start_idx + len(ssd_block_ids_per_seg)
+                    ]
                     local_cpu_start_idx += len(ssd_block_ids_per_seg)
 
                     layer_id = recv_meta.layer_id
@@ -2244,7 +2332,9 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                     continue
 
-                if not self.write_data_back_to_peer(recv_meta.peer_engine_addr, src_ptr_list, dst_ptr_list, data_size_list):
+                if not self.write_data_back_to_peer(
+                    recv_meta.peer_engine_addr, src_ptr_list, dst_ptr_list, data_size_list
+                ):
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                     flexkv_logger.error("Failed to write data back to peer")
                     continue
@@ -2253,6 +2343,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 nvtx.end_range(nvtx_range)
             except Exception as e:
                 flexkv_logger.error(f"Unexpected error in ssd_handle_loop: {e}")
+                # Send failure notify so the peer doesn't block waiting forever
+                try:
+                    if recv_meta is not None:
+                        self.zmq_server.send_transfer_status(
+                            recv_meta.peer_zmq_status_addr, failure_msg
+                        )
+                except Exception:
+                    pass
                 time.sleep(0.001)
 
     def copy_ssd_data_to_dram(
@@ -2291,9 +2389,13 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         dst_ptr_list: List[int],
         data_size_list: List[int]
     ):
-        flexkv_logger.info(f"Write data back to peer from src: {src_ptr_list} to {dst_ptr_list}")
-        ret = self.mooncake_transfer_engine.batch_transfer_sync_write(peer_address, src_ptr_list, dst_ptr_list, data_size_list)
-        return True if ret == 0 else False
+        flexkv_logger.info(
+            f"Write data back to peer from src: {src_ptr_list} to {dst_ptr_list}"
+        )
+        ret = self.mooncake_transfer_engine.batch_transfer_sync_write(
+            peer_address, src_ptr_list, dst_ptr_list, data_size_list
+        )
+        return ret == 0
 
 
     #============================== distrbuted cpu related ==========================
@@ -2324,7 +2426,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             # step1: get the remote meta info
             src_meta = self.get_node_meta(node_id)
             if src_meta is None:
-                return [] # NOTE: if we miss part of meta data, then we should abort this request
+                # Skip this node's blocks instead of aborting all nodes.
+                # In multi-node P2P, one dead node should not prevent fetching
+                # blocks from other healthy nodes.
+                flexkv_logger.warning(
+                    f"[PEER2CPUTransferWorker] Skipping node {node_id}: "
+                    f"meta unavailable, will skip {len(segments)} segment(s)"
+                )
+                continue
             peer_engine_addr = src_meta.engine_addr
             src_ptr_list = []
             dst_ptr_list = []
@@ -2366,11 +2475,13 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 assert len(data_size_list) == len(src_ptr_list) and len(data_size_list) == len(dst_ptr_list)
 
             flexkv_logger.info(
-                f"[PEER2CPUTransferWorker]: remote cpu op parser src_ptr_list: {src_ptr_list}, dst_ptr_list: {dst_ptr_list} "
+                f"[PEER2CPUTransferWorker]: remote cpu op parser "
+                f"src_ptr_list: {src_ptr_list}, dst_ptr_list: {dst_ptr_list} "
             )
             # step3: create RDMATaskInfo for each segment
             # NOTE: block wise layout: only one start ptr for each segment
-            #       layer wise layout: multiple start ptrs for each segment, the number of start ptrs equals to layer_granularity * kv_dim
+            #       layer wise layout: multiple start ptrs for each segment,
+            #       the number of start ptrs equals to layer_granularity * kv_dim
 
             task_info_list.append(
                   RDMATaskInfo(
@@ -2400,9 +2511,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         """
         Get the cpu buffer block start ptrs for the given cpu blocks.
         We have two layout types in flexkv, layerwise and blockwise.
-        1) For layerwise layout,although the cpu blocks are continous, we need to calculate the start ptrs for each layer and each kv dim. So
+        1) For layerwise layout, although the cpu blocks are continous, we need to
+        calculate the start ptrs for each layer and each kv dim. So
         the number of start ptrs equals to layer_granularity * kv_dim.
-        2) For blockwise layout, the cpu blocks are continuous, so we only need to calculate the start ptr for the first block. So
+        2) For blockwise layout, the cpu blocks are continuous, so we only need to
+        calculate the start ptr for the first block. So
         the number of start ptrs is 1.
         3) For other layout types, raise error.
 
@@ -2412,7 +2525,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             layer_start_id (int): the start layer id, only used for layerwise layout
             layer_granularity (int): the number of layers to be transferred, only used for layerwise layout
         Returns:
-            Tuple(List[int], int): the list of cpu buffer block start ptrs and data size per block (used for calculate total data size)
+            Tuple(List[int], int): the list of cpu buffer block start ptrs and
+                data size per block (used for calculate total data size)
         """
 
         # assuming that remote cpu buffer layout is the same as local cpu buffer layout
@@ -2456,8 +2570,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         return  src_block_ptrs, data_size_per_block
 
     ### redis client helper functions
-    def regist_node_meta(self, cpu_buffer_base_ptr: int, ssd_buffer_base_ptr: int, zmq_addr: str):
-        self.redis_meta_client.regist_node_meta(self.redis_meta_client.get_node_id(), self.mooncake_transfer_engine.get_engine_addr(),
+    def regist_node_meta(
+        self, cpu_buffer_base_ptr: int, ssd_buffer_base_ptr: int, zmq_addr: str
+    ):
+        self.redis_meta_client.regist_node_meta(
+            self.redis_meta_client.get_node_id(),
+            self.mooncake_transfer_engine.get_engine_addr(),
                                                 zmq_addr, cpu_buffer_base_ptr, ssd_buffer_base_ptr)
         #NOTE: maybe useless
         node_meta_info = NodeMetaInfo(
@@ -2475,8 +2593,27 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         flexkv_logger.info(f"Unregistered node {self.redis_meta_client.get_node_id()} from Redis.")
 
     def get_node_meta(self, node_id: int) -> Optional[NodeMetaInfo]:
-        # TODO: how to remove the invalid node meta info in node_metas
-        """Get the node meta info by node id."""
+        """Get the node meta info by node id.
+        
+        Before returning cached or freshly-fetched meta, we verify that the
+        node is still active (its node:<id> key exists in Redis and has not
+        expired).  This prevents RDMA transfers to stale addresses after a
+        remote node has crashed.
+        """
+        # ===== Active-node validation (Scheme 4) =====
+        if not self.redis_meta_client.is_node_active(node_id):
+            # Node is no longer active – purge cached meta if any
+            if node_id in self.node_metas:
+                del self.node_metas[node_id]
+                flexkv_logger.warning(
+                    f"Node {node_id} is no longer active, removed cached meta."
+                )
+            else:
+                flexkv_logger.warning(
+                    f"Node {node_id} is not active, skipping meta fetch."
+                )
+            return None
+
         if node_id not in self.node_metas:
             ## fetch from redis
             node_redis_data = self.redis_meta_client.get_node_meta(node_id)

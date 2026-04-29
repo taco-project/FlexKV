@@ -16,6 +16,7 @@ import textwrap
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
+from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.kvtask import KVTaskEngine
@@ -111,15 +112,31 @@ class KVServerHandle:
     def __init__(self, process: Union[mp.Process, 'subprocess.Popen']):
         self.process = process
 
+    def _is_alive(self) -> bool:
+        """Check if the process is still running (compatible with both Process and Popen)."""
+        if isinstance(self.process, subprocess.Popen):
+            return self.process.poll() is None
+        return self.process.is_alive()
+
+    def _join(self, timeout: float = None) -> None:
+        """Wait for the process to finish (compatible with both Process and Popen)."""
+        if isinstance(self.process, subprocess.Popen):
+            try:
+                self.process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            self.process.join(timeout=timeout)
+
     def shutdown(self) -> None:
-        self.process.join(timeout=5)
-        if self.process.is_alive():
+        self._join(timeout=5)
+        if self._is_alive():
             flexkv_logger.info("force terminate the server process")
             self.process.terminate()
-            self.process.join()
+            self._join()
 
     def __del__(self) -> None:
-        if self.process.is_alive():
+        if self._is_alive():
             self.shutdown()
 
 class KVServer:
@@ -141,7 +158,24 @@ class KVServer:
         # Use total_clients if provided (multi-instance mode), otherwise use dp_size
         max_clients = total_clients if total_clients > 0 else model_config.dp_size
         self.client_manager = ClientManager(max_num_dp_client=max_clients)
-        self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port)
+
+        # Initialize RedisMeta in KVServer for server_client_mode
+        self.redis_meta_client = None
+        if cache_config.enable_kv_sharing:
+            flexkv_logger.info(f"[kv server] initializing RedisMeta and connection to "
+                               f"{cache_config.redis_host}:{cache_config.redis_port}")
+            self.redis_meta_client = RedisMeta(
+                cache_config.redis_host,
+                cache_config.redis_port,
+                cache_config.redis_password,
+                cache_config.local_ip,
+                node_ttl_seconds=cache_config.node_ttl_seconds,
+            )
+            self.redis_meta_client.init_meta()
+            # update distributed_node_id
+            cache_config.distributed_node_id = self.redis_meta_client.get_node_id()
+
+        self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port, redis_meta=self.redis_meta_client)
 
         self.req_counter = 0
         self._is_ready = False
@@ -209,6 +243,12 @@ class KVServer:
                     env.update(child_env)
             else:
                 env = child_env or {}
+                # Always propagate FLEXKV_* env vars to child process so that
+                # runtime config overrides (e.g. FLEXKV_REBUILD_INTERVAL_MS)
+                # are visible when config.py is re-imported in the subprocess.
+                for key, val in os.environ.items():
+                    if key.startswith("FLEXKV_") and key not in env:
+                        env[key] = val
             
             # Remove CUDA_VISIBLE_DEVICES so server can see all GPUs
             env.pop('CUDA_VISIBLE_DEVICES', None)
@@ -285,8 +325,8 @@ class KVServer:
 
         # Cleanup after shutdown
         flexkv_logger.info("Server shutting down, cleaning up...")
-        if hasattr(self, 'kvmanager'):
-            self.kvmanager.shutdown()
+        if hasattr(self, 'kv_task_engine'):
+            self.kv_task_engine.shutdown()
         flexkv_logger.info("Server shutdown complete")
 
 
@@ -295,7 +335,6 @@ class KVServer:
         for field in fields(ModelConfig):
             client_val = getattr(model_config, field.name)
             server_val = getattr(self.model_config, field.name)
-            print(f"ModelConfig.{field.name} mismatch: client={client_val}, server={server_val}")
             assert client_val == server_val, \
                 f"ModelConfig.{field.name} mismatch: client={client_val}, server={server_val}"
 
