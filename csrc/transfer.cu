@@ -21,7 +21,42 @@
 
 namespace flexkv {
 
-#define FLOAT4_PTR(ptr) reinterpret_cast<float4 *>(ptr)
+namespace {
+
+// Streaming load: reads 16 bytes (uint4) without polluting L1 cache.
+// Uses integer registers (b32) to avoid FP pipeline dependency.
+// SM 80+ (Ampere/Hopper): L1::no_allocate — loads through L1 without
+//   allocating a cache line on miss, avoiding eviction of useful data.
+// Older GPUs: non-coherent (nc) load through read-only cache.
+__device__ __forceinline__ uint4 load_streaming(const uint4 *__restrict__ src) {
+  uint32_t r0, r1, r2, r3;
+#if __CUDA_ARCH__ >= 800
+  asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "l"(src));
+#else
+  asm volatile("ld.global.nc.v4.b32 {%0,%1,%2,%3},[%4];"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "l"(src));
+#endif
+  return make_uint4(r0, r1, r2, r3);
+}
+
+// Streaming store: writes 16 bytes (uint4) without polluting L1 cache.
+// SM 80+: L1::no_allocate. Older GPUs: cache-global (cg) bypassing L1.
+__device__ __forceinline__ void store_streaming(uint4 *__restrict__ dst,
+                                                uint4 val) {
+#if __CUDA_ARCH__ >= 800
+  asm volatile("st.global.L1::no_allocate.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(
+                   dst),
+               "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w));
+#else
+  asm volatile("st.global.cg.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst),
+               "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w));
+#endif
+}
+
+} // anonymous namespace
 
 // Templated CUDA kernel - backend type determined at compile time
 template <BackendType Type>
@@ -34,12 +69,19 @@ __global__ void transfer_kv_blocks_kernel(
     bool is_host_to_device) {
   int kv_dim = is_mla ? 1 : 2;
   int num_chunks = num_layers * kv_dim * num_blocks;
-  int64_t copy_size_in_float4 = copy_size * sizeof(int64_t) / sizeof(float4);
+  int64_t num_uint4 = copy_size * sizeof(int64_t) / sizeof(uint4);
 
   int warp_id = threadIdx.x / 32;
   int lane_id = threadIdx.x % 32;
   int warps_per_block = blockDim.x / 32;
   int total_warps = gridDim.x * warps_per_block;
+
+  // Batch load -> batch store: each thread loads BATCH_SIZE uint4 elements
+  // (64 bytes) into registers before writing them out. This separates read
+  // and write memory transactions for better latency hiding.
+  // Per warp per batch: 32 threads * 4 * 16B = 2048B (16 cache lines).
+  constexpr int BATCH_SIZE = 4;
+  constexpr int WARP_STRIDE = 32 * BATCH_SIZE;
 
   for (int chunk_idx = blockIdx.x * warps_per_block + warp_id;
        chunk_idx < num_chunks; chunk_idx += total_warps) {
@@ -58,21 +100,27 @@ __global__ void transfer_kv_blocks_kernel(
     int64_t *gpu_chunk_ptr =
         reinterpret_cast<int64_t *>(gpu_ptr) + gpu_startoff_inside_chunks;
 
-    int64_t *src_chunk_ptr = is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
-    int64_t *dst_chunk_ptr = is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
+    const uint4 *__restrict__ src_u4 = reinterpret_cast<const uint4 *>(
+        is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr);
+    uint4 *__restrict__ dst_u4 = reinterpret_cast<uint4 *>(
+        is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr);
 
-    for (int64_t idx = lane_id; idx < copy_size_in_float4; idx += 32) {
-      float4 element;
-      asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3},[%4];"
-                   : "=f"(element.x), "=f"(element.y), "=f"(element.z),
-                     "=f"(element.w)
-                   : "l"(&FLOAT4_PTR(src_chunk_ptr)[idx])
-                   : "memory");
-      asm volatile("st.global.cg.v4.f32 [%0],{%1,%2,%3,%4};" ::"l"(
-                       &FLOAT4_PTR(dst_chunk_ptr)[idx]),
-                   "f"(element.x), "f"(element.y), "f"(element.z),
-                   "f"(element.w)
-                   : "memory");
+    for (int64_t base = lane_id; base < num_uint4; base += WARP_STRIDE) {
+      uint4 buf[BATCH_SIZE];
+#pragma unroll
+      for (int b = 0; b < BATCH_SIZE; b++) {
+        int64_t idx = base + b * 32;
+        if (idx < num_uint4) {
+          buf[b] = load_streaming(&src_u4[idx]);
+        }
+      }
+#pragma unroll
+      for (int b = 0; b < BATCH_SIZE; b++) {
+        int64_t idx = base + b * 32;
+        if (idx < num_uint4) {
+          store_streaming(&dst_u4[idx], buf[b]);
+        }
+      }
     }
   }
 }
