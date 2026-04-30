@@ -80,6 +80,17 @@ class CacheConfig:
 
     distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
     num_tmp_cpu_blocks: int = 500 # only used when distributed ssd p2p, it controls the number blocks of temp cpu buffer which used for copy data from ssd to cpu
+    # When True, the main CPU KV cache is allocated from Linux HugePages via
+    # ``mmap(MAP_HUGETLB)`` instead of regular CPU memory. Requires pre-reserved
+    # huge pages on the host (see ``/proc/sys/vm/nr_hugepages``). Falls back
+    # silently if allocation fails.
+    use_hugepage_cpu_buffer: bool = False
+    # When True, the temporary SSD->CPU staging buffer (used by PEER2CPUTransferWorker
+    # under enable_p2p_ssd) is allocated from Linux HugePages via ``mmap(MAP_HUGETLB)``
+    # instead of a pinned ``torch.empty``. Requires pre-reserved huge pages on the host
+    # (see ``/proc/sys/vm/nr_hugepages``). Falls back silently if allocation fails.
+    use_hugepage_tmp_buffer: bool = False
+    hugepage_size_bytes: int = 2 * 1024 * 1024  # 2 MiB by default; set to 1<<30 for 1GiB
 
 
     # Indexer configuration
@@ -186,6 +197,9 @@ class UserConfig:
     ssd_cache_gb: int = 0  # 0 means disable ssd
     ssd_cache_dir: Union[str, List[str]] = "./ssd_cache"
     enable_gds: bool = False
+    use_hugepage_cpu_buffer: bool = False
+    use_hugepage_tmp_buffer: bool = False
+    hugepage_size_bytes: int = 2 * 1024 * 1024
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
@@ -249,6 +263,9 @@ def load_user_config_from_env() -> UserConfig:
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
         ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./flexkv_ssd")),
         enable_gds=bool(int(os.getenv('FLEXKV_ENABLE_GDS', 0))),
+        use_hugepage_cpu_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_CPU_BUFFER', 0))),
+        use_hugepage_tmp_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_TMP_BUFFER', 0))),
+        hugepage_size_bytes=int(os.getenv('FLEXKV_HUGEPAGE_SIZE_BYTES', 2 * 1024 * 1024)),
         kv_cache_dtype=os.getenv('FLEXKV_KV_CACHE_DTYPE', None),
     )
 
@@ -269,6 +286,9 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds
+    cache_config.use_hugepage_cpu_buffer = user_config.use_hugepage_cpu_buffer
+    cache_config.use_hugepage_tmp_buffer = user_config.use_hugepage_tmp_buffer
+    cache_config.hugepage_size_bytes = user_config.hugepage_size_bytes
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote

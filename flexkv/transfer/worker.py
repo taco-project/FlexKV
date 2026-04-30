@@ -10,7 +10,6 @@ from multiprocessing.connection import Connection
 from threading import Thread
 from typing import List, Any, Dict, Union, Optional, Tuple
 
-import ctypes
 import numpy as np
 import nvtx
 import torch
@@ -34,6 +33,11 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
 from flexkv.common.transfer import get_nvtx_range_color, LayerwiseTransferOp
 from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
+from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
+from flexkv.transfer.host_buffer import (
+    allocate_host_buffer,
+    cudaHostRegister,
+)
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
@@ -48,24 +52,6 @@ try:
 except ImportError:
     transfer_kv_blocks_remote = None
     shared_transfer_kv_blocks_remote_read = None
-
-
-cudart = ctypes.CDLL('libcudart.so')
-
-def cudaHostRegister(tensor: torch.Tensor) -> None:
-    """Register a CPU tensor with CUDA for pinned memory access"""
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 1) # 1 means cudaHostRegisterPortable
-    if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
-
-def cudaHostUnregister(tensor: torch.Tensor) -> None:
-    """Unregister a CPU tensor from CUDA for pinned memory access"""
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
-
 
 class TransferWorkerBase(ABC):
     _worker_id_counter = 0
@@ -276,7 +262,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
                  gpu_blocks: List[TensorSharedHandle],
-                 cpu_blocks: torch.Tensor,
+                 cpu_blocks: Union[torch.Tensor, HugePageTensorHandle],
                  gpu_kv_layout: KVCacheLayout,
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
@@ -288,6 +274,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         # Register CPU tensors with CUDA
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
         self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
@@ -427,7 +414,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
                  gpu_blocks: List[List[TensorSharedHandle]],
-                 cpu_blocks: torch.Tensor,
+                 cpu_blocks: Union[torch.Tensor, HugePageTensorHandle],
                  gpu_kv_layouts: List[KVCacheLayout],
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
@@ -442,6 +429,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
         # Handle tensor import for multi-process case
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
@@ -604,7 +592,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  transfer_conn: Connection,
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
-                 cpu_blocks: torch.Tensor,
+                 cpu_blocks: Union[torch.Tensor, HugePageTensorHandle],
                  ssd_files: Dict[int, List[str]],  # ssd_device_id -> file_paths
                  cpu_kv_layout: KVCacheLayout,
                  ssd_kv_layout: KVCacheLayout,
@@ -612,6 +600,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  num_blocks_per_file: int,
                  cache_config: CacheConfig):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
         self.ssd_files = ssd_files
         self.num_blocks_per_file = num_blocks_per_file
         self.num_files = sum(len(file_list) for file_list in ssd_files.values())
@@ -728,7 +717,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
                  transfer_conn: Connection,
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
-                 cpu_blocks: List[torch.Tensor],
+                 cpu_blocks: Union[List[torch.Tensor], torch.Tensor, HugePageTensorHandle],
                  remote_file: List[str],
                  cpu_kv_layout: KVCacheLayout,
                  remote_kv_layout: KVCacheLayout,
@@ -738,6 +727,8 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         if transfer_kv_blocks_remote is None:
             raise RuntimeError("transfer_kv_blocks_remote not available, please build with FLEXKV_ENABLE_CFS=1")
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
 
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.remote_files = remote_file
@@ -1328,7 +1319,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         transfer_conn: Connection,
         finished_ops_queue: MPQueue,
         op_buffer_tensor: torch.Tensor,
-        cpu_blocks: torch.Tensor,
+        cpu_blocks: Union[torch.Tensor, HugePageTensorHandle],
         cpu_kv_layout: KVCacheLayout,
         remote_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
@@ -1339,6 +1330,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         mooncake_config_path: str = None,
     ):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.num_layers = cpu_kv_layout.num_layer
         self.num_cpu_blocks = cpu_kv_layout.num_block
@@ -1435,14 +1427,25 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.cpu_kv_layout.num_head,
                 self.cpu_kv_layout.head_size,
                 self.cpu_kv_layout.is_mla,
-                self.cpu_kv_layout._kv_shape,
+                self.cpu_kv_layout.kv_shape,
             )
-            self.tmp_cpu_buffer = torch.empty(
-                self.tmp_cpu_buffer_layout.get_total_elements(),
+            # Allocate the temporary SSD->CPU staging buffer.
+            #
+            # Two backends are supported:
+            #  (a) HugePage-backed mmap (when ``cache_config.use_hugepage_tmp_buffer``
+            #      is True and the kernel has huge pages reserved). We still need
+            #      to pin it for CUDA via ``cudaHostRegister`` because the region
+            #      is not allocated through PyTorch's pinned-memory allocator.
+            #  (b) Pinned ``torch.empty`` (the original behavior, default).
+            tmp_num_elements = self.tmp_cpu_buffer_layout.get_total_elements()
+            self._tmp_cpu_buffer_handle = allocate_host_buffer(
+                num_elements=tmp_num_elements,
                 dtype=self.dtype,
-                device="cpu",
-                pin_memory=True,
+                use_hugepage=self.cache_config.use_hugepage_tmp_buffer,
+                hugepage_size_bytes=self.cache_config.hugepage_size_bytes,
             )
+            self.tmp_cpu_buffer = self._tmp_cpu_buffer_handle.tensor
+
             self.mooncake_transfer_engine.regist_buffer(
                 self.tmp_cpu_buffer.data_ptr(),
                 self.tmp_cpu_buffer.numel() * self.tmp_cpu_buffer.element_size(),
@@ -1515,6 +1518,9 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self.mooncake_transfer_engine.unregist_buffer(self.cpu_blocks.data_ptr())
         if self.cache_config.enable_p2p_ssd:
             self.mooncake_transfer_engine.unregist_buffer(self.tmp_cpu_buffer.data_ptr())
+            # Release CUDA pinning & HugePage mapping, if any.
+            if hasattr(self, "_tmp_cpu_buffer_handle"):
+                self._tmp_cpu_buffer_handle.release()
         # unregist node info from redis server
         self.unregist_node_meta()
 

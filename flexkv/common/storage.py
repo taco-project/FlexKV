@@ -172,6 +172,7 @@ class StorageHandle:
     num_blocks_per_file: Optional[int] = None
     gpu_device_id: Optional[int] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
+    worker_data: Optional[Any] = None
 
     def get_tensor_list(self) -> List[torch.Tensor]:
         assert isinstance(self.data, list) and \
@@ -194,6 +195,11 @@ class StorageHandle:
             return self.data
         else:
             raise ValueError(f"Invalid handle type: {self.handle_type}, expected TENSOR")
+
+    def get_worker_tensor(self) -> Any:
+        if self.worker_data is not None:
+            return self.worker_data
+        return self.get_tensor()
 
     def get_file_list(self) -> Union[List[str], Dict[int, List[str]]]:
         if self.handle_type == AccessHandleType.FILE:
