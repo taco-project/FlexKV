@@ -22,7 +22,7 @@ namespace flexkv {
 
 TPTransferThreadGroup::TPTransferThreadGroup(
     int num_gpus, const std::vector<int64_t> &gpu_block_ptrs_flat,
-    int num_tensors_per_gpu, int64_t cpu_blocks_ptr, int dp_group_id,
+    int num_tensors_per_gpu, int64_t cpu_blocks_ptr,
     int num_layers, const std::vector<int64_t> &gpu_kv_strides_in_bytes,
     const std::vector<int64_t> &gpu_block_strides_in_bytes,
     const std::vector<int64_t> &gpu_layer_strides_in_bytes,
@@ -30,7 +30,6 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     const std::vector<int64_t> &gpu_device_ids) {
   num_gpus_ = num_gpus;
   num_tensors_per_gpu_ = num_tensors_per_gpu;
-  dp_group_id_ = dp_group_id;
 
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
@@ -156,8 +155,7 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_block_stride_in_bytes,
     const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
-    const int layer_id, const int layer_granularity, const bool is_mla,
-    const bool is_nsa_cp) {
+    const int layer_id, const int layer_granularity, const bool is_mla) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;

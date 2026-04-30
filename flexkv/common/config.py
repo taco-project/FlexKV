@@ -1,6 +1,7 @@
 import os
 import json
-from dataclasses import dataclass
+import yaml
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Optional, List, Union, Dict, Any
 from argparse import Namespace
@@ -29,21 +30,40 @@ class ModelConfig:
     use_mla: bool = False
     dtype: torch.dtype = torch.bfloat16
 
-    # parallel configs
+    # ------------------------------------------------------------------
+    # Parallel configs
+    # ------------------------------------------------------------------
     tp_size: int = 1
-    dp_size: int = 1
-    dp_rank: int = 0
+    tp_rank: int = 0
+
     pp_size: int = 1
     pp_rank: int = 0
 
-    # topology configs
-    #   nnodes        : number of physical machines spanned by one replica
-    #                   (== server_args.nnodes in SGLang)
-    #   node_rank     : index of this machine within ``nnodes``
-    #                   (== server_args.node_rank in SGLang).  Used by
-    #                   KVTaskEngine's multi-node topology derivation and
-    #                   for logging; NOT embedded in the layerwise UDS
-    #                   socket path (UDS endpoints are kernel-local).
+    dp_size: int = 1
+    dp_rank: int = 0
+
+    # pp_start_layer / pp_end_layer: [start, end) layer indices for this PP stage.
+    pp_start_layer: int = 0
+    pp_end_layer: int = -1   # -1 → lazily resolved to num_layers
+
+    # ------------------------------------------------------------------
+    # Attention-level parallel configs
+    # ------------------------------------------------------------------
+    # enable_dp_attention: whether DP-attention is enabled (sglang
+    # ``--enable-dp-attention`` or TRT-LLM ``enable_attention_dp``).
+    # When True, the physical TP group is split into
+    # attn_tp × attn_cp × attn_dp.
+    enable_dp_attention: bool = False
+
+    # attn_cp_size / attn_cp_rank: context-parallel size/rank.
+    attn_cp_size: int = 1
+    attn_cp_rank: int = 0
+
+    # ------------------------------------------------------------------
+    # Topology configs
+    # ------------------------------------------------------------------
+    # nnodes: number of physical machines spanned by one replica
+    # node_rank: index of this machine within ``nnodes``
     nnodes: int = 1
     node_rank: int = 0
 
@@ -54,15 +74,144 @@ class ModelConfig:
     # ``--dist-init-addr``) to avoid exposing an extra env knob.
     master_host: Optional[str] = None
 
-    # NSA context parallelism: when True, layerwise transfer sends full
-    # (unpartitioned) KV cache to every rank instead of head-sliced data.
+    # NSA context parallelism: when True, every rank in the CP group holds
+    # identical (full) KV cache.  FlexKV treats CP ranks the same as TP ranks
+    # in MLA mode.
     is_nsa_cp: bool = False
-    cp_size: int = 1
+
+    # ------------------------------------------------------------------
+    # Freeze mechanism: after post_init, ModelConfig must not be mutated
+    # ------------------------------------------------------------------
+    _frozen: bool = field(default=False, init=False, repr=False)
+
+    def freeze(self) -> None:
+        """Lock the config so that any subsequent __setattr__ raises an error.
+        """
+        object.__setattr__(self, '_frozen', True)
+        flexkv_logger.info(
+            f"[FlexKV] ModelConfig FROZEN — primitive vars are now immutable. "
+            f"Derived: attn_tp_size={self.attn_tp_size}, attn_tp_rank={self.attn_tp_rank}, "
+            f"tp_size_per_node={self.tp_size_per_node}, "
+            f"nnodes_per_pp_rank={self.nnodes_per_pp_rank}, "
+            f"nnodes_per_tp_group={self.nnodes_per_tp_group}, "
+            f"total_gpus={self.total_gpus}, "
+            f"gpus_per_node={self.gpus_per_node}, "
+            f"num_kv_heads_per_node={self.num_kv_heads_per_node}, "
+            f"tp_rank_per_node={self.tp_rank_per_node}, "
+            f"local_rank={self.local_rank}"
+        )
+
+    def __setattr__(self, name: str, value) -> None:
+        if name == '_frozen':
+            return object.__setattr__(self, name, value)
+        if getattr(self, '_frozen', False):
+            raise AttributeError(
+                f"ModelConfig is frozen — cannot set '{name}'. "
+                f"All primitive fields must be set during post_init_from_*(), "
+                f"after which freeze() is called.  Derived fields (attn_tp_size, "
+                f"attn_tp_rank) are @property "
+                f"and cannot be set at all."
+            )
+        object.__setattr__(self, name, value)
+
+    # ------------------------------------------------------------------
+    # Derived topology properties
+    # ------------------------------------------------------------------
+    @property
+    def total_gpus(self) -> int:
+        """Total GPUs across all nodes for one FlexKV instance."""
+        return self.dp_size * self.tp_size * self.pp_size
+
+    @property
+    def gpus_per_node(self) -> int:
+        """Total GPUs on this node (across all DP, PP stages and TP groups)."""
+        return self.total_gpus // self.nnodes
+
+    @property
+    def nnodes_per_pp_rank(self) -> int:
+        """Number of nodes spanned by one PP stage."""
+        return max(self.nnodes // self.pp_size, 1)
+
+    @property
+    def nnodes_per_tp_group(self) -> int:
+        """Number of nodes spanned by one TP group."""
+        return self.nnodes_per_pp_rank
+
+    @property
+    def tp_size_per_node(self) -> int:
+        """Number of TP ranks on this node within one TP group."""
+        return self.tp_size // self.nnodes_per_tp_group
+
+    @property
+    def tp_rank_per_node(self) -> int:
+        """TP rank index within the local node (within one TP group)."""
+        return self.tp_rank % self.tp_size_per_node
+
+    @property
+    def local_rank(self) -> int:
+        """Local GPU device index within the node (a.k.a. ``LOCAL_RANK`` in
+        PyTorch distributed / sglang / vllm).
+
+        Matches the standard Megatron-style rank layout:
+            global_rank = dp_rank * pp_size * tp_size + pp_rank * tp_size + tp_rank
+
+        When DP-attention is enabled, DP replicas share the same physical
+        GPUs, so the DP dimension is not reflected in the device index.
+        The formula then reduces to:
+            local_rank = pp_rank_per_node * tp_size_per_node + tp_rank_per_node
+
+        When DP-attention is disabled, each DP replica has its own GPUs:
+            local_rank = (dp_rank_per_node * pp_size_per_node + pp_rank_per_node)
+                         * tp_size_per_node + tp_rank_per_node
+        where the ``_per_node`` values are derived inline from the global ranks
+        and topology.
+        """
+        pp_size_per_node = max(self.pp_size // self.nnodes, 1)
+        pp_rank_per_node = self.pp_rank % pp_size_per_node
+        if self.enable_dp_attention:
+            return pp_rank_per_node * self.tp_size_per_node + self.tp_rank_per_node
+        dp_size_per_node = self.gpus_per_node // (pp_size_per_node * self.tp_size_per_node)
+        dp_rank_per_node = self.dp_rank % dp_size_per_node
+        return (dp_rank_per_node * pp_size_per_node + pp_rank_per_node) * self.tp_size_per_node + self.tp_rank_per_node
+
+    @property
+    def attn_tp_size(self) -> int:
+        """Attention-level TP size derived from tp / attn_dp / attn_cp."""
+        attn_dp = max(1, self.dp_size) if self.enable_dp_attention else 1
+        cp = max(1, self.attn_cp_size)
+        return max(1, max(1, self.tp_size) // (attn_dp * cp))
+
+    @property
+    def attn_tp_rank(self) -> int:
+        """Attention-level TP rank derived from tp_rank / attn_tp_size."""
+        return self.tp_rank % max(1, self.attn_tp_size)
+
+    @property
+    def num_kv_heads_per_node(self) -> int:
+        """Number of KV heads visible to a single node."""
+        if self.use_mla:
+            return self.num_kv_heads
+        return self.num_kv_heads * self.tp_size_per_node // max(1, self.attn_tp_size)
+
+    @property
+    def kv_dim(self) -> int:
+        """KV dimension: 1 for MLA (no head split), 2 for standard (head split)."""
+        return 1 if self.use_mla else 2
+
+    @property
+    def num_layers_per_pp_stage(self) -> int:
+        """Number of layers managed by this PP stage."""
+        end = self.pp_end_layer if self.pp_end_layer >= 0 else self.num_layers
+        return end - self.pp_start_layer
 
     @property
     def token_size_in_bytes(self) -> int:
-        kv_dim = 1 if self.use_mla else 2
-        return self.num_layers * self.num_kv_heads * self.head_size * kv_dim * self.dtype.itemsize
+        return self.num_layers * self.num_kv_heads * self.head_size * self.kv_dim * self.dtype.itemsize
+
+    @property
+    def token_size_in_bytes_per_pp_stage(self) -> int:
+        """Token size in bytes for one PP stage (used by data plane)."""
+        return self.num_layers_per_pp_stage * self.num_kv_heads * self.head_size * self.kv_dim * self.dtype.itemsize
 
 @dataclass
 class CacheConfig:
@@ -229,10 +378,6 @@ def parse_path_list(path_str: str) -> List[str]:
     return paths
 
 def load_user_config_from_file(config_file: str) -> UserConfig:
-    import json
-    import yaml
-    from dataclasses import fields
-
     # read json config file or yaml config file
     if config_file.endswith('.json'):
         with open(config_file) as f:
@@ -275,7 +420,7 @@ def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
 def update_default_config_from_user_config(model_config: ModelConfig,
                                            cache_config: CacheConfig,
                                            user_config: UserConfig) -> None:
-    block_size_in_bytes = model_config.token_size_in_bytes * cache_config.tokens_per_block
+    block_size_in_bytes = model_config.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
 
     assert user_config.cpu_cache_gb > 0
     assert user_config.ssd_cache_gb >= 0

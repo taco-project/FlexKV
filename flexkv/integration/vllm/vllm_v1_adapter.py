@@ -336,6 +336,8 @@ class FlexKVSchedulerConnector:
         task_id, matched_mask = self.flexkv_manager.get_match(
             token_ids=np_token_ids,
             token_mask=np_token_mask,
+            dp_rank=self.flexkv_config.model_config.dp_rank,
+            pp_rank=self.flexkv_config.model_config.pp_rank,
             namespace=namespace,
         )
         num_new_matched_tokens = matched_mask.sum().item()
@@ -484,6 +486,8 @@ class FlexKVSchedulerConnector:
         namespace = self._extract_namespace(request)
         task_id, unmatched_mask = self.flexkv_manager.put_match(
             token_ids=np_token_ids,
+            dp_rank=self.flexkv_config.model_config.dp_rank,
+            pp_rank=self.flexkv_config.model_config.pp_rank,
             namespace=namespace,
         )
 
@@ -704,7 +708,10 @@ class FlexKVWorkerConnector:
         logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, "
                     f"server_client_mode={server_client_mode}, dp_client_id={dp_client_id}, "
                     f"client_id={client_id}, device_id={device_id}")
-        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, client_id, device_id)
+        self.tp_client = KVTPClient(flexkv_config.gpu_register_port,
+                                    dp_rank=client_id,
+                                    pp_rank=self.flexkv_config.model_config.pp_rank,
+                                    device_id=device_id)
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):

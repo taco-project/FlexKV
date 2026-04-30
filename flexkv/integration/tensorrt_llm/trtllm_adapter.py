@@ -45,7 +45,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.flexkv_manager = KVManager(model_config=self.model_config,
                                         cache_config=self.cache_config,
                                         server_recv_port=flexkv_config.server_recv_port,
-                                        dp_client_id=self.dp_rank)
+                                        dp_client_id=self.model_config.dp_rank)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
 
@@ -209,6 +209,8 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         task_id, matched_mask = self.flexkv_manager.get_match(
             token_ids=np_token_ids,
             token_mask=np_token_mask,
+            dp_rank=self.flexkv_config.model_config.dp_rank,
+            pp_rank=self.flexkv_config.model_config.pp_rank,
             namespace=namespace,
         )
         num_new_matched_tokens = matched_mask.sum().item()
@@ -366,6 +368,8 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         
         task_id, unmatched_mask = self.flexkv_manager.put_match(
             token_ids=np_token_ids,
+            dp_rank=self.flexkv_config.model_config.dp_rank,
+            pp_rank=self.flexkv_config.model_config.pp_rank,
             namespace=namespace,
         )
 
@@ -538,26 +542,30 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             self.remote_process = TransferManagerOnRemote.create_process()
             flexkv_logger.info(f"TransferManagerOnRemote process created, PID: {self.remote_process.pid}")
         
-        flexkv_logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, dp_client_id: {dp_client_id}")
-        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_client_id, current_device_id)
+        flexkv_logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, dp_rank: {dp_rank}")
+        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_rank=dp_rank, pp_rank=0, device_id=current_device_id)
         flexkv_logger.info("Finish init FlexKVWorkerConnector")
     
     def _need_to_create_remote_process(self) -> bool:
         """Check if need to create TransferManagerOnRemote process.
         
         Returns True when all of the following conditions are met:
-        - Multi-node TP is detected (tp_size > gpus_per_node)
+        - Multi-node TP is detected (nnodes_per_tp_group > 1)
         - Current node is not master node (node_rank > 0)
-        - Current worker is worker0 in TP group (tp_rank == 0)
+        - Current worker is worker0 in the local TP group (tp_rank_per_node == 0)
         
         Returns:
             bool: True if need to create TransferManagerOnRemote process, False otherwise.
         """
         try:
             is_master_node = self.node_rank == 0
-            is_first_worker = self.tp_rank % 8 == 0
-            is_multinode_tp = self.flexkv_config.model_config.tp_size > torch.cuda.device_count()
-            flexkv_logger.info(f"{is_master_node=}, {is_first_worker=}, {is_multinode_tp=}")
+            is_first_worker = self.flexkv_config.model_config.tp_rank_per_node == 0
+            is_multinode_tp = self.flexkv_config.model_config.nnodes_per_tp_group > 1
+            flexkv_logger.info(
+                f"{is_master_node=}, {is_first_worker=}, {is_multinode_tp=}, "
+                f"nnodes_per_tp_group={self.flexkv_config.model_config.nnodes_per_tp_group}, "
+                f"tp_rank_per_node={self.flexkv_config.model_config.tp_rank_per_node}"
+            )
             
             return is_multinode_tp and not is_master_node and is_first_worker
         except Exception as e:

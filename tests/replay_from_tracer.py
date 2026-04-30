@@ -147,7 +147,6 @@ class FlexKVReplayEngine:
             num_remote_blocks=cache_config_data['num_remote_blocks'],
             ssd_cache_dir=cache_config_data['ssd_cache_dir'],
             gds_cache_dir=cache_config_data['gds_cache_dir'],
-            remote_cache_size_mode=cache_config_data['remote_cache_size_mode'],
             remote_file_size=cache_config_data['remote_file_size'],
             remote_file_num=cache_config_data['remote_file_num'],
             remote_file_prefix=cache_config_data['remote_file_prefix'],
@@ -234,7 +233,8 @@ class FlexKVReplayEngine:
 
             # Create registration request
             register_req = RegisterTPClientRequest(
-                dp_client_id=gpu_id // self.model_config.tp_size,  # DP client ID
+                dp_rank=gpu_id // self.model_config.tp_size,  # DP client ID
+                pp_rank=0,  # single PP stage for replay
                 device_id=gpu_id,
                 handles=handles,
                 gpu_layout=self.gpu_layout
@@ -305,7 +305,8 @@ class FlexKVReplayEngine:
         slot_mapping = np.array(data['slot_mapping'], dtype=np.int64)
         token_mask = np.array(data['token_mask'], dtype=bool) if data['token_mask'] else None
         layer_granularity = data.get('layer_granularity', -1)
-        dp_id = data.get('dp_id', 0)
+        dp_rank = data.get('dp_id', 0)
+        pp_rank = data.get('pp_rank', 0)
 
         self.log(f"Replaying {request_type} request with {len(token_ids)} tokens")
 
@@ -319,7 +320,8 @@ class FlexKVReplayEngine:
                 slot_mapping=slot_mapping,
                 token_mask=token_mask,
                 layer_granularity=layer_granularity,
-                dp_id=dp_id
+                dp_rank=dp_rank,
+                pp_rank=pp_rank
             )
         elif request_type == "PUT":
             print(f"✅✅✅PUT token_ids: {token_ids[:128]}")
@@ -330,7 +332,8 @@ class FlexKVReplayEngine:
                 token_ids=token_ids,
                 slot_mapping=slot_mapping,
                 token_mask=token_mask,
-                dp_id=dp_id
+                dp_rank=dp_rank,
+                pp_rank=pp_rank
             )
         elif request_type == "GET_MATCH":
             print(f"🔍📝GET_MATCH token_ids: {token_ids[:128]}")
@@ -341,7 +344,8 @@ class FlexKVReplayEngine:
                 token_ids=token_ids,
                 token_mask=token_mask,
                 layer_granularity=layer_granularity,
-                dp_id=dp_id
+                dp_rank=dp_rank,
+                pp_rank=pp_rank
             )
         elif request_type == "PUT_MATCH":
             print(f"✅📝PUT_MATCH token_ids: {token_ids[:128]}")
@@ -351,7 +355,8 @@ class FlexKVReplayEngine:
             task_id, return_mask = self.kvmanager.put_match(
                 token_ids=token_ids,
                 token_mask=token_mask,
-                dp_id=dp_id
+                dp_rank=dp_rank,
+                pp_rank=pp_rank
             )
         else:
             raise ValueError(f"Unknown request type: {request_type}")

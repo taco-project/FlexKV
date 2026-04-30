@@ -419,9 +419,6 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  tp_group_size: int,
-                 dp_group_id: int,
-                 is_nsa_cp: bool = False,
-                 cp_size: int = 1,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
@@ -440,12 +437,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
         self.is_mla = gpu_kv_layouts[0].is_mla
-        self.is_nsa_cp = is_nsa_cp
-        self.cp_size = cp_size
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
-        self.dp_group_id = dp_group_id
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
@@ -497,7 +491,6 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             gpu_block_ptrs_flat,
             num_tensors_per_gpu,
             cpu_blocks_ptr,
-            dp_group_id,
             self.num_layers,
             self.gpu_kv_strides_in_bytes,
             self.gpu_block_strides_in_bytes,
@@ -551,7 +544,6 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             layer_id,
             layer_granularity,
             self.is_mla,
-            self.is_nsa_cp and self.cp_size > 1,
         )
 
 
@@ -1145,7 +1137,6 @@ class tpGDSTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         tp_group_size: int,
-        dp_group_id: int,
     ) -> None:
         """
         Initialize TP GDS Transfer Worker
@@ -1161,7 +1152,6 @@ class tpGDSTransferWorker(TransferWorkerBase):
             ssd_kv_layout: Layout of SSD KV cache
             dtype: Data type
             tp_group_size: Size of tensor parallel group
-            dp_group_id: Data parallel group ID
         """
         # Initialize base class first
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
@@ -1182,7 +1172,6 @@ class tpGDSTransferWorker(TransferWorkerBase):
         self.is_mla = gpu_kv_layouts[0].is_mla
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
-        self.dp_group_id = dp_group_id
 
         # Layout information
         self.num_layers = gpu_kv_layouts[0].num_layer
@@ -1205,7 +1194,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
         # SSD layout calculations
         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
         self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-        self.ssd_tp_stride_in_bytes = self.ssd_block_stride_in_bytes // self.tp_group_size if not self.is_mla else self.ssd_block_stride_in_bytes
+        self.ssd_tp_stride_in_bytes = self.ssd_block_stride_in_bytes // self.tp_size_per_node if not self.is_mla else self.ssd_block_stride_in_bytes
 
         # Resolve pointers in Python (where storage is valid); pass them to C++ so we avoid
         # "Tensor that doesn't have storage" when C++ calls .data_ptr() on tensors passed
@@ -1224,7 +1213,6 @@ class tpGDSTransferWorker(TransferWorkerBase):
             gpu_block_ptrs_flat,
             num_tensors_per_gpu,
             ssd_files,
-            dp_group_id,
             self.num_layers,
             self.gpu_kv_strides_in_bytes,
             self.gpu_block_strides_in_bytes,

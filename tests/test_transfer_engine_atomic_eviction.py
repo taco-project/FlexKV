@@ -300,7 +300,7 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         engine, main_worker, indexer_worker = self._make_engine_stub_with_indexer(enable_layerwise=True)
 
         op = _make_op(TransferType.LAYERWISE)
-        op.dp_id = 0
+        op.dp_rank = 0
         engine.op_id_to_op[op.op_id] = op
 
         initial_pending_count = op.pending_count  # should be 1
@@ -324,7 +324,7 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         engine, main_worker, indexer_worker = self._make_engine_stub_with_indexer(enable_layerwise=True)
 
         op = _make_op(TransferType.LAYERWISE)
-        op.dp_id = 0
+        op.dp_rank = 0
         engine.op_id_to_op[op.op_id] = op
 
         with patch('flexkv.transfer.transfer_engine.register_op_to_buffer'), \
@@ -358,7 +358,7 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         engine._worker_map[TransferType.LAYERWISE] = [main_layerwise_worker]
 
         op = _make_op(TransferType.LAYERWISE)
-        op.dp_id = 0
+        op.dp_rank = 0
         engine.op_id_to_op[op.op_id] = op
 
         initial_pending_count = op.pending_count  # should be 1

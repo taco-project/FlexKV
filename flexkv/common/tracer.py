@@ -195,7 +195,8 @@ class FlexKVTracer:
                      slot_mapping: Union[torch.Tensor, np.ndarray],
                      token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                      layer_granularity: int = -1,
-                     dp_id: int = 0,
+                     dp_rank: int = 0,
+                     pp_rank: int = 0,
                      **kwargs):
         """Record a request operation"""
         if not self.enabled:
@@ -211,7 +212,8 @@ class FlexKVTracer:
             "slot_mapping": self._convert_tensor_to_list(slot_mapping),
             "token_mask": self._convert_tensor_to_list(token_mask) if token_mask is not None else None,
             "layer_granularity": layer_granularity,
-            "dp_id": dp_id,
+            "dp_rank": dp_rank,
+            "pp_rank": pp_rank,
             "token_ids_shape": list(token_ids.shape),
             "slot_mapping_shape": list(slot_mapping.shape),
             "token_mask_shape": list(token_mask.shape) if token_mask is not None else None,

@@ -38,7 +38,7 @@ public:
   TPTransferThreadGroup(int num_gpus,
                         const std::vector<int64_t> &gpu_block_ptrs_flat,
                         int num_tensors_per_gpu, int64_t cpu_blocks_ptr,
-                        int dp_group_id, int num_layers,
+                        int num_layers,
                         const std::vector<int64_t> &gpu_kv_strides_in_bytes,
                         const std::vector<int64_t> &gpu_block_strides_in_bytes,
                         const std::vector<int64_t> &gpu_layer_strides_in_bytes,
@@ -56,15 +56,13 @@ public:
                          const int transfer_num_cta,
                          const bool is_host_to_device,
                          const bool use_ce_transfer, const int layer_id,
-                         const int layer_granularity, const bool is_mla,
-                         const bool is_nsa_cp);
+                         const int layer_granularity, const bool is_mla);
 
 private:
   using Task = std::function<void()>;
   std::future<void> enqueue_for_gpu(int gpu_idx, Task task);
 
   int num_gpus_;
-  int dp_group_id_;
   std::vector<int> gpu_device_ids_;
   void **gpu_blocks_;
   void *cpu_blocks_;

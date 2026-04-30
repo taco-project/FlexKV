@@ -398,7 +398,7 @@ class GlobalCacheEngine:
 
         if cache_config.enable_cpu:
             if cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size) #TODO
+                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta)
             elif self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
@@ -422,7 +422,7 @@ class GlobalCacheEngine:
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
-                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size) #TODO
+                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta)
             elif self.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
@@ -447,7 +447,7 @@ class GlobalCacheEngine:
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
-                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size)
+                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
             elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
@@ -532,14 +532,15 @@ class GlobalCacheEngine:
             slot_mapping: np.ndarray,
             layer_num: int = -1,
             layer_granularity: int = -1,
-            dp_id: int = 0,
+            dp_rank: int = 0,
+            pp_rank: int = 0,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None) \
                  -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         if layer_num == -1:
-            layer_num = self.model_config.num_layers
+            layer_num = self.model_config.num_layers_per_pp_stage
         if layer_granularity == -1:
             layer_granularity = layer_num
 
@@ -561,7 +562,7 @@ class GlobalCacheEngine:
 
         if aligned_length == 0 or not token_mask.any():
             transfer_graph = TransferOpGraph.create_empty_graph()
-            transfer_graph.bind_to_dp_group(dp_id)
+            transfer_graph.bind_to_worker(dp_rank, pp_rank)
             return_mask = np.zeros_like(token_mask, dtype=np.bool_)
             callback = partial(self._transfer_callback, node_to_unlock={}, buffer_to_free={})
             return transfer_graph, return_mask, callback, {}, -1
@@ -616,7 +617,7 @@ class GlobalCacheEngine:
         #                                                                         finished_ops_ids=finished_ops_ids,
         #                                                                         layer_num=layer_num,
         #                                                                         layer_granularity=layer_granularity)
-        transfer_graph.bind_to_dp_group(dp_id)
+        transfer_graph.bind_to_worker(dp_rank, pp_rank)
 
         for device_type in node_to_unlock:
             self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
@@ -1073,14 +1074,15 @@ class GlobalCacheEngine:
             token_mask: np.ndarray,
             slot_mapping: np.ndarray,
             layer_num : int = -1,
-            dp_id: int = 0,
+            dp_rank: int = 0,
+            pp_rank: int = 0,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
         if layer_num == -1:
-            layer_num = self.model_config.num_layers
+            layer_num = self.model_config.num_layers_per_pp_stage
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
         aligned_token_ids = token_ids[:aligned_length]
@@ -1131,7 +1133,7 @@ class GlobalCacheEngine:
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         return_mask[(block_start_idx + skipped_gpu_blocks)* self.tokens_per_block:
                     (block_start_idx + skipped_gpu_blocks + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
-        transfer_graph.bind_to_dp_group(dp_id)
+        transfer_graph.bind_to_worker(dp_rank, pp_rank)
 
         for device_type in node_to_unlock:
             self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
