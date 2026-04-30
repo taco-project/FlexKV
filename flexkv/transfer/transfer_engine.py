@@ -334,7 +334,7 @@ class TransferEngine:
                         gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
-                        tp_group_id=self.tp_size_per_node,
+                        tp_group_size=self.tp_size_per_node,
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
@@ -574,8 +574,8 @@ class TransferEngine:
                 flexkv_logger.info("TransferEngine: indexer Remote workers initialized")
             if self.cache_config.enable_gds and self._indexer_ssd_handle is not None:
                 if self.tp_size_per_node == 1:
-                    self._indexer_gds_workers = [
-                        GDSTransferWorker.create_worker(
+                    self._indexer_gds_workers: Dict[WorkerKey, WorkerHandle] = {
+                        worker_key: GDSTransferWorker.create_worker(
                             mp_ctx=self.mp_ctx,
                             finished_ops_queue=self._indexer_finished_ops_queue,
                             op_buffer_tensor=self.pin_buffer.get_buffer(),
@@ -587,11 +587,11 @@ class TransferEngine:
                             dtype=self._indexer_ssd_handle.dtype,
                             gpu_device_id=indexer_gpu_handles_list[0].gpu_device_id,
                         )
-                        for _, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
-                    ]
+                        for worker_key, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
+                    }
                 else:
-                    self._indexer_gds_workers = [
-                        tpGDSTransferWorker.create_worker(
+                    self._indexer_gds_workers = {
+                        worker_key: tpGDSTransferWorker.create_worker(
                             mp_ctx=self.mp_ctx,
                             finished_ops_queue=self._indexer_finished_ops_queue,
                             op_buffer_tensor=self.pin_buffer.get_buffer(),
@@ -603,8 +603,8 @@ class TransferEngine:
                             dtype=self._indexer_ssd_handle.dtype,
                             tp_group_size=self.tp_size_per_node,
                         )
-                        for _, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
-                    ]
+                        for worker_key, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
+                    }
                 self._indexer_worker_map[TransferType.DISK2D] = self._indexer_gds_workers
                 self._indexer_worker_map[TransferType.D2DISK] = self._indexer_gds_workers
                 flexkv_logger.info("TransferEngine: indexer GDS workers initialized")
