@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch, call
 
 import numpy as np
 
-from flexkv.common.transfer import TransferOp, TransferType, CompletedOp
+from flexkv.common.transfer import TransferOp, TransferType, CompletedOp, LayerwiseTransferOp, WorkerKey
 
 
 # ---------------------------------------------------------------------------
@@ -25,12 +25,27 @@ from flexkv.common.transfer import TransferOp, TransferType, CompletedOp
 
 def _make_op(transfer_type: TransferType = TransferType.D2H) -> TransferOp:
     """Create a minimal TransferOp for testing."""
+    if transfer_type == TransferType.LAYERWISE:
+        return _make_layerwise_op()
     return TransferOp(
         graph_id=0,
         transfer_type=transfer_type,
         src_block_ids=np.array([0, 1], dtype=np.int64),
         dst_block_ids=np.array([2, 3], dtype=np.int64),
     )
+
+
+def _make_layerwise_op(**kwargs) -> LayerwiseTransferOp:
+    """Create a minimal LayerwiseTransferOp for testing."""
+    defaults = dict(
+        graph_id=0,
+        src_block_ids_h2d=np.array([0, 1], dtype=np.int64),
+        dst_block_ids_h2d=np.array([2, 3], dtype=np.int64),
+        src_block_ids_disk2h=np.array([], dtype=np.int64),
+        dst_block_ids_disk2h=np.array([], dtype=np.int64),
+    )
+    defaults.update(kwargs)
+    return LayerwiseTransferOp(**defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +276,9 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         engine._worker_map[TransferType.H2D] = [MagicMock()]
         engine._worker_map[TransferType.D2H] = [MagicMock()]
         if enable_layerwise:
-            engine._worker_map[TransferType.LAYERWISE] = [main_layerwise_worker]
+            # LAYERWISE worker map must be Dict[WorkerKey, WorkerHandle]
+            wk0 = WorkerKey(dp_rank=0, pp_rank=0)
+            engine._worker_map[TransferType.LAYERWISE] = {wk0: main_layerwise_worker}
 
         # Create mock workers for indexer
         indexer_h2d_worker = MagicMock()
@@ -270,6 +287,10 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         engine._indexer_worker_map[TransferType.D2H] = [MagicMock()]
         if enable_layerwise:
             engine._indexer_worker_map[TransferType.LAYERWISE] = [indexer_layerwise_worker]
+
+        # PP replica tracking (needed by _assign_layerwise_op_to_workers)
+        engine._pp_replica_to_parent_op = {}
+        engine._pp_replica_op_map = {}
 
         return engine, main_layerwise_worker, indexer_layerwise_worker
 
@@ -289,10 +310,11 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         engine, _, _ = self._make_engine_stub_with_indexer(enable_layerwise=False)
         self.assertNotIn(TransferType.LAYERWISE, engine._indexer_worker_map)
 
-    def test_layerwise_op_pending_count_incremented_for_indexer(self):
+    def test_layerwise_op_pending_count_not_incremented_for_single_pp_stage(self):
         """
-        WHEN _assign_op_to_worker processes a LAYERWISE op with _has_indexer=True
-        THEN op.pending_count SHALL be incremented by 1 before submitting to indexer (req 2.2).
+        WHEN _assign_op_to_worker processes a LAYERWISE op with only one PP stage
+        THEN op.pending_count SHALL remain 1 (no fan-out needed).
+        LAYERWISE indexer is fused inside the worker, not dispatched separately.
         """
         from flexkv.transfer.transfer_engine import register_op_to_buffer
         import nvtx
@@ -301,6 +323,7 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
 
         op = _make_op(TransferType.LAYERWISE)
         op.dp_rank = 0
+        op.pp_rank = 0
         engine.op_id_to_op[op.op_id] = op
 
         initial_pending_count = op.pending_count  # should be 1
@@ -309,15 +332,14 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
              patch('nvtx.start_range', return_value=MagicMock()):
             engine._assign_op_to_worker(op)
 
-        # pending_count should have been incremented by 1 (for indexer) before submission
-        # After _assign_op_to_worker: pending_count = initial + 1 = 2
-        self.assertEqual(op.pending_count, initial_pending_count + 1)
+        # With a single PP stage, no fan-out → pending_count stays at 1
+        self.assertEqual(op.pending_count, initial_pending_count)
 
-    def test_layerwise_op_submitted_to_both_main_and_indexer_workers(self):
+    def test_layerwise_op_submitted_to_main_worker(self):
         """
-        WHEN _assign_op_to_worker processes a LAYERWISE op with _has_indexer=True
-        THEN op SHALL be submitted to main KV worker, and a separate indexer_op
-        SHALL be submitted to the indexer layerwise worker (req 2.1).
+        WHEN _assign_op_to_worker processes a LAYERWISE op
+        THEN op SHALL be submitted to the main KV layerwise worker.
+        LAYERWISE indexer is fused inside the worker, not dispatched separately.
         """
         from flexkv.transfer.transfer_engine import register_op_to_buffer
 
@@ -325,20 +347,15 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
 
         op = _make_op(TransferType.LAYERWISE)
         op.dp_rank = 0
+        op.pp_rank = 0
         engine.op_id_to_op[op.op_id] = op
 
         with patch('flexkv.transfer.transfer_engine.register_op_to_buffer'), \
              patch('nvtx.start_range', return_value=MagicMock()):
             engine._assign_op_to_worker(op)
 
-        # Main KV worker should have received the original op
+        # Main KV layerwise worker should have received the op
         main_worker.submit_transfer.assert_called_once_with(op)
-        # Indexer worker should have received a separate indexer_op (not the same op object)
-        indexer_worker.submit_transfer.assert_called_once()
-        indexer_op = indexer_worker.submit_transfer.call_args[0][0]
-        self.assertIsNot(indexer_op, op, "Indexer worker must receive a separate op, not the original")
-        self.assertEqual(indexer_op.graph_id, op.graph_id)
-        self.assertEqual(indexer_op.transfer_type, op.transfer_type)
 
     def test_layerwise_op_no_indexer_pending_count_stays_one(self):
         """
@@ -353,12 +370,16 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         engine._indexer_worker_map = {}
         engine.op_id_to_op = {}
         engine.op_id_to_nvtx_range = {}
+        engine._pp_replica_to_parent_op = {}
+        engine._pp_replica_op_map = {}
 
         main_layerwise_worker = MagicMock()
-        engine._worker_map[TransferType.LAYERWISE] = [main_layerwise_worker]
+        wk0 = WorkerKey(dp_rank=0, pp_rank=0)
+        engine._worker_map[TransferType.LAYERWISE] = {wk0: main_layerwise_worker}
 
         op = _make_op(TransferType.LAYERWISE)
         op.dp_rank = 0
+        op.pp_rank = 0
         engine.op_id_to_op[op.op_id] = op
 
         initial_pending_count = op.pending_count  # should be 1

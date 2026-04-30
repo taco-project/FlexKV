@@ -51,7 +51,7 @@ def run_tp_client(dp_rank,
     """Run tp_client process"""
     try:
         device_id = tp_rank + dp_rank * model_config.tp_size
-        tp_client = KVTPClient(server_recv_port, dp_rank, device_id)
+        tp_client = KVTPClient(server_recv_port, dp_rank, pp_rank=0, device_id=device_id)
 
         gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
 
@@ -648,6 +648,7 @@ def run_tp_client_with_indexer(dp_rank,
         tp_client = KVTPClient(
             gpu_register_port=server_recv_port + "_gpu_register",
             dp_rank=dp_rank,
+            pp_rank=0,
             device_id=device_id,
         )
         tp_client.register_to_server(

@@ -543,7 +543,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             flexkv_logger.info(f"TransferManagerOnRemote process created, PID: {self.remote_process.pid}")
         
         flexkv_logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, dp_rank: {dp_rank}")
-        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_rank=dp_rank, pp_rank=0, device_id=current_device_id)
+        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_rank=dp_rank, pp_rank=flexkv_config.model_config.pp_rank, device_id=current_device_id)
         flexkv_logger.info("Finish init FlexKVWorkerConnector")
     
     def _need_to_create_remote_process(self) -> bool:

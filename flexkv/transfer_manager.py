@@ -213,17 +213,19 @@ class TransferManager:
             indexer_remote_handle=indexer_remote_handle,
         )
 
-        # Derive local (dp_rank, pp_rank) from GPU registrations rather than
-        # model_config.  In cross-node PP, TransferManagerOnRemote receives
-        # model_config from the PP0 master (pp_rank=0), but local GPUs
-        # register with their true pp_rank (e.g. pp_rank=1).
+        # Derive local pp_rank from GPU registrations rather than model_config.
+        # In cross-node PP, TransferManagerOnRemote receives model_config from
+        # the PP0 master (pp_rank=0), but local GPUs register with their true
+        # pp_rank (e.g. pp_rank=1).  All local workers share the same pp_rank
+        # because they belong to the same PP stage on this node.
         worker_keys = set(self.gpu_worker_key_mapping.values())
         self._local_dp_rank = self.model_config.dp_rank
         self._local_pp_rank = self.model_config.pp_rank
-        if len(worker_keys) == 1:
-            wk = next(iter(worker_keys))
-            self._local_dp_rank = wk.dp_rank
-            self._local_pp_rank = wk.pp_rank
+        if len(worker_keys) >= 1:
+            pp_ranks = set(wk.pp_rank for wk in worker_keys)
+            assert len(pp_ranks) == 1, \
+                f"Expected all local workers to share the same pp_rank, got {pp_ranks}"
+            self._local_pp_rank = pp_ranks.pop()
 
         flexkv_logger.info(f"Initialized TransferEngine successfully, "
                            f"grouped_gpu_handles keys={list(grouped_gpu_handles.keys())}, "
@@ -308,7 +310,8 @@ class TransferManagerOnRemote(TransferManager):
         self._active_graphs_lock = threading.Lock()
 
         # Pending matching for cross-node PP: graph arrives before or after slot_mapping
-        self._pending_graphs: Dict[int, TransferOpGraph] = {}
+        # _pending_graphs stores (graph, task_end_op_id) tuples
+        self._pending_graphs: Dict[int, Tuple[TransferOpGraph, int]] = {}
         self._pending_slot_mappings: Dict[int, np.ndarray] = {}
         self._pending_lock = threading.Lock()
 
@@ -445,13 +448,14 @@ class TransferManagerOnRemote(TransferManager):
         set_gpu_blocks and submit.  Otherwise, store the slot_mapping and wait
         for the graph to arrive later.
         """
+        graph = None
+        task_end_op_id = -1
         with self._pending_lock:
             if task_id in self._pending_graphs:
-                # Graph already arrived, set GPU blocks and submit
-                graph = self._pending_graphs.pop(task_id)
+                # Graph already arrived, set GPU blocks and prepare for submit
+                graph, task_end_op_id = self._pending_graphs.pop(task_id)
                 graph.set_gpu_blocks(slot_mapping)
                 self._rebind_graph_to_local_worker(graph)
-                self.submit(graph)
                 flexkv_logger.debug(
                     f"[TransferManagerOnRemote] set_slot_mapping: "
                     f"graph for task_id={task_id} submitted (graph arrived first)"
@@ -463,6 +467,12 @@ class TransferManagerOnRemote(TransferManager):
                     f"[TransferManagerOnRemote] set_slot_mapping: "
                     f"slot_mapping stored for task_id={task_id}, waiting for graph"
                 )
+                return
+
+        # Submit graph to transfer engine
+        with self._active_graphs_lock:
+            self._active_graphs[graph.graph_id] = task_end_op_id
+        self.submit(graph)
 
     def _handle_submit(self, graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
         """Handle submit message with pending matching support.
@@ -482,8 +492,8 @@ class TransferManagerOnRemote(TransferManager):
                     f"graph for task_id={task_id} submitted (slot_mapping arrived first)"
                 )
             else:
-                # slot_mapping not yet arrived, store graph for later matching
-                self._pending_graphs[task_id] = graph
+                # slot_mapping not yet arrived, store graph and task_end_op_id for later matching
+                self._pending_graphs[task_id] = (graph, task_end_op_id)
                 flexkv_logger.debug(
                     f"[TransferManagerOnRemote] submit: "
                     f"graph stored for task_id={task_id}, waiting for slot_mapping"
@@ -496,25 +506,26 @@ class TransferManagerOnRemote(TransferManager):
         self.submit(graph)
 
     def _rebind_graph_to_local_worker(self, graph: TransferOpGraph) -> None:
-        """Rebind transfer graph ops to the local WorkerKey.
+        """Rebind transfer graph ops to the local pp_rank.
 
         In cross-node PP setups, the master (PP0) creates transfer graphs with
-        its own (dp_rank=0, pp_rank=0). When these graphs are sent to a remote
-        node (e.g. PP1), the ops must be rebound to the local (dp_rank, pp_rank)
-        so the TransferEngine can find the correct workers.
-        """
-        model_pp_rank = self.model_config.pp_rank
-        model_dp_rank = self.model_config.dp_rank
+        its own pp_rank=0. When these graphs are sent to a remote node (e.g. PP1),
+        the ops' pp_rank must be updated to the local pp_rank so the
+        TransferEngine can find the correct workers.
 
-        if model_pp_rank == self._local_pp_rank and model_dp_rank == self._local_dp_rank:
+        Each op's dp_rank is preserved — in multi-DP scenarios, different ops
+        may belong to different dp_ranks and should remain bound to their
+        original DP group.
+        """
+        if self.model_config.pp_rank == self._local_pp_rank:
             return  # No rebinding needed
 
-        old_key = WorkerKey(dp_rank=model_dp_rank, pp_rank=model_pp_rank)
-        new_key = WorkerKey(dp_rank=self._local_dp_rank, pp_rank=self._local_pp_rank)
-        graph.bind_to_worker(self._local_dp_rank, self._local_pp_rank)
+        for op in graph._op_map.values():
+            op.pp_rank = self._local_pp_rank
+
         flexkv_logger.debug(
             f"[TransferManagerOnRemote] Rebound graph {graph.graph_id} "
-            f"from {old_key} to {new_key}"
+            f"pp_rank from {self.model_config.pp_rank} to {self._local_pp_rank}"
         )
 
     def start(self) -> None:
