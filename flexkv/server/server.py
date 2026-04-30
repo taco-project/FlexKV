@@ -376,7 +376,8 @@ class KVServer:
             slot_mapping=req.slot_mapping,
             token_mask=req.token_mask,
             layer_granularity=req.layer_granularity,
-            dp_id=req.dp_client_id,
+            dp_rank=req.dp_client_id,
+            pp_rank=req.pp_rank,
             namespace=req.namespace,
         )
 
@@ -386,7 +387,8 @@ class KVServer:
             token_ids=req.token_ids,
             slot_mapping=req.slot_mapping,
             token_mask=req.token_mask,
-            dp_id=req.dp_client_id,
+            dp_rank=req.dp_client_id,
+            pp_rank=req.pp_rank,
             task_id=req.task_id,
             namespace=req.namespace,
         )
@@ -397,7 +399,8 @@ class KVServer:
             token_ids=req.token_ids,
             token_mask=req.token_mask,
             layer_granularity=req.layer_granularity,
-            dp_id=req.dp_client_id,
+            dp_rank=req.dp_client_id,
+            pp_rank=req.pp_rank,
             cpu_only=req.cpu_only,
             task_id=req.task_id,
             namespace=req.namespace,
@@ -411,7 +414,8 @@ class KVServer:
         req_id, mask = self.kv_task_engine.put_match(
             token_ids=req.token_ids,
             token_mask=req.token_mask,
-            dp_id=req.dp_client_id,
+            dp_rank=req.dp_client_id,
+            pp_rank=req.pp_rank,
             task_id=req.task_id,
             namespace=req.namespace,
         )
@@ -423,7 +427,8 @@ class KVServer:
         """Handle Prefetch request"""
         task_id = self.kv_task_engine.prefetch_async(
             token_ids=req.token_ids,
-            dp_id=req.dp_client_id,
+            dp_rank=req.dp_client_id,
+            pp_rank=req.pp_rank,
             task_id=req.task_id,
             namespace=req.namespace,
         )

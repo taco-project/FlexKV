@@ -40,7 +40,7 @@ def _fp8_cuda_ops_unavailable():
     except NotImplementedError:
         return True
 
-def run_tp_client(dp_client_id,
+def run_tp_client(dp_rank,
                   tp_rank,
                   server_recv_port,
                   model_config,
@@ -50,8 +50,8 @@ def run_tp_client(dp_client_id,
                   gpu_layout_type):
     """Run tp_client process"""
     try:
-        device_id = tp_rank + dp_client_id * model_config.tp_size
-        tp_client = KVTPClient(server_recv_port, dp_client_id, device_id)
+        device_id = tp_rank + dp_rank * model_config.tp_size
+        tp_client = KVTPClient(server_recv_port, dp_rank, device_id)
 
         gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
 
@@ -242,14 +242,14 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     initial_write_num = int(num_requests * initial_write_ratio)
     print("writing initial data...")
     put_ids = []
-    for token_ids, block_ids, dp_id in request_pairs[:initial_write_num]:
+    for token_ids, block_ids, dp_rank in request_pairs[:initial_write_num]:
         if gpu_kv_verifier is not None:
             gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
         write_request = kvmanager.put_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
             token_mask=None,
-            dp_id=dp_id,
+            dp_rank=dp_rank,
             namespace=namespace,
         )
         kvmanager.wait([write_request], completely=True)
@@ -261,7 +261,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
         token_ids=torch.randint(0, 100, size=(8,), dtype=torch.int64),
         slot_mapping=block_ids_2_slot_mapping(torch.arange(0,1, dtype=torch.int64), tokens_per_block, actual_length=8),
         token_mask=None,
-        dp_id=0,
+        dp_rank=0,
         namespace=namespace,
     )
     kvmanager.wait([write_request], completely=True)
@@ -272,7 +272,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     #    token_ids=torch.randint(0, 100, size=(16,), dtype=torch.int64),
     #    slot_mapping=block_ids_2_slot_mapping(torch.arange(0,1, dtype=torch.int64), tokens_per_block, actual_length=8),
     #    token_mask=my_mask,
-    #    dp_id=0,
+    #    dp_rank=0,
     #)
     #kvmanager.wait_for_graph_finished(write_request)
 
@@ -289,13 +289,13 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     for i in range(initial_write_num, num_requests):
         print(f"performing mixed read/write {i} / {num_requests} ...")
         read_idx = i - initial_write_num
-        token_ids, block_ids, dp_id = request_pairs[read_idx]
+        token_ids, block_ids, dp_rank = request_pairs[read_idx]
         slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
         request_id, _ = kvmanager.get_match(
             token_ids=token_ids,
             layer_granularity=-1,
             token_mask=None,
-            dp_id=dp_id,
+            dp_rank=dp_rank,
             namespace=namespace,
         )
         kvmanager.launch(request_id, slot_mapping)
@@ -303,14 +303,14 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
         running_get_requests.append(request_id)
         req_id2block_ids[request_id] = block_ids
         req_id2token_ids[request_id] = token_ids
-        token_ids, block_ids, dp_id = request_pairs[i]
+        token_ids, block_ids, dp_rank = request_pairs[i]
         if gpu_kv_verifier is not None:
             gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
         request_id = kvmanager.put_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
             token_mask=None,
-            dp_id=dp_id,
+            dp_rank=dp_rank,
             namespace=namespace,
         )
         req_id2block_ids[request_id] = block_ids
@@ -378,14 +378,14 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
 
         # Create multiple get_match requests
         for i in range(batch_size):
-            token_ids, block_ids, dp_id = request_pairs[random.randint(0, num_requests - 1)]
+            token_ids, block_ids, dp_rank = request_pairs[random.randint(0, num_requests - 1)]
             slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
 
             request_id, return_mask = kvmanager.get_match(
                 token_ids=token_ids,
                 layer_granularity=-1,
                 token_mask=None,
-                dp_id=dp_id,
+                dp_rank=dp_rank,
                 namespace=namespace,
             )
             batched_get_task_ids.append(request_id)
@@ -580,7 +580,7 @@ class GPUIndexerCacheVerifier:
         return verification_passed
 
 
-def run_tp_client_with_indexer(dp_client_id,
+def run_tp_client_with_indexer(dp_rank,
                                tp_rank,
                                server_recv_port,
                                model_config,
@@ -593,7 +593,7 @@ def run_tp_client_with_indexer(dp_client_id,
     Indexer configuration is read from cache_config.indexer (IndexerCacheConfig).
     """
     try:
-        device_id = tp_rank + dp_client_id * model_config.tp_size
+        device_id = tp_rank + dp_rank * model_config.tp_size
 
         gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
 
@@ -647,7 +647,7 @@ def run_tp_client_with_indexer(dp_client_id,
         # Use KVTPClient directly with indexer buffers (shadow transfer mode)
         tp_client = KVTPClient(
             gpu_register_port=server_recv_port + "_gpu_register",
-            dp_client_id=dp_client_id,
+            dp_rank=dp_rank,
             device_id=device_id,
         )
         tp_client.register_to_server(
@@ -786,7 +786,7 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
     initial_write_num = int(num_requests * initial_write_ratio)
 
     print(f"[Test] Testing put flow ({test_label})...")
-    for token_ids, block_ids, dp_id in request_pairs[:initial_write_num]:
+    for token_ids, block_ids, dp_rank in request_pairs[:initial_write_num]:
         if gpu_kv_verifier is not None:
             gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
         if indexer_kv_verifier is not None:
@@ -795,7 +795,7 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
             token_mask=None,
-            dp_id=dp_id,
+            dp_rank=dp_rank,
         )
         put_results = kvmanager.wait([write_request], completely=True)
         assert put_results[write_request].status == KVResponseStatus.SUCCESS
@@ -816,13 +816,13 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
     batch_slot_mappings = []
 
     for i in range(min(initial_write_num, num_requests)):
-        token_ids, block_ids, dp_id = request_pairs[i]
+        token_ids, block_ids, dp_rank = request_pairs[i]
         slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
         request_id, _ = kvmanager.get_match(
             token_ids=token_ids,
             layer_granularity=-1,
             token_mask=None,
-            dp_id=dp_id,
+            dp_rank=dp_rank,
         )
         batch_task_ids.append(request_id)
         batch_slot_mappings.append(slot_mapping)
@@ -889,7 +889,7 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
 
     print(f"[Test] Testing try_wait flow ({test_label})...")
     if initial_write_num < num_requests:
-        token_ids, block_ids, dp_id = request_pairs[initial_write_num]
+        token_ids, block_ids, dp_rank = request_pairs[initial_write_num]
         if gpu_kv_verifier is not None:
             gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
         if indexer_kv_verifier is not None:
@@ -898,7 +898,7 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
             token_mask=None,
-            dp_id=dp_id,
+            dp_rank=dp_rank,
         )
         finished = {}
         for _ in range(200):
@@ -1018,11 +1018,8 @@ def _mock_sglang_eventfd_client(socket_path: str,
                   f"after {max_retries} attempts")
             return
 
-        # Send 24-byte metadata: tp_rank, tp_size, cp_rank, cp_size,
-        #                         num_layers, num_counters
-        metadata = struct.pack("iiiiii",
+        metadata = struct.pack("iiii",
                                tp_rank, tp_size,
-                               0, 1,  # cp_rank=0, cp_size=1
                                num_layers, num_counters)
         sock.sendall(metadata)
 

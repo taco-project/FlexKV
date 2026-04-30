@@ -38,10 +38,10 @@ class StorageEngine:
         if self._cache_config.enable_cpu:
             self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
-                num_layer=self._model_config.num_layers,
+                num_layer=self._model_config.num_layers_per_pp_stage,
                 num_block=self._cache_config.num_cpu_blocks,
                 tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads,
+                num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla
             )
@@ -56,7 +56,7 @@ class StorageEngine:
                 # tokens_per_block is 1 (one indexer entry per page).
                 indexer_cpu_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
-                    num_layer=self._model_config.num_layers,
+                    num_layer=self._model_config.num_layers_per_pp_stage,
                     num_block=self._cache_config.num_cpu_blocks,
                     tokens_per_block=1,
                     num_head=self._indexer_config.num_kv_heads,
@@ -75,10 +75,10 @@ class StorageEngine:
                 raise ValueError(f"SSD layout type must be the same as CPU layout type: {self._cpu_layout.type}")
             self._ssd_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
-                num_layer=self._model_config.num_layers,
+                num_layer=self._model_config.num_layers_per_pp_stage,
                 num_block=self._cache_config.num_ssd_blocks,
                 tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads,
+                num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla
             )
@@ -92,7 +92,7 @@ class StorageEngine:
             if self._indexer_config is not None:
                 indexer_ssd_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
-                    num_layer=self._model_config.num_layers,
+                    num_layer=self._model_config.num_layers_per_pp_stage,
                     num_block=self._cache_config.num_ssd_blocks,
                     tokens_per_block=1,
                     num_head=self._indexer_config.num_kv_heads,
@@ -113,10 +113,10 @@ class StorageEngine:
                 raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
             self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
-                num_layer=self._model_config.num_layers,
+                num_layer=self._model_config.num_layers_per_pp_stage,
                 num_block=self._cache_config.num_remote_blocks,
                 tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads,
+                num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla
             )
@@ -130,7 +130,7 @@ class StorageEngine:
             if self._indexer_config is not None:
                 indexer_remote_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
-                    num_layer=self._model_config.num_layers,
+                    num_layer=self._model_config.num_layers_per_pp_stage,
                     num_block=self._cache_config.num_remote_blocks,
                     tokens_per_block=1,
                     num_head=self._indexer_config.num_kv_heads,

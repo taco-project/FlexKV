@@ -22,7 +22,7 @@ public:
   LayerwiseTransferGroup(
       int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
       torch::Tensor &cpu_blocks,
-      std::map<int, std::vector<std::string>> &ssd_files, int dp_group_id,
+      std::map<int, std::vector<std::string>> &ssd_files,
       int num_layers, torch::Tensor &gpu_kv_strides_tensor,
       torch::Tensor &gpu_block_strides_tensor,
       torch::Tensor &gpu_layer_strides_tensor,

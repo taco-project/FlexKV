@@ -94,6 +94,7 @@ class KVDPClient:
         token_ids: np.ndarray,
         slot_mapping: np.ndarray,
         token_mask: Optional[np.ndarray],
+        pp_rank: int = 0,
         namespace: Optional[List[str]] = None,
     ) -> int:
         req = PutRequest(self.dp_client_id,
@@ -101,6 +102,7 @@ class KVDPClient:
                          slot_mapping,
                          token_mask if token_mask is not None else None,
                          self._get_task_id(),
+                         pp_rank,
                          namespace)
         self.send_to_server.send_pyobj(req)
         return req.task_id
@@ -109,12 +111,14 @@ class KVDPClient:
         self,
         token_ids: np.ndarray,
         token_mask: Optional[np.ndarray],
+        pp_rank: int = 0,
         namespace: Optional[List[str]] = None,
     ) -> Optional[Tuple[int, np.ndarray]]:
         req = PutMatchRequest(self.dp_client_id,
                               token_ids,
                               token_mask if token_mask is not None else None,
                               self._get_task_id(),
+                              pp_rank,
                               namespace)
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
@@ -127,9 +131,10 @@ class KVDPClient:
     def prefetch_async(
         self,
         token_ids: np.ndarray,
+        pp_rank: int = 0,
         namespace: Optional[List[str]] = None,
     ) -> int:
-        req = PrefetchRequest(self.dp_client_id, token_ids, self._get_task_id(), namespace)
+        req = PrefetchRequest(self.dp_client_id, token_ids, self._get_task_id(), pp_rank, namespace)
         self.send_to_server.send_pyobj(req)
         return req.task_id
 
@@ -139,6 +144,7 @@ class KVDPClient:
         slot_mapping: np.ndarray,
         token_mask: Optional[np.ndarray],
         layer_granularity: int,
+        pp_rank: int = 0,
         namespace: Optional[List[str]] = None,
     ) -> int:
         req = GetRequest(self.dp_client_id,
@@ -147,6 +153,7 @@ class KVDPClient:
                          token_mask if token_mask is not None else None,
                          self._get_task_id(),
                          layer_granularity,
+                         pp_rank,
                          namespace)
         self.send_to_server.send_pyobj(req)
         return req.task_id
@@ -156,6 +163,7 @@ class KVDPClient:
         token_ids: np.ndarray,
         token_mask: Optional[np.ndarray],
         layer_granularity: int,
+        pp_rank: int = 0,
         cpu_only: bool = False,
         namespace: Optional[List[str]] = None,
     ) -> Optional[Tuple[int, np.ndarray]]:
@@ -165,6 +173,7 @@ class KVDPClient:
                               layer_granularity,
                               cpu_only,
                               self._get_task_id(),
+                              pp_rank,
                               namespace)
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
@@ -239,7 +248,8 @@ class KVTPClient:
     def __init__(
         self,
         gpu_register_port: str,
-        dp_client_id: int,
+        dp_rank: int,
+        pp_rank: int,
         device_id: int,
     ):
         # Init inter-process communication
@@ -248,11 +258,39 @@ class KVTPClient:
             context, zmq.SocketType.PUSH, gpu_register_port, False
         )
 
-        self.dp_client_id = dp_client_id
+        self.dp_rank = dp_rank
+        self.pp_rank = pp_rank
         self.device_id = device_id
 
-        flexkv_logger.info(f"KVTPClient {device_id} of KVDPClient {self.dp_client_id} Initialized! "
-                           f"(gpu_register_port={gpu_register_port})")
+        flexkv_logger.info(f"KVTPClient {device_id} of DP {self.dp_rank} Initialized! "
+                           f"(gpu_register_port={gpu_register_port}, dp_rank={dp_rank}, pp_rank={pp_rank})")
+
+    def set_slot_mapping(self, task_id: int, slot_mapping: np.ndarray) -> None:
+        """Send set_slot_mapping message to TransferManagerOnRemote via existing ZMQ channel.
+
+        Reuses the same PUSH socket (send_to_server) that connects to
+        TransferManagerOnRemote's command_socket — no separate IPC socket needed.
+        """
+        message = {
+            'type': 'set_slot_mapping',
+            'task_id': task_id,
+            'slot_mapping': slot_mapping,
+        }
+        try:
+            self.send_to_server.send_pyobj(message, flags=zmq.NOBLOCK)
+            flexkv_logger.debug(
+                f"KVTPClient {self.device_id}: set_slot_mapping sent for task_id={task_id}"
+            )
+        except zmq.Again:
+            flexkv_logger.warning(
+                f"KVTPClient {self.device_id}: zmq.Again when sending set_slot_mapping, "
+                f"retrying with blocking send..."
+            )
+            self.send_to_server.send_pyobj(message)
+            flexkv_logger.info(
+                f"KVTPClient {self.device_id}: set_slot_mapping sent (blocking retry) "
+                f"for task_id={task_id}"
+            )
 
     def register_to_server(
         self,
@@ -281,7 +319,8 @@ class KVTPClient:
                 indexer_handles.append(TensorSharedHandle(tensor, device_id))
 
         register_req = RegisterTPClientRequest(
-            self.dp_client_id,
+            self.dp_rank,
+            self.pp_rank,
             device_id,
             handles,
             kv_layout,
@@ -293,7 +332,7 @@ class KVTPClient:
             self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
             flexkv_logger.info(
                 f"KVTPClient {device_id}: registration message sent "
-                f"(dp_client_id={self.dp_client_id}, num_kv_caches={len(kv_caches)})")
+                f"(dp_rank={self.dp_rank}, num_kv_caches={len(kv_caches)})")
         except zmq.Again:
             flexkv_logger.error(
                 f"KVTPClient {device_id}: zmq.Again when sending registration "

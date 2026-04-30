@@ -9,7 +9,6 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
     const std::vector<int64_t> &gpu_block_ptrs_flat,
     int num_tensors_per_gpu,
     std::map<int, std::vector<std::string>> &ssd_files, 
-    int dp_group_id,
     int num_layers,
     const std::vector<int64_t> &gpu_kv_strides_in_bytes,
     const std::vector<int64_t> &gpu_block_strides_in_bytes,
@@ -19,7 +18,6 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
   
   num_gpus_ = num_gpus;
   num_tensors_per_gpu_ = num_tensors_per_gpu;
-  dp_group_id_ = dp_group_id;
   
   // per-GPU layout parameters
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];

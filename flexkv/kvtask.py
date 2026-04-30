@@ -25,6 +25,7 @@ from flexkv.transfer_manager import (
 )
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.integration.dynamo.collector import KVEventCollector
+from flexkv.transfer_manager import TransferManagerMultiNodeHandle
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -60,13 +61,15 @@ class KVTask:
     token_ids: np.ndarray
     slot_mapping: np.ndarray
     token_mask: Optional[np.ndarray]
-    dp_id: int
 
     # cache engine return
     graph: TransferOpGraph
     return_mask: Union[np.ndarray, list[np.ndarray]]
     callback: Optional[Union[Callable, List[Callable]]]
     op_callback_dict: Dict[int, Callable]
+
+    dp_rank: int = 0
+    pp_rank: int = 0
 
     # batch: points to the batch task id if this task was merged into a batch
     batch_task_id: Optional[int] = None
@@ -151,21 +154,10 @@ class KVTaskManager:
 
         self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta, event_collector)
 
-        model_config_for_transfer = copy.deepcopy(self.model_config)
-        if self.nnodes_per_tp_group > 1:
-            model_config_for_transfer.tp_size //= self.nnodes_per_tp_group
-            if not self.model_config.use_mla:
-                model_config_for_transfer.num_kv_heads //= self.nnodes_per_tp_group
-            # When NSA CP is active, cp_size mirrors tp_size and must also
-            # be divided so that TransferEngine's _eventfd_group_size matches
-            # the number of local GPUs on each node.
-            if model_config_for_transfer.is_nsa_cp and model_config_for_transfer.cp_size > 1:
-                model_config_for_transfer.cp_size //= self.nnodes_per_tp_group
-
         combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
         if not combine_with_trtllm:
             self.transfer_handles = [TransferManagerHandle(
-                model_config_for_transfer,
+                self.model_config,
                 self.cache_config,
                 mode="process",
                 gpu_register_port=gpu_register_port
@@ -178,7 +170,7 @@ class KVTaskManager:
             self.remote_process = TransferManagerOnRemote.create_process(mode="TrtllmSubprocess")
             self.transfer_handles = [
                 TransferManagerHandle(
-                    model_config_for_transfer,
+                    self.model_config,
                     self.cache_config,
                     mode="remote",
                     gpu_register_port=gpu_register_port,
@@ -188,12 +180,12 @@ class KVTaskManager:
             ]
             self.transfer_handles[0]._handle.send_config_to_remotes()
 
-        if self.nnodes_per_tp_group > 1:
+        if self.model_config.nnodes > 1:
             master_host, master_ports = resolve_master_host_and_ports(
                 master_host=self.model_config.master_host
             )
             self.transfer_handles.append(TransferManagerHandle(
-                model_config_for_transfer,
+                self.model_config,
                 self.cache_config,
                 mode="remote",
                 gpu_register_port=gpu_register_port,
@@ -246,7 +238,8 @@ class KVTaskManager:
                         slot_mapping: np.ndarray,
                         token_mask: Optional[np.ndarray] = None,
                         layer_granularity: int = -1,
-                        dp_id: int = 0,
+                        dp_rank: int = 0,
+                        pp_rank: int = 0,
                         is_fake_slot_mapping: bool = False,
                         temp_cache_strategy=DEFAULT_CACHE_STRATEGY,
                         namespace: Optional[List[str]] = None,
@@ -258,9 +251,10 @@ class KVTaskManager:
             token_ids=token_ids,
             token_mask=token_mask,
             slot_mapping=slot_mapping,
-            layer_num=self.model_config.num_layers,
+            layer_num=self.model_config.num_layers_per_pp_stage,
             layer_granularity=layer_granularity,
-            dp_id=dp_id,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
             temp_cache_strategy=temp_cache_strategy,
             namespace=namespace)
         self.tasks[task_id] = KVTask(
@@ -272,7 +266,8 @@ class KVTaskManager:
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             token_mask=token_mask,
-            dp_id=dp_id,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
             graph=graph,
             return_mask=return_mask,
             callback=callback,
@@ -285,7 +280,8 @@ class KVTaskManager:
                         token_ids: np.ndarray,
                         slot_mapping: np.ndarray,
                         token_mask: Optional[np.ndarray] = None,
-                        dp_id: int = 0,
+                        dp_rank: int = 0,
+                        pp_rank: int = 0,
                         is_fake_slot_mapping: bool = False,
                         namespace: Optional[List[str]] = None,
                         ) -> None:
@@ -296,8 +292,9 @@ class KVTaskManager:
             token_ids=token_ids,
             token_mask=token_mask,
             slot_mapping=slot_mapping,
-            layer_num=self.model_config.num_layers,
-            dp_id=dp_id,
+            layer_num=self.model_config.num_layers_per_pp_stage,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
             namespace=namespace)
         self.tasks[task_id] = KVTask(
             task_id=task_id,
@@ -308,7 +305,8 @@ class KVTaskManager:
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             token_mask=token_mask,
-            dp_id=dp_id,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
             graph=graph,
             return_mask=return_mask,
             callback=callback,
@@ -318,6 +316,7 @@ class KVTaskManager:
     def create_prefetch_task(self,
                             task_id: int,
                             token_ids: np.ndarray,
+                            pp_rank: int = 0,
                             namespace: Optional[List[str]] = None,
                             ) -> None:
         if task_id in self.tasks:
@@ -332,7 +331,9 @@ class KVTaskManager:
             token_ids=token_ids,
             token_mask=fake_token_mask,
             slot_mapping=fake_slot_mapping,
-            layer_num=self.model_config.num_layers,
+            layer_num=self.model_config.num_layers_per_pp_stage,
+            dp_rank=0,  # dp_rank irrelevant: prefetch only uploads to CPU (ignore_gpu=True)
+            pp_rank=pp_rank,
             temp_cache_strategy=temp_cache_strategy,
             namespace=namespace)
         self.tasks[task_id] = KVTask(
@@ -344,7 +345,8 @@ class KVTaskManager:
             token_ids=token_ids,
             slot_mapping=fake_slot_mapping,  # ignore slot_mapping for prefetch
             token_mask=fake_token_mask,  # ignore token_mask for prefetch
-            dp_id=0,  # ignore dp_id for prefetch
+            dp_rank=0,  # ignore dp_rank for prefetch
+            pp_rank=pp_rank,
             graph=graph,
             return_mask=return_mask,
             callback=callback,
@@ -361,7 +363,21 @@ class KVTaskManager:
         nvtx.mark(f"launch task: task_id={task_id}, graph_id={transfer_graph.graph_id}")
         if transfer_graph.num_ops > 0:
             for transfer_handle in self.transfer_handles:
-                transfer_handle.submit(transfer_graph)
+                # For remote handles: deepcopy graph and clear GPU blocks when
+                # it's a cross-machine PP handle (different PP stages have
+                # different GPU block_ids).  Cross-machine TP handles share
+                # the same slot_mapping, so no clear is needed.
+                if isinstance(transfer_handle._handle, TransferManagerMultiNodeHandle):
+                    if self.model_config.nnodes > 1 and self.model_config.pp_size > 1:
+                        # Cross-machine PP: each PP rank has different GPU blocks
+                        graph_copy = copy.deepcopy(transfer_graph)
+                        graph_copy.clear_gpu_blocks()
+                        transfer_handle.submit(graph_copy, task_end_op_id=self.tasks[task_id].task_end_op_id)
+                    else:
+                        # Cross-machine TP: same slot_mapping across TP ranks
+                        transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
+                else:
+                    transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
         completed_ops = self._get_completed_ops(timeout)
@@ -498,7 +514,7 @@ class KVTaskManager:
                     raise ValueError("remote_file_size must not None if use file_size model")
                 if model_config.use_mla:
                     kv_size = (
-                        model_config.num_layers
+                        model_config.num_layers_per_pp_stage
                         * cache_config.tokens_per_block
                         * model_config.num_kv_heads
                         * model_config.head_size
@@ -506,7 +522,7 @@ class KVTaskManager:
                     )
                 else:
                     kv_size = (
-                        model_config.num_layers
+                        model_config.num_layers_per_pp_stage
                         * 2
                         * cache_config.tokens_per_block
                         * model_config.num_kv_heads
@@ -535,7 +551,8 @@ class KVTaskEngine(KVTaskManager):
                   slot_mapping: np.ndarray,
                   token_mask: Optional[np.ndarray] = None,
                   layer_granularity: int = -1,
-                  dp_id: int = 0,
+                  dp_rank: int = 0,
+                  pp_rank: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         # self._sync_prefetch(token_ids, namespace)
@@ -544,7 +561,8 @@ class KVTaskEngine(KVTaskManager):
                                                     is_fake_slot_mapping=False,
                                                     token_mask=token_mask,
                                                     layer_granularity=layer_granularity,
-                                                    dp_id=dp_id,
+                                                    dp_rank=dp_rank,
+                                                    pp_rank=pp_rank,
                                                     task_id=task_id,
                                                     namespace=namespace)
         # trace get request
@@ -555,7 +573,8 @@ class KVTaskEngine(KVTaskManager):
             slot_mapping=slot_mapping,
             token_mask=token_mask,
             layer_granularity=layer_granularity,
-            dp_id=dp_id
+            dp_rank=dp_rank,
+            pp_rank=pp_rank
         )
         self._launch_task(task_id)
         return task_id, return_mask
@@ -564,14 +583,16 @@ class KVTaskEngine(KVTaskManager):
                   token_ids: np.ndarray,
                   slot_mapping: np.ndarray,
                   token_mask: Optional[np.ndarray] = None,
-                  dp_id: int = 0,
+                  dp_rank: int = 0,
+                  pp_rank: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         task_id, return_mask = self._put_match_impl(token_ids,
                                                     slot_mapping,
                                                     is_fake_slot_mapping=False,
                                                     token_mask=token_mask,
-                                                    dp_id=dp_id,
+                                                    dp_rank=dp_rank,
+                                                    pp_rank=pp_rank,
                                                     task_id=task_id,
                                                     namespace=namespace)
         # trace put request
@@ -582,7 +603,8 @@ class KVTaskEngine(KVTaskManager):
             slot_mapping=slot_mapping,
             token_mask=token_mask,
             layer_granularity=-1,  # put has no layer_granularity parameter
-            dp_id=dp_id
+            dp_rank=dp_rank,
+            pp_rank=pp_rank
         )
         self._launch_task(task_id)
         return task_id, return_mask
@@ -687,7 +709,8 @@ class KVTaskEngine(KVTaskManager):
                   token_ids: np.ndarray,
                   token_mask: Optional[np.ndarray] = None,
                   layer_granularity: int = -1,
-                  dp_id: int = 0,
+                  dp_rank: int = 0,
+                  pp_rank: int = 0,
                   cpu_only: bool = False,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
@@ -701,7 +724,8 @@ class KVTaskEngine(KVTaskManager):
                                                            is_fake_slot_mapping=True,
                                                            token_mask=token_mask,
                                                            layer_granularity=layer_granularity,
-                                                           dp_id=dp_id,
+                                                           dp_rank=dp_rank,
+                                                           pp_rank=pp_rank,
                                                            cpu_only=cpu_only,
                                                            task_id=task_id,
                                                            namespace=namespace)
@@ -713,7 +737,8 @@ class KVTaskEngine(KVTaskManager):
             slot_mapping=fake_slot_mapping,
             token_mask=token_mask,
             layer_granularity=layer_granularity,
-            dp_id=dp_id
+            dp_rank=dp_rank,
+            pp_rank=pp_rank
         )
         nvtx.pop_range()
         return result_task_id, return_mask
@@ -724,14 +749,15 @@ class KVTaskEngine(KVTaskManager):
                   is_fake_slot_mapping: bool = False,
                   token_mask: Optional[np.ndarray] = None,
                   layer_granularity: int = -1,
-                  dp_id: int = 0,
+                  dp_rank: int = 0,
+                  pp_rank: int = 0,
                   cpu_only: bool = False,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         if token_mask is None:
             token_mask = np.ones_like(token_ids)
         if layer_granularity == -1:
-            layer_granularity = self.model_config.num_layers
+            layer_granularity = self.model_config.num_layers_per_pp_stage
         if task_id == -1:
             task_id = self._gen_task_id()
         temp_cache_strategy = DEFAULT_CACHE_STRATEGY
@@ -743,7 +769,8 @@ class KVTaskEngine(KVTaskManager):
                              slot_mapping,
                              token_mask,
                              layer_granularity,
-                             dp_id,
+                             dp_rank,
+                             pp_rank=pp_rank,
                              is_fake_slot_mapping=is_fake_slot_mapping,
                              temp_cache_strategy=temp_cache_strategy,
                              namespace=namespace)
@@ -754,7 +781,8 @@ class KVTaskEngine(KVTaskManager):
     def put_match(self,
                   token_ids: np.ndarray,
                   token_mask: Optional[np.ndarray] = None,
-                  dp_id: int = 0,
+                  dp_rank: int = 0,
+                  pp_rank: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         fake_slot_mapping = np.zeros_like(token_ids)
@@ -762,7 +790,8 @@ class KVTaskEngine(KVTaskManager):
                                                            fake_slot_mapping,
                                                            is_fake_slot_mapping=True,
                                                            token_mask=token_mask,
-                                                           dp_id=dp_id,
+                                                           dp_rank=dp_rank,
+                                                           pp_rank=pp_rank,
                                                            task_id=task_id,
                                                            namespace=namespace)
         # trace put match request
@@ -773,7 +802,8 @@ class KVTaskEngine(KVTaskManager):
             slot_mapping=fake_slot_mapping,
             token_mask=token_mask,
             layer_granularity=-1,  # put has no layer_granularity parameter
-            dp_id=dp_id
+            dp_rank=dp_rank,
+            pp_rank=pp_rank
         )
         return result_task_id, return_mask
 
@@ -782,7 +812,8 @@ class KVTaskEngine(KVTaskManager):
                         slot_mapping: np.ndarray,
                         is_fake_slot_mapping: bool = False,
                         token_mask: Optional[np.ndarray] = None,
-                        dp_id: int = 0,
+                        dp_rank: int = 0,
+                        pp_rank: int = 0,
                         task_id: int = -1,
                         namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         if token_mask is None:
@@ -794,7 +825,8 @@ class KVTaskEngine(KVTaskManager):
                              token_ids,
                              slot_mapping,
                              token_mask,
-                             dp_id,
+                             dp_rank,
+                             pp_rank=pp_rank,
                              is_fake_slot_mapping=is_fake_slot_mapping,
                              namespace=namespace)
         self._process_empty_graph(task_id)
@@ -803,13 +835,14 @@ class KVTaskEngine(KVTaskManager):
 
     def prefetch_async(self,
                        token_ids: np.ndarray,
-                       dp_id: int = 0,
+                       dp_rank: int = 0,
+                       pp_rank: int = 0,
                        task_id: int = -1,
                        namespace: Optional[List[str]] = None) -> int:
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
-        self.create_prefetch_task(task_id, token_ids, namespace=namespace)
+        self.create_prefetch_task(task_id, token_ids, pp_rank=pp_rank, namespace=namespace)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
         # trace prefetch async request
@@ -820,7 +853,8 @@ class KVTaskEngine(KVTaskManager):
             slot_mapping=np.zeros_like(token_ids),
             token_mask=np.ones_like(token_ids),
             layer_granularity=-1,
-            dp_id=dp_id
+            dp_rank=dp_rank,
+            pp_rank=pp_rank
         )
         self._launch_task(task_id)
         return task_id
@@ -864,7 +898,8 @@ class KVTaskEngine(KVTaskManager):
             task_end_op_id=task_end_op_id,
             task_end_op_finished=False,
             status=TaskStatus.READY,
-            dp_id=self.tasks[task_ids[0]].dp_id,
+            dp_rank=self.tasks[task_ids[0]].dp_rank,
+            pp_rank=self.tasks[task_ids[0]].pp_rank,
             graph=batch_task_graph,
             return_mask=return_masks,
             callback=callbacks,

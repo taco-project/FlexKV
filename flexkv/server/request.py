@@ -18,7 +18,8 @@ class RegisterDPClientRequest:
 
 @dataclass
 class RegisterTPClientRequest:
-    dp_client_id: int
+    dp_rank: int
+    pp_rank: int
     device_id: int
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
@@ -37,6 +38,7 @@ class PutRequest:
     slot_mapping: np.ndarray
     token_mask: Optional[np.ndarray]
     task_id: int = -1
+    pp_rank: int = 0
     namespace: Optional[List[str]] = None
 
 
@@ -48,6 +50,7 @@ class GetRequest:
     token_mask: Optional[np.ndarray]
     task_id: int = -1
     layer_granularity: int = -1
+    pp_rank: int = 0
     namespace: Optional[List[str]] = None
 
 @dataclass
@@ -55,6 +58,7 @@ class PrefetchRequest:
     dp_client_id: int
     token_ids: np.ndarray
     task_id: int = -1
+    pp_rank: int = 0
     namespace: Optional[List[str]] = None
 
 @dataclass
@@ -63,6 +67,7 @@ class PutMatchRequest:
     token_ids: np.ndarray
     token_mask: Optional[np.ndarray]
     task_id: int = -1
+    pp_rank: int = 0
     namespace: Optional[List[str]] = None
 
 @dataclass
@@ -73,6 +78,7 @@ class GetMatchRequest:
     layer_granularity: int
     cpu_only: bool = False
     task_id: int = -1
+    pp_rank: int = 0
     namespace: Optional[List[str]] = None
 
 @dataclass
@@ -131,3 +137,4 @@ class ShutdownRequest:
 @dataclass
 class CheckRunningRequest:
     dp_client_id: int
+

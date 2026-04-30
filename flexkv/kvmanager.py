@@ -151,7 +151,8 @@ class KVManager:
                   slot_mapping: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   layer_granularity: int = -1,
-                  dp_id: int = 0,
+                  dp_rank: int = 0,
+                  pp_rank: int = 0,
                   namespace: Optional[List[str]] = None,
                   ) -> int:
         if isinstance(token_ids, torch.Tensor):
@@ -165,13 +166,15 @@ class KVManager:
                                                slot_mapping,
                                                token_mask,
                                                layer_granularity,
+                                               pp_rank=pp_rank,
                                                namespace=namespace)
         else:
             task_id, _ = self.kv_task_engine.get_async(token_ids,
                                                        slot_mapping,
                                                        token_mask,
                                                        layer_granularity,
-                                                       dp_id,
+                                                       dp_rank,
+                                                       pp_rank=pp_rank,
                                                        namespace=namespace)
         return task_id
 
@@ -179,7 +182,8 @@ class KVManager:
                   token_ids: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   layer_granularity: int = -1,
-                  dp_id: int = 0,
+                  dp_rank: int = 0,
+                  pp_rank: int = 0,
                   cpu_only: bool = False,
                   namespace: Optional[List[str]] = None,
                   ) -> Tuple[int, np.ndarray]:
@@ -191,13 +195,15 @@ class KVManager:
             task_id, mask = self.dp_client.get_match(token_ids,
                                                      token_mask,
                                                      layer_granularity,
+                                                     pp_rank=pp_rank,
                                                      cpu_only=cpu_only,
                                                      namespace=namespace)
         else:
             task_id, mask = self.kv_task_engine.get_match(token_ids,
                                                           token_mask,
                                                           layer_granularity,
-                                                          dp_id,
+                                                          dp_rank,
+                                                          pp_rank=pp_rank,
                                                           cpu_only=cpu_only,
                                                           namespace=namespace)
         return task_id, mask
@@ -206,7 +212,8 @@ class KVManager:
                   token_ids: Union[torch.Tensor, np.ndarray],
                   slot_mapping: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  dp_id: int = 0,
+                  dp_rank: int = 0,
+                  pp_rank: int = 0,
                   namespace: Optional[List[str]] = None,
                   ) -> int:
         if isinstance(token_ids, torch.Tensor):
@@ -216,15 +223,16 @@ class KVManager:
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask, namespace=namespace)
+            task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask, pp_rank=pp_rank, namespace=namespace)
         else:
-            task_id, _ = self.kv_task_engine.put_async(token_ids, slot_mapping, token_mask, dp_id, namespace=namespace)
+            task_id, _ = self.kv_task_engine.put_async(token_ids, slot_mapping, token_mask, dp_rank, pp_rank=pp_rank, namespace=namespace)
         return task_id
 
     def put_match(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  dp_id: int = 0,
+                  dp_rank: int = 0,
+                  pp_rank: int = 0,
                   namespace: Optional[List[str]] = None,
                   ) -> Tuple[int, np.ndarray]:
         if isinstance(token_ids, torch.Tensor):
@@ -232,21 +240,22 @@ class KVManager:
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id, mask = self.dp_client.put_match(token_ids, token_mask, namespace=namespace)
+            task_id, mask = self.dp_client.put_match(token_ids, token_mask, pp_rank=pp_rank, namespace=namespace)
         else:
-            task_id, mask = self.kv_task_engine.put_match(token_ids, token_mask, dp_id, namespace=namespace)
+            task_id, mask = self.kv_task_engine.put_match(token_ids, token_mask, dp_rank, pp_rank=pp_rank, namespace=namespace)
         return task_id, mask
 
     def prefetch_async(self,
                        token_ids: np.ndarray,
-                       dp_id: int = 0,
+                       dp_rank: int = 0,
+                       pp_rank: int = 0,
                        namespace: Optional[List[str]] = None) -> int:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if self.server_client_mode:
-            task_id = self.dp_client.prefetch_async(token_ids, namespace=namespace)
+            task_id = self.dp_client.prefetch_async(token_ids, pp_rank=pp_rank, namespace=namespace)
         else:
-            task_id = self.kv_task_engine.prefetch_async(token_ids, dp_id=dp_id, namespace=namespace)
+            task_id = self.kv_task_engine.prefetch_async(token_ids, dp_rank=dp_rank, pp_rank=pp_rank, namespace=namespace)
         return task_id
 
     def launch(self,

@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, TYPE_CHECKING, List, Dict
 
+import time
 import numpy as np
 import torch
 
@@ -37,9 +38,7 @@ class HierarchyLRCacheEngine:
                  evict_start_threshold: float = 1.0,
                  hit_reward_seconds: int = 0,
                  eviction_policy: str = "lru",
-                 meta: Optional[RedisMeta] = None,
-                 pp_rank: int = 0,
-                 pp_size: int = 1) -> None:
+                 meta: Optional[RedisMeta] = None) -> None:
         if num_total_blocks <= 0:
             raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
@@ -92,8 +91,6 @@ class HierarchyLRCacheEngine:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
         
         # cumulative statistics: for analyzing distributed KV reuse benefits
         self._stats_total_queried_tokens = 0       # total tokens queried
@@ -116,12 +113,8 @@ class HierarchyLRCacheEngine:
         else:
             raise ValueError(f"Invalid device type: {self.device_type}")
 
-        if self.pp_size > 1:
-            local_ch_block_key = f"{base_key}:pp{self.pp_rank}"
-            remote_ch_block_key = f"{base_key}:pp{self.pp_rank}"
-        else:
-            local_ch_block_key = base_key
-            remote_ch_block_key = base_key
+        local_ch_block_key = base_key
+        remote_ch_block_key = base_key
         self.remote_ch = self._meta.get_redis_meta_channel(remote_ch_block_key)
         self.local_ch = self._meta.get_redis_meta_channel(local_ch_block_key)
                 # Load and store mapping of node_id -> file_nodeids from Redis
@@ -161,7 +154,6 @@ class HierarchyLRCacheEngine:
         num_blocks = sequence_meta.num_blocks
 
         # Query both local and remote
-        import time
         t0 = time.perf_counter()
         mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
         t1 = time.perf_counter()
@@ -452,7 +444,7 @@ class HierarchyLRCacheEngine:
 
     #TODO pfcs may not work now
     @classmethod
-    def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None, pp_rank: int = 0, pp_size: int = 1) -> "HierarchyLRCacheEngine":
+    def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
         """Create a PCFSCacheEngine from CacheConfig.
 
         This replaces RemotePCFSCacheEngine. It wires both local and remote
@@ -531,16 +523,14 @@ class HierarchyLRCacheEngine:
             local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
             eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
             meta=meta,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
         )
 
     #TODO is this enough for peercpu and peerssd?
     @classmethod
-    def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, device_type: DeviceType, meta: Optional[RedisMeta] = None, pp_rank: int = 0, pp_size: int = 1) -> "HierarchyLRCacheEngine":
+    def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, device_type: DeviceType, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
 
         if device_type == DeviceType.REMOTE:
-            return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta, pp_rank=pp_rank, pp_size=pp_size)
+            return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta)
         else:
             # select correct blocks configuration based on device_type
             if device_type == DeviceType.CPU:
@@ -574,7 +564,5 @@ class HierarchyLRCacheEngine:
                 hit_reward_seconds=int(GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds),
                 eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
                 meta=meta,
-                pp_rank=pp_rank,
-                pp_size=pp_size,
             )
             raise ValueError("Invalid device type: {cache_config.device_type}")
