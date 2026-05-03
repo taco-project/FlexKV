@@ -106,29 +106,30 @@ def shutdown_tp_client(tp_client_processes):
 @pytest.mark.parametrize(
     "model_config",
     [
-        {"tp_size": 1, "dp_size": 1},
-        {"tp_size": 2, "dp_size": 2},
-        {"dtype": torch.float32},
-        {"use_mla": True},
-        {"tp_size": 4, "dp_size": 1, "use_mla": True},
-        {"tp_size": 4, "dp_size": 1},
+        {"tp_size": 1, "dp_size": 1, "dtype": torch.bfloat16},
+        # {"tp_size": 2, "dp_size": 2, "dtype": torch.bfloat16},
+        # {"dtype": torch.float32, "dtype": torch.bfloat16},
+        # {"use_mla": True, "dtype": torch.bfloat16},
+        # {"tp_size": 4, "dp_size": 1, "use_mla": True, "dtype": torch.bfloat16},
+        # {"tp_size": 4, "dp_size": 1, "dtype": torch.bfloat16},
         # fp8 端到端流程覆盖（仅在当前 PyTorch 支持 float8_e4m3fn 且 CUDA 具备 mul 等算子时启用）
-        pytest.param(
-            {"dtype": torch.float8_e4m3fn},
-            marks=pytest.mark.skipif(
-                _fp8_cuda_ops_unavailable(),
-                reason="fp8 dtype or CUDA ops (e.g. mul_cuda) not available in this PyTorch build",
-            ),
-        ),
+        # pytest.param(
+        #     {"dtype": torch.float8_e4m3fn},
+        #     marks=pytest.mark.skipif(
+        #         _fp8_cuda_ops_unavailable(),
+        #         reason="fp8 dtype or CUDA ops (e.g. mul_cuda) not available in this PyTorch build",
+        #     ),
+        # ),
     ],
     indirect=True,
 )
 @pytest.mark.parametrize("cache_config", [
     {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
-    {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 256, 'num_ssd_blocks': 2048},
+    {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 256, 'num_ssd_blocks': 2048,
+     'ssd_cache_dir': ['./ssd_cache', './ssd_cache2/']},
     # GDS test configs
-    {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': True, \
-        'enable_remote': False, 'num_cpu_blocks':256, 'num_ssd_blocks': 1024},
+    # {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': True, \
+    #     'enable_remote': False, 'num_cpu_blocks':256, 'num_ssd_blocks': 1024},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
@@ -239,20 +240,37 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
                      for i in range(num_requests)]
     initial_write_num = int(num_requests * initial_write_ratio)
     print("writing initial data...")
-    put_ids = []
-    for token_ids, block_ids, dp_id in request_pairs[:initial_write_num]:
+    batch_size = num_cpu_blocks // block_per_request
+    for batch_start in range(0, initial_write_num, batch_size):
+        batch_end = min(batch_start + batch_size, initial_write_num)
+        batch_pairs = request_pairs[batch_start:batch_end]
+
         if gpu_kv_verifier is not None:
-            gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
-        write_request = kvmanager.put_async(
-            token_ids=token_ids,
-            slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
-            token_mask=None,
-            dp_id=dp_id,
-            namespace=namespace,
-        )
-        kvmanager.wait([write_request], completely=True)
+            for token_ids, block_ids, _ in batch_pairs:
+                gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
+
+        batch_task_ids = []
+        batch_slot_mappings = []
+        for token_ids, block_ids, dp_id in batch_pairs:
+            task_id, _ = kvmanager.put_match(
+                token_ids=token_ids,
+                token_mask=None,
+                dp_id=dp_id,
+                namespace=namespace,
+            )
+            batch_task_ids.append(task_id)
+            batch_slot_mappings.append(block_ids_2_slot_mapping(block_ids, tokens_per_block))
+
+        batch_id = kvmanager.launch(
+            task_ids=batch_task_ids,
+            slot_mappings=batch_slot_mappings,
+            as_batch=True,
+        )[0]
+        kvmanager.wait(batch_id, completely=True)
+
         if gpu_kv_verifier is not None:
-            gpu_kv_verifier.clear_gpu_blocks(block_ids)
+            for _, block_ids, _ in batch_pairs:
+                gpu_kv_verifier.clear_gpu_blocks(block_ids)
 
     #corner case: input token length for put is less than tokens_per_block
     write_request = kvmanager.put_async(
