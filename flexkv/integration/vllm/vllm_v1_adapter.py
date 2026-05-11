@@ -658,6 +658,7 @@ class FlexKVSchedulerConnector:
         for task_id, response in response_from_manager.items():
             success = (response.status == KVResponseStatus.SUCCESS)
             task = task_dict.pop(task_id)
+            del self.req_id_to_task_dict[task.request.request_id]
             task.task_finished_time = task_finished_time
             if not success:
                 logger.error(f"{task} failed, status: {response.status}.")
