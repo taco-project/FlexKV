@@ -2554,6 +2554,10 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         assert len(src_block_ids) == len(dst_block_ids)
 
         src_block_node_ids = transfer_op.src_block_node_ids
+        # Convert to plain list — the compiled utils.so (pybind11) requires list,
+        # not numpy.ndarray.
+        if hasattr(src_block_node_ids, 'tolist'):
+            src_block_node_ids = src_block_node_ids.tolist()
 
         # step1: group the blocks by remote node id and remote block source type,
         # each segment is a list of continuous blocks
@@ -2936,8 +2940,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     "",
                     src_ptr_list,
                     dst_ptr_list,
-                    None,
-                    None,
+                    [],    # src_block_ids unused for PEERH2H (uses ptrs)
+                    [],    # dst_block_ids unused for PEERH2H (uses ptrs)
                     data_size_list,
                     data_size = sum(data_size_list)
                 )

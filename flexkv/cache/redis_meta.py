@@ -341,7 +341,7 @@ class RedisNodeInfo:
     
     def _heartbeat_worker(self) -> None:
         """Background thread that periodically renews the TTL of node:<id> key.
-        
+
         This ensures that if the process is alive, the node key never expires.
         If the process crashes (kill -9), the TTL will not be renewed and the
         key will auto-expire after NODE_TTL_SECONDS, allowing other nodes to
@@ -768,11 +768,12 @@ class RedisMeta:
             "cpu_buffer_ptr": int(cpu_buffer_ptr),
             "ssd_buffer_ptr": int(ssd_buffer_ptr),
         })
-        # Set TTL on meta key so it auto-expires after node crash.
-        # The heartbeat in regist_node_meta_renew_ttl() will keep it alive.
-        meta_ttl = self.nodeinfo.node_ttl_seconds * self.META_TTL_MULTIPLIER
-        if meta_ttl > 0:
-            r.expire(key, meta_ttl)
+        # No TTL on meta keys.  Liveness is guarded by get_node_meta()
+        # which calls is_node_active() (checking the heartbeat-protected
+        # node:<id> key) before returning cached or fresh meta.  Setting a
+        # TTL here caused meta keys to silently expire when the heartbeat
+        # thread runs in a different process than the one that registered
+        # the meta key (e.g. EngineCore vs Worker subprocess).
 
     def get_node_meta(self, node_id: int) -> dict:
         """Get node meta information from Redis.
