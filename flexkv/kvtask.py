@@ -377,7 +377,7 @@ class KVTaskManager:
         task = self.tasks[task_id]
         if not task.is_completed():
             task.status = TaskStatus.CANCELLED
-        self._release_task(task_id)
+        self._release_task(task_id, cache_response=False)
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
         task = self.tasks[task_id]
@@ -442,7 +442,7 @@ class KVTaskManager:
         if batch_id is not None and batch_id in self.tasks:
             self.tasks[batch_id].pending_sub_count -= 1
             if self.tasks[batch_id].pending_sub_count <= 0:
-                self._release_task(batch_id)
+                self._release_task(batch_id, cache_response=cache_response)
 
     def _mark_completed(self, task_id: int) -> None:
         task = self.tasks[task_id]
