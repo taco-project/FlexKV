@@ -40,11 +40,8 @@ class KVManager:
                  event_collector: Optional[KVEventCollector] = None):
         flexkv_logger.info(f"{model_config = }")
         flexkv_logger.info(f"{cache_config = }")
-        flexkv_logger.info(f"{GLOBAL_CONFIG_FROM_ENV = }")
         self.model_config = model_config
         self.cache_config = cache_config
-        self.instance_id = GLOBAL_CONFIG_FROM_ENV.instance_id
-        self.instance_num = GLOBAL_CONFIG_FROM_ENV.instance_num
 
         if server_recv_port != "":
             self.server_recv_port = server_recv_port
@@ -62,33 +59,32 @@ class KVManager:
 
         # Multi-instance mode also requires server_client_mode
         self.server_client_mode = (model_config.dp_size > 1 or
-                                   self.instance_num > 1 or
+                                   model_config.instance_num > 1 or
                                    GLOBAL_CONFIG_FROM_ENV.server_client_mode)
-        self.dp_client_id = dp_client_id
 
-        # Calculate global_client_id for multi-instance mode
-        self.global_client_id = self.instance_id * model_config.dp_size + dp_client_id
-
-        flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
+        flexkv_logger.info(
+            f"[KVManager] instance_num={model_config.instance_num}, dp_size={model_config.dp_size}, "
+            f"server_client_mode={self.server_client_mode}"
+        )
 
         self.redis_meta_client = None
         self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
 
         if self.server_client_mode:
-            # In server_client_mode, RedisMeta is created and initialized inside KVServer
-            # Server should only be created once across all instances and dp ranks
-            if self.instance_id == 0 and dp_client_id == 0:
-                total_clients = self.instance_num * model_config.dp_size
+            if dp_client_id == 0:
                 self.server_handle = KVServer.create_server(model_config=model_config,
                                                             cache_config=cache_config,
                                                             gpu_register_port=self.gpu_register_port,
                                                             server_recv_port=self.server_recv_port,
-                                                            total_clients=total_clients,
                                                             inherit_env=False)
 
             else:
                 self.server_handle = None
-            self.dp_client = KVDPClient(self.server_recv_port, self.model_config, self.global_client_id)
+            self.dp_client = KVDPClient(
+                self.server_recv_port,
+                model_config=model_config,
+                dp_client_id=dp_client_id,
+            )
         else:
             # In non-server_client_mode, create RedisMeta here and pass to KVTaskEngine
             if self.cache_config.enable_kv_sharing:
@@ -106,11 +102,13 @@ class KVManager:
                 self.cache_config.distributed_node_id = self.redis_meta_client.get_node_id()
 
             self.server_handle = None
-            self.kv_task_engine = KVTaskEngine(self.model_config, self.cache_config, self.gpu_register_port, redis_meta=self.redis_meta_client, event_collector=event_collector)
-
-    @property
-    def dpclient_id(self) -> int:
-        return self.dp_client_id
+            self.kv_task_engine = KVTaskEngine(
+                model_config,
+                self.cache_config,
+                self.gpu_register_port,
+                redis_meta=self.redis_meta_client,
+                event_collector=event_collector,
+            )
 
     def start(self) -> None:
         if self.enable_mps:
@@ -150,9 +148,6 @@ class KVManager:
                   token_ids: Union[torch.Tensor, np.ndarray],
                   slot_mapping: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  layer_granularity: int = -1,
-                  dp_rank: int = 0,
-                  pp_rank: int = 0,
                   namespace: Optional[List[str]] = None,
                   ) -> int:
         if isinstance(token_ids, torch.Tensor):
@@ -165,25 +160,19 @@ class KVManager:
             task_id = self.dp_client.get_async(token_ids,
                                                slot_mapping,
                                                token_mask,
-                                               layer_granularity,
-                                               pp_rank=pp_rank,
                                                namespace=namespace)
         else:
-            task_id, _ = self.kv_task_engine.get_async(token_ids,
-                                                       slot_mapping,
-                                                       token_mask,
-                                                       layer_granularity,
-                                                       dp_rank,
-                                                       pp_rank=pp_rank,
-                                                       namespace=namespace)
+            task_id, _ = self.kv_task_engine.get_async(
+                token_ids=token_ids,
+                slot_mapping=slot_mapping,
+                token_mask=token_mask,
+                namespace=namespace,
+            )
         return task_id
 
     def get_match(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  layer_granularity: int = -1,
-                  dp_rank: int = 0,
-                  pp_rank: int = 0,
                   cpu_only: bool = False,
                   namespace: Optional[List[str]] = None,
                   ) -> Tuple[int, np.ndarray]:
@@ -194,26 +183,21 @@ class KVManager:
         if self.server_client_mode:
             task_id, mask = self.dp_client.get_match(token_ids,
                                                      token_mask,
-                                                     layer_granularity,
-                                                     pp_rank=pp_rank,
                                                      cpu_only=cpu_only,
                                                      namespace=namespace)
         else:
-            task_id, mask = self.kv_task_engine.get_match(token_ids,
-                                                          token_mask,
-                                                          layer_granularity,
-                                                          dp_rank,
-                                                          pp_rank=pp_rank,
-                                                          cpu_only=cpu_only,
-                                                          namespace=namespace)
+            task_id, mask = self.kv_task_engine.get_match(
+                token_ids=token_ids,
+                token_mask=token_mask,
+                cpu_only=cpu_only,
+                namespace=namespace,
+            )
         return task_id, mask
 
     def put_async(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   slot_mapping: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  dp_rank: int = 0,
-                  pp_rank: int = 0,
                   namespace: Optional[List[str]] = None,
                   ) -> int:
         if isinstance(token_ids, torch.Tensor):
@@ -223,16 +207,20 @@ class KVManager:
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask, pp_rank=pp_rank, namespace=namespace)
+            task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask,
+                                               namespace=namespace)
         else:
-            task_id, _ = self.kv_task_engine.put_async(token_ids, slot_mapping, token_mask, dp_rank, pp_rank=pp_rank, namespace=namespace)
+            task_id, _ = self.kv_task_engine.put_async(
+                token_ids=token_ids,
+                slot_mapping=slot_mapping,
+                token_mask=token_mask,
+                namespace=namespace,
+            )
         return task_id
 
     def put_match(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  dp_rank: int = 0,
-                  pp_rank: int = 0,
                   namespace: Optional[List[str]] = None,
                   ) -> Tuple[int, np.ndarray]:
         if isinstance(token_ids, torch.Tensor):
@@ -240,22 +228,28 @@ class KVManager:
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id, mask = self.dp_client.put_match(token_ids, token_mask, pp_rank=pp_rank, namespace=namespace)
+            task_id, mask = self.dp_client.put_match(token_ids, token_mask,
+                                                     namespace=namespace)
         else:
-            task_id, mask = self.kv_task_engine.put_match(token_ids, token_mask, dp_rank, pp_rank=pp_rank, namespace=namespace)
+            task_id, mask = self.kv_task_engine.put_match(
+                token_ids=token_ids,
+                token_mask=token_mask,
+                namespace=namespace,
+            )
         return task_id, mask
 
     def prefetch_async(self,
                        token_ids: np.ndarray,
-                       dp_rank: int = 0,
-                       pp_rank: int = 0,
                        namespace: Optional[List[str]] = None) -> int:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if self.server_client_mode:
-            task_id = self.dp_client.prefetch_async(token_ids, pp_rank=pp_rank, namespace=namespace)
+            task_id = self.dp_client.prefetch_async(token_ids, namespace=namespace)
         else:
-            task_id = self.kv_task_engine.prefetch_async(token_ids, dp_rank=dp_rank, pp_rank=pp_rank, namespace=namespace)
+            task_id = self.kv_task_engine.prefetch_async(
+                token_ids,
+                namespace=namespace,
+            )
         return task_id
 
     def launch(self,

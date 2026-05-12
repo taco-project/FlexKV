@@ -13,6 +13,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.config import ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.transfer import WorkerKey
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp
@@ -20,25 +21,20 @@ from flexkv.transfer.worker import TransferWorkerBase, cudaHostRegister
 
 
 def build_layerwise_eventfd_socket_path(
+    dp_client_id: int,
     pp_rank: int,
-    dp_rank: int,
-    pp_size: int = 1,
-    dp_size: int = 1,
+    model_config: ModelConfig,
 ) -> str:
-    """Construct the LayerwiseWorker's UDS socket path.
-
-    Disambiguated by ``(pp_rank, dp_rank)`` so multiple PP stages and DP
-    replicas on the same host each get their own endpoint.
-    """
+    """Construct the LayerwiseWorker's UDS socket path."""
     base = os.environ.get(
         'FLEXKV_LAYERWISE_EVENTFD_SOCKET',
         '/tmp/flexkv_layerwise_eventfd.sock',
     )
     suffix = ""
-    if pp_size > 1:
+    if model_config.pp_size > 1:
         suffix += f"_pp{pp_rank}"
-    if dp_size > 1:
-        suffix += f"_dp{dp_rank}"
+    if model_config.instance_num > 1 or model_config.dp_size > 1:
+        suffix += f"_dp{dp_client_id}"
     if not suffix:
         return base
     root, ext = os.path.splitext(base)
@@ -109,6 +105,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
         self.is_mla = gpu_kv_layouts[0].is_mla
+        self.kv_dim = 1 if self.is_mla else 2
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
@@ -464,7 +461,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                       dst_block_ids_h2d: torch.Tensor,
                       src_block_ids_disk2h: Optional[torch.Tensor],
                       dst_block_ids_disk2h: Optional[torch.Tensor],
-                      layer_granularity: int,
                       counter_id: int = 0,
                       indexer_src_block_ids: Optional[torch.Tensor] = None,
                       indexer_dst_block_ids: Optional[torch.Tensor] = None,
@@ -517,7 +513,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.h2d_cta_num,
             self.use_ce_transfer_h2d,
             self.num_layers,
-            layer_granularity,
+            1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
             self.is_mla,
             counter_id,
             indexer_gpu_block_id_tensor,
@@ -535,10 +531,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         )
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
-        layer_granularity = transfer_op.layer_granularity
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-
         src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
         dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
 
@@ -566,15 +558,13 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             dst_block_ids_h2d,
             src_block_ids_disk2h,
             dst_block_ids_disk2h,
-            layer_granularity,
             transfer_op.counter_id,
             indexer_src_block_ids=indexer_src_block_ids,
             indexer_dst_block_ids=indexer_dst_block_ids,
         )
         end_time = time.time()
 
-        kv_dim = 2 if not self.is_mla else 1
-        transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * num_h2d_blocks * kv_dim
+        transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * num_h2d_blocks * self.kv_dim
 
         if self.is_mla:
             transfer_size *= self.tp_group_size

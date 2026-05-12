@@ -3,7 +3,7 @@ import json
 import os
 import torch
 import tempfile
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
@@ -117,73 +117,109 @@ class FlexKVConfig:
     def post_init_from_vllm_config(
         self,
         vllm_config: "VllmConfig",
-        ):
+        ) -> RankInfo:
+        tp_rank = getattr(vllm_config.parallel_config, 'tensor_parallel_rank', 0)
+        dp_rank = getattr(vllm_config.parallel_config, 'data_parallel_rank', 0)
+        node_rank = getattr(vllm_config.parallel_config, 'node_rank', 0)
         self.cache_config.tokens_per_block = vllm_config.cache_config.block_size
 
         self.model_config.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.model_config.head_size = vllm_config.model_config.get_head_size()
-        self.model_config.dtype = vllm_config.model_config.dtype
+        user_dtype_str = self.user_config.kv_cache_dtype
+        vllm_kv_cache_dtype = getattr(vllm_config.cache_config, 'cache_dtype', 'auto')
+        if user_dtype_str is not None:
+            self.model_config.dtype = _parse_dtype_str(user_dtype_str)
+            logger.info(
+                f"[FlexKV vllm] Using kv_cache_dtype from user_config: "
+                f"'{user_dtype_str}' -> {self.model_config.dtype}"
+            )
+        elif isinstance(vllm_kv_cache_dtype, str) and vllm_kv_cache_dtype != 'auto':
+            self.model_config.dtype = _parse_dtype_str(vllm_kv_cache_dtype)
+            logger.info(
+                f"[FlexKV vllm] Using kv_cache_dtype from vllm cache_config: "
+                f"'{vllm_kv_cache_dtype}' -> {self.model_config.dtype}"
+            )
+        else:
+            self.model_config.dtype = vllm_config.model_config.dtype
+            logger.info(
+                f"[FlexKV vllm] No explicit kv_cache_dtype, falling back to "
+                f"vllm model dtype: {self.model_config.dtype}"
+            )
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
         self.model_config.pp_size = vllm_config.parallel_config.pipeline_parallel_size
-        self.model_config.pp_rank = getattr(vllm_config.parallel_config, 'pipeline_parallel_rank', 0)
+        self.model_config.nnodes = max(1, getattr(vllm_config.parallel_config, 'nnodes', 1))
+
+        pp_rank = getattr(vllm_config.parallel_config, 'pipeline_parallel_rank', 0)
 
         if self.model_config.pp_size > 1:
             from vllm.distributed.utils import get_pp_indices as vllm_get_pp_indices
-            start_layer, end_layer = vllm_get_pp_indices(
-                self.model_config.num_layers, self.model_config.pp_rank, self.model_config.pp_size
+            pp_start_layer, pp_end_layer = vllm_get_pp_indices(
+                self.model_config.num_layers, pp_rank, self.model_config.pp_size
             )
-            self.model_config.pp_start_layer = start_layer
-            self.model_config.pp_end_layer = end_layer
         else:
-            self.model_config.pp_start_layer = 0
-            self.model_config.pp_end_layer = self.model_config.num_layers
+            pp_start_layer = 0
+            pp_end_layer = self.model_config.num_layers
         if self.model_config.use_mla:
             self.model_config.num_kv_heads = 1
         else:
             self.model_config.num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
-        update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
+
+        self.model_config.instance_num = int(GLOBAL_CONFIG_FROM_ENV.instance_num)
+        instance_id = int(GLOBAL_CONFIG_FROM_ENV.instance_id)
+
+        self.model_config.master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
+        self.model_config.master_ports = tuple(
+            os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558").split(",")
+        )
+
+        rank_info = RankInfo(
+            model_config=self.model_config,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            node_rank=node_rank,
+            instance_id=instance_id,
+            pp_start_layer=pp_start_layer,
+            pp_end_layer=pp_end_layer,
+        )
+        update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
         hf_config = getattr(vllm_config.model_config, 'hf_config', None)
         self._detect_indexer_config_from_hf(hf_config, source="vllm")
 
-        logger.info(
-            f"[FlexKV vllm] Primitive vars set: tp_size={self.model_config.tp_size}, "
-            f"dp_size={self.model_config.dp_size}, dp_rank={self.model_config.dp_rank}, "
-            f"pp_size={self.model_config.pp_size}, pp_rank={self.model_config.pp_rank}, "
-            f"enable_dp_attention={self.model_config.enable_dp_attention}, "
-            f"attn_cp_size={self.model_config.attn_cp_size}, "
-            f"attn_cp_rank={self.model_config.attn_cp_rank}"
-        )
-        logger.info(
-            f"[FlexKV vllm] Derived vars: attn_tp_size={self.model_config.attn_tp_size}, "
-            f"attn_tp_rank={self.model_config.attn_tp_rank}, "
-            f"local_rank={self.model_config.local_rank}"
-        )
+        logger.info(f"[FlexKV vllm] {self.model_config}, {rank_info}")
 
         # Freeze model_config — no further mutations allowed
         self.model_config.freeze()
+        return rank_info
 
     def post_init_from_sglang_config(
         self,
         sglang_config,
         server_args,
         page_size: int = 64,
-        tp_rank: Optional[int] = 0,
-        pp_rank: Optional[int] = 0,
-        dp_rank: Optional[int] = 0,
-        attn_cp_rank: Optional[int] = 0,
-    ):
-        """
-        Initialize FlexKVConfig fields from sglang config.
+        tp_rank: int = 0,
+        pp_rank: int = 0,
+        dp_rank: int = 0,
+        attn_cp_rank: int = 0,
+    ) -> RankInfo:
+        """Populate ``self.model_config`` / ``self.cache_config`` from a
+        sglang ModelConfig + ServerArgs and return the per-worker
+        ``RankInfo``.
+
+        See :meth:`post_init_from_vllm_config` for the rationale behind
+        returning ``RankInfo`` instead of writing it to ``self``.
+
         Args:
             sglang_config: sglang.srt.configs.model_config.ModelConfig-like object
             server_args: sglang ServerArgs — source of tp_size, dp_size,
                 nnodes, node_rank, enable_dp_attention, attn_cp_size,
-                is_nsa_cp, kv_cache_dtype, dist_init_addr
+                kv_cache_dtype,
+                dist_init_addr
             page_size: KV block size (tokens per block) used by sglang
             tp_rank: physical tensor parallel rank (runtime, from process group)
             pp_rank: pipeline parallel rank (runtime, from process group)
@@ -198,8 +234,8 @@ class FlexKVConfig:
         node_rank = server_args.node_rank
         enable_dp_attention = server_args.enable_dp_attention
         attn_cp_size = server_args.attn_cp_size
-        is_nsa_cp = getattr(server_args, 'enable_nsa_prefill_context_parallel', False)
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
+        dp_rank = 0 if dp_rank is None else int(dp_rank)
 
         # cache config: use page_size as tokens_per_block so that FlexKV's
         # CPU radix tree manages blocks at page granularity, ensuring that
@@ -278,34 +314,44 @@ class FlexKVConfig:
         self.model_config.use_mla = use_mla
 
         self.model_config.tp_size = int(tp_size)
-        self.model_config.tp_rank = int(tp_rank)
         self.model_config.dp_size = int(dp_size if dp_size is not None else 1)
-        self.model_config.dp_rank = int(dp_rank if dp_rank is not None else 0)
         self.model_config.pp_size = int(pp_size)
-        self.model_config.pp_rank = int(pp_rank)
 
         if pp_size > 1:
             from sglang.srt.distributed.utils import get_pp_indices as sglang_get_pp_indices
-            start_layer, end_layer = sglang_get_pp_indices(
-                self.model_config.num_layers, self.model_config.pp_rank, self.model_config.pp_size
+            pp_start_layer, pp_end_layer = sglang_get_pp_indices(
+                self.model_config.num_layers, pp_rank, self.model_config.pp_size
             )
-            self.model_config.pp_start_layer = start_layer
-            self.model_config.pp_end_layer = end_layer
         else:
-            self.model_config.pp_start_layer = 0
-            self.model_config.pp_end_layer = self.model_config.num_layers
+            pp_start_layer = 0
+            pp_end_layer = self.model_config.num_layers
         self.model_config.enable_dp_attention = bool(enable_dp_attention)
         self.model_config.attn_cp_size = int(attn_cp_size)
-        self.model_config.attn_cp_rank = int(attn_cp_rank)
-        self.model_config.is_nsa_cp = is_nsa_cp
         self.model_config.nnodes = max(1, int(nnodes))
-        self.model_config.node_rank = int(node_rank)
-        # Multi-node bootstrap: master host (derived from sglang --dist-init-addr).
-        # ``None`` here falls back to FLEXKV_MASTER_HOST env var downstream.
         _dist_init_addr = getattr(server_args, 'dist_init_addr', None)
-        master_host = _dist_init_addr.split(":")[0] if _dist_init_addr and int(nnodes) > 1 else None
-        self.model_config.master_host = master_host
-        update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
+        if _dist_init_addr and int(nnodes) > 1:
+            self.model_config.master_host = _dist_init_addr.split(":")[0]
+        else:
+            self.model_config.master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
+        self.model_config.master_ports = tuple(
+            os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558").split(",")
+        )
+
+        self.model_config.instance_num = int(GLOBAL_CONFIG_FROM_ENV.instance_num)
+        instance_id = int(GLOBAL_CONFIG_FROM_ENV.instance_id)
+
+        rank_info = RankInfo(
+            model_config=self.model_config,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            attn_cp_rank=attn_cp_rank,
+            node_rank=node_rank,
+            instance_id=instance_id,
+            pp_start_layer=pp_start_layer,
+            pp_end_layer=pp_end_layer,
+        )
+        update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
 
         hf_config = getattr(sglang_config, 'hf_config', None)
         self._detect_indexer_config_from_hf(hf_config, source="sglang")
@@ -319,33 +365,19 @@ class FlexKVConfig:
                 f"tokens_per_block={self.cache_config.tokens_per_block}"
             )
 
-        # Log primitive and derived variables for verification
-        logger.info(
-            f"[FlexKV sglang] Primitive vars set: tp_size={self.model_config.tp_size}, "
-            f"tp_rank={self.model_config.tp_rank}, dp_size={self.model_config.dp_size}, "
-            f"dp_rank={self.model_config.dp_rank}, pp_size={self.model_config.pp_size}, "
-            f"pp_rank={self.model_config.pp_rank}, "
-            f"enable_dp_attention={self.model_config.enable_dp_attention}, "
-            f"attn_cp_size={self.model_config.attn_cp_size}, "
-            f"attn_cp_rank={self.model_config.attn_cp_rank}, "
-            f"is_nsa_cp={self.model_config.is_nsa_cp}, "
-            f"nnodes={self.model_config.nnodes}, node_rank={self.model_config.node_rank}"
-        )
-        logger.info(
-            f"[FlexKV sglang] Derived vars: attn_tp_size={self.model_config.attn_tp_size}, "
-            f"attn_tp_rank={self.model_config.attn_tp_rank}, "
-            f"tp_rank_per_node={self.model_config.tp_rank_per_node}, "
-            f"tp_size_per_node={self.model_config.tp_size_per_node}, "
-            f"local_rank={self.model_config.local_rank}"
-        )
+        logger.info(f"[FlexKV sglang] {self.model_config}, {rank_info}")
 
         # Freeze model_config — no further mutations allowed
         self.model_config.freeze()
+        return rank_info
 
     def post_init_from_trt_config(
         self,
         config,
-    ):
+    ) -> RankInfo:
+        tp_rank = config.mapping.tp_rank
+        dp_rank = getattr(config.mapping, 'dp_rank', 0)
+        node_rank = config.mapping.node_rank
         self.cache_config.tokens_per_block = config.tokens_per_block
         # Convert dtype string to torch.dtype
         dtype_str = config.pytorch_backend_config.kv_cache_dtype
@@ -378,20 +410,15 @@ class FlexKVConfig:
         if config.mapping.enable_attention_dp:
             self.model_config.tp_size = 1
             self.model_config.dp_size = config.mapping.tp_size
+            dp_rank = config.mapping.rank
         else:
             self.model_config.tp_size = config.mapping.tp_size
             self.model_config.dp_size = 1
+            dp_rank = 0
         self.model_config.pp_size = getattr(config.mapping, 'pp_size', 1)
-        self.model_config.pp_rank = getattr(config.mapping, 'pp_rank', 0)
+        pp_rank = getattr(config.mapping, 'pp_rank', 0)
 
-        if self.model_config.pp_size > 1:
-            layers_range = config.mapping.pp_layers(self.model_config.num_layers)
-            self.model_config.pp_start_layer = layers_range[0]
-            self.model_config.pp_end_layer = layers_range[-1] + 1
-        else:
-            self.model_config.pp_start_layer = 0
-            self.model_config.pp_end_layer = self.model_config.num_layers
-
+        self.model_config.nnodes = max(1, getattr(config.mapping, 'nnodes', 1))
         # self.model_config (model configs part)
         try:
             model_path = getattr(config, 'hf_model_dir', None)
@@ -420,25 +447,48 @@ class FlexKVConfig:
             self._detect_indexer_config_from_hf(hf_config, source="TRT-LLM")
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
-        # Update cache config with user config after model config is initialized
-        update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
 
-        # Log primitive and derived variables for verification
-        flexkv_logger.info(
-            f"[FlexKV TRT-LLM] Primitive vars set: tp_size={self.model_config.tp_size}, "
-            f"tp_rank={self.model_config.tp_rank}, dp_size={self.model_config.dp_size}, "
-            f"dp_rank={self.model_config.dp_rank}, pp_size={self.model_config.pp_size}, "
-            f"pp_rank={self.model_config.pp_rank}, "
-            f"enable_dp_attention={self.model_config.enable_dp_attention}, "
-            f"attn_cp_size={self.model_config.attn_cp_size}, "
-            f"attn_cp_rank={self.model_config.attn_cp_rank}, "
-            f"nnodes={self.model_config.nnodes}, node_rank={self.model_config.node_rank}"
+        if self.model_config.pp_size > 1:
+            layers_range = config.mapping.pp_layers(self.model_config.num_layers)
+            pp_start_layer = layers_range[0]
+            pp_end_layer = layers_range[-1] + 1
+        else:
+            pp_start_layer = 0
+            pp_end_layer = self.model_config.num_layers
+
+        self.model_config.instance_num = int(GLOBAL_CONFIG_FROM_ENV.instance_num)
+        instance_id = int(GLOBAL_CONFIG_FROM_ENV.instance_id)
+
+
+        self.model_config.use_trtllm_subprocess = True
+        self.model_config.trtllm_subprocess_host = os.getenv(
+            "FLEXKV_TRT_SUBPROCESS_HOST", "localhost"
         )
-        flexkv_logger.info(
-            f"[FlexKV TRT-LLM] Derived vars: attn_tp_size={self.model_config.attn_tp_size}, "
-            f"attn_tp_rank={self.model_config.attn_tp_rank}, "
-            f"local_rank={self.model_config.local_rank}"
+        self.model_config.trtllm_subprocess_ports = tuple(
+            os.getenv("FLEXKV_TRT_SUBPROCESS_PORTS", "6667,6668,6669").split(",")
         )
+        # Multi-node master endpoint (used when nnodes > 1).
+        self.model_config.master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
+        self.model_config.master_ports = tuple(
+            os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558").split(",")
+        )
+
+        rank_info = RankInfo(
+            model_config=self.model_config,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            node_rank=node_rank,
+            instance_id=instance_id,
+            pp_start_layer=pp_start_layer,
+            pp_end_layer=pp_end_layer,
+        )
+
+        # Update cache config with user config after model config is initialized
+        update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
+
+        logger.info(f"[FlexKV TRT-LLM] {self.model_config}, {rank_info}")
 
         # Freeze model_config — no further mutations allowed
         self.model_config.freeze()
+        return rank_info
