@@ -376,7 +376,6 @@ class KVTaskManager:
         task = self.tasks[task_id]
         if not task.is_completed():
             task.status = TaskStatus.CANCELLED
-            task.shed_heavy_resources()
         self._release_task(task_id)
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
