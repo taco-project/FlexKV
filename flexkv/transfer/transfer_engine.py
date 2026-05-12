@@ -250,7 +250,7 @@ class TransferEngine:
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
             # DISK2H worker
-            if not _enable_layerwise:
+            if not _enable_layerwise or GLOBAL_CONFIG_FROM_ENV.prefetch_enabled: ## fix this 
                 self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
@@ -669,8 +669,8 @@ class TransferEngine:
         if _enable_layerwise:
             assert TransferType.H2D not in self._worker_map, \
                 "H2D worker should not exist in layerwise mode (fused into layerwise worker)"
-            assert TransferType.DISK2H not in self._worker_map, \
-                "DISK2H worker should not exist in layerwise mode (fused into layerwise worker)"
+            # assert TransferType.DISK2H not in self._worker_map, \
+            #     "DISK2H worker should not exist in layerwise mode (fused into layerwise worker)"
             assert TransferType.LAYERWISE in self._worker_map, \
                 "LAYERWISE worker must exist when layerwise transfer is enabled"
         # Start scheduler thread

@@ -325,6 +325,16 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
 
+    # Prefetch configuration
+    prefetch_enabled=bool(int(os.getenv('FLEXKV_PREFETCH_ENABLE', 1))),
+    prefetch_token_threshold=int(os.getenv('FLEXKV_PREFETCH_TOKEN_THRESHOLD', 256)),
+    prefetch_capacity_ratio=float(os.getenv('FLEXKV_PREFETCH_CAPACITY_RATIO', 0.5)),
+    prefetch_batch_size=int(os.getenv('FLEXKV_PREFETCH_BATCH_SIZE', 64)),
+    prefetch_batch_timeout=float(os.getenv('FLEXKV_PREFETCH_BATCH_TIMEOUT', 5.0)),
+    # prefetch_stop_policy=os.getenv('FLEXKV_PREFETCH_STOP_POLICY', 'timeout'), ## support three policies: timeout, best_effort, wait_complete
+    # prefetch_timeout_base=float(os.getenv('FLEXKV_PREFETCH_TIMEOUT_BASE', 1.0)),
+    # prefetch_timeout_per_ki_token=float(os.getenv('FLEXKV_PREFETCH_TIMEOUT_PER_KI_TOKEN', 0.25)),
+
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),
     trace_max_file_size_mb=int(os.getenv('FLEXKV_TRACE_MAX_FILE_SIZE_MB', 100)),

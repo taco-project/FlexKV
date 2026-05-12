@@ -254,9 +254,11 @@ class KVManager:
             token_ids = token_ids.numpy()
         if self.server_client_mode:
             task_id = self.dp_client.prefetch_async(token_ids, pp_rank=pp_rank, namespace=namespace)
+            # server_client_mode: actual_prefetch_tokens not yet available from server
+            return task_id, 0
         else:
-            task_id = self.kv_task_engine.prefetch_async(token_ids, dp_rank=dp_rank, pp_rank=pp_rank, namespace=namespace)
-        return task_id
+            task_id, actual_prefetch_tokens = self.kv_task_engine.prefetch_async(token_ids, dp_rank=dp_rank, pp_rank=pp_rank, namespace=namespace)
+            return task_id, actual_prefetch_tokens
 
     def launch(self,
                task_ids: Union[int, List[int]],
@@ -288,6 +290,19 @@ class KVManager:
             self.dp_client.cancel_tasks(task_ids)
         else:
             self.kv_task_engine.cancel_tasks(task_ids)
+
+    def terminate_prefetch(self, task_id: int) -> int:
+        """Request termination of an in-flight batched prefetch task.
+
+        If the task is being executed by a PrefetchBatchExecutor, signals it
+        to stop after the current batch.  No-op in server_client_mode or if
+        the task is not in batch execution mode.
+        """
+        if self.server_client_mode:
+            # server_client_mode: terminate not supported across ZMQ boundary
+            return 0
+        else:
+            return self.kv_task_engine.terminate_prefetch(task_id)
 
     def wait(self,
              task_ids: Union[int, List[int]],

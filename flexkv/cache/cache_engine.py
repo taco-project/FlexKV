@@ -474,7 +474,7 @@ class GlobalCacheEngine:
         self.start()
 
         self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]] = \
-            lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0)
+            lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0, None)
         self._empty_put_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]] = \
             lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0, 0)
 
@@ -496,6 +496,80 @@ class GlobalCacheEngine:
             self.ssd_cache_engine.reset()
         if self.remote_cache_engine:
             self.remote_cache_engine.reset()
+
+    def complete_task(self, task) -> None:
+        """Normal completion: unlock + set_ready + recycle buffer_to_free.
+
+        Called when a transfer finishes successfully. Equivalent to the old
+        _transfer_callback but driven by task-level resource references
+        instead of partial.keywords.
+        """
+        if task.node_to_unlock:
+            for device_type, (node, ready_len) in task.node_to_unlock.items():
+                engine = self.cache_engines.get(device_type)
+                if engine is not None:
+                    engine.unlock(node)
+                    engine.set_ready(node, True, ready_len)
+                    if task.is_put and device_type == DeviceType.CPU and self.cache_config.enable_p2p_cpu:
+                        engine.local_index.insert_and_publish(node)
+                    elif task.is_put and device_type == DeviceType.SSD and self.cache_config.enable_p2p_ssd:
+                        engine.local_index.insert_and_publish(node)
+                    elif task.is_put and device_type == DeviceType.REMOTE and self.enable_kv_sharing:
+                        engine.insert_and_publish(node)
+        if task.buffer_to_free:
+            for device_type, blocks in task.buffer_to_free.items():
+                if blocks is not None and len(blocks) > 0:
+                    engine = self.cache_engines.get(device_type)
+                    if engine is not None:
+                        engine.recycle(blocks)
+
+    def abort_task(self, task, recycle_blocks=None) -> None:
+        """Abnormal termination: unlock (no set_ready) + recycle blocks.
+
+        Called when a prefetch is terminated, discarded, or cancelled.
+        Does NOT call set_ready(True) — the node stays is_ready=False
+        so match_prefix won't return stale block IDs.
+
+        Args:
+            task: The KVTask being aborted.
+            recycle_blocks: Optional numpy array of CPU block IDs to recycle.
+                If provided, these are recycled instead of buffer_to_free[CPU]
+                (avoids double-free when executor.cpu_block_ids overlaps
+                with buffer_to_free).
+        """
+        if task.node_to_unlock:
+            for device_type, (node, ready_len) in task.node_to_unlock.items():
+                engine = self.cache_engines.get(device_type)
+                if engine is not None:
+                    engine.unlock(node)
+        # Recycle CPU blocks: use explicit recycle_blocks if provided,
+        # otherwise fall back to buffer_to_free[CPU]
+        if recycle_blocks is not None and len(recycle_blocks) > 0:
+            if self.cpu_cache_engine is not None:
+                try:
+                    self.cpu_cache_engine.recycle(recycle_blocks)
+                except Exception as e:
+                    flexkv_logger.error(f"abort_task recycle error: {e}")
+        elif task.buffer_to_free and DeviceType.CPU in task.buffer_to_free:
+            blocks = task.buffer_to_free[DeviceType.CPU]
+            if blocks is not None and len(blocks) > 0:
+                if self.cpu_cache_engine is not None:
+                    try:
+                        self.cpu_cache_engine.recycle(blocks)
+                    except Exception as e:
+                        flexkv_logger.error(f"abort_task recycle error: {e}")
+        # Recycle non-CPU buffer_to_free
+        if task.buffer_to_free:
+            for device_type, blocks in task.buffer_to_free.items():
+                if device_type == DeviceType.CPU:
+                    continue  # already handled above
+                if blocks is not None and len(blocks) > 0:
+                    engine = self.cache_engines.get(device_type)
+                    if engine is not None:
+                        try:
+                            engine.recycle(blocks)
+                        except Exception as e:
+                            flexkv_logger.error(f"abort_task recycle error: {e}")
 
     def _update_mempool_metrics(self) -> None:
         """Update memory pool metrics for all cache engines."""
@@ -564,7 +638,7 @@ class GlobalCacheEngine:
             transfer_graph = TransferOpGraph.create_empty_graph()
             transfer_graph.bind_to_worker(dp_rank, pp_rank)
             return_mask = np.zeros_like(token_mask, dtype=np.bool_)
-            callback = partial(self._transfer_callback, node_to_unlock={}, buffer_to_free={})
+            callback = partial[None](self._transfer_callback, node_to_unlock={}, buffer_to_free={})
             return transfer_graph, return_mask, callback, {}, -1
 
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
@@ -579,7 +653,8 @@ class GlobalCacheEngine:
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             # from this entrance, we will also handle the case of peer_cpu and peer_ssd
             (transfer_graph, finished_ops_ids, node_to_unlock,
-             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
+             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer,
+             deferred_insert_info) = \
                 self._get_impl_local(
                     request_id,
                     sequence_meta,
@@ -602,6 +677,7 @@ class GlobalCacheEngine:
                     layer_num,
                     temp_cache_strategy
                 )
+            deferred_insert_info = None
 
         transfer_graph, task_end_op_id = add_virtal_op_for_mutiple_finished_ops(
             transfer_graph,
@@ -609,8 +685,19 @@ class GlobalCacheEngine:
             )
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
-        return_mask[block_start_idx* self.tokens_per_block:
-                    (block_start_idx + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
+        if temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
+            # Prefetch path: report SSD→CPU (DISK2H) loaded blocks in return_mask
+            # so callers can track precise loaded token count.
+            disk2h_blocks = 0
+            for op in transfer_graph._op_map.values():
+                if op.transfer_type == TransferType.DISK2H:
+                    disk2h_blocks += len(op.src_block_ids)
+            if disk2h_blocks > 0:
+                return_mask[block_start_idx * self.tokens_per_block:
+                            (block_start_idx + disk2h_blocks) * self.tokens_per_block] = True
+        else:
+            return_mask[block_start_idx * self.tokens_per_block:
+                        (block_start_idx + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 
         # if layer_num // layer_granularity != 1:
         #     transfer_graph, finished_ops_ids = convert_read_graph_to_layer_wise_graph(transfer_graph=transfer_graph,
@@ -624,7 +711,8 @@ class GlobalCacheEngine:
 
         callback = partial(self._transfer_callback,
                            node_to_unlock=node_to_unlock,
-                           buffer_to_free=buffer_to_free)
+                           buffer_to_free=buffer_to_free,
+                           deferred_insert_info=deferred_insert_info)
 
         op_callback_dict = {} # dict, op_id -> callback
         for op_id in op_node_to_ready:
@@ -1018,10 +1106,13 @@ class GlobalCacheEngine:
                 # we only insert the buffer blocks to cpu cache engine only:
                 # 1. the cpu cache engine satisfies prefix cache after insertion
                 # 2. the sequence is all ready blocks
+                # 3. NOT in prefetch mode (ignore_gpu=True) — prefetch uses deferred insert
                 # TODO: for simplicity, if we use peer cpu results, we dont insert the buffer ssd blocks to local cpu any more
                 if (cpu_matched_result.matched_pos == "local" and
                     cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
-                    cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
+                    cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks and
+                    not temp_cache_strategy.ignore_gpu):
+                    # Normal GET path: insert immediately (transfer is synchronous, no zombie risk)
                     cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                                     fragment2_cpu_blocks,
                                                                     num_insert_blocks=fragment12_num_blocks + \
@@ -1062,10 +1153,26 @@ class GlobalCacheEngine:
         if ssd_node_to_unlock is not None:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
+
+        # Build deferred_insert_info for prefetch mode (ignore_gpu=True).
+        # When prefetch mode skips the immediate insert, we save the info needed
+        # to do insert(is_ready=True) after transfer completes.
+        deferred_insert_info = None
+        if temp_cache_strategy.ignore_gpu and fragment2_num_blocks > 0 and fragment2_cpu_blocks is not None:
+            if (cpu_matched_result.matched_pos == "local" and
+                cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
+                cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
+                deferred_insert_info = {
+                    'sequence_meta': sequence_meta,
+                    'num_insert_blocks': fragment12_num_blocks + block_mask_start,
+                    'cpu_block_ids': fragment2_cpu_blocks.copy(),
+                }
+
         nvtx.end_range(nvtx_range)
         return (
             transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
-            buffer_to_free, len(fragment12_gpu_blocks) if enable_gpu else 0
+            buffer_to_free, len(fragment12_gpu_blocks) if enable_gpu else 0,
+            deferred_insert_info
         )
 
     def put(self,
@@ -1475,7 +1582,8 @@ class GlobalCacheEngine:
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
                            buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
-                           is_put: bool = False) -> None:
+                           is_put: bool = False,
+                           **kwargs) -> None:
         if DeviceType.CPU in node_to_unlock:
             assert self.cpu_cache_engine is not None
             cpu_node = node_to_unlock[DeviceType.CPU][0]
