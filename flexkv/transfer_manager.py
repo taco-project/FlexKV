@@ -745,12 +745,24 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
 
         self.command_parent_conn, self.command_child_conn = self.mp_ctx.Pipe()
         self.result_parent_conn, self.result_child_conn = self.mp_ctx.Pipe()
+        self._send_lock = threading.Lock()  # Pipe is not thread-safe; guard concurrent sends
 
         self.process: Optional[Process] = None
         self.start_event = self.mp_ctx.Event()
         self.ready_event = self.mp_ctx.Event()
 
         self._completed_results: List[CompletedOp] = []
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # threading.Lock cannot be pickled; exclude it.
+        # It will be recreated in __setstate__ (only needed in parent process).
+        state.pop('_send_lock', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._send_lock = threading.Lock()
 
     def _start_process(self) -> None:
         if self.process is not None and self.process.is_alive():
@@ -897,10 +909,11 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
 
     def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
         nvtx_range = nvtx.start_range(message="TransferManagerInterProcessHandle.submit", color="green")
-        self.command_parent_conn.send({
-            'type': 'submit',
-            'transfer_graph': transfer_graph
-        })
+        with self._send_lock:
+            self.command_parent_conn.send({
+                'type': 'submit',
+                'transfer_graph': transfer_graph
+            })
         nvtx.end_range(nvtx_range)
 
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
@@ -909,10 +922,11 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             message=f"TransferManagerInterProcessHandle.submit_batch count={len(transfer_graphs)}",
             color="green"
         )
-        self.command_parent_conn.send({
-            'type': 'submit_batch',
-            'transfer_graphs': transfer_graphs
-        })
+        with self._send_lock:
+            self.command_parent_conn.send({
+                'type': 'submit_batch',
+                'transfer_graphs': transfer_graphs
+            })
         nvtx.end_range(nvtx_range)
 
     def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:

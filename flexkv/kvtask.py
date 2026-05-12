@@ -1,9 +1,11 @@
 import time
+import heapq
 from typing import Dict, Optional, List, Union, Tuple
 import threading
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
+from queue import Queue, Empty
 import multiprocessing as mp
 import copy
 import os
@@ -14,7 +16,7 @@ import numpy as np
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.block import hash_token
-from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
+from flexkv.common.transfer import TransferOpGraph, TransferOp, TransferType, merge_to_batch_graph, get_nvtx_default_color, CompletedOp, DeviceType
 from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import GlobalCacheEngine, DEFAULT_CACHE_STRATEGY, CPUONLY_CACHE_STRATEGY
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
@@ -74,6 +76,25 @@ class KVTask:
     # batch: points to the batch task id if this task was merged into a batch
     batch_task_id: Optional[int] = None
 
+    # ---- Prefetch-specific fields ----
+    # Token count reserved in _prefetch_tokens_occupied (for PREFETCH tasks only).
+    # Used by _mark_completed to decrement the exact amount that was added,
+    # independent of any later modifications to return_mask.
+    prefetch_tokens_reserved: int = 0
+
+    # ---- Resource references (for structured cleanup) ----
+    # Extracted from callback's partial.keywords at task creation time.
+    # Used by complete_task() / abort_task() instead of hacking partial internals.
+    node_to_unlock: Optional[Dict] = None     # {DeviceType: (node, ready_len)}
+    buffer_to_free: Optional[Dict] = None     # {DeviceType: np.ndarray}
+    is_put: bool = False
+
+    # ---- Deferred insert info (prefetch only) ----
+    # When prefetch mode skips immediate insert in _get_impl_local, this dict
+    # holds the info needed to do insert(is_ready=True) after transfer completes.
+    # Keys: 'sequence_meta', 'num_insert_blocks', 'cpu_block_ids'
+    deferred_insert_info: Optional[Dict] = None
+
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
 
@@ -86,6 +107,125 @@ TASK_STATUS_TO_RESPONSE_STATUS = {
 
 def convert_to_response_status(task_status: TaskStatus) -> KVResponseStatus:
     return TASK_STATUS_TO_RESPONSE_STATUS[task_status]
+
+
+@dataclass
+class PrefetchBatchExecutor:
+    """Manages batched execution of a large prefetch DISK2H transfer.
+
+    Instead of submitting the entire DISK2H transfer as one monolithic graph
+    (which blocks until the C++ io_uring call completes), this executor splits
+    it into multiple mini-graphs of ``batch_size_blocks`` each.  Between
+    batches, a termination flag is checked so that the prefetch can be
+    interrupted mid-flight, releasing CPU blocks for the untransferred portion.
+
+    Lifecycle:
+        1. ``create_prefetch_task()`` runs normally → full graph/callback/node_to_unlock.
+        2. ``_create_batch_executor()`` extracts the DISK2H op's src/dst blocks.
+        3. The original graph is NOT submitted.  Instead, the executor thread
+           creates and submits one mini-graph per batch.
+        4. After each batch completes, the executor checks ``_terminated``.
+        5. On completion or termination, ``_finalize_batch_executor()`` cleans up.
+
+    Thread-safety:
+        ``mark_terminate()`` / ``is_terminated()`` are safe to call from any
+        thread (protected by ``_lock``).  ``wait_current_batch()`` /
+        ``notify_batch_done()`` use a ``threading.Event``.
+    """
+    task_id: int
+
+    # ---- Blocks extracted from the original DISK2H op ----
+    ssd_block_ids: np.ndarray       # all SSD source blocks
+    cpu_block_ids: np.ndarray       # all CPU destination blocks (already allocated)
+
+    # ---- Batch configuration ----
+    batch_size_blocks: int = 32                     # blocks per mini-graph
+
+    # ---- Execution state ----
+    total_blocks: int = 0
+    completed_blocks: int = 0
+    completed_batches: int = 0
+
+    # ---- Termination control (thread-safe) ----
+    _terminated: bool = field(default=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    # ---- Batch synchronization ----
+    # The executor thread waits on this event; the main thread's _update_tasks
+    # sets it when the current mini-graph's CompletedOp arrives.
+    _batch_done_event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    # ---- Current mini-graph tracking ----
+    _current_mini_graph_id: Optional[int] = field(default=None, repr=False)
+    # Flag: set by notify_batch_done to indicate IO completion (vs terminate wakeup)
+    _io_done: bool = field(default=False, repr=False)
+
+    # ------------------------------------------------------------------
+    # Termination API
+    # ------------------------------------------------------------------
+
+    def mark_terminate(self) -> None:
+        """Request termination.  Thread-safe; may be called from scheduler thread."""
+        with self._lock:
+            self._terminated = True
+        # Wake up executor thread if it's waiting for a batch
+        self._batch_done_event.set()
+
+    def is_terminated(self) -> bool:
+        """Check termination flag.  Lock-free read (bool is atomic in CPython)."""
+        return self._terminated
+
+    # ------------------------------------------------------------------
+    # Batch synchronization API
+    # ------------------------------------------------------------------
+
+    def wait_current_batch(self, timeout: float) -> bool:
+        """Block until the current mini-graph completes or *timeout* elapses.
+
+        Called by the **executor thread**.
+        Returns ``True`` if the event was set (batch done), ``False`` on timeout.
+        """
+        return self._batch_done_event.wait(timeout=timeout)
+
+    def notify_batch_done(self) -> None:
+        """Signal that the current mini-graph has completed.
+
+        Called by the **main thread** from ``_update_tasks``.
+        """
+        self._io_done = True
+        self._batch_done_event.set()
+
+    def reset_batch_event(self) -> None:
+        """Prepare for the next batch.  Called by executor thread before submit."""
+        self._io_done = False
+        self._batch_done_event.clear()
+
+    # ------------------------------------------------------------------
+    # Computed properties
+    # ------------------------------------------------------------------
+
+    @property
+    def is_complete(self) -> bool:
+        return self.completed_blocks >= self.total_blocks
+
+    @property
+    def next_batch_start(self) -> int:
+        return self.completed_blocks
+
+    @property
+    def next_batch_end(self) -> int:
+        return min(self.completed_blocks + self.batch_size_blocks, self.total_blocks)
+
+    @property
+    def remaining_blocks(self) -> int:
+        return max(0, self.total_blocks - self.completed_blocks)
+
+    @property
+    def progress_ratio(self) -> float:
+        if self.total_blocks == 0:
+            return 1.0
+        return self.completed_blocks / self.total_blocks
+
 
 class KVTaskManager:
     def __init__(self,
@@ -210,6 +350,54 @@ class KVTaskManager:
         self.task_id_lock = threading.Lock()
 
         self.running_tasks: int = 0
+
+        self._prefetch_token_threshold: int = GLOBAL_CONFIG_FROM_ENV.prefetch_token_threshold
+        # Token-level flow control for prefetch.
+        # Capacity = cpu_total_tokens × ratio.  Prefetch tasks whose cumulative
+        # actual SSD→CPU token count would exceed this are discarded before enqueue.
+        if self.cache_engine.cpu_cache_engine is not None:
+            cpu_total_tokens = (
+                self.cache_engine.cpu_cache_engine.num_total_blocks
+                * self.cache_config.tokens_per_block
+            )
+            ratio = GLOBAL_CONFIG_FROM_ENV.prefetch_capacity_ratio
+            self._prefetch_token_capacity = max(0, int(cpu_total_tokens * ratio))
+        else:
+            self._prefetch_token_capacity = 0  # no CPU cache → no limit
+        self._prefetch_tokens_occupied: int = 0
+
+        # ---- Batched prefetch executor infrastructure ----
+        self._prefetch_enabled = GLOBAL_CONFIG_FROM_ENV.prefetch_enabled
+        self._prefetch_batch_size = GLOBAL_CONFIG_FROM_ENV.prefetch_batch_size
+        self._prefetch_batch_timeout = GLOBAL_CONFIG_FROM_ENV.prefetch_batch_timeout
+        # mini-graph_id → PrefetchBatchExecutor (for routing CompletedOps in _update_tasks)
+        self._pending_mini_graphs: Dict[int, PrefetchBatchExecutor] = {}
+        # task_id → PrefetchBatchExecutor (for terminate_prefetch lookup)
+        self._task_to_executor: Dict[int, PrefetchBatchExecutor] = {}
+        # Deferred insert queue: (task_id, completed_cpu_block_ids) pairs
+        # collected by executor thread, executed by main thread in _update_tasks
+        self._deferred_inserts_queue: List[tuple] = []
+        # Queue for the executor thread to pick up new executors
+        self._prefetch_executor_queue: Queue = Queue()
+        # Executor thread: started once at init, blocks on queue.get() when idle.
+        if self._prefetch_enabled:
+            self._prefetch_executor_thread = threading.Thread(
+                target=self._prefetch_executor_loop,
+                daemon=True,
+                name="flexkv-prefetch-batch-executor",
+            )
+            self._prefetch_executor_thread.start()
+        else:
+            self._prefetch_executor_thread = None
+
+        flexkv_logger.info(
+            f"prefetch_enabled: {self._prefetch_enabled}, "
+            f"prefetch_capacity_ratio: {GLOBAL_CONFIG_FROM_ENV.prefetch_capacity_ratio}, " 
+            f"prefetch_token_capacity: {self._prefetch_token_capacity}, "
+            f"prefetch_batch_size: {self._prefetch_batch_size}, "
+            f"prefetch_batch_timeout: {self._prefetch_batch_timeout}, "
+        )
+
 
     def start(self) -> None:
         for transfer_handle in self.transfer_handles:
@@ -336,6 +524,7 @@ class KVTaskManager:
             pp_rank=pp_rank,
             temp_cache_strategy=temp_cache_strategy,
             namespace=namespace)
+        node_to_unlock, buffer_to_free, is_put, deferred_insert_info = self._extract_resource_refs(callback)
         self.tasks[task_id] = KVTask(
             task_id=task_id,
             task_type=TaskType.PREFETCH,
@@ -350,11 +539,25 @@ class KVTaskManager:
             graph=graph,
             return_mask=return_mask,
             callback=callback,
-            op_callback_dict=op_callback_dict)
+            op_callback_dict=op_callback_dict,
+            node_to_unlock=node_to_unlock,
+            buffer_to_free=buffer_to_free,
+            is_put=is_put,
+            deferred_insert_info=deferred_insert_info)
 
         self.prefetch_tasks[self._gen_prefetch_key(token_ids, namespace)] = task_id
 
         self.graph_to_task[graph.graph_id] = task_id
+
+    @staticmethod
+    def _extract_resource_refs(callback) -> tuple:
+        """Extract node_to_unlock, buffer_to_free, is_put, deferred_insert_info from callback's partial.keywords."""
+        keywords = getattr(callback, 'keywords', {}) if callback is not None else {}
+        node_to_unlock = keywords.get('node_to_unlock', {})
+        buffer_to_free = keywords.get('buffer_to_free', {})
+        is_put = keywords.get('is_put', False)
+        deferred_insert_info = keywords.get('deferred_insert_info', None)
+        return node_to_unlock, buffer_to_free, is_put, deferred_insert_info
 
     def _launch_task(self, task_id: int) -> None:
         transfer_graph = self.check_task_ready(task_id)
@@ -382,6 +585,14 @@ class KVTaskManager:
     def _update_tasks(self, timeout: float = 0.001) -> None:
         completed_ops = self._get_completed_ops(timeout)
         for completed_op in completed_ops:
+            # Route mini-graph completions to the batch executor
+            if completed_op.graph_id in self._pending_mini_graphs:
+                executor = self._pending_mini_graphs[completed_op.graph_id]
+                if completed_op.is_graph_completed():
+                    executor.notify_batch_done()
+                    # Don't pop here — the executor thread does it after waking up
+                continue
+            # Route non-mini-graph completions to the task
             if completed_op.graph_id not in self.graph_to_task:
                 continue
             task_id = self.graph_to_task[completed_op.graph_id]
@@ -393,6 +604,11 @@ class KVTaskManager:
             if completed_op.op_id in task.op_callback_dict:
                 task.op_callback_dict[completed_op.op_id]()
 
+        # Execute deferred inserts collected by batch executor thread.
+        # This runs on main thread where radix tree operations are safe.
+        if self._prefetch_enabled:
+            self._drain_deferred_inserts()
+            
     def _cancel_task(self, task_id: int) -> None:
         task = self.tasks[task_id]
         if task.is_completed():
@@ -404,6 +620,14 @@ class KVTaskManager:
         if task.status == TaskStatus.CANCELLED:
             flexkv_logger.warning(f"Task {task_id} is already cancelled, cannot cancel")
             return
+        # Release resources: unlock (no set_ready) + recycle buffer_to_free
+        if task.node_to_unlock:
+            try:
+                self.cache_engine.abort_task(task)
+            except Exception as e:
+                flexkv_logger.error(f"_cancel_task abort error for task {task_id}: {e}")
+            task.node_to_unlock = None
+            task.buffer_to_free = None
         task.status = TaskStatus.CANCELLED
         self.graph_to_task.pop(task.graph.graph_id, None)
 
@@ -455,15 +679,27 @@ class KVTaskManager:
         task = self.tasks[task_id]
         if task.is_completed():
             return
-        if task.callback:
+        # Prefetch discard path uses structured resource refs (abort_task handles
+        # unlock without set_ready). Normal GET/PUT always use original callback.
+        if task.task_type == TaskType.PREFETCH and task.node_to_unlock:
+            self.cache_engine.complete_task(task)
+            task.node_to_unlock = None  # prevent double-processing
+        elif task.callback:
             if isinstance(task.callback, list):
                 for callback in task.callback:
                     callback()
             else:
                 task.callback()
+        if task.task_type == TaskType.PREFETCH:
+            # Release token capacity: use the exact value recorded at prefetch time,
+            # not return_mask (which may be modified by batch executor on termination).
+            if task.prefetch_tokens_reserved > 0:
+                self._prefetch_tokens_occupied = max(
+                    0, self._prefetch_tokens_occupied - task.prefetch_tokens_reserved
+                )
         task.status = TaskStatus.COMPLETED
         task.task_end_op_finished = True
-        self.graph_to_task.pop(task.graph.graph_id)
+        self.graph_to_task.pop(task.graph.graph_id, None)
 
     def _process_empty_graph(self, task_id: int) -> None:
         task = self.tasks[task_id]
@@ -555,6 +791,7 @@ class KVTaskEngine(KVTaskManager):
                   pp_rank: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+        self._drain_deferred_inserts()
         # self._sync_prefetch(token_ids, namespace)
         task_id, return_mask = self._get_match_impl(token_ids,
                                                     slot_mapping,
@@ -587,6 +824,7 @@ class KVTaskEngine(KVTaskManager):
                   pp_rank: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+        self._drain_deferred_inserts()
         task_id, return_mask = self._put_match_impl(token_ids,
                                                     slot_mapping,
                                                     is_fake_slot_mapping=False,
@@ -714,6 +952,7 @@ class KVTaskEngine(KVTaskManager):
                   cpu_only: bool = False,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+        self._drain_deferred_inserts()
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
         # self._sync_prefetch(token_ids, namespace)
         if token_mask is None:
@@ -785,6 +1024,7 @@ class KVTaskEngine(KVTaskManager):
                   pp_rank: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+        self._drain_deferred_inserts()
         fake_slot_mapping = np.zeros_like(token_ids)
         result_task_id, return_mask = self._put_match_impl(token_ids,
                                                            fake_slot_mapping,
@@ -838,13 +1078,86 @@ class KVTaskEngine(KVTaskManager):
                        dp_rank: int = 0,
                        pp_rank: int = 0,
                        task_id: int = -1,
-                       namespace: Optional[List[str]] = None) -> int:
+                       namespace: Optional[List[str]] = None) -> Tuple[int, int]:
+        self._drain_deferred_inserts()
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
         self.create_prefetch_task(task_id, token_ids, pp_rank=pp_rank, namespace=namespace)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
+
+        # ---- Phase1: early return if no substantive hit ----
+        # If the transfer graph was empty (no SSD/Remote hit), the task was
+        # already completed by _process_empty_graph → _mark_completed (callback
+        # executed, resources released).  Clean up bookkeeping and return -1
+        # so the caller (connector) does not track a no-op prefetch.
+        task = self.tasks.get(task_id)
+        if task is not None and task.is_completed():
+            self.prefetch_tasks.pop(self._gen_prefetch_key(token_ids, namespace), None)
+            del self.tasks[task_id]
+            flexkv_logger.info(f"[FlexKV] prefetch task {task_id} completed by _process_empty_graph, early return")
+            return -1, 0
+
+
+        # ---- Phase2: token-level flow control ----
+        # Precise SSD→CPU token count from return_mask (set by cache_engine.get
+        # during create_prefetch_task). If current prefetch would exceed capacity, 
+        # discard the task immediately and release all resources allocated by 
+        # create_prefetch_task
+        actual_prefetch_tokens = 0
+        if task is not None and task.return_mask is not None:
+            actual_prefetch_tokens = int(np.sum(task.return_mask))
+
+        # Token-level flow control (before enqueue/launch) 
+        discard = False
+        # first level check: if actual transfer is below threshold, discard the task immediately
+        if actual_prefetch_tokens < self._prefetch_token_threshold:
+            flexkv_logger.info(f"[FlexKV] prefetch task {task_id} discarded because actual transfer is below threshold {self._prefetch_token_threshold}")
+            discard = True
+
+        # second level check: if actual transfer would exceed capacity, discard the task immediately
+        if self._prefetch_token_capacity > 0 and actual_prefetch_tokens > 0 and self._prefetch_tokens_occupied + actual_prefetch_tokens > self._prefetch_token_capacity:
+            flexkv_logger.info(f"[FlexKV] prefetch task {task_id} discarded because actual transfer would exceed capacity {self._prefetch_token_capacity}")
+            discard = True
+
+        if discard and task is not None and not task.is_completed():
+            # Release all resources allocated by create_prefetch_task.
+            # With deferred insert, node_to_unlock is empty (no insert → no lock),
+            # but buffer_to_free[CPU] still holds allocated blocks that must be recycled.
+            if task.node_to_unlock:
+                # actually won't reach here
+                try:
+                    self.cache_engine.abort_task(task)
+                except Exception as e:
+                    flexkv_logger.error(
+                        f"[FlexKV] prefetch discard abort error for task {task_id}: {e}")
+                task.node_to_unlock = None
+                task.buffer_to_free = None
+            elif task.buffer_to_free:
+                # Deferred insert path: no node to unlock, but CPU blocks need recycling
+                for device_type, blocks in task.buffer_to_free.items():
+                    if len(blocks) > 0:
+                        self.cache_engine.cache_engines[device_type].recycle(blocks)
+                task.buffer_to_free = None
+
+            # Clean up task bookkeeping
+            self.graph_to_task.pop(task.graph.graph_id, None)
+            self.prefetch_tasks.pop(self._gen_prefetch_key(token_ids, namespace), None)
+            del self.tasks[task_id]
+            # trace prefetch discard
+            self.tracer.trace_request(
+                request_type="PREFETCH_ASYNC",
+                request_id=task_id,
+                token_ids=token_ids,
+                slot_mapping=np.zeros_like(token_ids),
+                token_mask=np.ones_like(token_ids),
+                layer_granularity=-1,
+                dp_rank=dp_rank,
+                pp_rank=pp_rank
+            )
+            return -1, 0
+
         # trace prefetch async request
         self.tracer.trace_request(
             request_type="PREFETCH_ASYNC",
@@ -856,8 +1169,469 @@ class KVTaskEngine(KVTaskManager):
             dp_rank=dp_rank,
             pp_rank=pp_rank
         )
-        self._launch_task(task_id)
-        return task_id
+
+        # ---- Phase3: enqueue/launch ----
+        # Track tokens occupied by this prefetch and record the exact value 
+        # so _mark_completed can decrement correctly,
+        # even if return_mask is later modified (e.g. by batch executor termination).
+        if actual_prefetch_tokens > 0:
+            self._prefetch_tokens_occupied += actual_prefetch_tokens
+            # Record the exact value so _mark_completed can decrement correctly,
+            # even if return_mask is later modified (e.g. by batch executor termination).
+            if task is not None:
+                task.prefetch_tokens_reserved = actual_prefetch_tokens
+
+        # Route to batch executor thread for all prefetch tasks with DISK2H ops.
+        batch_executor = self._create_batch_executor(task_id)
+
+        if batch_executor is not None:
+            # Route to batch executor thread — do NOT submit the original graph.
+            flexkv_logger.info(f"[FlexKV] prefetch task {task_id} routed to batch executor")
+            self._prefetch_executor_queue.put(batch_executor)
+        else:
+            # No DISK2H op found — should not happen after _process_empty_graph.
+            # Recycle allocated blocks and clean up to avoid resource leak.
+            flexkv_logger.warning(f"[FlexKV] prefetch task {task_id} has no DISK2H op, cleaning up")
+            if task is not None and task.buffer_to_free:
+                for device_type, blocks in task.buffer_to_free.items():
+                    if len(blocks) > 0:
+                        self.cache_engine.cache_engines[device_type].recycle(blocks)
+                task.buffer_to_free = None
+            if actual_prefetch_tokens > 0:
+                self._prefetch_tokens_occupied = max(
+                    0, self._prefetch_tokens_occupied - actual_prefetch_tokens)
+            self.graph_to_task.pop(task.graph.graph_id, None)
+            self.prefetch_tasks.pop(self._gen_prefetch_key(token_ids, namespace), None)
+            del self.tasks[task_id]
+            return -1, actual_prefetch_tokens
+
+
+        return task_id, actual_prefetch_tokens
+
+
+
+    # ------------------------------------------------------------------
+    # Deferred insert for prefetch (zombie-free design)
+    # ------------------------------------------------------------------
+
+    def _drain_deferred_inserts(self) -> None:
+        """Consume pending deferred inserts queued by executor thread.
+
+        MUST be called from main thread only. This ensures radix tree
+        operations (match/insert) are safe from concurrent access.
+
+        Called at the beginning of main-thread entry points that operate
+        on the radix tree: get_match, get_async, put_match, put_async,
+        prefetch_async.
+        """
+        if self._deferred_inserts_queue:
+            num_items = len(self._deferred_inserts_queue)
+            for task_id, cpu_block_ids in self._deferred_inserts_queue:
+                self._execute_deferred_insert(task_id, cpu_block_ids)
+            self._deferred_inserts_queue.clear()
+            # Monitor unready blocks after drain
+            try:
+                unready = self.cache_engine.cpu_cache_engine.index.total_unready_blocks()
+                free = self.cache_engine.cpu_cache_engine.mempool.num_free_blocks
+                total_pool = self.cache_engine.cpu_cache_engine.mempool.num_total_blocks
+                flexkv_logger.info(
+                    f"[FlexKV] _drain_deferred_inserts: processed {num_items} items, "
+                    f"unready_blocks={unready}, free_blocks={free}/{total_pool}")
+            except Exception:
+                pass
+
+    def _execute_deferred_insert(self, task_id: int, completed_cpu_block_ids: np.ndarray) -> None:
+        """Execute deferred insert after prefetch transfer completes.
+
+        Re-matches the CPU radix tree and inserts the transferred blocks
+        with is_ready=True. This avoids zombie nodes because insert only
+        happens after data is fully transferred.
+
+        Args:
+            task_id: The task whose deferred insert should be executed.
+            completed_cpu_block_ids: CPU block IDs that were successfully transferred.
+        """
+        task = self.tasks.get(task_id)
+        if task is None or task.deferred_insert_info is None:
+            return
+
+        info = task.deferred_insert_info
+        sequence_meta = info['sequence_meta']
+        num_insert_blocks = info['num_insert_blocks']
+
+        if len(completed_cpu_block_ids) == 0:
+            task.deferred_insert_info = None
+            return
+
+        try:
+            cpu_engine = self.cache_engine.cpu_cache_engine
+            # Step 1: Re-match CPU radix tree (tree may have changed)
+            match_result = cpu_engine.match(sequence_meta)
+            num_matched = match_result.num_matched_blocks
+
+            # Step 2: Calculate actual blocks to insert
+            actual_insert = num_insert_blocks - num_matched
+
+            if actual_insert <= 0:
+                # All already in tree (another request inserted them)
+                cpu_engine.recycle(completed_cpu_block_ids)
+                flexkv_logger.debug(
+                    f"[FlexKV] deferred insert for task {task_id}: "
+                    f"skipped (already in tree), recycled {len(completed_cpu_block_ids)} blocks")
+            elif actual_insert > len(completed_cpu_block_ids):
+                # Prefix was evicted, only insert what we have
+                actual_insert = len(completed_cpu_block_ids)
+                adjusted_num_insert = num_matched + actual_insert
+                node = cpu_engine.insert(sequence_meta,
+                                         completed_cpu_block_ids,
+                                         num_insert_blocks=adjusted_num_insert,
+                                         is_ready=True,
+                                         match_result=match_result)
+                if node is None:
+                    cpu_engine.recycle(completed_cpu_block_ids)
+                flexkv_logger.debug(
+                    f"[FlexKV] deferred insert for task {task_id}: "
+                    f"partial insert {actual_insert} blocks (prefix evicted)")
+            elif actual_insert < len(completed_cpu_block_ids):
+                # Some overlap with existing tree — recycle duplicates
+                blocks_to_insert = completed_cpu_block_ids[:actual_insert]
+                blocks_to_recycle = completed_cpu_block_ids[actual_insert:]
+                cpu_engine.recycle(blocks_to_recycle)
+                node = cpu_engine.insert(sequence_meta,
+                                         blocks_to_insert,
+                                         num_insert_blocks=num_insert_blocks,
+                                         is_ready=True,
+                                         match_result=match_result)
+                if node is None:
+                    cpu_engine.recycle(blocks_to_insert)
+                flexkv_logger.debug(
+                    f"[FlexKV] deferred insert for task {task_id}: "
+                    f"inserted {actual_insert} blocks, recycled {len(blocks_to_recycle)} duplicates")
+            else:
+                # Exact match: insert all completed blocks
+                node = cpu_engine.insert(sequence_meta,
+                                         completed_cpu_block_ids,
+                                         num_insert_blocks=num_insert_blocks,
+                                         is_ready=True,
+                                         match_result=match_result)
+                if node is None:
+                    cpu_engine.recycle(completed_cpu_block_ids)
+                    flexkv_logger.debug(
+                        f"[FlexKV] deferred insert for task {task_id}: "
+                        f"insert returned None, recycled {len(completed_cpu_block_ids)} blocks")
+                else:
+                    flexkv_logger.debug(
+                        f"[FlexKV] deferred insert for task {task_id}: "
+                        f"inserted {len(completed_cpu_block_ids)} blocks")
+
+            # Clear buffer_to_free[CPU] to prevent double-free:
+            # The blocks are now either in the tree or recycled above.
+            if task.buffer_to_free and DeviceType.CPU in task.buffer_to_free:
+                task.buffer_to_free[DeviceType.CPU] = np.array([], dtype=np.int64)
+
+        except Exception as e:
+            flexkv_logger.error(
+                f"[FlexKV] deferred insert failed for task {task_id}: {e}")
+            # Safety: recycle blocks to prevent leak
+            try:
+                self.cache_engine.cpu_cache_engine.recycle(completed_cpu_block_ids)
+            except Exception:
+                pass
+            if task.buffer_to_free and DeviceType.CPU in task.buffer_to_free:
+                task.buffer_to_free[DeviceType.CPU] = np.array([], dtype=np.int64)
+
+        task.deferred_insert_info = None
+
+    # ------------------------------------------------------------------
+    # Batched prefetch executor
+    # ------------------------------------------------------------------
+
+    def _create_batch_executor(self, task_id: int) -> Optional[PrefetchBatchExecutor]:
+        """Create a PrefetchBatchExecutor from an already-created prefetch task.
+
+        Inspects the task's transfer graph for a DISK2H op.  If one exists and
+        is large enough to benefit from batching, returns a new executor with
+        the op's block arrays extracted.  Returns ``None`` when batching is not
+        needed (no DISK2H, too few blocks, or feature disabled).
+
+        The caller is responsible for NOT submitting the original graph when a
+        batch executor is returned — the executor will create its own
+        mini-graphs.
+        """
+        if not self._prefetch_enabled:
+            return None
+
+        task = self.tasks.get(task_id)
+        if task is None or task.graph.num_ops == 0:
+            return None
+
+        # Find the DISK2H op in the graph
+        disk2h_op: Optional[TransferOp] = None
+        for op_id, op in task.graph._op_map.items():
+            if op.transfer_type == TransferType.DISK2H:
+                disk2h_op = op
+                break
+
+        if disk2h_op is None:
+            flexkv_logger.error(f"No DISK2H op found for task {task_id}")
+            # No DISK2H (pure CPU hit or empty graph) — no need to batch
+            return None
+
+        total_blocks = len(disk2h_op.src_block_ids)
+
+        executor = PrefetchBatchExecutor(
+            task_id=task_id,
+            ssd_block_ids=disk2h_op.src_block_ids,
+            cpu_block_ids=disk2h_op.dst_block_ids,
+            batch_size_blocks=self._prefetch_batch_size,
+            total_blocks=total_blocks,
+        )
+
+        # Register executor for terminate_prefetch lookup
+        self._task_to_executor[task_id] = executor
+
+        return executor
+
+    def _prefetch_executor_loop(self) -> None:
+        """Main loop of the batch executor thread.
+
+        Processes PrefetchBatchExecutors one at a time from the queue.
+        Each executor is driven to completion (or termination) before the
+        next one is picked up.
+        """
+        while True:
+            try:
+                executor = self._prefetch_executor_queue.get()
+                if executor is None:
+                    break  # shutdown signal
+                self._execute_prefetch_batched(executor)
+            except Exception as e:
+                flexkv_logger.error(
+                    f"[FlexKV] prefetch batch executor loop error: {e}")
+
+    def _execute_prefetch_batched(self, executor: PrefetchBatchExecutor) -> None:
+        """Drive one PrefetchBatchExecutor to completion or termination.
+
+        Called on the executor thread.  For each batch:
+        1. Create a mini TransferOpGraph with a slice of the DISK2H blocks.
+        2. Register it in ``_pending_mini_graphs`` so the main thread can
+           route its CompletedOp.
+        3. Submit to TransferManager.
+        4. Wait on ``executor._batch_done_event`` (set by main thread).
+        5. Check termination flag; if set, stop and finalize.
+        """
+        try:
+            # Mark task as RUNNING (batch executor bypasses _launch_task which
+            # normally sets this via check_task_ready).
+            task = self.tasks.get(executor.task_id)
+            if task is not None:
+                task.status = TaskStatus.RUNNING
+
+            while not executor.is_terminated() and not executor.is_complete:
+                start = executor.next_batch_start
+                end = executor.next_batch_end
+
+                # Create mini-graph for this batch
+                mini_graph = TransferOpGraph()
+                mini_op = TransferOp(
+                    graph_id=mini_graph.graph_id,
+                    transfer_type=TransferType.DISK2H,
+                    src_block_ids=executor.ssd_block_ids[start:end].copy(),
+                    dst_block_ids=executor.cpu_block_ids[start:end].copy(),
+                    layer_id=0,
+                    layer_granularity=self.model_config.num_layers,
+                )
+                flexkv_logger.info(f"[FlexKV] prefetch batch {executor.completed_batches} for task {executor.task_id} creating mini-graph {mini_graph.graph_id} with {len(executor.ssd_block_ids[start:end])} blocks")
+                mini_graph.add_transfer_op(mini_op)
+
+                # Register so _update_tasks can route the CompletedOp back
+                executor.reset_batch_event()
+                executor._current_mini_graph_id = mini_graph.graph_id
+                self._pending_mini_graphs[mini_graph.graph_id] = executor
+
+                # Submit to all transfer handles
+                for transfer_handle in self.transfer_handles:
+                    transfer_handle.submit(mini_graph)
+
+                # Wait for main thread to signal batch completion
+                batch_done = executor.wait_current_batch(
+                    timeout=self._prefetch_batch_timeout
+                )
+
+                if batch_done and not executor.is_terminated():
+                    # Normal completion: IO done, not terminated
+                    self._pending_mini_graphs.pop(mini_graph.graph_id, None)
+                    executor._current_mini_graph_id = None
+                    executor.completed_blocks = end
+                    executor.completed_batches += 1
+
+                elif executor.is_terminated():
+                    # Terminated: mark_terminate() woke us up.
+                    # The current batch IO may still be in flight — must wait for
+                    # it to complete before recycling blocks (prevents dirty writes
+                    # from io_uring writing to already-recycled CPU memory).
+                    if not executor._io_done:
+                        # IO hasn't completed yet — wait for actual CompletedOp.
+                        executor.reset_batch_event()
+                        batch_done = executor.wait_current_batch(
+                            timeout=self._prefetch_batch_timeout
+                        )
+
+                    # Now the current batch IO is definitely done (or timed out).
+                    self._pending_mini_graphs.pop(mini_graph.graph_id, None)
+                    executor._current_mini_graph_id = None
+                    if executor._io_done:
+                        # Current batch IO completed — count it as done
+                        executor.completed_blocks = end
+                        executor.completed_batches += 1
+                    # Break out of the loop — don't submit more batches
+                    break
+
+                else:
+                    # Batch timed out (neither done nor terminated)
+                    self._pending_mini_graphs.pop(mini_graph.graph_id, None)
+                    executor._current_mini_graph_id = None
+                    flexkv_logger.warning(
+                        f"[FlexKV] prefetch batch {executor.completed_batches} "
+                        f"for task {executor.task_id} timed out after "
+                        f"{self._prefetch_batch_timeout}s"
+                    )
+                    executor.mark_terminate()
+        except Exception as e:
+            flexkv_logger.error(
+                f"[FlexKV] _execute_prefetch_batched error for task "
+                f"{executor.task_id}: {e}"
+            )
+            if not executor.is_terminated():
+                executor.mark_terminate()
+        finally:
+            self._finalize_batch_executor(executor)
+
+    def _finalize_batch_executor(self, executor: PrefetchBatchExecutor) -> None:
+        """Clean up after a batch executor completes or is terminated.
+
+        With deferred insert design: no node was inserted during task creation,
+        so there is no zombie node to worry about. We simply:
+        - Collect completed blocks for deferred insert (main thread will execute)
+        - Recycle uncompleted blocks immediately
+        - Mark task as completed
+        """
+        task = self.tasks.get(executor.task_id)
+        completed = executor.completed_blocks
+        total = executor.total_blocks
+
+        if executor.is_complete and not executor.is_terminated():
+            # ---- Full success ----
+            # Queue deferred insert for all blocks (main thread will execute)
+            if task is not None and task.deferred_insert_info is not None:
+                self._deferred_inserts_queue.append(
+                    (executor.task_id, executor.cpu_block_ids.copy())
+                )
+            # Clear buffer_to_free[CPU] to prevent _mark_completed callback from
+            # recycling blocks that will be inserted into radix tree by deferred insert.
+            if task is not None and task.buffer_to_free and DeviceType.CPU in task.buffer_to_free:
+                task.buffer_to_free[DeviceType.CPU] = np.array([], dtype=np.int64)
+            flexkv_logger.info(
+                f"[FlexKV] prefetch batch for task {executor.task_id} completed: "
+                f"{completed}/{total} blocks "
+                f"in {executor.completed_batches} batches"
+            )
+        else:
+            # ---- Partial completion or terminated ----
+            # Queue deferred insert for completed portion only
+            if task is not None and task.deferred_insert_info is not None and completed > 0:
+                self._deferred_inserts_queue.append(
+                    (executor.task_id, executor.cpu_block_ids[:completed].copy())
+                )
+
+            # Recycle uncompleted blocks immediately (mempool is thread-safe)
+            if completed < total:
+                remaining_blocks = executor.cpu_block_ids[completed:]
+                try:
+                    self.cache_engine.cpu_cache_engine.recycle(remaining_blocks)
+                except Exception as e:
+                    flexkv_logger.error(
+                        f"[FlexKV] batch executor recycle remaining error for task "
+                        f"{executor.task_id}: {e}")
+
+            # Clear buffer_to_free[CPU] to prevent double-recycle in callback:
+            # - completed blocks will be handled by deferred insert
+            # - remaining blocks already recycled above
+            if task is not None and task.buffer_to_free and DeviceType.CPU in task.buffer_to_free:
+                task.buffer_to_free[DeviceType.CPU] = np.array([], dtype=np.int64)
+
+            # Update return_mask to reflect actual completion
+            if task is not None and task.return_mask is not None:
+                completed_tokens = completed * self.cache_config.tokens_per_block
+                task.return_mask[completed_tokens:] = False
+
+            flexkv_logger.info(
+                f"[FlexKV] prefetch batch for task {executor.task_id} terminated: "
+                f"{completed}/{total} blocks "
+                f"({executor.progress_ratio:.1%})"
+            )
+
+        # ---- Common cleanup ----
+        self._task_to_executor.pop(executor.task_id, None)
+
+        # Monitor unready blocks after prefetch finalize
+        try:
+            unready = self.cache_engine.cpu_cache_engine.index.total_unready_blocks()
+            free = self.cache_engine.cpu_cache_engine.mempool.num_free_blocks
+            total_pool = self.cache_engine.cpu_cache_engine.mempool.num_total_blocks
+            flexkv_logger.info(
+                f"[FlexKV] prefetch task {executor.task_id} finalized: "
+                f"unready_blocks={unready}, free_blocks={free}/{total_pool}, "
+                f"deferred_queue_len={len(self._deferred_inserts_queue)}")
+        except Exception:
+            pass
+
+        # Mark task as completed (releases prefetch token capacity).
+        # node_to_unlock is empty for prefetch (no insert was done), so
+        # _mark_completed just updates status + releases token capacity.
+        if task is not None and not task.is_completed():
+            self._mark_completed(executor.task_id)
+
+    # ------------------------------------------------------------------
+    # Terminate API
+    # ------------------------------------------------------------------
+
+    def terminate_prefetch(self, task_id: int) -> int:
+        """Request termination of an in-flight batched prefetch.
+
+        If the task is being executed by a PrefetchBatchExecutor, sets its
+        terminated flag.  The executor thread will stop after the current
+        batch completes and release remaining resources.
+
+        If the task was submitted via the original (non-batched) path, this
+        is a no-op — the C++ transfer cannot be interrupted.
+        """
+        if task_id not in self.tasks:
+            return 0
+        task = self.tasks[task_id]
+        if task.is_completed():
+            return 0
+
+        executor = self._task_to_executor.get(task_id)
+        if executor is not None:
+            executor.mark_terminate()
+            flexkv_logger.info(
+                f"[FlexKV] terminate_prefetch: task {task_id} "
+                f"(completed {executor.completed_blocks}/{executor.total_blocks})"
+            )
+            return executor.completed_blocks * self.cache_config.tokens_per_block
+        else:
+            # Non-batch path (_launch_task): cannot interrupt C++ IO.
+            # Check if the task already completed naturally.
+            task = self.tasks.get(task_id)
+            if task is not None and task.is_completed():
+                loaded = int(np.sum(task.return_mask)) if task.return_mask is not None else 0
+                return loaded
+            flexkv_logger.debug(
+                f"[FlexKV] terminate_prefetch: task {task_id} not in batch mode, "
+                f"cannot interrupt"
+            )
+            return 0
 
     def merge_to_batch_kvtask(self,
 
