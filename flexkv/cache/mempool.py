@@ -1,5 +1,4 @@
 from collections import deque
-from operator import le
 from typing import List
 
 import numpy as np
