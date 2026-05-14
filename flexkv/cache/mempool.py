@@ -42,7 +42,10 @@ class Mempool:
     def recycle_blocks(self, block_ids: np.ndarray) -> None:
         if block_ids.ndim != 1 or block_ids.dtype != np.int64:
             raise ValueError("block_ids must be a 1D tensor of int64")
-        
+        if len(block_ids) == 0:
+            return
+        if np.any(block_ids < 0) or np.any(block_ids >= self.num_total_blocks):
+            raise ValueError("block_ids must be within the range of [0, num_total_blocks)")
         # Remove duplicates first (same block ID appearing multiple times)
         block_ids = np.unique(block_ids)
         
