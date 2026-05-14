@@ -76,3 +76,6 @@ cover/
 
 # logs
 *.log
+
+.misc/
+.claude/

@@ -461,6 +461,35 @@ def test_tensor_shared_memory_modification():
     parent_conn.close()
 
 
+def _worker_test_fp8_tensor_from_bytes(conn, device_id):
+    """Child process: receive fp8 TensorSharedHandle, recover tensor, verify data."""
+    try:
+        handle = conn.recv()
+        assert isinstance(handle, TensorSharedHandle)
+        assert handle.use_direct_ipc
+        assert handle.tensor_dtype == torch.float8_e4m3fn
+        assert handle.tensor_shape == (10, 20)
+
+        tensor = handle.get_tensor()
+        assert isinstance(tensor, torch.Tensor)
+        assert tensor.is_cuda
+        assert tensor.device.index == device_id
+        assert tensor.shape == (10, 20)
+        assert tensor.dtype == torch.float8_e4m3fn
+
+        expected = (
+            torch.arange(200, dtype=torch.float32)
+            .reshape(10, 20)
+            .cuda(device_id)
+            .to(torch.float8_e4m3fn)
+        )
+        max_diff = (tensor.view(torch.int8) - expected.view(torch.int8)).abs().max().item()
+        conn.send(max_diff)
+    except Exception as e:
+        conn.send(f"Error: {e}")
+        raise
+
+
 @pytest.mark.skipif(
     (not torch.cuda.is_available()) or (not hasattr(torch, "float8_e4m3fn")),
     reason="CUDA with fp8 support required",
