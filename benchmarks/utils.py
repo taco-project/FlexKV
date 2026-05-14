@@ -122,7 +122,7 @@ def load_config(config_path: str) -> Tuple[ModelConfig, CacheConfig]:
             user_config.ssd_cache_dir = parse_path_list(config["ssd_cache_dir"])
         if "enable_gds" in config:
             user_config.enable_gds = config["enable_gds"]
-        update_default_config_from_user_config(model_config, cache_config, user_config)
+        update_default_config_from_user_config(RankInfo(model_config=model_config), cache_config, user_config)
         return model_config, cache_config
 
 if __name__ == "__main__":

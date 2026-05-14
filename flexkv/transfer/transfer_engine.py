@@ -102,12 +102,17 @@ class TransferEngine:
 
         Args:
             gpu_handles: Dict mapping WorkerKey(dp_rank, pp_rank) -> list of GPU handles for that TP group
+            model_config: global ModelConfig (parallelism sizes; no per-rank index)
+            cache_config: global CacheConfig
             cpu_handle: CPU handle
             ssd_handle: Optional SSD handle
             remote_handle: Optional remote handle
         """
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
+
+        first_handles = next(iter(gpu_handles.values()))
+        self._num_layers_for_local_pp_stage = first_handles[0].kv_layout.num_layer
 
         # Use spawn context for CUDA compatibility
         self.mp_ctx = mp.get_context('spawn')
@@ -142,18 +147,12 @@ class TransferEngine:
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
 
-        # self.dp_size = model_config.dp_size
-        self.tp_size_per_node = model_config.tp_size_per_node
         self.num_gpu_groups = len(self.gpu_handle_groups)
         self._running = False
         self._has_indexer = False
 
-        self._indexer_op_to_parent_op: Dict[int, int] = {}
-        self._indexer_op_map: Dict[int, TransferOp] = {}
-
-        # Same-node PP layerwise fan-out: replica op_id → parent op_id
-        self._pp_replica_to_parent_op: Dict[int, int] = {}
-        self._pp_replica_op_map: Dict[int, TransferOp] = {}
+        self._child_id_to_child: Dict[int, TransferOp] = {}
+        self._child_to_parent_op_id: Dict[int, int] = {}
 
     def _init_workers(self) -> None:
         if self._running:
@@ -167,7 +166,7 @@ class TransferEngine:
         
         # H2D worker
         if not _enable_layerwise:
-            if self.tp_size_per_node == 1:
+            if self.model_config.effective_tp_size_per_node == 1:
                 self.h2d_workers: Dict[WorkerKey, WorkerHandle] = {
                     worker_key: GPUCPUTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
@@ -197,7 +196,7 @@ class TransferEngine:
                         gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
                         cpu_kv_layout=self._cpu_handle.kv_layout,
                         dtype=gpu_handles[0].dtype,
-                        tp_group_size=self.tp_size_per_node,
+                        tp_group_size=self.model_config.effective_tp_size_per_node,
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -208,7 +207,7 @@ class TransferEngine:
             self._worker_map[TransferType.H2D] = self.h2d_workers
 
         # D2H worker
-        if self.tp_size_per_node == 1:
+        if self.model_config.effective_tp_size_per_node == 1:
             self.d2h_workers: Dict[WorkerKey, WorkerHandle] = {
                 worker_key: GPUCPUTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
@@ -238,7 +237,7 @@ class TransferEngine:
                     gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=gpu_handles[0].dtype,
-                    tp_group_size=self.tp_size_per_node,
+                    tp_group_size=self.model_config.effective_tp_size_per_node,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -306,7 +305,7 @@ class TransferEngine:
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
         if self.cache_config.enable_gds:
-            if self.tp_size_per_node == 1:
+            if self.model_config.effective_tp_size_per_node == 1:
                 self.gds_workers: Dict[WorkerKey, WorkerHandle] = {
                     worker_key: GDSTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
@@ -334,7 +333,7 @@ class TransferEngine:
                         gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
-                        tp_group_size=self.tp_size_per_node,
+                        tp_group_size=self.model_config.effective_tp_size_per_node,
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
@@ -354,10 +353,9 @@ class TransferEngine:
             self.layerwise_workers: Dict[WorkerKey, WorkerHandle] = {}
             for worker_key, gpu_handles in self.gpu_handle_groups.items():
                 _layerwise_eventfd_socket = build_layerwise_eventfd_socket_path(
+                    dp_client_id=worker_key.dp_client_id,
                     pp_rank=worker_key.pp_rank,
-                    dp_rank=worker_key.dp_rank,
-                    pp_size=self.model_config.pp_size,
-                    dp_size=self.model_config.dp_size,
+                    model_config=self.model_config,
                 )
                 # Resolve indexer handles for this WorkerKey
                 idx_handles = None
@@ -375,7 +373,7 @@ class TransferEngine:
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     ssd_kv_layout=ssd_kv_layout,
                     dtype=gpu_handles[0].dtype,
-                    tp_group_size=self.tp_size_per_node,
+                    tp_group_size=self.model_config.effective_tp_size_per_node,
                     layerwise_eventfd_socket=_layerwise_eventfd_socket,
                     num_blocks_per_file=num_blocks_per_file,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
@@ -395,7 +393,7 @@ class TransferEngine:
 
                 flexkv_logger.debug(
                     f"[TransferEngine] Created layerwise worker for {worker_key}: "
-                    f"tp_size_per_node={self.tp_size_per_node}, has_indexer={idx_handles is not None}, "
+                    f"effective_tp_size_per_node={self.model_config.effective_tp_size_per_node}, has_indexer={idx_handles is not None}, "
                     f"has_ssd={len(ssd_files) > 0}")
 
             self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
@@ -434,7 +432,7 @@ class TransferEngine:
             self._indexer_worker_map: Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]] = {}
             # H2D indexer worker
             if not _enable_layerwise:
-                if self.tp_size_per_node == 1:
+                if self.model_config.effective_tp_size_per_node == 1:
                     self._indexer_h2d_workers: Dict[WorkerKey, WorkerHandle] = {
                         worker_key: GPUCPUTransferWorker.create_worker(
                             mp_ctx=self.mp_ctx,
@@ -464,7 +462,7 @@ class TransferEngine:
                             gpu_kv_layouts=[h.kv_layout for h in indexer_gpu_handles_list],
                             cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
                             dtype=indexer_gpu_handles_list[0].dtype,
-                            tp_group_size=self.tp_size_per_node,
+                            tp_group_size=self.model_config.effective_tp_size_per_node,
                             use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                             use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                             transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -475,7 +473,7 @@ class TransferEngine:
                 self._indexer_worker_map[TransferType.H2D] = self._indexer_h2d_workers
 
             # D2H indexer worker
-            if self.tp_size_per_node == 1:
+            if self.model_config.effective_tp_size_per_node == 1:
                 self._indexer_d2h_workers: Dict[WorkerKey, WorkerHandle] = {
                     worker_key: GPUCPUTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
@@ -505,7 +503,7 @@ class TransferEngine:
                         gpu_kv_layouts=[h.kv_layout for h in indexer_gpu_handles_list],
                         cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
                         dtype=indexer_gpu_handles_list[0].dtype,
-                        tp_group_size=self.tp_size_per_node,
+                        tp_group_size=self.model_config.effective_tp_size_per_node,
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -573,7 +571,7 @@ class TransferEngine:
                 self._indexer_worker_map[TransferType.REMOTE2H] = self._indexer_remote2h_worker
                 flexkv_logger.info("TransferEngine: indexer Remote workers initialized")
             if self.cache_config.enable_gds and self._indexer_ssd_handle is not None:
-                if self.tp_size_per_node == 1:
+                if self.model_config.effective_tp_size_per_node == 1:
                     self._indexer_gds_workers: Dict[WorkerKey, WorkerHandle] = {
                         worker_key: GDSTransferWorker.create_worker(
                             mp_ctx=self.mp_ctx,
@@ -601,7 +599,7 @@ class TransferEngine:
                             gpu_kv_layouts=[h.kv_layout for h in indexer_gpu_handles_list],
                             ssd_kv_layout=self._indexer_ssd_handle.kv_layout,
                             dtype=self._indexer_ssd_handle.dtype,
-                            tp_group_size=self.tp_size_per_node,
+                            tp_group_size=self.model_config.effective_tp_size_per_node,
                         )
                         for worker_key, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
                     }
@@ -673,6 +671,7 @@ class TransferEngine:
                 "DISK2H worker should not exist in layerwise mode (fused into layerwise worker)"
             assert TransferType.LAYERWISE in self._worker_map, \
                 "LAYERWISE worker must exist when layerwise transfer is enabled"
+
         # Start scheduler thread
         self._running = True
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
@@ -742,22 +741,18 @@ class TransferEngine:
                         while True:
                             try:
                                 op_id = self.finished_ops_queue.get_nowait()
-                                # Check if this is a PP-replica op (same-node PP fan-out)
-                                if op_id in self._pp_replica_to_parent_op:
-                                    # PP-replica op: decrement parent's pending_count
-                                    replica_op = self._pp_replica_op_map.pop(op_id)
-                                    parent_op_id = self._pp_replica_to_parent_op.pop(op_id)
+                                if op_id in self._child_to_parent_op_id:
+                                    parent_op_id = self._child_to_parent_op_id.pop(op_id)
+                                    child_op = self._child_id_to_child.pop(op_id)
+                                    free_op_from_buffer(child_op, self.pin_buffer)
+                                    if op_id in self.op_id_to_nvtx_range:
+                                        nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
                                     parent_op = self.op_id_to_op[parent_op_id]
                                     parent_op.pending_count -= 1
-                                    # Clean up replica from op_id_to_op and NVTX
-                                    del self.op_id_to_op[op_id]
-                                    if op_id in self.op_id_to_nvtx_range:
-                                        nvtx.end_range(self.op_id_to_nvtx_range[op_id])
-                                        self.op_id_to_nvtx_range.pop(op_id)
                                     if parent_op.pending_count == 0:
                                         self._finalize_op(parent_op, finished_ops)
                                     flexkv_logger.debug(
-                                        f"[TransferEngine] PP replica op {op_id} completed, "
+                                        f"[TransferEngine] main-KV child op {op_id} completed, "
                                         f"parent op {parent_op_id} pending_count={parent_op.pending_count}")
                                 else:
                                     op = self.op_id_to_op[op_id]
@@ -774,14 +769,16 @@ class TransferEngine:
                         while True:
                             try:
                                 op_id = self._indexer_finished_ops_queue.get_nowait()
-                                assert op_id in self._indexer_op_to_parent_op, (
+                                assert op_id in self._child_to_parent_op_id, (
                                     f"[TransferEngine] Indexer op {op_id} not found in "
-                                    f"_indexer_op_to_parent_op. All indexer ops must be "
+                                    f"_child_to_parent_op_id. All indexer ops must be "
                                     f"registered with a parent op."
                                 )
-                                indexer_op = self._indexer_op_map.pop(op_id)
+                                parent_op_id = self._child_to_parent_op_id.pop(op_id)
+                                indexer_op = self._child_id_to_child.pop(op_id)
                                 free_op_from_buffer(indexer_op, self.pin_buffer)
-                                parent_op_id = self._indexer_op_to_parent_op.pop(op_id)
+                                if op_id in self.op_id_to_nvtx_range:
+                                    nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
                                 parent_op = self.op_id_to_op[parent_op_id]
                                 parent_op.pending_count -= 1
                                 if parent_op.pending_count == 0:
@@ -796,8 +793,9 @@ class TransferEngine:
 
                 # End NVTX ranges for finished ops
                 for op in finished_ops:
-                    nvtx.end_range(self.op_id_to_nvtx_range[op.op_id])
-                    self.op_id_to_nvtx_range.pop(op.op_id)
+                    nvtx_range = self.op_id_to_nvtx_range.pop(op.op_id, None)
+                    if nvtx_range is not None:
+                        nvtx.end_range(nvtx_range)
 
                 # Schedule next operations
                 nvtx_r3 = nvtx.start_range(message="transfer scheduler. schedule next ops", color="orange")
@@ -809,8 +807,9 @@ class TransferEngine:
                             self.completed_queue.put(CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
                         else:
                             self.op_id_to_op[op.op_id] = op
-                            # copy block ids into buffer and update slot id info
-                            register_op_to_buffer(op, self.pin_buffer)
+                            parent_worker = self._worker_map.get(op.transfer_type)
+                            if parent_worker is not None and not isinstance(parent_worker, dict):
+                                register_op_to_buffer(op, self.pin_buffer)
                             self._assign_op_to_worker(op)
                     # Handle completed graphs
                     for graph_id in completed_graph_ids:
@@ -818,7 +817,16 @@ class TransferEngine:
                 nvtx.end_range(nvtx_r3)
 
             except Exception as e:
-                flexkv_logger.error(f"Error in scheduler loop: {e}")
+                flexkv_logger.error(
+                    f"Error in scheduler loop: {type(e).__name__}: {e!r} "
+                    f"| op_id_to_op keys={list(self.op_id_to_op.keys())[:16]} "
+                    f"(total={len(self.op_id_to_op)}) "
+                    f"| child->parent keys={list(self._child_to_parent_op_id.keys())[:16]} "
+                    f"(total={len(self._child_to_parent_op_id)}) "
+                    f"| nvtx_range keys={list(self.op_id_to_nvtx_range.keys())[:16]} "
+                    f"(total={len(self.op_id_to_nvtx_range)})",
+                    exc_info=True,
+                )
                 time.sleep(0.001)  # Fallback on error
 
         # Cleanup
@@ -831,10 +839,16 @@ class TransferEngine:
         Called only when op.pending_count reaches 0, i.e., all workers (main KV + indexer)
         have completed this op. This ensures atomic eviction semantics.
         """
-        free_op_from_buffer(op, self.pin_buffer)
-        # Compute transfer metrics for this completed op
+        parent_worker = self._worker_map.get(op.transfer_type)
+        if parent_worker is not None and not isinstance(parent_worker, dict):
+            free_op_from_buffer(op, self.pin_buffer)
+        # Compute transfer metrics for this completed op.
         num_blocks = len(op.src_block_ids) if op.src_block_ids is not None else 0
-        num_bytes = num_blocks * self.cache_config.tokens_per_block * self.model_config.token_size_in_bytes_per_pp_stage
+        token_size_in_bytes_per_pp_stage = (
+            self._num_layers_for_local_pp_stage
+            * self.model_config.bytes_per_token_per_layer
+        )
+        num_bytes = num_blocks * self.cache_config.tokens_per_block * token_size_in_bytes_per_pp_stage
         transfer_type_str = op.transfer_type.value if op.transfer_type != TransferType.VIRTUAL else None
         self.completed_queue.put(CompletedOp(
             graph_id=op.graph_id,
@@ -846,17 +860,21 @@ class TransferEngine:
         finished_ops.append(op)
         del self.op_id_to_op[op.op_id]
 
-    def _assign_layerwise_op_to_workers(self, op: TransferOp) -> None:
-        """Fan-out a LAYERWISE op to all PP-stage layerwise workers on the same dp_rank.
+    @staticmethod
+    def _match_pp_siblings(
+        worker_map: Dict[WorkerKey, WorkerHandle],
+        dp_client_id: int,
+    ) -> List[WorkerKey]:
+        """Return every WorkerKey whose flat DP slice equals ``dp_client_id``.
 
-        In cross-node PP, the remote TransferManagerOnRemote handles this by
-        rebinding WorkerKey.  In same-node PP there is no remote TM, so we
-        replicate the op here for every PP-stage worker under the same dp_rank.
-
-        Replicas are tracked via ``_pp_replica_to_parent_op`` so that their
-        completion decrements the parent op's ``pending_count`` (identical to
-        how indexer ops are tracked).
+        After flattening, a single int fully identifies the DP slice —
+        PP siblings are the worker_keys that share it across pp_rank.
         """
+        return [wk for wk in worker_map.keys() if wk.dp_client_id == dp_client_id]
+
+    def _assign_layerwise_op_to_workers(self, op: TransferOp) -> None:
+        """Fan-out a LAYERWISE op symmetrically to every local PP-stage
+        sibling worker matching ``op.dp_client_id``."""
         from flexkv.common.transfer import LayerwiseTransferOp
         assert isinstance(op, LayerwiseTransferOp)
 
@@ -864,131 +882,145 @@ class TransferEngine:
         assert isinstance(worker_map, dict), \
             "LAYERWISE worker map must be a Dict[WorkerKey, WorkerHandle]"
 
-        # Find all layerwise workers sharing the same dp_rank
-        sibling_keys = [wk for wk in worker_map if wk.dp_rank == op.dp_rank]
-
+        sibling_keys = self._match_pp_siblings(worker_map, op.dp_client_id)
         if not sibling_keys:
             raise ValueError(
-                f"No layerwise worker found for dp_rank={op.dp_rank}, pp_rank={op.pp_rank}")
+                f"No LAYERWISE worker found matching "
+                f"dp_client_id={op.dp_client_id}; "
+                f"available worker keys={list(worker_map.keys())}"
+            )
 
-        # Submit to the original pp_rank's worker
-        primary_key = WorkerKey(dp_rank=op.dp_rank, pp_rank=op.pp_rank)
-        if primary_key in worker_map:
-            worker_map[primary_key].submit_transfer(op)
-        else:
-            # Original worker not found — this shouldn't happen, but handle gracefully
-            raise ValueError(
-                f"No layerwise worker found for primary key {primary_key}")
-
-        # If there's only one worker for this dp_rank, no fan-out needed
-        if len(sibling_keys) <= 1:
-            return
-
-        # Create replicas for every other pp_rank under the same dp_rank
         for wk in sibling_keys:
-            if wk == primary_key:
-                continue
-
-            # Create a replica LayerwiseTransferOp with the target pp_rank
             replica = LayerwiseTransferOp(
                 graph_id=op.graph_id,
                 src_block_ids_h2d=op.src_block_ids_h2d.copy(),
                 dst_block_ids_h2d=op.dst_block_ids_h2d.copy(),
                 src_block_ids_disk2h=op.src_block_ids_disk2h.copy(),
                 dst_block_ids_disk2h=op.dst_block_ids_disk2h.copy(),
-                layer_id=op.layer_id,
-                layer_granularity=op.layer_granularity,
-                dp_rank=op.dp_rank,
-                pp_rank=wk.pp_rank,
+                dp_client_id=op.dp_client_id,
                 counter_id=op.counter_id,
                 indexer_src_block_ids=op.indexer_src_block_ids.copy(),
                 indexer_dst_block_ids=op.indexer_dst_block_ids.copy(),
             )
-
-            # Track replica → parent so that completion decrements parent's pending_count
-            self._pp_replica_to_parent_op[replica.op_id] = op.op_id
-            self._pp_replica_op_map[replica.op_id] = replica
-            op.pending_count += 1
-
-            # Register in op_id_to_op so scheduler can find it on completion
-            self.op_id_to_op[replica.op_id] = replica
+            register_op_to_buffer(replica, self.pin_buffer)
+            self._child_id_to_child[replica.op_id] = replica
+            self._child_to_parent_op_id[replica.op_id] = op.op_id
             self.op_id_to_nvtx_range[replica.op_id] = nvtx.start_range(
-                f"schedule LAYERWISE_REPLICA op_id: {replica.op_id}, "
-                f"graph_id: {replica.graph_id}, pp_rank={wk.pp_rank}",
+                f"schedule {replica.transfer_type.name}_REPLICA op_id: {replica.op_id}, "
+                f"graph_id: {replica.graph_id}, worker_key={wk}",
                 color=get_nvtx_range_color(replica.graph_id))
-
+            op.pending_count += 1
             worker_map[wk].submit_transfer(replica)
-
             flexkv_logger.debug(
-                f"[TransferEngine] === Layerwise PP Replica Dispatched ==="
-                f"\n  parent_op_id={op.op_id}, replica_op_id={replica.op_id}"
-                f"\n  dp_rank={op.dp_rank}, pp_rank={wk.pp_rank}"
-                f"\n  pending_count={op.pending_count}")
+                f"[TransferEngine] LAYERWISE fan-out: "
+                f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
+                f"worker_key={wk}, pending_count={op.pending_count}")
 
     def _assign_op_to_worker(self, op: TransferOp) -> None:
-        self.op_id_to_nvtx_range[op.op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
-                                                                       f"op_id: {op.op_id}, "
-                                                                       f"graph_id: {op.graph_id}, "
-                                                                       f"successors: {op.successors}",
-                                                                       color=get_nvtx_range_color(op.graph_id))
-        """Assign operation to appropriate worker"""
+        """Assign operation to appropriate worker."""
         if op.transfer_type == TransferType.VIRTUAL:
             return
         if op.transfer_type not in self._worker_map:
             raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
 
-        # --- Same-node PP fan-out for LAYERWISE ops ---
-        # In cross-node PP, TransferManagerOnRemote rebinds WorkerKey so that
-        # PP1+ workers receive the op.  In same-node PP, only one local
-        # TransferManager exists, so we fan-out here: for every layerwise
-        # worker that shares the same dp_rank but has a different pp_rank, we
-        # create a replica op with the correct pp_rank.
         if op.transfer_type == TransferType.LAYERWISE:
             self._assign_layerwise_op_to_workers(op)
             return
-
-        worker_key = WorkerKey(dp_rank=op.dp_rank, pp_rank=op.pp_rank)
-
         if self._has_indexer and op.transfer_type in self._indexer_worker_map:
-            # Indexer maps 1:1 with main KV blocks, use block_ids directly.
-            src_page_ids = op.src_block_ids
-            dst_page_ids = op.dst_block_ids
-            num_pages = src_page_ids.size
-
+            num_pages = op.src_block_ids.size
             if num_pages > 0:
-                # Always create a separate indexer_op to avoid sharing the same op
-                # object between indexer worker and main KV worker.
-                indexer_op = TransferOp(
-                    graph_id=op.graph_id,
-                    transfer_type=op.transfer_type,
-                    src_block_ids=src_page_ids,
-                    dst_block_ids=dst_page_ids,
-                    layer_id=op.layer_id,
-                    layer_granularity=op.layer_granularity,
-                    dp_rank=op.dp_rank,
-                    pp_rank=op.pp_rank,
-                )
-                register_op_to_buffer(indexer_op, self.pin_buffer)
-                self._indexer_op_to_parent_op[indexer_op.op_id] = op.op_id
-                self._indexer_op_map[indexer_op.op_id] = indexer_op
-                op.pending_count += 1
-
-                flexkv_logger.debug(
-                    f"[TransferEngine] === Indexer Op Dispatched (non-layerwise) ==="
-                    f"\n  parent_op_id={op.op_id}, indexer_op_id={indexer_op.op_id}"
-                    f"\n  type={op.transfer_type.name}, dp_rank={op.dp_rank}, pp_rank={op.pp_rank}"
-                    f"\n  num_pages={num_pages}, pending_count={op.pending_count}")
-
                 indexer_worker = self._indexer_worker_map[op.transfer_type]
                 if isinstance(indexer_worker, dict):
-                    indexer_worker[worker_key].submit_transfer(indexer_op)
+                    sibling_keys = self._match_pp_siblings(indexer_worker, op.dp_client_id)
+                    if not sibling_keys:
+                        raise ValueError(
+                            f"No INDEXER_{op.transfer_type.name} worker found matching "
+                            f"dp_client_id={op.dp_client_id}; "
+                            f"available worker keys={list(indexer_worker.keys())}"
+                        )
+                    for wk in sibling_keys:
+                        indexer_replica = TransferOp(
+                            graph_id=op.graph_id,
+                            transfer_type=op.transfer_type,
+                            src_block_ids=op.src_block_ids.copy(),
+                            dst_block_ids=op.dst_block_ids.copy(),
+                            dp_client_id=op.dp_client_id,
+                        )
+                        register_op_to_buffer(indexer_replica, self.pin_buffer)
+                        self._child_id_to_child[indexer_replica.op_id] = indexer_replica
+                        self._child_to_parent_op_id[indexer_replica.op_id] = op.op_id
+                        self.op_id_to_nvtx_range[indexer_replica.op_id] = nvtx.start_range(
+                            f"schedule {indexer_replica.transfer_type.name}_INDEXER_REPLICA "
+                            f"op_id: {indexer_replica.op_id}, graph_id: {indexer_replica.graph_id}, "
+                            f"worker_key={wk}",
+                            color=get_nvtx_range_color(indexer_replica.graph_id))
+                        op.pending_count += 1
+                        indexer_worker[wk].submit_transfer(indexer_replica)
+                        flexkv_logger.debug(
+                            f"[TransferEngine] INDEXER_{op.transfer_type.name} fan-out: "
+                            f"parent_op_id={op.op_id}, replica_op_id={indexer_replica.op_id}, "
+                            f"worker_key={wk}, pending_count={op.pending_count}")
                 else:
+                    indexer_op = TransferOp(
+                        graph_id=op.graph_id,
+                        transfer_type=op.transfer_type,
+                        src_block_ids=op.src_block_ids.copy(),
+                        dst_block_ids=op.dst_block_ids.copy(),
+                        dp_client_id=op.dp_client_id,
+                    )
+                    register_op_to_buffer(indexer_op, self.pin_buffer)
+                    self._child_id_to_child[indexer_op.op_id] = indexer_op
+                    self._child_to_parent_op_id[indexer_op.op_id] = op.op_id
+                    self.op_id_to_nvtx_range[indexer_op.op_id] = nvtx.start_range(
+                        f"schedule {indexer_op.transfer_type.name}_INDEXER_REPLICA "
+                        f"op_id: {indexer_op.op_id}, graph_id: {indexer_op.graph_id}, "
+                        f"dp_client_id={indexer_op.dp_client_id}",
+                        color=get_nvtx_range_color(indexer_op.graph_id))
+                    op.pending_count += 1
                     indexer_worker.submit_transfer(indexer_op)
+                    flexkv_logger.debug(
+                        f"[TransferEngine] singleton-indexer dispatched: "
+                        f"parent_op_id={op.op_id}, indexer_op_id={indexer_op.op_id}, "
+                        f"type={op.transfer_type.name}, pending_count={op.pending_count}")
 
         worker = self._worker_map[op.transfer_type]
         if isinstance(worker, dict):
-            worker[worker_key].submit_transfer(op)
+            sibling_keys = self._match_pp_siblings(worker, op.dp_client_id)
+            if not sibling_keys:
+                raise ValueError(
+                    f"No MAIN_KV_{op.transfer_type.name} worker found matching "
+                    f"dp_client_id={op.dp_client_id}; "
+                    f"available worker keys={list(worker.keys())}"
+                )
+            for wk in sibling_keys:
+                replica = TransferOp(
+                    graph_id=op.graph_id,
+                    transfer_type=op.transfer_type,
+                    src_block_ids=op.src_block_ids.copy(),
+                    dst_block_ids=op.dst_block_ids.copy(),
+                    dp_client_id=op.dp_client_id,
+                )
+                register_op_to_buffer(replica, self.pin_buffer)
+                self._child_id_to_child[replica.op_id] = replica
+                self._child_to_parent_op_id[replica.op_id] = op.op_id
+                self.op_id_to_nvtx_range[replica.op_id] = nvtx.start_range(
+                    f"schedule {replica.transfer_type.name}_REPLICA op_id: {replica.op_id}, "
+                    f"graph_id: {replica.graph_id}, worker_key={wk}",
+                    color=get_nvtx_range_color(replica.graph_id))
+                op.pending_count += 1
+                worker[wk].submit_transfer(replica)
+                flexkv_logger.debug(
+                    f"[TransferEngine] MAIN_KV_{op.transfer_type.name} fan-out: "
+                    f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
+                    f"worker_key={wk}, pending_count={op.pending_count}")
         else:
+            self.op_id_to_nvtx_range[op.op_id] = nvtx.start_range(
+                f"schedule {op.transfer_type.name} "
+                f"op_id: {op.op_id}, graph_id: {op.graph_id}, "
+                f"successors: {op.successors}",
+                color=get_nvtx_range_color(op.graph_id),
+            )
+            op.pending_count += 1
             worker.submit_transfer(op)
 
     def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:

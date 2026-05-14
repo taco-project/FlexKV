@@ -10,13 +10,10 @@ from flexkv.common.debug import flexkv_logger
 
 @dataclass(frozen=True)
 class WorkerKey:
-    """Immutable, hashable key that uniquely identifies a worker by (dp_rank, pp_rank).
-
-    Used as dict keys in TransferEngine's worker maps and TransferManager's
-    GPU grouping instead of raw ``Tuple[int, int]`` to avoid ambiguity.
-    """
-    dp_rank: int
-    pp_rank: int
+    """Immutable, hashable key that uniquely identifies a worker by
+    ``(dp_client_id, pp_rank)``."""
+    dp_client_id: int = 0
+    pp_rank: int = 0
 
 
 @dataclass(frozen=True)
@@ -94,16 +91,13 @@ class TransferOp:
     transfer_type: TransferType
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
-    layer_id: int = 0
-    layer_granularity: int = -1
     # src_block_node_ids: Optional[np.ndarray] = None
     # this will change dynamically as transfer ops executed
     predecessors: Set[int] = field(default_factory=set)
     # this will keep the full info
     successors: Set[int] = field(default_factory=set)
     status: TransferOpStatus = TransferOpStatus.PENDING
-    dp_rank: int = 0
-    pp_rank: int = 0
+    dp_client_id: int = 0
     # used for get block ids inner worker process
     src_slot_id: int = -1
     dst_slot_id: int = -1
@@ -111,10 +105,7 @@ class TransferOp:
     remote_node_ids: Optional[np.ndarray] = None
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
-    # pending_count tracks how many workers (main KV + indexer) have not yet completed this op.
-    # Initialized to 1; incremented before submitting to indexer worker.
-    # _scheduler_loop decrements it on each worker completion; finalization happens only when it reaches 0.
-    pending_count: int = 1
+    pending_count: int = 0
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
@@ -147,10 +138,7 @@ class LayerwiseTransferOp(TransferOp):
                 dst_block_ids_h2d: np.ndarray,
                 src_block_ids_disk2h: np.ndarray,
                 dst_block_ids_disk2h: np.ndarray,
-                layer_id: int = 0,
-                layer_granularity: int = 1,
-                dp_rank: int = 0,
-                pp_rank: int = 0,
+                dp_client_id: int = 0,
                 counter_id: int = 0,
                 indexer_src_block_ids: Optional[np.ndarray] = None,
                 indexer_dst_block_ids: Optional[np.ndarray] = None) -> None:
@@ -169,18 +157,12 @@ class LayerwiseTransferOp(TransferOp):
             transfer_type=TransferType.LAYERWISE,
             src_block_ids=np.array([], dtype=np.int64),
             dst_block_ids=np.array([], dtype=np.int64),
-            layer_id=layer_id,
-            layer_granularity=layer_granularity,
-            dp_rank=dp_rank,
-            pp_rank=pp_rank,
+            dp_client_id=dp_client_id,
         )
 
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        if self.layer_granularity == -1:
-            flexkv_logger.warning("layer_granularity is not set, using default value 1")
-            self.layer_granularity = 1
         assert self.src_block_ids_h2d.size == self.dst_block_ids_h2d.size
         assert self.src_block_ids_disk2h.size == self.dst_block_ids_disk2h.size
         assert self.indexer_src_block_ids.size == self.indexer_dst_block_ids.size
@@ -318,16 +300,6 @@ class TransferOpGraph:
     def num_ops(self) -> int:
         return len(self._op_map)
 
-    def bind_to_worker(self, dp_rank: int, pp_rank: int) -> None:
-        """Bind all ops in this graph to the specified DP group and PP stage.
-
-        Both fields are always set together because they jointly determine
-        which worker (GPU) handles the transfer.
-        """
-        for op in self._op_map.values():
-            op.dp_rank = dp_rank
-            op.pp_rank = pp_rank
-
     def visualize(self) -> str:
         """
         Visualize the transfer op graph in a readable format.
@@ -382,7 +354,7 @@ class TransferOpGraph:
                 dst_str = format_blocks(op.dst_block_ids)
                 lines.append(f"║     ├─ src_blocks:   {src_str}".ljust(71) + "║")
                 lines.append(f"║     ├─ dst_blocks:   {dst_str}".ljust(71) + "║")
-                lines.append(f"║     └─ layer_id={op.layer_id}, dp_rank={op.dp_rank}, pp_rank={op.pp_rank}".ljust(71) + "║")
+                lines.append(f"║     └─ dp_client_id={op.dp_client_id}".ljust(71) + "║")
             else:
                 lines.append("║     └─ (VIRTUAL - no blocks)".ljust(71) + "║")
 
@@ -424,10 +396,7 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
         transfer_type=transfer_type,
         src_block_ids=src_blocks,
         dst_block_ids=dst_blocks,
-        layer_id=ops[0].layer_id,
-        layer_granularity=ops[0].layer_granularity,
-        dp_rank=ops[0].dp_rank,
-        pp_rank=ops[0].pp_rank,
+        dp_client_id=ops[0].dp_client_id,
     )
     if callbacks:
         if len(callbacks) == 1:
@@ -511,10 +480,7 @@ def merge_to_batch_graph(batch_id: int,
                 dst_block_ids_disk2h=merged_disk2h_op.dst_block_ids \
                     if merged_disk2h_op is not None \
                     else np.array([], dtype=np.int64),
-                layer_id=0,
-                layer_granularity=1,
-                dp_rank=ops_by_type[TransferType.H2D][0].dp_rank,
-                pp_rank=ops_by_type[TransferType.H2D][0].pp_rank,
+                dp_client_id=ops_by_type[TransferType.H2D][0].dp_client_id,
                 counter_id=counter_id,
                 # Indexer maps 1:1 with main KV blocks, use same block_ids
                 # CPU side (src) and GPU side (dst) for H2D direction

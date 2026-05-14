@@ -105,10 +105,7 @@ class RemoteSSD2HMetaInfo:
     peer_cpu_base_ptr: int # the cpu buffer base ptr of the peer node, used for calculating the dst ptrs.
     peer_zmq_status_addr: str
     data_size: int
-    layer_id: int
-    layer_granularity: int
-    
-    def __init__(self, task_id, cpu_block_ids, ssd_block_ids, peer_engine_addr, peer_cpu_base_ptr, peer_zmq_status_addr, data_size, layer_id, layer_granularity):
+    def __init__(self, task_id, cpu_block_ids, ssd_block_ids, peer_engine_addr, peer_cpu_base_ptr, peer_zmq_status_addr, data_size):
         self.task_id = task_id
         self.cpu_block_ids = cpu_block_ids
         self.ssd_block_ids = ssd_block_ids
@@ -116,8 +113,6 @@ class RemoteSSD2HMetaInfo:
         self.peer_cpu_base_ptr = peer_cpu_base_ptr
         self.peer_zmq_status_addr = peer_zmq_status_addr
         self.data_size = data_size
-        self.layer_id = layer_id
-        self.layer_granularity = layer_granularity
 
     @classmethod
     def from_dict(self, data: dict) -> "RemoteSSD2HMetaInfo":
@@ -129,8 +124,6 @@ class RemoteSSD2HMetaInfo:
             peer_cpu_base_ptr = data.get("peer_cpu_base_ptr"),
             peer_zmq_status_addr = data.get("peer_zmq_status_addr"),
             data_size=data.get("data_size"),
-            layer_id = data.get("layer_id"),
-            layer_granularity = data.get("layer_granularity")
         )
     def to_dict(self) -> dict:
         return {
@@ -141,8 +134,6 @@ class RemoteSSD2HMetaInfo:
             "peer_cpu_base_ptr": self.peer_cpu_base_ptr,
             "peer_zmq_status_addr": self.peer_zmq_status_addr,
             "data_size": self.data_size,
-            "layer_id": self.layer_id,
-            "layer_granularity": self.layer_granularity,
         }
         
 class NodeMetaInfo:
