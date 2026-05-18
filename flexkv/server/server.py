@@ -21,6 +21,7 @@ from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.kvtask import KVTaskEngine
 from flexkv.server.utils import get_zmq_socket
+from flexkv.gpu_backend import current_backend as _gpu_backend
 from flexkv.server.request import (
     RegisterDPClientRequest,
     RegisterTPClientRequest,
@@ -250,8 +251,10 @@ class KVServer:
                     if key.startswith("FLEXKV_") and key not in env:
                         env[key] = val
             
-            # Remove CUDA_VISIBLE_DEVICES so server can see all GPUs
-            env.pop('CUDA_VISIBLE_DEVICES', None)
+            # Remove vendor-specific GPU visibility masks so the server
+            # subprocess can see all GPUs (CUDA_VISIBLE_DEVICES /
+            # HIP_VISIBLE_DEVICES / MUSA_VISIBLE_DEVICES / ...).
+            _gpu_backend.strip_visible_devices(env)
             env.update({"FLEXKV_INSTANCE_NUM": str(total_clients // model_config.dp_size)})
             # Serialize arguments
             args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port, total_clients))

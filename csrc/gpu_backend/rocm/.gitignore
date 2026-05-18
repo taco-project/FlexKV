@@ -1,0 +1,5 @@
+# ROCm-specific build artifacts.
+# When FLEXKV_GPU_BACKEND=rocm, RocmBuilder.configure_env() will write
+# hipified .cu/.cuh files here. They are regenerated on every build and
+# should never be checked in.
+.hipified/

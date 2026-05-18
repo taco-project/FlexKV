@@ -76,3 +76,7 @@ cover/
 
 # logs
 *.log
+
+# FlexKV GPU backend abstraction (P3/P4)
+# Hipify-generated ROCm sources; rebuilt on every install.
+csrc/gpu_backend/rocm/.hipified/

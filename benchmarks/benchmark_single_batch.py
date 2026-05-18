@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from flexkv.gpu_backend import current_backend as _gpu_backend
+
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
@@ -67,9 +69,9 @@ def benchmark_flexkv(model_config: ModelConfig,
                      cache_config: CacheConfig,
                      benchmark_config: BenchmarkConfig,
                      ):
-    if model_config.tp_size * model_config.dp_size > torch.cuda.device_count():
+    if model_config.tp_size * model_config.dp_size > _gpu_backend.device_count():
         raise ValueError(f"tp_size {model_config.tp_size} * dp_size {model_config.dp_size} is greater than "
-                         f"the number of available GPUs {torch.cuda.device_count()}")
+                         f"the number of available GPUs {_gpu_backend.device_count()}")
     print(f"{benchmark_config = }")
     kvmanager = KVManager(model_config, cache_config)
     kvmanager.start()

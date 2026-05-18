@@ -11,7 +11,6 @@ from multiprocessing.connection import Connection
 from threading import Thread
 from typing import List, Any, Dict, Union, Optional, Tuple
 
-import ctypes
 import numpy as np
 import nvtx
 import torch
@@ -19,6 +18,7 @@ import zmq
 import json
 
 from flexkv import c_ext
+from flexkv.gpu_backend import current_backend as _gpu_backend
 
 from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
 
@@ -66,21 +66,15 @@ except ImportError:
     shared_transfer_kv_blocks_remote_read = None
 
 
-cudart = ctypes.CDLL('libcudart.so')
+cudart = None  # Deprecated: kept as None for backward compatibility; use _gpu_backend instead.
 
 def cudaHostRegister(tensor: torch.Tensor) -> None:
-    """Register a CPU tensor with CUDA for pinned memory access"""
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 1) # 1 means cudaHostRegisterPortable
-    if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+    """Register a CPU tensor with the active GPU backend for pinned memory access."""
+    _gpu_backend.register_host_tensor(tensor)
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
-    """Unregister a CPU tensor from CUDA for pinned memory access"""
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
+    """Unregister a CPU tensor from the active GPU backend."""
+    _gpu_backend.unregister_host_tensor(tensor)
 
 @dataclass
 class WorkerTransferOp:
@@ -369,8 +363,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
         # set GPU device
         if gpu_device_id != -1:
-            torch.cuda.set_device(gpu_device_id)
-        self.transfer_stream = torch.cuda.Stream()
+            _gpu_backend.set_device(gpu_device_id)
+        self.transfer_stream = _gpu_backend.create_stream()
         self.transfer_num_cta_h2d = transfer_num_cta_h2d
         self.transfer_num_cta_d2h = transfer_num_cta_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
@@ -443,7 +437,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
-        with torch.cuda.stream(self.transfer_stream):
+        with _gpu_backend.stream_context(self.transfer_stream):
             start_time = time.time()
             self._transfer_impl(
                 src_block_ids,
@@ -1081,8 +1075,8 @@ class GDSTransferWorker(TransferWorkerBase):
         # Set GPU device and create stream
         self.gpu_device_id = gpu_device_id
         if gpu_device_id != -1:
-            torch.cuda.set_device(gpu_device_id)
-        self.transfer_stream = torch.cuda.Stream()
+            _gpu_backend.set_device(gpu_device_id)
+        self.transfer_stream = _gpu_backend.create_stream()
 
     def _transfer_impl(
         self,
@@ -1167,7 +1161,7 @@ class GDSTransferWorker(TransferWorkerBase):
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
-        with torch.cuda.stream(self.transfer_stream):
+        with _gpu_backend.stream_context(self.transfer_stream):
             start_time = time.time()
             self._transfer_impl(
                 src_block_ids,
@@ -1488,8 +1482,8 @@ class NixlTransferWorker(TransferWorkerBase):
             self.chunk_size_in_bytes = self.gpu_chunk_size_in_bytes
             self.gpu_device_id = gpu_device_id
             if gpu_device_id != -1:
-                torch.cuda.set_device(gpu_device_id)
-            self.transfer_stream = torch.cuda.Stream()
+                _gpu_backend.set_device(gpu_device_id)
+            self.transfer_stream = _gpu_backend.create_stream()
             if not self._session.prepare_all_ssd_files(self.ssd_files):
                 raise RuntimeError("NIXL: prepare_all_ssd_files failed")
             if not self._session.prepare_vram_gpu(self.gpu_blocks):
@@ -1609,7 +1603,7 @@ class NixlTransferWorker(TransferWorkerBase):
             )
             if not ok:
                 raise RuntimeError("NIXL GDS_MT transfer failed")
-            torch.cuda.synchronize()
+            _gpu_backend.synchronize()
         else:
             base = self.cpu_blocks.data_ptr()
             dram_ptr_len: List[Tuple[int, int]] = []
@@ -1666,7 +1660,7 @@ class NixlTransferWorker(TransferWorkerBase):
 
         # GDS_MT runs NIXL VRAM xfers on a dedicated stream; POSIX/3FS are CPU-only.
         stream_ctx = (
-            torch.cuda.stream(self.transfer_stream)
+            _gpu_backend.stream_context(self.transfer_stream)
             if self.nixl_backend in NIXL_GPU_FILE_BACKENDS
             else contextlib.nullcontext()
         )

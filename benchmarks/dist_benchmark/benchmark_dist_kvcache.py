@@ -50,6 +50,8 @@ from dataclasses import dataclass
 import torch
 import numpy as np
 
+from flexkv.gpu_backend import current_backend as _gpu_backend
+
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.config import (
@@ -485,10 +487,10 @@ def main(args):
     # Add some extra blocks for safety
     num_gpu_blocks = int(num_gpu_blocks * 1.5) + 64
 
-    if model_config.tp_size * model_config.dp_size > torch.cuda.device_count():
+    if model_config.tp_size * model_config.dp_size > _gpu_backend.device_count():
         raise ValueError(
             f"tp_size {model_config.tp_size} * dp_size {model_config.dp_size} > "
-            f"available GPUs {torch.cuda.device_count()}"
+            f"available GPUs {_gpu_backend.device_count()}"
         )
 
     print("=" * 60)

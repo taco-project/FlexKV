@@ -3,34 +3,19 @@ import os
 import time
 from typing import Callable, Any, Optional, Tuple, Union
 from dataclasses import dataclass
-import ctypes
 
 import torch
 import torch.multiprocessing.reductions as reductions
 import zmq
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.gpu_backend import current_backend as _gpu_backend
 
-
-class cudaIpcMemHandle_t(ctypes.Structure):
-    _fields_ = [("reserved", ctypes.c_byte * 64)]
-
-
-# Load CUDA runtime library
-try:
-    cudart = ctypes.CDLL("libcudart.so")
-except:
-    try:
-        cudart = ctypes.CDLL("libcudart.so.12")
-    except:
-        cudart = ctypes.CDLL("libcudart.so.11")
-
-# CUDA IPC handle size (64 bytes on Linux)
-CUDA_IPC_HANDLE_SIZE = 64
-
-# CUDA error codes
-cudaSuccess = 0
-cudaErrorInvalidValue = 11
+# GPU IPC handle size (64 bytes on Linux for CUDA, HIP and MUSA, all of
+# which share the same opaque-handle ABI). The legacy name is preserved
+# for back-compat with external callers that import this constant.
+GPU_IPC_HANDLE_SIZE = 64
+CUDA_IPC_HANDLE_SIZE = GPU_IPC_HANDLE_SIZE  # legacy alias
 
 
 @dataclass
@@ -91,8 +76,16 @@ class TensorSharedHandle:
         device_id: int,
         force_direct_ipc: bool,
     ) -> None:
-        if not tensor.is_cuda:
-            raise ValueError("Only support CUDA tensor sharing")
+        # Validate tensor against the active GPU backend (CUDA / HIP / MUSA).
+        # We deliberately avoid hard-coding ``tensor.is_cuda`` because MUSA
+        # tensors report ``is_cuda == False`` even though they are GPU
+        # tensors from FlexKV's perspective.
+        if not _gpu_backend.is_gpu_tensor(tensor):
+            raise ValueError(
+                f"Only support GPU tensor sharing, got tensor on device "
+                f"{tensor.device} but active backend is "
+                f"{_gpu_backend.device_name()}"
+            )
 
         if not force_direct_ipc:
             ## Try PyTorch's built-in method first
@@ -105,7 +98,7 @@ class TensorSharedHandle:
                 if device_id == -1:
                     self.device = tensor_device_id
                 else:
-                    self.device = torch.device(f"cuda:{device_id}")
+                    self.device = _gpu_backend.make_device(device_id)
                     tmp_list = list(self.rebuild_args)
                     tmp_list[6] = device_id
                     self.rebuild_args = tuple(tmp_list)
@@ -118,23 +111,25 @@ class TensorSharedHandle:
                 flexkv_logger.info("Attempting direct CUDA IPC export...")
 
         try:
-            ## Try direct CUDA IPC export
-            self.ipc_handle = self._export_cuda_ipc_handle(tensor)
+            ## Try direct GPU IPC export via the active GPU backend
+            self.ipc_handle = _gpu_backend.get_ipc_handle(tensor)
             self.use_direct_ipc = True
             self.tensor_shape = tuple(tensor.shape)
             self.tensor_dtype = tensor.dtype
             self.tensor_numel = tensor.numel()
-            self.device = (
-                tensor.device if device_id == -1 else torch.device(f"cuda:{device_id}")
+            target_device = (
+                tensor.device if device_id == -1
+                else _gpu_backend.make_device(device_id)
             )
+            self.device = target_device
             self.rebuild_func = None
             self.rebuild_args = None
             self.offset = 0    ## only used when constructing from direct ipc handle
             flexkv_logger.info(
-                f"Tensor exported via direct CUDA IPC: tensor.device={tensor.device}, passed device_id={device_id}, final self.device={self.device}"
+                f"Tensor exported via direct GPU IPC: tensor.device={tensor.device}, passed device_id={device_id}, final self.device={self.device}"
             )
         except Exception as e:
-            raise RuntimeError(f"Both PyTorch and direct CUDA IPC export failed: {e}")
+            raise RuntimeError(f"Both PyTorch and direct GPU IPC export failed: {e}")
 
     def _init_from_ipc_handle(
         self,
@@ -164,7 +159,7 @@ class TensorSharedHandle:
         for dim in resolved_shape:
             numel *= dim
         self.tensor_numel = numel
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = _gpu_backend.make_device(device_id)
         self.rebuild_func = None
         self.rebuild_args = None
         self.offset = offset
@@ -332,46 +327,20 @@ class TensorSharedHandle:
             cuda_interface = CudaArrayInterface(data_ptr, shape, TYPESTR_MAP[dtype], strides)
             return torch.as_tensor(cuda_interface, dtype=dtype, device=device)
 
-    ## Export CUDA IPC handle
+    ## Export GPU IPC handle (delegates to the active GPU backend)
     @staticmethod
     def _export_cuda_ipc_handle(tensor: torch.Tensor) -> bytes:
-        """
-        Use CUDA IPC API to export the tensor's IPC handle
-        """
-        # Get device pointer
-        data_ptr = tensor.data_ptr()
-        device = tensor.device
-
+        """Use the active GPU backend to export the tensor's IPC handle."""
         flexkv_logger.debug(
-            f"Exporting CUDA IPC handle: device={device}, data_ptr={hex(data_ptr)}"
+            f"Exporting GPU IPC handle: device={tensor.device}, data_ptr={hex(tensor.data_ptr())}"
         )
-
-        # Ensure we're on the correct device
-        torch.cuda.set_device(device)
-
-        # Create IPC handle buffer
-        # ipc_handle = ctypes.create_string_buffer(CUDA_IPC_HANDLE_SIZE)
-        ipc_handle = cudaIpcMemHandle_t()
-
-        # Call cudaIpcGetMemHandle
-        result = cudart.cudaIpcGetMemHandle(
-            ctypes.byref(ipc_handle), ctypes.c_void_p(data_ptr)
-        )
-
-        if result != cudaSuccess:
-            error_msg = f"cudaIpcGetMemHandle failed with error code {result} for device {device}, ptr={hex(data_ptr)}"
-            flexkv_logger.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        # Return handle as bytes
-        # handle_bytes = bytes(ipc_handle.raw)
-        handle_bytes = ctypes.string_at(ctypes.byref(ipc_handle), 64)
+        handle_bytes = _gpu_backend.get_ipc_handle(tensor)
         flexkv_logger.debug(
             f"IPC handle exported successfully, first 16 bytes: {handle_bytes.hex()}"
         )
         return handle_bytes
 
-    ## Import CUDA IPC handle
+    ## Import GPU IPC handle (delegates to the active GPU backend)
     @staticmethod
     def _import_cuda_ipc_handle(
         ipc_handle: bytes,
@@ -380,67 +349,15 @@ class TensorSharedHandle:
         device: torch.device,
         offset: int = 0,
     ) -> torch.Tensor:
-        """
-        Using CUDA IPC API to import the tensor from the IPC handle
-        
-        Args:
-            ipc_handle: CUDA IPC memory handle (bytes)
-            shape: Tensor shape
-            dtype: Tensor dtype
-            device: Target CUDA device
-            offset: Offset in bytes from the base pointer (for memory pool allocations)
-        """
-        # Ensure CUDA is initialized in this process
-        if not torch.cuda.is_initialized():
-            flexkv_logger.info("Initializing CUDA in subprocess")
-            torch.cuda.init()
-
-        # Set device and create a dummy tensor to ensure context is created
+        """Use the active GPU backend to import a tensor from an IPC handle."""
         device_id = device.index if device.index is not None else 0
-        torch.cuda.set_device(device_id)
-
-        # Force CUDA context creation
-        _ = torch.zeros(1, device=device)
-
-        # Create IPC handle buffer
-        ipc_handle_buf = ctypes.create_string_buffer(ipc_handle, CUDA_IPC_HANDLE_SIZE)
-
-        # Rebuild IPC handle
-        handle = cudaIpcMemHandle_t()
-        ctypes.memmove(ctypes.byref(handle), ipc_handle, 64)
-
-        # Open IPC memory handle to get base pointer
-        base_ptr = ctypes.c_void_p()
-        result = cudart.cudaIpcOpenMemHandle(
-            ctypes.byref(base_ptr),
-            handle,
-            ctypes.c_int(1),  # cudaIpcMemLazyEnablePeerAccess = 1
+        tensor = _gpu_backend.open_ipc_handle(
+            ipc_handle, shape, dtype, device_id, offset=offset
         )
-        # Print GPU memory address for comparison with C++ side
-
-        if result != cudaSuccess:
-            error_msg = f"cudaIpcOpenMemHandle failed with error code {result} for device {device_id}"
-            flexkv_logger.error(error_msg)
-            flexkv_logger.error(f"IPC handle bytes (full): {ipc_handle.hex()}")
-            flexkv_logger.error(f"Current CUDA device: {torch.cuda.current_device()}")
-            flexkv_logger.error(f"Target device: {device_id}")
-            raise RuntimeError(error_msg)
-
-        # Calculate the actual data pointer: base_ptr + offset
-        data_ptr = base_ptr.value + offset
-        if offset > 0:
-            data_ptr_hex = hex(data_ptr)
-            base_ptr_hex = hex(base_ptr.value)
-            flexkv_logger.info(
-                f"_import_cuda_ipc_handle: Opened IPC handle: device={device}, base_gpu_ptr={base_ptr_hex}, offset={offset}, actual data_ptr={data_ptr_hex}"
-            )
-
-        # Create tensor from pointer using helper function
-        tensor = TensorSharedHandle._create_tensor_from_cuda_ptr(
-            data_ptr, shape, dtype, device
+        flexkv_logger.info(
+            f"Imported tensor with shape {shape} from GPU IPC handle, "
+            f"dtype={tensor.dtype}, offset={offset}"
         )
-
-        flexkv_logger.info(f"Imported tensor with shape {shape} from CUDA IPC handle, dtype={tensor.dtype}, offset={offset}")
         return tensor
 
 
@@ -458,7 +375,7 @@ def _zmq_test_worker() -> None:
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
 
-    gpu_tensor = torch.zeros(10, dtype=torch.int64, device="cuda:0")
+    gpu_tensor = torch.zeros(10, dtype=torch.int64, device=_gpu_backend.make_device(0))
     print(f"Process {os.getpid()}: tensor: {gpu_tensor}")
     gpu_handle = TensorSharedHandle(gpu_tensor, force_direct_ipc=True)
 

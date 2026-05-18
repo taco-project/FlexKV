@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Any, Tuple
 import torch
 import zmq
 
+from flexkv.gpu_backend import current_backend as _gpu_backend
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.memory_handle import TensorSharedHandle
@@ -187,7 +188,7 @@ class FlexKVReplayEngine:
         self.log("Creating GPU blocks...")
 
         total_gpus = self.model_config.tp_size * self.model_config.dp_size
-        available_gpus = torch.cuda.device_count()
+        available_gpus = _gpu_backend.device_count()
 
         if available_gpus < total_gpus:
             self.log(f"Warning: Need {total_gpus} GPUs but only {available_gpus} available. Using GPU 0 for all.")

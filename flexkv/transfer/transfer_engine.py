@@ -25,6 +25,8 @@ import contextlib
 import nvtx
 import torch
 
+from flexkv.gpu_backend import current_backend as _gpu_backend
+
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import StorageHandle
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp
@@ -590,5 +592,5 @@ class TransferEngine:
                 while not self.finished_ops_queue.empty():
                     self.finished_ops_queue.get_nowait()
 
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            _gpu_backend.empty_cache()
+            _gpu_backend.synchronize()

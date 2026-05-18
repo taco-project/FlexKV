@@ -8,6 +8,7 @@ import torch
 import multiprocessing as mp
 from multiprocessing import Process, Pipe
 
+from flexkv.gpu_backend import current_backend as _gpu_backend
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
@@ -29,10 +30,10 @@ def _fp8_cuda_ops_unavailable():
     """True if fp8 dtype exists but CUDA ops (e.g. mul_cuda) are not implemented."""
     if not hasattr(torch, "float8_e4m3fn"):
         return True
-    if not torch.cuda.is_available():
+    if not _gpu_backend.is_available():
         return False
     try:
-        t = torch.tensor([1.0], dtype=torch.float8_e4m3fn, device="cuda")
+        t = torch.tensor([1.0], dtype=torch.float8_e4m3fn, device=_gpu_backend.make_device(0))
         t.mul(1.0)
         return False
     except NotImplementedError:

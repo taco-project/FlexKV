@@ -8,6 +8,8 @@ import multiprocessing as mp
 import pytest
 import torch
 
+from flexkv.gpu_backend import current_backend as _gpu_backend
+
 from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.memory_handle import TensorSharedHandle
@@ -123,13 +125,13 @@ def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_
 
 def skip_if_insufficient_gpus(required_gpus: int):
     """Skip test if insufficient GPUs available"""
-    if torch.cuda.device_count() < required_gpus:
-        pytest.skip(f"Need at least {required_gpus} CUDA devices")
+    if _gpu_backend.device_count() < required_gpus:
+        pytest.skip(f"Need at least {required_gpus} GPU devices")
 
 def skip_if_no_cuda():
-    """Skip test if no CUDA devices available"""
-    if torch.cuda.device_count() == 0:
-        pytest.skip("No CUDA devices available")
+    """Skip test if no GPU devices available (kept for backward compat)."""
+    if _gpu_backend.device_count() == 0:
+        pytest.skip("No GPU devices available")
 
 
 class GPUKVCacheVerifier:
@@ -355,7 +357,7 @@ def gpu_blocks_worker_process(conn, model_config, cache_config, gpu_kv_layout):
                 gpu_kv_layout.num_head,
                 gpu_kv_layout.head_size,
                 dtype=model_config.dtype,
-                device='cuda:0' if torch.cuda.is_available() else 'cpu'
+                device=_gpu_backend.make_device(0) if _gpu_backend.is_available() else torch.device('cpu')
             )
             gpu_blocks.append(gpu_tensor)
 
@@ -425,7 +427,7 @@ def example_usage_gpu_kv_cache_verifier():
             gpu_kv_layout.num_head,
             gpu_kv_layout.head_size,
             dtype=model_config.dtype,
-            device='cuda:0' if torch.cuda.is_available() else 'cpu'
+            device=_gpu_backend.make_device(0) if _gpu_backend.is_available() else torch.device('cpu')
         )
         gpu_blocks.append(gpu_tensor)
 

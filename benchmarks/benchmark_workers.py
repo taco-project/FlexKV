@@ -9,6 +9,8 @@ import copy
 
 import torch
 
+from flexkv.gpu_backend import current_backend as _gpu_backend
+
 from flexkv.common.transfer import TransferOp, TransferType
 from flexkv.transfer.worker import GPUCPUTransferWorker, CPUSSDDiskTransferWorker, WorkerHandle, tpGPUCPUTransferWorker, \
     GDSTransferWorker, tpGDSTransferWorker
@@ -104,7 +106,7 @@ def create_cpu_gpu_worker(
     )
     gpu_handles = []
     for tp_id in range(model_config.tp_size):
-        torch.cuda.set_device(tp_id)
+        _gpu_backend.set_device(tp_id)
         gpu_handles.append(GPUAllocator.allocate(
             layout=gpu_layout,
             dtype=model_config.dtype,
@@ -257,7 +259,7 @@ def create_gpu_ssd_worker(
 
     gpu_handles = []
     for tp_id in range(model_config.tp_size):
-        torch.cuda.set_device(tp_id)
+        _gpu_backend.set_device(tp_id)
         gpu_handles.append(GPUAllocator.allocate(
             layout=gpu_layout,
             dtype=model_config.dtype,
@@ -332,9 +334,9 @@ def bench_worker(args):
     print(f"model_config: {model_config}")
     print(f"cache_config: {cache_config}")
     print(f"bench_config: {bench_config}")
-    if model_config.tp_size > torch.cuda.device_count():
+    if model_config.tp_size > _gpu_backend.device_count():
         raise ValueError(f"TP size {model_config.tp_size} is greater than "
-                         f"the number of GPUs {torch.cuda.device_count()}")
+                         f"the number of GPUs {_gpu_backend.device_count()}")
     warmup_round = bench_config.warmup_round
     benchmark_round = bench_config.benchmark_round
     transfer_type = bench_config.transfer_type

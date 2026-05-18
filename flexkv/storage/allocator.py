@@ -9,6 +9,7 @@ except ImportError:
 import numpy as np
 import torch
 
+from flexkv.gpu_backend import current_backend as _gpu_backend
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
@@ -44,8 +45,8 @@ class GPUAllocator(BaseStorageAllocator):
                  layout: KVCacheLayout,
                  dtype: torch.dtype,
                  **kwargs: Any) -> StorageHandle:
-        device_id = kwargs.get("device_id", torch.cuda.current_device())
-        device = f"cuda:{device_id}"
+        device_id = kwargs.get("device_id", _gpu_backend.current_device())
+        device = str(_gpu_backend.make_device(device_id))
         num_chunks = kwargs.get("num_chunks", 1)
 
         total_size = layout.get_total_elements()

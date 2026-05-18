@@ -28,6 +28,7 @@ from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import RegisterTPClientRequest, Response
+from flexkv.gpu_backend import current_backend as _gpu_backend
 
 
 class TransferManager:
@@ -385,12 +386,18 @@ class TransferManagerOnRemote(TransferManager):
 
         # Prepare environment - remove MPI-related variables to avoid conflicts
         env = os.environ.copy()
-        # CRITICAL: Remove CUDA_VISIBLE_DEVICES to allow access to all GPUs
-        # TransferManager needs to access all physical GPUs for IPC
-        if 'CUDA_VISIBLE_DEVICES' in env:
-            flexkv_logger.info(f"Removing CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} "
-                               "for TransferManager subprocess")
-            env.pop('CUDA_VISIBLE_DEVICES', None)
+        # CRITICAL: Remove the GPU visibility mask(s) so that the
+        # TransferManager subprocess can access *all* physical GPUs (it
+        # needs to do cross-device IPC). The mask names are vendor-specific
+        # (CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES / MUSA_VISIBLE_DEVICES
+        # / ...), so we delegate to the active GPU backend.
+        for _mask_name in _gpu_backend.visible_devices_env_vars():
+            if _mask_name in env:
+                flexkv_logger.info(
+                    f"Removing {_mask_name}={env[_mask_name]} "
+                    f"for TransferManager subprocess"
+                )
+        _gpu_backend.strip_visible_devices(env)
 
         # Create the subprocess script
         transfer_manager_script = textwrap.dedent(f'''

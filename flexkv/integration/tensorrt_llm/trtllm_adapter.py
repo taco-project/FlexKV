@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 import torch
 import traceback
+from flexkv.gpu_backend import current_backend as _gpu_backend
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -528,7 +529,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         flexkv_config.post_init_from_trt_config(config)
         dp_client_id = self.dp_rank
         
-        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
+        current_device_id = _gpu_backend.current_device() + dp_client_id * flexkv_config.model_config.tp_size
         self.flexkv_config = flexkv_config
         
         # For multi-node TP on remote node (node B), worker0 needs to create TransferManagerOnRemote process
@@ -556,7 +557,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         try:
             is_master_node = self.node_rank == 0
             is_first_worker = self.tp_rank % 8 == 0
-            is_multinode_tp = self.flexkv_config.model_config.tp_size > torch.cuda.device_count()
+            is_multinode_tp = self.flexkv_config.model_config.tp_size > _gpu_backend.device_count()
             flexkv_logger.info(f"{is_master_node=}, {is_first_worker=}, {is_multinode_tp=}")
             
             return is_multinode_tp and not is_master_node and is_first_worker
@@ -582,16 +583,16 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         flexkv_logger.debug(f"Tensor is on device: {kv_cache_tensor.device}, logical device.index={logical_device_id}")
         flexkv_logger.debug(f"self.tp_client.device_id (from init): {self.tp_client.device_id}")
         
-        # Get physical GPU ID (in case CUDA_VISIBLE_DEVICES is set)
-        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-        if cuda_visible_devices:
+        # Get physical GPU ID (in case the vendor's visibility mask is set,
+        # e.g. CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES / ...).
+        visible_gpus = _gpu_backend.get_visible_device_map()
+        if visible_gpus is not None:
             # Map logical ID to physical ID
-            visible_gpus = [int(x) for x in cuda_visible_devices.split(',')]
             physical_device_id = visible_gpus[logical_device_id] if logical_device_id < len(visible_gpus) else logical_device_id
-            flexkv_logger.debug(f"CUDA_VISIBLE_DEVICES={cuda_visible_devices}, mapping logical {logical_device_id} -> physical {physical_device_id}")
+            flexkv_logger.debug(f"visibility mask={visible_gpus}, mapping logical {logical_device_id} -> physical {physical_device_id}")
         else:
             physical_device_id = logical_device_id
-            flexkv_logger.debug(f"No CUDA_VISIBLE_DEVICES set, using logical device ID {logical_device_id}")
+            flexkv_logger.debug(f"No GPU visibility mask set, using logical device ID {logical_device_id}")
         
         # Use physical device ID for registration
         correct_device_id = physical_device_id
@@ -624,16 +625,16 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         self.tp_client.register_to_server(gpu_blocks, gpu_layout, override_device_id=correct_device_id)
         flexkv_logger.info(f"Finish register kv_caches on device {correct_device_id}")
 
-    def start_load_kv(self, stream: torch.cuda.Stream):
+    def start_load_kv(self, stream: Any):
         return
         
-    def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
+    def wait_for_layer_load(self, layer_idx: int, stream: Any):
         return
     
-    def save_kv_layer(self, layer_idx: int, stream: torch.cuda.Stream):
+    def save_kv_layer(self, layer_idx: int, stream: Any):
         return
 
-    def wait_for_save(self, stream: torch.cuda.Stream):
+    def wait_for_save(self, stream: Any):
         return
     
     def get_finished(
