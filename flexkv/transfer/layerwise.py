@@ -8,7 +8,8 @@ from typing import List, Any, Dict, Union, Optional, Tuple
 
 import torch
 
-from flexkv.c_ext import LayerwiseTransferGroup
+from flexkv import c_ext
+from flexkv.c_ext import LayerwiseTransferGroup, transfer_kv_blocks_ssd
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -94,6 +95,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             f"enable_eventfd={enable_eventfd}, "
             f"num_gpu_blocks={[len(b) for b in gpu_blocks]}")
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self.use_torch_copy_fallback = GLOBAL_CONFIG_FROM_ENV.use_torch_copy
         assert len(gpu_blocks) == tp_group_size, f"len(gpu_blocks) = {len(gpu_blocks)}, tp_group_size = {tp_group_size}"
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         imported_gpu_blocks = []
@@ -109,6 +111,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
+        self.cpu_kv_layout = cpu_kv_layout
+        self.gpu_kv_layouts = gpu_kv_layouts
         # Pre-computed UDS socket path.  Both ends (this worker and the
         # sglang connector) derive the path from the same ModelConfig
         # fields (pp_rank / dp_rank / node_rank / is_multinode_tp), so no
@@ -131,9 +135,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         if num_blocks_first_gpu == 1:
             self.gpu_block_type_ = 1  # TRTLLM
         elif num_blocks_first_gpu == self.num_layers:
-            self.gpu_block_type_ = 0  # VLLM
+            self.gpu_block_type_ = 0  # VLLM / MLA (MLA special-cased in copy logic)
         elif num_blocks_first_gpu == self.num_layers * 2:
-            self.gpu_block_type_ = 2  # SGLANG
+            self.gpu_block_type_ = 2  # SGLANG non-MLA
         else:
             raise ValueError(f"Invalid GPU block type: {num_blocks_first_gpu}")
 
@@ -143,12 +147,14 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         else:
             layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
         flexkv_logger.debug(f"[LayerwiseWorker] Eventfds received, tensor shape={layer_eventfds_tensor.shape}")
+        self._layer_eventfds_tensor = layer_eventfds_tensor
 
         # initialize CPU storage
         flexkv_logger.info(f"[LayerwiseWorker] Pinning CPU Memory: "
                            f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        cudaHostRegister(cpu_blocks)
-        flexkv_logger.debug("[LayerwiseWorker] CPU memory pinned successfully")
+        if not self.use_torch_copy_fallback:
+            cudaHostRegister(cpu_blocks)
+            flexkv_logger.debug("[LayerwiseWorker] CPU memory pinned successfully")
         self.cpu_blocks = cpu_blocks
 
         self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
@@ -218,7 +224,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             flexkv_logger.info(
                 f"[LayerwiseWorker] Pinning indexer CPU Memory: "
                 f"{indexer_cpu_blocks.numel() * indexer_cpu_blocks.element_size() / (1024 ** 3):.4f} GB")
-            cudaHostRegister(indexer_cpu_blocks)
+            if not self.use_torch_copy_fallback:
+                cudaHostRegister(indexer_cpu_blocks)
 
             # Compute indexer GPU stride tensors
             indexer_gpu_kv_strides = [layout.get_kv_stride() * indexer_dtype.itemsize
@@ -296,18 +303,51 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.indexer_ssd_layer_stride_in_bytes = 0
             self.indexer_cpu_chunk_size_in_bytes = 0
 
-        self.layerwise_transfer_group = LayerwiseTransferGroup(
-            self.num_gpus, self.gpu_blocks, cpu_blocks, ssd_files,
-            self.num_layers,
-            gpu_kv_strides_tensor, gpu_block_strides_tensor,
-            gpu_layer_strides_tensor, gpu_chunk_sizes_tensor,
-            GLOBAL_CONFIG_FROM_ENV.iouring_entries,
-            GLOBAL_CONFIG_FROM_ENV.iouring_flags,
-            layer_eventfds_tensor, tp_group_size,
-            self.indexer_gpu_blocks, self.indexer_cpu_blocks,
-            self.indexer_gpu_kv_strides_tensor, self.indexer_gpu_block_strides_tensor,
-            self.indexer_gpu_layer_strides_tensor, self.indexer_gpu_chunk_sizes_tensor,
-            self.indexer_ssd_files)
+        if not self.use_torch_copy_fallback:
+            self.layerwise_transfer_group = LayerwiseTransferGroup(
+                self.num_gpus, self.gpu_blocks, cpu_blocks, ssd_files,
+                self.num_layers,
+                gpu_kv_strides_tensor, gpu_block_strides_tensor,
+                gpu_layer_strides_tensor, gpu_chunk_sizes_tensor,
+                GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+                GLOBAL_CONFIG_FROM_ENV.iouring_flags,
+                layer_eventfds_tensor, tp_group_size,
+                self.indexer_gpu_blocks, self.indexer_cpu_blocks,
+                self.indexer_gpu_kv_strides_tensor, self.indexer_gpu_block_strides_tensor,
+                self.indexer_gpu_layer_strides_tensor, self.indexer_gpu_chunk_sizes_tensor,
+                self.indexer_ssd_files)
+        else:
+            # TorchCopy mode: skip LayerwiseTransferGroup (relies on custom CUDA kernels).
+            # SSD->CPU still uses the native io_uring path (transfer_kv_blocks_ssd),
+            # which is GPU-independent and works on hardware without custom kernel support.
+            flexkv_logger.info(
+                "[LayerwiseWorker] TorchCopy mode: skipping LayerwiseTransferGroup, "
+                "SSD->CPU will use native transfer_kv_blocks_ssd")
+            if self.enable_ssd:
+                try:
+                    self.ioctx = c_ext.SSDIOCTX(
+                        ssd_files, len(ssd_files),
+                        GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+                        GLOBAL_CONFIG_FROM_ENV.iouring_flags,
+                    )
+                except Exception as e:
+                    flexkv_logger.error(f"[LayerwiseWorker TorchCopy] init SSDIOCTX failed: {e}")
+                    raise RuntimeError("LayerwiseWorker SSDIOCTX init failed") from e
+            else:
+                self.ioctx = None
+            if self.enable_indexer_ssd:
+                try:
+                    self.indexer_ioctx = c_ext.SSDIOCTX(
+                        self.indexer_ssd_files, len(self.indexer_ssd_files),
+                        GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+                        GLOBAL_CONFIG_FROM_ENV.iouring_flags,
+                    )
+                except Exception as e:
+                    flexkv_logger.error(
+                        f"[LayerwiseWorker TorchCopy] init indexer SSDIOCTX failed: {e}")
+                    raise RuntimeError("LayerwiseWorker indexer SSDIOCTX init failed") from e
+            else:
+                self.indexer_ioctx = None
         flexkv_logger.info(f"[LayerwiseWorker] __init__ completed successfully, worker_id={worker_id}")
 
     def _receive_eventfds_from_sglang(self, tp_group_size: int,
@@ -456,6 +496,184 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         )
         return tensor
 
+    def _get_cpu_chunk(self, cpu_view: torch.Tensor, cpu_block_id: int, layer_id: int) -> torch.Tensor:
+        """Return a single (layer, block) slice from the CPU buffer."""
+        if self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST:
+            return cpu_view[cpu_block_id, layer_id, ...]
+        return cpu_view[layer_id, :, cpu_block_id, ...]
+
+    def _write_layer_eventfds(self, counter_id: int, layer_id: int) -> None:
+        """Write eventfd for a completed layer (all TP ranks)."""
+        if self._layer_eventfds_tensor.numel() == 0:
+            return
+        # tensor layout: [num_counters * tp_size * num_layers] flat
+        # index: counter_id * tp_size * num_layers + tp_rank * num_layers + layer_id
+        for tp_rank in range(self.tp_group_size):
+            idx = counter_id * self.tp_group_size * self.num_layers + tp_rank * self.num_layers + layer_id
+            fd = int(self._layer_eventfds_tensor[idx].item())
+            if fd >= 0:
+                os.write(fd, struct.pack('Q', 1))
+
+    def _torch_copy_fallback_impl(
+        self,
+        src_block_ids_h2d: torch.Tensor,
+        dst_block_ids_h2d: torch.Tensor,
+        src_block_ids_disk2h: Optional[torch.Tensor],
+        dst_block_ids_disk2h: Optional[torch.Tensor],
+        counter_id: int = 0,
+        indexer_src_block_ids: Optional[torch.Tensor] = None,
+        indexer_dst_block_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Pure-PyTorch layerwise fallback for CPU->GPU transfer.
+
+        SSD->CPU still uses the native io_uring path (transfer_kv_blocks_ssd),
+        which is GPU-independent and unaffected by missing custom CUDA kernels.
+        Only CPU->GPU is replaced by torch.copy_() to avoid the unsupported kernel.
+        """
+        # Step 1: SSD -> CPU (native io_uring path, runs all layers in one shot)
+        if (self.enable_ssd and self.ioctx is not None and
+                src_block_ids_disk2h is not None and len(src_block_ids_disk2h) > 0):
+            layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
+            transfer_kv_blocks_ssd(
+                ioctx=self.ioctx,
+                cpu_layer_id_list=layer_id_list,
+                cpu_tensor_ptr=self.cpu_blocks.data_ptr(),
+                ssd_block_ids=src_block_ids_disk2h,
+                cpu_block_ids=dst_block_ids_disk2h,
+                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
+                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
+                ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
+                ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
+                chunk_size_in_bytes=self.cpu_chunk_size_in_bytes,
+                block_stride_in_bytes=self.cpu_block_stride_in_bytes,
+                is_read=True,
+                num_blocks_per_file=self.num_blocks_per_file,
+                round_robin=self.round_robin,
+                num_threads_per_device=32,
+                is_mla=self.is_mla,
+            )
+
+        # Indexer SSD -> CPU (native io_uring path)
+        if (self.enable_indexer_ssd and self.indexer_ioctx is not None and
+                src_block_ids_disk2h is not None and len(src_block_ids_disk2h) > 0):
+            layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
+            transfer_kv_blocks_ssd(
+                ioctx=self.indexer_ioctx,
+                cpu_layer_id_list=layer_id_list,
+                cpu_tensor_ptr=self.indexer_cpu_blocks.data_ptr(),
+                ssd_block_ids=src_block_ids_disk2h,
+                cpu_block_ids=dst_block_ids_disk2h,
+                cpu_layer_stride_in_bytes=self.indexer_cpu_layer_stride_in_bytes,
+                cpu_kv_stride_in_bytes=self.indexer_ssd_kv_stride_in_bytes,
+                ssd_layer_stride_in_bytes=self.indexer_ssd_layer_stride_in_bytes,
+                ssd_kv_stride_in_bytes=self.indexer_ssd_kv_stride_in_bytes,
+                chunk_size_in_bytes=self.indexer_cpu_chunk_size_in_bytes,
+                block_stride_in_bytes=self.indexer_cpu_block_stride_in_bytes,
+                is_read=True,
+                num_blocks_per_file=self.indexer_num_blocks_per_file,
+                round_robin=self.round_robin,
+                num_threads_per_device=32,
+                is_mla=True,  # indexer always MLA
+            )
+
+        # Step 2: CPU -> GPU (per-layer torch.copy_ + per-layer eventfd notify)
+        # Synchronous copy_() ensures each layer is fully on GPU before we
+        # fire its eventfd, so sglang only sees data after it's actually ready.
+        if len(src_block_ids_h2d) == 0:
+            return
+
+        cpu_view = self.cpu_blocks.view(tuple(self.cpu_kv_layout.kv_shape))
+
+        for i in range(len(src_block_ids_h2d)):
+            cpu_bid = int(src_block_ids_h2d[i].item())
+            gpu_bid = int(dst_block_ids_h2d[i].item())
+            for lay in range(self.num_layers):
+                cpu_chunk = self._get_cpu_chunk(cpu_view, cpu_bid, lay)
+                for gpu_idx in range(self.num_gpus):
+                    gpu_blocks_for_rank = self.gpu_blocks[gpu_idx]
+                    heads_per_rank = self.gpu_kv_layouts[gpu_idx].num_head
+                    head_start = gpu_idx * heads_per_rank
+                    head_end = head_start + heads_per_rank
+
+                    if self.is_mla:
+                        # MLA: all TP ranks hold identical full copy, no head partitioning
+                        cpu_rank_chunk = cpu_chunk
+                    else:
+                        cpu_rank_chunk = cpu_chunk[..., head_start:head_end, :]
+
+                    try:
+                        if self.gpu_block_type_ == 0:
+                            if self.is_mla:
+                                # MLA: gpu tensor shape [num_blocks, tpb, head_size]
+                                # gpu_chunk shape after indexing: [tpb, head_size]
+                                # cpu_rank_chunk shape: [kv_dim=1, tpb, num_head=1, head_size]
+                                # Squeeze kv_dim and num_head to match gpu_chunk.
+                                gpu_chunk = gpu_blocks_for_rank[lay][gpu_bid]
+                                cpu_squeezed = cpu_rank_chunk.squeeze(0).squeeze(-2)
+                                gpu_chunk.copy_(cpu_squeezed, non_blocking=True)
+                                continue
+                            else:
+                                # Non-MLA: tensor shape [kv_dim, num_blocks, ...]
+                                gpu_chunk = gpu_blocks_for_rank[lay][:, gpu_bid, ...]
+                        elif self.gpu_block_type_ == 1:
+                            gpu_chunk = gpu_blocks_for_rank[0][gpu_bid, lay, ...]
+                        else:
+                            for kv_id in range(self.kv_dim):
+                                gpu_kv = gpu_blocks_for_rank[lay * self.kv_dim + kv_id][gpu_bid, ...]
+                                if self.kv_dim == 1:
+                                    cpu_kv = cpu_rank_chunk
+                                else:
+                                    cpu_kv = cpu_rank_chunk[kv_id, ...]
+                                gpu_kv.copy_(cpu_kv, non_blocking=True)
+                            continue
+                        gpu_chunk.copy_(cpu_rank_chunk, non_blocking=True)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"[LayerwiseWorker] Main KV H2D copy failed: "
+                            f"block_idx={i}, cpu_bid={cpu_bid}, gpu_bid={gpu_bid}, "
+                            f"layer={lay}, gpu_idx={gpu_idx}, gpu_block_type={self.gpu_block_type_}, "
+                            f"cpu_chunk_shape={cpu_rank_chunk.shape}, "
+                            f"gpu_tensor_shape={gpu_blocks_for_rank[lay * self.kv_dim].shape}, "
+                            f"error: {e}"
+                        ) from e
+
+                # Synchronize all GPUs for this layer before firing eventfd.
+                for gpu_idx in range(self.num_gpus):
+                    torch.cuda.synchronize(self.gpu_blocks[gpu_idx][0].device)
+                self._write_layer_eventfds(counter_id, lay)
+
+        # Indexer H2D transfer
+        if self.enable_indexer and indexer_dst_block_ids is not None and len(indexer_dst_block_ids) > 0:
+            # Simple indexer transfer (is_mla=True, no TP split)
+            # Indexer GPU blocks are per-layer 2D tensors: [num_pages, stride]
+            indexer_cpu_view = self.indexer_cpu_blocks.view(-1)
+            for i in range(len(indexer_src_block_ids)):
+                cpu_bid = int(indexer_src_block_ids[i].item())
+                gpu_bid = int(indexer_dst_block_ids[i].item())
+                for gpu_idx in range(self.num_gpus):
+                    for lay in range(len(self.indexer_gpu_blocks[gpu_idx])):
+                        gpu_t = self.indexer_gpu_blocks[gpu_idx][lay]
+                        gpu_chunk = gpu_t[gpu_bid, ...]
+                        # Compute CPU offset for indexer
+                        cs = gpu_chunk.numel()
+                        cpu_offset = lay * (self.indexer_cpu_layer_stride_in_bytes // self.dtype.itemsize) + \
+                                     cpu_bid * (self.indexer_cpu_block_stride_in_bytes // self.dtype.itemsize)
+                        cpu_chunk = indexer_cpu_view[cpu_offset:cpu_offset + cs].view(gpu_chunk.shape)
+                        try:
+                            gpu_chunk.copy_(cpu_chunk, non_blocking=True)
+                        except Exception as e:
+                            raise RuntimeError(
+                                f"[LayerwiseWorker] Indexer H2D copy failed: "
+                                f"block_idx={i}, cpu_bid={cpu_bid}, gpu_bid={gpu_bid}, "
+                                f"layer={lay}, gpu_idx={gpu_idx}, "
+                                f"cpu_chunk_shape={cpu_chunk.shape}, gpu_chunk_shape={gpu_chunk.shape}, "
+                                f"cpu_dtype={cpu_chunk.dtype}, gpu_dtype={gpu_chunk.dtype}, "
+                                f"error: {e}"
+                            ) from e
+            # Synchronize after all indexer copies
+            for gpu_idx in range(self.num_gpus):
+                torch.cuda.synchronize(self.gpu_blocks[gpu_idx][0].device)
+
     def _transfer_impl(self,
                       src_block_ids_h2d: torch.Tensor,
                       dst_block_ids_h2d: torch.Tensor,
@@ -472,6 +690,13 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             assert src_block_ids_disk2h.dtype == torch.int64
             assert dst_block_ids_disk2h.dtype == torch.int64
             assert len(src_block_ids_disk2h) == len(dst_block_ids_disk2h)
+
+        if self.use_torch_copy_fallback:
+            self._torch_copy_fallback_impl(
+                src_block_ids_h2d, dst_block_ids_h2d,
+                src_block_ids_disk2h, dst_block_ids_disk2h,
+                counter_id, indexer_src_block_ids, indexer_dst_block_ids)
+            return
 
         # Use unified layerwise transfer C++ interface
         ssd_block_ids = src_block_ids_disk2h if src_block_ids_disk2h is not None else torch.empty(0, dtype=torch.int64)
@@ -531,8 +756,12 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         )
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
-        src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
-        dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
+        if self.use_torch_copy_fallback:
+            src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64)
+            dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64)
+        else:
+            src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
+            dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
 
         if transfer_op.src_block_ids_disk2h.size > 0:
             src_block_ids_disk2h = torch.from_numpy(transfer_op.src_block_ids_disk2h).to(dtype=torch.int64)
@@ -545,10 +774,16 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         indexer_src_block_ids = None
         indexer_dst_block_ids = None
         if self.enable_indexer and transfer_op.indexer_src_block_ids.size > 0:
-            indexer_src_block_ids = torch.from_numpy(
-                transfer_op.indexer_src_block_ids).to(dtype=torch.int64).pin_memory()
-            indexer_dst_block_ids = torch.from_numpy(
-                transfer_op.indexer_dst_block_ids).to(dtype=torch.int64).pin_memory()
+            if self.use_torch_copy_fallback:
+                indexer_src_block_ids = torch.from_numpy(
+                    transfer_op.indexer_src_block_ids).to(dtype=torch.int64)
+                indexer_dst_block_ids = torch.from_numpy(
+                    transfer_op.indexer_dst_block_ids).to(dtype=torch.int64)
+            else:
+                indexer_src_block_ids = torch.from_numpy(
+                    transfer_op.indexer_src_block_ids).to(dtype=torch.int64).pin_memory()
+                indexer_dst_block_ids = torch.from_numpy(
+                    transfer_op.indexer_dst_block_ids).to(dtype=torch.int64).pin_memory()
 
         num_h2d_blocks = len(src_block_ids_h2d)
 

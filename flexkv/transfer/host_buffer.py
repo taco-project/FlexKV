@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.storage.allocator import alloc_hugepage_tensor, free_hugepage_tensor
 
 _cudart = None
@@ -37,6 +38,12 @@ def cuda_host_registration_available() -> bool:
 
 
 def cudaHostRegister(tensor: torch.Tensor) -> None:
+    if GLOBAL_CONFIG_FROM_ENV.use_torch_copy:
+        flexkv_logger.warning(
+            "[cudaHostRegister] Skipped: FLEXKV_USE_TORCH_COPY=1. "
+            "Host memory will not be pinned; H2D/D2H bandwidth may be lower."
+        )
+        return
     cudart = _get_cudart()
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
@@ -46,6 +53,8 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
 
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
+    if GLOBAL_CONFIG_FROM_ENV.use_torch_copy:
+        return
     cudart = _get_cudart()
     ptr = tensor.data_ptr()
     ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
