@@ -136,6 +136,16 @@ class KVTaskManager:
             ))
             self.transfer_handles[-1]._handle.send_config_to_remotes()
 
+        # Phase 0 task 0-G: when sharing-domain is on, replace / augment the
+        # handle list with one handle per SD (Master SD + every peer SD's
+        # Remote).  This runs after the legacy construction above so that
+        # legacy single-Remote and sharing-domain paths stay independent —
+        # the legacy branch leaves ``self.transfer_handles`` untouched when
+        # ``enable_sharing_domain`` is False.
+        self._master_coordinator = None
+        if getattr(self.cache_config, "enable_sharing_domain", False):
+            self._setup_sharing_domain_handles(gpu_register_port=gpu_register_port)
+
         self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
 
         # hash(token_ids) -> task_id
@@ -173,6 +183,203 @@ class KVTaskManager:
             self.remote_process.join()
             self.remote_process.close()
             self.remote_process = None
+        # Phase 0 task 0-G: tear down sharing-domain background threads.
+        if getattr(self, "_master_coordinator", None) is not None:
+            try:
+                # Batch-F: drop cache_engine's references before the
+                # coordinator goes away so any in-flight completion
+                # callback (_on_peer_sd_completed_op /
+                # handle_failure_report) sees a clean None instead of
+                # a half-torn-down object.
+                if hasattr(self, "cache_engine") and self.cache_engine is not None:
+                    try:
+                        self.cache_engine.detach_dist_reuse()
+                    except Exception:
+                        pass
+                self._master_coordinator.shutdown()
+            except Exception as e:
+                flexkv_logger.warning(f"MasterCoordinator.shutdown() raised: {e}")
+            self._master_coordinator = None
+
+    def _setup_sharing_domain_handles(self, *, gpu_register_port: Optional[str]) -> None:
+        """Populate ``self.transfer_handles`` with one handle per SD and
+        create a :class:`MasterCoordinator` on the Master node.
+
+        No-op when ``cache_config.enable_sharing_domain`` is False — the
+        caller already gates this.  This method is **best-effort**: if
+        the user hasn't populated ``remote_endpoints_by_sd`` yet (e.g.
+        single-SD degenerate mode), we keep the legacy handle list and
+        just construct the coordinator for the local SD.
+        """
+        from flexkv.common.dist_reuse import (
+            MasterCoordinator,
+            SharingDomainKey,
+            build_sharing_domain_handles,
+            make_session_epoch,
+        )
+
+        self_sd = SharingDomainKey.from_model_config(self.model_config)
+
+        # Single-SD degenerate case (no sharing) — no extra handles needed.
+        if self_sd.total_sd_count() <= 1:
+            flexkv_logger.info(
+                "[DistReuse] Master SD is the only SD in the instance; "
+                "skipping multi-SD handle construction."
+            )
+            # Still spin up a MasterCoordinator so aggregate-radix hooks
+            # work uniformly (it will just track 1 SD).
+            instance_id = self.cache_config.instance_id or f"inst-{self_sd.serialize()}"
+            self._master_coordinator = MasterCoordinator(
+                self_sd=self_sd,
+                instance_id=instance_id,
+                session_epoch=self.cache_config.session_epoch or make_session_epoch(),
+            )
+            self._master_coordinator.expect_remotes(0)
+            # Single-SD path still attaches the coord state to the cache
+            # engine so refcount / aggregate / failure-detection hooks work.
+            self._wire_dist_reuse_coord_dispatcher()
+            return
+
+        try:
+            specs = build_sharing_domain_handles(
+                self_sd=self_sd,
+                remote_endpoints_by_sd=self.cache_config.remote_endpoints_by_sd,
+            )
+        except KeyError as e:
+            flexkv_logger.warning(
+                f"[DistReuse] could not build multi-SD handles: {e}. "
+                f"Falling back to legacy handle list."
+            )
+            return
+
+        # Drop the legacy handles and rebuild from scratch — we're on the
+        # multi-SD path now.
+        for h in self.transfer_handles:
+            try:
+                h.shutdown()
+            except Exception:  # pragma: no cover
+                pass
+        self.transfer_handles = []
+
+        # Build new handle list per spec.
+        for spec in specs:
+            if spec.mode == "process":
+                handle = TransferManagerHandle(
+                    self.model_config, self.cache_config,
+                    mode="process", gpu_register_port=gpu_register_port,
+                )
+            else:
+                ep = spec.endpoint
+                master_host = ep.ip
+                master_ports = (ep.gpu_register_port, ep.command_port, ep.result_port)
+                handle = TransferManagerHandle(
+                    self.model_config, self.cache_config,
+                    mode="remote",
+                    gpu_register_port=gpu_register_port,
+                    master_host=master_host,
+                    master_ports=master_ports,
+                )
+                handle._handle.set_target_sd_key(spec.sd_key.serialize())
+                handle._handle.send_config_to_remotes()
+            self.transfer_handles.append(handle)
+
+        self.required_completed_count = len(self.transfer_handles)
+
+        # Create the Master coordinator; it will accept RemoteReadyMsg
+        # acks as Remote nodes finish their dist_reuse bootstrap.
+        instance_id = self.cache_config.instance_id or f"inst-{self_sd.serialize()}"
+        self._master_coordinator = MasterCoordinator(
+            self_sd=self_sd,
+            instance_id=instance_id,
+            session_epoch=self.cache_config.session_epoch or make_session_epoch(),
+            refcount_leak_timeout_seconds=self.cache_config.refcount_leak_timeout_seconds,
+        )
+        self._master_coordinator.expect_remotes(len(specs) - 1)
+
+        # Batch-F: wire up the cross-SD coordinator now that we have both
+        # the MasterCoordinator (aggregate radix + refcount owner) and
+        # the fully-populated transfer_handles list (one per SD).
+        self._wire_dist_reuse_coord_dispatcher()
+
+    def _wire_dist_reuse_coord_dispatcher(self) -> None:
+        """Phase D-2 (proposal_unify_with_graph_dispatch_2026-05-15.md
+        §6.3 / §3.5): wire the master-side completion sink so peer-SD
+        ``CompletedOp(sd_key, contributing_node_id)`` flowing back through
+        each Remote handle's ``_polling_worker`` is routed to the
+        cache_engine's ``_on_peer_sd_completed_op`` method.
+
+        Replaces the pre-Phase-D ``CoordinationCoordinator +
+        set_coord_ack_sink`` wiring (Phase D-4 deleted the latter
+        entirely).  ``set_coord_ack_sink`` is still used here, but only
+        for the surviving ``FailureReportMsg`` channel — see
+        ``MasterCoordinator.handle_failure_report``.
+
+        Idempotent: safe to call multiple times.
+        Degenerates to a single-SD no-op when the instance has exactly
+        one SD (``total_sd_count == 1``).
+        """
+        if self._master_coordinator is None:
+            return
+
+        self_sd = self._master_coordinator.self_sd
+        total = self_sd.total_sd_count()
+        if total <= 1:
+            # Single-SD instance: still attach the master_coord (for
+            # refcount / aggregate / failure detection), but no cross-SD
+            # dispatch is needed.
+            self.cache_engine.attach_dist_reuse(self._master_coordinator)
+            return
+
+        # Phase D-2: register the master's completion sink on every
+        # peer-SD handle so CompletedOp(sd_key=..., contributing_node_id=...)
+        # gets routed to GlobalCacheEngine._on_peer_sd_completed_op.
+        sink = self.cache_engine._on_peer_sd_completed_op
+        # Phase D-4: also register a FailureReportMsg sink so peer
+        # data-plane failures invalidate aggregate-radix prefixes.
+        failure_sink = self._master_coordinator.handle_failure_report
+        # Phase D-3 (proposal_unify_with_graph_dispatch_2026-05-15.md
+        # §6.4): the Master's own in-proc / inter-proc handle must also
+        # honour ``target_node_ids`` filtering so peer-SD clone ops
+        # (D-2 PUT D2H clones, D-3 GET PEERH2H clones) are NOT executed
+        # by the Master's local TransferEngine.  Without this the
+        # Master would either waste GPU bandwidth (D-2 D2H mirror is
+        # idempotent) or pull data from peer-SD mooncake endpoints it
+        # never connected to (D-3 PEERH2H — silent corruption).
+        master_self_nid = int(getattr(self.cache_config, "distributed_node_id", -1))
+        for h in self.transfer_handles:
+            inner = h._handle
+            if hasattr(inner, "set_completion_sink"):
+                try:
+                    inner.set_completion_sink(sink)
+                except Exception as e:  # pragma: no cover
+                    flexkv_logger.warning(
+                        f"[DistReuse] set_completion_sink failed: {e}"
+                    )
+            if hasattr(inner, "set_coord_ack_sink"):
+                try:
+                    inner.set_coord_ack_sink(failure_sink)
+                except Exception as e:  # pragma: no cover
+                    flexkv_logger.warning(
+                        f"[DistReuse] set_coord_ack_sink failed: {e}"
+                    )
+            # Phase D-3: only the Master's own in-proc / inter-proc
+            # handle exposes ``set_dist_reuse_node_id``; the multi-node
+            # remote handles do their filtering on the Remote side via
+            # ``TransferManagerOnRemote._filter_graph_by_target_node_ids``
+            # and ``_dist_reuse_node_id`` set during bootstrap.
+            if hasattr(inner, "set_dist_reuse_node_id") and master_self_nid >= 0:
+                try:
+                    inner.set_dist_reuse_node_id(master_self_nid)
+                except Exception as e:  # pragma: no cover
+                    flexkv_logger.warning(
+                        f"[DistReuse] set_dist_reuse_node_id failed: {e}"
+                    )
+
+        # Wire into the cache engine.  Cross-SD coordination flows
+        # through the graph-dispatch path with per-op
+        # ``target_node_ids`` filtering (Phase D-4); no separate coord
+        # dispatcher is needed.
+        self.cache_engine.attach_dist_reuse(self._master_coordinator)
 
     def create_get_task(self,
                         task_id: int,
@@ -288,22 +495,72 @@ class KVTaskManager:
             return
         nvtx.mark(f"launch task: task_id={task_id}, graph_id={transfer_graph.graph_id}")
         if transfer_graph.num_ops > 0:
-            for transfer_handle in self.transfer_handles:
-                # For remote handles: deepcopy graph and clear GPU blocks when
-                # it's a cross-machine PP handle (different PP stages have
-                # different GPU block_ids).  Cross-machine TP handles share
-                # the same slot_mapping, so no clear is needed.
+            # Phase 0 task 0-K: compute per-handle GPU-clear decision *once*
+            # so the sharing-domain-aware logic can be unit-tested separately.
+            clear_flags = self._compute_gpu_clear_flags()
+            for idx, transfer_handle in enumerate(self.transfer_handles):
                 if isinstance(transfer_handle._handle, TransferManagerMultiNodeHandle):
-                    if self.model_config.nnodes > 1 and self.model_config.pp_size > 1:
-                        # Cross-machine PP: each PP rank has different GPU blocks
+                    if clear_flags[idx]:
                         graph_copy = copy.deepcopy(transfer_graph)
                         graph_copy.clear_gpu_blocks()
                         transfer_handle.submit(graph_copy, task_end_op_id=self.tasks[task_id].task_end_op_id)
                     else:
-                        # Cross-machine TP: same slot_mapping across TP ranks
                         transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
                 else:
                     transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
+
+    def _compute_gpu_clear_flags(self) -> List[bool]:
+        """Decide for each transfer handle whether its graph needs
+        GPU-block clearing before send.
+
+        Legacy (``enable_sharing_domain=False``) behaviour: match the
+        pre-Batch-C rule — cross-machine PP needs clearing, cross-machine
+        TP does not.
+
+        Sharing-domain behaviour: consult the per-handle SD key and use
+        :func:`graph_needs_gpu_clear` from :mod:`flexkv.common.dist_reuse`.
+        """
+        if not self.transfer_handles:
+            return []
+
+        # Legacy branch first.
+        if not getattr(self.cache_config, "enable_sharing_domain", False):
+            legacy_clear = (
+                self.model_config.nnodes > 1 and self.model_config.pp_size > 1
+            )
+            out: List[bool] = []
+            for h in self.transfer_handles:
+                if isinstance(h._handle, TransferManagerMultiNodeHandle):
+                    out.append(legacy_clear)
+                else:
+                    out.append(False)
+            return out
+
+        # Sharing-domain branch.
+        from flexkv.common.dist_reuse import (
+            SharingDomainKey,
+            graph_needs_gpu_clear,
+        )
+        self_sd = SharingDomainKey.from_model_config(self.model_config)
+        flags: List[bool] = []
+        for h in self.transfer_handles:
+            if not isinstance(h._handle, TransferManagerMultiNodeHandle):
+                flags.append(False)
+                continue
+            peer_sd_str = getattr(h._handle, "_target_sd_key", None)
+            if peer_sd_str is None:
+                # Legacy remote with no SD tag — fall back to old rule.
+                flags.append(
+                    self.model_config.nnodes > 1 and self.model_config.pp_size > 1
+                )
+                continue
+            try:
+                peer_sd = SharingDomainKey.deserialize(peer_sd_str)
+            except ValueError:
+                flags.append(True)  # be conservative
+                continue
+            flags.append(graph_needs_gpu_clear(self_sd, peer_sd))
+        return flags
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
         completed_ops = self._get_completed_ops(timeout)

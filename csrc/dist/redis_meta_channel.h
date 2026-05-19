@@ -12,6 +12,8 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_set>
+#include <unordered_map>
+#include <utility>
 
 #include "block_meta.h"
 
@@ -29,12 +31,17 @@ private:
   int port_;
   int timeout_ms_;
   std::string password_;
+  // Logical Redis database number (0..15 by default).  Populated by
+  // ``connect()`` and re-applied after any implicit reconnect inside
+  // ``command()`` / ``pipeline()`` via a ``SELECT <db>`` command.
+  int db_;
 
 public:
   RedisHiredisClient();
   ~RedisHiredisClient();
 
-  bool connect(const std::string &host, int port, int timeout_ms = 3000, const std::string &password = "");
+  bool connect(const std::string &host, int port, int timeout_ms = 3000,
+               const std::string &password = "", int db = 0);
   void close();
 
   // Sends a RESP array command and parses a single reply into raw components.
@@ -61,15 +68,24 @@ private:
   std::string host;
   int port;
   uint32_t node_id;
-  std::string blocks_key;        // legacy, unused for list storage
+  // Full key-prefix namespace.  Format: ``sd:<sd_key>[:<device_prefix>]`` or
+  // legacy bare ``blocks`` / ``CPUB`` / ... .  Used verbatim by
+  // ``make_block_key`` and inspected by ``list_node_keys`` to derive the
+  // per-SD node-scan pattern.  See design doc §4.7 / §4.7.1.
+  std::string blocks_key;
   std::string local_ip;
   std::string password;
+  // Logical Redis db.  Matches ``CacheConfig.flexkv_redis_db`` and is
+  // forwarded to ``RedisHiredisClient::connect`` so every command this
+  // channel issues lands on the configured db.
+  int db;
 
 public:
   RedisMetaChannel(const std::string &host, int port, uint32_t node_id,
                    const std::string &local_ip,
                    const std::string &blocks_key = "blocks",
-                   const std::string &password = "");
+                   const std::string &password = "",
+                   int db = 0);
 
   bool connect();
   // Build Redis block key: <blocks_key>:block:<node_id>:<hash_hex>
@@ -88,6 +104,8 @@ public:
   // Returns the global node id assigned to this process, or UINT32_MAX if uninitialized.
   uint32_t get_node_id() const;
   const std::string &get_local_ip() const { return local_ip; }
+  const std::string &get_blocks_key() const { return blocks_key; }
+  int get_db() const { return db; }
 
   // Batch update state for given hashes belonging to node_id
   bool update_block_state_batch(uint32_t node_id,
@@ -103,10 +121,16 @@ public:
   // Generic helpers for metadata queries
   bool list_keys(const std::string &pattern, std::vector<std::string> &keys);
 
-  // List node keys: SCAN node:*
+  // List node keys **scoped to this channel's SD**.  The SD prefix is
+  // derived from ``blocks_key`` by stripping the trailing device-prefix
+  // component (if any) — see implementation.  Legacy bare ``blocks_key``
+  // values collapse to the bare ``node:*`` pattern for backward-compat.
   bool list_node_keys(std::vector<std::string> &keys);
   // List block keys for a specific node: SCAN <blocks_key>:block:<node_id>:*
   bool list_block_keys(uint32_t node_id, std::vector<std::string> &keys);
+  // Global SCAN over *every* block key in this SD (design doc §4.7.1.2).
+  // Produces ``<blocks_key>:block:*``.
+  bool list_all_block_keys(std::vector<std::string> &keys);
 
   // Pipeline HMGET for a single field over many keys. values.size()==keys.size() on success
   bool hmget_field_for_keys(const std::vector<std::string> &keys,
@@ -119,9 +143,21 @@ public:
                                  const std::string &field2,
                                  std::vector<std::pair<std::string, std::string>> &out);
 
-  // Load BlockMeta for provided keys via HMGET ph pb nid hash lt state
+  // Load BlockMeta for provided keys via HMGET ph pb nid hash lt state.
+  // ``batch_size`` controls the pipeline size (design doc §4.7.1.2); pass 0
+  // for the default (500).  The original no-batch-size overload is kept for
+  // backward compatibility.
   size_t load_metas_by_keys(const std::vector<std::string> &keys,
                             std::vector<BlockMeta> &out);
+  size_t load_metas_by_keys(const std::vector<std::string> &keys,
+                            std::vector<BlockMeta> &out,
+                            size_t batch_size);
+
+  // Read the ``flexkv:instance:<instance_id>:sd_nodes`` Hash
+  // (design doc §4.7.1.5).  Returns false when the key does not exist or
+  // a Redis error occurs; ``out`` is cleared on failure.
+  bool load_instance_sd_nodes(const std::string &instance_id,
+                              std::unordered_map<std::string, uint32_t> &out);
 };
 
 } // namespace flexkv

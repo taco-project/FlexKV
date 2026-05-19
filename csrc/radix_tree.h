@@ -1,6 +1,7 @@
 #pragma once
 #include <errno.h>
 #include <execinfo.h>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -227,17 +228,18 @@ public:
   CRadixNode *last_ready_node;
   CRadixNode *last_node;
   torch::Tensor physical_blocks;
-  torch::Tensor block_node_ids;
+  int32_t matched_node_id;       // single node_id for all matched blocks (-1 = no match)
 
   CMatchResult(int _num_ready_matched_blocks, int _num_matched_blocks,
                int _last_node_matched_length, CRadixNode *_last_ready_node,
                CRadixNode *_last_node, torch::Tensor blocks,
-               torch::Tensor block_node_ids = torch::Tensor())
+               int32_t matched_node_id = -1)
       : num_ready_matched_blocks(_num_ready_matched_blocks),
         num_matched_blocks(_num_matched_blocks),
         last_node_matched_length(_last_node_matched_length),
         last_ready_node(_last_ready_node), last_node(_last_node),
-        physical_blocks(blocks), block_node_ids(block_node_ids) {}
+        physical_blocks(blocks),
+        matched_node_id(matched_node_id) {}
 
   ~CMatchResult() {}
 };
@@ -407,6 +409,22 @@ public:
   virtual int evict(torch::Tensor &evicted_blocks, int num_evicted);
   virtual int evict(torch::Tensor &evicted_blocks,
                     torch::Tensor &evicted_block_hashes, int num_evicted);
+  // 4-arg overload for dist-reuse refcount guard (§2.2 of
+  // docs/dist_reuse/implementation_gap_*.md).  ``is_evictable_fn`` is a
+  // per-block_id predicate -- blocks for which it returns ``false`` are
+  // treated as refcount-pinned: they are *still* detached from the tree
+  // (so the LRU keeps making progress), but their block_ids are dropped
+  // from the returned ``evicted_blocks`` array so the upstream allocator
+  // never recycles them.  Behaviour mirrors the Python
+  // ``RadixTreeIndex.evict(..., is_evictable_fn=...)`` path in
+  // flexkv/cache/radixtree.py.
+  //
+  // When ``is_evictable_fn`` is a null std::function (default), this
+  // overload is byte-identical to the 3-arg version above -- no
+  // regression for callers that don't wire dist-reuse.
+  virtual int evict(torch::Tensor &evicted_blocks,
+                    torch::Tensor &evicted_block_hashes, int num_evicted,
+                    std::function<bool(int64_t)> is_evictable_fn);
   virtual std::shared_ptr<CMatchResult>
   match_prefix(torch::Tensor &block_hashes, int num_blocks,
                bool update_cache_info = true);

@@ -175,6 +175,7 @@ class KVServer:
                 cache_config.redis_password,
                 cache_config.local_ip,
                 node_ttl_seconds=cache_config.node_ttl_seconds,
+                db=int(getattr(cache_config, "flexkv_redis_db", 0)),
             )
             self.redis_meta_client.init_meta()
             # update distributed_node_id
