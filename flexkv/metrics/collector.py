@@ -219,8 +219,46 @@ class FlexKVMetricsCollector:
             labelnames=["device"],
         )
         
+        # ========== SGLang Adapter Metrics ==========
+        self.sglang_batch_set_calls_total = Counter(
+            name="flexkv_py_sglang_batch_set_calls_total",
+            documentation="Total batch_set_v1 calls from SGLang adapter",
+        )
+        self.sglang_batch_set_blocks_total = Counter(
+            name="flexkv_py_sglang_batch_set_blocks_total",
+            documentation="Total blocks processed in batch_set_v1 by type (written/deduped)",
+            labelnames=["type"],
+        )
+        self.sglang_batch_get_calls_total = Counter(
+            name="flexkv_py_sglang_batch_get_calls_total",
+            documentation="Total batch_get_v1 calls from SGLang adapter",
+        )
+        self.sglang_batch_get_blocks_total = Counter(
+            name="flexkv_py_sglang_batch_get_blocks_total",
+            documentation="Total blocks in batch_get_v1 by result (hit/miss)",
+            labelnames=["result"],
+        )
+        self.sglang_batch_get_remote_fetches_total = Counter(
+            name="flexkv_py_sglang_batch_get_remote_fetches_total",
+            documentation="Total remote P2P prefetch attempts by result (success/failure)",
+            labelnames=["result"],
+        )
+        self.sglang_batch_get_remote_blocks_total = Counter(
+            name="flexkv_py_sglang_batch_get_remote_blocks_total",
+            documentation="Total blocks fetched from remote nodes via P2P transfer",
+        )
+        self.sglang_batch_exists_calls_total = Counter(
+            name="flexkv_py_sglang_batch_exists_calls_total",
+            documentation="Total batch_exists calls from SGLang adapter",
+        )
+        self.sglang_errors_total = Counter(
+            name="flexkv_py_sglang_errors_total",
+            documentation="Total errors in SGLang adapter by operation (get/set/exists)",
+            labelnames=["operation"],
+        )
+
         logger.info("[FlexKV PyMetrics] Prometheus metrics collector initialized")
-    
+
     def _init_dummy_metrics(self):
         """Initialize dummy metrics when prometheus_client is not available."""
         class DummyMetric:
@@ -230,9 +268,9 @@ class FlexKVMetricsCollector:
                 pass
             def set(self, *args, **kwargs):
                 pass
-        
+
         dummy = DummyMetric()
-        
+
         # Cache engine dummy metrics
         self.cache_hit_blocks_total = dummy
         self.cache_miss_blocks_total = dummy
@@ -244,6 +282,16 @@ class FlexKVMetricsCollector:
         self.mempool_free_blocks = dummy
         self.evicted_blocks_total = dummy
         self.allocated_blocks_total = dummy
+
+        # SGLang adapter dummy metrics
+        self.sglang_batch_set_calls_total = dummy
+        self.sglang_batch_set_blocks_total = dummy
+        self.sglang_batch_get_calls_total = dummy
+        self.sglang_batch_get_blocks_total = dummy
+        self.sglang_batch_get_remote_fetches_total = dummy
+        self.sglang_batch_get_remote_blocks_total = dummy
+        self.sglang_batch_exists_calls_total = dummy
+        self.sglang_errors_total = dummy
     
 
     
@@ -342,7 +390,69 @@ class FlexKVMetricsCollector:
         if not self.enabled or num_blocks <= 0:
             return
         self.allocated_blocks_total.labels(device=device).inc(num_blocks)
-    
+
+    # ========== SGLang Adapter Recording Methods ==========
+
+    def record_sglang_batch_set(self, blocks_written: int, blocks_deduped: int):
+        """Record a batch_set_v1 call with block write/dedup counts.
+
+        Args:
+            blocks_written: Number of new blocks written to storage.
+            blocks_deduped: Number of blocks skipped due to deduplication.
+        """
+        if not self.enabled:
+            return
+        self.sglang_batch_set_calls_total.inc()
+        if blocks_written > 0:
+            self.sglang_batch_set_blocks_total.labels(type="written").inc(blocks_written)
+        if blocks_deduped > 0:
+            self.sglang_batch_set_blocks_total.labels(type="deduped").inc(blocks_deduped)
+
+    def record_sglang_batch_get(self, blocks_hit: int, blocks_missed: int):
+        """Record a batch_get_v1 call with hit/miss block counts.
+
+        Args:
+            blocks_hit: Number of blocks successfully loaded.
+            blocks_missed: Number of blocks not found in cache.
+        """
+        if not self.enabled:
+            return
+        self.sglang_batch_get_calls_total.inc()
+        if blocks_hit > 0:
+            self.sglang_batch_get_blocks_total.labels(result="hit").inc(blocks_hit)
+        if blocks_missed > 0:
+            self.sglang_batch_get_blocks_total.labels(result="miss").inc(blocks_missed)
+
+    def record_sglang_remote_fetch(self, success: bool, num_blocks: int = 0):
+        """Record a remote P2P prefetch attempt.
+
+        Args:
+            success: Whether the remote fetch succeeded.
+            num_blocks: Number of blocks fetched (only meaningful on success).
+        """
+        if not self.enabled:
+            return
+        result = "success" if success else "failure"
+        self.sglang_batch_get_remote_fetches_total.labels(result=result).inc()
+        if success and num_blocks > 0:
+            self.sglang_batch_get_remote_blocks_total.inc(num_blocks)
+
+    def record_sglang_batch_exists(self):
+        """Record a batch_exists call."""
+        if not self.enabled:
+            return
+        self.sglang_batch_exists_calls_total.inc()
+
+    def record_sglang_error(self, operation: str):
+        """Record an error in the SGLang adapter.
+
+        Args:
+            operation: Which operation failed ("get", "set", or "exists").
+        """
+        if not self.enabled:
+            return
+        self.sglang_errors_total.labels(operation=operation).inc()
+
 # Global collector instance
 _global_collector: Optional[FlexKVMetricsCollector] = None
 

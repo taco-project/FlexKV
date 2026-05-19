@@ -104,6 +104,15 @@ class FlexkvLogger:
             )
             self.logger.handle(record)
 
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        if self.enabled and self.logger.isEnabledFor(logging.ERROR):
+            filename, lineno = self._get_caller_info()
+            record = self.logger.makeRecord(
+                self.logger.name, logging.ERROR, filename, lineno, msg, args,
+                exc_info=sys.exc_info()
+            )
+            self.logger.handle(record)
+
 flexkv_logger = FlexkvLogger(os.getenv("FLEXKV_LOG_LEVEL", "INFO"))
 
 
