@@ -102,7 +102,11 @@ class CPUAllocator(BaseStorageAllocator):
         total_size = layout.get_total_elements()
         pin_memory = kwargs.get('pin_memory', False)
         # although the kv layout may have multiple dimensions, we only have one-dim CPU tensor
-        flexkv_logger.info(f"CPU allocate total_size: {2 * total_size/1024/1024/1024} GB")
+        flexkv_logger.info(
+            f"CPU allocate total_size: "
+            f"{total_size * dtype.itemsize / 1024 / 1024 / 1024:.4f} GB "
+            f"(elements={total_size}, dtype={dtype})"
+        )
         physical_tensor = torch.empty(
                             size=(total_size,),
                             dtype=dtype,
