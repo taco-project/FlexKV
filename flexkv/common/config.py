@@ -40,14 +40,8 @@ class ModelConfig:
     # ------------------------------------------------------------------
     # Attention-level parallel configs
     # ------------------------------------------------------------------
-    # enable_dp_attention: whether DP-attention is enabled (sglang
-    # ``--enable-dp-attention`` or TRT-LLM ``enable_attention_dp``).
-    # When True, the physical TP group is split into
-    # attn_tp × attn_cp × attn_dp.
-    enable_dp_attention: bool = False
-
-    # attn_cp_size: context-parallel size (global).
-    attn_cp_size: int = 1
+    # cp_size: context-parallel size (global), default 1.
+    cp_size: int = 1
 
     # ------------------------------------------------------------------
     # Topology configs (global)
@@ -94,16 +88,11 @@ class ModelConfig:
                 f"[ModelConfig] cannot derive gpus_per_node: "
                 f"total_gpus={self.total_gpus} not divisible by nnodes={self.nnodes}"
             )
-        if self.nnodes_per_tp_group > 2:
+        if self.nnodes_per_pp_rank > 2:
             raise ValueError(
                 f"[ModelConfig] only support 2-nodes TP for now, but got "
-                f"nnodes_per_tp_group={self.nnodes_per_tp_group} "
+                f"nnodes_per_pp_rank={self.nnodes_per_pp_rank} "
                 f"(tp_size={self.tp_size}, gpus_per_node={self.gpus_per_node})"
-            )
-        if self.tp_size % self.nnodes_per_tp_group != 0:
-            raise ValueError(
-                f"[ModelConfig] tp_size={self.tp_size} not divisible by "
-                f"nnodes_per_tp_group={self.nnodes_per_tp_group}"
             )
         if self.instance_num < 1:
             raise ValueError(
@@ -119,8 +108,8 @@ class ModelConfig:
             raise AttributeError(
                 f"ModelConfig is frozen — cannot set '{name}'. "
                 f"All primitive fields must be set during post_init_from_*(), "
-                f"after which freeze() is called.  Derived fields (attn_tp_size, "
-                f"tp_size_per_node) are @property "
+                f"after which freeze() is called.  Derived fields (effective_tp_size, "
+                f"tp_size_per_node, cp_size_per_node, nnodes_per_pp_rank) are @property "
                 f"and cannot be set at all."
             )
         object.__setattr__(self, name, value)
@@ -130,8 +119,10 @@ class ModelConfig:
     # ------------------------------------------------------------------
     @property
     def total_gpus(self) -> int:
-        """Total GPUs across all nodes for one FlexKV instance."""
-        return self.dp_size * self.tp_size * self.pp_size
+        """Total GPU worker registration slots across all nodes for one FlexKV instance.
+
+        Unified formula: dp_size × tp_size × cp_size × pp_size."""
+        return self.dp_size * self.tp_size * self.cp_size * self.pp_size
 
     @property
     def total_clients(self) -> int:
@@ -140,7 +131,7 @@ class ModelConfig:
 
     @property
     def gpus_per_node(self) -> int:
-        """Total GPUs on this node (across all DP, PP stages and TP groups)."""
+        """GPU worker registration slots on this node (across all DP shards, PP stages and TP groups)."""
         return self.total_gpus // self.nnodes
 
     @property
@@ -149,57 +140,34 @@ class ModelConfig:
         return max(self.nnodes // self.pp_size, 1)
 
     @property
-    def nnodes_per_tp_group(self) -> int:
-        """Number of nodes spanned by one TP group."""
-        return self.nnodes_per_pp_rank
-
-    @property
     def tp_size_per_node(self) -> int:
         """Number of TP ranks on this node within one TP group."""
-        flexkv_logger.info(f"[Config] TP size per node: {self.tp_size} // {self.nnodes_per_tp_group}")
-        return self.tp_size // self.nnodes_per_tp_group
+        return max(1, self.tp_size // self.nnodes_per_pp_rank)
 
     @property
-    def attn_dp_size(self) -> int:
-        """Attention-level DP size (= dp_size when enable_dp_attention else 1)."""
-        return max(1, self.dp_size) if self.enable_dp_attention else 1
+    def cp_size_per_node(self) -> int:
+        """CP size on this node for a single PP stage.
 
-    @property
-    def attn_tp_size(self) -> int:
-        """Attention-level TP size derived from tp / attn_dp / attn_cp."""
-        attn_dp = self.attn_dp_size
-        cp = max(1, self.attn_cp_size)
-        return max(1, max(1, self.tp_size) // (attn_dp * cp))
-
-    @property
-    def attn_tp_size_per_node(self) -> int:
-        """Attention-level TP size per node."""
-        flexkv_logger.info(f"[Config] Attention-level TP size per node: {self.attn_tp_size} // {self.nnodes_per_tp_group}")
-        return self.attn_tp_size // self.nnodes_per_tp_group
-
-    @property
-    def attn_cp_size_per_node(self) -> int:
-        """Attention-level CP size on this node for a single pp stage. """
-        flexkv_logger.info(f"[Config] Attention-level CP size per node: {self.attn_cp_size} // {self.nnodes_per_pp_rank}")
-        return max(1, self.attn_cp_size // self.nnodes_per_pp_rank)
+        Used for multi-node scenarios where the CP group spans multiple nodes.
+        """
+        return max(1, self.cp_size // self.nnodes_per_pp_rank)
 
     @property
     def effective_tp_size(self) -> int:
-        """Effective tp-group size used for *data-plane* CPU slicing."""
-        return max(1, self.attn_tp_size) * max(1, self.attn_cp_size)
+        """Number of CPU block slices = tp_size × cp_size."""
+        return max(1, self.tp_size) * max(1, self.cp_size)
 
     @property
     def effective_tp_size_per_node(self) -> int:
         """Per-node counterpart of :pyattr:`effective_tp_size`."""
-        flexkv_logger.info(f"[Config] Effective tp-group size per node: {self.attn_tp_size_per_node} * {self.attn_cp_size_per_node}")
-        return self.attn_tp_size_per_node * self.attn_cp_size_per_node
+        return self.tp_size_per_node * self.cp_size_per_node
 
     @property
     def num_kv_heads_per_node(self) -> int:
         """Number of KV heads visible to a single node."""
         if self.use_mla:
             return self.num_kv_heads
-        return self.num_kv_heads * self.tp_size_per_node // max(1, self.attn_tp_size)
+        return self.num_kv_heads * self.tp_size_per_node // max(1, self.tp_size)
 
     @property
     def kv_dim(self) -> int:
@@ -222,7 +190,8 @@ class ModelConfig:
             f", head_size={self.head_size}, use_mla={self.use_mla}"
             f", dtype={self.dtype}"
             f", tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}"
-            f", attn_cp_size={self.attn_cp_size}"
+            f", cp_size={self.cp_size}"
+            f", total_gpus={self.total_gpus}"
             f", nnodes={self.nnodes}, master_host={self.master_host!r}"
             f", instance_num={self.instance_num}"
         )
@@ -234,11 +203,12 @@ class RankInfo:
     tp_rank: int = 0
     pp_rank: int = 0
     dp_rank: int = 0
-    attn_cp_rank: int = 0
+    cp_rank: int = 0
     node_rank: int = 0
     instance_id: int = 0
     pp_start_layer: int = 0
     pp_end_layer: int = -1
+    local_rank: int = -1
     @property
     def tp_rank_per_node(self) -> int:
         """TP rank index within the local node (within one TP group)."""
@@ -257,17 +227,19 @@ class RankInfo:
         return self.instance_id * self.model_config.dp_size + self.dp_rank
 
     @property
-    def attn_tp_rank(self) -> int:
-        """Attention-level TP rank derived from tp_rank / attn_tp_size."""
-        return self.tp_rank % max(1, self.model_config.attn_tp_size)
-
-    @property
     def effective_tp_rank(self) -> int:
-        """Effective tp-rank in the *data-plane* segmentation space."""
+        """Effective tp-rank in the *data-plane* segmentation space.
+
+        For MLA models, every CP rank holds the same KV pages (the MLA latent
+        is not split along the sequence axis from a KV perspective), so
+        ``cp_rank`` must NOT participate in slice indexing — otherwise a CP rank
+        would write to a non-existent CPU slice and corrupt block accounting.
+        For non-MLA models, CP shards along the sequence dimension and each
+        ``(cp_rank, tp_rank)`` pair owns a unique slice.
+        """
         if self.model_config.use_mla:
-            return self.attn_tp_rank
-        attn_tp_size = max(1, self.model_config.attn_tp_size)
-        return self.attn_cp_rank * attn_tp_size + self.attn_tp_rank
+            return self.tp_rank
+        return self.cp_rank * max(1, self.model_config.tp_size) + self.tp_rank
 
     @property
     def pp_size_per_node(self) -> int:
@@ -279,25 +251,6 @@ class RankInfo:
     def pp_rank_per_node(self) -> int:
         """This rank's PP index *within* its node."""
         return self.pp_rank % self.pp_size_per_node
-
-    @property
-    def dp_size_per_node(self) -> int:
-        """Number of DP replicas co-located on a single node."""
-        model_config = self.model_config
-        return model_config.gpus_per_node // (self.pp_size_per_node * model_config.tp_size_per_node)
-
-    @property
-    def dp_rank_per_node(self) -> int:
-        """This rank's DP index *within* its node (non-DP-attention layout)."""
-        return self.dp_rank % self.dp_size_per_node
-
-    @property
-    def local_rank(self) -> int:
-        model_config = self.model_config
-        if model_config.enable_dp_attention:
-            return self.pp_rank_per_node * model_config.tp_size_per_node + self.tp_rank_per_node
-        return (self.dp_rank_per_node * self.pp_size_per_node + self.pp_rank_per_node) \
-               * model_config.tp_size_per_node + self.tp_rank_per_node
 
     @property
     def num_layers_per_pp_stage(self) -> int:
@@ -319,8 +272,9 @@ class RankInfo:
         """
         return (
             f"RankInfo(tp_rank={self.tp_rank}, pp_rank={self.pp_rank}"
-            f", dp_rank={self.dp_rank}, attn_cp_rank={self.attn_cp_rank}"
+            f", dp_rank={self.dp_rank}, cp_rank={self.cp_rank}"
             f", node_rank={self.node_rank}, instance_id={self.instance_id}"
+            f", local_rank={self.local_rank}, effective_tp_rank={self.effective_tp_rank}"
         )
 
 
@@ -676,6 +630,13 @@ def update_default_config_from_user_config(rank_info: RankInfo,
             f"[CacheConfig] GB->blocks conversion: "
             f"block_size={block_size_in_bytes} B"
         )
+
+    flexkv_logger.info(
+        f"[CacheConfig] GB->blocks conversion: "
+        f"block_size={block_size_in_bytes} B; "
+        f"cpu_cache_gb={user_config.cpu_cache_gb} -> num_cpu_blocks={cache_config.num_cpu_blocks}, "
+        f"ssd_cache_gb={user_config.ssd_cache_gb} -> num_ssd_blocks={cache_config.num_ssd_blocks}"
+    )
 
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
