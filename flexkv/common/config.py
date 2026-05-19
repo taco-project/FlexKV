@@ -81,6 +81,16 @@ class ModelConfig:
     # ------------------------------------------------------------------
     instance_num: int = 1
 
+    # NSA model layout flag: when True, the model is an NSA (Native Sparse
+    # Attention) model whose KV cache pool includes an extra ``index_k_with_scale_buffer``
+    # in addition to the main MLA KV cache.  This changes the per-block physical
+    # layout (extra indexer pool registered alongside main KV) and is therefore
+    # used as a layout-isolation key in SharingDomainKey.serialize().  This flag
+    # is independent of whether CP is enabled — even with cp_size=1, an NSA model
+    # still has the indexer K cache and must be isolated from non-NSA models in
+    # cross-instance reuse.
+    is_nsa: bool = False
+
     # ------------------------------------------------------------------
     # Freeze mechanism: after post_init, ModelConfig must not be mutated
     # ------------------------------------------------------------------
@@ -190,12 +200,138 @@ class ModelConfig:
         """Per-node counterpart of :pyattr:`effective_tp_size`."""
         return self.attn_tp_size_per_node * self.attn_cp_size_per_node
 
+    # ------------------------------------------------------------------
+    # Decoupled multinode flags (Phase 1 task 1-A)
+    #
+    # These two flags are intentionally *independent* — they describe
+    # orthogonal physical situations that historically were conflated
+    # under a single ``is_multinode`` switch in the sglang connector:
+    #
+    #   * ``is_multinode_tp`` is True when one TP group physically
+    #     spans more than one node (i.e. ``tp_size > gpus_per_node``).
+    #     Such deployments require cross-node KV transfer (SD-Remote)
+    #     because the local CPU pool only sees a *fraction* of the
+    #     KV heads.  This is the only case where a non-pp_rank-0
+    #     node needs to participate in dist_reuse handle construction
+    #     (see ``KVTaskManager.transfer_handles``).
+    #
+    #   * ``is_multinode_cp`` is True when CP > 1 *and* the CP group
+    #     spans more than one node.  CP all-gather makes every CP
+    #     rank's KV pool bit-wise identical, so for dist_reuse purposes
+    #     we treat all CP ranks as a single SD (CP does *not* enter
+    #     the SD key — see simplified design §4.5).  However, *physical*
+    #     transfer still needs one transfer worker per CP rank's GPU
+    #     so that the H2D scatter from sync_leader can actually land
+    #     in every cp_rank's local pool.
+    #
+    # Keeping these two flags separate (instead of an ``is_multinode``
+    # union) is a deliberate API decision — sglang's connector layer
+    # can branch on the dimension that genuinely affects its behavior
+    # rather than guessing.  The legacy single-flag formulation in
+    # sglang's ``flexkv_connector.py`` should migrate to read these
+    # two properties instead.
+    # ------------------------------------------------------------------
+    @property
+    def is_multinode_tp(self) -> bool:
+        """One TP group spans more than one physical node.
+
+        Equivalent to ``self.tp_node_count > 1`` (= ``nnodes_per_tp_group > 1``).
+        Use this — *not* ``self.nnodes > 1`` — to decide whether the
+        local KV pool is partial and therefore requires cross-node
+        SD-Remote transfer to assemble a full prefix.
+        """
+        return self.tp_node_count > 1
+
+    @property
+    def is_multinode_cp(self) -> bool:
+        """CP > 1 *and* the CP group spans more than one physical node.
+
+        CP within a single node ``(attn_cp_size > 1, fits on one host)``
+        does *not* trigger this flag — it's a purely intra-node concern
+        handled by the connector's local sync_leader scatter.  Only when
+        CP physically crosses node boundaries do additional transfer
+        considerations apply.
+
+        **Topology note:** in FlexKV/sglang, CP is *not* a top-level GPU
+        dimension — it lives inside the TP group as a sub-partition of
+        ``attn_tp_size``.  ``ModelConfig.total_gpus = tp × pp × dp`` does
+        *not* include CP.  Each CP group occupies ``attn_cp_size`` GPUs
+        carved out of the ``tp_size`` GPUs assigned to one TP group.
+        Therefore CP crosses nodes iff one TP group's per-node share
+        ``tp_size_per_node`` is **smaller than** ``attn_cp_size``.
+
+        **Reality check (2026):** under standard megatron-style topology
+        every TP group is sized so that ``tp_size_per_node`` is at least
+        as large as ``attn_cp_size`` (CP rarely exceeds 8 while TP per
+        node is 8 GPUs), so this flag is **always False** in production
+        deployments seen so far.  We keep the property as a stable API
+        surface for future deployments where CP could outgrow a node.
+
+        Note: CP never enters the SD key (simplified design §4.5), so
+        this flag does NOT influence ``SharingDomainKey``; it is purely
+        a transport-layer hint.
+        """
+        if self.attn_cp_size <= 1:
+            return False
+        # CP crosses nodes when one CP group cannot fit inside the slice
+        # of GPUs that a single node contributes to one TP group.
+        return self.attn_cp_size > max(1, self.tp_size_per_node)
+
     @property
     def num_kv_heads_per_node(self) -> int:
         """Number of KV heads visible to a single node."""
         if self.use_mla:
             return self.num_kv_heads
         return self.num_kv_heads * self.tp_size_per_node // max(1, self.attn_tp_size)
+
+    # ------------------------------------------------------------------
+    # Sharing-domain dimensions (Phase 0 task 0-A)
+    #
+    # These three properties translate FlexKV's existing topology fields
+    # into the (pp_rank, tp_node_idx, cp_rank) triple consumed by
+    # ``SharingDomainKey``.  ``tp_node_count`` is just an alias for the
+    # already-derived ``nnodes_per_tp_group``; ``tp_node_idx`` partitions
+    # the local TP rank by ``tp_size_per_node``.  ``model_id`` digests the
+    # invariant model architecture into a 16-char hex string suitable for
+    # embedding in a Redis key.
+    #
+    # Importing inside the property avoids a circular import between
+    # ``flexkv.common.config`` and ``flexkv.cache.sharing_domain``.
+    # ------------------------------------------------------------------
+    @property
+    def tp_node_count(self) -> int:
+        """Number of physical nodes one TP group spans (=
+        ``nnodes_per_tp_group``).  ``1`` when TP fits on a single node."""
+        return self.nnodes_per_tp_group
+
+    # NOTE: ``tp_node_idx`` is a per-rank concept and was moved to
+    # ``RankInfo`` in PR #165 (separate-per-rank-state-into-RankInfo).
+    # The previous ``ModelConfig.tp_node_idx`` referenced ``self.tp_rank``
+    # which no longer exists on ``ModelConfig``.  Use
+    # ``RankInfo.tp_node_idx`` instead; ``SharingDomainKey.from_model_config``
+    # already prefers ``rank_info.tp_node_idx`` and falls back to ``0`` via
+    # ``getattr``.
+
+    @property
+    def model_id(self) -> str:
+        """Stable cross-process digest of the invariant model architecture.
+
+        Two FlexKV instances that produce physically interchangeable CPU
+        blocks derive the same ``model_id`` regardless of TP/PP/CP
+        topology.  Used as the leading segment of every SD key (design
+        doc §3.1).
+        """
+        # Local import keeps ``flexkv.common.config`` a leaf in the import
+        # graph — anything that imports SharingDomain machinery already
+        # depends on config.
+        from flexkv.common.dist_reuse.sharing_domain import derive_model_id
+        return derive_model_id(
+            num_layers=self.num_layers,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            dtype=self.dtype,
+            use_mla=self.use_mla,
+        )
 
     @property
     def kv_dim(self) -> int:
@@ -239,6 +375,22 @@ class RankInfo:
     def tp_rank_per_node(self) -> int:
         """TP rank index within the local node (within one TP group)."""
         return self.tp_rank % self.model_config.tp_size_per_node
+
+    @property
+    def tp_node_idx(self) -> int:
+        """Index of this rank's node inside its TP group (0..tp_node_count-1).
+
+        Cross-node TP partitions ``tp_size`` ranks across
+        ``nnodes_per_tp_group`` physical nodes, with
+        ``tp_size_per_node = tp_size // nnodes_per_tp_group`` ranks per
+        node.  The node index is the floor-divide complement of
+        ``tp_rank_per_node``:  ``tp_rank // tp_size_per_node``.  Used by
+        ``SharingDomainKey`` to scope per-shard reuse.
+        """
+        per_node = self.model_config.tp_size_per_node
+        if per_node <= 0:
+            return 0
+        return self.tp_rank // per_node
 
     @property
     def dp_client_id(self) -> int:
@@ -321,6 +473,37 @@ class RankInfo:
 
 
 @dataclass
+class RemoteEndpoint:
+    """ZMQ endpoint of a Remote node belonging to a specific sharing domain.
+
+    Phase 0 task 0-J: ``CacheConfig.remote_endpoints_by_sd`` maps each
+    non-master sd_key (string form, see ``SharingDomainKey.serialize``) to
+    one of these.  The Master uses these to wire up its
+    ``TransferManagerMultiNodeHandle`` ZMQ peers — see
+    ``flexkv/transfer_manager.py``.
+
+    Fields mirror the three ports already exposed by
+    ``resolve_master_host_and_ports``:
+
+    * ``ip`` — host the Remote listens on (e.g. the Remote's RDMA-capable IP).
+    * ``gpu_register_port`` — port the local sglang worker uses to push GPU
+      handles into the Remote's TransferManagerOnRemote (channel ④).
+    * ``command_port`` — port the Master uses to push transfer-graph and
+      coordination commands to the Remote.
+    * ``result_port`` — port the Remote uses to push completion / failure
+      reports back to the Master.
+
+    All ports are ``str`` (matching ``master_ports``'s type) so they round-trip
+    through env vars cleanly.
+    """
+
+    ip: str
+    gpu_register_port: str
+    command_port: str
+    result_port: str
+
+
+@dataclass
 class CacheConfig:
     tokens_per_block: int = 16
     eviction_policy: str = "lru"
@@ -378,6 +561,15 @@ class CacheConfig:
     redis_port: int = 6379
     local_ip: str = "127.0.0.1"
     redis_password: Optional[str] = None
+    # Logical Redis database number (0..15 on default Redis servers).  Every
+    # FlexKV Redis client — both the Python ``RedisMeta`` / ``RedisNodeInfo``
+    # and the C++ ``RedisMetaChannel`` — honours this single value, so all
+    # dist-reuse metadata (nodes, blocks, sessions, aggregate markers) lives
+    # on the same logical db.  Defaults to 0 for backward compatibility with
+    # pre-Batch-D deployments.  Using a dedicated db (e.g. ``15``) is strongly
+    # recommended in environments where FlexKV shares a Redis instance with
+    # other tenants to make bulk cleanup (``FLUSHDB``) safe.
+    flexkv_redis_db: int = 0
     # TTL (seconds) for node:<id> key in Redis. Active nodes renew via heartbeat.
     # If a process crashes, the key auto-expires after this period.
     node_ttl_seconds: int = 30
@@ -385,10 +577,97 @@ class CacheConfig:
     # Mooncake transfer engine config path (serialized via pickle to survive spawn subprocesses)
     mooncake_config_path: Optional[str] = None
 
+    # ------------------------------------------------------------------
+    # Sharing-domain support (Phase 0 task 0-A)
+    #
+    # ``enable_sharing_domain`` is the master switch that turns on the new
+    # ``sd:<sd_key>:*`` Redis key layout, the cross-SD aggregate radix and
+    # the Master/Remote coordinated GET/PUT protocol.  It is auto-enabled
+    # whenever any P2P backend is on (``enable_p2p_cpu`` /
+    # ``enable_p2p_ssd``) — the legacy single-instance dist_reuse path is
+    # then served by the degenerate single-SD namespace produced by
+    # :meth:`SharingDomainKey.default`.
+    #
+    # ``instance_id`` and ``session_epoch`` identify the *whole FlexKV
+    # instance* (Master + every Remote) for the failure detector.  When
+    # left ``None`` the Master fills them in lazily (uuid4 / monotonic-uuid
+    # respectively) and propagates to Remotes via
+    # ``send_config_to_remotes``.
+    # ------------------------------------------------------------------
+    enable_sharing_domain: bool = False
+    instance_id: Optional[str] = None
+    session_epoch: Optional[str] = None
+
+    # Failure detector tunables (design doc §4.3.2 Layer-1 / §4.3.1 leak guard)
+    instance_session_ttl_seconds: int = 8
+    instance_session_renew_interval_seconds: int = 3
+    refcount_leak_timeout_seconds: int = 30
+    refcount_leak_scan_interval_seconds: int = 10
+
+    # ------------------------------------------------------------------
+    # Remote-endpoint discovery (Phase 0 task 0-J)
+    #
+    # ``remote_endpoints_by_sd`` is a ``{sd_key_str: RemoteEndpoint}`` dict
+    # populated by the framework launcher (e.g. sglang connector) before
+    # ``KVManager`` is constructed.  Each entry tells the Master which IP /
+    # ZMQ ports to use when reaching a Remote node belonging to the named
+    # SD.  When the dict is empty (legacy / single-Remote setups) the
+    # ``TransferManagerHandle`` falls back to ``resolve_master_host_and_ports``
+    # which derives a single endpoint from ``master_host`` + env vars.
+    #
+    # The dict values are plain dataclass instances rather than dicts so
+    # type-checkers / IDEs can verify field names — see ``RemoteEndpoint``
+    # below.  We keep them in this module (not in transfer_manager.py) to
+    # avoid a config → transfer_manager import cycle.
+    # ------------------------------------------------------------------
+    remote_endpoints_by_sd: Dict[str, "RemoteEndpoint"] = field(default_factory=dict)
+
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
         self.enable_remote = self.enable_3rd_remote
+        # Auto-enable sharing-domain whenever any P2P path is on.  Users can
+        # still flip it on manually for offline testing of the new key
+        # layout.  Idempotent.
+        if self.enable_p2p_cpu or self.enable_p2p_ssd:
+            self.enable_sharing_domain = True
+
+        # ------------------------------------------------------------------
+        # Lease-TTL safety check for P2P cross-instance reuse.
+        #
+        # The P2P CPU pull path (peer instance → master via mooncake RDMA
+        # READ) currently lacks an end-to-end refcount handshake — see
+        # ``docs/dist_reuse/KNOWN_ISSUE_p2p_refcount_2026-05-14.md``.
+        # We rely on the master-side lease (LocalRadixTree.lease_ttl_ms)
+        # plus the peer-side 1500ms freshness check
+        # (DistributedRadixTree.match_prefix) to keep peer reads from
+        # racing with master eviction.
+        #
+        # ``FLEXKV_LEASE_TTL_MS < 10000`` shrinks the safety margin to
+        # the same order of magnitude as a worst-case mooncake_read
+        # batch (a few hundred ms when the peer pulls thousands of
+        # blocks across multiple PEERH2H batches), at which point the
+        # lease alone is insufficient.  Refuse to start in that
+        # configuration so operators are not surprised in production.
+        if self.enable_p2p_cpu or self.enable_p2p_ssd:
+            try:
+                lease_ttl_ms = int(GLOBAL_CONFIG_FROM_ENV.lease_ttl_ms)
+            except Exception:
+                lease_ttl_ms = 0
+            _MIN_LEASE_TTL_MS_FOR_P2P = 10000
+            if lease_ttl_ms > 0 and lease_ttl_ms < _MIN_LEASE_TTL_MS_FOR_P2P:
+                raise ValueError(
+                    f"CacheConfig: enable_p2p_cpu / enable_p2p_ssd is True but "
+                    f"FLEXKV_LEASE_TTL_MS={lease_ttl_ms} is below the safety "
+                    f"floor of {_MIN_LEASE_TTL_MS_FOR_P2P}ms.  Without an "
+                    f"in-flight refcount handshake (tracked in "
+                    f"docs/dist_reuse/KNOWN_ISSUE_p2p_refcount_2026-05-14.md), "
+                    f"a short lease lets master eviction race with peer "
+                    f"mooncake_read and corrupt the KV cache.  Either raise "
+                    f"FLEXKV_LEASE_TTL_MS to >= {_MIN_LEASE_TTL_MS_FOR_P2P} "
+                    f"or implement the refcount glue (Plan A in the known-issue "
+                    f"doc) before enabling P2P in this configuration."
+                )
 
     def __str__(self) -> str:
         return (
@@ -481,6 +760,9 @@ class UserConfig:
     redis_port: Optional[int] = None
     local_ip: Optional[str] = None
     redis_password: Optional[str] = None
+    # Override for :attr:`CacheConfig.flexkv_redis_db` — typically only set
+    # in deployments where FlexKV shares a Redis instance with other services.
+    flexkv_redis_db: Optional[int] = None
     node_ttl_seconds: Optional[int] = None
     kv_cache_dtype: Optional[str] = None  # Override kv_cache_dtype when TRT config uses "auto". Supported values: "fp8", "float8", "e4m3", "fp16", "float16", "bf16", "bfloat16", "fp32", "float32"
 
@@ -563,6 +845,40 @@ def update_default_config_from_user_config(rank_info: RankInfo,
                                       cache_config.enable_p2p_ssd or
                                       cache_config.enable_3rd_remote)
     cache_config.enable_remote = cache_config.enable_3rd_remote
+    # Re-derive ``enable_sharing_domain`` here.  ``CacheConfig.__post_init__``
+    # only fires at construction time (with ``enable_p2p_cpu=False``), so any
+    # later flip via UserConfig (e.g. ``benchmark_dist_direct.py`` reading
+    # ``enable_p2p_cpu: true`` from yaml) would leave ``enable_sharing_domain``
+    # stuck at ``False`` and silently disable the dist_reuse fast-path.  Mirror
+    # the post-init invariant here so cross-instance KV reuse works whenever
+    # P2P is on.
+    if cache_config.enable_p2p_cpu or cache_config.enable_p2p_ssd:
+        cache_config.enable_sharing_domain = True
+
+        # Same lease-TTL safety check as ``CacheConfig.__post_init__`` —
+        # the yaml/UserConfig path bypasses ``__post_init__`` because the
+        # CacheConfig dataclass was already constructed (with P2P=False)
+        # before this function copies the UserConfig flags over.  Without
+        # this re-check, operators can ship a short-lease prod config that
+        # races peer mooncake_read with master eviction.  See
+        # ``docs/dist_reuse/KNOWN_ISSUE_p2p_refcount_2026-05-14.md``.
+        try:
+            lease_ttl_ms = int(GLOBAL_CONFIG_FROM_ENV.lease_ttl_ms)
+        except Exception:
+            lease_ttl_ms = 0
+        _MIN_LEASE_TTL_MS_FOR_P2P = 10000
+        if lease_ttl_ms > 0 and lease_ttl_ms < _MIN_LEASE_TTL_MS_FOR_P2P:
+            raise ValueError(
+                f"update_default_config_from_user_config: enable_p2p_cpu / "
+                f"enable_p2p_ssd is True but FLEXKV_LEASE_TTL_MS={lease_ttl_ms} "
+                f"is below the safety floor of {_MIN_LEASE_TTL_MS_FOR_P2P}ms.  "
+                f"Without an in-flight refcount handshake (see "
+                f"docs/dist_reuse/KNOWN_ISSUE_p2p_refcount_2026-05-14.md), a "
+                f"short lease lets master eviction race with peer mooncake_read "
+                f"and corrupt the KV cache.  Either raise FLEXKV_LEASE_TTL_MS "
+                f"to >= {_MIN_LEASE_TTL_MS_FOR_P2P} or implement the refcount "
+                f"glue (Plan A in the known-issue doc) before enabling P2P."
+            )
 
     if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
         cache_config.num_ssd_blocks = \
@@ -646,6 +962,8 @@ def update_default_config_from_user_config(rank_info: RankInfo,
         cache_config.local_ip = user_config.local_ip
     if user_config.redis_password is not None:
         cache_config.redis_password = user_config.redis_password
+    if user_config.flexkv_redis_db is not None:
+        cache_config.flexkv_redis_db = int(user_config.flexkv_redis_db)
     if user_config.node_ttl_seconds is not None:
         cache_config.node_ttl_seconds = user_config.node_ttl_seconds
 

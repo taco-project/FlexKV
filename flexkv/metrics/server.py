@@ -5,6 +5,7 @@ This module provides an HTTP server for exposing Prometheus metrics
 from the FlexKV Python runtime.
 """
 
+import os
 import threading
 from typing import Optional
 
@@ -96,7 +97,12 @@ def start_metrics_server(port: Optional[int] = None) -> bool:
             return True
         
         try:
-            from prometheus_client import start_http_server, REGISTRY
+            from prometheus_client import (
+                start_http_server,
+                REGISTRY,
+                CollectorRegistry,
+                multiprocess,
+            )
         except ImportError:
             raise RuntimeError(
                 "[FlexKV PyMetrics] prometheus_client not installed but metrics server requested. "
@@ -107,9 +113,32 @@ def start_metrics_server(port: Optional[int] = None) -> bool:
             port = get_metrics_port()
         
         try:
-            # Start server with default registry (single process mode)
+            # ----------------------------------------------------------
+            # Pick the right registry.
+            #
+            # When ``PROMETHEUS_MULTIPROC_DIR`` is set (the default when
+            # ``FLEXKV_ENABLE_METRICS=1``; see
+            # ``flexkv/metrics/collector.py::_bootstrap_multiproc_dir``),
+            # the HTTP server MUST use a fresh ``CollectorRegistry``
+            # wrapped with ``MultiProcessCollector``.  Otherwise it would
+            # serve only the parent process's local samples and silently
+            # drop everything emitted from ``mp.Process`` subprocess
+            # workers (the actual data path, e.g.
+            # ``PEER2CPUTransferWorker.observe_dist_reuse_peer_mooncake_read``).
+            # ----------------------------------------------------------
+            multiproc_dir = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+            if multiproc_dir:
+                registry = CollectorRegistry()
+                multiprocess.MultiProcessCollector(registry, path=multiproc_dir)
+                logger.info(
+                    f"[FlexKV PyMetrics] Multiprocess mode: aggregating from "
+                    f"{multiproc_dir}"
+                )
+            else:
+                registry = REGISTRY
+
             # Always bind to localhost (127.0.0.1) for security
-            start_http_server(port, addr=BIND_ADDRESS, registry=REGISTRY)
+            start_http_server(port, addr=BIND_ADDRESS, registry=registry)
             
             _server_started = True
             print(

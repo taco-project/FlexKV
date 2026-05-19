@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <nvtx3/nvToolsExt.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/functional.h>
 #include <pybind11/stl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -640,6 +641,19 @@ PYBIND11_MODULE(c_ext, m) {
                &flexkv::CRadixTreeIndex::evict),
            py::arg("evicted_blocks"), py::arg("evicted_block_hashes"),
            py::arg("num_evicted"), py::call_guard<py::gil_scoped_release>())
+      // 4-arg overload: dist-reuse refcount guard (§2.2).  The callback
+      // is invoked once per candidate physical block id; if it returns
+      // False the block id is dropped from the returned eviction set.
+      // NOTE: we do *not* release the GIL here because the predicate
+      // runs Python code — pybind11 would have to re-acquire on every
+      // call.  The evict loop is O(#evicted blocks) so the GIL impact
+      // is negligible compared to the Python callback cost itself.
+      .def("evict",
+           py::overload_cast<torch::Tensor &, torch::Tensor &, int,
+                             std::function<bool(int64_t)>>(
+               &flexkv::CRadixTreeIndex::evict),
+           py::arg("evicted_blocks"), py::arg("evicted_block_hashes"),
+           py::arg("num_evicted"), py::arg("is_evictable_fn"))
       .def("total_cached_blocks", &flexkv::CRadixTreeIndex::total_cached_blocks)
       .def("total_unready_blocks",
            &flexkv::CRadixTreeIndex::total_unready_blocks)
@@ -660,11 +674,18 @@ PYBIND11_MODULE(c_ext, m) {
   py::class_<flexkv::CMatchResult, std::shared_ptr<flexkv::CMatchResult>>(
       m, "CMatchResult")
       .def(py::init<int, int, int, flexkv::CRadixNode *, flexkv::CRadixNode *,
-                    torch::Tensor, torch::Tensor>())
+                    torch::Tensor, int32_t>(),
+           py::arg("num_ready_matched_blocks"),
+           py::arg("num_matched_blocks"),
+           py::arg("last_node_matched_length"),
+           py::arg("last_ready_node"),
+           py::arg("last_node"),
+           py::arg("physical_blocks"),
+           py::arg("matched_node_id") = -1)
       .def_readonly("last_ready_node", &flexkv::CMatchResult::last_ready_node)
       .def_readonly("last_node", &flexkv::CMatchResult::last_node)
       .def_readonly("physical_blocks", &flexkv::CMatchResult::physical_blocks)
-      .def_readonly("block_node_ids", &flexkv::CMatchResult::block_node_ids)
+      .def_readonly("matched_node_id", &flexkv::CMatchResult::matched_node_id)
       .def_readonly("num_ready_matched_blocks",
                     &flexkv::CMatchResult::num_ready_matched_blocks)
       .def_readonly("num_matched_blocks",
@@ -748,11 +769,13 @@ PYBIND11_MODULE(c_ext, m) {
 
   py::class_<flexkv::RedisMetaChannel>(m, "RedisMetaChannel")
       .def(py::init<const std::string &, int, uint32_t, const std::string &,
-                    const std::string &, const std::string &>(),
+                    const std::string &, const std::string &, int>(),
            py::arg("host"), py::arg("port"), py::arg("node_id"),
            py::arg("local_ip"), py::arg("blocks_key") = std::string("blocks"),
-           py::arg("password") = std::string(""))
+           py::arg("password") = std::string(""),
+           py::arg("db") = 0)
       .def("connect", &flexkv::RedisMetaChannel::connect)
+      .def("get_db", &flexkv::RedisMetaChannel::get_db)
       .def("get_node_id", &flexkv::RedisMetaChannel::get_node_id)
       .def("get_local_ip", &flexkv::RedisMetaChannel::get_local_ip)
       .def("make_block_key", &flexkv::RedisMetaChannel::make_block_key,
@@ -831,12 +854,38 @@ PYBIND11_MODULE(c_ext, m) {
       .def(
           "load_metas_by_keys",
           [](flexkv::RedisMetaChannel &ch,
-             const std::vector<std::string> &keys) {
+             const std::vector<std::string> &keys,
+             size_t batch_size) {
             std::vector<flexkv::BlockMeta> out;
-            ch.load_metas_by_keys(keys, out);
+            if (batch_size == 0) {
+              ch.load_metas_by_keys(keys, out);
+            } else {
+              ch.load_metas_by_keys(keys, out, batch_size);
+            }
             return out;
           },
-          py::arg("keys"))
+          py::arg("keys"), py::arg("batch_size") = 0)
+      .def(
+          "list_all_block_keys",
+          [](flexkv::RedisMetaChannel &ch) {
+            std::vector<std::string> keys;
+            ch.list_all_block_keys(keys);
+            return keys;
+          })
+      .def(
+          "load_instance_sd_nodes",
+          [](flexkv::RedisMetaChannel &ch, const std::string &instance_id) {
+            std::unordered_map<std::string, uint32_t> out;
+            ch.load_instance_sd_nodes(instance_id, out);
+            // Convert to py::dict explicitly — default caster maps uint32_t
+            // fine but we want a stable ordering for tests.
+            py::dict d;
+            for (auto &kv : out) {
+              d[py::cast(kv.first)] = py::cast(kv.second);
+            }
+            return d;
+          },
+          py::arg("instance_id"))
       .def(
           "update_block_state_batch",
           [](flexkv::RedisMetaChannel &ch, uint32_t node_id,

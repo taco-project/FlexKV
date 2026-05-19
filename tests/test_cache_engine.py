@@ -757,3 +757,69 @@ def test_eviction_policy_reinsert_after_eviction(engine_cls):
     assert engine.match(seqs[2]).num_matched_blocks == 0, (
         "C should be evicted to make room for re-inserted B"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests – MatchResultAccel matched_node_id field
+# ---------------------------------------------------------------------------
+class TestMatchResultAccelNodeId:
+    """Verify the single-node matching constraint data structures."""
+
+    def test_matched_node_id_default_none(self):
+        """matched_node_id defaults to None when not set."""
+        from flexkv.common.type import MatchResultAccel
+        result = MatchResultAccel(
+            num_ready_matched_blocks=0,
+            num_matched_blocks=0,
+            physical_blocks=np.array([], dtype=np.int64),
+        )
+        assert result.matched_node_id is None
+
+    def test_matched_node_id_set(self):
+        """matched_node_id can be set to a single integer."""
+        from flexkv.common.type import MatchResultAccel
+        result = MatchResultAccel(
+            num_ready_matched_blocks=5,
+            num_matched_blocks=5,
+            physical_blocks=np.arange(5, dtype=np.int64),
+            matched_node_id=42,
+        )
+        assert result.matched_node_id == 42
+        assert isinstance(result.matched_node_id, int)
+
+    def test_backward_compat_block_node_ids(self):
+        """block_node_ids (deprecated) still works alongside matched_node_id."""
+        from flexkv.common.type import MatchResultAccel
+        bnids = np.array([42, 42, 42], dtype=np.uint32)
+        result = MatchResultAccel(
+            num_ready_matched_blocks=3,
+            num_matched_blocks=3,
+            physical_blocks=np.arange(3, dtype=np.int64),
+            matched_node_id=42,
+            block_node_ids=bnids,
+        )
+        assert result.matched_node_id == 42
+        assert np.all(result.block_node_ids == 42)
+
+
+# ---------------------------------------------------------------------------
+# Tests – CMatchResult matched_node_id field (C++ binding)
+# ---------------------------------------------------------------------------
+class TestCMatchResultNodeId:
+    """Verify the C++ CMatchResult exposes matched_node_id."""
+
+    def test_cmatch_result_default_node_id(self):
+        """CMatchResult.matched_node_id defaults to -1."""
+        import torch
+        from flexkv.c_ext import CMatchResult
+        result = CMatchResult(0, 0, 0, None, None, torch.empty(0, dtype=torch.int64))
+        assert result.matched_node_id == -1
+
+    def test_cmatch_result_with_node_id(self):
+        """CMatchResult.matched_node_id can be set via constructor."""
+        import torch
+        from flexkv.c_ext import CMatchResult
+        blocks = torch.arange(3, dtype=torch.int64)
+        result = CMatchResult(3, 3, 0, None, None, blocks, 7)
+        assert result.matched_node_id == 7
+        assert result.physical_blocks.shape[0] == 3
