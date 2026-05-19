@@ -218,8 +218,8 @@ class FlexKVConfig:
             sglang_config: sglang.srt.configs.model_config.ModelConfig-like object
             server_args: sglang ServerArgs — source of tp_size, dp_size,
                 nnodes, node_rank, enable_dp_attention, attn_cp_size,
-                kv_cache_dtype,
-                dist_init_addr
+                is_nsa (read from server_args.enable_nsa_prefill_context_parallel),
+                kv_cache_dtype, dist_init_addr
             page_size: KV block size (tokens per block) used by sglang
             tp_rank: physical tensor parallel rank (runtime, from process group)
             pp_rank: pipeline parallel rank (runtime, from process group)
@@ -234,6 +234,11 @@ class FlexKVConfig:
         node_rank = server_args.node_rank
         enable_dp_attention = server_args.enable_dp_attention
         attn_cp_size = server_args.attn_cp_size
+        # ``is_nsa`` (NSA model layout flag): True when the model has an
+        # extra indexer K cache buffer.  Sourced from sglang's
+        # ``enable_nsa_prefill_context_parallel`` server arg, but in dist_reuse
+        # context the flag represents the *layout*, not whether CP is on.
+        is_nsa = getattr(server_args, 'enable_nsa_prefill_context_parallel', False)
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
         dp_rank = 0 if dp_rank is None else int(dp_rank)
 
@@ -327,6 +332,7 @@ class FlexKVConfig:
             pp_end_layer = self.model_config.num_layers
         self.model_config.enable_dp_attention = bool(enable_dp_attention)
         self.model_config.attn_cp_size = int(attn_cp_size)
+        self.model_config.is_nsa = is_nsa
         self.model_config.nnodes = max(1, int(nnodes))
         _dist_init_addr = getattr(server_args, 'dist_init_addr', None)
         if _dist_init_addr and int(nnodes) > 1:

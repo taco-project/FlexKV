@@ -132,6 +132,14 @@ def load_dist_direct_config(config_path: str):
         user_config.local_ip = config["local_ip"]
     if "redis_password" in config:
         user_config.redis_password = config["redis_password"]
+    # Optional: pick a non-default Redis logical DB so FlexKV keys don't collide
+    # with other tenants (e.g. Mooncake meta, or another running FlexKV /
+    # sglang instance on the same physical Redis).  The flexkv keys (``sd:*``,
+    # ``instance:*``, ``node:*`` …) all live in the selected DB; the mooncake
+    # backend continues to use whatever DB its ``metadata_server`` URL
+    # implies (default 0).
+    if "flexkv_redis_db" in config:
+        user_config.flexkv_redis_db = int(config["flexkv_redis_db"])
 
     # Auto-generate mooncake config JSON and set MOONCAKE_CONFIG_PATH if P2P is enabled
     if config.get("enable_p2p_cpu", False) or config.get("enable_p2p_ssd", False):

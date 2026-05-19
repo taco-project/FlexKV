@@ -38,6 +38,7 @@ from flexkv.transfer.host_buffer import (
     allocate_host_buffer,
     cudaHostRegister,
 )
+
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
@@ -207,8 +208,10 @@ class TransferWorkerBase(ABC):
                             transfer_status = self.launch_transfer(op)
                             nvtx.pop_range()
                         except Exception as e:
-                            flexkv_logger.error(f"Error launching transfer: {e}\n"
-                                        f"Failed transfer op: {op}")
+                            flexkv_logger.error(
+                                f"Error launching transfer: {e}\n"
+                                f"Failed transfer op: {op}"
+                            )
                         if transfer_status:
                             ## only put the op when transfer success
                             self.finished_ops_queue.put(op.transfer_op_id)
@@ -346,24 +349,29 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         gpu_tensor_ptrs = self.gpu_blocks_ptrs.contiguous().pin_memory()
 
+        # NOTE: use kwargs to bind to the C++ pybind signature exactly, otherwise
+        # positional args misalign on the new `start_layer_id` parameter and
+        # silently corrupt `transfer_num_cta` / `is_host_to_device` (D2H ends up
+        # with transfer_num_cta=0 → cudaErrorInvalidConfiguration).
         transfer_kv_blocks(
-            gpu_block_id_list,
-            gpu_tensor_ptrs,
-            self.gpu_kv_stride_in_bytes,
-            self.gpu_block_stride_in_bytes,
-            self.gpu_layer_stride_in_bytes,
-            cpu_block_id_list,
-            self.cpu_tensor,
-            self.cpu_kv_stride_in_bytes,
-            self.cpu_layer_stride_in_bytes,
-            self.cpu_block_stride_in_bytes,
-            self.chunk_size_in_bytes,
-            self.num_layers,
-            transfer_num_cta,
-            transfer_type == TransferType.H2D,
-            use_ce_transfer,
-            self.is_mla,
-            self.gpu_block_type_,
+            gpu_block_id_tensor=gpu_block_id_list,
+            gpu_tensor_ptrs_tensor=gpu_tensor_ptrs,
+            gpu_kv_stride_in_bytes=self.gpu_kv_stride_in_bytes,
+            gpu_block_stride_in_bytes=self.gpu_block_stride_in_bytes,
+            gpu_layer_stride_in_bytes=self.gpu_layer_stride_in_bytes,
+            cpu_block_id_tensor=cpu_block_id_list,
+            cpu_tensor=self.cpu_tensor,
+            cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
+            cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
+            cpu_block_stride_in_bytes=self.cpu_block_stride_in_bytes,
+            chunk_size_in_bytes=self.chunk_size_in_bytes,
+            start_layer_id=0,
+            num_layers=self.num_layers,
+            transfer_num_cta=transfer_num_cta,
+            is_host_to_device=(transfer_type == TransferType.H2D),
+            use_ce_transfer=use_ce_transfer,
+            is_mla=self.is_mla,
+            gpu_block_type=self.gpu_block_type_,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -1267,8 +1275,30 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.cache_config.redis_password,
                 self.cache_config.local_ip,
                 node_ttl_seconds=self.cache_config.node_ttl_seconds,
+                db=int(getattr(self.cache_config, "flexkv_redis_db", 0)),
             )
             self.redis_meta_client.set_node_id(self.cache_config.distributed_node_id)
+
+            # P0 FIX: bootstrap RedisNodeInfo discovery in this worker subprocess.
+            try:
+                if not self.redis_meta_client.nodeinfo.connect():
+                    flexkv_logger.warning(
+                        "PEER2CPUTransferWorker: nodeinfo.connect() returned "
+                        "False — cross-instance peer discovery may be degraded."
+                    )
+                else:
+                    self.redis_meta_client.nodeinfo.scan_active_nodes()
+                    active = self.redis_meta_client.nodeinfo.get_active_node_ids()
+                    flexkv_logger.info(
+                        f"PEER2CPUTransferWorker: nodeinfo bootstrap OK — "
+                        f"self_node_id={self.cache_config.distributed_node_id}, "
+                        f"current_active_nodes={sorted(active)}"
+                    )
+            except Exception as _e:
+                flexkv_logger.warning(
+                    f"PEER2CPUTransferWorker: nodeinfo bootstrap raised {_e!r}; "
+                    "is_node_active() may return False for live peers."
+                )
 
             # Persistent NodeMetaInfo Pool for skip redis operation when getting
             # NodeMetaInfo according to node_id
@@ -1462,9 +1492,72 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         transfer_type: TransferType,
         **kwargs,):
         if transfer_type == TransferType.PEERH2H:
+            # ----------------------------------------------------------
+            # P2P CPU pull observability (KNOWN_ISSUE_p2p_refcount_2026-05-14
+            # §4.2).  We time the mooncake_read and tag the outcome so the
+            # operator can monitor:
+            #   * latency P99 (lease-margin proxy)
+            #   * failure rate (mooncake errors + zero-byte transfers,
+            #     the latter being the symptom of the P0 bug fixed today)
+            #
+            # Metric collector lookup is best-effort — never raise from the
+            # data path, never block on metrics infrastructure failure.
+            # ----------------------------------------------------------
+            try:
+                # Use ``init_global_collector`` (not ``get_…``) because
+                # the global ``_global_collector`` singleton lives in
+                # *this* subprocess's address space — it's None on first
+                # call here even though the parent process initialized
+                # one before forking.  ``init_…`` is idempotent: it
+                # constructs a new collector and registers metrics
+                # against the multiprocess dir if and only if there
+                # isn't one already.  All metric writes route to the
+                # mmap'd files in ``$PROMETHEUS_MULTIPROC_DIR`` (set
+                # by the parent's ``_bootstrap_multiproc_dir`` and
+                # inherited via env into the spawn'd subprocess), so
+                # the parent's HTTP server's ``MultiProcessCollector``
+                # picks them up on the next scrape.
+                from flexkv.metrics import init_global_collector
+                _metrics = init_global_collector()
+            except Exception:
+                _metrics = None
+
+            try:
+                _expected_bytes = int(sum(task_info.data_lens or []))
+            except Exception:
+                _expected_bytes = 0
+
+            _t0 = time.perf_counter()
             ret = self.mooncake_transfer_engine.batch_transfer_sync_read(
                 task_info.peer_engine_addr, task_info.src_ptrs, task_info.dst_ptrs, task_info.data_lens
             )
+            _elapsed = time.perf_counter() - _t0
+
+            # Determine outcome:
+            #   * mooncake error  → reason="mooncake_error"
+            #   * zero-byte read while caller expected non-zero → reason=
+            #     "zero_byte_transfer"  (the P0-bug signature)
+            #   * otherwise success
+            _success = True
+            _reason = "ok"
+            if ret != 0:
+                _success = False
+                _reason = "mooncake_error"
+            elif _expected_bytes > 0 and (not task_info.data_lens or sum(task_info.data_lens) == 0):
+                # Defensive — data_lens was sanity-checked but the request
+                # asked for 0 bytes; treat as zero-byte transfer.
+                _success = False
+                _reason = "zero_byte_transfer"
+
+            if _metrics is not None:
+                try:
+                    _metrics.observe_dist_reuse_peer_mooncake_read(
+                        _elapsed, success=_success, reason=_reason,
+                    )
+                except Exception:
+                    # Never let metrics break the data path.
+                    pass
+
             if ret != 0:
                 flexkv_logger.error(f"RDMA transfer failed with error code: {ret}")
                 return False
@@ -2011,6 +2104,16 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         remote node has crashed.
         """
         # ===== Active-node validation (Scheme 4) =====
+        if not self.redis_meta_client.is_node_active(node_id):
+            # Cache may be stale: the listener thread is best-effort and an
+            # initial ``scan_active_nodes()`` may have run before the peer
+            # registered itself.  Force a fresh SCAN once before giving up so
+            # we don't drop a transfer just because of bootstrap order.
+            try:
+                self.redis_meta_client.nodeinfo.scan_active_nodes()
+            except Exception:  # noqa: BLE001
+                pass
+
         if not self.redis_meta_client.is_node_active(node_id):
             # Node is no longer active – purge cached meta if any
             if node_id in self.node_metas:
