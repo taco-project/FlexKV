@@ -288,8 +288,6 @@ class RedisNodeInfo:
                 "uuid": self.uuid,
                 "status": "active",
                 "timestamp": str(int(time.time())),
-                "pp_rank": str(getattr(self, 'pp_rank', 0)),
-                "pp_size": str(getattr(self, 'pp_size', 1)),
             })
 
             # Set TTL so the key auto-expires if the process crashes

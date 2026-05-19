@@ -500,7 +500,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
                 try:
                     with conn:
-                        # Receive 16-byte metadata: tp_rank_per_node, tp_size_per_node,
+                        # Receive 16-byte metadata: effective_tp_rank, effective_tp_size_per_node,
                         # num_layers, num_counters
                         metadata = conn.recv(16)
                         if len(metadata) < 16:
@@ -509,7 +509,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                                 f"expected 16 bytes, got {len(metadata)}")
                             continue
 
-                        rank_key, tp_size_per_node_recv, recv_num_layers, recv_num_counters = \
+                        rank_key, effective_tp_size_per_node_recv, recv_num_layers, recv_num_counters = \
                             struct.unpack("iiii", metadata[:16])
 
                         if not all_rank_eventfds:
@@ -517,8 +517,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
                         flexkv_logger.debug(
                             f"[LayerwiseWorker] Connection {conn_idx}: "
-                            f"tp_rank_per_node={rank_key}, "
-                            f"tp_size_per_node={tp_size_per_node_recv}, "
+                            f"effective_tp_rank={rank_key}, "
+                            f"effective_tp_size_per_node={effective_tp_size_per_node_recv}, "
                             f"num_layers={recv_num_layers}, "
                             f"num_counters={recv_num_counters}")
 
@@ -538,7 +538,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                         except Exception:
                             pass
                         flexkv_logger.info(
-                            f"[LayerwiseWorker] Received all eventfds from tp_rank_per_node={rank_key} "
+                            f"[LayerwiseWorker] Received all eventfds from effective_tp_rank={rank_key} "
                             f"on {socket_path}")
                 except Exception as e:
                     # Send NACK so client knows to retry

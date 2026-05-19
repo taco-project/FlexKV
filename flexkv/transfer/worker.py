@@ -1,6 +1,9 @@
 import math
 import os
 import copy
+import sys
+import faulthandler
+
 import torch.multiprocessing as mp
 import threading
 import time
@@ -176,6 +179,8 @@ class TransferWorkerBase(ABC):
     @classmethod
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
                         op_buffer_tensor: torch.Tensor, ready_event: Any, *args: Any, **kwargs: Any) -> None:
+        # Enable faulthandler in worker subprocess to capture segfault/SIGBUS stack traces.
+        faulthandler.enable(file=sys.stderr, all_threads=True)
         # Note: MPI initialization prevention is handled by create_safe_process
         # Environment variables are set before this function is called
         install_worker_crash_diagnostics(cls.__name__, worker_id)
@@ -1946,7 +1951,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
         Args:
             tp_group_size: Effective tp-group size on this node
                 (``effective_tp_size_per_node`` =
-                ``attn_tp_size_per_node × attn_cp_size_per_node``).
+                ``tp_size_per_node × cp_size_per_node``).
             layer_groups: Optional per-group KV layouts for heterogeneous models
                 (Gemma4 multi-shape, DSA/NSA indexer-as-group).
         """
