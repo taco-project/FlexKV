@@ -15,7 +15,7 @@
 import heapq
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional
+from typing import Callable, Dict, Tuple, Optional
 
 import numpy as np
 import torch
@@ -281,7 +281,30 @@ class RadixTreeIndex:
 
         return new_node
 
-    def evict(self, num_evicted: int) -> Tuple[np.ndarray, np.ndarray]:
+    def evict(self,
+              num_evicted: int,
+              is_evictable_fn: Optional[Callable[[int], bool]] = None,
+              ) -> Tuple[np.ndarray, np.ndarray]:
+        """Evict up to ``num_evicted`` blocks from the tree.
+
+        Args:
+            num_evicted: Target number of physical blocks to evict.
+            is_evictable_fn: Optional predicate.  When supplied, a
+                physical block id is only evicted if
+                ``is_evictable_fn(block_id)`` returns True.  This is
+                the dist-reuse refcount guard — blocks with an
+                in-flight coord GET refcount > 0 must stay pinned.
+                When ``None`` (default) the legacy behaviour is kept.
+        """
+        def _block_ok(block_id: int) -> bool:
+            if is_evictable_fn is None:
+                return True
+            try:
+                return bool(is_evictable_fn(int(block_id)))
+            except Exception:
+                # Defensive: never let a buggy guard wedge eviction.
+                return True
+
         candidates = []
         for node in self.leaf_nodes.values():
             if node.evictable():
@@ -306,6 +329,22 @@ class RadixTreeIndex:
                 physical_blocks = node.physical_blocks
                 _block_hashes = node.block_hashes
                 node.parent = None
+
+            # Dist-reuse refcount guard: drop block ids the Master
+            # coordinator has marked as "in-flight coord GET". The
+            # block has already been physically detached from the
+            # tree above, which is acceptable — the caller will not
+            # recycle those block ids, so the physical slot stays
+            # pinned until the refcount drains.  We simply omit them
+            # from the evicted set returned to the caller.
+            if is_evictable_fn is not None and physical_blocks.size > 0:
+                keep_mask = np.array(
+                    [_block_ok(int(b)) for b in physical_blocks],
+                    dtype=bool,
+                )
+                if not keep_mask.all():
+                    physical_blocks = physical_blocks[keep_mask]
+                    _block_hashes = _block_hashes[keep_mask]
 
             evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
             evicted_block_hashes = np.concatenate([evicted_block_hashes, _block_hashes])

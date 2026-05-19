@@ -241,8 +241,15 @@ class TensorSharedHandle:
             return tensor
 
         except Exception as e:
+            # NOTE: previously this returned ``torch.empty(0)`` on failure,
+            # which silently dropped the wrapper into a 0-element tensor and
+            # surfaced as an *unrelated* IndexError later in
+            # ``worker.py::_get_layer_ptrs`` (``layer_blocks[0]`` out of range)
+            # — making it nearly impossible to root-cause the real failure
+            # (e.g. cross-node CUDA IPC handle device-id mismatch).  Always
+            # propagate the real exception so the original traceback is kept.
             flexkv_logger.error("Import tensor handle failed: %s", e)
-            return torch.empty(0)
+            raise
 
     @staticmethod
     def _create_tensor_from_cuda_ptr(

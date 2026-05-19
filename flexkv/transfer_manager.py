@@ -31,6 +31,130 @@ from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import RegisterTPClientRequest, Response
 
 
+# ---------------------------------------------------------------------------
+# Coord-message routing (Phase D-4: heavy trim)
+#
+# Phase D-4 (proposal_unify_with_graph_dispatch_2026-05-15.md): the
+# CoordQuery / CoordGet / CoordPut messages were deleted.  Per-SD PUT/
+# GET coordination now flows through the unified TransferOpGraph
+# dispatch path; only ``failure_report`` remains as an asynchronous
+# Layer-2 closed-loop side channel (Remote → Master).
+# ---------------------------------------------------------------------------
+_COORD_ACK_TYPES = frozenset({
+    "failure_report",
+})
+
+
+def _filter_graph_inplace_by_target_node_ids(
+    graph: TransferOpGraph, self_nid: int,
+) -> int:
+    """Drop ops whose ``target_node_ids`` does not include ``self_nid``.
+
+    Phase D-3 (proposal_unify_with_graph_dispatch_2026-05-15.md §6.4):
+    ``target_node_ids`` is a per-op SD-routing tag.  Originally the
+    filter ran only on cross-machine ``TransferManagerOnRemote`` (Phase
+    D-1).  Phase D-3 lifts it to a module-level helper so the Master's
+    in-proc / inter-proc handles can apply the same rule before
+    handing the graph to its local TransferEngine.  Without this, the
+    Master would eagerly execute every peer-SD clone op in the graph,
+    which:
+
+    * For PUT-path D2H clones (Phase D-2): produces N-1 redundant
+      GPU→CPU copies — correct because the clones share src/dst block
+      IDs (mirror assumption), but wastes bandwidth.
+    * For GET-path PEERH2H clones (Phase D-3): each clone targets a
+      *different* peer instance's per-SD mooncake endpoint via
+      ``src_block_node_ids``; running them on the Master would fetch
+      data from endpoints the Master never connected to → silent
+      corruption / mooncake errors.
+
+    Semantics:
+
+    * ``target_node_ids`` is None / empty  → keep (legacy single-SD or
+      cross-machine TP/PP behaviour, unchanged).
+    * ``self_nid < 0``                     → keep everything (dist_reuse
+      bootstrap not finished yet — pre-D-3 behaviour).
+    * Otherwise: keep iff ``self_nid in target_node_ids``.
+
+    Dependency-graph repair (Phase D-3):
+    A dropped op may still appear in the ``predecessors`` set of an
+    op we *keep* (typical case: ``op_h2d → op_peerh2h_clone`` was
+    wired by the master before broadcast; on the Master the clones
+    are dropped but ``op_h2d`` remains).  The graph engine waits for
+    every predecessor to finish before scheduling a successor — if
+    the predecessor was filtered out it never completes, so the
+    successor would deadlock.  We therefore treat dropped ops as
+    *vacuously satisfied* on this handle: remove their op_id from
+    every kept op's ``predecessors`` set.  This is the natural
+    semantic — "this op runs on a different SD, so locally there is
+    nothing to wait for here; the cross-SD ack flows back through
+    the master polling thread's ``_completion_sink`` and is observed
+    on the Master's own graph copy".
+
+    Returns the number of dropped ops (for logging / metrics).
+    Mutates ``graph`` in place.
+    """
+    if self_nid < 0:
+        return 0
+
+    op_map = graph._op_map  # type: ignore[attr-defined]
+    to_drop: List[int] = []
+    for op_id, op in op_map.items():
+        tnids = getattr(op, "target_node_ids", None)
+        if not tnids:
+            continue  # No filter — keep.
+        if self_nid not in tnids:
+            to_drop.append(op_id)
+
+    if not to_drop:
+        return 0
+
+    drop_set = set(to_drop)
+
+    # Mirror the bookkeeping ``TransferOpGraph.add_transfer_op``
+    # populates so the resulting graph stays internally consistent.
+    for op_id in to_drop:
+        op_map.pop(op_id, None)
+        graph._ready_ops.discard(op_id)        # type: ignore[attr-defined]
+        graph._trigger_ops.discard(op_id)      # type: ignore[attr-defined]
+        try:
+            graph._gpu_transfer_op_id.remove(op_id)  # type: ignore[attr-defined]
+        except (ValueError, AttributeError):
+            pass
+
+    # Phase D-3: repair predecessor / successor sets on the kept ops
+    # so dropped ops appear "vacuously satisfied" to the local graph
+    # engine.  Without this fix, an ``op_h2d`` left in the master's
+    # graph would still list the (now-dropped) peer-SD ``op_peerh2h``
+    # clones in its ``predecessors`` and never become ready.
+    for op in op_map.values():
+        if op.predecessors:
+            op.predecessors.difference_update(drop_set)
+        if op.successors:
+            op.successors.difference_update(drop_set)
+        # If repairing predecessors made this op fully ready and it
+        # wasn't already in ``_ready_ops``, put it back so the next
+        # ``take_ready_ops`` call picks it up.  Status check guards
+        # against re-adding ops that have already completed in earlier
+        # passes (defensive — graphs are normally filtered exactly
+        # once at submit time).
+        if (
+            len(op.predecessors) == 0
+            and op.op_id not in graph._ready_ops  # type: ignore[attr-defined]
+            and op.op_id not in graph._trigger_ops  # type: ignore[attr-defined]
+        ):
+            try:
+                from flexkv.common.transfer import TransferOpStatus
+                if op.status == TransferOpStatus.PENDING:
+                    graph._ready_ops.add(op.op_id)  # type: ignore[attr-defined]
+            except Exception:
+                # Defensive — never let a status import / equality
+                # check wedge the filter pass.
+                pass
+
+    return len(to_drop)
+
+
 class TransferManager:
     def __init__(self,
                  model_config: ModelConfig,
@@ -308,12 +432,111 @@ class TransferManagerOnRemote(TransferManager):
             self.model_config = config_msg.get('model_config')
             self.cache_config = config_msg.get('cache_config')
             self.gpu_register_port = config_msg.get('gpu_register_port')
+            # Phase 0 task 0-F: stash SD bootstrap fields for post-init use.
+            self._dist_reuse_bootstrap_msg = {
+                'sd_key': config_msg.get('sd_key'),
+                'instance_id': config_msg.get('instance_id'),
+                'session_epoch': config_msg.get('session_epoch'),
+                'master_zmq_addr': config_msg.get('master_zmq_addr'),
+            }
             flexkv_logger.info(f"Received config from master, {self.model_config = }, \
                 {self.cache_config = }, {self.gpu_register_port = }.")
         else:
             raise RuntimeError(f"Expected config message, got: {config_msg}")
         flexkv_logger.info("Received config from master successfully")
         super().__init__(self.model_config, self.cache_config, self.gpu_register_port)
+
+        # Phase 0 task 0-F: opt-in to sharing-domain bootstrap.
+        if getattr(self.cache_config, "enable_sharing_domain", False):
+            self._bootstrap_sharing_domain()
+
+    def _bootstrap_sharing_domain(self) -> None:
+        """Run the RedisMeta + Mooncake bootstrap for this Remote node.
+
+        Called from :meth:`_initialize_with_config` after ``super().__init__``
+        so that the parent class has already allocated the CPU block pool
+        and we can register its buffer pointer with Mooncake.
+
+        Failure to bootstrap is fatal — we raise and let the parent process
+        restart the instance (design doc §4.3.1 co-destined failure model).
+        """
+        boot = self._dist_reuse_bootstrap_msg
+        sd_key_str = boot.get('sd_key') if boot else None
+        if not sd_key_str:
+            flexkv_logger.warning(
+                "[DistReuse] enable_sharing_domain=True but no sd_key in config; "
+                "skipping Remote bootstrap (Master still uses legacy discovery)."
+            )
+            return
+
+        from flexkv.common.dist_reuse import RemoteDistReuseInitializer
+
+        # ``cpu_blocks`` is allocated by the parent class; its data pointer
+        # and byte size drive Mooncake buffer registration.
+        cpu_blocks = getattr(self, "cpu_blocks", None)
+        if cpu_blocks is None:
+            flexkv_logger.warning(
+                "[DistReuse] parent did not allocate cpu_blocks; cannot register "
+                "Mooncake buffer.  Bootstrap skipped."
+            )
+            return
+
+        cpu_buffer_ptr = int(cpu_blocks.data_ptr())
+        cpu_buffer_size = int(cpu_blocks.numel() * cpu_blocks.element_size())
+        local_zmq_addr = f"{self.cache_config.local_zmq_ip}:{self.cache_config.local_zmq_port}"
+
+        init = RemoteDistReuseInitializer(
+            cache_config=self.cache_config,
+            sd_key_str=sd_key_str,
+            instance_id=boot.get('instance_id') or "",
+            session_epoch=boot.get('session_epoch') or "",
+            cpu_buffer_ptr=cpu_buffer_ptr,
+            cpu_buffer_size=cpu_buffer_size,
+            local_zmq_addr=local_zmq_addr,
+        )
+        result = init.bootstrap()
+
+        self._dist_reuse_sd_key = result.sd_key
+        self._dist_reuse_namespace = result.namespace
+        self._dist_reuse_redis_meta = result.redis_meta
+        self._dist_reuse_mooncake_engine = result.mooncake_engine
+        self._dist_reuse_node_id = result.distributed_node_id
+
+        # Phase D-4 (proposal_unify_with_graph_dispatch_2026-05-15.md):
+        # the old per-SD ZMQ coord protocol (``CoordQueryMsg``/
+        # ``CoordGetCmdMsg``/``CoordPutCmdMsg`` + ``RemoteCoordHandler``
+        # + ``BlockIndex`` + ``_d2h_and_publish`` closure) was deleted
+        # in this refactor.  Multi-SD coordination now flows through
+        # the unified ``TransferOpGraph`` dispatch path: the master
+        # broadcasts a graph carrying multiple D2H / PEERH2H ops with
+        # per-op ``target_node_ids``, each Remote's ``_handle_submit``
+        # filters by its own ``self_node_id``, the local transfer
+        # worker executes the slice, and the resulting ``CompletedOp``
+        # carries ``sd_key`` + ``contributing_node_id`` back through
+        # the existing master-side polling thread.
+        #
+        # No coord handler is constructed here — the Remote is now
+        # purely data-plane and reuses the regular submit/wait
+        # plumbing for both legacy cross-machine TP/PP graphs and
+        # dist_reuse multi-SD graphs.
+
+        # Push the ready message back to Master via the result channel.
+        # We deliberately reuse ``result_socket`` (rather than a dedicated
+        # dist_reuse channel) because the Master's polling worker already
+        # accepts arbitrary pyobjs on this socket.
+        try:
+            self.result_socket.send_pyobj({
+                'type': 'remote_ready',
+                'msg': result.ready_msg,
+            })
+            flexkv_logger.info(
+                f"[DistReuse] Remote bootstrap complete for sd_key={sd_key_str}, "
+                f"node_id={result.distributed_node_id}"
+            )
+        except Exception as e:
+            flexkv_logger.error(f"[DistReuse] failed to send ready to master: {e}")
+            raise
+
 
     def _polling_worker(self) -> None:
         flexkv_logger.info("Polling worker thread started")
@@ -343,6 +566,21 @@ class TransferManagerOnRemote(TransferManager):
                             elif msg_type == 'submit_batch':
                                 graphs = message.get('graphs', [])
                                 for graph in graphs:
+                                    # Phase D-1: filter ops by
+                                    # target_node_ids before rebinding.
+                                    self._filter_graph_by_target_node_ids(graph)
+                                    if graph.num_ops == 0:
+                                        try:
+                                            self.result_socket.send_pyobj(
+                                                CompletedOp.completed_graph(graph.graph_id)
+                                            )
+                                        except Exception as e:  # pragma: no cover
+                                            flexkv_logger.error(
+                                                f"[TransferManagerOnRemote] failed to send "
+                                                f"empty-batch-graph completion for "
+                                                f"graph={graph.graph_id}: {e}"
+                                            )
+                                        continue
                                     graph_id = graph.graph_id
                                     with self._active_graphs_lock:
                                         self._active_graphs[graph_id] = -1
@@ -376,16 +614,46 @@ class TransferManagerOnRemote(TransferManager):
                     completed = self.wait(timeout=0.001)
 
                     if completed:
+                        # Phase D-1: stamp ``sd_key`` + ``contributing_node_id``
+                        # onto every CompletedOp this Remote ships back so the
+                        # Master's polling worker can route per-SD completion
+                        # to ``mark_sd_ready``.  The values are read from the
+                        # bootstrap result; default to "" / -1 when bootstrap
+                        # didn't run (legacy single-SD path).
+                        sd_key_str = str(getattr(self, "_dist_reuse_sd_key", "") or "")
+                        contributing_nid = int(getattr(self, "_dist_reuse_node_id", -1))
+
                         with self._active_graphs_lock:
                             for completed_op in completed:
                                 if completed_op.graph_id in self._active_graphs:
                                     task_end_op_id = self._active_graphs[completed_op.graph_id]
 
                                     if task_end_op_id != -1 and completed_op.op_id == task_end_op_id:
-                                        end_op = CompletedOp(graph_id=completed_op.graph_id, op_id=task_end_op_id)
+                                        end_op = CompletedOp(
+                                            graph_id=completed_op.graph_id,
+                                            op_id=task_end_op_id,
+                                            sd_key=sd_key_str,
+                                            contributing_node_id=contributing_nid,
+                                        )
                                         self.result_socket.send_pyobj(end_op)
                                     if completed_op.is_graph_completed():
-                                        self.result_socket.send_pyobj(completed_op)
+                                        # ``completed_op`` is frozen — re-create
+                                        # it with the SD/node tags.  Preserve
+                                        # existing fields (transfer_type / num_*
+                                        # / success / error) so the master's
+                                        # bookkeeping doesn't lose info.
+                                        tagged = CompletedOp(
+                                            graph_id=completed_op.graph_id,
+                                            op_id=completed_op.op_id,
+                                            transfer_type=completed_op.transfer_type,
+                                            num_blocks=completed_op.num_blocks,
+                                            num_bytes=completed_op.num_bytes,
+                                            sd_key=sd_key_str,
+                                            contributing_node_id=contributing_nid,
+                                            success=completed_op.success,
+                                            error=completed_op.error,
+                                        )
+                                        self.result_socket.send_pyobj(tagged)
                                         del self._active_graphs[completed_op.graph_id]
 
                 except queue.Empty:
@@ -437,6 +705,29 @@ class TransferManagerOnRemote(TransferManager):
         If slot_mapping already arrived, set_gpu_blocks and submit immediately.
         Otherwise, store graph in pending_graphs for later matching.
         """
+        # Phase D-1: filter ops by ``target_node_ids`` BEFORE pending /
+        # rebind logic.  When the Master broadcasts a multi-SD graph
+        # (proposal_unify_with_graph_dispatch_2026-05-15.md §6), each
+        # Remote drops the ops not addressed to its own
+        # ``self_node_id`` so the TransferEngine only sees its own
+        # slice.  Legacy graphs whose ops have ``target_node_ids=None``
+        # are kept verbatim — backwards-compatible with single-SD
+        # cross-machine TP/PP graphs.
+        self._filter_graph_by_target_node_ids(graph)
+        if graph.num_ops == 0:
+            # Nothing for this Remote to do.  Still acknowledge graph
+            # completion so the Master's barrier doesn't hang waiting.
+            try:
+                self.result_socket.send_pyobj(
+                    CompletedOp.completed_graph(graph.graph_id)
+                )
+            except Exception as e:  # pragma: no cover
+                flexkv_logger.error(
+                    f"[TransferManagerOnRemote] failed to send empty-graph "
+                    f"completion for graph={graph.graph_id}: {e}"
+                )
+            return
+
         task_id = graph.graph_id  # Use graph_id as task_id for matching
         with self._pending_lock:
             if task_id in self._pending_slot_mappings:
@@ -460,6 +751,30 @@ class TransferManagerOnRemote(TransferManager):
         with self._active_graphs_lock:
             self._active_graphs[graph.graph_id] = task_end_op_id
         self.submit(graph)
+
+    def _filter_graph_by_target_node_ids(self, graph: TransferOpGraph) -> None:
+        """Drop ops whose ``target_node_ids`` does not include this
+        Remote's ``self_node_id``.
+
+        Phase D-3 (proposal_unify_with_graph_dispatch_2026-05-15.md §6.4):
+        the actual filter logic now lives in the module-level
+        :func:`_filter_graph_inplace_by_target_node_ids` so the Master's
+        in-proc / inter-proc handles can call it too.  This thin wrapper
+        only resolves ``self_nid`` and adds the per-Remote debug log.
+        """
+        # Resolve self node_id.  ``_dist_reuse_node_id`` is set by
+        # ``_bootstrap_sharing_domain`` once the Remote has registered
+        # with Redis; before that we have no SD identity, so legacy
+        # behaviour (no filtering) is the only safe choice.
+        self_nid = int(getattr(self, "_dist_reuse_node_id", -1))
+        dropped = _filter_graph_inplace_by_target_node_ids(graph, self_nid)
+        if dropped:
+            flexkv_logger.debug(
+                f"[TransferManagerOnRemote:nid={self_nid}] dropped "
+                f"{dropped} op(s) not addressed to me from "
+                f"graph={graph.graph_id}; remaining ops={graph.num_ops}"
+            )
+
 
     def start(self) -> None:
         self.initialize_transfer_engine()
@@ -643,6 +958,20 @@ class TransferManagerIntraProcessHandle(TransferManagerHandleBase):
                  gpu_register_port: str):
         self.transfer_manager = TransferManager(model_config, cache_config, gpu_register_port)
         self._is_ready = False
+        # Phase D-3 (proposal_unify_with_graph_dispatch_2026-05-15.md
+        # §6.4): Master's own ``distributed_node_id`` for ``target_node_ids``
+        # filtering on graphs submitted into the local TransferEngine.
+        # ``-1`` is the sentinel meaning "dist_reuse off / not yet wired";
+        # ``_filter_graph_inplace_by_target_node_ids`` then keeps every op
+        # (legacy behaviour).  Set via :meth:`set_dist_reuse_node_id` from
+        # ``KVTaskManager._wire_dist_reuse_coord_dispatcher``.
+        self._dist_reuse_self_nid: int = -1
+
+    def set_dist_reuse_node_id(self, self_nid: int) -> None:
+        """Phase D-3: install the Master's own ``distributed_node_id`` so
+        the in-proc submit path drops ops addressed to peer SDs.  Idempotent.
+        """
+        self._dist_reuse_self_nid = int(self_nid)
 
     def start(self) -> None:
         self.transfer_manager.initialize_transfer_engine()
@@ -653,9 +982,20 @@ class TransferManagerIntraProcessHandle(TransferManagerHandleBase):
         return self._is_ready
 
     def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
+        # Phase D-3: drop peer-SD ops (target_node_ids set + does not
+        # include self) before the local TransferEngine sees the graph.
+        # Legacy graphs (target_node_ids=None on every op) and pre-
+        # bootstrap state (self_nid=-1) are unaffected.
+        _filter_graph_inplace_by_target_node_ids(
+            transfer_graph, self._dist_reuse_self_nid,
+        )
         self.transfer_manager.submit(transfer_graph)
 
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
+        for g in transfer_graphs:
+            _filter_graph_inplace_by_target_node_ids(
+                g, self._dist_reuse_self_nid,
+            )
         self.transfer_manager.submit_batch(transfer_graphs)
 
     def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
@@ -684,6 +1024,19 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         self.ready_event = self.mp_ctx.Event()
 
         self._completed_results: List[CompletedOp] = []
+
+        # Phase D-3 (proposal_unify_with_graph_dispatch_2026-05-15.md
+        # §6.4): Master's own ``distributed_node_id`` for ``target_node_ids``
+        # filtering applied **in the parent process** before the graph
+        # is shipped through the Pipe.  ``-1`` = dist_reuse off / not
+        # yet wired → utility keeps every op (legacy behaviour).
+        self._dist_reuse_self_nid: int = -1
+
+    def set_dist_reuse_node_id(self, self_nid: int) -> None:
+        """Phase D-3: install the Master's own ``distributed_node_id``
+        so peer-SD ops are dropped before crossing the Pipe.  Idempotent.
+        """
+        self._dist_reuse_self_nid = int(self_nid)
 
     def _start_process(self) -> None:
         if self.process is not None and self.process.is_alive():
@@ -828,6 +1181,11 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
 
     def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
         nvtx_range = nvtx.start_range(message="TransferManagerInterProcessHandle.submit", color="green")
+        # Phase D-3: filter peer-SD ops *before* the Pipe send so the
+        # subprocess never sees them.  No-op for legacy graphs.
+        _filter_graph_inplace_by_target_node_ids(
+            transfer_graph, self._dist_reuse_self_nid,
+        )
         self.command_parent_conn.send({
             'type': 'submit',
             'transfer_graph': transfer_graph
@@ -840,6 +1198,11 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             message=f"TransferManagerInterProcessHandle.submit_batch count={len(transfer_graphs)}",
             color="green"
         )
+        # Phase D-3: filter every graph in place before shipping the batch.
+        for g in transfer_graphs:
+            _filter_graph_inplace_by_target_node_ids(
+                g, self._dist_reuse_self_nid,
+            )
         self.command_parent_conn.send({
             'type': 'submit_batch',
             'transfer_graphs': transfer_graphs
@@ -905,6 +1268,18 @@ class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
 
         self._result_buffer: List[CompletedOp] = []
         self._result_buffer_lock = threading.Lock()
+        # Phase 0 task 0-F / 0-G: sharing-domain Remote ready acks land
+        # here.  The KVTaskManager drains this list and forwards each
+        # message to its MasterCoordinator.
+        self._remote_ready_acks: List[Any] = []
+
+        # Phase D-4: sink for FailureReportMsg (only remaining ack
+        # type after the coord-protocol cleanup).  The KVTaskManager
+        # may set this to a handler that calls
+        # ``MasterCoordinator.handle_failure_report``.  Unset = drop
+        # silently (harmless — failure detector's Layer-1 path will
+        # eventually catch persistent peer outages).
+        self._coord_ack_sink: Optional[Any] = None
 
         self._bind_master_ports()
 
@@ -949,10 +1324,31 @@ class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
                 'cache_config': self.cache_config,
                 'gpu_register_port': self.gpu_register_port
             }
+            # Phase 0 task 0-F: when sharing-domain is on, ship the
+            # Remote's ``sd_key`` + ``instance_id`` + ``session_epoch`` in
+            # the same config message.  ``target_sd_key`` is populated
+            # externally by the Master (see KVTaskManager._build_sd_handles).
+            if getattr(self.cache_config, "enable_sharing_domain", False):
+                config_msg['sd_key'] = getattr(self, '_target_sd_key', None)
+                config_msg['instance_id'] = getattr(self.cache_config, 'instance_id', None)
+                config_msg['session_epoch'] = getattr(self.cache_config, 'session_epoch', None)
+                config_msg['master_zmq_addr'] = (
+                    f"{self.master_host}:{self.master_ports[0]}"
+                )
             self.command_socket.send_pyobj(config_msg)
             flexkv_logger.info(f"Config sent to remote at {self.master_host}:{self.master_ports[0]}")
         except Exception as e:
             flexkv_logger.error(f"Failed to send config to remote: {e}")
+
+    def set_target_sd_key(self, sd_key_str: str) -> None:
+        """Set the ``sd_key`` this handle is delivering config to.
+
+        Called by :class:`KVTaskManager` **before**
+        :meth:`send_config_to_remotes`.  The master must tag each remote
+        handle with the SD key the corresponding Remote node owns so the
+        Remote can register itself under the right namespace.
+        """
+        self._target_sd_key = str(sd_key_str)
 
     def _polling_worker(self) -> None:
         while not self._shutdown_flag:
@@ -961,6 +1357,54 @@ class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
                 if isinstance(result, CompletedOp):
                     with self._result_buffer_lock:
                         self._result_buffer.append(result)
+                    # Phase D-1: when the inbound CompletedOp carries an
+                    # ``sd_key`` (i.e. the Remote tagged it during
+                    # _polling_worker after dist_reuse bootstrap), notify
+                    # the registered ``_completion_sink`` so the Master's
+                    # GlobalCacheEngine can flip the per-SD ready bit on
+                    # the AggregateRadixTree.  This replaces the old
+                    # CoordPutAckMsg / CoordGetAckMsg ack route.
+                    if getattr(result, "sd_key", "") and result.success:
+                        sink = getattr(self, "_completion_sink", None)
+                        if sink is not None:
+                            try:
+                                sink(result)
+                            except Exception as e:  # pragma: no cover
+                                flexkv_logger.error(
+                                    f"[DistReuse] completion sink raised on "
+                                    f"CompletedOp(graph={result.graph_id}, "
+                                    f"op={result.op_id}, sd={result.sd_key}): {e}"
+                                )
+                elif (
+                    isinstance(result, dict)
+                    and result.get('type') == 'remote_ready'
+                ):
+                    # Phase 0 task 0-F / 0-G: Remote finished its
+                    # sharing-domain bootstrap.  Stash the message so the
+                    # Master's KVTaskManager can forward it to its
+                    # MasterCoordinator.
+                    msg = result.get('msg')
+                    if msg is not None:
+                        with self._result_buffer_lock:
+                            self._remote_ready_acks.append(msg)
+                elif (
+                    isinstance(result, dict)
+                    and result.get('type') in _COORD_ACK_TYPES
+                ):
+                    # Phase D-4: only ``failure_report`` reaches this
+                    # branch.  Decode and hand off to the registered
+                    # sink (typically ``MasterCoordinator.handle_failure_report``).
+                    try:
+                        from flexkv.common.dist_reuse import decode_coord_message
+                        ack_obj = decode_coord_message(result)
+                        sink = getattr(self, "_coord_ack_sink", None)
+                        if sink is not None:
+                            sink(ack_obj)
+                    except Exception as e:
+                        flexkv_logger.error(
+                            f"[DistReuse] failed to decode coord ACK "
+                            f"{result.get('type')!r}: {e}"
+                        )
                 else:
                     flexkv_logger.warning(f"Unexpected result format from remote: {result}")
 
@@ -974,6 +1418,33 @@ class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
     def start(self) -> None:
         self._polling_thread = threading.Thread(target=self._polling_worker, daemon=True)
         self._polling_thread.start()
+
+    def set_completion_sink(self, sink) -> None:
+        """Phase D-1 (proposal §3.5): register a callable invoked by the
+        master-side polling worker for every ``CompletedOp`` that arrives
+        with a non-empty ``sd_key`` tag and ``success=True``.
+
+        ``sink(completed_op)`` runs in the polling thread context.
+        Pass ``None`` to detach.
+
+        The KVTaskManager wires this to a small adapter that calls
+        ``GlobalCacheEngine._on_peer_sd_completed_op`` so the Master's
+        ``AggregateRadixTree`` learns which SDs are ready and from which
+        peer node — replacing the old CoordPutAckMsg / CoordGetAckMsg
+        ack route.
+        """
+        self._completion_sink = sink
+
+    def set_coord_ack_sink(self, sink) -> None:
+        """Phase D-4: install a callable ``sink(failure_report_msg)``
+        invoked when a ``FailureReportMsg`` arrives from this handle's
+        Remote.  Other coord types no longer exist (per-SD PUT/GET
+        coordination is done via ``CompletedOp(sd_key, ...)`` —
+        see ``set_completion_sink``).
+
+        Pass ``None`` to detach.
+        """
+        self._coord_ack_sink = sink
 
     def is_ready(self) -> bool:
         if not self._connected:

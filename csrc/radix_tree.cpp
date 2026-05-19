@@ -322,9 +322,32 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, int num_evicted) {
 }
 
 int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted_block_hashes, int num_evicted) {
+  // Delegate to the 4-arg overload with an empty (null) predicate — the
+  // "evict everything that's LRU-picked" legacy behaviour.
+  return evict(evicted_blocks, evicted_block_hashes, num_evicted,
+               std::function<bool(int64_t)>{});
+}
+
+int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks,
+                           torch::Tensor &evicted_block_hashes,
+                           int num_evicted,
+                           std::function<bool(int64_t)> is_evictable_fn) {
   int64_t *evicted_blocks_ptr = evicted_blocks.data_ptr<int64_t>();
   int64_t *evicted_block_hashes_ptr = evicted_block_hashes.data_ptr<int64_t>();
   int has_evicted = 0;
+
+  // Defensive: a buggy predicate must not wedge the allocator.  Any
+  // exception is swallowed and the block is treated as evictable
+  // (same semantics as the Python path in
+  // ``flexkv/cache/radixtree.py::RadixTreeIndex.evict``).
+  auto block_ok = [&is_evictable_fn](int64_t bid) -> bool {
+    if (!is_evictable_fn) return true;
+    try {
+      return is_evictable_fn(bid);
+    } catch (...) {
+      return true;
+    }
+  };
 
   // Optimization: Batch build the priority queue to reduce overhead from O(N log N) to O(N)
   std::vector<CRadixNode *> candidates;
@@ -345,12 +368,18 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted
 
     if (node->size() > num_evicted - has_evicted) {
       auto [blocks, block_hashes] = node->shrink(num_evicted - has_evicted);
-      auto _has_evicted(has_evicted); // Shadow index
-      for (auto it = blocks->begin(); it != blocks->end(); it++, _has_evicted++) {
-        evicted_blocks_ptr[_has_evicted] = *it;
-      }
-      for (auto it = block_hashes->begin(); it != block_hashes->end(); it++, has_evicted++) {
-        evicted_block_hashes_ptr[has_evicted] = *it;
+      // Dist-reuse refcount guard (§2.2): drop any block id the
+      // predicate says is pinned.  The block has already been
+      // physically detached via ``shrink`` — we just omit it from
+      // the returned eviction set so the allocator doesn't recycle
+      // the slot while a coord GET is in flight.
+      auto b_it = blocks->begin();
+      auto h_it = block_hashes->begin();
+      for (; b_it != blocks->end() && h_it != block_hashes->end(); ++b_it, ++h_it) {
+        if (!block_ok(*b_it)) continue;
+        evicted_blocks_ptr[has_evicted] = *b_it;
+        evicted_block_hashes_ptr[has_evicted] = *h_it;
+        has_evicted++;
       }
       delete blocks;
       delete block_hashes;
@@ -362,12 +391,13 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted
       assert(parent != nullptr);
       parent->remove_child(node->get_head_hash());
 
-      auto _has_evicted(has_evicted); // Shadow index
-      for (auto it = blocks.begin(); it != blocks.end(); it++, _has_evicted++) {
-        evicted_blocks_ptr[_has_evicted] = *it;
-      }
-      for (auto it = block_hashes.begin(); it != block_hashes.end(); it++, has_evicted++) {
-        evicted_block_hashes_ptr[has_evicted] = *it;
+      auto b_it = blocks.begin();
+      auto h_it = block_hashes.begin();
+      for (; b_it != blocks.end() && h_it != block_hashes.end(); ++b_it, ++h_it) {
+        if (!block_ok(*b_it)) continue;
+        evicted_blocks_ptr[has_evicted] = *b_it;
+        evicted_block_hashes_ptr[has_evicted] = *h_it;
+        has_evicted++;
       }
 
       if (parent->is_leaf() && !is_root(parent)) {
@@ -520,9 +550,8 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
   }
 
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
-  auto empty_uint32 = torch::Tensor();
   return std::make_shared<CMatchResult>(ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
-    last_ready_node, current_node, physical_blocks, empty_uint32);
+    last_ready_node, current_node, physical_blocks);
 }
 
 } //  namespace flexkv
