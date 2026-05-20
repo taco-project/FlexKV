@@ -416,7 +416,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("chunk_size_in_bytes"), py::arg("block_stride_in_bytes"),
         py::arg("is_read"), py::arg("num_blocks_per_file"),
         py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
-        py::arg("is_mla") = false);
+        py::arg("is_mla") = false, py::arg("ssd_copy_offset") = 0);
   py::class_<flexkv::LayerwiseTransferGroup>(m, "LayerwiseTransferGroup")
       .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
                     torch::Tensor &, std::map<int, std::vector<std::string>> &,
