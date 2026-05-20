@@ -31,7 +31,7 @@ from flexkv.common.dist_reuse import (
 )
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _dist_reuse_fakes import FakeRedis, ManualClock  # noqa: E402
+from _dist_reuse_fakes import FakeRedis  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -226,32 +226,6 @@ class TestMasterCoordinator:
         assert ok2 is True
         assert mc.match_fully_ready(0xAA) is not None
 
-    def test_invalidate_prefix(self):
-        sd = _sd()  # single SD
-        mc = MasterCoordinator(self_sd=sd, instance_id="inst-A")
-        mc.expect_remotes(0)
-        mc.mark_sd_ready(0xAA, sd.serialize(), [10])
-        assert mc.invalidate_prefix(0xAA) is True
-        assert mc.match_fully_ready(0xAA) is None
-
-    def test_scan_leaked_refcount(self):
-        sd = _sd()
-        clock = ManualClock()
-        mc = MasterCoordinator(
-            self_sd=sd, instance_id="inst-A",
-            refcount_leak_timeout_seconds=10.0,
-        )
-        # Inject our manual clock into the aggregate.
-        mc._aggregate._time_fn = clock  # direct attribute poke for testing
-        mc.expect_remotes(0)
-        mc.acquire_blocks([7, 8])
-        clock.advance(20.0)
-        leaked = mc.scan_leaked_refcount()
-        assert sorted(leaked) == [7, 8]
-        # Force-released: now evictable.
-        assert mc.is_evictable(7)
-        assert mc.is_evictable(8)
-
     def test_peer_loss_invalidates(self):
         sd = _sd()
         mc = MasterCoordinator(self_sd=sd, instance_id="inst-A")
@@ -392,16 +366,6 @@ class TestRemoteDistReuseInitializer:
         )
         with pytest.raises(AttributeError, match="regist_buffer"):
             init.bootstrap()
-
-    def test_encode_ready(self):
-        msg = RemoteReadyMsg(
-            sender_instance_id="inst", sender_epoch="e",
-            sd_key="m:ppn0/1:tpn0/1:nsa0",
-            distributed_node_id=1,
-        )
-        out = RemoteDistReuseInitializer.encode_ready(msg)
-        assert out["type"] == "remote_ready"
-        assert out["sd_key"] == "m:ppn0/1:tpn0/1:nsa0"
 
 
 # ---------------------------------------------------------------------------

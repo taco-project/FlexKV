@@ -66,7 +66,6 @@ class TestDryRun:
             "--dry-run",
         ])
         assert "node_rank=0/2" in proc.stdout
-        assert "need_full_sd_remote: true" in proc.stdout
         assert "instance_id        : unit-test-master" in proc.stdout
 
         # Check the generated mooncake config looks like valid JSON.
@@ -78,10 +77,19 @@ class TestDryRun:
         assert data["device_name"] == "mlx5_0"
         assert data["engine_port"] == 12345    # base (+ node_rank 0)
 
-    def test_cp_only_offmaster_emits_empty_config(self):
-        """CP-only cross-node instance: node_rank=1 is CP-peer stub,
-        mooncake config must be empty (sentinel for connector's
-        ``CP_PEER_REGISTRATION_ONLY`` path)."""
+    def test_cp_only_offmaster_still_emits_full_config(self):
+        """CP-only cross-node instance, node_rank=1.
+
+        Earlier revisions of this script tried to mirror the
+        connector's role-decision in bash by emitting an *empty*
+        sentinel mooncake_config.json for the CP-peer-only case so the
+        Python connector could side-channel on file existence.  That
+        coupling was reverted (see commit ``review-fixes(F1+F2+F3)``)
+        because it duplicated launch-time logic that belongs in the
+        connector.  The new contract is: shell *always* writes a valid
+        mooncake config, the Python layer decides whether to
+        instantiate a TransferEngine.  This test pins that contract.
+        """
         proc = _run([
             "--nnodes", "2",
             "--node-rank", "1",
@@ -96,14 +104,15 @@ class TestDryRun:
         ])
         assert "node_rank=1/2" in proc.stdout
         assert "is_multinode_cp    : true" in proc.stdout
-        assert "need_full_sd_remote: false" in proc.stdout
 
         cfg = (REPO_ROOT / "scripts" / "multi-nodes" / "gen"
                / "dist_reuse_node1" / "mooncake_config.json")
         assert cfg.exists()
-        # Empty sentinel — bytes length must be 0 to match the
-        # connector's "no mooncake here" contract.
-        assert cfg.read_text() == ""
+        # No more empty-sentinel hack — every node gets a valid config
+        # and the connector decides what to do with it at runtime.
+        assert cfg.stat().st_size > 0
+        data = json.loads(cfg.read_text())
+        assert data["metadata_backend"] == "redis"
 
     def test_tp_cross_node_offmaster_emits_full_config(self):
         proc = _run([
@@ -119,7 +128,6 @@ class TestDryRun:
             "--dry-run",
         ])
         assert "is_multinode_tp    : true" in proc.stdout
-        assert "need_full_sd_remote: true" in proc.stdout
 
         cfg = (REPO_ROOT / "scripts" / "multi-nodes" / "gen"
                / "dist_reuse_node1" / "mooncake_config.json")

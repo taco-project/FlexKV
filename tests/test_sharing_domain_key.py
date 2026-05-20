@@ -369,10 +369,6 @@ class TestEnumeratePeers:
         masters = [p for p in peers if p.is_master()]
         assert len(masters) == 1
 
-    def test_iter_dunder(self):
-        sd = SharingDomainKey.default()
-        assert list(sd) == sd.enumerate_peers()
-
 
 # ---------------------------------------------------------------------------
 # default()

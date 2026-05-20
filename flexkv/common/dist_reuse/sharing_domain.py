@@ -64,7 +64,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Iterator, List, Optional
+from typing import Any, List, Optional
 
 
 __all__ = [
@@ -360,8 +360,39 @@ class SharingDomainKey:
                         getattr(model_config, "tp_node_idx", 0))
             )
         else:
+            # Legacy path: PR #165 moved ``pp_rank`` / ``tp_node_idx``
+            # off ``ModelConfig`` onto :class:`RankInfo`.  These
+            # ``getattr(..., 0)`` reads therefore now return ``0``
+            # for any post-#165 ``ModelConfig`` instance — i.e. the
+            # caller silently gets the master-position SD even if it
+            # is actually on (pp_rank>0, tp_node_idx>0).  This is
+            # only safe for unit-test fakes that explicitly set
+            # ``pp_rank`` / ``tp_node_idx`` on the stub ModelConfig
+            # (see ``tests/test_sharing_domain_key.py``); production
+            # callers should pass ``rank_info=`` explicitly.  We log
+            # a one-time warning when the heuristic is exercised on
+            # a multi-rank topology so the error surfaces during
+            # bring-up instead of silently corrupting Redis keys.
             _pp_rank = int(getattr(model_config, "pp_rank", 0))
             _tp_node_idx = int(getattr(model_config, "tp_node_idx", 0))
+            _has_pp_rank = hasattr(model_config, "pp_rank")
+            _has_tp_node_idx = hasattr(model_config, "tp_node_idx")
+            if (
+                pp_size > 1 or int(getattr(model_config, "tp_node_count", 1)) > 1
+            ) and not (_has_pp_rank and _has_tp_node_idx):
+                # Local import to avoid pulling logger into module
+                # import-time graph (sharing_domain.py is imported
+                # very early by config.py via ``derive_model_id``).
+                from flexkv.common.debug import flexkv_logger
+                flexkv_logger.warning(
+                    "SharingDomainKey.from_model_config: called without "
+                    "rank_info on a multi-rank topology (pp_size=%d, "
+                    "tp_node_count=%s); per-rank fields default to 0, "
+                    "which only matches the master SD.  Pass rank_info="
+                    "<RankInfo> so the per-rank position is honoured.",
+                    pp_size,
+                    getattr(model_config, "tp_node_count", 1),
+                )
 
         _pp_node_idx = _pp_rank // pp_per_node
 
@@ -417,10 +448,6 @@ class SharingDomainKey:
             for tpn in range(self.tp_node_count):
                 out.append(replace(self, pp_node_idx=ppn, tp_node_idx=tpn))
         return out
-
-    # Iteration sugar — mostly for tests.
-    def __iter__(self) -> Iterator["SharingDomainKey"]:
-        return iter(self.enumerate_peers())
 
     def __str__(self) -> str:  # pragma: no cover — purely cosmetic
         return self.serialize()

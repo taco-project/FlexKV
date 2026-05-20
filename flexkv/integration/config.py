@@ -218,8 +218,11 @@ class FlexKVConfig:
             sglang_config: sglang.srt.configs.model_config.ModelConfig-like object
             server_args: sglang ServerArgs — source of tp_size, dp_size,
                 nnodes, node_rank, enable_dp_attention, attn_cp_size,
-                is_nsa (read from server_args.enable_nsa_prefill_context_parallel),
-                kv_cache_dtype, dist_init_addr
+                kv_cache_dtype, dist_init_addr.  ``is_nsa`` is **not**
+                read from server_args: see the body below — it is
+                derived from ``sglang_config.index_head_dim`` instead,
+                because NSA is a model-layout property orthogonal to
+                whether CP-prefill is enabled.
             page_size: KV block size (tokens per block) used by sglang
             tp_rank: physical tensor parallel rank (runtime, from process group)
             pp_rank: pipeline parallel rank (runtime, from process group)
@@ -234,11 +237,24 @@ class FlexKVConfig:
         node_rank = server_args.node_rank
         enable_dp_attention = server_args.enable_dp_attention
         attn_cp_size = server_args.attn_cp_size
-        # ``is_nsa`` (NSA model layout flag): True when the model has an
-        # extra indexer K cache buffer.  Sourced from sglang's
-        # ``enable_nsa_prefill_context_parallel`` server arg, but in dist_reuse
-        # context the flag represents the *layout*, not whether CP is on.
-        is_nsa = getattr(server_args, 'enable_nsa_prefill_context_parallel', False)
+        # ``is_nsa`` (NSA model layout flag): True when the model itself has
+        # an extra indexer K cache buffer.  This is a *layout* property of
+        # the model architecture, **independent** of whether CP is enabled
+        # at runtime — an NSA model with cp_size=1 still has the indexer K
+        # cache and must therefore be isolated from non-NSA models in the
+        # cross-instance reuse namespace (it lives in
+        # ``SharingDomainKey.serialize`` as the ``nsa<0|1>`` segment).
+        #
+        # Detection rule: an NSA/DSA model exposes a positive
+        # ``index_head_dim`` attribute on its sglang ModelConfig (the same
+        # signal already consulted ~25 lines below to size the indexer
+        # head buffer).  Falling back to
+        # ``server_args.enable_nsa_prefill_context_parallel`` was incorrect
+        # because it conflates the *runtime CP toggle* with the *static
+        # model layout* — a deployment can run an NSA model with CP=1
+        # (no prefill-CP) and still need NSA-isolated namespaces.
+        index_head_dim = getattr(sglang_config, "index_head_dim", None)
+        is_nsa = bool(index_head_dim) and int(index_head_dim) > 0
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
         dp_rank = 0 if dp_rank is None else int(dp_rank)
 

@@ -132,13 +132,13 @@ c3a2f91d0bcdef01:ppn0/1:tpn1/2:nsa0       — 跨机 TP=2 第 1 节点
 
 ---
 
-### 2.5 `sd:<sd_key>:aggregate:<prefix_hash>` — 跨 SD 聚合标记（预留）
+### 2.5 `sd:<sd_key>:aggregate:<prefix_hash>` — 跨 SD 聚合标记（未实现）
 
 | 属性 | 值 |
 |---|---|
-| 类型 | **未启用**（`SharingDomainNamespace.aggregate_key(...)` 已提供构造器） |
+| 类型 | **未启用**，且当前没有构造器实现 |
 
-预留供未来把 `MasterCoordinator` 的跨 SD 聚合状态持久化到 Redis（用于 Master 重启恢复）。现阶段 `AggregateRadixTree` 只在内存。
+预留 Redis key 命名空间，供未来把 `MasterCoordinator` 的跨 SD 聚合状态持久化到 Redis（用于 Master 重启恢复）。现阶段 `AggregateRadixTree` 只在内存。如需启用，应在 `SharingDomainNamespace` 上重新实现 key 构造器。
 
 ---
 

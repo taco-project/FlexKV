@@ -26,14 +26,12 @@ from .sharing_domain_namespace import (
     SharingDomainNamespace,
 )
 from .aggregate_radix import (
-    AggregateMatchResult,
     AggregateRadixTree,
     BlockNotTrackedError,
     ReadyEntry,
 )
 from .coordination_protocol import (
     CoordMsgType,
-    EpochVerifyError,
     FailureReportMsg,
     RemoteReadyMsg,
     decode_coord_message,
@@ -69,13 +67,11 @@ __all__ = [
     "SD_KEY_PREFIX",
     "SharingDomainNamespace",
     # aggregate_radix
-    "AggregateMatchResult",
     "AggregateRadixTree",
     "BlockNotTrackedError",
     "ReadyEntry",
     # coordination_protocol (Phase D-4: trimmed to RemoteReady + FailureReport)
     "CoordMsgType",
-    "EpochVerifyError",
     "FailureReportMsg",
     "RemoteReadyMsg",
     "decode_coord_message",

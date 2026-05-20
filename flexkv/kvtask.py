@@ -10,7 +10,7 @@ from expiring_dict import ExpiringDict
 import nvtx
 import numpy as np
 
-from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.config import CacheConfig, ModelConfig, RankInfo, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.block import hash_token
 from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
@@ -85,10 +85,21 @@ class KVTaskManager:
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
                  redis_meta: RedisMeta = None,
-                 event_collector: Optional[KVEventCollector] = None
+                 event_collector: Optional[KVEventCollector] = None,
+                 rank_info: Optional[RankInfo] = None,
                  ):
         self.model_config = model_config
         self.cache_config = cache_config
+        # Per-rank info is required for the SD-key constructor in
+        # ``_setup_sharing_domain_handles`` and the GPU-clear decision
+        # in ``_per_handle_gpu_clear_flags`` so the master/remote SD
+        # reflects this rank's actual (pp_rank, tp_node_idx) instead
+        # of silently defaulting to the (0, 0) master position.  Kept
+        # ``Optional`` so that legacy single-SD callers (sharing-domain
+        # disabled) and unit-test fakes that bypass the integration
+        # adapter remain valid — they just won't exercise multi-SD
+        # routing.
+        self.rank_info = rank_info
 
         flexkv_logger.info(
             f"[KVTaskEngine] topology: {self.model_config}"
@@ -218,7 +229,9 @@ class KVTaskManager:
             make_session_epoch,
         )
 
-        self_sd = SharingDomainKey.from_model_config(self.model_config)
+        self_sd = SharingDomainKey.from_model_config(
+            self.model_config, rank_info=self.rank_info,
+        )
 
         # Single-SD degenerate case (no sharing) — no extra handles needed.
         if self_sd.total_sd_count() <= 1:
@@ -541,7 +554,9 @@ class KVTaskManager:
             SharingDomainKey,
             graph_needs_gpu_clear,
         )
-        self_sd = SharingDomainKey.from_model_config(self.model_config)
+        self_sd = SharingDomainKey.from_model_config(
+            self.model_config, rank_info=self.rank_info,
+        )
         flags: List[bool] = []
         for h in self.transfer_handles:
             if not isinstance(h._handle, TransferManagerMultiNodeHandle):
@@ -680,9 +695,17 @@ class KVTaskEngine(KVTaskManager):
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
                  redis_meta: Optional[RedisMeta] = None,
-                 event_collector: Optional[KVEventCollector] = None
+                 event_collector: Optional[KVEventCollector] = None,
+                 rank_info: Optional[RankInfo] = None,
                  ):
-        super().__init__(model_config, cache_config, gpu_register_port, redis_meta, event_collector)
+        super().__init__(
+            model_config,
+            cache_config,
+            gpu_register_port,
+            redis_meta,
+            event_collector,
+            rank_info=rank_info,
+        )
         self.tracer = FlexKVTracer()
         self.tracer.trace_config(model_config, cache_config, gpu_layout=None)
 

@@ -30,10 +30,12 @@
 #   --model / --redis-host
 #
 # 备注：
-#   * 如果该 instance 只用 CP 跨节点（CP 跨机、TP/PP 不跨机），脚本会自动
-#     把 node_rank>0 的机器放到 CP_PEER_REGISTRATION_ONLY 路径上（不启
-#     TransferManagerOnRemote，sglang connector 侧按 multinode_policy
-#     策略自己决定）。
+#   * 是否在非主节点启动 TransferManagerOnRemote 由 sglang/vllm connector
+#     在 Python 侧根据 ``rank_info`` 自行判断 —— 本脚本只负责导出环境变
+#     量并 *始终* 写入一份合法的 Mooncake 配置。早期版本里这里有一段
+#     ``NEED_FULL_SD_REMOTE`` 分支 + 空 sentinel 文件的逻辑，等于把
+#     connector 的启动判定复制了一份到 bash 里，违反了
+#     “TransferManagerOnRemote 应该 per-node 自动兼容” 的设计意图，已删除。
 #   * 脚本**不直接启动** sglang/vLLM 进程；它只做环境变量和配置文件生
 #     成，然后 exec 用户指定的启动命令（--launcher-cmd / 默认是
 #     sglang 的 router 入口）。这样脚本本身单测友好。
@@ -113,11 +115,10 @@ fi
 
 # -------------------------------------------------------- derived topology
 # Basic rule: MASTER = node_rank 0.  Everything else is an off-master role
-# whose concrete type is picked by the connector's multinode_policy
-# (FlexKV/flexkv/integration/multinode_policy.py).  The script only needs
-# to decide whether to emit a Mooncake config (full SD-Remote) or just an
-# empty config (CP-peer stub); it does that by asking whether the
-# instance has any TP-level cross-node spread.
+# whose concrete behaviour (full SD-Remote vs. CP-peer stub) is picked by
+# the connector at runtime from ``rank_info``.  The script always emits a
+# real Mooncake config and lets the Python layer decide whether to
+# instantiate a TransferEngine on this rank.
 
 # tp_node_count = TP_SIZE / gpus_per_node.  We auto-detect gpus_per_node
 # via nvidia-smi (default 8 if unavailable).
@@ -142,8 +143,8 @@ IS_MULTINODE_TP="false"
 if (( TP_NODE_COUNT > 1 )) || (( PP_SIZE > 1 )); then
   # PP > 1 crossing nodes always needs a full SD-Remote on each PP-peer
   # node too.  We conservatively flag it as multinode_tp for the
-  # mooncake-config emission branch.  The connector's policy module
-  # still does the fine-grained role decision at runtime.
+  # mooncake-config emission branch.  The connector still does the
+  # fine-grained role decision at runtime from ``rank_info``.
   IS_MULTINODE_TP="true"
 fi
 
@@ -164,24 +165,22 @@ CFG_DIR="${SCRIPT_DIR}/gen/dist_reuse_node${NODE_RANK}"
 mkdir -p "$LOG_DIR" "$CFG_DIR"
 
 # ---------------------------------------------------------- mooncake config
-# Only emit a real mooncake config when we need a full SD-Remote on this
-# node.  CP-peer-only nodes don't touch mooncake.
-NEED_FULL_SD_REMOTE="false"
-if [[ "$NODE_RANK" == "0" ]]; then
-  # Master always needs mooncake — it owns the TransferEngine in-process.
-  NEED_FULL_SD_REMOTE="true"
-else
-  if [[ "$IS_MULTINODE_TP" == "true" ]]; then
-    NEED_FULL_SD_REMOTE="true"
-  fi
-  # CP-only multi-node: off-master is peer-stub only, no mooncake.
-fi
+# Always emit a real mooncake config — the integration connector
+# decides at runtime (from ``rank_info`` inside Python) whether to
+# actually instantiate a Mooncake TransferEngine on this rank.
+# Earlier versions of this script tried to mirror that policy in shell
+# (writing an empty sentinel file when the off-master node was a
+# CP-peer-only stub) but that duplicated the Python launch logic in
+# bash and forced the connector to read a side-channel file existence
+# check — exactly the "tight coupling" pointed out in code review.
+# The new contract is simple: the shell always provides
+# MOONCAKE_CONFIG_PATH, and the Python layer decides whether to read it.
+NEED_FULL_SD_REMOTE="true"
 
 MOONCAKE_ENGINE_PORT=$((MOONCAKE_ENGINE_PORT_BASE + NODE_RANK))
 MOONCAKE_CONFIG_FILE="${CFG_DIR}/mooncake_config.json"
 
-if [[ "$NEED_FULL_SD_REMOTE" == "true" ]]; then
-  cat > "$MOONCAKE_CONFIG_FILE" <<EOF
+cat > "$MOONCAKE_CONFIG_FILE" <<EOF
 {
     "engine_ip": "$(hostname -i | awk '{print $1}')",
     "engine_port": ${MOONCAKE_ENGINE_PORT},
@@ -192,11 +191,6 @@ if [[ "$NEED_FULL_SD_REMOTE" == "true" ]]; then
     "device_name": "${RDMA_DEVICE}"
 }
 EOF
-else
-  # Empty sentinel — the connector checks for file existence and picks
-  # the CP-peer stub path when absent.
-  : > "${MOONCAKE_CONFIG_FILE}"
-fi
 
 # --------------------------------------------------------- flexkv env vars
 # The sglang connector reads these at import time; we export them so
@@ -222,7 +216,6 @@ echo "  tp / pp / cp       : ${TP_SIZE} / ${PP_SIZE} / ${CP_SIZE}"
 echo "  tp_node_count      : ${TP_NODE_COUNT}  (gpus_per_node=${GPUS_PER_NODE})"
 echo "  is_multinode_tp    : ${IS_MULTINODE_TP}"
 echo "  is_multinode_cp    : ${IS_MULTINODE_CP}"
-echo "  need_full_sd_remote: ${NEED_FULL_SD_REMOTE}"
 echo "  instance_id        : ${INSTANCE_ID}"
 echo "  master_ip          : ${MASTER_IP}"
 echo "  dist_init          : ${MASTER_IP}:${DIST_INIT_PORT}"

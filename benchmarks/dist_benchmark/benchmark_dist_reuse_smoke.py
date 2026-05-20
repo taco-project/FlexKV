@@ -259,11 +259,11 @@ def scenario_aggregate_radix_put_hook(args) -> Dict[str, Any]:
         if entry is not None:
             results["ok"] += 1
             # Refcount protection: the aggregate pins blocks when acquired.
-            mc.pin_blocks_for_coord_get(block_ids)
+            mc.acquire_blocks(block_ids)
             for b in block_ids:
                 assert not mc.is_evictable(b), \
                     f"block {b} evictable while pinned — refcount guard broken"
-            mc.unpin_blocks_for_coord_get(block_ids)
+            mc.release_blocks(block_ids)
             for b in block_ids:
                 assert mc.is_evictable(b), \
                     f"block {b} NOT evictable after unpin — refcount stuck"

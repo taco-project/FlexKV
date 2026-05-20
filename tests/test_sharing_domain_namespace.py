@@ -57,15 +57,8 @@ def test_block_key_handles_negative_hash(ns):
     assert ns.block_key(0, h) == f"{ns.prefix}:block:0:ffffffffffffffff"
 
 
-def test_aggregate_key(ns):
-    assert ns.aggregate_key(0xCAFEBABE) == f"{ns.prefix}:aggregate:cafebabe"
-
-
 def test_scan_patterns(ns):
     assert ns.node_key_pattern() == f"{ns.prefix}:node:*"
-    assert ns.meta_key_pattern() == f"{ns.prefix}:meta:*"
-    assert ns.buffer_key_pattern() == f"{ns.prefix}:buffer:*"
-    assert ns.block_key_pattern() == f"{ns.prefix}:block:*"
     assert ns.block_key_pattern_for_node(7) == f"{ns.prefix}:block:7:*"
 
 
