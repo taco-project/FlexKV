@@ -9,7 +9,7 @@ import torch
 import zmq
 import numpy as np
 
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import ModelConfig, CacheConfig, LayerGroupSpec
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
@@ -304,8 +304,9 @@ class KVTPClient:
         kv_caches: List[torch.Tensor],
         kv_layout: KVCacheLayout,
         override_device_id: Optional[int] = None,
-        indexer_buffers: Optional[List[torch.Tensor]] = None,
-        indexer_layout: Optional[KVCacheLayout] = None,
+        layer_groups: Optional[List[LayerGroupSpec]] = None,
+        gpu_layouts: Optional[List[KVCacheLayout]] = None,
+        handles_per_group: Optional[List[List[torch.Tensor]]] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
@@ -318,12 +319,14 @@ class KVTPClient:
             handle = TensorSharedHandle(tensor, device_id)
             handles.append(handle)
 
-        # Build optional indexer handles
-        indexer_handles = None
-        if indexer_buffers is not None and len(indexer_buffers) > 0:
-            indexer_handles = []
-            for tensor in indexer_buffers:
-                indexer_handles.append(TensorSharedHandle(tensor, device_id))
+        # Build per-group shared handles when multi-group registration is requested
+        # (heterogeneous KV layouts: Gemma4 multi-shape, DSA/NSA indexer-as-group).
+        handles_per_group_shared: Optional[List[List[TensorSharedHandle]]] = None
+        if handles_per_group is not None:
+            handles_per_group_shared = []
+            for group_tensors in handles_per_group:
+                group_handles = [TensorSharedHandle(t, device_id) for t in group_tensors]
+                handles_per_group_shared.append(group_handles)
 
         register_req = RegisterTPClientRequest(
             dp_client_id=self.dp_client_id,
@@ -331,8 +334,9 @@ class KVTPClient:
             device_id=device_id,
             handles=handles,
             gpu_layout=kv_layout,
-            indexer_handles=indexer_handles,
-            indexer_gpu_layout=indexer_layout,
+            layer_groups=layer_groups,
+            gpu_layouts=gpu_layouts,
+            handles_per_group=handles_per_group_shared,
         )
 
         try:

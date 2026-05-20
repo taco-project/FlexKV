@@ -246,7 +246,7 @@ class FlexKVSchedulerConnector:
                                    num_new_matched_tokens=num_new_matched_tokens):
             return 0, False
 
-        return num_new_matched_tokens, True
+        return num_new_matched_tokens, False
 
     def _extract_namespace(self, request: "Request") -> Optional[List[str]]:
         """
@@ -313,6 +313,14 @@ class FlexKVSchedulerConnector:
         """
         match_start_time = time.perf_counter()
         num_tokens_to_get = (request.num_tokens//self.block_size)*self.block_size
+        # Never match ALL tokens: the scheduler requires num_new_tokens > 0,
+        # which means num_computed_tokens must be strictly less than
+        # request.num_tokens.  When the prompt length is an exact multiple of
+        # block_size, a full match would leave zero tokens for prefill.
+        if num_tokens_to_get == request.num_tokens:
+            num_tokens_to_get -= self.block_size
+        if num_tokens_to_get <= 0:
+            return -1, 0
         token_ids = request.all_token_ids[:num_tokens_to_get]
 
         assert num_computed_tokens <= num_tokens_to_get, (
@@ -335,7 +343,6 @@ class FlexKVSchedulerConnector:
 
         # Auto cancel if not call update_state_after_alloc()
         match_end_time = time.perf_counter()
-        # logger.debug(f"Get match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
         if num_new_matched_tokens > 0:
             self.req_id_to_task_dict[request.request_id] = task_id
             self.tasks_to_cancel[task_id] = FlexKVGetTask(task_id=task_id,
@@ -346,6 +353,8 @@ class FlexKVSchedulerConnector:
                                                         match_end_time=match_end_time)
 
             # logger.debug(f"FlexKV create get task: {self.tasks_to_cancel[task_id]}")
+        else:
+            self.flexkv_manager.cancel(task_ids=[task_id])
 
         return task_id, num_new_matched_tokens
 
@@ -448,8 +457,8 @@ class FlexKVSchedulerConnector:
         # compute slot mapping
         # num_blocks_to_put = (num_matched_tokens+num_unmatched_tokens) // self.block_size
         num_matched_blocks = num_matched_tokens // self.block_size
-        num_unmatched_tokens = num_unmatched_tokens // self.block_size
-        block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_tokens]
+        num_unmatched_blocks = num_unmatched_tokens // self.block_size
+        block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_blocks]
         task.slot_mapping = np.array(block_ids_to_put).repeat(self.block_size)*self.block_size
 
         return True
@@ -479,7 +488,6 @@ class FlexKVSchedulerConnector:
             token_ids=np_token_ids,
             namespace=namespace,
         )
-
         num_unmatched_tokens = unmatched_mask.sum().item()
         num_matched_tokens = num_tokens_to_put - num_unmatched_tokens
 
@@ -695,68 +703,216 @@ class FlexKVWorkerConnector:
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
-        logger.info("Start register kv_caches")
+        from collections import OrderedDict
+        from flexkv.common.config import LayerGroupSpec
 
-        # Separate main KV caches from indexer caches by layer name.
+        logger.info("Start register kv_caches")
+        is_mla = self.flexkv_config.model_config.use_mla
+
+        # Step 1: Split out indexer (DSA/NSA) tensors by ".k_cache" naming.
+        # Indexer tensors have a different shape and dtype from main KV and are
+        # registered as their own LayerGroupSpec (with dtype=fp8/uint8) at the end.
         main_kv_caches: dict[str, torch.Tensor] = {}
         indexer_kv_caches: dict[str, torch.Tensor] = {}
-        for layer_name, tensor in kv_caches.items():
-            if ".k_cache" in layer_name:
-                indexer_kv_caches[layer_name] = tensor
+        for name, tensor in kv_caches.items():
+            if ".k_cache" in name:
+                indexer_kv_caches[name] = tensor
             else:
-                main_kv_caches[layer_name] = tensor
+                main_kv_caches[name] = tensor
 
-        # Build main KV cache layout
-        gpu_blocks = list(main_kv_caches.values())
-        num_layer = len(main_kv_caches)
-        if self.flexkv_config.model_config.use_mla:
-            assert gpu_blocks[0].ndim == 3, (
-                f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
-            num_blocks = gpu_blocks[0].shape[0]
-            block_size = gpu_blocks[0].shape[1]
-            num_kv_heads = 1
-            head_size = gpu_blocks[0].shape[2]
+        # Step 2: Deduplicate shared-KV layers (same data_ptr = shared tensor).
+        # Applied to main KV only; indexer tensors are not deduplicated.
+        seen_ptrs: dict[int, str] = {}
+        unique_layers: list[tuple[str, torch.Tensor]] = []
+        for name, tensor in main_kv_caches.items():
+            ptr = tensor.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs[ptr] = name
+                unique_layers.append((name, tensor))
+            else:
+                logger.info(f"Layer {name} shares KV tensor with {seen_ptrs[ptr]}, skipping")
+
+        # Step 3: Group main KV layers by (num_kv_heads, head_size) shape
+        shape_groups: OrderedDict[tuple, list[tuple[int, str, torch.Tensor]]] = OrderedDict()
+        for idx, (name, tensor) in enumerate(unique_layers):
+            if is_mla:
+                assert tensor.ndim == 3, (
+                    f"expect MLA kv cached tensor has 3 dim but get shape={tensor.shape}.")
+                key = (1, tensor.shape[2])
+            else:
+                assert tensor.ndim == 5, (
+                    f"expect kv cached tensor has 5 dim but get shape={tensor.shape}.")
+                key = (tensor.shape[3], tensor.shape[4])  # (num_kv_heads, head_size)
+            shape_groups.setdefault(key, []).append((idx, name, tensor))
+
+        num_main_layers = len(unique_layers)
+        first_tensor = unique_layers[0][1]
+        if is_mla:
+            num_blocks = first_tensor.shape[0]
+            block_size = first_tensor.shape[1]
         else:
-            assert gpu_blocks[0].ndim == 5, (
-                f"expect kv cached tensor has 5 dim but get shape={gpu_blocks[0].shape}.")
-            num_blocks = gpu_blocks[0].shape[1]
-            block_size = gpu_blocks[0].shape[2]
-            num_kv_heads = gpu_blocks[0].shape[3]
-            head_size = gpu_blocks[0].shape[4]
-        gpu_layout = KVCacheLayout(
-            type=KVCacheLayoutType.LAYERFIRST,
-            num_layer=num_layer,
-            num_block=num_blocks,
-            tokens_per_block=block_size,
-            num_head=num_kv_heads,
-            head_size=head_size,
-            is_mla=self.flexkv_config.model_config.use_mla,
-        )
+            # Different attention backends use different KV cache layouts:
+            #   flash_attn:        [2, num_blocks, block_size, num_kv_heads, head_size]
+            #   triton/flashinfer: [num_blocks, 2, block_size, num_kv_heads, head_size]
+            # Compute num_blocks from total elements to be layout-agnostic.
+            num_kv_heads_0 = first_tensor.shape[3]
+            head_size_0 = first_tensor.shape[4]
+            kv_dim = 2
+            block_size = first_tensor.shape[2]
+            num_blocks = first_tensor.numel() // (
+                kv_dim * block_size * num_kv_heads_0 * head_size_0)
 
-        # Build indexer layout if indexer caches are present
-        indexer_buffers = None
-        indexer_layout = None
-        if indexer_kv_caches:
-            indexer_buffers = list(indexer_kv_caches.values())
-            first_indexer_buffer = indexer_buffers[0]
-            assert first_indexer_buffer.ndim == 3, (
-                f"expect indexer cache tensor has 3 dim but get shape={first_indexer_buffer.shape}.")
-            indexer_layout = KVCacheLayout(
+        has_indexer = len(indexer_kv_caches) > 0
+        has_multi_shape = len(shape_groups) > 1
+
+        if not has_indexer and not has_multi_shape:
+            # Uniform case — legacy single-shape path
+            (num_kv_heads, head_size), = shape_groups.keys()
+            gpu_blocks = [t for _, t in unique_layers]
+            gpu_layout = KVCacheLayout(
                 type=KVCacheLayoutType.LAYERFIRST,
-                num_layer=len(indexer_buffers),
-                num_block=first_indexer_buffer.shape[0],
-                tokens_per_block=first_indexer_buffer.shape[1],
-                num_head=1,
-                head_size=first_indexer_buffer.shape[2],
-                is_mla=True,
+                num_layer=num_main_layers,
+                num_block=num_blocks,
+                tokens_per_block=block_size,
+                num_head=num_kv_heads,
+                head_size=head_size,
+                is_mla=is_mla,
             )
+            self.tp_client.register_to_server(gpu_blocks, gpu_layout)
+        else:
+            # Multi-group path: heterogeneous shapes (Gemma4) and/or
+            # DSA/NSA indexer-as-group.
+            layer_groups: list[LayerGroupSpec] = []
+            gpu_layouts: list[KVCacheLayout] = []
+            handles_per_group: list[list[torch.Tensor]] = []
+            all_gpu_blocks: list[torch.Tensor] = []
 
-        self.tp_client.register_to_server(
-            kv_caches=gpu_blocks,
-            kv_layout=gpu_layout,
-            indexer_buffers=indexer_buffers,
-            indexer_layout=indexer_layout,
-        )
+            # 3a: Add main-KV groups
+            for (num_kv_heads, head_size), group_entries in shape_groups.items():
+                group_indices = [idx for idx, _, _ in group_entries]
+                group_tensors = [tensor for _, _, tensor in group_entries]
+                group_num_layers = len(group_entries)
+
+                layer_groups.append(LayerGroupSpec(
+                    num_layers=group_num_layers,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    layer_indices=group_indices,
+                ))
+                gpu_layouts.append(KVCacheLayout(
+                    type=KVCacheLayoutType.LAYERFIRST,
+                    num_layer=group_num_layers,
+                    num_block=num_blocks,
+                    tokens_per_block=block_size,
+                    num_head=num_kv_heads,
+                    head_size=head_size,
+                    is_mla=is_mla,
+                ))
+                handles_per_group.append(group_tensors)
+                all_gpu_blocks.extend(group_tensors)
+
+                logger.info(
+                    f"Layer group: {group_num_layers} layers, "
+                    f"num_kv_heads={num_kv_heads}, head_size={head_size}, "
+                    f"indices={group_indices}"
+                )
+
+            # 3b: Annotate SWA on main-KV groups (gemma4 path).
+            # Skip indexer group (added after this block); its indices are
+            # post-main and won't be in idx_to_original anyway.
+            hf_text_config = getattr(self.flexkv_config, '_hf_text_config', None)
+            if hf_text_config is not None:
+                layer_types = getattr(hf_text_config, 'layer_types', None)
+                sw = getattr(hf_text_config, 'sliding_window', None)
+                if layer_types and sw:
+                    import re
+                    idx_to_original = {}
+                    for idx, (name, _) in enumerate(unique_layers):
+                        m = re.search(r'layers\.(\d+)', name)
+                        if m:
+                            idx_to_original[idx] = int(m.group(1))
+
+                    for lg in layer_groups:
+                        orig_ids = [idx_to_original.get(i) for i in lg.layer_indices]
+                        if all(oid is not None and oid < len(layer_types)
+                               and layer_types[oid] == 'sliding_attention'
+                               for oid in orig_ids):
+                            lg.sliding_window = sw
+                            logger.info(
+                                f"Layer group ({lg.num_layers} layers, "
+                                f"kv_heads={lg.num_kv_heads}, head={lg.head_size}) "
+                                f"marked as SWA with sliding_window={sw}"
+                            )
+
+            # 3c: Append indexer as its own LayerGroupSpec.
+            # Indexer is MLA-style: ndim=3, num_kv_heads=1, dtype=fp8/uint8 typically.
+            # layer_indices live AFTER main layers in all_gpu_blocks ordering.
+            if has_indexer:
+                indexer_tensors = list(indexer_kv_caches.values())
+                first_idx = indexer_tensors[0]
+                assert first_idx.ndim == 3, (
+                    f"expect indexer cache tensor has 3 dim but got shape={first_idx.shape}.")
+                idx_num_blocks = first_idx.shape[0]
+                idx_block_size = first_idx.shape[1]
+                idx_head_size = first_idx.shape[2]
+
+                # Resolve indexer dtype: prefer cache_config.indexer.dtype (set by
+                # _detect_indexer_config_from_hf), fall back to the tensor's own dtype.
+                indexer_cfg = getattr(self.flexkv_config.cache_config, 'indexer', None)
+                indexer_dtype = indexer_cfg.dtype if indexer_cfg is not None else first_idx.dtype
+
+                indexer_layer_indices = list(
+                    range(num_main_layers, num_main_layers + len(indexer_tensors))
+                )
+
+                layer_groups.append(LayerGroupSpec(
+                    num_layers=len(indexer_tensors),
+                    num_kv_heads=1,
+                    head_size=idx_head_size,
+                    layer_indices=indexer_layer_indices,
+                    dtype=indexer_dtype,
+                ))
+                gpu_layouts.append(KVCacheLayout(
+                    type=KVCacheLayoutType.LAYERFIRST,
+                    num_layer=len(indexer_tensors),
+                    num_block=idx_num_blocks,
+                    tokens_per_block=idx_block_size,
+                    num_head=1,
+                    head_size=idx_head_size,
+                    is_mla=True,
+                ))
+                handles_per_group.append(indexer_tensors)
+                all_gpu_blocks.extend(indexer_tensors)
+
+                logger.info(
+                    f"Indexer group: {len(indexer_tensors)} layers, "
+                    f"head_size={idx_head_size}, dtype={indexer_dtype}, "
+                    f"indices={indexer_layer_indices}"
+                )
+
+            # Store layer_groups on model_config for downstream use.
+            # num_layers stays = main KV count so PP/RankInfo math is unaffected;
+            # token_size_in_bytes/cache sizing now reads from layer_groups instead.
+            self.flexkv_config.model_config.layer_groups = layer_groups
+            self.flexkv_config.model_config.num_layers = num_main_layers
+
+            # Primary layout (kv_layout arg) uses the first group's shape; the full
+            # per-group layout list goes in gpu_layouts.
+            primary_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=num_main_layers,
+                num_block=num_blocks,
+                tokens_per_block=block_size,
+                num_head=layer_groups[0].num_kv_heads,
+                head_size=layer_groups[0].head_size,
+                is_mla=is_mla,
+            )
+            self.tp_client.register_to_server(
+                all_gpu_blocks, primary_layout,
+                layer_groups=layer_groups,
+                gpu_layouts=gpu_layouts,
+                handles_per_group=handles_per_group,
+            )
 
         logger.info("Finish register kv_caches")
 
@@ -941,11 +1097,17 @@ class FlexKVConnectorV1Impl:
         self.connector.cancel_tasks()
         self.connector.launch_tasks()
 
-        # Optional: Synchronous wait for get tasks to ensure data consistency.
-        # This is a safety fallback because currently FlexKV worker does not support
-        # waiting for tasks in start_load_kv().
-        if os.getenv('FLEXKV_SYNC_GET', '0') == '1':
-            self.connector.wait_for_all_get_tasks()
+        # Synchronous wait for H2D (get) tasks before the forward pass.
+        # FlexKV does not use the async start_load_kv/wait_for_layer_load
+        # interface, so the transfer must complete here.
+        # With load_kv_async=False, the request is already RUNNING —
+        # reporting finished_recving would hit a scheduler assert,
+        # so we clean up get tasks here instead of in query_finished_task().
+        if self.connector.get_tasks:
+            responses = self.connector.wait_for_all_get_tasks()
+            for resp in responses:
+                self.connector.req_id_to_task_dict.pop(
+                    resp.request.request_id, None)
 
         return KVConnectorMetadata()
 

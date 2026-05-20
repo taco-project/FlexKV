@@ -11,7 +11,6 @@
 #include <unistd.h>
 
 #include "transfer_ssd.h"
-#include "monitoring/metrics_manager.h"
 
 namespace flexkv {
 
@@ -41,7 +40,7 @@ static void _transfer_iouring_impl(
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes,
     int num_files_per_device, bool is_read, bool is_mla,
-    bool enable_block_first_transfer) {
+    bool enable_block_first_transfer, int64_t ssd_copy_offset = 0) {
   int num_blocks = end_block - start_block;
   int rc;
 
@@ -64,7 +63,7 @@ static void _transfer_iouring_impl(
                             block_stride_in_bytes * cpu_block_id +
                             cpu_layers_chunk_offset;
       int64_t ssd_block_offset =
-          ssd_block_id * block_stride_in_bytes + ssd_layers_chunk_offset;
+          ssd_block_id * block_stride_in_bytes + ssd_copy_offset + ssd_layers_chunk_offset;
 
       ssize_t bytes_transfer = 0;
       if (is_read) {
@@ -85,14 +84,12 @@ static void _transfer_iouring_impl(
       if (bytes_transfer && (bytes_transfer != layers_chunk_size_in_bytes)) {
         throw std::runtime_error("Failed to transfer block");
       }
-      // Record bytes: io_uring submitted (rc >= 0) or fallback pread/pwrite succeeded
-      FLEXKV_CPU_SSD_TRANSFER(is_read, layers_chunk_size_in_bytes);
       continue;
     }
 
     for (int lid = start_layer; lid < end_layer; lid++) {
       int64_t ssd_k_block_offset = ssd_block_id * block_stride_in_bytes +
-                                   lid * ssd_layer_stride_in_bytes;
+                                   ssd_copy_offset + lid * ssd_layer_stride_in_bytes;
       int64_t ssd_v_block_offset = ssd_k_block_offset + ssd_kv_stride_in_bytes;
       int64_t cpu_k_block_offset = cpu_block_id * block_stride_in_bytes +
                                    lid * cpu_layer_stride_in_bytes;
@@ -123,8 +120,6 @@ static void _transfer_iouring_impl(
       if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
         throw std::runtime_error("Failed to transfer K block");
       }
-      // Record bytes: io_uring submitted (rc >= 0) or fallback pread/pwrite succeeded
-      FLEXKV_CPU_SSD_TRANSFER(is_read, chunk_size_in_bytes);
 
       if (is_mla) {
         continue;
@@ -150,8 +145,6 @@ static void _transfer_iouring_impl(
       if (bytes_transfer && (bytes_transfer != chunk_size_in_bytes)) {
         throw std::runtime_error("Failed to transfer K block");
       }
-      // Record bytes: io_uring submitted (rc >= 0) or fallback pread/pwrite succeeded
-      FLEXKV_CPU_SSD_TRANSFER(is_read, chunk_size_in_bytes);
     } // end layer loop
   } // end block loop
 
@@ -165,7 +158,8 @@ static void _transfer_single_thread_impl(
     int64_t cpu_layer_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes,
-    int num_files_per_device, bool is_read, bool is_mla) {
+    int num_files_per_device, bool is_read, bool is_mla,
+    int64_t ssd_copy_offset = 0) {
   int num_blocks = end_block - start_block;
   if (num_blocks == 0) {
     return;
@@ -179,7 +173,7 @@ static void _transfer_single_thread_impl(
 
     for (int lid = start_layer; lid < end_layer; lid++) {
       int64_t ssd_k_block_offset = ssd_block_id * block_stride_in_bytes +
-                                   lid * ssd_layer_stride_in_bytes;
+                                   ssd_copy_offset + lid * ssd_layer_stride_in_bytes;
       int64_t ssd_v_block_offset = ssd_k_block_offset + ssd_kv_stride_in_bytes;
       int64_t cpu_k_block_offset = cpu_block_id * block_stride_in_bytes +
                                    lid * cpu_layer_stride_in_bytes;
@@ -197,7 +191,7 @@ static void _transfer_single_thread_impl(
         bytes_transfer = pwrite(fd, cpu_k_block_ptr, chunk_size_in_bytes,
                                 ssd_k_block_offset);
       }
-      
+
       if (bytes_transfer == -1){
         perror("pread failed");
       }
@@ -205,8 +199,6 @@ static void _transfer_single_thread_impl(
       if (bytes_transfer != chunk_size_in_bytes) {
         throw std::runtime_error("Failed to transfer K block");
       }
-      // Record transfer bytes immediately after completion
-      FLEXKV_CPU_SSD_TRANSFER(is_read, bytes_transfer);
 
       if (is_mla) {
         continue;
@@ -222,8 +214,6 @@ static void _transfer_single_thread_impl(
       if (bytes_transfer != chunk_size_in_bytes) {
         throw std::runtime_error("Failed to transfer V block");
       }
-      // Record transfer bytes immediately after completion
-      FLEXKV_CPU_SSD_TRANSFER(is_read, bytes_transfer);
 
     } // end layer loop
   } // end block loop
@@ -240,7 +230,7 @@ void transfer_kv_blocks_ssd(
     int64_t ssd_kv_stride_in_bytes,    // in single file
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes, bool is_read,
     int num_blocks_per_file, int round_robin, int num_threads_per_device,
-    bool is_mla) {
+    bool is_mla, int64_t ssd_copy_offset) {
   const int num_devices = ioctx.get_num_devices();
   const int num_files_per_device = ioctx.get_num_files_per_device();
 
@@ -291,7 +281,7 @@ void transfer_kv_blocks_ssd(
               cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
               cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
               chunk_size_in_bytes, block_stride_in_bytes, num_files_per_device,
-              is_read, is_mla, enable_block_first_transfer);
+              is_read, is_mla, enable_block_first_transfer, ssd_copy_offset);
           continue;
         }
 
@@ -303,7 +293,8 @@ void transfer_kv_blocks_ssd(
              cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
              cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
              chunk_size_in_bytes, block_stride_in_bytes, num_files_per_device,
-             is_read, is_mla, prom = std::move(prom)]() mutable {
+             is_read, is_mla, ssd_copy_offset,
+             prom = std::move(prom)]() mutable {
               try {
                 _transfer_single_thread_impl(
                     fds[d], cpu_blocks_partition[d], ssd_blocks_partition[d],
@@ -312,7 +303,7 @@ void transfer_kv_blocks_ssd(
                     ssd_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
                     ssd_kv_stride_in_bytes, chunk_size_in_bytes,
                     block_stride_in_bytes, num_files_per_device, is_read,
-                    is_mla);
+                    is_mla, ssd_copy_offset);
                 prom.set_value(nullptr);
               } catch (...) {
                 prom.set_value(std::current_exception());

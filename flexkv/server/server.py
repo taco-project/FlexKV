@@ -149,6 +149,7 @@ class KVServer:
         cache_config: CacheConfig,
         gpu_register_port: str,
         server_recv_port: str,
+        total_clients: int = 0,
     ):
 
         self.model_config = model_config
@@ -161,8 +162,9 @@ class KVServer:
             f"gpu_register_port={gpu_register_port}"
         )
 
-        # Capacity == instance_num * dp_size; sourced from model_config (single source of truth).
-        self.client_manager = ClientManager(max_num_dp_client=model_config.total_clients)
+        # Use total_clients if provided (multi-instance mode), otherwise use dp_size
+        max_clients = total_clients if total_clients > 0 else model_config.dp_size
+        self.client_manager = ClientManager(max_num_dp_client=max_clients)
 
         # Initialize RedisMeta in KVServer for server_client_mode
         self.redis_meta_client = None
@@ -216,7 +218,10 @@ class KVServer:
                        gpu_register_port: str,
                        server_recv_port: str) -> None:
 
-        server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
+        server = KVServer(
+            model_config, cache_config, gpu_register_port, server_recv_port,
+            total_clients=model_config.total_clients,
+        )
         server.run()
 
     @classmethod
@@ -269,7 +274,10 @@ class KVServer:
 
                 args_data = {args_data!r}
                 model_config, cache_config, gpu_register_port, server_recv_port = pickle.loads(args_data)
-                server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
+                server = KVServer(
+                    model_config, cache_config, gpu_register_port, server_recv_port,
+                    total_clients=model_config.total_clients,
+                )
                 server.run()
             ''').strip()
             process = subprocess.Popen([
@@ -314,6 +322,12 @@ class KVServer:
                 req = self.recv_from_client.recv_pyobj()
                 flexkv_logger.info(f"recv req: {type(req)} from DP client "
                                    f"(dp_client_id={req.dp_client_id})")
+
+                # Flush any pending transfer completions before handling
+                # the request. This ensures D2H set_ready callbacks are
+                # processed so that subsequent get_match sees up-to-date
+                # num_ready_matched_blocks.
+                self.kv_task_engine._update_tasks(timeout=0)
 
                 # Use dispatch table for request handling
                 req_type = type(req)

@@ -146,6 +146,7 @@ class FlexKVConfig:
                 f"vllm model dtype: {self.model_config.dtype}"
             )
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
+        self._hf_text_config = getattr(vllm_config.model_config, 'hf_text_config', None)
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
         self.model_config.pp_size = vllm_config.parallel_config.pipeline_parallel_size
@@ -184,6 +185,12 @@ class FlexKVConfig:
             pp_start_layer=pp_start_layer,
             pp_end_layer=pp_end_layer,
         )
+
+        # Detect heterogeneous KV cache layers (e.g., Gemma4 with different
+        # head_dim/num_kv_heads for sliding vs full attention layers) BEFORE
+        # computing block counts, so token_size_in_bytes is correct from the start.
+        self._detect_heterogeneous_kv_layers()
+        
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
@@ -196,6 +203,96 @@ class FlexKVConfig:
         # Freeze model_config — no further mutations allowed
         self.model_config.freeze()
         return rank_info
+
+    def _detect_heterogeneous_kv_layers(self) -> None:
+        """Detect heterogeneous KV cache layer groups from hf_text_config.
+
+        Models like Gemma4 use different (num_kv_heads, head_dim) for different
+        attention layer types (sliding_attention vs full_attention).  When detected,
+        this sets model_config.layer_groups so that token_size_in_bytes (and thus
+        num_cpu_blocks / num_ssd_blocks) are computed correctly.
+        """
+        hf = self._hf_text_config
+        if hf is None:
+            return
+
+        layer_types = getattr(hf, 'layer_types', None)
+        if not layer_types:
+            return
+
+        # Read per-type KV configs (Gemma4 naming convention)
+        default_head_dim = getattr(hf, 'head_dim', None)
+        default_num_kv_heads = getattr(hf, 'num_key_value_heads', None)
+        global_head_dim = getattr(hf, 'global_head_dim', None)
+        global_num_kv_heads = getattr(hf, 'num_global_key_value_heads', None)
+
+        if default_head_dim is None or default_num_kv_heads is None:
+            return
+
+        # Resolve global values (fall back to default if not set)
+        if global_num_kv_heads is None:
+            global_num_kv_heads = default_num_kv_heads
+        if global_head_dim is None:
+            global_head_dim = default_head_dim
+
+        # Only proceed if there's actual heterogeneity in KV cache shapes
+        if global_head_dim == default_head_dim and global_num_kv_heads == default_num_kv_heads:
+            return
+
+        # Account for KV sharing between consecutive layers
+        num_kv_shared = getattr(hf, 'num_kv_shared_layers', 0)
+        group_size = max(num_kv_shared, 1)
+
+        sliding_window = getattr(hf, 'sliding_window', None)
+        tp_size = self.model_config.tp_size
+
+        # Count unique KV layers per type (stepping by group_size for sharing)
+        type_counts: dict = {}
+        type_indices: dict = {}
+        unique_idx = 0
+        for i in range(0, len(layer_types), group_size):
+            lt = layer_types[i]
+            type_counts[lt] = type_counts.get(lt, 0) + 1
+            type_indices.setdefault(lt, []).append(unique_idx)
+            unique_idx += 1
+
+        # Build LayerGroupSpec entries with per-GPU num_kv_heads
+        from flexkv.common.config import LayerGroupSpec
+        layer_groups = []
+        for lt, count in type_counts.items():
+            if lt == 'full_attention':
+                kv_heads = global_num_kv_heads // tp_size
+                h_dim = global_head_dim
+                sw = None
+            else:
+                kv_heads = default_num_kv_heads // tp_size
+                h_dim = default_head_dim
+                sw = sliding_window if 'sliding' in lt else None
+
+            layer_groups.append(LayerGroupSpec(
+                num_layers=count,
+                num_kv_heads=kv_heads,
+                head_size=h_dim,
+                layer_indices=type_indices[lt],
+                sliding_window=sw,
+            ))
+
+        # Validate: total unique layers must match what vLLM reported
+        total_unique = sum(g.num_layers for g in layer_groups)
+        if total_unique != self.model_config.num_layers:
+            logger.warning(
+                f"Heterogeneous layer detection: counted {total_unique} unique "
+                f"layers from hf_text_config but vLLM reports "
+                f"{self.model_config.num_layers}. Skipping early layer_groups "
+                f"(will be detected from GPU tensors later).")
+            return
+
+        self.model_config.layer_groups = layer_groups
+        for g in layer_groups:
+            logger.info(
+                f"Detected layer group from hf_text_config: "
+                f"{g.num_layers} layers, num_kv_heads={g.num_kv_heads}, "
+                f"head_size={g.head_size}, sliding_window={g.sliding_window}")
 
     def post_init_from_sglang_config(
         self,

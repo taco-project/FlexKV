@@ -90,18 +90,6 @@ bool MetricsManager::Initialize(const std::string& bind_address) {
         exposer_ = std::make_unique<prometheus::Exposer>(bind_address);
         exposer_->RegisterCollectable(registry_);
 
-        // Counter: Transfer operations count
-        transfer_ops_family_ = &prometheus::BuildCounter()
-            .Name("flexkv_cpp_transfer_ops_total")
-            .Help("Total number of transfer operations by type and direction")
-            .Register(*registry_);
-
-        // Counter: Transfer bytes count
-        transfer_bytes_family_ = &prometheus::BuildCounter()
-            .Name("flexkv_cpp_transfer_bytes_total")
-            .Help("Total bytes transferred by type and direction")
-            .Register(*registry_);
-
         // Counter: Cache operations
         cache_ops_family_ = &prometheus::BuildCounter()
             .Name("flexkv_cpp_cache_ops_total")
@@ -159,36 +147,6 @@ Labels MetricsManager::MergeLabels(const Labels& base, const Labels& extra) {
     return result;
 }
 #endif
-
-// ==================== Counter: Transfer Operations ====================
-
-void MetricsManager::RecordTransfer(TransferType type, const std::string& direction, size_t bytes) {
-#ifdef FLEXKV_ENABLE_MONITORING
-    if (!EnsureInitialized()) return;
-    
-    // Increment transfer ops counter
-    if (transfer_ops_family_) {
-        auto& ops_counter = transfer_ops_family_->Add({
-            {"type", TransferTypeToString(type)},
-            {"direction", direction}
-        });
-        ops_counter.Increment();
-    }
-    
-    // Increment transfer bytes counter
-    if (transfer_bytes_family_) {
-        auto& bytes_counter = transfer_bytes_family_->Add({
-            {"type", TransferTypeToString(type)},
-            {"direction", direction}
-        });
-        bytes_counter.Increment(static_cast<double>(bytes));
-    }
-#else
-    (void)type;
-    (void)direction;
-    (void)bytes;
-#endif
-}
 
 // ==================== Counter: Cache Operations ====================
 

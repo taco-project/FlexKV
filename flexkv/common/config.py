@@ -23,6 +23,19 @@ class IndexerCacheConfig:
 
 
 @dataclass
+class LayerGroupSpec:
+    """One group of layers sharing the same KV cache shape."""
+    num_layers: int
+    num_kv_heads: int
+    head_size: int
+    layer_indices: List[int]  # 0-based indices into the full layer list
+    sliding_window: Optional[int] = None  # Token count; None = full attention
+    # Per-group storage dtype. None = inherit ModelConfig.dtype.
+    # Indexer groups use a different dtype (e.g. fp8/uint8) than main KV (bf16).
+    dtype: Optional[torch.dtype] = None
+
+
+@dataclass
 class ModelConfig:
     num_layers: int = 1
     num_kv_heads: int = 1
@@ -80,6 +93,14 @@ class ModelConfig:
     # Multi-instance deployment
     # ------------------------------------------------------------------
     instance_num: int = 1
+
+    # ------------------------------------------------------------------
+    # Heterogeneous KV cache layers (Gemma4 multi-shape, Indexer-as-group, ...)
+    # ------------------------------------------------------------------
+    # When None, all layers share the same (num_kv_heads, head_size, dtype).
+    # When set, each group carries its own shape (and optionally its own dtype),
+    # and token_size_in_bytes/num_cpu_blocks are computed by summing across groups.
+    layer_groups: Optional[List[LayerGroupSpec]] = None
 
     # ------------------------------------------------------------------
     # Freeze mechanism: after post_init, ModelConfig must not be mutated
@@ -204,15 +225,35 @@ class ModelConfig:
 
     @property
     def bytes_per_token_per_layer(self) -> int:
-        """Raw byte footprint of a single (layer, token) KV slot."""
+        """Raw byte footprint of a single (layer, token) KV slot.
+
+        NOTE: assumes uniform (num_kv_heads, head_size, dtype) across layers.
+        Not meaningful when ``layer_groups`` is set — callers in that path must
+        use ``token_size_in_bytes`` instead.
+        """
         return self.num_kv_heads * self.head_size * self.kv_dim * self.dtype.itemsize
 
     @property
     def token_size_in_bytes(self) -> int:
-        """Whole-model token footprint (bytes) — all layers combined."""
-        return self.num_layers * self.bytes_per_token_per_layer
+        """Whole-model per-token KV footprint (bytes) across all layers/groups."""
+        kv_dim = 1 if self.use_mla else 2
+        if self.layer_groups:
+            # layer_groups store per-GPU num_kv_heads; multiply by tp_size
+            # to get full-model per-token size (matching CPU/SSD block sizing).
+            # Each group may carry its own dtype (None = inherit ModelConfig.dtype),
+            # so indexer-as-group (fp8/uint8) and main KV (bf16) sum correctly.
+            return sum(
+                g.num_layers * g.num_kv_heads * g.head_size * kv_dim
+                * (g.dtype or self.dtype).itemsize
+                for g in self.layer_groups
+            ) * self.tp_size
+        return self.num_layers * self.num_kv_heads * self.head_size * kv_dim * self.dtype.itemsize
 
     def __str__(self) -> str:
+        layer_groups_str = (
+            f", layer_groups={len(self.layer_groups)}groups"
+            if self.layer_groups else ""
+        )
         return (
             f"ModelConfig(num_layers={self.num_layers}, num_kv_heads={self.num_kv_heads}"
             f", head_size={self.head_size}, use_mla={self.use_mla}"
@@ -221,6 +262,7 @@ class ModelConfig:
             f", attn_cp_size={self.attn_cp_size}"
             f", nnodes={self.nnodes}, master_host={self.master_host!r}"
             f", instance_num={self.instance_num}"
+            f"{layer_groups_str}"
         )
 
 
@@ -319,7 +361,6 @@ class RankInfo:
             f", node_rank={self.node_rank}, instance_id={self.instance_id}"
         )
 
-
 @dataclass
 class CacheConfig:
     tokens_per_block: int = 16
@@ -384,6 +425,10 @@ class CacheConfig:
 
     # Mooncake transfer engine config path (serialized via pickle to survive spawn subprocesses)
     mooncake_config_path: Optional[str] = None
+
+    # Stored for deferred recomputation when layer_groups become known
+    _user_cpu_cache_gb: float = 0
+    _user_ssd_cache_gb: float = 0
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
@@ -453,7 +498,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     lt_pool_initial_capacity=int(os.getenv('FLEXKV_LT_POOL_INITIAL_CAPACITY', 10000000)),
     refresh_batch_size=int(os.getenv('FLEXKV_REFRESH_BATCH_SIZE', 256)),
-    rebuild_interval_ms=int(os.getenv('FLEXKV_REBUILD_INTERVAL_MS', 100)),
+    rebuild_interval_ms=int(os.getenv('FLEXKV_REBUILD_INTERVAL_MS', 2000)),
     idle_sleep_ms=int(os.getenv('FLEXKV_IDLE_SLEEP_MS', 10)),
     lease_ttl_ms=int(os.getenv('FLEXKV_LEASE_TTL_MS', 30000)),
     safety_ttl_ms=int(os.getenv('FLEXKV_SAFETY_TTL_MS', 100)),
@@ -544,6 +589,10 @@ def update_default_config_from_user_config(rank_info: RankInfo,
 
     assert user_config.cpu_cache_gb > 0
     assert user_config.ssd_cache_gb >= 0
+
+    # Store original GB values for deferred recomputation (when layer_groups become known)
+    cache_config._user_cpu_cache_gb = user_config.cpu_cache_gb
+    cache_config._user_ssd_cache_gb = user_config.ssd_cache_gb
 
     cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
     cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)

@@ -20,6 +20,7 @@ class WorkerKey:
 class CompletedOp:
     graph_id: int
     op_id: int
+    # Transfer metrics fields (populated when op completes, for post-completion metrics)
     transfer_type: Optional[str] = None
     num_blocks: int = 0
     num_bytes: int = 0
@@ -128,9 +129,6 @@ class LayerwiseTransferOp(TransferOp):
     src_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     dst_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     counter_id: int = 0  # Counter set index for triple buffering eventfd notification
-    # Indexer block_ids for fused indexer transfer (1:1 with main KV block_ids)
-    indexer_src_block_ids: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
-    indexer_dst_block_ids: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
 
     def __init__(self,
                 graph_id: int,
@@ -139,18 +137,12 @@ class LayerwiseTransferOp(TransferOp):
                 src_block_ids_disk2h: np.ndarray,
                 dst_block_ids_disk2h: np.ndarray,
                 dp_client_id: int = 0,
-                counter_id: int = 0,
-                indexer_src_block_ids: Optional[np.ndarray] = None,
-                indexer_dst_block_ids: Optional[np.ndarray] = None) -> None:
+                counter_id: int = 0) -> None:
         self.src_block_ids_h2d = src_block_ids_h2d
         self.dst_block_ids_h2d = dst_block_ids_h2d
         self.src_block_ids_disk2h = src_block_ids_disk2h
         self.dst_block_ids_disk2h = dst_block_ids_disk2h
         self.counter_id = counter_id
-        self.indexer_src_block_ids = indexer_src_block_ids if indexer_src_block_ids is not None \
-            else np.array([], dtype=np.int64)
-        self.indexer_dst_block_ids = indexer_dst_block_ids if indexer_dst_block_ids is not None \
-            else np.array([], dtype=np.int64)
 
         super().__init__(
             graph_id=graph_id,
@@ -165,14 +157,11 @@ class LayerwiseTransferOp(TransferOp):
 
         assert self.src_block_ids_h2d.size == self.dst_block_ids_h2d.size
         assert self.src_block_ids_disk2h.size == self.dst_block_ids_disk2h.size
-        assert self.indexer_src_block_ids.size == self.indexer_dst_block_ids.size
 
         assert self.src_block_ids_h2d.dtype == np.int64
         assert self.dst_block_ids_h2d.dtype == np.int64
         assert self.src_block_ids_disk2h.dtype == np.int64
         assert self.dst_block_ids_disk2h.dtype == np.int64
-        assert self.indexer_src_block_ids.dtype == np.int64
-        assert self.indexer_dst_block_ids.dtype == np.int64
 
 class TransferOpGraph:
     _next_graph_id = 0
@@ -482,10 +471,6 @@ def merge_to_batch_graph(batch_id: int,
                     else np.array([], dtype=np.int64),
                 dp_client_id=ops_by_type[TransferType.H2D][0].dp_client_id,
                 counter_id=counter_id,
-                # Indexer maps 1:1 with main KV blocks, use same block_ids
-                # CPU side (src) and GPU side (dst) for H2D direction
-                indexer_src_block_ids=merged_h2d_op.src_block_ids.copy(),
-                indexer_dst_block_ids=merged_h2d_op.dst_block_ids.copy(),
             )
             merged_graph.add_transfer_op(layerwise_transfer_op)
         batch_end_op_id = -1

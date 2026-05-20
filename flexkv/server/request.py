@@ -3,7 +3,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from flexkv.common.config import ModelConfig
+from flexkv.common.config import ModelConfig, LayerGroupSpec
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
 from flexkv.common.request import KVResponseStatus
@@ -23,9 +23,12 @@ class RegisterTPClientRequest:
     device_id: int
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
-    # --- Indexer shadow transfer fields ---
-    indexer_handles: Optional[List[TensorSharedHandle]] = None
-    indexer_gpu_layout: Optional[KVCacheLayout] = None
+    # Multi-group fields for heterogeneous KV cache layouts (Gemma4 multi-shape,
+    # DSA/NSA indexer-as-group). When None, the request describes a uniform
+    # single-shape model and the legacy ``handles``/``gpu_layout`` path is used.
+    layer_groups: Optional[List[LayerGroupSpec]] = None
+    gpu_layouts: Optional[List[KVCacheLayout]] = None
+    handles_per_group: Optional[List[List[TensorSharedHandle]]] = None
 
 
 @dataclass

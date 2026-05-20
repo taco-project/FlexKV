@@ -71,7 +71,10 @@ class KVManager:
         self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
 
         if self.server_client_mode:
-            if dp_client_id == 0:
+            # In server_client_mode, RedisMeta is created and initialized inside KVServer
+            # Server should only be created once across all instances and dp ranks
+            if self.instance_id == 0 and dp_client_id == 0:
+                total_clients = self.instance_num * model_config.dp_size
                 self.server_handle = KVServer.create_server(model_config=model_config,
                                                             cache_config=cache_config,
                                                             gpu_register_port=self.gpu_register_port,
@@ -100,6 +103,9 @@ class KVManager:
                 self.redis_meta_client.init_meta()
                 # update distributed_node_id
                 self.cache_config.distributed_node_id = self.redis_meta_client.get_node_id()
+
+            self.server_handle = None
+            self.kv_task_engine = KVTaskEngine(self.model_config, self.cache_config, self.gpu_register_port, redis_meta=self.redis_meta_client, event_collector=event_collector)
 
             self.server_handle = None
             self.kv_task_engine = KVTaskEngine(

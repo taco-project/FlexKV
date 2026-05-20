@@ -202,21 +202,26 @@ size_t LocalRadixTree::local_block_report(size_t max_batch) {
   if (channel == nullptr || max_batch == 0) return 0;
   size_t processed = 0;
   bool ret;
-  NewBlockMeta* node_ptr = nullptr;
-  // 1) publish new block metas
-  while (processed < max_batch && new_block_queue.pop(node_ptr)) {
-    publish_node_blocks(node_ptr);
-    delete node_ptr; // release the temporary copied node
-    processed++;
-    if (processed >= max_batch) {
-      std::cout << "[WARN] local_block_report: processed >= max_batch, processed: " 
-      << processed << ", max_batch: " << max_batch 
-      << ", new_block_queue size: " << new_block_queue.size() << std::endl;
+
+  // Priority 1: delete evicted blocks from Redis FIRST.
+  // This prevents stale RDMA reads from recycled memory addresses.
+  // Previously this was step 3 and could starve under heavy new-block publish load.
+  std::unique_ptr<std::deque<int64_t>> evicted_q_ptr;
+  while (processed < max_batch && evicted_blocks_queue.pop(evicted_q_ptr)) {
+    if (evicted_q_ptr) {
+      ret = channel->delete_blockmeta_batch(node_id, evicted_q_ptr.get());
+      if (!ret) {
+        std::cerr << "[ERROR] local_block_report: delete_blockmeta_batch failed. block hashes: " << evicted_q_ptr->front() << std::endl;
+      }
+      for (auto hash : *evicted_q_ptr) {
+        normal_block_hashes.remove(hash);
+      }
     }
+    evicted_q_ptr.reset();
+    processed++;
   }
 
-  // 2) update state to ABOUT_TO_EVICT for queued hashes
-  // Consume at most (max_batch - processed) items from about_to_evict_blocks_queue
+  // Priority 2: update state to ABOUT_TO_EVICT for queued hashes
   size_t budget = (max_batch > processed) ? (max_batch - processed) : 0;
   std::unique_ptr<std::deque<int64_t>> about_q_ptr;
   while (budget > 0 && about_to_evict_blocks_queue.pop(about_q_ptr)) {
@@ -232,36 +237,16 @@ size_t LocalRadixTree::local_block_report(size_t max_batch) {
     about_q_ptr.reset();
     processed++;
     budget--;
-    if (budget == 0) {
-      std::cout << "[WARN] local_block_report: budget is 0, budget: " 
-      << " max_batch: " << max_batch 
-      << ", processed: " << processed
-      << ", about_to_evict_blocks_queue size: " << about_to_evict_blocks_queue.size() << std::endl;
-    }
   }
 
-  // 3) delete evicted blocks
+  // Priority 3: publish new block metas (lowest priority — new blocks can wait)
+  NewBlockMeta* node_ptr = nullptr;
   budget = (max_batch > processed) ? (max_batch - processed) : 0;
-  std::unique_ptr<std::deque<int64_t>> evicted_q_ptr;
-  while (budget > 0 && evicted_blocks_queue.pop(evicted_q_ptr)) {
-    if (evicted_q_ptr) {
-      ret = channel->delete_blockmeta_batch(node_id, evicted_q_ptr.get());
-      if (!ret) {
-        std::cerr << "[ERROR] local_block_report: delete_blockmeta_batch failed. block hashes: " << evicted_q_ptr->front() << std::endl;
-      }
-      for (auto hash : *evicted_q_ptr) {
-        normal_block_hashes.remove(hash);
-      }
-    }
-    evicted_q_ptr.reset();
+  while (budget > 0 && new_block_queue.pop(node_ptr)) {
+    publish_node_blocks(node_ptr);
+    delete node_ptr;
     processed++;
     budget--;
-    if (budget == 0) {
-      std::cout << "[WARN] local_block_report: budget is 0, budget: " 
-      << " max_batch: " << max_batch 
-      << ", processed: " << processed
-      << ", evicted_blocks_queue size: " << evicted_blocks_queue.size() << std::endl;
-    }
   }
 
   return processed;
@@ -664,7 +649,14 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
 }
 
 int LocalRadixTree::evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted_block_hashes, int num_evicted) {
-  return 0;
+  // Call the primary evict (two-arg) which does the real work.
+  // It pushes hashes into evicted_blocks_queue for async Redis cleanup.
+  // Note: evicted_block_hashes is NOT populated here because extracting
+  // from the lock-free queue is unsafe while the background worker runs.
+  // Callers that need hashes (e.g. Dynamo event collector) should use
+  // CRadixTreeCacheEngine's evict which handles hashes natively.
+  // This stub exists to satisfy the virtual interface.
+  return evict(evicted_blocks, num_evicted);
 }
 
 // Delegate wrappers to base CRadixTreeIndex
@@ -711,28 +703,66 @@ void LocalRadixTree::set_ready(CRadixNode *node, bool ready, int ready_length) {
 }
 
 size_t LocalRadixTree::drain_pending_queues() {
-  size_t dropped = 0;
-  {
-    std::unique_ptr<std::deque<int64_t>> ptr;
-    while (evicted_blocks_queue.pop(ptr)) {
-      if (ptr) dropped += ptr->size();
-      ptr.reset();
+  // Flush all pending queues to Redis synchronously.
+  // Critical: evicted blocks MUST be deleted from Redis before their
+  // memory is recycled, otherwise another node could RDMA-read stale data.
+  size_t processed = 0;
+  if (channel != nullptr) {
+    // 1) Delete evicted blocks from Redis
+    {
+      std::unique_ptr<std::deque<int64_t>> ptr;
+      while (evicted_blocks_queue.pop(ptr)) {
+        if (ptr && !ptr->empty()) {
+          channel->delete_blockmeta_batch(node_id, ptr.get());
+          for (auto hash : *ptr) {
+            normal_block_hashes.remove(hash);
+          }
+          processed += ptr->size();
+        }
+        ptr.reset();
+      }
+    }
+    // 2) Update about-to-evict states
+    {
+      std::unique_ptr<std::deque<int64_t>> ptr;
+      while (about_to_evict_blocks_queue.pop(ptr)) {
+        if (ptr && !ptr->empty()) {
+          channel->update_block_state_batch(node_id, ptr.get(), NODE_STATE_ABOUT_TO_EVICT);
+          for (auto hash : *ptr) {
+            normal_block_hashes.remove(hash);
+          }
+          processed += ptr->size();
+        }
+        ptr.reset();
+      }
+    }
+    // 3) Publish new blocks
+    {
+      NewBlockMeta* node_ptr = nullptr;
+      while (new_block_queue.pop(node_ptr)) {
+        if (node_ptr) {
+          publish_node_blocks(node_ptr);
+          delete node_ptr;
+          processed++;
+        }
+      }
+    }
+  } else {
+    // No channel — just drop everything
+    {
+      std::unique_ptr<std::deque<int64_t>> ptr;
+      while (evicted_blocks_queue.pop(ptr)) { ptr.reset(); }
+    }
+    {
+      std::unique_ptr<std::deque<int64_t>> ptr;
+      while (about_to_evict_blocks_queue.pop(ptr)) { ptr.reset(); }
+    }
+    {
+      NewBlockMeta* ptr = nullptr;
+      while (new_block_queue.pop(ptr)) { if (ptr) delete ptr; }
     }
   }
-  {
-    std::unique_ptr<std::deque<int64_t>> ptr;
-    while (about_to_evict_blocks_queue.pop(ptr)) {
-      if (ptr) dropped += ptr->size();
-      ptr.reset();
-    }
-  }
-  {
-    NewBlockMeta* ptr = nullptr;
-    while (new_block_queue.pop(ptr)) {
-      if (ptr) delete ptr;
-    }
-  }
-  return dropped;
+  return processed;
 }
 
 } // namespace flexkv
