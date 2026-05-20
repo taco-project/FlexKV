@@ -31,7 +31,6 @@ from flexkv.common.dist_reuse import (
     RemoteReadyMsg,
     SharingDomainKey,
     SharingDomainNamespace,
-    encode_coord_message,
 )
 
 
@@ -216,14 +215,6 @@ class RemoteDistReuseInitializer:
             distributed_node_id=int(node_id),
             ready_msg=ready_msg,
         )
-
-    # ---- encoding --------------------------------------------------
-    @staticmethod
-    def encode_ready(msg: RemoteReadyMsg) -> dict:
-        """Convenience: turn a :class:`RemoteReadyMsg` into its wire
-        ``dict`` form (handy when the ZMQ transport prefers JSON)."""
-        return encode_coord_message(msg)
-
 
 # ---------------------------------------------------------------------------
 # Helpers

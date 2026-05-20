@@ -26,12 +26,11 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
 __all__ = [
     "ReadyEntry",
-    "AggregateMatchResult",
     "AggregateRadixTree",
     "BlockNotTrackedError",
 ]
@@ -42,9 +41,6 @@ class BlockNotTrackedError(KeyError):
     that the aggregate radix has never seen."""
 
 
-# ---------------------------------------------------------------------------
-# Data shapes
-# ---------------------------------------------------------------------------
 @dataclass
 class ReadyEntry:
     """Per-prefix bookkeeping.
@@ -93,19 +89,6 @@ class ReadyEntry:
         if that SD has not acked yet."""
         return self.ready_sds.get(sd_key)
 
-
-@dataclass
-class AggregateMatchResult:
-    """Result of :meth:`AggregateRadixTree.match_fully_ready`."""
-
-    matched_block_ids: Tuple[int, ...]
-    contributing_peers: FrozenSet[str]
-    # Always a single value (matches §4.7.1.4 single-Node match constraint
-    # already enforced by the C++ ``RefRadixTree``).  ``None`` when the
-    # match length is zero.
-    matched_node_id: Optional[int] = None
-
-
 # ---------------------------------------------------------------------------
 # Refcount entry
 # ---------------------------------------------------------------------------
@@ -113,7 +96,7 @@ class AggregateMatchResult:
 class _RefCountEntry:
     count: int = 0
     # Wall-clock time (seconds since epoch) of the most recent acquire.
-    # Used by ``scan_leaked_refcount`` to identify stuck refcounts.
+    # Reserved for future leak / staleness detectors.
     last_acquired_at: float = 0.0
 
 
@@ -125,10 +108,9 @@ class AggregateRadixTree:
 
     Public API surface mirrors design doc §4.3 / §4.3.1:
 
-    * :meth:`mark_sd_ready` / :meth:`mark_sd_evicted` — per-SD ack tracker
+    * :meth:`mark_sd_ready` — per-SD ack tracker
     * :meth:`match_fully_ready` — query the longest fully-ready prefix
     * :meth:`acquire` / :meth:`release` / :meth:`is_evictable` — refcount
-    * :meth:`scan_leaked_refcount` — leak detector
     * :meth:`invalidate_by_peer_instance` / :meth:`invalidate_prefix` —
       reactions to failure-detector events
     """
@@ -164,11 +146,6 @@ class AggregateRadixTree:
     def __len__(self) -> int:
         with self._lock:
             return len(self._prefixes)
-
-    def known_prefixes(self) -> List[int]:
-        """Snapshot of prefix hashes currently tracked (not necessarily ready)."""
-        with self._lock:
-            return list(self._prefixes.keys())
 
     # ------------------------------------------------------------------
     # Per-SD ack tracker
@@ -241,21 +218,6 @@ class AggregateRadixTree:
                 entry.first_ready_at = self._time_fn()
             return became_ready
 
-    def mark_sd_evicted(self, prefix_hash: int, sd_key: str) -> None:
-        """Remove ``sd_key`` from a prefix's ready-set.
-
-        If the set becomes empty the prefix is dropped entirely.  Silently
-        no-op if the prefix is unknown (matches the "Master single-handedly
-        evicts" semantics in design doc §4.3.1 — Remotes do not need to
-        observe an eviction)."""
-        with self._lock:
-            entry = self._prefixes.get(prefix_hash)
-            if entry is None:
-                return
-            entry.ready_sds.pop(sd_key, None)
-            if not entry.ready_sds:
-                self._drop_prefix_locked(entry)
-
     # ------------------------------------------------------------------
     # Match
     # ------------------------------------------------------------------
@@ -327,38 +289,6 @@ class AggregateRadixTree:
         with self._lock:
             ent = self._refcounts.get(int(block_id))
             return ent is None or ent.count <= 0
-
-    def get_refcount(self, block_id: int) -> int:
-        """Helper for tests / observability.  Never raises."""
-        with self._lock:
-            ent = self._refcounts.get(int(block_id))
-            return ent.count if ent is not None else 0
-
-    def scan_leaked_refcount(self, timeout_seconds: float) -> List[int]:
-        """Return all block_ids whose refcount has been > 0 longer than
-        ``timeout_seconds``.
-
-        The Master is expected to call this periodically (design doc §4.3.1
-        prerequisite C "refcount timeout safety net") and then forcibly
-        zero each leaked refcount + invalidate the owning prefix(es).
-        """
-        if timeout_seconds < 0:
-            raise ValueError(f"timeout_seconds must be >= 0, got {timeout_seconds!r}")
-        cutoff = self._time_fn() - timeout_seconds
-        with self._lock:
-            return [b for b, ent in self._refcounts.items() if ent.last_acquired_at <= cutoff]
-
-    def force_release(self, block_id: int) -> int:
-        """Hard-reset a block's refcount to zero.
-
-        Returns the previous refcount (0 if block was untracked).  Designed
-        to be the second half of the leak-recovery sequence — call it for
-        every entry returned by :meth:`scan_leaked_refcount`, then call
-        :meth:`invalidate_prefix` to drop the prefix from the radix.
-        """
-        with self._lock:
-            ent = self._refcounts.pop(int(block_id), None)
-            return ent.count if ent is not None else 0
 
     # ------------------------------------------------------------------
     # Invalidation

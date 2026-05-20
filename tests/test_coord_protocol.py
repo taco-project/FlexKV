@@ -16,7 +16,6 @@ import pytest
 
 from flexkv.common.dist_reuse.coordination_protocol import (
     CoordMsgType,
-    EpochVerifyError,
     FailureReportMsg,
     RemoteReadyMsg,
     decode_coord_message,
@@ -105,15 +104,6 @@ class TestDecodeErrors:
     def test_encode_rejects_non_message(self):
         with pytest.raises(TypeError):
             encode_coord_message({"type": "fake"})  # type: ignore[arg-type]
-
-
-# ---------------------------------------------------------------------------
-# EpochVerifyError sanity
-# ---------------------------------------------------------------------------
-def test_epoch_verify_error_is_runtime_error():
-    assert issubclass(EpochVerifyError, RuntimeError)
-    with pytest.raises(EpochVerifyError):
-        raise EpochVerifyError("stale")
 
 
 # ---------------------------------------------------------------------------

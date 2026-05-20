@@ -101,32 +101,14 @@ class SharingDomainNamespace:
         h = int(block_hash) & 0xFFFFFFFFFFFFFFFF
         return f"{self._prefix}:block:{int(node_id)}:{h:x}"
 
-    def aggregate_key(self, request_prefix_hash: int) -> str:
-        """Aggregate-radix marker (design doc §4.7) for tracking
-        fully-ready prefixes across SDs in this instance."""
-        h = int(request_prefix_hash) & 0xFFFFFFFFFFFFFFFF
-        return f"{self._prefix}:aggregate:{h:x}"
-
     # ------------------------------------------------------------------
     # SCAN-friendly patterns
     # ------------------------------------------------------------------
     def node_key_pattern(self) -> str:
         return f"{self._prefix}:node:*"
 
-    def meta_key_pattern(self) -> str:
-        return f"{self._prefix}:meta:*"
-
-    def buffer_key_pattern(self) -> str:
-        return f"{self._prefix}:buffer:*"
-
-    def block_key_pattern(self) -> str:
-        """Match every block in the SD regardless of node_id.  Used by the
-        global-SCAN optimization in design doc §4.7.1.2."""
-        return f"{self._prefix}:block:*"
-
     def block_key_pattern_for_node(self, node_id: int) -> str:
-        """Per-node block SCAN pattern (legacy path; the global pattern
-        above is preferred)."""
+        """Per-node block SCAN pattern."""
         return f"{self._prefix}:block:{int(node_id)}:*"
 
     # ------------------------------------------------------------------

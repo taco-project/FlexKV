@@ -12,20 +12,6 @@ from flexkv.common.dist_reuse.aggregate_radix import (
 
 
 # ---------------------------------------------------------------------------
-# Manual clock for deterministic time-based assertions
-# ---------------------------------------------------------------------------
-class _ManualClock:
-    def __init__(self, start: float = 0.0) -> None:
-        self.now = start
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, dt: float) -> None:
-        self.now += dt
-
-
-# ---------------------------------------------------------------------------
 # mark_sd_ready / fully-ready transition
 # ---------------------------------------------------------------------------
 class TestMarkSdReady:
@@ -132,30 +118,6 @@ class TestMarkSdReady:
 
 
 # ---------------------------------------------------------------------------
-# mark_sd_evicted
-# ---------------------------------------------------------------------------
-class TestMarkSdEvicted:
-    def test_evict_single_sd_drops_to_partial(self):
-        agg = AggregateRadixTree(total_sd_count=2)
-        agg.mark_sd_ready(1, "sd0", [10])
-        agg.mark_sd_ready(1, "sd1", [10])
-        assert agg.match_fully_ready(1) is not None
-        agg.mark_sd_evicted(1, "sd0")
-        assert agg.match_fully_ready(1) is None  # no longer fully ready
-
-    def test_evict_last_sd_drops_entry(self):
-        agg = AggregateRadixTree(total_sd_count=2)
-        agg.mark_sd_ready(1, "sd0", [10])
-        agg.mark_sd_evicted(1, "sd0")
-        # No SDs left → entry is gone, not just "partial"
-        assert 1 not in agg.known_prefixes()
-
-    def test_evict_unknown_prefix_is_noop(self):
-        agg = AggregateRadixTree(total_sd_count=1)
-        agg.mark_sd_evicted(99, "sd0")  # must not raise
-
-
-# ---------------------------------------------------------------------------
 # Refcount lifecycle
 # ---------------------------------------------------------------------------
 class TestRefcount:
@@ -164,18 +126,17 @@ class TestRefcount:
         assert agg.is_evictable(7) is True
         agg.acquire([7])
         assert agg.is_evictable(7) is False
-        assert agg.get_refcount(7) == 1
         agg.release([7])
         assert agg.is_evictable(7) is True
-        assert agg.get_refcount(7) == 0
 
     def test_acquire_increments(self):
         agg = AggregateRadixTree(total_sd_count=1)
         agg.acquire([1, 1, 1])
-        assert agg.get_refcount(1) == 3
+        # Three acquires — still pinned after two releases.
         agg.release([1, 1])
-        assert agg.get_refcount(1) == 1
         assert agg.is_evictable(1) is False
+        agg.release([1])
+        assert agg.is_evictable(1) is True
 
     def test_double_release_raises(self):
         agg = AggregateRadixTree(total_sd_count=1)
@@ -188,43 +149,6 @@ class TestRefcount:
         agg = AggregateRadixTree(total_sd_count=1)
         with pytest.raises(BlockNotTrackedError):
             agg.release([42])
-
-
-# ---------------------------------------------------------------------------
-# Leak scanner
-# ---------------------------------------------------------------------------
-class TestLeakScanner:
-    def test_finds_leaked_blocks(self):
-        clock = _ManualClock()
-        agg = AggregateRadixTree(total_sd_count=1, time_fn=clock)
-        agg.acquire([1])
-        clock.advance(40.0)
-        leaked = agg.scan_leaked_refcount(timeout_seconds=30.0)
-        assert leaked == [1]
-
-    def test_fresh_acquires_not_leaked(self):
-        clock = _ManualClock()
-        agg = AggregateRadixTree(total_sd_count=1, time_fn=clock)
-        agg.acquire([1])
-        leaked = agg.scan_leaked_refcount(timeout_seconds=30.0)
-        assert leaked == []
-
-    def test_force_release_clears_refcount(self):
-        clock = _ManualClock()
-        agg = AggregateRadixTree(total_sd_count=1, time_fn=clock)
-        agg.acquire([1, 1, 1])
-        prev = agg.force_release(1)
-        assert prev == 3
-        assert agg.is_evictable(1) is True
-
-    def test_force_release_unknown_returns_zero(self):
-        agg = AggregateRadixTree(total_sd_count=1)
-        assert agg.force_release(999) == 0
-
-    def test_negative_timeout_raises(self):
-        agg = AggregateRadixTree(total_sd_count=1)
-        with pytest.raises(ValueError):
-            agg.scan_leaked_refcount(-1.0)
 
 
 # ---------------------------------------------------------------------------

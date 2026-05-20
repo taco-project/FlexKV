@@ -104,16 +104,16 @@ class ModelConfig:
                 f"[ModelConfig] cannot derive gpus_per_node: "
                 f"total_gpus={self.total_gpus} not divisible by nnodes={self.nnodes}"
             )
-        if self.nnodes_per_tp_group > 2:
+        if self.tp_node_count > 2:
             raise ValueError(
                 f"[ModelConfig] only support 2-nodes TP for now, but got "
-                f"nnodes_per_tp_group={self.nnodes_per_tp_group} "
+                f"tp_node_count={self.tp_node_count} "
                 f"(tp_size={self.tp_size}, gpus_per_node={self.gpus_per_node})"
             )
-        if self.tp_size % self.nnodes_per_tp_group != 0:
+        if self.tp_size % self.tp_node_count != 0:
             raise ValueError(
                 f"[ModelConfig] tp_size={self.tp_size} not divisible by "
-                f"nnodes_per_tp_group={self.nnodes_per_tp_group}"
+                f"tp_node_count={self.tp_node_count}"
             )
         if self.instance_num < 1:
             raise ValueError(
@@ -160,13 +160,23 @@ class ModelConfig:
 
     @property
     def nnodes_per_tp_group(self) -> int:
-        """Number of nodes spanned by one TP group."""
-        return self.nnodes_per_pp_rank
+        """Number of nodes spanned by one TP group.
+
+        .. deprecated::
+            Kept as a stable alias of :pyattr:`tp_node_count` for
+            backwards compatibility with adapter code that pre-dates
+            the SD-key naming convention.  New code should read
+            ``tp_node_count`` directly — that property carries the
+            authoritative semantic ("the TP-axis node-count entering
+            ``SharingDomainKey``") and is the value tracked in the
+            redis schema (``docs/dist_reuse/redis_schema.md``).
+        """
+        return self.tp_node_count
 
     @property
     def tp_size_per_node(self) -> int:
         """Number of TP ranks on this node within one TP group."""
-        return self.tp_size // self.nnodes_per_tp_group
+        return self.tp_size // self.tp_node_count
 
     @property
     def attn_dp_size(self) -> int:
@@ -183,7 +193,7 @@ class ModelConfig:
     @property
     def attn_tp_size_per_node(self) -> int:
         """Attention-level TP size per node."""
-        return self.attn_tp_size // self.nnodes_per_tp_group
+        return self.attn_tp_size // self.tp_node_count
 
     @property
     def attn_cp_size_per_node(self) -> int:
@@ -243,6 +253,43 @@ class ModelConfig:
         return self.tp_node_count > 1
 
     @property
+    def is_multinode_pp(self) -> bool:
+        """PP is the dimension that makes *this instance* cross node boundaries.
+
+        Returns True iff:
+
+        * ``pp_size > 1``      — PP is actually deployed,
+        * ``nnodes > 1``       — the instance occupies more than one node,
+        * ``tp_node_count == 1`` — TP **does not** cross nodes
+          (otherwise TP-multinode is the dominant axis and would
+          already drive the SD-Remote decision; classifying the same
+          deployment as "multinode-PP" too would double-count).
+
+        This is the missing third axis next to :pyattr:`is_multinode_tp`
+        and :pyattr:`is_multinode_cp`.  It exists so the connector's
+        runtime launch logic can stop folding "PP-only crosses nodes"
+        into the off-master fall-through branch.
+
+        Worked examples:
+
+        * ``pp=4, nnodes=2, tp=8, gpus_per_node=8`` → True
+          (PP=4 stages × tp=8 = 32 GPUs across 2 nodes; each node
+          owns 2 PP stages; TP stays inside one node).
+        * ``pp=1, nnodes=2, tp=16`` → False
+          (PP single-stage; TP is the multinode axis).
+        * ``pp=2, nnodes=2, tp=16`` → False
+          (TP already crosses; PP is *not* the dominant axis here \u2014
+          we leave the multinode-TP branch to handle this).
+        * ``pp=2, nnodes=1`` → False
+          (single node; PP fits in-host).
+        """
+        return (
+            self.pp_size > 1
+            and self.nnodes > 1
+            and self.tp_node_count == 1
+        )
+
+    @property
     def is_multinode_cp(self) -> bool:
         """CP > 1 *and* the CP group spans more than one physical node.
 
@@ -300,9 +347,17 @@ class ModelConfig:
     # ------------------------------------------------------------------
     @property
     def tp_node_count(self) -> int:
-        """Number of physical nodes one TP group spans (=
-        ``nnodes_per_tp_group``).  ``1`` when TP fits on a single node."""
-        return self.nnodes_per_tp_group
+        """Number of physical nodes one TP group spans.
+
+        Authoritative source for the TP-axis node-count used in
+        :class:`SharingDomainKey` and ``docs/dist_reuse/redis_schema.md``.
+        ``1`` when TP fits on a single node.  Deprecated alias:
+        :pyattr:`nnodes_per_tp_group`.
+        """
+        # PP and TP groups share the same per-rank node assignment in the
+        # current topology (one TP group sits on the same set of nodes as
+        # one PP stage), so ``nnodes_per_tp_group == nnodes_per_pp_rank``.
+        return self.nnodes_per_pp_rank
 
     # NOTE: ``tp_node_idx`` is a per-rank concept and was moved to
     # ``RankInfo`` in PR #165 (separate-per-rank-state-into-RankInfo).

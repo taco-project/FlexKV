@@ -1,6 +1,6 @@
 """Wire format for Master ↔ Remote coordination of distributed KV reuse.
 
-Phase D-4 (proposal_unify_with_graph_dispatch_2026-05-15.md): the
+the
 ``CoordQuery*`` / ``CoordGet*`` / ``CoordPut*`` message types from the
 early implementation are **deleted** here.  They were the dataclasses
 behind the old per-SD ZMQ coord protocol; the unified graph-dispatch
@@ -32,7 +32,6 @@ __all__ = [
     "CoordMsgType",
     "RemoteReadyMsg",
     "FailureReportMsg",
-    "EpochVerifyError",
     "encode_coord_message",
     "decode_coord_message",
 ]
@@ -57,9 +56,9 @@ class CoordMsgType(str, Enum):
 class _BaseCoordMsg:
     """Common fields embedded in every wire message.
 
-    ``epoch`` carries the *sender's* expected ``session_epoch``; receivers
-    cross-check it against their own and raise :class:`EpochVerifyError`
-    when they disagree (design doc §4.3.2 anti-replay rule).
+    ``epoch`` carries the *sender's* expected ``session_epoch`` and is
+    propagated end-to-end so future receivers can do anti-replay checks
+    (design doc §4.3.2); the current decode path does not enforce it.
     """
 
     # Class-level discriminator; every concrete subclass overrides this in
@@ -129,12 +128,6 @@ _msg_class_with_type(FailureReportMsg, CoordMsgType.FAILURE_REPORT)
 # ---------------------------------------------------------------------------
 # Encoding helpers — protocol-level, not transport-level
 # ---------------------------------------------------------------------------
-class EpochVerifyError(RuntimeError):
-    """Raised when a receiver detects a stale ``sender_epoch``.  The caller
-    is expected to translate this into a ``STALE_EPOCH`` response and let
-    the sender invalidate its view of the affected peer."""
-
-
 _TYPE_TO_CLASS: Dict[CoordMsgType, Type[_BaseCoordMsg]] = {
     CoordMsgType.REMOTE_READY: RemoteReadyMsg,
     CoordMsgType.FAILURE_REPORT: FailureReportMsg,

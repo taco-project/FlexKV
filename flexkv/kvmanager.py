@@ -24,7 +24,7 @@ import torch
 from flexkv.server.client import KVDPClient
 from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
-from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
+from flexkv.common.config import ModelConfig, CacheConfig, RankInfo, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.common.debug import flexkv_logger
 from flexkv.cache.redis_meta import RedisMeta
@@ -37,11 +37,20 @@ class KVManager:
                  dp_client_id: int = 0,
                  server_recv_port: str = "",
                  gpu_register_port: str = "",
-                 event_collector: Optional[KVEventCollector] = None):
+                 event_collector: Optional[KVEventCollector] = None,
+                 rank_info: Optional[RankInfo] = None):
         flexkv_logger.info(f"{model_config = }")
         flexkv_logger.info(f"{cache_config = }")
         self.model_config = model_config
         self.cache_config = cache_config
+        # Per-rank metadata: forwarded into ``KVTaskEngine`` so the
+        # control-plane can construct the **correct** per-rank
+        # ``SharingDomainKey`` (pp_node_idx / tp_node_idx).  Without
+        # this, a non-master rank would silently use the (0, 0)
+        # master-position SD and write to the wrong Redis namespace.
+        # Kept optional for legacy single-SD / single-instance callers
+        # that don't construct a ``RankInfo`` (e.g. unit-test stubs).
+        self.rank_info = rank_info
 
         if server_recv_port != "":
             self.server_recv_port = server_recv_port
@@ -76,7 +85,8 @@ class KVManager:
                                                             cache_config=cache_config,
                                                             gpu_register_port=self.gpu_register_port,
                                                             server_recv_port=self.server_recv_port,
-                                                            inherit_env=False)
+                                                            inherit_env=False,
+                                                            rank_info=rank_info)
 
             else:
                 self.server_handle = None
@@ -109,6 +119,7 @@ class KVManager:
                 self.gpu_register_port,
                 redis_meta=self.redis_meta_client,
                 event_collector=event_collector,
+                rank_info=rank_info,
             )
 
     def start(self) -> None:

@@ -175,7 +175,8 @@ class FlexKVSchedulerConnector:
                                         cache_config=flexkv_config.cache_config,
                                         dp_client_id=self.rank_info.dp_client_id,
                                         server_recv_port=flexkv_config.server_recv_port,
-                                        event_collector=self.collector)
+                                        event_collector=self.collector,
+                                        rank_info=self.rank_info)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
 

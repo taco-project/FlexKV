@@ -232,20 +232,8 @@ class MasterCoordinator:
         return self._self_sd
 
     @property
-    def namespace(self) -> SharingDomainNamespace:
-        return self._namespace
-
-    @property
-    def instance_id(self) -> str:
-        return self._instance_id
-
-    @property
     def session_epoch(self) -> str:
         return self._session_epoch
-
-    @property
-    def aggregate_radix(self) -> AggregateRadixTree:
-        return self._aggregate
 
     @property
     def self_node_id(self) -> int:
@@ -300,10 +288,6 @@ class MasterCoordinator:
                 and len(self._ready_remotes) >= self._expected_remote_count
             )
 
-    def ready_remote_infos(self) -> Dict[str, RemoteReadyMsg]:
-        with self._lock:
-            return dict(self._ready_remotes)
-
     def build_sd_to_nid_map(self, self_node_id: int) -> Dict[str, int]:
         """Produce the ``sd_key → node_id`` mapping for
         ``RedisMeta.register_instance_sd_nodes``."""
@@ -335,59 +319,6 @@ class MasterCoordinator:
             for sd_key_str, msg in self._ready_remotes.items():
                 out[sd_key_str] = int(msg.distributed_node_id)
             return out
-
-    # ------------------------------------------------------------ lookup
-    def lookup_peer_by_node_id(self, node_id: int) -> Optional[Dict[str, str]]:
-        """Reverse-lookup: given a (global) distributed_node_id, return
-        the peer SD it belongs to plus the peer instance_id that owns
-        that SD.
-
-        Returns a dict with keys ``sd_key_str`` and ``instance_id``,
-        or ``None`` if the node_id isn't one of our ready peers (i.e.
-        it's either this instance's own node, unknown, or belongs to
-        an instance that hasn't finished its ready handshake).
-
-        Used by the GET main-path glue
-        (``GlobalCacheEngine._maybe_attach_multi_sd_peerh2h_ops``,
-        Phase D-3) and by ``handle_failure_report`` to map an
-        offending node_id back to the peer SD + instance it sits on.
-        """
-        if node_id is None:
-            return None
-        try:
-            nid = int(node_id)
-        except Exception:
-            return None
-        if nid < 0:
-            return None
-        with self._lock:
-            for sd_key_str, msg in self._ready_remotes.items():
-                if int(getattr(msg, "distributed_node_id", -1)) == nid:
-                    return {
-                        "sd_key_str": sd_key_str,
-                        "instance_id": str(getattr(msg, "sender_instance_id", "") or ""),
-                    }
-        return None
-
-    # -------------------------------------------------------- pin helpers
-    def pin_blocks_for_coord_get(self, block_ids: Iterable[int]) -> None:
-        """Refcount-pin ``block_ids`` against Master-side eviction while
-        an in-flight coord GET is expected to land on them.
-
-        Thin alias for :meth:`acquire_blocks` — kept so the GET-path
-        glue reads as intent rather than the lower-level primitive.
-        Used in conjunction with the multi-SD PEERH2H fan-out
-        (``GlobalCacheEngine._maybe_attach_multi_sd_peerh2h_ops``,
-        Phase D-3).
-        """
-        self._aggregate.acquire(block_ids)
-
-    def unpin_blocks_for_coord_get(self, block_ids: Iterable[int]) -> None:
-        """Release the refcount pin set by
-        :meth:`pin_blocks_for_coord_get`.  Must be called on both the
-        success and failure paths of the coord GET.
-        """
-        self._aggregate.release(block_ids)
 
     # ------------------------------------------------------------- discovery
     def register_instance_discoverables(
@@ -493,27 +424,8 @@ class MasterCoordinator:
             node_id=int(node_id),
         )
 
-    def mark_sd_evicted(self, prefix_hash: int, sd_key_str: str) -> None:
-        self._aggregate.mark_sd_evicted(prefix_hash, sd_key_str)
-
     def match_fully_ready(self, prefix_hash: int) -> Any:
         return self._aggregate.match_fully_ready(prefix_hash)
-
-    def invalidate_prefix(self, prefix_hash: int) -> bool:
-        return self._aggregate.invalidate_prefix(prefix_hash)
-
-    # --------------------------------------------------- periodic scans
-    def scan_leaked_refcount(self) -> List[int]:
-        """Called periodically by the KVTaskManager's background thread.
-
-        For every block that has been in-flight too long (design doc
-        §4.3.1 prerequisite C), force-release its refcount and
-        invalidate any prefix that owns it.
-        """
-        leaked = self._aggregate.scan_leaked_refcount(self._refcount_leak_timeout)
-        for block_id in leaked:
-            self._aggregate.force_release(block_id)
-        return leaked
 
     # --------------------------------------------------- failure callbacks
     def set_peer_lost_hook(self, cb: Optional[Any]) -> None:
@@ -574,12 +486,6 @@ class MasterCoordinator:
                 "invalidation for %s",
                 self._instance_id, peer,
             )
-
-    def peer_failure_count(self, peer_instance_id: str) -> int:
-        """Number of unescalated failures from ``peer_instance_id`` —
-        used by tests and ops dashboards."""
-        with self._lock:
-            return self._peer_failure_counts.get(peer_instance_id, 0)
 
     def _on_peer_lost(self, peer_instance_id: str) -> None:
         """Invoked by the FailureDetector on peer disappearance / epoch bump.
