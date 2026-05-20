@@ -14,7 +14,7 @@ import os
 import subprocess
 import textwrap
 
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.config import CacheConfig, ModelConfig, RankInfo
 from flexkv.common.debug import flexkv_logger
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.memory_handle import TensorSharedHandle
@@ -149,9 +149,18 @@ class KVServer:
         cache_config: CacheConfig,
         gpu_register_port: str,
         server_recv_port: str,
+        rank_info: Optional[RankInfo] = None,
     ):
 
         self.model_config = model_config
+        # Per-rank info — pickled across the spawn boundary so the in-
+        # subprocess ``KVTaskEngine`` can construct the correct
+        # ``SharingDomainKey`` (pp_node_idx / tp_node_idx).  Optional
+        # for legacy single-instance / single-SD callers; sharing-
+        # domain mode requires a non-None rank_info to avoid the
+        # ``from_model_config`` deprecation path that defaults
+        # per-rank fields to 0.
+        self.rank_info = rank_info
         # Init inter-process communication
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
@@ -175,12 +184,19 @@ class KVServer:
                 cache_config.redis_password,
                 cache_config.local_ip,
                 node_ttl_seconds=cache_config.node_ttl_seconds,
+                db=int(getattr(cache_config, "flexkv_redis_db", 0)),
             )
             self.redis_meta_client.init_meta()
             # update distributed_node_id
             cache_config.distributed_node_id = self.redis_meta_client.get_node_id()
 
-        self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port, redis_meta=self.redis_meta_client)
+        self.kv_task_engine = KVTaskEngine(
+            model_config,
+            cache_config,
+            gpu_register_port,
+            redis_meta=self.redis_meta_client,
+            rank_info=rank_info,
+        )
 
         self.req_counter = 0
         self._is_ready = False
@@ -214,9 +230,13 @@ class KVServer:
     def _server_process(model_config: ModelConfig,
                        cache_config: CacheConfig,
                        gpu_register_port: str,
-                       server_recv_port: str) -> None:
+                       server_recv_port: str,
+                       rank_info: Optional[RankInfo] = None) -> None:
 
-        server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
+        server = KVServer(
+            model_config, cache_config, gpu_register_port, server_recv_port,
+            rank_info=rank_info,
+        )
         server.run()
 
     @classmethod
@@ -226,7 +246,8 @@ class KVServer:
                       gpu_register_port: str,
                       server_recv_port: Optional[str] = None,
                       child_env: Optional[dict] = None,
-                      inherit_env: bool = True) -> 'KVServerHandle':
+                      inherit_env: bool = True,
+                      rank_info: Optional[RankInfo] = None) -> 'KVServerHandle':
 
         # Set spawn method for CUDA compatibility
         with contextlib.suppress(RuntimeError):
@@ -257,7 +278,9 @@ class KVServer:
             env.pop('CUDA_VISIBLE_DEVICES', None)
 
             # Serialize arguments
-            args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port))
+            args_data = pickle.dumps(
+                (model_config, cache_config, gpu_register_port, server_recv_port, rank_info)
+            )
 
             # Start subprocess
             flexkv_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -268,8 +291,11 @@ class KVServer:
                 from flexkv.server.server import KVServer
 
                 args_data = {args_data!r}
-                model_config, cache_config, gpu_register_port, server_recv_port = pickle.loads(args_data)
-                server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
+                model_config, cache_config, gpu_register_port, server_recv_port, rank_info = pickle.loads(args_data)
+                server = KVServer(
+                    model_config, cache_config, gpu_register_port, server_recv_port,
+                    rank_info=rank_info,
+                )
                 server.run()
             ''').strip()
             process = subprocess.Popen([
@@ -284,7 +310,7 @@ class KVServer:
         else:
             # Use multiprocessing as before
             process = mp.Process(target=cls._server_process,
-                                 args=(model_config, cache_config, gpu_register_port, server_recv_port))
+                                 args=(model_config, cache_config, gpu_register_port, server_recv_port, rank_info))
             process.start()
             flexkv_logger.info(
                 f"KVServer process started, PID: {process.pid}, "

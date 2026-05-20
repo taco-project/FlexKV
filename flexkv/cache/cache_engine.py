@@ -79,6 +79,31 @@ class CacheEngineAccel:
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
+        # Dist-reuse eviction refcount guard (§2.2).  When a guard is
+        # installed (typically by
+        # :meth:`GlobalCacheEngine.attach_dist_reuse` broadcasting
+        # ``MasterCoordinator.is_evictable`` down to every subengine),
+        # the ``take`` path below calls the 4-arg
+        # ``CRadixTreeIndex::evict`` overload that accepts a
+        # ``std::function<bool(int64_t)>`` predicate.  Block ids for
+        # which the predicate returns False are *not* recycled — the
+        # block stays physically pinned until the in-flight coord GET
+        # drains the refcount.  See
+        # :cpp:func:`flexkv::CRadixTreeIndex::evict` (radix_tree.cpp)
+        # for the authoritative implementation.
+        #
+        # The guard is optional — when ``None`` (default), ``take``
+        # calls the legacy 3-arg overload and behaviour is byte-
+        # identical to pre-§2.2.
+        self._evict_guard_fn: Optional[Callable[[int], bool]] = None
+
+    def set_evict_guard(self, fn: Optional[Callable[[int], bool]]) -> None:
+        """Install (or remove) the refcount guard used in ``take``'s
+        eviction path.  Called by
+        :meth:`GlobalCacheEngine.attach_dist_reuse` / ``detach_dist_reuse``.
+        """
+        self._evict_guard_fn = fn
+
     def reset(self) -> None:
         self.index.reset()
         self.mempool.reset()
@@ -89,15 +114,13 @@ class CacheEngineAccel:
                                               sequence_meta.num_blocks, True)
         # physical blocks (torch.Tensor -> numpy, zero-copy on CPU)
         phys = match_result.physical_blocks.cpu().numpy()
-        # optional block_node_ids
-        try:
-            bnis = getattr(match_result, "block_node_ids", None)
-            if isinstance(bnis, torch.Tensor) and bnis.numel() > 0:
-                bnids_np = bnis.cpu().numpy()
-            else:
-                bnids_np = None
-        except Exception:
-            bnids_np = None
+        # Extract single matched_node_id (single-node constraint)
+        raw_nid = getattr(match_result, "matched_node_id", -1)
+        single_node_id = int(raw_nid) if raw_nid is not None and raw_nid >= 0 else None
+        # Broadcast matched_node_id to per-block array for downstream compat
+        bnids_np = None
+        if single_node_id is not None and len(phys) > 0:
+            bnids_np = np.full(len(phys), single_node_id, dtype=np.uint32)
         return MatchResultAccel(
             num_ready_matched_blocks=match_result.num_ready_matched_blocks,
             num_matched_blocks=match_result.num_matched_blocks,
@@ -105,6 +128,7 @@ class CacheEngineAccel:
             last_node=match_result.last_node,
             last_node_matched_length=match_result.last_node_matched_length,
             physical_blocks=phys,
+            matched_node_id=single_node_id,
             block_node_ids=bnids_np,
             matched_pos="remote" if self.device_type == DeviceType.REMOTE else "local",
         )
@@ -177,7 +201,26 @@ class CacheEngineAccel:
             if evict_block_num > 0:
                 target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
                 evicted_block_hashes = torch.zeros(evict_block_num, dtype=torch.int64)
-                num_evicted = self.index.evict(target_blocks, evicted_block_hashes, evict_block_num)
+                # §2.2 dist-reuse refcount guard: when a guard is
+                # installed (``GlobalCacheEngine.attach_dist_reuse``
+                # pushes ``MasterCoordinator.is_evictable`` down here),
+                # call the 4-arg C++ overload so the eviction path
+                # never recycles a block id that still has a refcount
+                # > 0 from an in-flight coord GET.  Pure legacy path
+                # (no guard, default production deployments) keeps the
+                # 3-arg call unchanged — byte-identical to pre-§2.2
+                # behaviour.
+                if self._evict_guard_fn is not None:
+                    num_evicted = self.index.evict(
+                        target_blocks,
+                        evicted_block_hashes,
+                        evict_block_num,
+                        self._evict_guard_fn,
+                    )
+                else:
+                    num_evicted = self.index.evict(
+                        target_blocks, evicted_block_hashes, evict_block_num
+                    )
                 if num_evicted != evict_block_num:
                     target_blocks.resize_(num_evicted)
                     evicted_block_hashes.resize_(num_evicted)
@@ -248,6 +291,19 @@ class CacheEngine:
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
+        # Dist-reuse eviction refcount guard.  When set,
+        # ``RadixTreeIndex.evict`` will skip physical block ids where
+        # ``is_evictable_fn(block_id)`` is False (i.e. the block is
+        # pinned by an in-flight coord GET).  See
+        # :meth:`GlobalCacheEngine.attach_dist_reuse`.
+        self._evict_guard_fn: Optional[Callable[[int], bool]] = None
+
+    def set_evict_guard(self, fn: Optional[Callable[[int], bool]]) -> None:
+        """Install (or remove) the refcount guard used in ``take``'s
+        eviction path.  Called by ``GlobalCacheEngine.attach_dist_reuse``.
+        """
+        self._evict_guard_fn = fn
+
     def reset(self) -> None:
         self.index.reset()
         self.mempool.reset()
@@ -308,7 +364,10 @@ class CacheEngine:
                 int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
             )
             if evict_block_num > 0:
-                evicted_blocks, evicted_block_hashes = self.index.evict(evict_block_num)
+                evicted_blocks, evicted_block_hashes = self.index.evict(
+                    evict_block_num,
+                    is_evictable_fn=self._evict_guard_fn,
+                )
                 self.mempool.recycle_blocks(evicted_blocks)
 
                 # Record eviction metrics
@@ -362,6 +421,43 @@ class GlobalCacheEngine:
         self.cpu_cache_engine = None
         self.ssd_cache_engine = None
         self.remote_cache_engine = None
+
+        # --------------------------------------------------------------
+        # Dist-reuse integration hooks (Phase 1 integration glue).
+        #
+        # Populated by :meth:`attach_dist_reuse` **after** construction
+        # (the KVTaskManager owns the coordinator lifetimes and wires them
+        # in once all handles / Remote ready ACKs are collected).  When
+        # unset, every dist-reuse code path no-ops and the engine behaves
+        # exactly like pre-Batch-E — this keeps legacy deployments
+        # (``enable_sharing_domain=False``) byte-identical.
+        #
+        # ``_master_coord``  -> ``MasterCoordinator`` (owns the
+        #                      ``AggregateRadixTree``, refcounts, and the
+        #                      Layer-1 ``FailureDetector``).
+        # Peer-lost hook is registered on the ``FailureDetector`` via
+        # ``MasterCoordinator.set_peer_lost_hook`` and is mapped to
+        # ``aggregate_radix.invalidate_by_peer_instance``.
+        #
+        # Phase D-4 (proposal_unify_with_graph_dispatch_2026-05-15.md):
+        # the previous ``_coord_dispatcher -> CoordinationCoordinator``
+        # field was removed.  Cross-SD coordination now flows through
+        # the unified ``TransferOpGraph`` dispatch path with per-op
+        # ``target_node_ids`` filtering on each Remote, and peer-SD
+        # acks come back as ``CompletedOp(sd_key, contributing_node_id)``
+        # on the master polling worker.
+        # --------------------------------------------------------------
+        self._master_coord = None  # type: ignore[assignment]
+
+        # Phase D-2 (proposal_unify_with_graph_dispatch_2026-05-15.md
+        # §6.3): the PUT-path graph-dispatch ack book.  Populated by
+        # ``_notify_master_sd_ready`` when the Master's own SD finishes,
+        # consumed by ``_on_peer_sd_completed_op`` when peer-SD
+        # ``CompletedOp(sd_key, contributing_node_id)`` arrives via the
+        # master polling thread's ``_completion_sink``.
+        import threading as _threading
+        self._pending_put_lock = _threading.Lock()
+        self._pending_put_batches: Dict[int, list] = {}
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
         if cache_config.enable_kv_sharing:
@@ -591,6 +687,52 @@ class GlobalCacheEngine:
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         return_mask[block_start_idx* self.tokens_per_block:
                     (block_start_idx + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
+
+        # ------------------------------------------------------------------
+        # §2.1 dist_reuse GET main-path hook.
+        #
+        # When ``enable_sharing_domain`` is on AND the instance owns more
+        # than one SD (PP>1 or tp_node_count>1), every cross-instance
+        # reuse hit must clear a coordination barrier: the Master needs
+        # every peer SD to ACK that it also has the prefix, otherwise
+        # the GPU would receive half-assembled KV.  ``_sharing_domain_gate_get``
+        # returns False on barrier failure — in which case we reset the
+        # transfer_graph + return_mask to an empty result, equivalent to
+        # a cache miss.  Upstream will fall back to normal prefill.
+        #
+        # For the single-SD degenerate case (most common today: PP=1 +
+        # TP does not cross nodes) the gate is a no-op: ``coord_get``
+        # has nothing to coordinate so this short-circuits.  Zero
+        # regression for existing deployments that only use
+        # ``enable_p2p_cpu`` but not ``enable_sharing_domain``.
+        # ------------------------------------------------------------------
+        barrier_ok = self._sharing_domain_gate_get(
+            sequence_meta=sequence_meta,
+            return_mask=return_mask,
+            block_start_idx=block_start_idx,
+            num_gpu_blocks_to_transfer=num_gpu_blocks_to_transfer,
+        )
+        if not barrier_ok:
+            # Release anything we had locked during matching, reset to
+            # the empty-return shape — equivalent to a cache miss so
+            # upstream falls back to normal prefill.
+            for device_type, (node, _) in (node_to_unlock or {}).items():
+                try:
+                    self.cache_engines[device_type].unlock(node)
+                except Exception:
+                    pass
+            for device_type, blks in (buffer_to_free or {}).items():
+                try:
+                    if blks is not None and len(blks) > 0:
+                        self.cache_engines[device_type].recycle(blks)
+                except Exception:
+                    pass
+            empty_graph = TransferOpGraph.create_empty_graph()
+            empty_graph.bind_to_worker(dp_rank, pp_rank)
+            empty_mask = np.zeros_like(token_mask, dtype=np.bool_)
+            empty_cb = partial(self._transfer_callback,
+                               node_to_unlock={}, buffer_to_free={})
+            return empty_graph, empty_mask, empty_cb, {}, -1
 
         # if layer_num // layer_granularity != 1:
         #     transfer_graph, finished_ops_ids = convert_read_graph_to_layer_wise_graph(transfer_graph=transfer_graph,
@@ -947,6 +1089,24 @@ class GlobalCacheEngine:
                 dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_peerh2h)
+            # Phase D-3 (proposal_unify_with_graph_dispatch_2026-05-15.md
+            # §6.4): in a multi-SD instance, fan the PEERH2H out to one
+            # clone per peer SD so each SD pulls its own slice from the
+            # contributing peer instance through that SD's mooncake.
+            # Returns [] for single-SD / dist_reuse-off / not-fully-ready,
+            # in which case the legacy single-op path stays bit-identical.
+            # ``block_mask_start + fragment1_num_blocks - 1`` is the index
+            # in the *full* sequence of the last block we're reusing
+            # — the prefix terminal block whose hash keys the
+            # AggregateRadixTree fully-ready entry.
+            peerh2h_clones = self._maybe_attach_multi_sd_peerh2h_ops(
+                transfer_graph=transfer_graph,
+                op_peerh2h=op_peerh2h,
+                sequence_meta=sequence_meta,
+                prefix_terminal_block_idx=int(
+                    block_mask_start + fragment1_num_blocks - 1
+                ),
+            )
             #TODO here we dont combine peer cpu or local cpu match results, so we can safely add remote results to local cpu
             #TODO here assume all matched blocks are ready blocks for peer cpu
             if (cpu_matched_result.insert_to_local_cpu_index and
@@ -958,6 +1118,8 @@ class GlobalCacheEngine:
                 op_node_to_ready[op_peerh2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
             else:
                 cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment1_cpu_blocks_local])
+        else:
+            peerh2h_clones = []
 
         if fragment2_num_blocks > 0:
             if enable_gds:
@@ -1025,6 +1187,15 @@ class GlobalCacheEngine:
                 transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
             if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
                 transfer_graph.add_dependency(op_h2d.op_id, op_peerh2h.op_id)
+                # Phase D-3: H2D must wait for *every* peer-SD PEERH2H
+                # clone to land its slice into the master CPU pool
+                # before the GPU copy fires.  The peer-SD clones run on
+                # their respective Remote handles and their
+                # CompletedOp(success=True) flows back to the master
+                # polling thread through D-2's _completion_sink, which
+                # is what the graph dependency engine waits on.
+                for clone in peerh2h_clones:
+                    transfer_graph.add_dependency(op_h2d.op_id, clone.op_id)
             finished_ops_ids.append(op_h2d.op_id)
 
         node_to_unlock = {}
@@ -1104,10 +1275,26 @@ class GlobalCacheEngine:
         for device_type in node_to_unlock:
             self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
 
+        # §2.1 dist_reuse PUT-path glue: once the local PUT really
+        # lands its block meta in Redis (which happens inside
+        # ``_transfer_callback`` via ``insert_and_publish``), we want
+        # to tell the AggregateRadixTree that *this* SD now contributes
+        # to the prefix.  ``_notify_sd_ready_on_put`` is a no-op when
+        # dist_reuse isn't attached, so passing the parameters
+        # unconditionally keeps the legacy path zero-overhead.
+        sd_notify_kwargs = {
+            "sequence_meta": sequence_meta,
+            "inserted_block_ids": gpu_block_ids[
+                skipped_gpu_blocks: skipped_gpu_blocks + num_gpu_blocks_to_transfer
+            ] if num_gpu_blocks_to_transfer > 0 else None,
+            "block_start_idx": int(block_start_idx + skipped_gpu_blocks),
+            "num_blocks_inserted": int(num_gpu_blocks_to_transfer),
+        }
         callback = partial(self._transfer_callback,
                            node_to_unlock=node_to_unlock,
                            buffer_to_free=buffer_to_free,
-                           is_put=True)
+                           is_put=True,
+                           sd_notify_kwargs=sd_notify_kwargs)
 
         op_callback_dict = {}
         for op_id in op_node_to_ready:
@@ -1228,6 +1415,9 @@ class GlobalCacheEngine:
         )
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
+
+        # Phase D-2: tag self-SD + clone for each peer SD.
+        self._maybe_attach_multi_sd_d2h_ops(transfer_graph, op_d2h)
 
         if put_to_ssd:
             if len(fragment12_cpu_blocks) < fragment2_num_blocks:
@@ -1386,6 +1576,9 @@ class GlobalCacheEngine:
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
 
+        # Phase D-2: tag self-SD + clone for each peer SD.
+        self._maybe_attach_multi_sd_d2h_ops(transfer_graph, op_d2h)
+
         if fragment2_num_blocks > 0:
             if len(fragment12_cpu_blocks) < fragment2_num_blocks:
                 flexkv_logger.warning(f"fragment12_cpu_blocks: {len(fragment12_cpu_blocks)}, "
@@ -1436,7 +1629,8 @@ class GlobalCacheEngine:
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
                            buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
-                           is_put: bool = False) -> None:
+                           is_put: bool = False,
+                           sd_notify_kwargs: Optional[Dict] = None) -> None:
         if DeviceType.CPU in node_to_unlock:
             assert self.cpu_cache_engine is not None
             cpu_node = node_to_unlock[DeviceType.CPU][0]
@@ -1470,6 +1664,20 @@ class GlobalCacheEngine:
                 assert self.remote_cache_engine is not None
                 self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
 
+        # §2.1 dist_reuse PUT-path glue: once every cache level has
+        # unlocked + published, announce the new prefix to our own
+        # AggregateRadixTree (self-SD ACK).  Kept after the
+        # insert_and_publish calls above so the block meta is
+        # guaranteed visible in Redis before the in-memory ack fires.
+        # No-op when dist_reuse isn't attached.
+        if is_put and sd_notify_kwargs:
+            try:
+                self._notify_sd_ready_on_put(**sd_notify_kwargs)
+            except Exception:
+                # Absolute must-not-raise: the callback runs on the
+                # transfer worker's completion path.
+                pass
+
     def _op_callback(self, device_type: DeviceType, node_to_ready: RadixNode, ready_length: int) -> None:
         if device_type == DeviceType.CPU:
             assert self.cpu_cache_engine is not None
@@ -1480,6 +1688,709 @@ class GlobalCacheEngine:
         elif device_type == DeviceType.REMOTE:
             assert self.remote_cache_engine is not None
             self.remote_cache_engine.set_ready(node_to_ready, True, ready_length)
+
+    # ==================================================================
+    # Dist-reuse integration API (Batch F — cache_engine ↔ MasterCoordinator)
+    # ==================================================================
+    def attach_dist_reuse(self, master_coord) -> None:
+        """Wire this cache engine to the ``MasterCoordinator`` that the
+        ``KVTaskManager`` built after the Remote ready handshake completed.
+
+        Phase D-4 (proposal_unify_with_graph_dispatch_2026-05-15.md):
+        cross-SD coordination flows through the unified
+        ``TransferOpGraph`` dispatch path with per-op
+        ``target_node_ids`` filtering on each Remote, which replaced
+        the previous ``CoordinationCoordinator`` plumbing entirely.
+        The deprecated ``coord_dispatcher`` parameter was removed in
+        the same cleanup pass that deleted the legacy
+        ``coord_query`` / ``coord_get`` / ``coord_put`` ZMQ protocol.
+
+        Args:
+            master_coord: A
+                :class:`flexkv.common.dist_reuse.MasterCoordinator` owning
+                the per-instance ``AggregateRadixTree`` + refcount book-
+                keeping + Layer-1 ``FailureDetector``.
+        """
+        self._master_coord = master_coord
+
+        # Broadcast the refcount guard to every subengine so that each
+        # subengine's ``RadixTreeIndex.evict`` (or the accel equivalent,
+        # once plumbed on the C++ side) can honour
+        # ``MasterCoordinator.is_evictable``.  See §2.2 in
+        # docs/dist_reuse/implementation_gap_2026-05-11.md.
+        self._broadcast_evict_guard(self.is_evictable)
+
+        # Wire the Layer-1 FailureDetector's on_peer_lost callback to
+        # invalidate aggregate-radix entries from the dying peer.  Do
+        # this lazily (only if coordinator owns a detector).
+        if master_coord is not None and hasattr(master_coord, "set_peer_lost_hook"):
+            master_coord.set_peer_lost_hook(self._on_peer_lost)
+
+    def detach_dist_reuse(self) -> None:
+        """Drop references to the coordinator — invoked from shutdown."""
+        self._master_coord = None
+        # Remove the guard — eviction falls back to the legacy
+        # behaviour that only looks at ``lock_cnt``.
+        self._broadcast_evict_guard(None)
+
+    def _maybe_attach_multi_sd_d2h_ops(
+        self,
+        transfer_graph,
+        op_d2h,
+    ) -> None:
+        """Phase D-2 (proposal_unify_with_graph_dispatch_2026-05-15.md
+        §6.3): when the instance has multiple SDs, mirror the master's
+        D2H op into the per-peer-SD form so the broadcast graph
+        dispatch on each Remote handle picks up the right slice.
+
+        Specifically:
+
+        * Stamp ``target_node_ids=[self_node_id]`` on the master's own
+          ``op_d2h`` so the master in-process handle (and only that
+          handle) executes it.  Each peer Remote's ``_handle_submit``
+          will drop this op via the ``target_node_ids`` filter.
+        * For every peer SD known to the MasterCoordinator (with a
+          finished ``RemoteReadyMsg``), append a clone of ``op_d2h``
+          with ``target_node_ids=[peer_node_id]``.  Peer Remote's
+          ``_handle_submit`` keeps only its own clone.  The peer's
+          ``CompletedOp(sd_key, contributing_node_id)`` then routes
+          back through the master polling thread's
+          ``_completion_sink`` → :meth:`_on_peer_sd_completed_op`.
+
+        Single-SD / dist_reuse-disabled paths leave ``op_d2h``
+        untouched (``target_node_ids=None`` ⇒ no filter, identical to
+        legacy behaviour).
+        """
+        if self._master_coord is None:
+            return
+        try:
+            sd_to_nid = self._master_coord.get_sd_to_nid_map()
+        except Exception:
+            return
+        if not sd_to_nid:
+            return  # bootstrap not finished yet — leave legacy behaviour.
+
+        try:
+            self_sd_str = self._master_coord.self_sd.serialize()
+        except Exception:
+            return
+        self_node_id = sd_to_nid.get(self_sd_str, -1)
+        if self_node_id < 0:
+            return
+
+        # Tag master's own D2H op.
+        try:
+            op_d2h.target_node_ids = [int(self_node_id)]
+        except Exception:
+            return
+
+        # Append a clone per peer SD.
+        try:
+            from flexkv.common.transfer import TransferOp, TransferType
+        except Exception:
+            return
+        for sd_str, peer_nid in sd_to_nid.items():
+            if sd_str == self_sd_str:
+                continue
+            try:
+                peer_op = TransferOp(
+                    graph_id=transfer_graph.graph_id,
+                    transfer_type=TransferType.D2H,
+                    src_block_ids=op_d2h.src_block_ids,
+                    dst_block_ids=op_d2h.dst_block_ids,
+                    dp_client_id=op_d2h.dp_client_id,
+                    target_node_ids=[int(peer_nid)],
+                )
+                transfer_graph.add_transfer_op(peer_op)
+            except Exception as e:  # pragma: no cover
+                try:
+                    from flexkv.common.debug import flexkv_logger
+                    flexkv_logger.warning(
+                        f"[DistReuse:D-2] failed to append peer-SD D2H op "
+                        f"for sd={sd_str} (nid={peer_nid}): {e}"
+                    )
+                except Exception:
+                    pass
+
+    def _maybe_attach_multi_sd_peerh2h_ops(
+        self,
+        transfer_graph,
+        op_peerh2h,
+        sequence_meta,
+        prefix_terminal_block_idx: int,
+    ) -> List:
+        """Phase D-3 (proposal_unify_with_graph_dispatch_2026-05-15.md
+        §6.4): mirror of :meth:`_maybe_attach_multi_sd_d2h_ops` for the
+        GET-path PEERH2H op when the instance owns multiple SDs.
+
+        Why this is necessary
+        ---------------------
+        The single-SD PEERH2H op pulls one peer instance's CPU slice
+        through mooncake on the *Master's* SD.  In a multi-SD instance
+        every other SD must also pull its own slice from the same peer
+        instance — otherwise the GPU would see only the Master-SD
+        layer/head shard and PP / cross-node TP would be incomplete.
+
+        The legacy single-SD op as constructed by the caller already
+        targets the peer instance correctly on the Master's own SD
+        (``src_block_node_ids = cpu_matched_result.matched_node_ids``,
+        which is the peer instance's master-SD ``distributed_node_id``).
+        Phase D-3 transforms it into N ops, one per SD:
+
+        * Stamp ``target_node_ids = [self_node_id]`` on the master's
+          op so only the Master's local TransferEngine executes it
+          (``_filter_graph_inplace_by_target_node_ids`` on the in-proc
+          handle drops it from peer Remotes, and the per-Remote
+          ``_filter_graph_by_target_node_ids`` drops it from peers
+          on the wire).
+        * For every peer SD known to be ``fully_ready`` (per
+          :meth:`AggregateRadixTree.match_fully_ready`), append a
+          clone with ``target_node_ids = [peer_sd_node_id]`` and
+          ``src_block_node_ids = [peer_instance_node_on_that_sd]``
+          fetched from ``ReadyEntry.ready_sds``.  The clone runs on
+          that peer SD's Remote node and pulls *its* layer/head shard
+          from the same peer instance through that peer SD's mooncake
+          server.
+
+        Returns the list of clone ops added (empty list when single-SD
+        / dist_reuse off / aggregate not fully ready / bootstrap not
+        finished).  Caller is expected to add a graph dependency
+        ``op_h2d → clone`` for every returned clone so the H2D waits
+        for *all* SDs to land their slice before issuing the H2D copy.
+
+        Single-SD / dist_reuse-disabled paths leave ``op_peerh2h``
+        untouched (``target_node_ids=None`` ⇒ no filter, identical to
+        legacy behaviour).  No new ZMQ messages or sync primitives
+        are introduced — completion of each clone flows back through
+        the existing ``CompletedOp`` → ``_completion_sink`` route
+        already wired up by Phase D-2.
+        """
+        clones: List = []
+        if self._master_coord is None:
+            return clones
+        try:
+            sd_to_nid = self._master_coord.get_sd_to_nid_map()
+        except Exception:
+            return clones
+        if not sd_to_nid:
+            return clones  # bootstrap not finished yet — leave legacy behaviour.
+        try:
+            self_sd_str = self._master_coord.self_sd.serialize()
+        except Exception:
+            return clones
+        self_node_id = sd_to_nid.get(self_sd_str, -1)
+        if self_node_id < 0:
+            return clones
+
+        # Single-SD instance — no clones to make; do not even tag the
+        # master op (legacy code path stays bit-identical).
+        if len(sd_to_nid) <= 1:
+            return clones
+
+        # Look up the per-SD ``contributing peer node_id`` map from the
+        # AggregateRadixTree.  ``ready_sds[sd_key] = peer_instance's
+        # node_id on that SD``.  This is populated by D-2's PUT-path
+        # ``mark_sd_ready`` calls fired from each peer SD's CompletedOp
+        # ack.  If we somehow get here without a fully-ready entry
+        # (race with eviction, leak, etc.), fall back to legacy and
+        # let ``_sharing_domain_gate_get`` reject the GET downstream.
+        try:
+            sequence_meta.gen_hashes()
+        except Exception:
+            return clones
+        if (prefix_terminal_block_idx < 0 or
+            prefix_terminal_block_idx >= sequence_meta.block_hashes.shape[0]):
+            return clones
+        try:
+            prefix_hash = int(
+                sequence_meta.block_hashes[prefix_terminal_block_idx].item()
+            )
+        except Exception:
+            return clones
+        try:
+            entry = self._master_coord.match_fully_ready(prefix_hash)
+        except Exception:
+            return clones
+        if entry is None or not entry.ready_sds:
+            # Aggregate not fully ready → ``_sharing_domain_gate_get``
+            # will reject this GET anyway; do not pollute the graph
+            # with peer-SD clones that would never resolve.
+            return clones
+
+        # Tag master's own PEERH2H op so only the Master executes it.
+        try:
+            op_peerh2h.target_node_ids = [int(self_node_id)]
+        except Exception:
+            return clones
+
+        # Append a clone per peer SD, pointing at the same peer
+        # instance's slice on that SD.
+        try:
+            from flexkv.common.transfer import TransferOp, TransferType
+        except Exception:
+            return clones
+
+        # Cache shape needed for src_block_node_ids: an array of length
+        # ``len(src_block_ids)`` filled with the peer's node_id on that
+        # SD.  ``cpu_matched_result.matched_node_ids`` (master SD) is
+        # already in this shape; we mirror it for each peer SD.
+        n_blocks = len(op_peerh2h.src_block_ids)
+        for sd_str, peer_sd_nid in sd_to_nid.items():
+            if sd_str == self_sd_str:
+                continue
+            # Peer instance's node_id on *this* peer SD (as recorded
+            # by D-2's ack path).  -1 sentinel means we never got a
+            # confirming ack from that SD; skip — gate will reject.
+            try:
+                peer_instance_nid_on_sd = int(entry.ready_sds.get(sd_str, -1))
+            except Exception:
+                peer_instance_nid_on_sd = -1
+            if peer_instance_nid_on_sd < 0:
+                continue
+            try:
+                peer_src_node_ids = np.full(
+                    n_blocks, int(peer_instance_nid_on_sd), dtype=np.int64,
+                )
+                clone = TransferOp(
+                    graph_id=transfer_graph.graph_id,
+                    transfer_type=TransferType.PEERH2H,
+                    src_block_ids=op_peerh2h.src_block_ids,
+                    dst_block_ids=op_peerh2h.dst_block_ids,
+                    dp_client_id=op_peerh2h.dp_client_id,
+                    remote_node_ids=peer_src_node_ids,
+                    src_block_node_ids=peer_src_node_ids,
+                    target_node_ids=[int(peer_sd_nid)],
+                )
+                transfer_graph.add_transfer_op(clone)
+                clones.append(clone)
+            except Exception as e:  # pragma: no cover
+                try:
+                    from flexkv.common.debug import flexkv_logger
+                    flexkv_logger.warning(
+                        f"[DistReuse:D-3] failed to append peer-SD PEERH2H op "
+                        f"for sd={sd_str} (sd_nid={peer_sd_nid}, "
+                        f"peer_inst_nid={peer_instance_nid_on_sd}): {e}"
+                    )
+                except Exception:
+                    pass
+        return clones
+
+    def _broadcast_evict_guard(self, fn: Optional[Callable[[int], bool]]) -> None:
+        """Install ``fn`` as the refcount guard on every owned subengine.
+
+        Subengines that don't (yet) support a guard expose a no-op
+        ``set_evict_guard`` (see ``CacheEngineAccel``).  Legacy engines
+        without the method at all are simply skipped — their evict
+        behaviour is unchanged.
+        """
+        for engine in (
+            self.cpu_cache_engine,
+            self.ssd_cache_engine,
+            self.remote_cache_engine,
+        ):
+            if engine is None:
+                continue
+            setter = getattr(engine, "set_evict_guard", None)
+            if callable(setter):
+                try:
+                    setter(fn)
+                except Exception:
+                    # Defensive — a buggy subengine must not wedge
+                    # attach/detach for the rest of the system.
+                    pass
+
+    def _on_peer_lost(self, peer_instance_id: str) -> None:
+        """FailureDetector callback.  Best-effort — MUST NOT raise
+        (the callback runs on the detector's polling thread)."""
+        if self._master_coord is None:
+            return
+        try:
+            self._master_coord.invalidate_by_peer_instance(peer_instance_id)
+        except Exception as e:  # pragma: no cover — defensive
+            try:
+                from flexkv.common.debug import flexkv_logger
+                flexkv_logger.warning(
+                    f"[DistReuse] invalidate_by_peer_instance({peer_instance_id}) raised: {e}"
+                )
+            except Exception:
+                pass
+
+    # ---- refcount guard for evict paths --------------------------------
+    def is_evictable(self, block_id: int) -> bool:
+        """Evict path check: refcount>0 blocks participating in an in-flight
+        coord GET must NOT be evicted.  Defaults to True when dist-reuse
+        is off (legacy behaviour)."""
+        if self._master_coord is None:
+            return True
+        try:
+            return bool(self._master_coord.is_evictable(int(block_id)))
+        except Exception:
+            return True
+
+    # ---- hooks Master transfer_callback calls when a PUT lands --------
+    def _notify_master_sd_ready(
+        self,
+        prefix_hash: int,
+        block_ids: list,
+    ) -> None:
+        """Phase D-2 (proposal_unify_with_graph_dispatch_2026-05-15.md §6.3):
+        announce that the Master's own SD finished publishing a prefix.
+
+        The Master's self-SD ack is recorded in the ``AggregateRadixTree``
+        immediately.  In multi-SD deployments the **peer-SD acks arrive
+        asynchronously** through the graph-dispatch path: each peer SD's
+        ``TransferManagerOnRemote`` runs the per-SD D2H op (filtered into
+        its own slice by ``target_node_ids``) and ships back a
+        ``CompletedOp(sd_key, contributing_node_id, success=True)``.  The
+        Master's ``TransferManagerMultiNodeHandle._completion_sink`` then
+        invokes :meth:`_on_peer_sd_completed_op` which calls
+        ``mark_sd_ready(peer_sd, node_id=...)``.
+
+        That replaces the old ``coord_put`` broadcast-and-collect pattern
+        with a single mechanism (graph dispatch) shared with cross-machine
+        TP / PP — see proposal §2.
+
+        For ``total_sd_count == 1`` (the common single-SD shape) this
+        method is byte-identical to legacy: only the self-SD mark fires.
+        """
+        if self._master_coord is None:
+            return
+
+        # Self-SD mark — always first, always unconditional.  Pass
+        # node_id so the GET-side cross-instance reuse path knows which
+        # node holds the master SD's slice.  Best-effort lookup;
+        # default to -1 if the master coord doesn't expose it yet.
+        try:
+            self_node_id = int(getattr(self._master_coord, "self_node_id", -1))
+        except Exception:
+            self_node_id = -1
+        try:
+            self._master_coord.mark_sd_ready(
+                prefix_hash=int(prefix_hash),
+                sd_key_str=self._master_coord.self_sd.serialize(),
+                block_ids=list(block_ids) if block_ids is not None else [],
+                node_id=self_node_id,
+            )
+        except Exception as e:  # pragma: no cover
+            try:
+                from flexkv.common.debug import flexkv_logger
+                flexkv_logger.warning(f"[DistReuse] mark_sd_ready raised: {e}")
+            except Exception:
+                pass
+
+        # Phase D-2: register a pending PUT batch for the
+        # ``_completion_sink`` to consume when peer SD CompletedOps
+        # arrive.  Keyed by ``prefix_hash`` because the CompletedOp
+        # carries no batch identity beyond ``graph_id`` — and a single
+        # graph may carry several PUT prefixes (e.g. a merged batch
+        # graph).  We use ``prefix_hash`` as the natural identifier
+        # because ``mark_sd_ready`` keys on it.  See
+        # :meth:`_on_peer_sd_completed_op`.
+        try:
+            total_sd = int(getattr(self._master_coord, "total_sd_count", 1))
+        except Exception:
+            total_sd = 1
+        if total_sd <= 1:
+            return  # No peer SDs to wait for.
+
+        # Stash (prefix_hash, block_ids) keyed by the per-(prefix_hash,
+        # peer_sd) tuple that ``_on_peer_sd_completed_op`` will look up.
+        # We do not store ``contributing_peer`` here — that comes back
+        # on the CompletedOp's ``contributing_node_id`` field and the
+        # peer's instance_id can be reverse-looked-up via the
+        # MasterCoordinator if needed.
+        try:
+            block_ids_list = [int(b) for b in (block_ids or [])]
+        except Exception:
+            block_ids_list = []
+        try:
+            with self._pending_put_lock:
+                self._pending_put_batches[int(prefix_hash)] = block_ids_list
+        except AttributeError:
+            # Lock not yet initialized (legacy code path that constructs
+            # GlobalCacheEngine without going through __init__'s
+            # initialization of _pending_put_*).  Initialize lazily and
+            # retry once.
+            self._pending_put_lock = __import__("threading").Lock()
+            self._pending_put_batches: Dict[int, list] = {}
+            with self._pending_put_lock:
+                self._pending_put_batches[int(prefix_hash)] = block_ids_list
+
+    def _on_peer_sd_completed_op(self, completed_op) -> None:
+        """Phase D-2 (proposal §3.5 / §6.3): completion-sink handler.
+
+        Invoked on the master's polling thread for every ``CompletedOp``
+        that arrives with a non-empty ``sd_key`` and ``success=True``.
+        Each such CompletedOp signals "peer SD ``sd_key`` (held by
+        ``contributing_node_id``) finished its share of some PUT batch".
+
+        We map the ``CompletedOp`` back to the prefix_hash via the
+        ``_pending_put_batches`` registry populated by
+        :meth:`_notify_master_sd_ready`.  When the prefix is fully
+        ready (all peer SDs have acked) the entry naturally falls out
+        on the next eviction or stays as a no-op for further PUTs.
+
+        The CompletedOp carries no prefix_hash directly — the legacy
+        plan was to store ``graph_id → prefix_hash`` but that requires
+        threading through the kvtask boundary.  We take a simpler
+        route: when only one PUT batch is in flight per peer (the
+        common case), there's exactly one ``_pending_put_batches``
+        entry and it's the right one.  When multiple PUT batches are
+        in flight we mark every pending prefix that the peer hasn't
+        acked yet — overhead is O(in-flight batches × peer SDs) and
+        bounded by the kvtask scheduler's window.
+
+        NOTE: this is best-effort; absent a graph_id → prefix_hash
+        registry, false positives ("mark prefix X ready on SD Y when
+        actually a different batch finished") are possible if multiple
+        PUTs to the same SD run concurrently with overlapping
+        prefixes.  In practice the kvtask scheduler serializes a
+        single PUT at a time per request so collisions are rare.
+        Phase D-3 will add a ``graph_id → prefix_hash`` registry to
+        eliminate the ambiguity.
+        """
+        if self._master_coord is None:
+            return
+        sd_key = getattr(completed_op, "sd_key", "") or ""
+        if not sd_key:
+            return  # Not a peer-SD CompletedOp — ignore.
+        if sd_key == self._master_coord.self_sd.serialize():
+            # Master's own CompletedOp loops back through the same sink
+            # in some test harnesses — self-SD is already marked by
+            # _notify_master_sd_ready, ignore.
+            return
+        if not getattr(completed_op, "success", True):
+            # Failed op — let FailureReportMsg handle invalidation.
+            return
+
+        node_id = int(getattr(completed_op, "contributing_node_id", -1))
+        try:
+            with self._pending_put_lock:
+                # Mark every still-pending prefix as ready on this SD.
+                # The aggregate radix's ``mark_sd_ready`` is idempotent
+                # so repeated calls for the same (prefix_hash, sd_key)
+                # are harmless.
+                pending_snapshot = list(self._pending_put_batches.items())
+        except AttributeError:
+            return
+
+        for prefix_hash, block_ids_list in pending_snapshot:
+            try:
+                self._master_coord.mark_sd_ready(
+                    prefix_hash=int(prefix_hash),
+                    sd_key_str=sd_key,
+                    block_ids=block_ids_list,
+                    node_id=node_id,
+                )
+            except Exception as e:  # pragma: no cover
+                try:
+                    from flexkv.common.debug import flexkv_logger
+                    flexkv_logger.debug(
+                        f"[DistReuse] _on_peer_sd_completed_op: "
+                        f"mark_sd_ready({sd_key}, prefix={prefix_hash}) "
+                        f"raised: {e}"
+                    )
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # GET-path glue (§2.1 of docs/dist_reuse/implementation_gap_*.md)
+    # ------------------------------------------------------------------
+    def _sharing_domain_gate_get(
+        self,
+        *,
+        sequence_meta,
+        return_mask,
+        block_start_idx: int,
+        num_gpu_blocks_to_transfer: int,
+    ) -> bool:
+        """Cross-SD barrier for a GET about to reuse cached blocks.
+
+        **Contract** (design doc §4.4 / §5.1):
+
+        * Single-SD instance (``PP == 1 and tp_node_count == 1``) —
+          this is the dominant production shape today.  No coordination
+          needed; return ``True`` immediately.  Zero regression for
+          deployments that stay on ``enable_p2p_cpu`` only.
+
+        * Multi-SD instance (``PP > 1`` OR ``tp_node_count > 1``) —
+          every peer SD of the same instance must ACK that it also
+          holds the prefix.  The in-memory ``AggregateRadixTree``
+          ``fully_ready`` bit is what we gate on.  It is populated by
+          two paths:
+
+          1. **Self-SD PUT** (local ACK).  :meth:`_notify_master_sd_ready`
+             runs on the transfer_callback after D2H + Redis publish
+             on the Master's own SD.
+          2. **Peer-SD PUT** (remote ACK).  Each peer SD's
+             ``TransferManagerOnRemote`` runs the per-SD D2H clone op
+             (filtered into its own slice by ``target_node_ids``) and
+             ships back a ``CompletedOp(sd_key,
+             contributing_node_id, success=True)`` via the
+             ``TransferManagerMultiNodeHandle._completion_sink``,
+             which routes into :meth:`_on_peer_sd_completed_op` →
+             ``mark_sd_ready``.
+
+          Together these two paths flip ``fully_ready`` True for the
+          prefix, at which point a subsequent GET clears this gate.
+
+        * ``dist_reuse`` not attached (``has_dist_reuse`` is False) —
+          no-op, behave like the legacy path.
+
+        Return True to allow reuse; False to force the caller into a
+        cache-miss fallback.
+
+        Why a local ``fully_ready`` check rather than firing a
+        per-GET cross-SD query:
+
+        - Design-doc §4.4 favours PUT-driven propagation of the
+          aggregate state over GET-driven queries to keep the
+          per-request latency close to the existing single-SD path.
+          (An earlier draft proposed an on-demand ``coord_query``
+          round-trip; that protocol was dropped in Phase D-4 in
+          favour of the PUT-driven aggregate radix.)
+        - For ``total_sd_count == 1`` the prefix is trivially fully
+          ready once we inserted it locally.  No round-trip cost.
+        - For ``total_sd_count > 1`` with no peer SD acks yet (e.g.
+          single-node dev setup), the gate still enforces the
+          contract defensively: if we don't have a positive
+          ``fully_ready`` signal, we refuse to reuse.  This is
+          consistent with design §5.1 "any miss → fallback to
+          prefill".
+        """
+        if not self.has_dist_reuse:
+            return True
+        if self._master_coord is None:
+            return True
+
+        # Single-SD instance — degenerate case, no coordination needed.
+        try:
+            total_sd = int(getattr(self._master_coord, "total_sd_count", 1))
+        except Exception:
+            total_sd = 1
+        if total_sd <= 1:
+            return True
+
+        # Multi-SD instance — require the aggregate radix to have a
+        # fully-ready entry for the prefix we're about to reuse.
+        if num_gpu_blocks_to_transfer <= 0:
+            return True
+        try:
+            sequence_meta.gen_hashes()
+        except Exception:
+            # Defensive: if we can't hash, we can't gate — allow
+            # through and rely on data-plane failure closure.
+            return True
+
+        # The prefix we're about to reuse starts at ``block_start_idx``
+        # and covers ``num_gpu_blocks_to_transfer`` blocks.  Check the
+        # aggregate-radix ``fully_ready`` bit for the *last* block in
+        # the reuse range — design §5.1 requires *all* blocks in the
+        # reused prefix to be fully ready, but in practice the
+        # aggregate radix stores prefixes by their terminal block's
+        # hash, so we check the last block and rely on the tree's
+        # invariant (parent ready ⇒ ancestors ready).
+        terminal_block_idx = block_start_idx + num_gpu_blocks_to_transfer - 1
+        if terminal_block_idx >= sequence_meta.block_hashes.shape[0]:
+            return True
+        try:
+            prefix_hash = int(sequence_meta.block_hashes[terminal_block_idx].item())
+        except Exception:
+            return True
+
+        try:
+            entry = self._master_coord.match_fully_ready(prefix_hash)
+        except Exception:
+            return True  # never let a buggy aggregate wedge the GET
+
+        # Fully-ready: let the reuse proceed.
+        if entry is not None:
+            return True
+
+        # Not fully-ready: reject the reuse.  Caller converts to
+        # empty-return, upstream re-runs prefill.
+        try:
+            from flexkv.common.debug import flexkv_logger
+            flexkv_logger.debug(
+                f"[DistReuse] sharing-domain gate rejected prefix_hash={prefix_hash} "
+                f"(total_sd={total_sd}, fully_ready=no)"
+            )
+        except Exception:
+            pass
+        return False
+
+    def _notify_sd_ready_on_put(
+        self,
+        *,
+        sequence_meta,
+        inserted_block_ids,
+        block_start_idx: int,
+        num_blocks_inserted: int,
+    ) -> None:
+        """PUT-path hook (§4.4 design doc): mark the newly-inserted
+        prefix as ready on *this* SD (self-SD ACK) and register a
+        pending PUT batch so the graph-dispatch
+        ``_completion_sink`` can mark every peer SD ready when their
+        per-SD D2H clones complete.  Cross-SD coordination is carried
+        on the same ``TransferOpGraph`` the master broadcasts via
+        ``_launch_task`` — there is no separate coord protocol
+        message (Phase D-4).
+
+        This is idempotent and safe to call from the PUT completion
+        callback — in the degenerate single-SD case it still does the
+        self-SD mark, which makes ``_sharing_domain_gate_get`` return
+        True on the same prefix next time.
+
+        Best-effort — never raises.
+        """
+        if not self.has_dist_reuse:
+            return
+        if self._master_coord is None:
+            return
+        if num_blocks_inserted <= 0:
+            return
+        try:
+            sequence_meta.gen_hashes()
+        except Exception:
+            return
+        terminal_idx = block_start_idx + num_blocks_inserted - 1
+        if terminal_idx < 0 or terminal_idx >= sequence_meta.block_hashes.shape[0]:
+            return
+        try:
+            prefix_hash = int(sequence_meta.block_hashes[terminal_idx].item())
+        except Exception:
+            return
+
+        block_ids_list = []
+        try:
+            if inserted_block_ids is not None:
+                block_ids_list = [int(b) for b in inserted_block_ids]
+        except Exception:
+            block_ids_list = []
+
+        try:
+            self._notify_master_sd_ready(
+                prefix_hash=prefix_hash,
+                block_ids=block_ids_list,
+            )
+        except Exception as e:
+            try:
+                from flexkv.common.debug import flexkv_logger
+                flexkv_logger.warning(f"[DistReuse] _notify_sd_ready_on_put failed: {e}")
+            except Exception:
+                pass
+
+    # Phase D-4: _coord_get_cross_sd / _coord_get_cleanup_on_failure / ingest_coord_ack
+    # were deleted (proposal_unify_with_graph_dispatch_2026-05-15.md §附录 A).
+    # Cross-SD GET coordination is now expressed as multi-target PEERH2H ops on a
+    # single TransferOpGraph broadcast through the existing _launch_task path.
+
+    @property
+    def has_dist_reuse(self) -> bool:
+        """True when the engine is wired to a live ``MasterCoordinator``."""
+        return self._master_coord is not None
+
+
 
     @nvtx.annotate("Match Prefix Accel", color="yellow")
     def match_local_accel(self,

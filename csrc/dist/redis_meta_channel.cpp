@@ -13,17 +13,19 @@
 
 namespace flexkv {
 
-RedisHiredisClient::RedisHiredisClient() : context_(nullptr), port_(0), timeout_ms_(3000), password_("") {}
+RedisHiredisClient::RedisHiredisClient() : context_(nullptr), port_(0), timeout_ms_(3000), password_(""), db_(0) {}
 
 RedisHiredisClient::~RedisHiredisClient() { 
   close(); 
 }
 
-bool RedisHiredisClient::connect(const std::string &host, int port, int timeout_ms, const std::string &password) {
+bool RedisHiredisClient::connect(const std::string &host, int port, int timeout_ms,
+                                 const std::string &password, int db) {
   host_ = host;
   port_ = port;
   timeout_ms_ = timeout_ms;
   password_ = password;
+  db_ = db;
   
   // Create connection with timeout
   struct timeval timeout = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
@@ -56,7 +58,26 @@ bool RedisHiredisClient::connect(const std::string &host, int port, int timeout_
       return false;
     }
   }
-  
+
+  // Switch to the configured logical db.  db == 0 is the Redis default so
+  // we skip the SELECT round-trip in that case.
+  if (db_ != 0) {
+    redisReply* reply = (redisReply*)redisCommand(context_, "SELECT %d", db_);
+    if (!reply) {
+      redisFree(context_);
+      context_ = nullptr;
+      return false;
+    }
+    bool select_ok = (reply->type == REDIS_REPLY_STATUS &&
+                      strcmp(reply->str, "OK") == 0);
+    freeReplyObject(reply);
+    if (!select_ok) {
+      redisFree(context_);
+      context_ = nullptr;
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -187,12 +208,14 @@ bool RedisHiredisClient::parse_reply(redisReply* reply, std::vector<std::string>
 RedisMetaChannel::RedisMetaChannel(const std::string &h, int p, uint32_t node_id,
                                    const std::string &lip,
                                    const std::string &bk,
-                                   const std::string &pwd)
-  : host(h), port(p), node_id(node_id), blocks_key(bk), local_ip(lip), password(pwd) {
+                                   const std::string &pwd,
+                                   int db_)
+  : host(h), port(p), node_id(node_id), blocks_key(bk), local_ip(lip),
+    password(pwd), db(db_) {
 }
 
 bool RedisMetaChannel::connect() {
-  return client.connect(host, port, 3000, password);
+  return client.connect(host, port, 3000, password, db);
 }
 
 std::string RedisMetaChannel::make_block_key(uint32_t node_id, uint64_t hash) const {
@@ -436,11 +459,43 @@ bool RedisMetaChannel::list_keys(const std::string &pattern, std::vector<std::st
 }
 
 bool RedisMetaChannel::list_node_keys(std::vector<std::string> &keys) {
-  return list_keys("node:*", keys);
+  // Per-SD node pattern.  ``blocks_key`` carries the full SD prefix
+  // (plus an optional trailing ``:<device>`` component) — see
+  // ``_channel_blocks_key`` on the Python side.  We strip the device
+  // suffix (if any) and append ``:node:*``.
+  //
+  // Layout examples (simplified design — CP not in sd_key):
+  //   blocks_key = "sd:<sd>:CPUB"    → scan "sd:<sd>:node:*"
+  //   blocks_key = "sd:<sd>"          → scan "sd:<sd>:node:*"
+  //   blocks_key = "blocks" (legacy)  → scan "node:*" (backward compat)
+  if (blocks_key.compare(0, 3, "sd:") != 0) {
+    return list_keys("node:*", keys);
+  }
+  // Count the ':' separators to distinguish
+  //   sd:<model_id>:pp<>:tpn<>:nsa<>             (4 colons)  — SD only
+  //   sd:<model_id>:pp<>:tpn<>:nsa<>:<device>    (5 colons)  — SD + device
+  // Strip the last ':<device>' part only when we see > 4 colons.
+  size_t colons = 0;
+  for (char c : blocks_key) if (c == ':') ++colons;
+  std::string sd_prefix;
+  if (colons > 4) {
+    size_t pos = blocks_key.find_last_of(':');
+    sd_prefix = blocks_key.substr(0, pos);
+  } else {
+    sd_prefix = blocks_key;
+  }
+  return list_keys(sd_prefix + ":node:*", keys);
 }
 
 bool RedisMetaChannel::list_block_keys(uint32_t node_id, std::vector<std::string> &keys) {
   std::string pattern = blocks_key + ":block:" + std::to_string(node_id) + ":*";
+  return list_keys(pattern, keys);
+}
+
+bool RedisMetaChannel::list_all_block_keys(std::vector<std::string> &keys) {
+  // Global SCAN over every block in this SD/device namespace.  Used by the
+  // optimized ``remote_tree_refresh`` in Phase 1-F (design doc §4.7.1.2).
+  std::string pattern = blocks_key + ":block:*";
   return list_keys(pattern, keys);
 }
 
@@ -507,45 +562,81 @@ bool RedisMetaChannel::hmget_two_fields_for_keys(const std::vector<std::string> 
 
 size_t RedisMetaChannel::load_metas_by_keys(const std::vector<std::string> &keys,
                                             std::vector<BlockMeta> &out) {
+  // Preserve original single-shot behaviour for backward compatibility.
+  return load_metas_by_keys(keys, out, keys.size());
+}
+
+size_t RedisMetaChannel::load_metas_by_keys(const std::vector<std::string> &keys,
+                                            std::vector<BlockMeta> &out,
+                                            size_t batch_size) {
   out.clear();
   if (keys.empty()) return 0;
-  
-  // Batch HMGET for all fields
-  std::vector<std::vector<std::string>> batch;
-  batch.reserve(keys.size());
-  
-  for (const auto& key : keys) {
-    batch.push_back({"HMGET", key, "ph", "pb", "nid", "hash", "lt", "state"});
-  }
-  
-  std::vector<std::vector<std::string>> replies;
-  if (!client.pipeline(batch, replies)) return 0;
-  
-  // Parse replies into BlockMeta objects
-  for (size_t i = 0; i < replies.size() && i < keys.size(); ++i) {
-    const auto& reply = replies[i];
-    if (reply.size() == 6) {
+  if (batch_size == 0) batch_size = 500;
+
+  out.reserve(keys.size());
+
+  size_t idx = 0;
+  const size_t total = keys.size();
+  while (idx < total) {
+    const size_t end = std::min(idx + batch_size, total);
+
+    std::vector<std::vector<std::string>> batch;
+    batch.reserve(end - idx);
+    for (size_t i = idx; i < end; ++i) {
+      batch.push_back({"HMGET", keys[i], "ph", "pb", "nid", "hash", "lt", "state"});
+    }
+
+    std::vector<std::vector<std::string>> replies;
+    if (!client.pipeline(batch, replies)) {
+      out.clear();
+      return 0;
+    }
+
+    for (size_t i = 0; i < replies.size(); ++i) {
+      const auto& reply = replies[i];
       BlockMeta meta;
-      if (reply[0].empty() || reply[1].empty() || reply[2].empty() 
-      || reply[3].empty() || reply[4].empty() || reply[5].empty()) {
-        meta.state = NODE_STATE_EVICTED;
-      } else {
+      if (reply.size() == 6 &&
+          !reply[0].empty() && !reply[1].empty() && !reply[2].empty() &&
+          !reply[3].empty() && !reply[4].empty() && !reply[5].empty()) {
         meta.ph = std::stoll(reply[0]);
         meta.pb = std::stoll(reply[1]);
         meta.nid = std::stoul(reply[2]);
         meta.hash = std::stoll(reply[3]);
         meta.lt = std::stoul(reply[4]);
         meta.state = std::stoi(reply[5]);
+      } else {
+        meta.state = NODE_STATE_EVICTED;
       }
       out.push_back(meta);
-    } else {
-      BlockMeta meta;
-      meta.state = NODE_STATE_EVICTED;
-      out.push_back(meta);
+    }
+    idx = end;
+  }
+  return out.size();
+}
+
+bool RedisMetaChannel::load_instance_sd_nodes(const std::string &instance_id,
+                                              std::unordered_map<std::string, uint32_t> &out) {
+  out.clear();
+  if (instance_id.empty()) return false;
+  std::vector<std::string> resp;
+  const std::string key = "flexkv:instance:" + instance_id + ":sd_nodes";
+  if (!client.command({"HGETALL", key}, resp)) return false;
+  // HGETALL replies are a flat [field0, value0, field1, value1, ...] array.
+  if (resp.size() % 2 != 0) return false;
+  for (size_t i = 0; i + 1 < resp.size(); i += 2) {
+    const std::string &sd_key = resp[i];
+    const std::string &nid_str = resp[i + 1];
+    if (sd_key.empty() || nid_str.empty()) continue;
+    try {
+      // Intentionally use stoul — node_id is stored as an unsigned int on
+      // the Python side.  stoi would silently truncate overflow values.
+      out[sd_key] = static_cast<uint32_t>(std::stoul(nid_str));
+    } catch (const std::exception &) {
+      // Skip malformed entries but continue collecting the rest.
+      continue;
     }
   }
-  
-  return out.size();
+  return true;
 }
 
 static std::string key_for_block(RedisMetaChannel* ch, uint32_t node_id, int64_t hash) {

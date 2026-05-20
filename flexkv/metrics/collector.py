@@ -12,16 +12,95 @@ When enabled, the metrics HTTP server will automatically start on port 8080
 """
 
 import os
+import shutil
+import tempfile
 from typing import Dict, Optional
 
-# Optional import for prometheus_client
+
+# ---------------------------------------------------------------------------
+# Multi-process metrics bootstrap
+# ---------------------------------------------------------------------------
+#
+# FlexKV runs the actual data-plane workers (e.g.
+# ``PEER2CPUTransferWorker`` from ``flexkv/transfer/worker.py``) in
+# ``mp.Process`` subprocesses.  Each subprocess imports
+# ``prometheus_client`` independently and ends up with its own in-memory
+# Counter/Histogram values that **do not propagate** back to the HTTP
+# server running in the parent process.  The classic symptom is a
+# ``/metrics`` endpoint that always reports zeros for any counter that
+# is incremented from the subprocess (e.g.
+# ``flexkv_py_dist_reuse_peer_mooncake_read_*``).
+#
+# ``prometheus_client`` solves this with the
+# `PROMETHEUS_MULTIPROC_DIR <https://prometheus.github.io/client_python/multiprocess/>`_
+# convention: every process writes its samples to a shared directory of
+# mmap'd files, and the HTTP server uses ``MultiProcessCollector`` to
+# aggregate them on every scrape.
+#
+# We auto-bootstrap the directory so operators don't have to remember to
+# set the env var.  This must happen **before** ``prometheus_client`` is
+# imported, because the library reads ``PROMETHEUS_MULTIPROC_DIR`` at
+# import time.
+# ---------------------------------------------------------------------------
+def _bootstrap_multiproc_dir() -> Optional[str]:
+    """Pick a directory for ``prometheus_client`` multiprocess samples.
+
+    Honours an existing ``PROMETHEUS_MULTIPROC_DIR`` (operators may want
+    to point it at a tmpfs or a persistent path).  Otherwise creates a
+    process-shared dir under ``$TMPDIR/flexkv_prom_<pid>`` and exports
+    it.  The ``<pid>`` of the *parent* process is used so subprocesses
+    spawned later inherit the same env via ``mp.Process`` env-copying.
+
+    Returns the directory path on success, ``None`` if metrics are
+    disabled (so we skip the dir creation and avoid littering tmp).
+    """
+    # Honour caller-set value verbatim.
+    existing = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+    if existing:
+        try:
+            os.makedirs(existing, exist_ok=True)
+        except Exception:
+            pass
+        return existing
+
+    # Only bootstrap when metrics are actually enabled (avoid littering
+    # tmp on every test import).  We intentionally bypass
+    # ``GLOBAL_CONFIG_FROM_ENV`` here because that module is loaded later;
+    # read the env var directly to break the cycle.
+    if os.environ.get("FLEXKV_ENABLE_METRICS", "0") != "1":
+        return None
+
+    base = tempfile.gettempdir()
+    # Use parent PID so the directory survives across worker subprocess
+    # respawns within a single FlexKV instance.
+    parent_pid = os.getpid()
+    multiproc_dir = os.path.join(base, f"flexkv_prom_{parent_pid}")
+    try:
+        # Wipe stale samples from a previous run with the same pid (rare
+        # but possible after pid wrap-around).
+        if os.path.isdir(multiproc_dir):
+            shutil.rmtree(multiproc_dir, ignore_errors=True)
+        os.makedirs(multiproc_dir, exist_ok=True)
+    except Exception:
+        return None
+    os.environ["PROMETHEUS_MULTIPROC_DIR"] = multiproc_dir
+    return multiproc_dir
+
+
+_MULTIPROC_DIR = _bootstrap_multiproc_dir()
+
+
+# Optional import for prometheus_client.  Must happen AFTER the
+# multiproc dir bootstrap above so ``ValueClass`` picks the mmap'd
+# backend instead of the in-memory one.
 try:
-    from prometheus_client import Counter, Gauge
+    from prometheus_client import Counter, Gauge, Histogram
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
     Counter = None
     Gauge = None
+    Histogram = None
 
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
@@ -211,7 +290,86 @@ class FlexKVMetricsCollector:
             documentation="Total number of allocated blocks by device",
             labelnames=["device"],
         )
-        
+
+        # ========== Dist-Reuse P2P Safety Metrics ==========
+        # See docs/dist_reuse/KNOWN_ISSUE_p2p_refcount_2026-05-14.md §4 for
+        # why each of these is critical for safe P2P cross-instance reuse.
+        # All five default to zero / no-op when dist_reuse is not active —
+        # call sites are guarded so existing single-instance deployments pay
+        # zero cost.
+
+        # CRITICAL — non-zero means the master entered the high-watermark
+        # eviction path that bypasses lease protection.  Any positive value
+        # in production should page oncall immediately (KNOWN_ISSUE §5
+        # trigger #1).  Labelled by device because CPU and SSD pools have
+        # independent watermarks.
+        self.dist_reuse_lease_meta_nullptr_total = Counter(
+            name="flexkv_py_dist_reuse_lease_meta_nullptr_total",
+            documentation=(
+                "Number of blocks inserted with lease_meta=nullptr because "
+                "the master pool exceeded swap_block_threshold.  Such blocks "
+                "are evictable immediately and break the lease-based P2P "
+                "safety guarantee.  Should be 0 in healthy deployments."
+            ),
+            labelnames=["device"],
+        )
+
+        # WARN — counts the "fresh" branch of evict (lease still valid but
+        # we needed the slot anyway).  Healthy ratio of
+        # ``about_to_evict / evicted`` is < 1; sustained > 10 means the
+        # master is fighting eviction pressure and lease-based P2P safety
+        # margin is shrinking.
+        self.dist_reuse_about_to_evict_total = Counter(
+            name="flexkv_py_dist_reuse_about_to_evict_total",
+            documentation=(
+                "Number of blocks marked ABOUT_TO_EVICT (fresh-branch evict) "
+                "because the expired pool was insufficient.  Used together "
+                "with flexkv_py_evicted_blocks_total to compute the "
+                "fresh/expired evict ratio (KNOWN_ISSUE §4.1)."
+            ),
+            labelnames=["device"],
+        )
+
+        # OPS — peer-side mooncake_read latency.  P99 > 500ms means the
+        # remaining lease window is < ~10x typical lease_ttl; risk of lease
+        # exhaustion rises (KNOWN_ISSUE §4.2).  Buckets cover the practical
+        # range from sub-ms (in-memory) to seconds (network-degraded).
+        self.dist_reuse_peer_mooncake_read_seconds = Histogram(
+            name="flexkv_py_dist_reuse_peer_mooncake_read_seconds",
+            documentation=(
+                "Latency of peer-side mooncake transfer_sync_read calls "
+                "(P2P CPU pull from master instance).  P99 > 500ms triggers "
+                "the lease-margin alert (KNOWN_ISSUE §4.2)."
+            ),
+            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+        )
+
+        # CRITICAL — peer-side mooncake_read failure count.  Includes
+        # mooncake-level errors AND zero-byte transfers (the symptom of
+        # the P0 bug fixed on 2026-05-14).  Sustained > 0.1% failure rate
+        # warrants oncall (KNOWN_ISSUE §4.2).
+        self.dist_reuse_peer_mooncake_read_failures_total = Counter(
+            name="flexkv_py_dist_reuse_peer_mooncake_read_failures_total",
+            documentation=(
+                "Peer-side mooncake transfer_sync_read failures (non-zero "
+                "ret OR zero-byte transfer).  Failure rate > 0.1% indicates "
+                "either lease exhaustion racing master eviction, or peer "
+                "node discovery breakdown."
+            ),
+            labelnames=["reason"],
+        )
+
+        # SUCCESS counter — denominator for the failure-rate calculation
+        # above.  Without this, failure_rate would be unbounded if the
+        # service is idle.
+        self.dist_reuse_peer_mooncake_read_success_total = Counter(
+            name="flexkv_py_dist_reuse_peer_mooncake_read_success_total",
+            documentation=(
+                "Peer-side mooncake transfer_sync_read successes.  Use as "
+                "denominator together with the _failures_total counter."
+            ),
+        )
+
         logger.info("[FlexKV PyMetrics] Prometheus metrics collector initialized")
     
     def _init_dummy_metrics(self):
@@ -222,6 +380,8 @@ class FlexKVMetricsCollector:
             def inc(self, *args, **kwargs):
                 pass
             def set(self, *args, **kwargs):
+                pass
+            def observe(self, *args, **kwargs):
                 pass
         
         dummy = DummyMetric()
@@ -236,6 +396,13 @@ class FlexKVMetricsCollector:
         self.mempool_free_blocks = dummy
         self.evicted_blocks_total = dummy
         self.allocated_blocks_total = dummy
+
+        # Dist-reuse P2P safety dummy metrics (mirror of _init_metrics).
+        self.dist_reuse_lease_meta_nullptr_total = dummy
+        self.dist_reuse_about_to_evict_total = dummy
+        self.dist_reuse_peer_mooncake_read_seconds = dummy
+        self.dist_reuse_peer_mooncake_read_failures_total = dummy
+        self.dist_reuse_peer_mooncake_read_success_total = dummy
     
 
     
@@ -327,7 +494,63 @@ class FlexKVMetricsCollector:
         if not self.enabled or num_blocks <= 0:
             return
         self.allocated_blocks_total.labels(device=device).inc(num_blocks)
-    
+
+    # ========== Dist-Reuse P2P Safety Recording Methods ==========
+    #
+    # See docs/dist_reuse/KNOWN_ISSUE_p2p_refcount_2026-05-14.md §4 for
+    # the operational meaning of each metric.  All five degrade gracefully
+    # to no-op when metrics are disabled, so call sites can invoke them
+    # unconditionally.
+
+    def record_dist_reuse_lease_nullptr(self, device: str, count: int = 1):
+        """Record a master-side block insertion that received
+        ``lease_meta=nullptr`` because the pool exceeded
+        ``swap_block_threshold``.
+
+        **CRITICAL** — non-zero in production means the lease-based P2P
+        safety guarantee has been broken (KNOWN_ISSUE §5 trigger #1).
+        """
+        if not self.enabled or count <= 0:
+            return
+        self.dist_reuse_lease_meta_nullptr_total.labels(device=device).inc(count)
+
+    def record_dist_reuse_about_to_evict(self, device: str, count: int):
+        """Record blocks marked ABOUT_TO_EVICT in the fresh-branch evict
+        path.  Pair with ``record_eviction`` (the expired-branch counter)
+        to compute the fresh/expired evict ratio."""
+        if not self.enabled or count <= 0:
+            return
+        self.dist_reuse_about_to_evict_total.labels(device=device).inc(count)
+
+    def observe_dist_reuse_peer_mooncake_read(
+        self, duration_seconds: float, *, success: bool, reason: str = "ok",
+    ):
+        """Record a peer-side mooncake transfer_sync_read attempt.
+
+        Args:
+            duration_seconds: end-to-end latency of the read call.
+                Always recorded, including failures (so the latency
+                histogram captures the timeout / error path too).
+            success: True iff the read returned 0 bytes-of-error AND
+                non-zero data was actually moved.  See worker.py
+                P0-fix comment for why ``ret == 0`` alone is not a
+                sufficient success criterion.
+            reason: free-form tag for the failure mode when
+                ``success`` is False.  Recommended values:
+                ``"mooncake_error"`` (ret != 0),
+                ``"zero_byte_transfer"`` (the P0-bug symptom),
+                ``"node_meta_missing"`` (peer discovery breakdown),
+                ``"timeout"`` (long-running stuck read).
+        """
+        if not self.enabled:
+            return
+        if duration_seconds >= 0:
+            self.dist_reuse_peer_mooncake_read_seconds.observe(duration_seconds)
+        if success:
+            self.dist_reuse_peer_mooncake_read_success_total.inc()
+        else:
+            self.dist_reuse_peer_mooncake_read_failures_total.labels(reason=reason).inc()
+
 # Global collector instance
 _global_collector: Optional[FlexKVMetricsCollector] = None
 

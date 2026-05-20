@@ -23,6 +23,27 @@ class CompletedOp:
     transfer_type: Optional[str] = None
     num_blocks: int = 0
     num_bytes: int = 0
+    # Phase D-1 (proposal_unify_with_graph_dispatch_2026-05-15.md §3.5):
+    # SD identity tag — set by ``TransferManagerOnRemote._handle_submit``
+    # after rebinding the inbound graph, or implicitly equal to the
+    # Master's own SD when the op was scheduled in-process.  Master's
+    # polling worker uses this to route per-SD completion → ``mark_sd_ready``.
+    # Empty string ("") means "Master's own SD" (legacy default).
+    sd_key: str = ""
+    # Phase D-1: distributed_node_id of the node that physically completed
+    # this op.  For Remotes this is their own ``self_node_id``; for Master
+    # it's the Master's own ``self_node_id``.  ``-1`` is the sentinel
+    # "unknown" used by callers that don't care (e.g. legacy single-SD
+    # H2D on the master path).
+    contributing_node_id: int = -1
+    # Phase D-1: success flag.  ``False`` indicates the worker / D2H /
+    # Mooncake transfer failed.  Master uses this to decide whether to
+    # mark the SD ready or escalate to invalidate.  Default ``True`` so
+    # legacy CompletedOp construction (which never set it) keeps the
+    # historical "completed = success" semantics.
+    success: bool = True
+    # Phase D-1: optional opaque error text when ``success=False``.
+    error: Optional[str] = None
 
     def is_graph_completed(self) -> bool:
         return self.op_id == -1
@@ -106,6 +127,9 @@ class TransferOp:
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
     pending_count: int = 0
+    target_node_ids: Optional[List[int]] = None
+    block_hashes: Optional[List[int]] = None
+
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
@@ -442,6 +466,13 @@ def merge_to_batch_graph(batch_id: int,
     callbacks_by_type: Dict[TransferType, List[Callable]] = {}
     supported_types = {TransferType.DISK2H, TransferType.H2D,
                        TransferType.D2H, TransferType.H2DISK}
+    # P2P transfer types are *not* merged but passed through individually,
+    # because each op carries its own ``src_block_node_ids`` (per-block peer
+    # routing) and possibly distinct ``target_node_ids`` (D-3 multi-SD
+    # broadcast clones).  Merging would silently drop these fields.
+    passthrough_types = {TransferType.PEERH2H, TransferType.H2PEERH,
+                         TransferType.PEERSSD2H, TransferType.H2PEERSSD}
+    passthrough_ops: List[Tuple[TransferOp, Optional[Callable]]] = []
 
     for tt in supported_types:
         ops_by_type[tt] = []
@@ -451,10 +482,17 @@ def merge_to_batch_graph(batch_id: int,
         for op_id, op in graph._op_map.items():
             if op.transfer_type == TransferType.VIRTUAL:
                 continue
+            if op.transfer_type in passthrough_types:
+                # P2P ops: keep one-by-one, preserving src_block_node_ids /
+                # target_node_ids / remote_node_ids etc.
+                cb = op_callback_dict.get(op.op_id)
+                passthrough_ops.append((op, cb))
+                continue
             if op.transfer_type not in supported_types:
                 raise NotImplementedError(
                     f"Batch merge does not support transfer type: {op.transfer_type}. "
-                    f"Only DISK2H, H2D, D2H, and H2DISK are supported."
+                    f"Only DISK2H, H2D, D2H, H2DISK and P2P (PEERH2H, H2PEERH, "
+                    f"PEERSSD2H, H2PEERSSD) types are supported."
                 )
             ops_by_type[op.transfer_type].append(op)
             if op.op_id in op_callback_dict:
@@ -521,6 +559,43 @@ def merge_to_batch_graph(batch_id: int,
             batch_end_op_id = merged_d2h_op.op_id
         else:
             batch_end_op_id = -1
+
+    # ----- P2P passthrough (after main merge / layerwise emit) -----
+    # PEERH2H / H2PEERH / PEERSSD2H / H2PEERSSD are added to the merged
+    # graph one-by-one (NOT merged) and made a predecessor of the H2D op
+    # so the GPU upload waits for the peer-fetched data to land in the
+    # local CPU / SSD pool first.  This preserves per-op metadata
+    # (src_block_node_ids, target_node_ids, remote_node_ids).
+    if not layerwise_transfer:
+        for op, cb in passthrough_ops:
+            # ``add_transfer_op`` re-stamps op.graph_id to merged_graph's id.
+            merged_graph.add_transfer_op(op)
+            if cb is not None:
+                new_op_callback_dict[op.op_id] = cb
+            # GET-side P2P (PEERH2H / PEERSSD2H) must precede H2D so the
+            # data is in CPU / SSD pool before being uploaded to GPU.
+            if (merged_h2d_op is not None and
+                op.transfer_type in (TransferType.PEERH2H,
+                                     TransferType.PEERSSD2H)):
+                merged_graph.add_dependency(merged_h2d_op.op_id, op.op_id)
+            # PUT-side P2P (H2PEERH / H2PEERSSD) must follow D2H so the
+            # data is already in CPU pool before being shipped to peers.
+            if (merged_d2h_op is not None and
+                op.transfer_type in (TransferType.H2PEERH,
+                                     TransferType.H2PEERSSD)):
+                merged_graph.add_dependency(op.op_id, merged_d2h_op.op_id)
+    else:
+        # In layerwise mode the GET path collapses into a single
+        # LayerwiseTransferOp; we still need to passthrough P2P ops and
+        # have the layerwise op wait on them, but the current layerwise
+        # path does not surface a separate H2D op object to depend on.
+        # Defer support for layerwise + P2P until that path is exercised.
+        if passthrough_ops:
+            raise NotImplementedError(
+                "Batch merge: layerwise + P2P passthrough is not yet "
+                "implemented; got "
+                f"{[op.transfer_type for op, _ in passthrough_ops]}"
+            )
 
     return merged_graph, batch_end_op_id, new_op_callback_dict
 
