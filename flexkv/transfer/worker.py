@@ -265,6 +265,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  gpu_device_id: int,
+                 start_layer_id: int = 0,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
@@ -287,8 +288,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.kv_dim = gpu_kv_layout.kv_dim
 
         self.num_layers = gpu_kv_layout.num_layer
-
-        # a chunk can be located by layer_id * layer_stride + kv_id * kv_stride + block_id * block_stride
+        self.start_layer_id = start_layer_id
         self.chunk_size_in_bytes = gpu_kv_layout.get_chunk_size() * self.dtype.itemsize
         self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
@@ -297,6 +297,32 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+
+        assert start_layer_id + self.num_layers <= cpu_kv_layout.num_layer, (
+            f"GPUCPUTransferWorker: start_layer_id({start_layer_id}) + "
+            f"num_layers({self.num_layers}) exceeds cpu pool size({cpu_kv_layout.num_layer}). "
+            f"Single-node PP>1 deployment requires cpu pool to cover all PP stages."
+        )
+        # Offset cpu_tensor by start_layer_id so that the C++ kernel always uses
+        # layer_id=0 on the GPU side (GPU tensor is PP-stage-local, 0-indexed)
+        # while writing to the correct slice of the shared per-node CPU pool.
+        # The CPU pool covers all PP stages on this node; each PP stage's worker
+        # advances the base pointer by (start_layer_id * cpu_layer_stride) bytes.
+        if start_layer_id > 0:
+            layer_offset_elems = start_layer_id * (self.cpu_layer_stride_in_bytes // self.dtype.itemsize)
+            self.cpu_tensor = cpu_blocks.flatten()[layer_offset_elems:]
+            flexkv_logger.debug(
+                f"[GPUCPUTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id={start_layer_id}, num_layers={self.num_layers}, "
+                f"cpu_pool_total_layers={cpu_kv_layout.num_layer}, "
+                f"cpu_ptr_offset={start_layer_id * self.cpu_layer_stride_in_bytes} bytes"
+            )
+        else:
+            self.cpu_tensor = cpu_blocks
+            flexkv_logger.debug(
+                f"[GPUCPUTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id=0, num_layers={self.num_layers} (no cpu_ptr offset)"
+            )
 
         if len(self.gpu_blocks) == 1:
             self.gpu_block_type_ = 1
@@ -358,6 +384,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.chunk_size_in_bytes,
+            0,              # start_layer_id=0: GPU tensor is PP-stage-local (0-indexed);
+                            # CPU pool offset is baked into self.cpu_tensor pointer.
             self.num_layers,
             transfer_num_cta,
             transfer_type == TransferType.H2D,
@@ -405,6 +433,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  tp_group_size: int,
+                 start_layer_id: int = 0,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
@@ -432,7 +461,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         cudaHostRegister(cpu_blocks)
 
         self.num_layers = gpu_kv_layouts[0].num_layer
-        # here the chunk size doesn't include the layer info
+        self.start_layer_id = start_layer_id
         self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
                                 for gpu_kv_layout in gpu_kv_layouts]
         self.gpu_kv_strides_in_bytes = [gpu_kv_layout.get_kv_stride() * self.dtype.itemsize \
@@ -468,6 +497,27 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             for j in range(len(self.gpu_blocks[i]))
         ]
         cpu_blocks_ptr = cpu_blocks.data_ptr()
+        # Offset cpu_blocks_ptr by start_layer_id so that the C++ kernel always uses
+        # layer_id=0 on the GPU side (GPU tensor is PP-stage-local, 0-indexed)
+        # while writing to the correct slice of the shared per-node CPU pool.
+        # The CPU pool covers all PP stages on this node; each PP stage's worker
+        # advances the base pointer by (start_layer_id * cpu_layer_stride) bytes.
+        # Must use the post-div_head cpu_layer_stride_in_bytes here, because the
+        # C++ kernel uses the same stride for layer-wise addressing inside the block.
+        # (cpu_block_stride = num_layer * cpu_layer_stride_in_bytes in BLOCKFIRST layout
+        #  after div_head, so both strides are consistent.)
+        if start_layer_id > 0:
+            cpu_blocks_ptr += start_layer_id * self.cpu_layer_stride_in_bytes
+            flexkv_logger.debug(
+                f"[tpGPUCPUTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id={start_layer_id}, num_layers={self.num_layers}, "
+                f"cpu_ptr_offset={start_layer_id * self.cpu_layer_stride_in_bytes} bytes"
+            )
+        else:
+            flexkv_logger.debug(
+                f"[tpGPUCPUTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id=0, num_layers={self.num_layers} (no cpu_ptr offset)"
+            )
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
         num_tensors_per_gpu = len(self.gpu_blocks[0])
 
@@ -526,7 +576,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             transfer_num_cta,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
-            0,
+            0,              # layer_id=0: GPU tensor is PP-stage-local (0-indexed);
+                            # CPU pool offset is baked into cpu_blocks_ptr.
             self.num_layers,
             self.is_mla,
         )
@@ -889,6 +940,7 @@ class GDSTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         gpu_device_id: int = 0,
+        start_layer_id: int = 0,
     ) -> None:
         """
         Initialize GDS Transfer Worker
@@ -933,6 +985,21 @@ class GDSTransferWorker(TransferWorkerBase):
 
         # Layout information
         self.num_layers = gpu_kv_layout.num_layer
+        self.start_layer_id = start_layer_id
+        # Offset the SSD-side layer_id_list by start_layer_id at transfer time so that
+        # the C++ GDS kernel seeks to the correct slice of the shared per-node SSD pool.
+        # GPU side is PP-stage-local (0-indexed); the SSD pool covers all PP stages on this node.
+        if start_layer_id > 0:
+            flexkv_logger.debug(
+                f"[GDSTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id={start_layer_id}, num_layers={self.num_layers}, "
+                f"ssd_seek_offset will be applied at transfer time"
+            )
+        else:
+            flexkv_logger.debug(
+                f"[GDSTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id=0, num_layers={self.num_layers} (no SSD seek offset)"
+            )
         gpu_kv_layout_per_layer = gpu_kv_layout.div_layer(self.num_layers)
         ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
 
@@ -991,8 +1058,21 @@ class GDSTransferWorker(TransferWorkerBase):
         if len(ssd_block_id_list) == 0:
             return
 
-        # Process transfer for each layer
-        layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
+        # Offset the SSD-side layer_id_list by start_layer_id so that the C++ GDS
+        # kernel seeks to the correct slice of the shared per-node SSD pool.
+        # GPU side is PP-stage-local (0-indexed); the SSD pool covers all PP stages
+        # on this node, so layer_id_list[0] = start_layer_id encodes the SSD seek offset
+        # (start_layer_id * ssd_layer_stride bytes).
+        layer_id_list = torch.arange(self.start_layer_id, self.start_layer_id + self.num_layers, dtype=torch.int32)
+        if self.start_layer_id > 0:
+            flexkv_logger.debug(
+                f"[GDSTransferWorker] SSD layer_id_list starts at {self.start_layer_id} "
+                f"(ssd_seek_offset={self.start_layer_id * self.ssd_layer_stride_in_bytes} bytes)"
+            )
+        else:
+            flexkv_logger.debug(
+                f"[GDSTransferWorker] start_layer_id=0, num_layers={self.num_layers} (no SSD seek offset)"
+            )
 
         # Determine if this is a read operation
         is_read = (transfer_type == TransferType.DISK2D)
@@ -1064,6 +1144,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         tp_group_size: int,
+        start_layer_id: int = 0,
     ) -> None:
         """
         Initialize TP GDS Transfer Worker
@@ -1105,6 +1186,21 @@ class tpGDSTransferWorker(TransferWorkerBase):
 
         # Layout information
         self.num_layers = gpu_kv_layouts[0].num_layer
+        self.start_layer_id = start_layer_id
+        # start_layer_id is passed directly to the C++ tp_group_transfer kernel as the
+        # SSD-side layer seek offset (start_layer_id * ssd_layer_stride bytes).
+        # GPU side is PP-stage-local (0-indexed); the SSD pool covers all PP stages on this node.
+        if start_layer_id > 0:
+            flexkv_logger.debug(
+                f"[tpGDSTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id={start_layer_id}, num_layers={self.num_layers}, "
+                f"ssd_seek_offset will be computed at transfer time"
+            )
+        else:
+            flexkv_logger.debug(
+                f"[tpGDSTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id=0, num_layers={self.num_layers} (no SSD seek offset)"
+            )
         ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
         self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
         self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
@@ -1182,6 +1278,11 @@ class tpGDSTransferWorker(TransferWorkerBase):
         if len(gpu_block_id_list) == 0:
             return
 
+        # start_layer_id is passed directly to the C++ tp_group_transfer kernel,
+        # which uses it as the SSD-side layer seek offset (start_layer_id * ssd_layer_stride).
+        # GPU side is PP-stage-local (0-indexed); the SSD pool covers all PP stages
+        # on this node. This is equivalent to the layer_id_list offset used in
+        # GDSTransferWorker, but expressed as a scalar parameter to the TP kernel.
         self.tp_gds_transfer_thread_group.tp_group_transfer(
             gpu_block_id_list,
             ssd_block_id_list,
@@ -1191,7 +1292,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             self.ssd_tp_stride_in_bytes,
             self.num_blocks_per_file,
             is_read,
-            0,
+            self.start_layer_id,
             self.num_layers,
             self.is_mla,
         )
