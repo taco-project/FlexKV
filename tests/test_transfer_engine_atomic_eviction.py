@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch, call
 
 import numpy as np
 
-from flexkv.common.config import ModelConfig, RankInfo, CacheConfig
+from flexkv.common.config import ModelConfig, RankInfo, CacheConfig, LayerGroupSpec
 from flexkv.common.transfer import (
     TransferOp,
     TransferType,
@@ -706,28 +706,28 @@ class TestWorkerKeyInvariants(unittest.TestCase):
 
 class TestPendingCountBookkeepingMatrix(unittest.TestCase):
     """``pending_count`` MUST equal the number of submitted worker tasks
-    for every main×indexer worker-shape combination."""
+    for every (main_shape, n_pp_siblings, n_layer_groups) combination.
+
+    indexer / SWA / Gemma4 are all expressed as extra LayerGroupSpec entries; the worker absorbs the group-fan-out in C++ (one submit_transfer → N kernels → one finished callback). So Python dispatch sees ``pending_count`` grow only with PP siblings, never with the number of layer groups.
+    """
 
     def _make_engine(
         self,
         *,
         main_dict: bool,
-        indexer: str,  # "none" | "dict" | "singleton"
         n_main_siblings: int = 1,
-        n_indexer_siblings: int = 1,
+        n_layer_groups: int = 1,
     ):
-        """Build a TransferEngine stub with exactly the requested shapes.
+        """Build a TransferEngine stub with the requested worker shape and
+        ``n_layer_groups`` LayerGroupSpec entries on the model_config.
 
-        For dict shapes, sibling WorkerKeys all share the same
-        flat ``dp_client_id`` and only differ in ``pp_rank`` so
-        every sibling matches the op's dp_client_id.
+        ``n_layer_groups`` is varied to lock in that pending_count does NOT
+        depend on it (the worker collapses group fan-out internally).
         """
         from flexkv.transfer.transfer_engine import TransferEngine
 
         engine = object.__new__(TransferEngine)
-        engine._has_indexer = (indexer != "none")
         engine._worker_map = {}
-        engine._indexer_worker_map = {}
         engine.op_id_to_op = {}
         engine.op_id_to_nvtx_range = {}
         engine.completed_queue = MagicMock()
@@ -735,13 +735,21 @@ class TestPendingCountBookkeepingMatrix(unittest.TestCase):
         engine.cache_config = MagicMock()
         engine.cache_config.tokens_per_block = 16
         engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1)
+        # Synthesize N LayerGroupSpec entries — indexer / SWA / Gemma4 are
+        # all just extra entries in this list.
+        engine.model_config.layer_groups = [
+            LayerGroupSpec(
+                num_layers=2,
+                num_kv_heads=1,
+                head_size=1,
+                layer_indices=[2 * g, 2 * g + 1],
+            )
+            for g in range(n_layer_groups)
+        ]
         engine.rank_info = RankInfo(model_config=engine.model_config)
-        # Unified child tracking (replaces _indexer_op_to_parent_op /
-        # _indexer_op_map / _pp_replica_to_parent_op).
         engine._child_id_to_child = {}
         engine._child_to_parent_op_id = {}
 
-        # Main KV side: dict (n siblings, all matching) or a single singleton handle.
         if main_dict:
             engine._worker_map[TransferType.D2H] = {
                 WorkerKey(dp_client_id=0, pp_rank=pp): MagicMock(
@@ -751,17 +759,6 @@ class TestPendingCountBookkeepingMatrix(unittest.TestCase):
         else:
             engine._worker_map[TransferType.D2H] = MagicMock(name="main_singleton")
 
-        # Indexer side: absent / dict / singleton.
-        if indexer == "dict":
-            engine._indexer_worker_map[TransferType.D2H] = {
-                WorkerKey(dp_client_id=0, pp_rank=pp): MagicMock(
-                    name=f"indexer_pp{pp}")
-                for pp in range(n_indexer_siblings)
-            }
-        elif indexer == "singleton":
-            engine._indexer_worker_map[TransferType.D2H] = MagicMock(name="indexer_singleton")
-        # else: indexer == "none" → no entry, _has_indexer=False already
-
         return engine
 
     def _dispatch(self, engine, op):
@@ -770,46 +767,43 @@ class TestPendingCountBookkeepingMatrix(unittest.TestCase):
             engine._assign_op_to_worker(op)
 
     def _expected_submissions(self, engine) -> int:
-        """Count the unique submit_transfer calls actually issued, by walking
-        every worker mock in both maps. This is the ground-truth number the
-        invariant requires ``op.pending_count`` to equal."""
+        """
+        Count submit_transfer calls actually issued, walking only
+        """
         total = 0
-        for tt_map in (engine._worker_map, engine._indexer_worker_map):
-            for entry in tt_map.values():
-                if isinstance(entry, dict):
-                    for w in entry.values():
-                        total += w.submit_transfer.call_count
-                else:
-                    total += entry.submit_transfer.call_count
+        for entry in engine._worker_map.values():
+            if isinstance(entry, dict):
+                for w in entry.values():
+                    total += w.submit_transfer.call_count
+            else:
+                total += entry.submit_transfer.call_count
         return total
 
     def test_pending_count_matches_submissions_across_all_shapes(self):
-        """The invariant: ``op.pending_count == #submitted worker tasks``,
-        for every (main_shape, indexer_shape, fan-out widths) combination."""
-        cases = [
-            # (label, main_dict, indexer, n_main, n_indexer, expected_total)
-            ("dict-main(1)+no-indexer",        True,  "none",      1, 0, 1),
-            ("dict-main(3)+no-indexer",        True,  "none",      3, 0, 3),
-            ("singleton-main+no-indexer",      False, "none",      0, 0, 1),
-            ("dict-main(1)+singleton-indexer", True,  "singleton", 1, 0, 2),
-            ("dict-main(3)+singleton-indexer", True,  "singleton", 3, 0, 4),
-            ("singleton-main+singleton-indexer", False, "singleton", 0, 0, 2),
-            # The two shapes the OLD code under-counted by 1:
-            ("dict-main(2)+dict-indexer(2)",   True,  "dict",      2, 2, 4),
-            ("dict-main(3)+dict-indexer(2)",   True,  "dict",      3, 2, 5),
-            ("singleton-main+dict-indexer(2)", False, "dict",      0, 2, 3),
-            ("singleton-main+dict-indexer(3)", False, "dict",      0, 3, 4),
-        ]
-        for label, main_dict, indexer, n_main, n_indexer, expected in cases:
+        """``op.pending_count == #submitted worker tasks`` for every
+        (main_shape × n_pp_siblings × n_layer_groups) combo.
+
+        The ``n_layer_groups`` axis is the fence: any regression
+        that re-introduces group-level fan-out in ``_assign_op_to_worker``
+        will make the dict shapes overshoot by ``n_layer_groups - 1``.
+        """
+        cases = []
+        for main_dict, label_main in [(True, "dict-main"), (False, "singleton-main")]:
+            sibling_counts = [1, 2, 3] if main_dict else [0]
+            for n_main in sibling_counts:
+                for n_groups in (1, 2, 3):
+                    expected = n_main if main_dict else 1
+                    label = f"{label_main}({n_main})+groups={n_groups}"
+                    cases.append((label, main_dict, n_main, n_groups, expected))
+
+        for label, main_dict, n_main, n_groups, expected in cases:
             with self.subTest(case=label):
                 engine = self._make_engine(
                     main_dict=main_dict,
-                    indexer=indexer,
                     n_main_siblings=n_main,
-                    n_indexer_siblings=n_indexer,
+                    n_layer_groups=n_groups,
                 )
-                op = _make_op(TransferType.D2H,
-                              dp_client_id=0)
+                op = _make_op(TransferType.D2H, dp_client_id=0)
                 engine.op_id_to_op[op.op_id] = op
                 self.assertEqual(op.pending_count, 0,
                                  "fresh op must default to 0 (pure-counter semantics)")
@@ -823,36 +817,28 @@ class TestPendingCountBookkeepingMatrix(unittest.TestCase):
                     op.pending_count, expected,
                     f"[{label}] pending_count ({op.pending_count}) MUST equal "
                     f"the number of submitted worker tasks ({expected}). "
-                    f"If this fails, the pre-refactor 'self-counts-as-one' "
-                    f"bug has come back."
+                    f"pending_count must be independent of n_layer_groups."
                 )
 
     def test_simulating_all_completions_finalizes_exactly_once(self):
-        """End-to-end: after dispatch, simulating one completion per submitted
-        task MUST drive pending_count back to 0 and trigger _finalize_op
-        exactly once. This is the property the bug actually broke (with
-        the old code, pending_count would underflow or never hit 0 in
-        the dict+dict and singleton-main+dict-indexer shapes)."""
-        # Pick the previously-buggy shape as the canary.
+        """After dispatch, simulating one completion per submitted task
+        MUST drive pending_count back to 0.
+
+        Uses n_layer_groups=3 to also assert that extra groups don't
+        sneak in spurious pending_count increments.
+        """
         engine = self._make_engine(
-            main_dict=True, indexer="dict",
-            n_main_siblings=2, n_indexer_siblings=2,
+            main_dict=True, n_main_siblings=2, n_layer_groups=3,
         )
-        op = _make_op(TransferType.D2H,
-                      dp_client_id=0)
+        op = _make_op(TransferType.D2H, dp_client_id=0)
         engine.op_id_to_op[op.op_id] = op
 
         self._dispatch(engine, op)
-        self.assertEqual(op.pending_count, 4)
+        # Independent of n_layer_groups (= 3 here); only n_pp_siblings matters.
+        self.assertEqual(op.pending_count, 2)
 
-        # Drain: 4 completions → pending_count should land exactly at 0.
-        finalize_mock = MagicMock()
-        finished_ops: List[TransferOp] = []
-        for _ in range(op.pending_count):  # snapshot since we mutate it
+        for _ in range(op.pending_count):
             op.pending_count -= 1
-        # Simulating the scheduler-loop's "if 0 then finalize" check once
-        # per worker completion is what TestFinalizeOpLogic covers; here
-        # we only care that the target lands cleanly at 0.
         self.assertEqual(op.pending_count, 0)
 
 

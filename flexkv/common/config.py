@@ -14,15 +14,6 @@ from flexkv.common.debug import flexkv_logger
 
 
 @dataclass
-class IndexerCacheConfig:
-    """Indexer-specific cache configuration, embedded inside CacheConfig."""
-    # Indexer head layout
-    head_size: int = 0          # qk_rope_head_dim for DSA/NSA models
-    num_kv_heads: int = 1       # typically 1 for MLA-style indexer
-    dtype: torch.dtype = torch.uint8  # indexer storage dtype (fp8 quantized)
-
-
-@dataclass
 class LayerGroupSpec:
     """One group of layers sharing the same KV cache shape."""
     num_layers: int
@@ -389,9 +380,6 @@ class CacheConfig:
     use_hugepage_tmp_buffer: bool = False
     hugepage_size_bytes: int = 2 * 1024 * 1024  # 2 MiB by default; set to 1<<30 for 1GiB
 
-
-    # Indexer configuration
-    indexer: Optional[IndexerCacheConfig] = None
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000

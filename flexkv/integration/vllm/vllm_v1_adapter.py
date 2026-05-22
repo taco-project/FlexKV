@@ -856,10 +856,7 @@ class FlexKVWorkerConnector:
                 idx_block_size = first_idx.shape[1]
                 idx_head_size = first_idx.shape[2]
 
-                # Resolve indexer dtype: prefer cache_config.indexer.dtype (set by
-                # _detect_indexer_config_from_hf), fall back to the tensor's own dtype.
-                indexer_cfg = getattr(self.flexkv_config.cache_config, 'indexer', None)
-                indexer_dtype = indexer_cfg.dtype if indexer_cfg is not None else first_idx.dtype
+                indexer_dtype = first_idx.dtype
 
                 indexer_layer_indices = list(
                     range(num_main_layers, num_main_layers + len(indexer_tensors))

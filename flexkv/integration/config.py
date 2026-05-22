@@ -62,42 +62,6 @@ class FlexKVConfig:
         if self.gpu_register_port == "":
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
-    def _detect_indexer_config_from_hf(self, hf_config, source: str = "") -> None:
-        if hf_config is None:
-            return
-
-        try:
-            qk_rope_head_dim = getattr(hf_config, 'qk_rope_head_dim', None)
-            if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
-                return
-
-            index_head_dim = getattr(hf_config, 'index_head_dim', None)
-            if index_head_dim is not None and index_head_dim > 0:
-                quant_block_size = 128
-                head_size = self.cache_config.tokens_per_block * (
-                    index_head_dim + index_head_dim // quant_block_size * 4
-                )
-            else:
-                head_size = qk_rope_head_dim
-
-            # tokens_per_block is already set to sglang page_size before this
-            # call, so each FlexKV block = 1 sglang page.  The indexer maps
-            # 1:1 with blocks — no extra page_size grouping is needed.  For
-            # NSA/DSA models, head_size stores the packed per-page buffer width
-            # so the CPU layout matches the GPU indexer tensor shape.
-            self.cache_config.indexer = IndexerCacheConfig(
-                head_size=head_size,
-                num_kv_heads=1,
-                dtype=torch.uint8,
-            )
-            source_label = f" ({source})" if source else ""
-            logger.info(
-                f"Detected sparse attention indexer config{source_label}: "
-                f"head_size={head_size}, dtype=uint8, "
-                f"tokens_per_block={self.cache_config.tokens_per_block}")
-        except Exception as e:
-            logger.debug(f"Could not detect indexer config ({source}): {e}")
-
     @classmethod
     def from_env(cls) -> 'FlexKVConfig':
         enable_flexkv = bool(int(os.getenv('ENABLE_FLEXKV', 1)))
@@ -194,9 +158,6 @@ class FlexKVConfig:
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
-
-        hf_config = getattr(vllm_config.model_config, 'hf_config', None)
-        self._detect_indexer_config_from_hf(hf_config, source="vllm")
 
         logger.info(f"[FlexKV vllm] {self.model_config}, {rank_info}")
 
@@ -450,18 +411,6 @@ class FlexKVConfig:
         )
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
 
-        hf_config = getattr(sglang_config, 'hf_config', None)
-        self._detect_indexer_config_from_hf(hf_config, source="sglang")
-
-        if self.cache_config.indexer is not None:
-            logger.info(
-                f"[FlexKV] Complete indexer config (sglang): "
-                f"head_size={self.cache_config.indexer.head_size}, "
-                f"dtype={self.cache_config.indexer.dtype}, "
-                f"num_layers={self.model_config.num_layers}, "
-                f"tokens_per_block={self.cache_config.tokens_per_block}"
-            )
-
         logger.info(f"[FlexKV sglang] {self.model_config}, {rank_info}")
 
         # Freeze model_config — no further mutations allowed
@@ -541,7 +490,6 @@ class FlexKVConfig:
                     self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
                     self.model_config.num_kv_heads = hf_config.num_attention_heads
 
-            self._detect_indexer_config_from_hf(hf_config, source="TRT-LLM")
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
 

@@ -381,16 +381,27 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
             self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
 
+        # gpu_block_type_ is a framework-level tag (0=VLLM, 1=TRTLLM, 2=SGLANG).
+        # In multi-group mode all groups share the same per-layer GPU layout, so
+        # judge from any one group; the flat self.gpu_blocks would over-count.
         if self.group_transfer_params is None:
-            # Uniform mode: determine gpu_block_type_
-            if len(self.gpu_blocks) == 1:
-                self.gpu_block_type_ = 1
-            elif len(self.gpu_blocks) == self.num_layers:
-                self.gpu_block_type_ = 0
-            elif len(self.gpu_blocks) == self.num_layers * 2:
-                self.gpu_block_type_ = 2
-            else:
-                raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
+            ref_blocks_len = len(self.gpu_blocks)
+            ref_num_layers = self.num_layers
+        else:
+            ref_blocks_len = len(gpu_blocks_per_group[0])
+            ref_num_layers = layer_groups[0].num_layers
+
+        if ref_blocks_len == 1:
+            self.gpu_block_type_ = 1
+        elif ref_blocks_len == ref_num_layers:
+            self.gpu_block_type_ = 0
+        elif ref_blocks_len == ref_num_layers * 2:
+            self.gpu_block_type_ = 2
+        else:
+            raise ValueError(
+                f"Invalid GPU block type: ref_blocks_len={ref_blocks_len}, "
+                f"ref_num_layers={ref_num_layers}"
+            )
 
         # set GPU device
         if gpu_device_id != -1:
@@ -410,20 +421,26 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
     ) -> None:
         """Initialize per-group transfer parameters for models with mixed KV shapes."""
         kv_dim = 1 if self.is_mla else 2
-        dtype_size = self.dtype.itemsize
         tpb = cpu_kv_layout.tokens_per_block
         cpu_layout_type = cpu_kv_layout.type
         num_cpu_blocks = cpu_kv_layout.num_block
 
-        # Compute total per-block element count across all groups
-        total_block_elements = 0
-        for g in layer_groups:
-            total_block_elements += g.num_layers * kv_dim * tpb * g.num_kv_heads * g.head_size
+        # CPU buffer is sized in BYTES per block (see KVCacheLayout._compute_kv_shape).
+        # cpu_kv_layout.get_block_stride() returns bytes_per_block directly for
+        # multi-group BLOCKFIRST.  For LAYERFIRST, num_cpu_blocks is the contiguous
+        # dim count and we keep elements-based per-group accumulation below.
+        total_block_bytes = (
+            cpu_kv_layout.get_block_stride()
+            if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST else None
+        )
 
         self.group_transfer_params: list = []
-        cpu_offset_elements = 0  # element offset within a block for this group
+        cpu_offset_bytes = 0  # byte offset of this group within a CPU block
 
         for gi, (g, gpu_layout) in enumerate(zip(layer_groups, gpu_layouts_per_group)):
+            # Per-group dtype: indexer uses uint8 even when main KV is bf16/fp16.
+            dtype_size_g = g.dtype.itemsize
+
             # Resolve GPU tensors for this group
             group_gpu_blocks = [h.get_tensor() for h in gpu_blocks_per_group[gi]]
             group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
@@ -432,28 +449,30 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
             # GPU strides: compute from actual tensor to handle different
             # attention backend layouts (flash_attn vs triton/flashinfer).
-            gpu_chunk_size = chunk_elements * dtype_size
+            gpu_chunk_size = chunk_elements * dtype_size_g
             t0 = group_gpu_blocks[0]
-            gpu_strides = self._get_gpu_strides_from_tensor(t0, tpb, dtype_size, self.is_mla)
+            gpu_strides = self._get_gpu_strides_from_tensor(t0, tpb, dtype_size_g, self.is_mla)
             if gpu_strides is not None:
                 gpu_kv_stride, gpu_block_stride, gpu_layer_stride = gpu_strides
             else:
-                gpu_kv_stride = gpu_layout.get_kv_stride() * dtype_size
-                gpu_block_stride = gpu_layout.get_block_stride() * dtype_size
-                gpu_layer_stride = gpu_layout.get_layer_stride() * dtype_size
+                gpu_kv_stride = gpu_layout.get_kv_stride() * dtype_size_g
+                gpu_block_stride = gpu_layout.get_block_stride() * dtype_size_g
+                gpu_layer_stride = gpu_layout.get_layer_stride() * dtype_size_g
 
-            # CPU strides: depend on layout type
+            # CPU strides: depend on layout type.  All values are in bytes; the
+            # CPU buffer underlying self.cpu_tensor is uint8 for multi-group.
             if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
-                # BLOCKFIRST: [num_block, (all_layers_data)]
-                # Within a block, data is: layer0_k, layer0_v, layer1_k, ...
-                cpu_layer_stride = kv_dim * chunk_elements * dtype_size
-                cpu_block_stride = total_block_elements * dtype_size
-                cpu_kv_stride = chunk_elements * dtype_size
+                # BLOCKFIRST: [num_block, bytes_per_block]; within a block,
+                # data is laid out group-by-group (each group's region holds
+                # its own layer0_k, layer0_v, layer1_k, ... bytes).
+                cpu_layer_stride = kv_dim * chunk_elements * dtype_size_g
+                cpu_block_stride = total_block_bytes
+                cpu_kv_stride = chunk_elements * dtype_size_g
             else:
                 # LAYERFIRST: [all_layers, kv_dim, num_block, tpb, heads, head_dim]
-                cpu_layer_stride = kv_dim * num_cpu_blocks * chunk_elements * dtype_size
-                cpu_block_stride = chunk_elements * dtype_size
-                cpu_kv_stride = num_cpu_blocks * chunk_elements * dtype_size
+                cpu_layer_stride = kv_dim * num_cpu_blocks * chunk_elements * dtype_size_g
+                cpu_block_stride = chunk_elements * dtype_size_g
+                cpu_kv_stride = num_cpu_blocks * chunk_elements * dtype_size_g
 
             window_blocks = None
             if g.sliding_window is not None:
@@ -468,21 +487,23 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 'cpu_layer_stride': cpu_layer_stride,
                 'cpu_block_stride': cpu_block_stride,
                 'cpu_kv_stride': cpu_kv_stride,
-                'cpu_offset_elements': cpu_offset_elements,
+                'cpu_offset_bytes': cpu_offset_bytes,
                 'num_layers': g.num_layers,
                 'window_blocks': window_blocks,
             })
 
-            # Advance CPU offset for next group
+            # Advance CPU byte offset for next group.
             if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
-                cpu_offset_elements += g.num_layers * kv_dim * chunk_elements
+                cpu_offset_bytes += g.num_layers * kv_dim * chunk_elements * dtype_size_g
             else:
-                cpu_offset_elements += g.num_layers * kv_dim * num_cpu_blocks * chunk_elements
+                cpu_offset_bytes += (
+                    g.num_layers * kv_dim * num_cpu_blocks * chunk_elements * dtype_size_g
+                )
 
         window_info = [gp.get('window_blocks') for gp in self.group_transfer_params]
         flexkv_logger.info(
             f"Multi-group transfer initialized: {len(layer_groups)} groups, "
-            f"total_block_elements={total_block_elements}, "
+            f"total_block_bytes={total_block_bytes}, "
             f"window_blocks_per_group={window_info}"
         )
 
@@ -519,8 +540,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             # Multi-group transfer: one call per group
             for gi, gp in enumerate(self.group_transfer_params):
                 gpu_ptrs = gp['gpu_ptrs'].contiguous().pin_memory()
-                # Offset the CPU tensor to this group's region
-                cpu_tensor_for_group = self.cpu_tensor[gp['cpu_offset_elements']:]
+                # Offset the CPU tensor to this group's region.  cpu_tensor is
+                # uint8 in multi-group mode, so this slice is byte-addressed.
+                cpu_tensor_for_group = self.cpu_tensor[gp['cpu_offset_bytes']:]
 
                 g_gpu_blocks = gpu_block_id_list
                 g_cpu_blocks = cpu_block_id_list
@@ -737,21 +759,33 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         cpu_kv_layout: KVCacheLayout,
         layer_groups: List[LayerGroupSpec],
     ) -> None:
-        """Initialize per-group TPTransferThreadGroup instances."""
+        """Initialize per-group TPTransferThreadGroup instances.
+
+        CPU buffer is byte-flat (uint8) in multi-group mode: each block has
+        size kv_shape[1] = bytes_per_block (see KVCacheLayout._compute_kv_shape).
+        Per-group strides use g.dtype.itemsize so groups with different element
+        sizes (e.g. bf16 main + uint8 indexer) interleave correctly within a
+        block.
+        """
         kv_dim = 1 if self.is_mla else 2
-        dtype_size = self.dtype.itemsize
         tpb = cpu_kv_layout.tokens_per_block
         cpu_layout_type = cpu_kv_layout.type
         num_cpu_blocks = cpu_kv_layout.num_block
 
-        # Total per-block element count from the CPU layout — this already
-        # accounts for tp_size (each block holds data for all TP ranks).
-        total_block_elements = cpu_kv_layout.get_block_stride()
+        # For BLOCKFIRST multi-group, get_block_stride() returns bytes_per_block
+        # directly (already accounts for tp_size and per-group dtype sizes).
+        total_block_bytes = (
+            cpu_kv_layout.get_block_stride()
+            if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST else None
+        )
 
         self.tp_group_transfer_groups: list = []
-        cpu_offset_elements = 0
+        cpu_offset_bytes = 0
 
         for gi, g in enumerate(layer_groups):
+            # Per-group dtype: indexer uses uint8 even when main KV is bf16/fp16.
+            dtype_size_g = g.dtype.itemsize
+
             # gpu_blocks_per_group[gi] = list of per-GPU handle lists for this group
             # gpu_blocks_per_group[gi][gpu_idx] = handles for this group on GPU gpu_idx
             group_gpu_blocks_per_gpu = gpu_blocks_per_group[gi]
@@ -780,35 +814,35 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             gpu_chunk_sizes = []
             for i, layout in enumerate(group_gpu_layouts):
                 gpu_strides = self._get_gpu_strides_from_tensor(
-                    imported_group_blocks[i][0], tpb, dtype_size, self.is_mla,
+                    imported_group_blocks[i][0], tpb, dtype_size_g, self.is_mla,
                 ) if len(imported_group_blocks[i]) > 1 else None
                 if gpu_strides is not None:
                     kv_s, blk_s, layer_s = gpu_strides
                 else:
-                    kv_s = layout.get_kv_stride() * dtype_size
-                    blk_s = layout.get_block_stride() * dtype_size
-                    layer_s = layout.get_layer_stride() * dtype_size
+                    kv_s = layout.get_kv_stride() * dtype_size_g
+                    blk_s = layout.get_block_stride() * dtype_size_g
+                    layer_s = layout.get_layer_stride() * dtype_size_g
                 gpu_kv_strides.append(kv_s)
                 gpu_block_strides.append(blk_s)
                 gpu_layer_strides.append(layer_s)
-                gpu_chunk_sizes.append(layout.get_chunk_size() * dtype_size)
+                gpu_chunk_sizes.append(layout.get_chunk_size() * dtype_size_g)
 
             chunk_elements = tpb * g.num_kv_heads * g.head_size
 
-            # CPU strides for this group
+            # CPU strides for this group (all in bytes)
             if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
-                cpu_block_stride = total_block_elements * dtype_size
-                cpu_layer_stride = kv_dim * chunk_elements * dtype_size
-                cpu_kv_stride = chunk_elements * dtype_size
+                cpu_block_stride = total_block_bytes
+                cpu_layer_stride = kv_dim * chunk_elements * dtype_size_g
+                cpu_kv_stride = chunk_elements * dtype_size_g
                 cpu_tp_stride = cpu_block_stride // self.tp_group_size
             else:
-                cpu_block_stride = chunk_elements * dtype_size
-                cpu_layer_stride = kv_dim * num_cpu_blocks * chunk_elements * dtype_size
-                cpu_kv_stride = num_cpu_blocks * chunk_elements * dtype_size
+                cpu_block_stride = chunk_elements * dtype_size_g
+                cpu_layer_stride = kv_dim * num_cpu_blocks * chunk_elements * dtype_size_g
+                cpu_kv_stride = num_cpu_blocks * chunk_elements * dtype_size_g
                 cpu_tp_stride = cpu_block_stride // self.tp_group_size
 
-            # CPU tensor offset for this group
-            cpu_blocks_ptr = self.cpu_tensor[cpu_offset_elements:].data_ptr()
+            # CPU tensor offset for this group (cpu_tensor is uint8 in multi-group)
+            cpu_blocks_ptr = self.cpu_tensor[cpu_offset_bytes:].data_ptr()
 
             tp_thread_group = TPTransferThreadGroup(
                 self.num_gpus,
@@ -834,19 +868,22 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 'cpu_block_stride': cpu_block_stride,
                 'cpu_tp_stride': cpu_tp_stride,
                 'num_layers': g.num_layers,
-                'chunk_size': chunk_elements * dtype_size,
+                'chunk_size': chunk_elements * dtype_size_g,
                 'window_blocks': window_blocks,
             })
 
-            # Advance CPU offset for next group
+            # Advance CPU byte offset for next group
             if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
-                cpu_offset_elements += g.num_layers * kv_dim * chunk_elements
+                cpu_offset_bytes += g.num_layers * kv_dim * chunk_elements * dtype_size_g
             else:
-                cpu_offset_elements += g.num_layers * kv_dim * num_cpu_blocks * chunk_elements
+                cpu_offset_bytes += (
+                    g.num_layers * kv_dim * num_cpu_blocks * chunk_elements * dtype_size_g
+                )
 
         window_info = [gp.get('window_blocks') for gp in self.tp_group_transfer_groups]
         flexkv_logger.info(
             f"TP multi-group transfer initialized: {len(layer_groups)} groups, "
+            f"total_block_bytes={total_block_bytes}, "
             f"window_blocks_per_group={window_info}"
         )
 
@@ -1007,14 +1044,19 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         layer_groups: List[LayerGroupSpec],
     ) -> None:
-        """Initialize per-group transfer parameters for CPU<->SSD with mixed KV shapes."""
+        """Initialize per-group transfer parameters for CPU<->SSD with mixed KV shapes.
+
+        CPU/SSD buffer is byte-flat (uint8) in multi-group mode: each block has
+        size kv_shape[1] = bytes_per_block.  Per-group strides use
+        g.dtype.itemsize so groups with different element sizes (e.g. bf16 main
+        + uint8 indexer in DSv4) interleave correctly within a block.
+        """
         kv_dim = 1 if self.is_mla else 2
-        dtype_size = self.dtype.itemsize
         tpb = cpu_kv_layout.tokens_per_block
 
-        # Total block stride from the layout — accounts for tp_size when > 1,
-        # so each block can hold data for all TP ranks.
-        self.block_stride_in_bytes = cpu_kv_layout.get_block_stride() * dtype_size
+        # Multi-group BLOCKFIRST: get_block_stride() returns bytes_per_block
+        # directly (already accounts for tp_size and per-group dtype sizes).
+        self.block_stride_in_bytes = cpu_kv_layout.get_block_stride()
 
         # TP-aware: each CPU/SSD block holds data for all TP ranks.
         # We must transfer each rank's data separately.
@@ -1022,27 +1064,27 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.ssd_tp_stride_in_bytes = self.block_stride_in_bytes // self.ssd_tp_size
 
         self.group_ssd_params: list = []
-        offset_elements = 0
+        offset_bytes = 0
 
         for g in layer_groups:
+            # Per-group dtype: indexer uses uint8 even when main KV is bf16/fp16.
+            dtype_size_g = g.dtype.itemsize
             chunk_elements = tpb * g.num_kv_heads * g.head_size
-            layer_stride = kv_dim * chunk_elements  # elements per layer
-            kv_stride = chunk_elements  # elements per K or V half
-
-            offset_bytes = offset_elements * dtype_size
+            layer_stride_bytes = kv_dim * chunk_elements * dtype_size_g
+            kv_stride_bytes = chunk_elements * dtype_size_g
 
             self.group_ssd_params.append({
                 'num_layers': g.num_layers,
                 'cpu_offset_bytes': offset_bytes,
                 'ssd_offset_bytes': offset_bytes,  # same layout for CPU and SSD
-                'cpu_layer_stride': layer_stride * dtype_size,
-                'cpu_kv_stride': kv_stride * dtype_size,
-                'ssd_layer_stride': layer_stride * dtype_size,
-                'ssd_kv_stride': kv_stride * dtype_size,
-                'chunk_size': chunk_elements * dtype_size,
+                'cpu_layer_stride': layer_stride_bytes,
+                'cpu_kv_stride': kv_stride_bytes,
+                'ssd_layer_stride': layer_stride_bytes,
+                'ssd_kv_stride': kv_stride_bytes,
+                'chunk_size': chunk_elements * dtype_size_g,
             })
 
-            offset_elements += g.num_layers * layer_stride
+            offset_bytes += g.num_layers * layer_stride_bytes
 
         flexkv_logger.info(
             f"CPUSSDDiskTransferWorker multi-group initialized: {len(layer_groups)} groups, "
@@ -1470,22 +1512,28 @@ class GDSTransferWorker(TransferWorkerBase):
         gpu_blocks_per_group: Optional[List[List[TensorSharedHandle]]],
         gpu_layouts_per_group: Optional[List[KVCacheLayout]],
     ) -> None:
-        """Initialize per-group GDS transfer parameters."""
+        """Initialize per-group GDS transfer parameters.
+
+        SSD buffer is byte-flat (uint8) in multi-group mode; per-group strides
+        use g.dtype.itemsize so groups with different element sizes (e.g.
+        bf16 main + uint8 indexer) interleave correctly within a block.
+        """
         kv_dim = 1 if self.is_mla else 2
-        dtype_size = self.dtype.itemsize
         tpb = ssd_kv_layout.tokens_per_block
 
-        # Total SSD block stride from layout — accounts for tp_size
-        self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride() * dtype_size
+        # Multi-group BLOCKFIRST: get_block_stride() returns bytes_per_block
+        # directly (already accounts for tp_size and per-group dtype sizes).
+        self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride()
 
         self.group_gds_params: list = []
-        ssd_offset_elements = 0
+        ssd_offset_bytes = 0
 
         for gi, g in enumerate(layer_groups):
+            # Per-group dtype: indexer uses uint8 even when main KV is bf16/fp16.
+            dtype_size_g = g.dtype.itemsize
             chunk_elements = tpb * g.num_kv_heads * g.head_size
-            ssd_layer_stride = kv_dim * chunk_elements * dtype_size
-            ssd_kv_stride = chunk_elements * dtype_size
-            ssd_offset_bytes = ssd_offset_elements * dtype_size
+            ssd_layer_stride = kv_dim * chunk_elements * dtype_size_g
+            ssd_kv_stride = chunk_elements * dtype_size_g
 
             # GPU strides from per-group layout — compute from actual tensor to
             # handle different attention backend layouts (flash_attn vs triton).
@@ -1493,20 +1541,20 @@ class GDSTransferWorker(TransferWorkerBase):
                 gpu_layout = gpu_layouts_per_group[gi]
                 group_gpu_blocks = [h.get_tensor() for h in gpu_blocks_per_group[gi]]
                 gpu_strides = self._get_gpu_strides_from_tensor(
-                    group_gpu_blocks[0], tpb, dtype_size, self.is_mla,
+                    group_gpu_blocks[0], tpb, dtype_size_g, self.is_mla,
                 ) if len(group_gpu_blocks) > 1 else None
                 if gpu_strides is not None:
                     gpu_kv_stride, gpu_block_stride, gpu_layer_stride = gpu_strides
                 else:
-                    gpu_kv_stride = gpu_layout.get_kv_stride() * dtype_size
-                    gpu_block_stride = gpu_layout.get_block_stride() * dtype_size
-                    gpu_layer_stride = gpu_layout.get_layer_stride() * dtype_size
-                gpu_chunk_size = chunk_elements * dtype_size
+                    gpu_kv_stride = gpu_layout.get_kv_stride() * dtype_size_g
+                    gpu_block_stride = gpu_layout.get_block_stride() * dtype_size_g
+                    gpu_layer_stride = gpu_layout.get_layer_stride() * dtype_size_g
+                gpu_chunk_size = chunk_elements * dtype_size_g
             else:
                 gpu_kv_stride = self.gpu_kv_stride_in_bytes
                 gpu_block_stride = self.gpu_block_stride_in_bytes
                 gpu_layer_stride = self.gpu_layer_stride_in_bytes
-                gpu_chunk_size = chunk_elements * dtype_size
+                gpu_chunk_size = chunk_elements * dtype_size_g
 
             # GPU pointers for this group
             if gpu_blocks_per_group is not None:
@@ -1532,7 +1580,7 @@ class GDSTransferWorker(TransferWorkerBase):
                 'window_blocks': window_blocks,
             })
 
-            ssd_offset_elements += g.num_layers * kv_dim * chunk_elements
+            ssd_offset_bytes += g.num_layers * kv_dim * chunk_elements * dtype_size_g
 
         window_info = [gp.get('window_blocks') for gp in self.group_gds_params]
         flexkv_logger.info(
@@ -1789,24 +1837,30 @@ class tpGDSTransferWorker(TransferWorkerBase):
         gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]],
         ssd_files: Dict[int, List[str]],
     ) -> None:
-        """Initialize per-group TPGDSTransferThreadGroup instances."""
+        """Initialize per-group TPGDSTransferThreadGroup instances.
+
+        SSD buffer is byte-flat (uint8) in multi-group mode; per-group strides
+        use g.dtype.itemsize so groups with different element sizes (e.g.
+        bf16 main + uint8 indexer) interleave correctly within a block.
+        """
         kv_dim = 1 if self.is_mla else 2
-        dtype_size = self.dtype.itemsize
         tpb = ssd_kv_layout.tokens_per_block
 
-        # Total SSD block stride from layout — accounts for tp_size
-        self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride() * dtype_size
+        # Multi-group BLOCKFIRST: get_block_stride() returns bytes_per_block
+        # directly (already accounts for tp_size and per-group dtype sizes).
+        self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride()
 
         self.group_tp_gds_params: list = []
-        ssd_offset_elements = 0
+        ssd_offset_bytes = 0
 
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
 
         for gi, g in enumerate(layer_groups):
+            # Per-group dtype: indexer uses uint8 even when main KV is bf16/fp16.
+            dtype_size_g = g.dtype.itemsize
             chunk_elements = tpb * g.num_kv_heads * g.head_size
-            ssd_layer_stride = kv_dim * chunk_elements * dtype_size
-            ssd_kv_stride = chunk_elements * dtype_size
-            ssd_offset_bytes = ssd_offset_elements * dtype_size
+            ssd_layer_stride = kv_dim * chunk_elements * dtype_size_g
+            ssd_kv_stride = chunk_elements * dtype_size_g
             # TP stride for SSD: partition the block across TP ranks
             ssd_tp_stride = self.ssd_block_stride_in_bytes // self.tp_group_size if not self.is_mla \
                 else self.ssd_block_stride_in_bytes
@@ -1826,18 +1880,18 @@ class tpGDSTransferWorker(TransferWorkerBase):
                     grp_tensors = [h.get_tensor() for h in grp_handles]
 
                     gpu_strides = self._get_gpu_strides_from_tensor(
-                        grp_tensors[0], tpb, dtype_size, self.is_mla,
+                        grp_tensors[0], tpb, dtype_size_g, self.is_mla,
                     ) if len(grp_tensors) > 1 else None
                     if gpu_strides is not None:
                         kv_s, blk_s, layer_s = gpu_strides
                     else:
-                        kv_s = grp_layout.get_kv_stride() * dtype_size
-                        blk_s = grp_layout.get_block_stride() * dtype_size
-                        layer_s = grp_layout.get_layer_stride() * dtype_size
+                        kv_s = grp_layout.get_kv_stride() * dtype_size_g
+                        blk_s = grp_layout.get_block_stride() * dtype_size_g
+                        layer_s = grp_layout.get_layer_stride() * dtype_size_g
                     gpu_kv_strides.append(kv_s)
                     gpu_block_strides.append(blk_s)
                     gpu_layer_strides.append(layer_s)
-                    gpu_chunk_sizes.append(chunk_elements * dtype_size)
+                    gpu_chunk_sizes.append(chunk_elements * dtype_size_g)
 
                     for t in grp_tensors:
                         gpu_ptrs_flat.append(t.data_ptr())
@@ -1849,18 +1903,18 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 gpu_layer_strides = []
                 for i, l in enumerate(gpu_kv_layouts):
                     gpu_strides = self._get_gpu_strides_from_tensor(
-                        self.gpu_blocks[i][0], tpb, dtype_size, self.is_mla,
+                        self.gpu_blocks[i][0], tpb, dtype_size_g, self.is_mla,
                     ) if len(self.gpu_blocks[i]) > 1 else None
                     if gpu_strides is not None:
                         kv_s, blk_s, layer_s = gpu_strides
                     else:
-                        kv_s = l.get_kv_stride() * dtype_size
-                        blk_s = l.get_block_stride() * dtype_size
-                        layer_s = l.get_layer_stride() * dtype_size
+                        kv_s = l.get_kv_stride() * dtype_size_g
+                        blk_s = l.get_block_stride() * dtype_size_g
+                        layer_s = l.get_layer_stride() * dtype_size_g
                     gpu_kv_strides.append(kv_s)
                     gpu_block_strides.append(blk_s)
                     gpu_layer_strides.append(layer_s)
-                gpu_chunk_sizes = [chunk_elements * dtype_size] * self.num_gpus
+                gpu_chunk_sizes = [chunk_elements * dtype_size_g] * self.num_gpus
                 gpu_ptrs_flat = [
                     self.gpu_blocks[i][j].data_ptr()
                     for i in range(self.num_gpus)
@@ -1895,7 +1949,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 'window_blocks': window_blocks,
             })
 
-            ssd_offset_elements += g.num_layers * kv_dim * chunk_elements
+            ssd_offset_bytes += g.num_layers * kv_dim * chunk_elements * dtype_size_g
 
         window_info = [gp.get('window_blocks') for gp in self.group_tp_gds_params]
         flexkv_logger.info(

@@ -1,11 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Dict, Optional, List, Tuple, Union
 
 import torch
 import hashlib
 
-from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, CacheConfig, ModelConfig
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
@@ -17,6 +17,24 @@ from flexkv.storage.allocator import (
     RemoteAllocator,
     SSDAllocator,
 )
+
+
+def _resolve_layer_groups(
+    layer_groups: Optional[List[LayerGroupSpec]],
+    default_dtype: torch.dtype,
+) -> Optional[List[LayerGroupSpec]]:
+    """Fill in LayerGroupSpec.dtype=None with the model's default dtype.
+
+    KVCacheLayout's multi-group byte math requires every group to carry an
+    explicit dtype; this resolves the inheritance once at storage setup time
+    so downstream code can assume g.dtype is set.
+    """
+    if layer_groups is None:
+        return None
+    resolved: List[LayerGroupSpec] = []
+    for g in layer_groups:
+        resolved.append(g if g.dtype is not None else replace(g, dtype=default_dtype))
+    return resolved
 
 
 class StorageEngine:
@@ -34,6 +52,21 @@ class StorageEngine:
         self._model_config = model_config
         self._cache_config = cache_config
 
+        # Resolve per-group dtype inheritance in place so every downstream
+        # consumer (KVCacheLayout byte math, worker stride computation,
+        # TransferEngine) sees explicit dtypes.
+        if self._model_config.layer_groups is not None:
+            self._model_config.layer_groups = _resolve_layer_groups(
+                self._model_config.layer_groups, self._model_config.dtype
+            )
+
+        # For multi-group, the CPU/SSD/Remote buffer is sized in BYTES
+        # (kv_shape[1] = bytes_per_block, summed with per-group dtype.itemsize),
+        # so the underlying allocator must use uint8.  Single-group keeps its
+        # native dtype.
+        is_multi_group = self._model_config.layer_groups is not None
+        buffer_dtype = torch.uint8 if is_multi_group else self._model_config.dtype
+
         if self._cache_config.enable_cpu:
             self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
@@ -49,7 +82,7 @@ class StorageEngine:
             self.allocate(
                 device_type=DeviceType.CPU,
                 layout=self._cpu_layout,
-                dtype=self._model_config.dtype,
+                dtype=buffer_dtype,
             )
 
         if self._cache_config.enable_ssd:
@@ -69,7 +102,7 @@ class StorageEngine:
             self.allocate(
                 device_type=DeviceType.SSD,
                 layout=self._ssd_layout,
-                dtype=self._model_config.dtype,
+                dtype=buffer_dtype,
                 cache_dir=self._cache_config.ssd_cache_dir,
                 max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
@@ -91,7 +124,7 @@ class StorageEngine:
             self.allocate(
                 device_type=DeviceType.REMOTE,
                 layout=self._remote_layout,
-                dtype=self._model_config.dtype,
+                dtype=buffer_dtype,
                 file_path=self._cache_config.remote_cache_path,
                 remote_config_custom = self._cache_config.remote_config_custom
             )

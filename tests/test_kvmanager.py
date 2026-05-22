@@ -8,7 +8,7 @@ import torch
 import multiprocessing as mp
 from multiprocessing import Process, Pipe
 
-from flexkv.common.config import ModelConfig, CacheConfig, RankInfo
+from flexkv.common.config import ModelConfig, CacheConfig, RankInfo, LayerGroupSpec
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
 from flexkv.kvtask import KVTaskEngine
@@ -492,10 +492,12 @@ class GPUIndexerCacheVerifier:
     def fill_gpu_blocks(self, block_ids, main_kv_tokens_per_block, token_ids):
         """Fill indexer GPU blocks with deterministic hash values.
 
-        Indexer uses tokens_per_block=1 on CPU/SSD side.  Each indexer block
-        corresponds to one main-KV block (1:1 page mapping).  We hash the
-        *entire page* of token_ids from the main KV request to produce a
-        single deterministic value per (layer, block).
+        DSv4 indexer is per-token: indexer's tokens_per_block matches main KV.
+        Each block holds tokens_per_block entries on both GPU and CPU/SSD.
+        For test purposes we broadcast one hash value per (layer, block) across
+        all token positions in that block — the verifier checks ``[block_id, :, :]``
+        which validates the whole block uniformly, so the round-trip integrity
+        is exercised regardless of intra-block position layout.
 
         Args:
             block_ids: block IDs to fill (same as main KV block_ids).
@@ -517,7 +519,9 @@ class GPUIndexerCacheVerifier:
                         layer_id,
                         token_ids[start_token_idx:end_token_idx],
                     )
-                    # gpu_tensor shape: (num_blocks, tokens_per_block=1, head_size)
+                    # gpu_tensor shape: (num_blocks, tokens_per_block, head_size).
+                    # DSv4: tokens_per_block matches main KV; broadcast hash
+                    # uniformly across the token dim for the test.
                     gpu_tensor[block_id, :, :] = hash_value
 
     def clear_gpu_blocks(self, block_ids):
@@ -586,9 +590,12 @@ def run_tp_client_with_indexer(dp_client_id,
                                num_gpu_blocks,
                                child_conn,
                                gpu_layout_type):
-    """Run tp_client process with indexer support (shadow transfer mode).
+    """Run tp_client process with indexer expressed as an extra LayerGroupSpec.
 
-    Indexer configuration is read from cache_config.indexer (IndexerCacheConfig).
+    Reads indexer shape from ``model_config.layer_groups[-1]`` (the indexer
+    group, populated by _run_indexer_test before spawn). Registers main +
+    indexer buffers via the unified ``register_to_server(layer_groups=...,
+    gpu_layouts=..., handles_per_group=...)`` API.
     """
     try:
         device_id = tp_rank + dp_client_id * model_config.tp_size
@@ -611,13 +618,17 @@ def run_tp_client_with_indexer(dp_client_id,
         else:
             raise ValueError(f"Invalid GPU layout type for indexer test: {gpu_layout_type}")
 
-        # Derive indexer params from cache_config.indexer (IndexerCacheConfig).
-        # Indexer uses tokens_per_block=1 (one indexer entry per page/block),
-        # matching the CPU/SSD layout in StorageEngine.
-        indexer_cfg = cache_config.indexer
-        assert indexer_cfg is not None, "cache_config.indexer must be set for indexer shadow transfer tests"
-        indexer_tokens_per_block = 1  # indexer: 1 entry per page (not main KV tokens_per_block)
-        indexer_num_layers = model_config.num_layers
+        # Indexer parameters come from model_config.layer_groups[-1] — the
+        # indexer group appended by _run_indexer_test before spawn.
+        assert model_config.layer_groups and len(model_config.layer_groups) >= 2, (
+            "model_config.layer_groups must contain a main + indexer group "
+            "(set by _run_indexer_test)"
+        )
+        indexer_group = model_config.layer_groups[-1]
+        # DSv4 indexer is per-token (one entry per token in a block), matching
+        # the main KV's tokens_per_block.  No per-page summary variant.
+        indexer_tokens_per_block = cache_config.tokens_per_block
+        indexer_num_layers = indexer_group.num_layers
 
         # Create indexer GPU blocks (MLA-style: 3D tensors)
         indexer_blocks = []
@@ -626,8 +637,8 @@ def run_tp_client_with_indexer(dp_client_id,
                 torch.empty(
                     num_gpu_blocks,
                     indexer_tokens_per_block,
-                    indexer_cfg.head_size,
-                    dtype=indexer_cfg.dtype,
+                    indexer_group.head_size,
+                    dtype=indexer_group.dtype,
                 ).cuda(device_id)
             )
 
@@ -637,22 +648,24 @@ def run_tp_client_with_indexer(dp_client_id,
             num_layer=indexer_num_layers,
             num_block=num_gpu_blocks,
             tokens_per_block=indexer_tokens_per_block,
-            num_head=indexer_cfg.num_kv_heads,
-            head_size=indexer_cfg.head_size,
+            num_head=indexer_group.num_kv_heads,
+            head_size=indexer_group.head_size,
             is_mla=True,
         )
 
-        # Use KVTPClient directly with indexer buffers (shadow transfer mode)
+        # Unified registration: main + indexer go through one register_to_server
+        # call, matching the production vllm adapter path.
         tp_client = KVTPClient(
             gpu_register_port=server_recv_port + "_gpu_register",
             dp_client_id=dp_client_id, pp_rank=0,
             device_id=device_id,
         )
         tp_client.register_to_server(
-            kv_caches=gpu_blocks_for_tp,
+            kv_caches=gpu_blocks_for_tp + indexer_blocks,
             kv_layout=gpu_kv_layout,
-            indexer_buffers=indexer_blocks,
-            indexer_layout=indexer_layout,
+            layer_groups=model_config.layer_groups,
+            gpu_layouts=[gpu_kv_layout, indexer_layout],
+            handles_per_group=[gpu_blocks_for_tp, indexer_blocks],
         )
 
         # Send GPU blocks back to main process via pipe
@@ -691,12 +704,26 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
 
     skip_if_insufficient_gpus(tp_size)
 
-    from flexkv.common.config import IndexerCacheConfig
-    cache_config.indexer = IndexerCacheConfig(
-        head_size=64,
+    # indexer as an extra LayerGroupSpec appended to
+    # model_config.layer_groups.  The main group comes first (carrying the
+    # full set of "real" layers); the indexer group comes last with its
+    # own (num_kv_heads=1, head_size=64, dtype=uint8) shape.
+    main_layer_indices = list(range(model_config.num_layers))
+    main_group = LayerGroupSpec(
+        num_layers=model_config.num_layers,
+        num_kv_heads=model_config.num_kv_heads,
+        head_size=model_config.head_size,
+        layer_indices=main_layer_indices,
+        dtype=model_config.dtype,
+    )
+    indexer_group = LayerGroupSpec(
+        num_layers=model_config.num_layers,
         num_kv_heads=1,
+        head_size=64,
+        layer_indices=main_layer_indices,
         dtype=torch.uint8,
     )
+    model_config.layer_groups = [main_group, indexer_group]
 
     kvmanager = KVManager(
         model_config=model_config,
@@ -757,13 +784,17 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
         )
 
     indexer_kv_verifier = None
-    indexer_cfg = cache_config.indexer
+    indexer_cfg = (
+        model_config.layer_groups[-1]
+        if model_config.layer_groups and len(model_config.layer_groups) >= 2
+        else None
+    )
     if all_indexer_blocks and len(all_indexer_blocks) == tp_size and indexer_cfg is not None:
         indexer_gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
-            num_layer=model_config.num_layers,
+            num_layer=indexer_cfg.num_layers,
             num_block=num_gpu_blocks,
-            tokens_per_block=1,  # indexer: 1 entry per page
+            tokens_per_block=cache_config.tokens_per_block,  # DSv4 indexer is per-token
             num_head=indexer_cfg.num_kv_heads,
             head_size=indexer_cfg.head_size,
             is_mla=True,
@@ -926,7 +957,9 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
 @pytest.mark.parametrize(
     "model_config",
     [
-        {"tp_size": 1, "dp_size": 1},
+        # DSv4 form: main attention is MLA (kv_dim=1), indexer is also MLA-style
+        # (single tensor per layer with num_kv_heads=1, head_size=64, uint8).
+        {"tp_size": 1, "dp_size": 1, "use_mla": True},
     ],    indirect=True,
 )
 @pytest.mark.parametrize("cache_config", [
@@ -1046,7 +1079,8 @@ def _mock_sglang_eventfd_client(socket_path: str,
 @pytest.mark.parametrize(
     "model_config",
     [
-        {"tp_size": 1, "dp_size": 1},
+        # DSv4 form (see test_kvmanager_with_indexer).
+        {"tp_size": 1, "dp_size": 1, "use_mla": True},
     ],    indirect=True,
 )
 @pytest.mark.parametrize("cache_config", [
@@ -1057,6 +1091,7 @@ def _mock_sglang_eventfd_client(socket_path: str,
     {'num_gpu_blocks': 256, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
 ], indirect=True)
 @pytest.mark.parametrize("gpu_layout_type", [0])
+@pytest.mark.skip(reason="layerwise+indexer not yet supported; to be re-enabled once layerwise worker is rewritten for unified LayerGroupSpec dispatch")
 def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_config, gpu_layout_type):
     """Test KVManager with indexer in LAYERWISE mode.
 

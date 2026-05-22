@@ -73,15 +73,28 @@ class KVCacheLayout:
     def _compute_kv_shape(self) -> None:
         if self._kv_shape is None:
             if self.layer_groups is not None and self.type == KVCacheLayoutType.BLOCKFIRST:
-                # Multi-group: elements per block = sum of per-group contributions
-                # Each group: num_layers * kv_dim * tokens_per_block * num_kv_heads * head_size
-                # Note: layer_groups store per-GPU num_kv_heads (after TP split).
-                # Multiply by tp_size so each block holds data for ALL TP ranks.
-                elements_per_block = self.tp_size * sum(
-                    g.num_layers * self._kv_dim * self.tokens_per_block * g.num_kv_heads * g.head_size
+                # Multi-group: kv_shape's second dim is BYTES per block, not
+                # element count.  Groups may carry different dtypes (e.g. bf16
+                # main KV + uint8 indexer in DSv4), so we cannot factor out a
+                # single dtype_size.  Each group contributes
+                #   num_layers * kv_dim * tokens_per_block * num_kv_heads *
+                #   head_size * dtype.itemsize
+                # bytes.  kv_dim and tokens_per_block are taken from the layout
+                # top level (uniform across groups in supported configs).
+                # layer_groups store per-GPU num_kv_heads (after TP split);
+                # tp_size multiplies so each block holds data for ALL TP ranks.
+                if any(g.dtype is None for g in self.layer_groups):
+                    raise ValueError(
+                        "Multi-group KVCacheLayout requires LayerGroupSpec.dtype "
+                        "to be set on every group (resolve None to ModelConfig.dtype "
+                        "before constructing the layout)."
+                    )
+                bytes_per_block = self.tp_size * sum(
+                    g.num_layers * self.kv_dim * self.tokens_per_block *
+                    g.num_kv_heads * g.head_size * g.dtype.itemsize
                     for g in self.layer_groups
                 )
-                self._kv_shape = torch.Size([self.num_block, elements_per_block])
+                self._kv_shape = torch.Size([self.num_block, bytes_per_block])
             elif self.type == KVCacheLayoutType.LAYERFIRST:  # for Layerwise transfer
                 self._kv_shape = torch.Size([self.num_layer,
                                              self.kv_dim,
@@ -166,7 +179,8 @@ class KVCacheLayout:
 
     def get_block_stride(self) -> int:
         if self.layer_groups is not None:
-            # For multi-group BLOCKFIRST, kv_shape is [num_block, elements_per_block]
+            # For multi-group BLOCKFIRST, kv_shape is [num_block, bytes_per_block]
+            # — the value is already in BYTES, do not multiply by dtype.itemsize.
             return self.kv_shape[1]
         if self.type == KVCacheLayoutType.LAYERFIRST:
             return self.kv_shape[3:].numel()
@@ -206,7 +220,7 @@ class KVCacheLayout:
         for g in self.layer_groups:
             chunk = self.tokens_per_block * g.num_kv_heads * g.head_size
             kv_stride = chunk  # tpb * num_kv_heads * head_size
-            layer_stride = self._kv_dim * kv_stride
+            layer_stride = self.kv_dim * kv_stride
             group_elements = g.num_layers * layer_stride
             result.append({
                 'num_layers': g.num_layers,
