@@ -154,7 +154,7 @@ class FlexKVConfig:
         # head_dim/num_kv_heads for sliding vs full attention layers) BEFORE
         # computing block counts, so token_size_in_bytes is correct from the start.
         self._detect_heterogeneous_kv_layers()
-        
+
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"

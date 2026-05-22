@@ -1142,6 +1142,3 @@ def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_confi
         else:
             os.environ['FLEXKV_ENABLE_LAYERWISE_TRANSFER'] = orig_layerwise_env
         GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = orig_layerwise_flag
-
-
-
