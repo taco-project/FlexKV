@@ -63,8 +63,10 @@ public:
       int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size);
 
   // Multi-group constructor. ``gpu_blocks_per_group[gi][d]`` is the GPU-side
-  // tensor list for group ``gi`` on device ``d``. ``csr_*`` encode the
-  // 1:N mapping from original layer id to (group_idx, local_layer_id) members
+  // tensor list for group ``gi`` on device ``d``. ``layer_members`` encodes
+  // the 1:N mapping from original layer id to (group_idx, local_layer_id)
+  // members directly: ``layer_members[orig]`` is the list of
+  // ``(group_idx, local_layer_id)`` pairs for that original layer
   // (see ``flexkv.common.config.LayerMemberMap``).
   //
   // Per-group flat int64 arrays (size = num_groups) carry the per-group
@@ -77,9 +79,8 @@ public:
           &gpu_blocks_per_group,
       torch::Tensor &cpu_blocks,
       std::map<int, std::vector<std::string>> &ssd_files,
-      int num_original_layers, const std::vector<int> &csr_offsets,
-      const std::vector<int> &csr_group_idx,
-      const std::vector<int> &csr_local_id,
+      int num_original_layers,
+      const std::vector<std::vector<std::pair<int, int>>> &layer_members,
       const std::vector<int> &group_num_layers,
       const std::vector<int64_t> &group_cpu_offset_bytes,
       const std::vector<int64_t> &group_ssd_offset_bytes,
@@ -172,12 +173,9 @@ private:
   // ---- Multi-group state ----
   bool has_multi_group_;
   std::vector<GroupParams> groups_;
-  // CSR mapping: for original layer ``i``,
-  // members are at csr_offsets_[i] .. csr_offsets_[i+1] - 1, encoded by
-  // (csr_group_idx_[m], csr_local_id_[m]).
-  std::vector<int> csr_offsets_;
-  std::vector<int> csr_group_idx_;
-  std::vector<int> csr_local_id_;
+  // Dense mapping: ``layer_members_[orig]`` is the list of
+  // (group_idx, local_layer_id) pairs participating in original layer ``orig``.
+  std::vector<std::vector<std::pair<int, int>>> layer_members_;
   int num_original_layers_;
 
   // Single-group: ``expected_count = num_gpus_``.

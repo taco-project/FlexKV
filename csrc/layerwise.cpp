@@ -183,8 +183,7 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
         &gpu_blocks_per_group,
     torch::Tensor &cpu_blocks,
     std::map<int, std::vector<std::string>> &ssd_files, int num_original_layers,
-    const std::vector<int> &csr_offsets, const std::vector<int> &csr_group_idx,
-    const std::vector<int> &csr_local_id,
+    const std::vector<std::vector<std::pair<int, int>>> &layer_members,
     const std::vector<int> &group_num_layers,
     const std::vector<int64_t> &group_cpu_offset_bytes,
     const std::vector<int64_t> &group_ssd_offset_bytes,
@@ -237,16 +236,14 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
         "[LayerwiseTransferGroup multi-group] Initialized without eventfds\n");
   }
 
-  csr_offsets_ = csr_offsets;
-  csr_group_idx_ = csr_group_idx;
-  csr_local_id_ = csr_local_id;
+  layer_members_ = layer_members;
 
-  if (static_cast<int>(csr_offsets_.size()) != num_original_layers_ + 1) {
+  if (static_cast<int>(layer_members_.size()) != num_original_layers_) {
     throw std::runtime_error(
-        "[LayerwiseTransferGroup multi-group] csr_offsets must have length "
-        "num_original_layers + 1, got " +
-        std::to_string(csr_offsets_.size()) + " vs expected " +
-        std::to_string(num_original_layers_ + 1));
+        "[LayerwiseTransferGroup multi-group] layer_members must have length "
+        "num_original_layers, got " +
+        std::to_string(layer_members_.size()) + " vs expected " +
+        std::to_string(num_original_layers_));
   }
 
   int num_groups = static_cast<int>(group_num_layers.size());
@@ -701,10 +698,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   std::vector<std::string> h2d_range_names(num_original_layers_);
   for (int orig = 0; orig < num_original_layers_; ++orig) {
     char name[160];
-    int begin = csr_offsets_[orig];
-    int end = csr_offsets_[orig + 1];
-    snprintf(name, sizeof(name), "CPU->GPU OrigLayer[%d] members=%d", orig,
-             end - begin);
+    snprintf(name, sizeof(name), "CPU->GPU OrigLayer[%d] members=%zu", orig,
+             layer_members_[orig].size());
     h2d_range_names[orig] = name;
   }
   if (num_original_layers_ > 0) {
@@ -715,13 +710,12 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   // kernels (each on every GPU), then register a single eventfd callback that
   // fires after members_this_layer * num_gpus_ GPU callbacks land.
   for (int orig = 0; orig < num_original_layers_; ++orig) {
-    int begin = csr_offsets_[orig];
-    int end = csr_offsets_[orig + 1];
-    int members_this_layer = end - begin;
+    const auto &members = layer_members_[orig];
+    int members_this_layer = static_cast<int>(members.size());
 
-    for (int m = begin; m < end; ++m) {
-      int gi = csr_group_idx_[m];
-      int local_id = csr_local_id_[m];
+    for (const auto &member : members) {
+      int gi = member.first;
+      int local_id = member.second;
       const GroupParams &gp = groups_[gi];
 
       for (int d = 0; d < num_gpus_; ++d) {

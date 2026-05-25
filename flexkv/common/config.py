@@ -45,52 +45,37 @@ class LayerGroupSpec:
 
 @dataclass(frozen=True)
 class LayerMemberMap:
-    """CSR mapping from original layer id -> list of (group_idx, local_layer_id).
+    """Dense mapping from original layer id -> tuple of (group_idx, local_layer_id).
 
-    Three flat 1D arrays form a Compressed Sparse Row layout:
-
-    * ``offsets[i]`` is the start index of layer i's member range.
-    * ``offsets[i+1] - offsets[i]`` is the number of group members layer i has.
-    * ``group_idx[offsets[i] : offsets[i+1]]`` gives the group index for each
-      member (in ``model_config.layer_groups`` order, sorted ascending).
-    * ``local_id[offsets[i] : offsets[i+1]]`` gives the corresponding
-      ``local_layer_id`` within that group.
+    ``members[i]`` is the tuple of ``(group_idx, local_layer_id)`` pairs for
+    original layer ``i``, ordered by ascending ``group_idx`` (main KV before
+    auxiliary groups like indexer).
 
     Examples:
 
       Single group (uniform model): every layer has 1 member.
-        offsets   = [0, 1, 2, ..., N]
-        group_idx = [0, 0, ..., 0]
-        local_id  = [0, 1, ..., N-1]
+        members = (((0, 0),), ((0, 1),), ..., ((0, N-1),))
 
       DSv4 (main + indexer share every layer): every layer has 2 members.
-        offsets   = [0, 2, 4, ..., 2N]
-        group_idx = [0, 1, 0, 1, ...]   (main = 0, indexer = 1)
-        local_id  = [0, 0, 1, 1, ...]
+        members = (((0, 0), (1, 0)), ((0, 1), (1, 1)), ...)
 
-      Gemma3-style partition (sliding ↔ global alternating): each layer
+      Gemma3-style partition (sliding <-> global alternating): each layer
       belongs to exactly one group.
-        offsets   = [0, 1, 2, 3, ..., N]
-        group_idx = [0, 1, 0, 1, ...]   (no sharing, but partition)
-        local_id  = [0, 0, 1, 1, ...]
+        members = (((0, 0),), ((1, 0),), ((0, 1),), ((1, 1),), ...)
     """
-    offsets: Tuple[int, ...]
-    group_idx: Tuple[int, ...]
-    local_id: Tuple[int, ...]
+    members: Tuple[Tuple[Tuple[int, int], ...], ...]
 
     @property
     def num_original_layers(self) -> int:
-        return len(self.offsets) - 1
+        return len(self.members)
 
     @property
     def total_members(self) -> int:
-        return len(self.group_idx)
+        return sum(len(m) for m in self.members)
 
-    def members_of(self, original_layer_id: int) -> List[Tuple[int, int]]:
-        """Return [(group_idx, local_id), ...] for one original layer."""
-        begin = self.offsets[original_layer_id]
-        end = self.offsets[original_layer_id + 1]
-        return [(self.group_idx[m], self.local_id[m]) for m in range(begin, end)]
+    def members_of(self, original_layer_id: int) -> Tuple[Tuple[int, int], ...]:
+        """Return ((group_idx, local_id), ...) for one original layer."""
+        return self.members[original_layer_id]
 
 
 def build_layer_member_map(
@@ -110,20 +95,7 @@ def build_layer_member_map(
             buckets[orig].append((gi, local_id))
     for b in buckets:
         b.sort(key=lambda x: x[0])
-
-    offsets: List[int] = [0]
-    group_idx: List[int] = []
-    local_id: List[int] = []
-    for orig in range(num_original_layers):
-        for gi, lid in buckets[orig]:
-            group_idx.append(gi)
-            local_id.append(lid)
-        offsets.append(len(group_idx))
-    return LayerMemberMap(
-        offsets=tuple(offsets),
-        group_idx=tuple(group_idx),
-        local_id=tuple(local_id),
-    )
+    return LayerMemberMap(members=tuple(tuple(b) for b in buckets))
 
 
 @dataclass

@@ -296,11 +296,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         tpb = cpu_kv_layout.tokens_per_block
         num_original_layers = self.num_layers
 
-        # CSR mapping
+        # Dense mapping: original layer id -> [(group_idx, local_layer_id), ...]
         layer_member_map = build_layer_member_map(layer_groups, num_original_layers)
-        csr_offsets = list(layer_member_map.offsets)
-        csr_group_idx = list(layer_member_map.group_idx)
-        csr_local_id = list(layer_member_map.local_id)
+        layer_members = [list(m) for m in layer_member_map.members]
 
         # Block-stride is identical for CPU and SSD in multi-group BLOCKFIRST
         # (kv_shape[1] = bytes_per_block, already accounts for tp_size and per-group dtypes).
@@ -379,9 +377,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         # Store for transfer_impl / logging
         self.layer_groups = layer_groups
         self.group_cpu_block_stride = cpu_block_stride
-        self.csr_offsets = csr_offsets
-        self.csr_group_idx = csr_group_idx
-        self.csr_local_id = csr_local_id
+        self.layer_member_map = layer_member_map
 
         flexkv_logger.info(
             f"[LayerwiseWorker multi-group] {len(layer_groups)} groups, "
@@ -396,9 +392,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             cpu_blocks=cpu_blocks,
             ssd_files=ssd_files,
             num_original_layers=num_original_layers,
-            csr_offsets=csr_offsets,
-            csr_group_idx=csr_group_idx,
-            csr_local_id=csr_local_id,
+            layer_members=layer_members,
             group_num_layers=group_num_layers,
             group_cpu_offset_bytes=group_cpu_offset_bytes,
             group_ssd_offset_bytes=group_ssd_offset_bytes,
