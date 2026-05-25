@@ -625,9 +625,17 @@ def run_tp_client_with_indexer(dp_client_id,
             "(set by _run_indexer_test)"
         )
         indexer_group = model_config.layer_groups[-1]
-        # DSv4 indexer is per-token (one entry per token in a block), matching
-        # the main KV's tokens_per_block.  No per-page summary variant.
-        indexer_tokens_per_block = cache_config.tokens_per_block
+        # Indexer per-block token count after compression. With
+        # compress_ratio=1 (default) this matches the main KV's tpb (DSv4
+        # per-token form); with compress_ratio>1 the GPU tensor shrinks to
+        # tpb_g = tpb // compress_ratio, matching the shape sglang allocates
+        # for the compressed group (see storage._compute_kv_shape and
+        # worker._init_multi_group).
+        assert cache_config.tokens_per_block % indexer_group.compress_ratio == 0, (
+            f"indexer compress_ratio={indexer_group.compress_ratio} must divide "
+            f"tokens_per_block={cache_config.tokens_per_block}"
+        )
+        indexer_tokens_per_block = cache_config.tokens_per_block // indexer_group.compress_ratio
         indexer_num_layers = indexer_group.num_layers
 
         # Create indexer GPU blocks (MLA-style: 3D tensors)
@@ -689,11 +697,17 @@ def run_tp_client_with_indexer(dp_client_id,
             child_conn.close()
 
 
-def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, test_label="indexer", layerwise=False):
+def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
+                      test_label="indexer", layerwise=False,
+                      indexer_compress_ratio: int = 1):
     """Core test logic for KVManager with indexer shadow transfer.
 
     Shared by test_kvmanager_with_indexer (non-layerwise) and
     test_kvmanager_with_indexer_layerwise (layerwise mode).
+
+    ``indexer_compress_ratio`` controls how many tokens of the main KV each
+    indexer slot covers (DSv4 NSA: tpb_g = tpb // compress_ratio).  Must
+    divide cache_config.tokens_per_block.
     """
     tp_size = model_config.tp_size
     tokens_per_block = cache_config.tokens_per_block
@@ -703,6 +717,11 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
     num_requests = num_gpu_blocks // block_per_request
 
     skip_if_insufficient_gpus(tp_size)
+
+    assert tokens_per_block % indexer_compress_ratio == 0, (
+        f"indexer_compress_ratio={indexer_compress_ratio} must divide "
+        f"tokens_per_block={tokens_per_block}"
+    )
 
     # indexer as an extra LayerGroupSpec appended to
     # model_config.layer_groups.  The main group comes first (carrying the
@@ -722,6 +741,7 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
         head_size=64,
         layer_indices=main_layer_indices,
         dtype=torch.uint8,
+        compress_ratio=indexer_compress_ratio,
     )
     model_config.layer_groups = [main_group, indexer_group]
 
@@ -790,11 +810,14 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
         else None
     )
     if all_indexer_blocks and len(all_indexer_blocks) == tp_size and indexer_cfg is not None:
+        # Indexer GPU layout uses tpb_g = tpb // compress_ratio (matches the
+        # GPU tensor allocated in run_tp_client_with_indexer).
+        indexer_gpu_tpb = cache_config.tokens_per_block // indexer_cfg.compress_ratio
         indexer_gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=indexer_cfg.num_layers,
             num_block=num_gpu_blocks,
-            tokens_per_block=cache_config.tokens_per_block,  # DSv4 indexer is per-token
+            tokens_per_block=indexer_gpu_tpb,
             num_head=indexer_cfg.num_kv_heads,
             head_size=indexer_cfg.head_size,
             is_mla=True,
@@ -970,11 +993,15 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type, 
     {'num_gpu_blocks': 256, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
 ], indirect=True)
 @pytest.mark.parametrize("gpu_layout_type", [0])
-def test_kvmanager_with_indexer(model_config, cache_config, test_config, gpu_layout_type):
+@pytest.mark.parametrize("indexer_compress_ratio", [1, 4])
+def test_kvmanager_with_indexer(model_config, cache_config, test_config,
+                                gpu_layout_type, indexer_compress_ratio):
     """Test KVManager with indexer: GPU↔CPU (and optionally ↔SSD) data correctness."""
     ssd_label = "+ssd" if cache_config.enable_ssd else ""
+    cr_label = f"+cr{indexer_compress_ratio}" if indexer_compress_ratio != 1 else ""
     _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
-                      test_label=f"indexer{ssd_label}")
+                      test_label=f"indexer{ssd_label}{cr_label}",
+                      indexer_compress_ratio=indexer_compress_ratio)
 
 
 import ctypes
@@ -1091,7 +1118,9 @@ def _mock_sglang_eventfd_client(socket_path: str,
     {'num_gpu_blocks': 256, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
 ], indirect=True)
 @pytest.mark.parametrize("gpu_layout_type", [0])
-def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_config, gpu_layout_type):
+@pytest.mark.parametrize("indexer_compress_ratio", [1, 4])
+def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_config,
+                                          gpu_layout_type, indexer_compress_ratio):
     """Test KVManager with indexer in LAYERWISE mode.
 
     Validates the full round-trip:
@@ -1130,8 +1159,11 @@ def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_confi
         eventfd_thread.start()
 
         ssd_label = "+ssd" if cache_config.enable_ssd else ""
+        cr_label = f"+cr{indexer_compress_ratio}" if indexer_compress_ratio != 1 else ""
         _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
-                          test_label=f"layerwise+indexer{ssd_label}", layerwise=True)
+                          test_label=f"layerwise+indexer{ssd_label}{cr_label}",
+                          layerwise=True,
+                          indexer_compress_ratio=indexer_compress_ratio)
 
         eventfd_thread.join(timeout=10)
     finally:

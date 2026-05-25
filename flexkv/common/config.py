@@ -41,6 +41,14 @@ class LayerGroupSpec:
     # Per-group storage dtype. None = inherit ModelConfig.dtype.
     # Indexer groups use a different dtype (e.g. fp8/uint8) than main KV (bf16).
     dtype: Optional[torch.dtype] = None
+    # Per-group KV compression along the tokens_per_block dimension. The CPU/SSD
+    # block stores ``tokens_per_block // compress_ratio`` tokens worth of data
+    # for this group (the GPU tensor sglang allocates is already compressed to
+    # the same shrunk shape). ``1`` = uncompressed (legacy behavior). Used by
+    # DSv4-style models where different layer roles compress at different ratios
+    # (e.g. CSA at 4x, HCA at 128x). ``tokens_per_block % compress_ratio == 0``
+    # is enforced when the KVCacheLayout is built.
+    compress_ratio: int = 1
 
 
 @dataclass(frozen=True)
@@ -207,8 +215,12 @@ class ModelConfig:
         * ``g.num_layers == len(g.layer_indices)`` for every group.
         * No internal duplicate ``layer_indices`` within one group.
         * Every ``layer_indices`` entry lies in ``[0, num_layers)``.
-        * Union of all groups' ``layer_indices`` covers ``{0, ..., N-1}``
-          exactly once (every original layer is owned by at least one group).
+        * ``g.compress_ratio >= 1`` for every group.
+
+        Uncached layers (e.g. DSv4 layers 0/1 with ``compress_ratio == 0`` at
+        the model level) simply do not appear in any group's ``layer_indices``
+        and produce empty member lists in the resulting :class:`LayerMemberMap`;
+        the union is therefore *not* required to cover every original layer.
         """
         if not self.layer_groups:
             return
@@ -225,6 +237,11 @@ class ModelConfig:
                     f"[ModelConfig] layer_groups[{gi}].layer_indices has duplicates: "
                     f"{g.layer_indices}"
                 )
+            if g.compress_ratio < 1:
+                raise ValueError(
+                    f"[ModelConfig] layer_groups[{gi}].compress_ratio must be >= 1, "
+                    f"got {g.compress_ratio}"
+                )
             for orig in g.layer_indices:
                 if not 0 <= orig < N:
                     raise ValueError(
@@ -232,14 +249,6 @@ class ModelConfig:
                         f"layer index {orig} (must be in [0, {N}))"
                     )
             seen.extend(g.layer_indices)
-        union = set(seen)
-        expected = set(range(N))
-        if union != expected:
-            missing = sorted(expected - union)
-            raise ValueError(
-                f"[ModelConfig] layer_groups do not cover every original layer: "
-                f"missing original layer ids = {missing}"
-            )
 
     @cached_property
     def layer_member_map(self) -> Optional[LayerMemberMap]:
@@ -364,9 +373,15 @@ class ModelConfig:
             # to get full-model per-token size (matching CPU/SSD block sizing).
             # Each group may carry its own dtype (None = inherit ModelConfig.dtype),
             # so indexer-as-group (fp8/uint8) and main KV (bf16) sum correctly.
+            # ``compress_ratio`` shrinks the per-token contribution: a compressed
+            # group only stores ``1/compress_ratio`` tokens per uncompressed token
+            # slot, so ``token_size_in_bytes * tokens_per_block`` keeps matching
+            # bytes_per_block (the divisibility ``tpb % compress_ratio == 0`` is
+            # enforced when the KVCacheLayout is built).
             return sum(
                 g.num_layers * g.num_kv_heads * g.head_size * kv_dim
                 * (g.dtype or self.dtype).itemsize
+                // g.compress_ratio
                 for g in self.layer_groups
             ) * self.tp_size
         return self.num_layers * self.num_kv_heads * self.head_size * kv_dim * self.dtype.itemsize

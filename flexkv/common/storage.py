@@ -89,8 +89,20 @@ class KVCacheLayout:
                         "to be set on every group (resolve None to ModelConfig.dtype "
                         "before constructing the layout)."
                     )
+                # Per-group tokens_per_block after compression. The CPU/SSD block
+                # only stores ``tpb_g`` compressed tokens per group, matching the
+                # shrunk shape sglang allocates on the GPU for that group.
+                for gi, g in enumerate(self.layer_groups):
+                    if self.tokens_per_block % g.compress_ratio != 0:
+                        raise ValueError(
+                            f"KVCacheLayout: layer_groups[{gi}].compress_ratio="
+                            f"{g.compress_ratio} does not divide tokens_per_block="
+                            f"{self.tokens_per_block}. Choose a page_size that is a "
+                            f"multiple of every group's compress_ratio."
+                        )
                 bytes_per_block = self.tp_size * sum(
-                    g.num_layers * self.kv_dim * self.tokens_per_block *
+                    g.num_layers * self.kv_dim *
+                    (self.tokens_per_block // g.compress_ratio) *
                     g.num_kv_heads * g.head_size * g.dtype.itemsize
                     for g in self.layer_groups
                 )
@@ -206,9 +218,12 @@ class KVCacheLayout:
         Returns a list of dicts, one per group, each containing:
             - num_layers: number of layers in this group
             - offset_elements: element offset of this group within a block
-            - layer_stride: elements per layer (kv_dim * tpb * num_kv_heads * head_size)
-            - kv_stride: elements per KV half (tpb * num_kv_heads * head_size)
-            - chunk_size: elements per K or V chunk (tpb * num_kv_heads * head_size)
+            - layer_stride: elements per layer (kv_dim * tpb_g * num_kv_heads * head_size)
+            - kv_stride: elements per KV half (tpb_g * num_kv_heads * head_size)
+            - chunk_size: elements per K or V chunk (tpb_g * num_kv_heads * head_size)
+
+        ``tpb_g = tokens_per_block // g.compress_ratio`` — compressed groups
+        store only ``1/compress_ratio`` tokens per block in this group's region.
         """
         if self.layer_groups is None:
             raise ValueError("get_group_strides() requires layer_groups to be set")
@@ -218,8 +233,9 @@ class KVCacheLayout:
         result = []
         offset = 0
         for g in self.layer_groups:
-            chunk = self.tokens_per_block * g.num_kv_heads * g.head_size
-            kv_stride = chunk  # tpb * num_kv_heads * head_size
+            tpb_g = self.tokens_per_block // g.compress_ratio
+            chunk = tpb_g * g.num_kv_heads * g.head_size
+            kv_stride = chunk  # tpb_g * num_kv_heads * head_size
             layer_stride = self.kv_dim * kv_stride
             group_elements = g.num_layers * layer_stride
             result.append({

@@ -327,7 +327,12 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         offset_bytes = 0
         for gi, g in enumerate(layer_groups):
             dtype_size_g = g.dtype.itemsize
-            chunk_elements = tpb * g.num_kv_heads * g.head_size
+            # Compressed groups shrink the per-block token count by compress_ratio;
+            # the GPU tensor sglang allocates is already at the same shrunk shape,
+            # so chunk_elements (= bytes that travel for one (layer, K-or-V) on the
+            # CPU side per block) matches GPU exactly.
+            tpb_g = tpb // g.compress_ratio
+            chunk_elements = tpb_g * g.num_kv_heads * g.head_size
             chunk_size_bytes = chunk_elements * dtype_size_g
             layer_stride_bytes = kv_dim * chunk_size_bytes
             kv_stride_bytes = chunk_size_bytes

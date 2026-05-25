@@ -695,23 +695,40 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     nvtxRangePop();
   }
 
-  // NVTX ranges per original layer.
+  // Uncached layers (e.g. DSv4 layers 0/1/MTP with compress_ratio==0 at the
+  // model level) carry empty member lists and are skipped entirely — no
+  // kernels launched, no eventfd callback registered, no NVTX range opened.
+  // Sglang does not wait on their eventfds, so omitting the callback is safe.
+  std::vector<int> active_origs;
+  active_origs.reserve(num_original_layers_);
+  for (int orig = 0; orig < num_original_layers_; ++orig) {
+    if (!layer_members_[orig].empty()) {
+      active_origs.push_back(orig);
+    }
+  }
+
+  // NVTX ranges per original layer (one slot per orig so callbacks can index
+  // by orig regardless of how the active subset chains together).
   std::vector<nvtxRangeId_t> h2d_range_ids(num_original_layers_, 0);
   std::vector<std::string> h2d_range_names(num_original_layers_);
-  for (int orig = 0; orig < num_original_layers_; ++orig) {
+  for (int orig : active_origs) {
     char name[160];
     snprintf(name, sizeof(name), "CPU->GPU OrigLayer[%d] members=%zu", orig,
              layer_members_[orig].size());
     h2d_range_names[orig] = name;
   }
-  if (num_original_layers_ > 0) {
-    h2d_range_ids[0] = nvtxRangeStartA(h2d_range_names[0].c_str());
+  if (!active_origs.empty()) {
+    int first = active_origs.front();
+    h2d_range_ids[first] = nvtxRangeStartA(h2d_range_names[first].c_str());
   }
 
-  // Main loop: iterate by original layer. For each, fan out N members' transfer
-  // kernels (each on every GPU), then register a single eventfd callback that
-  // fires after members_this_layer * num_gpus_ GPU callbacks land.
-  for (int orig = 0; orig < num_original_layers_; ++orig) {
+  // Main loop: iterate the *active* original layers only. For each, fan out N
+  // members' transfer kernels (each on every GPU), then register a single
+  // eventfd callback that fires after members_this_layer * num_gpus_ GPU
+  // callbacks land. The "next" NVTX range chains to the next active orig, so
+  // gaps from uncached layers do not leave unclosed ranges.
+  for (size_t ai = 0; ai < active_origs.size(); ++ai) {
+    int orig = active_origs[ai];
     const auto &members = layer_members_[orig];
     int members_this_layer = static_cast<int>(members.size());
 
@@ -763,15 +780,16 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
       }
     }
 
-    bool is_last_orig = (orig == num_original_layers_ - 1);
+    bool is_last_active = (ai + 1 == active_origs.size());
+    int next_orig = is_last_active ? -1 : active_origs[ai + 1];
     const char *next_name =
-        is_last_orig ? nullptr : h2d_range_names[orig + 1].c_str();
+        is_last_active ? nullptr : h2d_range_names[next_orig].c_str();
     nvtxRangeId_t *next_id_ptr =
-        is_last_orig ? nullptr : &h2d_range_ids[orig + 1];
+        is_last_active ? nullptr : &h2d_range_ids[next_orig];
 
     layer_done_callback(/*start_layer=*/orig, /*layers_this_batch=*/1,
                         /*expected_count=*/members_this_layer * num_gpus_,
-                        &h2d_range_ids[orig], is_last_orig, next_name,
+                        &h2d_range_ids[orig], is_last_active, next_name,
                         next_id_ptr,
                         /*callbacks_per_gpu=*/members_this_layer);
   }
