@@ -14,6 +14,29 @@ from flexkv.common.debug import flexkv_logger
 
 
 @dataclass
+class SWAPoolConfig:
+    """Configuration for the SWA (Sliding Window Attention) pool.
+
+    SWA maintains a fixed-size ring buffer (window_size tokens) per request,
+    covering all SWA layers.  From FlexKV's perspective each SWA page is a
+    fixed-size blob that can be offloaded/restored independently.
+
+    Hit policy: TRAILING_PAGES — only the latest page must be present.
+    """
+    enabled: bool = False
+    window_size: int = 128                  # tokens in SWA ring buffer
+    bytes_per_token_per_layer: int = 584    # k_nope FP8(448) + k_rope BF16(128) + scale(8)
+    num_swa_layers: int = 61                # number of layers using SWA
+    num_slots: int = 1000                   # max SWA pages cached simultaneously
+    evict_ratio: float = 0.1                # fraction to evict when pool is full
+
+    @property
+    def page_size_bytes(self) -> int:
+        """Size of one SWA page in bytes."""
+        return self.window_size * self.bytes_per_token_per_layer * self.num_swa_layers
+
+
+@dataclass
 class IndexerCacheConfig:
     """Indexer-specific cache configuration, embedded inside CacheConfig."""
     # Indexer head layout
@@ -351,6 +374,9 @@ class CacheConfig:
 
     # Indexer configuration
     indexer: Optional[IndexerCacheConfig] = None
+
+    # SWA pool configuration
+    swa: Optional[SWAPoolConfig] = None
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000

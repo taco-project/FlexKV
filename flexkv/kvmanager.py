@@ -309,3 +309,135 @@ class KVManager:
             return
         else:
             self.kv_task_engine._clear_cpu_cache()
+
+    # ------------------------------------------------------------------
+    # SWA (Sliding Window Attention) Pool API
+    # ------------------------------------------------------------------
+
+    def swa_put(self,
+                token_ids: Union[torch.Tensor, np.ndarray],
+                swa_data: Union[torch.Tensor, np.ndarray],
+                ) -> bool:
+        """Offload an SWA page to the CPU cache.
+
+        Args:
+            token_ids: Full token sequence (used to derive endpoint hash for lookup key).
+            swa_data: Raw SWA ring-buffer bytes (uint8 tensor/array, shape=[page_size_bytes]).
+
+        Returns:
+            True if the page was successfully stored, False otherwise.
+        """
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+
+        if not hasattr(self, '_swa_engine'):
+            self._init_swa_pool()
+
+        if self._swa_engine is None:
+            return False
+
+        from flexkv.common.hash_utils import HashType
+        endpoint_hash = self._compute_swa_endpoint_hash(token_ids)
+        slot = self._swa_engine.allocate(endpoint_hash)
+        if slot is None:
+            return False
+
+        self._swa_storage.write_slot(slot, swa_data)
+        self._swa_engine.set_ready(endpoint_hash, True)
+        return True
+
+    def swa_get(self,
+                token_ids: Union[torch.Tensor, np.ndarray],
+                ) -> Optional[np.ndarray]:
+        """Restore an SWA page from the CPU cache.
+
+        Uses TRAILING_PAGES hit policy: matches by the endpoint hash
+        (hash of the last block in the token sequence).
+
+        Args:
+            token_ids: Full token sequence (used to derive endpoint hash).
+
+        Returns:
+            SWA page data as numpy array (uint8), or None if not cached.
+        """
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+
+        if not hasattr(self, '_swa_engine'):
+            self._init_swa_pool()
+
+        if self._swa_engine is None:
+            return None
+
+        endpoint_hash = self._compute_swa_endpoint_hash(token_ids)
+        result = self._swa_engine.match(endpoint_hash)
+        if not result.hit:
+            return None
+
+        data = self._swa_storage.read_slot(result.physical_block)
+        if isinstance(data, torch.Tensor):
+            return data.numpy()
+        return data
+
+    def swa_remove(self,
+                   token_ids: Union[torch.Tensor, np.ndarray],
+                   ) -> None:
+        """Explicitly remove an SWA page from the cache.
+
+        Args:
+            token_ids: Full token sequence (endpoint hash derived from this).
+        """
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+
+        if not hasattr(self, '_swa_engine') or self._swa_engine is None:
+            return
+
+        endpoint_hash = self._compute_swa_endpoint_hash(token_ids)
+        self._swa_engine.remove(endpoint_hash)
+
+    def _init_swa_pool(self) -> None:
+        """Lazily initialize the SWA pool from cache_config.swa."""
+        swa_cfg = self.cache_config.swa
+        if swa_cfg is None or not swa_cfg.enabled:
+            self._swa_engine = None
+            self._swa_storage = None
+            return
+
+        from flexkv.swa.swa_cache_engine import SWACacheEngine
+        from flexkv.swa.swa_storage import SWAStorage, SWAStorageConfig
+
+        self._swa_engine = SWACacheEngine(
+            num_slots=swa_cfg.num_slots,
+            evict_ratio=swa_cfg.evict_ratio,
+        )
+        self._swa_storage = SWAStorage(
+            SWAStorageConfig.from_pool_config(swa_cfg),
+            pin_memory=True,
+        )
+        flexkv_logger.info(
+            f"[KVManager] SWA pool initialized: "
+            f"num_slots={swa_cfg.num_slots}, "
+            f"page_size={swa_cfg.page_size_bytes} bytes "
+            f"({swa_cfg.window_size} tokens x {swa_cfg.num_swa_layers} layers)"
+        )
+
+    def _compute_swa_endpoint_hash(self, token_ids: np.ndarray):
+        """Compute endpoint hash for SWA lookup.
+
+        Uses the hash of the last tokens_per_block tokens as the key,
+        consistent with the main KV pool's RadixTree block hashing.
+        """
+        from flexkv.common.hash_utils import HashType, Hasher
+
+        tokens_per_block = self.cache_config.tokens_per_block
+        if len(token_ids) < tokens_per_block:
+            # Short sequence: hash whatever we have
+            h = Hasher.hash_tokens(token_ids)
+        else:
+            # Hash the last full block
+            last_block = token_ids[-(len(token_ids) % tokens_per_block or tokens_per_block):]
+            if len(last_block) == 0:
+                last_block = token_ids[-tokens_per_block:]
+            h = Hasher.hash_tokens(last_block)
+        return HashType(int(h))
