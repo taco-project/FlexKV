@@ -3,6 +3,7 @@ import json
 import yaml
 from dataclasses import dataclass, field, fields
 from enum import Enum
+from functools import cached_property
 from typing import Optional, List, Tuple, Union, Dict, Any
 from argparse import Namespace
 import copy
@@ -15,15 +16,114 @@ from flexkv.common.debug import flexkv_logger
 
 @dataclass
 class LayerGroupSpec:
-    """One group of layers sharing the same KV cache shape."""
+    """One group of layers sharing the same KV cache shape.
+
+    ``layer_indices[k]`` is the *original layer id* (index into the full
+    ``model_config.num_layers`` range) that this group's k-th local layer
+    (local_id = k) maps to.  Multiple groups MAY share the same original
+    layer id — this expresses heterogeneous KV at one transformer block
+    (e.g. DSv4: main KV bf16 and indexer uint8 both attached to the same
+    layer).
+
+    Invariants (enforced by ``ModelConfig._validate_layer_groups``):
+
+    * ``num_layers == len(layer_indices)``
+    * ``layer_indices`` has no internal duplicates
+    * every element of ``layer_indices`` is in ``[0, model_config.num_layers)``
+    * across all groups, the union of ``layer_indices`` covers every original
+      layer (``{0, ..., num_layers-1}``)
+    """
     num_layers: int
     num_kv_heads: int
     head_size: int
-    layer_indices: List[int]  # 0-based indices into the full layer list
+    layer_indices: List[int]
     sliding_window: Optional[int] = None  # Token count; None = full attention
     # Per-group storage dtype. None = inherit ModelConfig.dtype.
     # Indexer groups use a different dtype (e.g. fp8/uint8) than main KV (bf16).
     dtype: Optional[torch.dtype] = None
+
+
+@dataclass(frozen=True)
+class LayerMemberMap:
+    """CSR mapping from original layer id -> list of (group_idx, local_layer_id).
+
+    Three flat 1D arrays form a Compressed Sparse Row layout:
+
+    * ``offsets[i]`` is the start index of layer i's member range.
+    * ``offsets[i+1] - offsets[i]`` is the number of group members layer i has.
+    * ``group_idx[offsets[i] : offsets[i+1]]`` gives the group index for each
+      member (in ``model_config.layer_groups`` order, sorted ascending).
+    * ``local_id[offsets[i] : offsets[i+1]]`` gives the corresponding
+      ``local_layer_id`` within that group.
+
+    Examples:
+
+      Single group (uniform model): every layer has 1 member.
+        offsets   = [0, 1, 2, ..., N]
+        group_idx = [0, 0, ..., 0]
+        local_id  = [0, 1, ..., N-1]
+
+      DSv4 (main + indexer share every layer): every layer has 2 members.
+        offsets   = [0, 2, 4, ..., 2N]
+        group_idx = [0, 1, 0, 1, ...]   (main = 0, indexer = 1)
+        local_id  = [0, 0, 1, 1, ...]
+
+      Gemma3-style partition (sliding ↔ global alternating): each layer
+      belongs to exactly one group.
+        offsets   = [0, 1, 2, 3, ..., N]
+        group_idx = [0, 1, 0, 1, ...]   (no sharing, but partition)
+        local_id  = [0, 0, 1, 1, ...]
+    """
+    offsets: Tuple[int, ...]
+    group_idx: Tuple[int, ...]
+    local_id: Tuple[int, ...]
+
+    @property
+    def num_original_layers(self) -> int:
+        return len(self.offsets) - 1
+
+    @property
+    def total_members(self) -> int:
+        return len(self.group_idx)
+
+    def members_of(self, original_layer_id: int) -> List[Tuple[int, int]]:
+        """Return [(group_idx, local_id), ...] for one original layer."""
+        begin = self.offsets[original_layer_id]
+        end = self.offsets[original_layer_id + 1]
+        return [(self.group_idx[m], self.local_id[m]) for m in range(begin, end)]
+
+
+def build_layer_member_map(
+    layer_groups: List[LayerGroupSpec],
+    num_original_layers: int,
+) -> LayerMemberMap:
+    """Construct a ``LayerMemberMap`` from ``layer_groups``.
+
+    Members within one original layer are ordered by ascending ``group_idx``
+    (i.e., the order in which groups appear in ``model_config.layer_groups``).
+    By convention main KV should be group 0 so that on the stream it always
+    fires before any auxiliary group (e.g., indexer).
+    """
+    buckets: List[List[Tuple[int, int]]] = [[] for _ in range(num_original_layers)]
+    for gi, g in enumerate(layer_groups):
+        for local_id, orig in enumerate(g.layer_indices):
+            buckets[orig].append((gi, local_id))
+    for b in buckets:
+        b.sort(key=lambda x: x[0])
+
+    offsets: List[int] = [0]
+    group_idx: List[int] = []
+    local_id: List[int] = []
+    for orig in range(num_original_layers):
+        for gi, lid in buckets[orig]:
+            group_idx.append(gi)
+            local_id.append(lid)
+        offsets.append(len(group_idx))
+    return LayerMemberMap(
+        offsets=tuple(offsets),
+        group_idx=tuple(group_idx),
+        local_id=tuple(local_id),
+    )
 
 
 @dataclass
@@ -122,7 +222,66 @@ class ModelConfig:
                 f"[ModelConfig] instance_num must be >= 1, got {self.instance_num}"
             )
 
+        # ---- LayerGroup invariants ----
+        self._validate_layer_groups()
+
         object.__setattr__(self, '_frozen', True)
+
+    def _validate_layer_groups(self) -> None:
+        """Validate ``layer_groups`` against ``num_layers``.
+
+        No-op when ``layer_groups`` is None (uniform model). Enforces:
+
+        * ``g.num_layers == len(g.layer_indices)`` for every group.
+        * No internal duplicate ``layer_indices`` within one group.
+        * Every ``layer_indices`` entry lies in ``[0, num_layers)``.
+        * Union of all groups' ``layer_indices`` covers ``{0, ..., N-1}``
+          exactly once (every original layer is owned by at least one group).
+        """
+        if not self.layer_groups:
+            return
+        N = self.num_layers
+        seen: List[int] = []
+        for gi, g in enumerate(self.layer_groups):
+            if g.num_layers != len(g.layer_indices):
+                raise ValueError(
+                    f"[ModelConfig] layer_groups[{gi}].num_layers={g.num_layers} "
+                    f"does not match len(layer_indices)={len(g.layer_indices)}"
+                )
+            if len(set(g.layer_indices)) != len(g.layer_indices):
+                raise ValueError(
+                    f"[ModelConfig] layer_groups[{gi}].layer_indices has duplicates: "
+                    f"{g.layer_indices}"
+                )
+            for orig in g.layer_indices:
+                if not 0 <= orig < N:
+                    raise ValueError(
+                        f"[ModelConfig] layer_groups[{gi}] has out-of-range "
+                        f"layer index {orig} (must be in [0, {N}))"
+                    )
+            seen.extend(g.layer_indices)
+        union = set(seen)
+        expected = set(range(N))
+        if union != expected:
+            missing = sorted(expected - union)
+            raise ValueError(
+                f"[ModelConfig] layer_groups do not cover every original layer: "
+                f"missing original layer ids = {missing}"
+            )
+
+    @cached_property
+    def layer_member_map(self) -> Optional[LayerMemberMap]:
+        """CSR mapping from original layer id -> [(group_idx, local_id), ...].
+
+        Returns ``None`` when ``layer_groups`` is not set (uniform model — the
+        layerwise transfer path then uses the legacy single-group code path).
+        Computed once on first access and cached in ``__dict__`` via
+        ``functools.cached_property`` (write bypasses the frozen
+        ``__setattr__``).
+        """
+        if not self.layer_groups:
+            return None
+        return build_layer_member_map(self.layer_groups, self.num_layers)
 
     def __setattr__(self, name: str, value) -> None:
         if name == '_frozen':

@@ -1091,7 +1091,6 @@ def _mock_sglang_eventfd_client(socket_path: str,
     {'num_gpu_blocks': 256, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
 ], indirect=True)
 @pytest.mark.parametrize("gpu_layout_type", [0])
-@pytest.mark.skip(reason="layerwise+indexer not yet supported; to be re-enabled once layerwise worker is rewritten for unified LayerGroupSpec dispatch")
 def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_config, gpu_layout_type):
     """Test KVManager with indexer in LAYERWISE mode.
 
