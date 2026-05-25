@@ -663,33 +663,35 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   int64_t *cpu_block_ids =
       static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
 
-  // Step 0: SSD -> CPU for all layers in all groups, splitting per TP rank.
-  // Each (group, tp_rank) lands at offset = group_cpu_offset + rank *
-  // group_cpu_tp_stride.
+  // Step 0: SSD -> CPU. CPU and SSD share an identical per-block byte layout
+  // (multi-group BLOCKFIRST), so each block is transferred as one opaque blob.
+  // Collapses the prior num_groups * tp_size calls into a single call and
+  // removes the sub-4KiB IO hazard for groups with small per-chunk sizes
+  // (e.g., DSv4 indexer at compress_ratio=128). The kernel's slow path with
+  // num_layers=1, layer_stride=chunk_size=block_stride and is_mla=true issues
+  // exactly one pread/pwrite of block_stride bytes per block.
   if (enable_ssd_ && ssd_block_ids.numel() > 0) {
+    const int64_t block_stride = groups_[0].cpu_block_stride;
     char ssd_range_name[128];
     snprintf(ssd_range_name, sizeof(ssd_range_name),
-             "SSD->CPU MultiGroup OrigLayers[0,%d)", num_original_layers_);
+             "SSD->CPU MultiGroup Blocks (%lld blocks, %.2fMB each)",
+             static_cast<long long>(ssd_block_ids.numel()),
+             block_stride / (1024.0 * 1024.0));
     nvtxRangePushA(ssd_range_name);
 
-    for (size_t gi = 0; gi < groups_.size(); ++gi) {
-      const GroupParams &gp = groups_[gi];
-      torch::Tensor all_layer_ids = torch::arange(
-          0, gp.num_layers, torch::TensorOptions().dtype(torch::kInt32));
-      for (int tp_rank = 0; tp_rank < tp_size_; ++tp_rank) {
-        int64_t rank_offset_bytes = tp_rank * gp.cpu_tp_stride;
-        transfer_kv_blocks_ssd(
-            *ioctx_, all_layer_ids,
-            reinterpret_cast<int64_t>(cpu_blocks_) + gp.cpu_offset_bytes +
-                rank_offset_bytes,
-            ssd_block_ids, cpu_block_ids_d2h, gp.cpu_layer_stride,
-            gp.cpu_kv_stride, gp.ssd_layer_stride, gp.ssd_kv_stride,
-            gp.chunk_size, gp.cpu_block_stride,
-            true, // is_read
-            num_blocks_per_file, round_robin, num_threads_per_device, is_mla,
-            gp.ssd_offset_bytes + rank_offset_bytes);
-      }
-    }
+    torch::Tensor one_layer_id =
+        torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32));
+    transfer_kv_blocks_ssd(
+        *ioctx_, one_layer_id, reinterpret_cast<int64_t>(cpu_blocks_),
+        ssd_block_ids, cpu_block_ids_d2h,
+        /*cpu_layer_stride_in_bytes=*/block_stride,
+        /*cpu_kv_stride_in_bytes=*/0,
+        /*ssd_layer_stride_in_bytes=*/block_stride,
+        /*ssd_kv_stride_in_bytes=*/0,
+        /*chunk_size_in_bytes=*/block_stride,
+        /*block_stride_in_bytes=*/block_stride,
+        /*is_read=*/true, num_blocks_per_file, round_robin,
+        num_threads_per_device, /*is_mla=*/true, /*ssd_copy_offset=*/0);
     nvtxRangePop();
   }
 

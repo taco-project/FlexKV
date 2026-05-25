@@ -1044,52 +1044,19 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         layer_groups: List[LayerGroupSpec],
     ) -> None:
-        """Initialize per-group transfer parameters for CPU<->SSD with mixed KV shapes.
+        """Initialize CPU<->SSD multi-group parameters.
 
-        CPU/SSD buffer is byte-flat (uint8) in multi-group mode: each block has
-        size kv_shape[1] = bytes_per_block.  Per-group strides use
-        g.dtype.itemsize so groups with different element sizes (e.g. bf16 main
-        + uint8 indexer in DSv4) interleave correctly within a block.
+        CPU and SSD share an identical per-block byte layout (BLOCKFIRST),
+        so multi-group SSD transfers move whole blocks as opaque blobs —
+        no per-group / per-tp_rank slicing needed at the IO layer.
         """
-        kv_dim = 1 if self.is_mla else 2
-        tpb = cpu_kv_layout.tokens_per_block
-
         # Multi-group BLOCKFIRST: get_block_stride() returns bytes_per_block
         # directly (already accounts for tp_size and per-group dtype sizes).
         self.block_stride_in_bytes = cpu_kv_layout.get_block_stride()
 
-        # TP-aware: each CPU/SSD block holds data for all TP ranks.
-        # We must transfer each rank's data separately.
-        self.ssd_tp_size = cpu_kv_layout.tp_size
-        self.ssd_tp_stride_in_bytes = self.block_stride_in_bytes // self.ssd_tp_size
-
-        self.group_ssd_params: list = []
-        offset_bytes = 0
-
-        for g in layer_groups:
-            # Per-group dtype: indexer uses uint8 even when main KV is bf16/fp16.
-            dtype_size_g = g.dtype.itemsize
-            chunk_elements = tpb * g.num_kv_heads * g.head_size
-            layer_stride_bytes = kv_dim * chunk_elements * dtype_size_g
-            kv_stride_bytes = chunk_elements * dtype_size_g
-
-            self.group_ssd_params.append({
-                'num_layers': g.num_layers,
-                'cpu_offset_bytes': offset_bytes,
-                'ssd_offset_bytes': offset_bytes,  # same layout for CPU and SSD
-                'cpu_layer_stride': layer_stride_bytes,
-                'cpu_kv_stride': kv_stride_bytes,
-                'ssd_layer_stride': layer_stride_bytes,
-                'ssd_kv_stride': kv_stride_bytes,
-                'chunk_size': chunk_elements * dtype_size_g,
-            })
-
-            offset_bytes += g.num_layers * layer_stride_bytes
-
         flexkv_logger.info(
             f"CPUSSDDiskTransferWorker multi-group initialized: {len(layer_groups)} groups, "
-            f"block_stride={self.block_stride_in_bytes} bytes, "
-            f"tp_size={self.ssd_tp_size}, tp_stride={self.ssd_tp_stride_in_bytes} bytes"
+            f"block_stride={self.block_stride_in_bytes} bytes"
         )
 
     def _transfer_impl(
@@ -1116,31 +1083,32 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         cpu_base_ptr = self.cpu_layer_ptrs[0].item()
 
         if self.has_multi_group:
-            for gp in self.group_ssd_params:
-                layer_id_list = torch.arange(0, gp['num_layers'], dtype=torch.int32)
-                # Each CPU/SSD block holds data for all TP ranks.
-                # Transfer each rank's data with the appropriate offset.
-                for tp_rank in range(self.ssd_tp_size):
-                    rank_offset = tp_rank * self.ssd_tp_stride_in_bytes
-                    transfer_kv_blocks_ssd(
-                        ioctx=self.ioctx,
-                        cpu_layer_id_list=layer_id_list,
-                        cpu_tensor_ptr=cpu_base_ptr + gp['cpu_offset_bytes'] + rank_offset,
-                        ssd_block_ids=ssd_block_id_list,
-                        cpu_block_ids=cpu_block_id_list,
-                        cpu_layer_stride_in_bytes=gp['cpu_layer_stride'],
-                        cpu_kv_stride_in_bytes=gp['cpu_kv_stride'],
-                        ssd_layer_stride_in_bytes=gp['ssd_layer_stride'],
-                        ssd_kv_stride_in_bytes=gp['ssd_kv_stride'],
-                        chunk_size_in_bytes=gp['chunk_size'],
-                        block_stride_in_bytes=self.block_stride_in_bytes,
-                        is_read=is_read,
-                        num_blocks_per_file=self.num_blocks_per_file,
-                        round_robin=self.round_robin,
-                        num_threads_per_device=32,
-                        is_mla=self.is_mla,
-                        ssd_copy_offset=gp['ssd_offset_bytes'] + rank_offset,
-                    )
+            # CPU and SSD share an identical per-block byte layout in multi-group
+            # mode, so each block can be transferred as one opaque blob — no
+            # per-group / per-tp_rank loop needed. num_layers=1,
+            # layer_stride=chunk_size=block_stride, is_mla=True (skip V) make
+            # the kernel issue exactly one pread/pwrite of block_stride bytes
+            # per block, sidestepping the sub-4KiB chunk hazard for highly
+            # compressed groups (e.g. DSv4 indexer at compress_ratio=128).
+            one_layer_id = torch.tensor([0], dtype=torch.int32)
+            transfer_kv_blocks_ssd(
+                ioctx=self.ioctx,
+                cpu_layer_id_list=one_layer_id,
+                cpu_tensor_ptr=cpu_base_ptr,
+                ssd_block_ids=ssd_block_id_list,
+                cpu_block_ids=cpu_block_id_list,
+                cpu_layer_stride_in_bytes=self.block_stride_in_bytes,
+                cpu_kv_stride_in_bytes=0,
+                ssd_layer_stride_in_bytes=self.block_stride_in_bytes,
+                ssd_kv_stride_in_bytes=0,
+                chunk_size_in_bytes=self.block_stride_in_bytes,
+                block_stride_in_bytes=self.block_stride_in_bytes,
+                is_read=is_read,
+                num_blocks_per_file=self.num_blocks_per_file,
+                round_robin=self.round_robin,
+                num_threads_per_device=32,
+                is_mla=True,
+            )
         else:
             layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
 
