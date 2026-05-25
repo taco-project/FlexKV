@@ -335,10 +335,9 @@ class KVTaskManager:
                     operation = "put"
                 else:
                     operation = "unknown"
-                metrics_collector.record_transfer_completed(
+                metrics_collector.record_transfer(
                     completed_op.transfer_type,
                     completed_op.num_blocks,
-                    completed_op.num_bytes,
                     operation,
                 )
             if completed_op.is_graph_completed():
