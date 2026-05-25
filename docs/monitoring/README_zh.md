@@ -39,7 +39,6 @@ Python 指标由 `GlobalCacheEngine` 在 `cache_engine.py` 中记录，通过 `F
 | `flexkv_py_cache_miss_blocks_total` | Counter | - | 缓存未命中的 blocks 总数（所有层级均未命中） |
 | `flexkv_py_transfer_blocks_total` | Counter | `transfer_type`, `operation` | 传输的 blocks 总数 |
 | `flexkv_py_transfer_ops_total` | Counter | `transfer_type`, `operation` | 传输操作次数 |
-| `flexkv_py_transfer_bytes_total` | Counter | `transfer_type`, `operation` | 传输字节总数 |
 | `flexkv_py_mempool_total_blocks` | Gauge | `device` | 内存池总 blocks |
 | `flexkv_py_mempool_free_blocks` | Gauge | `device` | 内存池空闲 blocks |
 | `flexkv_py_evicted_blocks_total` | Counter | `device` | 驱逐的 blocks 总数 |
@@ -54,6 +53,8 @@ C++ 指标由 `MetricsManager` 单例管理，主要在 RadixTree 缓存操作�
 
 | 指标名称 | 类型 | 标签 | 描述 |
 |---|---|---|---|
+| `flexkv_cpp_transfer_ops_total` | Counter | `type`, `direction` | C++ 层数据传输操作次数 |
+| `flexkv_cpp_transfer_bytes_total` | Counter | `type`, `direction` | C++ 层数据传输字节总数 |
 | `flexkv_cpp_cache_ops_total` | Counter | `operation` | RadixTree 缓存操作次数 |
 | `flexkv_cpp_cache_blocks_total` | Counter | `operation` | RadixTree 缓存操作涉及的 blocks 数 |
 
@@ -127,12 +128,11 @@ curl -s http://localhost:8081/metrics | grep flexkv_cpp_
 
 **预置仪表板包含以下典型面板：**
 
-| 分区 | 面板 | 说明 |
-|---|---|---|
-| Python Runtime Metrics | Cache Hit/Miss Rate | 缓存命中/未命中速率 |
-| Python Runtime Metrics | Memory Pool Blocks | 内存池块数统计 |
-| Python Runtime Metrics | Transfer Throughput | 数据传输吞吐量 |
-| C++ Runtime Metrics | Cache Operations Rate | 缓存操作速率 |
-| C++ Runtime Metrics | Cache Blocks Rate | 缓存块操作速率 |
+| 面板 | 说明 |
+|---|---|
+| Cache Hit/Miss Rate | Python 层缓存命中/未命中速率 |
+| Memory Pool Blocks | Python 层内存池块数统计 |
+| C++ Cache Operations Rate | C++ 层缓存操作速率 |
+| C++ Transfer Throughput | C++ 层数据传输吞吐量 |
 
 > 用户可以按需创建自定义面板并添加和配置 PromQL 查询语句。

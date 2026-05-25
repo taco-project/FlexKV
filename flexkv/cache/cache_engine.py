@@ -614,6 +614,7 @@ class GlobalCacheEngine:
 
         # Record metrics for GET operation
         if self._metrics_collector is not None:
+            self._record_transfer_ops(transfer_graph, "get")
             self._update_mempool_metrics()
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
@@ -851,6 +852,10 @@ class GlobalCacheEngine:
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
 
+
+        # DEBUG: Log GET operation with hash info
+        #if len(sequence_meta.block_hashes) > 0:
+        #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
 
         # tailor the blocks to assure:
         # the blocks are needed by the mask & the blocks are ready
@@ -1111,8 +1116,9 @@ class GlobalCacheEngine:
                                               node_to_ready=op_node_to_ready[op_id][1],
                                               ready_length=op_node_to_ready[op_id][2])
 
-        # Update mempool metrics after PUT operation
+        # Record metrics for PUT operation
         if self._metrics_collector is not None:
+            self._record_transfer_ops(transfer_graph, "put")
             self._update_mempool_metrics()
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id

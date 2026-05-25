@@ -626,7 +626,7 @@ def parse_args():
 
     # Cross-node sync params
     parser.add_argument("--rebuild-interval-ms", type=int, default=None,
-                        help="Override FLEXKV_REBUILD_INTERVAL_MS (default: use env or 2000). "
+                        help="Override FLEXKV_REBUILD_INTERVAL_MS (default: use env or 100). "
                              "Recommended: 20 for cross-node benchmarks")
 
     return parser.parse_args()
