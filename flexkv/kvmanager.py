@@ -315,3 +315,112 @@ class KVManager:
             return
         else:
             self.kv_task_engine._clear_cpu_cache()
+
+    # ===== SWA (Sliding Window Attention) Integration =====
+
+    def _get_swa_connector(self):
+        """Lazily create SWAConnector if SWA is configured."""
+        if hasattr(self, '_swa_connector'):
+            return self._swa_connector
+
+        if self.cache_config.swa is None or not self.cache_config.swa.enabled:
+            self._swa_connector = None
+            return None
+
+        from flexkv.swa.swa_connector import SWAConnector
+        from flexkv.swa.swa_radix_manager import SWARadixManager
+
+        swa_manager = SWARadixManager(
+            config=self.cache_config.swa,
+            tokens_per_block=self.cache_config.tokens_per_block,
+        )
+
+        # Get the radix tree index from the cache engine
+        radix_tree = self.kv_task_engine.cache_engine.cpu_cache_engine.tree_index
+
+        self._swa_connector = SWAConnector(
+            swa_manager=swa_manager,
+            radix_tree=radix_tree,
+        )
+        flexkv_logger.info(
+            f"[KVManager] SWA connector initialized: "
+            f"num_slots={self.cache_config.swa.num_slots}, "
+            f"window_size={self.cache_config.swa.window_size}"
+        )
+        return self._swa_connector
+
+    def swa_put(self,
+                token_ids: Union[torch.Tensor, np.ndarray],
+                swa_data: Union[torch.Tensor, np.ndarray, bytes]) -> bool:
+        """Store SWA data when request finishes (write-through).
+
+        Only available in direct mode (non-server_client_mode).
+
+        Args:
+            token_ids: Full token sequence for the completed request.
+            swa_data: SWA snapshot data to store.
+
+        Returns:
+            True if stored successfully, False otherwise.
+        """
+        if self.server_client_mode:
+            flexkv_logger.warning("swa_put is not supported in server_client_mode")
+            return False
+
+        connector = self._get_swa_connector()
+        if connector is None:
+            return False
+
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+
+        return connector.store_swa(token_ids, swa_data)
+
+    def swa_get(self,
+                token_ids: Union[torch.Tensor, np.ndarray]) -> Optional[Union[torch.Tensor, np.ndarray]]:
+        """Get SWA data for prefix match hit. Returns data or None.
+
+        Only available in direct mode (non-server_client_mode).
+
+        Args:
+            token_ids: Token prefix that was matched.
+
+        Returns:
+            SWA data buffer or None if not available.
+        """
+        if self.server_client_mode:
+            flexkv_logger.warning("swa_get is not supported in server_client_mode")
+            return None
+
+        connector = self._get_swa_connector()
+        if connector is None:
+            return None
+
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+
+        return connector.load_swa(token_ids)
+
+    def swa_available(self,
+                      token_ids: Union[torch.Tensor, np.ndarray]) -> bool:
+        """Check if SWA is available for given token_ids.
+
+        Only available in direct mode (non-server_client_mode).
+
+        Args:
+            token_ids: Token prefix to check.
+
+        Returns:
+            True if SWA data is available for the trailing window.
+        """
+        if self.server_client_mode:
+            return False
+
+        connector = self._get_swa_connector()
+        if connector is None:
+            return False
+
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+
+        return connector.check_swa(token_ids)
