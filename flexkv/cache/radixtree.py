@@ -57,6 +57,15 @@ class RadixNode:
     parent: Optional['RadixNode'] = None
     children: Dict[Optional[HashType], 'RadixNode'] = field(default_factory=dict)
 
+    # ===== SWA (Sliding Window Attention) fields =====
+    swa_tombstone: bool = True              # True = no SWA data available (default)
+    swa_host_slot: Optional[int] = None     # CPU SWA Host Pool slot id (None = no backup)
+    swa_lock_ref: int = 0                   # SWA lock reference count
+    swa_last_access_time: float = 0.0       # SWA LRU timestamp
+    # Intrusive LRU list pointers (managed by SWAPoolLRU)
+    _swa_lru_prev: Optional['RadixNode'] = field(default=None, repr=False, compare=False)
+    _swa_lru_next: Optional['RadixNode'] = field(default=None, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         assert self.block_hashes.ndim == 1
         assert self.physical_blocks.ndim == 1
@@ -101,9 +110,16 @@ class RadixNode:
             hit_count=self.hit_count,
             creation_time=self.creation_time,
             last_access_time=self.last_access_time,
+            # SWA: inherit tombstone status, release host slot (strategy B)
+            swa_tombstone=self.swa_tombstone,
+            swa_host_slot=None,  # split invalidates stored data
+            swa_lock_ref=self.swa_lock_ref,
+            swa_last_access_time=self.swa_last_access_time,
         )
         self.block_hashes = self.block_hashes[prefix_length:]
         self.physical_blocks = self.physical_blocks[prefix_length:]
+        # SWA: invalidate host slot on original node since data range changed
+        self.swa_host_slot = None
 
         self.parent.children[new_node.head_hash()] = new_node
         new_node.parent = self.parent

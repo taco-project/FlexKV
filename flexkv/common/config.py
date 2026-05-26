@@ -499,6 +499,31 @@ class RankInfo:
         )
 
 @dataclass
+class SWAPoolConfig:
+    """Configuration for SWA (Sliding Window Attention) CPU host pool."""
+    enabled: bool = False
+    num_slots: int = 1024              # Number of CPU pool slots
+    window_size: int = 128             # SWA sliding window size in tokens
+    num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
+    bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
+    evict_ratio: float = 0.1           # Fraction of pool to evict when full
+    pin_memory: bool = True            # Use pinned memory for async DMA
+
+    @property
+    def slot_size_bytes(self) -> int:
+        """Total bytes per slot = window_size * layers * bytes_per_token_per_layer."""
+        return self.window_size * self.num_swa_layers * self.bytes_per_token_per_layer
+
+    @property
+    def total_size_bytes(self) -> int:
+        return self.num_slots * self.slot_size_bytes
+
+    @property
+    def total_size_gb(self) -> float:
+        return self.total_size_bytes / (1024 ** 3)
+
+
+@dataclass
 class CacheConfig:
     tokens_per_block: int = 16
     eviction_policy: str = "lru"
@@ -563,6 +588,9 @@ class CacheConfig:
     # Stored for deferred recomputation when layer_groups become known
     _user_cpu_cache_gb: float = 0
     _user_ssd_cache_gb: float = 0
+
+    # SWA pool config (DeepSeek V4)
+    swa: Optional['SWAPoolConfig'] = None
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
