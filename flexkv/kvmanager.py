@@ -318,8 +318,30 @@ class KVManager:
 
     # ===== SWA (Sliding Window Attention) Integration =====
 
+    def _get_swa_production_manager(self):
+        """Lazily create SWAProductionManager if SWA is configured (production C++ path)."""
+        if hasattr(self, '_swa_prod_manager'):
+            return self._swa_prod_manager
+
+        if self.cache_config.swa is None or not self.cache_config.swa.enabled:
+            self._swa_prod_manager = None
+            return None
+
+        from flexkv.swa.swa_production_manager import SWAProductionManager
+
+        self._swa_prod_manager = SWAProductionManager(
+            config=self.cache_config.swa,
+            tokens_per_block=self.cache_config.tokens_per_block,
+        )
+        flexkv_logger.info(
+            f"[KVManager] SWA production manager initialized: "
+            f"num_slots={self.cache_config.swa.num_slots}, "
+            f"window_size={self.cache_config.swa.window_size}"
+        )
+        return self._swa_prod_manager
+
     def _get_swa_connector(self):
-        """Lazily create SWAConnector if SWA is configured."""
+        """Lazily create SWAConnector if SWA is configured (Python radix tree path)."""
         if hasattr(self, '_swa_connector'):
             return self._swa_connector
 
@@ -351,14 +373,19 @@ class KVManager:
 
     def swa_put(self,
                 token_ids: Union[torch.Tensor, np.ndarray],
-                swa_data: Union[torch.Tensor, np.ndarray, bytes]) -> bool:
+                swa_data: Union[torch.Tensor, np.ndarray, bytes],
+                physical_block_ids: Optional[np.ndarray] = None) -> bool:
         """Store SWA data when request finishes (write-through).
 
-        Only available in direct mode (non-server_client_mode).
+        Tries the production manager first (for C++ radix tree path).
+        Falls back to the Python SWAConnector path if production manager
+        is not available.
 
         Args:
             token_ids: Full token sequence for the completed request.
             swa_data: SWA snapshot data to store.
+            physical_block_ids: Optional physical block IDs from the radix tree
+                insert (used for cascade eviction tracking in production path).
 
         Returns:
             True if stored successfully, False otherwise.
@@ -367,12 +394,18 @@ class KVManager:
             flexkv_logger.warning("swa_put is not supported in server_client_mode")
             return False
 
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+
+        # Try production manager first
+        prod_mgr = self._get_swa_production_manager()
+        if prod_mgr is not None:
+            return prod_mgr.put(token_ids, swa_data, physical_block_ids=physical_block_ids)
+
+        # Fallback to Python connector path
         connector = self._get_swa_connector()
         if connector is None:
             return False
-
-        if isinstance(token_ids, torch.Tensor):
-            token_ids = token_ids.numpy()
 
         return connector.store_swa(token_ids, swa_data)
 
@@ -380,7 +413,9 @@ class KVManager:
                 token_ids: Union[torch.Tensor, np.ndarray]) -> Optional[Union[torch.Tensor, np.ndarray]]:
         """Get SWA data for prefix match hit. Returns data or None.
 
-        Only available in direct mode (non-server_client_mode).
+        Tries the production manager first (for C++ radix tree path).
+        Falls back to the Python SWAConnector path if production manager
+        is not available.
 
         Args:
             token_ids: Token prefix that was matched.
@@ -392,12 +427,18 @@ class KVManager:
             flexkv_logger.warning("swa_get is not supported in server_client_mode")
             return None
 
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+
+        # Try production manager first
+        prod_mgr = self._get_swa_production_manager()
+        if prod_mgr is not None:
+            return prod_mgr.get(token_ids)
+
+        # Fallback to Python connector path
         connector = self._get_swa_connector()
         if connector is None:
             return None
-
-        if isinstance(token_ids, torch.Tensor):
-            token_ids = token_ids.numpy()
 
         return connector.load_swa(token_ids)
 
@@ -405,7 +446,9 @@ class KVManager:
                       token_ids: Union[torch.Tensor, np.ndarray]) -> bool:
         """Check if SWA is available for given token_ids.
 
-        Only available in direct mode (non-server_client_mode).
+        Tries the production manager first (for C++ radix tree path).
+        Falls back to the Python SWAConnector path if production manager
+        is not available.
 
         Args:
             token_ids: Token prefix to check.
@@ -416,11 +459,17 @@ class KVManager:
         if self.server_client_mode:
             return False
 
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+
+        # Try production manager first
+        prod_mgr = self._get_swa_production_manager()
+        if prod_mgr is not None:
+            return prod_mgr.has(token_ids)
+
+        # Fallback to Python connector path
         connector = self._get_swa_connector()
         if connector is None:
             return False
-
-        if isinstance(token_ids, torch.Tensor):
-            token_ids = token_ids.numpy()
 
         return connector.check_swa(token_ids)

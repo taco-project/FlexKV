@@ -12,7 +12,7 @@ from flexkv.cache.redis_meta import RedisMetaChannel as _PyRedisMetaChannel
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.block import SequenceMeta
 #if TYPE_CHECKING:
-from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.config import CacheConfig, SWAPoolConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import DeviceType
 from flexkv.common.type import MatchResultAccel
 
@@ -98,6 +98,25 @@ class HierarchyLRCacheEngine:
         self._stats_local_matched_tokens = 0       # total tokens matched in FlexKV local
         self._stats_distributed_matched_tokens = 0 # total tokens matched in FlexKV global (distributed reuse)
         self._stats_match_count = 0                # match_all call count
+
+        # SWA (Sliding Window Attention) production manager — initialized via init_swa()
+        self.swa_manager = None
+
+    def init_swa(self, swa_config: "SWAPoolConfig") -> None:
+        """Initialize the production SWA manager for this cache engine.
+
+        Should be called after construction when SWA is enabled.
+        The SWA manager uses endpoint hashing to track SWA data independently
+        of the C++ radix tree node objects.
+
+        Args:
+            swa_config: SWA pool configuration.
+        """
+        from flexkv.swa.swa_production_manager import SWAProductionManager
+        self.swa_manager = SWAProductionManager(
+            config=swa_config,
+            tokens_per_block=self.tokens_per_block,
+        )
 
     def start(self) -> None:
         if self._meta is None:
@@ -425,6 +444,10 @@ class HierarchyLRCacheEngine:
                     target_blocks.resize_(num_evicted)
                 evicted_np = target_blocks.numpy()
                 self.mempool.recycle_blocks(evicted_np)
+
+                # Notify SWA manager about evicted blocks (cascade eviction)
+                if self.swa_manager is not None and num_evicted > 0:
+                    self.swa_manager.on_blocks_evicted(evicted_np)
             
             if protected_node is not None:
                 self.local_index.unlock(protected_node)
