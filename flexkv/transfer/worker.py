@@ -246,6 +246,7 @@ class TransferWorkerBase(ABC):
 
     def run(self) -> None:
         """main loop for worker process"""
+        should_shutdown = False
         while True:
             try:
                 if self.transfer_conn.poll(timeout=0.0001):  # check if data available
@@ -262,6 +263,7 @@ class TransferWorkerBase(ABC):
                     while self.transfer_conn.poll(timeout=0):
                         op = self.transfer_conn.recv()
                         if op is None:
+                            should_shutdown = True
                             break
                         batch_ops.append(op)
                     for op in batch_ops:
@@ -279,6 +281,13 @@ class TransferWorkerBase(ABC):
                         if transfer_status:
                             ## only put the op when transfer success
                             self.finished_ops_queue.put(op.transfer_op_id)
+                    if should_shutdown:
+                        if hasattr(self, "shutdown") and callable(self.shutdown):
+                            try:
+                                self.shutdown()
+                            except Exception as e:
+                                flexkv_logger.error(f"Error when shut down worker: {e}")
+                        break
                 else:
                     continue
             except EOFError:
