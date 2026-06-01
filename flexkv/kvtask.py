@@ -405,6 +405,7 @@ class KVTaskManager:
         graph_ids = self.cache_engine.slot_mapping_to_block_ids(slot_mapping,
                                                                 self.cache_config.tokens_per_block)
         task.graph.set_gpu_blocks(graph_ids)
+        task.slot_mapping = slot_mapping
         task.status = TaskStatus.READY
 
     def _gen_task_id(self) -> int:
