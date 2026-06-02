@@ -158,7 +158,7 @@ class CacheEngineAccel:
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
-             strict: bool = True) -> torch.Tensor:
+             strict: bool = True) -> np.ndarray:
         # Calculate current utilization
         utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
         
