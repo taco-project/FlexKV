@@ -267,6 +267,13 @@ class ModelConfig:
     def __setattr__(self, name: str, value) -> None:
         if name == '_frozen':
             return object.__setattr__(self, name, value)
+        # ``layer_groups`` is a derived field that is sometimes discovered late
+        # (e.g. DeepSeek V4 sub-pool layout is only known once SGLang has built
+        # the GPU KV pools, which happens after FlexKVConfig.from_env()/post_init
+        # have already called freeze()). Allow late assignment of this field
+        # specifically so multi-group registration paths work.
+        if name == 'layer_groups':
+            return object.__setattr__(self, name, value)
         if getattr(self, '_frozen', False):
             raise AttributeError(
                 f"ModelConfig is frozen — cannot set '{name}'. "

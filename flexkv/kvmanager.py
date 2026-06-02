@@ -43,6 +43,12 @@ class KVManager:
         self.model_config = model_config
         self.cache_config = cache_config
 
+        # Multi-instance identifiers: read from env-driven globals.
+        # ``instance_id`` is per-process (set via FLEXKV_INSTANCE_ID); ``instance_num``
+        # comes from the model config (FLEXKV_INSTANCE_NUM is mirrored there at parse time).
+        self.instance_id = GLOBAL_CONFIG_FROM_ENV.instance_id
+        self.instance_num = model_config.instance_num
+
         if server_recv_port != "":
             self.server_recv_port = server_recv_port
         else:
@@ -390,10 +396,9 @@ class KVManager:
         Returns:
             True if stored successfully, False otherwise.
         """
-        if self.server_client_mode:
-            flexkv_logger.warning("swa_put is not supported in server_client_mode")
-            return False
-
+        # SWA pool is process-local (lives on every rank's leader connector).
+        # It does NOT need to go through dp_client/server. We can run the
+        # production SWAManager locally even in server_client_mode.
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
 
@@ -423,10 +428,7 @@ class KVManager:
         Returns:
             SWA data buffer or None if not available.
         """
-        if self.server_client_mode:
-            flexkv_logger.warning("swa_get is not supported in server_client_mode")
-            return None
-
+        # SWA pool is process-local (lives on every rank's leader connector).
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
 
@@ -456,9 +458,7 @@ class KVManager:
         Returns:
             True if SWA data is available for the trailing window.
         """
-        if self.server_client_mode:
-            return False
-
+        # SWA pool is process-local (lives on every rank's leader connector).
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
 

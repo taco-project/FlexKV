@@ -116,9 +116,16 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
         # ``num_layers`` is the *original* layer count for this PP stage —
         # the framework's per-layer eventfd index space. Same field is used
-        # in both single-group and multi-group modes; in multi-group it
-        # equals ``cpu_kv_layout.num_layer`` (== num_layers_per_pp_stage).
-        self.num_layers = gpu_kv_layouts[0].num_layer
+        # in both single-group and multi-group modes.  In multi-group mode
+        # ``cpu_kv_layout.num_layer`` is the authoritative full-stage count
+        # (set by storage_engine to ``num_layers_per_pp_stage``); per-group
+        # ``gpu_kv_layouts[gi].num_layer`` is the GROUP's layer count (subset
+        # of full stage), so we must NOT use it as the original-layer index
+        # space — that would make ``layer_indices`` go out of range.
+        if layer_groups is not None:
+            self.num_layers = cpu_kv_layout.num_layer
+        else:
+            self.num_layers = gpu_kv_layouts[0].num_layer
 
         self.has_multi_group = (
             layer_groups is not None
