@@ -121,8 +121,15 @@ class HierarchyLRCacheEngine:
                 self.nid_to_file_nodeids = self._meta.load_pcfs_file_nodeids()
             except Exception:
                 raise ValueError("Failed to load PCFS file nodeids from Redis")
-        self.local_index.start(self.local_ch)
-        self.remote_index.start(self.remote_ch)
+        if not self.local_index.start(self.local_ch):
+            raise RuntimeError(
+                f"Failed to start local radix tree for device type: {self.device_type}"
+            )
+        if not self.remote_index.start(self.remote_ch):
+            self.local_index.stop()
+            raise RuntimeError(
+                f"Failed to start distributed radix tree for device type: {self.device_type}"
+            )
 
     def stop(self) -> None:
         self.local_index.stop()
@@ -565,4 +572,3 @@ class HierarchyLRCacheEngine:
                 meta=meta,
             )
             raise ValueError("Invalid device type: {cache_config.device_type}")
-
