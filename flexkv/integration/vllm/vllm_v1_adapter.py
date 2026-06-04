@@ -251,6 +251,7 @@ class FlexKVSchedulerConnector:
         if not self._need_to_get(num_prompt_tokens=request.num_tokens,
                                    num_computed_tokens=num_computed_tokens,
                                    num_new_matched_tokens=num_new_matched_tokens):
+            self.flexkv_manager.cancel(task_ids=[task_id])
             return 0, False
 
         return num_new_matched_tokens, True
@@ -448,6 +449,7 @@ class FlexKVSchedulerConnector:
         if not self._need_to_put(num_all_tokens=request.num_tokens,
                                 num_matched_tokens=num_matched_tokens,
                                 num_unmatched_tokens=num_unmatched_tokens):
+            self.flexkv_manager.cancel(task_ids=[task_id])
             return False
 
         # prepare to launch task
