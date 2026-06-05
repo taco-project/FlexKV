@@ -59,7 +59,9 @@ class SWAHostPool:
     def write(self, slot_id: int, data: Union['torch.Tensor', np.ndarray, bytes]) -> None:
         """Write SWA data into a slot."""
         if isinstance(data, bytes):
-            arr = np.frombuffer(data, dtype=np.uint8)
+            # np.frombuffer on bytes yields a read-only array; copy so the
+            # resulting tensor is writable and torch.from_numpy stays quiet.
+            arr = np.frombuffer(data, dtype=np.uint8).copy()
         elif _TORCH_AVAILABLE and isinstance(data, torch.Tensor):
             arr = data.detach().cpu().view(-1).to(torch.uint8)
         else:
