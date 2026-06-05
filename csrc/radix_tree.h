@@ -46,6 +46,16 @@ private:
   int hit_count;
   int leaf_vector_index = -1;
 
+  // ===== SWA (Sliding Window Attention) fields =====
+  // SWA snapshot state attached to this node. Mirrors the Python RadixNode
+  // fields (see flexkv/cache/radixtree.py). swa_host_slot uses -1 as the
+  // "no slot" sentinel (Python uses None). Invariant: SWA is a subset of full,
+  // i.e. a node may have full KV without SWA (tombstone), but never the reverse.
+  int swa_host_slot = -1;          // CPU SWA host pool slot id (-1 = no backup)
+  bool swa_tombstone = true;       // true = no SWA data available (default)
+  int swa_lock_ref = 0;            // SWA lock reference count
+  uint64_t swa_last_access_time = 0; // SWA LRU timestamp
+
   std::deque<int64_t> block_hashes;
   std::deque<int64_t> physical_blocks;
   std::unordered_map<HashType, CRadixNode *> children;
@@ -112,6 +122,28 @@ public:
   void set_leaf_vector_index(int index) { leaf_vector_index = index; }
 
   int get_leaf_vector_index() { return leaf_vector_index; }
+
+  // ===== SWA accessors =====
+  int get_swa_host_slot() { return swa_host_slot; }
+
+  void set_swa_host_slot(int slot) { swa_host_slot = slot; }
+
+  bool get_swa_tombstone() { return swa_tombstone; }
+
+  void set_swa_tombstone(bool tombstone) { swa_tombstone = tombstone; }
+
+  int get_swa_lock_ref() { return swa_lock_ref; }
+
+  void inc_swa_lock_ref() { swa_lock_ref++; }
+
+  void dec_swa_lock_ref() {
+    assert(swa_lock_ref > 0);
+    swa_lock_ref--;
+  }
+
+  void set_swa_last_access_time(uint64_t time) { swa_last_access_time = time; }
+
+  uint64_t get_swa_last_access_time() { return swa_last_access_time; }
 
   void update_time(int hit_reward_seconds) {
     struct timeval now;
@@ -254,6 +286,12 @@ protected:
   int hit_reward_seconds;
   EvictionPolicy eviction_policy;
 
+  // SWA slots that were freed because their node was deleted/invalidated by a
+  // structural change (split / merge / evict). The Python side drains this and
+  // returns the slots to the SWA host pool, enforcing the SWA-subset-of-full
+  // invariant (full evicted => SWA slot must be released).
+  std::vector<int> freed_swa_slots;
+
 public:
   CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000,
                   int hit_reward_seconds = 0,
@@ -363,6 +401,25 @@ public:
   void inc_node_count() { node_count++; }
 
   void dec_node_count() { node_count--; }
+
+  // If the node holds a SWA host-pool slot, record it for release and clear the
+  // node's SWA state. Called from any path that deletes or invalidates a node
+  // (split / merge / evict) so the slot is never leaked.
+  void record_freed_swa_slot(CRadixNode *node) {
+    int slot = node->get_swa_host_slot();
+    if (slot != -1) {
+      freed_swa_slots.push_back(slot);
+      node->set_swa_host_slot(-1);
+      node->set_swa_tombstone(true);
+    }
+  }
+
+  // Drain and return all SWA slots freed since the last call.
+  std::vector<int> drain_freed_swa_slots() {
+    std::vector<int> out;
+    out.swap(freed_swa_slots);
+    return out;
+  }
 
   virtual void set_ready(CRadixNode *node, bool ready = true,
                          int ready_length = -1) {

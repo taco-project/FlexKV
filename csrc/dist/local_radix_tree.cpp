@@ -571,6 +571,9 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
         done++;
       }
       delete blocks;
+      // SWA: node survives but its trailing range shrank, so any snapshot on it
+      // no longer covers the full range. Release the slot.
+      record_freed_swa_slot(node);
     } else {
       auto parent = node->get_parent();
       auto &blocks = node->get_physical_blocks();
@@ -593,6 +596,8 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
         evicted_blocks_ptr[has_evicted + done] = *it;
         done++;
       }
+      // SWA: node is being deleted; release its slot if any so it is not leaked.
+      record_freed_swa_slot(node);
       remove_leaf(node);
       remove_node(node);
     }

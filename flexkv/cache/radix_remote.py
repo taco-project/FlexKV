@@ -261,6 +261,15 @@ class LocalRadixTree:
             raise RuntimeError("LocalRadixTree must be started before calling insert_and_publish")
         return bool(self._c.insert_and_publish(node))
 
+    def drain_freed_swa_slots(self) -> List[int]:
+        """Drain SWA host-pool slots freed by structural changes (split/merge/evict).
+
+        Returns the list of slot ids whose owning node was deleted or invalidated
+        since the last call. The caller (SWA manager) returns them to the host
+        pool, enforcing the "SWA subset of full" invariant.
+        """
+        return list(self._c.drain_freed_swa_slots())
+
     def drain_pending_queues(self) -> int:
         return int(self._c.drain_pending_queues())
 

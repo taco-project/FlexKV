@@ -660,7 +660,9 @@ PYBIND11_MODULE(c_ext, m) {
       .def("match_prefix", &flexkv::CRadixTreeIndex::match_prefix,
            py::arg("block_hashes"), py::arg("num_blocks"),
            py::arg("update_cache_info"),
-           py::call_guard<py::gil_scoped_release>());
+           py::call_guard<py::gil_scoped_release>())
+      .def("drain_freed_swa_slots",
+           &flexkv::CRadixTreeIndex::drain_freed_swa_slots);
 
   py::class_<flexkv::CRadixNode>(m, "CRadixNode")
       .def(py::init<flexkv::CRadixTreeIndex *, bool, int>())
@@ -668,7 +670,16 @@ PYBIND11_MODULE(c_ext, m) {
       .def("size", &flexkv::CRadixNode::size)
       .def("has_block_node_ids", &flexkv::CRadixNode::has_block_node_ids)
       .def_property_readonly("parent", &flexkv::CRadixNode::get_parent,
-                             py::return_value_policy::reference);
+                             py::return_value_policy::reference)
+      // ===== SWA accessors (node-attached SWA state) =====
+      .def_property("swa_host_slot", &flexkv::CRadixNode::get_swa_host_slot,
+                    &flexkv::CRadixNode::set_swa_host_slot)
+      .def_property("swa_tombstone", &flexkv::CRadixNode::get_swa_tombstone,
+                    &flexkv::CRadixNode::set_swa_tombstone)
+      .def_property_readonly("swa_lock_ref",
+                             &flexkv::CRadixNode::get_swa_lock_ref)
+      .def("inc_swa_lock_ref", &flexkv::CRadixNode::inc_swa_lock_ref)
+      .def("dec_swa_lock_ref", &flexkv::CRadixNode::dec_swa_lock_ref);
 
   py::class_<flexkv::CMatchResult, std::shared_ptr<flexkv::CMatchResult>>(
       m, "CMatchResult")

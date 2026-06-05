@@ -80,19 +80,10 @@ def _compute_block_hashes(token_ids: np.ndarray, tokens_per_block: int) -> np.nd
     return hashes
 
 
-def _insert_sequence(radix_tree, token_ids, tokens_per_block):
-    """Insert a token sequence into the radix tree and return the leaf node.
-
-    Uses direct hash computation (no c_ext/SequenceMeta dependency).
-    """
-    if isinstance(token_ids, torch.Tensor):
-        token_ids = token_ids.numpy()
-    token_ids = np.asarray(token_ids, dtype=np.int64)
-
+def _fake_seq(token_ids, tokens_per_block):
+    """A minimal SequenceMeta-like object hashed with the local sha256 scheme."""
     block_hashes = _compute_block_hashes(token_ids, tokens_per_block)
-    num_blocks = len(block_hashes)
 
-    # Create a minimal SequenceMeta-like object for match_prefix
     class _FakeSeq:
         def __init__(self, hashes, tpb):
             self.block_hashes = hashes
@@ -106,7 +97,45 @@ def _insert_sequence(radix_tree, token_ids, tokens_per_block):
                 return HashType(int(self.block_hashes[idx]))
             return HashType(0)
 
-    seq = _FakeSeq(block_hashes, tokens_per_block)
+    return _FakeSeq(block_hashes, tokens_per_block)
+
+
+def _make_seq(token_ids, tokens_per_block):
+    """Build a sequence object hashed the SAME way as SWAConnector._find_leaf_node.
+
+    When c_ext is real, the connector hashes via SequenceMeta (xxhash), so the
+    tree must be populated with SequenceMeta too — otherwise lookup-by-token-ids
+    inserts under one hash and searches under another and never matches. When
+    c_ext is mocked (this file run in isolation), SequenceMeta yields degenerate
+    hashes, so we use the local sha256 scheme on both sides instead.
+
+    We branch on _c_ext_is_real rather than try/except: a half-active MagicMock
+    makes SequenceMeta.gen_hashes() succeed silently with garbage hashes (all
+    zero → colliding nodes), which try/except cannot detect.
+
+    Running the whole suite imports the real c_ext (this file's mock then
+    no-ops), which is why insert and lookup must agree on hashing dynamically.
+    """
+    if _c_ext_is_real:
+        from flexkv.common.block import SequenceMeta
+        seq = SequenceMeta(token_ids=token_ids, tokens_per_block=tokens_per_block)
+        seq.gen_hashes()
+        return seq
+    return _fake_seq(token_ids, tokens_per_block)
+
+
+def _insert_sequence(radix_tree, token_ids, tokens_per_block):
+    """Insert a token sequence into the radix tree and return the leaf node.
+
+    Hashing matches SWAConnector._find_leaf_node (see _make_seq) so store-then-
+    lookup-by-token-ids resolves the same node.
+    """
+    if isinstance(token_ids, torch.Tensor):
+        token_ids = token_ids.numpy()
+    token_ids = np.asarray(token_ids, dtype=np.int64)
+
+    seq = _make_seq(token_ids, tokens_per_block)
+    num_blocks = seq.num_blocks
 
     # Match existing prefix
     match_result = radix_tree.match_prefix(seq, update_cache_info=False)
@@ -265,21 +294,7 @@ class TestSWAConnectorPrefixMatch:
         # New request: first 8 tokens match (shares prefix)
         # The match should find the stored node
         new_tokens = np.array([1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 99, 99], dtype=np.int64)
-        block_hashes = _compute_block_hashes(new_tokens, tokens_per_block)
-
-        class _FakeSeq:
-            def __init__(self, hashes, tpb):
-                self.block_hashes = hashes
-                self.num_blocks = len(hashes)
-                self.tokens_per_block = tpb
-            def gen_hashes(self):
-                pass
-            def get_hash(self, idx):
-                if idx < len(self.block_hashes):
-                    return HashType(int(self.block_hashes[idx]))
-                return HashType(0)
-
-        seq = _FakeSeq(block_hashes, tokens_per_block)
+        seq = _make_seq(new_tokens, tokens_per_block)
         match_result = radix_tree.match_prefix(seq)
 
         # Should match at least 2 blocks (8 tokens)
@@ -429,21 +444,7 @@ class TestSWAEndToEndFlow:
         req2_tokens = np.array([1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 22, 23], dtype=np.int64)
 
         # 2a. Prefix match (simulates get_match)
-        block_hashes_2 = _compute_block_hashes(req2_tokens, tokens_per_block)
-
-        class _FakeSeq2:
-            def __init__(self, hashes, tpb):
-                self.block_hashes = hashes
-                self.num_blocks = len(hashes)
-                self.tokens_per_block = tpb
-            def gen_hashes(self):
-                pass
-            def get_hash(self, idx):
-                if idx < len(self.block_hashes):
-                    return HashType(int(self.block_hashes[idx]))
-                return HashType(0)
-
-        seq2 = _FakeSeq2(block_hashes_2, tokens_per_block)
+        seq2 = _make_seq(req2_tokens, tokens_per_block)
         match = radix_tree.match_prefix(seq2)
 
         # Should match first 2 blocks (8 tokens)

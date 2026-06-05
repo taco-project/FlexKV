@@ -163,6 +163,11 @@ CRadixNode *CRadixNode::split(int prefix_length) {
   new_node->set_child(get_head_hash(), this);
 
   set_parent(new_node);
+
+  // SWA: the snapshot stored on the original node covered the full pre-split
+  // range, which no longer exists. Free it (if any) and leave both halves as
+  // tombstones. new_node defaults to tombstone=true / slot=-1.
+  index->record_freed_swa_slot(this);
   return new_node;
 }
 
@@ -194,6 +199,12 @@ void CRadixNode::merge_child() {
     }
   }
   children.clear();
+
+  // SWA: the merged child disappears; release its slot if any. The parent (this)
+  // keeps its own SWA state, but since its block range grew, any snapshot on it
+  // no longer covers the full range either — free it too to stay conservative.
+  index->record_freed_swa_slot(child);
+  index->record_freed_swa_slot(this);
 
   child->clear_parent();
   index->remove_leaf(child);
@@ -354,6 +365,9 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted
       }
       delete blocks;
       delete block_hashes;
+      // SWA: node survives but its trailing range was removed, so any snapshot
+      // on it no longer covers the full range. Release the slot.
+      record_freed_swa_slot(node);
     } else {
       auto parent = node->get_parent();
       auto &blocks = node->get_physical_blocks();
@@ -376,6 +390,9 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted
           candidate.push(parent);
         }
       }
+
+      // SWA: node is being deleted; release its slot if any so it is not leaked.
+      record_freed_swa_slot(node);
 
       node->clear_parent();
       remove_leaf(node);
