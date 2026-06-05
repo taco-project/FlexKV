@@ -28,7 +28,12 @@ except ImportError:
     transfer_kv_blocks_gds = None
     TPGDSTransferThreadGroup = None
 
-from flexkv.common.debug import flexkv_logger
+from flexkv.common.debug import (
+    flexkv_logger,
+    format_process_exit,
+    install_worker_crash_diagnostics,
+    summarize_id_tensor,
+)
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
@@ -173,8 +178,18 @@ class TransferWorkerBase(ABC):
                         op_buffer_tensor: torch.Tensor, ready_event: Any, *args: Any, **kwargs: Any) -> None:
         # Note: MPI initialization prevention is handled by create_safe_process
         # Environment variables are set before this function is called
+        install_worker_crash_diagnostics(cls.__name__, worker_id)
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] worker process boot: "
+            f"class={cls.__name__}, worker_id={worker_id}, pid={os.getpid()}"
+        )
         worker = cls(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs)
         ready_event.set()
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] worker ready: "
+            f"class={cls.__name__}, worker_id={worker_id}, pid={os.getpid()}, "
+            f"gpu_capacity={worker._gpu_capacity_hint()}"
+        )
         worker.run()
 
     @abstractmethod
@@ -235,6 +250,52 @@ class TransferWorkerBase(ABC):
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         pass
 
+    def _gpu_capacity_hint(self) -> str:
+        parts: List[str] = []
+        if hasattr(self, "gpu_block_type_"):
+            parts.append(f"block_type={self.gpu_block_type_}")
+        if hasattr(self, "num_gpus"):
+            parts.append(f"num_gpus={self.num_gpus}")
+        if hasattr(self, "gpu_blocks") and self.gpu_blocks:
+            blocks = self.gpu_blocks
+            if isinstance(blocks[0], list):
+                for gi, gpu_tensors in enumerate(blocks[:2]):
+                    if gpu_tensors and hasattr(gpu_tensors[0], "shape"):
+                        parts.append(f"gpu{gi}_layer0_shape={tuple(gpu_tensors[0].shape)}")
+                        parts.append(f"gpu{gi}_num_layers={len(gpu_tensors)}")
+            elif hasattr(blocks[0], "shape"):
+                parts.append(f"gpu_layer0_shape={tuple(blocks[0].shape)}")
+                parts.append(f"num_layers={len(blocks)}")
+        if getattr(self, "group_transfer_params", None):
+            parts.append(f"num_groups={len(self.group_transfer_params)}")
+        if getattr(self, "tp_group_transfer_groups", None):
+            parts.append(f"tp_num_groups={len(self.tp_group_transfer_groups)}")
+        if hasattr(self, "use_ce_transfer_d2h"):
+            parts.append(f"ce_d2h={self.use_ce_transfer_d2h}")
+        if hasattr(self, "transfer_num_cta_d2h"):
+            parts.append(f"d2h_cta={self.transfer_num_cta_d2h}")
+        return ", ".join(parts) if parts else "unknown"
+
+    def _log_incoming_worker_op(self, transfer_op: WorkerTransferOp) -> None:
+        try:
+            src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op, pinned=False)
+            flexkv_logger.info(
+                "[FlexKV-SEGV-DEBUG] worker recv op: "
+                f"class={type(self).__name__}, worker_id={self.worker_id}, pid={os.getpid()}, "
+                f"op_id={transfer_op.transfer_op_id}, graph_id={transfer_op.transfer_graph_id}, "
+                f"type={transfer_op.transfer_type.name}, valid_block_num={transfer_op.valid_block_num}, "
+                f"src_slot={transfer_op.src_slot_id}, dst_slot={transfer_op.dst_slot_id}, "
+                f"{summarize_id_tensor('src', src_block_ids)}, "
+                f"{summarize_id_tensor('dst', dst_block_ids)}, "
+                f"gpu_capacity={self._gpu_capacity_hint()}"
+            )
+        except Exception as e:
+            flexkv_logger.warning(
+                "[FlexKV-SEGV-DEBUG] worker recv op log failed: "
+                f"class={type(self).__name__}, worker_id={self.worker_id}, "
+                f"op_id={transfer_op.transfer_op_id}, err={e}"
+            )
+
     def run(self) -> None:
         """main loop for worker process"""
         while True:
@@ -257,26 +318,58 @@ class TransferWorkerBase(ABC):
                         batch_ops.append(op)
                     for op in batch_ops:
                         transfer_status = False
+                        if isinstance(op, WorkerTransferOp):
+                            self._log_incoming_worker_op(op)
+                        else:
+                            flexkv_logger.info(
+                                "[FlexKV-SEGV-DEBUG] worker recv layerwise op: "
+                                f"class={type(self).__name__}, worker_id={self.worker_id}, "
+                                f"pid={os.getpid()}, op_id={op.transfer_op_id}, "
+                                f"graph_id={op.transfer_graph_id}"
+                            )
                         try:
                             nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
                                                 f"graph_id: {op.transfer_graph_id}",
                                                 color=get_nvtx_range_color(op.transfer_graph_id))
                             transfer_status = self.launch_transfer(op)
                             nvtx.pop_range()
+                            if transfer_status:
+                                flexkv_logger.info(
+                                    "[FlexKV-SEGV-DEBUG] worker op done: "
+                                    f"class={type(self).__name__}, worker_id={self.worker_id}, "
+                                    f"pid={os.getpid()}, op_id={op.transfer_op_id}, "
+                                    f"type={op.transfer_type.name}"
+                                )
                         except Exception as e:
-                            flexkv_logger.error(f"Error launching transfer: {e}\n"
-                                        f"Failed transfer op: {op}")
+                            flexkv_logger.error(
+                                "[FlexKV-SEGV-DEBUG] worker launch_transfer raised: "
+                                f"class={type(self).__name__}, worker_id={self.worker_id}, "
+                                f"pid={os.getpid()}, op_id={op.transfer_op_id}, "
+                                f"type={op.transfer_type.name}, err={e}",
+                                exc_info=True,
+                            )
                         if transfer_status:
                             ## only put the op when transfer success
                             self.finished_ops_queue.put(op.transfer_op_id)
                 else:
                     continue
             except EOFError:
-                # Connection closed
+                flexkv_logger.error(
+                    "[FlexKV-SEGV-DEBUG] worker run loop EOF: "
+                    f"worker_id={self.worker_id}, pid={os.getpid()}"
+                )
                 break
             except Exception as e:
-                flexkv_logger.error(f"Error in worker run loop: {e}")
+                flexkv_logger.error(
+                    f"Error in worker run loop: worker_id={self.worker_id}, "
+                    f"pid={os.getpid()}, err={e}",
+                    exc_info=True,
+                )
                 continue
+        flexkv_logger.error(
+            "[FlexKV-SEGV-DEBUG] worker run loop exiting: "
+            f"worker_id={self.worker_id}, pid={os.getpid()}"
+        )
 
 class WorkerHandle:
     """handle for worker process"""
@@ -286,12 +379,33 @@ class WorkerHandle:
         self.process = process
         self.ready_event = ready_event
 
+    def status_str(self) -> str:
+        return (
+            f"worker_id={self.worker_id}, pid={self.process.pid}, "
+            f"alive={self.process.is_alive()}, "
+            f"exitcode={format_process_exit(self.process.exitcode)}"
+        )
+
     def submit_transfer(self, op: Union[TransferOp, LayerwiseTransferOp]) -> None:
         if isinstance(op, LayerwiseTransferOp):
             worker_op = WorkerLayerwiseTransferOp(op)
         else:
             worker_op = WorkerTransferOp(op)
-        self.transfer_conn.send(worker_op)
+        if not self.process.is_alive():
+            flexkv_logger.error(
+                "[FlexKV-SEGV-DEBUG] submit_transfer to dead worker: "
+                f"{self.status_str()}, op_id={op.op_id}, transfer_type={op.transfer_type.name}"
+            )
+        try:
+            self.transfer_conn.send(worker_op)
+        except (BrokenPipeError, OSError) as e:
+            self.process.join(timeout=0.2)
+            flexkv_logger.error(
+                "[FlexKV-SEGV-DEBUG] submit_transfer broken pipe: "
+                f"{self.status_str()}, op_id={op.op_id}, "
+                f"transfer_type={op.transfer_type.name}, err={e!r}"
+            )
+            raise
 
     def shutdown(self) -> None:
         try:
@@ -549,6 +663,15 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 g_gpu_blocks = gpu_block_id_list
                 g_cpu_blocks = cpu_block_id_list
 
+                flexkv_logger.info(
+                    "[FlexKV-SEGV-DEBUG] GPUCPUTransferWorker group xfer: "
+                    f"worker_id={self.worker_id}, pid={os.getpid()}, "
+                    f"type={transfer_type.name}, group={gi}/{len(self.group_transfer_params)}, "
+                    f"{summarize_id_tensor('gpu', g_gpu_blocks)}, "
+                    f"{summarize_id_tensor('cpu', g_cpu_blocks)}, "
+                    f"num_layers={gp['num_layers']}, window_blocks={gp.get('window_blocks')}"
+                )
+
                 # SWA optimization: disabled — stale GPU blocks cause
                 # attention corruption when HMA is off.  Re-enable once
                 # HMA works with FlexKV or zero-fill is added.
@@ -608,6 +731,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             color="purple")
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] GPUCPUTransferWorker before xfer: "
+            f"worker_id={self.worker_id}, pid={os.getpid()}, "
+            f"op_id={transfer_op.transfer_op_id}, type={transfer_op.transfer_type.name}, "
+            f"{summarize_id_tensor('src', src_block_ids)}, "
+            f"{summarize_id_tensor('dst', dst_block_ids)}"
+        )
 
         with torch.cuda.stream(self.transfer_stream):
             start_time = time.time()
@@ -616,7 +746,15 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 dst_block_ids,
                 transfer_op.transfer_type,
             )
+            if transfer_op.transfer_type == TransferType.D2H:
+                torch.cuda.synchronize()
             end_time = time.time()
+            flexkv_logger.info(
+                "[FlexKV-SEGV-DEBUG] GPUCPUTransferWorker after xfer: "
+                f"worker_id={self.worker_id}, pid={os.getpid()}, "
+                f"op_id={transfer_op.transfer_op_id}, type={transfer_op.transfer_type.name}, "
+                f"elapsed={end_time - start_time:.4f}s"
+            )
 
             if self.group_transfer_params is not None:
                 transfer_size = 0
@@ -928,6 +1066,16 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 g_gpu = gpu_block_id_list
                 g_cpu = cpu_block_id_list
 
+                flexkv_logger.info(
+                    "[FlexKV-SEGV-DEBUG] tpGPUCPUTransferWorker group xfer: "
+                    f"worker_id={self.worker_id}, pid={os.getpid()}, "
+                    f"type={transfer_type.name}, group={gi}/{len(self.tp_group_transfer_groups)}, "
+                    f"{summarize_id_tensor('gpu', g_gpu)}, "
+                    f"{summarize_id_tensor('cpu', g_cpu)}, "
+                    f"num_layers={gp['num_layers']}, window_blocks={gp.get('window_blocks')}, "
+                    f"ce={use_ce_transfer}, cta={transfer_num_cta}"
+                )
+
                 # SWA optimization: disabled — stale GPU blocks cause
                 # attention corruption when HMA is off.
 
@@ -964,6 +1112,15 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] tpGPUCPUTransferWorker before xfer: "
+            f"worker_id={self.worker_id}, pid={os.getpid()}, "
+            f"op_id={transfer_op.transfer_op_id}, type={transfer_op.transfer_type.name}, "
+            f"num_gpus={self.num_gpus}, tp_group_size={self.tp_group_size}, "
+            f"{summarize_id_tensor('src', src_block_ids)}, "
+            f"{summarize_id_tensor('dst', dst_block_ids)}, "
+            f"gpu_capacity={self._gpu_capacity_hint()}"
+        )
 
         start_time = time.time()
         self._transfer_impl(
@@ -971,7 +1128,15 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             dst_block_ids,
             transfer_op.transfer_type,
         )
+        if transfer_op.transfer_type == TransferType.D2H:
+            torch.cuda.synchronize()
         end_time = time.time()
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] tpGPUCPUTransferWorker after xfer: "
+            f"worker_id={self.worker_id}, pid={os.getpid()}, "
+            f"op_id={transfer_op.transfer_op_id}, type={transfer_op.transfer_type.name}, "
+            f"elapsed={end_time - start_time:.4f}s"
+        )
 
         if self.tp_group_transfer_groups is not None:
             transfer_size = 0

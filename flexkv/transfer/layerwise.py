@@ -9,7 +9,10 @@ from typing import List, Any, Dict, Union, Optional, Tuple
 import torch
 
 from flexkv.c_ext import LayerwiseTransferGroup
-from flexkv.common.debug import flexkv_logger
+from flexkv.common.debug import (
+    flexkv_logger,
+    summarize_id_tensor,
+)
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.config import (
@@ -397,6 +400,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             f"block_stride={cpu_block_stride}, tp_stride={cpu_tp_stride}"
         )
 
+        self.gpu_blocks_per_group_tensors = gpu_blocks_per_group_tensors
+
         flexkv_logger.debug("[LayerwiseWorker] Creating LayerwiseTransferGroup (multi-group)...")
         self.layerwise_transfer_group = LayerwiseTransferGroup(
             num_gpus=self.num_gpus,
@@ -634,6 +639,25 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             counter_id,
         )
 
+    def _layerwise_gpu_capacity_hint(self) -> str:
+        if self.has_multi_group:
+            try:
+                first_tensor = self.gpu_blocks_per_group_tensors[0][0][0]
+                return (
+                    f"multi_group_layers={len(self.layer_groups)}, "
+                    f"first_layer_shape={tuple(first_tensor.shape)}"
+                )
+            except Exception as e:
+                return f"multi_group_capacity_unavailable ({e})"
+        try:
+            first_tensor = self.gpu_blocks[0][0]
+            return (
+                f"single_group_layers={self.num_layers}, "
+                f"first_layer_shape={tuple(first_tensor.shape)}"
+            )
+        except Exception as e:
+            return f"single_group_capacity_unavailable ({e})"
+
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
         src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
         dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
@@ -646,16 +670,38 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             dst_block_ids_disk2h = None
 
         num_h2d_blocks = len(src_block_ids_h2d)
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] LAYERWISE before transfer "
+            f"op_id={transfer_op.transfer_op_id}, graph_id={transfer_op.transfer_graph_id}, "
+            f"worker_id={self.worker_id}, pid={os.getpid()}, counter_id={transfer_op.counter_id}, "
+            f"num_h2d_blocks={num_h2d_blocks}, "
+            f"{summarize_id_tensor('src_h2d', src_block_ids_h2d)}, "
+            f"{summarize_id_tensor('dst_h2d', dst_block_ids_h2d)}, "
+            f"gpu_capacity={self._layerwise_gpu_capacity_hint()}"
+        )
 
         start_time = time.time()
-        self._transfer_impl(
-            src_block_ids_h2d,
-            dst_block_ids_h2d,
-            src_block_ids_disk2h,
-            dst_block_ids_disk2h,
-            transfer_op.counter_id,
-        )
+        try:
+            self._transfer_impl(
+                src_block_ids_h2d,
+                dst_block_ids_h2d,
+                src_block_ids_disk2h,
+                dst_block_ids_disk2h,
+                transfer_op.counter_id,
+            )
+        except Exception as e:
+            flexkv_logger.error(
+                "[FlexKV-SEGV-DEBUG] LAYERWISE transfer raised in worker "
+                f"op_id={transfer_op.transfer_op_id}, pid={os.getpid()}: {e}",
+                exc_info=True,
+            )
+            raise
         end_time = time.time()
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] LAYERWISE after transfer "
+            f"op_id={transfer_op.transfer_op_id}, pid={os.getpid()}, "
+            f"elapsed={end_time - start_time:.4f}s"
+        )
 
         if self.has_multi_group:
             # Multi-group: full block byte size already accounts for tp_size and all groups

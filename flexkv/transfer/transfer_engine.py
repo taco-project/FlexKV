@@ -25,7 +25,7 @@ import nvtx
 import numpy as np
 import torch
 
-from flexkv.common.debug import flexkv_logger
+from flexkv.common.debug import flexkv_logger, summarize_id_tensor
 from flexkv.common.storage import StorageHandle
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp, WorkerKey
 from flexkv.common.transfer import get_nvtx_range_color
@@ -524,14 +524,20 @@ class TransferEngine:
         # Wait for all main KV workers to ready
         for transfer_type, worker in self._worker_map.items():
             if isinstance(worker, dict):
-                for w in worker.values():
+                for wk, w in worker.items():
                     flexkv_logger.debug(f"waiting for {transfer_type.name} worker {w.worker_id} to ready")
                     w.ready_event.wait()
-                    flexkv_logger.debug(f"{transfer_type.name} worker {w.worker_id} is ready")
+                    flexkv_logger.info(
+                        "[FlexKV-SEGV-DEBUG] worker spawned: "
+                        f"transfer_type={transfer_type.name}, worker_key={wk}, {w.status_str()}"
+                    )
             else:
                 flexkv_logger.debug(f"waiting for {transfer_type.name} worker {worker.worker_id} to ready")
                 worker.ready_event.wait()
-                flexkv_logger.debug(f"{transfer_type.name} worker {worker.worker_id} is ready")
+                flexkv_logger.info(
+                    "[FlexKV-SEGV-DEBUG] worker spawned: "
+                    f"transfer_type={transfer_type.name}, {worker.status_str()}"
+                )
         # Startup assertions: verify layerwise mode worker map consistency
         if _enable_layerwise:
             assert TransferType.H2D not in self._worker_map, \
@@ -660,6 +666,7 @@ class TransferEngine:
                 nvtx.end_range(nvtx_r3)
 
             except Exception as e:
+                self._log_all_workers_status(f"scheduler_loop:{type(e).__name__}")
                 flexkv_logger.error(
                     f"Error in scheduler loop: {type(e).__name__}: {e!r} "
                     f"| op_id_to_op keys={list(self.op_id_to_op.keys())[:16]} "
@@ -762,6 +769,26 @@ class TransferEngine:
                 f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
                 f"worker_key={wk}, pending_count={op.pending_count}")
 
+    def _log_all_workers_status(self, context: str) -> None:
+        for transfer_type, worker_entry in self._worker_map.items():
+            if isinstance(worker_entry, dict):
+                for worker_key, handle in worker_entry.items():
+                    handle.process.join(timeout=0)
+                    level = flexkv_logger.error if not handle.process.is_alive() else flexkv_logger.info
+                    level(
+                        "[FlexKV-SEGV-DEBUG] worker registry "
+                        f"({context}): transfer_type={transfer_type.name}, "
+                        f"worker_key={worker_key}, {handle.status_str()}"
+                    )
+            else:
+                worker_entry.process.join(timeout=0)
+                level = flexkv_logger.error if not worker_entry.process.is_alive() else flexkv_logger.info
+                level(
+                    "[FlexKV-SEGV-DEBUG] worker registry "
+                    f"({context}): transfer_type={transfer_type.name}, "
+                    f"{worker_entry.status_str()}"
+                )
+
     def _assign_op_to_worker(self, op: TransferOp) -> None:
         """Assign operation to appropriate worker."""
         if op.transfer_type == TransferType.VIRTUAL:
@@ -770,6 +797,13 @@ class TransferEngine:
             raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
 
         if op.transfer_type == TransferType.LAYERWISE:
+            if hasattr(op, "dst_block_ids_h2d"):
+                flexkv_logger.info(
+                    "[FlexKV-SEGV-DEBUG] schedule LAYERWISE parent op "
+                    f"op_id={op.op_id}, graph_id={op.graph_id}, "
+                    f"num_h2d_blocks={len(op.dst_block_ids_h2d)}, "
+                    f"{summarize_id_tensor('dst_h2d', op.dst_block_ids_h2d)}"
+                )
             self._assign_layerwise_op_to_workers(op)
             return
 
@@ -790,6 +824,15 @@ class TransferEngine:
                     dst_block_ids=op.dst_block_ids.copy(),
                     dp_client_id=op.dp_client_id,
                 )
+                if op.transfer_type in (TransferType.D2H, TransferType.H2D):
+                    flexkv_logger.info(
+                        "[FlexKV-SEGV-DEBUG] schedule MAIN_KV op "
+                        f"type={op.transfer_type.name}, parent_op_id={op.op_id}, "
+                        f"replica_op_id={replica.op_id}, graph_id={op.graph_id}, "
+                        f"worker_key={wk}, worker={worker[wk].status_str()}, "
+                        f"{summarize_id_tensor('src', replica.src_block_ids)}, "
+                        f"{summarize_id_tensor('dst', replica.dst_block_ids)}"
+                    )
                 register_op_to_buffer(replica, self.pin_buffer)
                 self._child_id_to_child[replica.op_id] = replica
                 self._child_to_parent_op_id[replica.op_id] = op.op_id
