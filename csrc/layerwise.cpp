@@ -696,11 +696,41 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   }
 
   // Uncached layers (e.g. DSv4 layers 0/1/MTP with compress_ratio==0 at the
-  // model level) carry empty member lists and are skipped entirely — no
-  // kernels launched, no eventfd callback registered, no NVTX range opened.
-  // Sglang does not wait on their eventfds, so omitting the callback is safe.
+  // model level) carry empty member lists: no data to transfer, so no kernels
+  // are launched, no eventfd callback is registered, and no NVTX range opened.
+  //
+  // HOWEVER, the model's forward still waits per-layer on these eventfds for
+  // any path that reads a per-layer buffer regardless of compress_ratio. In
+  // particular DSv4-Flash's SWA reload path calls
+  // ``get_swa_key_buffer_radix(layer_id) -> wait_layer_transfer(layer_id) ->
+  // eventfd_read`` for EVERY layer (the SWA pool spans all layers, including
+  // the ratio==0 dense layers). If we never post the skipped layers' eventfds,
+  // the consumer blocks forever -> scheduler watchdog timeout. So we post a
+  // "no-op satisfied" signal (the same value 2 the real callback writes) for
+  // every skipped layer immediately: they have no in-flight transfer, so the
+  // data they cover (none) is trivially "ready". Done before the active-layer
+  // loop launches kernels so the consumer can never observe an unposted gap.
   std::vector<int> active_origs;
   active_origs.reserve(num_original_layers_);
+  if (enable_eventfd_ && num_counters_ > 0 && !layer_eventfds_.empty()) {
+    int offset = current_counter_id_ * tp_size_ * num_layers_;
+    int *eventfds_ptr = layer_eventfds_.data() + offset;
+    for (int orig = 0; orig < num_original_layers_; ++orig) {
+      if (!layer_members_[orig].empty()) {
+        continue;
+      }
+      for (int tp_rank = 0; tp_rank < tp_size_; ++tp_rank) {
+        int fd = eventfds_ptr[tp_rank * num_layers_ + orig];
+        if (fd >= 0) {
+          // Match layer_done_host_callback: write 2 to satisfy both
+          // get_key_buffer and get_value_buffer waits for this layer.
+          uint64_t val = 2;
+          ssize_t ret = write(fd, &val, sizeof(val));
+          (void)ret;
+        }
+      }
+    }
+  }
   for (int orig = 0; orig < num_original_layers_; ++orig) {
     if (!layer_members_[orig].empty()) {
       active_origs.push_back(orig);

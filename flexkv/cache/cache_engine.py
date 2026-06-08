@@ -79,6 +79,29 @@ class CacheEngineAccel:
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
+        # SWA (Sliding Window Attention) production manager — node-attached.
+        # Created lazily via init_swa() when SWA is enabled. SWA state lives on
+        # each CRadixNode (swa_host_slot / swa_tombstone); this manager owns only
+        # the host pool and the LRU ordering for SWA-only eviction. Cascade
+        # eviction is driven by self.index.drain_freed_swa_slots() in insert()/take().
+        self.swa_manager = None
+
+    def init_swa(self, swa_config: "SWAPoolConfig") -> None:
+        """Initialize the node-attached SWA manager for this cache engine."""
+        from flexkv.swa.swa_production_manager import SWAProductionManager
+        self.swa_manager = SWAProductionManager(
+            config=swa_config,
+            tokens_per_block=self.tokens_per_block,
+        )
+
+    def _drain_swa_slots(self) -> None:
+        """Return SWA slots freed by structural tree changes (split/evict) to the pool."""
+        if self.swa_manager is None:
+            return
+        freed_slots = self.index.drain_freed_swa_slots()
+        if freed_slots:
+            self.swa_manager.free_slots(freed_slots)
+
     def reset(self) -> None:
         self.index.reset()
         self.mempool.reset()
@@ -138,6 +161,11 @@ class CacheEngineAccel:
                 block_size=self.tokens_per_block,
                 medium=DEVICE_TYPE[self.device_type]
             )
+
+        # Cascade (SWA subset of full): insert may split an existing node, which
+        # invalidates its SWA snapshot. Drain freed slots back to the pool now.
+        self._drain_swa_slots()
+
         return node
 
     def lock_node(self, node: CRadixNode) -> None:
@@ -183,6 +211,10 @@ class CacheEngineAccel:
                     evicted_block_hashes.resize_(num_evicted)
                 target_blocks = target_blocks.numpy()
                 self.mempool.recycle_blocks(target_blocks)
+
+                # Cascade (SWA subset of full): evicted/split nodes recorded their
+                # SWA slots; return them to the pool so they are not leaked.
+                self._drain_swa_slots()
 
                 # Record eviction metrics
                 if self._metrics_collector is not None and num_evicted > 0:

@@ -28,6 +28,7 @@ from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_EN
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.common.debug import flexkv_logger
 from flexkv.cache.redis_meta import RedisMeta
+from flexkv.common.block import SequenceMeta
 
 
 class KVManager:
@@ -324,58 +325,100 @@ class KVManager:
 
     # ===== SWA (Sliding Window Attention) Integration =====
 
+    def _get_cpu_cache_engine(self):
+        """Return the CPU cache engine that owns the local radix tree.
+
+        Only available in non-server_client_mode (the engine runs in-process).
+        DSv4 SWA runs in this mode. Works for CacheEngineAccel (default,
+        index_accel=1), CacheEngine, and HierarchyLRCacheEngine. Returns None if
+        unavailable.
+        """
+        if self.server_client_mode:
+            return None
+        try:
+            return self.kv_task_engine.cache_engine.cpu_cache_engine
+        except AttributeError:
+            return None
+
+    @staticmethod
+    def _engine_tree(engine):
+        """Return the radix tree index of a cache engine, field-name agnostic.
+
+        CacheEngineAccel / CacheEngine expose it as `index`; HierarchyLRCacheEngine
+        (p2p path) as `local_index`. Returns None if neither is present.
+        """
+        tree = getattr(engine, "index", None)
+        if tree is None:
+            tree = getattr(engine, "local_index", None)
+        return tree
+
     def _get_swa_production_manager(self):
-        """Lazily create SWAProductionManager if SWA is configured (production C++ path)."""
+        """Return the node-attached SWAProductionManager owned by the cache engine.
+
+        The manager is created once (lazily) on the cache engine via init_swa(),
+        so that SWA put/get (here) and cascade eviction (in the engine's take())
+        share a single pool and a single source of truth (the SWA state stored on
+        each CRadixNode).
+        """
         if hasattr(self, '_swa_prod_manager'):
             return self._swa_prod_manager
 
+        self._swa_prod_manager = None
         if self.cache_config.swa is None or not self.cache_config.swa.enabled:
-            self._swa_prod_manager = None
             return None
 
-        from flexkv.swa.swa_production_manager import SWAProductionManager
+        engine = self._get_cpu_cache_engine()
+        if engine is None:
+            return None
 
-        self._swa_prod_manager = SWAProductionManager(
-            config=self.cache_config.swa,
-            tokens_per_block=self.cache_config.tokens_per_block,
-        )
+        # Node-attached SWA requires the C++ tree (drain_freed_swa_slots) and an
+        # init_swa hook. CacheEngineAccel (default) and HierarchyLRCacheEngine
+        # qualify; the pure-Python CacheEngine fallback does not.
+        tree = self._engine_tree(engine)
+        if tree is None or not hasattr(tree, "drain_freed_swa_slots") \
+                or not hasattr(engine, "init_swa"):
+            flexkv_logger.warning(
+                "[KVManager] SWA enabled but cache engine does not support "
+                "node-attached SWA; SWA disabled for this engine."
+            )
+            return None
+
+        # Ensure the engine has a SWA manager and reuse it (single shared pool).
+        if getattr(engine, "swa_manager", None) is None:
+            engine.init_swa(self.cache_config.swa)
+        self._swa_prod_manager = engine.swa_manager
         flexkv_logger.info(
-            f"[KVManager] SWA production manager initialized: "
+            f"[KVManager] SWA production manager bound: "
             f"num_slots={self.cache_config.swa.num_slots}, "
             f"window_size={self.cache_config.swa.window_size}"
         )
         return self._swa_prod_manager
 
-    def _get_swa_connector(self):
-        """Lazily create SWAConnector if SWA is configured (Python radix tree path)."""
-        if hasattr(self, '_swa_connector'):
-            return self._swa_connector
+    def _match_node(self, token_ids: np.ndarray):
+        """Resolve token_ids to the deepest matching CRadixNode in the local tree.
 
-        if self.cache_config.swa is None or not self.cache_config.swa.enabled:
-            self._swa_connector = None
+        Returns the last matched node, or None if there is no match (empty tree
+        or no shared prefix). This is the single query path: SWA never does its
+        own prefix matching — it only reads SWA state off the resolved node.
+        """
+        engine = self._get_cpu_cache_engine()
+        if engine is None:
             return None
-
-        from flexkv.swa.swa_connector import SWAConnector
-        from flexkv.swa.swa_radix_manager import SWARadixManager
-
-        swa_manager = SWARadixManager(
-            config=self.cache_config.swa,
+        tree = self._engine_tree(engine)
+        if tree is None:
+            return None
+        seq = SequenceMeta(
+            token_ids=np.asarray(token_ids, dtype=np.int64),
             tokens_per_block=self.cache_config.tokens_per_block,
         )
-
-        # Get the radix tree index from the cache engine
-        radix_tree = self.kv_task_engine.cache_engine.cpu_cache_engine.tree_index
-
-        self._swa_connector = SWAConnector(
-            swa_manager=swa_manager,
-            radix_tree=radix_tree,
-        )
-        flexkv_logger.info(
-            f"[KVManager] SWA connector initialized: "
-            f"num_slots={self.cache_config.swa.num_slots}, "
-            f"window_size={self.cache_config.swa.window_size}"
-        )
-        return self._swa_connector
+        seq.gen_hashes()
+        if seq.num_blocks == 0:
+            return None
+        block_hashes_t = torch.from_numpy(seq.block_hashes).to(torch.int64)
+        mr = tree.match_prefix(block_hashes_t, int(seq.num_blocks), False)
+        if mr is None or int(mr.num_matched_blocks) == 0:
+            return None
+        return mr.last_node
 
     def swa_put(self,
                 token_ids: Union[torch.Tensor, np.ndarray],
@@ -396,23 +439,22 @@ class KVManager:
         Returns:
             True if stored successfully, False otherwise.
         """
-        # SWA pool is process-local (lives on every rank's leader connector).
-        # It does NOT need to go through dp_client/server. We can run the
-        # production SWAManager locally even in server_client_mode.
+        # SWA pool is process-local. Query the radix tree to resolve the node,
+        # then store the snapshot on it. swa_put does NOT depend on the full-KV
+        # put task having completed: the node only needs to exist in the tree
+        # (the ready blocks are inserted synchronously). If it isn't there yet,
+        # we skip storing — SWA can always be recomputed.
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
 
-        # Try production manager first
         prod_mgr = self._get_swa_production_manager()
-        if prod_mgr is not None:
-            return prod_mgr.put(token_ids, swa_data, physical_block_ids=physical_block_ids)
-
-        # Fallback to Python connector path
-        connector = self._get_swa_connector()
-        if connector is None:
+        if prod_mgr is None:
             return False
 
-        return connector.store_swa(token_ids, swa_data)
+        node = self._match_node(token_ids)
+        if node is None:
+            return False
+        return prod_mgr.put(node, swa_data)
 
     def swa_get(self,
                 token_ids: Union[torch.Tensor, np.ndarray]) -> Optional[Union[torch.Tensor, np.ndarray]]:
@@ -428,21 +470,17 @@ class KVManager:
         Returns:
             SWA data buffer or None if not available.
         """
-        # SWA pool is process-local (lives on every rank's leader connector).
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
 
-        # Try production manager first
         prod_mgr = self._get_swa_production_manager()
-        if prod_mgr is not None:
-            return prod_mgr.get(token_ids)
-
-        # Fallback to Python connector path
-        connector = self._get_swa_connector()
-        if connector is None:
+        if prod_mgr is None:
             return None
 
-        return connector.load_swa(token_ids)
+        node = self._match_node(token_ids)
+        if node is None:
+            return None
+        return prod_mgr.get(node)
 
     def swa_available(self,
                       token_ids: Union[torch.Tensor, np.ndarray]) -> bool:
@@ -458,18 +496,14 @@ class KVManager:
         Returns:
             True if SWA data is available for the trailing window.
         """
-        # SWA pool is process-local (lives on every rank's leader connector).
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
 
-        # Try production manager first
         prod_mgr = self._get_swa_production_manager()
-        if prod_mgr is not None:
-            return prod_mgr.has(token_ids)
-
-        # Fallback to Python connector path
-        connector = self._get_swa_connector()
-        if connector is None:
+        if prod_mgr is None:
             return False
 
-        return connector.check_swa(token_ids)
+        node = self._match_node(token_ids)
+        if node is None:
+            return False
+        return prod_mgr.has(node)

@@ -105,9 +105,11 @@ class HierarchyLRCacheEngine:
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
         """Initialize the production SWA manager for this cache engine.
 
-        Should be called after construction when SWA is enabled.
-        The SWA manager uses endpoint hashing to track SWA data independently
-        of the C++ radix tree node objects.
+        Should be called after construction when SWA is enabled. The SWA manager
+        is node-attached: SWA state lives on each CRadixNode (swa_host_slot /
+        swa_tombstone), and this manager owns only the host pool and the LRU
+        ordering used for SWA-only eviction. Cascade eviction is driven by the
+        tree's drain_freed_swa_slots() (see insert() and take()).
 
         Args:
             swa_config: SWA pool configuration.
@@ -348,6 +350,15 @@ class HierarchyLRCacheEngine:
             )
         # NOTE: Do NOT lock the node here, because the caller (put() method) will lock it
         # The node will be unlocked in _transfer_callback after data transfer completes
+
+        # Cascade (SWA subset of full): insert may split an existing node, which
+        # invalidates its SWA snapshot. Drain any slots freed by that split so
+        # they are returned to the pool promptly rather than at the next evict.
+        if self.swa_manager is not None:
+            freed_slots = self.local_index.drain_freed_swa_slots()
+            if freed_slots:
+                self.swa_manager.free_slots(freed_slots)
+
         return node
 
     def lock_node(self, node: CRadixNode) -> None:
@@ -445,9 +456,13 @@ class HierarchyLRCacheEngine:
                 evicted_np = target_blocks.numpy()
                 self.mempool.recycle_blocks(evicted_np)
 
-                # Notify SWA manager about evicted blocks (cascade eviction)
-                if self.swa_manager is not None and num_evicted > 0:
-                    self.swa_manager.on_blocks_evicted(evicted_np)
+                # Cascade eviction (SWA subset of full): the C++ tree recorded
+                # the SWA slots of any node deleted/invalidated by this evict (and
+                # by any split during insert). Drain them and return to the pool.
+                if self.swa_manager is not None:
+                    freed_slots = self.local_index.drain_freed_swa_slots()
+                    if freed_slots:
+                        self.swa_manager.free_slots(freed_slots)
             
             if protected_node is not None:
                 self.local_index.unlock(protected_node)
