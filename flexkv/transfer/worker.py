@@ -1067,13 +1067,22 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 g_cpu = cpu_block_id_list
 
                 flexkv_logger.info(
-                    "[FlexKV-SEGV-DEBUG] tpGPUCPUTransferWorker group xfer: "
+                    "[FlexKV-SEGV-DEBUG] tpGPUCPUTransferWorker group xfer BEGIN: "
                     f"worker_id={self.worker_id}, pid={os.getpid()}, "
                     f"type={transfer_type.name}, group={gi}/{len(self.tp_group_transfer_groups)}, "
                     f"{summarize_id_tensor('gpu', g_gpu)}, "
                     f"{summarize_id_tensor('cpu', g_cpu)}, "
                     f"num_layers={gp['num_layers']}, window_blocks={gp.get('window_blocks')}, "
                     f"ce={use_ce_transfer}, cta={transfer_num_cta}"
+                )
+                from flexkv.common.debug import maybe_dump_transfer_block_ids
+
+                maybe_dump_transfer_block_ids(
+                    getattr(self, "_current_op_id", -1),
+                    transfer_type.name,
+                    g_gpu,
+                    g_cpu,
+                    group_idx=gi,
                 )
 
                 # SWA optimization: disabled — stale GPU blocks cause
@@ -1092,6 +1101,11 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                     0,                 # start_layer_id (always 0 within group)
                     gp['num_layers'],  # all layers in this group
                     self.is_mla,
+                )
+                flexkv_logger.info(
+                    "[FlexKV-SEGV-DEBUG] tpGPUCPUTransferWorker group xfer END: "
+                    f"worker_id={self.worker_id}, pid={os.getpid()}, "
+                    f"type={transfer_type.name}, group={gi}/{len(self.tp_group_transfer_groups)}"
                 )
         else:
             self.tp_transfer_thread_group.tp_group_transfer(
@@ -1122,12 +1136,16 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             f"gpu_capacity={self._gpu_capacity_hint()}"
         )
 
+        self._current_op_id = transfer_op.transfer_op_id
         start_time = time.time()
-        self._transfer_impl(
-            src_block_ids,
-            dst_block_ids,
-            transfer_op.transfer_type,
-        )
+        try:
+            self._transfer_impl(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type,
+            )
+        finally:
+            self._current_op_id = -1
         if transfer_op.transfer_type == TransferType.D2H:
             torch.cuda.synchronize()
         end_time = time.time()

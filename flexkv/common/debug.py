@@ -176,6 +176,47 @@ def install_worker_crash_diagnostics(worker_class_name: str, worker_id: int) -> 
             pass
 
 
+def maybe_dump_transfer_block_ids(
+    op_id: int,
+    transfer_type: str,
+    gpu_block_ids: Union[torch.Tensor, np.ndarray],
+    cpu_block_ids: Union[torch.Tensor, np.ndarray],
+    group_idx: Optional[int] = None,
+) -> None:
+    """Dump full block-id lists for hang post-mortem when FLEXKV_DUMP_D2H_BLOCK_IDS=1."""
+    if os.getenv("FLEXKV_DUMP_D2H_BLOCK_IDS", "0") not in ("1", "true", "TRUE"):
+        return
+    dump_dir = os.getenv(
+        "FLEXKV_DUMP_DIR", "/cfs_zhongwei/leolingli/dsv4/log/flexkv_dumps"
+    )
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        if isinstance(gpu_block_ids, torch.Tensor):
+            gpu_arr = gpu_block_ids.detach().cpu().numpy()
+        else:
+            gpu_arr = np.asarray(gpu_block_ids)
+        if isinstance(cpu_block_ids, torch.Tensor):
+            cpu_arr = cpu_block_ids.detach().cpu().numpy()
+        else:
+            cpu_arr = np.asarray(cpu_block_ids)
+        suffix = f"_g{group_idx}" if group_idx is not None else ""
+        path = os.path.join(
+            dump_dir,
+            f"op{op_id}_{transfer_type}{suffix}_pid{os.getpid()}.npz",
+        )
+        np.savez(path, gpu_block_ids=gpu_arr, cpu_block_ids=cpu_arr)
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] dumped block ids: path=%s, gpu_count=%d, cpu_count=%d",
+            path,
+            gpu_arr.size,
+            cpu_arr.size,
+        )
+    except Exception as e:
+        flexkv_logger.warning(
+            "[FlexKV-SEGV-DEBUG] dump block ids failed op_id=%s: %s", op_id, e
+        )
+
+
 def summarize_block_ids_from_slots(
     slot_mapping: Union[torch.Tensor, np.ndarray],
     tokens_per_block: int,
