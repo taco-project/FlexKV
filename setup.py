@@ -1,3 +1,5 @@
+import glob
+import importlib.util
 import os
 import shutil
 import sys
@@ -28,6 +30,69 @@ def detect_cuda_arch():
     fallback = "8.0;8.6;9.0"
     print(f"No GPU detected, using fallback architectures: {fallback}")
     return fallback
+
+
+def _find_nvcomp(nvcomp_root):
+    """Locate public nvcomp headers and library.
+
+    Probing priority:
+      1. NVCOMP_ROOT (error if set but not usable — no silent fallback).
+      2. pip-installed nvidia-nvcomp-cu12 (via importlib.find_spec).
+      3. System /usr.
+
+    Returns (include_dirs, lib_dir, link_name, source_description).
+    link_name is either "nvcomp" or ":libnvcomp.so.X" when only a
+    versioned .so (no unversioned symlink) is available (e.g. pip wheel).
+    """
+    def probe(root):
+        inc_dirs = [
+            d for d in (
+                os.path.join(root, "include"),
+                os.path.join(root, "build", "include"),
+            ) if os.path.isdir(d)
+        ]
+        if not any(os.path.exists(os.path.join(d, "nvcomp", "ans.h"))
+                   for d in inc_dirs):
+            return None
+        for sub in ("build/lib", "lib/x86_64-linux-gnu", "lib64", "lib", ""):
+            d = os.path.join(root, sub) if sub else root
+            if not os.path.isdir(d):
+                continue
+            if os.path.exists(os.path.join(d, "libnvcomp.so")):
+                return inc_dirs, d, "nvcomp"
+            versioned = sorted(glob.glob(os.path.join(d, "libnvcomp.so.*")))
+            if versioned:
+                return inc_dirs, d, ":" + os.path.basename(versioned[-1])
+        return None
+
+    if nvcomp_root:
+        if not os.path.exists(nvcomp_root):
+            raise ValueError(f"NVCOMP_ROOT={nvcomp_root} does not exist")
+        result = probe(nvcomp_root)
+        if not result:
+            raise ValueError(
+                f"NVCOMP_ROOT={nvcomp_root} does not contain a usable nvcomp "
+                "install (need include/nvcomp/ans.h and libnvcomp.so*)"
+            )
+        return (*result, f"NVCOMP_ROOT={nvcomp_root}")
+
+    spec = importlib.util.find_spec("nvidia.nvcomp")
+    if spec and spec.origin:
+        pip_root = os.path.dirname(spec.origin)
+        result = probe(pip_root)
+        if result:
+            return (*result, f"pip nvidia-nvcomp-cu12 ({pip_root})")
+
+    result = probe("/usr")
+    if result:
+        return (*result, "system (/usr)")
+
+    raise ValueError(
+        "nvcomp not found. Install via one of:\n"
+        "  pip install nvidia-nvcomp-cu12==4.2.0.14   (recommended)\n"
+        "  a system/distro nvcomp package\n"
+        "Or set NVCOMP_ROOT=/path/to/nvcomp manually."
+    )
 
 def get_version():
     import subprocess
@@ -63,6 +128,7 @@ enable_cfs = os.environ.get("FLEXKV_ENABLE_CFS", "0") == "1"
 enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
 enable_p2p = os.environ.get("FLEXKV_ENABLE_P2P", "0") == "1"
 enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
+enable_nvcomp = os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") == "1"
 # FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
 enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 
@@ -155,6 +221,23 @@ if enable_p2p:
         "csrc/dist/lease_meta_mempool.cpp",
     ])
     extra_compile_args.append("-DFLEXKV_ENABLE_P2P")
+if enable_nvcomp:
+    nvcomp_inc_dirs, nvcomp_lib_dir, nvcomp_link_name, nvcomp_source = \
+        _find_nvcomp(os.environ.get("NVCOMP_ROOT"))
+    print(f"ENABLE_NVCOMP = true: Compiling with nvcomp ANS support "
+          f"(source={nvcomp_source}, lib={nvcomp_lib_dir})")
+    # The ANS code lives in csrc/transfer.cu and csrc/transfer_ssd.cpp (already
+    # in cpp_sources), guarded by -DFLEXKV_ENABLE_NVCOMP added below.
+    include_dirs.extend(nvcomp_inc_dirs)
+    extra_link_args.extend([
+        f"-l{nvcomp_link_name}",
+        f"-L{nvcomp_lib_dir}",
+        f"-Wl,-rpath,{nvcomp_lib_dir}",
+    ])
+    extra_compile_args.append("-DFLEXKV_ENABLE_NVCOMP")
+    nvcc_compile_args.append("-DFLEXKV_ENABLE_NVCOMP")
+else:
+    print("ENABLE_NVCOMP = false: Skipping nvcomp ANS compression")
 if not enable_gds:
     print("ENABLE_GDS = false: Skipping GDS code")
 if not enable_p2p:

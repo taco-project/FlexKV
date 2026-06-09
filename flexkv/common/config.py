@@ -21,7 +21,6 @@ class IndexerCacheConfig:
     num_kv_heads: int = 1       # typically 1 for MLA-style indexer
     dtype: torch.dtype = torch.uint8  # indexer storage dtype (fp8 quantized)
 
-
 @dataclass
 class ModelConfig:
     num_layers: int = 1
@@ -458,6 +457,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     lease_ttl_ms=int(os.getenv('FLEXKV_LEASE_TTL_MS', 30000)),
     safety_ttl_ms=int(os.getenv('FLEXKV_SAFETY_TTL_MS', 100)),
     renew_lease_ms=int(os.getenv('FLEXKV_RENEW_LEASE_MS', 4000)),
+
+    nvcomp_batch_size=int(os.getenv('FLEXKV_NVCOMP_BATCH_SIZE', '0')),  # 0 = auto
 )
 
 @dataclass

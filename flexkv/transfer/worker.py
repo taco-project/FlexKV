@@ -27,6 +27,15 @@ except ImportError:
     transfer_kv_blocks_gds = None
     TPGDSTransferThreadGroup = None
 
+# nvcomp ANS imports are optional (only available when compiled with FLEXKV_ENABLE_NVCOMP=1)
+try:
+    from flexkv.c_ext import (ANSTransferContext, transfer_kv_blocks_ans_comp,
+                               transfer_kv_blocks_ans_decomp,
+                               transfer_kv_blocks_ssd_ans_packed)
+    _NVCOMP_AVAILABLE = True
+except ImportError:
+    _NVCOMP_AVAILABLE = False
+
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -43,7 +52,15 @@ from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferO
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
-from flexkv.transfer.utils import group_blocks_by_node_and_segment, group_blocks_by_node, split_contiguous_blocks, RemoteSSD2HMetaInfo, NodeMetaInfo, RDMATaskInfo
+from flexkv.transfer.utils import (
+    NvcompHelper,
+    group_blocks_by_node_and_segment,
+    group_blocks_by_node,
+    split_contiguous_blocks,
+    RemoteSSD2HMetaInfo,
+    NodeMetaInfo,
+    RDMATaskInfo,
+)
 try:
     from flexkv.c_ext import (
         transfer_kv_blocks_remote,
@@ -174,6 +191,22 @@ class TransferWorkerBase(ABC):
             f"transfer bandwidth: {transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
         )
 
+    def _log_nvcomp_transfer_performance(self,
+                                         transfer_op: WorkerTransferOp,
+                                         comp_size: int,
+                                         uncomp_size: int,
+                                         start_time: float,
+                                         end_time: float) -> None:
+        comp_ratio = uncomp_size / comp_size if comp_size > 0 else 0.0
+        flexkv_logger.info(
+            f"{transfer_op.transfer_type.name} nvcomp transfer request: {transfer_op.transfer_op_id} finished "
+            f"comp_ratio: {comp_ratio:.3f}x "
+            f"comp_size: {comp_size / (1024 * 1024 * 1024):.3f} GB "
+            f"uncomp_size: {uncomp_size / (1024 * 1024 * 1024):.3f} GB "
+            f"transfer time: {end_time - start_time:.4f} s "
+            f"transfer bandwidth: {comp_size / (end_time - start_time) / 1e9:.2f} GB/s"
+        )
+
     @abstractmethod
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         pass
@@ -253,6 +286,33 @@ class WorkerHandle:
         if self.process.is_alive():
             self.shutdown()
 
+def _bind_size_table(table, label, *, register=False, expected_dims=(3, 4)):
+    """Extract (ptr, rank_stride, block_stride, layer_stride) from a uint32
+    nvcomp compressed-size table, in entry units; all-zeros when table is None.
+    A 3-D [blocks, layers, kv] table has no rank dimension (rank_stride=0); a
+    4-D [tp, blocks, layers, kv] table is per-rank.
+
+    register: cudaHostRegister the table (only for tables a GPU kernel touches;
+    the SSD worker's CPU-only tables skip it). expected_dims asserts the table's
+    dimensionality, preserving each call site's MLA/MHA correctness check.
+    """
+    if table is None:
+        return 0, 0, 0, 0
+    assert table.dtype == torch.uint32, f"{label} must be uint32"
+    assert table.dim() in expected_dims, \
+        f"{label}: expected dim in {expected_dims}, got {table.dim()}"
+    if register:
+        cudaHostRegister(table)
+    if table.dim() == 3:
+        rank_stride, block_stride, layer_stride = 0, table.stride(0), table.stride(1)
+    else:
+        rank_stride, block_stride, layer_stride = (
+            table.stride(0), table.stride(1), table.stride(2))
+    tbl_mb = table.numel() * table.element_size() / (1024 ** 2)
+    flexkv_logger.info(
+        f"{label}: shape={tuple(table.shape)} dtype=uint32 size={tbl_mb:.2f} MB")
+    return table.data_ptr(), rank_stride, block_stride, layer_stride
+
 class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non-tp and non-dp case
     def __init__(self,
                  worker_id: int,
@@ -268,13 +328,17 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
-                 transfer_num_cta_d2h: int = 4) -> None:
+                 transfer_num_cta_d2h: int = 4,
+                 cpu_size_table: Optional[torch.Tensor] = None,
+                 enable_nvcomp: Optional[bool] = None,
+                 ) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         # Register CPU tensors with CUDA
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
+
         self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
         # Get pointers first
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
@@ -297,6 +361,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+        self.cpu_layout_type = cpu_kv_layout.type
 
         if len(self.gpu_blocks) == 1:
             self.gpu_block_type_ = 1
@@ -314,6 +379,33 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.transfer_num_cta_d2h = transfer_num_cta_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
+
+        # nvcomp ANS compression (conditional)
+        self.enable_nvcomp = NvcompHelper.check_worker_nvcomp_enable(
+            enable_nvcomp,
+            path="gpu_cpu",
+            cpu_size_table=cpu_size_table,
+        )
+
+        if self.enable_nvcomp:
+            self.cpu_size_table = cpu_size_table
+            # Non-TP canonical table is 3-D [blocks, layers, kv]; the GPU kernel touches it, so register=True.
+            (self.cpu_size_table_ptr, _,
+            self.cpu_size_table_block_stride,
+            self.cpu_size_table_layer_stride) = _bind_size_table(
+                cpu_size_table, "[GPUCPUTransferWorker] cpu_size_table",
+                register=True, expected_dims=(3,))
+
+            if self.cpu_size_table_ptr == 0:
+                raise RuntimeError(
+                    "GPUCPUTransferWorker: nvcomp is enabled but "
+                    "cpu_size_table was not supplied.")
+            self.ans_ctx = NvcompHelper.create_ans_context(
+                chunk_size_bytes=self.chunk_size_in_bytes,
+                dtype=self.dtype,
+                is_mla=self.is_mla,
+                log_prefix="[nvcomp]",
+            )
 
     def _transfer_impl(
         self,
@@ -358,6 +450,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.chunk_size_in_bytes,
+            0,
             self.num_layers,
             transfer_num_cta,
             transfer_type == TransferType.H2D,
@@ -365,6 +458,82 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.is_mla,
             self.gpu_block_type_,
         )
+
+    def _transfer_impl_nvcomp(
+        self,
+        src_block_ids: torch.Tensor,
+        dst_block_ids: torch.Tensor,
+        transfer_type: TransferType,
+        **kwargs: Any,
+    ) -> int:
+        # H2D writes the GPU side (dst); D2H reads it (src).
+        if transfer_type == TransferType.H2D:
+            gpu_block_id_list, cpu_block_id_list = dst_block_ids, src_block_ids
+        elif transfer_type == TransferType.D2H:
+            gpu_block_id_list, cpu_block_id_list = src_block_ids, dst_block_ids
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_type} for GPUCPUTransferWorker")
+        if len(gpu_block_id_list) == 0:
+            return 0
+        nvtx_range = nvtx.start_range(
+            message=f"GPUCPUWorker.transfer_impl_nvcomp[{transfer_type.name}]",
+            color="purple")
+        gpu_tensor_ptrs = self.gpu_blocks_ptrs
+
+        if transfer_type == TransferType.D2H:
+            _r_ans = nvtx.start_range(message="D2H_nvcomp:transfer_kv_blocks_ans_comp", color="orange")
+            compressed_bytes = transfer_kv_blocks_ans_comp(
+                self.ans_ctx,
+                gpu_block_id_list,
+                gpu_tensor_ptrs,
+                self.gpu_kv_stride_in_bytes,
+                self.gpu_block_stride_in_bytes,
+                self.gpu_layer_stride_in_bytes,
+                cpu_block_id_list,
+                self.cpu_tensor,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.chunk_size_in_bytes,
+                0,
+                self.num_layers,
+                self.is_mla,
+                self.gpu_block_type_,
+                self.cpu_size_table_ptr,
+                self.cpu_size_table_block_stride,
+                self.cpu_size_table_layer_stride,
+            )
+            nvtx.end_range(_r_ans)
+
+        elif transfer_type == TransferType.H2D:
+            _r_ans = nvtx.start_range(message="H2D_nvcomp:transfer_kv_blocks_ans_decomp", color="orange")
+            compressed_bytes = transfer_kv_blocks_ans_decomp(
+                self.ans_ctx,
+                gpu_block_id_list,
+                gpu_tensor_ptrs,
+                self.gpu_kv_stride_in_bytes,
+                self.gpu_block_stride_in_bytes,
+                self.gpu_layer_stride_in_bytes,
+                cpu_block_id_list,
+                self.cpu_tensor,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.chunk_size_in_bytes,
+                0,
+                self.num_layers,
+                self.is_mla,
+                self.gpu_block_type_,
+                self.cpu_size_table_ptr,
+                self.cpu_size_table_block_stride,
+                self.cpu_size_table_layer_stride,
+            )
+            nvtx.end_range(_r_ans)
+        else:
+            nvtx.end_range(nvtx_range)
+            raise ValueError(f"Invalid transfer type: {transfer_type} for GPUCPUTransferWorker")
+        nvtx.end_range(nvtx_range)
+        return int(compressed_bytes)
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         nvtx_range = nvtx.start_range(
@@ -375,20 +544,36 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         with torch.cuda.stream(self.transfer_stream):
             start_time = time.time()
-            self._transfer_impl(
-                src_block_ids,
-                dst_block_ids,
-                transfer_op.transfer_type,
-            )
-            end_time = time.time()
-            transfer_size = self.chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
+            if self.enable_nvcomp:
+                compressed_bytes = self._transfer_impl_nvcomp(
+                    src_block_ids,
+                    dst_block_ids,
+                    transfer_op.transfer_type
+                )
+                end_time = time.time()
+                uncomp_size = self.chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
+                self._log_nvcomp_transfer_performance(
+                    transfer_op,
+                    int(compressed_bytes),
+                    uncomp_size,
+                    start_time,
+                    end_time,
+                )
+            else:
+                self._transfer_impl(
+                    src_block_ids,
+                    dst_block_ids,
+                    transfer_op.transfer_type
+                )
+                transfer_size = self.chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
+                end_time = time.time()
+                self._log_transfer_performance(
+                    transfer_op,
+                    transfer_size,
+                    start_time,
+                    end_time,
+                )
 
-            self._log_transfer_performance(
-                transfer_op,
-                transfer_size,
-                start_time,
-                end_time,
-            )
         nvtx.end_range(nvtx_range)
 
         return True
@@ -408,7 +593,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
-                 transfer_num_cta_d2h: int = 4):
+                 transfer_num_cta_d2h: int = 4,
+                 cpu_size_table_tp: Optional[torch.Tensor] = None,
+                 enable_nvcomp: Optional[bool] = None):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
@@ -473,6 +660,37 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         flexkv_logger.info(f"num_tensors_per_gpu: {num_tensors_per_gpu}")
 
+        nvcomp_batch_size = 0
+        data_type = 0
+        self.cpu_size_table_tp = cpu_size_table_tp
+        self.enable_nvcomp = NvcompHelper.check_worker_nvcomp_enable(
+            enable_nvcomp,
+            path="gpu_cpu",
+            cpu_size_table=cpu_size_table_tp,
+            tp_size=self.num_gpus,
+            gpu_chunk_sizes_in_bytes=self.gpu_chunk_sizes_in_bytes,
+        )
+
+        if self.enable_nvcomp:
+            nvcomp_batch_size, data_type = NvcompHelper.setup_tp_worker(
+                gpu_chunk_sizes_in_bytes=self.gpu_chunk_sizes_in_bytes,
+                dtype=self.dtype,
+                tp_size=self.num_gpus,
+            )
+            # setup size table. MLA -> 3-D canonical [blocks, layers, 1]
+            # (rank_stride=0, owner compresses / all ranks read the same);
+            # MHA -> 4-D per-rank [tp, blocks, layers, kv]. GPU-touched -> register.
+            (self.cpu_size_table_tp_ptr, self.cpu_size_table_tp_rank_stride,
+             self.cpu_size_table_block_stride,
+             self.cpu_size_table_layer_stride) = _bind_size_table(
+                cpu_size_table_tp, "[tpGPUCPUTransferWorker] cpu_size_table_tp",
+                register=True, expected_dims=(3,) if self.is_mla else (4,))
+        else:
+            self.cpu_size_table_tp_ptr = 0
+            self.cpu_size_table_tp_rank_stride = 0
+            self.cpu_size_table_block_stride = 0
+            self.cpu_size_table_layer_stride = 0
+
         self.tp_transfer_thread_group = TPTransferThreadGroup(
             self.num_gpus,
             gpu_block_ptrs_flat,
@@ -484,6 +702,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.gpu_layer_strides_in_bytes,
             self.gpu_chunk_sizes_in_bytes,
             gpu_device_ids,
+            self.enable_nvcomp,
+            nvcomp_batch_size,
+            data_type,
         )
 
 
@@ -531,25 +752,90 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.is_mla,
         )
 
+    def _transfer_impl_nvcomp(self,
+                              src_block_ids: torch.Tensor,
+                              dst_block_ids: torch.Tensor,
+                              transfer_type: TransferType,
+                              **kwargs: Any,
+                              ) -> int:
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
+        assert len(src_block_ids) == len(dst_block_ids)
+
+        if transfer_type == TransferType.H2D:
+            gpu_block_id_list = dst_block_ids
+            cpu_block_id_list = src_block_ids
+            use_ce_transfer = self.use_ce_transfer_h2d
+            transfer_num_cta = self.transfer_num_cta_h2d
+        elif transfer_type == TransferType.D2H:
+            gpu_block_id_list = src_block_ids
+            cpu_block_id_list = dst_block_ids
+            use_ce_transfer = self.use_ce_transfer_d2h
+            transfer_num_cta = self.transfer_num_cta_d2h
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_type} for tpGPUCPUTransferWorker")
+
+        assert len(gpu_block_id_list) == len(cpu_block_id_list)
+        if len(gpu_block_id_list) == 0:
+            return 0
+
+        nvtx_range = nvtx.start_range(
+            message=f"tpGPUCPUWorker.transfer_impl_nvcomp[{transfer_type.name}]",
+            color="purple")
+        compressed_bytes = self.tp_transfer_thread_group.tp_group_transfer_ans(
+            gpu_block_id_list,
+            cpu_block_id_list,
+            self.cpu_kv_stride_in_bytes,
+            self.cpu_layer_stride_in_bytes,
+            self.cpu_block_stride_in_bytes,
+            self.cpu_tp_stride_in_bytes,
+            transfer_num_cta,
+            transfer_type == TransferType.H2D,
+            use_ce_transfer,
+            0,
+            self.num_layers,
+            self.is_mla,
+            self.cpu_size_table_tp_ptr,
+            self.cpu_size_table_tp_rank_stride,
+            self.cpu_size_table_block_stride,
+            self.cpu_size_table_layer_stride,
+        )
+        nvtx.end_range(nvtx_range)
+        return int(compressed_bytes)
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         start_time = time.time()
-        self._transfer_impl(
-            src_block_ids,
-            dst_block_ids,
-            transfer_op.transfer_type,
-        )
-        end_time = time.time()
-        transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
-
-        self._log_transfer_performance(
-            transfer_op,
-            transfer_size,
-            start_time,
-            end_time,
-        )
+        if self.enable_nvcomp:
+            compressed_bytes = self._transfer_impl_nvcomp(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type
+            )
+            end_time = time.time()
+            uncomp_size = self.cpu_chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
+            self._log_nvcomp_transfer_performance(
+                transfer_op,
+                int(compressed_bytes),
+                uncomp_size,
+                start_time,
+                end_time,
+            )
+        else:
+            self._transfer_impl(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type
+            )
+            transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
+            end_time = time.time()
+            self._log_transfer_performance(
+                transfer_op,
+                transfer_size,
+                start_time,
+                end_time,
+            )
         return True
 
 class CPUSSDDiskTransferWorker(TransferWorkerBase):
@@ -564,7 +850,13 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  ssd_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  num_blocks_per_file: int,
-                 cache_config: CacheConfig):
+                 cache_config: CacheConfig,
+                 cpu_size_table: Optional[torch.Tensor] = None,
+                 ssd_size_table: Optional[torch.Tensor] = None,
+                 cpu_size_table_tp: Optional[torch.Tensor] = None,
+                 ssd_size_table_tp: Optional[torch.Tensor] = None,
+                 enable_nvcomp: Optional[bool] = None,
+                 tp_size: int = 1):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         self.ssd_files = ssd_files
@@ -585,6 +877,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
 
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
+        self.cpu_layout_type = cpu_kv_layout.type
 
         ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
 
@@ -601,6 +894,139 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         except Exception as e:
             flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
             raise RuntimeError("SSD Worker init failed") from e
+
+        self.cpu_size_table = cpu_size_table
+        self.ssd_size_table = ssd_size_table
+        self.cpu_size_table_tp = cpu_size_table_tp
+        self.ssd_size_table_tp = ssd_size_table_tp
+        self.tp_size = tp_size
+        (self.nvcomp_ssd_packed_write_threads,
+         self.nvcomp_ssd_packed_read_threads) = NvcompHelper.ssd_packed_threads(
+            self.is_mla)
+        self.enable_nvcomp = NvcompHelper.check_worker_nvcomp_enable(
+            enable_nvcomp,
+            path="cpu_ssd",
+            cpu_size_table=(self.cpu_size_table_tp
+                            if self.cpu_size_table_tp is not None
+                            else self.cpu_size_table),
+            ssd_size_table=(self.ssd_size_table_tp
+                            if self.ssd_size_table_tp is not None
+                            else self.ssd_size_table),
+            tp_size=self.tp_size if self.cpu_size_table_tp is not None else 1,
+        )
+
+        # Non-TP CPU/SSD tables are 3-D [blocks, layers, kv]. Neither is touched
+        # by a GPU kernel (the SSD worker is CPU-only), so no cudaHostRegister --
+        # which also avoids potential cross-process shared-memory pin hangs.
+        (self.cpu_size_table_ptr, _,
+         self.cpu_size_table_block_stride,
+         self.cpu_size_table_layer_stride) = _bind_size_table(
+            cpu_size_table, "[CPUSSDDiskTransferWorker] cpu_size_table",
+            expected_dims=(3,))
+        (self.ssd_size_table_ptr, _,
+         self.ssd_size_table_block_stride,
+         self.ssd_size_table_layer_stride) = _bind_size_table(
+            ssd_size_table, "[CPUSSDDiskTransferWorker] ssd_size_table",
+            expected_dims=(3,))
+
+        self.per_rank_chunk_in_bytes = 0
+        self.cpu_size_table_rank_stride_tp = 0
+        self.ssd_size_table_rank_stride_tp = 0
+        self._last_nvcomp_ssd_path = None
+        if cpu_size_table_tp is not None:
+            assert ssd_size_table_tp is not None, \
+                "cpu_size_table_tp and ssd_size_table_tp must be supplied together"
+            self.per_rank_chunk_in_bytes = self.chunk_size_in_bytes // self.tp_size
+            # 4-D per-rank [tp, blocks, layers, kv]; CPU-only -> no register.
+            (_, self.cpu_size_table_rank_stride_tp,
+             self.cpu_size_table_block_stride_tp,
+             self.cpu_size_table_layer_stride_tp) = _bind_size_table(
+                cpu_size_table_tp, "[CPUSSDDiskTransferWorker] cpu_size_table_tp",
+                expected_dims=(4,))
+            (_, self.ssd_size_table_rank_stride_tp,
+             self.ssd_size_table_block_stride_tp,
+             self.ssd_size_table_layer_stride_tp) = _bind_size_table(
+                ssd_size_table_tp, "[CPUSSDDiskTransferWorker] ssd_size_table_tp",
+                expected_dims=(4,))
+
+    def _build_ssd_packed_kwargs(
+        self,
+        transfer_type: TransferType,
+    ) -> Dict[str, Any]:
+        num_threads = (
+            self.nvcomp_ssd_packed_read_threads
+            if transfer_type == TransferType.DISK2H
+            else self.nvcomp_ssd_packed_write_threads
+        )
+        use_ranked_table = self.cpu_size_table_tp is not None and not self.is_mla
+        use_canonical_rank0_table = self.cpu_size_table_tp is not None and self.is_mla
+
+        if use_ranked_table:
+            if self.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
+                cpu_layer_stride = self.cpu_layer_stride_in_bytes // self.tp_size
+                cpu_kv_stride = self.cpu_kv_stride_in_bytes // self.tp_size
+                cpu_tp_rank_stride = self.block_stride_in_bytes // self.tp_size
+            elif self.cpu_layout_type == KVCacheLayoutType.LAYERFIRST:
+                cpu_layer_stride = self.cpu_layer_stride_in_bytes
+                cpu_kv_stride = self.cpu_kv_stride_in_bytes
+                cpu_tp_rank_stride = self.per_rank_chunk_in_bytes
+            else:
+                # TODO(nvcomp-guard): keep TP packed SSD layout handling explicit.
+                raise RuntimeError(
+                    "CPUSSDDiskTransferWorker: nvcomp+SSD only supports "
+                    "BLOCKFIRST/LAYERFIRST layouts; requested "
+                    f"layout={self.cpu_layout_type.name}.")
+
+            return {
+                "cpu_layer_stride_in_bytes": cpu_layer_stride,
+                "cpu_kv_stride_in_bytes": cpu_kv_stride,
+                "chunk_size_in_bytes": self.per_rank_chunk_in_bytes,
+                "num_threads_per_device": num_threads,
+                "cpu_size_table_ptr": self.cpu_size_table_tp.data_ptr(),
+                "cpu_size_table_rank_stride": self.cpu_size_table_rank_stride_tp,
+                "cpu_size_table_block_stride": self.cpu_size_table_block_stride_tp,
+                "cpu_size_table_layer_stride": self.cpu_size_table_layer_stride_tp,
+                "ssd_size_table_ptr": self.ssd_size_table_tp.data_ptr(),
+                "ssd_size_table_rank_stride": self.ssd_size_table_rank_stride_tp,
+                "ssd_size_table_block_stride": self.ssd_size_table_block_stride_tp,
+                "ssd_size_table_layer_stride": self.ssd_size_table_layer_stride_tp,
+                "is_mla": False,
+                "tp_size": self.tp_size,
+                "cpu_tp_rank_stride_in_bytes": cpu_tp_rank_stride,
+            }
+
+        if use_canonical_rank0_table:
+            cpu_table_ptr = self.cpu_size_table_tp.data_ptr()
+            ssd_table_ptr = self.ssd_size_table_tp.data_ptr()
+            cpu_block_stride = self.cpu_size_table_block_stride_tp
+            cpu_layer_stride_tbl = self.cpu_size_table_layer_stride_tp
+            ssd_block_stride = self.ssd_size_table_block_stride_tp
+            ssd_layer_stride_tbl = self.ssd_size_table_layer_stride_tp
+        else:
+            cpu_table_ptr = self.cpu_size_table_ptr
+            ssd_table_ptr = self.ssd_size_table_ptr
+            cpu_block_stride = self.cpu_size_table_block_stride
+            cpu_layer_stride_tbl = self.cpu_size_table_layer_stride
+            ssd_block_stride = self.ssd_size_table_block_stride
+            ssd_layer_stride_tbl = self.ssd_size_table_layer_stride
+
+        return {
+            "cpu_layer_stride_in_bytes": self.cpu_layer_stride_in_bytes,
+            "cpu_kv_stride_in_bytes": self.cpu_kv_stride_in_bytes,
+            "chunk_size_in_bytes": self.chunk_size_in_bytes,
+            "num_threads_per_device": num_threads,
+            "cpu_size_table_ptr": cpu_table_ptr,
+            "cpu_size_table_rank_stride": 0,
+            "cpu_size_table_block_stride": cpu_block_stride,
+            "cpu_size_table_layer_stride": cpu_layer_stride_tbl,
+            "ssd_size_table_ptr": ssd_table_ptr,
+            "ssd_size_table_rank_stride": 0,
+            "ssd_size_table_block_stride": ssd_block_stride,
+            "ssd_size_table_layer_stride": ssd_layer_stride_tbl,
+            "is_mla": self.is_mla,
+            "tp_size": 1,
+            "cpu_tp_rank_stride_in_bytes": 0,
+        }
 
     def _transfer_impl(
         self,
@@ -643,25 +1069,86 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             num_threads_per_device=32,
             is_mla=self.is_mla,
         )
+        self._last_nvcomp_ssd_path = "baseline"
 
+    def _transfer_impl_nvcomp(self,
+                              src_block_ids: torch.Tensor,
+                              dst_block_ids: torch.Tensor,
+                              transfer_type: TransferType,
+                              **kwargs: Any,
+                              ) -> int:
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
+        assert len(src_block_ids) == len(dst_block_ids)
+
+        if transfer_type == TransferType.H2DISK:
+            ssd_block_id_list = dst_block_ids
+            cpu_block_id_list = src_block_ids
+        elif transfer_type == TransferType.DISK2H:
+            ssd_block_id_list = src_block_ids
+            cpu_block_id_list = dst_block_ids
+        else:
+            raise ValueError(f"Invalid transfer type: {transfer_type} for CPUSSDDiskTransferWorker")
+
+        # nvcomp+SSD always transfers the full layer range as one packed entry
+        # per block.  TP/MHA vs canonical MLA table details live in
+        # _build_ssd_packed_kwargs().
+        layer_id_list = torch.arange(self.num_layers, dtype=torch.int32)
+        packed_kwargs = self._build_ssd_packed_kwargs(transfer_type)
+        compressed_bytes = transfer_kv_blocks_ssd_ans_packed(
+            ioctx=self.ioctx,
+            cpu_layer_id_list=layer_id_list,
+            cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
+            ssd_block_ids=ssd_block_id_list,
+            cpu_block_ids=cpu_block_id_list,
+            block_stride_in_bytes=self.block_stride_in_bytes,
+            is_read=(transfer_type == TransferType.DISK2H),
+            num_blocks_per_file=self.num_blocks_per_file,
+            layout_type=self.cpu_layout_type.value,
+            total_layers=self.num_layers,
+            round_robin=self.round_robin,
+            **packed_kwargs,
+        )
+        self._last_nvcomp_ssd_path = (
+            "packed_blockfirst"
+            if self.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST
+            else "packed_layerfirst")
+        return int(compressed_bytes)
+    
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         src_block_ids , dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         start_time = time.time()
-        self._transfer_impl(
-            src_block_ids,
-            dst_block_ids,
-            transfer_op.transfer_type,
-        )
-        end_time = time.time()
-        transfer_size = self.chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
-
-        self._log_transfer_performance(
-            transfer_op,
-            transfer_size,
-            start_time,
-            end_time,
-        )
+        if self.enable_nvcomp:
+            # real compressed payload moved to/from SSD (summed across threads)
+            transfer_size = self._transfer_impl_nvcomp(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type
+            )
+            end_time = time.time()
+            uncomp_size = self.chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
+            self._log_nvcomp_transfer_performance(
+                transfer_op,
+                transfer_size,
+                uncomp_size,
+                start_time,
+                end_time,
+            )
+        else:
+            self._transfer_impl(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type
+            )
+            transfer_size = self.chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
+            end_time = time.time()
+            self._log_transfer_performance(
+                transfer_op,
+                transfer_size,
+                start_time,
+                end_time,
+            )
 
         return True
 
