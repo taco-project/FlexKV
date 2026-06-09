@@ -121,6 +121,117 @@ def format_process_exit(exitcode: Optional[int]) -> str:
     return f"exit {exitcode}"
 
 
+def describe_tensor_memory(name: str, tensor: torch.Tensor) -> str:
+    """CUDA / pinning attributes useful for D2H kernel vs CE debugging."""
+    parts = [
+        f"{name}",
+        f"ptr=0x{tensor.data_ptr():x}",
+        f"shape={tuple(tensor.shape)}",
+        f"dtype={tensor.dtype}",
+        f"device={tensor.device}",
+        f"is_pinned={torch.cuda.is_available() and tensor.is_pinned()}",
+        f"is_contiguous={tensor.is_contiguous()}",
+    ]
+    if tensor.numel() > 0:
+        parts.append(f"numel={tensor.numel()}")
+        parts.append(f"nbytes={tensor.numel() * tensor.element_size()}")
+    return ", ".join(parts)
+
+
+def estimate_d2h_cpu_bounds(
+    *,
+    max_cpu_block_id: int,
+    num_layers: int,
+    cpu_layer_stride: int,
+    cpu_block_stride: int,
+    chunk_size: int,
+    cpu_group_offset: int = 0,
+    cpu_shard_offset: int = 0,
+    start_layer_id: int = 0,
+) -> dict:
+    """Upper-bound byte offset touched on CPU for one TP shard."""
+    end_byte = (
+        cpu_group_offset
+        + (start_layer_id + num_layers) * cpu_layer_stride
+        + max_cpu_block_id * cpu_block_stride
+        + cpu_shard_offset
+        + chunk_size
+    )
+    return {
+        "max_cpu_block_id": max_cpu_block_id,
+        "cpu_group_offset": cpu_group_offset,
+        "cpu_shard_offset": cpu_shard_offset,
+        "est_end_byte": end_byte,
+    }
+
+
+def log_d2h_preflight(
+  op_id: int,
+  transfer_type: str,
+  group_idx: int,
+  num_groups: int,
+  gpu_ids: torch.Tensor,
+  cpu_ids: torch.Tensor,
+  gp: dict,
+  *,
+  use_ce: bool,
+  num_gpus: int,
+  cpu_tensor: torch.Tensor,
+  gpu_capacity_hint: str,
+) -> bool:
+    """Log D2H bounds; return True when CPU destination would be out of buffer."""
+    max_gpu = int(gpu_ids.max().item()) if gpu_ids.numel() else -1
+    max_cpu = int(cpu_ids.max().item()) if cpu_ids.numel() else -1
+    cpu_total = cpu_tensor.numel() * cpu_tensor.element_size()
+    shard = gp["chunk_size"] // num_gpus if gp.get("chunk_size") else 0
+    bounds = estimate_d2h_cpu_bounds(
+        max_cpu_block_id=max_cpu,
+        num_layers=gp["num_layers"],
+        cpu_layer_stride=gp["cpu_layer_stride"],
+        cpu_block_stride=gp["cpu_block_stride"],
+        chunk_size=shard,
+        cpu_group_offset=gp.get("cpu_offset_bytes", 0),
+        cpu_shard_offset=(num_gpus - 1) * shard,
+    )
+    oob_cpu = bounds["est_end_byte"] > cpu_total
+    flexkv_logger.info(
+        "[FlexKV-D2H-DEBUG] preflight op_id=%s type=%s group=%s/%s ce=%s "
+        "gpu_max_blk=%s cpu_max_blk=%s shard_bytes=%s memcpy_per_gpu=%s "
+        "cpu_total_bytes=%s est_cpu_end_byte=%s oob_cpu=%s %s %s %s",
+        op_id,
+        transfer_type,
+        group_idx,
+        num_groups,
+        use_ce,
+        max_gpu,
+        max_cpu,
+        shard,
+        gp["num_layers"] * gpu_ids.numel(),
+        cpu_total,
+        bounds["est_end_byte"],
+        oob_cpu,
+        summarize_id_tensor("gpu", gpu_ids),
+        summarize_id_tensor("cpu", cpu_ids),
+        gpu_capacity_hint,
+    )
+    flexkv_logger.info(
+        "[FlexKV-D2H-DEBUG] preflight tensors %s; %s; %s",
+        describe_tensor_memory("cpu_tensor", cpu_tensor),
+        describe_tensor_memory("gpu_ids", gpu_ids),
+        describe_tensor_memory("cpu_ids", cpu_ids),
+    )
+    if oob_cpu:
+        flexkv_logger.error(
+            "[FlexKV-D2H-DEBUG] CPU OOB suspected op_id=%s group=%s: "
+            "est_end_byte=%s > cpu_total=%s",
+            op_id,
+            group_idx,
+            bounds["est_end_byte"],
+            cpu_total,
+        )
+    return oob_cpu
+
+
 def summarize_id_tensor(
     name: str,
     ids: Union[torch.Tensor, np.ndarray],

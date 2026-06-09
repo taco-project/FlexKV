@@ -751,10 +751,82 @@ def load_user_config_from_env() -> UserConfig:
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
     return int(size_in_GB * 1024 * 1024 * 1024 / block_size_in_bytes)
 
+
+def block_size_in_bytes_for_cache(
+    model_config: ModelConfig,
+    cache_config: CacheConfig,
+    rank_info: Optional["RankInfo"] = None,
+) -> int:
+    """Bytes per CPU/SSD block for pool sizing.
+
+  When ``layer_groups`` is set, use the whole-model ``token_size_in_bytes``
+  (heterogeneous / multi-pool layout).  Otherwise fall back to the uniform
+  per-PP-stage estimate from ``rank_info``.
+    """
+    if model_config.layer_groups is not None:
+        return model_config.token_size_in_bytes * cache_config.tokens_per_block
+    if rank_info is None:
+        raise ValueError(
+            "rank_info is required when model_config.layer_groups is None")
+    return rank_info.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
+
+
+def recompute_cache_block_counts(
+    model_config: ModelConfig,
+    cache_config: CacheConfig,
+) -> bool:
+    """Recompute ``num_cpu_blocks`` / ``num_ssd_blocks`` from stored GB budgets.
+
+    No-op when ``layer_groups`` is unset (initial uniform estimate is final).
+    Returns True if any block count changed.
+    """
+    if model_config.layer_groups is None:
+        return False
+
+    block_size_in_bytes = (
+        model_config.token_size_in_bytes * cache_config.tokens_per_block
+    )
+    changed = False
+
+    if cache_config._user_cpu_cache_gb > 0:
+        old_cpu = cache_config.num_cpu_blocks
+        new_cpu = convert_to_block_num(
+            cache_config._user_cpu_cache_gb, block_size_in_bytes)
+        if new_cpu != old_cpu:
+            flexkv_logger.info(
+                f"Recomputed num_cpu_blocks with layer_groups: "
+                f"{old_cpu} -> {new_cpu} "
+                f"(block_size={block_size_in_bytes} B)")
+            cache_config.num_cpu_blocks = new_cpu
+            changed = True
+
+    if cache_config._user_ssd_cache_gb > 0:
+        old_ssd = cache_config.num_ssd_blocks
+        new_ssd = convert_to_block_num(
+            cache_config._user_ssd_cache_gb, block_size_in_bytes)
+        if new_ssd != old_ssd:
+            flexkv_logger.info(
+                f"Recomputed num_ssd_blocks with layer_groups: "
+                f"{old_ssd} -> {new_ssd} "
+                f"(block_size={block_size_in_bytes} B)")
+            cache_config.num_ssd_blocks = new_ssd
+            changed = True
+            if (cache_config.num_ssd_blocks
+                    % len(cache_config.ssd_cache_dir) != 0):
+                cache_config.num_ssd_blocks = (
+                    (cache_config.num_ssd_blocks
+                     // len(cache_config.ssd_cache_dir) + 1)
+                    * len(cache_config.ssd_cache_dir)
+                )
+
+    return changed
+
+
 def update_default_config_from_user_config(rank_info: RankInfo,
                                            cache_config: CacheConfig,
                                            user_config: UserConfig) -> None:
-    block_size_in_bytes = rank_info.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
+    block_size_in_bytes = block_size_in_bytes_for_cache(
+        rank_info.model_config, cache_config, rank_info)
 
     assert user_config.cpu_cache_gb > 0
     assert user_config.ssd_cache_gb >= 0

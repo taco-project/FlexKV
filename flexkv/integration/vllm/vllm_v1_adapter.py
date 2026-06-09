@@ -892,6 +892,11 @@ class FlexKVWorkerConnector:
             # token_size_in_bytes/cache sizing now reads from layer_groups instead.
             self.flexkv_config.model_config.layer_groups = layer_groups
             self.flexkv_config.model_config.num_layers = num_main_layers
+            from flexkv.common.config import recompute_cache_block_counts
+            recompute_cache_block_counts(
+                self.flexkv_config.model_config,
+                self.flexkv_config.cache_config,
+            )
 
             # Primary layout (kv_layout arg) uses the first group's shape; the full
             # per-group layout list goes in gpu_layouts.

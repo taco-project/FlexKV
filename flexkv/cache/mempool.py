@@ -35,6 +35,12 @@ class Mempool:
         free_ids = self._free_ids[self._free_ids_offset:self._free_ids_offset+num]
         self._free_ids_offset += num
 
+        if len(free_ids) > 0 and int(free_ids.max()) >= self.num_total_blocks:
+            raise ValueError(
+                f"Mempool internal error: allocated block id "
+                f"{int(free_ids.max())} >= num_total_blocks={self.num_total_blocks}"
+            )
+
         self._free_mask[free_ids] = False
         self._num_free -= num
         return free_ids

@@ -812,6 +812,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.tp_group_size = tp_group_size
         self.layer_groups = layer_groups
         self.cpu_tensor = cpu_blocks
+        self.num_cpu_blocks = cpu_kv_layout.num_block
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
@@ -1010,6 +1011,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 'cpu_layer_stride': cpu_layer_stride,
                 'cpu_block_stride': cpu_block_stride,
                 'cpu_tp_stride': cpu_tp_stride,
+                'cpu_offset_bytes': cpu_offset_bytes,
                 'num_layers': g.num_layers,
                 'chunk_size': chunk_elements * dtype_size_g,
                 'window_blocks': window_blocks,
@@ -1085,27 +1087,77 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                     group_idx=gi,
                 )
 
+                from flexkv.common.debug import log_d2h_preflight
+
+                if log_d2h_preflight(
+                    getattr(self, "_current_op_id", -1),
+                    transfer_type.name,
+                    gi,
+                    len(self.tp_group_transfer_groups),
+                    g_gpu,
+                    g_cpu,
+                    gp,
+                    use_ce=use_ce_transfer,
+                    num_gpus=self.num_gpus,
+                    cpu_tensor=self.cpu_tensor,
+                    gpu_capacity_hint=self._gpu_capacity_hint(),
+                ):
+                    max_cpu = int(g_cpu.max().item()) if g_cpu.numel() else -1
+                    num_cpu_blocks = getattr(self, "num_cpu_blocks", None)
+                    raise RuntimeError(
+                        f"D2H aborted: CPU block id {max_cpu} exceeds physical "
+                        f"buffer (num_cpu_blocks={num_cpu_blocks}, "
+                        f"cpu_tensor_bytes={self.cpu_tensor.numel() * self.cpu_tensor.element_size()}). "
+                        f"CacheEngine mempool and StorageEngine block counts are mismatched."
+                    )
+
                 # SWA optimization: disabled — stale GPU blocks cause
                 # attention corruption when HMA is off.
 
-                gp['tp_thread_group'].tp_group_transfer(
-                    g_gpu,
-                    g_cpu,
-                    gp['cpu_kv_stride'],
-                    gp['cpu_layer_stride'],
-                    gp['cpu_block_stride'],
-                    gp['cpu_tp_stride'],
-                    transfer_num_cta,
-                    transfer_type == TransferType.H2D,
-                    use_ce_transfer,
-                    0,                 # start_layer_id (always 0 within group)
-                    gp['num_layers'],  # all layers in this group
-                    self.is_mla,
-                )
+                group_t0 = time.time()
+                try:
+                    gp['tp_thread_group'].tp_group_transfer(
+                        g_gpu,
+                        g_cpu,
+                        gp['cpu_kv_stride'],
+                        gp['cpu_layer_stride'],
+                        gp['cpu_block_stride'],
+                        gp['cpu_tp_stride'],
+                        transfer_num_cta,
+                        transfer_type == TransferType.H2D,
+                        use_ce_transfer,
+                        0,                 # start_layer_id (always 0 within group)
+                        gp['num_layers'],  # all layers in this group
+                        self.is_mla,
+                    )
+                except Exception as e:
+                    flexkv_logger.error(
+                        "[FlexKV-D2H-DEBUG] tp_group_transfer raised op_id=%s "
+                        "group=%s/%s ce=%s err=%r",
+                        getattr(self, "_current_op_id", -1),
+                        gi,
+                        len(self.tp_group_transfer_groups),
+                        use_ce_transfer,
+                        e,
+                    )
+                    for dev_i in range(self.num_gpus):
+                        try:
+                            torch.cuda.set_device(dev_i)
+                            torch.cuda.synchronize()
+                        except Exception as sync_e:
+                            flexkv_logger.error(
+                                "[FlexKV-D2H-DEBUG] cuda sync after error "
+                                "dev=%s err=%r",
+                                dev_i,
+                                sync_e,
+                            )
+                    raise
+                group_elapsed = time.time() - group_t0
                 flexkv_logger.info(
                     "[FlexKV-SEGV-DEBUG] tpGPUCPUTransferWorker group xfer END: "
                     f"worker_id={self.worker_id}, pid={os.getpid()}, "
-                    f"type={transfer_type.name}, group={gi}/{len(self.tp_group_transfer_groups)}"
+                    f"type={transfer_type.name}, group={gi}/{len(self.tp_group_transfer_groups)}, "
+                    f"ce={use_ce_transfer}, elapsed={group_elapsed:.4f}s"
                 )
         else:
             self.tp_transfer_thread_group.tp_group_transfer(

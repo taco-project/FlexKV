@@ -21,7 +21,8 @@ import sys
 
 from flexkv.common.transfer import TransferOpGraph, CompletedOp, WorkerKey
 from flexkv.common.config import (
-    CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV, convert_to_block_num,
+    CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV,
+    recompute_cache_block_counts,
 )
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
@@ -147,28 +148,11 @@ class TransferManager:
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
         num_layers_per_pp_stage = next(iter(self.all_gpu_layouts.values())).num_layer
 
-        # Recompute block counts if layer_groups changed token_size_in_bytes.
-        # This is the deferred-recompute path: the initial num_cpu/ssd_blocks
-        # computed in update_default_config_from_user_config used
-        # bytes_per_token_per_layer (uniform assumption); now we know the real
-        # layer_groups layout and can correct it before StorageEngine allocates.
-        if self.model_config.layer_groups is not None:
-            block_size_in_bytes = (self.model_config.token_size_in_bytes
-                                   * self.cache_config.tokens_per_block)
-            if self.cache_config._user_cpu_cache_gb > 0:
-                old_cpu = self.cache_config.num_cpu_blocks
-                self.cache_config.num_cpu_blocks = convert_to_block_num(
-                    self.cache_config._user_cpu_cache_gb, block_size_in_bytes)
-                flexkv_logger.info(
-                    f"Recomputed num_cpu_blocks with layer_groups: {old_cpu} -> "
-                    f"{self.cache_config.num_cpu_blocks}")
-            if self.cache_config._user_ssd_cache_gb > 0:
-                old_ssd = self.cache_config.num_ssd_blocks
-                self.cache_config.num_ssd_blocks = convert_to_block_num(
-                    self.cache_config._user_ssd_cache_gb, block_size_in_bytes)
-                flexkv_logger.info(
-                    f"Recomputed num_ssd_blocks with layer_groups: {old_ssd} -> "
-                    f"{self.cache_config.num_ssd_blocks}")
+        # Recompute block counts once layer_groups are known (heterogeneous /
+        # multi-pool models).  Must match CacheEngine mempool sizing in the
+        # main process — sglang DSv4 applies the same recompute before
+        # KVManager; this path covers late discovery at GPU registration.
+        recompute_cache_block_counts(self.model_config, self.cache_config)
 
         self.storage_engine = StorageEngine(
             self.model_config,

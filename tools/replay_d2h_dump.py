@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 from flexkv.c_ext import TPTransferThreadGroup, transfer_kv_blocks
+from flexkv.transfer.host_buffer import alloc_kernel_visible_cpu_tensor
 
 
 @dataclass(frozen=True)
@@ -97,11 +98,12 @@ def _load_block_ids(npz_path: str, remap: bool) -> Tuple[torch.Tensor, torch.Ten
         meta["remapped"] = True
     else:
         meta["remapped"] = False
-    return (
-        torch.from_numpy(gpu),
-        torch.from_numpy(cpu),
-        meta,
-    )
+    # Custom kernels dereference block-id arrays from the GPU; they must be
+    # pinned host memory (same as worker.get_transfer_block_ids pinned=True).
+    # CE reads ids on the CPU host loop, so pageable tensors still work there.
+    gpu_ids = torch.from_numpy(gpu).to(dtype=torch.int64).contiguous().pin_memory()
+    cpu_ids = torch.from_numpy(cpu).to(dtype=torch.int64).contiguous().pin_memory()
+    return gpu_ids, cpu_ids, meta
 
 
 def _alloc_buffers(
@@ -127,7 +129,10 @@ def _alloc_buffers(
         gpu_layers.append(layers)
 
     cpu_bytes = max_cpu * layout.total_block_bytes + layout.num_layers * layout.cpu_layer_stride
-    cpu_tensor = torch.zeros(cpu_bytes, dtype=torch.uint8, pin_memory=True)
+    # Custom D2H kernels store into host via device pointers; plain pin_memory is
+    # not UVA-mapped and only works with CE cudaMemcpy (see host_buffer.py).
+    cpu_tensor = alloc_kernel_visible_cpu_tensor(cpu_bytes, torch.uint8)
+    cpu_tensor.zero_()
     return gpu_layers, cpu_tensor
 
 
