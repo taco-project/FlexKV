@@ -156,12 +156,14 @@ class KVDPClient:
         token_ids: np.ndarray,
         token_mask: Optional[np.ndarray],
         layer_granularity: int,
+        cpu_only: bool = False,
         namespace: Optional[List[str]] = None,
     ) -> Optional[Tuple[int, np.ndarray]]:
         req = GetMatchRequest(self.dp_client_id,
                               token_ids,
                               token_mask if token_mask is not None else None,
                               layer_granularity,
+                              cpu_only,
                               self._get_task_id(),
                               namespace)
         self.send_to_server.send_pyobj(req)
