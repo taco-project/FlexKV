@@ -24,6 +24,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.transfer import DeviceType
 from flexkv.common.storage import KVCacheLayout
+from flexkv.server.aoti_protocol import decode_request
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.server.utils import get_zmq_socket
@@ -80,7 +81,7 @@ class TransferManager:
             while len(self.all_gpu_blocks) < self.expected_gpus:
                 try:
                     # Recv from: flexkv.server.client.KVTPClient.register_to_server
-                    req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
+                    req, _ = decode_request(self.recv_from_client.recv(zmq.NOBLOCK))
                 except zmq.Again:
                     time.sleep(0.001)
                     continue

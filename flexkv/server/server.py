@@ -1,6 +1,7 @@
 from collections import deque
 from dataclasses import fields
 from typing import Optional, Dict, List, Union
+import pickle
 
 import tempfile
 import zmq
@@ -20,6 +21,18 @@ from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.kvtask import KVTaskEngine
+from flexkv.server.aoti_protocol import (
+    RegisterRawDPClientRequest,
+    decode_request,
+    encode_error_response,
+    encode_get_match_response,
+    encode_is_ready_response,
+    encode_wait_response,
+    RESP_GET_MATCH,
+    RESP_IS_READY,
+    RESP_TRY_WAIT,
+    RESP_WAIT,
+)
 from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import (
     RegisterDPClientRequest,
@@ -47,11 +60,13 @@ class DPClient:
         client_id: int,
         send_to_client: zmq.Socket,
         tp_size: int = 1,
+        use_raw_protocol: bool = False,
     ):
         self.client_id = client_id
         self.tp_size = tp_size
 
         self.send_to_client = send_to_client
+        self.use_raw_protocol = use_raw_protocol
 
         self.is_ready: bool = False
 
@@ -70,6 +85,7 @@ class ClientManager:
         client_recv_port: str,
         tp_size: int = 1,
         client_id: Optional[int] = None,
+        use_raw_protocol: bool = False,
     ) -> int:
         if client_id is None:
             if len(self.free_client_ids) == 0:
@@ -84,6 +100,7 @@ class ClientManager:
             client_id=client_id,
             tp_size=tp_size,
             send_to_client=send_to_client,
+            use_raw_protocol=use_raw_protocol,
         )
         flexkv_logger.info(f"DP client {client_id} registered successfully")
 
@@ -107,6 +124,9 @@ class ClientManager:
         if dp_client_id in self.client_dict:
             return self.client_dict[dp_client_id].is_ready
         return False
+
+    def uses_raw_protocol(self, dp_client_id: int) -> bool:
+        return self.client_dict[dp_client_id].use_raw_protocol
 
 class KVServerHandle:
     def __init__(self, process: Union[mp.Process, 'subprocess.Popen']):
@@ -185,6 +205,7 @@ class KVServer:
         self.request_handlers = {
             StartRequest: self._handle_start_request,
             RegisterDPClientRequest: self._handle_register_dp_client_request,
+            RegisterRawDPClientRequest: self._handle_register_raw_dp_client_request,
             IsReadyRequest: self._handle_is_ready_request,
             GetRequest: self._handle_get_request,
             PutRequest: self._handle_put_request,
@@ -289,7 +310,7 @@ class KVServer:
         # TODO: handle error and return error response
         # TODO: support check finish
         flexkv_logger.info("Servering waiting to be started")
-        req = self.recv_from_client.recv_pyobj()
+        req, _ = decode_request(self.recv_from_client.recv())
         if isinstance(req, StartRequest):
             flexkv_logger.info(f"Received start request from DP client {req.dp_client_id}, "
                                f"Starting server...")
@@ -299,9 +320,10 @@ class KVServer:
                             f"{req.dp_client_id} before the start request")
         self._running = True
         while self._running:
+            req = None
             try:
                 flexkv_logger.info("start waiting for req")
-                req = self.recv_from_client.recv_pyobj()
+                req, _ = decode_request(self.recv_from_client.recv())
                 flexkv_logger.info(f"recv req: {type(req)} from DP client {req.dp_client_id}")
 
                 # Use dispatch table for request handling
@@ -322,6 +344,9 @@ class KVServer:
                 flexkv_logger.error(f"ZMQ Error: {e}", exc_info=True)
             except Exception as e:
                 flexkv_logger.error(f"Error: {e}", exc_info=True)
+                dp_client_id = getattr(req, "dp_client_id", None)
+                if dp_client_id in self.client_manager.client_dict and self.client_manager.uses_raw_protocol(dp_client_id):
+                    self.client_manager.get_zmq(dp_client_id).send(encode_error_response(str(e)))
 
         # Cleanup after shutdown
         flexkv_logger.info("Server shutting down, cleaning up...")
@@ -347,19 +372,42 @@ class KVServer:
     def _handle_register_dp_client_request(self, req: RegisterDPClientRequest) -> None:
         """Handle DP client registration request"""
         self._verify_model_config(req.model_config)
-        client_id = self.client_manager.register_dp_client(
+        self.client_manager.register_dp_client(
             self.context,
             req.client_recv_port,
             req.model_config.tp_size,
             req.dp_client_id,
         )
 
+    def _handle_register_raw_dp_client_request(self, req: RegisterRawDPClientRequest) -> None:
+        """Handle raw-protocol DP client registration request."""
+        self.client_manager.register_dp_client(
+            self.context,
+            req.client_recv_port,
+            req.tp_size,
+            req.dp_client_id,
+            use_raw_protocol=True,
+        )
+
+    def _send_response(self, dp_client_id: int, response: Response, raw_opcode: Optional[int] = None) -> None:
+        result_zmq = self.client_manager.get_zmq(dp_client_id)
+        if self.client_manager.uses_raw_protocol(dp_client_id):
+            if raw_opcode == RESP_IS_READY:
+                result_zmq.send(encode_is_ready_response(response.is_ready))
+            elif raw_opcode == RESP_GET_MATCH:
+                result_zmq.send(encode_get_match_response(response.task_id, response.mask))
+            elif raw_opcode in (RESP_WAIT, RESP_TRY_WAIT):
+                result_zmq.send(encode_wait_response(raw_opcode, response.status))
+            else:
+                raise RuntimeError(f"Unsupported raw response opcode: {raw_opcode}")
+            return
+        result_zmq.send_pyobj(response)
+
     def _handle_is_ready_request(self, req: IsReadyRequest) -> None:
         """Handle ready state check request"""
         is_ready = self.kv_task_engine.is_ready()
         response = Response(req.dp_client_id, is_ready=is_ready)
-        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
-        result_zmq.send_pyobj(response)
+        self._send_response(req.dp_client_id, response, RESP_IS_READY)
 
     def _handle_get_request(self, req: GetRequest) -> None:
         """Handle Get request"""
@@ -395,8 +443,7 @@ class KVServer:
             namespace=req.namespace,
         )
         response = Response(req.dp_client_id, task_id=req_id, mask=mask)
-        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
-        result_zmq.send_pyobj(response)
+        self._send_response(req.dp_client_id, response, RESP_GET_MATCH)
 
     def _handle_put_match_request(self, req: PutMatchRequest) -> None:
         """Handle PutMatch request"""
@@ -408,8 +455,7 @@ class KVServer:
             namespace=req.namespace,
         )
         response = Response(req.dp_client_id, task_id=req_id, mask=mask)
-        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
-        result_zmq.send_pyobj(response)
+        self._send_response(req.dp_client_id, response, RESP_GET_MATCH)
 
     def _handle_prefetch_request(self, req: PrefetchRequest) -> None:
         """Handle Prefetch request"""
@@ -436,8 +482,7 @@ class KVServer:
             completely=req.completely,
         )
         response = Response(req.dp_client_id, status=kv_responses)
-        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
-        result_zmq.send_pyobj(response)
+        self._send_response(req.dp_client_id, response, RESP_WAIT)
 
     def _handle_try_wait_request(self, req: TryWaitRequest) -> None:
         """Handle TryWait request"""
@@ -445,8 +490,7 @@ class KVServer:
             req.try_wait_task_ids,
         )
         response = Response(req.dp_client_id, status=kv_responses)
-        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
-        result_zmq.send_pyobj(response)
+        self._send_response(req.dp_client_id, response, RESP_TRY_WAIT)
 
     def _handle_shutdown_request(self, req: ShutdownRequest) -> None:
         """Handle shutdown request"""
