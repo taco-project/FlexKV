@@ -11,7 +11,7 @@ import torch
 
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
-
+from flexkv.external.mooncake_store_keys import PoolSpec, PoolKind
 
 @dataclass
 class IndexerCacheConfig:
@@ -156,6 +156,7 @@ class ModelConfig:
     @property
     def tp_size_per_node(self) -> int:
         """Number of TP ranks on this node within one TP group."""
+        flexkv_logger.info(f"[Config] TP size per node: {self.tp_size} // {self.nnodes_per_tp_group}")
         return self.tp_size // self.nnodes_per_tp_group
 
     @property
@@ -173,11 +174,13 @@ class ModelConfig:
     @property
     def attn_tp_size_per_node(self) -> int:
         """Attention-level TP size per node."""
+        flexkv_logger.info(f"[Config] Attention-level TP size per node: {self.attn_tp_size} // {self.nnodes_per_tp_group}")
         return self.attn_tp_size // self.nnodes_per_tp_group
 
     @property
     def attn_cp_size_per_node(self) -> int:
         """Attention-level CP size on this node for a single pp stage. """
+        flexkv_logger.info(f"[Config] Attention-level CP size per node: {self.attn_cp_size} // {self.nnodes_per_pp_rank}")
         return max(1, self.attn_cp_size // self.nnodes_per_pp_rank)
 
     @property
@@ -188,6 +191,7 @@ class ModelConfig:
     @property
     def effective_tp_size_per_node(self) -> int:
         """Per-node counterpart of :pyattr:`effective_tp_size`."""
+        flexkv_logger.info(f"[Config] Effective tp-group size per node: {self.attn_tp_size_per_node} * {self.attn_cp_size_per_node}")
         return self.attn_tp_size_per_node * self.attn_cp_size_per_node
 
     @property
@@ -389,10 +393,33 @@ class CacheConfig:
     # Mooncake transfer engine config path (serialized via pickle to survive spawn subprocesses)
     mooncake_config_path: Optional[str] = None
 
+    # Mooncake-store distributed KV cache backend
+    # When True, mooncake-store replaces the CFS/PCFS remote backend.
+    # The store manages a global pool of CPU memory pinned for RDMA zero-copy.
+    use_mooncake_store_backend: bool = False
+    mooncake_store_config_path: Optional[str] = None  # Path to mooncake-store JSON config file
+    # PP isolation knobs: mooncake keys are partitioned by the *node-local*
+    # CPU pool layer range (see ``build_key``). pp_rank/pp_size identify
+    # the stage in cross-node deployments; node_layer_start/end describe
+    # which model-layer range this node's CPU pool covers; total_layers
+    # is the full model layer count.  Defaults are safe (no suffix) for
+    # PP==1 single-node case.
+    mooncake_store_pp_rank: int = 0
+    mooncake_store_pp_size: int = 1
+    mooncake_store_node_layer_start: int = 0
+    mooncake_store_node_layer_end: int = 0
+    mooncake_store_total_layers: int = 0
+
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
         self.enable_remote = self.enable_3rd_remote
+        self.use_mooncake_store_backend = self.use_mooncake_store_backend or bool(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', 0))
+        if self.use_mooncake_store_backend:
+            if self.mooncake_store_config_path is None:
+                self.mooncake_store_config_path = os.getenv('FLEXKV_MOONCAKE_STORE_CONFIG_PATH', None)
+                if self.mooncake_store_config_path is None:
+                    raise ValueError(f"Mooncake store config file path not found in cache config or environment variable MOONCAKE_STORE_CONFIG_PATH")
 
     def __str__(self) -> str:
         return (
@@ -406,6 +433,16 @@ class CacheConfig:
             f", num_cpu_blocks={self.num_cpu_blocks}"
             f", num_ssd_blocks={self.num_ssd_blocks})"
         )
+    def enable_pool_specs(self) -> List[PoolSpec]:
+        """Return the pool specs that are actually active in this run.
+        The main KV pool is always present. Side-cars are appended in a
+        deterministic order so all components (worker creation, match
+        joint query, key-prefix builders) see the same list.
+        """
+        specs = [PoolSpec(PoolKind.KV)]
+        if self.indexer is not None:
+            specs.append(PoolSpec(PoolKind.INDEXER))
+        return specs
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
@@ -419,6 +456,9 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     cpp_metrics_port=int(os.getenv('FLEXKV_CPP_METRICS_PORT', 8081)),
     ## Port for Python metrics HTTP server (default: 8080)
     py_metrics_port=int(os.getenv('FLEXKV_PY_METRICS_PORT', 8080)),
+
+    use_mooncake_store_backend=bool(int(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', 0))),
+    mooncake_store_config_path=os.getenv('FLEXKV_MOONCAKE_STORE_CONFIG_PATH', None),
 
     # Server-client mode configuration
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
@@ -490,6 +530,16 @@ class UserConfig:
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
 
+    # Mooncake-store backend (distributed global KV cache pool)
+    use_mooncake_store_backend: bool = False
+    mooncake_store_config_path: Optional[str] = None  # Path to mooncake-store JSON config file
+    # PP isolation knobs (see CacheConfig for the suffix policy details).
+    mooncake_store_pp_rank: int = 0
+    mooncake_store_pp_size: int = 1
+    mooncake_store_node_layer_start: int = 0
+    mooncake_store_node_layer_end: int = 0
+    mooncake_store_total_layers: int = 0
+
     # distributed zmq configs
     local_zmq_ip: Optional[str] = None
     local_zmq_port: Optional[int] = None
@@ -558,8 +608,18 @@ def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
 def update_default_config_from_user_config(rank_info: RankInfo,
                                            cache_config: CacheConfig,
                                            user_config: UserConfig) -> None:
+    # Block size (bytes) used to translate cpu_cache_gb / ssd_cache_gb
+    # into block counts. On single-node PP the CPU pool covers all PP stages
+    # on the node, so size each block with the full model layer count.
+    # Cross-node PP keeps rank-local PP-stage sizing.
+    if int(rank_info.model_config.nnodes) == 1:
+        layers_per_block = int(rank_info.model_config.num_layers)
+    else:
+        layers_per_block = int(rank_info.num_layers_per_pp_stage)
     main_block_size_in_bytes = (
-        rank_info.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
+        layers_per_block
+        * rank_info.model_config.bytes_per_token_per_layer
+        * cache_config.tokens_per_block
     )
     indexer_block_size_in_bytes = 0
     if cache_config.indexer is not None:
@@ -574,7 +634,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
             * indexer_cfg.dtype.itemsize
         )
         indexer_block_size_in_bytes = (
-            rank_info.num_layers_per_pp_stage
+            layers_per_block
             * indexer_bytes_per_token_per_layer
         )
     block_size_in_bytes = main_block_size_in_bytes + indexer_block_size_in_bytes
@@ -628,11 +688,46 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote
 
+    # Propagate mooncake-store backend settings
+    cache_config.use_mooncake_store_backend = user_config.use_mooncake_store_backend
+    cache_config.mooncake_store_config_path = user_config.mooncake_store_config_path
+
+    # PP isolation: forward this rank's pp_rank / pp_size onto cache_config
+    # for cross-node PP key suffix.  total_layers (full model layer count)
+    # also flows through here.  node_layer_start/end describe the per-node
+    # CPU pool layer range and are NOT known yet at this point ��� they get
+    # populated later by transfer_manager once all GPU registrations have
+    # arrived (gpu_pp_start_layer_mapping is complete).  See
+    # transfer_manager.py around the node_min_pp_start_layer block.
+    cache_config.mooncake_store_pp_rank = int(rank_info.pp_rank)
+    cache_config.mooncake_store_pp_size = int(rank_info.model_config.pp_size)
+    cache_config.mooncake_store_total_layers = int(rank_info.model_config.num_layers)
+
+    # Single-node deployment: the per-node CPU pool always covers the FULL
+    # model layer set regardless of pp_size, so we can resolve
+    # node_layer_start/end up-front here.  This is critical for the match
+    # path: GlobalCacheEngine creates MooncakeStoreCacheEngine in the parent
+    # process at construction time and snapshots these fields, so any later
+    # write-back from the TransferManager subprocess never reaches the
+    # parent.  Pre-populating here keeps the match path consistent with the
+    # worker (subprocess) path for single-node deployments.
+    #
+    # Cross-node PP is the only case where a node holds *part* of the model:
+    # leave node_layer_start/end at their defaults (0, 0) so transfer_manager
+    # later overwrites them inside the subprocess.  Match-side correctness
+    # for that case is a separate concern (the parent process still snapshots
+    # 0/0 and falls into the cross-node branch by sticking the
+    # _pp_rank_<i>_of_<N> suffix, which is the right behavior for cross-node
+    # PP).
+    if int(rank_info.model_config.nnodes) == 1:
+        cache_config.mooncake_store_node_layer_start = 0
+        cache_config.mooncake_store_node_layer_end = int(rank_info.model_config.num_layers)
+
     # Update derived flags after setting p2p and remote configs
     cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or
                                       cache_config.enable_p2p_ssd or
                                       cache_config.enable_3rd_remote)
-    cache_config.enable_remote = cache_config.enable_3rd_remote
+    cache_config.enable_remote = cache_config.enable_3rd_remote or cache_config.use_mooncake_store_backend
 
     if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
         cache_config.num_ssd_blocks = \
@@ -642,7 +737,8 @@ def update_default_config_from_user_config(rank_info: RankInfo,
 
     if not cache_config.enable_cpu:
         raise ValueError("enable_cpu must be True")
-    if cache_config.enable_remote and not cache_config.enable_ssd:
+    if (cache_config.enable_remote and not cache_config.enable_ssd
+            and not cache_config.use_mooncake_store_backend):
         raise ValueError("enable_ssd must be True if enable_remote is True")
     if not cache_config.enable_cpu and not cache_config.enable_gds:
         raise ValueError("enable_gds must be True if enable_cpu is False")
@@ -653,7 +749,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
             "enable_kv_sharing and enable_gds cannot be used at the same time"
         )
 
-    if cache_config.enable_remote:
+    if cache_config.enable_remote and not cache_config.use_mooncake_store_backend:
         if cache_config.remote_cache_path is None:
             if cache_config.remote_file_prefix is None:
                 raise ValueError(

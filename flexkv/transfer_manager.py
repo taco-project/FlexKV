@@ -46,6 +46,7 @@ class TransferManager:
         self.all_gpu_layouts: Dict[int, KVCacheLayout] = {}
         self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks
         self.gpu_worker_key_mapping: Dict[int, WorkerKey] = {}
+        self.gpu_pp_start_layer_mapping: Dict[int, int] = {}  # device_id -> pp_start_layer
 
         # Indexer GPU registration data
         self.all_indexer_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> indexer_gpu_blocks
@@ -73,6 +74,7 @@ class TransferManager:
                     dp_client_id=req.dp_client_id,
                     pp_rank=req.pp_rank,
                 )
+                self.gpu_pp_start_layer_mapping[device_id] = req.pp_start_layer
                 # Store indexer GPU data if present
                 if req.indexer_handles is not None:
                     self.all_indexer_gpu_blocks[device_id] = req.indexer_handles
@@ -137,11 +139,59 @@ class TransferManager:
             f"Expected {self.expected_gpus} GPU layouts, got {len(self.all_gpu_layouts)}"
         assert len(self.all_gpu_blocks) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
-        num_layers_per_pp_stage = next(iter(self.all_gpu_layouts.values())).num_layer
+
+        # Compute total layers on this node: sum up num_layer for each distinct pp_rank.
+        # In single-node PP>1 deployments, multiple pp_ranks share this TransferManager,
+        # so the CPU pool must cover all their layer ranges, not just one pp_stage.
+        pp_rank_to_num_layers: Dict[int, int] = {}
+        for device_id, layout in self.all_gpu_layouts.items():
+            worker_key = self.gpu_worker_key_mapping[device_id]
+            pp_rank = worker_key.pp_rank
+            if pp_rank not in pp_rank_to_num_layers:
+                pp_rank_to_num_layers[pp_rank] = layout.num_layer
+        num_layers_on_node = sum(pp_rank_to_num_layers.values())
+        flexkv_logger.info(
+            f"CPU pool num_layers_on_node={num_layers_on_node} "
+            f"(pp_rank_to_num_layers={pp_rank_to_num_layers})")
+
+        # Build per-WorkerKey start_layer_id mapping for TransferEngine.
+        # gpu_pp_start_layer_mapping stores the *global* layer offset computed by
+        # get_pp_indices (e.g. pp_rank=1 on a 32-layer model with PP=2 gives 16).
+        # The CPU pool on this node is indexed from 0, so we subtract the minimum
+        # global pp_start_layer seen on this node to get the CPU-pool-local offset.
+        # Examples:
+        #   single-node PP=2: node_min=0, pp_rank=0 → 0, pp_rank=1 → L/2   ✓
+        #   cross-node PP=2, node-1: node_min=L/2, pp_rank=1 → L/2-L/2=0   ✓
+        node_min_pp_start_layer = min(self.gpu_pp_start_layer_mapping.values(), default=0)
+        worker_key_to_start_layer_id: Dict[WorkerKey, int] = {}
+        for device_id, pp_start_layer in self.gpu_pp_start_layer_mapping.items():
+            worker_key = self.gpu_worker_key_mapping[device_id]
+            if worker_key not in worker_key_to_start_layer_id:
+                worker_key_to_start_layer_id[worker_key] = pp_start_layer - node_min_pp_start_layer
+        flexkv_logger.info(
+            f"worker_key_to_start_layer_id={worker_key_to_start_layer_id} "
+            f"(node_min_pp_start_layer={node_min_pp_start_layer})")
+
+        if self.cache_config.use_mooncake_store_backend:
+            # Mooncake key suffix uses the per-node CPU pool layer range.
+            # Full-model node (single-node PP) -> no suffix; partial node
+            # (cross-node PP) -> _pp_rank_<i>_of_<N> suffix.  See build_key.
+            node_layer_end = node_min_pp_start_layer + num_layers_on_node
+            self.cache_config.mooncake_store_node_layer_start = int(node_min_pp_start_layer)
+            self.cache_config.mooncake_store_node_layer_end = int(node_layer_end)
+            # total_layers usually injected by update_default_config_from_user_config,
+            # but be defensive in case the engine was constructed bare.
+            if int(getattr(self.cache_config, 'mooncake_store_total_layers', 0) or 0) == 0:
+                self.cache_config.mooncake_store_total_layers = int(self.model_config.num_layers)
+            flexkv_logger.info(
+                f"mooncake key range: node_layer_start={node_min_pp_start_layer}, "
+                f"node_layer_end={node_layer_end}, "
+                f"total_layers={self.cache_config.mooncake_store_total_layers}")
+
         self.storage_engine = StorageEngine(
             self.model_config,
             self.cache_config,
-            num_layers_per_pp_stage,
+            num_layers_on_node,
         )
 
         # Register GPU blocks with their global device IDs
@@ -174,9 +224,11 @@ class TransferManager:
             if self.cache_config.enable_cpu else None
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
             if self.cache_config.enable_ssd else None
+        # mooncake-store backend does not use RemoteAllocator; remote is handled by MooncakeStoreTransferWorker.
+        use_mooncake_store = self.cache_config.use_mooncake_store_backend
         remote_handle = (
             self.storage_engine.get_storage_handle(DeviceType.REMOTE) \
-            if self.cache_config.enable_remote \
+            if self.cache_config.enable_remote and not use_mooncake_store\
             else None
         )
 
@@ -213,6 +265,7 @@ class TransferManager:
             cpu_handle=cpu_handle,
             ssd_handle=ssd_handle,
             remote_handle=remote_handle,
+            worker_key_to_start_layer_id=worker_key_to_start_layer_id,
             indexer_gpu_handles=indexer_gpu_handles,
             indexer_cpu_handle=indexer_cpu_handle,
             indexer_ssd_handle=indexer_ssd_handle,

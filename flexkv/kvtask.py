@@ -746,13 +746,19 @@ class KVTaskEngine(KVTaskManager):
                        token_ids: np.ndarray,
                        dp_client_id: int = 0,
                        task_id: int = -1,
-                       namespace: Optional[List[str]] = None) -> int:
+                       namespace: Optional[List[str]] = None) -> Tuple[int, int]:
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
         self.create_prefetch_task(task_id, token_ids, dp_client_id=dp_client_id, namespace=namespace)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
+        task = self.tasks[task_id]
+        actual_prefetch_tokens = 0
+        if task is not None and task.return_mask is not None:
+            actual_prefetch_tokens = int(np.sum(task.return_mask))
+        else:
+            flexkv_logger.warning(f"prefetch task {task_id} returned None")
         # trace prefetch async request
         self.tracer.trace_request(
             request_type="PREFETCH_ASYNC",
@@ -763,7 +769,7 @@ class KVTaskEngine(KVTaskManager):
             dp_client_id=dp_client_id
         )
         self._launch_task(task_id)
-        return task_id
+        return task_id, actual_prefetch_tokens
 
     def merge_to_batch_kvtask(self,
                               batch_id: int,

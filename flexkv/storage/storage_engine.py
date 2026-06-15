@@ -46,6 +46,7 @@ class StorageEngine:
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla
             )
+            flexkv_logger.info(f"[StorageEngine] CPU layout: {self._cpu_layout}")
             self.allocate(
                 device_type=DeviceType.CPU,
                 layout=self._cpu_layout,
@@ -110,47 +111,66 @@ class StorageEngine:
                 )
 
         if self._cache_config.enable_remote:
-            if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
-                raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
-            self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
-                num_layer=num_layers_per_pp_stage,
-                num_block=self._cache_config.num_remote_blocks,
-                tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads_per_node,
-                head_size=self._model_config.head_size,
-                is_mla=self._model_config.use_mla
-            )
-            self.allocate(
-                device_type=DeviceType.REMOTE,
-                layout=self._remote_layout,
-                dtype=self._model_config.dtype,
-                file_path=self._cache_config.remote_cache_path,
-                remote_config_custom = self._cache_config.remote_config_custom
-            )
-            if self._indexer_config is not None:
-                indexer_remote_layout = KVCacheLayout(
+            use_mooncake_store = self._cache_config.use_mooncake_store_backend
+            if use_mooncake_store:
+                # No separate contributed region: hot CPU buffer is registered with
+                # mooncake-store directly (synchronous PUSH semantics, no staging needed).
+                # print(f"!!!!!! num_remote_blocks: {self._cache_config.num_remote_blocks}")
+                # self._remote_layout = KVCacheLayout(
+                #     type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                #     num_layer=num_layers_per_pp_stage,
+                #     num_block=self._cache_config.num_remote_blocks,
+                #     tokens_per_block=self._cache_config.tokens_per_block,
+                #     num_head=self._model_config.num_kv_heads_per_node,
+                #     head_size=self._model_config.head_size,
+                #     is_mla=self._model_config.use_mla
+                # )
+                flexkv_logger.info(
+                    "[StorageEngine] mooncake-store backend: hot CPU buffer will be "
+                    "registered directly (no separate contributed region)."
+                )
+            else:
+                if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
+                    raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
+                self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
                     num_layer=num_layers_per_pp_stage,
                     num_block=self._cache_config.num_remote_blocks,
-                    tokens_per_block=1,
-                    num_head=self._indexer_config.num_kv_heads,
-                    head_size=self._indexer_config.head_size,
-                    is_mla=True
+                    tokens_per_block=self._cache_config.tokens_per_block,
+                    num_head=self._model_config.num_kv_heads_per_node,
+                    head_size=self._model_config.head_size,
+                    is_mla=self._model_config.use_mla
                 )
-                indexer_remote_path = self._cache_config.remote_cache_path
-                if isinstance(indexer_remote_path, str):
-                    indexer_remote_path = indexer_remote_path + "_indexer"
-                elif isinstance(indexer_remote_path, list):
-                    indexer_remote_path = [p + "_indexer" for p in indexer_remote_path]
                 self.allocate(
                     device_type=DeviceType.REMOTE,
-                    layout=indexer_remote_layout,
-                    dtype=self._indexer_config.dtype,
-                    file_path=indexer_remote_path,
-                    remote_config_custom=self._cache_config.remote_config_custom,
-                    is_indexer=True,
+                    layout=self._remote_layout,
+                    dtype=self._model_config.dtype,
+                    file_path=self._cache_config.remote_cache_path,
+                    remote_config_custom = self._cache_config.remote_config_custom
                 )
+                if self._indexer_config is not None:
+                    indexer_remote_layout = KVCacheLayout(
+                        type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                        num_layer=num_layers_per_pp_stage,
+                        num_block=self._cache_config.num_remote_blocks,
+                        tokens_per_block=1,
+                        num_head=self._indexer_config.num_kv_heads,
+                        head_size=self._indexer_config.head_size,
+                        is_mla=True
+                    )
+                    indexer_remote_path = self._cache_config.remote_cache_path
+                    if isinstance(indexer_remote_path, str):
+                        indexer_remote_path = indexer_remote_path + "_indexer"
+                    elif isinstance(indexer_remote_path, list):
+                        indexer_remote_path = [p + "_indexer" for p in indexer_remote_path]
+                    self.allocate(
+                        device_type=DeviceType.REMOTE,
+                        layout=indexer_remote_layout,
+                        dtype=self._indexer_config.dtype,
+                        file_path=indexer_remote_path,
+                        remote_config_custom=self._cache_config.remote_config_custom,
+                        is_indexer=True,
+                    )
 
     @property
     def _has_indexer(self) -> bool:

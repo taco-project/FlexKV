@@ -18,6 +18,7 @@ import zmq
 import json
 
 from flexkv import c_ext
+from flexkv.external.mooncake_store_keys import PoolKind
 
 from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
 
@@ -46,6 +47,7 @@ from flexkv.transfer.compression.common.strategy import (
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
+from flexkv.external.mooncake_store_keys import build_key
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.transfer.utils import (
@@ -304,6 +306,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  gpu_device_id: int,
+                 start_layer_id: int = 0,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
@@ -328,8 +331,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.kv_dim = gpu_kv_layout.kv_dim
 
         self.num_layers = gpu_kv_layout.num_layer
-
-        # a chunk can be located by layer_id * layer_stride + kv_id * kv_stride + block_id * block_stride
+        self.start_layer_id = start_layer_id
         self.chunk_size_in_bytes = gpu_kv_layout.get_chunk_size() * self.dtype.itemsize
         self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
@@ -338,6 +340,32 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+
+        assert start_layer_id + self.num_layers <= cpu_kv_layout.num_layer, (
+            f"GPUCPUTransferWorker: start_layer_id({start_layer_id}) + "
+            f"num_layers({self.num_layers}) exceeds cpu pool size({cpu_kv_layout.num_layer}). "
+            f"Single-node PP>1 deployment requires cpu pool to cover all PP stages."
+        )
+        # Offset cpu_tensor by start_layer_id so that the C++ kernel always uses
+        # layer_id=0 on the GPU side (GPU tensor is PP-stage-local, 0-indexed)
+        # while writing to the correct slice of the shared per-node CPU pool.
+        # The CPU pool covers all PP stages on this node; each PP stage's worker
+        # advances the base pointer by (start_layer_id * cpu_layer_stride) bytes.
+        if start_layer_id > 0:
+            layer_offset_elems = start_layer_id * (self.cpu_layer_stride_in_bytes // self.dtype.itemsize)
+            self.cpu_tensor = cpu_blocks.flatten()[layer_offset_elems:]
+            flexkv_logger.debug(
+                f"[GPUCPUTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id={start_layer_id}, num_layers={self.num_layers}, "
+                f"cpu_pool_total_layers={cpu_kv_layout.num_layer}, "
+                f"cpu_ptr_offset={start_layer_id * self.cpu_layer_stride_in_bytes} bytes"
+            )
+        else:
+            self.cpu_tensor = cpu_blocks
+            flexkv_logger.debug(
+                f"[GPUCPUTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id=0, num_layers={self.num_layers} (no cpu_ptr offset)"
+            )
 
         if len(self.gpu_blocks) == 1:
             self.gpu_block_type_ = 1
@@ -402,7 +430,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.chunk_size_in_bytes,
-            0,
+            0,              # start_layer_id=0: GPU tensor is PP-stage-local (0-indexed);
+                            # CPU pool offset is baked into self.cpu_tensor pointer.
             self.num_layers,
             transfer_num_cta,
             transfer_type == TransferType.H2D,
@@ -440,6 +469,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  tp_group_size: int,
+                 start_layer_id: int = 0,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
@@ -468,7 +498,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         cudaHostRegister(cpu_blocks)
 
         self.num_layers = gpu_kv_layouts[0].num_layer
-        # here the chunk size doesn't include the layer info
+        self.start_layer_id = start_layer_id
         self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
                                 for gpu_kv_layout in gpu_kv_layouts]
         self.gpu_kv_strides_in_bytes = [gpu_kv_layout.get_kv_stride() * self.dtype.itemsize \
@@ -509,6 +539,27 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             for j in range(len(self.gpu_blocks[i]))
         ]
         cpu_blocks_ptr = cpu_blocks.data_ptr()
+        # Offset cpu_blocks_ptr by start_layer_id so that the C++ kernel always uses
+        # layer_id=0 on the GPU side (GPU tensor is PP-stage-local, 0-indexed)
+        # while writing to the correct slice of the shared per-node CPU pool.
+        # The CPU pool covers all PP stages on this node; each PP stage's worker
+        # advances the base pointer by (start_layer_id * cpu_layer_stride) bytes.
+        # Must use the post-div_head cpu_layer_stride_in_bytes here, because the
+        # C++ kernel uses the same stride for layer-wise addressing inside the block.
+        # (cpu_block_stride = num_layer * cpu_layer_stride_in_bytes in BLOCKFIRST layout
+        #  after div_head, so both strides are consistent.)
+        if start_layer_id > 0:
+            cpu_blocks_ptr += start_layer_id * self.cpu_layer_stride_in_bytes
+            flexkv_logger.debug(
+                f"[tpGPUCPUTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id={start_layer_id}, num_layers={self.num_layers}, "
+                f"cpu_ptr_offset={start_layer_id * self.cpu_layer_stride_in_bytes} bytes"
+            )
+        else:
+            flexkv_logger.debug(
+                f"[tpGPUCPUTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id=0, num_layers={self.num_layers} (no cpu_ptr offset)"
+            )
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
         num_tensors_per_gpu = len(self.gpu_blocks[0])
 
@@ -570,7 +621,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             transfer_num_cta,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
-            0,
+            0,              # layer_id=0: GPU tensor is PP-stage-local (0-indexed);
+                            # CPU pool offset is baked into cpu_blocks_ptr.
             self.num_layers,
             self.is_mla,
             self.mla_d2h_mode,  # Pass MLA D2H mode to C++
@@ -922,6 +974,7 @@ class GDSTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         gpu_device_id: int = 0,
+        start_layer_id: int = 0,
     ) -> None:
         """
         Initialize GDS Transfer Worker
@@ -966,6 +1019,21 @@ class GDSTransferWorker(TransferWorkerBase):
 
         # Layout information
         self.num_layers = gpu_kv_layout.num_layer
+        self.start_layer_id = start_layer_id
+        # Offset the SSD-side layer_id_list by start_layer_id at transfer time so that
+        # the C++ GDS kernel seeks to the correct slice of the shared per-node SSD pool.
+        # GPU side is PP-stage-local (0-indexed); the SSD pool covers all PP stages on this node.
+        if start_layer_id > 0:
+            flexkv_logger.debug(
+                f"[GDSTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id={start_layer_id}, num_layers={self.num_layers}, "
+                f"ssd_seek_offset will be applied at transfer time"
+            )
+        else:
+            flexkv_logger.debug(
+                f"[GDSTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id=0, num_layers={self.num_layers} (no SSD seek offset)"
+            )
         gpu_kv_layout_per_layer = gpu_kv_layout.div_layer(self.num_layers)
         ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
 
@@ -1024,8 +1092,21 @@ class GDSTransferWorker(TransferWorkerBase):
         if len(ssd_block_id_list) == 0:
             return
 
-        # Process transfer for each layer
-        layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
+        # Offset the SSD-side layer_id_list by start_layer_id so that the C++ GDS
+        # kernel seeks to the correct slice of the shared per-node SSD pool.
+        # GPU side is PP-stage-local (0-indexed); the SSD pool covers all PP stages
+        # on this node, so layer_id_list[0] = start_layer_id encodes the SSD seek offset
+        # (start_layer_id * ssd_layer_stride bytes).
+        layer_id_list = torch.arange(self.start_layer_id, self.start_layer_id + self.num_layers, dtype=torch.int32)
+        if self.start_layer_id > 0:
+            flexkv_logger.debug(
+                f"[GDSTransferWorker] SSD layer_id_list starts at {self.start_layer_id} "
+                f"(ssd_seek_offset={self.start_layer_id * self.ssd_layer_stride_in_bytes} bytes)"
+            )
+        else:
+            flexkv_logger.debug(
+                f"[GDSTransferWorker] start_layer_id=0, num_layers={self.num_layers} (no SSD seek offset)"
+            )
 
         # Determine if this is a read operation
         is_read = (transfer_type == TransferType.DISK2D)
@@ -1097,6 +1178,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         tp_group_size: int,
+        start_layer_id: int = 0,
     ) -> None:
         """
         Initialize TP GDS Transfer Worker
@@ -1138,6 +1220,21 @@ class tpGDSTransferWorker(TransferWorkerBase):
 
         # Layout information
         self.num_layers = gpu_kv_layouts[0].num_layer
+        self.start_layer_id = start_layer_id
+        # start_layer_id is passed directly to the C++ tp_group_transfer kernel as the
+        # SSD-side layer seek offset (start_layer_id * ssd_layer_stride bytes).
+        # GPU side is PP-stage-local (0-indexed); the SSD pool covers all PP stages on this node.
+        if start_layer_id > 0:
+            flexkv_logger.debug(
+                f"[tpGDSTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id={start_layer_id}, num_layers={self.num_layers}, "
+                f"ssd_seek_offset will be computed at transfer time"
+            )
+        else:
+            flexkv_logger.debug(
+                f"[tpGDSTransferWorker] worker_id={worker_id}: "
+                f"start_layer_id=0, num_layers={self.num_layers} (no SSD seek offset)"
+            )
         ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
         self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
         self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
@@ -1219,6 +1316,11 @@ class tpGDSTransferWorker(TransferWorkerBase):
         if len(gpu_block_id_list) == 0:
             return
 
+        # start_layer_id is passed directly to the C++ tp_group_transfer kernel,
+        # which uses it as the SSD-side layer seek offset (start_layer_id * ssd_layer_stride).
+        # GPU side is PP-stage-local (0-indexed); the SSD pool covers all PP stages
+        # on this node. This is equivalent to the layer_id_list offset used in
+        # GDSTransferWorker, but expressed as a scalar parameter to the TP kernel.
         self.tp_gds_transfer_thread_group.tp_group_transfer(
             gpu_block_id_list,
             ssd_block_id_list,
@@ -1228,7 +1330,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             self.ssd_tp_stride_in_bytes,
             self.num_blocks_per_file,
             is_read,
-            0,
+            self.start_layer_id,
             self.num_layers,
             self.is_mla,
         )
@@ -2479,3 +2581,191 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.info(f"Fetched node {node_id} meta from Redis.")
 
         return self.node_metas[node_id]
+
+
+# ---------------------------------------------------------------------------
+# MooncakeStoreTransferWorker
+# ---------------------------------------------------------------------------
+
+class MooncakeStoreTransferWorker(TransferWorkerBase):
+    """
+    Transfer worker that uses mooncake-store for remote KV cache I/O.
+
+    Transfer semantics
+    * **H2REMOTE (PUT)**: build (key, ptr, size) triples that point directly
+      into the hot-CPU buffer and call ``batch_put``.
+
+    * **REMOTE2H (GET)**: call ``batch_get`` directly with pointers into the
+      hot-CPU buffer.
+
+    Addressing
+    Key format: ``"{block_hash}_{kind.value}"`` — one key per block (all layers are stored
+    together as a single contiguous slab under one key for each kind).
+    """
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        cpu_blocks: Union[List[torch.Tensor], torch.Tensor],
+        cpu_kv_layout: "KVCacheLayout",
+        dtype: torch.dtype,
+        cache_config: "CacheConfig",
+        pool_kind: PoolKind = PoolKind.KV,
+        override_global_segment_size: Optional[int] = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        cpu_blocks:
+            Hot-CPU KV cache tensor (flat, from
+            ``StorageHandle.get_worker_tensor()``).
+        cpu_kv_layout:
+            KVCacheLayout for the hot-CPU slab.
+        dtype:
+            Element dtype of the KV tensors.
+        cache_config:
+            CacheConfig used to load MooncakeStoreConfig via
+            ``MooncakeStoreConfig.from_file()``.
+        suffix_str:
+            String appended to each key for namespace isolation. The main KV
+            worker uses the default ``"FlexKV"``; sidecar workers (e.g. indexer)
+            should use a distinct value (e.g. ``"FlexKV_indexer"``) to keep
+            their objects separate in the global Mooncake namespace.
+        override_global_segment_size:
+            If set, overrides the ``global_segment_size`` from the JSON config.
+            Pass ``0`` to create a *pure-client* worker that does NOT contribute
+            its own segment to the cluster pool. Use this for sidecar workers
+            (e.g. indexer) so we do not waste memory on duplicate segments.
+        """
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        # Single source of truth: cache_config carries PP / layer-range info
+        # populated by update_default_config_from_user_config (pp_rank/pp_size/
+        # total_layers) plus transfer_manager (node_layer_start/end after the
+        # GPU registration phase).  Defaults keep pp_size==1 callers untouched.
+        self.pp_rank = int(getattr(cache_config, 'mooncake_store_pp_rank', 0) or 0)
+        self.pp_size = int(getattr(cache_config, 'mooncake_store_pp_size', 1) or 1)
+        self.node_layer_start = int(getattr(cache_config, 'mooncake_store_node_layer_start', 0) or 0)
+        self.node_layer_end = int(getattr(cache_config, 'mooncake_store_node_layer_end', 0) or 0)
+        self.total_layers = int(getattr(cache_config, 'mooncake_store_total_layers', 0) or 0)
+
+        self.suffix_str = pool_kind.value
+        self.pool_kind = pool_kind
+        # ---- Hot CPU region ------------------------------------------------
+        cpu_blocks: torch.Tensor = materialize_worker_tensor(cpu_blocks)
+        flexkv_logger.info(
+            f"Pinning CPU Memory: "
+            f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB"
+        )
+        cudaHostRegister(cpu_blocks)
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+
+        self.num_layers: int = cpu_kv_layout.num_layer
+        self.num_cpu_blocks: int = cpu_kv_layout.num_block
+        self.block_size =cpu_kv_layout.get_chunk_size()
+        self.dtype: torch.dtype = dtype
+
+        self.cpu_kv_layout = cpu_kv_layout
+        assert self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
+
+        self.is_mla: bool = cpu_kv_layout.is_mla
+        self.kv_dim = 2 if not self.is_mla else 1
+
+        self.cpu_blocks = cpu_blocks
+        self.cache_config = cache_config
+        self._cpu_buffer = cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks
+        cpu_memory_size = self.cpu_kv_layout.get_total_elements() * self.dtype.itemsize
+
+
+        # ---- mooncake-store client -----------------------------------------
+        from flexkv.external.mooncake_store_utils import MooncakeStoreClient, MooncakeStoreConfig
+        store_config = MooncakeStoreConfig.from_file(
+            self.cache_config,
+            override_global_segment_size=override_global_segment_size,
+        )
+        self.mooncake_client = MooncakeStoreClient(store_config)
+
+        # Register hot CPU buffer directly for mooncake-store access.
+        self.mooncake_client.register_buffer(self._cpu_buffer)
+        flexkv_logger.info(
+            f"[MooncakeStoreTransferWorker:{self.suffix_str}] Registered hot CPU buffer "
+            f"ptr=0x{self._cpu_buffer.data_ptr():x} "
+            f"size={self._cpu_buffer.numel() * self._cpu_buffer.element_size()} B "
+            f"({self.num_cpu_blocks} blocks x {self.num_layers} layers), "
+            f"global_segment_size={store_config.global_segment_size}"
+        )
+
+    # ------------------------------------------------------------------
+    # TransferWorkerBase interface
+    # ------------------------------------------------------------------
+
+    def _transfer_impl(
+        self,
+        cpu_ptrs: List[int],
+        block_sizes: List[int],
+        keys: List[str],
+        transfer_type: TransferType,
+    ) -> None:
+        if transfer_type == TransferType.H2REMOTE:
+            put_ok = self.mooncake_client.batch_put(keys, cpu_ptrs, block_sizes)
+            if os.environ.get("FLEXKV_DEBUG_MOONCAKE_STORE", "0"):
+                flexkv_logger.info(f"[MooncakeStoreTransferWorker] H2REMOTE transfer keys: {keys}, ok={sum(put_ok)}, fail={len(keys) - sum(put_ok)}")
+        elif transfer_type == TransferType.REMOTE2H:
+            get_ok = self.mooncake_client.batch_get(keys, cpu_ptrs, block_sizes)
+            if os.environ.get("FLEXKV_DEBUG_MOONCAKE_STORE", "0"):
+                flexkv_logger.info(f"[MooncakeStoreTransferWorker] REMOTE2H transfer keys: {keys}, ok={sum(get_ok)}, fail={len(keys) - sum(get_ok)}")
+        else:
+            raise ValueError(f"[MooncakeStoreTransferWorker] Invalid transfer type: {transfer_type} for mooncake-store transfer worker. "
+                             "Only H2REMOTE and REMOTE2H are supported.")
+
+    def launch_transfer(self, transfer_op: "WorkerTransferOp") -> bool:  # type: ignore[override]
+        cpu_ptrs, block_sizes, keys = self._preprocess(transfer_op)
+        transfer_type = transfer_op.transfer_type
+        start_time = time.time()
+        self._transfer_impl(cpu_ptrs, block_sizes, keys, transfer_type)
+        end_time = time.time()
+
+
+        transfer_size = sum(block_sizes)
+        self._log_transfer_performance(transfer_op, transfer_size, start_time, end_time)
+        return True
+
+    # ------------------------------------------------------------------
+    # internal helper functions
+    # ------------------------------------------------------------------
+
+    def _preprocess(self, transfer_op: "WorkerTransferOp") -> Tuple[List[int], List[int], List[str]]:
+        # REMOTE2H: fill CPU (dst); H2REMOTE: read from CPU (src)
+        cpu_block_ids = (
+            transfer_op.dst_block_ids 
+            if transfer_op.transfer_type == TransferType.REMOTE2H 
+            else transfer_op.src_block_ids
+        )
+        assert transfer_op.mooncake_store_block_hashes is not None
+        elements_per_block = self.cpu_kv_layout.get_elements_per_block()
+
+        block_size_bytes = elements_per_block * self.dtype.itemsize
+        cpu_ptrs = []
+        block_sizes = []
+        keys = []
+        base_ptr = self._cpu_buffer.data_ptr()
+        for i, blk_id in enumerate(cpu_block_ids):
+            cpu_ptr = base_ptr + blk_id * block_size_bytes
+            key = build_key(
+                transfer_op.mooncake_store_block_hashes[i],
+                self.pool_kind,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                node_layer_start=self.node_layer_start,
+                node_layer_end=self.node_layer_end,
+                total_layers=self.total_layers,
+            )
+            cpu_ptrs.append(cpu_ptr)
+            block_sizes.append(block_size_bytes)
+            keys.append(key)
+        return cpu_ptrs, block_sizes, keys
+
+    def _postprocess(self, transfer_op: "WorkerTransferOp") -> None:
+        pass
