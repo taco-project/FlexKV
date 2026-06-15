@@ -106,6 +106,9 @@ class TransferOp:
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
     pending_count: int = 0
+    # Block content hashes for mooncake-store key-based addressing.
+    # Each element corresponds to one block in src_block_ids / dst_block_ids.
+    mooncake_store_block_hashes: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
@@ -406,6 +409,46 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
     return merged_op
 
 
+
+def _merge_remote2h_ops(ops, transfer_type, graph, callbacks, op_callback_dict):
+    """REMOTE2H/H2REMOTE merge support — preserves the extra fields that the
+    plain ``_merge_ops`` would drop:
+      * ``mooncake_store_block_hashes`` (used by mooncake-store worker to
+        build per-block keys via build_key)
+      * ``src_block_node_ids``           (used by PCFS / multi-host workers)
+
+    The merge is a straight concatenation, mirroring the SIMM-branch design.
+    """
+    if not ops:
+        return None
+    src_blocks = np.concatenate([op.src_block_ids for op in ops])
+    dst_blocks = np.concatenate([op.dst_block_ids for op in ops])
+    mooncake_hashes = None
+    if all(op.mooncake_store_block_hashes is not None for op in ops):
+        mooncake_hashes = np.concatenate(
+            [op.mooncake_store_block_hashes for op in ops]
+        )
+    src_node_ids = None
+    if all(getattr(op, "src_block_node_ids", None) is not None for op in ops):
+        src_node_ids = np.concatenate([op.src_block_node_ids for op in ops])
+
+    merged_op = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=transfer_type,
+        src_block_ids=src_blocks,
+        dst_block_ids=dst_blocks,
+        dp_client_id=ops[0].dp_client_id,
+        src_block_node_ids=src_node_ids,
+        mooncake_store_block_hashes=mooncake_hashes,
+    )
+    if callbacks:
+        if len(callbacks) == 1:
+            op_callback_dict[merged_op.op_id] = callbacks[0]
+        else:
+            op_callback_dict[merged_op.op_id] = _make_combined_callback(callbacks)
+    return merged_op
+
+
 def merge_to_batch_graph(batch_id: int,
                          transfer_graphs: List[TransferOpGraph],
                          task_end_op_ids: List[int],
@@ -440,8 +483,11 @@ def merge_to_batch_graph(batch_id: int,
 
     ops_by_type: Dict[TransferType, List[TransferOp]] = {}
     callbacks_by_type: Dict[TransferType, List[Callable]] = {}
+    # REMOTE2H/H2REMOTE merge support: both directions of the
+    # mooncake-store sidecar pool participate in the batch.
     supported_types = {TransferType.DISK2H, TransferType.H2D,
-                       TransferType.D2H, TransferType.H2DISK}
+                       TransferType.D2H, TransferType.H2DISK,
+                       TransferType.REMOTE2H, TransferType.H2REMOTE}
 
     for tt in supported_types:
         ops_by_type[tt] = []
@@ -454,7 +500,7 @@ def merge_to_batch_graph(batch_id: int,
             if op.transfer_type not in supported_types:
                 raise NotImplementedError(
                     f"Batch merge does not support transfer type: {op.transfer_type}. "
-                    f"Only DISK2H, H2D, D2H, and H2DISK are supported."
+                    f"Only DISK2H, H2D, D2H, H2DISK, REMOTE2H, and H2REMOTE are supported."
                 )
             ops_by_type[op.transfer_type].append(op)
             if op.op_id in op_callback_dict:
@@ -462,13 +508,28 @@ def merge_to_batch_graph(batch_id: int,
 
     new_op_callback_dict: Dict[int, Callable] = {}
 
-    # GET path: DISK2H -> H2D
+    # GET path: REMOTE2H (optional) + DISK2H (optional) -> H2D
     merged_disk2h_op = _merge_ops(ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
                                   merged_graph, callbacks_by_type[TransferType.DISK2H], new_op_callback_dict)
     merged_h2d_op = _merge_ops(ops_by_type[TransferType.H2D], TransferType.H2D,
                                merged_graph, callbacks_by_type[TransferType.H2D], new_op_callback_dict)
+    # REMOTE2H needs the specialised merger to keep mooncake hashes /
+    # node ids. The op is not yet attached to the graph; caller branches
+    # below decide when to add it.
+    merged_remote2h_op = _merge_remote2h_ops(
+        ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
+        merged_graph, callbacks_by_type[TransferType.REMOTE2H], new_op_callback_dict,
+    )
 
     if layerwise_transfer:
+        # REMOTE2H/H2REMOTE merge support (layerwise path): REMOTE2H is an
+        # *external* pre-stage to the C++ layerwise pipeline. We attach
+        # it as a standalone graph node and make the LayerwiseTransferOp
+        # depend on it. This keeps the C++ fused worker unchanged while
+        # guaranteeing that the mooncake prefix is in CPU buffer before
+        # the first layer fires its eventfd.
+        if merged_remote2h_op is not None:
+            merged_graph.add_transfer_op(merged_remote2h_op)
         if merged_h2d_op is not None:
             layerwise_transfer_op = LayerwiseTransferOp(
                 graph_id=merged_graph.graph_id,
@@ -488,6 +549,12 @@ def merge_to_batch_graph(batch_id: int,
                 indexer_dst_block_ids=merged_h2d_op.dst_block_ids.copy(),
             )
             merged_graph.add_transfer_op(layerwise_transfer_op)
+            # REMOTE2H/H2REMOTE merge support: gate the layerwise op on
+            # the REMOTE2H prefetch finishing (CPU buffer fully populated).
+            if merged_remote2h_op is not None:
+                merged_graph.add_dependency(
+                    layerwise_transfer_op.op_id, merged_remote2h_op.op_id,
+                )
         batch_end_op_id = -1
         new_op_callback_dict.clear()
     else:
@@ -497,24 +564,50 @@ def merge_to_batch_graph(batch_id: int,
             merged_graph.add_transfer_op(merged_h2d_op)
         if merged_disk2h_op is not None and merged_h2d_op is not None:
             merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
+        # REMOTE2H/H2REMOTE merge support (non-layerwise GET): attach
+        # REMOTE2H and gate H2D on it (mirrors the SIMM-branch design).
+        if merged_remote2h_op is not None:
+            merged_graph.add_transfer_op(merged_remote2h_op)
+            if merged_h2d_op is not None:
+                merged_graph.add_dependency(
+                    merged_h2d_op.op_id, merged_remote2h_op.op_id,
+                )
 
         # PUT path: D2H -> H2DISK
         merged_d2h_op = _merge_ops(ops_by_type[TransferType.D2H], TransferType.D2H,
                                    merged_graph, callbacks_by_type[TransferType.D2H], new_op_callback_dict)
         merged_h2disk_op = _merge_ops(ops_by_type[TransferType.H2DISK], TransferType.H2DISK,
                                       merged_graph, callbacks_by_type[TransferType.H2DISK], new_op_callback_dict)
+        # REMOTE2H/H2REMOTE merge support (PUT path): merge H2REMOTE with
+        # the specialised merger to preserve mooncake hashes.
+        merged_h2remote_op = _merge_remote2h_ops(
+            ops_by_type[TransferType.H2REMOTE], TransferType.H2REMOTE,
+            merged_graph, callbacks_by_type[TransferType.H2REMOTE], new_op_callback_dict,
+        )
         if merged_d2h_op is not None:
             merged_graph.add_transfer_op(merged_d2h_op)
         if merged_h2disk_op is not None:
             merged_graph.add_transfer_op(merged_h2disk_op)
         if merged_d2h_op is not None and merged_h2disk_op is not None:
             merged_graph.add_dependency(merged_h2disk_op.op_id, merged_d2h_op.op_id)
+        if merged_h2remote_op is not None:
+            merged_graph.add_transfer_op(merged_h2remote_op)
+            if merged_d2h_op is not None:
+                merged_graph.add_dependency(
+                    merged_h2remote_op.op_id, merged_d2h_op.op_id,
+                )
 
-        # batch_end_op_id: GET: H2D > DISK2H; PUT: H2DISK > D2H
+        # batch_end_op_id (REMOTE2H/H2REMOTE merge support):
+        #   GET: H2D > REMOTE2H > DISK2H
+        #   PUT: H2REMOTE > H2DISK > D2H
         if merged_h2d_op is not None:
             batch_end_op_id = merged_h2d_op.op_id
+        elif merged_remote2h_op is not None:
+            batch_end_op_id = merged_remote2h_op.op_id
         elif merged_disk2h_op is not None:
             batch_end_op_id = merged_disk2h_op.op_id
+        elif merged_h2remote_op is not None:
+            batch_end_op_id = merged_h2remote_op.op_id
         elif merged_h2disk_op is not None:
             batch_end_op_id = merged_h2disk_op.op_id
         elif merged_d2h_op is not None:
