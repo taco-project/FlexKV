@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <cstdio>
 #include <torch/extension.h>
 #include <unistd.h>
 #include <vector>
@@ -256,9 +257,25 @@ void transfer_kv_blocks_ssd(
   const int num_blocks = ssd_block_ids.size(0);
   const int num_layers = cpu_layer_id_list.size(0);
   const int32_t *cpu_layer_id_list_ptr = cpu_layer_id_list.data_ptr<int32_t>();
-  bool is_direct = chunk_size_in_bytes % 4096 == 0;
+
+  const bool cpu_is_block_first =
+      block_stride_in_bytes > cpu_layer_stride_in_bytes;
+  const bool ssd_is_block_first =
+      block_stride_in_bytes > ssd_layer_stride_in_bytes;
+  const bool enable_block_first_transfer =
+      cpu_is_block_first && ssd_is_block_first;
 
   IOUring &iouring = ioctx.get_iouring();
+
+  bool is_direct;
+  if (iouring.enabled() && enable_block_first_transfer) {
+    int64_t io_size = cpu_layer_stride_in_bytes * num_layers;
+    is_direct = (io_size % 4096 == 0) &&
+                (block_stride_in_bytes % 4096 == 0);
+  } else {
+    is_direct = chunk_size_in_bytes % 4096 == 0;
+  }
+  
   std::vector<std::vector<int>> &fds = ioctx.get_fds(is_read, is_direct);
 
   std::vector<std::vector<int>> cpu_blocks_partition(num_devices,
@@ -268,13 +285,6 @@ void transfer_kv_blocks_ssd(
   partition_and_remap_blocks_by_device(
       cpu_block_id_ptr, ssd_block_id_ptr, num_blocks, num_devices, round_robin,
       cpu_blocks_partition, ssd_blocks_partition);
-
-  const bool cpu_is_block_first =
-      block_stride_in_bytes > cpu_layer_stride_in_bytes;
-  const bool ssd_is_block_first =
-      block_stride_in_bytes > ssd_layer_stride_in_bytes;
-  const bool enable_block_first_transfer =
-      cpu_is_block_first && ssd_is_block_first;
 
   std::vector<std::thread> threads;
   std::vector<std::future<std::exception_ptr>> futures;
