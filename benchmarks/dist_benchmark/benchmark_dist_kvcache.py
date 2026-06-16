@@ -307,14 +307,20 @@ def benchmark_single_batch(kvmanager, model_config, cache_config, bench_config):
             batch_get_ids.append(task_id)
         get_match_time = time.time() - start_time
 
-        kvmanager.launch(batch_get_ids, batch_slot_mapping, as_batch=True, layerwise_transfer=False)
-        get_result = kvmanager.wait(batch_get_ids)
+        # When as_batch=True, launch returns the batch id(s); the sub-tasks are popped
+        # by the engine, so we must wait on the returned id(s), not on batch_get_ids.
+        launched_get_ids = kvmanager.launch(batch_get_ids, batch_slot_mapping, as_batch=True)
+        get_result = kvmanager.wait(launched_get_ids)
         elapsed_time_get = time.time() - start_time
 
         cached_tokens = 0
         for _, response in get_result.items():
             if response.status == KVResponseStatus.SUCCESS:
-                cached_tokens += response.return_mask.sum().item()
+                # For a batched task return_mask is a list of per-sub-task masks.
+                masks = response.return_mask if isinstance(response.return_mask, list) \
+                    else [response.return_mask]
+                for mask in masks:
+                    cached_tokens += mask.sum().item()
         transfer_data_size_GB = cached_tokens * model_config.token_size_in_bytes / (1024 ** 3)
         transfer_bandwidth_get = transfer_data_size_GB / elapsed_time_get if elapsed_time_get > 0 else 0
         print(f"  GET: {cached_tokens}/{all_tokens} tokens, data_size: {transfer_data_size_GB:.3f} GB, "
