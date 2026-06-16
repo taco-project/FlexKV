@@ -106,11 +106,15 @@ class MooncakeStoreConfig:
             )
         with open(file_path, "r") as f:
             config = json.load(f)
-
+            
         global_segment_size = (
             override_global_segment_size
             if override_global_segment_size is not None
-            else config["global_segment_size"]
+            else config["global_segment_size"] * 1024 * 1024 * 1024
+        )
+        flexkv_logger.info(
+            "[MooncakeStoreConfig] global_segment_size for mooncake store is: %d GB",
+            global_segment_size / 1024 / 1024 / 1024,
         )
 
         return cls(
