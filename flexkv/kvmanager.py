@@ -240,7 +240,15 @@ class KVManager:
 
     def prefetch_async(self,
                        token_ids: np.ndarray,
-                       namespace: Optional[List[str]] = None) -> int:
+                       namespace: Optional[List[str]] = None) -> Tuple[int, int]:
+        """Schedule a prefix-match + async load.
+
+        Returns ``(task_id, actual_prefetch_tokens)``:
+        - ``task_id`` >= 0 if a prefetch task was successfully launched, < 0 otherwise.
+        - ``actual_prefetch_tokens`` is the number of tokens that the underlying
+          KV task engine already knows it can serve from external storage.
+
+        """
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if self.server_client_mode:
