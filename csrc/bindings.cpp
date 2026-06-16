@@ -1,10 +1,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
-#include "transfer.cuh"
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
@@ -37,6 +38,13 @@
 #include <deque>
 
 namespace py = pybind11;
+
+namespace flexkv {
+#ifdef FLEXKV_ENABLE_NVCOMP
+void register_common_compression_bindings(pybind11::module_& m);
+void register_ans_bindings(pybind11::module_& m);
+#endif
+} // namespace flexkv
 
 void transfer_kv_blocks_binding(
     torch::Tensor &gpu_block_id_tensor, torch::Tensor &gpu_tensor_ptrs_tensor,
@@ -509,18 +517,23 @@ PYBIND11_MODULE(c_ext, m) {
       .def(
           py::init<std::map<int, std::vector<std::string>> &, int, int, int>());
 
-  py::class_<flexkv::TPTransferThreadGroup>(m, "TPTransferThreadGroup")
+  py::class_<flexkv::TPTransferThreadGroup> tp_thread_group(
+      m, "TPTransferThreadGroup");
+  tp_thread_group
       .def(py::init<int, const std::vector<int64_t> &, int, int64_t, int,
                     const std::vector<int64_t> &, const std::vector<int64_t> &,
                     const std::vector<int64_t> &, const std::vector<int64_t> &,
-                    const std::vector<int64_t> &>(),
+                    const std::vector<int64_t> &, bool, int, int>(),
            py::arg("num_gpus"), py::arg("gpu_block_ptrs_flat"),
            py::arg("num_tensors_per_gpu"), py::arg("cpu_blocks_ptr"),
            py::arg("num_layers"),
            py::arg("gpu_kv_strides_in_bytes"),
            py::arg("gpu_block_strides_in_bytes"),
            py::arg("gpu_layer_strides_in_bytes"),
-           py::arg("gpu_chunk_sizes_in_bytes"), py::arg("gpu_device_ids"))
+           py::arg("gpu_chunk_sizes_in_bytes"), py::arg("gpu_device_ids"),
+           py::arg("enable_nvcomp") = false,
+           py::arg("nvcomp_batch_size") = 0,
+           py::arg("nvcomp_data_type") = 0)
       .def("tp_group_transfer",
            &flexkv::TPTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),
@@ -529,8 +542,28 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_block_stride_in_bytes"),
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
-           py::arg("layer_id"), py::arg("layer_granularity"), py::arg("is_mla")
-           );
+           py::arg("layer_id"), py::arg("layer_granularity"),
+           py::arg("is_mla"));
+#ifdef FLEXKV_ENABLE_NVCOMP
+  // nvcomp ANS variant: tp_group_transfer_ans() lazily initializes from the
+  // constructor config and returns total compressed bytes across ranks.
+  tp_thread_group
+      .def("init_nvcomp", &flexkv::TPTransferThreadGroup::init_nvcomp,
+           py::arg("nvcomp_batch_size"), py::arg("nvcomp_data_type"))
+      .def("tp_group_transfer_ans",
+           &flexkv::TPTransferThreadGroup::tp_group_transfer_ans,
+           py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),
+           py::arg("cpu_kv_stride_in_bytes"),
+           py::arg("cpu_layer_stride_in_bytes"),
+           py::arg("cpu_block_stride_in_bytes"),
+           py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
+           py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
+           py::arg("layer_id"), py::arg("layer_granularity"), py::arg("is_mla"),
+           py::arg("cpu_size_table_tp_ptr"),
+           py::arg("cpu_size_table_tp_rank_stride"),
+           py::arg("cpu_size_table_block_stride"),
+           py::arg("cpu_size_table_layer_stride"));
+#endif // FLEXKV_ENABLE_NVCOMP
 
 #ifdef FLEXKV_ENABLE_GDS
   py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")
@@ -951,4 +984,9 @@ PYBIND11_MODULE(c_ext, m) {
       .def("inc_ref_cnt", &flexkv::RefRadixTree::inc_ref_cnt)
       .def("get_generation", &flexkv::RefRadixTree::get_generation);
 #endif
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  flexkv::register_common_compression_bindings(m);
+  flexkv::register_ans_bindings(m);
+#endif // FLEXKV_ENABLE_NVCOMP
 }

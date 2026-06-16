@@ -38,6 +38,10 @@ from flexkv.transfer.host_buffer import (
     allocate_host_buffer,
     cudaHostRegister,
 )
+from flexkv.transfer.compression.common.strategy import (
+    CompressionStrategy,
+    NullCompressionStrategy,
+)
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
@@ -165,11 +169,19 @@ class TransferWorkerBase(ABC):
                                   transfer_op: WorkerTransferOp,
                                   transfer_size: int,
                                   start_time: float,
-                                  end_time: float) -> None:
+                                  end_time: float,
+                                  uncompressed_size: Optional[int] = None) -> None:
         """Common method to log transfer performance"""
+        size_text = (
+            f"comp_ratio: {uncompressed_size / transfer_size:.3f}x "
+            f"comp_size: {transfer_size / (1024 * 1024 * 1024):.3f} GB "
+            f"uncomp_size: {uncompressed_size / (1024 * 1024 * 1024):.3f} GB "
+            if uncompressed_size is not None and transfer_size > 0
+            else f"transfer data size: {transfer_size / (1024 * 1024 * 1024)} GB "
+        )
         flexkv_logger.info(
             f"{transfer_op.transfer_type.name} transfer request: {transfer_op.transfer_op_id} finished "
-            f"transfer data size: {transfer_size / (1024 * 1024 * 1024)} GB "
+            f"{size_text}"
             f"transfer time: {end_time - start_time:.4f} s "
             f"transfer bandwidth: {transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
         )
@@ -268,7 +280,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
-                 transfer_num_cta_d2h: int = 4) -> None:
+                 transfer_num_cta_d2h: int = 4,
+                 compressor: Optional[CompressionStrategy] = None,
+                 ) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         # Register CPU tensors with CUDA
@@ -315,6 +329,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
+        self._compressor = compressor or NullCompressionStrategy()
+        self._compressor.attach(self)
+
     def _transfer_impl(
         self,
         src_block_ids: torch.Tensor,
@@ -358,6 +375,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.chunk_size_in_bytes,
+            0,
             self.num_layers,
             transfer_num_cta,
             transfer_type == TransferType.H2D,
@@ -373,23 +391,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
-        with torch.cuda.stream(self.transfer_stream):
-            start_time = time.time()
-            self._transfer_impl(
-                src_block_ids,
-                dst_block_ids,
-                transfer_op.transfer_type,
-            )
-            end_time = time.time()
-            transfer_size = self.chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
-
-            self._log_transfer_performance(
-                transfer_op,
-                transfer_size,
-                start_time,
-                end_time,
-            )
-        nvtx.end_range(nvtx_range)
+        try:
+            with torch.cuda.stream(self.transfer_stream):
+                self._compressor.run(
+                    self, src_block_ids=src_block_ids,
+                    dst_block_ids=dst_block_ids, op=transfer_op)
+        finally:
+            nvtx.end_range(nvtx_range)
 
         return True
 
@@ -408,7 +416,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
-                 transfer_num_cta_d2h: int = 4):
+                 transfer_num_cta_d2h: int = 4,
+                 compressor: Optional[CompressionStrategy] = None):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
@@ -444,6 +453,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
         self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+        self.chunk_size_in_bytes = self.cpu_chunk_size_in_bytes
         # tp has effect on the layout of the cpu tensor
         # the tp dim should always be right after the block dim
         # on both blockfirst layout and layerfirst layout
@@ -485,6 +495,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.gpu_chunk_sizes_in_bytes,
             gpu_device_ids,
         )
+
+        self._compressor = compressor or NullCompressionStrategy()
+        self._compressor.attach(self)
 
 
     def _transfer_impl(self,
@@ -534,22 +547,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
-
-        start_time = time.time()
-        self._transfer_impl(
-            src_block_ids,
-            dst_block_ids,
-            transfer_op.transfer_type,
-        )
-        end_time = time.time()
-        transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
-
-        self._log_transfer_performance(
-            transfer_op,
-            transfer_size,
-            start_time,
-            end_time,
-        )
+        self._compressor.run(
+            self, src_block_ids=src_block_ids,
+            dst_block_ids=dst_block_ids, op=transfer_op)
         return True
 
 class CPUSSDDiskTransferWorker(TransferWorkerBase):
@@ -564,7 +564,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  ssd_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  num_blocks_per_file: int,
-                 cache_config: CacheConfig):
+                 cache_config: CacheConfig,
+                 compressor: Optional[CompressionStrategy] = None):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         self.ssd_files = ssd_files
@@ -582,6 +583,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
 
         self.is_mla = cpu_kv_layout.is_mla
         self.kv_dim = cpu_kv_layout.kv_dim
+        self.cpu_layout_type = cpu_kv_layout.type
 
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
@@ -601,6 +603,9 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         except Exception as e:
             flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
             raise RuntimeError("SSD Worker init failed") from e
+
+        self._compressor = compressor or NullCompressionStrategy()
+        self._compressor.attach(self)
 
     def _transfer_impl(
         self,
@@ -645,24 +650,10 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
-        src_block_ids , dst_block_ids = self.get_transfer_block_ids(transfer_op)
-
-        start_time = time.time()
-        self._transfer_impl(
-            src_block_ids,
-            dst_block_ids,
-            transfer_op.transfer_type,
-        )
-        end_time = time.time()
-        transfer_size = self.chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
-
-        self._log_transfer_performance(
-            transfer_op,
-            transfer_size,
-            start_time,
-            end_time,
-        )
-
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+        self._compressor.run(
+            self, src_block_ids=src_block_ids,
+            dst_block_ids=dst_block_ids, op=transfer_op)
         return True
 
 class CPURemoteTransferWorker(TransferWorkerBase):

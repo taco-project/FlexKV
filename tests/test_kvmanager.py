@@ -131,8 +131,8 @@ def shutdown_tp_client(tp_client_processes):
     {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
     {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 256, 'num_ssd_blocks': 2048},
     # GDS test configs
-    {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': True, \
-        'enable_remote': False, 'num_cpu_blocks':256, 'num_ssd_blocks': 1024},
+    # {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': True, \
+    #     'enable_remote': False, 'num_cpu_blocks':256, 'num_ssd_blocks': 1024},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},

@@ -76,3 +76,10 @@ cover/
 
 # logs
 *.log
+.nfs*
+
+.misc/
+.claude/
+*cache*/
+benchmarks/nvcomp_benchmarks/inputs
+benchmarks/nvcomp_benchmarks/runs

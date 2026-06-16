@@ -8,7 +8,6 @@
 #include <mutex>
 #include <sys/mman.h>
 #include <thread>
-#include <unistd.h>
 
 #include "transfer_ssd.h"
 #include "monitoring/metrics_manager.h"
@@ -19,7 +18,11 @@ static void partition_and_remap_blocks_by_device(
     const int64_t *cpu_block_ids, const int64_t *ssd_block_ids, int num_blocks,
     int num_devices, int round_robin,
     std::vector<std::vector<int>> &cpu_blocks_partition,
-    std::vector<std::vector<int>> &ssd_blocks_partition) {
+    std::vector<std::vector<int>> &ssd_blocks_partition,
+    // Optional: when non-null, also collect the original (pre-remap) ssd block
+    // ids per device. The packed-nvcomp path needs them to index the SSD size
+    // table.
+    std::vector<std::vector<int>> *ssd_orig_blocks_partition = nullptr) {
   for (int i = 0; i < num_blocks; i++) {
     int64_t ssd_block_id = ssd_block_ids[i];
     int64_t cpu_block_id = cpu_block_ids[i];
@@ -29,6 +32,9 @@ static void partition_and_remap_blocks_by_device(
         (ssd_block_id % round_robin);
     ssd_blocks_partition[device_id].push_back(block_id_in_device);
     cpu_blocks_partition[device_id].push_back(cpu_block_id);
+    if (ssd_orig_blocks_partition)
+      (*ssd_orig_blocks_partition)[device_id].push_back(
+          static_cast<int>(ssd_block_id));
   }
 }
 

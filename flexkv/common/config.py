@@ -458,6 +458,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     lease_ttl_ms=int(os.getenv('FLEXKV_LEASE_TTL_MS', 30000)),
     safety_ttl_ms=int(os.getenv('FLEXKV_SAFETY_TTL_MS', 100)),
     renew_lease_ms=int(os.getenv('FLEXKV_RENEW_LEASE_MS', 4000)),
+
+    nvcomp_batch_size=int(os.getenv('FLEXKV_NVCOMP_BATCH_SIZE', '0')),  # 0 = auto
 )
 
 @dataclass
