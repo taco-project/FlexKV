@@ -433,7 +433,7 @@ class KVTaskManager:
         if task.graph is not None:
             self.graph_to_task.pop(task.graph.graph_id, None)
         self.tasks.pop(task_id, None)
-        
+
     def _mark_completed(self, task_id: int) -> None:
         task = self.tasks[task_id]
         if task.is_completed():
