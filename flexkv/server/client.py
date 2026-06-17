@@ -23,6 +23,9 @@ from flexkv.server.request import (
     GetRequest,
     PutMatchRequest,
     GetMatchRequest,
+    SWAPutRequest,
+    SWAAvailableRequest,
+    SWAGetRequest,
     LaunchTaskRequest,
     CancelTaskRequest,
     WaitRequest,
@@ -186,6 +189,47 @@ class KVDPClient:
         else:
             flexkv_logger.error(f"get_match failed, error_msg: {response.error_msg}")
             return None
+
+    def swa_put(
+        self,
+        token_ids: np.ndarray,
+        swa_data: np.ndarray,
+    ) -> bool:
+        req = SWAPutRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            swa_data=swa_data,
+        )
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.error_msg is not None:
+            flexkv_logger.error(f"swa_put failed: {response.error_msg}")
+            return False
+        return bool(response.swa_put_ok)
+
+    def swa_available(self, token_ids: np.ndarray) -> bool:
+        req = SWAAvailableRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+        )
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.error_msg is not None:
+            flexkv_logger.error(f"swa_available failed: {response.error_msg}")
+            return False
+        return bool(response.swa_available)
+
+    def swa_get(self, token_ids: np.ndarray) -> Optional[np.ndarray]:
+        req = SWAGetRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+        )
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.error_msg is not None:
+            flexkv_logger.error(f"swa_get failed: {response.error_msg}")
+            return None
+        return response.swa_data
 
     def launch_tasks(
         self,

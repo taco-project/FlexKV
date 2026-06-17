@@ -84,6 +84,25 @@ class GetMatchRequest:
 
 
 @dataclass
+class SWAPutRequest:
+    dp_client_id: int
+    token_ids: np.ndarray
+    swa_data: np.ndarray
+
+
+@dataclass
+class SWAAvailableRequest:
+    dp_client_id: int
+    token_ids: np.ndarray
+
+
+@dataclass
+class SWAGetRequest:
+    dp_client_id: int
+    token_ids: np.ndarray
+
+
+@dataclass
 class LaunchTaskRequest:
     dp_client_id: int
     task_ids: List[int]
@@ -123,6 +142,9 @@ class Response:
     status: Optional[Dict[int, KVResponseStatus]] = None
     is_ready: bool = False
     error_msg: Optional[str] = None
+    swa_put_ok: Optional[bool] = None
+    swa_available: Optional[bool] = None
+    swa_data: Optional[np.ndarray] = None
 
     @property
     def success(self) -> bool:

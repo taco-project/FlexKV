@@ -292,7 +292,11 @@ class KVManager:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         if self.server_client_mode:
-            self.dp_client.cancel_tasks(task_ids)
+            # KVDPClient exposes the singular `cancel_task(List[int])`, not
+            # `cancel_tasks`. The plural form was a typo that never fired
+            # under prior workloads because release_load_state was only
+            # called on rare alloc-rollback paths.
+            self.dp_client.cancel_task(task_ids)
         else:
             self.kv_task_engine.cancel_tasks(task_ids)
 
@@ -324,6 +328,37 @@ class KVManager:
             self.kv_task_engine._clear_cpu_cache()
 
     # ===== SWA (Sliding Window Attention) Integration =====
+
+    def swa_unavailable_reason(self) -> Optional[str]:
+        """Return why SWA production manager is unavailable, or None if it should work."""
+        if self.cache_config.swa is None or not self.cache_config.swa.enabled:
+            return "SWAPoolConfig is None or disabled"
+        if self.server_client_mode:
+            # SWA radix-tree ops run on FlexKV Server via SWAPut/SWAAvailable/SWAGet RPC.
+            return None
+        from flexkv.swa.node_swa_ops import swa_unavailable_reason as _reason_on_engine
+        try:
+            engine = self.kv_task_engine.cache_engine.cpu_cache_engine
+        except AttributeError:
+            return "kv_task_engine.cache_engine.cpu_cache_engine missing (no in-process engine)"
+        return _reason_on_engine(self.cache_config, engine)
+
+    def _log_swa_diag_once(self, caller: str) -> None:
+        """Emit one INFO log explaining why SWA is broken (avoids per-request spam)."""
+        if getattr(self, "_swa_diag_logged", False):
+            return
+        self._swa_diag_logged = True
+        reason = self.swa_unavailable_reason()
+        if reason is None:
+            flexkv_logger.info(
+                f"[KVManager-SWA-DIAG] {caller}: SWA infrastructure looks OK "
+                f"(server_client_mode={self.server_client_mode}, "
+                f"dp_size={self.model_config.dp_size})"
+            )
+        else:
+            flexkv_logger.info(
+                f"[KVManager-SWA-DIAG] {caller}: SWA unavailable — {reason}"
+            )
 
     def _get_cpu_cache_engine(self):
         """Return the CPU cache engine that owns the local radix tree.
@@ -365,10 +400,12 @@ class KVManager:
 
         self._swa_prod_manager = None
         if self.cache_config.swa is None or not self.cache_config.swa.enabled:
+            self._log_swa_diag_once("_get_swa_production_manager")
             return None
 
         engine = self._get_cpu_cache_engine()
         if engine is None:
+            self._log_swa_diag_once("_get_swa_production_manager")
             return None
 
         # Node-attached SWA requires the C++ tree (drain_freed_swa_slots) and an
@@ -447,14 +484,22 @@ class KVManager:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
 
-        prod_mgr = self._get_swa_production_manager()
-        if prod_mgr is None:
-            return False
+        if self.server_client_mode:
+            from flexkv.swa.node_swa_ops import _normalize_swa_data
+            return self.dp_client.swa_put(token_ids, _normalize_swa_data(swa_data))
 
-        node = self._match_node(token_ids)
-        if node is None:
+        from flexkv.swa.node_swa_ops import swa_put_on_engine
+        engine = self._get_cpu_cache_engine()
+        if engine is None:
+            self._log_swa_diag_once("swa_put")
             return False
-        return prod_mgr.put(node, swa_data)
+        ok = swa_put_on_engine(self.cache_config, engine, token_ids, swa_data)
+        if not ok:
+            flexkv_logger.info(
+                f"[KVManager-SWA-DIAG] swa_put: failed in-process "
+                f"(token_count={len(token_ids)})"
+            )
+        return ok
 
     def swa_get(self,
                 token_ids: Union[torch.Tensor, np.ndarray]) -> Optional[Union[torch.Tensor, np.ndarray]]:
@@ -473,14 +518,14 @@ class KVManager:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
 
-        prod_mgr = self._get_swa_production_manager()
-        if prod_mgr is None:
-            return None
+        if self.server_client_mode:
+            return self.dp_client.swa_get(token_ids)
 
-        node = self._match_node(token_ids)
-        if node is None:
+        from flexkv.swa.node_swa_ops import swa_get_on_engine
+        engine = self._get_cpu_cache_engine()
+        if engine is None:
             return None
-        return prod_mgr.get(node)
+        return swa_get_on_engine(self.cache_config, engine, token_ids)
 
     def swa_available(self,
                       token_ids: Union[torch.Tensor, np.ndarray]) -> bool:
@@ -499,11 +544,12 @@ class KVManager:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
 
-        prod_mgr = self._get_swa_production_manager()
-        if prod_mgr is None:
-            return False
+        if self.server_client_mode:
+            return self.dp_client.swa_available(token_ids)
 
-        node = self._match_node(token_ids)
-        if node is None:
+        from flexkv.swa.node_swa_ops import swa_available_on_engine
+        engine = self._get_cpu_cache_engine()
+        if engine is None:
+            self._log_swa_diag_once("swa_available")
             return False
-        return prod_mgr.has(node)
+        return swa_available_on_engine(self.cache_config, engine, token_ids)

@@ -29,6 +29,9 @@ from flexkv.server.request import (
     GetRequest,
     PutMatchRequest,
     GetMatchRequest,
+    SWAPutRequest,
+    SWAAvailableRequest,
+    SWAGetRequest,
     LaunchTaskRequest,
     CancelTaskRequest,
     WaitRequest,
@@ -153,6 +156,7 @@ class KVServer:
     ):
 
         self.model_config = model_config
+        self.cache_config = cache_config
         # Init inter-process communication
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
@@ -197,6 +201,9 @@ class KVServer:
             PutRequest: self._handle_put_request,
             GetMatchRequest: self._handle_get_match_request,
             PutMatchRequest: self._handle_put_match_request,
+            SWAPutRequest: self._handle_swa_put_request,
+            SWAAvailableRequest: self._handle_swa_available_request,
+            SWAGetRequest: self._handle_swa_get_request,
             PrefetchRequest: self._handle_prefetch_request,
             WaitRequest: self._handle_wait_request,
             LaunchTaskRequest: self._handle_launch_task_request,
@@ -211,6 +218,28 @@ class KVServer:
     def start_server(self) -> None:
         self.kv_task_engine.start()
         self._is_ready = True
+        try:
+            engine = self.kv_task_engine.cache_engine.cpu_cache_engine
+            from flexkv.swa.node_swa_ops import engine_tree, swa_unavailable_reason
+
+            tree = engine_tree(engine)
+            reason = swa_unavailable_reason(self.cache_config, engine)
+            flexkv_logger.info(
+                f"[KVServer-SWA-DIAG] Server subprocess started: "
+                f"cpu_cache_engine=present, "
+                f"radix_tree={'present' if tree is not None else 'missing'}, "
+                f"drain_freed_swa_slots="
+                f"{hasattr(tree, 'drain_freed_swa_slots') if tree is not None else False}, "
+                f"init_swa={hasattr(engine, 'init_swa')}, "
+                f"swa_enabled={self.cache_config.swa is not None and self.cache_config.swa.enabled}, "
+                f"dp_size={self.model_config.dp_size}, "
+                f"swa_rpc=enabled (SWAPut/SWAAvailable/SWAGet). "
+                f"unavailable_reason={reason!r}"
+            )
+        except Exception as e:
+            flexkv_logger.info(
+                f"[KVServer-SWA-DIAG] Server started but engine diag failed: {e}"
+            )
 
     @staticmethod
     def _server_process(model_config: ModelConfig,
@@ -439,6 +468,69 @@ class KVServer:
                             task_id=req_id, mask=mask)
         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
         result_zmq.send_pyobj(response)
+
+    def _cpu_cache_engine(self):
+        return self.kv_task_engine.cache_engine.cpu_cache_engine
+
+    def _handle_swa_put_request(self, req: SWAPutRequest) -> None:
+        from flexkv.swa.node_swa_ops import swa_put_on_engine
+
+        try:
+            ok = swa_put_on_engine(
+                self.cache_config,
+                self._cpu_cache_engine(),
+                req.token_ids,
+                req.swa_data,
+            )
+            response = Response(dp_client_id=req.dp_client_id, swa_put_ok=ok)
+        except Exception as e:
+            flexkv_logger.error(f"[KVServer] swa_put failed: {e}", exc_info=True)
+            response = Response(
+                dp_client_id=req.dp_client_id,
+                swa_put_ok=False,
+                error_msg=str(e),
+            )
+        self.client_manager.get_zmq(req.dp_client_id).send_pyobj(response)
+
+    def _handle_swa_available_request(self, req: SWAAvailableRequest) -> None:
+        from flexkv.swa.node_swa_ops import swa_available_on_engine
+
+        try:
+            avail = swa_available_on_engine(
+                self.cache_config,
+                self._cpu_cache_engine(),
+                req.token_ids,
+            )
+            response = Response(dp_client_id=req.dp_client_id, swa_available=avail)
+        except Exception as e:
+            flexkv_logger.error(f"[KVServer] swa_available failed: {e}", exc_info=True)
+            response = Response(
+                dp_client_id=req.dp_client_id,
+                swa_available=False,
+                error_msg=str(e),
+            )
+        self.client_manager.get_zmq(req.dp_client_id).send_pyobj(response)
+
+    def _handle_swa_get_request(self, req: SWAGetRequest) -> None:
+        from flexkv.swa.node_swa_ops import swa_get_on_engine
+
+        try:
+            data = swa_get_on_engine(
+                self.cache_config,
+                self._cpu_cache_engine(),
+                req.token_ids,
+            )
+            if data is not None and hasattr(data, "numpy"):
+                data = data.numpy()
+            response = Response(dp_client_id=req.dp_client_id, swa_data=data)
+        except Exception as e:
+            flexkv_logger.error(f"[KVServer] swa_get failed: {e}", exc_info=True)
+            response = Response(
+                dp_client_id=req.dp_client_id,
+                swa_data=None,
+                error_msg=str(e),
+            )
+        self.client_manager.get_zmq(req.dp_client_id).send_pyobj(response)
 
     def _handle_prefetch_request(self, req: PrefetchRequest) -> None:
         """Handle Prefetch request"""
