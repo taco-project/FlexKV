@@ -218,28 +218,6 @@ class KVServer:
     def start_server(self) -> None:
         self.kv_task_engine.start()
         self._is_ready = True
-        try:
-            engine = self.kv_task_engine.cache_engine.cpu_cache_engine
-            from flexkv.swa.node_swa_ops import engine_tree, swa_unavailable_reason
-
-            tree = engine_tree(engine)
-            reason = swa_unavailable_reason(self.cache_config, engine)
-            flexkv_logger.info(
-                f"[KVServer-SWA-DIAG] Server subprocess started: "
-                f"cpu_cache_engine=present, "
-                f"radix_tree={'present' if tree is not None else 'missing'}, "
-                f"drain_freed_swa_slots="
-                f"{hasattr(tree, 'drain_freed_swa_slots') if tree is not None else False}, "
-                f"init_swa={hasattr(engine, 'init_swa')}, "
-                f"swa_enabled={self.cache_config.swa is not None and self.cache_config.swa.enabled}, "
-                f"dp_size={self.model_config.dp_size}, "
-                f"swa_rpc=enabled (SWAPut/SWAAvailable/SWAGet). "
-                f"unavailable_reason={reason!r}"
-            )
-        except Exception as e:
-            flexkv_logger.info(
-                f"[KVServer-SWA-DIAG] Server started but engine diag failed: {e}"
-            )
 
     @staticmethod
     def _server_process(model_config: ModelConfig,

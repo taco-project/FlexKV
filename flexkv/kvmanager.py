@@ -343,23 +343,6 @@ class KVManager:
             return "kv_task_engine.cache_engine.cpu_cache_engine missing (no in-process engine)"
         return _reason_on_engine(self.cache_config, engine)
 
-    def _log_swa_diag_once(self, caller: str) -> None:
-        """Emit one INFO log explaining why SWA is broken (avoids per-request spam)."""
-        if getattr(self, "_swa_diag_logged", False):
-            return
-        self._swa_diag_logged = True
-        reason = self.swa_unavailable_reason()
-        if reason is None:
-            flexkv_logger.info(
-                f"[KVManager-SWA-DIAG] {caller}: SWA infrastructure looks OK "
-                f"(server_client_mode={self.server_client_mode}, "
-                f"dp_size={self.model_config.dp_size})"
-            )
-        else:
-            flexkv_logger.info(
-                f"[KVManager-SWA-DIAG] {caller}: SWA unavailable — {reason}"
-            )
-
     def _get_cpu_cache_engine(self):
         """Return the CPU cache engine that owns the local radix tree.
 
@@ -400,12 +383,10 @@ class KVManager:
 
         self._swa_prod_manager = None
         if self.cache_config.swa is None or not self.cache_config.swa.enabled:
-            self._log_swa_diag_once("_get_swa_production_manager")
             return None
 
         engine = self._get_cpu_cache_engine()
         if engine is None:
-            self._log_swa_diag_once("_get_swa_production_manager")
             return None
 
         # Node-attached SWA requires the C++ tree (drain_freed_swa_slots) and an
@@ -491,15 +472,8 @@ class KVManager:
         from flexkv.swa.node_swa_ops import swa_put_on_engine
         engine = self._get_cpu_cache_engine()
         if engine is None:
-            self._log_swa_diag_once("swa_put")
             return False
-        ok = swa_put_on_engine(self.cache_config, engine, token_ids, swa_data)
-        if not ok:
-            flexkv_logger.info(
-                f"[KVManager-SWA-DIAG] swa_put: failed in-process "
-                f"(token_count={len(token_ids)})"
-            )
-        return ok
+        return swa_put_on_engine(self.cache_config, engine, token_ids, swa_data)
 
     def swa_get(self,
                 token_ids: Union[torch.Tensor, np.ndarray]) -> Optional[Union[torch.Tensor, np.ndarray]]:
@@ -550,6 +524,5 @@ class KVManager:
         from flexkv.swa.node_swa_ops import swa_available_on_engine
         engine = self._get_cpu_cache_engine()
         if engine is None:
-            self._log_swa_diag_once("swa_available")
             return False
         return swa_available_on_engine(self.cache_config, engine, token_ids)
