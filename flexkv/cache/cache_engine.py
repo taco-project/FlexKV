@@ -1289,8 +1289,8 @@ class GlobalCacheEngine:
         if put_to_remote:
             if fragment3_num_blocks > fragment12_num_blocks:
                 extra_num_cpu_blocks = fragment3_num_blocks - fragment12_num_blocks
-                fragment3_cpu_blocks = np.concatenate([fragment12_cpu_blocks,
-                                                  cpu_matched_blocks[-extra_num_cpu_blocks:]])
+                fragment3_cpu_blocks = np.concatenate([cpu_matched_blocks[-extra_num_cpu_blocks:],
+                                                       fragment12_cpu_blocks])
             else:
                 fragment3_cpu_blocks = fragment12_cpu_blocks[-fragment3_num_blocks:]
             op_h2remote = TransferOp(
