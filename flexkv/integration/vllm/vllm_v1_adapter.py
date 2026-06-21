@@ -718,6 +718,7 @@ class FlexKVWorkerConnector:
         if self.flexkv_config.model_config.use_mla:
             assert gpu_blocks[0].ndim == 3, (
                 f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
+            gpu_layout_type = KVCacheLayoutType.LAYERFIRST
             num_blocks = gpu_blocks[0].shape[0]
             block_size = gpu_blocks[0].shape[1]
             num_kv_heads = 1
@@ -725,12 +726,23 @@ class FlexKVWorkerConnector:
         else:
             assert gpu_blocks[0].ndim == 5, (
                 f"expect kv cached tensor has 5 dim but get shape={gpu_blocks[0].shape}.")
-            num_blocks = gpu_blocks[0].shape[1]
+            # Detect GPU layout from the kv dim position (which holds size 2):
+            #   vLLM <= 0.21: (kv=2, num_blocks, ...)  -> LAYERFIRST
+            #   vLLM >= 0.23: (num_blocks, kv=2, ...)  -> LAYERBLOCK
+            if gpu_blocks[0].shape[1] == 2:
+                gpu_layout_type = KVCacheLayoutType.LAYERBLOCK
+                num_blocks = gpu_blocks[0].shape[0]
+            elif gpu_blocks[0].shape[0] == 2:
+                gpu_layout_type = KVCacheLayoutType.LAYERFIRST
+                num_blocks = gpu_blocks[0].shape[1]
+            else:
+                raise ValueError(
+                    f"cannot infer non-MLA kv layout from shape={tuple(gpu_blocks[0].shape)}")
             block_size = gpu_blocks[0].shape[2]
             num_kv_heads = gpu_blocks[0].shape[3]
             head_size = gpu_blocks[0].shape[4]
         gpu_layout = KVCacheLayout(
-            type=KVCacheLayoutType.LAYERFIRST,
+            type=gpu_layout_type,
             num_layer=num_layer,
             num_block=num_blocks,
             tokens_per_block=block_size,
