@@ -14,11 +14,14 @@ class AccessHandleType(Enum):
     TENSOR_HANDLE = auto()  # single tensor handle or tensor handle list
     GDS_MANAGER = auto()
 
-# NOTE: currently, we assume that the layout type of GPU should always be LAYERFIRST
-# and the layout type of CPU, SSD, remote should be the same, either laywise or BLOCKFIRST
+# NOTE: GPU layout depends on the vLLM version's non-MLA KV cache shape:
+#   vLLM <= 0.21: (kv, num_blocks, ...)  -> LAYERFIRST
+#   vLLM >= 0.23: (num_blocks, kv, ...)  -> LAYERBLOCK
+# CPU, SSD, remote layout should be the same, either LAYERFIRST or BLOCKFIRST.
 class KVCacheLayoutType(Enum):
     LAYERFIRST = "LAYERFIRST"
     BLOCKFIRST = "BLOCKFIRST"
+    LAYERBLOCK = "LAYERBLOCK"
 
 @dataclass
 class KVCacheLayout:
@@ -69,6 +72,13 @@ class KVCacheLayout:
             elif self.type == KVCacheLayoutType.BLOCKFIRST:
                 self._kv_shape = torch.Size([self.num_block,
                                              self.num_layer,
+                                             self._kv_dim,
+                                             self.tokens_per_block,
+                                             self.num_head,
+                                             self.head_size])
+            elif self.type == KVCacheLayoutType.LAYERBLOCK:  # vLLM >= 0.23 non-MLA GPU layout
+                self._kv_shape = torch.Size([self.num_layer,
+                                             self.num_block,
                                              self._kv_dim,
                                              self.tokens_per_block,
                                              self.num_head,
@@ -130,6 +140,8 @@ class KVCacheLayout:
             return self.kv_shape[1:].numel()
         elif self.type == KVCacheLayoutType.BLOCKFIRST:
             return self.kv_shape[2:].numel()
+        elif self.type == KVCacheLayoutType.LAYERBLOCK:
+            return self.kv_shape[1:].numel()
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
 
@@ -138,6 +150,8 @@ class KVCacheLayout:
             return self.kv_shape[3:].numel()
         elif self.type == KVCacheLayoutType.BLOCKFIRST:
             return self.kv_shape[1:].numel()
+        elif self.type == KVCacheLayoutType.LAYERBLOCK:
+            return self.kv_shape[2:].numel()
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
 
@@ -145,6 +159,8 @@ class KVCacheLayout:
         if self.type == KVCacheLayoutType.LAYERFIRST:
             return self.kv_shape[2:].numel()
         elif self.type == KVCacheLayoutType.BLOCKFIRST:
+            return self.kv_shape[3:].numel()
+        elif self.type == KVCacheLayoutType.LAYERBLOCK:
             return self.kv_shape[3:].numel()
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
