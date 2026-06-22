@@ -137,6 +137,7 @@ class FlexKVConfig:
             logger.info(f"[FlexKV] Using kv_cache_dtype from framework config: '{framework_dtype_str}' -> {resolved}")
             return
 
+        # --- Priority 3: fallback ---
         self.model_config.dtype = fallback_dtype
         logger.warning(
             f"[FlexKV] No kv_cache_dtype from user/framework config, "
@@ -151,33 +152,42 @@ class FlexKVConfig:
         indexer_head_size: Optional[int] = None,
         indexer_dtype: Optional[torch.dtype] = None,
     ) -> None:
-        """Detect sparse-attention indexer config (DSv4 / NSA).
+        """Detect and configure indexer from HuggingFace model config.
 
-        NOTE: kept on this branch because mooncake-store integration needs
-        IndexerCacheConfig to size the dedicated indexer CPU pool. The
-        layerwise-rebase upstream comment claimed this method conflicts with
-        ``layer_groups``-based heterogeneous KV, but on the mooncake branch
-        we use ``IndexerCacheConfig`` directly (multi-pool path).
+        All three frameworks store the indexer K cache in an FP8-quantized
+        layout with ``quant_block_size = 128`` (hardcoded in each):
+
+        - vLLM (``DeepseekV32IndexerCache`` / ``deepseek_v4_attention.py``):
+            head_dim = index_head_dim + index_head_dim // 128 * 4, dtype=uint8
+        - TRT-LLM (``DSACacheManager``, ``dsa.py``):
+            per_token_size = index_head_dim + index_head_dim // 128 * 4
+        - sglang (``NSATokenToKVPool``, ``memory_pool.py``):
+            index_k_with_scale_buffer_dtype = torch.uint8  (class constant)
+            shape: page_size * (index_head_dim + index_head_dim // 128 * 4)
+
+        Formula:
+            head_size = tpb * (index_head_dim + index_head_dim // 128 * 4)
+            dtype     = torch.uint8
+
+        where ``+ index_head_dim // 128 * 4`` is the per-block FP32 scale
+        overhead (4 bytes per 128-element block).
         """
         if hf_config is None:
             return
 
         try:
-            qk_rope_head_dim = getattr(hf_config, 'qk_rope_head_dim', None)
-            if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
-                return
+            if indexer_head_size is not None and indexer_head_size > 0:
+                head_size = indexer_head_size
+            else:
+                index_head_dim = getattr(hf_config, 'index_head_dim', None)
+                if index_head_dim is None or index_head_dim <= 0:
+                    # This model has no sparse attention indexer — skip.
+                    return
 
-            index_head_dim = getattr(hf_config, 'index_head_dim', None)
-            if index_head_dim is not None and index_head_dim > 0:
                 quant_block_size = 128
                 head_size = self.cache_config.tokens_per_block * (
                     index_head_dim + index_head_dim // quant_block_size * 4
                 )
-            else:
-                head_size = qk_rope_head_dim
-
-            if indexer_head_size is not None and indexer_head_size > 0:
-                head_size = indexer_head_size
 
             dtype = indexer_dtype if indexer_dtype is not None else torch.uint8
 
@@ -303,14 +313,24 @@ class FlexKVConfig:
             # authoritative physical device index.
             local_rank=int(os.environ.get('LOCAL_RANK', -1)),
         )
+        # Detect indexer config from HuggingFace model config.
+        # vLLM exposes hf_config via vllm_config.model_config.hf_config.
+        hf_config = getattr(vllm_config.model_config, 'hf_config', None)
+        self._detect_indexer_config_from_hf(hf_config)
+
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
-        hf_config = getattr(vllm_config.model_config, 'hf_config', None)
-        self._detect_indexer_config_from_hf(hf_config, source="vllm")
-
         logger.info(f"[FlexKV vllm] {self.model_config}, {rank_info}")
+
+
+        if self.cache_config.indexer is not None:
+            logger.info(
+                f"[FlexKV vLLM] Indexer config detected: "
+                f"head_size={self.cache_config.indexer.head_size}, "
+                f"dtype={self.cache_config.indexer.dtype}"
+            )
 
         # Freeze model_config — no further mutations allowed
         self.model_config.freeze()
@@ -495,10 +515,11 @@ class FlexKVConfig:
             # via torch.cuda.set_device(gpu_id) before this point.
             local_rank=torch.cuda.current_device(),
         )
-        update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
-
         hf_config = getattr(sglang_config, 'hf_config', None)
-        self._detect_indexer_config_from_hf(hf_config, source="sglang")
+
+        self._detect_indexer_config_from_hf(hf_config)
+
+        update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
 
         if self.cache_config.indexer is not None:
             logger.info(
@@ -582,7 +603,7 @@ class FlexKVConfig:
                     self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
                     self.model_config.num_kv_heads = hf_config.num_attention_heads
 
-            self._detect_indexer_config_from_hf(hf_config, source="TRT-LLM")
+            self._detect_indexer_config_from_hf(hf_config)
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
 
@@ -627,6 +648,13 @@ class FlexKVConfig:
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
 
         logger.info(f"[FlexKV TRT-LLM] {self.model_config}, {rank_info}")
+
+        if self.cache_config.indexer is not None:
+            logger.info(
+                f"[FlexKV TRT-LLM] Indexer config detected: "
+                f"head_size={self.cache_config.indexer.head_size}, "
+                f"dtype={self.cache_config.indexer.dtype}"
+            )
 
         # Freeze model_config — no further mutations allowed
         self.model_config.freeze()

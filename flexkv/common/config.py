@@ -623,20 +623,17 @@ def update_default_config_from_user_config(rank_info: RankInfo,
             f"[CacheConfig] GB->blocks conversion (with indexer): "
             f"main_block_size={main_block_size_in_bytes} B, "
             f"indexer_block_size={indexer_block_size_in_bytes} B, "
-            f"total_block_size={block_size_in_bytes} B"
+            f"total_block_size={block_size_in_bytes} B; "
+            f"cpu_cache_gb={user_config.cpu_cache_gb} -> num_cpu_blocks={cache_config.num_cpu_blocks}, "
+            f"ssd_cache_gb={user_config.ssd_cache_gb} -> num_ssd_blocks={cache_config.num_ssd_blocks}"
         )
     else:
         flexkv_logger.info(
             f"[CacheConfig] GB->blocks conversion: "
-            f"block_size={block_size_in_bytes} B"
+            f"block_size={block_size_in_bytes} B; "
+            f"cpu_cache_gb={user_config.cpu_cache_gb} -> num_cpu_blocks={cache_config.num_cpu_blocks}, "
+            f"ssd_cache_gb={user_config.ssd_cache_gb} -> num_ssd_blocks={cache_config.num_ssd_blocks}"
         )
-
-    flexkv_logger.info(
-        f"[CacheConfig] GB->blocks conversion: "
-        f"block_size={block_size_in_bytes} B; "
-        f"cpu_cache_gb={user_config.cpu_cache_gb} -> num_cpu_blocks={cache_config.num_cpu_blocks}, "
-        f"ssd_cache_gb={user_config.ssd_cache_gb} -> num_ssd_blocks={cache_config.num_ssd_blocks}"
-    )
 
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
