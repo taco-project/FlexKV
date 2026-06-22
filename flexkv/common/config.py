@@ -237,8 +237,8 @@ class RankInfo:
         For non-MLA models, CP shards along the sequence dimension and each
         ``(cp_rank, tp_rank)`` pair owns a unique slice.
         """
-        if self.model_config.use_mla:
-            return self.tp_rank
+        # if self.model_config.use_mla:
+        #     return self.tp_rank
         return self.cp_rank * max(1, self.model_config.tp_size) + self.tp_rank
 
     @property
@@ -555,15 +555,35 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     #   For nnodes==1 the per-node pool is always the full model, so use the full
     #   layer count up-front. Cross-node PP keeps the per-stage sizing because
     #   each node only holds its own slice.
-    if int(rank_info.model_config.nnodes) == 1:
-        layers_per_block = int(rank_info.model_config.num_layers)
-    else:
-        layers_per_block = int(rank_info.num_layers_per_pp_stage)
-    block_size_in_bytes = (
-        layers_per_block
-        * rank_info.model_config.bytes_per_token_per_layer
-        * cache_config.tokens_per_block
+    # if int(rank_info.model_config.nnodes) == 1:
+    #     layers_per_block = int(rank_info.model_config.num_layers)
+    # else:
+    #     layers_per_block = int(rank_info.num_layers_per_pp_stage)
+    # block_size_in_bytes = (
+    #     layers_per_block
+    #     * rank_info.model_config.bytes_per_token_per_layer
+    #     * cache_config.tokens_per_block
+    # )
+
+    main_block_size_in_bytes = (
+        rank_info.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
     )
+    indexer_block_size_in_bytes = 0
+    if cache_config.indexer is not None:
+        indexer_cfg = cache_config.indexer
+        # Indexer is MLA-style (single shared head set, no TP head split),
+        # so per-token bytes = num_kv_heads * head_size * dtype.itemsize.
+        indexer_bytes_per_token_per_layer = (
+            indexer_cfg.num_kv_heads
+            * indexer_cfg.head_size
+            * indexer_cfg.dtype.itemsize
+        )
+        indexer_block_size_in_bytes = (
+            rank_info.num_layers_per_pp_stage
+            * indexer_bytes_per_token_per_layer
+            * 1
+        )
+    block_size_in_bytes = main_block_size_in_bytes + indexer_block_size_in_bytes
 
     assert user_config.cpu_cache_gb > 0
     assert user_config.ssd_cache_gb >= 0
@@ -571,12 +591,22 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
     cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)
 
-    flexkv_logger.info(
-        f"[CacheConfig] GB->blocks conversion: "
-        f"block_size={block_size_in_bytes} B; "
-        f"cpu_cache_gb={user_config.cpu_cache_gb} -> num_cpu_blocks={cache_config.num_cpu_blocks}, "
-        f"ssd_cache_gb={user_config.ssd_cache_gb} -> num_ssd_blocks={cache_config.num_ssd_blocks}"
-    )
+    if cache_config.indexer is not None:
+        flexkv_logger.info(
+            f"[CacheConfig] GB->blocks conversion (with indexer): "
+            f"main_block_size={main_block_size_in_bytes} B, "
+            f"indexer_block_size={indexer_block_size_in_bytes} B, "
+            f"total_block_size={block_size_in_bytes} B; "
+            f"cpu_cache_gb={user_config.cpu_cache_gb} -> num_cpu_blocks={cache_config.num_cpu_blocks}, "
+            f"ssd_cache_gb={user_config.ssd_cache_gb} -> num_ssd_blocks={cache_config.num_ssd_blocks}"
+        )
+    else:
+        flexkv_logger.info(
+            f"[CacheConfig] GB->blocks conversion: "
+            f"block_size={block_size_in_bytes} B; "
+            f"cpu_cache_gb={user_config.cpu_cache_gb} -> num_cpu_blocks={cache_config.num_cpu_blocks}, "
+            f"ssd_cache_gb={user_config.ssd_cache_gb} -> num_ssd_blocks={cache_config.num_ssd_blocks}"
+        )
 
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
