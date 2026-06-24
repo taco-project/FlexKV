@@ -13,6 +13,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.config import ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp
 from flexkv.transfer.worker import TransferWorkerBase, cudaHostRegister
@@ -79,7 +80,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
                  gpu_blocks: List[List[TensorSharedHandle]],
-                 cpu_blocks: torch.Tensor,
+                 cpu_blocks: Union[torch.Tensor, HugePageTensorHandle],
                  ssd_files: Dict[int, List[str]],
                  gpu_kv_layouts: List[KVCacheLayout],
                  cpu_kv_layout: KVCacheLayout,
@@ -100,7 +101,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  enable_eventfd: bool = True,
                  is_nsa_cp: bool = False,
                  indexer_gpu_blocks: Optional[List[List[TensorSharedHandle]]] = None,
-                 indexer_cpu_blocks: Optional[torch.Tensor] = None,
+                 indexer_cpu_blocks: Optional[Union[torch.Tensor, HugePageTensorHandle]] = None,
                  indexer_gpu_kv_layouts: Optional[List[KVCacheLayout]] = None,
                  indexer_cpu_kv_layout: Optional[KVCacheLayout] = None,
                  indexer_dtype: Optional[torch.dtype] = None,
@@ -115,6 +116,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             f"num_gpu_blocks={[len(b) for b in gpu_blocks]}")
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size, f"len(gpu_blocks) = {len(gpu_blocks)}, tp_group_size = {tp_group_size}"
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
             blocks_in_one_gpu = []
@@ -234,6 +236,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             assert indexer_gpu_kv_layouts is not None
             assert indexer_cpu_kv_layout is not None
             assert indexer_dtype is not None
+            indexer_cpu_blocks = materialize_worker_tensor(indexer_cpu_blocks)
 
             # Import indexer GPU tensor handles
             imported_indexer_gpu_blocks = []

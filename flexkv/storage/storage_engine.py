@@ -10,10 +10,21 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
-from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator
+from flexkv.storage.allocator import (
+    CPUAllocator,
+    GPUAllocator,
+    HugePageAllocator,
+    RemoteAllocator,
+    SSDAllocator,
+)
 
 
 class StorageEngine:
+    def _cpu_allocator(self) -> type[CPUAllocator] | type[HugePageAllocator]:
+        if self._cache_config.use_hugepage_cpu_buffer:
+            return HugePageAllocator
+        return CPUAllocator
+
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig):
@@ -226,21 +237,28 @@ class StorageEngine:
 
         storage_handle: StorageHandle
         if device_type == DeviceType.CPU:
+            cpu_allocator = self._cpu_allocator()
             pin_memory = kwargs.get('pin_memory', False)
+            page_size_bytes = kwargs.get(
+                'page_size_bytes',
+                self._cache_config.hugepage_size_bytes,
+            )
             if raw_data is not None:
                 assert isinstance(raw_data, torch.Tensor), \
                     "raw_data for CPUAllocator must be Tensor"
-                storage_handle = CPUAllocator.from_raw_data(
+                storage_handle = cpu_allocator.from_raw_data(
                     data=raw_data,  # type: ignore
                     layout=layout,
                     dtype=dtype,
-                    pin_memory=pin_memory
+                    pin_memory=pin_memory,
+                    page_size_bytes=page_size_bytes,
                 )
             else:
-                storage_handle = CPUAllocator.allocate(
+                storage_handle = cpu_allocator.allocate(
                     layout=layout,
                     dtype=dtype,
-                    pin_memory=pin_memory
+                    pin_memory=pin_memory,
+                    page_size_bytes=page_size_bytes,
                 )
         elif device_type == DeviceType.GPU:
             num_chunks = kwargs.get('num_chunks', 1)

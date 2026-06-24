@@ -47,6 +47,9 @@ enable_gds: false
 | `FLEXKV_SSD_CACHE_GB`    | int   | 0           | SSD 缓存层容量，单位为 GB。建议设置大于 `FLEXKV_CPU_CACHE_GB`并为`FLEXKV_MAX_FILE_SIZE_GB`的整数倍，若仅用CPU缓存则设为 0（此时不启用 SSD 缓存）               |
 | `FLEXKV_SSD_CACHE_DIR`   | str   | "./flexkv_ssd" | SSD 缓存数据的存放目录。若有多块 SSD，可通过分号 `;` 分隔多个挂载路径。例如 `"/data0/flexkv_ssd/;/data1/flexkv_ssd/"`，以提升带宽                  |
 | `FLEXKV_ENABLE_GDS`      | bool  | 0           | 是否启用 GPU Direct Storage（GDS）。如硬件和驱动支持，开启后可提升 SSD 到 GPU 的数据吞吐能力。默认关闭，开启请设为 1                    |
+| `FLEXKV_USE_HUGEPAGE_CPU_BUFFER` | bool | 0 | 是否为通用 CPU KV cache 启用 HugePage。默认关闭，开启请设为 1 |
+| `FLEXKV_USE_HUGEPAGE_TMP_BUFFER` | bool | 0 | 是否为 `enable_p2p_ssd` 场景下的 tmp CPU staging buffer 启用 HugePage。默认关闭，开启请设为 1 |
+| `FLEXKV_HUGEPAGE_SIZE_BYTES` | int | 2097152 | HugePage 大小，默认 2 MiB。如果宿主机准备的是 1 GiB HugePage，可设为 `1073741824` |
 
 ---
 
