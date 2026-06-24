@@ -33,6 +33,10 @@
 
 namespace flexkv {
 
+#ifdef FLEXKV_ENABLE_NVCOMP
+struct NvcompTPState;
+#endif
+
 class TPTransferThreadGroup {
 public:
   TPTransferThreadGroup(int num_gpus,
@@ -43,7 +47,10 @@ public:
                         const std::vector<int64_t> &gpu_block_strides_in_bytes,
                         const std::vector<int64_t> &gpu_layer_strides_in_bytes,
                         const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
-                        const std::vector<int64_t> &gpu_device_ids);
+                        const std::vector<int64_t> &gpu_device_ids,
+                        bool enable_nvcomp = false,
+                        int nvcomp_batch_size = 0,
+                        int nvcomp_data_type = 0);
 
   ~TPTransferThreadGroup();
 
@@ -57,6 +64,28 @@ public:
                          const bool is_host_to_device,
                          const bool use_ce_transfer, const int layer_id,
                          const int layer_granularity, const bool is_mla);
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+
+  void init_nvcomp(int nvcomp_batch_size, int nvcomp_data_type);
+  void destroy_nvcomp_state();
+  void ensure_nvcomp_initialized();
+
+  size_t tp_group_transfer_ans(const torch::Tensor &gpu_block_id_tensor,
+                               const torch::Tensor &cpu_block_id_tensor,
+                               const int64_t cpu_kv_stride_in_bytes,
+                               const int64_t cpu_layer_stride_in_bytes,
+                               const int64_t cpu_block_stride_in_bytes,
+                               const int64_t cpu_tp_stride_in_bytes,
+                               const int transfer_num_cta,
+                               const bool is_host_to_device,
+                               const bool use_ce_transfer, const int layer_id,
+                               const int layer_granularity, const bool is_mla,
+                               const int64_t cpu_size_table_tp_ptr,
+                               const int64_t cpu_size_table_tp_rank_stride,
+                               const int64_t cpu_size_table_block_stride,
+                               const int64_t cpu_size_table_layer_stride);
+#endif
 
 private:
   using Task = std::function<void()>;
@@ -83,6 +112,10 @@ private:
   std::vector<std::mutex> mtxs_;
   std::vector<std::condition_variable> cvs_;
   std::atomic<bool> stop_pool_;
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  std::unique_ptr<NvcompTPState> nvcomp_state_;
+#endif
 };
 
 } // namespace flexkv

@@ -16,7 +16,13 @@
  */
 #include "tp_transfer_thread_group.h"
 #include "transfer.cuh"
+#ifdef FLEXKV_ENABLE_NVCOMP
+#include "compression/ans/nvcomp_ans_tp.h"
+#endif
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <stdexcept>
+#include <type_traits>
 
 namespace flexkv {
 
@@ -27,7 +33,10 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     const std::vector<int64_t> &gpu_block_strides_in_bytes,
     const std::vector<int64_t> &gpu_layer_strides_in_bytes,
     const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
-    const std::vector<int64_t> &gpu_device_ids) {
+    const std::vector<int64_t> &gpu_device_ids,
+    bool enable_nvcomp, int nvcomp_batch_size, int nvcomp_data_type) {
+  const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
+
   num_gpus_ = num_gpus;
   num_tensors_per_gpu_ = num_tensors_per_gpu;
 
@@ -116,9 +125,18 @@ TPTransferThreadGroup::TPTransferThreadGroup(
       }
     });
   }
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  if (enable_nvcomp) {
+    init_nvcomp(nvcomp_batch_size, nvcomp_data_type);
+  }
+#endif
+
 }
 
 TPTransferThreadGroup::~TPTransferThreadGroup() {
+  const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
+
   stop_pool_ = true;
   for (auto &cv : cvs_)
     cv.notify_all();
@@ -127,6 +145,10 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
       t.join();
 
   cudaFreeHost(gpu_blocks_);
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  destroy_nvcomp_state();
+#endif
 
   gpu_tensor_handlers_.clear();
   delete[] gpu_kv_strides_in_bytes_;

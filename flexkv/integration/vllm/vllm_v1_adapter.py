@@ -782,6 +782,18 @@ class FlexKVConnectorV1Impl:
             # Track scheduled requests to detect preemptions in build_connector_meta
             self.previous_scheduled_req_ids: set[str] = set()
         elif role == KVConnectorRole.WORKER:
+            # vllm's ParallelConfig has no ``tensor_parallel_rank`` field, so
+            # the value read in post_init_from_vllm_config is always 0 on every
+            # worker.  Override it here using the initialized TP group rank so
+            # each worker registers a distinct device_id with FlexKV.
+            try:
+                import dataclasses
+                from vllm.distributed.parallel_state import get_tp_group
+                rank_info = dataclasses.replace(
+                    rank_info, tp_rank=get_tp_group().rank_in_group)
+            except Exception as _e:
+                logger.warning(
+                    f"FlexKV: could not derive tp_rank from vllm TP group: {_e}")
             self.connector = FlexKVWorkerConnector(flexkv_config, rank_info)
         else:
             raise ValueError(f"Unrecognized KVConnectorRole: {role}.")

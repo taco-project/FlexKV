@@ -54,7 +54,7 @@ class CacheEngineAccel:
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector = None,
-                 protected_threshold: int = 2):
+                 protected_threshold = 2):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -228,7 +228,7 @@ class CacheEngine:
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector = None,
-                 protected_threshold: int = 2):
+                 protected_threshold = 2):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:

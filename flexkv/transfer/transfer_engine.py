@@ -41,6 +41,7 @@ from flexkv.transfer.worker import (
     NixlTransferWorker,
     PEER2CPUTransferWorker,
 )
+from flexkv.transfer.compression import build_compressors
 from flexkv.transfer.layerwise import (
     LayerwiseTransferWorker,
     build_layerwise_eventfd_socket_path,
@@ -155,6 +156,15 @@ class TransferEngine:
         self._child_id_to_child: Dict[int, TransferOp] = {}
         self._child_to_parent_op_id: Dict[int, int] = {}
 
+        self._compressors = build_compressors(
+            cpu_handle=self._cpu_handle,
+            ssd_handle=self._ssd_handle,
+            cache_config=self.cache_config,
+            model_config=self.model_config,
+            gpu_handle_groups=self.gpu_handle_groups,
+            layerwise_enabled=GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer,
+        )
+
     def _init_workers(self) -> None:
         if self._running:
             return
@@ -183,6 +193,7 @@ class TransferEngine:
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                        compressor=self._compressors["gpu_cpu"],
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
@@ -202,6 +213,7 @@ class TransferEngine:
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                        compressor=self._compressors["gpu_cpu_tp"],
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
@@ -224,6 +236,7 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    compressor=self._compressors["gpu_cpu"],
                 )
                 for worker_key, gpu_handles in self.gpu_handle_groups.items()
             }
@@ -243,6 +256,7 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    compressor=self._compressors["gpu_cpu_tp"],
                 )
                 for worker_key, gpu_handles in self.gpu_handle_groups.items()
             }
@@ -262,6 +276,7 @@ class TransferEngine:
                     dtype=self._cpu_handle.dtype,
                     num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
                     cache_config=self._cache_config,
+                    compressor=self._compressors["cpu_ssd"],
                 )
                 self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
 
@@ -277,6 +292,7 @@ class TransferEngine:
                 dtype=self._cpu_handle.dtype,
                 num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
                 cache_config=self._cache_config,
+                compressor=self._compressors["cpu_ssd"],
             )
             self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
         if self._remote_handle is not None and self._cpu_handle is not None:
@@ -477,6 +493,7 @@ class TransferEngine:
                             use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                             transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                             transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                            compressor=self._compressors["indexer_gpu_cpu"],
                         )
                         for worker_key, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
                     }
@@ -496,6 +513,7 @@ class TransferEngine:
                             use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                             transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                             transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                            compressor=self._compressors["indexer_gpu_cpu_tp"],
                         )
                         for worker_key, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
                     }
@@ -518,6 +536,7 @@ class TransferEngine:
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                        compressor=self._compressors["indexer_gpu_cpu"],
                     )
                     for worker_key, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
                 }
@@ -537,6 +556,7 @@ class TransferEngine:
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                        compressor=self._compressors["indexer_gpu_cpu_tp"],
                     )
                     for worker_key, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
                 }
@@ -554,6 +574,7 @@ class TransferEngine:
                     dtype=self._indexer_cpu_handle.dtype,
                     num_blocks_per_file=self._indexer_ssd_handle.num_blocks_per_file,
                     cache_config=self._cache_config,
+                    compressor=self._compressors["indexer_cpu_ssd"],
                 )
                 self._indexer_worker_map[TransferType.H2DISK] = self._indexer_h2disk_worker
                 # DISK2H indexer worker
@@ -569,6 +590,7 @@ class TransferEngine:
                         dtype=self._indexer_cpu_handle.dtype,
                         num_blocks_per_file=self._indexer_ssd_handle.num_blocks_per_file,
                         cache_config=self._cache_config,
+                        compressor=self._compressors["indexer_cpu_ssd"],
                     )
                     self._indexer_worker_map[TransferType.DISK2H] = self._indexer_disk2h_worker
                 flexkv_logger.info("TransferEngine: indexer SSD workers initialized")
