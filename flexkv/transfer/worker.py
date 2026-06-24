@@ -515,6 +515,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         # the tp dim should always be right after the block dim
         # on both blockfirst layout and layerfirst layout
         if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and not self.is_mla:
+            flexkv_logger.info(f"[tpGPUCPUTransferWorker] div_head tp_group_size: {self.tp_group_size}")
             cpu_kv_layout = cpu_kv_layout.div_head(self.tp_group_size)
 
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
