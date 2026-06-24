@@ -1,8 +1,9 @@
 import os
 import json
-from dataclasses import dataclass
+import yaml
+from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import Optional, List, Union, Dict, Any
+from typing import Optional, List, Tuple, Union, Dict, Any
 from argparse import Namespace
 import copy
 
@@ -29,40 +30,295 @@ class ModelConfig:
     use_mla: bool = False
     dtype: torch.dtype = torch.bfloat16
 
-    # parallel configs
+    # ------------------------------------------------------------------
+    # Parallelism sizes (global, identical for every rank)
+    # ------------------------------------------------------------------
     tp_size: int = 1
-    dp_size: int = 1
-    dp_rank: int = 0
     pp_size: int = 1
-    pp_rank: int = 0
+    dp_size: int = 1
 
-    # topology configs
-    #   nnodes        : number of physical machines spanned by one replica
-    #                   (== server_args.nnodes in SGLang)
-    #   node_rank     : index of this machine within ``nnodes``
-    #                   (== server_args.node_rank in SGLang).  Used by
-    #                   KVTaskEngine's multi-node topology derivation and
-    #                   for logging; NOT embedded in the layerwise UDS
-    #                   socket path (UDS endpoints are kernel-local).
+    # ------------------------------------------------------------------
+    # Attention-level parallel configs
+    # ------------------------------------------------------------------
+    # enable_dp_attention: whether DP-attention is enabled (sglang
+    # ``--enable-dp-attention`` or TRT-LLM ``enable_attention_dp``).
+    # When True, the physical TP group is split into
+    # attn_tp × attn_cp × attn_dp.
+    enable_dp_attention: bool = False
+
+    # attn_cp_size: context-parallel size (global).
+    attn_cp_size: int = 1
+
+    # ------------------------------------------------------------------
+    # Topology configs (global)
+    # ------------------------------------------------------------------
+    # nnodes: number of physical machines spanned by one replica
     nnodes: int = 1
-    node_rank: int = 0
 
     # Multi-node bootstrap: master node's IP for TransferManager rendezvous.
-    # ``None`` falls back to ``FLEXKV_MASTER_HOST`` env var (default
-    # ``"localhost"``) inside ``resolve_master_host_and_ports``.  Set this
-    # from the framework's own launch config (e.g. sglang's
-    # ``--dist-init-addr``) to avoid exposing an extra env knob.
-    master_host: Optional[str] = None
+    # Bare host (no scheme); zmq sockets prepend ``tcp://`` at connect time.
+    # Set this from the framework's own launch config (e.g. sglang's
+    # ``--dist-init-addr``, TRT-LLM's launch script) so runtime layers
+    # (TransferManager / KVTaskManager) never need to read env vars.
+    master_host: str = "localhost"
 
-    # NSA context parallelism: when True, layerwise transfer sends full
-    # (unpartitioned) KV cache to every rank instead of head-sliced data.
-    is_nsa_cp: bool = False
-    cp_size: int = 1
+    # Master endpoint ports (command, result, query). Set via integration
+    # adapter when the launch script exposes a different port triple.
+    master_ports: Tuple[str, str, str] = ("5556", "5557", "5558")
+
+    # Whether KVTaskManager should run TransferManagerOnRemote in a
+    # subprocess (currently only used by TRT-LLM to avoid MPI conflicts).
+    # Set by the TRT-LLM adapter; default ``False`` for sglang/vllm.
+    use_trtllm_subprocess: bool = False
+
+    # Endpoint of that TRT-LLM subprocess TransferManagerOnRemote.
+    # Only consulted when ``use_trtllm_subprocess`` is True.
+    trtllm_subprocess_host: str = "localhost"
+    trtllm_subprocess_ports: Tuple[str, str, str] = ("6667", "6668", "6669")
+
+    # ------------------------------------------------------------------
+    # Multi-instance deployment
+    # ------------------------------------------------------------------
+    instance_num: int = 1
+
+    # ------------------------------------------------------------------
+    # Freeze mechanism: after post_init, ModelConfig must not be mutated
+    # ------------------------------------------------------------------
+    _frozen: bool = field(default=False, init=False, repr=False)
+
+    def freeze(self) -> None:
+        """Lock the config so that any subsequent __setattr__ raises an error."""
+        # ---- Topology validation ----
+        if self.total_gpus % self.nnodes != 0:
+            raise ValueError(
+                f"[ModelConfig] cannot derive gpus_per_node: "
+                f"total_gpus={self.total_gpus} not divisible by nnodes={self.nnodes}"
+            )
+        if self.nnodes_per_tp_group > 2:
+            raise ValueError(
+                f"[ModelConfig] only support 2-nodes TP for now, but got "
+                f"nnodes_per_tp_group={self.nnodes_per_tp_group} "
+                f"(tp_size={self.tp_size}, gpus_per_node={self.gpus_per_node})"
+            )
+        if self.tp_size % self.nnodes_per_tp_group != 0:
+            raise ValueError(
+                f"[ModelConfig] tp_size={self.tp_size} not divisible by "
+                f"nnodes_per_tp_group={self.nnodes_per_tp_group}"
+            )
+        if self.instance_num < 1:
+            raise ValueError(
+                f"[ModelConfig] instance_num must be >= 1, got {self.instance_num}"
+            )
+
+        object.__setattr__(self, '_frozen', True)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name == '_frozen':
+            return object.__setattr__(self, name, value)
+        if getattr(self, '_frozen', False):
+            raise AttributeError(
+                f"ModelConfig is frozen — cannot set '{name}'. "
+                f"All primitive fields must be set during post_init_from_*(), "
+                f"after which freeze() is called.  Derived fields (attn_tp_size, "
+                f"tp_size_per_node) are @property "
+                f"and cannot be set at all."
+            )
+        object.__setattr__(self, name, value)
+
+    # ------------------------------------------------------------------
+    # Derived topology properties
+    # ------------------------------------------------------------------
+    @property
+    def total_gpus(self) -> int:
+        """Total GPUs across all nodes for one FlexKV instance."""
+        return self.dp_size * self.tp_size * self.pp_size
+
+    @property
+    def total_clients(self) -> int:
+        """Total number of DPClient endpoints across all instances."""
+        return self.instance_num * self.dp_size
+
+    @property
+    def gpus_per_node(self) -> int:
+        """Total GPUs on this node (across all DP, PP stages and TP groups)."""
+        return self.total_gpus // self.nnodes
+
+    @property
+    def nnodes_per_pp_rank(self) -> int:
+        """Number of nodes spanned by one PP stage."""
+        return max(self.nnodes // self.pp_size, 1)
+
+    @property
+    def nnodes_per_tp_group(self) -> int:
+        """Number of nodes spanned by one TP group."""
+        return self.nnodes_per_pp_rank
+
+    @property
+    def tp_size_per_node(self) -> int:
+        """Number of TP ranks on this node within one TP group."""
+        return self.tp_size // self.nnodes_per_tp_group
+
+    @property
+    def attn_dp_size(self) -> int:
+        """Attention-level DP size (= dp_size when enable_dp_attention else 1)."""
+        return max(1, self.dp_size) if self.enable_dp_attention else 1
+
+    @property
+    def attn_tp_size(self) -> int:
+        """Attention-level TP size derived from tp / attn_dp / attn_cp."""
+        attn_dp = self.attn_dp_size
+        cp = max(1, self.attn_cp_size)
+        return max(1, max(1, self.tp_size) // (attn_dp * cp))
+
+    @property
+    def attn_tp_size_per_node(self) -> int:
+        """Attention-level TP size per node."""
+        return self.attn_tp_size // self.nnodes_per_tp_group
+
+    @property
+    def attn_cp_size_per_node(self) -> int:
+        """Attention-level CP size on this node for a single pp stage. """
+        return max(1, self.attn_cp_size // self.nnodes_per_pp_rank)
+
+    @property
+    def effective_tp_size(self) -> int:
+        """Effective tp-group size used for *data-plane* CPU slicing."""
+        return max(1, self.attn_tp_size) * max(1, self.attn_cp_size)
+
+    @property
+    def effective_tp_size_per_node(self) -> int:
+        """Per-node counterpart of :pyattr:`effective_tp_size`."""
+        return self.attn_tp_size_per_node * self.attn_cp_size_per_node
+
+    @property
+    def num_kv_heads_per_node(self) -> int:
+        """Number of KV heads visible to a single node."""
+        if self.use_mla:
+            return self.num_kv_heads
+        return self.num_kv_heads * self.tp_size_per_node // max(1, self.attn_tp_size)
+
+    @property
+    def kv_dim(self) -> int:
+        """KV dimension: 1 for MLA (no head split), 2 for standard (head split)."""
+        return 1 if self.use_mla else 2
+
+    @property
+    def bytes_per_token_per_layer(self) -> int:
+        """Raw byte footprint of a single (layer, token) KV slot."""
+        return self.num_kv_heads * self.head_size * self.kv_dim * self.dtype.itemsize
 
     @property
     def token_size_in_bytes(self) -> int:
-        kv_dim = 1 if self.use_mla else 2
-        return self.num_layers * self.num_kv_heads * self.head_size * kv_dim * self.dtype.itemsize
+        """Whole-model token footprint (bytes) — all layers combined."""
+        return self.num_layers * self.bytes_per_token_per_layer
+
+    def __str__(self) -> str:
+        return (
+            f"ModelConfig(num_layers={self.num_layers}, num_kv_heads={self.num_kv_heads}"
+            f", head_size={self.head_size}, use_mla={self.use_mla}"
+            f", dtype={self.dtype}"
+            f", tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}"
+            f", attn_cp_size={self.attn_cp_size}"
+            f", nnodes={self.nnodes}, master_host={self.master_host!r}"
+            f", instance_num={self.instance_num}"
+        )
+
+
+@dataclass(frozen=True)
+class RankInfo:
+    model_config: ModelConfig
+    tp_rank: int = 0
+    pp_rank: int = 0
+    dp_rank: int = 0
+    attn_cp_rank: int = 0
+    node_rank: int = 0
+    instance_id: int = 0
+    pp_start_layer: int = 0
+    pp_end_layer: int = -1
+    @property
+    def tp_rank_per_node(self) -> int:
+        """TP rank index within the local node (within one TP group)."""
+        return self.tp_rank % self.model_config.tp_size_per_node
+
+    @property
+    def dp_client_id(self) -> int:
+        """Flat DP route label: unique int across all instances.
+
+        Equals ``instance_id * dp_size + dp_rank``. All transfer-engine
+        routing (worker maps, NVTX labels, socket paths, server-side
+        client registration) keys on this single int so the legacy
+        ``(instance_id, dp_rank)`` tuple (DPRoutingKey) is no longer
+        needed.
+        """
+        return self.instance_id * self.model_config.dp_size + self.dp_rank
+
+    @property
+    def attn_tp_rank(self) -> int:
+        """Attention-level TP rank derived from tp_rank / attn_tp_size."""
+        return self.tp_rank % max(1, self.model_config.attn_tp_size)
+
+    @property
+    def effective_tp_rank(self) -> int:
+        """Effective tp-rank in the *data-plane* segmentation space."""
+        if self.model_config.use_mla:
+            return self.attn_tp_rank
+        attn_tp_size = max(1, self.model_config.attn_tp_size)
+        return self.attn_cp_rank * attn_tp_size + self.attn_tp_rank
+
+    @property
+    def pp_size_per_node(self) -> int:
+        """Number of PP stages co-located on a single node."""
+        model_config = self.model_config
+        return max(model_config.pp_size // model_config.nnodes, 1)
+
+    @property
+    def pp_rank_per_node(self) -> int:
+        """This rank's PP index *within* its node."""
+        return self.pp_rank % self.pp_size_per_node
+
+    @property
+    def dp_size_per_node(self) -> int:
+        """Number of DP replicas co-located on a single node."""
+        model_config = self.model_config
+        return model_config.gpus_per_node // (self.pp_size_per_node * model_config.tp_size_per_node)
+
+    @property
+    def dp_rank_per_node(self) -> int:
+        """This rank's DP index *within* its node (non-DP-attention layout)."""
+        return self.dp_rank % self.dp_size_per_node
+
+    @property
+    def local_rank(self) -> int:
+        model_config = self.model_config
+        if model_config.enable_dp_attention:
+            return self.pp_rank_per_node * model_config.tp_size_per_node + self.tp_rank_per_node
+        return (self.dp_rank_per_node * self.pp_size_per_node + self.pp_rank_per_node) \
+               * model_config.tp_size_per_node + self.tp_rank_per_node
+
+    @property
+    def num_layers_per_pp_stage(self) -> int:
+        """Number of layers managed by this PP stage."""
+        end = self.pp_end_layer if self.pp_end_layer >= 0 else self.model_config.num_layers
+        return end - self.pp_start_layer
+
+    @property
+    def token_size_in_bytes_per_pp_stage(self) -> int:
+        """Per-pp-stage token footprint (bytes) — rank-exact."""
+        return (self.num_layers_per_pp_stage
+                * self.model_config.bytes_per_token_per_layer)
+
+    def __str__(self) -> str:
+        """Human-readable summary of this rank including derived quantities.
+
+        Equivalent to the retired ``FlexKVContext.describe_rank`` output
+        (kept stable so log-grep patterns keep working).
+        """
+        return (
+            f"RankInfo(tp_rank={self.tp_rank}, pp_rank={self.pp_rank}"
+            f", dp_rank={self.dp_rank}, attn_cp_rank={self.attn_cp_rank}"
+            f", node_rank={self.node_rank}, instance_id={self.instance_id}"
+        )
+
 
 @dataclass
 class CacheConfig:
@@ -137,6 +393,19 @@ class CacheConfig:
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
         self.enable_remote = self.enable_3rd_remote
+
+    def __str__(self) -> str:
+        return (
+            f"CacheConfig(tokens_per_block={self.tokens_per_block}"
+            f", enable_cpu={self.enable_cpu}, enable_ssd={self.enable_ssd}"
+            f", enable_gds={self.enable_gds}, enable_remote={self.enable_remote}"
+            f", enable_kv_sharing={self.enable_kv_sharing}"
+            f", enable_p2p_cpu={self.enable_p2p_cpu}"
+            f", enable_p2p_ssd={self.enable_p2p_ssd}"
+            f", enable_3rd_remote={self.enable_3rd_remote}"
+            f", num_cpu_blocks={self.num_cpu_blocks}"
+            f", num_ssd_blocks={self.num_ssd_blocks})"
+        )
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
@@ -235,10 +504,6 @@ def parse_path_list(path_str: str) -> List[str]:
     return paths
 
 def load_user_config_from_file(config_file: str) -> UserConfig:
-    import json
-    import yaml
-    from dataclasses import fields
-
     # read json config file or yaml config file
     if config_file.endswith('.json'):
         with open(config_file) as f:
@@ -279,10 +544,10 @@ def load_user_config_from_env() -> UserConfig:
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
     return int(size_in_GB * 1024 * 1024 * 1024 / block_size_in_bytes)
 
-def update_default_config_from_user_config(model_config: ModelConfig,
+def update_default_config_from_user_config(rank_info: RankInfo,
                                            cache_config: CacheConfig,
                                            user_config: UserConfig) -> None:
-    block_size_in_bytes = model_config.token_size_in_bytes * cache_config.tokens_per_block
+    block_size_in_bytes = rank_info.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
 
     assert user_config.cpu_cache_gb > 0
     assert user_config.ssd_cache_gb >= 0
@@ -312,6 +577,69 @@ def update_default_config_from_user_config(model_config: ModelConfig,
             (cache_config.num_ssd_blocks // len(cache_config.ssd_cache_dir) + 1) * len(cache_config.ssd_cache_dir)
         flexkv_logger.warning(f"num_ssd_blocks is not a multiple of num_ssd_devices, "
                               f"adjust num_ssd_blocks to {cache_config.num_ssd_blocks}")
+
+    if not cache_config.enable_cpu:
+        raise ValueError("enable_cpu must be True")
+    if cache_config.enable_remote and not cache_config.enable_ssd:
+        raise ValueError("enable_ssd must be True if enable_remote is True")
+    if not cache_config.enable_cpu and not cache_config.enable_gds:
+        raise ValueError("enable_gds must be True if enable_cpu is False")
+    if cache_config.enable_gds and not cache_config.enable_ssd:
+        raise ValueError("enable_ssd must be True if enable_gds is True")
+    if cache_config.enable_kv_sharing and cache_config.enable_gds:
+        raise ValueError(
+            "enable_kv_sharing and enable_gds cannot be used at the same time"
+        )
+
+    if cache_config.enable_remote:
+        if cache_config.remote_cache_path is None:
+            if cache_config.remote_file_prefix is None:
+                raise ValueError(
+                    "remote_file_prefix must be provided when remote_cache_path is None"
+                )
+            if (cache_config.remote_file_num is None
+                    or cache_config.remote_file_num <= 0):
+                raise ValueError("remote_file_num must be a positive integer")
+            cache_config.remote_cache_path = [
+                f"{cache_config.remote_file_prefix}_{i}"
+                for i in range(cache_config.remote_file_num)
+            ]
+
+        if cache_config.remote_cache_size_mode not in ("block_num", "file_size"):
+            raise ValueError(
+                f"remote_cache_size_mode must be 'block_num' or 'file_size', "
+                f"got {cache_config.remote_cache_size_mode!r}"
+            )
+
+        if cache_config.remote_cache_size_mode == "file_size":
+            if cache_config.remote_file_size is None:
+                raise ValueError(
+                    "remote_file_size must be set when remote_cache_size_mode == 'file_size'"
+                )
+            if (cache_config.remote_file_num is None
+                    or cache_config.remote_file_num <= 0):
+                raise ValueError("remote_file_num must be a positive integer")
+            cache_config.num_remote_blocks = (
+                cache_config.remote_file_size // block_size_in_bytes
+                * cache_config.remote_file_num
+            )
+            flexkv_logger.info(
+                f"num_remote_blocks derived from remote_file_size "
+                f"(per-pp-stage, num_layers_per_pp_stage="
+                f"{rank_info.num_layers_per_pp_stage}): "
+                f"remote_file_size={cache_config.remote_file_size}, "
+                f"remote_file_num={cache_config.remote_file_num}, "
+                f"block_size_in_bytes={block_size_in_bytes} "
+                f"-> num_remote_blocks={cache_config.num_remote_blocks}"
+            )
+
+        if (cache_config.num_remote_blocks is None
+                or cache_config.num_remote_blocks <= 0):
+            raise ValueError(
+                "num_remote_blocks must be a positive integer "
+                "(file_size mode: derived above from remote_file_size; "
+                "block_num mode: set it explicitly)"
+            )
 
     # Update distributed zmq and Redis configs if provided in user_config
     if user_config.local_zmq_ip is not None:

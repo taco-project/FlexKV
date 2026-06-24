@@ -61,7 +61,7 @@ static void CUDART_CB layer_done_host_callback(void *userData) {
 LayerwiseTransferGroup::LayerwiseTransferGroup(
     int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
     torch::Tensor &cpu_blocks,
-    std::map<int, std::vector<std::string>> &ssd_files, int dp_group_id,
+    std::map<int, std::vector<std::string>> &ssd_files,
     int num_layers, torch::Tensor &gpu_kv_strides_tensor,
     torch::Tensor &gpu_block_strides_tensor,
     torch::Tensor &gpu_layer_strides_tensor,
@@ -146,8 +146,6 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
   }
 
   cpu_blocks_ = cpu_blocks.data_ptr();
-
-  dp_group_id_ = dp_group_id;
 
   // Get GPU device IDs from tensors (like tp_transfer_thread_group.cpp)
   gpu_device_ids_.resize(num_gpus_);

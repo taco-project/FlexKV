@@ -3,7 +3,7 @@ import json
 import os
 import torch
 import tempfile
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
@@ -15,6 +15,28 @@ if TYPE_CHECKING:
 
 
 logger = flexkv_logger
+
+
+def _parse_dtype_str(dtype_str: str) -> torch.dtype:
+    """Convert a dtype string (e.g. 'fp8', 'bfloat16', 'fp8_e4m3') to torch.dtype.
+
+    Shared by sglang / vllm / TRT-LLM integration adapters so that dtype
+    parsing logic is defined in exactly one place.
+    """
+    dtype_map = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+        "bf16": torch.bfloat16,
+        "fp8": torch.float8_e4m3fn,
+        "float8": torch.float8_e4m3fn,
+        "e4m3": torch.float8_e4m3fn,
+        "fp8_e4m3": torch.float8_e4m3fn,
+    }
+    return dtype_map.get(dtype_str.lower(), torch.bfloat16)
+
 
 @dataclass
 class FlexKVConfig:
@@ -95,79 +117,135 @@ class FlexKVConfig:
     def post_init_from_vllm_config(
         self,
         vllm_config: "VllmConfig",
-        ):
+        ) -> RankInfo:
+        tp_rank = getattr(vllm_config.parallel_config, 'tensor_parallel_rank', 0)
+        dp_rank = getattr(vllm_config.parallel_config, 'data_parallel_rank', 0)
+        node_rank = getattr(vllm_config.parallel_config, 'node_rank', 0)
         self.cache_config.tokens_per_block = vllm_config.cache_config.block_size
 
         self.model_config.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.model_config.head_size = vllm_config.model_config.get_head_size()
-        self.model_config.dtype = vllm_config.model_config.dtype
+        user_dtype_str = self.user_config.kv_cache_dtype
+        vllm_kv_cache_dtype = getattr(vllm_config.cache_config, 'cache_dtype', 'auto')
+        if user_dtype_str is not None:
+            self.model_config.dtype = _parse_dtype_str(user_dtype_str)
+            logger.info(
+                f"[FlexKV vllm] Using kv_cache_dtype from user_config: "
+                f"'{user_dtype_str}' -> {self.model_config.dtype}"
+            )
+        elif isinstance(vllm_kv_cache_dtype, str) and vllm_kv_cache_dtype != 'auto':
+            self.model_config.dtype = _parse_dtype_str(vllm_kv_cache_dtype)
+            logger.info(
+                f"[FlexKV vllm] Using kv_cache_dtype from vllm cache_config: "
+                f"'{vllm_kv_cache_dtype}' -> {self.model_config.dtype}"
+            )
+        else:
+            self.model_config.dtype = vllm_config.model_config.dtype
+            logger.info(
+                f"[FlexKV vllm] No explicit kv_cache_dtype, falling back to "
+                f"vllm model dtype: {self.model_config.dtype}"
+            )
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
         self.model_config.pp_size = vllm_config.parallel_config.pipeline_parallel_size
-        self.model_config.pp_rank = getattr(vllm_config.parallel_config, 'pipeline_parallel_rank', 0)
+        self.model_config.nnodes = max(1, getattr(vllm_config.parallel_config, 'nnodes', 1))
+
+        pp_rank = getattr(vllm_config.parallel_config, 'pipeline_parallel_rank', 0)
+
+        if self.model_config.pp_size > 1:
+            from vllm.distributed.utils import get_pp_indices as vllm_get_pp_indices
+            pp_start_layer, pp_end_layer = vllm_get_pp_indices(
+                self.model_config.num_layers, pp_rank, self.model_config.pp_size
+            )
+        else:
+            pp_start_layer = 0
+            pp_end_layer = self.model_config.num_layers
         if self.model_config.use_mla:
             self.model_config.num_kv_heads = 1
         else:
             self.model_config.num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
-        update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
+
+        self.model_config.instance_num = int(GLOBAL_CONFIG_FROM_ENV.instance_num)
+        instance_id = int(GLOBAL_CONFIG_FROM_ENV.instance_id)
+
+        self.model_config.master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
+        self.model_config.master_ports = tuple(
+            os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558").split(",")
+        )
+
+        rank_info = RankInfo(
+            model_config=self.model_config,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            node_rank=node_rank,
+            instance_id=instance_id,
+            pp_start_layer=pp_start_layer,
+            pp_end_layer=pp_end_layer,
+        )
+        update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
         hf_config = getattr(vllm_config.model_config, 'hf_config', None)
         self._detect_indexer_config_from_hf(hf_config, source="vllm")
 
+        logger.info(f"[FlexKV vllm] {self.model_config}, {rank_info}")
+
+        # Freeze model_config — no further mutations allowed
+        self.model_config.freeze()
+        return rank_info
+
     def post_init_from_sglang_config(
         self,
         sglang_config,
-        tp_size: int,
-        page_size: int,
-        num_local_layers: int = 0,
-        pp_size: int = 1,
+        server_args,
+        page_size: int = 64,
+        tp_rank: int = 0,
         pp_rank: int = 0,
-        dp_size: int = 1,
         dp_rank: int = 0,
-        nnodes: int = 1,
-        node_rank: int = 0,
-        is_nsa_cp: bool = False,
-        cp_size: int = 1,
-        cp_rank: int = 0,
-        kv_cache_dtype: Optional[str] = None,
-        master_host: Optional[str] = None,
-    ):
-        """
-        Initialize FlexKVConfig fields from sglang config.
+        attn_cp_rank: int = 0,
+    ) -> RankInfo:
+        """Populate ``self.model_config`` / ``self.cache_config`` from a
+        sglang ModelConfig + ServerArgs and return the per-worker
+        ``RankInfo``.
+
+        See :meth:`post_init_from_vllm_config` for the rationale behind
+        returning ``RankInfo`` instead of writing it to ``self``.
+
         Args:
             sglang_config: sglang.srt.configs.model_config.ModelConfig-like object
-            tp_size: tensor parallel size used by sglang
+            server_args: sglang ServerArgs — source of tp_size, dp_size,
+                nnodes, node_rank, enable_dp_attention, attn_cp_size,
+                kv_cache_dtype,
+                dist_init_addr
             page_size: KV block size (tokens per block) used by sglang
-            num_local_layers: number of layers on this PP rank (0 means no PP, use total layers)
-            pp_size: pipeline parallel size (default 1, no PP)
-            pp_rank: pipeline parallel rank (default 0)
-            dp_size: data parallel size (default 1, no DP)
-            dp_rank: data parallel rank (default 0)
-            nnodes: number of nodes (aligned with server_args.nnodes, default 1)
-            node_rank: index of this node (aligned with server_args.node_rank, default 0)
-            is_nsa_cp: whether NSA context parallelism is enabled
-            cp_size: context parallel size (default 1, no CP)
-            cp_rank: context parallel rank (default 0)
-            kv_cache_dtype: KV cache dtype (default None, use model dtype)
-            master_host: master host for multi-node setup (default None, use localhost)
+            tp_rank: physical tensor parallel rank (runtime, from process group)
+            pp_rank: pipeline parallel rank (runtime, from process group)
+            dp_rank: data parallel rank (runtime, from process group)
+            attn_cp_rank: attention-level context parallel rank (runtime)
         """
+        # Extract parallelism params from server_args
+        tp_size = server_args.tp_size
+        pp_size = server_args.pp_size
+        dp_size = server_args.dp_size
+        nnodes = server_args.nnodes
+        node_rank = server_args.node_rank
+        enable_dp_attention = server_args.enable_dp_attention
+        attn_cp_size = server_args.attn_cp_size
+        kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
+        dp_rank = 0 if dp_rank is None else int(dp_rank)
+
         # cache config: use page_size as tokens_per_block so that FlexKV's
         # CPU radix tree manages blocks at page granularity, ensuring that
         # hash generation, matching, insertion and eviction are all page-aligned.
         self.cache_config.tokens_per_block = page_size
 
-        total_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
-        self.model_config.num_layers = int(num_local_layers) if num_local_layers > 0 else total_layers
+        self.model_config.num_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
 
-        attn_arch = getattr(sglang_config, "attention_arch", None)
-        use_mla = False
-        if hasattr(attn_arch, "name"):
-            use_mla = (attn_arch.name.upper() == "MLA")
-        elif isinstance(attn_arch, str):
-            use_mla = (attn_arch.upper() == "MLA")
+        from sglang.srt.configs.model_config import AttentionArch
+        use_mla = getattr(sglang_config, "attention_arch", None) == AttentionArch.MLA
 
         if use_mla:
             kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
@@ -196,21 +274,6 @@ class FlexKVConfig:
         # to the sglang model dtype.  sglang's ModelConfig.dtype is the *model
         # weight* dtype (e.g. bfloat16), which may differ from the KV cache
         # dtype (e.g. fp8_e4m3 when --kv-cache-dtype fp8_e4m3 is used).
-        def _parse_dtype_str(dtype_str: str) -> torch.dtype:
-            dtype_map = {
-                "float16": torch.float16,
-                "float32": torch.float32,
-                "bfloat16": torch.bfloat16,
-                "fp16": torch.float16,
-                "fp32": torch.float32,
-                "bf16": torch.bfloat16,
-                "fp8": torch.float8_e4m3fn,
-                "float8": torch.float8_e4m3fn,
-                "e4m3": torch.float8_e4m3fn,
-                "fp8_e4m3": torch.float8_e4m3fn,
-            }
-            return dtype_map.get(dtype_str.lower(), torch.bfloat16)
-
         user_dtype_str = self.user_config.kv_cache_dtype
         if user_dtype_str is not None:
             self.model_config.dtype = _parse_dtype_str(user_dtype_str)
@@ -252,46 +315,43 @@ class FlexKVConfig:
 
         self.model_config.tp_size = int(tp_size)
         self.model_config.dp_size = int(dp_size if dp_size is not None else 1)
-        self.model_config.dp_rank = int(dp_rank if dp_rank is not None else 0)
         self.model_config.pp_size = int(pp_size)
-        self.model_config.pp_rank = int(pp_rank)
-        self.model_config.is_nsa_cp = is_nsa_cp
-        self.model_config.cp_size = int(cp_size if cp_size is not None else 1)
-        # Topology: nnodes + node_rank (aligned with sglang server_args).
-        # ``gpus_per_node`` is no longer stored on model_config; KVTaskEngine
-        # derives it locally as (tp_size * pp_size) // nnodes.
+
+        if pp_size > 1:
+            from sglang.srt.distributed.utils import get_pp_indices as sglang_get_pp_indices
+            pp_start_layer, pp_end_layer = sglang_get_pp_indices(
+                self.model_config.num_layers, pp_rank, self.model_config.pp_size
+            )
+        else:
+            pp_start_layer = 0
+            pp_end_layer = self.model_config.num_layers
+        self.model_config.enable_dp_attention = bool(enable_dp_attention)
+        self.model_config.attn_cp_size = int(attn_cp_size)
         self.model_config.nnodes = max(1, int(nnodes))
-        self.model_config.node_rank = int(node_rank)
-        # Multi-node bootstrap: master host (derived from sglang --dist-init-addr).
-        # ``None`` here falls back to FLEXKV_MASTER_HOST env var downstream.
-        self.model_config.master_host = master_host
-        update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
-
-        # Each PP rank needs its own IPC ports so that their
-        # KVManager / TransferManager instances do not collide on the same
-        # ZMQ endpoint.  DP ranks share the same KVServer (only DP0 creates
-        # it), so they must use the same IPC port.
-        _dp_rank = int(dp_rank if dp_rank is not None else 0)
-        port_suffix = ""
-        if int(pp_size) > 1:
-            port_suffix += f"_pp{int(pp_rank)}"
-        if port_suffix:
-            self.server_recv_port = f"{self.server_recv_port}{port_suffix}"
-            self.gpu_register_port = f"{self.server_recv_port}_gpu_register"
-
-        rank_parts = []
-        if int(tp_size) > 1:
-            rank_parts.append("tp_rank=0")
-        if int(pp_size) > 1:
-            rank_parts.append(f"pp_rank={int(pp_rank)}")
-        if int(self.model_config.dp_size) > 1:
-            rank_parts.append(f"dp_rank={_dp_rank}")
-        rank_label = f" [{', '.join(rank_parts)}]" if rank_parts else ""
-        logger.info(
-            f"[FlexKV] IPC ports configured{rank_label}: "
-            f"server_recv_port={self.server_recv_port}, "
-            f"gpu_register_port={self.gpu_register_port}"
+        _dist_init_addr = getattr(server_args, 'dist_init_addr', None)
+        if _dist_init_addr and int(nnodes) > 1:
+            self.model_config.master_host = _dist_init_addr.split(":")[0]
+        else:
+            self.model_config.master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
+        self.model_config.master_ports = tuple(
+            os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558").split(",")
         )
+
+        self.model_config.instance_num = int(GLOBAL_CONFIG_FROM_ENV.instance_num)
+        instance_id = int(GLOBAL_CONFIG_FROM_ENV.instance_id)
+
+        rank_info = RankInfo(
+            model_config=self.model_config,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            attn_cp_rank=attn_cp_rank,
+            node_rank=node_rank,
+            instance_id=instance_id,
+            pp_start_layer=pp_start_layer,
+            pp_end_layer=pp_end_layer,
+        )
+        update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
 
         hf_config = getattr(sglang_config, 'hf_config', None)
         self._detect_indexer_config_from_hf(hf_config, source="sglang")
@@ -305,29 +365,23 @@ class FlexKVConfig:
                 f"tokens_per_block={self.cache_config.tokens_per_block}"
             )
 
+        logger.info(f"[FlexKV sglang] {self.model_config}, {rank_info}")
+
+        # Freeze model_config — no further mutations allowed
+        self.model_config.freeze()
+        return rank_info
+
     def post_init_from_trt_config(
         self,
         config,
-    ):
+    ) -> RankInfo:
+        tp_rank = config.mapping.tp_rank
+        dp_rank = getattr(config.mapping, 'dp_rank', 0)
+        node_rank = config.mapping.node_rank
         self.cache_config.tokens_per_block = config.tokens_per_block
         # Convert dtype string to torch.dtype
         dtype_str = config.pytorch_backend_config.kv_cache_dtype
         flexkv_logger.info(f"[FlexKVConfig] dtype_str from TRT config: {dtype_str}")
-
-        # Helper function to convert dtype string to torch.dtype
-        def _parse_dtype_str(dtype_str: str) -> torch.dtype:
-            dtype_map = {
-                "float16": torch.float16,
-                "float32": torch.float32,
-                "bfloat16": torch.bfloat16,
-                "fp16": torch.float16,
-                "fp32": torch.float32,
-                "bf16": torch.bfloat16,
-                "fp8": torch.float8_e4m3fn,
-                "float8": torch.float8_e4m3fn,
-                "e4m3": torch.float8_e4m3fn,
-            }
-            return dtype_map.get(dtype_str.lower(), torch.bfloat16)
 
         if dtype_str == "auto":
             # When dtype_str is "auto", try to get kv_cache_dtype from user_config first
@@ -356,12 +410,15 @@ class FlexKVConfig:
         if config.mapping.enable_attention_dp:
             self.model_config.tp_size = 1
             self.model_config.dp_size = config.mapping.tp_size
+            dp_rank = config.mapping.rank
         else:
             self.model_config.tp_size = config.mapping.tp_size
             self.model_config.dp_size = 1
+            dp_rank = 0
         self.model_config.pp_size = getattr(config.mapping, 'pp_size', 1)
-        self.model_config.pp_rank = getattr(config.mapping, 'pp_rank', 0)
+        pp_rank = getattr(config.mapping, 'pp_rank', 0)
 
+        self.model_config.nnodes = max(1, getattr(config.mapping, 'nnodes', 1))
         # self.model_config (model configs part)
         try:
             model_path = getattr(config, 'hf_model_dir', None)
@@ -390,5 +447,48 @@ class FlexKVConfig:
             self._detect_indexer_config_from_hf(hf_config, source="TRT-LLM")
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
+
+        if self.model_config.pp_size > 1:
+            layers_range = config.mapping.pp_layers(self.model_config.num_layers)
+            pp_start_layer = layers_range[0]
+            pp_end_layer = layers_range[-1] + 1
+        else:
+            pp_start_layer = 0
+            pp_end_layer = self.model_config.num_layers
+
+        self.model_config.instance_num = int(GLOBAL_CONFIG_FROM_ENV.instance_num)
+        instance_id = int(GLOBAL_CONFIG_FROM_ENV.instance_id)
+
+
+        self.model_config.use_trtllm_subprocess = True
+        self.model_config.trtllm_subprocess_host = os.getenv(
+            "FLEXKV_TRT_SUBPROCESS_HOST", "localhost"
+        )
+        self.model_config.trtllm_subprocess_ports = tuple(
+            os.getenv("FLEXKV_TRT_SUBPROCESS_PORTS", "6667,6668,6669").split(",")
+        )
+        # Multi-node master endpoint (used when nnodes > 1).
+        self.model_config.master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
+        self.model_config.master_ports = tuple(
+            os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558").split(",")
+        )
+
+        rank_info = RankInfo(
+            model_config=self.model_config,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            node_rank=node_rank,
+            instance_id=instance_id,
+            pp_start_layer=pp_start_layer,
+            pp_end_layer=pp_end_layer,
+        )
+
         # Update cache config with user config after model config is initialized
-        update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
+        update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
+
+        logger.info(f"[FlexKV TRT-LLM] {self.model_config}, {rank_info}")
+
+        # Freeze model_config — no further mutations allowed
+        self.model_config.freeze()
+        return rank_info

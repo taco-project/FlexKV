@@ -19,8 +19,8 @@ import subprocess
 import pickle
 import sys
 
-from flexkv.common.transfer import TransferOpGraph, CompletedOp
-from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.transfer import TransferOpGraph, CompletedOp, WorkerKey
+from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.transfer import DeviceType
@@ -39,16 +39,13 @@ class TransferManager:
         self.model_config = model_config
         self.cache_config = cache_config
         self.gpu_register_port = gpu_register_port
-        
-        # Multi-instance support: get instance_num from environment
-        self.instance_num = GLOBAL_CONFIG_FROM_ENV.instance_num
-        
-        # Calculate total expected GPUs across all instances
-        self.expected_gpus = self.instance_num * model_config.tp_size * model_config.dp_size
+        self.instance_num = self.model_config.instance_num
+        # Calculate total expected GPUs on this node across all instances
+        self.expected_gpus = self.instance_num * self.model_config.gpus_per_node
 
         self.all_gpu_layouts: Dict[int, KVCacheLayout] = {}
         self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks
-        self.gpu_client_mapping: Dict[int, int] = {}  # device_id -> dp_client_id
+        self.gpu_worker_key_mapping: Dict[int, WorkerKey] = {}
 
         # Indexer GPU registration data
         self.all_indexer_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> indexer_gpu_blocks
@@ -59,7 +56,7 @@ class TransferManager:
             self.context, zmq.SocketType.PULL, gpu_register_port, True)
 
         self.transfer_engine: Optional[TransferEngine] = None
-        self.storage_engine = StorageEngine(self.model_config, self.cache_config)
+        self.storage_engine: Optional[StorageEngine] = None
         flexkv_logger.info(f"Initialized TransferManager with config successfully, "
                            f"instance_num={self.instance_num}, expected_gpus={self.expected_gpus}")
 
@@ -72,7 +69,10 @@ class TransferManager:
             try:
                 self.all_gpu_blocks[device_id] = req.handles
                 self.all_gpu_layouts[device_id] = req.gpu_layout
-                self.gpu_client_mapping[device_id] = req.dp_client_id
+                self.gpu_worker_key_mapping[device_id] = WorkerKey(
+                    dp_client_id=req.dp_client_id,
+                    pp_rank=req.pp_rank,
+                )
                 # Store indexer GPU data if present
                 if req.indexer_handles is not None:
                     self.all_indexer_gpu_blocks[device_id] = req.indexer_handles
@@ -87,8 +87,8 @@ class TransferManager:
         try:
             flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port}, "
                                f"expected {self.expected_gpus} GPUs to register "
-                               f"(instance_num={self.instance_num}, tp={self.model_config.tp_size}, "
-                               f"dp={self.model_config.dp_size})")
+                               f"(instance_num={self.instance_num}, gpus_per_node={self.model_config.gpus_per_node}, "
+                               f"total_gpus={self.model_config.total_gpus}, nnodes={self.model_config.nnodes})")
             last_log_time = time.time()
             while len(self.all_gpu_blocks) < self.expected_gpus:
                 try:
@@ -109,7 +109,9 @@ class TransferManager:
                     continue
 
                 if isinstance(req, RegisterTPClientRequest):
-                    flexkv_logger.info(f"Received GPU blocks registration request: {type(req)}")
+                    flexkv_logger.info(f"Received GPU blocks registration request: {type(req)}, "
+                                       f"device_id={req.device_id}, "
+                                       f"dp_client_id={req.dp_client_id}, pp_rank={req.pp_rank}")
                     self._handle_gpu_blocks_registration(req)
                     flexkv_logger.info(f"GPU {req.device_id} registered successfully, "
                                        f"waiting for {self.expected_gpus - len(self.all_gpu_blocks)} GPUs to register")
@@ -135,7 +137,13 @@ class TransferManager:
             f"Expected {self.expected_gpus} GPU layouts, got {len(self.all_gpu_layouts)}"
         assert len(self.all_gpu_blocks) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
-        
+        num_layers_per_pp_stage = next(iter(self.all_gpu_layouts.values())).num_layer
+        self.storage_engine = StorageEngine(
+            self.model_config,
+            self.cache_config,
+            num_layers_per_pp_stage,
+        )
+
         # Register GPU blocks with their global device IDs
         for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
             # Get indexer data for this device if available
@@ -152,16 +160,16 @@ class TransferManager:
                 indexer_gpu_layout=indexer_gpu_layout,
                 indexer_dtype=indexer_dtype,
             )
-        
-        # Group GPU handles by dp_client_id
-        grouped_gpu_handles: Dict[int, List] = {}
+
+        # Group GPU handles by WorkerKey
+        grouped_gpu_handles: Dict[WorkerKey, List] = {}
         for device_id in sorted(self.all_gpu_blocks.keys()):
-            dp_client_id = self.gpu_client_mapping[device_id]
-            if dp_client_id not in grouped_gpu_handles:
-                grouped_gpu_handles[dp_client_id] = []
-            grouped_gpu_handles[dp_client_id].append(
+            worker_key = self.gpu_worker_key_mapping[device_id]
+            if worker_key not in grouped_gpu_handles:
+                grouped_gpu_handles[worker_key] = []
+            grouped_gpu_handles[worker_key].append(
                 self.storage_engine.get_storage_handle(DeviceType.GPU, device_id))
-        
+
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
@@ -172,15 +180,15 @@ class TransferManager:
             else None
         )
 
-        indexer_gpu_handles: Optional[Dict[int, List]] = None
+        indexer_gpu_handles: Optional[Dict[WorkerKey, List]] = None
         if self.storage_engine.has_storage_handle(DeviceType.CPU, is_indexer=True):
             indexer_gpu_handles = {}
             for device_id in sorted(self.all_gpu_blocks.keys()):
                 if self.storage_engine.has_storage_handle(DeviceType.GPU, device_id, is_indexer=True):
-                    dp_client_id = self.gpu_client_mapping[device_id]
-                    if dp_client_id not in indexer_gpu_handles:
-                        indexer_gpu_handles[dp_client_id] = []
-                    indexer_gpu_handles[dp_client_id].append(
+                    worker_key = self.gpu_worker_key_mapping[device_id]
+                    if worker_key not in indexer_gpu_handles:
+                        indexer_gpu_handles[worker_key] = []
+                    indexer_gpu_handles[worker_key].append(
                         self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_indexer=True))
         indexer_cpu_handle = (
             self.storage_engine.get_storage_handle(DeviceType.CPU, is_indexer=True)
@@ -210,7 +218,10 @@ class TransferManager:
             indexer_ssd_handle=indexer_ssd_handle,
             indexer_remote_handle=indexer_remote_handle,
         )
-        flexkv_logger.info("Initialized TransferEngine successfully")
+
+        flexkv_logger.info(f"Initialized TransferEngine successfully, "
+                           f"grouped_gpu_handles keys={list(grouped_gpu_handles.keys())}, "
+                           f"num_gpu_groups={len(grouped_gpu_handles)}")
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:
         self.transfer_engine.submit_transfer_graph(transfer_graph)
@@ -228,51 +239,21 @@ class TransferManager:
         if hasattr(self, 'transfer_engine'):
             self.transfer_engine.shutdown()
 
-def resolve_master_host_and_ports(
-    master_host: Optional[str] = None,
-) -> Tuple[str, Tuple[str, str, str]]:
-    """Resolve the (master_host, master_ports) tuple for multi-node transfer.
-
-    ``master_host`` resolution order:
-        1. explicit ``master_host`` argument (when provided by the caller,
-           e.g. via sglang ``--dist-init-addr``);
-        2. ``FLEXKV_MASTER_HOST`` env var (used by framework-agnostic
-           launchers such as TRT-LLM's ``multi_node_launch.sh``);
-        3. ``"localhost"`` default.
-
-    ``master_ports`` always comes from ``FLEXKV_MASTER_PORTS`` (or default),
-    because changing ports rarely warrants a host-aware plumbing change.
-    """
-    if master_host is None:
-        master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
-    master_ports = os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558")
-    master_ports = tuple(master_ports.split(","))
-    flexkv_logger.info(
-        f"[TransferManager] resolved master endpoint: "
-        f"host={master_host!r} (source={'arg' if master_host is not None else 'env/default'}), "
-        f"ports={master_ports}"
-    )
-    return "tcp://" + master_host, master_ports
-
-def get_trtllm_subprocess_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
-    flexkv_trt_subprocess_host = os.getenv("FLEXKV_TRT_SUBPROCESS_HOST", "localhost")
-    flexkv_trt_subprocess_ports = os.getenv("FLEXKV_TRT_SUBPROCESS_PORTS", "6667,6668,6669")
-    flexkv_trt_subprocess_ports = tuple(flexkv_trt_subprocess_ports.split(","))
-    return "tcp://" + flexkv_trt_subprocess_host, flexkv_trt_subprocess_ports
-
 class TransferManagerOnRemote(TransferManager):
     """
     TransferManager for remote mode, used for multi-node tensor parallelism.
     """
-    def __init__(self, mode: str = "Default", master_host: Optional[str] = None):
-        if mode == "Default":
-            self.master_host, self.master_ports = resolve_master_host_and_ports(
-                master_host=master_host
-            )
-        elif mode == "TrtllmSubprocess":
-            self.master_host, self.master_ports = get_trtllm_subprocess_host_and_ports_from_env()
-        else:
-            raise ValueError(f"Invalid mode: {mode}, must be Default or TrtllmSubprocess")
+    def __init__(
+        self,
+        master_host: str,
+        master_ports: Tuple[str, str, str],
+    ):
+        self.master_host = master_host
+        self.master_ports = master_ports
+        flexkv_logger.info(
+            f"[TransferManagerOnRemote] master endpoint: "
+            f"host={master_host!r}, ports={master_ports}"
+        )
 
         self.context = zmq.Context()
         self.command_socket = self.context.socket(zmq.PULL)
@@ -289,6 +270,10 @@ class TransferManagerOnRemote(TransferManager):
         self._active_graphs: Dict[int, int] = {}
         self._active_graphs_lock = threading.Lock()
 
+        self._pending_graphs: Dict[int, Tuple[TransferOpGraph, int]] = {}
+        self._pending_slot_mappings: Dict[int, np.ndarray] = {}
+        self._pending_lock = threading.Lock()
+
         self._worker_thread: threading.Thread | None = None
 
         self._connect_to_master_transfer_manager()
@@ -298,15 +283,15 @@ class TransferManagerOnRemote(TransferManager):
 
     def _connect_to_master_transfer_manager(self) -> None:
         try:
-            command_addr = f"{self.master_host}:{self.master_ports[0]}"
+            command_addr = f"tcp://{self.master_host}:{self.master_ports[0]}"
             self.command_socket.connect(command_addr)
             flexkv_logger.debug(f"Connected to master command port at {command_addr}")
 
-            result_addr = f"{self.master_host}:{self.master_ports[1]}"
+            result_addr = f"tcp://{self.master_host}:{self.master_ports[1]}"
             self.result_socket.connect(result_addr)
             flexkv_logger.debug(f"Connected to master result port at {result_addr}")
 
-            query_addr = f"{self.master_host}:{self.master_ports[2]}"
+            query_addr = f"tcp://{self.master_host}:{self.master_ports[2]}"
             self.query_socket.connect(query_addr)
             flexkv_logger.debug(f"Connected to master query port at {query_addr}")
 
@@ -352,12 +337,7 @@ class TransferManagerOnRemote(TransferManager):
                                 task_end_op_id = message.get('task_end_op_id', -1)
 
                                 if graph is not None:
-                                    graph_id = graph.graph_id
-
-                                    with self._active_graphs_lock:
-                                        self._active_graphs[graph_id] = task_end_op_id
-
-                                    self.submit(graph)
+                                    self._handle_submit(graph, task_end_op_id)
                                 else:
                                     flexkv_logger.warning("Received submit message without graph")
                             elif msg_type == 'submit_batch':
@@ -367,6 +347,10 @@ class TransferManagerOnRemote(TransferManager):
                                     with self._active_graphs_lock:
                                         self._active_graphs[graph_id] = -1
                                     self.submit(graph)
+                            elif msg_type == 'set_slot_mapping':
+                                task_id = message.get('task_id')
+                                slot_mapping = message.get('slot_mapping')
+                                self._handle_set_slot_mapping(task_id, slot_mapping)
                             else:
                                 flexkv_logger.warning(f"Unexpected command message: {message}")
                         else:
@@ -415,11 +399,73 @@ class TransferManagerOnRemote(TransferManager):
         poller.unregister(self.command_socket)
         poller.unregister(self.query_socket)
 
+    def _handle_set_slot_mapping(self, task_id: int, slot_mapping: np.ndarray) -> None:
+        """Handle set_slot_mapping message from FlexKVConnector.
+
+        When the graph (with cleared GPU blocks) arrived earlier, we can immediately
+        set_gpu_blocks and submit.  Otherwise, store the slot_mapping and wait
+        for the graph to arrive later.
+        """
+        graph = None
+        task_end_op_id = -1
+        with self._pending_lock:
+            if task_id in self._pending_graphs:
+                # Graph already arrived, set GPU blocks and prepare for submit
+                graph, task_end_op_id = self._pending_graphs.pop(task_id)
+                graph.set_gpu_blocks(slot_mapping)
+                flexkv_logger.debug(
+                    f"[TransferManagerOnRemote] set_slot_mapping: "
+                    f"graph for task_id={task_id} submitted (graph arrived first)"
+                )
+            else:
+                # Graph not yet arrived, store slot_mapping for later matching
+                self._pending_slot_mappings[task_id] = slot_mapping
+                flexkv_logger.debug(
+                    f"[TransferManagerOnRemote] set_slot_mapping: "
+                    f"slot_mapping stored for task_id={task_id}, waiting for graph"
+                )
+                return
+
+        # Submit graph to transfer engine
+        with self._active_graphs_lock:
+            self._active_graphs[graph.graph_id] = task_end_op_id
+        self.submit(graph)
+
+    def _handle_submit(self, graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
+        """Handle submit message with pending matching support.
+
+        If slot_mapping already arrived, set_gpu_blocks and submit immediately.
+        Otherwise, store graph in pending_graphs for later matching.
+        """
+        task_id = graph.graph_id  # Use graph_id as task_id for matching
+        with self._pending_lock:
+            if task_id in self._pending_slot_mappings:
+                # slot_mapping already arrived, set GPU blocks and submit
+                slot_mapping = self._pending_slot_mappings.pop(task_id)
+                graph.set_gpu_blocks(slot_mapping)
+                flexkv_logger.debug(
+                    f"[TransferManagerOnRemote] submit: "
+                    f"graph for task_id={task_id} submitted (slot_mapping arrived first)"
+                )
+            else:
+                # slot_mapping not yet arrived, store graph and task_end_op_id for later matching
+                self._pending_graphs[task_id] = (graph, task_end_op_id)
+                flexkv_logger.debug(
+                    f"[TransferManagerOnRemote] submit: "
+                    f"graph stored for task_id={task_id}, waiting for slot_mapping"
+                )
+                return  # Don't submit yet, wait for slot_mapping
+
+        # Submit graph to transfer engine
+        with self._active_graphs_lock:
+            self._active_graphs[graph.graph_id] = task_end_op_id
+        self.submit(graph)
+
     def start(self) -> None:
         self.initialize_transfer_engine()
         super().start()
 
-        self._is_ready = true
+        self._is_ready = True
 
         self._worker_thread = threading.Thread(
             target=self._polling_worker, daemon=True
@@ -455,9 +501,6 @@ class TransferManagerOnRemote(TransferManager):
 
     @classmethod
     def create_process(cls, **kwargs: Any) -> Process:
-        import tempfile
-        import os
-
         # Serialize the class and kwargs
         cls_data = pickle.dumps(cls)
         kwargs_data = pickle.dumps(kwargs)
@@ -538,7 +581,6 @@ class TransferManagerOnRemote(TransferManager):
             except Exception:
                 pass
 
-        import threading
         cleanup_thread = threading.Thread(target=cleanup_files, daemon=True)
         cleanup_thread.start()
 
@@ -647,6 +689,10 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         if self.process is not None and self.process.is_alive():
             return
 
+        flexkv_logger.debug(
+            f"Spawning TransferManager subprocess: "
+            f"tp_size={self.model_config.tp_size}, dp_size={self.model_config.dp_size}, "
+            f"gpu_register_port={self.gpu_register_port}")
         self.process = self.mp_ctx.Process(
             target=self._process_worker,
             args=(self.model_config,
@@ -659,6 +705,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             daemon=False
         )
         self.process.start()
+        flexkv_logger.debug(f"TransferManager subprocess spawned, pid={self.process.pid}")
 
     def _process_worker(self,
                         model_config: ModelConfig,
@@ -682,11 +729,14 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     break
         signal.signal(signal.SIGCHLD, _reap_children)
         try:
+            flexkv_logger.debug(f"_process_worker started, pid={os.getpid()}, "
+                               f"gpu_register_port={gpu_register_port}")
             start_event.set()
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
             transfer_manager = TransferManager(model_config, cache_config, gpu_register_port)
             transfer_manager.initialize_transfer_engine()
             transfer_manager.start()
+            flexkv_logger.debug("TransferEngine started successfully, setting ready_event")
             ready_event.set()
 
             # Setup selector for event-driven processing (complete zero polling!)
@@ -825,7 +875,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         self.shutdown()
 
 
-class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
+class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
@@ -862,15 +912,15 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
 
     def _bind_master_ports(self) -> None:
         try:
-            command_addr = f"{self.master_host}:{self.master_ports[0]}"
+            command_addr = f"tcp://{self.master_host}:{self.master_ports[0]}"
             self.command_socket.bind(command_addr)
             flexkv_logger.info(f"Master bound command port at {command_addr}")
 
-            result_addr = f"{self.master_host}:{self.master_ports[1]}"
+            result_addr = f"tcp://{self.master_host}:{self.master_ports[1]}"
             self.result_socket.bind(result_addr)
             flexkv_logger.info(f"Master bound result port at {result_addr}")
 
-            query_addr = f"{self.master_host}:{self.master_ports[2]}"
+            query_addr = f"tcp://{self.master_host}:{self.master_ports[2]}"
             self.query_socket.bind(query_addr)
             flexkv_logger.info(f"Master bound query port at {query_addr}")
 
@@ -1023,6 +1073,11 @@ class TransferManagerHandle:
                  gpu_register_port: Optional[str] = None,
                  mode: str = "process",
                  **kwargs): # process or thread or remote
+        flexkv_logger.debug(
+            f"Creating TransferManagerHandle: mode={mode}, "
+            f"tp_size={model_config.tp_size}, dp_size={model_config.dp_size}, "
+            f"pp_size={model_config.pp_size}, nnodes={model_config.nnodes}, "
+            f"gpu_register_port={gpu_register_port}")
         if gpu_register_port is None:
             gpu_register_port = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
         if mode == "process":
@@ -1036,7 +1091,7 @@ class TransferManagerHandle:
         elif mode == "remote":
             master_host = kwargs["master_host"]
             master_ports = kwargs["master_ports"]
-            self._handle: TransferManagerHandleBase = TranserManagerMultiNodeHandle(
+            self._handle: TransferManagerHandleBase = TransferManagerMultiNodeHandle(
                 model_config, cache_config, gpu_register_port, master_host, master_ports
             )
         else:

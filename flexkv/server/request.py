@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -19,6 +19,7 @@ class RegisterDPClientRequest:
 @dataclass
 class RegisterTPClientRequest:
     dp_client_id: int
+    pp_rank: int
     device_id: int
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
@@ -26,9 +27,11 @@ class RegisterTPClientRequest:
     indexer_handles: Optional[List[TensorSharedHandle]] = None
     indexer_gpu_layout: Optional[KVCacheLayout] = None
 
+
 @dataclass
 class IsReadyRequest:
     dp_client_id: int
+
 
 @dataclass
 class PutRequest:
@@ -47,8 +50,8 @@ class GetRequest:
     slot_mapping: np.ndarray
     token_mask: Optional[np.ndarray]
     task_id: int = -1
-    layer_granularity: int = -1
     namespace: Optional[List[str]] = None
+
 
 @dataclass
 class PrefetchRequest:
@@ -56,6 +59,7 @@ class PrefetchRequest:
     token_ids: np.ndarray
     task_id: int = -1
     namespace: Optional[List[str]] = None
+
 
 @dataclass
 class PutMatchRequest:
@@ -65,15 +69,16 @@ class PutMatchRequest:
     task_id: int = -1
     namespace: Optional[List[str]] = None
 
+
 @dataclass
 class GetMatchRequest:
     dp_client_id: int
     token_ids: np.ndarray
     token_mask: Optional[np.ndarray]
-    layer_granularity: int
     cpu_only: bool = False
     task_id: int = -1
     namespace: Optional[List[str]] = None
+
 
 @dataclass
 class LaunchTaskRequest:
@@ -85,30 +90,31 @@ class LaunchTaskRequest:
     layerwise_transfer: bool = False
     counter_id: int = 0  # Counter set index for triple buffering eventfd notification
 
+
 @dataclass
 class CancelTaskRequest:
     dp_client_id: int
     task_ids: List[int]
 
+
 @dataclass
 class WaitRequest:
     dp_client_id: int
-    tp_rank: Optional[int]
     wait_task_ids: List[int]
     wait_timeout: float = 20.0
     completely: bool = False
+
 
 # Used for async put/get
 @dataclass
 class TryWaitRequest:
     dp_client_id: int
-    tp_rank: Optional[int]
     try_wait_task_ids: List[int]
 
 
 @dataclass
 class Response:
-    dp_client_id: int = -1
+    dp_client_id: int
     task_id: Optional[int] = None
     mask: Optional[Dict[int, np.ndarray]] = None
     status: Optional[Dict[int, KVResponseStatus]] = None
@@ -120,13 +126,16 @@ class Response:
         return self.status is not None and \
                all(self.status[task_id] == KVResponseStatus.SUCCESS for task_id in self.status)
 
+
 @dataclass
 class StartRequest:
     dp_client_id: int
 
+
 @dataclass
 class ShutdownRequest:
     dp_client_id: int
+
 
 @dataclass
 class CheckRunningRequest:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from flexkv.common.config import (
     CacheConfig,
     ModelConfig,
+    RankInfo,
     UserConfig,
     load_user_config_from_env,
     update_default_config_from_user_config,
@@ -37,7 +38,7 @@ def test_update_default_config_from_user_config_applies_hugepage_flags() -> None
         hugepage_size_bytes=1 << 30,
     )
 
-    update_default_config_from_user_config(model_config, cache_config, user_config)
+    update_default_config_from_user_config(RankInfo(model_config=model_config), cache_config, user_config)
 
     assert cache_config.use_hugepage_cpu_buffer is True
     assert cache_config.use_hugepage_tmp_buffer is True

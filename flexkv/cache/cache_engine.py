@@ -20,7 +20,6 @@ from queue import Queue
 from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field
 
-import os
 import numpy as np
 import nvtx
 import torch
@@ -30,7 +29,7 @@ from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
-from flexkv.cache.transfer_pattern import add_virtal_op_for_mutiple_finished_ops
+from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import (
@@ -409,7 +408,7 @@ class GlobalCacheEngine:
 
         if cache_config.enable_cpu:
             if cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size) #TODO
+                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta)
             elif self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.CPU,
@@ -439,7 +438,7 @@ class GlobalCacheEngine:
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
-                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size) #TODO
+                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta)
             elif self.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.SSD,
@@ -470,7 +469,7 @@ class GlobalCacheEngine:
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
-                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size)
+                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
             elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.REMOTE,
@@ -544,38 +543,19 @@ class GlobalCacheEngine:
             token_ids: np.ndarray,
             token_mask: np.ndarray,
             slot_mapping: np.ndarray,
-            layer_num: int = -1,
-            layer_granularity: int = -1,
-            dp_id: int = 0,
+            dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None) \
                  -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
-        if layer_num == -1:
-            layer_num = self.model_config.num_layers
-        if layer_granularity == -1:
-            layer_granularity = layer_num
-
-        if layer_num != layer_granularity:
-            flexkv_logger.error(f"Layerwise transfer is not supported yet, "
-                                f"layer_num: {layer_num}, layer_granularity: {layer_granularity}")
-            raise NotImplementedError(f"Layerwise transfer is not supported yet, "
-                                      f"layer_num: {layer_num}, layer_granularity: {layer_granularity}")
-
-        combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
-        if not combine_with_trtllm:
-            aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
-        else:
-            # When using FlexKV with TensorRT-LLM, we ignore the last incomplete block.
-            aligned_length = ((token_ids.shape[0] - 1) // self.tokens_per_block) * self.tokens_per_block
+        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
 
         aligned_token_ids = token_ids[:aligned_length]
         token_mask[aligned_length:] = False
 
         if aligned_length == 0 or not token_mask.any():
             transfer_graph = TransferOpGraph.create_empty_graph()
-            transfer_graph.bind_to_dp_group(dp_id)
             return_mask = np.zeros_like(token_mask, dtype=np.bool_)
             callback = partial(self._transfer_callback, node_to_unlock={}, buffer_to_free={})
             return transfer_graph, return_mask, callback, {}, -1
@@ -599,8 +579,8 @@ class GlobalCacheEngine:
                     block_start_idx,
                     block_end_idx,
                     gpu_block_ids,
-                    layer_num,
-                    temp_cache_strategy
+                    temp_cache_strategy,
+                    dp_client_id,
                 )
         else:
             #TODO pcfs will be supported later
@@ -612,13 +592,14 @@ class GlobalCacheEngine:
                     block_start_idx,
                     block_end_idx,
                     gpu_block_ids,
-                    layer_num,
-                    temp_cache_strategy
+                    temp_cache_strategy,
+                    dp_client_id,
                 )
 
-        transfer_graph, task_end_op_id = add_virtal_op_for_mutiple_finished_ops(
+        transfer_graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
             transfer_graph,
-            finished_ops_ids
+            finished_ops_ids,
+            dp_client_id,
             )
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
@@ -630,7 +611,6 @@ class GlobalCacheEngine:
         #                                                                         finished_ops_ids=finished_ops_ids,
         #                                                                         layer_num=layer_num,
         #                                                                         layer_granularity=layer_granularity)
-        transfer_graph.bind_to_dp_group(dp_id)
 
         for device_type in node_to_unlock:
             self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
@@ -658,8 +638,8 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num: int,
-            temp_cache_strategy: CacheStrategy) \
+            temp_cache_strategy: CacheStrategy,
+            dp_client_id: int) \
                  -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
         """
         transfer pattern:
@@ -772,9 +752,8 @@ class GlobalCacheEngine:
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.DISK2H,
                 src_block_ids = fragment2_ssd_blocks,
-                dst_block_ids = fragment123_cpu_blocks[fragment1_num_blocks:fragment12_num_blocks],
-                layer_id = 0,
-                layer_granularity = layer_num
+                dst_block_ids = fragment123_cpu_blocks[fragment1_num_blocks:fragment12_num_blocks],    
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_disk2h)
 
@@ -785,9 +764,8 @@ class GlobalCacheEngine:
                 transfer_type = TransferType.REMOTE2H,
                 src_block_ids = fragment3_remote_blocks,
                 dst_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
-                layer_id = 0,
-                layer_granularity = layer_num,
-                src_block_node_ids = fragment3_remote_file_nodeids
+                src_block_node_ids = fragment3_remote_file_nodeids,
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_remote2h)
 
@@ -813,8 +791,7 @@ class GlobalCacheEngine:
                     transfer_type = TransferType.H2DISK,
                     src_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
                     dst_block_ids = fragment3_ssd_blocks,
-                    layer_id = 0,
-                    layer_granularity = layer_num
+                    dp_client_id = dp_client_id,
                 )
                 transfer_graph.add_transfer_op(op_h2disk)
                 transfer_graph.add_dependency(op_h2disk.op_id, op_remote2h.op_id)
@@ -831,8 +808,7 @@ class GlobalCacheEngine:
                 transfer_type = TransferType.H2D,
                 src_block_ids = fragment123_cpu_blocks,
                 dst_block_ids = fragment123_gpu_blocks,
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_h2d)
             if op_disk2h is not None:
@@ -863,8 +839,8 @@ class GlobalCacheEngine:
                         block_mask_start: int,
                         block_mask_end: int,
                         gpu_block_ids: np.ndarray,
-                        layer_num: int,
-                        temp_cache_strategy: CacheStrategy) \
+                        temp_cache_strategy: CacheStrategy,
+                        dp_client_id: int) \
                             -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
         """
         transfer pattern:
@@ -979,10 +955,9 @@ class GlobalCacheEngine:
                 transfer_type = TransferType.PEERH2H,
                 src_block_ids = fragment1_cpu_blocks,
                 dst_block_ids = fragment1_cpu_blocks_local,
-                layer_id = 0,
-                layer_granularity = layer_num,
                 remote_node_ids = cpu_matched_result.matched_node_ids,
-                src_block_node_ids = cpu_matched_result.matched_node_ids  # Add this for worker
+                src_block_node_ids = cpu_matched_result.matched_node_ids,  # Add this for worker
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_peerh2h)
             #TODO here we dont combine peer cpu or local cpu match results, so we can safely add remote results to local cpu
@@ -1005,8 +980,7 @@ class GlobalCacheEngine:
                     transfer_type = TransferType.DISK2D,
                     src_block_ids = fragment2_ssd_blocks,
                     dst_block_ids = fragment12_gpu_blocks[-fragment2_num_blocks:],
-                    layer_id = 0,
-                    layer_granularity = layer_num
+                    dp_client_id = dp_client_id,
                 )
                 transfer_graph.add_transfer_op(op_gds_transfer)
                 finished_ops_ids.append(op_gds_transfer.op_id)
@@ -1021,10 +995,9 @@ class GlobalCacheEngine:
                     transfer_type = TransferType.PEERSSD2H if ssd_matched_result.matched_pos == "remote" else TransferType.DISK2H,
                     src_block_ids = fragment2_ssd_blocks,
                     dst_block_ids = fragment2_cpu_blocks,
-                    layer_id = 0,
-                    layer_granularity = layer_num,
                     remote_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None,
-                    src_block_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None
+                    src_block_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None,
+                    dp_client_id = dp_client_id,
                 )
                 transfer_graph.add_transfer_op(op_disk2h)
                 # we only insert the buffer blocks to cpu cache engine only:
@@ -1058,8 +1031,7 @@ class GlobalCacheEngine:
                 src_block_ids = fragment12_cpu_blocks if not enable_gds else fragment1_cpu_blocks,
                 dst_block_ids = fragment12_gpu_blocks if not enable_gds \
                     else fragment12_gpu_blocks[:fragment1_num_blocks],
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_h2d)
             if op_disk2h is not None:
@@ -1085,15 +1057,11 @@ class GlobalCacheEngine:
             token_ids: np.ndarray,
             token_mask: np.ndarray,
             slot_mapping: np.ndarray,
-            layer_num : int = -1,
-            dp_id: int = 0,
+            dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
-
-        if layer_num == -1:
-            layer_num = self.model_config.num_layers
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
         aligned_token_ids = token_ids[:aligned_length]
@@ -1120,8 +1088,8 @@ class GlobalCacheEngine:
                     block_start_idx,
                     block_end_idx,
                     gpu_block_ids,
-                    layer_num,
-                    temp_cache_strategy
+                    temp_cache_strategy,
+                    dp_client_id,
                 )
         else:
             (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
@@ -1132,19 +1100,19 @@ class GlobalCacheEngine:
                     block_start_idx,
                     block_end_idx,
                     gpu_block_ids,
-                    layer_num,
-                    temp_cache_strategy
+                    temp_cache_strategy,
+                    dp_client_id,
                 )
 
-        transfer_graph, task_end_op_id = add_virtal_op_for_mutiple_finished_ops(
+        transfer_graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
             transfer_graph,
-            finished_ops_ids
+            finished_ops_ids,
+            dp_client_id,
         )
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         return_mask[(block_start_idx + skipped_gpu_blocks)* self.tokens_per_block:
                     (block_start_idx + skipped_gpu_blocks + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
-        transfer_graph.bind_to_dp_group(dp_id)
 
         for device_type in node_to_unlock:
             self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
@@ -1173,8 +1141,8 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num : int,
-            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+            temp_cache_strategy: CacheStrategy,
+            dp_client_id: int) \
                 -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
         """
         transfer pattern:
@@ -1268,8 +1236,7 @@ class GlobalCacheEngine:
             transfer_type = TransferType.D2H,
             src_block_ids = fragment12_gpu_blocks,
             dst_block_ids = fragment12_cpu_blocks,
-            layer_id = 0,
-            layer_granularity = layer_num
+            dp_client_id = dp_client_id,
         )
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
@@ -1286,8 +1253,7 @@ class GlobalCacheEngine:
                 transfer_type = TransferType.H2DISK,
                 src_block_ids = fragment2_cpu_blocks,
                 dst_block_ids = fragment2_ssd_blocks,
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_h2disk)
 
@@ -1305,8 +1271,7 @@ class GlobalCacheEngine:
                 transfer_type = TransferType.H2REMOTE,
                 src_block_ids = fragment3_cpu_blocks,
                 dst_block_ids = fragment3_remote_blocks,
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_h2remote)
             transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)
@@ -1347,8 +1312,8 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num : int,
-            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+            temp_cache_strategy: CacheStrategy,
+            dp_client_id: int) \
                 -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
         """
         transfer pattern:
@@ -1428,8 +1393,7 @@ class GlobalCacheEngine:
             transfer_type = TransferType.D2H,
             src_block_ids = fragment12_gpu_blocks,
             dst_block_ids = fragment12_cpu_blocks,
-            layer_id = 0,
-            layer_granularity = layer_num
+            dp_client_id = dp_client_id,
         )
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
@@ -1450,8 +1414,7 @@ class GlobalCacheEngine:
                 transfer_type = TransferType.H2DISK,
                 src_block_ids = fragment2_cpu_blocks,
                 dst_block_ids = fragment2_ssd_blocks,
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_h2disk)
 

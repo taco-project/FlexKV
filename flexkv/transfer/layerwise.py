@@ -13,42 +13,28 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.config import ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.transfer import WorkerKey
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp
 from flexkv.transfer.worker import TransferWorkerBase, cudaHostRegister
 
 
-def build_layerwise_eventfd_socket_path(model_config: ModelConfig) -> str:
-    """Construct the LayerwiseWorker's UDS socket path.
-
-    Disambiguated by ``(pp_rank, dp_rank)`` so multiple PP stages and DP
-    replicas on the same host each get their own endpoint.
-
-    We deliberately do NOT embed ``node_rank`` in the path: Unix domain
-    sockets are kernel-local, so two FlexKV instances on different
-    physical hosts cannot collide even when ``/tmp`` happens to be on a
-    shared filesystem (NFS and friends propagate the inode, not the
-    socket endpoint).  Deployments that stack multiple containers on one
-    host with a shared ``/tmp`` should disambiguate via the
-    ``FLEXKV_LAYERWISE_EVENTFD_SOCKET`` env var (e.g. embed ``$HOSTNAME``
-    or the container id in the base path).
-
-    Must stay in sync with the sglang-side consumer at
-    ``sglang.srt.mem_cache.storage.flexkv.flexkv_connector``, which
-    imports this helper directly so the two ends cannot drift.  Both
-    sides derive the path from the same ``ModelConfig`` fields, so no
-    env-var plumbing between processes is required.
-    """
+def build_layerwise_eventfd_socket_path(
+    dp_client_id: int,
+    pp_rank: int,
+    model_config: ModelConfig,
+) -> str:
+    """Construct the LayerwiseWorker's UDS socket path."""
     base = os.environ.get(
         'FLEXKV_LAYERWISE_EVENTFD_SOCKET',
         '/tmp/flexkv_layerwise_eventfd.sock',
     )
     suffix = ""
     if model_config.pp_size > 1:
-        suffix += f"_pp{model_config.pp_rank}"
-    if model_config.dp_size > 1:
-        suffix += f"_dp{model_config.dp_rank}"
+        suffix += f"_pp{pp_rank}"
+    if model_config.instance_num > 1 or model_config.dp_size > 1:
+        suffix += f"_dp{dp_client_id}"
     if not suffix:
         return base
     root, ext = os.path.splitext(base)
@@ -87,11 +73,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  ssd_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  tp_group_size: int,
-                 dp_group_id: int,
-                 pp_rank: int,
-                 pp_size: int,
-                 dp_size: int,
-                 dp_rank: int,
                  layerwise_eventfd_socket: str,
                  num_blocks_per_file: int,
                  use_ce_transfer_h2d: bool = False,
@@ -99,7 +80,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  h2d_cta_num: int = 4,
                  d2h_cta_num: int = 4,
                  enable_eventfd: bool = True,
-                 is_nsa_cp: bool = False,
                  indexer_gpu_blocks: Optional[List[List[TensorSharedHandle]]] = None,
                  indexer_cpu_blocks: Optional[Union[torch.Tensor, HugePageTensorHandle]] = None,
                  indexer_gpu_kv_layouts: Optional[List[KVCacheLayout]] = None,
@@ -110,8 +90,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  indexer_num_blocks_per_file: int = 0) -> None:
         flexkv_logger.debug(
             f"[LayerwiseWorker] __init__ started: worker_id={worker_id}, "
-            f"tp_group_size={tp_group_size}, dp_group_id={dp_group_id}, "
-            f"pp_rank={pp_rank}, pp_size={pp_size}, "
+            f"tp_group_size={tp_group_size}, "
             f"enable_eventfd={enable_eventfd}, "
             f"num_gpu_blocks={[len(b) for b in gpu_blocks]}")
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
@@ -126,20 +105,15 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
         self.is_mla = gpu_kv_layouts[0].is_mla
+        self.kv_dim = 1 if self.is_mla else 2
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size if pp_size > 0 else 1
-        self.dp_group_id = dp_group_id
-        self.dp_size = dp_size if dp_size > 0 else 1
-        self.dp_rank = dp_rank
         # Pre-computed UDS socket path.  Both ends (this worker and the
         # sglang connector) derive the path from the same ModelConfig
         # fields (pp_rank / dp_rank / node_rank / is_multinode_tp), so no
         # env-var plumbing between processes is required.
         self.layerwise_eventfd_socket = layerwise_eventfd_socket
-        self.is_nsa_cp = is_nsa_cp
 
         # initialize GPU storage
         self.num_layers = gpu_kv_layouts[0].num_layer
@@ -183,17 +157,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         # TP-divided CPU strides (for CPU->GPU, each rank reads its own portion)
-        if self.is_nsa_cp:
-            # CP: no head partitioning, every rank gets the full KV cache
-            cpu_kv_layout_tp = cpu_kv_layout
-            self.cpu_tp_stride_in_bytes = 0
+        if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and not self.is_mla:
+            cpu_kv_layout_tp = cpu_kv_layout.div_head(self.tp_group_size)
         else:
-            # TP: partition by heads, each rank reads a different head slice
-            if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and not self.is_mla:
-                cpu_kv_layout_tp = cpu_kv_layout.div_head(self.tp_group_size)
-            else:
-                cpu_kv_layout_tp = cpu_kv_layout
-            self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
+            cpu_kv_layout_tp = cpu_kv_layout
+        self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
         self.h2d_cpu_kv_stride_in_bytes = cpu_kv_layout_tp.get_kv_stride() * self.dtype.itemsize
         self.h2d_cpu_layer_stride_in_bytes = cpu_kv_layout_tp.get_layer_stride() * self.dtype.itemsize
 
@@ -330,7 +298,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
         self.layerwise_transfer_group = LayerwiseTransferGroup(
             self.num_gpus, self.gpu_blocks, cpu_blocks, ssd_files,
-            dp_group_id, self.num_layers,
+            self.num_layers,
             gpu_kv_strides_tensor, gpu_block_strides_tensor,
             gpu_layer_strides_tensor, gpu_chunk_sizes_tensor,
             GLOBAL_CONFIG_FROM_ENV.iouring_entries,
@@ -347,15 +315,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                                        retry_interval: float = 1.0) -> torch.Tensor:
         """Receive eventfds from SGLang via Unix socket (FlexKV as server)."""
         socket_path = self.layerwise_eventfd_socket
-
-        rank_parts = []
-        if int(self.tp_group_size) > 1:
-            rank_parts.append("tp_rank=0")
-        if int(self.pp_size) > 1:
-            rank_parts.append(f"pp_rank={int(self.pp_rank)}")
-        if int(self.dp_size) > 1:
-            rank_parts.append(f"dp_rank={int(self.dp_rank)}")
-        rank_label = f" [{', '.join(rank_parts)}]" if rank_parts else ""
 
         def cleanup_socket():
             try:
@@ -374,11 +333,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             server_sock.listen(tp_group_size * 3)
             os.chmod(socket_path, 0o777)
             flexkv_logger.info(
-                f"[LayerwiseWorker] Eventfd server created{rank_label}: "
+                f"[LayerwiseWorker] Eventfd server created: "
                 f"socket={socket_path}, waiting for {tp_group_size} connection(s)")
         except Exception as e:
             flexkv_logger.error(
-                f"[LayerwiseWorker] Failed to bind/listen on {socket_path}{rank_label}: {e}")
+                f"[LayerwiseWorker] Failed to bind/listen on {socket_path}: {e}")
             server_sock.close()
             return torch.empty(0, dtype=torch.int32)
 
@@ -397,7 +356,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             while len(all_rank_eventfds) < tp_group_size:
                 if time.time() > total_deadline:
                     flexkv_logger.error(
-                        f"[LayerwiseWorker] Deadline exceeded on {socket_path}{rank_label}, "
+                        f"[LayerwiseWorker] Deadline exceeded on {socket_path}, "
                         f"received {len(all_rank_eventfds)}/{tp_group_size} ranks")
                     break
 
@@ -410,41 +369,34 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                     flexkv_logger.info(
                         f"[LayerwiseWorker] Accepted connection "
                         f"{conn_idx} (registered {len(all_rank_eventfds)}/{tp_group_size}) "
-                        f"on {socket_path}{rank_label}")
+                        f"on {socket_path}")
                 except socket.timeout:
                     flexkv_logger.warning(
-                        f"[LayerwiseWorker] Timeout waiting for connection on {socket_path}{rank_label}, "
+                        f"[LayerwiseWorker] Timeout waiting for connection on {socket_path}, "
                         f"registered {len(all_rank_eventfds)}/{tp_group_size}, retrying...")
                     continue
 
                 try:
                     with conn:
-                        # Accept both 16-byte (legacy: tp_rank, tp_size, num_layers, num_counters)
-                        # and 24-byte (new: tp_rank, tp_size, cp_rank, cp_size, num_layers, num_counters)
-                        metadata = conn.recv(24)
+                        # Receive 16-byte metadata: tp_rank_per_node, tp_size_per_node,
+                        # num_layers, num_counters
+                        metadata = conn.recv(16)
                         if len(metadata) < 16:
                             flexkv_logger.error(
-                                f"[LayerwiseWorker] Incomplete metadata on {socket_path}{rank_label}: "
-                                f"{len(metadata)} bytes")
+                                f"[LayerwiseWorker] Incomplete metadata on {socket_path}: "
+                                f"expected 16 bytes, got {len(metadata)}")
                             continue
 
-                        if len(metadata) >= 24:
-                            tp_rank, _, cp_rank, cp_size, recv_num_layers, recv_num_counters = \
-                                struct.unpack("iiiiii", metadata[:24])
-                        else:
-                            tp_rank, _, recv_num_layers, recv_num_counters = \
-                                struct.unpack("iiii", metadata[:16])
-                            cp_rank, cp_size = 0, 1
+                        rank_key, tp_size_per_node_recv, recv_num_layers, recv_num_counters = \
+                            struct.unpack("iiii", metadata[:16])
 
-                        # Use cp_rank as the connection key when CP is active,
-                        # otherwise use tp_rank
-                        rank_key = cp_rank if cp_size > 1 else tp_rank
                         if not all_rank_eventfds:
                             num_layers, num_counters = recv_num_layers, recv_num_counters
 
                         flexkv_logger.debug(
                             f"[LayerwiseWorker] Connection {conn_idx}: "
-                            f"tp_rank={tp_rank}, cp_rank={cp_rank}, cp_size={cp_size}, "
+                            f"tp_rank_per_node={rank_key}, "
+                            f"tp_size_per_node={tp_size_per_node_recv}, "
                             f"num_layers={recv_num_layers}, "
                             f"num_counters={recv_num_counters}")
 
@@ -455,7 +407,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                             rank_eventfds[counter_id] = fds
                             flexkv_logger.debug(
                                 f"[LayerwiseWorker] Received counter_id={counter_id}, "
-                                f"num_fds={len(fds)} from rank_key={rank_key}")
+                                f"num_fds={len(fds)} from tp_rank_per_node={rank_key}")
 
                         all_rank_eventfds[rank_key] = rank_eventfds
                         # Send ACK to client so it knows the fds were received
@@ -464,8 +416,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                         except Exception:
                             pass
                         flexkv_logger.info(
-                            f"[LayerwiseWorker] Received all eventfds from rank_key={rank_key} "
-                            f"(tp_rank={tp_rank}, cp_rank={cp_rank}) on {socket_path}")
+                            f"[LayerwiseWorker] Received all eventfds from tp_rank_per_node={rank_key} "
+                            f"on {socket_path}")
                 except Exception as e:
                     # Send NACK so client knows to retry
                     try:
@@ -474,19 +426,19 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                         pass
                     flexkv_logger.warning(
                         f"[LayerwiseWorker] Failed to receive eventfds from connection {conn_idx} "
-                        f"on {socket_path}{rank_label}: {e}. "
+                        f"on {socket_path}: {e}. "
                         f"Client will retry, continuing accept loop...")
                     continue
         except Exception as e:
             flexkv_logger.error(
-                f"[LayerwiseWorker] Fatal error in accept loop on {socket_path}{rank_label}: {e}")
+                f"[LayerwiseWorker] Fatal error in accept loop on {socket_path}: {e}")
         finally:
             server_sock.close()
             cleanup_socket()
 
         if not all_rank_eventfds:
             flexkv_logger.warning(
-                f"[LayerwiseWorker] No connections received on {socket_path}{rank_label}")
+                f"[LayerwiseWorker] No connections received on {socket_path}")
             return torch.empty(0, dtype=torch.int32)
 
         # Build tensor: [num_counters, tp_size, num_layers]
@@ -498,9 +450,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
         tensor = torch.tensor(eventfds_list, dtype=torch.int32)
         flexkv_logger.info(
-            f"[LayerwiseWorker] Eventfd setup complete{rank_label}: "
+            f"[LayerwiseWorker] Eventfd setup complete: "
             f"socket={socket_path}, tensor_shape={tensor.shape}, "
-            f"counters={num_counters}, tp_size={tp_group_size}, layers={num_layers}"
+            f"counters={num_counters}, tp_size_per_rank={tp_group_size}, layers={num_layers}"
         )
         return tensor
 
@@ -509,7 +461,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                       dst_block_ids_h2d: torch.Tensor,
                       src_block_ids_disk2h: Optional[torch.Tensor],
                       dst_block_ids_disk2h: Optional[torch.Tensor],
-                      layer_granularity: int,
                       counter_id: int = 0,
                       indexer_src_block_ids: Optional[torch.Tensor] = None,
                       indexer_dst_block_ids: Optional[torch.Tensor] = None,
@@ -562,7 +513,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.h2d_cta_num,
             self.use_ce_transfer_h2d,
             self.num_layers,
-            layer_granularity,
+            1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
             self.is_mla,
             counter_id,
             indexer_gpu_block_id_tensor,
@@ -580,10 +531,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         )
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
-        layer_granularity = transfer_op.layer_granularity
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-
         src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
         dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
 
@@ -611,17 +558,15 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             dst_block_ids_h2d,
             src_block_ids_disk2h,
             dst_block_ids_disk2h,
-            layer_granularity,
             transfer_op.counter_id,
             indexer_src_block_ids=indexer_src_block_ids,
             indexer_dst_block_ids=indexer_dst_block_ids,
         )
         end_time = time.time()
 
-        kv_dim = 2 if not self.is_mla else 1
-        transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * num_h2d_blocks * kv_dim
+        transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * num_h2d_blocks * self.kv_dim
 
-        if self.is_nsa_cp or self.is_mla:
+        if self.is_mla:
             transfer_size *= self.tp_group_size
 
         self._log_transfer_performance(

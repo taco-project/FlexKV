@@ -67,10 +67,20 @@ target_include_directories(xxhash PUBLIC
 install(FILES ${XXHASH_HEADERS} DESTINATION include)
 
 # ==================== prometheus-cpp Library ====================
-# Option to enable/disable monitoring (env FLEXKV_ENABLE_METRICS=0 or -DFLEXKV_ENABLE_MONITORING=OFF)
-set(_FLEXKV_MONITORING_DEFAULT ON)
+# Step 1: Auto-detect default from directory existence
+if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prometheus-cpp")
+    set(_FLEXKV_MONITORING_DEFAULT ON)
+else()
+    set(_FLEXKV_MONITORING_DEFAULT OFF)
+    message(STATUS "third_party/prometheus-cpp not found, Prometheus monitoring defaults to OFF")
+endif()
+
+# Step 2: Environment variable override (FLEXKV_ENABLE_METRICS=1/0)
 if(DEFINED ENV{FLEXKV_ENABLE_METRICS})
-  if("$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "0" OR "$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "OFF"
+  if("$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "1" OR "$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "ON"
+      OR "$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "YES" OR "$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "TRUE")
+    set(_FLEXKV_MONITORING_DEFAULT ON)
+  elseif("$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "0" OR "$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "OFF"
       OR "$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "NO" OR "$ENV{FLEXKV_ENABLE_METRICS}" STREQUAL "FALSE")
     set(_FLEXKV_MONITORING_DEFAULT OFF)
   endif()

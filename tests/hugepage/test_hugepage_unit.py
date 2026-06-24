@@ -178,7 +178,7 @@ def test_storage_engine_cpu_cache_uses_hugepage_when_enabled() -> None:
         hugepage_size_bytes=PAGE,
     )
 
-    storage_engine = StorageEngine(model_config, cache_config)
+    storage_engine = StorageEngine(model_config, cache_config, model_config.num_layers)
     cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
     cpu_tensor = cpu_handle.get_tensor()
 
@@ -210,7 +210,7 @@ def test_storage_engine_cpu_cache_falls_back_when_hugepage_unavailable(monkeypat
     )
     monkeypatch.setenv("FLEXKV_HUGETLBFS_DIR", "/nonexistent/flexkv_hugetlbfs")
 
-    storage_engine = StorageEngine(model_config, cache_config)
+    storage_engine = StorageEngine(model_config, cache_config, model_config.num_layers)
     cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
     cpu_tensor = cpu_handle.get_tensor()
 

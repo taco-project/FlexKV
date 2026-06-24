@@ -707,14 +707,13 @@ class RedisMeta:
         # rpush returns the new length of the list
         return int(r.rpush(f"pcfs:{nid}", *values))
 
-    def regist_buffer(self, mrs: Iterable[object], pp_rank: int = 0, pp_size: int = 1) -> int:
+    def regist_buffer(self, mrs: Iterable[object]) -> int:
         """Register RDMA memory regions in Redis.
 
         Each element in mrs can be one of:
           - dict with keys {"buffer_ptr": ..., "buffer_size": ...}
           - tuple/list (buffer_ptr, buffer_size)
-        Stored as hash: key = buffer:<node_id>[:pp<pp_rank>]:<buffer_ptr>, field "buffer_size" = <buffer_size>.
-        When pp_size > 1, pp_rank is included in the key for isolation.
+        Stored as hash: key = buffer:<node_id>:<buffer_ptr>, field "buffer_size" = <buffer_size>.
         Returns the number of regions processed.
         """
         nid = self.get_node_id()
@@ -731,27 +730,21 @@ class RedisMeta:
                 continue
             if ptr is None or size is None:
                 continue
-            if pp_size > 1:
-                key = f"buffer:{nid}:pp{pp_rank}:{int(ptr)}"
-            else:
-                key = f"buffer:{nid}:{int(ptr)}"
+            key = f"buffer:{nid}:{int(ptr)}"
             pipe.hset(key, mapping={"buffer_size": int(size)})
             processed += 1
         if processed:
             pipe.execute()
         return processed
 
-    def unregist_buffer(self, buffer_ptr: Union[int, str], pp_rank: int = 0, pp_size: int = 1) -> bool:
+    def unregist_buffer(self, buffer_ptr: Union[int, str]) -> bool:
         """Unregister a previously registered RDMA memory region by buffer_ptr.
 
-        Looks up key buffer:<node_id>[:pp<pp_rank>]:<buffer_ptr> and deletes it if present.
+        Looks up key buffer:<node_id>:<buffer_ptr> and deletes it if present.
         Returns True if the key existed and was deleted, otherwise False.
         """
         nid = self.get_node_id()
-        if pp_size > 1:
-            key = f"buffer:{nid}:pp{pp_rank}:{int(buffer_ptr)}"
-        else:
-            key = f"buffer:{nid}:{int(buffer_ptr)}"
+        key = f"buffer:{nid}:{int(buffer_ptr)}"
         r = self._client()
         exists = bool(r.exists(key))
         if exists:
@@ -790,18 +783,15 @@ class RedisMeta:
         if meta_ttl > 0:
             r.expire(key, meta_ttl)
 
-    def get_node_meta(self, node_id: int, pp_rank: int = 0, pp_size: int = 1) -> dict:
+    def get_node_meta(self, node_id: int) -> dict:
         """Get node meta information from Redis.
 
-        Reads key meta:<node_id>[:pp<pp_rank>] and returns a dict with fields:
+        Reads key meta:<node_id> and returns a dict with fields:
         node_id (int), addr (str), cpu_buffer_ptr (int), ssd_buffer_ptr (int).
         Returns empty dict if the key does not exist.
         """
         r = self._client()
-        if pp_size > 1:
-            key = f"meta:{int(node_id)}:pp{pp_rank}"
-        else:
-            key = f"meta:{int(node_id)}"
+        key = f"meta:{int(node_id)}"
         data = r.hgetall(key)
         if not data:
             return {}

@@ -66,7 +66,11 @@ fi
 echo "=== Building in ${BUILD_TYPE} mode ==="
 
 # Install submodules
-git submodule update --init --recursive
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git submodule update --init --recursive
+else
+  echo "WARNING: Not a git repository, skipping submodule update. If submodules are missing, please clone the repo instead of copying."
+fi
 
 mkdir -p build
 cd build
