@@ -780,16 +780,25 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         break
                 except ChildProcessError:
                     break
+
         signal.signal(signal.SIGCHLD, _reap_children)
         try:
-            flexkv_logger.debug(f"_process_worker started, pid={os.getpid()}, "
-                               f"gpu_register_port={gpu_register_port}")
+            flexkv_logger.debug(
+                f"_process_worker started, pid={os.getpid()}, "
+                f"gpu_register_port={gpu_register_port}"
+            )
+            os.environ["MPI4PY_RC_INITIALIZE"] = "false"
+            transfer_manager = TransferManager(
+                model_config, cache_config, gpu_register_port
+            )
+            # Signal parent only after the ZMQ PULL socket is bound so GPU
+            # registration messages are not dropped by early PUSH sends.
             start_event.set()
-            os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
-            transfer_manager = TransferManager(model_config, cache_config, gpu_register_port)
             transfer_manager.initialize_transfer_engine()
             transfer_manager.start()
-            flexkv_logger.debug("TransferEngine started successfully, setting ready_event")
+            flexkv_logger.debug(
+                "TransferEngine started successfully, setting ready_event"
+            )
             ready_event.set()
 
             # Setup selector for event-driven processing (complete zero polling!)
@@ -854,7 +863,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             flexkv_logger.error(f"Failed to initialize transfer manager process: {e}")
         finally:
             # Cleanup selector (only if it was created)
-            if 'sel' in locals():
+            if "sel" in locals():
                 try:
                     sel.close()
                 except Exception as e:

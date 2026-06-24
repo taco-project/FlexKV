@@ -355,7 +355,7 @@ class MooncakeStoreClient:
         assert len(key_strs) == len(buffer_ptrs) == len(buffer_sizes)
 
         exist_results = self.batch_exists_impl(key_strs)
-
+        flexkv_logger.info(f"[MooncakeStoreClient] batch_put exist_results: {exist_results}")
         set_keys = []
         set_buffer_ptrs = []
         set_buffer_sizes = []
@@ -412,7 +412,7 @@ class MooncakeStoreClient:
         """
         self._ensure_setup()
         exit_results = self.batch_exists_impl(keys_strs)
-        flexkv_logger.info(f"[MooncakeStoreClient] batch_exists: {exit_results}")
+        flexkv_logger.info(f"[MooncakeStoreClient] batch_exists, exit_results: {exit_results}")
         for i in range(len(keys_strs)):
             if exit_results[i] != 1:
                 return i
@@ -585,6 +585,7 @@ class MooncakeStoreCacheEngine:
             matched_length = self.mooncake_store_client.batch_exists(all_keys)
         else:
             raw = self.mooncake_store_client.batch_exists_impl(all_keys)
+            flexkv_logger.info(f"[MooncakeStoreCacheEngine] match: exist_results: {raw}")
             matched_length = 0
             for i in range(n_blocks):
                 ok = all(raw[p * n_blocks + i] == 1 for p in range(spec_counts))

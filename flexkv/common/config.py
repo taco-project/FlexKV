@@ -160,6 +160,7 @@ class ModelConfig:
     @property
     def effective_tp_size_per_node(self) -> int:
         """Per-node counterpart of :pyattr:`effective_tp_size`."""
+        flexkv_logger.info(f"[Config] effective_tp_size_per_node: {self.tp_size_per_node} * {self.cp_size_per_node}")
         return self.tp_size_per_node * self.cp_size_per_node
 
     @property
