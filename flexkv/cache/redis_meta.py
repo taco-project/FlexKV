@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Iterable, List, Tuple, Optional, Union, Dict
 from dataclasses import dataclass
 from enum import IntEnum
@@ -158,8 +159,8 @@ class RedisNodeInfo:
         self._listener_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self.current_node_id_set: set = set()
-        self._client: Optional[_redis.Redis] = None
-        self._sub_client: Optional[_redis.Redis] = None
+        self._client: Optional["_redis.Redis"] = None
+        self._sub_client: Optional["_redis.Redis"] = None
         self._cleanup_done = False
         
         # register cleanup function on exit
@@ -180,7 +181,7 @@ class RedisNodeInfo:
             # ignore exceptions in destructor, avoid affecting program exit
             pass
     
-    def _get_client(self) -> _redis.Redis:
+    def _get_client(self) -> "_redis.Redis":
         """Get Redis client with connection settings"""
         return _redis.Redis(
             host=self.host,
@@ -286,7 +287,9 @@ class RedisNodeInfo:
                 "local_ip": self.local_ip,  # Keep for backward compatibility
                 "uuid": self.uuid,
                 "status": "active",
-                "timestamp": str(int(time.time()))
+                "timestamp": str(int(time.time())),
+                "pp_rank": str(getattr(self, 'pp_rank', 0)),
+                "pp_size": str(getattr(self, 'pp_size', 1)),
             })
 
             # Set TTL so the key auto-expires if the process crashes
@@ -753,20 +756,26 @@ class RedisMeta:
     # survives normal heartbeat jitter but auto-expires after a crash.
     META_TTL_MULTIPLIER: int = 5
 
-    def regist_node_meta(self, node_id: int, addr: str, zmq_addr: str, cpu_buffer_ptr: int, ssd_buffer_ptr: int) -> None:
+    def regist_node_meta(self, node_id: int, addr: str, zmq_addr: str, cpu_buffer_ptr: int, ssd_buffer_ptr: int, pp_rank: int = 0, pp_size: int = 1) -> None:
         """Register node meta information as a Redis hash.
 
-        Key: meta:<node_id>
+        Key: meta:<node_id>[:pp<pp_rank>]
+        When pp_size > 1, pp_rank is included in the key for PP rank isolation.
         Fields: node_id (int), addr (str), cpu_buffer_ptr (int), ssd_buffer_ptr (int)
         """
         r = self._client()
-        key = f"meta:{int(node_id)}"
+        if pp_size > 1:
+            key = f"meta:{int(node_id)}:pp{pp_rank}"
+        else:
+            key = f"meta:{int(node_id)}"
         r.hset(key, mapping={
             "node_id": int(node_id),
             "addr": str(addr),
             "zmq_addr": str(zmq_addr),
             "cpu_buffer_ptr": int(cpu_buffer_ptr),
             "ssd_buffer_ptr": int(ssd_buffer_ptr),
+            "pp_rank": int(pp_rank),
+            "pp_size": int(pp_size),
         })
         # Set TTL on meta key so it auto-expires after node crash.
         # The heartbeat in regist_node_meta_renew_ttl() will keep it alive.
@@ -797,10 +806,16 @@ class RedisMeta:
         out["ssd_buffer_ptr"] = int(sb) if sb is not None and sb != "" else 0
         return out
 
-    def unregist_node_meta(self, node_id: int) -> bool:
-        """Unregister node meta by node_id. Returns True if deleted."""
+    def unregist_node_meta(self, node_id: int, pp_rank: int = 0, pp_size: int = 1) -> bool:
+        """Unregister node meta by node_id. Returns True if deleted.
+
+        When pp_size > 1, only deletes the key for the specified pp_rank.
+        """
         r = self._client()
-        key = f"meta:{int(node_id)}"
+        if pp_size > 1:
+            key = f"meta:{int(node_id)}:pp{pp_rank}"
+        else:
+            key = f"meta:{int(node_id)}"
         return bool(r.delete(key))
 
 

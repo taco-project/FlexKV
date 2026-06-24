@@ -71,7 +71,7 @@ def test_config(request: pytest.FixtureRequest):
 
 # Utility functions
 def generate_request_pair(idx: int, block_per_request, num_gpu_blocks, tokens_per_block, dp_size):
-    """Generate a request pair with token_ids, block_ids, and dp_id"""
+    """Generate a request pair with token_ids, block_ids, and dp_rank"""
     start_idx = (idx * block_per_request) % num_gpu_blocks
     assert start_idx + block_per_request <= num_gpu_blocks
     block_ids = torch.arange(
@@ -347,7 +347,7 @@ def gpu_blocks_worker_process(conn, model_config, cache_config, gpu_kv_layout):
         gpu_blocks = []
         for layer_id in range(model_config.num_layers):
             # LAYERFIRST format: [kv_dim, num_block, tokens_per_block, num_head, head_size]
-            kv_dim = 2 if not model_config.use_mla else 1
+            kv_dim = model_config.kv_dim
             gpu_tensor = torch.zeros(
                 kv_dim,
                 gpu_kv_layout.num_block,
@@ -417,7 +417,7 @@ def example_usage_gpu_kv_cache_verifier():
     gpu_blocks = []
     for layer_id in range(model_config.num_layers):
         # LAYERFIRST format: [kv_dim, num_block, tokens_per_block, num_head, head_size]
-        kv_dim = 2 if not model_config.use_mla else 1
+        kv_dim = model_config.kv_dim
         gpu_tensor = torch.zeros(
             kv_dim,
             gpu_kv_layout.num_block,

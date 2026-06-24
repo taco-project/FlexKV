@@ -9,11 +9,11 @@ import torch
 
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
+from flexkv.common.config import RankInfo
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
-from flexkv.integration.utils import cdiv
 from flexkv.integration.config import FlexKVConfig
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.transfer_manager import TransferManagerOnRemote
@@ -159,25 +159,22 @@ class FlexKVSchedulerConnector:
     def __init__(
         self,
         flexkv_config: FlexKVConfig,
-        dp_rank: int = 0,
+        rank_info: "RankInfo",
     ):
-        logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}")
+        logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}, {rank_info}")
         self.server_recv_port = flexkv_config.server_recv_port
-        self.tp_size = flexkv_config.model_config.tp_size
-        self.dp_size = flexkv_config.model_config.dp_size
         self.block_size = flexkv_config.cache_config.tokens_per_block
-        self.model_config = flexkv_config.model_config
         self.cache_config = flexkv_config.cache_config
+        self.rank_info = rank_info
 
         if os.getenv('DYNAMO_USE_FLEXKV', '0') == '1':
             self.collector = KVEventCollector()
         else:
             self.collector = None
-
-        self.flexkv_manager = KVManager(model_config=self.model_config,
-                                        cache_config=self.cache_config,
+        self.flexkv_manager = KVManager(model_config=self.rank_info.model_config,
+                                        cache_config=flexkv_config.cache_config,
+                                        dp_client_id=self.rank_info.dp_client_id,
                                         server_recv_port=flexkv_config.server_recv_port,
-                                        dp_client_id=dp_rank,
                                         event_collector=self.collector)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
@@ -217,10 +214,6 @@ class FlexKVSchedulerConnector:
         self.flexkv_manager.shutdown()
         if self.collector is not None:
             self.collector.close()
-
-    @property
-    def dp_client_id(self) -> int:
-        return self.flexkv_manager.dp_client_id
 
     ####################
     #### Get Method ####
@@ -476,7 +469,7 @@ class FlexKVSchedulerConnector:
                             the task_id, number of matched tokens and number of unmatched tokens.
         """
         match_start_time = time.perf_counter()
-        num_tokens_to_put = (cdiv(request.num_tokens, self.block_size)-1)*self.block_size
+        num_tokens_to_put = ((request.num_tokens - 1) // self.block_size) * self.block_size
         token_ids = request.all_token_ids[:num_tokens_to_put]
 
         if num_tokens_to_put == 0:
@@ -690,49 +683,54 @@ class FlexKVWorkerConnector:
     def __init__(
         self,
         flexkv_config: FlexKVConfig,
-        dp_client_id: int,
+        rank_info: "RankInfo",
     ):
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 
-        self.is_local_leader = get_tp_group().local_rank == 0
-        self.launch_remote_transfer_manager = get_tp_group().local_rank == 0 and \
-            get_tp_group().rank_in_group != 0
-
-        local_device = torch.cuda.current_device()
 
         # Determine if server_client_mode (same logic as KVManager)
         server_client_mode = (GLOBAL_CONFIG_FROM_ENV.instance_num > 1 or
-                              flexkv_config.model_config.dp_size > 1 or
+                              rank_info.model_config.dp_size > 1 or
                               GLOBAL_CONFIG_FROM_ENV.server_client_mode)
 
-        if server_client_mode:
-            # Assuming Server can see all GPUs, use global device ID
-            cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
-            if cuda_visible:
-                visible_ids = [int(x.strip()) for x in cuda_visible.split(',') if x.strip()]
-                device_id = visible_ids[local_device] if local_device < len(visible_ids) else local_device
-            else:
-                device_id = local_device
-
-            client_id = GLOBAL_CONFIG_FROM_ENV.instance_id * flexkv_config.model_config.dp_size + dp_client_id
-        else:
-            device_id = local_device
-            client_id = dp_client_id
+        instance_id = rank_info.instance_id
 
         self.flexkv_config = flexkv_config
-        if self.launch_remote_transfer_manager:
-            self.remote_transfer_manager_process = TransferManagerOnRemote.create_process()
+        self.rank_info = rank_info
+        if (rank_info.model_config.nnodes > 1
+                and rank_info.node_rank > 0
+                and rank_info.local_rank == 0):
+            self.remote_transfer_manager_process = TransferManagerOnRemote.create_process(
+                master_host=rank_info.model_config.master_host,
+                master_ports=rank_info.model_config.master_ports,
+            )
 
         logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, "
-                    f"server_client_mode={server_client_mode}, dp_client_id={dp_client_id}, "
-                    f"client_id={client_id}, device_id={device_id}")
-        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, client_id, device_id)
+                    f"server_client_mode={server_client_mode}, dp_rank={rank_info.dp_rank}, "
+                    f"instance_id={instance_id}, local_rank={rank_info.local_rank}")
+        self.tp_client = KVTPClient(
+            flexkv_config.gpu_register_port,
+            dp_client_id=rank_info.dp_client_id,
+            pp_rank=rank_info.pp_rank,
+            device_id=rank_info.local_rank,
+        )
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
         logger.info("Start register kv_caches")
-        gpu_blocks = list(kv_caches.values())
-        num_layer = len(kv_caches)
+
+        # Separate main KV caches from indexer caches by layer name.
+        main_kv_caches: dict[str, torch.Tensor] = {}
+        indexer_kv_caches: dict[str, torch.Tensor] = {}
+        for layer_name, tensor in kv_caches.items():
+            if ".k_cache" in layer_name:
+                indexer_kv_caches[layer_name] = tensor
+            else:
+                main_kv_caches[layer_name] = tensor
+
+        # Build main KV cache layout
+        gpu_blocks = list(main_kv_caches.values())
+        num_layer = len(main_kv_caches)
         if self.flexkv_config.model_config.use_mla:
             assert gpu_blocks[0].ndim == 3, (
                 f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
@@ -756,7 +754,32 @@ class FlexKVWorkerConnector:
             head_size=head_size,
             is_mla=self.flexkv_config.model_config.use_mla,
         )
-        self.tp_client.register_to_server(gpu_blocks, gpu_layout)
+
+        # Build indexer layout if indexer caches are present
+        indexer_buffers = None
+        indexer_layout = None
+        if indexer_kv_caches:
+            indexer_buffers = list(indexer_kv_caches.values())
+            first_indexer_buffer = indexer_buffers[0]
+            assert first_indexer_buffer.ndim == 3, (
+                f"expect indexer cache tensor has 3 dim but get shape={first_indexer_buffer.shape}.")
+            indexer_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(indexer_buffers),
+                num_block=first_indexer_buffer.shape[0],
+                tokens_per_block=first_indexer_buffer.shape[1],
+                num_head=1,
+                head_size=first_indexer_buffer.shape[2],
+                is_mla=True,
+            )
+
+        self.tp_client.register_to_server(
+            kv_caches=gpu_blocks,
+            kv_layout=gpu_layout,
+            indexer_buffers=indexer_buffers,
+            indexer_layout=indexer_layout,
+        )
+
         logger.info("Finish register kv_caches")
 
     def __del__(self):
@@ -770,15 +793,26 @@ class FlexKVConnectorV1Impl:
     def __init__(self, vllm_config: "VllmConfig", role: "KVConnectorRole"):
         self.role = role
         flexkv_config = FlexKVConfig.from_env()
-        flexkv_config.post_init_from_vllm_config(vllm_config)
-        dp_rank = vllm_config.parallel_config.data_parallel_rank
+        rank_info = flexkv_config.post_init_from_vllm_config(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector = FlexKVSchedulerConnector(flexkv_config, dp_rank)
+            self.connector = FlexKVSchedulerConnector(flexkv_config, rank_info)
             # Track scheduled requests to detect preemptions in build_connector_meta
             self.previous_scheduled_req_ids: set[str] = set()
         elif role == KVConnectorRole.WORKER:
-            self.connector = FlexKVWorkerConnector(flexkv_config, dp_rank)
+            # vllm's ParallelConfig has no ``tensor_parallel_rank`` field, so
+            # the value read in post_init_from_vllm_config is always 0 on every
+            # worker.  Override it here using the initialized TP group rank so
+            # each worker registers a distinct device_id with FlexKV.
+            try:
+                import dataclasses
+                from vllm.distributed.parallel_state import get_tp_group
+                rank_info = dataclasses.replace(
+                    rank_info, tp_rank=get_tp_group().rank_in_group)
+            except Exception as _e:
+                logger.warning(
+                    f"FlexKV: could not derive tp_rank from vllm TP group: {_e}")
+            self.connector = FlexKVWorkerConnector(flexkv_config, rank_info)
         else:
             raise ValueError(f"Unrecognized KVConnectorRole: {role}.")
 

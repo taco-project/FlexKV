@@ -5,6 +5,16 @@ from typing import ClassVar, List, Set, Dict, Callable, Tuple, Optional
 
 import numpy as np
 
+from flexkv.common.debug import flexkv_logger
+
+
+@dataclass(frozen=True)
+class WorkerKey:
+    """Immutable, hashable key that uniquely identifies a worker by
+    ``(dp_client_id, pp_rank)``."""
+    dp_client_id: int = 0
+    pp_rank: int = 0
+
 
 @dataclass(frozen=True)
 class CompletedOp:
@@ -57,6 +67,7 @@ class TransferType(Enum):
     # so that the op 3 will not be executed actually, but can indicate the completion of
     # a group of transfer ops
     VIRTUAL = "Virtual"
+    LAYERWISE = "LAYERWISE"
 
 # class DistType(Enum):
 #     DISTH = "DISTH"
@@ -81,15 +92,13 @@ class TransferOp:
     transfer_type: TransferType
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
-    layer_id: int = 0
-    layer_granularity: int = -1
     # src_block_node_ids: Optional[np.ndarray] = None
     # this will change dynamically as transfer ops executed
     predecessors: Set[int] = field(default_factory=set)
     # this will keep the full info
     successors: Set[int] = field(default_factory=set)
     status: TransferOpStatus = TransferOpStatus.PENDING
-    dp_id: int = 0
+    dp_client_id: int = 0
     # used for get block ids inner worker process
     src_slot_id: int = -1
     dst_slot_id: int = -1
@@ -97,6 +106,7 @@ class TransferOp:
     remote_node_ids: Optional[np.ndarray] = None
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
+    pending_count: int = 0
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
@@ -111,6 +121,59 @@ class TransferOp:
         assert self.dst_block_ids.dtype == np.int64
         self.valid_block_num = self.src_block_ids.size
 
+@dataclass
+class LayerwiseTransferOp(TransferOp):
+
+    src_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    dst_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    src_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    dst_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    counter_id: int = 0  # Counter set index for triple buffering eventfd notification
+    # Indexer block_ids for fused indexer transfer (1:1 with main KV block_ids)
+    indexer_src_block_ids: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    indexer_dst_block_ids: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+
+    def __init__(self,
+                graph_id: int,
+                src_block_ids_h2d: np.ndarray,
+                dst_block_ids_h2d: np.ndarray,
+                src_block_ids_disk2h: np.ndarray,
+                dst_block_ids_disk2h: np.ndarray,
+                dp_client_id: int = 0,
+                counter_id: int = 0,
+                indexer_src_block_ids: Optional[np.ndarray] = None,
+                indexer_dst_block_ids: Optional[np.ndarray] = None) -> None:
+        self.src_block_ids_h2d = src_block_ids_h2d
+        self.dst_block_ids_h2d = dst_block_ids_h2d
+        self.src_block_ids_disk2h = src_block_ids_disk2h
+        self.dst_block_ids_disk2h = dst_block_ids_disk2h
+        self.counter_id = counter_id
+        self.indexer_src_block_ids = indexer_src_block_ids if indexer_src_block_ids is not None \
+            else np.array([], dtype=np.int64)
+        self.indexer_dst_block_ids = indexer_dst_block_ids if indexer_dst_block_ids is not None \
+            else np.array([], dtype=np.int64)
+
+        super().__init__(
+            graph_id=graph_id,
+            transfer_type=TransferType.LAYERWISE,
+            src_block_ids=np.array([], dtype=np.int64),
+            dst_block_ids=np.array([], dtype=np.int64),
+            dp_client_id=dp_client_id,
+        )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        assert self.src_block_ids_h2d.size == self.dst_block_ids_h2d.size
+        assert self.src_block_ids_disk2h.size == self.dst_block_ids_disk2h.size
+        assert self.indexer_src_block_ids.size == self.indexer_dst_block_ids.size
+
+        assert self.src_block_ids_h2d.dtype == np.int64
+        assert self.dst_block_ids_h2d.dtype == np.int64
+        assert self.src_block_ids_disk2h.dtype == np.int64
+        assert self.dst_block_ids_disk2h.dtype == np.int64
+        assert self.indexer_src_block_ids.dtype == np.int64
+        assert self.indexer_dst_block_ids.dtype == np.int64
 
 class TransferOpGraph:
     _next_graph_id = 0
@@ -223,13 +286,20 @@ class TransferOpGraph:
             assert op.src_block_ids.size == op.dst_block_ids.size, \
                 f"src_block_ids.size={op.src_block_ids.size}, dst_block_ids.size={op.dst_block_ids.size}"
 
+    def clear_gpu_blocks(self) -> None:
+        """Clear GPU block_ids from the graph.
+        """
+        for op_id in self._gpu_transfer_op_id:
+            op = self._op_map[op_id]
+            # Replace with empty arrays; set_gpu_blocks() will fill them later
+            if op.src_block_ids.size > 0:
+                op.src_block_ids = np.array([], dtype=op.src_block_ids.dtype)
+            if op.dst_block_ids.size > 0:
+                op.dst_block_ids = np.array([], dtype=op.dst_block_ids.dtype)
+
     @property
     def num_ops(self) -> int:
         return len(self._op_map)
-
-    def bind_to_dp_group(self, dp_id: int) -> None:
-        for op in self._op_map.values():
-            op.dp_id = dp_id
 
     def visualize(self) -> str:
         """
@@ -285,7 +355,7 @@ class TransferOpGraph:
                 dst_str = format_blocks(op.dst_block_ids)
                 lines.append(f"║     ├─ src_blocks:   {src_str}".ljust(71) + "║")
                 lines.append(f"║     ├─ dst_blocks:   {dst_str}".ljust(71) + "║")
-                lines.append(f"║     └─ layer_id={op.layer_id}, dp_id={op.dp_id}".ljust(71) + "║")
+                lines.append(f"║     └─ dp_client_id={op.dp_client_id}".ljust(71) + "║")
             else:
                 lines.append("║     └─ (VIRTUAL - no blocks)".ljust(71) + "║")
 
@@ -327,11 +397,8 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
         transfer_type=transfer_type,
         src_block_ids=src_blocks,
         dst_block_ids=dst_blocks,
-        layer_id=ops[0].layer_id,
-        layer_granularity=ops[0].layer_granularity,
-        dp_id=ops[0].dp_id,
+        dp_client_id=ops[0].dp_client_id,
     )
-    graph.add_transfer_op(merged_op)
     if callbacks:
         if len(callbacks) == 1:
             op_callback_dict[merged_op.op_id] = callbacks[0]
@@ -340,8 +407,12 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
     return merged_op
 
 
-def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], task_end_op_ids: List[int],
-                         op_callback_dict: Dict[int, Callable]) -> Tuple[TransferOpGraph, int, Dict[int, Callable]]:
+def merge_to_batch_graph(batch_id: int,
+                         transfer_graphs: List[TransferOpGraph],
+                         task_end_op_ids: List[int],
+                         op_callback_dict: Dict[int, Callable],
+                         layerwise_transfer: bool = False,
+                         counter_id: int = 0) -> Tuple[TransferOpGraph, int, Dict[int, Callable]]:
     """
     Merge multiple TransferOpGraphs into a single batch graph.
 
@@ -355,6 +426,7 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
         transfer_graphs: List of graphs to merge
         task_end_op_ids: List of end op IDs for each task (one per graph)
         op_callback_dict: Dict mapping old op_id -> callback
+        layerwise_transfer: Whether to merge the graphs into a layerwise transfer op
 
     Returns:
         (merged_graph, batch_end_op_id, new_op_callback_dict)
@@ -396,28 +468,60 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
                                   merged_graph, callbacks_by_type[TransferType.DISK2H], new_op_callback_dict)
     merged_h2d_op = _merge_ops(ops_by_type[TransferType.H2D], TransferType.H2D,
                                merged_graph, callbacks_by_type[TransferType.H2D], new_op_callback_dict)
-    if merged_disk2h_op is not None and merged_h2d_op is not None:
-        merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
 
-    # PUT path: D2H -> H2DISK
-    merged_d2h_op = _merge_ops(ops_by_type[TransferType.D2H], TransferType.D2H,
-                               merged_graph, callbacks_by_type[TransferType.D2H], new_op_callback_dict)
-    merged_h2disk_op = _merge_ops(ops_by_type[TransferType.H2DISK], TransferType.H2DISK,
-                                  merged_graph, callbacks_by_type[TransferType.H2DISK], new_op_callback_dict)
-    if merged_d2h_op is not None and merged_h2disk_op is not None:
-        merged_graph.add_dependency(merged_h2disk_op.op_id, merged_d2h_op.op_id)
-
-    # batch_end_op_id: GET: H2D > DISK2H; PUT: H2DISK > D2H
-    if merged_h2d_op is not None:
-        batch_end_op_id = merged_h2d_op.op_id
-    elif merged_disk2h_op is not None:
-        batch_end_op_id = merged_disk2h_op.op_id
-    elif merged_h2disk_op is not None:
-        batch_end_op_id = merged_h2disk_op.op_id
-    elif merged_d2h_op is not None:
-        batch_end_op_id = merged_d2h_op.op_id
-    else:
+    if layerwise_transfer:
+        if merged_h2d_op is not None:
+            layerwise_transfer_op = LayerwiseTransferOp(
+                graph_id=merged_graph.graph_id,
+                src_block_ids_h2d=merged_h2d_op.src_block_ids,
+                dst_block_ids_h2d=merged_h2d_op.dst_block_ids,
+                src_block_ids_disk2h=merged_disk2h_op.src_block_ids \
+                    if merged_disk2h_op is not None \
+                    else np.array([], dtype=np.int64),
+                dst_block_ids_disk2h=merged_disk2h_op.dst_block_ids \
+                    if merged_disk2h_op is not None \
+                    else np.array([], dtype=np.int64),
+                dp_client_id=ops_by_type[TransferType.H2D][0].dp_client_id,
+                counter_id=counter_id,
+                # Indexer maps 1:1 with main KV blocks, use same block_ids
+                # CPU side (src) and GPU side (dst) for H2D direction
+                indexer_src_block_ids=merged_h2d_op.src_block_ids.copy(),
+                indexer_dst_block_ids=merged_h2d_op.dst_block_ids.copy(),
+            )
+            merged_graph.add_transfer_op(layerwise_transfer_op)
         batch_end_op_id = -1
+        new_op_callback_dict.clear()
+    else:
+        if merged_disk2h_op is not None:
+            merged_graph.add_transfer_op(merged_disk2h_op)
+        if merged_h2d_op is not None:
+            merged_graph.add_transfer_op(merged_h2d_op)
+        if merged_disk2h_op is not None and merged_h2d_op is not None:
+            merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
+
+        # PUT path: D2H -> H2DISK
+        merged_d2h_op = _merge_ops(ops_by_type[TransferType.D2H], TransferType.D2H,
+                                   merged_graph, callbacks_by_type[TransferType.D2H], new_op_callback_dict)
+        merged_h2disk_op = _merge_ops(ops_by_type[TransferType.H2DISK], TransferType.H2DISK,
+                                      merged_graph, callbacks_by_type[TransferType.H2DISK], new_op_callback_dict)
+        if merged_d2h_op is not None:
+            merged_graph.add_transfer_op(merged_d2h_op)
+        if merged_h2disk_op is not None:
+            merged_graph.add_transfer_op(merged_h2disk_op)
+        if merged_d2h_op is not None and merged_h2disk_op is not None:
+            merged_graph.add_dependency(merged_h2disk_op.op_id, merged_d2h_op.op_id)
+
+        # batch_end_op_id: GET: H2D > DISK2H; PUT: H2DISK > D2H
+        if merged_h2d_op is not None:
+            batch_end_op_id = merged_h2d_op.op_id
+        elif merged_disk2h_op is not None:
+            batch_end_op_id = merged_disk2h_op.op_id
+        elif merged_h2disk_op is not None:
+            batch_end_op_id = merged_h2disk_op.op_id
+        elif merged_d2h_op is not None:
+            batch_end_op_id = merged_d2h_op.op_id
+        else:
+            batch_end_op_id = -1
 
     return merged_graph, batch_end_op_id, new_op_callback_dict
 

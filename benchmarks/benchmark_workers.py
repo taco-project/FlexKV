@@ -377,12 +377,10 @@ def bench_worker(args):
 
     transfer_op = TransferOp(
         transfer_type=transfer_type,
-        layer_id=0,
-        layer_granularity=num_layers_to_transfer,
         src_block_ids=block_ids,
         dst_block_ids=block_ids,
         graph_id=0,
-        dp_id=0,
+        dp_client_id=0,
         successors=[],
         predecessors=[],
     )
@@ -397,12 +395,10 @@ def bench_worker(args):
 
         reverse_transfer_op = TransferOp(
             transfer_type=reverse_type,
-            layer_id=0,
-            layer_granularity=num_layers_to_transfer,
             src_block_ids=reverse_block_ids,
             dst_block_ids=reverse_block_ids,
             graph_id=1,
-            dp_id=0,
+            dp_client_id=0,
             successors=[],
             predecessors=[],
         )

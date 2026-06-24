@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, TYPE_CHECKING, List, Dict
 
+import time
 import numpy as np
 import torch
 
@@ -102,17 +103,18 @@ class HierarchyLRCacheEngine:
         if self._meta is None:
             raise ValueError("RedisMeta is not provided; ensure from_cache_config stores it or pass it to start().")
         #TODO can we use like this to distinguish the different tree pairs?
+        # Determine base block key prefix by device type
         if self.device_type == DeviceType.REMOTE:
-            local_ch_block_key = "PCFSB"
-            remote_ch_block_key = "PCFSB"
+            base_key = "PCFSB"
         elif self.device_type == DeviceType.CPU:
-            local_ch_block_key = "CPUB"
-            remote_ch_block_key = "CPUB"
+            base_key = "CPUB"
         elif self.device_type == DeviceType.SSD:
-            local_ch_block_key = "SSDB"
-            remote_ch_block_key = "SSDB"
+            base_key = "SSDB"
         else:
             raise ValueError(f"Invalid device type: {self.device_type}")
+
+        local_ch_block_key = base_key
+        remote_ch_block_key = base_key
         self.remote_ch = self._meta.get_redis_meta_channel(remote_ch_block_key)
         self.local_ch = self._meta.get_redis_meta_channel(local_ch_block_key)
                 # Load and store mapping of node_id -> file_nodeids from Redis
@@ -159,7 +161,6 @@ class HierarchyLRCacheEngine:
         num_blocks = sequence_meta.num_blocks
 
         # Query both local and remote
-        import time
         t0 = time.perf_counter()
         mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
         t1 = time.perf_counter()

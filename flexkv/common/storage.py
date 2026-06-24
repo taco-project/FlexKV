@@ -44,7 +44,7 @@ class KVCacheLayout:
                 self.kv_shape == other.kv_shape)
 
     @property
-    def _kv_dim(self) -> int:
+    def kv_dim(self) -> int:
         return 2 if not self.is_mla else 1
 
     @property
@@ -61,7 +61,7 @@ class KVCacheLayout:
         if self._kv_shape is None:
             if self.type == KVCacheLayoutType.LAYERFIRST:  # for Layerwise transfer
                 self._kv_shape = torch.Size([self.num_layer,
-                                             self._kv_dim,
+                                             self.kv_dim,
                                              self.num_block,
                                              self.tokens_per_block,
                                              self.num_head,
@@ -69,7 +69,7 @@ class KVCacheLayout:
             elif self.type == KVCacheLayoutType.BLOCKFIRST:
                 self._kv_shape = torch.Size([self.num_block,
                                              self.num_layer,
-                                             self._kv_dim,
+                                             self.kv_dim,
                                              self.tokens_per_block,
                                              self.num_head,
                                              self.head_size])
@@ -172,6 +172,7 @@ class StorageHandle:
     num_blocks_per_file: Optional[int] = None
     gpu_device_id: Optional[int] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
+    worker_data: Optional[Any] = None
 
     def get_tensor_list(self) -> List[torch.Tensor]:
         assert isinstance(self.data, list) and \
@@ -194,6 +195,11 @@ class StorageHandle:
             return self.data
         else:
             raise ValueError(f"Invalid handle type: {self.handle_type}, expected TENSOR")
+
+    def get_worker_tensor(self) -> Any:
+        if self.worker_data is not None:
+            return self.worker_data
+        return self.get_tensor()
 
     def get_file_list(self) -> Union[List[str], Dict[int, List[str]]]:
         if self.handle_type == AccessHandleType.FILE:

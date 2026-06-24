@@ -6,13 +6,11 @@ from dataclasses import dataclass
 from typing import Callable
 import multiprocessing as mp
 import copy
-import os
 from expiring_dict import ExpiringDict
 import nvtx
-import torch
 import numpy as np
 
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.block import hash_token
 from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
@@ -25,13 +23,10 @@ from flexkv.cache.cache_engine import (
 )
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
-from flexkv.transfer_manager import (
-    get_master_host_and_ports_from_env,
-    get_trtllm_subprocess_host_and_ports_from_env
-)
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics.collector import get_global_collector
+from flexkv.transfer_manager import TransferManagerMultiNodeHandle
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -67,7 +62,6 @@ class KVTask:
     token_ids: np.ndarray
     slot_mapping: np.ndarray
     token_mask: Optional[np.ndarray]
-    dp_id: int
 
     # cache engine return
     graph: TransferOpGraph
@@ -118,66 +112,57 @@ class KVTaskManager:
             raise ValueError("enable_kv_sharing and enable_gds cannot be used at the same time")
         if cache_config.enable_nixl and not cache_config.enable_gds:
             raise ValueError("enable_nixl requires enable_gds to be True")
-        if cache_config.enable_nixl and model_config.tp_size > 1:
+        if cache_config.enable_nixl and model_config.effective_tp_size_per_node > 1:
             raise ValueError(
-                "enable_nixl GPU-SSD path currently requires tp_size==1 (no tpNixlTransferWorker)"
+                "enable_nixl GPU-SSD path currently requires effective_tp_size_per_node==1 "
+                "(no tpNixlTransferWorker)"
             )
-        self.cache_config = cache_config
         self.model_config = model_config
-        self._check_config(model_config, cache_config)
+        self.cache_config = cache_config
 
-        self.is_multinode_tp = False
-        self.tp_node_count = 1
-        if self.model_config.tp_size > torch.cuda.device_count():
-            if self.model_config.tp_size != torch.cuda.device_count() * 2:
-                raise ValueError("Only support 2 nodes TP for now")
-            assert self.model_config.dp_size == 1
-            self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
-            self.is_multinode_tp = True
+        flexkv_logger.info(
+            f"[KVTaskEngine] topology: {self.model_config}"
+        )
 
         self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta, event_collector)
 
-        model_config_for_transfer = copy.deepcopy(self.model_config)
-        if self.is_multinode_tp:
-            model_config_for_transfer.tp_size //= self.tp_node_count
-            if not self.model_config.use_mla:
-                model_config_for_transfer.num_kv_heads //= self.tp_node_count
-
-        combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
-        if not combine_with_trtllm:
+        if not self.model_config.use_trtllm_subprocess:
             self.transfer_handles = [TransferManagerHandle(
-                model_config_for_transfer,
-                self.cache_config,
+                model_config,
+                cache_config,
                 mode="process",
                 gpu_register_port=gpu_register_port
             )]
         else:
             # When using FlexKV with TensorRT-LLM, we use remote mode to transfer data
             #  to avoid the way we launch subprocess in FlexKV
-            #  conflict with TensorRT-LLM's MPI initialization
-            master_host, master_ports = get_trtllm_subprocess_host_and_ports_from_env()
-            self.remote_process = TransferManagerOnRemote.create_process(mode="TrtllmSubprocess")
+            #  conflict with TensorRT-LLM's MPI initialization.
+            sub_host = self.model_config.trtllm_subprocess_host
+            sub_ports = self.model_config.trtllm_subprocess_ports
+            self.remote_process = TransferManagerOnRemote.create_process(
+                master_host=sub_host,
+                master_ports=sub_ports,
+            )
             self.transfer_handles = [
                 TransferManagerHandle(
-                    model_config_for_transfer,
-                    self.cache_config,
+                    model_config,
+                    cache_config,
                     mode="remote",
                     gpu_register_port=gpu_register_port,
-                    master_host=master_host,
-                    master_ports=master_ports
+                    master_host=sub_host,
+                    master_ports=sub_ports,
                 )
             ]
             self.transfer_handles[0]._handle.send_config_to_remotes()
 
-        if self.is_multinode_tp:
-            master_host, master_ports = get_master_host_and_ports_from_env()
+        if self.model_config.nnodes > 1:
             self.transfer_handles.append(TransferManagerHandle(
-                model_config_for_transfer,
-                self.cache_config,
+                model_config,
+                cache_config,
                 mode="remote",
                 gpu_register_port=gpu_register_port,
-                master_host=master_host,
-                master_ports=master_ports
+                master_host=self.model_config.master_host,
+                master_ports=self.model_config.master_ports,
             ))
             self.transfer_handles[-1]._handle.send_config_to_remotes()
 
@@ -223,9 +208,8 @@ class KVTaskManager:
                         task_id: int,
                         token_ids: np.ndarray,
                         slot_mapping: np.ndarray,
+                        dp_client_id: int,
                         token_mask: Optional[np.ndarray] = None,
-                        layer_granularity: int = -1,
-                        dp_id: int = 0,
                         is_fake_slot_mapping: bool = False,
                         temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
                         namespace: Optional[List[str]] = None,
@@ -237,9 +221,7 @@ class KVTaskManager:
             token_ids=token_ids,
             token_mask=token_mask,
             slot_mapping=slot_mapping,
-            layer_num=self.model_config.num_layers,
-            layer_granularity=layer_granularity,
-            dp_id=dp_id,
+            dp_client_id=dp_client_id,
             temp_cache_strategy=temp_cache_strategy,
             namespace=namespace)
         self.tasks[task_id] = KVTask(
@@ -251,7 +233,6 @@ class KVTaskManager:
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             token_mask=token_mask,
-            dp_id=dp_id,
             graph=graph,
             return_mask=return_mask,
             callback=callback,
@@ -263,8 +244,8 @@ class KVTaskManager:
                         task_id: int,
                         token_ids: np.ndarray,
                         slot_mapping: np.ndarray,
+                        dp_client_id: int,
                         token_mask: Optional[np.ndarray] = None,
-                        dp_id: int = 0,
                         is_fake_slot_mapping: bool = False,
                         namespace: Optional[List[str]] = None,
                         ) -> None:
@@ -275,8 +256,7 @@ class KVTaskManager:
             token_ids=token_ids,
             token_mask=token_mask,
             slot_mapping=slot_mapping,
-            layer_num=self.model_config.num_layers,
-            dp_id=dp_id,
+            dp_client_id=dp_client_id,
             namespace=namespace)
         self.tasks[task_id] = KVTask(
             task_id=task_id,
@@ -287,7 +267,6 @@ class KVTaskManager:
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             token_mask=token_mask,
-            dp_id=dp_id,
             graph=graph,
             return_mask=return_mask,
             callback=callback,
@@ -297,6 +276,7 @@ class KVTaskManager:
     def create_prefetch_task(self,
                             task_id: int,
                             token_ids: np.ndarray,
+                            dp_client_id: int,
                             namespace: Optional[List[str]] = None,
                             ) -> None:
         if task_id in self.tasks:
@@ -311,7 +291,7 @@ class KVTaskManager:
             token_ids=token_ids,
             token_mask=fake_token_mask,
             slot_mapping=fake_slot_mapping,
-            layer_num=self.model_config.num_layers,
+            dp_client_id=dp_client_id,
             temp_cache_strategy=temp_cache_strategy,
             namespace=namespace)
         self.tasks[task_id] = KVTask(
@@ -323,7 +303,6 @@ class KVTaskManager:
             token_ids=token_ids,
             slot_mapping=fake_slot_mapping,  # ignore slot_mapping for prefetch
             token_mask=fake_token_mask,  # ignore token_mask for prefetch
-            dp_id=0,  # ignore dp_id for prefetch
             graph=graph,
             return_mask=return_mask,
             callback=callback,
@@ -340,7 +319,21 @@ class KVTaskManager:
         nvtx.mark(f"launch task: task_id={task_id}, graph_id={transfer_graph.graph_id}")
         if transfer_graph.num_ops > 0:
             for transfer_handle in self.transfer_handles:
-                transfer_handle.submit(transfer_graph)
+                # For remote handles: deepcopy graph and clear GPU blocks when
+                # it's a cross-machine PP handle (different PP stages have
+                # different GPU block_ids).  Cross-machine TP handles share
+                # the same slot_mapping, so no clear is needed.
+                if isinstance(transfer_handle._handle, TransferManagerMultiNodeHandle):
+                    if self.model_config.nnodes > 1 and self.model_config.pp_size > 1:
+                        # Cross-machine PP: each PP rank has different GPU blocks
+                        graph_copy = copy.deepcopy(transfer_graph)
+                        graph_copy.clear_gpu_blocks()
+                        transfer_handle.submit(graph_copy, task_end_op_id=self.tasks[task_id].task_end_op_id)
+                    else:
+                        # Cross-machine TP: same slot_mapping across TP ranks
+                        transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
+                else:
+                    transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
         completed_ops = self._get_completed_ops(timeout)
@@ -477,49 +470,6 @@ class KVTaskManager:
                         self.uncompleted_ops[completed_op.op_id] = completed_count
         return results
 
-    def _check_config(self, model_config: ModelConfig, cache_config: CacheConfig) -> None:
-        if cache_config.enable_remote:
-            if cache_config.remote_cache_path is None:
-
-                if cache_config.remote_file_prefix is None:
-                    raise ValueError("remote_file_prefix must be provided when remote_cache_path is None")
-
-                if cache_config.remote_file_num is None or cache_config.remote_file_num <= 0:
-                    raise ValueError("remote_file_num must be a positive integer")
-
-                cache_config.remote_cache_path = [
-                    f"{cache_config.remote_file_prefix}_{i}"
-                    for i in range(cache_config.remote_file_num)
-                ]
-
-            if cache_config.remote_cache_size_mode == "block_num":
-                if cache_config.num_remote_blocks is None:
-                    raise ValueError("num_remote_blocks must not None if use block_num model")
-            elif cache_config.remote_cache_size_mode == "file_size":
-                if cache_config.remote_file_size is None:
-                    raise ValueError("remote_file_size must not None if use file_size model")
-                if model_config.use_mla:
-                    kv_size = (
-                        model_config.num_layers
-                        * cache_config.tokens_per_block
-                        * model_config.num_kv_heads
-                        * model_config.head_size
-                        * model_config.dtype.itemsize
-                    )
-                else:
-                    kv_size = (
-                        model_config.num_layers
-                        * 2
-                        * cache_config.tokens_per_block
-                        * model_config.num_kv_heads
-                        * model_config.head_size
-                        * model_config.dtype.itemsize
-                    )
-                cache_config.num_remote_blocks = cache_config.remote_file_size // kv_size * cache_config.remote_file_num
-
-            else:
-                raise ValueError("remote_cache_size_mode must block_num or file_size model")
-
 class KVTaskEngine(KVTaskManager):
     def __init__(self,
                  model_config: ModelConfig,
@@ -535,18 +485,16 @@ class KVTaskEngine(KVTaskManager):
     def get_async(self,
                   token_ids: np.ndarray,
                   slot_mapping: np.ndarray,
+                  dp_client_id: int = 0,
                   token_mask: Optional[np.ndarray] = None,
-                  layer_granularity: int = -1,
-                  dp_id: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
-        self._sync_prefetch(token_ids, namespace)
+        # self._sync_prefetch(token_ids, namespace)
         task_id, return_mask = self._get_match_impl(token_ids,
                                                     slot_mapping,
                                                     is_fake_slot_mapping=False,
                                                     token_mask=token_mask,
-                                                    layer_granularity=layer_granularity,
-                                                    dp_id=dp_id,
+                                                    dp_client_id=dp_client_id,
                                                     task_id=task_id,
                                                     namespace=namespace)
         # trace get request
@@ -556,8 +504,7 @@ class KVTaskEngine(KVTaskManager):
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             token_mask=token_mask,
-            layer_granularity=layer_granularity,
-            dp_id=dp_id
+            dp_client_id=dp_client_id
         )
         self._launch_task(task_id)
         return task_id, return_mask
@@ -565,15 +512,15 @@ class KVTaskEngine(KVTaskManager):
     def put_async(self,
                   token_ids: np.ndarray,
                   slot_mapping: np.ndarray,
+                  dp_client_id: int = 0,
                   token_mask: Optional[np.ndarray] = None,
-                  dp_id: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         task_id, return_mask = self._put_match_impl(token_ids,
                                                     slot_mapping,
                                                     is_fake_slot_mapping=False,
                                                     token_mask=token_mask,
-                                                    dp_id=dp_id,
+                                                    dp_client_id=dp_client_id,
                                                     task_id=task_id,
                                                     namespace=namespace)
         # trace put request
@@ -583,8 +530,7 @@ class KVTaskEngine(KVTaskManager):
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             token_mask=token_mask,
-            layer_granularity=-1,  # put has no layer_granularity parameter
-            dp_id=dp_id
+            dp_client_id=dp_client_id
         )
         self._launch_task(task_id)
         return task_id, return_mask
@@ -688,14 +634,13 @@ class KVTaskEngine(KVTaskManager):
 
     def get_match(self,
                   token_ids: np.ndarray,
+                  dp_client_id: int = 0,
                   token_mask: Optional[np.ndarray] = None,
-                  layer_granularity: int = -1,
-                  dp_id: int = 0,
                   cpu_only: bool = False,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
-        self._sync_prefetch(token_ids, namespace)
+        # self._sync_prefetch(token_ids, namespace)
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
         fake_slot_mapping = np.zeros_like(token_ids[token_mask])
@@ -703,8 +648,7 @@ class KVTaskEngine(KVTaskManager):
                                                            fake_slot_mapping,
                                                            is_fake_slot_mapping=True,
                                                            token_mask=token_mask,
-                                                           layer_granularity=layer_granularity,
-                                                           dp_id=dp_id,
+                                                           dp_client_id=dp_client_id,
                                                            cpu_only=cpu_only,
                                                            task_id=task_id,
                                                            namespace=namespace)
@@ -715,8 +659,7 @@ class KVTaskEngine(KVTaskManager):
             token_ids=token_ids,
             slot_mapping=fake_slot_mapping,
             token_mask=token_mask,
-            layer_granularity=layer_granularity,
-            dp_id=dp_id
+            dp_client_id=dp_client_id
         )
         nvtx.pop_range()
         return result_task_id, return_mask
@@ -724,29 +667,25 @@ class KVTaskEngine(KVTaskManager):
     def _get_match_impl(self,
                   token_ids: np.ndarray,
                   slot_mapping: np.ndarray,
+                  dp_client_id: int,
                   is_fake_slot_mapping: bool = False,
                   token_mask: Optional[np.ndarray] = None,
-                  layer_granularity: int = -1,
-                  dp_id: int = 0,
                   cpu_only: bool = False,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         if token_mask is None:
             token_mask = np.ones_like(token_ids)
-        if layer_granularity == -1:
-            layer_granularity = self.model_config.num_layers
         if task_id == -1:
             task_id = self._gen_task_id()
         temp_cache_strategy = DEFAULT_CACHE_STRATEGY
         if cpu_only:
             temp_cache_strategy = CPUONLY_CACHE_STRATEGY
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
-        self.create_get_task(task_id,
-                             token_ids,
-                             slot_mapping,
-                             token_mask,
-                             layer_granularity,
-                             dp_id,
+        self.create_get_task(task_id=task_id,
+                             token_ids=token_ids,
+                             slot_mapping=slot_mapping,
+                             dp_client_id=dp_client_id,
+                             token_mask=token_mask,
                              is_fake_slot_mapping=is_fake_slot_mapping,
                              temp_cache_strategy=temp_cache_strategy,
                              namespace=namespace)
@@ -756,8 +695,8 @@ class KVTaskEngine(KVTaskManager):
 
     def put_match(self,
                   token_ids: np.ndarray,
+                  dp_client_id: int = 0,
                   token_mask: Optional[np.ndarray] = None,
-                  dp_id: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         fake_slot_mapping = np.zeros_like(token_ids)
@@ -765,7 +704,7 @@ class KVTaskEngine(KVTaskManager):
                                                            fake_slot_mapping,
                                                            is_fake_slot_mapping=True,
                                                            token_mask=token_mask,
-                                                           dp_id=dp_id,
+                                                           dp_client_id=dp_client_id,
                                                            task_id=task_id,
                                                            namespace=namespace)
         # trace put match request
@@ -775,17 +714,16 @@ class KVTaskEngine(KVTaskManager):
             token_ids=token_ids,
             slot_mapping=fake_slot_mapping,
             token_mask=token_mask,
-            layer_granularity=-1,  # put has no layer_granularity parameter
-            dp_id=dp_id
+            dp_client_id=dp_client_id
         )
         return result_task_id, return_mask
 
     def _put_match_impl(self,
                         token_ids: np.ndarray,
                         slot_mapping: np.ndarray,
+                        dp_client_id: int,
                         is_fake_slot_mapping: bool = False,
                         token_mask: Optional[np.ndarray] = None,
-                        dp_id: int = 0,
                         task_id: int = -1,
                         namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         if token_mask is None:
@@ -793,11 +731,11 @@ class KVTaskEngine(KVTaskManager):
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"put match: task_id={task_id}", color=get_nvtx_default_color())
-        self.create_put_task(task_id,
-                             token_ids,
-                             slot_mapping,
-                             token_mask,
-                             dp_id,
+        self.create_put_task(task_id=task_id,
+                             token_ids=token_ids,
+                             slot_mapping=slot_mapping,
+                             dp_client_id=dp_client_id,
+                             token_mask=token_mask,
                              is_fake_slot_mapping=is_fake_slot_mapping,
                              namespace=namespace)
         self._process_empty_graph(task_id)
@@ -806,13 +744,13 @@ class KVTaskEngine(KVTaskManager):
 
     def prefetch_async(self,
                        token_ids: np.ndarray,
-                       dp_id: int = 0,
+                       dp_client_id: int = 0,
                        task_id: int = -1,
                        namespace: Optional[List[str]] = None) -> int:
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
-        self.create_prefetch_task(task_id, token_ids, namespace=namespace)
+        self.create_prefetch_task(task_id, token_ids, dp_client_id=dp_client_id, namespace=namespace)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
         # trace prefetch async request
@@ -822,8 +760,7 @@ class KVTaskEngine(KVTaskManager):
             token_ids=token_ids,
             slot_mapping=np.zeros_like(token_ids),
             token_mask=np.ones_like(token_ids),
-            layer_granularity=-1,
-            dp_id=dp_id
+            dp_client_id=dp_client_id
         )
         self._launch_task(task_id)
         return task_id
@@ -831,7 +768,9 @@ class KVTaskEngine(KVTaskManager):
     def merge_to_batch_kvtask(self,
                               batch_id: int,
                               task_ids: List[int],
-                              batch_task_type: TaskType) -> TransferOpGraph:
+                              batch_task_type: TaskType,
+                              layerwise_transfer: bool = False,
+                              counter_id: int = 0) -> TransferOpGraph:
         op_callback_dict = {}
         task_end_op_ids = []
         callbacks = []
@@ -848,11 +787,12 @@ class KVTaskEngine(KVTaskManager):
                 task_end_op_ids.append(self.tasks[task_id].task_end_op_id)
                 callbacks.append(self.tasks[task_id].callback)
                 return_masks.append(self.tasks[task_id].return_mask)
-
         batch_task_graph, task_end_op_id, op_callback_dict = merge_to_batch_graph(batch_id,
                                                                                   transfer_graphs,
                                                                                   task_end_op_ids,
-                                                                                  op_callback_dict)
+                                                                                  op_callback_dict,
+                                                                                  layerwise_transfer,
+                                                                                  counter_id)
         self.tasks[batch_id] = KVTask(
             task_id=batch_id,
             token_ids=np.concatenate([self.tasks[task_id].token_ids for task_id in task_ids]),
@@ -862,7 +802,6 @@ class KVTaskEngine(KVTaskManager):
             task_end_op_id=task_end_op_id,
             task_end_op_finished=False,
             status=TaskStatus.READY,
-            dp_id=self.tasks[task_ids[0]].dp_id,
             graph=batch_task_graph,
             return_mask=return_masks,
             callback=callbacks,
@@ -880,7 +819,9 @@ class KVTaskEngine(KVTaskManager):
                     task_ids: List[int],
                     slot_mappings: List[np.ndarray],
                     as_batch: bool = False,
-                    batch_id: int = -1) -> List[int]:
+                    batch_id: int = -1,
+                    layerwise_transfer: bool = False,
+                    counter_id: int = 0) -> List[int]:
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
@@ -891,11 +832,21 @@ class KVTaskEngine(KVTaskManager):
 
         all_get = all(self.tasks[tid].task_type == TaskType.GET for tid in task_ids)
         all_put = all(self.tasks[tid].task_type == TaskType.PUT for tid in task_ids)
-        if len(task_ids) > 1 and as_batch and (all_get or all_put):
+        if (len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put):
             if batch_id == -1:
                 batch_id = self._gen_task_id()
+            if layerwise_transfer:
+                if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+                    flexkv_logger.warning("layerwise transfer is not enabled")
+                    layerwise_transfer = False
+                elif not all_get:
+                    flexkv_logger.warning("only support layerwise get")
+                    layerwise_transfer = False
             batch_task_type = TaskType.BATCH_GET if all_get else TaskType.BATCH_PUT
-            transfer_graphs = [self.merge_to_batch_kvtask(batch_id, task_ids, batch_task_type)]
+            batch_task_graph = self.merge_to_batch_kvtask(
+                batch_id, task_ids, batch_task_type, layerwise_transfer, counter_id
+            )
+            transfer_graphs = [batch_task_graph]
             self.tasks[batch_id].status = TaskStatus.RUNNING
             task_ids = [batch_id]
         else:

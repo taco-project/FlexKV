@@ -65,7 +65,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.config import (
-    ModelConfig, CacheConfig, UserConfig,
+    ModelConfig, CacheConfig, UserConfig, RankInfo,
     update_default_config_from_user_config, parse_path_list,
     GLOBAL_CONFIG_FROM_ENV,
 )
@@ -163,7 +163,7 @@ def load_dist_direct_config(config_path: str):
         # Store mooncake_config_path in cache_config so it survives spawn subprocesses via pickle
         cache_config.mooncake_config_path = mooncake_config_path
 
-    update_default_config_from_user_config(model_config, cache_config, user_config)
+    update_default_config_from_user_config(RankInfo(model_config=model_config), cache_config, user_config)
 
     # IMPORTANT: Ensure server_client_mode is NOT set for direct mode
     # Even if config says server_client_mode: true, we override it here

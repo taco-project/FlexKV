@@ -170,10 +170,10 @@ class TensorSharedHandle:
         self.offset = offset
         
   
-        flexkv_logger.info(
-            f"TensorSharedHandle constructed from external IPC handle {self.ipc_handle.hex()} on device {self.device} \
-                with shape {self.tensor_shape} and dtype {self.tensor_dtype}, ptr offset={offset}"
-        )
+        # flexkv_logger.info(
+        #     f"TensorSharedHandle constructed from external IPC handle {self.ipc_handle.hex()} on device {self.device} \
+        #         with shape {self.tensor_shape} and dtype {self.tensor_dtype}, ptr offset={offset}"
+        # )
 
     @staticmethod
     def _ensure_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:

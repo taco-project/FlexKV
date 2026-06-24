@@ -47,10 +47,10 @@ class FlexkvLogger:
         self.logger.setLevel(log_level)
         self.enabled = log_level != (logging.CRITICAL + 1)
 
-    def _get_caller_info(self):
+    def _get_caller_info(self, skip: int = 2):
         frame = inspect.currentframe()
         try:
-            for _ in range(2):
+            for _ in range(skip):
                 frame = frame.f_back
                 if frame is None:
                     break
@@ -64,45 +64,42 @@ class FlexkvLogger:
 
         return "unknown", 0
 
+    def _log(self, level: int, msg: str, args: tuple, kwargs: dict) -> None:
+        """Build & dispatch a LogRecord, honoring ``exc_info`` like stdlib."""
+        # skip 3 frames: _get_caller_info -> _log -> public wrapper (e.g. error)
+        filename, lineno = self._get_caller_info(skip=3)
+        exc_info = kwargs.get("exc_info")
+        if exc_info:
+            if isinstance(exc_info, BaseException):
+                exc_info = (type(exc_info), exc_info, exc_info.__traceback__)
+            elif not isinstance(exc_info, tuple):
+                exc_info = sys.exc_info()
+        else:
+            exc_info = None
+        record = self.logger.makeRecord(
+            self.logger.name, level, filename, lineno, msg, args, exc_info
+        )
+        self.logger.handle(record)
+
     def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
         if self.enabled and self.logger.isEnabledFor(logging.DEBUG):
-            filename, lineno = self._get_caller_info()
-            record = self.logger.makeRecord(
-                self.logger.name, logging.DEBUG, filename, lineno, msg, args, None
-            )
-            self.logger.handle(record)
+            self._log(logging.DEBUG, msg, args, kwargs)
 
     def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
         if self.enabled and self.logger.isEnabledFor(logging.INFO):
-            filename, lineno = self._get_caller_info()
-            record = self.logger.makeRecord(
-                self.logger.name, logging.INFO, filename, lineno, msg, args, None
-            )
-            self.logger.handle(record)
+            self._log(logging.INFO, msg, args, kwargs)
 
     def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
         if self.enabled and self.logger.isEnabledFor(logging.WARNING):
-            filename, lineno = self._get_caller_info()
-            record = self.logger.makeRecord(
-                self.logger.name, logging.WARNING, filename, lineno, msg, args, None
-            )
-            self.logger.handle(record)
+            self._log(logging.WARNING, msg, args, kwargs)
 
     def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
         if self.enabled and self.logger.isEnabledFor(logging.ERROR):
-            filename, lineno = self._get_caller_info()
-            record = self.logger.makeRecord(
-                self.logger.name, logging.ERROR, filename, lineno, msg, args, None
-            )
-            self.logger.handle(record)
+            self._log(logging.ERROR, msg, args, kwargs)
 
     def critical(self, msg: str, *args: Any, **kwargs: Any) -> None:
         if self.enabled and self.logger.isEnabledFor(logging.CRITICAL):
-            filename, lineno = self._get_caller_info()
-            record = self.logger.makeRecord(
-                self.logger.name, logging.CRITICAL, filename, lineno, msg, args, None
-            )
-            self.logger.handle(record)
+            self._log(logging.CRITICAL, msg, args, kwargs)
 
 flexkv_logger = FlexkvLogger(os.getenv("FLEXKV_LOG_LEVEL", "INFO"))
 

@@ -16,21 +16,29 @@
  */
 #include "tp_transfer_thread_group.h"
 #include "transfer.cuh"
+#ifdef FLEXKV_ENABLE_NVCOMP
+#include "compression/ans/nvcomp_ans_tp.h"
+#endif
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <stdexcept>
+#include <type_traits>
 
 namespace flexkv {
 
 TPTransferThreadGroup::TPTransferThreadGroup(
     int num_gpus, const std::vector<int64_t> &gpu_block_ptrs_flat,
-    int num_tensors_per_gpu, int64_t cpu_blocks_ptr, int dp_group_id,
+    int num_tensors_per_gpu, int64_t cpu_blocks_ptr,
     int num_layers, const std::vector<int64_t> &gpu_kv_strides_in_bytes,
     const std::vector<int64_t> &gpu_block_strides_in_bytes,
     const std::vector<int64_t> &gpu_layer_strides_in_bytes,
     const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
-    const std::vector<int64_t> &gpu_device_ids) {
+    const std::vector<int64_t> &gpu_device_ids,
+    bool enable_nvcomp, int nvcomp_batch_size, int nvcomp_data_type) {
+  const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
+
   num_gpus_ = num_gpus;
   num_tensors_per_gpu_ = num_tensors_per_gpu;
-  dp_group_id_ = dp_group_id;
 
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
@@ -117,9 +125,18 @@ TPTransferThreadGroup::TPTransferThreadGroup(
       }
     });
   }
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  if (enable_nvcomp) {
+    init_nvcomp(nvcomp_batch_size, nvcomp_data_type);
+  }
+#endif
+
 }
 
 TPTransferThreadGroup::~TPTransferThreadGroup() {
+  const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
+
   stop_pool_ = true;
   for (auto &cv : cvs_)
     cv.notify_all();
@@ -128,6 +145,10 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
       t.join();
 
   cudaFreeHost(gpu_blocks_);
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  destroy_nvcomp_state();
+#endif
 
   gpu_tensor_handlers_.clear();
   delete[] gpu_kv_strides_in_bytes_;
@@ -167,6 +188,8 @@ void TPTransferThreadGroup::tp_group_transfer(
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
+  bool enable_sharded_d2h = is_mla && !is_host_to_device;
+
   for (int i = 0; i < num_gpus_; ++i) {
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
@@ -177,23 +200,20 @@ void TPTransferThreadGroup::tp_group_transfer(
         int64_t *cpu_block_ids =
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
         void *cpu_ptr = cpu_blocks_;
-        int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
-        if (is_mla && !is_host_to_device) {
+        int64_t cpu_startoff_inside_chunks = 0;
+        if (enable_sharded_d2h)
           cpu_startoff_inside_chunks =
               i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
-        } else if (is_mla && is_host_to_device) {
-          cpu_startoff_inside_chunks = 0;
-        }
+        else if (!is_mla)
+          cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
         int64_t gpu_startoff_inside_chunks =
-            is_mla && !is_host_to_device
-                ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_
-                : 0;
+            enable_sharded_d2h ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_
+                               : 0;
         // we assume that the chunk size is the same for all gpus,
         // even if they have different number of gpu_blocks
-        int64_t chunk_size = is_mla && !is_host_to_device
+        int64_t chunk_size = enable_sharded_d2h
                                  ? gpu_chunk_sizes_in_bytes_[i] / num_gpus_
                                  : gpu_chunk_sizes_in_bytes_[i];
-
         // Dispatch to the appropriate template based on backend type
         switch (backend_type_) {
         case BackendType::VLLM:

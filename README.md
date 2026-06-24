@@ -8,6 +8,8 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 
 ## Updates
 
+- **Jun 8, 2026**: Integrate nvcomp into FlexKV.
+
 - **Mar 17, 2026**: 🎉 FlexKV has been officially merged into [vLLM](https://github.com/vllm-project/vllm) mainline ([PR #34328](https://github.com/vllm-project/vllm/pull/34328))! Starting from **vLLM v0.17.2**, `FlexKVConnectorV1` is built in — no patch required. See [docs/vllm_adapter/README_en.md](docs/vllm_adapter/README_en.md) for updated usage.
 
 - **Mar 3, 2026**: 🎉 FlexKV has been officially merged into [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) ([PR #5858](https://github.com/ai-dynamo/dynamo/pull/5858))! FlexKV is now a native KV Cache Offloading option in Dynamo, enabling KV-aware routing + multi-level cache offloading in a unified pipeline. See [docs/dynamo_integration/README_en.md](docs/dynamo_integration/README_en.md).
