@@ -1,5 +1,6 @@
 import os
 import multiprocessing as mp
+import signal
 import time
 import queue
 import selectors
@@ -49,6 +50,10 @@ class TransferManager:
         self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks
         self.gpu_client_mapping: Dict[int, int] = {}  # device_id -> dp_client_id
 
+        # Indexer GPU registration data
+        self.all_indexer_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> indexer_gpu_blocks
+        self.all_indexer_gpu_layouts: Dict[int, KVCacheLayout] = {}
+
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
             self.context, zmq.SocketType.PULL, gpu_register_port, True)
@@ -68,6 +73,13 @@ class TransferManager:
                 self.all_gpu_blocks[device_id] = req.handles
                 self.all_gpu_layouts[device_id] = req.gpu_layout
                 self.gpu_client_mapping[device_id] = req.dp_client_id
+                # Store indexer GPU data if present
+                if req.indexer_handles is not None:
+                    self.all_indexer_gpu_blocks[device_id] = req.indexer_handles
+                    self.all_indexer_gpu_layouts[device_id] = req.indexer_gpu_layout
+                    flexkv_logger.info(
+                        f"GPU {device_id}: registered indexer handles "
+                        f"({len(req.indexer_handles)} layers)")
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
 
@@ -77,11 +89,22 @@ class TransferManager:
                                f"expected {self.expected_gpus} GPUs to register "
                                f"(instance_num={self.instance_num}, tp={self.model_config.tp_size}, "
                                f"dp={self.model_config.dp_size})")
+            last_log_time = time.time()
             while len(self.all_gpu_blocks) < self.expected_gpus:
                 try:
                     # Recv from: flexkv.server.client.KVTPClient.register_to_server
                     req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
                 except zmq.Again:
+                    # Periodically log waiting status for debugging
+                    now = time.time()
+                    if now - last_log_time >= 5.0:
+                        registered_ids = sorted(self.all_gpu_blocks.keys())
+                        flexkv_logger.info(
+                            f"Still waiting for GPU registrations: "
+                            f"{len(self.all_gpu_blocks)}/{self.expected_gpus} registered "
+                            f"(registered_device_ids={registered_ids}, "
+                            f"port={self.gpu_register_port})")
+                        last_log_time = now
                     time.sleep(0.001)
                     continue
 
@@ -115,10 +138,20 @@ class TransferManager:
         
         # Register GPU blocks with their global device IDs
         for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
-            self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper,
-                                                    self.all_gpu_layouts[device_id],
-                                                    device_id,
-                                                    dtype=self.model_config.dtype)
+            # Get indexer data for this device if available
+            indexer_gpu_blocks = self.all_indexer_gpu_blocks.get(device_id)
+            indexer_gpu_layout = self.all_indexer_gpu_layouts.get(device_id)
+            indexer_dtype = (self.cache_config.indexer.dtype
+                             if self.cache_config.indexer is not None else None)
+            self.storage_engine.register_gpu_blocks(
+                gpu_blocks_wrapper,
+                self.all_gpu_layouts[device_id],
+                device_id,
+                dtype=self.model_config.dtype,
+                indexer_gpu_blocks=indexer_gpu_blocks,
+                indexer_gpu_layout=indexer_gpu_layout,
+                indexer_dtype=indexer_dtype,
+            )
         
         # Group GPU handles by dp_client_id
         grouped_gpu_handles: Dict[int, List] = {}
@@ -138,12 +171,45 @@ class TransferManager:
             if self.cache_config.enable_remote \
             else None
         )
-        self.transfer_engine = TransferEngine(gpu_handles=grouped_gpu_handles,
-                                              model_config=self.model_config,
-                                              cache_config=self.cache_config,
-                                              cpu_handle=cpu_handle,
-                                              ssd_handle=ssd_handle,
-                                              remote_handle=remote_handle)
+
+        indexer_gpu_handles: Optional[Dict[int, List]] = None
+        if self.storage_engine.has_storage_handle(DeviceType.CPU, is_indexer=True):
+            indexer_gpu_handles = {}
+            for device_id in sorted(self.all_gpu_blocks.keys()):
+                if self.storage_engine.has_storage_handle(DeviceType.GPU, device_id, is_indexer=True):
+                    dp_client_id = self.gpu_client_mapping[device_id]
+                    if dp_client_id not in indexer_gpu_handles:
+                        indexer_gpu_handles[dp_client_id] = []
+                    indexer_gpu_handles[dp_client_id].append(
+                        self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_indexer=True))
+        indexer_cpu_handle = (
+            self.storage_engine.get_storage_handle(DeviceType.CPU, is_indexer=True)
+            if self.storage_engine.has_storage_handle(DeviceType.CPU, is_indexer=True)
+            else None
+        )
+        indexer_ssd_handle = (
+            self.storage_engine.get_storage_handle(DeviceType.SSD, is_indexer=True)
+            if self.storage_engine.has_storage_handle(DeviceType.SSD, is_indexer=True)
+            else None
+        )
+        indexer_remote_handle = (
+            self.storage_engine.get_storage_handle(DeviceType.REMOTE, is_indexer=True)
+            if self.storage_engine.has_storage_handle(DeviceType.REMOTE, is_indexer=True)
+            else None
+        )
+
+        self.transfer_engine = TransferEngine(
+            gpu_handles=grouped_gpu_handles,
+            model_config=self.model_config,
+            cache_config=self.cache_config,
+            cpu_handle=cpu_handle,
+            ssd_handle=ssd_handle,
+            remote_handle=remote_handle,
+            indexer_gpu_handles=indexer_gpu_handles,
+            indexer_cpu_handle=indexer_cpu_handle,
+            indexer_ssd_handle=indexer_ssd_handle,
+            indexer_remote_handle=indexer_remote_handle,
+        )
         flexkv_logger.info("Initialized TransferEngine successfully")
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:
@@ -162,10 +228,30 @@ class TransferManager:
         if hasattr(self, 'transfer_engine'):
             self.transfer_engine.shutdown()
 
-def get_master_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
-    master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
+def resolve_master_host_and_ports(
+    master_host: Optional[str] = None,
+) -> Tuple[str, Tuple[str, str, str]]:
+    """Resolve the (master_host, master_ports) tuple for multi-node transfer.
+
+    ``master_host`` resolution order:
+        1. explicit ``master_host`` argument (when provided by the caller,
+           e.g. via sglang ``--dist-init-addr``);
+        2. ``FLEXKV_MASTER_HOST`` env var (used by framework-agnostic
+           launchers such as TRT-LLM's ``multi_node_launch.sh``);
+        3. ``"localhost"`` default.
+
+    ``master_ports`` always comes from ``FLEXKV_MASTER_PORTS`` (or default),
+    because changing ports rarely warrants a host-aware plumbing change.
+    """
+    if master_host is None:
+        master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
     master_ports = os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558")
     master_ports = tuple(master_ports.split(","))
+    flexkv_logger.info(
+        f"[TransferManager] resolved master endpoint: "
+        f"host={master_host!r} (source={'arg' if master_host is not None else 'env/default'}), "
+        f"ports={master_ports}"
+    )
     return "tcp://" + master_host, master_ports
 
 def get_trtllm_subprocess_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
@@ -178,9 +264,11 @@ class TransferManagerOnRemote(TransferManager):
     """
     TransferManager for remote mode, used for multi-node tensor parallelism.
     """
-    def __init__(self, mode: str = "Default"):
+    def __init__(self, mode: str = "Default", master_host: Optional[str] = None):
         if mode == "Default":
-            self.master_host, self.master_ports = get_master_host_and_ports_from_env()
+            self.master_host, self.master_ports = resolve_master_host_and_ports(
+                master_host=master_host
+            )
         elif mode == "TrtllmSubprocess":
             self.master_host, self.master_ports = get_trtllm_subprocess_host_and_ports_from_env()
         else:
@@ -580,6 +668,19 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         gpu_register_port: str,
                         ready_event,
                         start_event) -> None:
+        # Automatically reap child processes (daemon transfer workers) to
+        # prevent zombie accumulation.  Use a handler that calls waitpid()
+        # with WNOHANG so that multiprocessing.Process.join() still works
+        # correctly (SIG_IGN would cause join() to raise ChildProcessError).
+        def _reap_children(signum, frame):
+            while True:
+                try:
+                    pid, _ = os.waitpid(-1, os.WNOHANG)
+                    if pid == 0:
+                        break
+                except ChildProcessError:
+                    break
+        signal.signal(signal.SIGCHLD, _reap_children)
         try:
             start_event.set()
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
@@ -655,6 +756,13 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     sel.close()
                 except Exception as e:
                     flexkv_logger.error(f"Error closing selector: {e}")
+
+            # Gracefully shut down transfer engine and its worker subprocesses
+            if 'transfer_manager' in locals():
+                try:
+                    transfer_manager.shutdown()
+                except Exception as e:
+                    flexkv_logger.error(f"Error shutting down transfer manager: {e}")
 
             command_conn.close()
             result_conn.close()
@@ -756,20 +864,20 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
         try:
             command_addr = f"{self.master_host}:{self.master_ports[0]}"
             self.command_socket.bind(command_addr)
-            flexkv_logger.debug(f"Master bound command port at {command_addr}")
+            flexkv_logger.info(f"Master bound command port at {command_addr}")
 
             result_addr = f"{self.master_host}:{self.master_ports[1]}"
             self.result_socket.bind(result_addr)
-            flexkv_logger.debug(f"Master bound result port at {result_addr}")
+            flexkv_logger.info(f"Master bound result port at {result_addr}")
 
             query_addr = f"{self.master_host}:{self.master_ports[2]}"
             self.query_socket.bind(query_addr)
-            flexkv_logger.debug(f"Master bound query port at {query_addr}")
+            flexkv_logger.info(f"Master bound query port at {query_addr}")
 
             self.result_socket.setsockopt(zmq.RCVTIMEO, 0)
 
             self._connected = True
-            flexkv_logger.debug("Master transfer manager ready for remote connections")
+            flexkv_logger.info("Master transfer manager ready for remote connections")
 
         except Exception as e:
             flexkv_logger.error(f"Master failed to bind ports: {e}")

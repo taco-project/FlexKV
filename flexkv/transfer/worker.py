@@ -33,8 +33,10 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
-from flexkv.common.transfer import get_nvtx_range_color
+from flexkv.common.transfer import get_nvtx_range_color, LayerwiseTransferOp
 from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
+from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
+
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
@@ -82,40 +84,6 @@ def cudaHostUnregister(tensor: torch.Tensor) -> None:
     size = tensor.numel() * tensor.element_size()
     ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
 
-@dataclass
-class WorkerTransferOp:
-    transfer_op_id: int
-    transfer_graph_id: int
-    transfer_type: TransferType
-    layer_id: int
-    layer_granularity: int
-    src_slot_id: int
-    dst_slot_id: int
-    valid_block_num: int
-    src_block_ids: np.ndarray
-    dst_block_ids: np.ndarray
-    src_block_node_ids: Optional[np.ndarray]
-    # successors: List[int]
-
-    def __init__(self, transfer_op: TransferOp):
-        self.transfer_op_id = transfer_op.op_id
-        self.transfer_graph_id = transfer_op.graph_id
-        self.transfer_type = transfer_op.transfer_type
-        self.layer_id = transfer_op.layer_id
-        self.layer_granularity = transfer_op.layer_granularity
-        self.src_slot_id = transfer_op.src_slot_id
-        self.dst_slot_id = transfer_op.dst_slot_id
-        self.valid_block_num = transfer_op.valid_block_num
-        # Always preserve optional src_block_node_ids from TransferOp
-        self.src_block_node_ids = transfer_op.src_block_node_ids
-
-        if self.src_slot_id == -1 or self.dst_slot_id == -1:
-            self.src_block_ids = transfer_op.src_block_ids
-            self.dst_block_ids = transfer_op.dst_block_ids
-        else:
-            self.src_block_ids = np.empty(0)
-            self.dst_block_ids = np.empty(0)
-        # self.successors = list(transfer_op.successors)  # for nvtx
 
 class TransferWorkerBase(ABC):
     _worker_id_counter = 0
@@ -270,8 +238,7 @@ class TransferWorkerBase(ABC):
                         transfer_status = False
                         try:
                             nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
-                                                f"graph_id: {op.transfer_graph_id}, "
-                                                f"num_blocks: {op.valid_block_num}",
+                                                f"graph_id: {op.transfer_graph_id}",
                                                 color=get_nvtx_range_color(op.transfer_graph_id))
                             transfer_status = self.launch_transfer(op)
                             nvtx.pop_range()
@@ -305,8 +272,12 @@ class WorkerHandle:
         self.process = process
         self.ready_event = ready_event
 
-    def submit_transfer(self, op: TransferOp) -> None:
-        self.transfer_conn.send(WorkerTransferOp(op))
+    def submit_transfer(self, op: Union[TransferOp, LayerwiseTransferOp]) -> None:
+        if isinstance(op, LayerwiseTransferOp):
+            worker_op = WorkerLayerwiseTransferOp(op)
+        else:
+            worker_op = WorkerTransferOp(op)
+        self.transfer_conn.send(worker_op)
 
     def shutdown(self) -> None:
         try:
@@ -489,6 +460,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  dtype: torch.dtype,
                  tp_group_size: int,
                  dp_group_id: int,
+                 is_nsa_cp: bool = False,
+                 cp_size: int = 1,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
@@ -506,6 +479,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
         self.is_mla = gpu_kv_layouts[0].is_mla
+        self.is_nsa_cp = is_nsa_cp
+        self.cp_size = cp_size
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
@@ -553,6 +528,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         cpu_blocks_ptr = cpu_blocks.data_ptr()
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
         num_tensors_per_gpu = len(self.gpu_blocks[0])
+
+        flexkv_logger.info(f"num_tensors_per_gpu: {num_tensors_per_gpu}")
 
         self.tp_transfer_thread_group = TPTransferThreadGroup(
             self.num_gpus,
@@ -613,6 +590,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             layer_id,
             layer_granularity,
             self.is_mla,
+            self.is_nsa_cp and self.cp_size > 1,
         )
 
 
@@ -2603,7 +2581,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
     def get_node_meta(self, node_id: int) -> Optional[NodeMetaInfo]:
         """Get the node meta info by node id.
-        
+
         Before returning cached or freshly-fetched meta, we verify that the
         node is still active (its node:<id> key exists in Redis and has not
         expired).  This prevents RDMA transfers to stale addresses after a

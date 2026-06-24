@@ -179,11 +179,13 @@ class KVDPClient:
         task_ids: List[int],
         slot_mappings: List[np.ndarray],
         as_batch: bool = False,
+        layerwise_transfer: bool = False,
+        counter_id: int = 0,
     ) -> List[int]:
         batch_id = -1
         if as_batch:
             batch_id = self._get_task_id()
-        req = LaunchTaskRequest(self.dp_client_id, task_ids, slot_mappings, as_batch, batch_id)
+        req = LaunchTaskRequest(self.dp_client_id, task_ids, slot_mappings, as_batch, batch_id, layerwise_transfer, counter_id)
         self.send_to_server.send_pyobj(req)
         return [batch_id] if as_batch else task_ids
 
@@ -249,13 +251,16 @@ class KVTPClient:
         self.dp_client_id = dp_client_id
         self.device_id = device_id
 
-        flexkv_logger.info(f"KVTPClient {device_id} of KVDPClient {self.dp_client_id} Initialized!")
+        flexkv_logger.info(f"KVTPClient {device_id} of KVDPClient {self.dp_client_id} Initialized! "
+                           f"(gpu_register_port={gpu_register_port})")
 
     def register_to_server(
         self,
         kv_caches: List[torch.Tensor],
         kv_layout: KVCacheLayout,
         override_device_id: Optional[int] = None,
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+        indexer_layout: Optional[KVCacheLayout] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
@@ -268,14 +273,33 @@ class KVTPClient:
             handle = TensorSharedHandle(tensor, device_id)
             handles.append(handle)
 
+        # Build optional indexer handles
+        indexer_handles = None
+        if indexer_buffers is not None and len(indexer_buffers) > 0:
+            indexer_handles = []
+            for tensor in indexer_buffers:
+                indexer_handles.append(TensorSharedHandle(tensor, device_id))
+
         register_req = RegisterTPClientRequest(
             self.dp_client_id,
             device_id,
             handles,
-            kv_layout
+            kv_layout,
+            indexer_handles=indexer_handles,
+            indexer_gpu_layout=indexer_layout,
         )
 
-        self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
+        try:
+            self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
+            flexkv_logger.info(
+                f"KVTPClient {device_id}: registration message sent "
+                f"(dp_client_id={self.dp_client_id}, num_kv_caches={len(kv_caches)})")
+        except zmq.Again:
+            flexkv_logger.error(
+                f"KVTPClient {device_id}: zmq.Again when sending registration "
+                f"(send buffer full or no connection). Retrying with blocking send...")
+            self.send_to_server.send_pyobj(register_req)
+            flexkv_logger.info(f"KVTPClient {device_id}: registration message sent (blocking retry)")
 
 
 if __name__ == "__main__":

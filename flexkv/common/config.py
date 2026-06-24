@@ -11,6 +11,16 @@ import torch
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
 
+
+@dataclass
+class IndexerCacheConfig:
+    """Indexer-specific cache configuration, embedded inside CacheConfig."""
+    # Indexer head layout
+    head_size: int = 0          # qk_rope_head_dim for DSA/NSA models
+    num_kv_heads: int = 1       # typically 1 for MLA-style indexer
+    dtype: torch.dtype = torch.uint8  # indexer storage dtype (fp8 quantized)
+
+
 @dataclass
 class ModelConfig:
     num_layers: int = 1
@@ -22,6 +32,32 @@ class ModelConfig:
     # parallel configs
     tp_size: int = 1
     dp_size: int = 1
+    dp_rank: int = 0
+    pp_size: int = 1
+    pp_rank: int = 0
+
+    # topology configs
+    #   nnodes        : number of physical machines spanned by one replica
+    #                   (== server_args.nnodes in SGLang)
+    #   node_rank     : index of this machine within ``nnodes``
+    #                   (== server_args.node_rank in SGLang).  Used by
+    #                   KVTaskEngine's multi-node topology derivation and
+    #                   for logging; NOT embedded in the layerwise UDS
+    #                   socket path (UDS endpoints are kernel-local).
+    nnodes: int = 1
+    node_rank: int = 0
+
+    # Multi-node bootstrap: master node's IP for TransferManager rendezvous.
+    # ``None`` falls back to ``FLEXKV_MASTER_HOST`` env var (default
+    # ``"localhost"``) inside ``resolve_master_host_and_ports``.  Set this
+    # from the framework's own launch config (e.g. sglang's
+    # ``--dist-init-addr``) to avoid exposing an extra env knob.
+    master_host: Optional[str] = None
+
+    # NSA context parallelism: when True, layerwise transfer sends full
+    # (unpartitioned) KV cache to every rank instead of head-sliced data.
+    is_nsa_cp: bool = False
+    cp_size: int = 1
 
     @property
     def token_size_in_bytes(self) -> int:
@@ -49,6 +85,9 @@ class CacheConfig:
     distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
     num_tmp_cpu_blocks: int = 500 # only used when distributed ssd p2p, it controls the number blocks of temp cpu buffer which used for copy data from ssd to cpu
 
+
+    # Indexer configuration
+    indexer: Optional[IndexerCacheConfig] = None
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
@@ -110,6 +149,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     ssd_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_SSD_LAYOUT', 'BLOCKFIRST').upper()),
     remote_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_REMOTE_LAYOUT', 'BLOCKFIRST').upper()),
     gds_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_GDS_LAYOUT', 'BLOCKFIRST').upper()),
+
+    enable_layerwise_transfer=bool(int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', 0))),
 
     use_ce_transfer_h2d=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0))),
     use_ce_transfer_d2h=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0))),

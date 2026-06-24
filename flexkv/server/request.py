@@ -22,6 +22,9 @@ class RegisterTPClientRequest:
     device_id: int
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
+    # --- Indexer shadow transfer fields ---
+    indexer_handles: Optional[List[TensorSharedHandle]] = None
+    indexer_gpu_layout: Optional[KVCacheLayout] = None
 
 @dataclass
 class IsReadyRequest:
@@ -79,6 +82,8 @@ class LaunchTaskRequest:
     slot_mappings: List[np.ndarray]
     as_batch: bool = False
     batch_id: int = -1
+    layerwise_transfer: bool = False
+    counter_id: int = 0  # Counter set index for triple buffering eventfd notification
 
 @dataclass
 class CancelTaskRequest:

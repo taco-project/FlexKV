@@ -9,10 +9,9 @@ import copy
 import os
 from expiring_dict import ExpiringDict
 import nvtx
-import torch
 import numpy as np
 
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.block import hash_token
 from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
@@ -26,7 +25,7 @@ from flexkv.cache.cache_engine import (
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
 from flexkv.transfer_manager import (
-    get_master_host_and_ports_from_env,
+    resolve_master_host_and_ports,
     get_trtllm_subprocess_host_and_ports_from_env
 )
 from flexkv.cache.redis_meta import RedisMeta
@@ -130,22 +129,61 @@ class KVTaskManager:
         self.model_config = model_config
         self._check_config(model_config, cache_config)
 
-        self.is_multinode_tp = False
-        self.tp_node_count = 1
-        if self.model_config.tp_size > torch.cuda.device_count():
-            if self.model_config.tp_size != torch.cuda.device_count() * 2:
-                raise ValueError("Only support 2 nodes TP for now")
-            assert self.model_config.dp_size == 1
-            self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
-            self.is_multinode_tp = True
+        # ---- Multi-node topology ----
+        nnodes = self.model_config.nnodes
+        pp_size = self.model_config.pp_size
+        tp_size = self.model_config.tp_size
+
+        total_gpus = tp_size * pp_size
+        if total_gpus % nnodes != 0:
+            raise ValueError(
+                f"[KVTaskEngine] cannot derive gpus_per_node: "
+                f"tp*pp={total_gpus} not divisible by nnodes={nnodes}"
+            )
+        gpus_per_node = total_gpus // nnodes
+
+        self.nnodes_per_tp_group = max(
+            (tp_size + gpus_per_node - 1) // gpus_per_node, 1
+        )
+        if self.nnodes_per_tp_group > 2:
+            raise ValueError(
+                f"Only support 2-nodes TP for now, but got "
+                f"nnodes_per_tp_group={self.nnodes_per_tp_group} "
+                f"(tp_size={tp_size}, gpus_per_node={gpus_per_node})"
+            )
+
+        if tp_size % self.nnodes_per_tp_group != 0:
+            raise ValueError(
+                f"[KVTaskEngine] tp_size={tp_size} not divisible by "
+                f"nnodes_per_tp_group={self.nnodes_per_tp_group}"
+            )
+        tp_size_per_node = tp_size // self.nnodes_per_tp_group
+
+        flexkv_logger.info(
+            f"[KVTaskEngine] topology: "
+            f"nnodes={nnodes}, "
+            f"node_rank={self.model_config.node_rank}, "
+            f"gpus_per_node={gpus_per_node}, "
+            f"tp_size={tp_size}, "
+            f"pp_size={pp_size}, "
+            f"dp_size={self.model_config.dp_size}, "
+            f"nnodes_per_tp_group={self.nnodes_per_tp_group}, "
+            f"tp_size_per_node={tp_size_per_node}, "
+            f"master_host={self.model_config.master_host!r}"
+        )
 
         self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta, event_collector)
 
         model_config_for_transfer = copy.deepcopy(self.model_config)
-        if self.is_multinode_tp:
-            model_config_for_transfer.tp_size //= self.tp_node_count
+        if self.nnodes_per_tp_group > 1:
+            model_config_for_transfer.tp_size //= self.nnodes_per_tp_group
             if not self.model_config.use_mla:
-                model_config_for_transfer.num_kv_heads //= self.tp_node_count
+                model_config_for_transfer.num_kv_heads //= self.nnodes_per_tp_group
+            # When NSA CP is active, cp_size mirrors tp_size and must also
+            # be divided so that TransferEngine's _eventfd_group_size matches
+            # the number of local GPUs on each node.
+            if model_config_for_transfer.is_nsa_cp and model_config_for_transfer.cp_size > 1:
+                model_config_for_transfer.cp_size //= self.nnodes_per_tp_group
 
         combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
         if not combine_with_trtllm:
@@ -173,8 +211,10 @@ class KVTaskManager:
             ]
             self.transfer_handles[0]._handle.send_config_to_remotes()
 
-        if self.is_multinode_tp:
-            master_host, master_ports = get_master_host_and_ports_from_env()
+        if self.nnodes_per_tp_group > 1:
+            master_host, master_ports = resolve_master_host_and_ports(
+                master_host=self.model_config.master_host
+            )
             self.transfer_handles.append(TransferManagerHandle(
                 model_config_for_transfer,
                 self.cache_config,
@@ -551,7 +591,7 @@ class KVTaskEngine(KVTaskManager):
                   dp_id: int = 0,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
-        self._sync_prefetch(token_ids, namespace)
+        # self._sync_prefetch(token_ids, namespace)
         task_id, return_mask = self._get_match_impl(token_ids,
                                                     slot_mapping,
                                                     is_fake_slot_mapping=False,
@@ -707,7 +747,7 @@ class KVTaskEngine(KVTaskManager):
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
-        self._sync_prefetch(token_ids, namespace)
+        # self._sync_prefetch(token_ids, namespace)
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
         fake_slot_mapping = np.zeros_like(token_ids[token_mask])
@@ -841,9 +881,13 @@ class KVTaskEngine(KVTaskManager):
         return task_id
 
     def merge_to_batch_kvtask(self,
+
                               batch_id: int,
+
                               task_ids: List[int],
-                              batch_task_type: TaskType) -> TransferOpGraph:
+                              batch_task_type: TaskType,
+                              layerwise_transfer: bool = False,
+                              counter_id: int = 0) -> TransferOpGraph:
         op_callback_dict = {}
         task_end_op_ids = []
         callbacks = []
@@ -860,11 +904,12 @@ class KVTaskEngine(KVTaskManager):
                 task_end_op_ids.append(self.tasks[task_id].task_end_op_id)
                 callbacks.append(self.tasks[task_id].callback)
                 return_masks.append(self.tasks[task_id].return_mask)
-
         batch_task_graph, task_end_op_id, op_callback_dict = merge_to_batch_graph(batch_id,
                                                                                   transfer_graphs,
                                                                                   task_end_op_ids,
-                                                                                  op_callback_dict)
+                                                                                  op_callback_dict,
+                                                                                  layerwise_transfer,
+                                                                                  counter_id)
         self.tasks[batch_id] = KVTask(
             task_id=batch_id,
             token_ids=np.concatenate([self.tasks[task_id].token_ids for task_id in task_ids]),
@@ -891,7 +936,9 @@ class KVTaskEngine(KVTaskManager):
                     task_ids: List[int],
                     slot_mappings: List[np.ndarray],
                     as_batch: bool = False,
-                    batch_id: int = -1) -> List[int]:
+                    batch_id: int = -1,
+                    layerwise_transfer: bool = False,
+                    counter_id: int = 0) -> List[int]:
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
@@ -902,11 +949,21 @@ class KVTaskEngine(KVTaskManager):
 
         all_get = all(self.tasks[tid].task_type == TaskType.GET for tid in task_ids)
         all_put = all(self.tasks[tid].task_type == TaskType.PUT for tid in task_ids)
-        if len(task_ids) > 1 and as_batch and (all_get or all_put):
+        if (len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put):
             if batch_id == -1:
                 batch_id = self._gen_task_id()
+            if layerwise_transfer:
+                if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+                    flexkv_logger.warning("layerwise transfer is not enabled")
+                    layerwise_transfer = False
+                elif not all_get:
+                    flexkv_logger.warning("only support layerwise get")
+                    layerwise_transfer = False
             batch_task_type = TaskType.BATCH_GET if all_get else TaskType.BATCH_PUT
-            transfer_graphs = [self.merge_to_batch_kvtask(batch_id, task_ids, batch_task_type)]
+            batch_task_graph = self.merge_to_batch_kvtask(
+                batch_id, task_ids, batch_task_type, layerwise_transfer, counter_id
+            )
+            transfer_graphs = [batch_task_graph]
             self.tasks[batch_id].status = TaskStatus.RUNNING
             task_ids = [batch_id]
         else:

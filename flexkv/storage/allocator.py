@@ -172,6 +172,12 @@ class SSDAllocator(BaseStorageAllocator):
         real_file_size = num_blocks_per_file * block_size
 
         ssd_files: Dict[int, List[str]] = {}
+        total_num_files = num_files_per_device * num_ssd_devices
+        real_total_size = total_num_files * real_file_size
+        flexkv_logger.info(f"SSD allocator creating {total_num_files} files in {cache_dir}, "
+                           f"each file {real_file_size/1024/1024/1024:.2f} GB, "
+                           f"total {real_total_size/1024/1024/1024:.2f} GB")
+        file_count = 0
         for i in range(num_ssd_devices):
             ssd_files[i] = []
             for j in range(num_files_per_device):
@@ -179,9 +185,13 @@ class SSDAllocator(BaseStorageAllocator):
                 with open(file_path, "wb+", buffering=0) as file:
                     cls._create_file(file, real_file_size)
                 ssd_files[i].append(file_path)
-        total_num_files = num_files_per_device * num_ssd_devices
-        real_total_size = total_num_files * real_file_size
-        flexkv_logger.info(f"SSD allocator create total {total_num_files} files in {cache_dir}, "
+                file_count += 1
+                if file_count % max(1, total_num_files // 10) == 0 or file_count == total_num_files:
+                    flexkv_logger.info(
+                        f"SSD allocator progress: {file_count}/{total_num_files} files created "
+                        f"({file_count * 100 // total_num_files}%)"
+                    )
+        flexkv_logger.info(f"SSD allocator done: {total_num_files} files in {cache_dir}, "
                            f"each file has {real_file_size/1024/1024/1024:.2f} GB, total size {real_total_size/1024/1024/1024:.2f} GB")
         return StorageHandle(
             handle_type=AccessHandleType.FILE,

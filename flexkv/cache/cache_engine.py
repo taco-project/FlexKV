@@ -81,7 +81,7 @@ class CacheEngineAccel:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
-        
+
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
@@ -161,25 +161,25 @@ class CacheEngineAccel:
              strict: bool = True) -> np.ndarray:
         # Calculate current utilization
         utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
-        
+
         # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
         should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
-        
+
         if should_evict:
             if protected_node is not None:
                 self.index.lock(protected_node)
-            
+
             # Calculate how many blocks to evict
             # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
             target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
             evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
-            
+
             evict_block_num = max(
                 num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
                 evict_to_reach_target,                               # Or reach target free ratio
                 int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
             )
-            
+
             if evict_block_num > 0:
                 target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
                 evicted_block_hashes = torch.zeros(evict_block_num, dtype=torch.int64)
@@ -201,18 +201,18 @@ class CacheEngineAccel:
                     )
             if protected_node is not None:
                 self.index.unlock(protected_node)
-        
+
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise RuntimeError(f"Not enough free blocks to take, "
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
-        
+
         # Record allocation metrics
         if self._metrics_collector is not None and num_allocated_blocks > 0:
             self._metrics_collector.record_allocation(DEVICE_TYPE[self.device_type].lower(), num_allocated_blocks)
-        
+
         return allocated_blocks
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
@@ -300,19 +300,19 @@ class CacheEngine:
              strict: bool = True) -> np.ndarray:
         # Calculate current utilization
         utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
-        
+
         # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
         should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
-        
+
         if should_evict:
             if protected_node is not None:
                 self.index.lock(protected_node)
-            
+
             # Calculate how many blocks to evict
             # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
             target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
             evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
-            
+
             evict_block_num = max(
                 num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
                 evict_to_reach_target,                               # Or reach target free ratio
@@ -321,28 +321,28 @@ class CacheEngine:
             if evict_block_num > 0:
                 evicted_blocks, evicted_block_hashes = self.index.evict(evict_block_num)
                 self.mempool.recycle_blocks(evicted_blocks)
-                
+
                 # Record eviction metrics
                 if self._metrics_collector is not None and len(evicted_blocks) > 0:
                     self._metrics_collector.record_eviction(DEVICE_TYPE[self.device_type].lower(), len(evicted_blocks))
-                
+
                 if self.event_collector is not None:
                     self.event_collector.publish_removed(block_hashes=evicted_block_hashes,
                                                          medium=DEVICE_TYPE[self.device_type])
             if protected_node is not None:
                 self.index.unlock(protected_node)
-        
+
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise RuntimeError("Not enough free blocks to take, ",
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
-        
+
         # Record allocation metrics
         if self._metrics_collector is not None and num_allocated_blocks > 0:
             self._metrics_collector.record_allocation(DEVICE_TYPE[self.device_type].lower(), num_allocated_blocks)
-        
+
         return allocated_blocks
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
@@ -409,7 +409,7 @@ class GlobalCacheEngine:
 
         if cache_config.enable_cpu:
             if cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
+                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size) #TODO
             elif self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.CPU,
@@ -439,7 +439,7 @@ class GlobalCacheEngine:
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
-                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
+                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size) #TODO
             elif self.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.SSD,
@@ -470,7 +470,7 @@ class GlobalCacheEngine:
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
-                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
+                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta, pp_rank=self.model_config.pp_rank, pp_size=self.model_config.pp_size)
             elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.REMOTE,
@@ -506,7 +506,7 @@ class GlobalCacheEngine:
             lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0)
         self._empty_put_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]] = \
             lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0, 0)
-        
+
         # Update initial mempool stats
         self._update_mempool_metrics()
 
@@ -538,7 +538,7 @@ class GlobalCacheEngine:
                     engine.mempool.num_total_blocks,
                     engine.mempool.num_free_blocks
                 )
-    
+
     def get(self,
             request_id: int,
             token_ids: np.ndarray,
@@ -572,6 +572,13 @@ class GlobalCacheEngine:
 
         aligned_token_ids = token_ids[:aligned_length]
         token_mask[aligned_length:] = False
+
+        if aligned_length == 0 or not token_mask.any():
+            transfer_graph = TransferOpGraph.create_empty_graph()
+            transfer_graph.bind_to_dp_group(dp_id)
+            return_mask = np.zeros_like(token_mask, dtype=np.bool_)
+            callback = partial(self._transfer_callback, node_to_unlock={}, buffer_to_free={})
+            return transfer_graph, return_mask, callback, {}, -1
 
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
         assert block_end_idx == aligned_length // self.tokens_per_block
@@ -638,11 +645,11 @@ class GlobalCacheEngine:
                                               device_type=op_node_to_ready[op_id][0],
                                               node_to_ready=op_node_to_ready[op_id][1],
                                               ready_length=op_node_to_ready[op_id][2])
-        
+
         # Update mempool metrics after GET operation
         if self._metrics_collector is not None:
             self._update_mempool_metrics()
-        
+
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
     def _get_impl_global(self,
@@ -980,7 +987,7 @@ class GlobalCacheEngine:
             transfer_graph.add_transfer_op(op_peerh2h)
             #TODO here we dont combine peer cpu or local cpu match results, so we can safely add remote results to local cpu
             #TODO here assume all matched blocks are ready blocks for peer cpu
-            if (cpu_matched_result.insert_to_local_cpu_index and 
+            if (cpu_matched_result.insert_to_local_cpu_index and
                 cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
                 cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
                 cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
@@ -1373,11 +1380,11 @@ class GlobalCacheEngine:
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
-        
+
         #if len(cpu_matched_blocks) > len(ssd_matched_blocks):
         #    print(f"[PUT_LOCAL] CPU matched blocks are greater than SSD matched blocks, skipping")
         #    return self._empty_put_return(request_id)
-        
+
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
