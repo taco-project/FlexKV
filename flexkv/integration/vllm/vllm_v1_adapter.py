@@ -27,26 +27,92 @@ from vllm.distributed.parallel_state import get_tp_group
 try:
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 
-    class _FlexKVWorkerSentinelStats(KVConnectorStats):
-        """Sentinel stats returned from the worker side so that
-        KVConnectorOutput.is_empty() returns False.  The scheduler
-        aggregates worker stats with its own; this implementation
-        simply forwards to the other side so no real data is lost."""
+    class FlexKVConnectorStats(KVConnectorStats):
+        """Stats type used on BOTH worker and scheduler sides of
+        FlexKVConnectorV1.
+
+        Why a single subclass for both sides
+        ------------------------------------
+        vLLM's ``MultiKVConnectorStats.aggregate()`` (see
+        ``vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py``)
+        does a strict ``isinstance(stats, type(self.data[connector_id]))``
+        check before delegating to the per-connector aggregate.  In
+        ``MultiConnector([FlexKVConnectorV1, NixlConnector])`` (the typical
+        PD-disaggregated setup with Dynamo) the worker-side and
+        scheduler-side stats for a given sub-connector must therefore be the
+        SAME concrete subclass — otherwise the assertion fires on the very
+        first scheduler step and the engine dies with
+        ``EngineDeadError``.
+
+        Previous versions returned ``_FlexKVWorkerSentinelStats`` on the
+        worker and base ``KVConnectorStats`` on the scheduler; that violates
+        the contract and crashes ``MultiKVConnectorStats``.  Using a single
+        subclass on both sides is what every other connector
+        (NixlConnector, HF3FS, offloading worker, ...) already does.
+
+        Why we need to subclass at all
+        ------------------------------
+        - The base ``KVConnectorStats.aggregate / reduce / reset / is_empty``
+          all raise ``NotImplementedError``, so returning the base class
+          directly would crash any aggregator that calls those methods.
+        - The worker side must return a non-None object so
+          ``KVConnectorOutput.is_empty()`` returns False, otherwise
+          ``no_forward()`` discards the output when
+          ``total_num_scheduled_tokens == 0`` and requests stuck in
+          ``WAITING_FOR_REMOTE_KVS`` hang forever.
+
+        Semantics
+        ---------
+        - Worker side produces an empty-data instance (no FlexKV metrics
+          collected on workers; the scheduler-side connector owns them).
+        - Scheduler side produces an instance populated with the real
+          per-interval counters.
+        - ``aggregate`` is empty-aware so ``worker.aggregate(scheduler)``
+          yields the scheduler's real data without losing it.
+        - ``is_empty`` reports True only when there is no data, so vLLM's
+          ``KVConnectorLogging`` pipeline actually surfaces FlexKV metrics.
+        """
 
         def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
-            return other
+            # Empty-aware merge: whichever side is empty defers to the other.
+            # This preserves the prior "worker just forwards to scheduler"
+            # behaviour while also being well-defined if both sides ever
+            # carry real data in the future.
+            self_empty = not self.data
+            other_empty = not getattr(other, "data", None)
+            if self_empty and other_empty:
+                return self
+            if self_empty:
+                return other
+            if other_empty:
+                return self
+            merged = dict(self.data)
+            for k, v in other.data.items():
+                cur = merged.get(k)
+                if isinstance(v, (int, float)) and isinstance(cur, (int, float)):
+                    merged[k] = cur + v
+                else:
+                    merged[k] = v
+            return FlexKVConnectorStats(data=merged)
 
         def reduce(self) -> dict[str, int | float]:
-            return {}
+            # Already-flat scalar dict — return as-is for the logger.
+            return dict(self.data)
 
         def reset(self):
-            pass
+            self.data = {}
 
         def is_empty(self) -> bool:
-            return True
+            return not self.data
+
+    # Back-compat alias: older code paths inside FlexKV (and any third party
+    # patches against this module) imported the previous sentinel name.
+    # Keep the symbol pointing at the merged class so they keep working.
+    _FlexKVWorkerSentinelStats = FlexKVConnectorStats
 
 except ImportError:
     KVConnectorStats = None  # type: ignore[misc,assignment]
+    FlexKVConnectorStats = None  # type: ignore[misc,assignment]
     _FlexKVWorkerSentinelStats = None  # type: ignore[misc,assignment]
 
 # KVConnectorOutput: available since v0.10.1
@@ -1030,19 +1096,30 @@ class FlexKVConnectorV1Impl:
         """
         Get the KV connector stats collected during the last interval.
         Available since vLLM v0.11.0.
+
+        Both worker and scheduler return the SAME concrete subclass
+        (``FlexKVConnectorStats``).  This is required by vLLM's
+        ``MultiKVConnectorStats.aggregate()`` (used in PD-disaggregated
+        deployments where FlexKV sits alongside NixlConnector inside a
+        ``MultiConnector``) which asserts type-equality between the
+        worker-side and scheduler-side stats for a given sub-connector
+        before delegating to the per-connector aggregate.  Returning
+        different subtypes here causes ``EngineDeadError`` on the first
+        request.  See the ``FlexKVConnectorStats`` docstring for details.
         """
-        if KVConnectorStats is None:
+        if KVConnectorStats is None or FlexKVConnectorStats is None:
             return None
 
         if self.role != KVConnectorRole.SCHEDULER:
-            # Must return non-None so KVConnectorOutput.is_empty() returns
-            # False on the worker side.  Otherwise, when
-            # total_num_scheduled_tokens == 0, no_forward() discards the
-            # output and the scheduler never polls query_finished_task(),
-            # causing requests in WAITING_FOR_REMOTE_KVS to hang forever.
-            # Use sentinel subclass whose aggregate() delegates to the
-            # scheduler's stats, avoiding NotImplementedError.
-            return _FlexKVWorkerSentinelStats(data={})
+            # Worker side: must return non-None so
+            # ``KVConnectorOutput.is_empty()`` returns False.  Otherwise,
+            # when ``total_num_scheduled_tokens == 0``, ``no_forward()``
+            # discards the output and the scheduler never polls
+            # ``query_finished_task()``, causing requests stuck in
+            # WAITING_FOR_REMOTE_KVS to hang forever.  Empty-data instance
+            # of the same concrete subclass keeps type-equality with the
+            # scheduler-side return below.
+            return FlexKVConnectorStats(data={})
 
         stats = self.connector.flexkv_stats
         data = {
@@ -1057,7 +1134,7 @@ class FlexKVConnectorV1Impl:
             "get_gpu_match_ratio": stats.get_gpu_match_ratio,
             "get_flexkv_match_ratio": stats.get_flexkv_match_ratio,
         }
-        return KVConnectorStats(data=data)
+        return FlexKVConnectorStats(data=data)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         if self.role == KVConnectorRole.SCHEDULER:
