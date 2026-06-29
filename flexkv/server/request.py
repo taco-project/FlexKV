@@ -29,6 +29,9 @@ class RegisterTPClientRequest:
     layer_groups: Optional[List[LayerGroupSpec]] = None
     gpu_layouts: Optional[List[KVCacheLayout]] = None
     handles_per_group: Optional[List[List[TensorSharedHandle]]] = None
+    # SWA transfer fileds
+    swa_handles: Optional[List[TensorSharedHandle]] = None
+    swa_layout: Optional[KVCacheLayout] = None
 
 
 @dataclass

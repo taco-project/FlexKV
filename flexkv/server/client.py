@@ -351,6 +351,8 @@ class KVTPClient:
         layer_groups: Optional[List[LayerGroupSpec]] = None,
         gpu_layouts: Optional[List[KVCacheLayout]] = None,
         handles_per_group: Optional[List[List[torch.Tensor]]] = None,
+        swa_caches: Optional[List[torch.Tensor]] = None,
+        swa_layout: Optional[KVCacheLayout] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
@@ -372,6 +374,15 @@ class KVTPClient:
                 group_handles = [TensorSharedHandle(t, device_id) for t in group_tensors]
                 handles_per_group_shared.append(group_handles)
 
+        # SWA dedicated pool handles (channel B): build CUDA IPC handles for
+        # the sliding-window-attention GPU buffers so the FlexKV worker process
+        # can map them independently of the main-KV pool.
+        swa_handles_shared: Optional[List[TensorSharedHandle]] = None
+        if swa_caches is not None and len(swa_caches) > 0:
+            if not swa_caches[0].is_cuda:
+                raise ValueError("SWA blocks must be CUDA tensors")
+            swa_handles_shared = [TensorSharedHandle(t, device_id) for t in swa_caches]
+
         register_req = RegisterTPClientRequest(
             dp_client_id=self.dp_client_id,
             pp_rank=self.pp_rank,
@@ -381,6 +392,8 @@ class KVTPClient:
             layer_groups=layer_groups,
             gpu_layouts=gpu_layouts,
             handles_per_group=handles_per_group_shared,
+            swa_handles=swa_handles_shared,
+            swa_layout=swa_layout,
         )
 
         try:

@@ -9,6 +9,7 @@ from typing import Dict, Optional, List, Tuple, Any
 from abc import ABC, abstractmethod
 from multiprocessing import Process, Pipe, Event
 from sympy.assumptions.assume import true
+import torch
 import zmq
 import nvtx
 import tempfile
@@ -55,6 +56,12 @@ class TransferManager:
         self.all_gpu_layouts_per_group: Dict[int, Optional[List[KVCacheLayout]]] = {}
         self.all_gpu_blocks_per_group: Dict[int, Optional[List[List[TensorSharedHandle]]]] = {}
 
+        # SWA dedicated GPU pool (channel B): independent of the main-KV pool.
+        # device_id -> SWA handles / layout. Populated only when the registering
+        # client provides swa_handles (DSv4 sliding-window-attention pool).
+        self.all_swa_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}
+        self.all_swa_gpu_layouts: Dict[int, KVCacheLayout] = {}
+
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
             self.context, zmq.SocketType.PULL, gpu_register_port, True)
@@ -81,6 +88,14 @@ class TransferManager:
                 # This covers Gemma4 heterogeneous shapes and DSA/NSA indexer-as-group.
                 self.all_gpu_layouts_per_group[device_id] = req.gpu_layouts
                 self.all_gpu_blocks_per_group[device_id] = req.handles_per_group
+                # Store SWA GPU data if present
+                if getattr(req, "swa_handles", None) is not None and req.swa_layout is not None:
+                    self.all_swa_gpu_blocks[device_id] = req.swa_handles
+                    self.all_swa_gpu_layouts[device_id] = req.swa_layout
+                    flexkv_logger.info(
+                        f"GPU {device_id}: registered SWA handles "
+                        f"({len(req.swa_handles)} layers)"
+                    )
                 # Propagate layer_groups to model_config (first registration wins).
                 # token_size_in_bytes / num_cpu_blocks recompute downstream depends on this.
                 if req.layer_groups is not None and self.model_config.layer_groups is None:
@@ -167,6 +182,18 @@ class TransferManager:
                 self.all_gpu_layouts[device_id],
                 device_id,
                 dtype=self.model_config.dtype,
+            )
+
+        # Register SWA dedicated GPU pool. 
+        for device_id, swa_blocks in self.all_swa_gpu_blocks.items():
+            self.storage_engine.register_swa_gpu_blocks(
+                swa_blocks,
+                self.all_swa_gpu_layouts[device_id],
+                device_id,
+                dtype=torch.uint8,
+            )
+            flexkv_logger.info(
+                f"StorageEngine registered SWA GPU pool for device {device_id}"
             )
 
         # Group GPU handles by WorkerKey

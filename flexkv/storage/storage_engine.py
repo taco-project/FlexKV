@@ -49,6 +49,11 @@ class StorageEngine:
                  num_layers_per_pp_stage: int):
         """Initialize storage engine"""
         self._storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
+        # SWA dedicated GPU pool handles, physically isolated from the main-KV
+        # _storage_handles so the SAME physical device_id can hold both a main-KV
+        # GPU handle and an independent SWA GPU handle without key collision.
+        # Mirrors the indexer's _indexer_storage_handles pattern (57045c3).
+        self._swa_storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
         self._model_config = model_config
         self._cache_config = cache_config
 
@@ -142,6 +147,41 @@ class StorageEngine:
             raw_data=gpu_blocks
         )
 
+    def register_swa_gpu_blocks(self,
+                                swa_blocks: List[TensorSharedHandle],
+                                swa_layout: KVCacheLayout,
+                                device_id: int = 0,
+                                dtype: torch.dtype = torch.uint8) -> None:
+        """Register the SWA dedicated GPU pool (channel B).
+
+        Stored in the independent ``_swa_storage_handles`` dict (via
+        ``is_swa=True``), keyed by the ORIGINAL physical ``device_id``. This
+        physically isolates it from the main-KV GPU handle for the same device,
+        so there is no key collision and no magic offset. Mirrors the indexer's
+        ``is_indexer`` routing (commit 57045c3). Reuses the standard GPU
+        allocate path (GPUAllocator.from_raw_data), which maps each
+        TensorSharedHandle via CUDA IPC into the worker process.
+        """
+        self.allocate(
+            device_type=DeviceType.GPU,
+            layout=swa_layout,
+            dtype=dtype,
+            device_id=device_id,
+            raw_data=swa_blocks,
+            is_swa=True,
+        )
+
+    def get_swa_storage_handle(self, device_id: int = 0) -> StorageHandle:
+        """Return the SWA dedicated GPU StorageHandle for a physical device."""
+        return self.get_storage_handle(
+            DeviceType.GPU, device_id, is_swa=True
+        )
+
+    def has_swa_storage_handle(self, device_id: int = 0) -> bool:
+        return self.has_storage_handle(
+            DeviceType.GPU, device_id, is_swa=True
+        )
+
     def allocate(self,
                  device_type: DeviceType,
                  layout: KVCacheLayout,
@@ -173,8 +213,13 @@ class StorageEngine:
         Returns:
             bool: True if allocator created successfully, False if already exists.
         """
+        # Route to the SWA-dedicated dict when is_swa=True (mirrors indexer's
+        # is_indexer routing): same physical device_id can hold both a main-KV
+        # and an SWA GPU handle without collision.
+        is_swa = kwargs.get('is_swa', False)
+        storage_handles = self._swa_storage_handles if is_swa else self._storage_handles
         key = (device_type, device_id)
-        if key in self._storage_handles:
+        if key in storage_handles:
             return False
 
         storage_handle: StorageHandle
@@ -277,35 +322,41 @@ class StorageEngine:
                 )
         else:
             raise ValueError(f"Unsupported device type: {device_type}")
-        self._storage_handles[key] = storage_handle
+        storage_handles[key] = storage_handle
         return True
 
     def get_storage_handle(self,
                            device_type: DeviceType,
-                           device_id: int = 0) -> StorageHandle:
+                           device_id: int = 0,
+                           is_swa: bool = False) -> StorageHandle:
         """
         Get accessible handle for specified blocks.
 
         Args:
             device_type: Type of the device to get handle from.
             device_id: Device ID.
+            is_swa: Whether to fetch from the SWA-dedicated handle dict.
         """
+        storage_handles = self._swa_storage_handles if is_swa else self._storage_handles
         key = (device_type, device_id)
-        if key not in self._storage_handles:
+        if key not in storage_handles:
             raise ValueError(
                 f"Storage handle not found for device type: {device_type}, "
-                f"device id: {device_id}"
+                f"device id: {device_id}, is_swa: {is_swa}"
             )
-        return self._storage_handles[key]
+        return storage_handles[key]
 
     def has_storage_handle(self,
                            device_type: DeviceType,
-                           device_id: int = 0) -> bool:
+                           device_id: int = 0,
+                           is_swa: bool = False) -> bool:
         """
         Check if storage handle exists for given device type and id.
 
         Args:
             device_type: Type of the device.
             device_id: Device ID.
+            is_swa: Whether to check the SWA-dedicated handle dict.
         """
-        return (device_type, device_id) in self._storage_handles
+        storage_handles = self._swa_storage_handles if is_swa else self._storage_handles
+        return (device_type, device_id) in storage_handles
