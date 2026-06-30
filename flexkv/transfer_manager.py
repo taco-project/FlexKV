@@ -232,6 +232,35 @@ class TransferManager:
             if self.cache_config.enable_remote \
             else None
         )
+        # Group SWA GPU handles by WorkerKey, mirroring the main-KV grouping,
+        # so the dedicated SWA worker map can be built per TP group.
+        swa_gpu_handles: Optional[Dict[WorkerKey, List]] = None
+        if self.storage_engine.has_storage_handle(DeviceType.CPU, is_swa=True):
+            swa_gpu_handles = {}
+            for device_id in sorted(self.all_swa_gpu_blocks.keys()):
+                if self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_swa=True):
+                    worker_key = self.gpu_worker_key_mapping[device_id]
+                    if worker_key not in swa_gpu_handles:
+                        swa_gpu_handles[worker_key] = []
+                    swa_gpu_handles[worker_key].append(
+                        self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_swa=True))
+
+        swa_cpu_handle =(
+         self.storage_engine.get_storage_handle(DeviceType.CPU, is_swa=True)
+         if self.storage_engine.has_storage_handle(DeviceType.CPU, is_swa=True)
+         else None
+         )
+        swa_ssd_handle = (
+         self.storage_engine.get_storage_handle(DeviceType.SSD, is_swa=True)
+         if self.storage_engine.has_storage_handle(DeviceType.SSD, is_swa=True)
+         else None
+         )
+        swa_remote_handle = (
+         self.storage_engine.get_storage_handle(DeviceType.REMOTE, is_swa=True)
+         if self.storage_engine.has_storage_handle(DeviceType.REMOTE, is_swa=True)
+         else None
+         )
+
         self.transfer_engine = TransferEngine(
             gpu_handles=grouped_gpu_handles,
             model_config=self.model_config,
@@ -241,6 +270,10 @@ class TransferManager:
             remote_handle=remote_handle,
             gpu_blocks_per_group=grouped_gpu_blocks_per_group,
             gpu_layouts_per_group=grouped_gpu_layouts_per_group,
+            swa_gpu_handles=swa_gpu_handles,
+            swa_cpu_handle=swa_cpu_handle,
+            swa_ssd_handle=swa_ssd_handle,
+            swa_remote_handle=swa_remote_handle,
         )
         flexkv_logger.info(
             f"Initialized TransferEngine successfully, "

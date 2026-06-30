@@ -52,7 +52,6 @@ class StorageEngine:
         # SWA dedicated GPU pool handles, physically isolated from the main-KV
         # _storage_handles so the SAME physical device_id can hold both a main-KV
         # GPU handle and an independent SWA GPU handle without key collision.
-        # Mirrors the indexer's _indexer_storage_handles pattern (57045c3).
         self._swa_storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
         self._model_config = model_config
         self._cache_config = cache_config
@@ -133,6 +132,92 @@ class StorageEngine:
                 file_path=self._cache_config.remote_cache_path,
                 remote_config_custom = self._cache_config.remote_config_custom
             )
+
+        # SWA pool allocate
+        self._swa_cpu_layout: Optional[KVCacheLayout] = None
+        self._swa_ssd_layout: Optional[KVCacheLayout] = None
+        swa_cfg = getattr(self._cache_config, "swa", None)
+        if swa_cfg is not None and swa_cfg.enabled:
+            if self._cache_config.enable_cpu:
+                # uint8, num_head=1, is_mla=True; per-token-per-layer bytes -> head_size.
+                self._swa_cpu_layout = KVCacheLayout(
+                    type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
+                    num_layer=swa_cfg.num_swa_layers,
+                    num_block=swa_cfg.num_slots,
+                    tokens_per_block=swa_cfg.window_size,
+                    num_head=1,
+                    head_size=swa_cfg.bytes_per_token_per_layer,
+                    is_mla=True,
+                )
+                self.allocate(
+                    device_type=DeviceType.CPU,
+                    layout=self._swa_cpu_layout,
+                    dtype=torch.uint8,
+                    device_id=0,
+                    raw_data=None,
+                    is_swa=True,
+                    pin_memory=swa_cfg.pin_memory,
+                )
+
+
+            if self._cache_config.enable_ssd:
+                if not GLOBAL_CONFIG_FROM_ENV.ssd_layout_type == self._swa_cpu_layout.type:
+                    raise ValueError(
+                        f"SWA SSD layout type must match SWA CPU layout type: "
+                        f"{self._swa_cpu_layout.type}"
+                    )
+                self._swa_ssd_layout = KVCacheLayout(
+                    type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
+                    num_layer=swa_cfg.num_swa_layers,
+                    num_block=swa_cfg.num_slots,
+                    tokens_per_block=swa_cfg.window_size,
+                    num_head=1,
+                    head_size=swa_cfg.bytes_per_token_per_layer,
+                    is_mla=True,
+                )
+                self.allocate(
+                    device_type=DeviceType.SSD,
+                    layout=self._swa_ssd_layout,
+                    dtype=torch.uint8,
+                    device_id=0,
+                    raw_data=None,
+                    is_swa=True,
+                    cache_dir=self._cache_config.ssd_cache_dir,
+                    max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
+                )
+
+            if self._cache_config.enable_remote:
+                if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._swa_cpu_layout.type:
+                    raise ValueError(
+                        f"SWA Remote layout type must match SWA CPU layout type: "
+                        f"{self._swa_cpu_layout.type}"
+                    )
+                self._swa_remote_layout = KVCacheLayout(
+                    type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                    num_layer=swa_cfg.num_swa_layers,
+                    num_block=swa_cfg.num_slots,
+                    tokens_per_block=swa_cfg.window_size,
+                    num_head=1,
+                    head_size=swa_cfg.bytes_per_token_per_layer,
+                    is_mla=True,
+                )
+                swa_remote_path = self._cache_config.remote_cache_path
+                if isinstance(swa_remote_path, str):
+                    swa_remote_path = swa_remote_path + "_swa"
+                elif isinstance(swa_remote_path, list):
+                    swa_remote_path = [path + "_swa" for path in swa_remote_path]
+       
+                self.allocate(
+                    device_type=DeviceType.REMOTE,
+                    layout=self._swa_remote_layout,
+                    dtype=torch.uint8,
+                    device_id=0,
+                    raw_data=None,
+                    is_swa=True,
+                    file_path=swa_remote_path,
+                    remote_config_custom=self._cache_config.remote_config_custom,
+                )
+
 
     def register_gpu_blocks(self,
                             gpu_blocks: List[TensorSharedHandle],
@@ -286,6 +371,11 @@ class StorageEngine:
                 hash_value = hashlib.md5(server_recv_port.encode()).hexdigest()
                 rand_suffix = f"{hash_value[:6]}"
                 file_prefix = f"flexkv_ssdcache_{rand_suffix}"
+                # Physically separate the SWA SSD cache files from the main-KV
+                # ones: without this, both share the same prefix (server_recv_port
+                # is identical in-process) and overwrite each other on disk.
+                if is_swa:
+                    file_prefix = f"{file_prefix}_swa"
                 storage_handle = SSDAllocator.allocate(
                     layout=layout,
                     dtype=dtype,

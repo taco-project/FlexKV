@@ -107,7 +107,8 @@ class TransferOp:
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
     pending_count: int = 0
-
+    is_swa: bool = False
+    
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
             self.src_block_ids.size != self.dst_block_ids.size:
