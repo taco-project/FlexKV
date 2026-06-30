@@ -771,14 +771,44 @@ class FlexKVWorkerConnector:
                 master_ports=rank_info.model_config.master_ports,
             )
 
+        # Map the TP-local rank (vLLM-visible 0..TP-1) to the PHYSICAL GPU
+        # index before handing it to FlexKV.  FlexKV's transfer subprocesses
+        # strip CUDA_VISIBLE_DEVICES (see flexkv/transfer_manager.py:
+        # "Removing CUDA_VISIBLE_DEVICES to allow access to all GPUs") and
+        # address GPUs by their *physical* index.  If we register the
+        # logical rank as device_id, then any worker not placed on physical
+        # GPUs 0..N-1 — typically the decode side of single-node 1P1D
+        # (prefill on 0-3, decode on 4-7) — has its FlexKV transfer worker
+        # fail at cudaHostRegister with code 100 (cudaErrorNoDevice),
+        # because the device_id it tries to use does not exist after the
+        # CUDA_VISIBLE_DEVICES strip.
+        #
+        # Matches the mapping that flexkv/integration/tensorrt_llm/
+        # trtllm_adapter.py:551-563 already does for TRT-LLM.
+        logical_device_id = rank_info.local_rank
+        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+        if cuda_visible_devices:
+            visible_gpus = [
+                int(x) for x in cuda_visible_devices.split(',') if x.strip()
+            ]
+            physical_device_id = (
+                visible_gpus[logical_device_id]
+                if logical_device_id < len(visible_gpus)
+                else logical_device_id
+            )
+        else:
+            physical_device_id = logical_device_id
+
         logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, "
                     f"server_client_mode={server_client_mode}, dp_rank={rank_info.dp_rank}, "
-                    f"instance_id={instance_id}, local_rank={rank_info.local_rank}")
+                    f"instance_id={instance_id}, local_rank={rank_info.local_rank}, "
+                    f"physical_device_id={physical_device_id}, "
+                    f"CUDA_VISIBLE_DEVICES={cuda_visible_devices}")
         self.tp_client = KVTPClient(
             flexkv_config.gpu_register_port,
             dp_client_id=rank_info.dp_client_id,
             pp_rank=rank_info.pp_rank,
-            device_id=rank_info.local_rank,
+            device_id=physical_device_id,
         )
         logger.info("Finish init FlexKVWorkerConnector")
 
