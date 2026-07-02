@@ -845,7 +845,15 @@ class GlobalCacheEngine:
             return transfer_graph, return_mask, callback, {}, -1
 
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
-        assert block_end_idx == aligned_length // self.tokens_per_block
+        # block_end_idx is the block just past the LAST True in token_mask. On the
+        # plain get() path the caller marks every non-resident token up to the
+        # aligned end, so this equals aligned_length // tokens_per_block. The
+        # SWA-aware caller (kvtask.get_match_swa) deliberately truncates the mask
+        # to usable = min(full_hit, swa_hit), leaving trailing False when the full
+        # hit runs past the reusable SWA window — a legitimate short match. So the
+        # invariant is <= (can never exceed the aligned length), not ==. Nothing
+        # below uses aligned_length; all downstream sizing keys off block_end_idx.
+        assert block_end_idx <= aligned_length // self.tokens_per_block
         gpu_block_ids = self.slot_mapping_to_block_ids(slot_mapping,
                                                        self.tokens_per_block)[:block_end_idx-block_start_idx]
 
