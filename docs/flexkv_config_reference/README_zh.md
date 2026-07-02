@@ -99,6 +99,7 @@ enable_gds: false
 | `FLEXKV_USE_CE_TRANSFER_D2H` | bool | 0 |  是否使用 cudaMemcpyAsync 实现 Device→Host 传输，可以避免占用 SM，但是传输速度会降低 |
 | `FLEXKV_TRANSFER_NUM_CTA_H2D` | int | 4 | H2D 传输使用的 CUDA thread block (CTA) 数量，仅在`FLEXKV_USE_CE_TRANSFER_H2D`为0时生效 |
 | `FLEXKV_TRANSFER_NUM_CTA_D2H` | int | 4 | D2H 传输使用的 CUDA thread block (CTA) 数量，仅在`FLEXKV_USE_CE_TRANSFER_D2H`为0时生效 |
+| `FLEXKV_MLA_D2H_MODE` | str | "sharded" | **仅适用于 MLA 场景**（kv_heads=1，所有 TP rank 的 KV 相同）。控制 D2H 时 CPU KV Cache 的写入模式。可选值：<br/>• `sharded` - 每个 GPU 写 1/N 分片拼成一个完整 KV<br/>• `all_write` - 每个 GPU 写完整 KV 到各自位置（CPU 内存占用 Nx）<br/>• `rank0_only` - 仅 rank 0 写完整 KV |
 
 ---
 

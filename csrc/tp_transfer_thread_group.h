@@ -63,7 +63,8 @@ public:
                          const int transfer_num_cta,
                          const bool is_host_to_device,
                          const bool use_ce_transfer, const int layer_id,
-                         const int layer_granularity, const bool is_mla);
+                         const int layer_granularity, const bool is_mla,
+                         const std::string &mla_d2h_mode = "sharded");
 
 #ifdef FLEXKV_ENABLE_NVCOMP
 

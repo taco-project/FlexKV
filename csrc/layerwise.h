@@ -72,7 +72,8 @@ public:
       const int64_t indexer_ssd_layer_stride_in_bytes = 0,
       const int64_t indexer_ssd_kv_stride_in_bytes = 0,
       const int64_t indexer_cpu_chunk_size_in_bytes = 0,
-      const int indexer_num_blocks_per_file = 0);
+      const int indexer_num_blocks_per_file = 0,
+      const std::string &mla_d2h_mode = "sharded");
 
 private:
   int num_gpus_;

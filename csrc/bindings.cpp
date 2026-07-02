@@ -476,7 +476,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("indexer_ssd_layer_stride_in_bytes") = 0,
            py::arg("indexer_ssd_kv_stride_in_bytes") = 0,
            py::arg("indexer_cpu_chunk_size_in_bytes") = 0,
-           py::arg("indexer_num_blocks_per_file") = 0);
+           py::arg("indexer_num_blocks_per_file") = 0,
+           py::arg("mla_d2h_mode") = "sharded");
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
         "Transfer KV blocks between remote and CPU memory",
@@ -543,7 +544,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"),
-           py::arg("is_mla"));
+           py::arg("is_mla"), py::arg("mla_d2h_mode") = "sharded");
 #ifdef FLEXKV_ENABLE_NVCOMP
   // nvcomp ANS variant: tp_group_transfer_ans() lazily initializes from the
   // constructor config and returns total compressed bytes across ranks.

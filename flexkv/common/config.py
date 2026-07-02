@@ -465,6 +465,10 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     renew_lease_ms=int(os.getenv('FLEXKV_RENEW_LEASE_MS', 4000)),
 
     nvcomp_batch_size=int(os.getenv('FLEXKV_NVCOMP_BATCH_SIZE', '0')),  # 0 = auto
+
+    # MLA D2H transfer mode (only effective when kv_heads=1)
+    # Available modes: "sharded" (default), "all_write", "rank0_only"
+    mla_d2h_mode=os.getenv('FLEXKV_MLA_D2H_MODE', 'sharded'),
 )
 
 @dataclass
@@ -554,8 +558,27 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     assert user_config.cpu_cache_gb > 0
     assert user_config.ssd_cache_gb >= 0
 
-    cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
-    cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)
+    # MLA all_write mode: each logical KV block occupies N× physical space
+    # on CPU/SSD (N GPUs each write a complete KV copy to distinct block slots).
+    # To keep the physical memory budget (cpu_cache_gb / ssd_cache_gb) unchanged,
+    # the logical block capacity must be divided by N.
+    # This mirrors the C++ offset logic in tp_transfer_thread_group.cpp where
+    # GPU i writes to cpu_startoff = i * chunk_size, requiring N slots per logical block.
+    model_config = rank_info.model_config
+    mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
+    capacity_divisor = 1
+    if model_config.use_mla and mla_d2h_mode == "all_write":
+        num_gpus_per_node = model_config.effective_tp_size_per_node
+        if num_gpus_per_node > 1:
+            capacity_divisor = num_gpus_per_node
+            flexkv_logger.info(
+                f"[config] MLA all_write mode: logical cpu/ssd capacity "
+                f"÷{num_gpus_per_node} (each block occupies {num_gpus_per_node}× "
+                f"physical space, total memory budget unchanged)"
+            )
+
+    cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes) // capacity_divisor
+    cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes) // capacity_divisor
 
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0

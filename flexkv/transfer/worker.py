@@ -496,6 +496,10 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
+        # Read MLA D2H mode from global config
+        self.mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
+        flexkv_logger.debug(f"[tpGPUCPUTransferWorker] mla_d2h_mode={self.mla_d2h_mode}")
+
         # Resolve pointers in Python (where storage is valid); pass them to C++ so we avoid
         # "Tensor that doesn't have storage" when C++ calls .data_ptr() on tensors passed
         # across the pybind11 boundary from a spawn'd subprocess (shared memory / CUDA IPC).
@@ -569,6 +573,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             0,
             self.num_layers,
             self.is_mla,
+            self.mla_d2h_mode,  # Pass MLA D2H mode to C++
         )
 
 

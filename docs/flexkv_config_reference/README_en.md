@@ -98,6 +98,7 @@ Some configurations can only be set through environment variables.
 | `FLEXKV_USE_CE_TRANSFER_D2H` | bool | 0 | Whether to use cudaMemcpyAsync for Device→Host transfers. Can avoid occupying SM, but transfer speed will be reduced |
 | `FLEXKV_TRANSFER_NUM_CTA_H2D` | int | 4 | Number of CUDA thread blocks (CTAs) used for H2D transfer, only effective when `FLEXKV_USE_CE_TRANSFER_H2D` is 0 |
 | `FLEXKV_TRANSFER_NUM_CTA_D2H` | int | 4 | Number of CUDA thread blocks (CTAs) used for D2H transfer, only effective when `FLEXKV_USE_CE_TRANSFER_D2H` is 0 |
+| `FLEXKV_MLA_D2H_MODE` | str | "sharded" | **Only applicable to MLA scenarios** (kv_heads=1, all TP ranks have identical KV). Controls how CPU KV Cache is written during D2H transfer. Available options:<br/>• `sharded` - Each GPU writes 1/N shard to form one complete KV<br/>• `all_write` - Each GPU writes complete KV to its own location (Nx CPU memory)<br/>• `rank0_only` - Only rank 0 writes complete KV |
 
 ---
 

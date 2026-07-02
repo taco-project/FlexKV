@@ -329,7 +329,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t indexer_ssd_layer_stride_in_bytes,
     const int64_t indexer_ssd_kv_stride_in_bytes,
     const int64_t indexer_cpu_chunk_size_in_bytes,
-    const int indexer_num_blocks_per_file) {
+    const int indexer_num_blocks_per_file,
+    const std::string &mla_d2h_mode) {
 
   // Set current counter ID for eventfd notification
   current_counter_id_ = counter_id;
@@ -378,6 +379,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
     int sl = b * layer_granularity;
     int ltb = std::min(layer_granularity, num_layers - sl);
     // Calculate data size for this batch: chunk_size * 2 (K+V) * layers * num_blocks
+    // H2D: every GPU reads a full KV copy regardless of mla_d2h_mode (the mode
+    // only controls where on CPU it reads from, not how much).
     int64_t bytes_this_batch = 0;
     for (int g = 0; g < num_gpus_; ++g) {
       bytes_this_batch += gpu_chunk_sizes_in_bytes_[g] * 2 * ltb * num_blocks;
@@ -479,14 +482,37 @@ void LayerwiseTransferGroup::layerwise_transfer(
     // NVTX range for this batch was already started (by main thread for first batch,
     // or by previous batch's callback for subsequent batches)
     
+    // Validate mla_d2h_mode once before the per-GPU loop
+    std::string mode = mla_d2h_mode;
+    if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only") {
+      fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'sharded'\n",
+              mode.c_str());
+      mode = "sharded";
+    }
+
     for (int i = 0; i < num_gpus_; ++i) {
       cudaSetDevice(gpu_device_ids_[i]);
       int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
-      if (is_mla) {
-        cpu_startoff_inside_chunks = 0;
-      }
       int64_t gpu_startoff_inside_chunks = 0;
       int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
+
+      // Handle MLA D2H mode for H2D transfer (inlined logic)
+      if (is_mla) {
+        if (mode == "sharded") {
+          cpu_startoff_inside_chunks = 0;
+          gpu_startoff_inside_chunks = 0;
+        } else if (mode == "all_write") {
+          // Each rank's complete KV occupies num_blocks blocks on CPU.
+          // Use cpu_block_stride (not gpu_chunk_size) because BLOCKFIRST's
+          // block_stride includes all layers+kv_dims, while LAYERFIRST's
+          // block_stride == chunk_size (same result).
+          cpu_startoff_inside_chunks = i * num_blocks * cpu_block_stride_in_bytes;
+          gpu_startoff_inside_chunks = 0;
+        } else if (mode == "rank0_only") {
+          cpu_startoff_inside_chunks = 0;
+          gpu_startoff_inside_chunks = 0;
+        }
+      }
 
       switch (backend_type_) {
       case BackendType::VLLM:
@@ -604,7 +630,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
     cudaEventElapsedTime(&elapsed_ms, timing_events[i], timing_events[i + 1]);
 
     // Calculate bytes transferred for this batch
-    // For each GPU: chunk_size * 2 (K+V) * layers * num_blocks
+    // H2D: every GPU reads a full KV copy regardless of mla_d2h_mode
     int64_t bytes_this_batch = 0;
     for (int g = 0; g < num_gpus_; ++g) {
       bytes_this_batch += gpu_chunk_sizes_in_bytes_[g] * 2 * batch_layers_count[i] * num_blocks;

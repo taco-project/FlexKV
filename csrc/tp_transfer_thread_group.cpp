@@ -177,7 +177,8 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_block_stride_in_bytes,
     const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
-    const int layer_id, const int layer_granularity, const bool is_mla) {
+    const int layer_id, const int layer_granularity, const bool is_mla,
+    const std::string &mla_d2h_mode) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -188,9 +189,41 @@ void TPTransferThreadGroup::tp_group_transfer(
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
-  bool enable_sharded_d2h = is_mla && !is_host_to_device;
+  // Validate mla_d2h_mode parameter (only meaningful for MLA)
+  std::string mode = mla_d2h_mode;
+  if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only") {
+    fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'sharded'\n",
+            mode.c_str());
+    mode = "sharded";
+  }
+
+  // In sharded D2H mode, chunk_size is divided by num_gpus_ and used as both
+  // the per-rank transfer size and the stride between ranks. If chunk_size
+  // is not divisible by num_gpus_, the integer division drops trailing bytes,
+  // leaving a hole in the assembled KV on CPU.
+  // All ranks share the same chunk_size (MLA = identical KV), so check [0] once.
+  if (is_mla && !is_host_to_device && mode == "sharded" && num_gpus_ > 1) {
+    if (gpu_chunk_sizes_in_bytes_[0] % num_gpus_ != 0) {
+      throw std::runtime_error(
+          "sharded MLA D2H mode requires gpu_chunk_size divisible by "
+          "num_gpus, but chunk_size=" +
+          std::to_string(gpu_chunk_sizes_in_bytes_[0]) + " and num_gpus=" +
+          std::to_string(num_gpus_) + ". Use 'all_write' or 'rank0_only' "
+          "mode, or adjust head_dim/tokens_per_block so chunk_size is "
+          "divisible.");
+    }
+  }
 
   for (int i = 0; i < num_gpus_; ++i) {
+    // For rank0_only mode in D2H: only rank 0 performs transfer
+    if (is_mla && !is_host_to_device && mode == "rank0_only" && i != 0) {
+      // Skip D2H transfer for non-rank0 GPUs
+      futures.emplace_back(enqueue_for_gpu(i, [i]() {
+        // Empty task - non-rank0 GPUs do nothing in rank0_only D2H mode
+      }));
+      continue;
+    }
+
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
         int num_blocks = gpu_block_id_tensor.numel();
@@ -201,19 +234,45 @@ void TPTransferThreadGroup::tp_group_transfer(
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
         void *cpu_ptr = cpu_blocks_;
         int64_t cpu_startoff_inside_chunks = 0;
-        if (enable_sharded_d2h)
-          cpu_startoff_inside_chunks =
-              i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
-        else if (!is_mla)
+        int64_t gpu_startoff_inside_chunks = 0;
+        int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
+
+        if (is_mla) {
+          // MLA offset logic — inlined (was shared via mla_utils.h)
+          if (mode == "sharded") {
+            if (!is_host_to_device) {
+              int64_t shard = gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
+              cpu_startoff_inside_chunks = i * shard;
+              gpu_startoff_inside_chunks = i * shard;
+              chunk_size = shard;
+            } else {
+              cpu_startoff_inside_chunks = 0;
+              gpu_startoff_inside_chunks = 0;
+              chunk_size = gpu_chunk_sizes_in_bytes_[i];
+            }
+          } else if (mode == "all_write") {
+            // Each rank's complete KV occupies num_blocks blocks on CPU
+            // ([GPU0][GPU1]...[GPUN]). Rank i's region starts at i * num_blocks
+            // blocks from the base. Use cpu_block_stride (not gpu_chunk_size)
+            // because BLOCKFIRST's block_stride includes all layers+kv_dims,
+            // while LAYERFIRST's block_stride == chunk_size (same result).
+            cpu_startoff_inside_chunks = i * num_blocks * cpu_block_stride_in_bytes;
+            gpu_startoff_inside_chunks = 0;
+            chunk_size = gpu_chunk_sizes_in_bytes_[i];
+          } else if (mode == "rank0_only") {
+            // D2H: only rank 0 writes (non-rank0 handled by outer continue)
+            // H2D: all GPUs read from offset 0
+            cpu_startoff_inside_chunks = 0;
+            gpu_startoff_inside_chunks = 0;
+            chunk_size = gpu_chunk_sizes_in_bytes_[i];
+          }
+        } else {
+          // Non-MLA scenario: use default logic
           cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
-        int64_t gpu_startoff_inside_chunks =
-            enable_sharded_d2h ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_
-                               : 0;
-        // we assume that the chunk size is the same for all gpus,
-        // even if they have different number of gpu_blocks
-        int64_t chunk_size = enable_sharded_d2h
-                                 ? gpu_chunk_sizes_in_bytes_[i] / num_gpus_
-                                 : gpu_chunk_sizes_in_bytes_[i];
+          gpu_startoff_inside_chunks = 0;
+          chunk_size = gpu_chunk_sizes_in_bytes_[i];
+        }
+        
         // Dispatch to the appropriate template based on backend type
         switch (backend_type_) {
         case BackendType::VLLM:
