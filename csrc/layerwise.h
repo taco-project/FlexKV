@@ -60,7 +60,18 @@ public:
       torch::Tensor &gpu_block_strides_tensor,
       torch::Tensor &gpu_layer_strides_tensor,
       torch::Tensor &gpu_chunk_sizes_tensor, int iouring_entries,
-      int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size);
+      int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size,
+      // ---- SWA fields ----
+      bool has_swa = false,
+      const std::vector<std::vector<torch::Tensor>> &swa_gpu_blocks =
+          std::vector<std::vector<torch::Tensor>>(),
+      torch::Tensor swa_cpu_blocks = torch::Tensor(),
+      std::map<int, std::vector<std::string>> swa_ssd_files =
+          std::map<int, std::vector<std::string>>(),
+      torch::Tensor swa_gpu_kv_strides_tensor = torch::Tensor(),
+      torch::Tensor swa_gpu_block_strides_tensor = torch::Tensor(),
+      torch::Tensor swa_gpu_layer_strides_tensor = torch::Tensor(),
+      torch::Tensor swa_gpu_chunk_sizes_tensor = torch::Tensor());
 
   // Multi-group constructor. ``gpu_blocks_per_group[gi][d]`` is the GPU-side
   // tensor list for group ``gi`` on device ``d``. ``layer_members`` encodes
@@ -97,7 +108,18 @@ public:
       const std::vector<int64_t> &group_gpu_block_strides,
       const std::vector<int64_t> &group_gpu_layer_strides,
       const std::vector<int64_t> &group_gpu_chunk_sizes, int iouring_entries,
-      int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size);
+      int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size,
+      // ---- SWA sidecar (orthogonal to layer_groups) ----
+      bool has_swa = false,
+      const std::vector<std::vector<torch::Tensor>> &swa_gpu_blocks =
+          std::vector<std::vector<torch::Tensor>>(),
+      torch::Tensor swa_cpu_blocks = torch::Tensor(),
+      std::map<int, std::vector<std::string>> swa_ssd_files =
+          std::map<int, std::vector<std::string>>(),
+      torch::Tensor swa_gpu_kv_strides_tensor = torch::Tensor(),
+      torch::Tensor swa_gpu_block_strides_tensor = torch::Tensor(),
+      torch::Tensor swa_gpu_layer_strides_tensor = torch::Tensor(),
+      torch::Tensor swa_gpu_chunk_sizes_tensor = torch::Tensor());
 
   ~LayerwiseTransferGroup();
 
@@ -123,7 +145,22 @@ public:
       const int64_t h2d_cpu_layer_stride_in_bytes,
       const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
       const bool use_ce_transfer, const int num_layers,
-      const int layer_granularity, const bool is_mla, const int counter_id = 0);
+      const int layer_granularity, const bool is_mla, const int counter_id = 0,
+      // ---- SWA per-call ids + strides (fused into same layer loop) ----
+      const torch::Tensor &swa_h2d_src = torch::Tensor(),
+      const torch::Tensor &swa_h2d_dst = torch::Tensor(),
+      const torch::Tensor &swa_disk2h_src = torch::Tensor(),
+      const torch::Tensor &swa_disk2h_dst = torch::Tensor(),
+      const int64_t swa_cpu_kv_stride_in_bytes = 0,
+      const int64_t swa_cpu_layer_stride_in_bytes = 0,
+      const int64_t swa_cpu_block_stride_in_bytes = 0,
+      const int64_t swa_cpu_chunk_size_in_bytes = 0,
+      const int64_t swa_h2d_cpu_kv_stride_in_bytes = 0,
+      const int64_t swa_h2d_cpu_layer_stride_in_bytes = 0,
+      const int64_t swa_cpu_tp_stride_in_bytes = 0,
+      const int64_t swa_ssd_layer_stride_in_bytes = 0,
+      const int64_t swa_ssd_kv_stride_in_bytes = 0,
+      const int swa_num_blocks_per_file = 0);
 
   // Multi-group layerwise transfer: SSD->CPU per group, CPU->GPU per original
   // layer (expanding the CSR to fire one transfer kernel per group member).
@@ -135,7 +172,22 @@ public:
       const int round_robin, const int num_threads_per_device,
       const torch::Tensor &gpu_block_id_tensor,
       const torch::Tensor &cpu_block_id_tensor, const int transfer_cta_num,
-      const bool use_ce_transfer, const bool is_mla, const int counter_id = 0);
+      const bool use_ce_transfer, const bool is_mla, const int counter_id = 0,
+      // ---- SWA per-call ids + strides (fused into same per-orig loop) ----
+      const torch::Tensor &swa_h2d_src = torch::Tensor(),
+      const torch::Tensor &swa_h2d_dst = torch::Tensor(),
+      const torch::Tensor &swa_disk2h_src = torch::Tensor(),
+      const torch::Tensor &swa_disk2h_dst = torch::Tensor(),
+      const int64_t swa_cpu_kv_stride_in_bytes = 0,
+      const int64_t swa_cpu_layer_stride_in_bytes = 0,
+      const int64_t swa_cpu_block_stride_in_bytes = 0,
+      const int64_t swa_cpu_chunk_size_in_bytes = 0,
+      const int64_t swa_h2d_cpu_kv_stride_in_bytes = 0,
+      const int64_t swa_h2d_cpu_layer_stride_in_bytes = 0,
+      const int64_t swa_cpu_tp_stride_in_bytes = 0,
+      const int64_t swa_ssd_layer_stride_in_bytes = 0,
+      const int64_t swa_ssd_kv_stride_in_bytes = 0,
+      const int swa_num_blocks_per_file = 0);
 
 private:
   int num_gpus_;
@@ -161,6 +213,20 @@ private:
   bool enable_ssd_;
   std::unique_ptr<SSDIOCTX> ioctx_;
 
+  // ---- SWA dedicated pool state (sidecar; single- and multi-group) ----
+  bool has_swa_ = false;
+  void **swa_gpu_blocks_ = nullptr;    // flat [num_gpus * num_tensors_per_gpu]
+  void *swa_cpu_blocks_ = nullptr;
+  int swa_num_tensors_per_gpu_ = 0;
+  int64_t *swa_gpu_kv_strides_in_bytes_ = nullptr;
+  int64_t *swa_gpu_block_strides_in_bytes_ = nullptr;
+  int64_t *swa_gpu_layer_strides_in_bytes_ = nullptr;
+  int64_t *swa_gpu_chunk_sizes_in_bytes_ = nullptr;
+  std::vector<GTensorHandler> swa_gpu_tensor_handlers_;
+  BackendType swa_backend_type_;
+  bool swa_enable_ssd_ = false;
+  std::unique_ptr<SSDIOCTX> swa_ioctx_;
+
   // Layer eventfds for notification
   // Shape: [num_counters, tp_size, num_layers]
   bool enable_eventfd_;
@@ -179,13 +245,33 @@ private:
   int num_original_layers_;
 
   // Single-group: ``expected_count = num_gpus_``.
-  // Multi-group: ``expected_count = members_this_layer * num_gpus_``.
+  // Multi-group: ``expected_count = slots_per_gpu * num_gpus_`` where
+  // ``slots_per_gpu = members_this_layer + (swa_active ? 1 : 0)``.
   void layer_done_callback(int start_layer, int layers_this_batch,
                            int expected_count,
                            nvtxRangeId_t *current_range_id_ptr,
                            bool is_last_batch, const char *next_range_name,
                            nvtxRangeId_t *next_range_id_ptr,
                            int callbacks_per_gpu = 1);
+
+  void init_swa_sidecar_(
+      bool has_swa,
+      const std::vector<std::vector<torch::Tensor>> &swa_gpu_blocks,
+      torch::Tensor swa_cpu_blocks,
+      std::map<int, std::vector<std::string>> &swa_ssd_files,
+      torch::Tensor swa_gpu_kv_strides_tensor,
+      torch::Tensor swa_gpu_block_strides_tensor,
+      torch::Tensor swa_gpu_layer_strides_tensor,
+      torch::Tensor swa_gpu_chunk_sizes_tensor, int num_layers,
+      int iouring_entries, int iouring_flags);
+
+  void launch_swa_h2d_layer_(
+      int start_layer, int layers_this_batch, int num_blocks,
+      int64_t *swa_gpu_block_ids, int64_t *swa_cpu_block_ids,
+      int64_t swa_h2d_cpu_kv_stride_in_bytes,
+      int64_t swa_h2d_cpu_layer_stride_in_bytes,
+      int64_t swa_cpu_block_stride_in_bytes, int transfer_cta_num,
+      bool use_ce_transfer);
 };
 
 } // namespace flexkv

@@ -488,6 +488,26 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    # ---- SWA pool wiring (single worker fused with main-KV) ----
+                    # Pass SWA handles when registered; otherwise None and the
+                    # worker stays in pure main-KV mode (has_swa=False inside).
+                    swa_gpu_blocks=(
+                        [h.get_tensor_handle_list() for h in self._swa_gpu_handles[worker_key]]
+                        if self._has_swa else None),
+                    swa_cpu_blocks=(self._swa_cpu_handle.get_worker_tensor()
+                                    if self._has_swa else None),
+                    swa_gpu_kv_layouts=([h.kv_layout for h in self._swa_gpu_handles[worker_key]]
+                                        if self._has_swa else None),
+                    swa_cpu_kv_layout=(self._swa_cpu_handle.kv_layout
+                                       if self._has_swa else None),
+                    swa_dtype=(self._swa_gpu_handles[worker_key][0].dtype
+                               if self._has_swa else None),
+                    swa_ssd_files=(self._swa_ssd_handle.get_file_list()
+                                   if self._has_swa and self._swa_ssd_handle is not None else None),
+                    swa_ssd_kv_layout=(self._swa_ssd_handle.kv_layout
+                                       if self._has_swa and self._swa_ssd_handle is not None else None),
+                    swa_num_blocks_per_file=(self._swa_ssd_handle.num_blocks_per_file
+                                             if self._has_swa and self._swa_ssd_handle is not None else 0),
                     **self._get_multi_group_kwargs_tp(worker_key),
                 )
                 self.layerwise_workers[worker_key] = worker
@@ -991,6 +1011,13 @@ class TransferEngine:
                 dst_block_ids_h2d=op.dst_block_ids_h2d.copy(),
                 src_block_ids_disk2h=op.src_block_ids_disk2h.copy(),
                 dst_block_ids_disk2h=op.dst_block_ids_disk2h.copy(),
+                # SWA ids must be carried through PP fan-out replicas, otherwise
+                # each PP sibling's worker would only see main-KV ids and the SWA
+                # layer-fused branch in cpp would be silently skipped.
+                swa_src_block_ids_h2d=op.swa_src_block_ids_h2d.copy(),
+                swa_dst_block_ids_h2d=op.swa_dst_block_ids_h2d.copy(),
+                swa_src_block_ids_disk2h=op.swa_src_block_ids_disk2h.copy(),
+                swa_dst_block_ids_disk2h=op.swa_dst_block_ids_disk2h.copy(),
                 dp_client_id=op.dp_client_id,
                 counter_id=op.counter_id,
             )

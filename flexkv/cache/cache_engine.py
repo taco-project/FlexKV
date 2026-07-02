@@ -556,6 +556,89 @@ class GlobalCacheEngine:
                 num_blocks = len(op.src_block_ids) if op.src_block_ids is not None else 0
                 self._metrics_collector.record_transfer(transfer_type_str, num_blocks, operation)
 
+    def _swa_enabled(self) -> bool:
+        swa = getattr(self.cache_config, "swa", None)
+        return swa is not None and swa.enabled
+
+    def _append_swa_put_ops(
+        self,
+        transfer_graph: TransferOpGraph,
+        finished_ops_ids: List[int],
+        gpu_block_ids: np.ndarray,
+        cpu_block_ids: np.ndarray,
+        dp_client_id: int,
+        *,
+        fragment2_cpu_blocks: Optional[np.ndarray] = None,
+        fragment2_ssd_blocks: Optional[np.ndarray] = None,
+    ) -> None:
+        """Mirror main-KV PUT transfers into the SWA CPU/SSD pools."""
+        if not self._swa_enabled() or gpu_block_ids.size == 0:
+            return
+        op_swa_d2h = TransferOp(
+            graph_id=transfer_graph.graph_id,
+            transfer_type=TransferType.D2H,
+            src_block_ids=gpu_block_ids,
+            dst_block_ids=cpu_block_ids,
+            dp_client_id=dp_client_id,
+            is_swa=True,
+        )
+        transfer_graph.add_transfer_op(op_swa_d2h)
+        finished_ops_ids.append(op_swa_d2h.op_id)
+
+        if (fragment2_ssd_blocks is not None and fragment2_ssd_blocks.size > 0
+                and fragment2_cpu_blocks is not None and fragment2_cpu_blocks.size > 0):
+            op_swa_h2disk = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=TransferType.H2DISK,
+                src_block_ids=fragment2_cpu_blocks,
+                dst_block_ids=fragment2_ssd_blocks,
+                dp_client_id=dp_client_id,
+                is_swa=True,
+            )
+            transfer_graph.add_transfer_op(op_swa_h2disk)
+            transfer_graph.add_dependency(op_swa_h2disk.op_id, op_swa_d2h.op_id)
+            finished_ops_ids.append(op_swa_h2disk.op_id)
+
+    def _append_swa_get_ops(
+        self,
+        transfer_graph: TransferOpGraph,
+        dp_client_id: int,
+        *,
+        fragment12_cpu_blocks: np.ndarray,
+        fragment12_gpu_blocks: np.ndarray,
+        fragment2_ssd_blocks: Optional[np.ndarray] = None,
+        fragment2_cpu_blocks: Optional[np.ndarray] = None,
+        op_swa_disk2h: Optional[TransferOp] = None,
+    ) -> Optional[TransferOp]:
+        """Add SWA DISK2H/H2D ops for layerwise merge (is_swa=True)."""
+        if not self._swa_enabled() or fragment12_gpu_blocks.size == 0:
+            return None
+
+        if (fragment2_ssd_blocks is not None and fragment2_ssd_blocks.size > 0
+                and fragment2_cpu_blocks is not None and fragment2_cpu_blocks.size > 0):
+            op_swa_disk2h = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=TransferType.DISK2H,
+                src_block_ids=fragment2_ssd_blocks,
+                dst_block_ids=fragment2_cpu_blocks,
+                dp_client_id=dp_client_id,
+                is_swa=True,
+            )
+            transfer_graph.add_transfer_op(op_swa_disk2h)
+
+        op_swa_h2d = TransferOp(
+            graph_id=transfer_graph.graph_id,
+            transfer_type=TransferType.H2D,
+            src_block_ids=fragment12_cpu_blocks,
+            dst_block_ids=fragment12_gpu_blocks,
+            dp_client_id=dp_client_id,
+            is_swa=True,
+        )
+        transfer_graph.add_transfer_op(op_swa_h2d)
+        if op_swa_disk2h is not None:
+            transfer_graph.add_dependency(op_swa_h2d.op_id, op_swa_disk2h.op_id)
+        return op_swa_h2d
+
     def get(self,
             request_id: int,
             token_ids: np.ndarray,
@@ -1059,6 +1142,18 @@ class GlobalCacheEngine:
                 transfer_graph.add_dependency(op_h2d.op_id, op_peerh2h.op_id)
             finished_ops_ids.append(op_h2d.op_id)
 
+            swa_cpu_blocks = fragment12_cpu_blocks if not enable_gds else fragment1_cpu_blocks
+            swa_gpu_blocks = fragment12_gpu_blocks if not enable_gds \
+                else fragment12_gpu_blocks[:fragment1_num_blocks]
+            self._append_swa_get_ops(
+                transfer_graph,
+                dp_client_id,
+                fragment12_cpu_blocks=swa_cpu_blocks,
+                fragment12_gpu_blocks=swa_gpu_blocks,
+                fragment2_ssd_blocks=fragment2_ssd_blocks if fragment2_num_blocks > 0 else None,
+                fragment2_cpu_blocks=fragment2_cpu_blocks,
+            )
+
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
@@ -1271,6 +1366,7 @@ class GlobalCacheEngine:
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
 
+        fragment2_cpu_for_swa = None
         if put_to_ssd:
             if len(fragment12_cpu_blocks) < fragment2_num_blocks:
                 num_needed_from_cpu_matched = fragment2_num_blocks - len(fragment12_cpu_blocks)
@@ -1278,6 +1374,7 @@ class GlobalCacheEngine:
                     fragment12_cpu_blocks])
             else:
                 fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
+            fragment2_cpu_for_swa = fragment2_cpu_blocks
             op_h2disk = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2DISK,
@@ -1305,6 +1402,16 @@ class GlobalCacheEngine:
             )
             transfer_graph.add_transfer_op(op_h2remote)
             transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)
+
+        self._append_swa_put_ops(
+            transfer_graph,
+            finished_ops_ids,
+            fragment12_gpu_blocks,
+            fragment12_cpu_blocks,
+            dp_client_id,
+            fragment2_cpu_blocks=fragment2_cpu_for_swa,
+            fragment2_ssd_blocks=fragment2_ssd_blocks if put_to_ssd else None,
+        )
 
         cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                           fragment12_cpu_blocks,
@@ -1437,6 +1544,7 @@ class GlobalCacheEngine:
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
 
+        fragment2_cpu_for_swa = None
         if fragment2_num_blocks > 0:
             if len(fragment12_cpu_blocks) < fragment2_num_blocks:
                 flexkv_logger.warning(f"fragment12_cpu_blocks: {len(fragment12_cpu_blocks)}, "
@@ -1448,6 +1556,7 @@ class GlobalCacheEngine:
                     fragment12_cpu_blocks])
             else:
                 fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
+            fragment2_cpu_for_swa = fragment2_cpu_blocks
             op_h2disk = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2DISK,
@@ -1458,6 +1567,16 @@ class GlobalCacheEngine:
             transfer_graph.add_transfer_op(op_h2disk)
 
             transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
+
+        self._append_swa_put_ops(
+            transfer_graph,
+            finished_ops_ids,
+            fragment12_gpu_blocks,
+            fragment12_cpu_blocks,
+            dp_client_id,
+            fragment2_cpu_blocks=fragment2_cpu_for_swa,
+            fragment2_ssd_blocks=fragment2_ssd_blocks if fragment2_num_blocks > 0 else None,
+        )
 
         """insert and lock"""
         cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
