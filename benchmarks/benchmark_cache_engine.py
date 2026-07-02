@@ -41,14 +41,17 @@ def main(args):
         if req.request_type == "get":
             num_get_requests += 1
             if not args.only_put:
+                # GlobalCacheEngine.get(request_id, token_ids, token_mask,
+                #   slot_mapping, dp_client_id, temp_cache_strategy=DEFAULT).
+                # dp_client_id=-1 (no GPU register in this control-plane bench).
                 profiler.runctx('graph, return_mask, transfer_call_back, op_callback_dict, finished_ops_ids = '
                                 'cache_engine.get(request_id, req.token_ids, req.token_mask, '
-                                'fake_slot_mapping, -1, -1)',
+                                'fake_slot_mapping, -1)',
                                 globals(), local_vars)
             else:
                 graph, return_mask, transfer_call_back, op_callback_dict, finished_ops_ids = \
                     cache_engine.get(request_id, req.token_ids, req.token_mask,
-                                   fake_slot_mapping, -1, -1)
+                                   fake_slot_mapping, -1)
                 local_vars.update({
                     'graph': graph,
                     'return_mask': return_mask,
@@ -56,6 +59,12 @@ def main(args):
                     'op_callback_dict': op_callback_dict,
                     'finished_ops_ids': finished_ops_ids
                 })
+            # Drive the per-op ready callbacks then the transfer callback so the
+            # matched/loaded nodes become ready+unlocked (mirrors the transfer
+            # engine completing the ops), otherwise inserted blocks stay unready
+            # and later gets never hit.
+            for _cb in local_vars['op_callback_dict'].values():
+                _cb()
             profiler.runctx('transfer_call_back()', globals(), local_vars)
 
             return_mask = local_vars['return_mask']
@@ -69,11 +78,11 @@ def main(args):
             num_put_requests += 1
             if not args.only_get:
                 profiler.runctx('graph, return_mask, transfer_call_back, op_callback_dict, finished_ops_ids = '
-                                'cache_engine.put(request_id, req.token_ids, req.token_mask, fake_slot_mapping)',
+                                'cache_engine.put(request_id, req.token_ids, req.token_mask, fake_slot_mapping, -1)',
                                 globals(), local_vars)
             else:
                 graph, return_mask, transfer_call_back, op_callback_dict, finished_ops_ids = \
-                    cache_engine.put(request_id, req.token_ids, req.token_mask, fake_slot_mapping)
+                    cache_engine.put(request_id, req.token_ids, req.token_mask, fake_slot_mapping, -1)
                 local_vars.update({
                     'graph': graph,
                     'return_mask': return_mask,
@@ -82,6 +91,10 @@ def main(args):
                     'finished_ops_ids': finished_ops_ids
                 })
 
+            # Complete the ops (set nodes ready) then run the transfer callback,
+            # so the stored prefix is matchable by subsequent gets.
+            for _cb in local_vars['op_callback_dict'].values():
+                _cb()
             profiler.runctx('transfer_call_back()', globals(), local_vars)
 
             return_mask = local_vars['return_mask']

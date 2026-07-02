@@ -1,9 +1,11 @@
-"""Step 1 + Step 2 verification: node-attached SWA state on the C++ radix tree.
+"""Node-mounted SWA state on the C++ radix tree (CRadixNode / CRadixTreeIndex).
 
 Covers:
-  - CRadixNode SWA fields are exposed and read/write round-trips (Step 1).
-  - split / evict release the node's SWA slot into freed_swa_slots so the Python
-    side can drain it, enforcing the "SWA subset of full" invariant (Step 2).
+  - CRadixNode SWA fields are exposed and read/write round-trips.
+  - Full eviction connect-frees the node's SWA slot into freed_swa_slots so the
+    Python side can drain it, enforcing the "SWA subset of full" invariant (I1).
+  - Split PRESERVES the SWA on the suffix half (the half that still owns the
+    original last page), rather than freeing it (I0/I4 — node-mount design).
 
 Requires a real flexkv.c_ext built with FLEXKV_ENABLE_P2P=1 (LocalRadixTree).
 Skips cleanly if the C extension or LocalRadixTree is unavailable.
@@ -83,7 +85,7 @@ class TestStep1Fields:
 
 
 # --------------------------------------------------------------------------- #
-# Step 2: cascade release on evict / split                                     #
+# Step 2: full-evict connect-frees SWA (I1); split PRESERVES SWA (I0)          #
 # --------------------------------------------------------------------------- #
 
 class TestStep2Cascade:
@@ -94,7 +96,7 @@ class TestStep2Cascade:
         node.swa_host_slot = 7
         node.swa_tombstone = False
 
-        # Evict everything; the node should be deleted and its slot drained.
+        # Evict everything; the node should be deleted and its slot drained (I1).
         buf = torch.zeros(64, dtype=torch.int64)
         tree.evict(buf, 64)
         freed = tree.drain_freed_swa_slots()
@@ -109,7 +111,9 @@ class TestStep2Cascade:
         tree.evict(buf, 64)
         assert tree.drain_freed_swa_slots() == []
 
-    def test_split_drains_slot(self):
+    def test_split_preserves_swa_on_suffix(self):
+        """Node-mount (I0/I4): split keeps the SWA on the half that owns the
+        original last page (the suffix). It must NOT be freed."""
         tree = _make_tree()
         # Long sequence, then a sequence sharing a prefix to force a split.
         long_tokens = np.arange(0, TPB * 4, dtype=np.int64)
@@ -123,8 +127,11 @@ class TestStep2Cascade:
         seq2 = np.concatenate([shared, divergent])
         _insert(tree, seq2, 300)
 
-        freed = tree.drain_freed_swa_slots()
-        assert 9 in freed
+        # Split preserves the SWA (nothing drained), and the original node (now
+        # the suffix half) still carries slot 9.
+        assert tree.drain_freed_swa_slots() == []
+        assert node.swa_host_slot == 9
+        assert node.swa_tombstone is False
 
     def test_drain_is_idempotent(self):
         tree = _make_tree()
@@ -137,3 +144,66 @@ class TestStep2Cascade:
         assert 5 in tree.drain_freed_swa_slots()
         # second drain returns nothing
         assert tree.drain_freed_swa_slots() == []
+
+
+# --------------------------------------------------------------------------- #
+# Step 3: tree-level set_swa / evict_swa / dual lock (node-mount)              #
+# --------------------------------------------------------------------------- #
+
+class TestStep3TreeLevel:
+    def test_set_swa_and_match_reports_last_swa_node(self):
+        tree = _make_tree()
+        tokens = np.arange(0, TPB * 3, dtype=np.int64)
+        node, block_hashes = _insert(tree, tokens, 0)
+        tree.set_swa(node, 42)
+        assert node.swa_host_slot == 42 and node.swa_tombstone is False
+        mr = tree.match_prefix(block_hashes, len(tokens) // TPB, False)
+        assert mr.last_swa_node is not None
+        assert mr.last_swa_node.swa_host_slot == 42
+        assert mr.swa_hit_blocks == len(tokens) // TPB
+
+    def test_evict_swa_internal_node_tombstone_keeps_full(self):
+        """SWA-only eviction of an internal node drops its SWA, keeps Full KV."""
+        tree = _make_tree()
+        long_tokens = np.arange(0, TPB * 4, dtype=np.int64)
+        node, _ = _insert(tree, long_tokens, 200)
+        tree.set_swa(node, 9)
+        shared = np.arange(0, TPB * 2, dtype=np.int64)
+        divergent = np.arange(900, 900 + TPB * 2, dtype=np.int64)
+        _insert(tree, np.concatenate([shared, divergent]), 300)
+        internal = node.parent  # prefix half became an internal node
+        tree.set_swa(internal, 8)
+        # Evict all SWA: the internal node's SWA (8) must be freed but its Full
+        # KV kept (still an internal node with children).
+        buf = torch.zeros(0, dtype=torch.int64)
+        freed = tree.evict_swa(buf, 8)
+        assert freed >= 1
+        assert 8 in tree.drain_freed_swa_slots()
+
+    def test_dual_lock_ref_walk(self):
+        tree = _make_tree()
+        tokens = np.arange(0, TPB * 2, dtype=np.int64)
+        node, _ = _insert(tree, tokens, 100)
+        tree.set_swa(node, 55)
+        boundary = tree.inc_lock_ref(node)
+        assert boundary is not None
+        assert node.get_lock_cnt() >= 1
+        assert node.swa_lock_ref == 1
+        assert node.get_lock_cnt() >= node.swa_lock_ref  # I3
+        tree.dec_lock_ref(node, boundary)
+        assert node.get_lock_cnt() == 0 and node.swa_lock_ref == 0
+
+    def test_dec_swa_lock_only_then_skip(self):
+        tree = _make_tree()
+        tokens = np.arange(0, TPB * 2, dtype=np.int64)
+        node, _ = _insert(tree, tokens, 100)
+        tree.set_swa(node, 66)
+        boundary = tree.inc_lock_ref(node)
+        tree.dec_swa_lock_only(boundary)
+        # leaf: SWA freed early + tombstone; full lock still held
+        assert node.swa_lock_ref == 0
+        assert node.swa_tombstone is True
+        assert node.get_lock_cnt() == 1
+        assert 66 in tree.drain_freed_swa_slots()
+        tree.dec_lock_ref(node, boundary, True)  # skip_swa=True
+        assert node.get_lock_cnt() == 0
