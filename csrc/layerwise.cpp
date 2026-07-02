@@ -63,6 +63,128 @@ static void CUDART_CB layer_done_host_callback(void *userData) {
   delete data;
 }
 
+void LayerwiseTransferGroup::init_swa_sidecar_(
+    bool has_swa, const std::vector<std::vector<torch::Tensor>> &swa_gpu_blocks,
+    torch::Tensor swa_cpu_blocks,
+    std::map<int, std::vector<std::string>> &swa_ssd_files,
+    torch::Tensor swa_gpu_kv_strides_tensor,
+    torch::Tensor swa_gpu_block_strides_tensor,
+    torch::Tensor swa_gpu_layer_strides_tensor,
+    torch::Tensor swa_gpu_chunk_sizes_tensor, int num_layers,
+    int iouring_entries, int iouring_flags) {
+  has_swa_ = has_swa && !swa_gpu_blocks.empty() && swa_cpu_blocks.defined() &&
+             swa_cpu_blocks.numel() > 0;
+  if (!has_swa_) {
+    return;
+  }
+
+  swa_gpu_kv_strides_in_bytes_ = new int64_t[num_gpus_];
+  swa_gpu_block_strides_in_bytes_ = new int64_t[num_gpus_];
+  swa_gpu_layer_strides_in_bytes_ = new int64_t[num_gpus_];
+  swa_gpu_chunk_sizes_in_bytes_ = new int64_t[num_gpus_];
+  int64_t *swa_kv = swa_gpu_kv_strides_tensor.data_ptr<int64_t>();
+  int64_t *swa_blk = swa_gpu_block_strides_tensor.data_ptr<int64_t>();
+  int64_t *swa_lay = swa_gpu_layer_strides_tensor.data_ptr<int64_t>();
+  int64_t *swa_chk = swa_gpu_chunk_sizes_tensor.data_ptr<int64_t>();
+  for (int i = 0; i < num_gpus_; i++) {
+    swa_gpu_kv_strides_in_bytes_[i] = swa_kv[i];
+    swa_gpu_block_strides_in_bytes_[i] = swa_blk[i];
+    swa_gpu_layer_strides_in_bytes_[i] = swa_lay[i];
+    swa_gpu_chunk_sizes_in_bytes_[i] = swa_chk[i];
+  }
+
+  swa_num_tensors_per_gpu_ = swa_gpu_blocks[0].size();
+  cudaMallocHost((void **)&swa_gpu_blocks_,
+                 num_gpus_ * swa_num_tensors_per_gpu_ * sizeof(void *));
+  for (int i = 0; i < num_gpus_; ++i) {
+    for (int j = 0; j < swa_num_tensors_per_gpu_; ++j) {
+      swa_gpu_blocks_[i * swa_num_tensors_per_gpu_ + j] =
+          swa_gpu_blocks[i][j].data_ptr();
+    }
+  }
+
+  if (swa_num_tensors_per_gpu_ == 1) {
+    swa_backend_type_ = BackendType::TRTLLM;
+  } else if (swa_num_tensors_per_gpu_ == num_layers) {
+    swa_backend_type_ = BackendType::VLLM;
+  } else if (swa_num_tensors_per_gpu_ == num_layers * 2) {
+    swa_backend_type_ = BackendType::SGLANG;
+  } else {
+    throw std::runtime_error("Unsupported SWA GPU block type: " +
+                             std::to_string(swa_num_tensors_per_gpu_));
+  }
+
+  swa_gpu_tensor_handlers_.reserve(num_gpus_);
+  for (int i = 0; i < num_gpus_; i++) {
+    int64_t **swa_ptr = reinterpret_cast<int64_t **>(
+        swa_gpu_blocks_ + i * swa_num_tensors_per_gpu_);
+    swa_gpu_tensor_handlers_.emplace_back(
+        swa_backend_type_, swa_ptr, num_layers,
+        swa_gpu_kv_strides_in_bytes_[i], swa_gpu_block_strides_in_bytes_[i],
+        swa_gpu_layer_strides_in_bytes_[i]);
+  }
+
+  swa_cpu_blocks_ = swa_cpu_blocks.data_ptr();
+
+  swa_enable_ssd_ = !swa_ssd_files.empty();
+  if (swa_enable_ssd_) {
+    swa_ioctx_ = std::make_unique<SSDIOCTX>(
+        swa_ssd_files, swa_ssd_files.size(), iouring_entries, iouring_flags);
+  }
+  printf("[LayerwiseTransferGroup] SWA sidecar initialized: "
+         "num_tensors_per_gpu=%d, backend=%d, swa_ssd=%d, multi_group=%d\n",
+         swa_num_tensors_per_gpu_, (int)swa_backend_type_, (int)swa_enable_ssd_,
+         (int)has_multi_group_);
+}
+
+void LayerwiseTransferGroup::launch_swa_h2d_layer_(
+    int start_layer, int layers_this_batch, int num_blocks,
+    int64_t *swa_gpu_block_ids, int64_t *swa_cpu_block_ids,
+    int64_t swa_h2d_cpu_kv_stride_in_bytes,
+    int64_t swa_h2d_cpu_layer_stride_in_bytes,
+    int64_t swa_cpu_block_stride_in_bytes, int transfer_cta_num,
+    bool use_ce_transfer) {
+  if (!has_swa_) {
+    return;
+  }
+  for (int i = 0; i < num_gpus_; ++i) {
+    cudaSetDevice(gpu_device_ids_[i]);
+    int64_t swa_chunk_size = swa_gpu_chunk_sizes_in_bytes_[i];
+    switch (swa_backend_type_) {
+    case BackendType::VLLM:
+      flexkv::transfer_kv_blocks<BackendType::VLLM>(
+          num_blocks, start_layer, layers_this_batch, swa_gpu_block_ids,
+          swa_gpu_tensor_handlers_[i],
+          /*gpu_startoff=*/0, swa_cpu_block_ids, swa_cpu_blocks_,
+          swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
+          swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
+          streams_[i], transfer_cta_num, true, use_ce_transfer,
+          /*is_mla=*/true, false);
+      break;
+    case BackendType::TRTLLM:
+      flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+          num_blocks, start_layer, layers_this_batch, swa_gpu_block_ids,
+          swa_gpu_tensor_handlers_[i],
+          /*gpu_startoff=*/0, swa_cpu_block_ids, swa_cpu_blocks_,
+          swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
+          swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
+          streams_[i], transfer_cta_num, true, use_ce_transfer,
+          /*is_mla=*/true, false);
+      break;
+    case BackendType::SGLANG:
+      flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+          num_blocks, start_layer, layers_this_batch, swa_gpu_block_ids,
+          swa_gpu_tensor_handlers_[i],
+          /*gpu_startoff=*/0, swa_cpu_block_ids, swa_cpu_blocks_,
+          swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
+          swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
+          streams_[i], transfer_cta_num, true, use_ce_transfer,
+          /*is_mla=*/true, false);
+      break;
+    }
+  }
+}
+
 LayerwiseTransferGroup::LayerwiseTransferGroup(
     int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
     torch::Tensor &cpu_blocks,
@@ -71,7 +193,15 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     torch::Tensor &gpu_block_strides_tensor,
     torch::Tensor &gpu_layer_strides_tensor,
     torch::Tensor &gpu_chunk_sizes_tensor, int iouring_entries,
-    int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size) {
+    int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size,
+    bool has_swa,
+    const std::vector<std::vector<torch::Tensor>> &swa_gpu_blocks,
+    torch::Tensor swa_cpu_blocks,
+    std::map<int, std::vector<std::string>> swa_ssd_files,
+    torch::Tensor swa_gpu_kv_strides_tensor,
+    torch::Tensor swa_gpu_block_strides_tensor,
+    torch::Tensor swa_gpu_layer_strides_tensor,
+    torch::Tensor swa_gpu_chunk_sizes_tensor) {
 
   num_gpus_ = num_gpus;
   num_layers_ = num_layers;
@@ -117,6 +247,7 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     gpu_layer_strides_in_bytes_[i] = layer_strides_ptr[i];
   }
 
+  // resolve the whole gpu tensor pointers
   num_tensors_per_gpu_ = gpu_blocks[0].size();
   cudaMallocHost((void **)&gpu_blocks_,
                  num_gpus_ * num_tensors_per_gpu_ * sizeof(void *));
@@ -137,6 +268,8 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
                              std::to_string(num_tensors_per_gpu_));
   }
 
+  // create the gpu tensor handlers, each handler is 
+  // a pointer to the whole gpu tensor pointers array
   gpu_tensor_handlers_.reserve(num_gpus_);
   for (int i = 0; i < num_gpus_; i++) {
     int64_t **gpu_blocks_ptr =
@@ -175,6 +308,11 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     ioctx_ = std::make_unique<SSDIOCTX>(ssd_files, ssd_files.size(),
                                         iouring_entries, iouring_flags);
   }
+
+  init_swa_sidecar_(has_swa, swa_gpu_blocks, swa_cpu_blocks, swa_ssd_files,
+                    swa_gpu_kv_strides_tensor, swa_gpu_block_strides_tensor,
+                    swa_gpu_layer_strides_tensor, swa_gpu_chunk_sizes_tensor,
+                    num_layers, iouring_entries, iouring_flags);
 }
 
 LayerwiseTransferGroup::LayerwiseTransferGroup(
@@ -200,7 +338,15 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     const std::vector<int64_t> &group_gpu_block_strides,
     const std::vector<int64_t> &group_gpu_layer_strides,
     const std::vector<int64_t> &group_gpu_chunk_sizes, int iouring_entries,
-    int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size) {
+    int iouring_flags, torch::Tensor &layer_eventfds_tensor, int tp_size,
+    bool has_swa,
+    const std::vector<std::vector<torch::Tensor>> &swa_gpu_blocks,
+    torch::Tensor swa_cpu_blocks,
+    std::map<int, std::vector<std::string>> swa_ssd_files,
+    torch::Tensor swa_gpu_kv_strides_tensor,
+    torch::Tensor swa_gpu_block_strides_tensor,
+    torch::Tensor swa_gpu_layer_strides_tensor,
+    torch::Tensor swa_gpu_chunk_sizes_tensor) {
 
   num_gpus_ = num_gpus;
   num_layers_ = num_original_layers;
@@ -352,6 +498,11 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     ioctx_ = std::make_unique<SSDIOCTX>(ssd_files, ssd_files.size(),
                                         iouring_entries, iouring_flags);
   }
+
+  init_swa_sidecar_(has_swa, swa_gpu_blocks, swa_cpu_blocks, swa_ssd_files,
+                    swa_gpu_kv_strides_tensor, swa_gpu_block_strides_tensor,
+                    swa_gpu_layer_strides_tensor, swa_gpu_chunk_sizes_tensor,
+                    num_original_layers, iouring_entries, iouring_flags);
 }
 
 LayerwiseTransferGroup::~LayerwiseTransferGroup() {
@@ -376,6 +527,17 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
   delete[] gpu_block_strides_in_bytes_;
   delete[] gpu_layer_strides_in_bytes_;
   delete[] gpu_chunk_sizes_in_bytes_;
+
+  // ---- SWA fused pool cleanup ----
+  if (swa_gpu_blocks_ != nullptr) {
+    cudaFreeHost(swa_gpu_blocks_);
+    swa_gpu_blocks_ = nullptr;
+  }
+  swa_gpu_tensor_handlers_.clear();
+  delete[] swa_gpu_kv_strides_in_bytes_;
+  delete[] swa_gpu_block_strides_in_bytes_;
+  delete[] swa_gpu_layer_strides_in_bytes_;
+  delete[] swa_gpu_chunk_sizes_in_bytes_;
 }
 
 void LayerwiseTransferGroup::layer_done_callback(
@@ -430,7 +592,19 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t h2d_cpu_layer_stride_in_bytes,
     const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
     const bool use_ce_transfer, const int num_layers,
-    const int layer_granularity, const bool is_mla, const int counter_id) {
+    const int layer_granularity, const bool is_mla, const int counter_id,
+    const torch::Tensor &swa_h2d_src, const torch::Tensor &swa_h2d_dst,
+    const torch::Tensor &swa_disk2h_src, const torch::Tensor &swa_disk2h_dst,
+    const int64_t swa_cpu_kv_stride_in_bytes,
+    const int64_t swa_cpu_layer_stride_in_bytes,
+    const int64_t swa_cpu_block_stride_in_bytes,
+    const int64_t swa_cpu_chunk_size_in_bytes,
+    const int64_t swa_h2d_cpu_kv_stride_in_bytes,
+    const int64_t swa_h2d_cpu_layer_stride_in_bytes,
+    const int64_t swa_cpu_tp_stride_in_bytes,
+    const int64_t swa_ssd_layer_stride_in_bytes,
+    const int64_t swa_ssd_kv_stride_in_bytes,
+    const int swa_num_blocks_per_file) {
 
   if (has_multi_group_) {
     throw std::runtime_error(
@@ -515,6 +689,32 @@ void LayerwiseTransferGroup::layerwise_transfer(
     nvtxRangePop();
   }
 
+  // ---- SWA plumbing (fused). Derive h2d pointers + do SWA SSD->CPU once. ----
+  const bool swa_active = has_swa_ && (swa_h2d_src.numel() > 0);
+  int64_t *swa_gpu_block_ids = nullptr;
+  int64_t *swa_cpu_block_ids = nullptr;
+  int swa_num_blocks = 0;
+  if (swa_active) {
+    swa_num_blocks = swa_h2d_dst.numel();
+    swa_gpu_block_ids = static_cast<int64_t *>(swa_h2d_dst.data_ptr());
+    swa_cpu_block_ids = static_cast<int64_t *>(swa_h2d_src.data_ptr());
+  }
+  // SWA SSD->CPU one-shot (independent ioctx / strides), mirrors main-KV.
+  if (has_swa_ && swa_enable_ssd_ && swa_disk2h_src.numel() > 0) {
+    torch::Tensor swa_all_layer_ids = torch::arange(
+        0, num_layers, torch::TensorOptions().dtype(torch::kInt32));
+    transfer_kv_blocks_ssd(
+        *swa_ioctx_, swa_all_layer_ids,
+        reinterpret_cast<int64_t>(swa_cpu_blocks_), swa_disk2h_src,
+        swa_disk2h_dst, swa_cpu_layer_stride_in_bytes,
+        swa_cpu_kv_stride_in_bytes, swa_ssd_layer_stride_in_bytes,
+        swa_ssd_kv_stride_in_bytes, swa_cpu_chunk_size_in_bytes,
+        swa_cpu_block_stride_in_bytes,
+        true, // is_read: SSD -> CPU
+        swa_num_blocks_per_file, round_robin, num_threads_per_device,
+        /*is_mla=*/true);
+  }
+
   int batch_idx = 0;
   for (int start_layer = 0; start_layer < num_layers;
        start_layer += layer_granularity) {
@@ -566,6 +766,15 @@ void LayerwiseTransferGroup::layerwise_transfer(
             false);
         break;
       }
+    }
+
+    if (swa_active) {
+      launch_swa_h2d_layer_(start_layer, layers_this_batch, swa_num_blocks,
+                            swa_gpu_block_ids, swa_cpu_block_ids,
+                            swa_h2d_cpu_kv_stride_in_bytes,
+                            swa_h2d_cpu_layer_stride_in_bytes,
+                            swa_cpu_block_stride_in_bytes, transfer_cta_num,
+                            use_ce_transfer);
     }
 
     // Record event after this batch on GPU 0
@@ -647,7 +856,20 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     const int num_blocks_per_file, const int round_robin,
     const int num_threads_per_device, const torch::Tensor &gpu_block_id_tensor,
     const torch::Tensor &cpu_block_id_tensor, const int transfer_cta_num,
-    const bool use_ce_transfer, const bool is_mla, const int counter_id) {
+    const bool use_ce_transfer, const bool is_mla, const int counter_id,
+    const torch::Tensor &swa_h2d_src, const torch::Tensor &swa_h2d_dst,
+    const torch::Tensor &swa_disk2h_src, const torch::Tensor &swa_disk2h_dst,
+    const int64_t swa_cpu_kv_stride_in_bytes,
+    const int64_t swa_cpu_layer_stride_in_bytes,
+    const int64_t swa_cpu_block_stride_in_bytes,
+    const int64_t swa_cpu_chunk_size_in_bytes,
+    const int64_t swa_h2d_cpu_kv_stride_in_bytes,
+    const int64_t swa_h2d_cpu_layer_stride_in_bytes,
+    const int64_t swa_cpu_tp_stride_in_bytes,
+    const int64_t swa_ssd_layer_stride_in_bytes,
+    const int64_t swa_ssd_kv_stride_in_bytes,
+    const int swa_num_blocks_per_file) {
+  (void)swa_cpu_tp_stride_in_bytes;
 
   if (!has_multi_group_) {
     throw std::runtime_error(
@@ -663,13 +885,17 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   int64_t *cpu_block_ids =
       static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
 
-  // Step 0: SSD -> CPU. CPU and SSD share an identical per-block byte layout
-  // (multi-group BLOCKFIRST), so each block is transferred as one opaque blob.
-  // Collapses the prior num_groups * tp_size calls into a single call and
-  // removes the sub-4KiB IO hazard for groups with small per-chunk sizes
-  // (e.g., DSv4 indexer at compress_ratio=128). The kernel's slow path with
-  // num_layers=1, layer_stride=chunk_size=block_stride and is_mla=true issues
-  // exactly one pread/pwrite of block_stride bytes per block.
+  const bool swa_active = has_swa_ && (swa_h2d_src.numel() > 0);
+  int64_t *swa_gpu_block_ids = nullptr;
+  int64_t *swa_cpu_block_ids = nullptr;
+  int swa_num_blocks = 0;
+  if (swa_active) {
+    swa_num_blocks = static_cast<int>(swa_h2d_dst.numel());
+    swa_gpu_block_ids = static_cast<int64_t *>(swa_h2d_dst.data_ptr());
+    swa_cpu_block_ids = static_cast<int64_t *>(swa_h2d_src.data_ptr());
+  }
+
+  // Step 0a: main-KV SSD -> CPU (opaque multi-group block).
   if (enable_ssd_ && ssd_block_ids.numel() > 0) {
     const int64_t block_stride = groups_[0].cpu_block_stride;
     char ssd_range_name[128];
@@ -695,35 +921,33 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     nvtxRangePop();
   }
 
-  // Uncached layers (e.g. DSv4 layers 0/1/MTP with compress_ratio==0 at the
-  // model level) carry empty member lists: no data to transfer, so no kernels
-  // are launched, no eventfd callback is registered, and no NVTX range opened.
-  //
-  // HOWEVER, the model's forward still waits per-layer on these eventfds for
-  // any path that reads a per-layer buffer regardless of compress_ratio. In
-  // particular DSv4-Flash's SWA reload path calls
-  // ``get_swa_key_buffer_radix(layer_id) -> wait_layer_transfer(layer_id) ->
-  // eventfd_read`` for EVERY layer (the SWA pool spans all layers, including
-  // the ratio==0 dense layers). If we never post the skipped layers' eventfds,
-  // the consumer blocks forever -> scheduler watchdog timeout. So we post a
-  // "no-op satisfied" signal (the same value 2 the real callback writes) for
-  // every skipped layer immediately: they have no in-flight transfer, so the
-  // data they cover (none) is trivially "ready". Done before the active-layer
-  // loop launches kernels so the consumer can never observe an unposted gap.
-  std::vector<int> active_origs;
-  active_origs.reserve(num_original_layers_);
+  // Step 0b: SWA SSD -> CPU (uniform per-layer layout, independent ioctx).
+  if (has_swa_ && swa_enable_ssd_ && swa_disk2h_src.numel() > 0) {
+    torch::Tensor swa_all_layer_ids = torch::arange(
+        0, num_original_layers_, torch::TensorOptions().dtype(torch::kInt32));
+    transfer_kv_blocks_ssd(
+        *swa_ioctx_, swa_all_layer_ids,
+        reinterpret_cast<int64_t>(swa_cpu_blocks_), swa_disk2h_src,
+        swa_disk2h_dst, swa_cpu_layer_stride_in_bytes,
+        swa_cpu_kv_stride_in_bytes, swa_ssd_layer_stride_in_bytes,
+        swa_ssd_kv_stride_in_bytes, swa_cpu_chunk_size_in_bytes,
+        swa_cpu_block_stride_in_bytes,
+        true, swa_num_blocks_per_file, round_robin, num_threads_per_device,
+        /*is_mla=*/true);
+  }
+
+  // Empty-member layers: immediate eventfd only when SWA is not active for
+  // this transfer (otherwise SWA H2D + callback will post the fd).
   if (enable_eventfd_ && num_counters_ > 0 && !layer_eventfds_.empty()) {
     int offset = current_counter_id_ * tp_size_ * num_layers_;
     int *eventfds_ptr = layer_eventfds_.data() + offset;
     for (int orig = 0; orig < num_original_layers_; ++orig) {
-      if (!layer_members_[orig].empty()) {
+      if (!layer_members_[orig].empty() || swa_active) {
         continue;
       }
       for (int tp_rank = 0; tp_rank < tp_size_; ++tp_rank) {
         int fd = eventfds_ptr[tp_rank * num_layers_ + orig];
         if (fd >= 0) {
-          // Match layer_done_host_callback: write 2 to satisfy both
-          // get_key_buffer and get_value_buffer waits for this layer.
           uint64_t val = 2;
           ssize_t ret = write(fd, &val, sizeof(val));
           (void)ret;
@@ -731,34 +955,31 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
       }
     }
   }
+
+  std::vector<int> work_origs;
+  work_origs.reserve(num_original_layers_);
   for (int orig = 0; orig < num_original_layers_; ++orig) {
-    if (!layer_members_[orig].empty()) {
-      active_origs.push_back(orig);
+    if (!layer_members_[orig].empty() || swa_active) {
+      work_origs.push_back(orig);
     }
   }
 
-  // NVTX ranges per original layer (one slot per orig so callbacks can index
-  // by orig regardless of how the active subset chains together).
   std::vector<nvtxRangeId_t> h2d_range_ids(num_original_layers_, 0);
   std::vector<std::string> h2d_range_names(num_original_layers_);
-  for (int orig : active_origs) {
-    char name[160];
-    snprintf(name, sizeof(name), "CPU->GPU OrigLayer[%d] members=%zu", orig,
-             layer_members_[orig].size());
+  for (int orig : work_origs) {
+    char name[192];
+    snprintf(name, sizeof(name),
+             "CPU->GPU OrigLayer[%d] members=%zu swa=%d", orig,
+             layer_members_[orig].size(), swa_active ? 1 : 0);
     h2d_range_names[orig] = name;
   }
-  if (!active_origs.empty()) {
-    int first = active_origs.front();
+  if (!work_origs.empty()) {
+    int first = work_origs.front();
     h2d_range_ids[first] = nvtxRangeStartA(h2d_range_names[first].c_str());
   }
 
-  // Main loop: iterate the *active* original layers only. For each, fan out N
-  // members' transfer kernels (each on every GPU), then register a single
-  // eventfd callback that fires after members_this_layer * num_gpus_ GPU
-  // callbacks land. The "next" NVTX range chains to the next active orig, so
-  // gaps from uncached layers do not leave unclosed ranges.
-  for (size_t ai = 0; ai < active_origs.size(); ++ai) {
-    int orig = active_origs[ai];
+  for (size_t ai = 0; ai < work_origs.size(); ++ai) {
+    int orig = work_origs[ai];
     const auto &members = layer_members_[orig];
     int members_this_layer = static_cast<int>(members.size());
 
@@ -810,18 +1031,27 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
       }
     }
 
-    bool is_last_active = (ai + 1 == active_origs.size());
-    int next_orig = is_last_active ? -1 : active_origs[ai + 1];
+    if (swa_active) {
+      launch_swa_h2d_layer_(orig, 1, swa_num_blocks, swa_gpu_block_ids,
+                            swa_cpu_block_ids, swa_h2d_cpu_kv_stride_in_bytes,
+                            swa_h2d_cpu_layer_stride_in_bytes,
+                            swa_cpu_block_stride_in_bytes, transfer_cta_num,
+                            use_ce_transfer);
+    }
+
+    bool is_last_active = (ai + 1 == work_origs.size());
+    int next_orig = is_last_active ? -1 : work_origs[ai + 1];
     const char *next_name =
         is_last_active ? nullptr : h2d_range_names[next_orig].c_str();
     nvtxRangeId_t *next_id_ptr =
         is_last_active ? nullptr : &h2d_range_ids[next_orig];
 
+    int slots_per_gpu = members_this_layer + (swa_active ? 1 : 0);
     layer_done_callback(/*start_layer=*/orig, /*layers_this_batch=*/1,
-                        /*expected_count=*/members_this_layer * num_gpus_,
+                        /*expected_count=*/slots_per_gpu * num_gpus_,
                         &h2d_range_ids[orig], is_last_active, next_name,
                         next_id_ptr,
-                        /*callbacks_per_gpu=*/members_this_layer);
+                        /*callbacks_per_gpu=*/slots_per_gpu);
   }
 
   for (int d = 0; d < num_gpus_; ++d) {

@@ -372,17 +372,27 @@ class KVTaskManager:
 
     def set_slot_mappings(self,
                           task_ids: List[int],
-                          slot_mappings: List[np.ndarray]) -> None:
-        for task_id, slot_mapping in zip(task_ids, slot_mappings):
-            self._set_slot_mapping_impl(task_id, slot_mapping)
+                          slot_mappings: List[np.ndarray],
+                          swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None) -> None:
+        if swa_slot_mappings is None:
+            swa_slot_mappings = [None] * len(task_ids)
+        for task_id, slot_mapping, swa_slot_mapping in zip(task_ids, slot_mappings, swa_slot_mappings):
+            self._set_slot_mapping_impl(task_id, slot_mapping, swa_slot_mapping)
 
-    def _set_slot_mapping_impl(self, task_id: int, slot_mapping: np.ndarray) -> None:
+    def _set_slot_mapping_impl(self,
+                               task_id: int,
+                               slot_mapping: np.ndarray,
+                               swa_slot_mapping: Optional[np.ndarray] = None) -> None:
         task = self.tasks[task_id]
         if task.status != TaskStatus.UNREADY:
             return
         graph_ids = self.cache_engine.slot_mapping_to_block_ids(slot_mapping,
                                                                 self.cache_config.tokens_per_block)
-        task.graph.set_gpu_blocks(graph_ids)
+        swa_graph_ids = None
+        if swa_slot_mapping is not None:
+            swa_graph_ids = self.cache_engine.slot_mapping_to_block_ids(
+                swa_slot_mapping, self.cache_config.tokens_per_block)
+        task.graph.set_gpu_blocks(graph_ids, swa_graph_ids)
         task.status = TaskStatus.READY
 
     def _gen_task_id(self) -> int:
@@ -812,6 +822,7 @@ class KVTaskEngine(KVTaskManager):
     def launch_tasks(self,
                     task_ids: List[int],
                     slot_mappings: List[np.ndarray],
+                    swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None,
                     as_batch: bool = False,
                     batch_id: int = -1,
                     layerwise_transfer: bool = False,
@@ -819,7 +830,7 @@ class KVTaskEngine(KVTaskManager):
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
-        self.set_slot_mappings(task_ids, slot_mappings)
+        self.set_slot_mappings(task_ids, slot_mappings, swa_slot_mappings)
 
         # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
