@@ -662,13 +662,36 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("update_cache_info"),
            py::call_guard<py::gil_scoped_release>())
       .def("drain_freed_swa_slots",
-           &flexkv::CRadixTreeIndex::drain_freed_swa_slots);
+           &flexkv::CRadixTreeIndex::drain_freed_swa_slots)
+      // ===== SWA node-mount: store-side mount + SWA-only eviction =====
+      .def("set_swa", &flexkv::CRadixTreeIndex::set_swa, py::arg("node"),
+           py::arg("slot"))
+      .def("evict_swa", &flexkv::CRadixTreeIndex::evict_swa,
+           py::arg("evicted_full_blocks"), py::arg("num_swa_evicted"),
+           py::call_guard<py::gil_scoped_release>())
+      // ===== SWA dual lock (full + swa), tree-level walk (design §7) =====
+      .def("inc_lock_ref", &flexkv::CRadixTreeIndex::inc_lock_ref,
+           py::arg("node"), py::return_value_policy::reference)
+      .def("dec_lock_ref", &flexkv::CRadixTreeIndex::dec_lock_ref,
+           py::arg("node"), py::arg("swa_boundary") = nullptr,
+           py::arg("skip_swa") = false)
+      .def("dec_swa_lock_only", &flexkv::CRadixTreeIndex::dec_swa_lock_only,
+           py::arg("swa_boundary"));
 
   py::class_<flexkv::CRadixNode>(m, "CRadixNode")
       .def(py::init<flexkv::CRadixTreeIndex *, bool, int>())
       .def(py::init<flexkv::CRadixTreeIndex *, bool, int, bool>())
       .def("size", &flexkv::CRadixNode::size)
       .def("has_block_node_ids", &flexkv::CRadixNode::has_block_node_ids)
+      // Structural / lock accessors — needed to assert the node-mount SWA
+      // invariants (I1/I2/I3) from Python against the production CRadixTreeIndex
+      // path (see tests/test_swa_accel_nodemount.py). Previously only bound for
+      // the P2P LocalRadixTree, so the non-P2P DSv4 build had no way to read
+      // them and the C++ node-mount SWA path went untested.
+      .def("is_leaf", &flexkv::CRadixNode::is_leaf)
+      .def("num_children", &flexkv::CRadixNode::get_num_children)
+      .def("get_lock_cnt", &flexkv::CRadixNode::get_lock_cnt)
+      .def("has_swa", &flexkv::CRadixNode::has_swa)
       .def_property_readonly("parent", &flexkv::CRadixNode::get_parent,
                              py::return_value_policy::reference)
       // ===== SWA accessors (node-attached SWA state) =====
@@ -694,7 +717,11 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readonly("num_matched_blocks",
                     &flexkv::CMatchResult::num_matched_blocks)
       .def_readonly("last_node_matched_length",
-                    &flexkv::CMatchResult::last_node_matched_length);
+                    &flexkv::CMatchResult::last_node_matched_length)
+      // ===== SWA node-mount: deepest ready node carrying a live SWA slot =====
+      .def_readonly("last_swa_node", &flexkv::CMatchResult::last_swa_node,
+                    py::return_value_policy::reference)
+      .def_readonly("swa_hit_blocks", &flexkv::CMatchResult::swa_hit_blocks);
 #ifdef FLEXKV_ENABLE_GDS
   // Add GDS Manager class binding
   py::class_<GDSManager>(m, "GDSManager")
