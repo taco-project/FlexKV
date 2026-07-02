@@ -361,18 +361,6 @@ def print_results_table(results):
 def print_analysis(results):
     """Per-size analysis: group by engine -> layout -> strategy.
     For each engine, find best layout for MHA and best layout+mode for MLA."""
-    print("")
-    print("=" * 90)
-    print("Summary (per size, D2H+H2D round-trip)")
-    print("=" * 90)
-
-    sizes_present = sorted(set(r["size"] for r in results))
-
-    for size in sizes_present:
-        size_results = [r for r in results if r["size"] == size]
-        num_layers, num_blocks, head_dim = SIZES[size]
-        kv_bytes = num_layers * 1 * num_blocks * 1 * 1 * head_dim * ES
-
     print("\n" + "=" * 90)
     print("Benchmark Results (D2H+H2D round-trip)")
     print("=" * 90)
@@ -510,11 +498,11 @@ def main():
             size_name, num_layers, num_blocks, head_dim, kv_bytes / (1024**2)))
 
         for engine_name, use_ce in engines:
-            for strat_label, is_mla, mode in active_strategies:
-                for layout_name in args.layouts:
+            for layout_name in args.layouts:
+                for strat_label, is_mla, mode in active_strategies:
                     cpu_layout_type = LAYOUTS[layout_name]
                     label = "{} | {} | {} | {}".format(
-                        size_name, engine_name, strat_label, layout_name)
+                        size_name, engine_name, layout_name, strat_label)
                     print("  Running: {} ...".format(label), end=" ", flush=True)
                     try:
                         r = bench_one(
