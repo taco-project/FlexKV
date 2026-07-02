@@ -68,6 +68,9 @@ class KVTask:
     batch_task_id: Optional[int] = None
     # ref count: number of sub-tasks referencing this batch task
     pending_sub_count: int = 0
+    # SWA GPU slot_mapping (SWA-pool token index space), bound LATE at launch —
+    # the SWA counterpart to slot_mapping. None when the request has no SWA ops.
+    swa_slot_mapping: Optional[np.ndarray] = None
 
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
@@ -372,17 +375,27 @@ class KVTaskManager:
 
     def set_slot_mappings(self,
                           task_ids: List[int],
-                          slot_mappings: List[np.ndarray]) -> None:
-        for task_id, slot_mapping in zip(task_ids, slot_mappings):
-            self._set_slot_mapping_impl(task_id, slot_mapping)
+                          slot_mappings: List[np.ndarray],
+                          swa_slot_mappings: Optional[List[np.ndarray]] = None) -> None:
+        for i, (task_id, slot_mapping) in enumerate(zip(task_ids, slot_mappings)):
+            swa_sm = swa_slot_mappings[i] if swa_slot_mappings is not None else None
+            self._set_slot_mapping_impl(task_id, slot_mapping, swa_sm)
 
-    def _set_slot_mapping_impl(self, task_id: int, slot_mapping: np.ndarray) -> None:
+    def _set_slot_mapping_impl(self, task_id: int, slot_mapping: np.ndarray,
+                               swa_slot_mapping: Optional[np.ndarray] = None) -> None:
         task = self.tasks[task_id]
         if task.status != TaskStatus.UNREADY:
             return
         graph_ids = self.cache_engine.slot_mapping_to_block_ids(slot_mapping,
                                                                 self.cache_config.tokens_per_block)
         task.graph.set_gpu_blocks(graph_ids)
+        # Bind the GPU-side SWA slots (late-bind, mirror of set_gpu_blocks). Only
+        # when the graph actually carries SWA GPU ops AND the connector supplied a
+        # swa_slot_mapping; otherwise the SWA ops stay CPU-only / absent.
+        swa_sm = swa_slot_mapping if swa_slot_mapping is not None else task.swa_slot_mapping
+        if getattr(task.graph, "_swa_gpu_transfer_op_id", None) and swa_sm is not None:
+            swa_slot_ids = self.cache_engine.swa_slot_mapping_to_slot_ids(swa_sm)
+            task.graph.set_swa_gpu_blocks(swa_slot_ids)
         task.status = TaskStatus.READY
 
     def _gen_task_id(self) -> int:
@@ -687,6 +700,97 @@ class KVTaskEngine(KVTaskManager):
         nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
 
+    def get_match_swa(self,
+                      token_ids: np.ndarray,
+                      full_mask: Optional[np.ndarray] = None,
+                      swa_mask: Optional[np.ndarray] = None,
+                      dp_client_id: int = 0,
+                      cpu_only: bool = False,
+                      task_id: int = -1,
+                      namespace: Optional[List[str]] = None,
+                      update_state_for_load: bool = True,
+                      ) -> Tuple[int, np.ndarray, np.ndarray]:
+        """Dual-mask SWA-aware match — the SWA counterpart to :meth:`get_match`.
+
+        Unlike the single-mask :meth:`get_match`, the Full-KV transfer is bounded
+        by the SWA-reusable prefix: it computes ``usable = min(full_hit, swa_hit)``
+        FIRST (match-only, no allocation), then builds the transfer graph truncated
+        to ``usable``. This is mandatory — loading Full-KV past the reusable SWA
+        prefix would (a) waste H2D bandwidth on blocks the caller will recompute,
+        and (b) feed stale / unrestored SWA KV to the SWA-layer attention. Because
+        the graph is built once at ``usable``, there is no src/dst block-count
+        mismatch (the failure the old connector avoided via cancel+reissue).
+
+        ``full_mask`` (1 = token NOT on GPU full pool, needs transfer) drives the
+        Full-KV match; ``swa_mask`` (1 = token NOT on GPU SWA pool) is reserved for
+        the future SWA H2D restore and not yet consumed.
+
+        When the GPU already holds the full prefix (``full_mask`` all-0), the
+        Full-KV match is empty and ``usable`` reduces to the SWA hit — the
+        "SWA-only" form — handled by the same code path (the truncated mask stays
+        all-0, so ``_get_match_impl`` builds an empty Full-KV graph).
+
+        The match itself (full hit, SWA hit, window) is computed by
+        :meth:`GlobalCacheEngine.swa_align`, which owns ALL SWA tier access — this
+        layer never touches the SWA radix state directly.
+
+        Returns ``(task_id, return_mask_full, return_mask_swa)``; both masks are
+        token-length, True where CPU can supply that token.  The single-mask
+        :meth:`get_match` is left untouched.
+        """
+        nvtx.push_range(f"get match swa: task_id={task_id}", color=get_nvtx_default_color())
+        # Flush pending D2H completions so set_ready callbacks run before we check
+        # the radix tree — same rationale as get_match.
+        self._update_tasks(timeout=0)
+        if full_mask is None:
+            full_mask = np.ones_like(token_ids, dtype=np.bool_)
+
+        tokens_per_block = self.cache_engine.tokens_per_block
+        num_tokens = token_ids.shape[0]
+
+        # --- ① Align first (match-only): full hit, SWA hit -------------------
+        # All tier access (node-mounted SWA / match_swa_prefix) lives in the cache
+        # engine; kvtask stays at the task-lifecycle layer. lock_for_load stays
+        # False until the SWA data plane can release the lock.
+        full_hit_blocks, swa_hit_blocks = self.cache_engine.swa_align(
+            token_ids, full_mask, namespace=namespace,
+            cpu_only=cpu_only, lock_for_load=False)
+        # SWA must be a subset of Full, so this is just swa_hit_blocks — but the
+        # min() makes the SWA-bound explicit and is robust if that ever loosens.
+        usable_blocks = min(full_hit_blocks, swa_hit_blocks)
+
+        # --- ② Truncate full_mask to usable, THEN build the transfer graph ----
+        # Past usable, the Full-KV bytes have no reusable SWA window, so they are
+        # excluded from transfer. The graph is built once at this length.
+        truncated_full_mask = full_mask.copy()
+        truncated_full_mask[usable_blocks * tokens_per_block:] = False
+        fake_slot_mapping = np.zeros_like(token_ids[truncated_full_mask])
+        result_task_id, return_mask_full = self._get_match_impl(
+            token_ids, fake_slot_mapping, is_fake_slot_mapping=True,
+            token_mask=truncated_full_mask, dp_client_id=dp_client_id,
+            cpu_only=cpu_only, task_id=task_id, namespace=namespace)
+
+        # --- ③ return_mask_swa: the trailing SWA window at the SWA hit ---------
+        # SWA is page-granular: one slot = one swa_page window = exactly one
+        # block (window_size == tokens_per_block), so the trailing window is the
+        # single block ending at swa_hit_blocks.
+        return_mask_swa = np.zeros(num_tokens, dtype=np.bool_)
+        if swa_hit_blocks > 0:
+            return_mask_swa[(swa_hit_blocks - 1) * tokens_per_block:
+                            swa_hit_blocks * tokens_per_block] = True
+
+        # trace get match swa request (mirrors get_match's GET_MATCH trace)
+        self.tracer.trace_request(
+            request_type="GET_MATCH_SWA",
+            request_id=result_task_id,
+            token_ids=token_ids,
+            slot_mapping=fake_slot_mapping,
+            token_mask=truncated_full_mask,
+            dp_client_id=dp_client_id
+        )
+        nvtx.pop_range()
+        return result_task_id, return_mask_full, return_mask_swa
+
     def put_match(self,
                   token_ids: np.ndarray,
                   dp_client_id: int = 0,
@@ -815,11 +919,12 @@ class KVTaskEngine(KVTaskManager):
                     as_batch: bool = False,
                     batch_id: int = -1,
                     layerwise_transfer: bool = False,
-                    counter_id: int = 0) -> List[int]:
+                    counter_id: int = 0,
+                    swa_slot_mappings: Optional[List[np.ndarray]] = None) -> List[int]:
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
-        self.set_slot_mappings(task_ids, slot_mappings)
+        self.set_slot_mappings(task_ids, slot_mappings, swa_slot_mappings)
 
         # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")

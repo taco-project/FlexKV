@@ -99,26 +99,44 @@ class HierarchyLRCacheEngine:
         self._stats_distributed_matched_tokens = 0 # total tokens matched in FlexKV global (distributed reuse)
         self._stats_match_count = 0                # match_all call count
 
-        # SWA (Sliding Window Attention) production manager — initialized via init_swa()
-        self.swa_manager = None
+        # SWA (Sliding Window Attention) — node-mounted on the radix tree (see
+        # CacheEngineAccel). This hierarchical/distributed tier does not (yet)
+        # carry node-mounted SWA state in its remote radix index, so SWA stays
+        # effectively disabled here: init_swa builds the host pool but match_swa
+        # only reports a hit when the underlying index exposes last_swa_node.
+        # DSv4 uses CacheEngineAccel (index_accel), not this engine.
+        self.swa_pool = None
 
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
-        """Initialize the production SWA manager for this cache engine.
+        """Initialize the SWA host pool for node-mounted SWA on this engine."""
+        from flexkv.swa.swa_host_pool import SWAHostPool
+        self.swa_pool = SWAHostPool(swa_config)
 
-        Should be called after construction when SWA is enabled. The SWA manager
-        is node-attached: SWA state lives on each CRadixNode (swa_host_slot /
-        swa_tombstone), and this manager owns only the host pool and the LRU
-        ordering used for SWA-only eviction. Cascade eviction is driven by the
-        tree's drain_freed_swa_slots() (see insert() and take()).
+    @property
+    def swa_enabled(self) -> bool:
+        return self.swa_pool is not None
 
-        Args:
-            swa_config: SWA pool configuration.
-        """
-        from flexkv.swa.swa_production_manager import SWAProductionManager
-        self.swa_manager = SWAProductionManager(
-            config=swa_config,
-            tokens_per_block=self.tokens_per_block,
-        )
+    def _drain_swa_slots(self) -> None:
+        if self.swa_pool is None:
+            return
+        drain = getattr(self.index, "drain_freed_swa_slots", None)
+        if drain is None:
+            return
+        for slot in drain():
+            if slot is not None and slot >= 0:
+                self.swa_pool.free(int(slot))
+
+    def match_swa(self,
+                  sequence_meta: "SequenceMeta",
+                  upper_bound_blocks: int,
+                  lock_for_load: bool = False):
+        """Node-mounted SWA match. Returns no-hit unless the (remote) radix index
+        exposes last_swa_node on its match result."""
+        if self.swa_pool is None or upper_bound_blocks <= 0:
+            return 0, -1, -1
+        # The distributed/remote radix index does not surface node-mounted SWA
+        # yet; report no hit (SWA is served by the accel CPU tier for DSv4).
+        return 0, -1, -1
 
     def start(self) -> None:
         if self._meta is None:
@@ -351,14 +369,6 @@ class HierarchyLRCacheEngine:
         # NOTE: Do NOT lock the node here, because the caller (put() method) will lock it
         # The node will be unlocked in _transfer_callback after data transfer completes
 
-        # Cascade (SWA subset of full): insert may split an existing node, which
-        # invalidates its SWA snapshot. Drain any slots freed by that split so
-        # they are returned to the pool promptly rather than at the next evict.
-        if self.swa_manager is not None:
-            freed_slots = self.local_index.drain_freed_swa_slots()
-            if freed_slots:
-                self.swa_manager.free_slots(freed_slots)
-
         return node
 
     def lock_node(self, node: CRadixNode) -> None:
@@ -456,14 +466,6 @@ class HierarchyLRCacheEngine:
                 evicted_np = target_blocks.numpy()
                 self.mempool.recycle_blocks(evicted_np)
 
-                # Cascade eviction (SWA subset of full): the C++ tree recorded
-                # the SWA slots of any node deleted/invalidated by this evict (and
-                # by any split during insert). Drain them and return to the pool.
-                if self.swa_manager is not None:
-                    freed_slots = self.local_index.drain_freed_swa_slots()
-                    if freed_slots:
-                        self.swa_manager.free_slots(freed_slots)
-            
             if protected_node is not None:
                 self.local_index.unlock(protected_node)
         

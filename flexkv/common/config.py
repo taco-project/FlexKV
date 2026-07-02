@@ -1,7 +1,7 @@
 import os
 import json
 import yaml
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from functools import cached_property
 from typing import Optional, List, Tuple, Union, Dict, Any
@@ -465,10 +465,20 @@ class RankInfo:
 
 @dataclass
 class SWAPoolConfig:
-    """Configuration for SWA (Sliding Window Attention) CPU host pool."""
+    """Configuration for SWA (Sliding Window Attention) host pool(s).
+
+    SWA is managed at PAGE granularity: one pool slot stores exactly one
+    swa_page of window KV, and all SWA IO moves a whole page (one slot) at a
+    time. Despite the field name, ``window_size`` below carries the physical
+    ``swa_page_size`` (DSv4 = 256, hard-coded in integration/config.py), NOT the
+    HF attention sliding_window (128). Because ``window_size == tokens_per_block
+    == swa_page_size`` on DSv4, one window == one page == one block == one slot.
+    """
     enabled: bool = False
-    num_slots: int = 1024              # Number of CPU pool slots
-    window_size: int = 128             # SWA sliding window size in tokens
+    num_slots: int = 1024              # Number of CPU SWA pool slots
+    num_ssd_slots: int = 0             # Number of SSD SWA pool slots (0 = no SSD SWA tier)
+    num_remote_slots: int = 0          # Number of REMOTE SWA pool slots (0 = no REMOTE SWA tier)
+    window_size: int = 128             # = physical swa_page_size (DSv4=256), one slot = one swa_page
     num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
     bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
@@ -476,7 +486,7 @@ class SWAPoolConfig:
 
     @property
     def slot_size_bytes(self) -> int:
-        """Total bytes per slot = window_size * layers * bytes_per_token_per_layer."""
+        """Total bytes per slot (= one swa_page) = window_size * layers * bytes_per_token_per_layer."""
         return self.window_size * self.num_swa_layers * self.bytes_per_token_per_layer
 
     @property
@@ -486,6 +496,18 @@ class SWAPoolConfig:
     @property
     def total_size_gb(self) -> float:
         return self.total_size_bytes / (1024 ** 3)
+
+    def for_ssd_tier(self) -> "SWAPoolConfig":
+        """Derive the SSD-tier SWA config (same slot geometry, num_ssd_slots slots).
+
+        SSD SWA slots are not pinned host memory; pin_memory is forced off."""
+        return replace(self, num_slots=self.num_ssd_slots, pin_memory=False)
+
+    def for_remote_tier(self) -> "SWAPoolConfig":
+        """Derive the REMOTE-tier SWA config (same slot geometry, num_remote_slots).
+
+        REMOTE SWA slots are not pinned host memory; pin_memory is forced off."""
+        return replace(self, num_slots=self.num_remote_slots, pin_memory=False)
 
 
 @dataclass
@@ -556,6 +578,14 @@ class CacheConfig:
 
     # SWA pool config (DeepSeek V4)
     swa: Optional['SWAPoolConfig'] = None
+
+    # Gate for the SWA peer-op DATA-PLANE transfer (SWA_H2D/SWA_D2H ops built into
+    # the transfer graph). Default False: the SWA control plane (node-mounted match /
+    # capacity / lock) works regardless, but the actual async SWA byte transfer
+    # requires the dedicated SWA transfer worker (data plane). Keep this False
+    # until that worker is registered, otherwise SWA ops would hit "Unsupported
+    # transfer type" in the transfer engine. Flip to True once the worker lands.
+    enable_swa_transfer: bool = False
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \

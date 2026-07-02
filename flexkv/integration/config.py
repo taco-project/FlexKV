@@ -475,9 +475,8 @@ class FlexKVConfig:
         # sliding_window (128). The per-token byte size is hard-asserted to
         # 584 (qk_nope_head_dim fp8 448 + qk_rope_head_dim bf16 128 + scale 8)
         # in DeepSeekV4SingleKVPool. Without this config, cache_config.swa
-        # stays None -> kvmanager.swa_available() always returns False -> the
-        # connector never stores/reloads SWA KV, so host->device reload (H2D)
-        # is never triggered for this all-SWA model.
+        # stays None -> the cache engine never builds an SWA pool -> get_match_swa
+        # finds no SWA, so SWA KV is never matched/reused for this all-SWA model.
         is_dsv4 = bool(getattr(sglang_config, "is_deepseek_v4_arch", False))
         if is_dsv4 and self.cache_config.swa is None:
             swa_window = 256  # physical swa_page_size, asserted == 256 by sglang

@@ -1,13 +1,11 @@
 from flexkv.swa.swa_host_pool import SWAHostPool
-from flexkv.swa.swa_pool_lru import SWAPoolLRU
-from flexkv.swa.swa_radix_manager import SWARadixManager
-from flexkv.swa.swa_connector import SWAConnector
-from flexkv.swa.swa_production_manager import SWAProductionManager
+
+# SWA is NODE-MOUNTED on the Full-KV radix tree (see csrc/radix_tree.cpp and
+# flexkv/cache/radixtree.py). The radix nodes own the SWA slot / tombstone /
+# lock; this host pool only supplies the slot bytes + free-list. Eviction is
+# unified with Full-KV through the one tree. See
+# deployments/swa_design/08_节点挂载SWA架构.md.
 
 __all__ = [
     "SWAHostPool",
-    "SWAPoolLRU",
-    "SWARadixManager",
-    "SWAConnector",
-    "SWAProductionManager",
 ]
