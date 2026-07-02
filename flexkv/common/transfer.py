@@ -107,8 +107,17 @@ class TransferOp:
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
     pending_count: int = 0
+    # ---- SWA (Sliding Window Attention) routing -------------------------------
+    # When True, this op moves SWA KV (an independent GPU/CPU/SSD/REMOTE pool with
+    # its own slot-id space), so the transfer engine routes it to the dedicated
+    # SWA worker (_swa_worker_map) instead of the main-KV worker. The op reuses the
+    # standard transfer_type (D2H/H2D/DISK2H/H2DISK/REMOTE2H/H2REMOTE); src/dst
+    # block ids are SWA-pool slot ids, NOT full-KV block ids. ``swa_key`` is the
+    # SWA slot key the completion callback uses to drive set_ready (store) /
+    # unlock (load).
     is_swa: bool = False
-    
+    swa_key: int = -1
+
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
             self.src_block_ids.size != self.dst_block_ids.size:
@@ -164,6 +173,7 @@ class LayerwiseTransferOp(TransferOp):
         assert self.src_block_ids_disk2h.dtype == np.int64
         assert self.dst_block_ids_disk2h.dtype == np.int64
 
+
 class TransferOpGraph:
     _next_graph_id = 0
     _lock = threading.Lock()
@@ -174,6 +184,12 @@ class TransferOpGraph:
         self._ready_ops: Set[int] = set()
         self._trigger_ops: Set[int] = set()
         self._gpu_transfer_op_id: List[int] = []
+        # SWA GPU-transfer ops (is_swa=True, GPU on one side). Bound LATE via
+        # set_swa_gpu_blocks() from the request's SWA-pool slot_mapping, exactly
+        # as _gpu_transfer_op_id is bound from the full-KV slot_mapping. Kept in a
+        # SEPARATE list because SWA lives in its own GPU pool / slot-id space and
+        # must never be rebound with full-KV block ids (see add_transfer_op).
+        self._swa_gpu_transfer_op_id: List[int] = []
 
     @classmethod
     def _get_graph_id(cls) -> int:
@@ -206,11 +222,27 @@ class TransferOpGraph:
     def add_transfer_op(self, op: TransferOp) -> None:
         op.graph_id = self.graph_id
         self._op_map[op.op_id] = op
-        if op.transfer_type == TransferType.H2D or \
-            op.transfer_type == TransferType.D2H or \
-            op.transfer_type == TransferType.D2DISK or \
-            op.transfer_type == TransferType.DISK2D:
+        # NOTE: SWA ops (op.is_swa) are intentionally NOT added to
+        # _gpu_transfer_op_id. set_gpu_blocks() rebinds the GPU-side block ids of
+        # every op in that list from the FULL-KV gpu_blocks slice (matching by
+        # "2D" name). SWA lives in a separate GPU pool with its own slot-id space,
+        # so its GPU slots are supplied independently by the connector / SWA data
+        # plane and must NOT be overwritten with full-KV block ids.
+        if not op.is_swa and (
+            op.transfer_type == TransferType.H2D or
+            op.transfer_type == TransferType.D2H or
+            op.transfer_type == TransferType.D2DISK or
+            op.transfer_type == TransferType.DISK2D):
             self._gpu_transfer_op_id.append(op.op_id)
+        # SWA GPU-transfer ops: the GPU side is an SWA-pool slot bound LATE via
+        # set_swa_gpu_blocks() from the request's swa_slot_mapping (mirror of the
+        # full-KV late-bind). Only H2D (GPU dst) and D2H (GPU src) touch the GPU
+        # SWA pool; the CPU<->SSD/REMOTE staging ops (DISK2H/H2DISK/REMOTE2H/
+        # H2REMOTE) carry no GPU slot and are left untouched.
+        if op.is_swa and (
+            op.transfer_type == TransferType.H2D or
+            op.transfer_type == TransferType.D2H):
+            self._swa_gpu_transfer_op_id.append(op.op_id)
         self._ready_ops.add(op.op_id)
 
     def add_dependency(self, successor_op_id: int, predecessor_op_id: int) -> None:
@@ -285,6 +317,34 @@ class TransferOpGraph:
                 op.src_block_ids = np.array([], dtype=op.src_block_ids.dtype)
             if op.dst_block_ids.size > 0:
                 op.dst_block_ids = np.array([], dtype=op.dst_block_ids.dtype)
+
+    def set_swa_gpu_blocks(self, swa_gpu_blocks: np.ndarray) -> None:
+        """Bind the GPU-side SWA-pool slot ids for every SWA GPU-transfer op.
+
+        Mirror of :meth:`set_gpu_blocks` for the SWA channel: for an SWA ``H2D``
+        the GPU pool is the destination, for an SWA ``D2H`` it is the source.
+        ``swa_gpu_blocks`` are SWA-pool slot ids (already converted from the
+        connector's swa_slot_mapping). The CPU/SSD/REMOTE side of each SWA op was
+        set at build time (node-mounted radix slot) and is left untouched."""
+        for op_id in self._swa_gpu_transfer_op_id:
+            op = self._op_map[op_id]
+            if op.transfer_type.name.endswith("2D"):   # H2D: GPU is dst
+                op.dst_block_ids = swa_gpu_blocks[:op.dst_block_ids.size]
+            else:                                       # D2H: GPU is src
+                op.src_block_ids = swa_gpu_blocks[:op.src_block_ids.size]
+            assert op.src_block_ids.size == op.dst_block_ids.size, \
+                f"swa src.size={op.src_block_ids.size}, dst.size={op.dst_block_ids.size}"
+
+    def clear_swa_gpu_blocks(self) -> None:
+        """Clear the GPU-side SWA slot ids (mirror of clear_gpu_blocks for SWA)."""
+        for op_id in self._swa_gpu_transfer_op_id:
+            op = self._op_map[op_id]
+            if op.transfer_type.name.endswith("2D"):
+                if op.dst_block_ids.size > 0:
+                    op.dst_block_ids = np.array([], dtype=op.dst_block_ids.dtype)
+            else:
+                if op.src_block_ids.size > 0:
+                    op.src_block_ids = np.array([], dtype=op.src_block_ids.dtype)
 
     @property
     def num_ops(self) -> int:

@@ -29,9 +29,7 @@ from flexkv.server.request import (
     GetRequest,
     PutMatchRequest,
     GetMatchRequest,
-    SWAPutRequest,
-    SWAAvailableRequest,
-    SWAGetRequest,
+    GetMatchSwaRequest,
     LaunchTaskRequest,
     CancelTaskRequest,
     WaitRequest,
@@ -200,10 +198,8 @@ class KVServer:
             GetRequest: self._handle_get_request,
             PutRequest: self._handle_put_request,
             GetMatchRequest: self._handle_get_match_request,
+            GetMatchSwaRequest: self._handle_get_match_swa_request,
             PutMatchRequest: self._handle_put_match_request,
-            SWAPutRequest: self._handle_swa_put_request,
-            SWAAvailableRequest: self._handle_swa_available_request,
-            SWAGetRequest: self._handle_swa_get_request,
             PrefetchRequest: self._handle_prefetch_request,
             WaitRequest: self._handle_wait_request,
             LaunchTaskRequest: self._handle_launch_task_request,
@@ -433,6 +429,28 @@ class KVServer:
         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
         result_zmq.send_pyobj(response)
 
+    def _handle_get_match_swa_request(self, req: GetMatchSwaRequest) -> None:
+        """Handle SWA-aware dual-mask GetMatch request (DSv4 server mode).
+
+        Mirrors :meth:`_handle_get_match_request`: runs the same in-process
+        get_match_swa and replies with return_mask_full in ``mask`` and
+        return_mask_swa in ``mask_swa``.
+        """
+        req_id, mask_full, mask_swa = self.kv_task_engine.get_match_swa(
+            token_ids=req.token_ids,
+            full_mask=req.full_mask,
+            swa_mask=req.swa_mask,
+            dp_client_id=req.dp_client_id,
+            cpu_only=req.cpu_only,
+            task_id=req.task_id,
+            namespace=req.namespace,
+            update_state_for_load=req.update_state_for_load,
+        )
+        response = Response(dp_client_id=req.dp_client_id,
+                            task_id=req_id, mask=mask_full, mask_swa=mask_swa)
+        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+        result_zmq.send_pyobj(response)
+
     def _handle_put_match_request(self, req: PutMatchRequest) -> None:
         """Handle PutMatch request"""
         req_id, mask = self.kv_task_engine.put_match(
@@ -449,66 +467,6 @@ class KVServer:
 
     def _cpu_cache_engine(self):
         return self.kv_task_engine.cache_engine.cpu_cache_engine
-
-    def _handle_swa_put_request(self, req: SWAPutRequest) -> None:
-        from flexkv.swa.node_swa_ops import swa_put_on_engine
-
-        try:
-            ok = swa_put_on_engine(
-                self.cache_config,
-                self._cpu_cache_engine(),
-                req.token_ids,
-                req.swa_data,
-            )
-            response = Response(dp_client_id=req.dp_client_id, swa_put_ok=ok)
-        except Exception as e:
-            flexkv_logger.error(f"[KVServer] swa_put failed: {e}", exc_info=True)
-            response = Response(
-                dp_client_id=req.dp_client_id,
-                swa_put_ok=False,
-                error_msg=str(e),
-            )
-        self.client_manager.get_zmq(req.dp_client_id).send_pyobj(response)
-
-    def _handle_swa_available_request(self, req: SWAAvailableRequest) -> None:
-        from flexkv.swa.node_swa_ops import swa_available_on_engine
-
-        try:
-            avail = swa_available_on_engine(
-                self.cache_config,
-                self._cpu_cache_engine(),
-                req.token_ids,
-            )
-            response = Response(dp_client_id=req.dp_client_id, swa_available=avail)
-        except Exception as e:
-            flexkv_logger.error(f"[KVServer] swa_available failed: {e}", exc_info=True)
-            response = Response(
-                dp_client_id=req.dp_client_id,
-                swa_available=False,
-                error_msg=str(e),
-            )
-        self.client_manager.get_zmq(req.dp_client_id).send_pyobj(response)
-
-    def _handle_swa_get_request(self, req: SWAGetRequest) -> None:
-        from flexkv.swa.node_swa_ops import swa_get_on_engine
-
-        try:
-            data = swa_get_on_engine(
-                self.cache_config,
-                self._cpu_cache_engine(),
-                req.token_ids,
-            )
-            if data is not None and hasattr(data, "numpy"):
-                data = data.numpy()
-            response = Response(dp_client_id=req.dp_client_id, swa_data=data)
-        except Exception as e:
-            flexkv_logger.error(f"[KVServer] swa_get failed: {e}", exc_info=True)
-            response = Response(
-                dp_client_id=req.dp_client_id,
-                swa_data=None,
-                error_msg=str(e),
-            )
-        self.client_manager.get_zmq(req.dp_client_id).send_pyobj(response)
 
     def _handle_prefetch_request(self, req: PrefetchRequest) -> None:
         """Handle Prefetch request"""
