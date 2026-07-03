@@ -83,6 +83,54 @@ def test_shed_heavy_resources_keeps_status():
     assert t.return_mask is not None
 
 
+# --- M15/M16: get_match_swa's core arithmetic (pure, mirrors kvtask logic) --- #
+
+def _usable_and_swa_mask(full_hit, swa_hit, num_tokens, tpb):
+    """Replicate the arithmetic in KVTaskEngine.get_match_swa (② + ③) so the
+    contract is pinned without standing up a KVTaskEngine (which needs a GPU
+    TransferManager subprocess). usable=min(full,swa) truncates the full_mask
+    BEFORE the graph is built; return_mask_swa marks the trailing SWA window."""
+    usable = min(full_hit, swa_hit)
+    full_mask = np.ones(num_tokens, dtype=np.bool_)
+    truncated = full_mask.copy()
+    truncated[usable * tpb:] = False
+    swa_mask = np.zeros(num_tokens, dtype=np.bool_)
+    if swa_hit > 0:
+        swa_mask[(swa_hit - 1) * tpb: swa_hit * tpb] = True
+    return usable, truncated, swa_mask
+
+
+@pytest.mark.parametrize("full_hit,swa_hit,exp_usable", [
+    (10, 6, 6),   # M15.1: SWA shorter than full -> clamp full to SWA
+    (6, 6, 6),    # M15.4: SWA covers whole full hit -> no truncation loss
+    (10, 0, 0),   # M15.3: no SWA hit -> usable 0 -> empty full graph
+])
+def test_get_match_swa_usable_is_min(full_hit, swa_hit, exp_usable):
+    tpb, num_tokens = 16, 10 * 16
+    usable, truncated, _ = _usable_and_swa_mask(full_hit, swa_hit, num_tokens, tpb)
+    assert usable == exp_usable
+    # The full transfer is shaped to exactly `usable` blocks (truncate-before-build).
+    assert int(truncated.sum()) == exp_usable * tpb
+
+
+@pytest.mark.parametrize("swa_hit", [1, 3, 6])
+def test_get_match_swa_trailing_window_is_one_block(swa_hit):
+    """M16.1: SWA is page-granular (window == tokens_per_block), so return_mask_swa
+    marks exactly ONE block, ending at swa_hit."""
+    tpb, num_tokens = 16, 6 * 16
+    _, _, swa_mask = _usable_and_swa_mask(6, swa_hit, num_tokens, tpb)
+    assert int(swa_mask.sum()) == tpb                       # exactly one block
+    assert swa_mask[(swa_hit - 1) * tpb: swa_hit * tpb].all()  # the trailing one
+
+
+def test_get_match_swa_no_hit_empty_window_no_underflow():
+    """M16.2: swa_hit=0 -> return_mask_swa all-zero, and the (swa_hit-1) index is
+    never evaluated (no negative-index wraparound marking the last block)."""
+    tpb, num_tokens = 16, 6 * 16
+    _, _, swa_mask = _usable_and_swa_mask(6, 0, num_tokens, tpb)
+    assert not swa_mask.any()
+
+
 # --------------------------------------------------------------------------- #
 # 2. SWA load-lock lifecycle on the engine (needs c_ext)                       #
 # --------------------------------------------------------------------------- #

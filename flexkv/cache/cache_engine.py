@@ -2029,7 +2029,30 @@ class GlobalCacheEngine:
             ssd_full_hit_blocks=full_hit_blocks,
             remote_full_hit_blocks=full_hit_blocks,
             lock_for_load=lock_for_load)
-        return full_hit_blocks, swa_match.best_hit_blocks
+
+        # Tier-consistency (SWA subset of Full, AND graph shape must match the
+        # tier actually fetched). swa_align's return shapes the SWA transfer graph
+        # (kvtask truncates to usable=min(full, this)); but the GET data plane
+        # (_swa_get_slots) currently fetches the CPU tier ONLY. best_hit_blocks is
+        # the cross-tier MAX, so if SSD/REMOTE ever carry a LONGER SWA hit than
+        # CPU, returning best_hit_blocks would shape the graph for blocks the
+        # CPU-only fetch cannot fill -> src/dst block-count mismatch / stale-SWA
+        # read (silent corruption). Today SSD/REMOTE SWA default to 0 slots so
+        # best == cpu_hit and this is a no-op; clamp to the fetched (CPU) tier and
+        # warn once if a longer non-CPU hit is dropped, so enabling SSD/REMOTE SWA
+        # without extending the fetcher fails safe (lose a few SWA hits) instead
+        # of shaping an unfillable graph.
+        cpu_hit = swa_match.cpu_hit_blocks
+        best_hit = swa_match.best_hit_blocks
+        if best_hit > cpu_hit and not getattr(self, "_warned_swa_multitier", False):
+            self._warned_swa_multitier = True
+            flexkv_logger.warning(
+                "SWA multi-tier hit (best=%d blocks) exceeds the CPU tier "
+                "(cpu=%d); GET fetches CPU-only, clamping the SWA graph to the "
+                "CPU hit to avoid an unfillable transfer graph. Extend "
+                "_swa_get_slots to the winning tier before relying on SSD/REMOTE "
+                "SWA loads.", best_hit, cpu_hit)
+        return full_hit_blocks, cpu_hit
 
     # --- SWA slot sources for the get()/put() build chains --------------------
     # Resolve the per-tier SWA-pool slot ids for the current request so the SWA

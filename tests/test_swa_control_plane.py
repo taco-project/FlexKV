@@ -138,6 +138,46 @@ def test_swa_align_clamps_full_to_swa_hit():
     assert min(full_hit, swa_hit) == 4
 
 
+def test_swa_align_hit_equals_fetched_cpu_tier(monkeypatch):
+    """#9 tier-consistency guard: swa_align's returned SWA hit shapes the transfer
+    graph, but the GET data plane (_swa_get_slots) fetches the CPU tier ONLY.
+    match_swa_prefix reports best_hit_blocks = cross-tier MAX. If a non-CPU tier
+    ever reports a LONGER hit than CPU, returning best would shape a graph the
+    CPU-only fetch cannot fill (src/dst mismatch / stale SWA). swa_align must
+    clamp its return to the CPU (fetched) tier. We fake a longer SSD hit and
+    assert the returned hit stays at the CPU tier's value."""
+    eng = GlobalCacheEngine(_cache_config(True), _model_config())
+    tok = _tokens(4, base=7)
+    mask = np.ones_like(tok, dtype=np.int64)
+    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
+    _g, _rm, cb, op_cb, _e = eng.put(1, tok, mask, slot_mapping, dp_client_id=0)
+    _complete(op_cb, cb)
+
+    # CPU-only truth: best == cpu == 4.
+    full_hit, swa_hit = eng.swa_align(tok, np.ones_like(tok, dtype=np.bool_))
+    assert swa_hit == 4
+
+    # Simulate a future SSD/REMOTE tier reporting a LONGER SWA hit than CPU.
+    real_match = eng.match_swa_prefix
+
+    def _fake_match(sequence_meta, cpu_full_hit_blocks, ssd_full_hit_blocks=0,
+                    remote_full_hit_blocks=0, lock_for_load=False):
+        r = real_match(sequence_meta, cpu_full_hit_blocks=cpu_full_hit_blocks,
+                       ssd_full_hit_blocks=ssd_full_hit_blocks,
+                       remote_full_hit_blocks=remote_full_hit_blocks,
+                       lock_for_load=lock_for_load)
+        r.ssd_hit_blocks = r.cpu_hit_blocks + 2  # SSD claims a longer hit
+        r.ssd_slot = 999
+        return r
+
+    monkeypatch.setattr(eng, "match_swa_prefix", _fake_match)
+    full_hit2, swa_hit2 = eng.swa_align(tok, np.ones_like(tok, dtype=np.bool_))
+    # Must clamp to the fetched CPU tier (4), NOT the cross-tier max (6).
+    assert swa_hit2 == 4, (
+        f"swa_align returned {swa_hit2} (cross-tier best) but GET fetches CPU-only "
+        f"(cpu_hit=4); graph would be shaped for blocks the fetch cannot fill")
+
+
 def test_get_builds_full_plus_swa_load_chain():
     eng = GlobalCacheEngine(_cache_config(True), _model_config())
     tok = _tokens(4, base=3)
