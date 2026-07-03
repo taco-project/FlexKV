@@ -2029,7 +2029,27 @@ class GlobalCacheEngine:
             ssd_full_hit_blocks=full_hit_blocks,
             remote_full_hit_blocks=full_hit_blocks,
             lock_for_load=lock_for_load)
-        return full_hit_blocks, swa_match.best_hit_blocks
+        swa_hit_blocks = swa_match.best_hit_blocks
+
+        # SWA hit/miss telemetry (peer of the Full-KV record_cache_hit/miss above).
+        # SWA is a subset of Full, so the reusable Full-KV prefix (full_hit_blocks)
+        # is the denominator: the trailing-SWA prefix we reused is the hit, and the
+        # remaining reusable Full-KV prefix that had no matching SWA window is the
+        # miss. hit / full_hit is the SWA reuse rate — the signal that regresses if
+        # SWA-LRU eviction degrades (e.g. toward FIFO), which is otherwise invisible.
+        if self._metrics_collector is not None and swa_hit_blocks > 0:
+            # Attribute the hit to the winning tier (data-plane sources CPU>SSD>REMOTE).
+            if swa_match.cpu_hit_blocks == swa_hit_blocks:
+                swa_device = "cpu"
+            elif swa_match.ssd_hit_blocks == swa_hit_blocks:
+                swa_device = "ssd"
+            else:
+                swa_device = "remote"
+            self._metrics_collector.record_swa_hit(swa_device, swa_hit_blocks)
+        if self._metrics_collector is not None:
+            self._metrics_collector.record_swa_miss(full_hit_blocks - swa_hit_blocks)
+
+        return full_hit_blocks, swa_hit_blocks
 
     # --- SWA slot sources for the get()/put() build chains --------------------
     # Resolve the per-tier SWA-pool slot ids for the current request so the SWA

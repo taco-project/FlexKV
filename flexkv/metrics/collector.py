@@ -104,6 +104,8 @@ class FlexKVMetricsCollector:
     This collector provides cache engine metrics for GlobalCacheEngine:
     - flexkv_py_cache_hit_blocks_total: Cache hit block counts by device
     - flexkv_py_cache_miss_blocks_total: Cache miss block counts (not found in any cache level)
+    - flexkv_py_swa_hit_blocks_total: SWA hit block counts by device (reused from SWA pool)
+    - flexkv_py_swa_miss_blocks_total: SWA miss block counts (Full-KV hit without a matching SWA window)
     - flexkv_py_transfer_blocks_total: Transfer block counts by transfer type and operation
     - flexkv_py_transfer_ops_total: Transfer operation counts by transfer type and operation
     - flexkv_py_mempool_total_blocks: Memory pool total blocks by device
@@ -158,6 +160,24 @@ class FlexKVMetricsCollector:
         self.cache_miss_blocks_total = Counter(
             name="flexkv_py_cache_miss_blocks_total",
             documentation="Total number of cache miss blocks (not found in any cache level)",
+        )
+
+        # SWA (Sliding Window Attention) hit/miss counters. The SWA hit is the
+        # trailing-window prefix reused from the node-mounted SWA pool, clamped to
+        # the Full-KV hit (SWA subset of Full). Peer of the cache hit/miss counters
+        # above; without these the SWA-LRU reuse rate is unobservable, so a policy
+        # regression (e.g. SWA-LRU degrading toward FIFO) would be invisible.
+        self.swa_hit_blocks_total = Counter(
+            name="flexkv_py_swa_hit_blocks_total",
+            documentation="Total number of SWA hit blocks reused from the SWA pool by device",
+            labelnames=["device"],
+        )
+
+        # SWA miss counter (no device label - miss means the reusable Full-KV prefix
+        # had no matching SWA window on any tier).
+        self.swa_miss_blocks_total = Counter(
+            name="flexkv_py_swa_miss_blocks_total",
+            documentation="Total number of SWA miss blocks (Full-KV hit without a matching SWA window)",
         )
         
         # Allocation failure counter by mode (global/local)
@@ -229,6 +249,8 @@ class FlexKVMetricsCollector:
         # Cache engine dummy metrics
         self.cache_hit_blocks_total = dummy
         self.cache_miss_blocks_total = dummy
+        self.swa_hit_blocks_total = dummy
+        self.swa_miss_blocks_total = dummy
         self.allocation_failures_total = dummy
         self.transfer_blocks_total = dummy
         self.transfer_ops_total = dummy
@@ -256,13 +278,41 @@ class FlexKVMetricsCollector:
     def record_cache_miss(self, num_blocks: int):
         """
         Record cache miss blocks (not found in any cache level).
-        
+
         Args:
             num_blocks: Number of miss blocks
         """
         if not self.enabled or num_blocks <= 0:
             return
         self.cache_miss_blocks_total.inc(num_blocks)
+
+    def record_swa_hit(self, device: str, num_blocks: int):
+        """
+        Record SWA hit blocks for a device.
+
+        A SWA hit is the trailing-window prefix reused from the node-mounted SWA
+        pool on the given tier, clamped to that tier's Full-KV hit (SWA subset of
+        Full). Peer of :meth:`record_cache_hit`.
+
+        Args:
+            device: Device type ("cpu", "ssd", "remote")
+            num_blocks: Number of SWA hit blocks
+        """
+        if not self.enabled or num_blocks <= 0:
+            return
+        self.swa_hit_blocks_total.labels(device=device).inc(num_blocks)
+
+    def record_swa_miss(self, num_blocks: int):
+        """
+        Record SWA miss blocks (reusable Full-KV prefix without a matching SWA
+        window on any tier). Peer of :meth:`record_cache_miss`.
+
+        Args:
+            num_blocks: Number of SWA miss blocks
+        """
+        if not self.enabled or num_blocks <= 0:
+            return
+        self.swa_miss_blocks_total.inc(num_blocks)
     
     def record_allocation_failure(self, mode: str):
         """
