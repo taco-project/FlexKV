@@ -421,7 +421,11 @@ PYBIND11_MODULE(c_ext, m) {
       .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
                     torch::Tensor &, std::map<int, std::vector<std::string>> &,
                     int, torch::Tensor &, torch::Tensor &, torch::Tensor &,
-                    torch::Tensor &, int, int, torch::Tensor &, int>(),
+                    torch::Tensor &, int, int, torch::Tensor &, int,
+                    bool, const std::vector<std::vector<torch::Tensor>> &,
+                    torch::Tensor, std::map<int, std::vector<std::string>>,
+                    torch::Tensor, torch::Tensor, torch::Tensor,
+                    torch::Tensor>(),
            py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("cpu_blocks"),
            py::arg("ssd_files"), py::arg("num_layers"),
            py::arg("gpu_kv_strides_tensor"),
@@ -429,7 +433,17 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("gpu_layer_strides_tensor"),
            py::arg("gpu_chunk_sizes_tensor"), py::arg("iouring_entries"),
            py::arg("iouring_flags"), py::arg("layer_eventfds_tensor"),
-           py::arg("tp_size"))
+           py::arg("tp_size"),
+           py::arg("has_swa") = false,
+           py::arg("swa_gpu_blocks") =
+               std::vector<std::vector<torch::Tensor>>(),
+           py::arg("swa_cpu_blocks") = torch::Tensor(),
+           py::arg("swa_ssd_files") =
+               std::map<int, std::vector<std::string>>(),
+           py::arg("swa_gpu_kv_strides_tensor") = torch::Tensor(),
+           py::arg("swa_gpu_block_strides_tensor") = torch::Tensor(),
+           py::arg("swa_gpu_layer_strides_tensor") = torch::Tensor(),
+           py::arg("swa_gpu_chunk_sizes_tensor") = torch::Tensor())
       .def(
           py::init<
               int, const std::vector<std::vector<std::vector<torch::Tensor>>> &,
@@ -443,7 +457,10 @@ PYBIND11_MODULE(c_ext, m) {
               const std::vector<int64_t> &, const std::vector<int64_t> &,
               const std::vector<int64_t> &, const std::vector<int64_t> &,
               const std::vector<int64_t> &, const std::vector<int64_t> &,
-              const std::vector<int64_t> &, int, int, torch::Tensor &, int>(),
+              const std::vector<int64_t> &, int, int, torch::Tensor &, int,
+              bool, const std::vector<std::vector<torch::Tensor>> &,
+              torch::Tensor, std::map<int, std::vector<std::string>>,
+              torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(),
           py::arg("num_gpus"), py::arg("gpu_blocks_per_group"),
           py::arg("cpu_blocks"), py::arg("ssd_files"),
           py::arg("num_original_layers"), py::arg("layer_members"),
@@ -457,7 +474,17 @@ PYBIND11_MODULE(c_ext, m) {
           py::arg("group_gpu_kv_strides"), py::arg("group_gpu_block_strides"),
           py::arg("group_gpu_layer_strides"), py::arg("group_gpu_chunk_sizes"),
           py::arg("iouring_entries"), py::arg("iouring_flags"),
-          py::arg("layer_eventfds_tensor"), py::arg("tp_size"))
+          py::arg("layer_eventfds_tensor"), py::arg("tp_size"),
+          py::arg("has_swa") = false,
+          py::arg("swa_gpu_blocks") =
+              std::vector<std::vector<torch::Tensor>>(),
+          py::arg("swa_cpu_blocks") = torch::Tensor(),
+          py::arg("swa_ssd_files") =
+              std::map<int, std::vector<std::string>>(),
+          py::arg("swa_gpu_kv_strides_tensor") = torch::Tensor(),
+          py::arg("swa_gpu_block_strides_tensor") = torch::Tensor(),
+          py::arg("swa_gpu_layer_strides_tensor") = torch::Tensor(),
+          py::arg("swa_gpu_chunk_sizes_tensor") = torch::Tensor())
       .def("layerwise_transfer",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -474,7 +501,21 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_cta_num"),
            py::arg("use_ce_transfer"), py::arg("num_layers"),
            py::arg("layer_granularity"), py::arg("is_mla"),
-           py::arg("counter_id") = 0)
+           py::arg("counter_id") = 0,
+           py::arg("swa_h2d_src") = torch::Tensor(),
+           py::arg("swa_h2d_dst") = torch::Tensor(),
+           py::arg("swa_disk2h_src") = torch::Tensor(),
+           py::arg("swa_disk2h_dst") = torch::Tensor(),
+           py::arg("swa_cpu_kv_stride_in_bytes") = 0,
+           py::arg("swa_cpu_layer_stride_in_bytes") = 0,
+           py::arg("swa_cpu_block_stride_in_bytes") = 0,
+           py::arg("swa_cpu_chunk_size_in_bytes") = 0,
+           py::arg("swa_h2d_cpu_kv_stride_in_bytes") = 0,
+           py::arg("swa_h2d_cpu_layer_stride_in_bytes") = 0,
+           py::arg("swa_cpu_tp_stride_in_bytes") = 0,
+           py::arg("swa_ssd_layer_stride_in_bytes") = 0,
+           py::arg("swa_ssd_kv_stride_in_bytes") = 0,
+           py::arg("swa_num_blocks_per_file") = 0)
       .def("layerwise_transfer_multi_group",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer_multi_group,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -482,7 +523,21 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("num_threads_per_device"), py::arg("gpu_block_id_tensor"),
            py::arg("cpu_block_id_tensor"), py::arg("transfer_cta_num"),
            py::arg("use_ce_transfer"), py::arg("is_mla"),
-           py::arg("counter_id") = 0);
+           py::arg("counter_id") = 0,
+           py::arg("swa_h2d_src") = torch::Tensor(),
+           py::arg("swa_h2d_dst") = torch::Tensor(),
+           py::arg("swa_disk2h_src") = torch::Tensor(),
+           py::arg("swa_disk2h_dst") = torch::Tensor(),
+           py::arg("swa_cpu_kv_stride_in_bytes") = 0,
+           py::arg("swa_cpu_layer_stride_in_bytes") = 0,
+           py::arg("swa_cpu_block_stride_in_bytes") = 0,
+           py::arg("swa_cpu_chunk_size_in_bytes") = 0,
+           py::arg("swa_h2d_cpu_kv_stride_in_bytes") = 0,
+           py::arg("swa_h2d_cpu_layer_stride_in_bytes") = 0,
+           py::arg("swa_cpu_tp_stride_in_bytes") = 0,
+           py::arg("swa_ssd_layer_stride_in_bytes") = 0,
+           py::arg("swa_ssd_kv_stride_in_bytes") = 0,
+           py::arg("swa_num_blocks_per_file") = 0);
 
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,

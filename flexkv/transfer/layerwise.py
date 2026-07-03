@@ -88,7 +88,16 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  enable_eventfd: bool = True,
                  layer_groups: Optional[List[LayerGroupSpec]] = None,
                  gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]] = None,
-                 gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None) -> None:
+                 gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None,
+                 swa_gpu_blocks: Optional[List[List[TensorSharedHandle]]] = None,
+                 swa_cpu_blocks: Optional[Union[torch.Tensor, HugePageTensorHandle]] = None,
+                 swa_gpu_kv_layouts: Optional[List[KVCacheLayout]] = None,
+                 swa_cpu_kv_layout:  Optional[KVCacheLayout] = None,
+                 swa_dtype: Optional[torch.dtype] = None,
+                 swa_ssd_files:  Optional[Dict[int, List[str]]] = None,
+                 swa_ssd_kv_layout:  Optional[KVCacheLayout] = None,
+                 swa_num_blocks_per_file: int = 0,
+                 ) -> None:
         flexkv_logger.debug(
             f"[LayerwiseWorker] __init__ started: worker_id={worker_id}, "
             f"tp_group_size={tp_group_size}, "
@@ -165,6 +174,43 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         flexkv_logger.debug("[LayerwiseWorker] CPU memory pinned successfully")
         self.cpu_blocks = cpu_blocks
 
+        self.has_swa = swa_gpu_blocks is not None and swa_cpu_blocks is not None
+        if self.has_swa:
+            assert swa_gpu_blocks is not None
+            assert len(swa_gpu_blocks) == self.num_gpus, (
+                f"len(swa_gpu_blocks)={len(swa_gpu_blocks)} != num_gpus={self.num_gpus}"
+            )
+            imported_swa_gpu_blocks: List[List[torch.Tensor]] = []
+            for handles_in_one_gpu in swa_gpu_blocks:
+                blocks_in_one_gpu = []
+                for handle in handles_in_one_gpu:
+                    blocks_in_one_gpu.append(handle.get_tensor())
+                imported_swa_gpu_blocks.append(blocks_in_one_gpu)
+            self.swa_gpu_blocks = imported_swa_gpu_blocks
+            swa_cpu_blocks = materialize_worker_tensor(swa_cpu_blocks)
+            cudaHostRegister(swa_cpu_blocks)
+            flexkv_logger.info("[LayerwiseWorker] SWA CPU memory pinned successfully")
+            self.swa_cpu_blocks = swa_cpu_blocks
+            self.swa_num_layers = swa_cpu_kv_layout.num_layer
+
+            # Keep layouts/dtype on self for stride derivation in _init_single_group
+            self._swa_gpu_kv_layouts = swa_gpu_kv_layouts
+            self._swa_cpu_kv_layout = swa_cpu_kv_layout
+            self.swa_dtype = swa_dtype if swa_dtype is not None else self.dtype
+
+            # SSD-side SWA (optional; mirrors main-KV ssd handling)
+            self._swa_ssd_files = swa_ssd_files if swa_ssd_files is not None else {}
+            self._swa_ssd_kv_layout = swa_ssd_kv_layout
+            self._swa_num_blocks_per_file = swa_num_blocks_per_file
+            self._swa_enable_ssd = len(self._swa_ssd_files) > 0
+            self._swa_num_files = sum(len(fl) for fl in self._swa_ssd_files.values()) \
+                                        if self._swa_enable_ssd else 0
+        else:
+            self._swa_enable_ssd = False
+
+        if self.has_swa:
+            self._init_swa_strides()
+
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
         self.h2d_cta_num = h2d_cta_num
@@ -205,6 +251,117 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             )
 
         flexkv_logger.info(f"[LayerwiseWorker] __init__ completed successfully, worker_id={worker_id}")
+
+    def _init_swa_strides(self) -> None:
+        """Derive SWA byte strides (shared by single- and multi-group paths)."""
+        swa_cpu_layout = self._swa_cpu_kv_layout
+        swa_dtype_size = self.swa_dtype.itemsize if self.swa_dtype is not None else self.dtype.itemsize
+
+        self.swa_gpu_chunk_sizes_in_bytes = [
+            l.get_chunk_size() * swa_dtype_size for l in self._swa_gpu_kv_layouts]
+        self.swa_gpu_kv_strides_in_bytes = [
+            l.get_kv_stride() * swa_dtype_size for l in self._swa_gpu_kv_layouts]
+        self.swa_gpu_block_strides_in_bytes = [
+            l.get_block_stride() * swa_dtype_size for l in self._swa_gpu_kv_layouts]
+        self.swa_gpu_layer_strides_in_bytes = [
+            l.get_layer_stride() * swa_dtype_size for l in self._swa_gpu_kv_layouts]
+
+        self.swa_cpu_chunk_size_in_bytes = swa_cpu_layout.get_chunk_size() * swa_dtype_size
+        self.swa_cpu_block_stride_in_bytes = swa_cpu_layout.get_block_stride() * swa_dtype_size
+        self.swa_cpu_kv_stride_in_bytes = swa_cpu_layout.get_kv_stride() * swa_dtype_size
+        self.swa_cpu_layer_stride_in_bytes = swa_cpu_layout.get_layer_stride() * swa_dtype_size
+        self.swa_h2d_cpu_kv_stride_in_bytes = self.swa_cpu_kv_stride_in_bytes
+        self.swa_h2d_cpu_layer_stride_in_bytes = self.swa_cpu_layer_stride_in_bytes
+        self.swa_cpu_tp_stride_in_bytes = self.swa_cpu_block_stride_in_bytes // self.tp_group_size
+
+        if self._swa_enable_ssd:
+            swa_ssd_per_file = self._swa_ssd_kv_layout.div_block(
+                self._swa_num_files, padding=True)
+            self.swa_ssd_kv_stride_in_bytes = swa_ssd_per_file.get_kv_stride() * swa_dtype_size
+            self.swa_ssd_layer_stride_in_bytes = swa_ssd_per_file.get_layer_stride() * swa_dtype_size
+            self.swa_ssd_block_stride_in_bytes = swa_ssd_per_file.get_block_stride() * swa_dtype_size
+        else:
+            self.swa_ssd_kv_stride_in_bytes = 0
+            self.swa_ssd_layer_stride_in_bytes = 0
+            self.swa_ssd_block_stride_in_bytes = 0
+
+        self.swa_gpu_kv_strides_tensor = torch.tensor(
+            self.swa_gpu_kv_strides_in_bytes, dtype=torch.int64)
+        self.swa_gpu_block_strides_tensor = torch.tensor(
+            self.swa_gpu_block_strides_in_bytes, dtype=torch.int64)
+        self.swa_gpu_layer_strides_tensor = torch.tensor(
+            self.swa_gpu_layer_strides_in_bytes, dtype=torch.int64)
+        self.swa_gpu_chunk_sizes_tensor = torch.tensor(
+            self.swa_gpu_chunk_sizes_in_bytes, dtype=torch.int64)
+
+        assert self.swa_num_layers == self.num_layers, (
+            f"SWA num_layers ({self.swa_num_layers}) must equal main-KV num_layers "
+            f"({self.num_layers}) for fused layerwise — per-layer eventfd index space is shared")
+
+        flexkv_logger.info(
+            f"[LayerwiseWorker] SWA strides ready: "
+            f"cpu_block_stride={self.swa_cpu_block_stride_in_bytes}, "
+            f"cpu_layer_stride={self.swa_cpu_layer_stride_in_bytes}, "
+            f"cpu_chunk={self.swa_cpu_chunk_size_in_bytes}, "
+            f"swa_ssd={self._swa_enable_ssd}, multi_group={self.has_multi_group}")
+
+    def _swa_init_kwargs(self) -> Dict[str, Any]:
+        if not self.has_swa:
+            return {"has_swa": False}
+        return dict(
+            has_swa=True,
+            swa_gpu_blocks=self.swa_gpu_blocks,
+            swa_cpu_blocks=self.swa_cpu_blocks,
+            swa_ssd_files=self._swa_ssd_files,
+            swa_gpu_kv_strides_tensor=self.swa_gpu_kv_strides_tensor,
+            swa_gpu_block_strides_tensor=self.swa_gpu_block_strides_tensor,
+            swa_gpu_layer_strides_tensor=self.swa_gpu_layer_strides_tensor,
+            swa_gpu_chunk_sizes_tensor=self.swa_gpu_chunk_sizes_tensor,
+        )
+
+    def _swa_transfer_kwargs(
+        self,
+        swa_src_h2d: Optional[torch.Tensor],
+        swa_dst_h2d: Optional[torch.Tensor],
+        swa_src_disk2h: Optional[torch.Tensor],
+        swa_dst_disk2h: Optional[torch.Tensor],
+    ) -> Dict[str, Any]:
+        empty = torch.empty(0, dtype=torch.int64)
+        if not self.has_swa:
+            # pybind cannot match layerwise_transfer_multi_group when the four
+            # SWA tensor kwargs are omitted; pass explicit empty tensors.
+            return dict(
+                swa_h2d_src=empty,
+                swa_h2d_dst=empty,
+                swa_disk2h_src=empty,
+                swa_disk2h_dst=empty,
+                swa_cpu_kv_stride_in_bytes=0,
+                swa_cpu_layer_stride_in_bytes=0,
+                swa_cpu_block_stride_in_bytes=0,
+                swa_cpu_chunk_size_in_bytes=0,
+                swa_h2d_cpu_kv_stride_in_bytes=0,
+                swa_h2d_cpu_layer_stride_in_bytes=0,
+                swa_cpu_tp_stride_in_bytes=0,
+                swa_ssd_layer_stride_in_bytes=0,
+                swa_ssd_kv_stride_in_bytes=0,
+                swa_num_blocks_per_file=0,
+            )
+        return dict(
+            swa_h2d_src=swa_src_h2d if swa_src_h2d is not None else empty,
+            swa_h2d_dst=swa_dst_h2d if swa_dst_h2d is not None else empty,
+            swa_disk2h_src=swa_src_disk2h if swa_src_disk2h is not None else empty,
+            swa_disk2h_dst=swa_dst_disk2h if swa_dst_disk2h is not None else empty,
+            swa_cpu_kv_stride_in_bytes=self.swa_cpu_kv_stride_in_bytes,
+            swa_cpu_layer_stride_in_bytes=self.swa_cpu_layer_stride_in_bytes,
+            swa_cpu_block_stride_in_bytes=self.swa_cpu_block_stride_in_bytes,
+            swa_cpu_chunk_size_in_bytes=self.swa_cpu_chunk_size_in_bytes,
+            swa_h2d_cpu_kv_stride_in_bytes=self.swa_h2d_cpu_kv_stride_in_bytes,
+            swa_h2d_cpu_layer_stride_in_bytes=self.swa_h2d_cpu_layer_stride_in_bytes,
+            swa_cpu_tp_stride_in_bytes=self.swa_cpu_tp_stride_in_bytes,
+            swa_ssd_layer_stride_in_bytes=self.swa_ssd_layer_stride_in_bytes,
+            swa_ssd_kv_stride_in_bytes=self.swa_ssd_kv_stride_in_bytes,
+            swa_num_blocks_per_file=self._swa_num_blocks_per_file,
+        )
 
     # ------------------------------------------------------------------
     # Single-group init (legacy)
@@ -267,7 +424,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             gpu_layer_strides_tensor, gpu_chunk_sizes_tensor,
             GLOBAL_CONFIG_FROM_ENV.iouring_entries,
             GLOBAL_CONFIG_FROM_ENV.iouring_flags,
-            layer_eventfds_tensor, tp_group_size)
+            layer_eventfds_tensor, tp_group_size,
+            **self._swa_init_kwargs(),
+        )
 
     # ------------------------------------------------------------------
     # Multi-group init
@@ -430,6 +589,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             iouring_flags=GLOBAL_CONFIG_FROM_ENV.iouring_flags,
             layer_eventfds_tensor=layer_eventfds_tensor,
             tp_size=tp_group_size,
+            **self._swa_init_kwargs(),
         )
 
     def _receive_eventfds_from_sglang(self, tp_group_size: int,
@@ -584,6 +744,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                       src_block_ids_disk2h: Optional[torch.Tensor],
                       dst_block_ids_disk2h: Optional[torch.Tensor],
                       counter_id: int = 0,
+                      swa_src_block_ids_h2d: Optional[torch.Tensor] = None,
+                      swa_dst_block_ids_h2d: Optional[torch.Tensor] = None,
+                      swa_src_block_ids_disk2h: Optional[torch.Tensor] = None,
+                      swa_dst_block_ids_disk2h: Optional[torch.Tensor] = None,
                       **kwargs: Any) -> None:
         assert src_block_ids_h2d.dtype == torch.int64
         assert dst_block_ids_h2d.dtype == torch.int64
@@ -592,6 +756,32 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             assert src_block_ids_disk2h.dtype == torch.int64
             assert dst_block_ids_disk2h.dtype == torch.int64
             assert len(src_block_ids_disk2h) == len(dst_block_ids_disk2h)
+
+        # SWA validation — sizes / dtypes, and gate on self.has_swa.
+        swa_has_h2d = swa_src_block_ids_h2d is not None and swa_src_block_ids_h2d.numel() > 0
+        swa_has_disk2h = swa_src_block_ids_disk2h is not None and swa_src_block_ids_disk2h.numel() > 0
+        if swa_has_h2d:
+            assert self.has_swa, 'swa_src/dst_block_ids_h2d set but worker has no SWA pool registered'
+            assert swa_src_block_ids_h2d.dtype == torch.int64
+            assert swa_dst_block_ids_h2d.dtype == torch.int64
+            assert len(swa_src_block_ids_h2d) == len(swa_dst_block_ids_h2d)
+        if swa_has_disk2h:
+            assert self.has_swa and self._swa_enable_ssd, \
+                'swa_src/dst_block_ids_disk2h set but worker has no SWA SSD pool registered'
+            assert swa_src_block_ids_disk2h.dtype == torch.int64
+            assert swa_dst_block_ids_disk2h.dtype == torch.int64
+            assert len(swa_src_block_ids_disk2h) == len(swa_dst_block_ids_disk2h)
+        if swa_has_h2d or swa_has_disk2h:
+            flexkv_logger.debug(
+                f"[LayerwiseWorker] SWA ids: "
+                f"swa_h2d={swa_src_block_ids_h2d.numel() if swa_has_h2d else 0}, "
+                f"swa_disk2h={swa_src_block_ids_disk2h.numel() if swa_has_disk2h else 0}, "
+                f"multi_group={self.has_multi_group}")
+
+        swa_kwargs = self._swa_transfer_kwargs(
+            swa_src_block_ids_h2d, swa_dst_block_ids_h2d,
+            swa_src_block_ids_disk2h, swa_dst_block_ids_disk2h,
+        )
 
         # Use unified layerwise transfer C++ interface
         ssd_block_ids = src_block_ids_disk2h if src_block_ids_disk2h is not None else torch.empty(0, dtype=torch.int64)
@@ -611,6 +801,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 use_ce_transfer=self.use_ce_transfer_h2d,
                 is_mla=self.is_mla,
                 counter_id=counter_id,
+                **swa_kwargs,
             )
             return
 
@@ -637,6 +828,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
             self.is_mla,
             counter_id,
+            **swa_kwargs,
         )
 
     def _layerwise_gpu_capacity_hint(self) -> str:
@@ -669,6 +861,20 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             src_block_ids_disk2h = None
             dst_block_ids_disk2h = None
 
+        # SWA ids: empty np arrays -> None (so _transfer_impl can short-circuit cleanly).
+        if transfer_op.swa_src_block_ids_h2d.size > 0:
+            swa_src_h2d = torch.from_numpy(transfer_op.swa_src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
+            swa_dst_h2d = torch.from_numpy(transfer_op.swa_dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
+        else:
+            swa_src_h2d = None
+            swa_dst_h2d = None
+        if transfer_op.swa_src_block_ids_disk2h.size > 0:
+            swa_src_disk2h = torch.from_numpy(transfer_op.swa_src_block_ids_disk2h).to(dtype=torch.int64)
+            swa_dst_disk2h = torch.from_numpy(transfer_op.swa_dst_block_ids_disk2h).to(dtype=torch.int64)
+        else:
+            swa_src_disk2h = None
+            swa_dst_disk2h = None
+
         num_h2d_blocks = len(src_block_ids_h2d)
         flexkv_logger.info(
             "[FlexKV-SEGV-DEBUG] LAYERWISE before transfer "
@@ -688,6 +894,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 src_block_ids_disk2h,
                 dst_block_ids_disk2h,
                 transfer_op.counter_id,
+                swa_src_block_ids_h2d=swa_src_h2d,
+                swa_dst_block_ids_h2d=swa_dst_h2d,
+                swa_src_block_ids_disk2h=swa_src_disk2h,
+                swa_dst_block_ids_disk2h=swa_dst_disk2h,
             )
         except Exception as e:
             flexkv_logger.error(
