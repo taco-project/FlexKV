@@ -27,6 +27,8 @@ if "swa_host_slot" not in dir(c_ext.CRadixNode):
 from flexkv.cache.radix_remote import LocalRadixTree
 from flexkv.common.block import SequenceMeta
 
+pytestmark = pytest.mark.unit
+
 
 TPB = 4
 

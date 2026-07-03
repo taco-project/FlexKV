@@ -35,6 +35,8 @@ from flexkv.common.transfer import (
 from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
 from flexkv.cache.swa_cache_engine import SWACacheManager, SWAMatchResult
 
+pytestmark = pytest.mark.unit
+
 
 # --- graph dump (data-plane interface view) ----------------------------------
 

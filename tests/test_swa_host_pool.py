@@ -5,6 +5,8 @@ import pytest
 from flexkv.common.config import SWAPoolConfig
 from flexkv.swa.swa_host_pool import SWAHostPool
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def small_config():

@@ -24,6 +24,8 @@ import torch
 
 from flexkv.kvtask import KVTask, TaskType, TaskStatus
 
+pytestmark = pytest.mark.unit
+
 
 # --------------------------------------------------------------------------- #
 # 1. KVTask state machine (pure, no engine)                                    #

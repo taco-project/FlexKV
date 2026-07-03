@@ -25,6 +25,7 @@ import sys
 import time
 
 import numpy as np
+import pytest
 import torch
 
 from flexkv.cache.cache_engine import GlobalCacheEngine
@@ -242,6 +243,14 @@ def main() -> int:
     print("[verify] PASS: engine control-plane graph moved main-KV + SWA byte-exact, "
           "no stub, lock released", flush=True)
     return 0
+
+
+@pytest.mark.e2e
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="SWA byte-exact e2e needs a GPU")
+def test_swa_control_plane_e2e_byte_exact():
+    """pytest entry: run the byte-exact GPU->CPU->GPU roundtrip (main() returns 0
+    on success). Collected by `pytest -m e2e`; also runnable standalone."""
+    assert main() == 0
 
 
 if __name__ == "__main__":
