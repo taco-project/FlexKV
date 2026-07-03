@@ -164,10 +164,14 @@ CRadixNode *CRadixNode::split(int prefix_length) {
 
   set_parent(new_node);
 
-  // SWA: the snapshot stored on the original node covered the full pre-split
-  // range, which no longer exists. Free it (if any) and leave both halves as
-  // tombstones. new_node defaults to tombstone=true / slot=-1.
-  index->record_freed_swa_slot(this);
+  // SWA (node-mount, I0/I4): the SWA snapshot lives on the node's LAST page.
+  // After the split, `this` is the SUFFIX half and still owns that original
+  // last page, so its SWA (slot / tombstone / lock / SWA-LRU membership) stays
+  // exactly where it is — we must NOT free it here (the old behavior did).
+  // new_node is the PREFIX half; its trailing page is an interior page of the
+  // pre-split node, which never carried a window, so it defaults to no SWA
+  // (swa_host_slot=-1, swa_tombstone=true).
+  assert(new_node->get_swa_host_slot() == -1 && new_node->get_swa_tombstone());
   return new_node;
 }
 
@@ -200,11 +204,24 @@ void CRadixNode::merge_child() {
   }
   children.clear();
 
-  // SWA: the merged child disappears; release its slot if any. The parent (this)
-  // keeps its own SWA state, but since its block range grew, any snapshot on it
-  // no longer covers the full range either — free it too to stay conservative.
-  index->record_freed_swa_slot(child);
-  index->record_freed_swa_slot(this);
+  // SWA (node-mount, I0): after merging, the combined node's LAST page is the
+  // child's last page. So the SWA snapshot should follow the child: free the
+  // parent's own (now-stale) SWA, then move the child's SWA onto `this`. The
+  // child is about to be deleted, so unthread it from the SWA-LRU without
+  // buffering its slot for release (the slot is being kept, not freed).
+  index->record_freed_swa_slot(this);            // release parent's old SWA (if any)
+  int child_slot = child->get_swa_host_slot();
+  if (child_slot != -1) {
+    index->swa_lru_remove(child);                // detach child from SWA-LRU
+    child->set_swa_host_slot(-1);                // child no longer owns it
+    child->set_swa_tombstone(true);
+    if (!index->is_root(this)) {
+      index->set_swa(this, child_slot);          // remount on the merged node
+    } else {
+      // root cannot carry SWA; free the slot rather than leak it.
+      index->buffer_freed_swa_slot(child_slot);
+    }
+  }
 
   child->clear_parent();
   index->remove_leaf(child);
@@ -408,6 +425,136 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks, torch::Tensor &evicted
   return has_evicted;
 }
 
+// SWA-only eviction (node-mount, §6.2). Reclaims up to `num_swa_evicted` SWA
+// slots by walking the SWA-LRU from the LRU end, WITHOUT touching Full KV where
+// possible. Mirrors flexkv/cache/radixtree.py::evict_swa (the executable spec).
+//   * internal node  -> free SWA slot + tombstone; Full KV KEPT (multi-turn:
+//                       interior-prefix SWA is dropped first).
+//   * leaf, full-locked -> free SWA slot + tombstone; leaf stays (Full in use).
+//   * leaf, unlocked -> a leaf without SWA is meaningless (I2), delete the whole
+//                       node (Full+SWA) and iteratively delete tombstone leaves.
+// Freed SWA slots are buffered in freed_swa_slots (drain to the pool). The freed
+// full physical blocks (from leaf/tombstone deletions) are written into
+// `evicted_full_blocks` (resized to the count) so the caller can recycle them.
+int CRadixTreeIndex::evict_swa(torch::Tensor &evicted_full_blocks,
+                               int num_swa_evicted) {
+  std::vector<int64_t> freed_full;
+  int num_swa_freed = 0;
+
+  auto delete_leaf_full = [&](CRadixNode *node) {
+    // Detach a leaf and collect its full blocks (mirrors evict()'s delete arm).
+    auto parent = node->get_parent();
+    assert(parent != nullptr);
+    parent->remove_child(node->get_head_hash());
+    auto &blocks = node->get_physical_blocks();
+    for (auto b : blocks) {
+      freed_full.push_back(b);
+    }
+    node->clear_parent();
+    remove_leaf(node);
+    remove_node(node);
+    return parent;
+  };
+
+  while (num_swa_freed < num_swa_evicted) {
+    CRadixNode *x = swa_lru_get_lru_unlocked();
+    if (x == nullptr) {
+      break;
+    }
+    assert(x->has_swa());  // nodes on the SWA-LRU always carry a live slot
+    if (!x->is_leaf()) {
+      // Internal node: drop SWA only, keep Full KV.
+      record_freed_swa_slot(x);  // also unlinks from SWA-LRU
+      num_swa_freed++;
+    } else if (x->get_lock_cnt() > 0) {
+      // Leaf whose Full is still locked: drop SWA only.
+      record_freed_swa_slot(x);
+      num_swa_freed++;
+    } else {
+      // Leaf, Full unlocked: delete the whole node (Full + SWA), then cascade.
+      record_freed_swa_slot(x);
+      num_swa_freed++;
+      CRadixNode *parent = delete_leaf_full(x);
+      if (parent->is_leaf() && !is_root(parent)) {
+        add_leaf(parent);
+      }
+      // Cascade: a parent that just became a tombstone leaf with no Full lock is
+      // meaningless (I2) — delete it and continue up.
+      while (parent != nullptr && !is_root(parent) && parent->is_leaf() &&
+             parent->get_swa_tombstone() && parent->get_lock_cnt() == 0 &&
+             parent->is_ready()) {
+        CRadixNode *grandparent = parent->get_parent();
+        record_freed_swa_slot(parent);  // tombstone has no slot; unlink for safety
+        delete_leaf_full(parent);
+        parent = grandparent;
+        if (parent != nullptr && parent->is_leaf() && !is_root(parent)) {
+          add_leaf(parent);
+        }
+      }
+    }
+  }
+
+  // Publish the freed full blocks into the (resized) output tensor.
+  int n = static_cast<int>(freed_full.size());
+  evicted_full_blocks.resize_({n});
+  if (n > 0) {
+    auto *out = evicted_full_blocks.data_ptr<int64_t>();
+    for (int i = 0; i < n; ++i) {
+      out[i] = freed_full[i];
+    }
+  }
+  if (num_swa_freed > 0) {
+    FLEXKV_CACHE_EVICT();
+  }
+  return num_swa_freed;
+}
+
+// ===== dual lock (full + swa), tree-level walk (design §7) =================
+CRadixNode *CRadixTreeIndex::inc_lock_ref(CRadixNode *node) {
+  CRadixNode *swa_boundary = nullptr;
+  CRadixNode *cur = node;
+  while (cur != nullptr && !is_root(cur)) {
+    cur->lock();  // full_lock on every node from [node, root)
+    // SWA-lock only the single deepest node carrying a live SWA.
+    if (swa_boundary == nullptr && cur->has_swa()) {
+      cur->inc_swa_lock_ref();
+      assert(cur->get_lock_cnt() >= cur->get_swa_lock_ref());  // I3
+      swa_boundary = cur;
+    }
+    cur = cur->get_parent();
+  }
+  return swa_boundary;
+}
+
+void CRadixTreeIndex::dec_lock_ref(CRadixNode *node, CRadixNode *swa_boundary,
+                                   bool skip_swa) {
+  CRadixNode *cur = node;
+  while (cur != nullptr && !is_root(cur)) {
+    cur->unlock();  // asserts lock_cnt > 0
+    // Release the SWA lock only on the exact boundary node inc_lock_ref locked.
+    if (!skip_swa && cur == swa_boundary && cur->get_swa_lock_ref() > 0) {
+      cur->dec_swa_lock_ref();
+    }
+    assert(cur->get_lock_cnt() >= cur->get_swa_lock_ref());  // I3
+    cur = cur->get_parent();
+  }
+}
+
+void CRadixTreeIndex::dec_swa_lock_only(CRadixNode *swa_boundary) {
+  if (swa_boundary == nullptr) {
+    return;
+  }
+  assert(swa_boundary->get_swa_lock_ref() > 0);
+  swa_boundary->dec_swa_lock_ref();
+  if (swa_boundary->get_swa_lock_ref() == 0 && swa_boundary->has_swa()) {
+    if (swa_boundary->is_leaf()) {
+      // Leaf: free SWA now (Full stays until the full lock drops).
+      record_freed_swa_slot(swa_boundary);
+    }
+    // internal: keep SWA, stays evictable on the SWA-LRU
+  }
+}
+
 std::shared_ptr<CMatchResult>
 CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
                               bool update_cache_info) {
@@ -416,6 +563,9 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
   auto prefix_blocks_num = 0;
   auto ready_prefix_blocks_num = 0;
   auto last_node_matched_length = 0;
+  // SWA (node-mount): deepest fully-matched ready node carrying a live SWA slot.
+  CRadixNode *last_swa_node = nullptr;
+  int swa_hit_blocks = 0;
   auto physical_blocks_tensor = torch::empty({num_blocks}, torch::dtype(torch::kInt64));
   auto *pb_out = physical_blocks_tensor.data_ptr<int64_t>();
   int64_t pb_write = 0;
@@ -449,6 +599,12 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
       if (current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += matched_length;
+        // SWA hit only when the WHOLE node matched (its trailing page is
+        // exposed); a partial match must not claim the node's tail window.
+        if (matched_length == current_node->size() && current_node->has_swa()) {
+          last_swa_node = current_node;
+          swa_hit_blocks = ready_prefix_blocks_num;
+        }
       }
       last_node_matched_length = matched_length;
       prefix_blocks_num += matched_length;
@@ -468,6 +624,11 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
       if (current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += current_node->size();
+        // Whole node matched (we are descending into a child): expose its SWA.
+        if (current_node->has_swa()) {
+          last_swa_node = current_node;
+          swa_hit_blocks = ready_prefix_blocks_num;
+        }
       }
       prefix_blocks_num += current_node->size();
       auto &pbs = current_node->get_physical_blocks();
@@ -511,6 +672,11 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
       if (current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += matched_length;
+        // Only a full node match exposes the trailing page's SWA.
+        if (matched_length == current_node->size() && current_node->has_swa()) {
+          last_swa_node = current_node;
+          swa_hit_blocks = ready_prefix_blocks_num;
+        }
       }
 
       last_node_matched_length = matched_length;
@@ -539,7 +705,8 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
   auto empty_uint32 = torch::Tensor();
   return std::make_shared<CMatchResult>(ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
-    last_ready_node, current_node, physical_blocks, empty_uint32);
+    last_ready_node, current_node, physical_blocks, empty_uint32,
+    last_swa_node, swa_hit_blocks);
 }
 
 } //  namespace flexkv

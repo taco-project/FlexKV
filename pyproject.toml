@@ -78,3 +78,18 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# Only collect FlexKV's own tests — never third_party/ (googletest ships .py
+# files that pytest would try to import and choke on).
+testpaths = ["tests"]
+# Test tiers (replaces the former tests/run_test_plan.sh — pytest does discovery
+# + reporting natively; select a tier with `pytest -m <tier>`):
+#   unit  — pure-logic + c_ext logic, no GPU   (pytest -m unit)
+#   smoke — control-plane / graph-build / bind, no GPU
+#   e2e   — needs a GPU (dispatch, byte-exact roundtrip, KVManager full flow);
+#           each e2e test also skipif(not torch.cuda.is_available()).
+# Tests with no marker still run under a bare `pytest`. Run everything: `pytest`.
+markers = [
+    "unit: pure-logic / c_ext logic unit tests (no GPU)",
+    "smoke: control-plane / graph-build / late-bind (no GPU)",
+    "e2e: end-to-end tests requiring a GPU",
+]

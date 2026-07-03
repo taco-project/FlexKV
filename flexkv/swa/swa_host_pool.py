@@ -1,8 +1,11 @@
 """SWA Host Pool — CPU-side pinned memory for SWA page storage.
 
-Each slot stores one SWA snapshot: window_size tokens x num_swa_layers layers x bytes_per_token_per_layer.
-Slot allocation uses a simple free-list (stack). When the pool is full, the caller
-(SWARadixManager) triggers LRU eviction before retrying.
+SWA is managed at PAGE granularity: each slot stores exactly one swa_page of
+window KV = swa_page_size tokens x num_swa_layers layers x bytes_per_token_per_layer
+(``window_size`` in SWAPoolConfig carries the physical swa_page_size). All SWA
+IO addresses a whole slot (= one page) at a time. Slot allocation uses a simple
+free-list (stack). When the pool is full, the caller (cache engine) triggers SWA-LRU
+eviction before retrying.
 """
 import time
 from typing import Optional, Union
@@ -54,6 +57,15 @@ class SWAHostPool:
         """Return a slot to the free list."""
         self._free_slots.append(slot_id)
 
+    def reset(self) -> None:
+        """Return every slot to the free list (all SWA state dropped).
+
+        Called when the owning radix tree is reset: the tree bulk-deletes all
+        nodes without buffering their slots, so the pool must be re-armed as
+        fully free to avoid permanently leaking those slots.
+        """
+        self._free_slots = list(range(self._num_slots - 1, -1, -1))
+
     # --- Data Access -------------------------------------------------------
 
     def write(self, slot_id: int, data: Union['torch.Tensor', np.ndarray, bytes]) -> None:
@@ -91,6 +103,15 @@ class SWAHostPool:
             return self._buffer[slot_id].copy()
 
     # --- Properties --------------------------------------------------------
+
+    @property
+    def buffer(self):
+        """The backing slot buffer ``[num_slots, slot_size_bytes]`` (uint8).
+
+        Pinned torch tensor when CUDA is available, else a numpy array. The SWA
+        transfer worker (data plane) shares this and addresses bytes by slot row.
+        """
+        return self._buffer
 
     @property
     def num_free(self) -> int:

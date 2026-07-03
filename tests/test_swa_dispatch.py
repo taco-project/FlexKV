@@ -25,6 +25,7 @@ import sys
 import time
 
 import numpy as np
+import pytest
 import torch
 
 from flexkv.common.config import (
@@ -281,6 +282,14 @@ def main() -> int:
     print("[verify] PASS: end-to-end main-KV + SWA roundtrip byte-exact",
           flush=True)
     return 0
+
+
+@pytest.mark.e2e
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="SWA dispatch e2e needs a GPU")
+def test_swa_dispatch_byte_exact():
+    """pytest entry: data-plane SWA dispatch byte-exact roundtrip (main() -> 0).
+    Collected by `pytest -m e2e`; also runnable standalone."""
+    assert main() == 0
 
 
 if __name__ == "__main__":
