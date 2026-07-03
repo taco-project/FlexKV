@@ -322,10 +322,10 @@ class KVManager:
     def launch(self,
                task_ids: Union[int, List[int]],
                slot_mappings: Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]],
+               swa_slot_mappings: Optional[Union[np.ndarray, List[Optional[np.ndarray]], torch.Tensor, List[Optional[torch.Tensor]]]] = None,
                as_batch: bool = False,
                layerwise_transfer: bool = False,
-               counter_id: int = 0,
-               swa_slot_mappings: Optional[Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]]] = None) -> List[int]:
+               counter_id: int = 0) -> List[int]:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         if not isinstance(slot_mappings, List):
@@ -334,11 +334,13 @@ class KVManager:
             slot_mappings = [slot_mapping.numpy() for slot_mapping in slot_mappings]
         # SWA GPU slot_mappings (optional): the connector supplies these only when
         # it registered an SWA GPU pool and the request has an SWA reuse window.
-        if swa_slot_mappings is not None:
-            if not isinstance(swa_slot_mappings, List):
-                swa_slot_mappings = [swa_slot_mappings]
-            if len(swa_slot_mappings) > 0 and isinstance(swa_slot_mappings[0], torch.Tensor):
-                swa_slot_mappings = [sm.numpy() for sm in swa_slot_mappings]
+        if swa_slot_mappings is not None and not isinstance(swa_slot_mappings, List):
+            swa_slot_mappings = [swa_slot_mappings]
+        if isinstance(swa_slot_mappings, List):
+            swa_slot_mappings = [
+                sm.numpy() if isinstance(sm, torch.Tensor) else sm
+                for sm in swa_slot_mappings
+            ]
         if self.server_client_mode:
             # server mode: forward SWA only if the RPC client supports it, else
             # degrade to full-KV launch (SWA stays CPU-resident) rather than crash.
@@ -353,10 +355,10 @@ class KVManager:
             return self.kv_task_engine.launch_tasks(
                 task_ids,
                 slot_mappings,
+                swa_slot_mappings=swa_slot_mappings,
                 as_batch=as_batch,
                 layerwise_transfer=layerwise_transfer,
                 counter_id=counter_id,
-                swa_slot_mappings=swa_slot_mappings,
             )
 
     def cancel(self, task_ids: Union[int, List[int]]) -> None:

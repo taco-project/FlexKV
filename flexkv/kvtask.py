@@ -376,26 +376,31 @@ class KVTaskManager:
     def set_slot_mappings(self,
                           task_ids: List[int],
                           slot_mappings: List[np.ndarray],
-                          swa_slot_mappings: Optional[List[np.ndarray]] = None) -> None:
-        for i, (task_id, slot_mapping) in enumerate(zip(task_ids, slot_mappings)):
-            swa_sm = swa_slot_mappings[i] if swa_slot_mappings is not None else None
-            self._set_slot_mapping_impl(task_id, slot_mapping, swa_sm)
+                          swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None) -> None:
+        if swa_slot_mappings is None:
+            swa_slot_mappings = [None] * len(task_ids)
+        for task_id, slot_mapping, swa_slot_mapping in zip(task_ids, slot_mappings, swa_slot_mappings):
+            self._set_slot_mapping_impl(task_id, slot_mapping, swa_slot_mapping)
 
-    def _set_slot_mapping_impl(self, task_id: int, slot_mapping: np.ndarray,
+    def _set_slot_mapping_impl(self,
+                               task_id: int,
+                               slot_mapping: np.ndarray,
                                swa_slot_mapping: Optional[np.ndarray] = None) -> None:
         task = self.tasks[task_id]
         if task.status != TaskStatus.UNREADY:
             return
         graph_ids = self.cache_engine.slot_mapping_to_block_ids(slot_mapping,
                                                                 self.cache_config.tokens_per_block)
-        task.graph.set_gpu_blocks(graph_ids)
-        # Bind the GPU-side SWA slots (late-bind, mirror of set_gpu_blocks). Only
-        # when the graph actually carries SWA GPU ops AND the connector supplied a
-        # swa_slot_mapping; otherwise the SWA ops stay CPU-only / absent.
+        # Late-bind the GPU-side SWA slots via the unified set_gpu_blocks(gpu,
+        # swa_gpu) path (PR#191). On DSv4 window == tokens_per_block, so the SWA
+        # mapping folds by the same stride as full-KV (slot_mapping_to_block_ids).
+        # A None swa_slot_mapping leaves the graph's SWA ops at their built ids.
         swa_sm = swa_slot_mapping if swa_slot_mapping is not None else task.swa_slot_mapping
-        if getattr(task.graph, "_swa_gpu_transfer_op_id", None) and swa_sm is not None:
-            swa_slot_ids = self.cache_engine.swa_slot_mapping_to_slot_ids(swa_sm)
-            task.graph.set_swa_gpu_blocks(swa_slot_ids)
+        swa_graph_ids = None
+        if swa_sm is not None:
+            swa_graph_ids = self.cache_engine.slot_mapping_to_block_ids(
+                swa_sm, self.cache_config.tokens_per_block)
+        task.graph.set_gpu_blocks(graph_ids, swa_graph_ids)
         task.status = TaskStatus.READY
 
     def _gen_task_id(self) -> int:
@@ -916,11 +921,11 @@ class KVTaskEngine(KVTaskManager):
     def launch_tasks(self,
                     task_ids: List[int],
                     slot_mappings: List[np.ndarray],
+                    swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None,
                     as_batch: bool = False,
                     batch_id: int = -1,
                     layerwise_transfer: bool = False,
-                    counter_id: int = 0,
-                    swa_slot_mappings: Optional[List[np.ndarray]] = None) -> List[int]:
+                    counter_id: int = 0) -> List[int]:
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
