@@ -234,6 +234,12 @@ class RadixTreeIndex:
         # SWA slots freed by structural changes (split / merge / evict / evict_swa),
         # drained by the cache engine to return them to the SWA host pool.
         self._freed_swa_slots: List[int] = []
+        # True once any SWA slot has been mounted (set from set_swa). Gates the I2
+        # tombstone-leaf cascade in the always-running full-KV evict(): a node's
+        # swa_tombstone DEFAULTS to True, so in a non-SWA deployment EVERY leaf is
+        # a tombstone and an unconditional cascade would over-evict valid
+        # ancestors. evict_swa() needs no gate (it only runs when SWA is enabled).
+        self._swa_enabled: bool = False
 
     def reset(self) -> None:
         self.root_node = RadixNode(block_hashes=np.array([], dtype=np.int64),
@@ -245,6 +251,8 @@ class RadixTreeIndex:
         self._swa_lru_head.swa_lru_next = self._swa_lru_tail
         self._swa_lru_tail.swa_lru_prev = self._swa_lru_head
         self._freed_swa_slots.clear()
+        # keep _swa_enabled sticky across reset (mirrors C++: the pool geometry /
+        # SWA usage is a deployment property, not per-tree-generation state)
 
     def is_empty(self) -> bool:
         return len(self.leaf_nodes) == 0
@@ -312,6 +320,21 @@ class RadixTreeIndex:
         node.swa_tombstone = False
         node.swa_last_access_time = time.time()
         self._swa_lru_add_mru(node)
+        self._swa_enabled = True  # arm the I2 cascade in full-KV evict()
+
+    def promote_swa(self, node: RadixNode) -> None:
+        """Refresh a node's SWA recency on read-hit: splice it to the SWA-LRU MRU.
+
+        SWA recency lives in the LRU *list position* (evict_swa walks the linked
+        list via _swa_lru_get_lru_unlocked and never reads swa_last_access_time),
+        so a hit that only bumped the timestamp would NOT survive eviction — we
+        must actually move the node to MRU. Mirror of set_swa's LRU touch, minus
+        the mount. No-op for root or a node with no live SWA (a tombstone is not
+        on the SWA-LRU; re-adding it would corrupt the list)."""
+        if node is self.root_node or not node.has_swa():
+            return
+        node.swa_last_access_time = time.time()
+        self._swa_lru_add_mru(node)  # remove+reinsert = move to MRU (idempotent)
 
     def merge_child(self, node: RadixNode) -> None:
         """Merge ``node``'s only child into it, moving SWA to follow the child.
@@ -490,19 +513,29 @@ class RadixTreeIndex:
                 # window no longer covers the last page — release it (I1).
                 self.record_freed_swa_slot(node)
             else:
-                assert node.parent is not None  # node is not root
-                node.parent.children.pop(node.head_hash())
+                parent = node.parent
+                assert parent is not None  # node is not root
+                parent.children.pop(node.head_hash())
                 self.leaf_nodes.pop(node.head_hash(), None)
-                if node.parent.is_leaf():
-                    self.leaf_nodes[node.parent.head_hash()] = node.parent
-                if node.parent.evictable():
-                    priority = self._get_eviction_priority(node.parent)
-                    heapq.heappush(candidates, (priority, node.parent))
                 physical_blocks = node.physical_blocks
                 _block_hashes = node.block_hashes
                 # SWA: node is deleted; release its slot so it is not leaked (I1).
                 self.record_freed_swa_slot(node)
                 node.parent = None
+                if parent.is_leaf() and not parent.is_root():
+                    self.leaf_nodes[parent.head_hash()] = parent
+                if self._swa_enabled:
+                    # I2: a parent that just became a tombstone leaf (Full but no
+                    # SWA, not locked) is meaningless — cascade-delete it and its
+                    # tombstone ancestors. Their blocks append beyond num_evicted.
+                    cascade_blocks, cascade_hashes, parent = \
+                        self._iteratively_delete_tombstone_leaf(parent)
+                    if cascade_blocks.size:
+                        physical_blocks = np.concatenate([physical_blocks, cascade_blocks])
+                        _block_hashes = np.concatenate([_block_hashes, cascade_hashes])
+                if parent is not None and parent.evictable():
+                    priority = self._get_eviction_priority(parent)
+                    heapq.heappush(candidates, (priority, parent))
 
             evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
             evicted_block_hashes = np.concatenate([evicted_block_hashes, _block_hashes])
@@ -557,16 +590,21 @@ class RadixTreeIndex:
                     self.leaf_nodes[parent.head_hash()] = parent
                 # Cascade: a parent that just became a tombstone leaf is
                 # meaningless (I2) — delete it and continue up.
-                freed_full = self._iteratively_delete_tombstone_leaf(parent)
+                freed_full, _freed_hashes, _survivor = \
+                    self._iteratively_delete_tombstone_leaf(parent)
                 if freed_full.size:
                     evicted_full_blocks = np.concatenate([evicted_full_blocks, freed_full])
         return evicted_full_blocks, num_swa_freed
 
-    def _iteratively_delete_tombstone_leaf(self, node: RadixNode) -> np.ndarray:
+    def _iteratively_delete_tombstone_leaf(
+            self, node: RadixNode) -> Tuple[np.ndarray, np.ndarray, Optional[RadixNode]]:
         """Delete ``node`` and its ancestors while they are tombstone leaves with
         no Full lock (a leaf without SWA is meaningless, I2). Returns the Full
-        physical blocks freed (to recycle)."""
+        physical blocks freed, their block hashes, and the last surviving
+        ancestor (a non-tombstone leaf, a locked/unready node, an internal node,
+        or root) so the caller can reconsider it for eviction."""
         freed = np.array([], dtype=np.int64)
+        freed_hashes = np.array([], dtype=np.int64)
         while (node is not None and not node.is_root() and node.is_leaf()
                and node.swa_tombstone and node.lock_cnt == 0 and node.is_ready):
             parent = node.parent
@@ -576,11 +614,12 @@ class RadixTreeIndex:
             # tombstone node has no SWA slot, but call for uniformity / LRU safety
             self.record_freed_swa_slot(node)
             freed = np.concatenate([freed, node.physical_blocks])
+            freed_hashes = np.concatenate([freed_hashes, node.block_hashes])
             node.parent = None
             if parent.is_leaf() and not parent.is_root():
                 self.leaf_nodes[parent.head_hash()] = parent
             node = parent
-        return freed
+        return freed, freed_hashes, node
 
     # ===== SWA dual lock (mirror of sglang inc/dec_lock_ref) ==============
     # FlexKV's SWA window == one page == one node's trailing page, so sglang's

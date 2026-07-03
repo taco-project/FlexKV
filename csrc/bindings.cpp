@@ -721,6 +721,8 @@ PYBIND11_MODULE(c_ext, m) {
       // ===== SWA node-mount: store-side mount + SWA-only eviction =====
       .def("set_swa", &flexkv::CRadixTreeIndex::set_swa, py::arg("node"),
            py::arg("slot"))
+      .def("promote_swa", &flexkv::CRadixTreeIndex::promote_swa,
+           py::arg("node"))
       .def("evict_swa", &flexkv::CRadixTreeIndex::evict_swa,
            py::arg("evicted_full_blocks"), py::arg("num_swa_evicted"),
            py::call_guard<py::gil_scoped_release>())
