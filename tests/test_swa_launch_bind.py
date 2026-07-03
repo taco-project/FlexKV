@@ -94,8 +94,11 @@ def test_launch_bind_get_rebinds_swa_gpu_only():
     swa_h2d = [o for o in graph._op_map.values()
                if o.is_swa and o.transfer_type == TransferType.H2D]
     assert len(swa_h2d) == 1, "expected one SWA H2D"
+    # Unified model (PR#191): the SWA H2D is tracked in BOTH lists. The safety
+    # property is verified below — single-arg set_gpu_blocks(full_gpu) leaves the
+    # SWA op untouched, and set_swa_gpu_blocks binds it independently.
     assert swa_h2d[0].op_id in graph._swa_gpu_transfer_op_id
-    assert swa_h2d[0].op_id not in graph._gpu_transfer_op_id
+    assert swa_h2d[0].op_id in graph._gpu_transfer_op_id
 
     # Bind full-KV GPU blocks (as _set_slot_mapping_impl does).
     full_gpu = np.arange(100, 100 + len(tok) // TPB, dtype=np.int64)

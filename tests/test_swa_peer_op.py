@@ -244,16 +244,24 @@ def test_gate_off_produces_no_swa_ops():
     assert len(g._op_map) == 1
 
 
-def test_swa_ops_excluded_from_gpu_transfer_list():
-    """SWA ops must NOT be in _gpu_transfer_op_id (set_gpu_blocks would clobber
-    their independent SWA slot space with full-KV block ids)."""
+def test_swa_ops_tracked_in_both_lists_but_preserved_by_single_arg_set_gpu_blocks():
+    """Unified GPU-transfer model (PR#191 integration): SWA H2D/D2H ops ARE in
+    _gpu_transfer_op_id (so set_gpu_blocks(gpu, swa_gpu) can bind them) AND in
+    _swa_gpu_transfer_op_id (so set_swa_gpu_blocks / the kvtask two-call path can
+    bind them). The safety property is no longer 'excluded from the list' but
+    'single-arg set_gpu_blocks(gpu) never overwrites an SWA op's slot' — verified
+    in test_set_gpu_blocks_does_not_touch_swa_slots below."""
     mgr = _mgr(enabled=True, ssd=True)
     g = TransferOpGraph()
     full = _full_h2d(g)        # full H2D IS a gpu transfer op
     swa_id = mgr.build_get_chain(g, SWA_GPU, SWA_CPU, ssd_slot_ids=SWA_SSD)
     assert full.op_id in g._gpu_transfer_op_id
+    assert full.op_id not in g._swa_gpu_transfer_op_id
+    # SWA GPU-touching ops (H2D/D2H) are tracked in BOTH lists now.
     for op in _swa_ops(g):
-        assert op.op_id not in g._gpu_transfer_op_id
+        if op.transfer_type in (TransferType.H2D, TransferType.D2H):
+            assert op.op_id in g._gpu_transfer_op_id
+            assert op.op_id in g._swa_gpu_transfer_op_id
 
 
 def test_set_gpu_blocks_does_not_touch_swa_slots():
