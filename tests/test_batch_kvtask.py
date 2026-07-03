@@ -113,8 +113,8 @@ def test_batched_put_and_get_lifecycle(running_kvmanager, cache_config):
 
     # ---- batched PUT (first write -> every sub-task has a non-empty graph) ----
     put_ids, put_slot_mappings = [], []
-    for token_ids, block_ids, dp_id in pairs:
-        task_id, _ = kvmanager.put_match(token_ids=token_ids, token_mask=None, dp_id=dp_id)
+    for token_ids, block_ids, _ in pairs:
+        task_id, _ = kvmanager.put_match(token_ids=token_ids, token_mask=None)
         put_ids.append(task_id)
         put_slot_mappings.append(block_ids_2_slot_mapping(block_ids, tokens_per_block))
     launched_put = kvmanager.launch(put_ids, put_slot_mappings, as_batch=True)
@@ -122,8 +122,8 @@ def test_batched_put_and_get_lifecycle(running_kvmanager, cache_config):
 
     # ---- batched GET of the same tokens -> should fully hit the cache ----
     get_ids, get_slot_mappings = [], []
-    for token_ids, block_ids, dp_id in pairs:
-        task_id, _ = kvmanager.get_match(token_ids=token_ids, token_mask=None, dp_id=dp_id)
+    for token_ids, block_ids, _ in pairs:
+        task_id, _ = kvmanager.get_match(token_ids=token_ids, token_mask=None)
         get_ids.append(task_id)
         get_slot_mappings.append(block_ids_2_slot_mapping(block_ids, tokens_per_block))
     launched_get = kvmanager.launch(get_ids, get_slot_mappings, as_batch=True)
