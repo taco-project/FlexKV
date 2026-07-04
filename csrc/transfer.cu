@@ -33,7 +33,12 @@ __global__ void transfer_kv_blocks_kernel(
     int64_t cpu_startoff_inside_chunks, int64_t copy_size, bool is_mla,
     bool is_host_to_device) {
   int kv_dim = is_mla ? 1 : 2;
-  int num_chunks = num_layers * kv_dim * num_blocks;
+  // Fold kv_dim into an inner loop so each warp iteration processes all KV
+  // slots of one (layer, block). For non-MLA this halves the outer iteration
+  // count, amortizing setup cost (division, block_ids fetch, layer_idx and
+  // cpu_base compute) over 2x the useful work per warp step. For MLA
+  // (kv_dim=1) it is equivalent to the original code.
+  int num_chunks = num_layers * num_blocks;
   int64_t copy_size_in_float4 = copy_size * sizeof(int64_t) / sizeof(float4);
 
   int warp_id = threadIdx.x / 32;
@@ -43,36 +48,43 @@ __global__ void transfer_kv_blocks_kernel(
 
   for (int chunk_idx = blockIdx.x * warps_per_block + warp_id;
        chunk_idx < num_chunks; chunk_idx += total_warps) {
-    int layer_idx = start_layer_id + chunk_idx / (num_blocks * kv_dim);
-    int kv_idx = (chunk_idx % (num_blocks * kv_dim)) / num_blocks;
-    int gpu_block_idx = gpu_block_ids[chunk_idx % num_blocks];
-    int cpu_block_idx = cpu_block_ids[chunk_idx % num_blocks];
+    int layer_idx = start_layer_id + chunk_idx / num_blocks;
+    int block_pos = chunk_idx % num_blocks;
+    int gpu_block_idx = gpu_block_ids[block_pos];
+    int cpu_block_idx = cpu_block_ids[block_pos];
 
-    int64_t *cpu_chunk_ptr =
-        cpu_ptr + layer_idx * cpu_layer_stride + kv_idx * cpu_kv_stride +
-        cpu_block_idx * cpu_block_stride + cpu_startoff_inside_chunks;
+    int64_t *cpu_base = cpu_ptr + layer_idx * cpu_layer_stride +
+                        cpu_block_idx * cpu_block_stride +
+                        cpu_startoff_inside_chunks;
 
-    // Use template specialization to compute gpu pointer
-    int64_t *gpu_ptr =
-        ptr_at<Type>(gpu_handler, layer_idx, kv_idx, gpu_block_idx);
-    int64_t *gpu_chunk_ptr =
-        reinterpret_cast<int64_t *>(gpu_ptr) + gpu_startoff_inside_chunks;
+#pragma unroll
+    for (int kv_idx = 0; kv_idx < kv_dim; kv_idx++) {
+      int64_t *cpu_chunk_ptr = cpu_base + kv_idx * cpu_kv_stride;
 
-    int64_t *src_chunk_ptr = is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
-    int64_t *dst_chunk_ptr = is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
+      // Use template specialization to compute gpu pointer
+      int64_t *gpu_ptr =
+          ptr_at<Type>(gpu_handler, layer_idx, kv_idx, gpu_block_idx);
+      int64_t *gpu_chunk_ptr =
+          reinterpret_cast<int64_t *>(gpu_ptr) + gpu_startoff_inside_chunks;
 
-    for (int64_t idx = lane_id; idx < copy_size_in_float4; idx += 32) {
-      float4 element;
-      asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3},[%4];"
-                   : "=f"(element.x), "=f"(element.y), "=f"(element.z),
-                     "=f"(element.w)
-                   : "l"(&FLOAT4_PTR(src_chunk_ptr)[idx])
-                   : "memory");
-      asm volatile("st.global.cg.v4.f32 [%0],{%1,%2,%3,%4};" ::"l"(
-                       &FLOAT4_PTR(dst_chunk_ptr)[idx]),
-                   "f"(element.x), "f"(element.y), "f"(element.z),
-                   "f"(element.w)
-                   : "memory");
+      int64_t *src_chunk_ptr =
+          is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
+      int64_t *dst_chunk_ptr =
+          is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
+
+      for (int64_t idx = lane_id; idx < copy_size_in_float4; idx += 32) {
+        float4 element;
+        asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3},[%4];"
+                     : "=f"(element.x), "=f"(element.y), "=f"(element.z),
+                       "=f"(element.w)
+                     : "l"(&FLOAT4_PTR(src_chunk_ptr)[idx])
+                     : "memory");
+        asm volatile("st.global.cg.v4.f32 [%0],{%1,%2,%3,%4};" ::"l"(
+                         &FLOAT4_PTR(dst_chunk_ptr)[idx]),
+                     "f"(element.x), "f"(element.y), "f"(element.z),
+                     "f"(element.w)
+                     : "memory");
+      }
     }
   }
 }

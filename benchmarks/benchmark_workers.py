@@ -30,6 +30,8 @@ class BenchmarkConfig:
     benchmark_round: int = 10
     bidirectional: bool = False
     gpu_layout_type: int = 0
+    use_ce_transfer: bool = False
+    transfer_num_cta: int = 4
 
 def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]:
     config_file = args.config
@@ -49,7 +51,9 @@ def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]
             warmup_round=args.warmup_round,
             benchmark_round=args.benchmark_round,
             bidirectional=args.bi,
-            gpu_layout_type=args.gpu_layout_type
+            gpu_layout_type=args.gpu_layout_type,
+            use_ce_transfer=args.use_ce,
+            transfer_num_cta=args.cta,
         )
         cache_config.num_ssd_blocks = max(cache_config.num_ssd_blocks, bench_config.num_blocks_to_transfer)
         return model_config, cache_config, bench_config
@@ -60,7 +64,9 @@ def create_cpu_gpu_worker(
                   model_config: ModelConfig,
                   cache_config: CacheConfig,
                   num_gpu_blocks: int,
-                  gpu_layout_type: int = 0) -> Tuple[WorkerHandle, mp.Queue]:
+                  gpu_layout_type: int = 0,
+                  use_ce_transfer: bool = False,
+                  transfer_num_cta: int = 4) -> Tuple[WorkerHandle, mp.Queue]:
     mp.set_start_method('spawn', force=True)
     cpu_layout = KVCacheLayout(
         type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
@@ -128,10 +134,10 @@ def create_cpu_gpu_worker(
             cpu_kv_layout=cpu_handle.kv_layout,
             dtype=model_config.dtype,
             gpu_device_id=0,
-            use_ce_transfer_h2d=False,
-            use_ce_transfer_d2h=False,
-            transfer_num_cta_h2d=4,
-            transfer_num_cta_d2h=4,
+            use_ce_transfer_h2d=use_ce_transfer,
+            use_ce_transfer_d2h=use_ce_transfer,
+            transfer_num_cta_h2d=transfer_num_cta,
+            transfer_num_cta_d2h=transfer_num_cta,
         )
     else:
         worker_handle = tpGPUCPUTransferWorker.create_worker(
@@ -145,10 +151,10 @@ def create_cpu_gpu_worker(
             dtype=model_config.dtype,
             tp_group_size=model_config.tp_size,
             dp_group_id=0,
-            use_ce_transfer_h2d=False,
-            use_ce_transfer_d2h=False,
-            transfer_num_cta_h2d=4,
-            transfer_num_cta_d2h=4,
+            use_ce_transfer_h2d=use_ce_transfer,
+            use_ce_transfer_d2h=use_ce_transfer,
+            transfer_num_cta_h2d=transfer_num_cta,
+            transfer_num_cta_d2h=transfer_num_cta,
         )
     return (
         worker_handle,
@@ -329,128 +335,129 @@ REVERSE_TYPE_MAP = {
 
 def bench_worker(args):
     model_config, cache_config, bench_config = make_configs(args)
-    print(f"model_config: {model_config}")
-    print(f"cache_config: {cache_config}")
-    print(f"bench_config: {bench_config}")
     if model_config.tp_size > torch.cuda.device_count():
         raise ValueError(f"TP size {model_config.tp_size} is greater than "
                          f"the number of GPUs {torch.cuda.device_count()}")
+
+    # Determine block counts: sweep mode or single run
+    if args.sweep_blocks:
+        block_counts = [int(x.strip()) for x in args.sweep_blocks.split(",")]
+        print(f"Sweep mode: {len(block_counts)} block counts: {block_counts}")
+    else:
+        block_counts = [bench_config.num_blocks_to_transfer]
+
+    transfer_type = bench_config.transfer_type
+    gpu_layout_type = bench_config.gpu_layout_type
     warmup_round = bench_config.warmup_round
     benchmark_round = bench_config.benchmark_round
-    transfer_type = bench_config.transfer_type
+
+    # In sweep mode, create the worker once with the maximum block count to
+    # avoid paying memory-pin overhead on every step.
+    max_blocks = max(block_counts)
+
     num_layers_to_transfer = bench_config.num_layers_to_transfer
     if num_layers_to_transfer == -1:
         num_layers_to_transfer = model_config.num_layers
-    num_blocks_to_transfer = bench_config.num_blocks_to_transfer
-    shuffle_ids = bench_config.shuffle_ids
-    bidirectional = bench_config.bidirectional
-    gpu_layout_type = bench_config.gpu_layout_type
 
     if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
-        worker_handle, finished_ops_queue = create_cpu_gpu_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type)
+        worker_handle, finished_ops_queue = create_cpu_gpu_worker(
+            model_config, cache_config, max_blocks,
+            gpu_layout_type, bench_config.use_ce_transfer,
+            bench_config.transfer_num_cta)
     elif transfer_type == TransferType.H2DISK or transfer_type == TransferType.DISK2H:
         worker_handle, finished_ops_queue = create_cpu_ssd_worker(model_config, cache_config)
     elif transfer_type == TransferType.DISK2D or transfer_type == TransferType.D2DISK:
-        worker_handle, finished_ops_queue = create_gpu_ssd_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type)
+        worker_handle, finished_ops_queue = create_gpu_ssd_worker(
+            model_config, cache_config, max_blocks, gpu_layout_type)
     else:
-        raise ValueError(f"Unsupported transfer type: {transfer_type} for benchmark, "
-                         f"currently only support {TransferType.H2D.name}, {TransferType.D2H.name}, "
-                         f"{TransferType.H2DISK.name}, {TransferType.DISK2H.name}, "
-                         f"{TransferType.DISK2D.name}, {TransferType.D2DISK.name}")
-    reverse_worker_handle = None
-    reverse_finished_ops_queue = None
-    if bidirectional:
-        if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
-            reverse_worker_handle, reverse_finished_ops_queue = \
-                create_cpu_gpu_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type)
-        elif transfer_type == TransferType.H2DISK or transfer_type == TransferType.DISK2H:
-            reverse_worker_handle, reverse_finished_ops_queue = \
-                create_cpu_ssd_worker(model_config, cache_config)
-        elif transfer_type == TransferType.DISK2D or transfer_type == TransferType.D2DISK:
-            reverse_worker_handle, reverse_finished_ops_queue = \
-                create_gpu_ssd_worker(model_config, cache_config, num_blocks_to_transfer, gpu_layout_type)
+        raise ValueError(f"Unsupported transfer type: {transfer_type}")
 
-    if shuffle_ids:
-        block_ids = torch.randperm(num_blocks_to_transfer).numpy()
-    else:
-        block_ids = torch.arange(num_blocks_to_transfer).numpy()
+    results = []
 
-    transfer_op = TransferOp(
-        transfer_type=transfer_type,
-        src_block_ids=block_ids,
-        dst_block_ids=block_ids,
-        graph_id=0,
-        dp_client_id=0,
-        successors=[],
-        predecessors=[],
-    )
+    for num_blocks_to_transfer in block_counts:
+        if bench_config.shuffle_ids:
+            block_ids = torch.randperm(num_blocks_to_transfer).numpy()
+        else:
+            block_ids = torch.arange(num_blocks_to_transfer).numpy()
 
-    reverse_transfer_op = None
-    if bidirectional:
-        reverse_type = REVERSE_TYPE_MAP.get(transfer_type)
-        if reverse_type is None:
-            raise ValueError(f"Bidirectional test not supported for transfer type: {transfer_type}")
-
-        reverse_block_ids = torch.randperm(num_blocks_to_transfer).numpy()
-
-        reverse_transfer_op = TransferOp(
-            transfer_type=reverse_type,
-            src_block_ids=reverse_block_ids,
-            dst_block_ids=reverse_block_ids,
-            graph_id=1,
+        transfer_op = TransferOp(
+            transfer_type=transfer_type,
+            src_block_ids=block_ids,
+            dst_block_ids=block_ids,
+            graph_id=0,
             dp_client_id=0,
             successors=[],
             predecessors=[],
         )
-    if transfer_type == TransferType.DISK2H or transfer_type == TransferType.H2DISK:
-        tmp_op = copy.deepcopy(transfer_op)
-        tmp_op.transfer_type = TransferType.H2DISK
-        tmp_op.src_block_ids = transfer_op.dst_block_ids
-        tmp_op.dst_block_ids = transfer_op.src_block_ids
-        launch_transfer(worker_handle, finished_ops_queue, tmp_op)
-        sync_all(finished_ops_queue, 1)
-    elif transfer_type == TransferType.DISK2D:
-        tmp_op = copy.deepcopy(transfer_op)
-        tmp_op.transfer_type = TransferType.D2DISK
-        tmp_op.src_block_ids = transfer_op.dst_block_ids
-        tmp_op.dst_block_ids = transfer_op.src_block_ids
-        launch_transfer(worker_handle, finished_ops_queue, tmp_op)
-        sync_all(finished_ops_queue, 1)
 
-    for _ in range(warmup_round):
-        if bidirectional:
-            launch_transfer(reverse_worker_handle, reverse_finished_ops_queue, reverse_transfer_op)
-        launch_transfer(worker_handle, finished_ops_queue, transfer_op)
-    sync_all(finished_ops_queue, warmup_round)
-    if bidirectional:
-        sync_all(reverse_finished_ops_queue, warmup_round)
+        if transfer_type == TransferType.DISK2H or transfer_type == TransferType.H2DISK:
+            tmp_op = copy.deepcopy(transfer_op)
+            tmp_op.transfer_type = TransferType.H2DISK
+            tmp_op.src_block_ids = transfer_op.dst_block_ids
+            tmp_op.dst_block_ids = transfer_op.src_block_ids
+            launch_transfer(worker_handle, finished_ops_queue, tmp_op)
+            sync_all(finished_ops_queue, 1)
+        elif transfer_type == TransferType.DISK2D:
+            tmp_op = copy.deepcopy(transfer_op)
+            tmp_op.transfer_type = TransferType.D2DISK
+            tmp_op.src_block_ids = transfer_op.dst_block_ids
+            tmp_op.dst_block_ids = transfer_op.src_block_ids
+            launch_transfer(worker_handle, finished_ops_queue, tmp_op)
+            sync_all(finished_ops_queue, 1)
 
-    pbar = tqdm(total=benchmark_round, desc="Benchmarking")
-    start_time = time.time()
-    for _ in range(benchmark_round):
-        if bidirectional:
-            launch_transfer(reverse_worker_handle, reverse_finished_ops_queue, reverse_transfer_op)
-        launch_transfer(worker_handle, finished_ops_queue, transfer_op)
-        pbar.update(1)
-    pbar.close()
-    sync_all(finished_ops_queue, benchmark_round)
-    end_time = time.time()
-    if bidirectional:
-        sync_all(reverse_finished_ops_queue, benchmark_round)
-    total_data_size_GB = (
-        num_blocks_to_transfer *
-        cache_config.tokens_per_block *
-        model_config.token_size_in_bytes *
-        num_layers_to_transfer /
-        (model_config.num_layers * 1024 * 1024 * 1024)
-    )
-    avg_time = (end_time - start_time) / benchmark_round
-    print(f"Total data size: {total_data_size_GB} GB")
-    print(f"Avg Time taken: {avg_time} seconds")
-    print(f"Avg Bandwidth: {total_data_size_GB / avg_time} GB/s")
+        for _ in range(warmup_round):
+            launch_transfer(worker_handle, finished_ops_queue, transfer_op)
+        sync_all(finished_ops_queue, warmup_round)
+
+        desc = f"Blocks={num_blocks_to_transfer}" if len(block_counts) > 1 else "Benchmarking"
+        pbar = tqdm(total=benchmark_round, desc=desc)
+        start_time = time.time()
+        for _ in range(benchmark_round):
+            launch_transfer(worker_handle, finished_ops_queue, transfer_op)
+            pbar.update(1)
+        pbar.close()
+        sync_all(finished_ops_queue, benchmark_round)
+        end_time = time.time()
+
+        total_data_size_GB = (
+            num_blocks_to_transfer *
+            cache_config.tokens_per_block *
+            model_config.token_size_in_bytes *
+            num_layers_to_transfer /
+            (model_config.num_layers * 1024 * 1024 * 1024)
+        )
+        avg_time = (end_time - start_time) / benchmark_round
+        bw = total_data_size_GB / avg_time
+        results.append({
+            "num_blocks": num_blocks_to_transfer,
+            "total_gb": total_data_size_GB,
+            "avg_time_s": avg_time,
+            "bw_gbps": bw,
+        })
+        if len(block_counts) == 1:
+            print(f"Total data size: {total_data_size_GB:.2f} GB")
+            print(f"Avg Time taken: {avg_time:.6f} seconds")
+            print(f"Avg Bandwidth: {bw:.2f} GB/s")
+        else:
+            print(f"  -> {total_data_size_GB:.2f} GB | {avg_time*1000:.3f} ms | {bw:.2f} GB/s")
+
     worker_handle.shutdown()
-    if bidirectional:
-        reverse_worker_handle.shutdown()
+
+    # Summary table in sweep mode
+    if len(block_counts) > 1:
+        print("\n" + "=" * 70)
+        print(f"  Sweep Summary: {transfer_type.name} | "
+              f"CE={'on' if bench_config.use_ce_transfer else 'off'} | "
+              f"CTA={bench_config.transfer_num_cta}")
+        print("=" * 70)
+        hdr = "{:>10s}  {:>10s}  {:>12s}  {:>12s}".format(
+            "Blocks", "Total GB", "Avg ms", "BW GB/s")
+        print("  " + hdr)
+        print("  " + "-" * len(hdr))
+        for r in results:
+            print("  {:>10d}  {:>10.2f}  {:>12.3f}  {:>12.2f}".format(
+                r["num_blocks"], r["total_gb"],
+                r["avg_time_s"] * 1000, r["bw_gbps"]))
 
 def parse_args():
     parser = ArgumentParser()
@@ -482,6 +489,18 @@ def parse_args():
                         default=0,
                         choices=[0, 1, 2],
                         help="GPU KV cache layout type")
+    parser.add_argument("--use-ce",
+                        action="store_true",
+                        help="Use CE (cudaMemcpyAsync) transfer path instead of CUDA kernel")
+    parser.add_argument("--cta",
+                        type=int,
+                        default=4,
+                        help="transfer_num_cta for kernel path (default: 4)")
+    parser.add_argument("--sweep-blocks",
+                        type=str,
+                        default=None,
+                        help="Comma-separated block counts to sweep "
+                             "(e.g. '64,128,256,512,1024,2048,4096')")
     return parser.parse_args()
 
 if __name__ == "__main__":
