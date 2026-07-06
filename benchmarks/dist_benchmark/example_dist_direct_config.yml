@@ -1,0 +1,40 @@
+# Distributed KVCache benchmark config (direct mode, non-server_client_mode)
+# In direct mode, KVManager creates KVTaskEngine directly in the main process
+# without going through KVServer/KVDPClient IPC. This is simpler and has
+# lower overhead, suitable for single-instance single-dp benchmarks.
+
+# Model config
+num_layers: 4
+num_kv_heads: 8
+head_size: 128
+dtype: bfloat16
+use_mla: false
+tp_size: 1
+dp_size: 1
+tokens_per_block: 16
+
+# Cache config
+cpu_cache_gb: 4
+ssd_cache_gb: 0
+
+# Distributed KVCache config
+enable_p2p_cpu: true
+
+# Redis config (for KV sharing metadata)
+redis_host: "10.135.1.175"
+redis_port: 6379
+redis_password: "123456"
+local_ip: "10.135.1.176"
+
+# Mooncake Transfer Engine config (required for P2P)
+mooncake_engine_ip: "10.135.1.176"
+mooncake_engine_port: 5555
+mooncake_metadata_backend: "redis"
+mooncake_metadata_server: "redis://10.135.1.175:6379"
+mooncake_metadata_server_auth: "123456"
+mooncake_protocol: "rdma"        # "tcp" or "rdma"
+mooncake_device_name: "mlx5_0,mlx5_1,mlx5_4,mlx5_5"        # RDMA device name, e.g. "mlx5_0"; leave empty for tcp
+
+# Direct mode (non-server_client_mode)
+# In direct mode, KVTaskEngine runs in the main process
+server_client_mode: false

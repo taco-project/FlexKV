@@ -1,0 +1,77 @@
+[build-system]
+requires = [
+    #"setuptools>=61",
+    #"torch==2.3.0"
+    "setuptools>=40.0.0",
+    "torch>=1.10.0"
+]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+# Allow lines to be as long as 120.
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-simplify
+    "SIM",
+    # isort
+    # "I",
+    "G",
+]
+ignore = [
+    # star imports
+    "F405", "F403",
+    # unused import
+    "F401",
+    # lambda expression assignment
+    "E731",
+    # Loop control variable not used within loop body
+    "B007",
+    # f-string format
+    "UP032",
+    # Python 3.8 typing
+    "UP006", "UP035",
+    # Can remove once 3.10+ is the minimum Python version
+    "UP007",
+    # Use a context manager for opening files
+    "SIM115",
+    # Unused variable
+    "F841",
+    # Use ternary operator
+    "SIM108",
+    # Logging statement uses f-string
+    "G004",
+    # Use X | None for type annotations.
+    "UP045",
+]
+
+[tool.mypy]
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+warn_no_return = true
+warn_unreachable = false
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = "nvtx.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "flexkv.c_ext.*"
+ignore_missing_imports = true

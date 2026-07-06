@@ -1,0 +1,124 @@
+#!/bin/bash
+set -e
+
+PROJECT_ROOT=$(pwd)
+BUILD_TYPE="debug"  # Default to debug build
+
+# Parse command line arguments
+for arg in "$@"; do
+  case $arg in
+    --debug)
+      BUILD_TYPE="debug"
+      shift
+      ;;
+    --release)
+      BUILD_TYPE="release"
+      shift
+      ;;
+    --clean)
+      BUILD_TYPE="clean"
+      shift
+      ;;
+    *)
+      # Unknown option
+      ;;
+  esac
+done
+
+# Handle clean
+if [ "$BUILD_TYPE" = "clean" ]; then
+  echo "=== Cleaning all build artifacts ==="
+
+  # Remove CMake build directory
+  if [ -d "build" ]; then
+    rm -rf build
+    echo "Removed build/"
+  fi
+
+  # Remove compiled .so files in package directory
+  find flexkv -name "*.so" -type f -delete -print | sed 's/^/Removed /'
+
+  # Remove copied libs directory
+  if [ -d "flexkv/lib" ]; then
+    rm -rf flexkv/lib
+    echo "Removed flexkv/lib/"
+  fi
+
+  # Remove Python build artifacts
+  find . -maxdepth 2 -name "*.egg-info" -type d | while read d; do
+    rm -rf "$d"
+    echo "Removed $d"
+  done
+  # Only remove top-level dist/ (Python build output), not csrc/dist/ source directory
+  if [ -d "dist" ]; then
+    rm -rf dist
+    echo "Removed dist/"
+  fi
+  find . -name "__pycache__" -type d | while read d; do
+    rm -rf "$d"
+    echo "Removed $d"
+  done
+
+  echo "=== Clean completed ==="
+  exit 0
+fi
+
+echo "=== Building in ${BUILD_TYPE} mode ==="
+
+# Install submodules
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git submodule update --init --recursive
+else
+  echo "WARNING: Not a git repository, skipping submodule update. If submodules are missing, please clone the repo instead of copying."
+fi
+
+mkdir -p build
+cd build
+
+echo "=== Running CMake configuration ==="
+# Respect FLEXKV_ENABLE_METRICS=0 to disable Prometheus (avoids needing third_party/prometheus-cpp)
+CMAKE_EXTRA=""
+if [ -n "$FLEXKV_ENABLE_METRICS" ] && [ "$FLEXKV_ENABLE_METRICS" = "0" ]; then
+  CMAKE_EXTRA="-DFLEXKV_ENABLE_MONITORING=OFF"
+  echo "FLEXKV_ENABLE_METRICS=0: building without Prometheus monitoring"
+fi
+cmake .. $CMAKE_EXTRA
+
+echo "=== Building third-party libraries ==="
+cmake --build .
+
+BUILD_LIB_PATH=$(pwd)/lib
+echo "=== Setting BUILD_LIB_PATH to $BUILD_LIB_PATH ==="
+
+cd ..
+
+# Set LD_LIBRARY_PATH for immediate use
+export LD_LIBRARY_PATH=$BUILD_LIB_PATH:$LD_LIBRARY_PATH
+echo "Added $BUILD_LIB_PATH to LD_LIBRARY_PATH for current session"
+
+# Copy shared libraries to package directory for permanent access
+echo "=== Copying shared libraries to package directory ==="
+PACKAGE_LIB_DIR="flexkv/lib"
+mkdir -p $PACKAGE_LIB_DIR
+
+if [ -d "$BUILD_LIB_PATH" ]; then
+    for lib_file in $BUILD_LIB_PATH/*.so*; do
+        if [ -f "$lib_file" ]; then
+            cp "$lib_file" "$PACKAGE_LIB_DIR/"
+            echo "Copied $(basename $lib_file) to $PACKAGE_LIB_DIR/"
+        fi
+    done
+else
+    echo "Warning: Build lib directory $BUILD_LIB_PATH not found"
+fi
+
+echo "=== Build and installation completed successfully in ${BUILD_TYPE} mode ==="
+echo "You can now run tests directly without setting LD_LIBRARY_PATH manually"
+
+if [ "$BUILD_TYPE" = "debug" ]; then
+  FLEXKV_DEBUG=1 pip install -v --no-build-isolation -e .
+elif [ "$BUILD_TYPE" = "release" ]; then
+  FLEXKV_DEBUG=0 python3 setup.py bdist_wheel -v
+else
+  FLEXKV_DEBUG=0 pip install -v --no-build-isolation -e .
+fi

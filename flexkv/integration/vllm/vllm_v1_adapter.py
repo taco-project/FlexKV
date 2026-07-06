@@ -1,0 +1,1077 @@
+import os
+import time
+from typing import TYPE_CHECKING, Optional, Literal, Iterable, Any, List
+from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
+
+import numpy as np
+import torch
+
+from flexkv.kvmanager import KVManager
+from flexkv.server.client import KVTPClient
+from flexkv.common.config import RankInfo
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.common.request import KVResponseStatus
+from flexkv.common.debug import flexkv_logger
+from flexkv.integration.stats import FlexKVStats
+from flexkv.integration.config import FlexKVConfig
+from flexkv.integration.dynamo.collector import KVEventCollector
+from flexkv.transfer_manager import TransferManagerOnRemote
+
+# vllm
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata, KVConnectorRole)
+from vllm.distributed.parallel_state import get_tp_group
+
+# KVConnectorStats: available since v0.11.0
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+
+    class _FlexKVWorkerSentinelStats(KVConnectorStats):
+        """Sentinel stats returned from the worker side so that
+        KVConnectorOutput.is_empty() returns False.  The scheduler
+        aggregates worker stats with its own; this implementation
+        simply forwards to the other side so no real data is lost."""
+
+        def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
+            return other
+
+        def reduce(self) -> dict[str, int | float]:
+            return {}
+
+        def reset(self):
+            pass
+
+        def is_empty(self) -> bool:
+            return True
+
+except ImportError:
+    KVConnectorStats = None  # type: ignore[misc,assignment]
+    _FlexKVWorkerSentinelStats = None  # type: ignore[misc,assignment]
+
+# KVConnectorOutput: available since v0.10.1
+try:
+    from vllm.v1.outputs import KVConnectorOutput as _KVConnectorOutput
+    _HAS_KV_CONNECTOR_OUTPUT = True
+except ImportError:
+    _HAS_KV_CONNECTOR_OUTPUT = False
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.core.sched.output import SchedulerOutput
+    try:
+        from vllm.v1.attention.backend import AttentionMetadata
+    except ImportError:
+        # vllm <= 0.13.x used the old path
+        from vllm.attention.backends.abstract import AttentionMetadata  # type: ignore[no-redef]
+    from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.forward_context import ForwardContext
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.request import Request
+    if _HAS_KV_CONNECTOR_OUTPUT:
+        from vllm.v1.outputs import KVConnectorOutput
+
+
+logger = flexkv_logger
+
+
+@dataclass
+class FlexKVResponse:
+    task_id: int
+    task_type: Literal["get", "put"]
+    request: "Request"
+    success: bool
+
+
+@dataclass
+class FlexKVTask(ABC):
+    task_id: int = 0
+    request: "Request" = 0
+
+    # slot mapping
+    slot_mapping: Optional[np.ndarray] = None
+    # block ids for tracking errors
+    block_ids: list[int] = field(default_factory=list)
+
+    # timer
+    match_start_time: float = 0
+    match_end_time: float = 0
+    task_launch_time: float = 0
+    task_finished_time: float = 0
+
+    @property
+    def match_cost(self) -> float:
+        return (self.match_end_time - self.match_start_time)
+
+    @property
+    def task_execute_cost(self) -> float:
+        return (self.task_finished_time - self.task_launch_time)
+
+    @property
+    @abstractmethod
+    def task_type(self) -> str:
+        ...
+
+    def __str__(self):
+        return (f"FlexKVTask(task_id={self.task_id}, "
+                f"request={self.request.request_id}, "
+                f"match_cost {self.match_cost*1000:.2f} ms, "
+                f"task execute cost {self.task_execute_cost*1000:.2f} ms)")
+
+
+@dataclass(kw_only=True)
+class FlexKVGetTask(FlexKVTask):
+    num_computed_tokens: int
+    num_new_matched_tokens: int
+
+    @property
+    def task_type(self) -> str:
+        return "get"
+
+    def __str__(self):
+        return (f"FlexKVGetTask(task_id={self.task_id}, "
+                f"request={self.request.request_id}, "
+                f"num_computed_tokens={self.num_computed_tokens}, "
+                f"num_new_matched_tokens={self.num_new_matched_tokens}, "
+                f"match_cost {self.match_cost*1000:.2f} ms, "
+                f"task execute cost {self.task_execute_cost*1000:.2f} ms)")
+
+
+@dataclass(kw_only=True)
+class FlexKVPutTask(FlexKVTask):
+    num_matched_tokens: int
+    num_unmatched_tokens: int
+
+    @property
+    def task_type(self) -> str:
+        return "put"
+
+    def __str__(self):
+        return (f"FlexKVPutTask(task_id={self.task_id}, "
+                f"request={self.request.request_id}, "
+                f"num_matched_tokens={self.num_matched_tokens}, "
+                f"num_unmatched_tokens={self.num_unmatched_tokens}, "
+                f"match_cost {self.match_cost*1000:.2f} ms, "
+                f"task execute cost {self.task_execute_cost*1000:.2f} ms)")
+
+
+class FlexKVSchedulerConnector:
+    def __init__(
+        self,
+        flexkv_config: FlexKVConfig,
+        rank_info: "RankInfo",
+    ):
+        logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}, {rank_info}")
+        self.server_recv_port = flexkv_config.server_recv_port
+        self.block_size = flexkv_config.cache_config.tokens_per_block
+        self.cache_config = flexkv_config.cache_config
+        self.rank_info = rank_info
+
+        if os.getenv('DYNAMO_USE_FLEXKV', '0') == '1':
+            self.collector = KVEventCollector()
+        else:
+            self.collector = None
+        self.flexkv_manager = KVManager(model_config=self.rank_info.model_config,
+                                        cache_config=flexkv_config.cache_config,
+                                        dp_client_id=self.rank_info.dp_client_id,
+                                        server_recv_port=flexkv_config.server_recv_port,
+                                        event_collector=self.collector)
+        self.flexkv_manager.start()
+        # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
+
+        # request_id -> task_id
+        self.req_id_to_task_dict: dict[str, int] = {}
+        # launched but unfinished tasks
+        self.get_tasks: dict[int, list[FlexKVGetTask]] = {}
+        self.put_tasks: dict[int, list[FlexKVPutTask]] = {}
+        # unlaunched tasks
+        self.tasks_to_launch: dict[int, FlexKVTask] = {}
+        self.tasks_to_cancel: dict[int, FlexKVTask] = {}
+
+        self.flexkv_stats = FlexKVStats(int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', '200')))
+        self.failed_block_ids: set[int] = set()
+
+        self.maybe_skip_put = os.getenv('FLEXKV_MAYBE_SKIP_PUT', '0') == '1'
+
+        # only support local batching for now
+        self.enable_batch = (not self.cache_config.enable_kv_sharing
+                             and not self.cache_config.enable_remote
+                             and not self.cache_config.enable_gds)
+
+        while not self.is_ready():
+            logger.info("Waiting for flexkv init...")
+            time.sleep(5)
+
+        logger.info("Finish init FlexKVSchedulerConnector")
+
+    def is_ready(
+        self,
+    ) -> bool:
+        " Ask flexkv is ready "
+        return self.flexkv_manager.is_ready()
+
+    def shutdown(self) -> None:
+        self.flexkv_manager.shutdown()
+        if self.collector is not None:
+            self.collector.close()
+
+    ####################
+    #### Get Method ####
+    ####################
+
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int, bool]:
+        """
+        Args:
+            request: Request to get.
+            num_computed_tokens: Number of prefix tokens have already been computed,
+                                which means not need to transfer from flexkv.
+
+        Returns:
+            tuple[int, bool]: A tuple containing an integer and a bool representing the
+                            number of new matched tokens and whether it is necessary
+                            to get the new matched blocks from flexkv, respectively.
+        """
+        task_id, num_new_matched_tokens = self._get_match(request=request,
+                                                          num_computed_tokens=num_computed_tokens)
+        self.flexkv_stats.record_get(num_prompt_tokens=request.num_tokens,
+                                     num_gpu_matched_tokens=num_computed_tokens,
+                                     num_flexkv_matched_tokens=num_new_matched_tokens)
+
+        if not self._need_to_get(num_prompt_tokens=request.num_tokens,
+                                   num_computed_tokens=num_computed_tokens,
+                                   num_new_matched_tokens=num_new_matched_tokens):
+            return 0, False
+
+        return num_new_matched_tokens, True
+
+    def _extract_namespace(self, request: "Request") -> Optional[List[str]]:
+        """
+        Extract namespace information from vLLM Request for cache isolation.
+
+        This method extracts namespace components from multiple sources in priority order:
+        1. lora_request.lora_name: LoRA adapter name for multi-tenant LoRA serving
+        2. cache_salt: Explicit cache isolation identifier
+        3. namespace_info: User-defined namespace hierarchy (can be list or single value)
+
+        The namespace components are combined to form a hierarchical namespace path,
+        enabling fine-grained KV cache isolation across different tenants, users, or sessions.
+
+        Args:
+            request: vLLM Request object containing namespace-related fields
+
+        Returns:
+            Optional[List[str]]: Ordered list of namespace components forming the hierarchy,
+                                or None if no namespace information is available
+
+        Example:
+            If request has lora_name="tenant_A", cache_salt="session_1",
+            namespace_info=["user_1"], the result will be:
+            ["tenant_A", "session_1", "user_1"]
+        """
+        namespace_info = []
+
+        if hasattr(request, 'lora_request') and request.lora_request is not None:
+            lora_id = request.lora_request.lora_name
+            if lora_id is not None:
+                namespace_info.append(str(lora_id))
+
+        if hasattr(request, 'cache_salt') and request.cache_salt is not None:
+            cache_salt = request.cache_salt
+            if cache_salt is not None:
+                namespace_info.append(str(cache_salt))
+
+        if hasattr(request, 'namespace_info') and request.namespace_info is not None:
+            user_namespace = request.namespace_info
+            if isinstance(user_namespace, list):
+                namespace_info.extend([str(item) for item in user_namespace])
+            else:
+                namespace_info.append(str(user_namespace))
+
+        if len(namespace_info) == 0:
+            return None
+
+        return namespace_info
+
+    def _get_match(
+        self,
+        request: "Request",
+        num_computed_tokens: int = 0,
+    ) -> tuple[int, int]:
+        """
+        Args:
+            request: Request to get.
+            num_computed_tokens: Number of prefix tokens have already been computed,
+                                which means not need to transfer from flexkv.
+
+        Returns:
+            tuple[int, int]:  A tuple containing two integer values representing
+                            the task_id and number of new matched tokens.
+        """
+        match_start_time = time.perf_counter()
+        num_tokens_to_get = (request.num_tokens//self.block_size)*self.block_size
+        token_ids = request.all_token_ids[:num_tokens_to_get]
+
+        assert num_computed_tokens <= num_tokens_to_get, (
+            f"{num_computed_tokens=} must less equal to {num_tokens_to_get=}")
+        assert num_computed_tokens % self.block_size == 0
+
+        if num_tokens_to_get == num_computed_tokens:
+            return -1, 0
+
+        np_token_ids = np.array(token_ids)
+        np_token_mask = np.ones_like(np_token_ids, dtype=bool)
+        np_token_mask[:num_computed_tokens] = False
+        namespace = self._extract_namespace(request)
+        task_id, matched_mask = self.flexkv_manager.get_match(
+            token_ids=np_token_ids,
+            token_mask=np_token_mask,
+            namespace=namespace,
+        )
+        num_new_matched_tokens = matched_mask.sum().item()
+
+        # Auto cancel if not call update_state_after_alloc()
+        match_end_time = time.perf_counter()
+        # logger.debug(f"Get match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
+        if num_new_matched_tokens > 0:
+            self.req_id_to_task_dict[request.request_id] = task_id
+            self.tasks_to_cancel[task_id] = FlexKVGetTask(task_id=task_id,
+                                                        request=request,
+                                                        num_computed_tokens=num_computed_tokens,
+                                                        num_new_matched_tokens=num_new_matched_tokens,
+                                                        match_start_time=match_start_time,
+                                                        match_end_time=match_end_time)
+
+            # logger.debug(f"FlexKV create get task: {self.tasks_to_cancel[task_id]}")
+        else:
+            self.flexkv_manager.cancel(task_ids=[task_id])
+
+        return task_id, num_new_matched_tokens
+
+    def _need_to_get(
+        self,
+        num_prompt_tokens: int,
+        num_computed_tokens: int,
+        num_new_matched_tokens: int,
+    ) -> bool:
+        """
+        Determine whether it is necessary to get the new matched blocks from flexkv.
+        """
+        return num_new_matched_tokens > 0
+
+    def update_state_after_alloc(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        num_new_matched_tokens: int,
+    ) -> None:
+        """
+        Compute slot mapping and prepare to launch task.
+        Only call after get_num_new_matched_tokens().
+
+        Args:
+            request: Request to get.
+            blocks: All blocks of the request.
+            num_new_matched_tokens: Number of new matched tokens returned by
+            get_num_new_matched_tokens().
+
+        Returns:
+            None.
+        """
+        if num_new_matched_tokens == 0:
+            return
+        # prepare to launch task
+        task_id = self.req_id_to_task_dict[request.request_id]
+        task: FlexKVGetTask = self.tasks_to_cancel.pop(task_id)
+        self.tasks_to_launch[task_id] = task
+
+        # compute slot_mapping
+        num_computed_blocks = task.num_computed_tokens // self.block_size
+        num_blocks_to_get = num_new_matched_tokens // self.block_size
+        all_block_ids = blocks.get_block_ids()[0]
+        block_ids_to_get = all_block_ids[num_computed_blocks:num_computed_blocks+num_blocks_to_get]
+        task.block_ids = block_ids_to_get
+        task.slot_mapping = np.array(block_ids_to_get).repeat(self.block_size)*self.block_size
+
+    def wait_for_all_get_tasks(self) -> list[FlexKVResponse]:
+        """
+        Blocking wait for all get tasks.
+
+        Returns:
+            list[FlexKVResponse]: Responses of all get tasks.
+        """
+        return self._blocking_waiting_for_tasks(self.get_tasks)
+
+    ####################
+    #### Put Method ####
+    ####################
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> bool:
+        """
+        Args:
+            request: Request to put.
+            blocks: All block_ids of the request.
+
+        Returns:
+            bool: whether thire is unfinished task for this request.
+        """
+        # Task not finished, can't free blocks
+        if request.request_id in self.req_id_to_task_dict:
+            return True
+
+        # Abnormal finished, don't put
+        if not (request.is_finished() and request.get_finished_reason() < 2):
+            return False
+
+        if self.maybe_skip_put and os.path.exists('/tmp/flexkv_skip_put'):
+            return False
+
+        task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(request=request)
+
+        self.flexkv_stats.record_put(num_all_tokens=request.num_tokens,
+                                     num_unmatched_tokens=num_unmatched_tokens)
+
+        if not self._need_to_put(num_all_tokens=request.num_tokens,
+                                num_matched_tokens=num_matched_tokens,
+                                num_unmatched_tokens=num_unmatched_tokens):
+            return False
+
+        # prepare to launch task
+        task: FlexKVPutTask = self.tasks_to_cancel.pop(task_id)
+        self.tasks_to_launch[task_id] = task
+
+        # compute slot mapping
+        # num_blocks_to_put = (num_matched_tokens+num_unmatched_tokens) // self.block_size
+        num_matched_blocks = num_matched_tokens // self.block_size
+        num_unmatched_tokens = num_unmatched_tokens // self.block_size
+        block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_tokens]
+        task.slot_mapping = np.array(block_ids_to_put).repeat(self.block_size)*self.block_size
+
+        return True
+
+    def _put_match(
+        self,
+        request: "Request"
+    ) -> tuple[int, int, int]:
+        """
+        Args:
+            request: Request to put.
+
+        Returns:
+            tuple[int, int, int]:  A tuple containing three integer values representing
+                            the task_id, number of matched tokens and number of unmatched tokens.
+        """
+        match_start_time = time.perf_counter()
+        num_tokens_to_put = ((request.num_tokens - 1) // self.block_size) * self.block_size
+        token_ids = request.all_token_ids[:num_tokens_to_put]
+
+        if num_tokens_to_put == 0:
+            return -1, 0, 0
+
+        np_token_ids = np.array(token_ids)
+        namespace = self._extract_namespace(request)
+        task_id, unmatched_mask = self.flexkv_manager.put_match(
+            token_ids=np_token_ids,
+            namespace=namespace,
+        )
+
+        num_unmatched_tokens = unmatched_mask.sum().item()
+        num_matched_tokens = num_tokens_to_put - num_unmatched_tokens
+
+        # Auto cancel if not need to put.
+        match_end_time = time.perf_counter()
+        # logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
+
+        if num_unmatched_tokens > 0:
+            self.req_id_to_task_dict[request.request_id] = task_id
+            self.tasks_to_cancel[task_id] = FlexKVPutTask(task_id=task_id,
+                                                        request=request,
+                                                        num_matched_tokens=num_matched_tokens,
+                                                        num_unmatched_tokens=num_unmatched_tokens,
+                                                        match_start_time=match_start_time,
+                                                        match_end_time=match_end_time)
+            # logger.debug(f"FlexKV create put task: {self.tasks_to_cancel[task_id]}")
+        else:
+            self.flexkv_manager.cancel(task_ids=[task_id])
+        return task_id, num_matched_tokens, num_unmatched_tokens
+
+    def _need_to_put(
+        self,
+        num_all_tokens: int,
+        num_matched_tokens: int,
+        num_unmatched_tokens: int,
+    ) -> bool:
+        """
+        Determine whether it is necessary to put the unmatched blocks from flexkv.
+        """
+        return num_unmatched_tokens > 0
+
+    def wait_for_all_put_tasks(self) -> list[FlexKVResponse]:
+        """
+        Blocking wait for all put tasks.
+
+        Returns:
+            list[FlexKVResponse]: Responses of all put tasks.
+        """
+        return self._blocking_waiting_for_tasks(self.put_tasks)
+
+    #######################
+    #### Common Method ####
+    #######################
+
+    def cancel_tasks(self) -> None:
+        """
+        Cancel tasks in self.cancel_tasks.
+        Call before launch_tasks() to delete req_id in self.req_id_to_task_dict
+        """
+        # TODO: check if this method is inproc.
+        if len(self.tasks_to_cancel) == 0:
+            return
+        for task in self.tasks_to_cancel.values():
+            del self.req_id_to_task_dict[task.request.request_id]
+            logger.info(f"FlexKV Cancel task: {task}")
+        self.flexkv_manager.cancel(task_ids=list(self.tasks_to_cancel.keys()))
+        self.tasks_to_cancel.clear()
+
+    def launch_tasks(self) -> None:
+        """
+        Launch tasks in self.tasks_to_launch
+        """
+        if len(self.tasks_to_launch) == 0:
+            return
+        task_launch_time = time.perf_counter()
+        get_task_ids: list[int] = []
+        get_slot_mappings: list[np.ndarray] = []
+        get_tasks_to_launch: list[FlexKVGetTask] = []
+        put_task_ids: list[int] = []
+        put_slot_mappings: list[np.ndarray] = []
+        put_tasks_to_launch: list[FlexKVPutTask] = []
+
+        for task_id, task in self.tasks_to_launch.items():
+            task.task_launch_time = task_launch_time
+            if isinstance(task, FlexKVGetTask):
+                get_task_ids.append(task_id)
+                get_slot_mappings.append(task.slot_mapping)
+                get_tasks_to_launch.append(task)
+            else:
+                put_task_ids.append(task_id)
+                put_slot_mappings.append(task.slot_mapping)
+                put_tasks_to_launch.append(task)
+        if get_task_ids:
+            launched_get_task_ids = self.flexkv_manager.launch(task_ids=get_task_ids,
+                                       slot_mappings=get_slot_mappings,
+                                       as_batch=self.enable_batch)
+            if len(launched_get_task_ids) == 1 and len(get_tasks_to_launch) > 1:
+                self.get_tasks[launched_get_task_ids[0]] = get_tasks_to_launch
+            elif len(launched_get_task_ids) == len(get_tasks_to_launch):
+                for launched_task_id, task in zip(launched_get_task_ids, get_tasks_to_launch):
+                    self.get_tasks[launched_task_id] = [task]
+            else:
+                raise ValueError("KVTaskManager returned unexpected number of launched get task ids.")
+        if put_task_ids:
+            launched_put_task_ids = self.flexkv_manager.launch(task_ids=put_task_ids,
+                                       slot_mappings=put_slot_mappings,
+                                       as_batch=self.enable_batch)
+            if len(launched_put_task_ids) == 1 and len(put_tasks_to_launch) > 1:
+                self.put_tasks[launched_put_task_ids[0]] = put_tasks_to_launch
+            elif len(launched_put_task_ids) == len(put_tasks_to_launch):
+                for launched_task_id, task in zip(launched_put_task_ids, put_tasks_to_launch):
+                    self.put_tasks[launched_task_id] = [task]
+            else:
+                raise ValueError("KVTaskManager returned unexpected number of launched put task ids.")
+        self.tasks_to_launch.clear()
+
+    def query_finished_task(self) -> tuple[set[str], set[str]]:
+        """
+        Get response of finished task.
+
+        Returns:
+            list[FlexKVResponse]: Responses of finished tasks.
+        """
+        if len(self.req_id_to_task_dict) == 0:
+            return set(), set()
+        # logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
+        task_ids = list(self.get_tasks.keys()) + list(self.put_tasks.keys())
+        responses_from_manager = self.flexkv_manager.try_wait(task_ids)
+        task_finished_time = time.perf_counter()
+        # responses_to_return: list[FlexKVResponse] = []
+        finished_sending = set()
+        finished_recving = set()
+        num_failed_tasks = 0
+        for task_id, response in responses_from_manager.items():
+            success = (response.status == KVResponseStatus.SUCCESS)
+            if task_id in self.get_tasks:
+                tasks = self.get_tasks.pop(task_id)
+                finished_recving.update(task.request.request_id for task in tasks)
+            else:
+                tasks = self.put_tasks.pop(task_id)
+                finished_sending.update(task.request.request_id for task in tasks)
+            for task in tasks:
+                del self.req_id_to_task_dict[task.request.request_id]
+                task.task_finished_time = task_finished_time
+                if not success:
+                    logger.error(f"{task} failed, status: {response.status}.")
+                    num_failed_tasks += 1
+                    if isinstance(task, FlexKVGetTask):
+                        self.failed_block_ids.update(task.block_ids)
+                # responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
+                #                                             request=task.request, success=success))
+        self.flexkv_stats.record_faild(num_failed_requests=num_failed_tasks)
+        return finished_sending, finished_recving
+
+    def get_and_clear_failed_block_ids(self) -> set[int]:
+        failed = self.failed_block_ids
+        self.failed_block_ids = set()
+        return failed
+
+    def handle_preemptions(self, preempted_req_ids: set[str]):
+        """
+        Handle preempted requests.
+        Cancel pending tasks for preempted requests to avoid unnecessary transfers
+        and potential race conditions with block reuse.
+        """
+        for req_id in preempted_req_ids:
+            if req_id in self.req_id_to_task_dict:
+                task_id = self.req_id_to_task_dict[req_id]
+                # If the task is waiting to be launched, we can safely cancel it.
+                if task_id in self.tasks_to_launch:
+                    # Move to tasks_to_cancel to ensure underlying resources are freed
+                    # by cancel_tasks() which is called right after this.
+                    task = self.tasks_to_launch.pop(task_id)
+                    self.tasks_to_cancel[task_id] = task
+                    logger.info(f"Moved pending task {task_id} for preempted request {req_id} to cancel list")
+                # If the task is already launched (in self.get_tasks or self.put_tasks),
+                # we currently cannot cancel the underlying transfer in FlexKV.
+                # However, since the request is preempted, vLLM might reuse these blocks.
+                # Ideally, FlexKV should support cancelling running tasks.
+
+    def _blocking_waiting_for_tasks(self, task_dict: dict[int, FlexKVTask]) -> list[FlexKVResponse]:
+        """
+        Blocking wait for tasks in task_dict.
+
+        Returns:
+            list[FlexKVResponse]: Responses of all tasks in task_dict.
+        """
+        if len(task_dict) == 0:
+            return []
+
+        task_ids = list(task_dict.keys())
+        response_from_manager = self.flexkv_manager.wait(task_ids=task_ids)
+        task_finished_time = time.perf_counter()
+        responses_to_return: list[FlexKVResponse] = []
+        for task_id, response in response_from_manager.items():
+            success = (response.status == KVResponseStatus.SUCCESS)
+            tasks = task_dict.pop(task_id)
+            for task in tasks:
+                del self.req_id_to_task_dict[task.request.request_id]
+                task.task_finished_time = task_finished_time
+                if not success:
+                    logger.error(f"{task} failed, status: {response.status}.")
+                responses_to_return.append(FlexKVResponse(task_id=task.task_id, task_type=task.task_type,
+                                           request=task.request, success=success))
+        return responses_to_return
+
+
+class FlexKVWorkerConnector:
+    def __init__(
+        self,
+        flexkv_config: FlexKVConfig,
+        rank_info: "RankInfo",
+    ):
+        from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+
+
+        # Determine if server_client_mode (same logic as KVManager)
+        server_client_mode = (GLOBAL_CONFIG_FROM_ENV.instance_num > 1 or
+                              rank_info.model_config.dp_size > 1 or
+                              GLOBAL_CONFIG_FROM_ENV.server_client_mode)
+
+        instance_id = rank_info.instance_id
+
+        self.flexkv_config = flexkv_config
+        self.rank_info = rank_info
+        if (rank_info.model_config.nnodes > 1
+                and rank_info.node_rank > 0
+                and rank_info.local_rank == 0):
+            self.remote_transfer_manager_process = TransferManagerOnRemote.create_process(
+                master_host=rank_info.model_config.master_host,
+                master_ports=rank_info.model_config.master_ports,
+            )
+
+        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, "
+                    f"server_client_mode={server_client_mode}, dp_rank={rank_info.dp_rank}, "
+                    f"instance_id={instance_id}, local_rank={rank_info.local_rank}")
+        self.tp_client = KVTPClient(
+            flexkv_config.gpu_register_port,
+            dp_client_id=rank_info.dp_client_id,
+            pp_rank=rank_info.pp_rank,
+            device_id=rank_info.local_rank,
+        )
+        logger.info("Finish init FlexKVWorkerConnector")
+
+    def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
+        logger.info("Start register kv_caches")
+
+        # Separate main KV caches from indexer caches by layer name.
+        main_kv_caches: dict[str, torch.Tensor] = {}
+        indexer_kv_caches: dict[str, torch.Tensor] = {}
+        for layer_name, tensor in kv_caches.items():
+            if ".k_cache" in layer_name:
+                indexer_kv_caches[layer_name] = tensor
+            else:
+                main_kv_caches[layer_name] = tensor
+
+        # Build main KV cache layout
+        gpu_blocks = list(main_kv_caches.values())
+        num_layer = len(main_kv_caches)
+        if self.flexkv_config.model_config.use_mla:
+            assert gpu_blocks[0].ndim == 3, (
+                f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
+            gpu_layout_type = KVCacheLayoutType.LAYERFIRST
+            num_blocks = gpu_blocks[0].shape[0]
+            block_size = gpu_blocks[0].shape[1]
+            num_kv_heads = 1
+            head_size = gpu_blocks[0].shape[2]
+        else:
+            assert gpu_blocks[0].ndim == 5, (
+                f"expect kv cached tensor has 5 dim but get shape={gpu_blocks[0].shape}.")
+            # Detect GPU layout from the kv dim position (which holds size 2):
+            #   vLLM <= 0.21: (kv=2, num_blocks, ...)  -> LAYERFIRST
+            #   vLLM >= 0.23: (num_blocks, kv=2, ...)  -> LAYERBLOCK
+            if gpu_blocks[0].shape[1] == 2:
+                gpu_layout_type = KVCacheLayoutType.LAYERBLOCK
+                num_blocks = gpu_blocks[0].shape[0]
+            elif gpu_blocks[0].shape[0] == 2:
+                gpu_layout_type = KVCacheLayoutType.LAYERFIRST
+                num_blocks = gpu_blocks[0].shape[1]
+            else:
+                raise ValueError(
+                    f"cannot infer non-MLA kv layout from shape={tuple(gpu_blocks[0].shape)}")
+            block_size = gpu_blocks[0].shape[2]
+            num_kv_heads = gpu_blocks[0].shape[3]
+            head_size = gpu_blocks[0].shape[4]
+        gpu_layout = KVCacheLayout(
+            type=gpu_layout_type,
+            num_layer=num_layer,
+            num_block=num_blocks,
+            tokens_per_block=block_size,
+            num_head=num_kv_heads,
+            head_size=head_size,
+            is_mla=self.flexkv_config.model_config.use_mla,
+        )
+
+        # Build indexer layout if indexer caches are present
+        indexer_buffers = None
+        indexer_layout = None
+        if indexer_kv_caches:
+            indexer_buffers = list(indexer_kv_caches.values())
+            first_indexer_buffer = indexer_buffers[0]
+            assert first_indexer_buffer.ndim == 3, (
+                f"expect indexer cache tensor has 3 dim but get shape={first_indexer_buffer.shape}.")
+            indexer_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(indexer_buffers),
+                num_block=first_indexer_buffer.shape[0],
+                tokens_per_block=first_indexer_buffer.shape[1],
+                num_head=1,
+                head_size=first_indexer_buffer.shape[2],
+                is_mla=True,
+            )
+
+        self.tp_client.register_to_server(
+            kv_caches=gpu_blocks,
+            kv_layout=gpu_layout,
+            indexer_buffers=indexer_buffers,
+            indexer_layout=indexer_layout,
+        )
+
+        logger.info("Finish register kv_caches")
+
+    def __del__(self):
+        if hasattr(self, "remote_transfer_manager_process") and \
+            self.remote_transfer_manager_process is not None:
+            self.remote_transfer_manager_process.join()
+            self.remote_transfer_manager_process.close()
+            self.remote_transfer_manager_process = None
+
+class FlexKVConnectorV1Impl:
+    def __init__(self, vllm_config: "VllmConfig", role: "KVConnectorRole"):
+        self.role = role
+        flexkv_config = FlexKVConfig.from_env()
+        rank_info = flexkv_config.post_init_from_vllm_config(vllm_config)
+
+        if role == KVConnectorRole.SCHEDULER:
+            self.connector = FlexKVSchedulerConnector(flexkv_config, rank_info)
+            # Track scheduled requests to detect preemptions in build_connector_meta
+            self.previous_scheduled_req_ids: set[str] = set()
+        elif role == KVConnectorRole.WORKER:
+            # vllm's ParallelConfig has no ``tensor_parallel_rank`` field, so
+            # the value read in post_init_from_vllm_config is always 0 on every
+            # worker.  Override it here using the initialized TP group rank so
+            # each worker registers a distinct device_id with FlexKV.
+            try:
+                import dataclasses
+                from vllm.distributed.parallel_state import get_tp_group
+                rank_info = dataclasses.replace(
+                    rank_info, tp_rank=get_tp_group().rank_in_group)
+            except Exception as _e:
+                logger.warning(
+                    f"FlexKV: could not derive tp_rank from vllm TP group: {_e}")
+            self.connector = FlexKVWorkerConnector(flexkv_config, rank_info)
+        else:
+            raise ValueError(f"Unrecognized KVConnectorRole: {role}.")
+
+    def shutdown(self):
+        if self.role == KVConnectorRole.SCHEDULER:
+            self.connector.shutdown()
+
+    # ==============================
+    # Worker-side methods
+    # ==============================
+    def start_load_kv(self, forward_context: "ForwardContext",
+                      **kwargs) -> None:
+        """
+        Start loading the KV cache from the connector to vLLM's paged
+        KV buffer. This is called from the forward context before the
+        forward pass to enable async loading during model execution.
+
+        Args:
+            forward_context (ForwardContext): the forward context.
+            **kwargs: additional arguments for the load operation
+
+        Note:
+            The number of elements in kv_caches and layer_names should be
+            the same.
+
+        """
+        pass
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        """
+        Block until the KV for a specific layer is loaded into vLLM's
+        paged buffer. This is called from within attention layer to ensure
+        async copying from start_load_kv is complete.
+
+        This interface will be useful for layer-by-layer pipelining.
+
+        Args:
+            layer_name: the name of that layer
+        """
+        pass
+
+    def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
+                      attn_metadata: "AttentionMetadata", **kwargs) -> None:
+        """
+        Start saving the a layer of KV cache from vLLM's paged buffer
+        to the connector. This is called from within attention layer to
+        enable async copying during execution.
+
+        Args:
+            layer_name (str): the name of the layer.
+            kv_layer (torch.Tensor): the paged KV buffer of the current
+                layer in vLLM.
+            attn_metadata (AttentionMetadata): the attention metadata.
+            **kwargs: additional arguments for the save operation.
+        """
+        pass
+
+    def wait_for_save(self):
+        """
+        Block until all the save operations is done. This is called
+        as the forward context exits to ensure that the async saving
+        from save_kv_layer is complete before finishing the forward.
+
+        This prevents overwrites of paged KV buffer before saving done.
+        """
+        pass
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        """
+        Notifies worker-side connector ids of requests that have
+        finished generating tokens.
+
+        Returns:
+            ids of requests that have finished asynchronous transfer
+            (requests that previously returned True from request_finished()),
+            tuple of (sending/saving ids, recving/loading ids).
+            The finished saves/sends req ids must belong to a set provided in a
+            call to this method (this call or a prior one).
+        """
+        return None, None
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """
+        Initialize with the KV caches. Useful for pre-registering the
+        KV Caches in the KVConnector (e.g. for NIXL).
+
+        Args: kv_caches:
+            dictionary of layer names, kv cache
+        """
+        self.connector.register_to_server(kv_caches)
+
+    # ==============================
+    # Scheduler-side methods
+    # ==============================
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int, bool]:
+        """
+        Get number of new tokens that can be loaded from the
+        external KV cache beyond the num_computed_tokens.
+
+        Args:
+            request (Request): the request object.
+            num_computed_tokens (int): the number of locally
+                computed tokens for this request
+
+        Returns:
+            the number of tokens that can be loaded from the
+            external KV cache beyond what is already computed.
+        """
+        return self.connector.get_num_new_matched_tokens(
+            request, num_computed_tokens)
+
+    def update_state_after_alloc(self, request: "Request",
+                                 blocks: "KVCacheBlocks",
+                                 num_external_tokens: int):
+        """
+        Update KVConnector state after block allocation.
+        """
+        self.connector.update_state_after_alloc(request, blocks, num_external_tokens)
+
+    def build_connector_meta(
+            self, scheduler_output: "SchedulerOutput") -> "KVConnectorMetadata":
+        """
+        Build the connector metadata for this step.
+
+        This function should NOT modify fields in the scheduler_output.
+        Also, calling this function will reset the state of the connector.
+
+        Args:
+            scheduler_output (SchedulerOutput): the scheduler output object.
+        """
+        # Handle preemptions
+        # Try to get preempted_req_ids from scheduler_output (available in v2)
+        preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", None)
+
+        # Fallback for v1 or if not populated: calculate from state difference
+        if preempted_req_ids is None:
+            current_req_ids = set()
+            for req in scheduler_output.scheduled_new_reqs:
+                current_req_ids.add(req.req_id)
+            if scheduler_output.scheduled_cached_reqs:
+                current_req_ids.update(scheduler_output.scheduled_cached_reqs.req_ids)
+
+            finished_req_ids = scheduler_output.finished_req_ids
+
+            # Preempted = Previous - Current - Finished
+            preempted_req_ids = self.previous_scheduled_req_ids - current_req_ids - finished_req_ids
+
+            # Update previous for next step
+            self.previous_scheduled_req_ids = current_req_ids
+
+        if preempted_req_ids:
+            self.connector.handle_preemptions(preempted_req_ids)
+
+        self.connector.cancel_tasks()
+        self.connector.launch_tasks()
+
+        # Optional: Synchronous wait for get tasks to ensure data consistency.
+        # This is a safety fallback because currently FlexKV worker does not support
+        # waiting for tasks in start_load_kv().
+        if os.getenv('FLEXKV_SYNC_GET', '0') == '1':
+            self.connector.wait_for_all_get_tasks()
+
+        return KVConnectorMetadata()
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        """
+        Update KVConnector state from worker-side connectors output.
+        Available since vLLM v0.10.1.
+
+        Args:
+            connector_output (KVConnectorOutput): the worker-side
+                connectors output.
+        """
+        if not _HAS_KV_CONNECTOR_OUTPUT:
+            return
+
+        finished_sending, finished_recving = self.connector.query_finished_task()
+        connector_output.finished_sending = finished_sending
+        connector_output.finished_recving = finished_recving
+
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """
+        Called when a request has finished, before its blocks are freed.
+
+        Returns:
+            True if the request is being saved/sent asynchronously and blocks
+            should not be freed until the request_id is returned from
+            get_finished().
+            Optional KVTransferParams to be included in the request outputs
+            returned by the engine.
+        """
+        return self.connector.request_finished(request, block_ids), None
+
+    def take_events(self) -> Iterable['KVCacheEvent']:
+        '''
+        Collect buffered KV cache events.
+        '''
+        collector: Optional[KVEventCollector] = getattr(self.connector, "collector", None)
+        if collector is None:
+            return []
+        return collector.take_events()
+
+    def get_kv_connector_stats(self) -> Optional["KVConnectorStats"]:
+        """
+        Get the KV connector stats collected during the last interval.
+        Available since vLLM v0.11.0.
+        """
+        if KVConnectorStats is None:
+            return None
+
+        if self.role != KVConnectorRole.SCHEDULER:
+            # Must return non-None so KVConnectorOutput.is_empty() returns
+            # False on the worker side.  Otherwise, when
+            # total_num_scheduled_tokens == 0, no_forward() discards the
+            # output and the scheduler never polls query_finished_task(),
+            # causing requests in WAITING_FOR_REMOTE_KVS to hang forever.
+            # Use sentinel subclass whose aggregate() delegates to the
+            # scheduler's stats, avoiding NotImplementedError.
+            return _FlexKVWorkerSentinelStats(data={})
+
+        stats = self.connector.flexkv_stats
+        data = {
+            "num_get_requests": stats.num_get_requests,
+            "num_get_query_tokens": stats.num_get_query_tokens,
+            "num_gpu_matched_tokens": stats.num_gpu_matched_tokens,
+            "num_flexkv_matched_tokens": stats.num_flexkv_matched_tokens,
+            "num_put_requests": stats.num_put_requests,
+            "num_put_query_tokens": stats.num_put_query_tokens,
+            "num_put_unmatched_tokens": stats.num_put_unmatched_tokens,
+            "num_failed_requests": stats.num_failed_requests,
+            "get_gpu_match_ratio": stats.get_gpu_match_ratio,
+            "get_flexkv_match_ratio": stats.get_flexkv_match_ratio,
+        }
+        return KVConnectorStats(data=data)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if self.role == KVConnectorRole.SCHEDULER:
+            return self.connector.get_and_clear_failed_block_ids()
+        return set()

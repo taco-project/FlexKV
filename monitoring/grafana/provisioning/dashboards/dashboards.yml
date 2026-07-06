@@ -1,0 +1,16 @@
+# Grafana Dashboard Provisioning Configuration
+# This file auto-loads dashboards from the specified path
+
+apiVersion: 1
+
+providers:
+  - name: 'FlexKV Dashboards'
+    orgId: 1
+    folder: 'FlexKV'
+    folderUid: 'flexkv'
+    type: file
+    disableDeletion: false
+    editable: true
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

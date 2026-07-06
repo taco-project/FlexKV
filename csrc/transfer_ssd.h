@@ -1,0 +1,288 @@
+#pragma once
+#include <errno.h>
+#include <liburing.h>
+#include <linux/ioprio.h>
+#include <sys/syscall.h>
+#include <torch/extension.h>
+#include <unistd.h>
+#include <vector>
+
+#ifndef IOPRIO_CLASS_SHIFT
+#define IOPRIO_CLASS_SHIFT 13
+#define IOPRIO_PRIO_MASK ((1UL << IOPRIO_CLASS_SHIFT) - 1)
+#define IOPRIO_PRIO_VALUE(class, data) (((class) << IOPRIO_CLASS_SHIFT) | data)
+#define IOPRIO_CLASS_RT 1
+#define IOPRIO_CLASS_BE 2
+#define IOPRIO_CLASS_IDLE 3
+#endif
+
+namespace flexkv {
+
+class IOUring {
+public:
+  IOUring(int _entries, int flags) {
+    entries = 0;
+    prepared = 0;
+    inflight = 0;
+    cqe_err = 0;
+    total_cqe_err = 0;
+    total_over_limit = 0;
+    total_submitted = 0;
+    total_completed = 0;
+
+    if (_entries > 0) {
+      if (!io_uring_queue_init(_entries, &ring, flags)) {
+        entries = _entries;
+      } else {
+        fprintf(stderr,
+                "IOUring(%p) init failed, entries(%d), flags(%d), errno(%d)\n",
+                this, _entries, flags, errno);
+      }
+    }
+
+    rt_supported = (syscall(SYS_ioprio_set, 1, 0,
+                            IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 0)) == 0);
+    if (rt_supported) {
+      syscall(SYS_ioprio_set, 1, 0, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4));
+      read_ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 0);
+    } else {
+      read_ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 0);
+    }
+    write_ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4);
+
+    fprintf(stdout, "IOUring(%p) : RT ioprio %s\n", this,
+            rt_supported ? "supported" : "not supported, using BE");
+  }
+
+  ~IOUring() {
+    if (entries > 0) {
+      io_uring_queue_exit(&ring);
+    }
+
+    dump(0);
+  }
+
+  bool enabled() { return entries > 0; }
+
+  int submit() {
+    int rc;
+
+    if (prepared) {
+      rc = io_uring_submit(&ring);
+      if (rc < 0) {
+        return -1;
+      }
+
+      prepared -= rc;
+      inflight += rc;
+      total_submitted += rc;
+    }
+    return 0;
+  }
+
+  int wait_completion() {
+    constexpr int MAX_CQES = 32;
+    io_uring_cqe *cqes[MAX_CQES];
+    while (total_completed < total_submitted) {
+      unsigned count = io_uring_peek_batch_cqe(&ring, cqes, MAX_CQES);
+      if (count == 0) {
+        if (io_uring_wait_cqe(&ring, &cqe) < 0)
+          continue;
+        count = 1;
+        cqes[0] = cqe;
+      }
+
+      for (unsigned i = 0; i < count; i++) {
+        if (cqes[i]->res < 0) {
+          cqe_err++;
+        }
+      }
+      total_completed += count;
+      inflight -= count;
+      io_uring_cq_advance(&ring, count);
+    }
+
+    if (cqe_err) {
+      total_cqe_err += cqe_err;
+      cqe_err = 0;
+      return -1;
+    }
+    return 0;
+  }
+
+  int prep_read(int fd, void *ptr, uint64_t size, uint64_t offset) {
+    if (prepare()) {
+      total_over_limit++;
+      return -1;
+    }
+
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+      return -1;
+    }
+
+    // Single-segment I/O: io_uring_prep_read takes (buf, len) directly, so we
+    // avoid a per-I/O heap iovec (and the matching delete on completion).
+    io_uring_prep_read(sqe, fd, ptr, size, offset);
+
+    sqe->ioprio = read_ioprio;
+
+    prepared++;
+    return 0;
+  }
+
+  int prep_write(int fd, void *ptr, uint64_t size, uint64_t offset) {
+    if (prepare()) {
+      total_over_limit++;
+      return -1;
+    }
+
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+      return -1;
+    }
+
+    // Single-segment I/O: io_uring_prep_write takes (buf, len) directly, so we
+    // avoid a per-I/O heap iovec (and the matching delete on completion).
+    io_uring_prep_write(sqe, fd, ptr, size, offset);
+
+    sqe->ioprio = write_ioprio;
+
+    prepared++;
+    return 0;
+  }
+
+  void dump(int force) {
+    if (force || total_cqe_err || total_over_limit) {
+      fprintf(
+          stdout,
+          "IOUring(%p) : entries = %d, inflight = %d, prepared = %d, "
+          "submitted = %lu, completed = %lu, over_limit = %lu, cqe_err = %lu\n",
+          this, entries, inflight, prepared, total_submitted, total_completed,
+          total_over_limit, total_cqe_err);
+    }
+  }
+
+private:
+  int prepare() {
+    if (prepared >= entries / 2) {
+      submit();
+    }
+
+    if (inflight + prepared == entries) {
+      if (io_uring_peek_cqe(&ring, &cqe)) {
+        return -1;
+      }
+
+      if (cqe->res < 0) {
+        cqe_err++;
+      }
+
+      io_uring_cqe_seen(&ring, cqe);
+      total_completed++;
+      inflight--;
+    }
+    return 0;
+  }
+
+  io_uring ring;
+  io_uring_sqe *sqe;
+  io_uring_cqe *cqe;
+
+  bool rt_supported;
+  uint16_t read_ioprio;
+  uint16_t write_ioprio;
+
+  int cqe_err;
+  int entries;
+  int inflight;
+  int prepared;
+  uint64_t total_submitted;
+  uint64_t total_completed;
+  uint64_t total_over_limit;
+  uint64_t total_cqe_err;
+};
+
+class SSDIOCTX {
+public:
+  SSDIOCTX(std::map<int, std::vector<std::string>> &ssd_files, int num_devices,
+           int iouring_entries, int iouring_flags)
+      : iouring(iouring_entries, iouring_flags), fds_buffer_io(num_devices),
+        fds_direct_io(num_devices) {
+
+    int i, j, fd_buffer_io, fd_direct_io;
+
+    this->num_devices = num_devices;
+    this->num_files_per_device = ssd_files[0].size();
+
+    for (i = 0; i < num_devices; i++) {
+      for (j = 0; j < num_files_per_device; j++) {
+        fd_buffer_io = open(ssd_files[i][j].c_str(), O_RDWR);
+        fd_direct_io = open(ssd_files[i][j].c_str(), O_RDWR | O_DIRECT);
+
+        if (fd_buffer_io < 0 || fd_direct_io < 0) {
+          std::cerr << "open file failed, path = " << ssd_files[i][j]
+                    << std::endl;
+          throw std::runtime_error("Failed to open file");
+        } else {
+          posix_fadvise(fd_buffer_io, 0, 0, POSIX_FADV_SEQUENTIAL);
+          posix_fadvise(fd_buffer_io, 0, 0, POSIX_FADV_WILLNEED);
+        }
+
+        fds_buffer_io[i].push_back(fd_buffer_io);
+        fds_direct_io[i].push_back(fd_direct_io);
+      }
+    }
+  }
+
+  ~SSDIOCTX() {
+    for (const auto &fd_list : fds_buffer_io) {
+      for (const auto &fd : fd_list) {
+        if (fd >= 0) {
+          close(fd);
+        }
+      }
+    }
+
+    for (const auto &fd_list : fds_direct_io) {
+      for (const auto &fd : fd_list) {
+        if (fd >= 0) {
+          close(fd);
+        }
+      }
+    }
+  }
+
+  int get_num_devices() { return num_devices; }
+
+  int get_num_files_per_device() { return num_files_per_device; }
+
+  IOUring &get_iouring() { return iouring; }
+
+  std::vector<std::vector<int>> &get_fds(bool is_read, bool is_direct) {
+    if (is_direct) {
+      return fds_direct_io;
+    } else {
+      return fds_buffer_io;
+    }
+  }
+
+private:
+  int num_devices;
+  int num_files_per_device;
+
+  IOUring iouring;
+  std::vector<std::vector<int>> fds_buffer_io;
+  std::vector<std::vector<int>> fds_direct_io;
+};
+
+void transfer_kv_blocks_ssd(
+    SSDIOCTX &ioctx, const torch::Tensor &cpu_layer_id_list,
+    int64_t cpu_tensor_ptr, const torch::Tensor &ssd_block_ids,
+    const torch::Tensor &cpu_block_ids, int64_t cpu_layer_stride_in_bytes,
+    int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
+    int64_t ssd_kv_stride_in_bytes, int64_t chunk_size_in_bytes,
+    int64_t block_stride_in_bytes, bool is_read, int num_blocks_per_file,
+    int round_robin = 1, int num_threads_per_device = 16, bool is_mla = false);
+
+} // namespace flexkv

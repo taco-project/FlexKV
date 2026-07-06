@@ -1,0 +1,370 @@
+import time
+from multiprocessing import Lock, Queue
+from multiprocessing.connection import Connection
+from queue import Queue as ThreadQueue
+from typing import Dict, List, Optional, Tuple, Callable
+
+import tempfile
+import torch
+import zmq
+import numpy as np
+
+from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.debug import flexkv_logger
+from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.storage import KVCacheLayout
+from flexkv.common.request import KVResponseStatus, KVResponse
+from flexkv.server.utils import get_zmq_socket
+from flexkv.server.request import (
+    RegisterDPClientRequest,
+    RegisterTPClientRequest,
+    IsReadyRequest,
+    PutRequest,
+    GetRequest,
+    PutMatchRequest,
+    GetMatchRequest,
+    LaunchTaskRequest,
+    CancelTaskRequest,
+    WaitRequest,
+    TryWaitRequest,
+    CheckRunningRequest,
+    StartRequest,
+    ShutdownRequest,
+    PrefetchRequest,
+    Response
+)
+
+class KVDPClient:
+    def __init__(
+        self,
+        server_recv_port: str,
+        model_config: ModelConfig,
+        dp_client_id: int,
+    ):
+        # Init inter-process communication
+        context = zmq.Context(2)
+        self.send_to_server = get_zmq_socket(
+            context, zmq.SocketType.PUSH, server_recv_port, False
+        )
+        self.client_recv_port = f"ipc://{tempfile.NamedTemporaryFile(delete=True).name}"
+        self.recv_from_server = get_zmq_socket(
+            context, zmq.SocketType.PULL, self.client_recv_port, True
+        )
+        self.dp_client_id = dp_client_id
+        self.model_config = model_config
+
+        self._task_id_range = (self.dp_client_id * 10000000, (self.dp_client_id + 1) * 10000000)
+        self._task_id_counter = self._task_id_range[0]
+        self._task_id_lock = Lock()
+        flexkv_logger.info(f"KVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
+
+    def _get_task_id(self) -> int:
+        with self._task_id_lock:
+            old_value = self._task_id_counter
+            self._task_id_counter += 1
+            if self._task_id_counter >= self._task_id_range[1]:
+                self._task_id_counter = self._task_id_range[0]
+            return old_value
+
+    def start_server_and_register(self) -> None:
+        #start server and register
+        req = StartRequest(self.dp_client_id)
+        self.send_to_server.send_pyobj(req)
+        self.register_to_server(self.model_config, self.client_recv_port)
+
+    def register_to_server(
+        self,
+        model_config: ModelConfig,
+        client_recv_port: str,
+    ) -> None:
+        register_req = RegisterDPClientRequest(
+            dp_client_id=self.dp_client_id,
+            model_config=model_config,
+            client_recv_port=client_recv_port,
+        )
+        self.send_to_server.send_pyobj(register_req)
+        flexkv_logger.info(f"DP client {self.dp_client_id} registered to server request sent!")
+
+    def is_ready(
+        self,
+    ) -> bool:
+        req = IsReadyRequest(self.dp_client_id)
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        return response.is_ready
+
+    def put_async(
+        self,
+        token_ids: np.ndarray,
+        slot_mapping: np.ndarray,
+        token_mask: Optional[np.ndarray],
+        namespace: Optional[List[str]] = None,
+    ) -> int:
+        req = PutRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask if token_mask is not None else None,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+        )
+        self.send_to_server.send_pyobj(req)
+        return req.task_id
+
+    def put_match(
+        self,
+        token_ids: np.ndarray,
+        token_mask: Optional[np.ndarray],
+        namespace: Optional[List[str]] = None,
+    ) -> Optional[Tuple[int, np.ndarray]]:
+        req = PutMatchRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            token_mask=token_mask if token_mask is not None else None,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+        )
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.error_msg is None:
+            return response.task_id, response.mask
+        else:
+            flexkv_logger.error(f"put_match failed, error_msg: {response.error_msg}")
+            return None
+
+    def prefetch_async(
+        self,
+        token_ids: np.ndarray,
+        namespace: Optional[List[str]] = None,
+    ) -> int:
+        req = PrefetchRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+        )
+        self.send_to_server.send_pyobj(req)
+        return req.task_id
+
+    def get_async(
+        self,
+        token_ids: np.ndarray,
+        slot_mapping: np.ndarray,
+        token_mask: Optional[np.ndarray],
+        namespace: Optional[List[str]] = None,
+    ) -> int:
+        req = GetRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask if token_mask is not None else None,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+        )
+        self.send_to_server.send_pyobj(req)
+        return req.task_id
+
+    def get_match(
+        self,
+        token_ids: np.ndarray,
+        token_mask: Optional[np.ndarray],
+        cpu_only: bool = False,
+        namespace: Optional[List[str]] = None,
+    ) -> Optional[Tuple[int, np.ndarray]]:
+        req = GetMatchRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            token_mask=token_mask if token_mask is not None else None,
+            cpu_only=cpu_only,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+        )
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.error_msg is None:
+            return req.task_id, response.mask
+        else:
+            flexkv_logger.error(f"get_match failed, error_msg: {response.error_msg}")
+            return None
+
+    def launch_tasks(
+        self,
+        task_ids: List[int],
+        slot_mappings: List[np.ndarray],
+        as_batch: bool = False,
+        layerwise_transfer: bool = False,
+        counter_id: int = 0,
+    ) -> List[int]:
+        batch_id = -1
+        if as_batch:
+            batch_id = self._get_task_id()
+        req = LaunchTaskRequest(self.dp_client_id, task_ids, slot_mappings, as_batch, batch_id, layerwise_transfer, counter_id)
+        self.send_to_server.send_pyobj(req)
+        return [batch_id] if as_batch else task_ids
+
+    def cancel_task(
+        self,
+        task_ids: List[int],
+    ) -> None:
+        req = CancelTaskRequest(self.dp_client_id, task_ids)
+        self.send_to_server.send_pyobj(req)
+
+    def wait(
+        self,
+        wait_task_ids: List[int],
+        wait_timeout: float = 20.0,
+        completely: bool = False,
+    ) -> Optional[Dict[int, KVResponse]]:
+        req = WaitRequest(self.dp_client_id, wait_task_ids, wait_timeout, completely)
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.status is not None:
+            for k, v in response.status.items():
+                if v.status != KVResponseStatus.SUCCESS:
+                    flexkv_logger.error(f"wait task {k} failed: {v.status}")
+            return response.status
+        else:
+            flexkv_logger.error(f"wait tasks: {wait_task_ids} in dp_client_id={self.dp_client_id} failed.")
+            return None
+
+    def try_wait(
+        self,
+        try_wait_task_ids: List[int],
+    ) -> Optional[Dict[int, KVResponse]]:
+        req = TryWaitRequest(self.dp_client_id, try_wait_task_ids)
+
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.status is not None:
+            for k, v in response.status.items():
+                if v.status != KVResponseStatus.SUCCESS:
+                    flexkv_logger.error(f"try_wait task {k} failed: {v.status}")
+            return response.status
+        else:
+            flexkv_logger.error(f"try_wait tasks: {try_wait_task_ids} in dp_client_id={self.dp_client_id} failed.")
+            return None
+
+    def shutdown(self) -> None:
+        req = ShutdownRequest(self.dp_client_id)
+        self.send_to_server.send_pyobj(req)
+
+class KVTPClient:
+    def __init__(
+        self,
+        gpu_register_port: str,
+        dp_client_id: int,
+        device_id: int,
+        pp_rank: int = 0,
+    ):
+        """A TP-level GPU registration client."""
+        # Init inter-process communication
+        context = zmq.Context(2)
+        self.send_to_server = get_zmq_socket(
+            context, zmq.SocketType.PUSH, gpu_register_port, False
+        )
+
+        self.dp_client_id = dp_client_id
+        self.pp_rank = pp_rank
+        self.device_id = device_id
+
+        flexkv_logger.info(
+            f"KVTPClient {device_id} Initialized! "
+            f"(gpu_register_port={gpu_register_port}, "
+            f"dp_client_id={dp_client_id}, pp_rank={pp_rank})")
+
+    def set_slot_mapping(self, task_id: int, slot_mapping: np.ndarray) -> None:
+        """Send set_slot_mapping message to TransferManagerOnRemote via existing ZMQ channel.
+
+        Reuses the same PUSH socket (send_to_server) that connects to
+        TransferManagerOnRemote's command_socket — no separate IPC socket needed.
+        """
+        message = {
+            'type': 'set_slot_mapping',
+            'task_id': task_id,
+            'slot_mapping': slot_mapping,
+        }
+        try:
+            self.send_to_server.send_pyobj(message, flags=zmq.NOBLOCK)
+            flexkv_logger.debug(
+                f"KVTPClient {self.device_id}: set_slot_mapping sent for task_id={task_id}"
+            )
+        except zmq.Again:
+            flexkv_logger.warning(
+                f"KVTPClient {self.device_id}: zmq.Again when sending set_slot_mapping, "
+                f"retrying with blocking send..."
+            )
+            self.send_to_server.send_pyobj(message)
+            flexkv_logger.info(
+                f"KVTPClient {self.device_id}: set_slot_mapping sent (blocking retry) "
+                f"for task_id={task_id}"
+            )
+
+    def register_to_server(
+        self,
+        kv_caches: List[torch.Tensor],
+        kv_layout: KVCacheLayout,
+        override_device_id: Optional[int] = None,
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+        indexer_layout: Optional[KVCacheLayout] = None,
+    ) -> None:
+        if not kv_caches or not kv_caches[0].is_cuda:
+            raise ValueError("GPU blocks must be CUDA tensors")
+
+        # Use override_device_id if provided, otherwise use self.device_id
+        device_id = override_device_id if override_device_id is not None else self.device_id
+
+        handles = []
+        for _, tensor in enumerate(kv_caches):
+            handle = TensorSharedHandle(tensor, device_id)
+            handles.append(handle)
+
+        # Build optional indexer handles
+        indexer_handles = None
+        if indexer_buffers is not None and len(indexer_buffers) > 0:
+            indexer_handles = []
+            for tensor in indexer_buffers:
+                indexer_handles.append(TensorSharedHandle(tensor, device_id))
+
+        register_req = RegisterTPClientRequest(
+            dp_client_id=self.dp_client_id,
+            pp_rank=self.pp_rank,
+            device_id=device_id,
+            handles=handles,
+            gpu_layout=kv_layout,
+            indexer_handles=indexer_handles,
+            indexer_gpu_layout=indexer_layout,
+        )
+
+        try:
+            self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
+            flexkv_logger.info(
+                f"KVTPClient {device_id}: registration message sent "
+                f"(dp_client_id={self.dp_client_id}, pp_rank={self.pp_rank}, "
+                f"num_kv_caches={len(kv_caches)})")
+        except zmq.Again:
+            flexkv_logger.error(
+                f"KVTPClient {device_id}: zmq.Again when sending registration "
+                f"(send buffer full or no connection). Retrying with blocking send...")
+            self.send_to_server.send_pyobj(register_req)
+            flexkv_logger.info(f"KVTPClient {device_id}: registration message sent (blocking retry)")
+
+
+if __name__ == "__main__":
+    num_layers = 32
+    num_kv_heads = 8
+    head_size = 128
+    num_cpu_blocks = 300
+    tp_size = 2
+    tokens_per_block = 4
+
+    model_config = ModelConfig(num_layers=num_layers,
+                                num_kv_heads=num_kv_heads,
+                                head_size=head_size,
+                                use_mla=False,
+                                tp_size=tp_size,
+                                dtype=torch.float16)
+    dp_client = KVDPClient(
+        "ipc:///tmp/tmp6isie_et",
+        model_config=model_config,
+        dp_client_id=0,
+    )
