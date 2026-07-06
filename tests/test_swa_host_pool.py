@@ -1,5 +1,4 @@
-"""Tests for SWA Host Pool — CPU pinned memory slot allocation."""
-import numpy as np
+"""Tests for SWA Host Pool — CPU-side SWA slot-id allocation (free-list)."""
 import pytest
 
 from flexkv.common.config import SWAPoolConfig
@@ -59,32 +58,16 @@ class TestSWAHostPoolAllocation:
         new_slot = pool.allocate()
         assert new_slot is not None
 
+    def test_reset_rearms_all_slots(self, pool):
+        for _ in range(5):
+            pool.allocate()
+        assert pool.num_used == 5
+        pool.reset()
+        assert pool.num_free == 8
+        assert pool.num_used == 0
 
-class TestSWAHostPoolIO:
-    def test_write_read_numpy(self, pool, small_config):
-        slot = pool.allocate()
-        data = np.arange(small_config.slot_size_bytes, dtype=np.uint8)
-        pool.write(slot, data)
-        result = pool.read(slot)
-        np.testing.assert_array_equal(np.asarray(result)[:len(data)], data)
-
-    def test_write_read_bytes(self, pool, small_config):
-        slot = pool.allocate()
-        data = bytes(range(min(256, small_config.slot_size_bytes)))
-        pool.write(slot, data)
-        result = np.asarray(pool.read(slot))
-        np.testing.assert_array_equal(result[:len(data)], np.frombuffer(data, dtype=np.uint8))
-
-    def test_slot_size(self, pool, small_config):
-        expected = 4 * 2 * 8  # window_size * layers * bytes
-        assert pool.slot_size_bytes == expected
-
-    def test_read_copy_independence(self, pool, small_config):
-        slot = pool.allocate()
-        data = np.ones(small_config.slot_size_bytes, dtype=np.uint8) * 42
-        pool.write(slot, data)
-        copy1 = pool.read_copy(slot)
-        copy2 = pool.read_copy(slot)
-        # Modify copy1, copy2 should be unaffected
-        np.asarray(copy1)[0] = 99
-        assert np.asarray(copy2)[0] == 42
+    def test_slot_size_bytes_forwarded_from_config(self, pool, small_config):
+        # slot_size_bytes is a pure forward of the config geometry; the pool
+        # holds no bytes (those live in the StorageEngine is_swa buffer).
+        expected = 4 * 2 * 8  # window_size * layers * bytes_per_token_per_layer
+        assert pool.slot_size_bytes == expected == small_config.slot_size_bytes

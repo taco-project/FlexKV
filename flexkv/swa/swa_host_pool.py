@@ -1,46 +1,28 @@
-"""SWA Host Pool — CPU-side pinned memory for SWA page storage.
+"""SWA Host Pool — CPU-side slot-id allocator for SWA pages.
 
-SWA is managed at PAGE granularity: each slot stores exactly one swa_page of
+SWA is managed at PAGE granularity: each slot denotes exactly one swa_page of
 window KV = swa_page_size tokens x num_swa_layers layers x bytes_per_token_per_layer
 (``window_size`` in SWAPoolConfig carries the physical swa_page_size). All SWA
-IO addresses a whole slot (= one page) at a time. Slot allocation uses a simple
-free-list (stack). When the pool is full, the caller (cache engine) triggers SWA-LRU
-eviction before retrying.
+IO addresses a whole slot (= one page) at a time.
+
+This pool is purely a slot-id allocator / free-list (stack): it hands out and
+reclaims integer slot ids and keeps the used/free accounting. It does NOT hold
+the SWA KV bytes — those live in the ``StorageEngine`` buffer allocated with
+``is_swa=True`` (sized from the SAME SWAPoolConfig geometry) and are read/written
+by the transfer worker via the storage handle, addressed by slot id. When the
+pool is full, the caller (cache engine) triggers SWA-LRU eviction before retrying.
 """
-import time
-from typing import Optional, Union
-
-import numpy as np
-
-try:
-    import torch
-    _TORCH_AVAILABLE = True
-except ImportError:
-    _TORCH_AVAILABLE = False
+from typing import Optional
 
 from flexkv.common.config import SWAPoolConfig
 
 
 class SWAHostPool:
-    """Fixed-size CPU buffer pool for SWA page snapshots."""
+    """Fixed-size SWA slot-id allocator (free-list); holds no KV bytes."""
 
     def __init__(self, config: SWAPoolConfig):
         self._config = config
-        self._slot_size = config.slot_size_bytes
         self._num_slots = config.num_slots
-
-        # Allocate buffer
-        if _TORCH_AVAILABLE:
-            use_pin = config.pin_memory and torch.cuda.is_available()
-            self._buffer = torch.zeros(
-                (self._num_slots, self._slot_size),
-                dtype=torch.uint8,
-                pin_memory=use_pin,
-            )
-            self._use_torch = True
-        else:
-            self._buffer = np.zeros((self._num_slots, self._slot_size), dtype=np.uint8)
-            self._use_torch = False
 
         # Free-list (stack-based)
         self._free_slots = list(range(self._num_slots - 1, -1, -1))
@@ -66,52 +48,7 @@ class SWAHostPool:
         """
         self._free_slots = list(range(self._num_slots - 1, -1, -1))
 
-    # --- Data Access -------------------------------------------------------
-
-    def write(self, slot_id: int, data: Union['torch.Tensor', np.ndarray, bytes]) -> None:
-        """Write SWA data into a slot."""
-        if isinstance(data, bytes):
-            # np.frombuffer on bytes yields a read-only array; copy so the
-            # resulting tensor is writable and torch.from_numpy stays quiet.
-            arr = np.frombuffer(data, dtype=np.uint8).copy()
-        elif _TORCH_AVAILABLE and isinstance(data, torch.Tensor):
-            arr = data.detach().cpu().view(-1).to(torch.uint8)
-        else:
-            arr = np.asarray(data, dtype=np.uint8).ravel()
-
-        n = min(len(arr), self._slot_size)
-        if self._use_torch:
-            if isinstance(arr, np.ndarray):
-                self._buffer[slot_id, :n] = torch.from_numpy(arr[:n])
-            else:
-                self._buffer[slot_id, :n] = arr[:n]
-        else:
-            if _TORCH_AVAILABLE and isinstance(arr, torch.Tensor):
-                self._buffer[slot_id, :n] = arr[:n].numpy()
-            else:
-                self._buffer[slot_id, :n] = arr[:n]
-
-    def read(self, slot_id: int) -> Union['torch.Tensor', np.ndarray]:
-        """Read SWA data from a slot (returns a view, zero-copy)."""
-        return self._buffer[slot_id]
-
-    def read_copy(self, slot_id: int) -> Union['torch.Tensor', np.ndarray]:
-        """Read SWA data from a slot (returns a copy)."""
-        if self._use_torch:
-            return self._buffer[slot_id].clone()
-        else:
-            return self._buffer[slot_id].copy()
-
     # --- Properties --------------------------------------------------------
-
-    @property
-    def buffer(self):
-        """The backing slot buffer ``[num_slots, slot_size_bytes]`` (uint8).
-
-        Pinned torch tensor when CUDA is available, else a numpy array. The SWA
-        transfer worker (data plane) shares this and addresses bytes by slot row.
-        """
-        return self._buffer
 
     @property
     def num_free(self) -> int:
@@ -127,7 +64,12 @@ class SWAHostPool:
 
     @property
     def slot_size_bytes(self) -> int:
-        return self._slot_size
+        """Bytes per slot (= one swa_page), forwarded from the config.
+
+        The bytes themselves live in the StorageEngine ``is_swa=True`` buffer,
+        not here; this is exposed only so callers can size that buffer / slot.
+        """
+        return self._config.slot_size_bytes
 
     @property
     def config(self) -> SWAPoolConfig:

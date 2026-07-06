@@ -583,17 +583,12 @@ def _make_workload(num_users, num_turns, sys_len, turn_in, turn_out, seed):
     return work
 
 
-def _page_fingerprint(block_hash, slot_size):
-    """Deterministic bytes keyed by the window's block hash — stands in for the
-    real SWA-page KV; byte-identical read-back proves the slot round-tripped."""
-    rs = np.random.RandomState(block_hash & 0xFFFFFFFF)
-    return rs.randint(0, 256, size=slot_size, dtype=np.uint8)
-
-
 class _SWAWorkloadDriver:
     """Minimal port of the former benchmark Driver: match(get) -> store(put)
-    with an SWA page mounted on each stored tail node, real byte IO on hit, and
-    ground-truth pool invariant sweeps."""
+    with an SWA slot mounted on each stored tail node, and ground-truth pool
+    invariant sweeps (slot-id accounting: no double-free / use-after-free / leak).
+    The SWA pool is a pure slot-id allocator (bytes live in the StorageEngine
+    is_swa buffer), so this driver tracks slot lifecycle, not page bytes."""
 
     def __init__(self, num_cpu_blocks, swa_slots, slot_bytes):
         from flexkv.cache.cache_engine import CacheEngineAccel
@@ -609,11 +604,9 @@ class _SWAWorkloadDriver:
             enabled=True, num_slots=swa_slots, window_size=_WTPB,
             num_swa_layers=1, bytes_per_token_per_layer=max(1, slot_bytes // _WTPB),
         ))
-        self.slot_size = self.engine.swa_pool.slot_size_bytes
         self._slot_expect: Dict[int, int] = {}
         self.violations: List[str] = []
         self.swa_hits = 0
-        self.bytes_verified = 0
 
     def _seq(self, token_ids):
         aligned = (len(token_ids) // self.tpb) * self.tpb
@@ -640,14 +633,6 @@ class _SWAWorkloadDriver:
                 sm, upper_bound_blocks=full_hit, lock_for_load=False)
             if swa_hit > 0 and slot >= 0:
                 self.swa_hits += 1
-                got = np.asarray(self.engine.swa_pool.read_copy(slot)).ravel()
-                exp_hash = self._slot_expect.get(int(slot))
-                if exp_hash is not None:
-                    exp = _page_fingerprint(exp_hash, self.slot_size)
-                    if got.shape == exp.shape and np.array_equal(got, exp):
-                        self.bytes_verified += 1
-                    else:
-                        self.violations.append(f"SWA byte mismatch on slot {slot}")
 
         num_new = nblocks - full_hit
         if num_new > 0:
@@ -670,7 +655,6 @@ class _SWAWorkloadDriver:
         if slot == -1:
             return
         tail_hash = int(sm.block_hashes[nblocks - 1])
-        self.engine.swa_pool.write(slot, _page_fingerprint(tail_hash, self.slot_size))
         self._slot_expect[int(slot)] = tail_hash
         self.engine.set_swa(node, slot)
         self._reconcile()
@@ -711,17 +695,16 @@ class _SWAWorkloadDriver:
 def test_workload_pressure_no_leak_no_corruption(cpu_blocks, swa_slots):
     """Stochastic multi-turn workload on the production path: under Full and SWA
     pool pressure, the two pools stay in lock-step — no double-free, no
-    use-after-free of a live window, byte-identical SWA read-back, no leak after
-    reset. (Folded from benchmark_swa_nodemount.py; small params for CI.)"""
+    use-after-free of a live window, no slot leak after reset. (Folded from
+    benchmark_swa_nodemount.py; small params for CI.)"""
     work = _make_workload(num_users=24, num_turns=6, sys_len=8 * _WTPB,
                           turn_in=6 * _WTPB, turn_out=2 * _WTPB, seed=1234)
     drv = _SWAWorkloadDriver(cpu_blocks, swa_slots, slot_bytes=4096)
     violations = drv.run(work, check_every=25)
     assert not violations, "invariant violations:\n" + "\n".join(violations[:20])
-    # Sanity: the workload actually exercised SWA hits + real byte verify (so a
-    # silent no-op regression that stops mounting/reading SWA is caught).
+    # Sanity: the workload actually exercised SWA hits (so a silent no-op
+    # regression that stops mounting/matching SWA slots is caught).
     assert drv.swa_hits > 0, "workload produced no SWA hits — coverage regressed"
-    assert drv.bytes_verified > 0, "no SWA byte round-trip verified"
 
 
 # --------------------------------------------------------------------------- #
