@@ -183,6 +183,9 @@ class CacheEngineAccel:
         slot = int(swa_node.swa_host_slot)
         if slot < 0:
             return 0, -1, -1
+        # Read-hit保温: move the hit node to SWA-LRU MRU (a match-only probe is a
+        # real "use" — this is the LRU-thrash fix). Independent of lock_for_load.
+        self.index.promote_swa(swa_node)
         if lock_for_load:
             # Pin the SWA against eviction until the load completes. Paired
             # unlock is the data-plane completion callback (kept off until wired).
@@ -213,8 +216,54 @@ class CacheEngineAccel:
         slot = int(swa_node.swa_host_slot)
         if slot < 0:
             return 0, -1, -1, None
+        self.index.promote_swa(swa_node)  # read-hit保温 (before pin)
         swa_node.inc_swa_lock_ref()
         return swa_hit, slot, slot, swa_node
+
+    def match_swa_from_result(self,
+                              match_result,
+                              sequence_meta: SequenceMeta,
+                              upper_bound_blocks: int,
+                              lock_for_load: bool = False,
+                              ) -> Tuple[int, int, int, "CRadixNode"]:
+        """Resolve the SWA hit by REUSING an already-computed Full-KV match
+        instead of re-walking the radix tree.
+
+        ``match_result`` is the tier's Full-KV match (carrying ``last_swa_node`` /
+        ``swa_hit_blocks`` from the same single forward pass). When the SWA hit
+        fits within ``upper_bound_blocks`` (the tier's clamped Full-KV hit) we use
+        it directly — the common case, zero extra traversal. When it EXCEEDS the
+        bound (a masked prefix gap made the reusable Full hit shallower than the
+        deepest SWA node), a plain ``min()`` would point past the reusable prefix,
+        so we fall back to the clamped ``match_swa`` probe to find the deepest SWA
+        node WITHIN the bound.
+
+        Returns ``(swa_hit, slot, swa_key, node)`` (node is the pinned node when
+        ``lock_for_load`` else None); ``(0, -1, -1, None)`` on miss.
+        """
+        if self.swa_pool is None or upper_bound_blocks <= 0:
+            return 0, -1, -1, None
+        swa_node = getattr(match_result, "last_swa_node", None) if match_result is not None else None
+        swa_hit = int(getattr(match_result, "swa_hit_blocks", 0) or 0) if match_result is not None else 0
+        if swa_node is None or swa_hit <= 0:
+            return 0, -1, -1, None
+        if swa_hit > upper_bound_blocks:
+            # Deepest SWA lies past the reusable Full hit — re-probe clamped.
+            if lock_for_load:
+                return self.match_swa_locked(sequence_meta, upper_bound_blocks)
+            swa_hit2, slot2, key2 = self.match_swa(
+                sequence_meta, upper_bound_blocks, lock_for_load=False)
+            return swa_hit2, slot2, key2, None
+        slot = int(swa_node.swa_host_slot)
+        if slot < 0:
+            return 0, -1, -1, None
+        # REUSE branch: promote here. The fallback branch above delegates to
+        # match_swa[_locked], which promote internally — do NOT double-promote.
+        self.index.promote_swa(swa_node)
+        if lock_for_load:
+            swa_node.inc_swa_lock_ref()
+            return swa_hit, slot, slot, swa_node
+        return swa_hit, slot, slot, None
 
     def reset(self) -> None:
         self.index.reset()
@@ -248,6 +297,10 @@ class CacheEngineAccel:
             physical_blocks=phys,
             block_node_ids=bnids_np,
             matched_pos="remote" if self.device_type == DeviceType.REMOTE else "local",
+            # SWA node-mount: pass through the SWA hit found in the SAME forward
+            # pass so swa_align can reuse it (no second match_prefix walk).
+            last_swa_node=getattr(match_result, "last_swa_node", None),
+            swa_hit_blocks=int(getattr(match_result, "swa_hit_blocks", 0) or 0),
         )
 
     def insert(self,
@@ -319,8 +372,12 @@ class CacheEngineAccel:
             if evict_block_num > 0:
                 target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
                 evicted_block_hashes = torch.zeros(evict_block_num, dtype=torch.int64)
+                # evict() resizes both tensors in-place to the actual freed count
+                # (which may EXCEED evict_block_num when the I2 tombstone cascade
+                # frees ancestors) and returns that count. Trust it, don't assume
+                # evict_block_num.
                 num_evicted = self.index.evict(target_blocks, evicted_block_hashes, evict_block_num)
-                if num_evicted != evict_block_num:
+                if target_blocks.numel() != num_evicted:
                     target_blocks.resize_(num_evicted)
                     evicted_block_hashes.resize_(num_evicted)
                 target_blocks = target_blocks.numpy()
@@ -467,6 +524,7 @@ class CacheEngine:
         slot = int(swa_node.swa_host_slot)
         if slot < 0:
             return 0, -1, -1
+        self.index.promote_swa(swa_node)  # read-hit保温 (before pin)
         if lock_for_load:
             swa_node.swa_lock_ref += 1
         return swa_hit, slot, slot
@@ -492,8 +550,41 @@ class CacheEngine:
         slot = int(swa_node.swa_host_slot)
         if slot < 0:
             return 0, -1, -1, None
+        self.index.promote_swa(swa_node)  # read-hit保温 (before pin)
         swa_node.swa_lock_ref += 1
         return swa_hit, slot, slot, swa_node
+
+    def match_swa_from_result(self,
+                              match_result,
+                              sequence_meta: SequenceMeta,
+                              upper_bound_blocks: int,
+                              lock_for_load: bool = False,
+                              ) -> Tuple[int, int, int, "RadixNode"]:
+        """Reuse an already-computed Full-KV match to resolve the SWA hit without
+        re-walking the tree (mirror of CacheEngineAccel.match_swa_from_result;
+        see it for the fallback rationale)."""
+        if self.swa_pool is None or upper_bound_blocks <= 0:
+            return 0, -1, -1, None
+        swa_node = getattr(match_result, "last_swa_node", None) if match_result is not None else None
+        swa_hit = int(getattr(match_result, "swa_hit_blocks", 0) or 0) if match_result is not None else 0
+        if swa_node is None or swa_hit <= 0:
+            return 0, -1, -1, None
+        if swa_hit > upper_bound_blocks:
+            if lock_for_load:
+                return self.match_swa_locked(sequence_meta, upper_bound_blocks)
+            swa_hit2, slot2, key2 = self.match_swa(
+                sequence_meta, upper_bound_blocks, lock_for_load=False)
+            return swa_hit2, slot2, key2, None
+        slot = int(swa_node.swa_host_slot)
+        if slot < 0:
+            return 0, -1, -1, None
+        # REUSE branch: promote here. The fallback branch above delegates to
+        # match_swa[_locked], which promote internally — do NOT double-promote.
+        self.index.promote_swa(swa_node)
+        if lock_for_load:
+            swa_node.swa_lock_ref += 1
+            return swa_hit, slot, slot, swa_node
+        return swa_hit, slot, slot, None
 
     def reset(self) -> None:
         self.index.reset()
@@ -1079,7 +1170,7 @@ class GlobalCacheEngine:
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.DISK2H,
                 src_block_ids = fragment2_ssd_blocks,
-                dst_block_ids = fragment123_cpu_blocks[fragment1_num_blocks:fragment12_num_blocks],    
+                dst_block_ids = fragment123_cpu_blocks[fragment1_num_blocks:fragment12_num_blocks],
                 dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_disk2h)
@@ -1914,14 +2005,24 @@ class GlobalCacheEngine:
                          cpu_full_hit_blocks: int,
                          ssd_full_hit_blocks: int = 0,
                          remote_full_hit_blocks: int = 0,
-                         lock_for_load: bool = False) -> SWAMatchResult:
-        """Multi-tier SWA prefix match (delegates to SWACacheManager.match_prefix)."""
+                         lock_for_load: bool = False,
+                         cpu_match_result=None,
+                         ssd_match_result=None,
+                         remote_match_result=None) -> SWAMatchResult:
+        """Multi-tier SWA prefix match (delegates to SWACacheManager.match_prefix).
+
+        Per-tier ``*_match_result`` (from the SAME forward pass that produced the
+        full hits) let the SWA match REUSE that pass instead of re-walking.
+        """
         return self.swa_cache.match_prefix(
             sequence_meta,
             cpu_full_hit_blocks=cpu_full_hit_blocks,
             ssd_full_hit_blocks=ssd_full_hit_blocks,
             remote_full_hit_blocks=remote_full_hit_blocks,
             lock_for_load=lock_for_load,
+            cpu_match_result=cpu_match_result,
+            ssd_match_result=ssd_match_result,
+            remote_match_result=remote_match_result,
         )
 
     def swa_align(self,
@@ -1997,6 +2098,7 @@ class GlobalCacheEngine:
             ready = getattr(match_result, "num_ready_matched_blocks", 0)
             return max(0, min(int(ready), block_end_idx) - block_start_idx)
 
+        remote_mr = None
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             if self.index_accel:
                 cpu_mr, ssd_mr = self.match_local_accel(
@@ -2028,7 +2130,12 @@ class GlobalCacheEngine:
             sequence_meta, cpu_full_hit_blocks=full_hit_blocks,
             ssd_full_hit_blocks=full_hit_blocks,
             remote_full_hit_blocks=full_hit_blocks,
-            lock_for_load=lock_for_load)
+            lock_for_load=lock_for_load,
+            # Reuse the Full-KV matches just computed above — the SWA hit rides the
+            # SAME forward pass, so no tier re-walks the tree.
+            cpu_match_result=cpu_mr,
+            ssd_match_result=ssd_mr,
+            remote_match_result=remote_mr)
         return full_hit_blocks, swa_match.best_hit_blocks
 
     # --- SWA slot sources for the get()/put() build chains --------------------

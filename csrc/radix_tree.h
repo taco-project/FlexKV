@@ -329,6 +329,31 @@ protected:
   CRadixNode *swa_lru_head = nullptr;
   CRadixNode *swa_lru_tail = nullptr;
 
+  // True once any SWA slot has been mounted (set from set_swa). Gates the I2
+  // tombstone-leaf cascade in the always-running full-KV evict(): swa_tombstone
+  // DEFAULTS to true, so in a non-SWA deployment EVERY leaf is a tombstone and
+  // an unconditional cascade would over-evict valid ancestors. evict_swa() needs
+  // no gate (it only runs when the SWA-LRU is non-empty, i.e. SWA is enabled).
+  bool swa_enabled_ = false;
+
+  // Detach a leaf node: remove it from its parent, collect its full physical
+  // blocks into out_blocks (+ hashes into out_hashes when non-null), free any
+  // SWA slot, and unlink it from leaf_list / node_list. Returns the parent.
+  // Shared by evict() and evict_swa().
+  CRadixNode *detach_leaf_collect(CRadixNode *node,
+                                  std::vector<int64_t> &out_blocks,
+                                  std::vector<int64_t> *out_hashes);
+
+  // Walk up from `parent`, deleting each ancestor that is a meaningless
+  // tombstone leaf (leaf && swa_tombstone && lock_cnt==0 && ready) — invariant
+  // I2. Freed blocks/hashes append to out_blocks/out_hashes. Returns the last
+  // surviving ancestor (a non-tombstone leaf, a locked node, root, or a
+  // still-internal node) so the caller can reconsider it for eviction. The
+  // caller gates the SWA-enabled decision (evict() guards on swa_enabled_).
+  CRadixNode *cascade_delete_tombstone_leaves(CRadixNode *parent,
+                                              std::vector<int64_t> &out_blocks,
+                                              std::vector<int64_t> *out_hashes);
+
 public:
   CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000,
                   int hit_reward_seconds = 0,
@@ -506,6 +531,24 @@ public:
     node->set_swa_last_access_time((uint64_t)now.tv_sec * 1000000 +
                                    (uint64_t)now.tv_usec);
     swa_lru_add_mru(node);
+    swa_enabled_ = true;  // arm the I2 cascade in full-KV evict()
+  }
+
+  // Refresh a node's SWA recency on read-hit: splice it to the SWA-LRU MRU.
+  // SWA recency lives in the LRU list position (evict_swa walks the list, never
+  // reads swa_last_access_time), so a hit that only bumped the timestamp would
+  // NOT survive eviction — we must actually move the node. Mirror of the Python
+  // RadixTreeIndex.promote_swa. No-op for root or a node with no live SWA (a
+  // tombstone is not on the SWA-LRU; re-adding it would corrupt the list).
+  void promote_swa(CRadixNode *node) {
+    if (node == root || !node->has_swa()) {
+      return;
+    }
+    struct timeval now;
+    gettimeofday(&now, nullptr);
+    node->set_swa_last_access_time((uint64_t)now.tv_sec * 1000000 +
+                                   (uint64_t)now.tv_usec);
+    swa_lru_add_mru(node);  // remove+reinsert = move to MRU (idempotent)
   }
 
   // If the node holds a SWA host-pool slot, record it for release and clear the
