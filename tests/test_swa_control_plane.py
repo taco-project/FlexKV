@@ -64,6 +64,26 @@ def _cache_config(enable_swa_transfer: bool = True):
     return cc
 
 
+def _cache_config_ssd(enable_swa_transfer: bool = True):
+    """CPU + SSD tiers, both with an SWA host pool. The SSD cache engine is an
+    in-memory radix+mempool+swa_pool (no real SSD files at construction — files
+    are only touched by the data-plane worker at transfer time), so multi-tier
+    SWA orchestration (_swa_put_slots / _swa_get_slots) is testable at smoke
+    level without disk I/O."""
+    cc = CacheConfig(
+        tokens_per_block=TPB,
+        enable_cpu=True, enable_ssd=True, enable_remote=False,
+        num_cpu_blocks=4096, num_ssd_blocks=4096,
+        ssd_cache_dir="./ssd_cache_swa_test",
+    )
+    cc.swa = SWAPoolConfig(
+        enabled=True, num_slots=256, num_ssd_slots=256, window_size=TPB,
+        num_swa_layers=1, bytes_per_token_per_layer=64,
+    )
+    cc.enable_swa_transfer = enable_swa_transfer
+    return cc
+
+
 def _swa_ops(graph):
     return [op for op in graph._op_map.values() if getattr(op, "is_swa", False)]
 
@@ -136,46 +156,6 @@ def test_swa_align_clamps_full_to_swa_hit():
     assert full_hit == 4, f"full_hit={full_hit}"
     assert swa_hit == 4, f"swa_hit={swa_hit}"
     assert min(full_hit, swa_hit) == 4
-
-
-def test_swa_align_hit_equals_fetched_cpu_tier(monkeypatch):
-    """#9 tier-consistency guard: swa_align's returned SWA hit shapes the transfer
-    graph, but the GET data plane (_swa_get_slots) fetches the CPU tier ONLY.
-    match_swa_prefix reports best_hit_blocks = cross-tier MAX. If a non-CPU tier
-    ever reports a LONGER hit than CPU, returning best would shape a graph the
-    CPU-only fetch cannot fill (src/dst mismatch / stale SWA). swa_align must
-    clamp its return to the CPU (fetched) tier. We fake a longer SSD hit and
-    assert the returned hit stays at the CPU tier's value."""
-    eng = GlobalCacheEngine(_cache_config(True), _model_config())
-    tok = _tokens(4, base=7)
-    mask = np.ones_like(tok, dtype=np.int64)
-    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
-    _g, _rm, cb, op_cb, _e = eng.put(1, tok, mask, slot_mapping, dp_client_id=0)
-    _complete(op_cb, cb)
-
-    # CPU-only truth: best == cpu == 4.
-    full_hit, swa_hit = eng.swa_align(tok, np.ones_like(tok, dtype=np.bool_))
-    assert swa_hit == 4
-
-    # Simulate a future SSD/REMOTE tier reporting a LONGER SWA hit than CPU.
-    real_match = eng.match_swa_prefix
-
-    def _fake_match(sequence_meta, cpu_full_hit_blocks, ssd_full_hit_blocks=0,
-                    remote_full_hit_blocks=0, lock_for_load=False):
-        r = real_match(sequence_meta, cpu_full_hit_blocks=cpu_full_hit_blocks,
-                       ssd_full_hit_blocks=ssd_full_hit_blocks,
-                       remote_full_hit_blocks=remote_full_hit_blocks,
-                       lock_for_load=lock_for_load)
-        r.ssd_hit_blocks = r.cpu_hit_blocks + 2  # SSD claims a longer hit
-        r.ssd_slot = 999
-        return r
-
-    monkeypatch.setattr(eng, "match_swa_prefix", _fake_match)
-    full_hit2, swa_hit2 = eng.swa_align(tok, np.ones_like(tok, dtype=np.bool_))
-    # Must clamp to the fetched CPU tier (4), NOT the cross-tier max (6).
-    assert swa_hit2 == 4, (
-        f"swa_align returned {swa_hit2} (cross-tier best) but GET fetches CPU-only "
-        f"(cpu_hit=4); graph would be shaped for blocks the fetch cannot fill")
 
 
 def test_get_builds_full_plus_swa_load_chain():
@@ -303,6 +283,106 @@ def test_no_swa_slot_mapping_leaves_placeholder():
     graph.set_gpu_blocks(np.arange(50, 50 + len(tok) // TPB, dtype=np.int64))
     assert swa_d2h.src_block_ids.tolist() == before  # untouched by full-KV bind
     _complete(op_cb, cb)
+
+
+# =========================================================================== #
+# 3. multi-tier SWA orchestration (CPU + SSD): write-through + get staging     #
+#    These exercise _swa_put_slots / _swa_get_slots across tiers (the layer    #
+#    that was CPU-only). Written TDD-first: they FAIL against CPU-only code.    #
+# =========================================================================== #
+
+def test_put_writethrough_ssd_builds_swa_h2disk():
+    """PUT with an SSD tier: SWA store must write through to SSD, mirroring the
+    full-KV H2DISK. The SWA graph should carry a SWA D2H (GPU->CPU) AND a SWA
+    H2DISK (CPU->SSD) that depends on the D2H (fire-and-forget), and an SSD SWA
+    slot must be allocated + mounted on the SSD store node."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    tok = _tokens(4, base=21)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+
+    graph, _rm, cb, op_cb, _e = eng.put(1, tok, mask, sm, dp_client_id=0)
+    swa = _swa_ops(graph)
+    kinds = sorted(o.transfer_type.name for o in swa)
+    assert "D2H" in kinds, f"SWA D2H missing: {kinds}"
+    assert "H2DISK" in kinds, f"SWA write-through H2DISK missing (CPU-only bug): {kinds}"
+    swa_d2h = [o for o in swa if o.transfer_type == TransferType.D2H][0]
+    swa_h2disk = [o for o in swa if o.transfer_type == TransferType.H2DISK][0]
+    assert swa_d2h.op_id in swa_h2disk.predecessors, "H2DISK must depend on SWA D2H"
+    # an SSD SWA slot was allocated (mounted on the SSD store node)
+    assert eng.ssd_cache_engine.swa_pool.num_used == 1
+    _complete(op_cb, cb)
+
+
+def test_get_ssd_staging_when_only_ssd_has_swa():
+    """GET where the SWA window lives ONLY on SSD (CPU SWA evicted): the load
+    must stage SSD->CPU (SWA DISK2H) then CPU->GPU (SWA H2D), mirroring full-KV
+    fragment2. CPU-only code returns no SSD slot -> no DISK2H -> FAIL."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    tok = _tokens(4, base=22)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+    # store to both tiers, complete, then drop the CPU SWA slot so only SSD holds it
+    _pg, _rm, pcb, pop, _pe = eng.put(1, tok, mask, sm, dp_client_id=0)
+    _complete(pop, pcb)
+    # evict the CPU SWA (SWA-only eviction) so the CPU tier no longer matches it
+    eng.cpu_cache_engine._evict_swa(eng.cpu_cache_engine.swa_pool.num_used)
+
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    cpu_hit, _s, _k = eng.cpu_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    assert cpu_hit == 0, "precondition: CPU SWA must be gone"
+    ssd_hit, _s2, _k2 = eng.ssd_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    assert ssd_hit > 0, "precondition: SSD SWA must still hold the window"
+
+    graph, _rm2, gcb, gop, _ge = eng.get(
+        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm, dp_client_id=0)
+    swa = _swa_ops(graph)
+    kinds = sorted(o.transfer_type.name for o in swa)
+    assert "H2D" in kinds and "DISK2H" in kinds, (
+        f"SSD staging chain missing (CPU-only bug): {kinds}")
+    swa_h2d = [o for o in swa if o.transfer_type == TransferType.H2D][0]
+    swa_disk2h = [o for o in swa if o.transfer_type == TransferType.DISK2H][0]
+    assert swa_disk2h.op_id in swa_h2d.predecessors, "H2D must depend on SSD DISK2H"
+    _complete(gop, gcb)
+
+
+def test_get_prefers_cpu_when_both_tiers_have_swa():
+    """Tier priority CPU>SSD: when CPU still holds the SWA window, GET sources
+    from CPU (plain H2D, no staging) even though SSD also has it."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    tok = _tokens(4, base=23)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+    _pg, _rm, pcb, pop, _pe = eng.put(1, tok, mask, sm, dp_client_id=0)
+    _complete(pop, pcb)
+
+    graph, _rm2, gcb, gop, _ge = eng.get(
+        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm, dp_client_id=0)
+    swa = _swa_ops(graph)
+    kinds = sorted(o.transfer_type.name for o in swa)
+    assert "H2D" in kinds, kinds
+    assert "DISK2H" not in kinds, f"CPU-resident SWA must not stage from SSD: {kinds}"
+    _complete(gop, gcb)
+
+
+def test_swa_align_uses_best_across_tiers():
+    """Supersedes the #196 CPU-clamp guard: now that GET fetches all tiers,
+    swa_align must return the best (longest) reusable SWA hit across tiers, not
+    clamp to CPU. Here SSD holds a window CPU lost -> swa_align must still report
+    it (best == ssd_hit), so the graph is shaped to reuse it."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    tok = _tokens(4, base=24)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+    _pg, _rm, pcb, pop, _pe = eng.put(1, tok, mask, sm, dp_client_id=0)
+    _complete(pop, pcb)
+    eng.cpu_cache_engine._evict_swa(eng.cpu_cache_engine.swa_pool.num_used)
+
+    full_hit, swa_hit = eng.swa_align(tok, np.ones_like(tok, dtype=np.bool_))
+    assert full_hit == 4
+    assert swa_hit == 4, (
+        f"swa_align must report the SSD SWA hit (best across tiers), got {swa_hit} "
+        f"(the #196 CPU clamp would return 0 here)")
 
 
 if __name__ == "__main__":

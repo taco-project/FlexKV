@@ -900,7 +900,7 @@ class GlobalCacheEngine:
         # SWA hit is clamped to it (SWA subset of Full).
         num_full_hit = block_start_idx + num_gpu_blocks_to_transfer
         (swa_gpu_slots, swa_cpu_slots, swa_ssd_slots, swa_remote_slots,
-         swa_key, swa_lock_node) = \
+         swa_key, swa_lock_node, swa_staging_slot) = \
             self._swa_get_slots(request_id, sequence_meta, block_start_idx,
                                 block_end_idx, num_full_hit)
         swa_h2d_id = self.swa_cache.build_get_chain(
@@ -948,9 +948,14 @@ class GlobalCacheEngine:
         # (lock_for_load) so it can't be evicted before the SWA H2D reads it. When
         # that H2D completes, release the pin. Keyed on the SWA H2D op so it fires
         # exactly once on completion, alongside the full-KV op callbacks.
-        if swa_h2d_id is not None and swa_lock_node is not None:
+        # The SWA H2D completion callback releases the source-tier pin and, for a
+        # staged (SSD/REMOTE) source, frees the transient CPU staging slot. Keyed
+        # on the SWA H2D op so it fires exactly once, alongside the full-KV ops.
+        if swa_h2d_id is not None and (swa_lock_node is not None
+                                       or swa_staging_slot >= 0):
             op_callback_dict[swa_h2d_id] = partial(
-                self._swa_release_load_lock, node=swa_lock_node)
+                self._swa_release_load_lock, node=swa_lock_node,
+                staging_slot=swa_staging_slot)
 
         # Record metrics for GET operation
         if self._metrics_collector is not None:
@@ -1442,11 +1447,9 @@ class GlobalCacheEngine:
         # set_swa); the GPU slot is a placeholder bound LATE from the request's
         # swa_slot_mapping. The stored tail node is node_to_unlock[CPU] (the new
         # ready prefix's deepest node); its trailing page is the SWA window.
-        cpu_store_node = node_to_unlock[DeviceType.CPU][0] \
-            if DeviceType.CPU in node_to_unlock else None
         swa_gpu_slots, swa_cpu_slots, swa_ssd_slots, swa_remote_slots, swa_key = \
             self._swa_put_slots(request_id, sequence_meta, block_start_idx,
-                                block_end_idx, cpu_store_node)
+                                block_end_idx, node_to_unlock)
         swa_d2h_id = self.swa_cache.build_put_chain(
             transfer_graph,
             gpu_slot_ids=swa_gpu_slots,
@@ -2030,29 +2033,18 @@ class GlobalCacheEngine:
             remote_full_hit_blocks=full_hit_blocks,
             lock_for_load=lock_for_load)
 
-        # Tier-consistency (SWA subset of Full, AND graph shape must match the
-        # tier actually fetched). swa_align's return shapes the SWA transfer graph
-        # (kvtask truncates to usable=min(full, this)); but the GET data plane
-        # (_swa_get_slots) currently fetches the CPU tier ONLY. best_hit_blocks is
-        # the cross-tier MAX, so if SSD/REMOTE ever carry a LONGER SWA hit than
-        # CPU, returning best_hit_blocks would shape the graph for blocks the
-        # CPU-only fetch cannot fill -> src/dst block-count mismatch / stale-SWA
-        # read (silent corruption). Today SSD/REMOTE SWA default to 0 slots so
-        # best == cpu_hit and this is a no-op; clamp to the fetched (CPU) tier and
-        # warn once if a longer non-CPU hit is dropped, so enabling SSD/REMOTE SWA
-        # without extending the fetcher fails safe (lose a few SWA hits) instead
-        # of shaping an unfillable graph.
-        cpu_hit = swa_match.cpu_hit_blocks
+        # Return the best (longest) reusable SWA hit across tiers. This shapes the
+        # SWA transfer graph (kvtask truncates full to usable=min(full, this)),
+        # and the GET data plane (_swa_get_slots) now sources the window from the
+        # highest-priority tier that holds it (CPU > SSD > REMOTE, staging
+        # SSD/REMOTE -> CPU -> GPU), so any tier's hit is fetchable. best is
+        # already clamped per tier to that tier's Full-KV hit (SWA subset of Full)
+        # inside match_swa_prefix, so best <= full_hit_blocks always holds.
         best_hit = swa_match.best_hit_blocks
-        if best_hit > cpu_hit and not getattr(self, "_warned_swa_multitier", False):
-            self._warned_swa_multitier = True
-            flexkv_logger.warning(
-                "SWA multi-tier hit (best=%d blocks) exceeds the CPU tier "
-                "(cpu=%d); GET fetches CPU-only, clamping the SWA graph to the "
-                "CPU hit to avoid an unfillable transfer graph. Extend "
-                "_swa_get_slots to the winning tier before relying on SSD/REMOTE "
-                "SWA loads.", best_hit, cpu_hit)
-        return full_hit_blocks, cpu_hit
+        assert best_hit <= full_hit_blocks, (
+            f"SWA hit {best_hit} exceeds Full-KV hit {full_hit_blocks} "
+            "(SWA-subset-of-Full violated)")
+        return full_hit_blocks, best_hit
 
     # --- SWA slot sources for the get()/put() build chains --------------------
     # Resolve the per-tier SWA-pool slot ids for the current request so the SWA
@@ -2071,48 +2063,97 @@ class GlobalCacheEngine:
     def _empty_swa_slots(self, with_node: bool = False):
         empty = np.array([], dtype=np.int64)
         if with_node:
-            # (gpu, cpu, ssd, remote, swa_key, lock_node)
-            return empty, empty, empty, empty, -1, None
+            # (gpu, cpu, ssd, remote, swa_key, lock_node, staging_slot)
+            return empty, empty, empty, empty, -1, None, -1
         # (gpu, cpu, ssd, remote, swa_key)
         return empty, empty, empty, empty, -1
 
     def _swa_get_slots(self, request_id, sequence_meta, block_start_idx,
                        block_end_idx, full_hit_blocks):
-        """Resolve SWA-pool slots for a GET (load).
+        """Resolve SWA-pool slots for a GET (load), sourced across tiers.
 
-        Returns ``(gpu, cpu, ssd, remote, swa_key, lock_node)``. Matches the
-        node-mounted SWA within the full-KV hit (SWA subset of Full) on the CPU
-        tier, pins it (lock_for_load) so it survives until the SWA H2D reads it,
-        and returns the CPU SWA slot + the pinned node (released in the H2D
-        completion callback). Empty when SWA is disabled or there is no SWA hit.
-        """
+        Mirrors full-KV multi-tier staging: the trailing SWA window (page
+        granular, one slot) is sourced from the highest-priority tier that holds
+        it (CPU > SSD > REMOTE), matching full-KV's loader preference.
+
+        * CPU source: the matched CPU SWA slot feeds the SWA H2D directly (no
+          staging), and the CPU node is pinned (released on H2D completion).
+        * SSD/REMOTE source: there is no CPU-resident window, so a TRANSIENT CPU
+          SWA staging slot is allocated as the DISK2H/REMOTE2H destination and
+          the SWA H2D source (mirrors full-KV's fragment23 CPU staging blocks).
+          The source-tier node is pinned; the staging slot is freed on H2D
+          completion (it is unmounted — not a cached entry).
+
+        Returns ``(gpu, cpu, ssd, remote, swa_key, lock_node, staging_slot)``.
+        ``cpu`` is always the SWA H2D source (matched CPU slot OR staging slot);
+        ``ssd``/``remote`` are non-empty only for a staged source; ``staging_slot``
+        is the transient CPU slot to free on H2D completion (-1 when CPU-sourced).
+        Empty when SWA is disabled or no tier holds the window."""
         if not self.swa_cache.enabled or full_hit_blocks <= 0:
             return self._empty_swa_slots(with_node=True)
         cpu_engine = self.cpu_cache_engine
         if cpu_engine is None or not getattr(cpu_engine, "swa_enabled", False):
             return self._empty_swa_slots(with_node=True)
-        # match_swa returns (swa_hit_blocks, cpu_slot, swa_key) and, with
-        # lock_for_load=True, pins the matched CPU SWA node. We also need the node
-        # handle to release the pin later, so use the lower-level match to grab it.
-        swa_hit, cpu_slot, swa_key, lock_node = \
-            cpu_engine.match_swa_locked(sequence_meta, upper_bound_blocks=full_hit_blocks)
-        if swa_hit <= 0 or cpu_slot < 0:
-            return self._empty_swa_slots(with_node=True)
-        cpu = np.array([cpu_slot], dtype=np.int64)
         gpu = self._SWA_GPU_PLACEHOLDER.copy()
         empty = np.array([], dtype=np.int64)
-        # SSD/REMOTE SWA staging is a later tier; CPU-resident SWA needs no stage.
-        return gpu, cpu, empty, empty, swa_key, lock_node
+
+        # 1) CPU tier first (preferred, no staging). match_swa_locked pins the
+        #    matched CPU SWA node; the H2D completion callback releases the pin.
+        swa_hit, cpu_slot, swa_key, lock_node = \
+            cpu_engine.match_swa_locked(sequence_meta, upper_bound_blocks=full_hit_blocks)
+        if swa_hit > 0 and cpu_slot >= 0:
+            cpu = np.array([cpu_slot], dtype=np.int64)
+            return gpu, cpu, empty, empty, swa_key, lock_node, -1
+
+        # 2) Fall back to SSD then REMOTE: source tier stages into a transient
+        #    CPU SWA slot (DISK2H/REMOTE2H -> CPU) that the SWA H2D then reads.
+        for device_type in (DeviceType.SSD, DeviceType.REMOTE):
+            engine = self.cache_engines.get(device_type)
+            if engine is None or not getattr(engine, "swa_enabled", False):
+                continue
+            tier_hit, tier_slot, tier_key, tier_node = \
+                engine.match_swa_locked(sequence_meta, upper_bound_blocks=full_hit_blocks)
+            if tier_hit <= 0 or tier_slot < 0:
+                continue
+            # Transient CPU staging slot (unmounted; freed on H2D completion).
+            staging_slot = cpu_engine.swa_alloc_slot()
+            if staging_slot < 0:
+                # No CPU room to stage: release the just-taken source pin and
+                # skip SWA reuse for this get (full-KV load is unaffected).
+                if tier_node is not None and getattr(tier_node, "swa_lock_ref", 0) > 0:
+                    tier_node.dec_swa_lock_ref()
+                cpu_engine._drain_swa_slots()
+                return self._empty_swa_slots(with_node=True)
+            cpu = np.array([staging_slot], dtype=np.int64)
+            tier = np.array([tier_slot], dtype=np.int64)
+            ssd = tier if device_type == DeviceType.SSD else empty
+            remote = tier if device_type == DeviceType.REMOTE else empty
+            return gpu, cpu, ssd, remote, tier_key, tier_node, staging_slot
+
+        return self._empty_swa_slots(with_node=True)
 
     def _swa_put_slots(self, request_id, sequence_meta, block_start_idx,
-                       block_end_idx, cpu_store_node):
-        """Resolve SWA-pool slots for a PUT (store).
+                       block_end_idx, node_to_unlock):
+        """Resolve SWA-pool slots for a PUT (store), across all stored tiers.
 
-        Allocates a fresh SWA host-pool slot (evicting SWA-LRU when full) and
-        mounts it on the stored tail node (set_swa) so a future GET matches it.
-        Returns ``(gpu_placeholder, cpu=[slot], ssd, remote, swa_key)``; empty
-        when SWA is disabled, there is no stored node, or the pool is full and
-        every entry is locked (full-KV store is unaffected)."""
+        Mirrors full-KV write-through: the SWA D2H lands the window in the CPU
+        SWA pool, and — for every tier full-KV ALSO stored to (CPU/SSD/REMOTE,
+        i.e. present in ``node_to_unlock``) — allocate that tier's SWA slot and
+        mount it on that tier's store node (set_swa). build_put_chain then emits
+        the SWA H2DISK / H2REMOTE write-through ops (CPU SWA slot -> tier slot),
+        fire-and-forget, exactly like the full-KV H2DISK/H2REMOTE. Gating on
+        ``node_to_unlock`` keeps SWA a subset of Full PER TIER: SWA is written to
+        a tier iff full-KV was.
+
+        Returns ``(gpu_placeholder, cpu=[slot], ssd, remote, swa_key)``. The CPU
+        slot is required (the D2H target); ssd/remote are non-empty only when
+        that tier both stored full-KV and has an SWA host pool. All empty when
+        SWA is disabled, there is no CPU store node, or the CPU pool is full and
+        fully locked (full-KV store is unaffected)."""
+        empty = np.array([], dtype=np.int64)
+        cpu_store_node = (node_to_unlock[DeviceType.CPU][0]
+                          if node_to_unlock and DeviceType.CPU in node_to_unlock
+                          else None)
         if not self.swa_cache.enabled or cpu_store_node is None:
             return self._empty_swa_slots()
         cpu_engine = self.cpu_cache_engine
@@ -2125,19 +2166,51 @@ class GlobalCacheEngine:
         cpu_engine._drain_swa_slots()
         cpu = np.array([slot], dtype=np.int64)
         gpu = self._SWA_GPU_PLACEHOLDER.copy()
-        empty = np.array([], dtype=np.int64)
-        return gpu, cpu, empty, empty, slot
 
-    def _swa_release_load_lock(self, node) -> None:
-        """Release the load-time SWA pin taken by _swa_get_slots (H2D done).
+        # Write-through to a lower tier iff full-KV stored there AND that tier
+        # has an SWA host pool. One slot per tier (page-granular window). A tier
+        # whose SWA pool is full-and-locked simply skips write-through (its slot
+        # stays empty) — the CPU SWA store is unaffected.
+        def _tier_slot(device_type):
+            if device_type not in node_to_unlock:
+                return empty
+            engine = self.cache_engines.get(device_type)
+            if engine is None or not getattr(engine, "swa_enabled", False):
+                return empty
+            tier_slot = engine.swa_alloc_slot()
+            if tier_slot < 0:
+                return empty
+            engine.set_swa(node_to_unlock[device_type][0], tier_slot)
+            engine._drain_swa_slots()
+            return np.array([tier_slot], dtype=np.int64)
 
-        Uses the plain SWA lock dec (dec_swa_lock_ref), NOT dec_swa_lock_only:
-        the loaded SWA window stays cached for future reuse; we only drop the
-        eviction pin. No-op if the node lost its SWA meanwhile."""
+        ssd = _tier_slot(DeviceType.SSD)
+        remote = _tier_slot(DeviceType.REMOTE)
+        return gpu, cpu, ssd, remote, slot
+
+
+    def _swa_release_load_lock(self, node, staging_slot: int = -1) -> None:
+        """SWA H2D completion callback: release the source pin and free any
+        transient CPU staging slot.
+
+        For a CPU-sourced load, ``node`` is the matched CPU SWA node and its pin
+        is dropped with the plain dec (dec_swa_lock_ref, NOT dec_swa_lock_only):
+        the loaded window stays cached for future reuse. For a staged
+        (SSD/REMOTE) source, ``node`` is the source-tier node (same pin release)
+        and ``staging_slot`` is the transient CPU SWA slot used as the DISK2H/
+        REMOTE2H destination — it is unmounted (not a cached entry), so free it
+        back to the CPU SWA pool. No-op on parts that are absent."""
         try:
             if node is not None and getattr(node, "swa_lock_ref", 0) > 0:
                 node.dec_swa_lock_ref()
         except Exception:  # noqa: BLE001 — never let a callback crash the loop
+            pass
+        try:
+            if staging_slot is not None and staging_slot >= 0:
+                cpu_engine = self.cpu_cache_engine
+                if cpu_engine is not None and cpu_engine.swa_pool is not None:
+                    cpu_engine.swa_pool.free(int(staging_slot))
+        except Exception:  # noqa: BLE001
             pass
 
     @nvtx.annotate("Match Prefix", color="yellow")
