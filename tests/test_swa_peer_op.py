@@ -322,20 +322,21 @@ def test_match_cpu_preferred_then_ssd_then_remote():
     mgr = _mgr_tiers(cpu=_FakeSWANode(0, -1, -1),
                      ssd=_FakeSWANode(2, 22, 222),
                      remote=_FakeSWANode(5, 33, 333))
-    r = mgr.match_prefix(_Seq(), 6, 6, 6)
+    r = mgr.match_prefix(_Seq(), 6)
     assert r.cpu_hit_blocks == 0
     assert r.ssd_hit_blocks == 2 and r.ssd_slot == 22
     assert r.remote_hit_blocks == 5 and r.remote_slot == 33
     assert r.best_hit_blocks == 5
 
 
-def test_match_per_tier_clamp_to_full_hit():
+def test_match_clamp_to_full_hit():
+    """Every tier's SWA hit is clamped to the single ``max_full_hit_blocks``
+    upper bound (SWA subset of Full)."""
     mgr = _mgr_tiers(cpu=_FakeSWANode(0, -1, -1),
                      ssd=_FakeSWANode(9, 22, 222),
                      remote=_FakeSWANode(9, 33, 333))
-    r = mgr.match_prefix(_Seq(), cpu_full_hit_blocks=0,
-                         ssd_full_hit_blocks=2, remote_full_hit_blocks=3)
-    assert r.ssd_hit_blocks == 2 and r.remote_hit_blocks == 3
+    r = mgr.match_prefix(_Seq(), max_full_hit_blocks=3)
+    assert r.ssd_hit_blocks == 3 and r.remote_hit_blocks == 3
 
 
 def test_match_no_cpu_index_empty():
@@ -350,15 +351,15 @@ def test_match_propagates_per_tier_keys():
     mgr = _mgr_tiers(cpu=_FakeSWANode(1, 10, 100),
                      ssd=_FakeSWANode(2, 22, 222),
                      remote=_FakeSWANode(5, 33, 333))
-    r = mgr.match_prefix(_Seq(), 6, 6, 6)
+    r = mgr.match_prefix(_Seq(), 6)
     assert r.cpu_hit_blocks == 1 and r.cpu_slot == 10 and r.cpu_key == 100
     assert r.ssd_key == 222 and r.remote_key == 333
     assert r.best_hit_blocks == 5        # cross-tier max (REMOTE here)
 
 
 def test_match_forwards_upper_bound_and_lock_per_tier():
-    """Each tier's match_swa is called with THAT tier's Full-KV hit as the upper
-    bound (SWA subset of Full) and the caller's lock_for_load is forwarded."""
+    """Each tier's match_swa is called with the single ``max_full_hit_blocks``
+    upper bound (SWA subset of Full) and the caller's lock_for_load is forwarded."""
     calls = {}
 
     def _engine(tier):
@@ -373,10 +374,8 @@ def test_match_forwards_upper_bound_and_lock_per_tier():
                DeviceType.REMOTE: _engine("remote")}
     gce = SimpleNamespace(cache_engines=engines,
                           cache_config=SimpleNamespace(enable_swa_transfer=True))
-    SWACacheManager(gce).match_prefix(_Seq(), cpu_full_hit_blocks=3,
-                                      ssd_full_hit_blocks=5,
-                                      remote_full_hit_blocks=7,
+    SWACacheManager(gce).match_prefix(_Seq(), max_full_hit_blocks=5,
                                       lock_for_load=True)
-    assert calls["cpu"] == (3, True)
+    assert calls["cpu"] == (5, True)
     assert calls["ssd"] == (5, True)
-    assert calls["remote"] == (7, True)
+    assert calls["remote"] == (5, True)

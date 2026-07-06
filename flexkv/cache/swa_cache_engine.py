@@ -134,30 +134,29 @@ class SWACacheManager:
 
     def match_prefix(self,
                      sequence_meta: SequenceMeta,
-                     cpu_full_hit_blocks: int,
-                     ssd_full_hit_blocks: int = 0,
-                     remote_full_hit_blocks: int = 0,
+                     max_full_hit_blocks: int,
                      lock_for_load: bool = False,
                      cpu_match_result=None,
                      ssd_match_result=None,
                      remote_match_result=None) -> SWAMatchResult:
-        """Match the trailing-SWA prefix on each tier, clamped to its Full-KV hit.
+        """Match the trailing-SWA prefix on each tier, clamped to the Full-KV hit.
 
         Each tier's node-mounted SWA (on its radix tree) is matched independently
-        within that tier's Full-KV hit (SWA subset of Full).
-        CPU is preferred; SSD then REMOTE are the fallbacks whose load needs a
-        staging chain (SWA DISK2H / REMOTE2H -> SWA H2D, all is_swa=True).
+        within the (already cross-tier max'd) Full-KV hit ``max_full_hit_blocks``
+        (SWA subset of Full). CPU is preferred; SSD then REMOTE are the fallbacks
+        whose load needs a staging chain (SWA DISK2H / REMOTE2H -> SWA H2D, all
+        is_swa=True).
 
         When a tier's Full-KV ``*_match_result`` is supplied (from the SAME
-        forward pass that produced its ``*_full_hit_blocks``), the SWA hit is
+        forward pass that produced ``max_full_hit_blocks``), the SWA hit is
         REUSED from it via ``match_swa_from_result`` — no second tree walk. When
         omitted, it falls back to the standalone ``match_swa`` probe.
 
         Args:
             sequence_meta: the (page-aligned) query prefix.
-            cpu_full_hit_blocks: Full-KV CPU hit length in blocks (CPU upper bound).
-            ssd_full_hit_blocks: Full-KV SSD hit length in blocks (SSD upper bound).
-            remote_full_hit_blocks: Full-KV REMOTE hit length in blocks (upper bound).
+            max_full_hit_blocks: Full-KV hit length in blocks, the single upper
+                bound applied to every tier (the caller has already collapsed the
+                per-tier Full hits to their cross-tier max).
             lock_for_load: pin the matched SWA entries against eviction until load.
             cpu_match_result / ssd_match_result / remote_match_result: the tier's
                 Full-KV match to reuse (optional; carries last_swa_node/swa_hit_blocks).
@@ -184,17 +183,17 @@ class SWACacheManager:
                 sequence_meta, upper_bound_blocks=upper_bound,
                 lock_for_load=lock_for_load)
 
-        if cpu_full_hit_blocks > 0:
+        if max_full_hit_blocks > 0:
             result.cpu_hit_blocks, result.cpu_slot, result.cpu_key = \
-                _match(self._engine(DeviceType.CPU), cpu_full_hit_blocks, cpu_match_result)
+                _match(self._engine(DeviceType.CPU), max_full_hit_blocks, cpu_match_result)
 
-        if self._swa_enabled_tier(DeviceType.SSD) and ssd_full_hit_blocks > 0:
-            result.ssd_hit_blocks, result.ssd_slot, result.ssd_key = \
-                _match(self._engine(DeviceType.SSD), ssd_full_hit_blocks, ssd_match_result)
+            if self._swa_enabled_tier(DeviceType.SSD):
+                result.ssd_hit_blocks, result.ssd_slot, result.ssd_key = \
+                    _match(self._engine(DeviceType.SSD), max_full_hit_blocks, ssd_match_result)
 
-        if self._swa_enabled_tier(DeviceType.REMOTE) and remote_full_hit_blocks > 0:
-            result.remote_hit_blocks, result.remote_slot, result.remote_key = \
-                _match(self._engine(DeviceType.REMOTE), remote_full_hit_blocks, remote_match_result)
+            if self._swa_enabled_tier(DeviceType.REMOTE):
+                result.remote_hit_blocks, result.remote_slot, result.remote_key = \
+                    _match(self._engine(DeviceType.REMOTE), max_full_hit_blocks, remote_match_result)
         return result
 
     # --- peer-op graph construction (gated) --------------------------------
