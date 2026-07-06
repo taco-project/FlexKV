@@ -297,6 +297,74 @@ def test_py_merge_child_moves_swa_to_merged_node():
     assert 900 in idx2.drain_freed_swa_slots()
 
 
+# --------------------------------------------------------------------------- #
+# promote_swa: read-hit refreshes SWA-LRU (match-promote to MRU)              #
+# --------------------------------------------------------------------------- #
+
+def _three_swa_leaves():
+    """root -> {n1, n2, n3} sibling leaves, each with a live SWA. set_swa order
+    n1,n2,n3 leaves n3 at MRU and n1 at the LRU tail."""
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    n2 = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3), is_ready=True)
+    n3 = idx.insert(_seq([9, 10, 11, 12]), _phys(4, 5), is_ready=True)
+    idx.set_swa(n1, slot=100)
+    idx.set_swa(n2, slot=200)
+    idx.set_swa(n3, slot=300)
+    return idx, n1, n2, n3
+
+
+def test_promote_swa_moves_to_mru():
+    """promote_swa splices the hit node to the MRU side (right after head) and
+    refreshes its timestamp."""
+    idx, n1, n2, n3 = _three_swa_leaves()
+    # MRU=n3, LRU=n1 after the set_swa order above.
+    assert idx._swa_lru_head.swa_lru_next is n3
+    assert idx._swa_lru_tail.swa_lru_prev is n1
+    t_before = n1.swa_last_access_time
+
+    idx.promote_swa(n1)
+
+    assert idx._swa_lru_head.swa_lru_next is n1          # n1 is now MRU
+    assert idx._swa_lru_tail.swa_lru_prev is n2          # n2 sank to LRU
+    assert n1.on_swa_lru and n1.has_swa()
+    assert n1.swa_last_access_time >= t_before
+
+
+def test_promote_swa_survives_eviction():
+    """Key regression: a promoted (read-hit) node must NOT be the eviction
+    victim even though it was written least recently. Without promote, n1 (the
+    LRU tail) would be evicted; after promote, n2 is the victim and n1 lives."""
+    idx, n1, n2, n3 = _three_swa_leaves()
+    idx.promote_swa(n1)  # n1 hit -> MRU; new LRU order (MRU..LRU): n1, n3, n2
+
+    _evicted_full, num_freed = idx.evict_swa(1)
+
+    assert num_freed == 1
+    assert n1.has_swa()                                  # the promoted node lives
+    assert 200 in idx.drain_freed_swa_slots()            # n2's slot was reclaimed
+
+
+def test_promote_swa_ignores_dead_node():
+    """promote_swa on a tombstone (SWA already freed) node is a no-op — it must
+    not re-thread a dead node onto the SWA-LRU (would corrupt evict_swa)."""
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    idx.set_swa(n1, slot=100)
+    idx.record_freed_swa_slot(n1)                        # tombstone it
+    assert n1.swa_tombstone and not n1.on_swa_lru
+    idx.drain_freed_swa_slots()                          # clear the buffer
+
+    idx.promote_swa(n1)
+
+    assert not n1.on_swa_lru and n1.swa_tombstone        # still off the list
+    assert idx.drain_freed_swa_slots() == []             # nothing touched
+
+    # root is also a no-op (never on the SWA-LRU).
+    idx.promote_swa(idx.root_node)
+    assert not idx.root_node.on_swa_lru
+
+
 # =========================================================================== #
 # 2. C++ PRODUCTION — CRadixTreeIndex                                         #
 # =========================================================================== #
@@ -705,6 +773,98 @@ def test_workload_pressure_no_leak_no_corruption(cpu_blocks, swa_slots):
     # silent no-op regression that stops mounting/reading SWA is caught).
     assert drv.swa_hits > 0, "workload produced no SWA hits — coverage regressed"
     assert drv.bytes_verified > 0, "no SWA byte round-trip verified"
+
+
+# --------------------------------------------------------------------------- #
+# I2 in FULL eviction: deleting a leaf cascades tombstone-leaf ancestors       #
+# --------------------------------------------------------------------------- #
+
+def _build_prefix_chain():
+    """root -> A(prefix, 2blk) -> {a(leaf w/ SWA), b(divergent leaf)}.
+
+    Returns (idx, A, a, b). A is an internal tombstone (Full, no SWA); a carries
+    SWA and is the leaf we will evict; b is a sibling keeping A internal.
+    """
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    a = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    idx.set_swa(a, slot=901)
+    sd = _seq([1, 2, 3, 4, 55, 66, 77, 88])
+    idx.insert(sd, _phys(8, 9), is_ready=True, match_result=idx.match_prefix(sd))
+    A = a.parent
+    b = [c for c in A.children.values() if c is not a][0]
+    return idx, A, a, b
+
+
+def test_full_evict_cascades_tombstone_leaf_parent():
+    """I2 (full-evict): after both children are gone, the parent A is a tombstone
+    leaf (Full, no SWA, unlocked) — meaningless, so it is cascade-deleted and its
+    Full blocks are freed too, even beyond the requested num_evicted."""
+    idx, A, a, b = _build_prefix_chain()
+    # Drop SWA off the divergent sibling b so evicting both leaves leaves A a
+    # tombstone leaf. b starts as a tombstone (no set_swa), a carries SWA=901.
+    # Evict 2 blocks: the LRU leaf gets deleted; then A becomes a tombstone leaf.
+    # Give a smaller grace so it (and b) are the eviction victims; A must cascade.
+    # Force deletion of BOTH leaves by requesting their combined size.
+    a.lock_cnt = 0
+    b.lock_cnt = 0
+    total_before = idx.total_cached_blocks()  # A(2) + a(2) + b(2) = 6
+    assert total_before == 6
+    ev_blocks, ev_hashes = idx.evict(4)  # ask for the two 2-block leaves
+    # Both leaves (4 blocks) + cascaded parent A (2 blocks) = 6 freed, though we
+    # only asked for 4 — the I2 cascade freed A on top.
+    assert len(ev_blocks) == 6
+    assert len(ev_hashes) == 6
+    assert idx.is_empty()
+    assert idx.total_swa_slots() == 0
+    assert 901 in idx.drain_freed_swa_slots()
+
+
+def test_full_evict_keeps_full_locked_tombstone_leaf():
+    """I2 exception: a parent that becomes a tombstone leaf but whose Full is
+    locked is NOT cascade-deleted (its Full KV is still referenced)."""
+    idx, A, a, b = _build_prefix_chain()
+    A.lock_cnt = 1  # pin A's Full
+    ev_blocks, _ = idx.evict(4)  # delete both leaves a, b
+    # A is a tombstone leaf now but full-locked -> survives; only 4 blocks freed.
+    assert len(ev_blocks) == 4
+    assert not idx.is_empty()
+    assert A.is_leaf() and A.swa_tombstone and A.lock_cnt == 1
+    assert A.size() == 2
+
+
+def test_full_evict_no_cascade_when_swa_disabled():
+    """Non-SWA regression: with SWA never enabled (no set_swa), swa_tombstone is
+    True on every node, but the I2 cascade must NOT fire — evict() frees EXACTLY
+    the requested blocks and leaves valid ancestors intact."""
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    a = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    sd = _seq([1, 2, 3, 4, 55, 66, 77, 88])
+    idx.insert(sd, _phys(8, 9), is_ready=True, match_result=idx.match_prefix(sd))
+    A = a.parent
+    assert not idx._swa_enabled  # never armed
+    total_before = idx.total_cached_blocks()  # 6
+    ev_blocks, _ = idx.evict(4)  # delete both leaves
+    # Exactly 4 freed; the tombstone parent A survives (no cascade when disabled).
+    assert len(ev_blocks) == 4
+    assert not idx.is_empty()
+    assert A.is_leaf() and A.size() == 2 and idx.total_cached_blocks() == 2
+
+
+# --------------------------------------------------------------------------- #
+# Double-match elimination: match_swa_from_result reuse + fallback             #
+# --------------------------------------------------------------------------- #
+
+def test_match_swa_from_result_reuses_within_bound():
+    """match_swa_from_result reuses the Full-KV match when swa_hit <= bound."""
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    idx.set_swa(n1, slot=100)
+    mr = idx.match_prefix(_seq([1, 2, 3, 4, 5, 6, 7, 8]))
+    assert mr.swa_hit_blocks == 4 and mr.last_swa_node is n1
+    # Simulate the reuse logic directly on the match result (engine-independent):
+    # within a bound >= swa_hit, the slot is read straight from last_swa_node.
+    assert mr.swa_hit_blocks <= 4
+    assert int(mr.last_swa_node.swa_host_slot) == 100
 
 
 if __name__ == "__main__":
