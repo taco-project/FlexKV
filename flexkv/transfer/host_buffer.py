@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 from dataclasses import dataclass
 from typing import Optional
 
@@ -9,48 +8,32 @@ import torch
 from flexkv.common.debug import flexkv_logger
 from flexkv.storage.allocator import alloc_hugepage_tensor, free_hugepage_tensor
 
-_cudart = None
-_cudart_load_error: Optional[OSError] = None
-
-
-def _get_cudart():
-    global _cudart
-    global _cudart_load_error
-
-    if _cudart is None and _cudart_load_error is None:
-        try:
-            _cudart = ctypes.CDLL("libcudart.so")
-        except OSError as e:
-            _cudart_load_error = e
-
-    if _cudart is None:
-        raise RuntimeError(f"libcudart.so is unavailable: {_cudart_load_error}")
-    return _cudart
-
 
 def cuda_host_registration_available() -> bool:
     try:
-        _get_cudart()
-    except RuntimeError:
+        torch.cuda.cudart()
+        return True
+    except Exception:
         return False
-    return True
 
 
 def cudaHostRegister(tensor: torch.Tensor) -> None:
-    cudart = _get_cudart()
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 1)
-    if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+    err = torch.cuda.cudart().cudaHostRegister(ptr, size, 1)
+    if isinstance(err, tuple):
+        err = err[0]
+    if err != 0:
+        raise RuntimeError(f"cudaHostRegister failed with error code {err}")
 
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
-    cudart = _get_cudart()
     ptr = tensor.data_ptr()
-    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
-    if ret != 0:
-        raise RuntimeError(f"cudaHostUnregister failed with error code {ret}")
+    err = torch.cuda.cudart().cudaHostUnregister(ptr)
+    if isinstance(err, tuple):
+        err = err[0]
+    if err != 0:
+        raise RuntimeError(f"cudaHostUnregister failed with error code {err}")
 
 
 @dataclass

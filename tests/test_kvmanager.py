@@ -37,7 +37,7 @@ def _fp8_cuda_ops_unavailable():
         t = torch.tensor([1.0], dtype=torch.float8_e4m3fn, device="cuda")
         t.mul(1.0)
         return False
-    except NotImplementedError:
+    except (NotImplementedError, RuntimeError):
         return True
 
 def run_tp_client(dp_client_id,

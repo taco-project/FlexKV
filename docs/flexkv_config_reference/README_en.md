@@ -99,6 +99,7 @@ Some configurations can only be set through environment variables.
 | `FLEXKV_TRANSFER_NUM_CTA_H2D` | int | 4 | Number of CUDA thread blocks (CTAs) used for H2D transfer, only effective when `FLEXKV_USE_CE_TRANSFER_H2D` is 0 |
 | `FLEXKV_TRANSFER_NUM_CTA_D2H` | int | 4 | Number of CUDA thread blocks (CTAs) used for D2H transfer, only effective when `FLEXKV_USE_CE_TRANSFER_D2H` is 0 |
 | `FLEXKV_MLA_D2H_MODE` | str | "sharded" | **Only applicable to MLA scenarios** (kv_heads=1, all TP ranks have identical KV). Controls how CPU KV Cache is written during D2H transfer. Available options:<br/>• `sharded` - Each GPU writes 1/N shard to form one complete KV<br/>• `all_write` - Each GPU writes complete KV to its own location (Nx CPU memory)<br/>• `rank0_only` - Only rank 0 writes complete KV |
+| `FLEXKV_LAYERWISE_NOTIFY_MODE` | str | "hostfunc" | Notification mechanism used by layerwise H2D transfer to signal the inference engine after each layer batch completes:<br/>• `hostfunc` - Default. Uses `cudaLaunchHostFunc` to enqueue a host callback on the CUDA stream; fires precisely when the GPU finishes the batch<br/>• `polling` - A background thread polls per-batch CUDA events via `cudaEventQuery` and writes the eventfd as soon as all GPUs complete each batch. Avoids the cross-thread scheduling overhead of `cudaLaunchHostFunc`; benchmarked faster than `hostfunc` on NVIDIA 8x GPU (e.g. cuda engine: small 0.60→0.40ms 1.50x, medium 4.39→1.87ms 2.35x, large 16.79→16.62ms 1.01x). Costs one busy-polling CPU thread per `LayerwiseTransferGroup` instance |
 
 ---
 

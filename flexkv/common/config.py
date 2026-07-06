@@ -469,6 +469,11 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # MLA D2H transfer mode (only effective when kv_heads=1)
     # Available modes: "sharded" (default), "all_write", "rank0_only"
     mla_d2h_mode=os.getenv('FLEXKV_MLA_D2H_MODE', 'sharded'),
+
+    # Layerwise notification mode
+    # "hostfunc" (default): notify via cudaLaunchHostFunc callback
+    # "polling": notify via cudaEventRecord + polling thread
+    layerwise_notify_mode=os.getenv('FLEXKV_LAYERWISE_NOTIFY_MODE', 'hostfunc'),
 )
 
 @dataclass
@@ -553,7 +558,26 @@ def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
 def update_default_config_from_user_config(rank_info: RankInfo,
                                            cache_config: CacheConfig,
                                            user_config: UserConfig) -> None:
-    block_size_in_bytes = rank_info.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
+    main_block_size_in_bytes = (
+        rank_info.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
+    )
+    indexer_block_size_in_bytes = 0
+    if cache_config.indexer is not None:
+        indexer_cfg = cache_config.indexer
+        # Indexer is MLA-style (single shared head set, no TP head split).
+        # head_size already includes page_stride_size (main tokens_per_block ×
+        # index_head_dim), so per-block bytes = num_kv_heads × head_size ×
+        # dtype.itemsize — no additional tokens_per_block multiplication.
+        indexer_bytes_per_token_per_layer = (
+            indexer_cfg.num_kv_heads
+            * indexer_cfg.head_size
+            * indexer_cfg.dtype.itemsize
+        )
+        indexer_block_size_in_bytes = (
+            rank_info.num_layers_per_pp_stage
+            * indexer_bytes_per_token_per_layer
+        )
+    block_size_in_bytes = main_block_size_in_bytes + indexer_block_size_in_bytes
 
     assert user_config.cpu_cache_gb > 0
     assert user_config.ssd_cache_gb >= 0
@@ -579,6 +603,19 @@ def update_default_config_from_user_config(rank_info: RankInfo,
 
     cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes) // capacity_divisor
     cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes) // capacity_divisor
+
+    if cache_config.indexer is not None:
+        flexkv_logger.info(
+            f"[CacheConfig] GB->blocks conversion (with indexer): "
+            f"main_block_size={main_block_size_in_bytes} B, "
+            f"indexer_block_size={indexer_block_size_in_bytes} B, "
+            f"total_block_size={block_size_in_bytes} B"
+        )
+    else:
+        flexkv_logger.info(
+            f"[CacheConfig] GB->blocks conversion: "
+            f"block_size={block_size_in_bytes} B"
+        )
 
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0

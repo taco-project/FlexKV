@@ -477,7 +477,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("indexer_ssd_kv_stride_in_bytes") = 0,
            py::arg("indexer_cpu_chunk_size_in_bytes") = 0,
            py::arg("indexer_num_blocks_per_file") = 0,
-           py::arg("mla_d2h_mode") = "sharded");
+           py::arg("mla_d2h_mode") = "sharded",
+           py::arg("notify_mode") = "hostfunc");
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
         "Transfer KV blocks between remote and CPU memory",

@@ -3,7 +3,7 @@ import json
 import os
 import torch
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
@@ -15,27 +15,6 @@ if TYPE_CHECKING:
 
 
 logger = flexkv_logger
-
-
-def _parse_dtype_str(dtype_str: str) -> torch.dtype:
-    """Convert a dtype string (e.g. 'fp8', 'bfloat16', 'fp8_e4m3') to torch.dtype.
-
-    Shared by sglang / vllm / TRT-LLM integration adapters so that dtype
-    parsing logic is defined in exactly one place.
-    """
-    dtype_map = {
-        "float16": torch.float16,
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "fp16": torch.float16,
-        "fp32": torch.float32,
-        "bf16": torch.bfloat16,
-        "fp8": torch.float8_e4m3fn,
-        "float8": torch.float8_e4m3fn,
-        "e4m3": torch.float8_e4m3fn,
-        "fp8_e4m3": torch.float8_e4m3fn,
-    }
-    return dtype_map.get(dtype_str.lower(), torch.bfloat16)
 
 
 @dataclass
@@ -62,7 +41,62 @@ class FlexKVConfig:
         if self.gpu_register_port == "":
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
-    def _detect_indexer_config_from_hf(self, hf_config, source: str = "") -> None:
+    @staticmethod
+    def _parse_dtype_str(dtype_str: str) -> torch.dtype:
+        """Convert a dtype string to torch.dtype. Shared by all adapters."""
+        dtype_map = {
+            "float16": torch.float16,
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp8": torch.float8_e4m3fn,
+            "float8": torch.float8_e4m3fn,
+            "e4m3": torch.float8_e4m3fn,
+            "fp8_e4m3": torch.float8_e4m3fn,
+        }
+        return dtype_map.get(dtype_str.lower(), torch.bfloat16)
+
+    def _resolve_dtype(
+        self,
+        framework_dtype_str: Optional[str],
+        fallback_dtype: torch.dtype,
+    ) -> None:
+        """Resolve KV cache dtype with unified priority logic.
+
+        Priority:
+          1. User env-var / config (user_config.kv_cache_dtype) — highest
+          2. Framework-reported dtype (framework_dtype_str, e.g. from
+             sglang --kv-cache-dtype or vllm cache_dtype)
+          3. fallback_dtype — model weight dtype or hardcoded default
+        """
+        user_dtype_str = self.user_config.kv_cache_dtype
+
+        if user_dtype_str is not None:
+            resolved = self._parse_dtype_str(user_dtype_str)
+            self.model_config.dtype = resolved
+            logger.info(f"[FlexKV] Using kv_cache_dtype from user_config: '{user_dtype_str}' -> {resolved}")
+            return
+
+        if framework_dtype_str is not None and framework_dtype_str != "auto":
+            resolved = self._parse_dtype_str(framework_dtype_str)
+            self.model_config.dtype = resolved
+            logger.info(f"[FlexKV] Using kv_cache_dtype from framework config: '{framework_dtype_str}' -> {resolved}")
+            return
+
+        self.model_config.dtype = fallback_dtype
+        logger.warning(
+            f"[FlexKV] No kv_cache_dtype from user/framework config, "
+            f"falling back to {fallback_dtype}."
+        )
+
+    def _detect_indexer_config_from_hf(
+        self,
+        hf_config,
+        indexer_head_size: Optional[int] = None,
+        indexer_dtype: Optional[torch.dtype] = None,
+    ) -> None:
         if hf_config is None:
             return
 
@@ -80,23 +114,22 @@ class FlexKVConfig:
             else:
                 head_size = qk_rope_head_dim
 
-            # tokens_per_block is already set to sglang page_size before this
-            # call, so each FlexKV block = 1 sglang page.  The indexer maps
-            # 1:1 with blocks — no extra page_size grouping is needed.  For
-            # NSA/DSA models, head_size stores the packed per-page buffer width
-            # so the CPU layout matches the GPU indexer tensor shape.
+            if indexer_head_size is not None and indexer_head_size > 0:
+                head_size = indexer_head_size
+
+            dtype = indexer_dtype if indexer_dtype is not None else torch.uint8
+
             self.cache_config.indexer = IndexerCacheConfig(
                 head_size=head_size,
                 num_kv_heads=1,
-                dtype=torch.uint8,
+                dtype=dtype,
             )
-            source_label = f" ({source})" if source else ""
             logger.info(
-                f"Detected sparse attention indexer config{source_label}: "
-                f"head_size={head_size}, dtype=uint8, "
+                f"Detected sparse attention indexer config: "
+                f"head_size={head_size}, dtype={dtype}, "
                 f"tokens_per_block={self.cache_config.tokens_per_block}")
         except Exception as e:
-            logger.debug(f"Could not detect indexer config ({source}): {e}")
+            logger.debug(f"Could not detect indexer config: {e}")
 
     @classmethod
     def from_env(cls) -> 'FlexKVConfig':
@@ -125,26 +158,11 @@ class FlexKVConfig:
 
         self.model_config.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.model_config.head_size = vllm_config.model_config.get_head_size()
-        user_dtype_str = self.user_config.kv_cache_dtype
         vllm_kv_cache_dtype = getattr(vllm_config.cache_config, 'cache_dtype', 'auto')
-        if user_dtype_str is not None:
-            self.model_config.dtype = _parse_dtype_str(user_dtype_str)
-            logger.info(
-                f"[FlexKV vllm] Using kv_cache_dtype from user_config: "
-                f"'{user_dtype_str}' -> {self.model_config.dtype}"
-            )
-        elif isinstance(vllm_kv_cache_dtype, str) and vllm_kv_cache_dtype != 'auto':
-            self.model_config.dtype = _parse_dtype_str(vllm_kv_cache_dtype)
-            logger.info(
-                f"[FlexKV vllm] Using kv_cache_dtype from vllm cache_config: "
-                f"'{vllm_kv_cache_dtype}' -> {self.model_config.dtype}"
-            )
-        else:
-            self.model_config.dtype = vllm_config.model_config.dtype
-            logger.info(
-                f"[FlexKV vllm] No explicit kv_cache_dtype, falling back to "
-                f"vllm model dtype: {self.model_config.dtype}"
-            )
+        self._resolve_dtype(
+            framework_dtype_str=vllm_kv_cache_dtype if isinstance(vllm_kv_cache_dtype, str) else None,
+            fallback_dtype=getattr(vllm_config.model_config, 'dtype', torch.bfloat16),
+        )
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -189,7 +207,7 @@ class FlexKVConfig:
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
         hf_config = getattr(vllm_config.model_config, 'hf_config', None)
-        self._detect_indexer_config_from_hf(hf_config, source="vllm")
+        self._detect_indexer_config_from_hf(hf_config)
 
         logger.info(f"[FlexKV vllm] {self.model_config}, {rank_info}")
 
@@ -233,7 +251,7 @@ class FlexKVConfig:
         nnodes = server_args.nnodes
         node_rank = server_args.node_rank
         enable_dp_attention = server_args.enable_dp_attention
-        attn_cp_size = server_args.attn_cp_size
+        attn_cp_size = getattr(server_args, 'attn_cp_size', 1)
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
         dp_rank = 0 if dp_rank is None else int(dp_rank)
 
@@ -269,33 +287,11 @@ class FlexKVConfig:
                 self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
             self.model_config.head_size = int(getattr(sglang_config, "head_dim", 0))
 
-        # Determine KV cache dtype: prioritize user_config.kv_cache_dtype (from
-        # flexkv_config.yaml or FLEXKV_KV_CACHE_DTYPE env var), then fall back
-        # to the sglang model dtype.  sglang's ModelConfig.dtype is the *model
-        # weight* dtype (e.g. bfloat16), which may differ from the KV cache
-        # dtype (e.g. fp8_e4m3 when --kv-cache-dtype fp8_e4m3 is used).
-        user_dtype_str = self.user_config.kv_cache_dtype
-        if user_dtype_str is not None:
-            self.model_config.dtype = _parse_dtype_str(user_dtype_str)
-            logger.info(
-                f"[FlexKV] Using kv_cache_dtype from user_config: "
-                f"'{user_dtype_str}' -> {self.model_config.dtype}"
-            )
-        elif kv_cache_dtype is not None and kv_cache_dtype != "auto":
-            # Use the kv_cache_dtype from sglang server_args (e.g. "fp8_e4m3")
-            self.model_config.dtype = _parse_dtype_str(kv_cache_dtype)
-            logger.info(
-                f"[FlexKV] Using kv_cache_dtype from sglang server_args: "
-                f"'{kv_cache_dtype}' -> {self.model_config.dtype}"
-            )
-        else:
-            self.model_config.dtype = getattr(sglang_config, "dtype", torch.bfloat16)
-            logger.warning(
-                f"[FlexKV] No kv_cache_dtype in user_config or server_args, falling back to sglang "
-                f"model dtype: {self.model_config.dtype}. If your KV cache uses a "
-                f"different dtype (e.g. fp8), add 'kv_cache_dtype: fp8' to your "
-                f"flexkv_config.yaml or set FLEXKV_KV_CACHE_DTYPE=fp8 environment variable."
-            )
+        # Resolve KV cache dtype via unified priority logic.
+        self._resolve_dtype(
+            framework_dtype_str=kv_cache_dtype,
+            fallback_dtype=getattr(sglang_config, "dtype", torch.bfloat16),
+        )
 
         if use_mla and getattr(sglang_config, "index_head_dim", None) is not None:
             kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
@@ -354,7 +350,7 @@ class FlexKVConfig:
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
 
         hf_config = getattr(sglang_config, 'hf_config', None)
-        self._detect_indexer_config_from_hf(hf_config, source="sglang")
+        self._detect_indexer_config_from_hf(hf_config)
 
         if self.cache_config.indexer is not None:
             logger.info(
@@ -384,25 +380,12 @@ class FlexKVConfig:
         flexkv_logger.info(f"[FlexKVConfig] dtype_str from TRT config: {dtype_str}")
 
         if dtype_str == "auto":
-            # When dtype_str is "auto", try to get kv_cache_dtype from user_config first
-            # This allows users to specify kv_cache_dtype in flexkv_config.json or via environment variable
-            user_dtype_str = self.user_config.kv_cache_dtype
-            if user_dtype_str is not None:
-                parsed_dtype = _parse_dtype_str(user_dtype_str)
-                self.model_config.dtype = parsed_dtype
-                flexkv_logger.info(f"[FlexKVConfig] dtype_str='auto', but found kv_cache_dtype='{user_dtype_str}' in user_config, using it -> {parsed_dtype}")
-            else:
-                # Try to infer from TRT config if possible (e.g., from actual tensor dtype)
-                # Note: This might not be available at initialization time
-                self.model_config.dtype = torch.bfloat16
-                flexkv_logger.warning(
-                    f"[FlexKVConfig] dtype_str='auto' and no kv_cache_dtype in user_config. "
-                    f"Falling back to {self.model_config.dtype}. To specify a different dtype, add 'kv_cache_dtype' "
-                    f"to your flexkv_config.json file (e.g., {{\"kv_cache_dtype\": \"fp8\"}}) "
-                    f"or set FLEXKV_KV_CACHE_DTYPE environment variable."
-                )
+            self._resolve_dtype(
+                framework_dtype_str=None,
+                fallback_dtype=torch.bfloat16,
+            )
         elif isinstance(dtype_str, str):
-            self.model_config.dtype = _parse_dtype_str(dtype_str)
+            self.model_config.dtype = self._parse_dtype_str(dtype_str)
         else:
             self.model_config.dtype = dtype_str
 
@@ -444,7 +427,7 @@ class FlexKVConfig:
                     self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
                     self.model_config.num_kv_heads = hf_config.num_attention_heads
 
-            self._detect_indexer_config_from_hf(hf_config, source="TRT-LLM")
+            self._detect_indexer_config_from_hf(hf_config)
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
 

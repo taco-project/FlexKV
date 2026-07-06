@@ -174,6 +174,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
         flexkv_logger.debug(f"[LayerwiseWorker] mla_d2h_mode={self.mla_d2h_mode}")
 
+        # Read layerwise notification mode from global config
+        self.layerwise_notify_mode = GLOBAL_CONFIG_FROM_ENV.layerwise_notify_mode
+        flexkv_logger.debug(f"[LayerwiseWorker] layerwise_notify_mode={self.layerwise_notify_mode}")
+
         # initialize SSD storage
         self.enable_ssd = len(ssd_files) > 0
         self.ssd_files = ssd_files
@@ -533,6 +537,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.indexer_cpu_chunk_size_in_bytes,
             self.indexer_num_blocks_per_file,
             self.mla_d2h_mode,  # Pass MLA D2H mode to C++
+            self.layerwise_notify_mode,  # Pass notification mode to C++
         )
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:

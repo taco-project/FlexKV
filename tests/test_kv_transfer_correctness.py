@@ -248,30 +248,37 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers):
     )
 
 
-def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_layers):
-    """Create LayerwiseTransferGroup for H2D-only testing (no SSD, no eventfd).
-
-    Mirrors LayerwiseTransferWorker construction in layerwise.py. GPU chunk_size
-    does NOT include kv_dim (same as tp_group). SSD disabled via empty ssd_files;
-    eventfd disabled via empty layer_eventfds_tensor.
-    """
+def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
+                         layer_eventfds_tensor=None):
+    """Create LayerwiseTransferGroup for H2D-only testing."""
     def strides_tensor(getter):
         return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
 
+    if layer_eventfds_tensor is None:
+        layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
+    ssd_files = {}
+    # C++ ctor takes non-const refs, so all args must be lvalues.
+    # Also pybind11's default-value filling for trailing indexer params is
+    # unreliable, so pass all 20 args explicitly (mirrors production layerwise.py).
+    indexer_gpu_blocks = []
+    indexer_cpu_blocks = torch.Tensor()
+    indexer_gpu_kv_strides = torch.Tensor()
+    indexer_gpu_block_strides = torch.Tensor()
+    indexer_gpu_layer_strides = torch.Tensor()
+    indexer_gpu_chunk_sizes = torch.Tensor()
+    indexer_ssd_files = {}
+
     return LayerwiseTransferGroup(
-        num_gpus=num_gpus,
-        gpu_blocks=all_gpu,
-        cpu_blocks=cpu_ptr_unused,  # actual pinned CPU tensor
-        ssd_files={},
-        num_layers=num_layers,
-        gpu_kv_strides_tensor=strides_tensor(gpu_layout.get_kv_stride),
-        gpu_block_strides_tensor=strides_tensor(gpu_layout.get_block_stride),
-        gpu_layer_strides_tensor=strides_tensor(gpu_layout.get_layer_stride),
-        gpu_chunk_sizes_tensor=strides_tensor(gpu_layout.get_chunk_size),
-        iouring_entries=0,
-        iouring_flags=0,
-        layer_eventfds_tensor=torch.empty(0, dtype=torch.int32),
-        tp_size=num_gpus,
+        num_gpus, all_gpu, cpu_tensor, ssd_files,
+        num_layers,
+        strides_tensor(gpu_layout.get_kv_stride),
+        strides_tensor(gpu_layout.get_block_stride),
+        strides_tensor(gpu_layout.get_layer_stride),
+        strides_tensor(gpu_layout.get_chunk_size),
+        0, 0, layer_eventfds_tensor, num_gpus,
+        indexer_gpu_blocks, indexer_cpu_blocks, indexer_gpu_kv_strides,
+        indexer_gpu_block_strides, indexer_gpu_layer_strides,
+        indexer_gpu_chunk_sizes, indexer_ssd_files,
     )
 
 
@@ -487,6 +494,88 @@ def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, 
 
 
 # ---------------------------------------------------------------------------
+# Layerwise H2D test with notify modes (hostfunc / polling)
+# ---------------------------------------------------------------------------
+
+LAYERWISE_NOTIFY_MODES = ["hostfunc", "polling"]
+
+
+@pytest.mark.parametrize("data_config", [pytest.param((4, 8, 16, 1, 512), id="ds3-mini")])
+@pytest.mark.parametrize("engine_name,use_ce", ENGINES)
+@pytest.mark.parametrize("notify_mode", LAYERWISE_NOTIFY_MODES)
+def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mode):
+    """Layerwise H2D round-trip under hostfunc / polling notify modes.
+
+    Verifies data correctness under both notification modes.
+    """
+    skip_if_engine_unsupported(use_ce)
+
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    num_gpus = NUM_GPUS
+
+    gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        "BLOCKFIRST", True, num_gpus)
+
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb, heads_per_rank,
+                                head_dim, kv_dim, g) for g in range(num_gpus)]
+    fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb, heads_per_rank,
+             head_dim, kv_dim)
+    for g in range(1, num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].copy_(all_gpu[0][l])
+    sync_all(num_gpus)
+
+    cpu_kv = make_cpu_tensor(cpu_layout, num_layers, num_blocks)
+    cpu_stride_kv = cpu_layout_tp.get_kv_stride() * ES
+    cpu_stride_layer = cpu_layout_tp.get_layer_stride() * ES
+    cpu_stride_block = cpu_layout.get_block_stride() * ES
+    cpu_stride_tp = cpu_stride_block // num_gpus
+
+    # D2H via TP group to populate CPU
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers)
+    gpu_block_ids = block_ids(num_blocks)
+    cpu_block_ids = block_ids(num_blocks)
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=gpu_block_ids, cpu_block_id_tensor=cpu_block_ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
+        layer_id=0, layer_granularity=num_layers, is_mla=True,
+        mla_d2h_mode="sharded",
+    )
+    sync_all(num_gpus)
+    del tp
+
+    for g in range(num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].zero_()
+    sync_all(num_gpus)
+
+    # H2D via layerwise with the requested notify mode
+    lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers)
+    lw.layerwise_transfer(
+        torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64),
+        0, 0, 0, 0, 0,
+        gpu_block_ids, cpu_block_ids,
+        cpu_stride_kv, cpu_stride_layer, cpu_stride_block,
+        gpu_layout.get_chunk_size() * ES,
+        cpu_stride_kv, cpu_stride_layer, cpu_stride_tp,
+        4, use_ce, num_layers, 1, True, 0,
+        torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
+        torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
+        "sharded", notify_mode,
+    )
+    sync_all(num_gpus)
+
+    spot_check_gpu(all_gpu, 0, num_gpus, num_layers, num_blocks,
+                   tpb, head_dim, kv_dim, label=f"notify={notify_mode}")
+    del lw
+
+
+# ---------------------------------------------------------------------------
 # Invalid mode fallback test
 # ---------------------------------------------------------------------------
 
@@ -529,10 +618,6 @@ def test_invalid_mode_fallback():
     # Should behave like sharded — just verify no crash
     del tp
 
-
-# ---------------------------------------------------------------------------
-# Layerwise H2D test (via LayerwiseTransferGroup::layerwise_transfer)
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

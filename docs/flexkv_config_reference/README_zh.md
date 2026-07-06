@@ -100,6 +100,7 @@ enable_gds: false
 | `FLEXKV_TRANSFER_NUM_CTA_H2D` | int | 4 | H2D 传输使用的 CUDA thread block (CTA) 数量，仅在`FLEXKV_USE_CE_TRANSFER_H2D`为0时生效 |
 | `FLEXKV_TRANSFER_NUM_CTA_D2H` | int | 4 | D2H 传输使用的 CUDA thread block (CTA) 数量，仅在`FLEXKV_USE_CE_TRANSFER_D2H`为0时生效 |
 | `FLEXKV_MLA_D2H_MODE` | str | "sharded" | **仅适用于 MLA 场景**（kv_heads=1，所有 TP rank 的 KV 相同）。控制 D2H 时 CPU KV Cache 的写入模式。可选值：<br/>• `sharded` - 每个 GPU 写 1/N 分片拼成一个完整 KV<br/>• `all_write` - 每个 GPU 写完整 KV 到各自位置（CPU 内存占用 Nx）<br/>• `rank0_only` - 仅 rank 0 写完整 KV |
+| `FLEXKV_LAYERWISE_NOTIFY_MODE` | str | "hostfunc" | layerwise H2D 传输在每个 layer batch 完成后通知推理引擎的机制：<br/>• `hostfunc` - 默认。使用 `cudaLaunchHostFunc` 在 CUDA stream 上排队一个 host callback，GPU 完成该 batch 时精确触发<br/>• `polling` - 后台线程通过 `cudaEventQuery` 轮询每 batch 的 CUDA event，所有 GPU 完成该 batch 后立即写 eventfd。避免 `cudaLaunchHostFunc` 的跨线程调度开销；在 NVIDIA 8x GPU 上实测快于 `hostfunc`（cuda 引擎：small 0.60→0.40ms 1.50x，medium 4.39→1.87ms 2.35x，large 16.79→16.62ms 1.01x）。代价是每个 `LayerwiseTransferGroup` 实例占用一个 busy-polling CPU 线程 |
 
 ---
 

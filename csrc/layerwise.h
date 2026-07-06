@@ -1,10 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <torch/extension.h>
 #include <vector>
 #include <sys/eventfd.h>
@@ -73,7 +75,8 @@ public:
       const int64_t indexer_ssd_kv_stride_in_bytes = 0,
       const int64_t indexer_cpu_chunk_size_in_bytes = 0,
       const int indexer_num_blocks_per_file = 0,
-      const std::string &mla_d2h_mode = "sharded");
+      const std::string &mla_d2h_mode = "sharded",
+      const std::string &notify_mode = "hostfunc");
 
 private:
   int num_gpus_;
@@ -126,6 +129,27 @@ private:
                            bool is_last_batch,
                            const char *next_range_name,
                            nvtxRangeId_t *next_range_id_ptr);
+
+  // ===== Event polling notification =====
+  // Used when notify_mode == "polling".
+  // The polling thread queries per-batch CUDA events and writes eventfds
+  // as soon as each batch completes on all GPUs.
+  enum class NotifyMode { HOSTFUNC, POLLING };
+  NotifyMode notify_mode_ = NotifyMode::HOSTFUNC;
+
+  struct PollBatchInfo {
+    int start_layer;
+    int layers_this_batch;
+    std::vector<cudaEvent_t> per_gpu_events;
+    bool notified = false;
+  };
+  std::vector<PollBatchInfo> poll_batches_;
+  std::atomic<bool> poll_stop_{false};
+  std::atomic<int> poll_next_batch_{0};
+  std::thread poll_thread_;
+
+  void notify_layer_batch(int start_layer, int layers_this_batch);
+  void event_polling_loop();
 };
 
 } // namespace flexkv
