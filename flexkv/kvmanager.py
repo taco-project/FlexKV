@@ -209,39 +209,31 @@ class KVManager:
     def get_match_swa(self,
                       token_ids: Union[torch.Tensor, np.ndarray],
                       full_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                      swa_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                       cpu_only: bool = False,
                       namespace: Optional[List[str]] = None,
                       update_state_for_load: bool = True,
                       ) -> Tuple[int, np.ndarray, np.ndarray]:
-        """Dual-mask SWA-aware match — deployment-dispatch wrapper.
+        """SWA-aware match — deployment-dispatch wrapper for get_match_swa.
 
-        Mirrors :meth:`get_match`'s wrapper exactly: convert tensors to numpy and
-        dispatch on ``server_client_mode``. ``full_mask`` is the original
-        token_mask (1 = token not on GPU full pool, needs transfer); ``swa_mask``
-        marks tokens missing on the GPU SWA pool.  Returns
+        Mirrors :meth:`get_match`'s wrapper: convert tensors to numpy and dispatch
+        on ``server_client_mode``. ``full_mask`` (1 = token not on GPU full pool,
+        needs transfer) drives the match. Returns
         ``(task_id, return_mask_full, return_mask_swa)``; the matching itself lives
         in :meth:`KVTaskEngine.get_match_swa`.
 
-        Both deployment forms are supported (this is the SWA analogue of
-        ``get_match``'s ``if server_client_mode`` branch): in-process calls
-        ``kv_task_engine.get_match_swa``; server mode forwards over the SWA RPC
-        (``dp_client.get_match_swa`` → ``GetMatchSwaRequest`` →
-        ``_handle_get_match_swa_request``).  If the RPC fails, it falls back to a
-        no-hit reply (matching ``get_match``'s None-on-error tolerance) rather than
-        crashing the scheduler.
+        In-process mode calls ``kv_task_engine.get_match_swa`` directly; server
+        mode forwards over the SWA RPC (``dp_client.get_match_swa`` →
+        ``GetMatchSwaRequest`` → ``_handle_get_match_swa_request``). If the RPC
+        fails it degrades to a no-hit reply rather than crashing the scheduler.
         """
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if isinstance(full_mask, torch.Tensor):
             full_mask = full_mask.numpy()
-        if isinstance(swa_mask, torch.Tensor):
-            swa_mask = swa_mask.numpy()
         if self.server_client_mode:
             result = self.dp_client.get_match_swa(
                 token_ids,
                 full_mask,
-                swa_mask,
                 cpu_only=cpu_only,
                 namespace=namespace,
                 update_state_for_load=update_state_for_load,
@@ -255,7 +247,6 @@ class KVManager:
         return self.kv_task_engine.get_match_swa(
             token_ids=token_ids,
             full_mask=full_mask,
-            swa_mask=swa_mask,
             cpu_only=cpu_only,
             namespace=namespace,
             update_state_for_load=update_state_for_load,

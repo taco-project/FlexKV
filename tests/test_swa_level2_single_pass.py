@@ -1,23 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Level 2 — SWA light-attach to the full-KV path (single-pass match).
+"""SWA single-pass match: SWA rides the full-KV match, no redundant second pass.
 
 Node-mount makes ``radix.match_prefix`` return the full prefix AND the deepest
-in-range SWA node in ONE forward pass. Level 2 removes the redundant standalone
-match that ``swa_align`` used to run: a SWA-aware GET must resolve
-``usable = min(full_hit, swa_hit)`` and build the (clamped) graph from a SINGLE
-per-tier match, not two.
+in-range SWA node in one forward pass. A SWA-aware GET therefore resolves
+``usable = min(full_hit, swa_hit)`` and builds the (clamped) graph from a SINGLE
+per-tier match.
 
-These tests pin the Level 2 contract at the GlobalCacheEngine layer (no GPU /
-KVTaskEngine needed — the match redundancy lives entirely in the engine):
+These tests pin that contract at the GlobalCacheEngine layer (no GPU /
+KVTaskEngine needed):
 
-  RED (the point of Level 2):
-    * a SWA-aware get triggers exactly ONE round of per-tier full-KV matching
-      (today's swa_align + get() path does TWO — this is what we remove).
-  Behavior-equivalence (must stay green after the fold):
-    * the full-KV transfer is still clamped to usable = min(full, swa).
-  Guardrail (must stay green — plain path untouched):
-    * a NON-SWA get on an SWA-enabled cache is never clamped and matches once.
+  * a SWA-aware get triggers exactly ONE round of per-tier full-KV matching;
+  * the full-KV transfer is clamped to usable = min(full, swa);
+  * a plain (non-SWA) get on an SWA-enabled cache is never clamped and matches once.
 
 Requires flexkv.c_ext (production CacheEngineAccel / CRadixTreeIndex).
 """
@@ -112,20 +107,14 @@ class _MatchCounter:
 
 
 # =========================================================================== #
-# RED — the redundant-match removal (Level 2 core)                            #
+# single-pass match                                                           #
 # =========================================================================== #
 
 def test_swa_aware_get_matches_once():
-    """A single SWA-aware GET must trigger exactly ONE round of full-KV matching.
+    """A SWA-aware GET triggers exactly ONE round of per-tier full-KV matching.
 
-    Today the get_match_swa path does two rounds: swa_align() runs a full
-    per-tier match to compute usable, then get() -> _get_impl_* runs the SAME
-    match again to build the graph. Level 2 folds usable computation into
-    _get_impl_*; get(swa_aware=True) must own the single match.
-
-    RED until Level 2 lands: get() has no swa_aware parameter (TypeError), and
-    even routed through it the current code would match once in get() while
-    swa_align matched separately.
+    get(swa_aware=True) matches once, reads the SWA hit off that same match, and
+    builds the clamped graph — no separate match pass.
     """
     eng = GlobalCacheEngine(_cache_config(), _model_config())
     tok = _tokens(4, base=31)
@@ -137,8 +126,7 @@ def test_swa_aware_get_matches_once():
                 slot_mapping=np.arange(tok.shape[0], dtype=np.int64),
                 dp_client_id=0, swa_aware=True)
     assert mc.n == 1, (
-        f"SWA-aware get matched {mc.n} rounds; Level 2 requires exactly 1 "
-        "(no separate swa_align pass)")
+        f"SWA-aware get matched {mc.n} rounds; must be exactly 1")
 
 
 def test_swa_aware_get_clamps_full_to_usable():
@@ -169,9 +157,9 @@ def test_swa_aware_get_clamps_full_to_usable():
 # =========================================================================== #
 
 def test_plain_get_on_swa_cache_matches_once_and_unclamped():
-    """A plain get() (swa_aware defaults False) on an SWA-enabled cache must
-    match exactly once and must NOT be clamped by any SWA window. This is the
-    critical guardrail: Level 2 touches the shared _get_impl_* hot path."""
+    """A plain get() (swa_aware defaults False) on an SWA-enabled cache matches
+    exactly once and is NOT clamped by any SWA window — the shared _get_impl_*
+    hot path is unaffected for non-SWA callers."""
     eng = GlobalCacheEngine(_cache_config(), _model_config())
     tok = _tokens(4, base=33)
     _put(eng, tok)
@@ -189,15 +177,14 @@ def test_plain_get_on_swa_cache_matches_once_and_unclamped():
 
 
 # =========================================================================== #
-# kvtask dispatch — get_match_swa's main path drops swa_align (single pass)   #
+# kvtask dispatch — get_match_swa main path resolves in a single match        #
 # =========================================================================== #
 
 def test_get_match_swa_main_path_no_swa_align():
     """KVTaskEngine.get_match_swa on the main path (mask has 1s) must NOT call
-    swa_align (the removed redundant match) and must drive exactly ONE
-    _get_match_impl with swa_aware=True. Exercised via the real unbound method on
-    a fake self — no GPU/TransferManager subprocess, mirroring the pure-logic
-    tests in test_kvtask_lifecycle.py."""
+    swa_align and must drive exactly ONE _get_match_impl with swa_aware=True.
+    Exercised via the real unbound method on a fake self — no GPU subprocess,
+    mirroring the pure-logic tests in test_kvtask_lifecycle.py."""
     import types
     from flexkv.kvtask import KVTaskEngine
 
@@ -229,7 +216,7 @@ def test_get_match_swa_main_path_no_swa_align():
     tid, rm_full, rm_swa = KVTaskEngine.get_match_swa(
         fake, tok, full_mask=full_mask, dp_client_id=0)
 
-    assert calls["swa_align"] == 0, "main path must NOT call swa_align (Level 2)"
+    assert calls["swa_align"] == 0, "main path must NOT call swa_align"
     assert calls["get_match_impl"] == [True], \
         "must drive exactly one _get_match_impl with swa_aware=True"
     assert tid == 7

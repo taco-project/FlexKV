@@ -88,15 +88,12 @@ class GetMatchRequest:
 
 @dataclass
 class GetMatchSwaRequest:
-    # SWA-aware dual-mask match (DSv4). Mirrors GetMatchRequest but carries the
-    # two masks of get_match_swa: ``full_mask`` (== the single-mask token_mask,
-    # drives the Full-KV match) and ``swa_mask`` (reserved for the future SWA H2D
-    # restore, currently unconsumed). The reply uses Response.mask for
+    # SWA-aware match (DSv4). Mirrors GetMatchRequest; ``full_mask`` (== the
+    # single-mask token_mask) drives the match. The reply uses Response.mask for
     # return_mask_full and Response.mask_swa for return_mask_swa.
     dp_client_id: int
     token_ids: np.ndarray
     full_mask: Optional[np.ndarray]
-    swa_mask: Optional[np.ndarray]
     cpu_only: bool = False
     task_id: int = -1
     namespace: Optional[List[str]] = None

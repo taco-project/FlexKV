@@ -712,46 +712,30 @@ class KVTaskEngine(KVTaskManager):
     def get_match_swa(self,
                       token_ids: np.ndarray,
                       full_mask: Optional[np.ndarray] = None,
-                      swa_mask: Optional[np.ndarray] = None,
                       dp_client_id: int = 0,
                       cpu_only: bool = False,
                       task_id: int = -1,
                       namespace: Optional[List[str]] = None,
                       update_state_for_load: bool = True,
                       ) -> Tuple[int, np.ndarray, np.ndarray]:
-        """Dual-mask SWA-aware match — the SWA counterpart to :meth:`get_match`.
+        """SWA-aware match: match Full-KV and its trailing SWA window together.
 
-        Unlike the single-mask :meth:`get_match`, the Full-KV transfer is bounded
-        by the SWA-reusable prefix: it computes ``usable = min(full_hit, swa_hit)``
-        FIRST (match-only, no allocation), then builds the transfer graph truncated
-        to ``usable``. This is mandatory — loading Full-KV past the reusable SWA
-        prefix would (a) waste H2D bandwidth on blocks the caller will recompute,
-        and (b) feed stale / unrestored SWA KV to the SWA-layer attention. Because
-        the graph is built once at ``usable``, there is no src/dst block-count
-        mismatch (the failure the old connector avoided via cancel+reissue).
+        Bounds the Full-KV transfer to ``usable = min(full_hit, swa_hit)``: past
+        the reusable SWA window the Full-KV bytes would feed stale KV to the
+        SWA-layer attention, so they are excluded. A single radix match yields
+        both the Full-KV hit and the node-mounted SWA hit, and the graph is built
+        clamped to ``usable`` in one pass (no src/dst count mismatch).
 
-        ``full_mask`` (1 = token NOT on GPU full pool, needs transfer) drives the
-        Full-KV match; ``swa_mask`` (1 = token NOT on GPU SWA pool) is reserved for
-        the future SWA H2D restore and not yet consumed.
-
-        When the GPU already holds the full prefix (``full_mask`` all-0), the
-        Full-KV match is empty and ``usable`` reduces to the SWA hit — the
-        "SWA-only" form — handled by the same code path.
-
-        Level 2 (single pass): the Full-KV match inside ``get(swa_aware=True)``
-        rides ONE forward pass that also yields the node-mounted SWA hit, and
-        clamps the Full-KV transfer to ``usable = min(full, swa)`` in-place. There
-        is no separate ``swa_align`` match — kvtask passes the ORIGINAL mask and
-        the engine owns the single match + clamp. ``return_mask_full`` therefore
-        already ends at ``usable``; the SWA window is its trailing page-block.
+        ``full_mask`` (1 = token not on the GPU full pool, needs transfer) drives
+        the match. When it is all-0 the GPU already holds the full prefix and only
+        the trailing SWA window needs reloading (the SWA-only form).
 
         Returns ``(task_id, return_mask_full, return_mask_swa)``; both masks are
-        token-length, True where CPU can supply that token.  The single-mask
-        :meth:`get_match` is left untouched.
+        token-length, True where CPU can supply that token. ``return_mask_swa``
+        marks the single trailing SWA page-block at the SWA hit.
         """
         nvtx.push_range(f"get match swa: task_id={task_id}", color=get_nvtx_default_color())
-        # Flush pending D2H completions so set_ready callbacks run before we check
-        # the radix tree — same rationale as get_match.
+        # Flush pending D2H completions so set_ready callbacks see the latest tree.
         self._update_tasks(timeout=0)
         if full_mask is None:
             full_mask = np.ones_like(token_ids, dtype=np.bool_)
@@ -759,12 +743,9 @@ class KVTaskEngine(KVTaskManager):
         tokens_per_block = self.cache_engine.tokens_per_block
         num_tokens = token_ids.shape[0]
 
-        # --- SWA-only branch: GPU already holds the full prefix (full_mask all-0)
-        # There is NO Full-KV match to ride, so this path resolves the SWA hit via
-        # a single swa_align probe and reports the trailing window. get() would
-        # early-return an empty graph on an all-0 mask, so the fold below cannot
-        # derive the window from return_mask_full here — this is the one branch
-        # that keeps swa_align (a single match, not a redundant second one).
+        # SWA-only: the GPU already holds the full prefix (full_mask all-0), so
+        # only the trailing SWA window needs reloading. There is no Full-KV
+        # transfer to build, so match the SWA hit directly and report its window.
         if not full_mask.any():
             _full_hit, swa_hit_blocks = self.cache_engine.swa_align(
                 token_ids, full_mask, namespace=namespace,
@@ -786,11 +767,10 @@ class KVTaskEngine(KVTaskManager):
             nvtx.pop_range()
             return result_task_id, return_mask_full, return_mask_swa
 
-        # --- Single pass: build the (SWA-clamped) transfer graph directly -----
-        # get(swa_aware=True) matches ONCE, reads the SWA hit off that same pass,
-        # clamps Full-KV to usable = min(full, swa), and builds the graph. No
-        # standalone swa_align match. The ORIGINAL mask goes in; the engine does
-        # the truncation, so return_mask_full already ends at usable.
+        # Build the SWA-clamped Full-KV graph. Passing swa_aware=True makes the
+        # engine match once, read the SWA hit off that same pass, and clamp the
+        # Full-KV transfer to usable = min(full, swa). return_mask_full ends at
+        # usable.
         fake_slot_mapping = np.zeros_like(token_ids[full_mask])
         result_task_id, return_mask_full = self._get_match_impl(
             token_ids, fake_slot_mapping, is_fake_slot_mapping=True,
@@ -798,18 +778,14 @@ class KVTaskEngine(KVTaskManager):
             cpu_only=cpu_only, task_id=task_id, namespace=namespace,
             swa_aware=True)
 
-        # --- return_mask_swa: the trailing SWA window at the SWA hit -----------
-        # SWA is page-granular: one slot = one swa_page window = exactly one block
-        # (window_size == tokens_per_block). usable == swa_hit (Full clamped to
-        # SWA), so the reusable SWA window is the LAST True page-block of
-        # return_mask_full. Derived from the clamped mask — no extra match.
+        # The SWA window is page-granular (one block). Since Full-KV is clamped to
+        # the SWA hit, it is the last block of return_mask_full.
         return_mask_swa = np.zeros(num_tokens, dtype=np.bool_)
         usable_blocks = int(return_mask_full.sum()) // tokens_per_block
         if usable_blocks > 0:
             return_mask_swa[(usable_blocks - 1) * tokens_per_block:
                             usable_blocks * tokens_per_block] = True
 
-        # trace get match swa request (mirrors get_match's GET_MATCH trace)
         self.tracer.trace_request(
             request_type="GET_MATCH_SWA",
             request_id=result_task_id,

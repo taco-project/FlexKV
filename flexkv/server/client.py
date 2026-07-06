@@ -192,20 +192,18 @@ class KVDPClient:
         self,
         token_ids: np.ndarray,
         full_mask: Optional[np.ndarray],
-        swa_mask: Optional[np.ndarray] = None,
         cpu_only: bool = False,
         namespace: Optional[List[str]] = None,
         update_state_for_load: bool = True,
     ) -> Optional[Tuple[int, np.ndarray, np.ndarray]]:
-        """SWA-aware dual-mask match RPC — the server-mode counterpart to
-        :meth:`get_match`. Returns ``(task_id, return_mask_full, return_mask_swa)``
-        or None on server error (mirrors get_match's None-on-error contract so the
-        connector can fall back to single-mask get_match)."""
+        """SWA-aware match RPC — the server-mode counterpart to :meth:`get_match`.
+        Returns ``(task_id, return_mask_full, return_mask_swa)`` or None on server
+        error (mirrors get_match's None-on-error contract so the connector can fall
+        back to single-mask get_match)."""
         req = GetMatchSwaRequest(
             dp_client_id=self.dp_client_id,
             token_ids=token_ids,
             full_mask=full_mask if full_mask is not None else None,
-            swa_mask=swa_mask if swa_mask is not None else None,
             cpu_only=cpu_only,
             task_id=self._get_task_id(),
             namespace=namespace,
