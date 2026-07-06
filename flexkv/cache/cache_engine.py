@@ -2044,9 +2044,7 @@ class GlobalCacheEngine:
 
     def match_swa_prefix(self,
                          sequence_meta: SequenceMeta,
-                         cpu_full_hit_blocks: int,
-                         ssd_full_hit_blocks: int = 0,
-                         remote_full_hit_blocks: int = 0,
+                         max_full_hit_blocks: int,
                          lock_for_load: bool = False,
                          cpu_match_result=None,
                          ssd_match_result=None,
@@ -2054,13 +2052,12 @@ class GlobalCacheEngine:
         """Multi-tier SWA prefix match (delegates to SWACacheManager.match_prefix).
 
         Per-tier ``*_match_result`` (from the SAME forward pass that produced the
-        full hits) let the SWA match REUSE that pass instead of re-walking.
+        full hit) let the SWA match REUSE that pass instead of re-walking. Every
+        tier is clamped to the single ``max_full_hit_blocks`` upper bound.
         """
         return self.swa_cache.match_prefix(
             sequence_meta,
-            cpu_full_hit_blocks=cpu_full_hit_blocks,
-            ssd_full_hit_blocks=ssd_full_hit_blocks,
-            remote_full_hit_blocks=remote_full_hit_blocks,
+            max_full_hit_blocks=max_full_hit_blocks,
             lock_for_load=lock_for_load,
             cpu_match_result=cpu_match_result,
             ssd_match_result=ssd_match_result,
@@ -2169,9 +2166,7 @@ class GlobalCacheEngine:
             return full_hit_blocks, 0
 
         swa_match = self.match_swa_prefix(
-            sequence_meta, cpu_full_hit_blocks=full_hit_blocks,
-            ssd_full_hit_blocks=full_hit_blocks,
-            remote_full_hit_blocks=full_hit_blocks,
+            sequence_meta, max_full_hit_blocks=full_hit_blocks,
             lock_for_load=lock_for_load,
             # Reuse the Full-KV matches just computed above — the SWA hit rides the
             # SAME forward pass, so no tier re-walks the tree.
