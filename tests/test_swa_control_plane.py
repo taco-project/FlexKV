@@ -349,6 +349,41 @@ def test_get_prefers_cpu_when_both_tiers_have_swa():
     _complete(gop, gcb)
 
 
+def test_multitier_match_promotes_swa_in_each_tier():
+    """Multi-tier heat parity: one full-KV match promotes the matched SWA copy in
+    EVERY tier that holds it (CPU AND SSD), so a reused prefix survives SWA
+    eviction over a never-reused one independently per tier — mirroring how
+    full-KV match_prefix(update_cache_info=True) bumps each tier's heat.
+
+    Store A then B (distinct prefixes) to both tiers with SWA -> per-tier SWA-LRU
+    order tail->head = A, B. A real multi-tier match of A must promote A to MRU in
+    BOTH tiers, so a single SWA eviction per tier drops B and keeps A."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    tok_a = _tokens(4, base=40)
+    tok_b = _tokens(4, base=41)
+    for i, tok in enumerate((tok_a, tok_b)):
+        m = np.ones_like(tok, dtype=np.int64)
+        sm = np.arange(tok.shape[0], dtype=np.int64)
+        _pg, _rm, pcb, pop, _pe = eng.put(i + 1, tok, m, sm, dp_client_id=0)
+        _complete(pop, pcb)
+
+    # A real match of A on each tier (match() -> match_prefix(update_cache_info=True)).
+    seq_a = SequenceMeta(token_ids=tok_a, tokens_per_block=TPB); seq_a.gen_hashes()
+    eng.cpu_cache_engine.match(seq_a)
+    eng.ssd_cache_engine.match(seq_a)
+
+    # Evict one SWA slot per tier: B (never reused) must go, A (reused) survives.
+    eng.cpu_cache_engine._evict_swa(1)
+    eng.ssd_cache_engine._evict_swa(1)
+
+    seq_b = SequenceMeta(token_ids=tok_b, tokens_per_block=TPB); seq_b.gen_hashes()
+    for name, engine in (("cpu", eng.cpu_cache_engine), ("ssd", eng.ssd_cache_engine)):
+        a_hit, _sa, _ka = engine.match_swa(seq_a, upper_bound_blocks=4)
+        b_hit, _sb, _kb = engine.match_swa(seq_b, upper_bound_blocks=4)
+        assert a_hit == 4, f"{name}: reused SWA A was evicted (tier not promoted)"
+        assert b_hit == 0, f"{name}: never-reused SWA B should have been evicted"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v", "-s"]))
