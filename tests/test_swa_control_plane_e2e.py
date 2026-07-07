@@ -121,7 +121,7 @@ def main() -> int:
         tokens_per_block=TOKENS_PER_BLOCK, enable_cpu=True, enable_ssd=False,
         enable_remote=False, num_cpu_blocks=NUM_BLOCKS_CPU,
         swa=SWAPoolConfig(enabled=True, num_slots=NUM_SWA_SLOTS,
-                          window_size=TOKENS_PER_BLOCK, num_swa_layers=NUM_LAYERS,
+                          num_swa_layers=NUM_LAYERS,
                           bytes_per_token_per_layer=BYTES_PER_TOKEN_PER_LAYER,
                           pin_memory=True))
     cache_config.enable_swa_transfer = True
@@ -229,7 +229,7 @@ def main() -> int:
 
     # SWA lock released by the H2D callback (no leak).
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); sm.gen_hashes()
-    hit, slot, key, node = engine.cpu_cache_engine.match_swa_locked(sm, upper_bound_blocks=1)
+    hit, slot, node = engine.cpu_cache_engine.match_swa_locked(sm, upper_bound_blocks=1)
     if node is not None:
         lock_ok = (node.swa_lock_ref == 1)  # our fresh probe lock; prior load lock released
         node.dec_swa_lock_ref()

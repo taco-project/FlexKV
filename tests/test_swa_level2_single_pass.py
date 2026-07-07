@@ -48,8 +48,10 @@ def _cache_config():
         num_cpu_blocks=4096,
     )
     cc.swa = SWAPoolConfig(
-        enabled=True, num_slots=256, window_size=TPB,
-        num_swa_layers=1, bytes_per_token_per_layer=64,
+        enabled=True,
+        num_slots=256,
+        num_swa_layers=1,
+        bytes_per_token_per_layer=64,
     )
     cc.enable_swa_transfer = True
     return cc
@@ -211,4 +213,3 @@ def test_get_match_threads_swa_aware():
         "must drive exactly one _get_match_impl with swa_aware=True"
     assert tid == 7
     assert int(mask.sum()) == 4 * TPB
-

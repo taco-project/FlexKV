@@ -53,7 +53,6 @@ def dump_graph(graph: TransferOpGraph) -> str:
         lines.append(
             f"  op#{op_id} [{tag}] {op.transfer_type.name} "
             f"src={src} dst={dst} deps={preds}"
-            + (f" swa_key={op.swa_key}" if getattr(op, 'is_swa', False) else "")
         )
     return "\n".join(lines)
 
@@ -140,12 +139,14 @@ def test_get_full_plus_swa_cpu():
     mgr = _mgr(enabled=True)
     g = TransferOpGraph()
     full = _full_h2d(g)
-    swa_id = mgr.build_get_chain(g, gpu_slot_ids=SWA_GPU, cpu_slot_ids=SWA_CPU, swa_key=7)
+    swa_id = mgr.build_get_chain(g, gpu_slot_ids=SWA_GPU, cpu_slot_ids=SWA_CPU)
     g, end = add_virtual_op_for_multiple_finished_ops(g, [full.op_id, swa_id], 0)
     _print_scenario("GET full + SWA(CPU)", g, end)
     swa = _swa_ops(g)
     assert len(swa) == 1 and swa[0].transfer_type == TransferType.H2D
-    assert swa[0].is_swa and swa[0].swa_key == 7
+    assert swa[0].is_swa
+    np.testing.assert_array_equal(swa[0].src_block_ids, SWA_CPU)
+    np.testing.assert_array_equal(swa[0].dst_block_ids, SWA_GPU)
     assert len(swa[0].predecessors) == 0          # CPU-resident: no staging dep
     # barrier waits for BOTH full and SWA
     barrier = g._op_map[end]
@@ -159,7 +160,7 @@ def test_get_full_plus_swa_ssd_staging():
     g = TransferOpGraph()
     full = _full_h2d(g)
     swa_id = mgr.build_get_chain(g, gpu_slot_ids=SWA_GPU, cpu_slot_ids=SWA_CPU,
-                                 ssd_slot_ids=SWA_SSD, swa_key=7)
+                                 ssd_slot_ids=SWA_SSD)
     g, end = add_virtual_op_for_multiple_finished_ops(g, [full.op_id, swa_id], 0)
     _print_scenario("GET full + SWA(SSD staging)", g, end)
     swa_h2d = g._op_map[swa_id]
@@ -176,7 +177,7 @@ def test_get_full_plus_swa_ssd_and_remote_staging():
     g = TransferOpGraph()
     full = _full_h2d(g)
     swa_id = mgr.build_get_chain(g, gpu_slot_ids=SWA_GPU, cpu_slot_ids=SWA_CPU,
-                                 ssd_slot_ids=SWA_SSD, remote_slot_ids=SWA_REMOTE, swa_key=7)
+                                 ssd_slot_ids=SWA_SSD, remote_slot_ids=SWA_REMOTE)
     g, end = add_virtual_op_for_multiple_finished_ops(g, [full.op_id, swa_id], 0)
     _print_scenario("GET full + SWA(SSD+REMOTE staging)", g, end)
     swa_h2d = g._op_map[swa_id]
@@ -194,7 +195,7 @@ def test_put_full_plus_swa_cpu_only():
     mgr = _mgr(enabled=True)
     g = TransferOpGraph()
     full = _full_d2h(g)
-    swa_id = mgr.build_put_chain(g, gpu_slot_ids=SWA_GPU, cpu_slot_ids=SWA_CPU, swa_key=7)
+    swa_id = mgr.build_put_chain(g, gpu_slot_ids=SWA_GPU, cpu_slot_ids=SWA_CPU)
     g, end = add_virtual_op_for_multiple_finished_ops(g, [full.op_id, swa_id], 0)
     _print_scenario("PUT full + SWA(CPU)", g, end)
     swa = _swa_ops(g)
@@ -207,7 +208,7 @@ def test_put_swa_writethrough_ssd_remote_fire_and_forget():
     g = TransferOpGraph()
     full = _full_d2h(g)
     swa_d2h_id = mgr.build_put_chain(g, gpu_slot_ids=SWA_GPU, cpu_slot_ids=SWA_CPU,
-                                     ssd_slot_ids=SWA_SSD, remote_slot_ids=SWA_REMOTE, swa_key=7)
+                                     ssd_slot_ids=SWA_SSD, remote_slot_ids=SWA_REMOTE)
     finished = [full.op_id, swa_d2h_id]   # only D2H ops reported
     g, end = add_virtual_op_for_multiple_finished_ops(g, finished, 0)
     _print_scenario("PUT full + SWA write-through(SSD+REMOTE)", g, end)

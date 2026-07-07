@@ -468,34 +468,17 @@ class SWAPoolConfig:
     """Configuration for SWA (Sliding Window Attention) host pool(s).
 
     SWA is managed at PAGE granularity: one pool slot stores exactly one
-    swa_page of window KV, and all SWA IO moves a whole page (one slot) at a
-    time. Despite the field name, ``window_size`` below carries the physical
-    ``swa_page_size`` (DSv4 = 256, hard-coded in integration/config.py), NOT the
-    HF attention sliding_window (128). Because ``window_size == tokens_per_block
-    == swa_page_size`` on DSv4, one window == one page == one block == one slot.
+    ``tokens_per_block`` page of SWA KV, and all SWA IO moves a whole page
+    (one slot) at a time.
     """
     enabled: bool = False
     num_slots: int = 1024              # Number of CPU SWA pool slots
     num_ssd_slots: int = 0             # Number of SSD SWA pool slots (0 = no SSD SWA tier)
     num_remote_slots: int = 0          # Number of REMOTE SWA pool slots (0 = no REMOTE SWA tier)
-    window_size: int = 128             # = physical swa_page_size (DSv4=256), one slot = one swa_page
     num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
     bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
     pin_memory: bool = True            # Use pinned memory for async DMA
-
-    @property
-    def slot_size_bytes(self) -> int:
-        """Total bytes per slot (= one swa_page) = window_size * layers * bytes_per_token_per_layer."""
-        return self.window_size * self.num_swa_layers * self.bytes_per_token_per_layer
-
-    @property
-    def total_size_bytes(self) -> int:
-        return self.num_slots * self.slot_size_bytes
-
-    @property
-    def total_size_gb(self) -> float:
-        return self.total_size_bytes / (1024 ** 3)
 
     def for_ssd_tier(self) -> "SWAPoolConfig":
         """Derive the SSD-tier SWA config (same slot geometry, num_ssd_slots slots).

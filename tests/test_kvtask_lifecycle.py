@@ -115,7 +115,7 @@ def test_get_match_swa_usable_is_min(full_hit, swa_hit, exp_usable):
 
 @pytest.mark.parametrize("swa_hit", [1, 3, 6])
 def test_get_match_swa_trailing_window_is_one_block(swa_hit):
-    """M16.1: SWA is page-granular (window == tokens_per_block), so return_mask_swa
+    """M16.1: SWA is page-granular, so return_mask_swa
     marks exactly ONE block, ending at swa_hit."""
     tpb, num_tokens = 16, 6 * 16
     _, _, swa_mask = _usable_and_swa_mask(6, swa_hit, num_tokens, tpb)
@@ -151,8 +151,12 @@ def _engine():
                      use_mla=True, dtype=torch.bfloat16, tp_size=1, dp_size=1)
     cc = CacheConfig(tokens_per_block=TPB, enable_cpu=True, enable_ssd=False,
                      enable_remote=False, num_cpu_blocks=4096)
-    cc.swa = SWAPoolConfig(enabled=True, num_slots=256, window_size=TPB,
-                           num_swa_layers=1, bytes_per_token_per_layer=64)
+    cc.swa = SWAPoolConfig(
+        enabled=True,
+        num_slots=256,
+        num_swa_layers=1,
+        bytes_per_token_per_layer=64,
+    )
     cc.enable_swa_transfer = True
     return GlobalCacheEngine(cc, mc)
 
@@ -185,7 +189,7 @@ def test_get_pins_then_releases_swa_lock():
 
     # After building the GET graph, the matched CPU SWA node is pinned.
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
-    hit, slot, key = eng.cpu_cache_engine.match_swa(sm, upper_bound_blocks=4)
+    hit, slot = eng.cpu_cache_engine.match_swa(sm, upper_bound_blocks=4)
     assert hit == 4
     # The node carries the load pin (>=1) taken by _swa_get_slots.
     node = eng.cpu_cache_engine.index.match_prefix(

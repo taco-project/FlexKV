@@ -81,3 +81,56 @@ def test_set_gpu_blocks_can_fill_swa_when_explicit_mapping_provided():
 
     assert np.array_equal(main_h2d.dst_block_ids, np.array([100, 101], dtype=np.int64))
     assert np.array_equal(swa_h2d.dst_block_ids, np.array([900, 901], dtype=np.int64))
+
+
+def test_set_gpu_blocks_explicit_swa_mapping_consumes_per_op():
+    graph = TransferOpGraph()
+    first = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=TransferType.H2D,
+        src_block_ids=np.array([10], dtype=np.int64),
+        dst_block_ids=np.array([0], dtype=np.int64),
+        is_swa=True,
+    )
+    second = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=TransferType.H2D,
+        src_block_ids=np.array([11], dtype=np.int64),
+        dst_block_ids=np.array([0], dtype=np.int64),
+        is_swa=True,
+    )
+    graph.add_transfer_op(first)
+    graph.add_transfer_op(second)
+
+    graph.set_gpu_blocks(
+        np.array([], dtype=np.int64),
+        np.array([900, 901], dtype=np.int64),
+    )
+
+    assert np.array_equal(first.dst_block_ids, np.array([900], dtype=np.int64))
+    assert np.array_equal(second.dst_block_ids, np.array([901], dtype=np.int64))
+
+
+def test_set_swa_gpu_blocks_consumes_per_op():
+    graph = TransferOpGraph()
+    first = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=TransferType.H2D,
+        src_block_ids=np.array([10], dtype=np.int64),
+        dst_block_ids=np.array([0], dtype=np.int64),
+        is_swa=True,
+    )
+    second = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=TransferType.D2H,
+        src_block_ids=np.array([0], dtype=np.int64),
+        dst_block_ids=np.array([11], dtype=np.int64),
+        is_swa=True,
+    )
+    graph.add_transfer_op(first)
+    graph.add_transfer_op(second)
+
+    graph.set_swa_gpu_blocks(np.array([900, 901], dtype=np.int64))
+
+    assert np.array_equal(first.dst_block_ids, np.array([900], dtype=np.int64))
+    assert np.array_equal(second.src_block_ids, np.array([901], dtype=np.int64))

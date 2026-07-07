@@ -133,10 +133,10 @@ class HierarchyLRCacheEngine:
         """Node-mounted SWA match. Returns no-hit unless the (remote) radix index
         exposes last_swa_node on its match result."""
         if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, -1
+            return 0, -1
         # The distributed/remote radix index does not surface node-mounted SWA
         # yet; report no hit (SWA is served by the accel CPU tier for DSv4).
-        return 0, -1, -1
+        return 0, -1
 
     def start(self) -> None:
         if self._meta is None:

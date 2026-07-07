@@ -57,8 +57,10 @@ def _cache_config(enable_swa_transfer: bool = True):
         num_cpu_blocks=4096,
     )
     cc.swa = SWAPoolConfig(
-        enabled=True, num_slots=256, window_size=TPB,
-        num_swa_layers=1, bytes_per_token_per_layer=64,
+        enabled=True,
+        num_slots=256,
+        num_swa_layers=1,
+        bytes_per_token_per_layer=64,
     )
     cc.enable_swa_transfer = enable_swa_transfer
     return cc
@@ -77,8 +79,11 @@ def _cache_config_ssd(enable_swa_transfer: bool = True):
         ssd_cache_dir="./ssd_cache_swa_test",
     )
     cc.swa = SWAPoolConfig(
-        enabled=True, num_slots=256, num_ssd_slots=256, window_size=TPB,
-        num_swa_layers=1, bytes_per_token_per_layer=64,
+        enabled=True,
+        num_slots=256,
+        num_ssd_slots=256,
+        num_swa_layers=1,
+        bytes_per_token_per_layer=64,
     )
     cc.enable_swa_transfer = enable_swa_transfer
     return cc
@@ -138,7 +143,7 @@ def test_put_builds_full_plus_swa_store_chain():
     _complete(op_cb, cb)
     # after completion the SWA slot is mounted on the stored tail node.
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
-    hit, slot, key = eng.cpu_cache_engine.match_swa(sm, upper_bound_blocks=4)
+    hit, slot = eng.cpu_cache_engine.match_swa(sm, upper_bound_blocks=4)
     assert hit == 4 and slot >= 0
 
 
@@ -165,7 +170,7 @@ def test_get_builds_full_plus_swa_load_chain():
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     _complete(gop_cb, gcb)
     # after release, the node's SWA is unlocked (a fresh match can lock again).
-    hit, slot, key, node = eng.cpu_cache_engine.match_swa_locked(sm, upper_bound_blocks=4)
+    hit, slot, node = eng.cpu_cache_engine.match_swa_locked(sm, upper_bound_blocks=4)
     assert node is not None and node.swa_lock_ref == 1
     node.dec_swa_lock_ref()
 
@@ -186,7 +191,7 @@ def test_gate_off_no_swa_ops_in_control_plane_graph():
 # 2. launch-time late-bind of the SWA GPU slot                                #
 # =========================================================================== #
 
-def test_swa_slot_mapping_to_slot_ids_folds_by_window():
+def test_swa_slot_mapping_to_slot_ids_folds_by_page():
     eng = GlobalCacheEngine(_cache_config(), _model_config())
     # 3 windows worth of token-index slot_mapping starting at GPU slot 5,6,7.
     sm = np.concatenate([
@@ -313,9 +318,9 @@ def test_get_ssd_staging_when_only_ssd_has_swa():
     eng.cpu_cache_engine._evict_swa(eng.cpu_cache_engine.swa_pool.num_used)
 
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
-    cpu_hit, _s, _k = eng.cpu_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    cpu_hit, _s = eng.cpu_cache_engine.match_swa(seq, upper_bound_blocks=4)
     assert cpu_hit == 0, "precondition: CPU SWA must be gone"
-    ssd_hit, _s2, _k2 = eng.ssd_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    ssd_hit, _s2 = eng.ssd_cache_engine.match_swa(seq, upper_bound_blocks=4)
     assert ssd_hit > 0, "precondition: SSD SWA must still hold the window"
 
     graph, _rm2, gcb, gop, _ge = eng.get(
@@ -378,8 +383,8 @@ def test_multitier_match_promotes_swa_in_each_tier():
 
     seq_b = SequenceMeta(token_ids=tok_b, tokens_per_block=TPB); seq_b.gen_hashes()
     for name, engine in (("cpu", eng.cpu_cache_engine), ("ssd", eng.ssd_cache_engine)):
-        a_hit, _sa, _ka = engine.match_swa(seq_a, upper_bound_blocks=4)
-        b_hit, _sb, _kb = engine.match_swa(seq_b, upper_bound_blocks=4)
+        a_hit, _sa = engine.match_swa(seq_a, upper_bound_blocks=4)
+        b_hit, _sb = engine.match_swa(seq_b, upper_bound_blocks=4)
         assert a_hit == 4, f"{name}: reused SWA A was evicted (tier not promoted)"
         assert b_hit == 0, f"{name}: never-reused SWA B should have been evicted"
 

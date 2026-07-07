@@ -244,8 +244,12 @@ def test_py_reset_rearms_swa_pool_via_host_pool():
     """SWAHostPool.reset re-arms every slot free (tree reset drops all nodes)."""
     from flexkv.swa.swa_host_pool import SWAHostPool
     from flexkv.common.config import SWAPoolConfig
-    cfg = SWAPoolConfig(enabled=True, num_slots=4, window_size=TPB,
-                        num_swa_layers=1, bytes_per_token_per_layer=2)
+    cfg = SWAPoolConfig(
+        enabled=True,
+        num_slots=4,
+        num_swa_layers=1,
+        bytes_per_token_per_layer=2,
+    )
     pool = SWAHostPool(cfg)
     a, b = pool.allocate(), pool.allocate()
     assert a is not None and b is not None and pool.num_free == 2
@@ -682,8 +686,10 @@ class _SWAWorkloadDriver:
             evict_start_threshold=1.0, eviction_policy="lru",
         )
         self.engine.init_swa(SWAPoolConfig(
-            enabled=True, num_slots=swa_slots, window_size=_WTPB,
-            num_swa_layers=1, bytes_per_token_per_layer=max(1, slot_bytes // _WTPB),
+            enabled=True,
+            num_slots=swa_slots,
+            num_swa_layers=1,
+            bytes_per_token_per_layer=max(1, slot_bytes // _WTPB),
         ))
         self._slot_expect: Dict[int, int] = {}
         self.violations: List[str] = []
@@ -710,7 +716,7 @@ class _SWAWorkloadDriver:
         mr = self.engine.match(sm)
         full_hit = int(mr.num_ready_matched_blocks)
         if full_hit > 0:
-            swa_hit, slot, _key = self.engine.match_swa(
+            swa_hit, slot = self.engine.match_swa(
                 sm, upper_bound_blocks=full_hit, lock_for_load=False)
             if swa_hit > 0 and slot >= 0:
                 self.swa_hits += 1
