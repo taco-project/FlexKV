@@ -79,7 +79,7 @@ class KVCacheLayout:
             elif self.type == KVCacheLayoutType.LAYERBLOCK:  # vLLM >= 0.23 non-MLA GPU layout
                 self._kv_shape = torch.Size([self.num_layer,
                                              self.num_block,
-                                             self._kv_dim,
+                                             self.kv_dim,
                                              self.tokens_per_block,
                                              self.num_head,
                                              self.head_size])

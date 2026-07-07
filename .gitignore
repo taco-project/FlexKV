@@ -90,3 +90,4 @@ ssd_cache*/
 *cache*/
 benchmarks/nvcomp_benchmarks/inputs
 benchmarks/nvcomp_benchmarks/runs
+uv.lock

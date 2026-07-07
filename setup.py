@@ -34,26 +34,75 @@ NVCOMP_HEADERS = [
 ]
 
 
+# Mainstream datacenter + workstation architectures we want the shipped
+# c_ext.so to run on out of the box (Ampere -> Hopper -> Blackwell). The final
+# list is intersected with what the local nvcc actually supports, so this stays
+# buildable on older CUDA toolkits that lack sm_100/sm_120.
+MAINSTREAM_ARCHS = ["8.0", "8.6", "8.9", "9.0", "10.0", "12.0"]
+
+
+def _nvcc_supported_archs():
+    """Return the set of 'major.minor' arches the local nvcc can target.
+
+    Parses ``nvcc --list-gpu-arch`` (lines like ``compute_90``). Returns an
+    empty set if nvcc is unavailable, in which case callers should not filter."""
+    import re
+    import shutil
+    import subprocess
+    nvcc = shutil.which("nvcc") or os.path.join(
+        os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "nvcc")
+    try:
+        out = subprocess.run([nvcc, "--list-gpu-arch"],
+                             capture_output=True, text=True, check=True).stdout
+    except Exception as e:
+        print(f"Could not query nvcc for supported arches: {e}")
+        return set()
+    archs = set()
+    for m in re.finditer(r"compute_(\d+)", out):
+        code = m.group(1)  # e.g. "90" -> 9.0, "100" -> 10.0, "120" -> 12.0
+        archs.add(f"{int(code[:-1])}.{code[-1]}")
+    return archs
+
+
 def detect_cuda_arch():
-    """Auto-detect GPU compute capability. Returns a semicolon-separated arch list.
-    Falls back to a safe default when no GPU is available."""
+    """Return a semicolon-separated TORCH_CUDA_ARCH_LIST.
+
+    By default we build a *multi-arch* binary covering mainstream datacenter and
+    workstation GPUs so a single c_ext.so is portable across machines (this
+    avoids the "no kernel image is available for execution on the device" error
+    that a single-arch build hits when moved to a different GPU). The mainstream
+    set is filtered to what the local nvcc supports, the locally-detected arch is
+    always added, and +PTX is appended to the newest arch for forward-compat JIT
+    onto future GPUs."""
+    supported = _nvcc_supported_archs()
+
+    # Start from the mainstream set, filtered by what nvcc can actually build.
+    archs = {a for a in MAINSTREAM_ARCHS if not supported or a in supported}
+
+    # Always cover the GPU(s) present on the build host, even if not mainstream.
+    local = set()
     try:
         import torch
         if torch.cuda.is_available():
-            archs = set()
             for i in range(torch.cuda.device_count()):
                 major, minor = torch.cuda.get_device_capability(i)
-                archs.add(f"{major}.{minor}")
-            if archs:
-                arch_list = ";".join(sorted(archs))
-                print(f"Auto-detected GPU architectures: {arch_list}")
-                return arch_list
+                local.add(f"{major}.{minor}")
     except Exception as e:
         print(f"GPU architecture auto-detection failed: {e}")
-    # Fallback: common architectures (Ampere + Hopper)
-    fallback = "8.0;8.6;9.0"
-    print(f"No GPU detected, using fallback architectures: {fallback}")
-    return fallback
+    archs |= {a for a in local if not supported or a in supported}
+
+    if not archs:
+        # nvcc query failed AND no torch/GPU: fall back to a broad static list.
+        fallback = "8.0;8.6;9.0"
+        print(f"No arch info available, using fallback architectures: {fallback}")
+        return fallback
+
+    ordered = sorted(archs, key=lambda a: tuple(int(x) for x in a.split(".")))
+    # Emit PTX for the newest arch so unknown future GPUs can JIT from PTX.
+    arch_list = ";".join(ordered[:-1] + [f"{ordered[-1]}+PTX"])
+    print(f"Building for architectures: {arch_list} "
+          f"(mainstream default + local {sorted(local) or 'none'})")
+    return arch_list
 
 
 def _probe_nvcomp_root(root, source):

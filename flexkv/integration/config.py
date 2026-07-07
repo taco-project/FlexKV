@@ -17,6 +17,49 @@ if TYPE_CHECKING:
 logger = flexkv_logger
 
 
+def _is_nvfp4_dtype_str(dtype_str: Optional[str]) -> bool:
+    """Return True if *dtype_str* selects the NVFP4 packed KV cache layout."""
+    return isinstance(dtype_str, str) and dtype_str.lower() in ("nvfp4", "fp4", "e2m1")
+
+
+def nvfp4_kv_cache_full_dim(head_size: int) -> int:
+    """Packed last-dim size (in bytes / uint8 elements) for an NVFP4 KV cache.
+
+    Mirrors vLLM's ``vllm.utils.torch_utils.nvfp4_kv_cache_full_dim``:
+    each head packs ``head_size // 2`` bytes of fp4 data (2 fp4 values per byte)
+    plus ``head_size // 16`` bytes of fp8 block scales (1 scale per 16 elements).
+    """
+    return head_size // 2 + head_size // 16
+
+
+def _warn_nvfp4_unsupported_framework(dtype_str: Optional[str], framework: str) -> None:
+    """Warn if NVFP4 KV cache is requested from a framework whose FlexKV adapter
+    has not yet implemented the nvfp4 packed-layout ``head_size`` fold.
+
+    Only the vLLM adapter (``post_init_from_vllm_config``) folds the packed width
+    ``head_size//2 + head_size//16`` into ``head_size`` so the CPU/SSD mirror
+    matches the framework's packed GPU tensor byte-for-byte. Without that fold the
+    CPU mirror is sized for the *logical* head_size and offload/reload would be
+    byte-misaligned. Until each framework's packed nvfp4 layout is verified we
+    only warn here rather than silently produce a corrupt mirror.
+    """
+    if not _is_nvfp4_dtype_str(dtype_str):
+        return
+    # TODO(nvfp4): implement + verify the nvfp4 packed head_size fold for the
+    # {framework} adapter (mirror post_init_from_vllm_config: guard non-MLA,
+    # set model_config.head_size = nvfp4_kv_cache_full_dim(head_size)). Confirm
+    # the framework stores nvfp4 KV as a single packed uint8 tensor with the same
+    # (head_size//2 + head_size//16) last-dim layout as vLLM before enabling.
+    logger.warning(
+        f"[FlexKV {framework}] kv_cache_dtype='{dtype_str}' (NVFP4) requested, but "
+        f"the {framework} FlexKV adapter does NOT yet apply the nvfp4 packed "
+        f"head_size fold. The CPU/SSD mirror may be byte-misaligned with the "
+        f"packed GPU tensor -> offload/reload correctness is NOT guaranteed. "
+        f"NVFP4 is currently verified only through the vLLM adapter. "
+        f"See TODO(nvfp4) in flexkv/integration/config.py."
+    )
+
+
 @dataclass
 class FlexKVConfig:
     enable_flexkv: bool = True
@@ -55,6 +98,15 @@ class FlexKVConfig:
             "float8": torch.float8_e4m3fn,
             "e4m3": torch.float8_e4m3fn,
             "fp8_e4m3": torch.float8_e4m3fn,
+            # NVFP4: vLLM stores the packed fp4 data + fp8 block scales in a
+            # single uint8 tensor, so FlexKV mirrors it as a 1-byte-per-element
+            # buffer. The packed per-head element count is folded into head_size
+            # elsewhere (see ``nvfp4_kv_cache_full_dim`` /
+            # ``post_init_from_vllm_config``).
+            "nvfp4": torch.uint8,
+            "fp4": torch.uint8,
+            "e2m1": torch.uint8,
+            "fp4_e2m1": torch.uint8,
         }
         return dtype_map.get(dtype_str.lower(), torch.bfloat16)
 
@@ -163,7 +215,36 @@ class FlexKVConfig:
             framework_dtype_str=vllm_kv_cache_dtype if isinstance(vllm_kv_cache_dtype, str) else None,
             fallback_dtype=getattr(vllm_config.model_config, 'dtype', torch.bfloat16),
         )
-        self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
+        is_mla = vllm_config.model_config.is_deepseek_mla
+        self.model_config.use_mla = is_mla
+
+        # NVFP4: vLLM stores the packed fp4 data + fp8 block scales in a single
+        # uint8 tensor whose per-head last dim is head_size//2 + head_size//16.
+        # _resolve_dtype has already mapped nvfp4 -> uint8; here we fold the
+        # packed width into head_size so the CPU/SSD mirror matches vLLM's packed
+        # GPU tensor byte-for-byte. The effective dtype string follows the same
+        # user-first-else-framework priority _resolve_dtype uses.
+        effective_dtype_str = (
+            self.user_config.kv_cache_dtype
+            if self.user_config.kv_cache_dtype is not None
+            else (vllm_kv_cache_dtype if isinstance(vllm_kv_cache_dtype, str) else None)
+        )
+        if _is_nvfp4_dtype_str(effective_dtype_str) and not is_mla:
+            logical_head_size = self.model_config.head_size
+            packed_head_size = nvfp4_kv_cache_full_dim(logical_head_size)
+            self.model_config.head_size = packed_head_size
+            logger.info(
+                f"[FlexKV vllm] NVFP4 KV cache detected: folding packed layout "
+                f"into head_size (logical={logical_head_size} -> "
+                f"packed={packed_head_size}, dtype=uint8)"
+            )
+        elif _is_nvfp4_dtype_str(effective_dtype_str) and is_mla:
+            logger.warning(
+                "[FlexKV vllm] kv_cache_dtype='nvfp4' requested for an MLA "
+                "model. vLLM MLA backends do NOT support nvfp4 KV cache now; "
+                "skipping the nvfp4 head_size fold. If vLLM rejects this "
+                "config, use fp8/fp8_ds_mla for MLA instead."
+            )
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
         self.model_config.pp_size = vllm_config.parallel_config.pipeline_parallel_size
@@ -292,6 +373,12 @@ class FlexKVConfig:
             framework_dtype_str=kv_cache_dtype,
             fallback_dtype=getattr(sglang_config, "dtype", torch.bfloat16),
         )
+        # NVFP4 packed head_size fold is only implemented/verified for vLLM.
+        _warn_nvfp4_unsupported_framework(
+            self.user_config.kv_cache_dtype
+            if self.user_config.kv_cache_dtype is not None else kv_cache_dtype,
+            framework="sglang",
+        )
 
         if use_mla and getattr(sglang_config, "index_head_dim", None) is not None:
             kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
@@ -388,6 +475,13 @@ class FlexKVConfig:
             self.model_config.dtype = self._parse_dtype_str(dtype_str)
         else:
             self.model_config.dtype = dtype_str
+        # NVFP4 packed head_size fold is only implemented/verified for vLLM.
+        _warn_nvfp4_unsupported_framework(
+            self.user_config.kv_cache_dtype
+            if self.user_config.kv_cache_dtype is not None
+            else (dtype_str if isinstance(dtype_str, str) else None),
+            framework="trtllm",
+        )
 
         # Set model config (parallel configs part)
         if config.mapping.enable_attention_dp:

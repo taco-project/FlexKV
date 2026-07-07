@@ -499,7 +499,7 @@ class UserConfig:
     local_ip: Optional[str] = None
     redis_password: Optional[str] = None
     node_ttl_seconds: Optional[int] = None
-    kv_cache_dtype: Optional[str] = None  # Override kv_cache_dtype when TRT config uses "auto". Supported values: "fp8", "float8", "e4m3", "fp16", "float16", "bf16", "bfloat16", "fp32", "float32"
+    kv_cache_dtype: Optional[str] = None  # Override kv_cache_dtype when TRT config uses "auto". Supported values: "fp8", "float8", "e4m3", "fp16", "float16", "bf16", "bfloat16", "fp32", "float32", "nvfp4" (packed fp4+fp8-scale, stored as uint8)
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
