@@ -16,8 +16,8 @@ class MatchResultAccel:
     matched_node_ids: Optional[np.ndarray] = None #TODO id or ids? should we allow one req match results on multiple nodes?
     insert_to_local_cpu_index: bool = True
     # ===== SWA (node-mounted) — passed through from CMatchResult so the SWA
-    # control plane can reuse the SAME forward match instead of re-walking the
-    # tree (see GlobalCacheEngine.swa_align / match_swa_from_result). The deepest
+    # slot resolution can reuse the SAME forward match instead of re-walking the
+    # tree (see CacheEngineAccel.match_swa_from_result). The deepest
     # fully-matched ready node carrying a live SWA slot, and the ready-prefix
     # block count ending at it. None / 0 when no SWA on the matched path.
     last_swa_node: Optional['CRadixNode'] = None

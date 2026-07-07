@@ -198,6 +198,7 @@ class KVTaskManager:
                         is_fake_slot_mapping: bool = False,
                         temp_cache_strategy=DEFAULT_CACHE_STRATEGY,
                         namespace: Optional[List[str]] = None,
+                        swa_aware: bool = False,
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
@@ -208,7 +209,8 @@ class KVTaskManager:
             slot_mapping=slot_mapping,
             dp_client_id=dp_client_id,
             temp_cache_strategy=temp_cache_strategy,
-            namespace=namespace)
+            namespace=namespace,
+            swa_aware=swa_aware)
         self.tasks[task_id] = KVTask(
             task_id=task_id,
             task_type=TaskType.GET,
@@ -645,7 +647,18 @@ class KVTaskEngine(KVTaskManager):
                   token_mask: Optional[np.ndarray] = None,
                   cpu_only: bool = False,
                   task_id: int = -1,
-                  namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                  namespace: Optional[List[str]] = None,
+                  swa_aware: bool = False) -> Tuple[int, np.ndarray]:
+        """Match a prefix and build the load graph; return (task_id, return_mask).
+
+        With ``swa_aware=True`` the Full-KV transfer is clamped to the reusable
+        SWA window (``usable = min(full_hit, swa_hit)``) from the same single radix
+        match: past that window the Full-KV bytes would feed stale KV to the
+        SWA-layer attention. The SWA window is the trailing block of the returned
+        mask (page-granular), which the caller reads directly — there is no
+        separate SWA mask. ``swa_aware=False`` (default) is the plain path,
+        untouched.
+        """
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
         # self._sync_prefetch(token_ids, namespace)
         # Flush pending D2H completions so set_ready callbacks run before
@@ -663,7 +676,8 @@ class KVTaskEngine(KVTaskManager):
                                                            dp_client_id=dp_client_id,
                                                            cpu_only=cpu_only,
                                                            task_id=task_id,
-                                                           namespace=namespace)
+                                                           namespace=namespace,
+                                                           swa_aware=swa_aware)
         # trace get match request
         self.tracer.trace_request(
             request_type="GET_MATCH",
@@ -684,7 +698,8 @@ class KVTaskEngine(KVTaskManager):
                   token_mask: Optional[np.ndarray] = None,
                   cpu_only: bool = False,
                   task_id: int = -1,
-                  namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                  namespace: Optional[List[str]] = None,
+                  swa_aware: bool = False) -> Tuple[int, np.ndarray]:
         if token_mask is None:
             token_mask = np.ones_like(token_ids)
         if task_id == -1:
@@ -700,101 +715,11 @@ class KVTaskEngine(KVTaskManager):
                              token_mask=token_mask,
                              is_fake_slot_mapping=is_fake_slot_mapping,
                              temp_cache_strategy=temp_cache_strategy,
-                             namespace=namespace)
+                             namespace=namespace,
+                             swa_aware=swa_aware)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
-
-    def get_match_swa(self,
-                      token_ids: np.ndarray,
-                      full_mask: Optional[np.ndarray] = None,
-                      swa_mask: Optional[np.ndarray] = None,
-                      dp_client_id: int = 0,
-                      cpu_only: bool = False,
-                      task_id: int = -1,
-                      namespace: Optional[List[str]] = None,
-                      update_state_for_load: bool = True,
-                      ) -> Tuple[int, np.ndarray, np.ndarray]:
-        """Dual-mask SWA-aware match — the SWA counterpart to :meth:`get_match`.
-
-        Unlike the single-mask :meth:`get_match`, the Full-KV transfer is bounded
-        by the SWA-reusable prefix: it computes ``usable = min(full_hit, swa_hit)``
-        FIRST (match-only, no allocation), then builds the transfer graph truncated
-        to ``usable``. This is mandatory — loading Full-KV past the reusable SWA
-        prefix would (a) waste H2D bandwidth on blocks the caller will recompute,
-        and (b) feed stale / unrestored SWA KV to the SWA-layer attention. Because
-        the graph is built once at ``usable``, there is no src/dst block-count
-        mismatch (the failure the old connector avoided via cancel+reissue).
-
-        ``full_mask`` (1 = token NOT on GPU full pool, needs transfer) drives the
-        Full-KV match; ``swa_mask`` (1 = token NOT on GPU SWA pool) is reserved for
-        the future SWA H2D restore and not yet consumed.
-
-        When the GPU already holds the full prefix (``full_mask`` all-0), the
-        Full-KV match is empty and ``usable`` reduces to the SWA hit — the
-        "SWA-only" form — handled by the same code path (the truncated mask stays
-        all-0, so ``_get_match_impl`` builds an empty Full-KV graph).
-
-        The match itself (full hit, SWA hit, window) is computed by
-        :meth:`GlobalCacheEngine.swa_align`, which owns ALL SWA tier access — this
-        layer never touches the SWA radix state directly.
-
-        Returns ``(task_id, return_mask_full, return_mask_swa)``; both masks are
-        token-length, True where CPU can supply that token.  The single-mask
-        :meth:`get_match` is left untouched.
-        """
-        nvtx.push_range(f"get match swa: task_id={task_id}", color=get_nvtx_default_color())
-        # Flush pending D2H completions so set_ready callbacks run before we check
-        # the radix tree — same rationale as get_match.
-        self._update_tasks(timeout=0)
-        if full_mask is None:
-            full_mask = np.ones_like(token_ids, dtype=np.bool_)
-
-        tokens_per_block = self.cache_engine.tokens_per_block
-        num_tokens = token_ids.shape[0]
-
-        # --- ① Align first (match-only): full hit, SWA hit -------------------
-        # All tier access (node-mounted SWA / match_swa_prefix) lives in the cache
-        # engine; kvtask stays at the task-lifecycle layer. lock_for_load stays
-        # False until the SWA data plane can release the lock.
-        full_hit_blocks, swa_hit_blocks = self.cache_engine.swa_align(
-            token_ids, full_mask, namespace=namespace,
-            cpu_only=cpu_only, lock_for_load=False)
-        # SWA must be a subset of Full, so this is just swa_hit_blocks — but the
-        # min() makes the SWA-bound explicit and is robust if that ever loosens.
-        usable_blocks = min(full_hit_blocks, swa_hit_blocks)
-
-        # --- ② Truncate full_mask to usable, THEN build the transfer graph ----
-        # Past usable, the Full-KV bytes have no reusable SWA window, so they are
-        # excluded from transfer. The graph is built once at this length.
-        truncated_full_mask = full_mask.copy()
-        truncated_full_mask[usable_blocks * tokens_per_block:] = False
-        fake_slot_mapping = np.zeros_like(token_ids[truncated_full_mask])
-        result_task_id, return_mask_full = self._get_match_impl(
-            token_ids, fake_slot_mapping, is_fake_slot_mapping=True,
-            token_mask=truncated_full_mask, dp_client_id=dp_client_id,
-            cpu_only=cpu_only, task_id=task_id, namespace=namespace)
-
-        # --- ③ return_mask_swa: the trailing SWA window at the SWA hit ---------
-        # SWA is page-granular: one slot = one swa_page window = exactly one
-        # block (window_size == tokens_per_block), so the trailing window is the
-        # single block ending at swa_hit_blocks.
-        return_mask_swa = np.zeros(num_tokens, dtype=np.bool_)
-        if swa_hit_blocks > 0:
-            return_mask_swa[(swa_hit_blocks - 1) * tokens_per_block:
-                            swa_hit_blocks * tokens_per_block] = True
-
-        # trace get match swa request (mirrors get_match's GET_MATCH trace)
-        self.tracer.trace_request(
-            request_type="GET_MATCH_SWA",
-            request_id=result_task_id,
-            token_ids=token_ids,
-            slot_mapping=fake_slot_mapping,
-            token_mask=truncated_full_mask,
-            dp_client_id=dp_client_id
-        )
-        nvtx.pop_range()
-        return result_task_id, return_mask_full, return_mask_swa
 
     def put_match(self,
                   token_ids: np.ndarray,

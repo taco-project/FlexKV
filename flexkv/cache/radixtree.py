@@ -423,6 +423,14 @@ class RadixTreeIndex:
                 last_node_matched_length = matched_length
                 prefix_blocks_num += matched_length
                 break
+        # Read-hit heat update: on a real match (update_cache_info=True), promote
+        # the matched SWA node to its SWA-LRU MRU — the SWA peer of the per-node
+        # Full-KV heat bump above, so a reused SWA copy survives eviction over a
+        # never-reused one. last_swa_node is the deepest fully-matched ready node
+        # with a live SWA slot (or None); promote_swa no-ops on root / no-SWA.
+        # A probe (update_cache_info=False) must NOT touch the SWA-LRU.
+        if update_cache_info and last_swa_node is not None:
+            self.promote_swa(last_swa_node)
         return MatchResult(num_matched_blocks=prefix_blocks_num,
                            num_ready_matched_blocks=ready_prefix_blocks_num,
                            last_ready_node=last_ready_node,

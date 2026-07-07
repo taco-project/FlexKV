@@ -1,26 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end SWA data-plane test entered from the ENGINE control-plane API
-(GlobalCacheEngine.put/get), with real byte movement — NO stubs.
+"""End-to-end SWA SSD-staging byte-exact test (multi-tier), entered from the
+ENGINE control-plane API with real byte movement — NO stubs.
 
-This is the production-path proof for the SWA data plane: the transfer graph is
-produced by ``GlobalCacheEngine.put()`` / ``get()`` (which call the now-wired
-``_swa_put_slots`` / ``_swa_get_slots`` — real SWA-pool alloc + node-mounted
-match, plus the size-1 GPU placeholder), the GPU sides are bound LATE via
-``set_gpu_blocks`` (full-KV) and ``set_swa_gpu_blocks`` (SWA) exactly as
-``KVTaskEngine.launch`` does, and the resulting graph is submitted to a real
-``TransferEngine`` with GPU pools. We then assert a byte-exact main-KV + SWA
-GPU->CPU->GPU roundtrip.
+Proves the SSD SWA tier round-trip that the CPU-only e2e (test_swa_control_plane_e2e.py)
+does not cover:
 
-Flow (mirrors KVManager get_match(swa_aware=True) + launch, minus the tp_client subprocess):
-  PUT : engine.put() -> graph {full D2H, SWA D2H} -> bind GPU slots -> submit
-        -> full+SWA bytes land in the shared CPU pool + SWA host pool
-  GET : engine.get() -> graph {full H2D, SWA H2D} -> bind GPU slots -> submit
-        -> bytes restored to fresh GPU blocks -> byte-exact compare
+  PUT : engine.put() -> graph {full D2H, SWA D2H, SWA H2DISK write-through}
+        -> the SWA window lands in BOTH the CPU SWA host pool AND the SSD SWA
+           files (write-through).
+  EVICT: drop the CPU SWA slot (SWA-only eviction) so the window survives ONLY
+         on SSD — forcing the GET to stage from SSD.
+  GET : engine.get() -> graph {full H2D, SWA DISK2H (SSD->CPU staging) -> SWA H2D
+        (CPU->GPU)} -> bytes restored to a fresh GPU SWA slot -> byte-exact.
+
+This exercises the multi-tier _swa_put_slots (write-through) and _swa_get_slots
+(SSD->CPU transient staging slot + H2D), plus the transient staging slot free on
+H2D completion.
 
 Run INSIDE the container on a free GPU:
-    CUDA_VISIBLE_DEVICES=0 python3 tests/test_swa_control_plane_e2e.py
+    CUDA_VISIBLE_DEVICES=0 python3 tests/test_swa_ssd_staging_e2e.py
 """
+import os
+import shutil
 import sys
 import time
 
@@ -40,15 +42,14 @@ from flexkv.transfer.transfer_engine import TransferEngine
 NUM_LAYERS = 4
 NUM_BLOCKS_GPU = 64
 NUM_BLOCKS_CPU = 64
+NUM_BLOCKS_SSD = 128
 TOKENS_PER_BLOCK = 16
 BYTES_PER_TOKEN_PER_LAYER = 64
 DEVICE_ID = 0
-NUM_SWA_SLOTS = 64
-
-# GPU SWA slot the connector would pick for the trailing window (arbitrary free
-# slot in the SWA GPU pool). The engine builds the SWA op with a placeholder GPU
-# slot; late-bind (set_swa_gpu_blocks) rebinds it to this.
+NUM_SWA_SLOTS = 32
+NUM_SWA_SSD_SLOTS = 32
 SWA_GPU_SLOT = 9
+SSD_CACHE_DIR = "./_swa_ssd_e2e_cache"
 
 
 def make_gpu_pool(num_blocks):
@@ -89,11 +90,7 @@ def wait_for_op(te, op_ids, timeout_s=30.0):
         raise TimeoutError(f"Ops {pending} did not complete in {timeout_s}s")
 
 
-def _run_graph(te, engine, graph, op_cb, cb, full_gpu_blocks, swa_gpu_slot,
-               reported_op_ids):
-    """Late-bind GPU slots (full-KV + SWA), submit to the TransferEngine, wait,
-    then run the engine's op/transfer callbacks (set_ready/unlock/lock-release),
-    exactly as KVTaskEngine.launch + _update_tasks would."""
+def _run_graph(te, graph, op_cb, cb, full_gpu_blocks, swa_gpu_slot, reported_op_ids):
     graph.set_gpu_blocks(np.asarray(full_gpu_blocks, dtype=np.int64))
     if graph._swa_gpu_transfer_op_id:
         graph.set_swa_gpu_blocks(np.asarray([swa_gpu_slot], dtype=np.int64))
@@ -110,32 +107,31 @@ def main() -> int:
         print("[verify] CUDA not available", flush=True)
         return 2
     torch.cuda.set_device(DEVICE_ID)
-    print(f"[verify] device cuda:{DEVICE_ID}", flush=True)
+    if os.path.isdir(SSD_CACHE_DIR):
+        shutil.rmtree(SSD_CACHE_DIR)
+    os.makedirs(SSD_CACHE_DIR, exist_ok=True)
+    print(f"[verify] device cuda:{DEVICE_ID}, ssd_dir={SSD_CACHE_DIR}", flush=True)
 
-    # ---- config: engine mempool and TransferEngine CPU pool share num_cpu_blocks
     model_config = ModelConfig(num_layers=NUM_LAYERS, num_kv_heads=1,
                                head_size=BYTES_PER_TOKEN_PER_LAYER, use_mla=True,
                                dtype=torch.uint8, tp_size=1, pp_size=1, dp_size=1,
                                cp_size=1)
     cache_config = CacheConfig(
-        tokens_per_block=TOKENS_PER_BLOCK, enable_cpu=True, enable_ssd=False,
+        tokens_per_block=TOKENS_PER_BLOCK, enable_cpu=True, enable_ssd=True,
         enable_remote=False, num_cpu_blocks=NUM_BLOCKS_CPU,
+        num_ssd_blocks=NUM_BLOCKS_SSD, ssd_cache_dir=SSD_CACHE_DIR,
         swa=SWAPoolConfig(enabled=True, num_slots=NUM_SWA_SLOTS,
+                          num_ssd_slots=NUM_SWA_SSD_SLOTS,
                           window_size=TOKENS_PER_BLOCK, num_swa_layers=NUM_LAYERS,
                           bytes_per_token_per_layer=BYTES_PER_TOKEN_PER_LAYER,
                           pin_memory=True))
     cache_config.enable_swa_transfer = True
 
-    # ---- GPU pools: main-KV + SWA (dedicated), seed one input block of each ----
     mk_pool = make_gpu_pool(NUM_BLOCKS_GPU)
     sw_pool = make_gpu_pool(NUM_SWA_SLOTS)
-    # One-block request (== one page == one SWA window on DSv4). Put reads GPU
-    # block 0 (full) and SWA GPU slot SWA_GPU_SLOT; get restores into block 3 /
-    # SWA slot SWA_GPU_SLOT (a different block for full to prove CPU sourcing).
     PUT_FULL_GPU, GET_FULL_GPU = 0, 3
     seed_block(mk_pool, PUT_FULL_GPU, salt=0xA1)
     seed_block(sw_pool, SWA_GPU_SLOT, salt=0xB2)
-    expected_mk = block_bytes(mk_pool, PUT_FULL_GPU)
     expected_sw = block_bytes(sw_pool, SWA_GPU_SLOT)
 
     mk_handles = [TensorSharedHandle(mk_pool[l].contiguous(), DEVICE_ID)
@@ -143,11 +139,9 @@ def main() -> int:
     sw_handles = [TensorSharedHandle(sw_pool[l].contiguous(), DEVICE_ID)
                   for l in range(NUM_LAYERS)]
 
-    # ---- StorageEngine: CPU pool (shared block space with engine mempool) +
-    #      main-KV GPU pool + SWA GPU pool ----
     se = StorageEngine(model_config, cache_config, num_layers_per_pp_stage=NUM_LAYERS)
-    assert se.has_storage_handle(DeviceType.CPU, device_id=0, is_swa=True), \
-        "SWA CPU host pool missing"
+    assert se.has_storage_handle(DeviceType.CPU, device_id=0, is_swa=True), "SWA CPU pool missing"
+    assert se.has_storage_handle(DeviceType.SSD, device_id=0, is_swa=True), "SWA SSD pool missing"
     gpu_layout = make_layout(NUM_BLOCKS_GPU)
     swa_gpu_layout = make_layout(NUM_SWA_SLOTS)
     se.register_gpu_blocks(mk_handles, gpu_layout, device_id=DEVICE_ID, dtype=torch.uint8)
@@ -158,98 +152,100 @@ def main() -> int:
         gpu_handles={worker_key: [se.get_storage_handle(DeviceType.GPU, device_id=DEVICE_ID)]},
         model_config=model_config, cache_config=cache_config,
         cpu_handle=se.get_storage_handle(DeviceType.CPU),
+        ssd_handle=se.get_storage_handle(DeviceType.SSD),
         swa_gpu_handles={worker_key: [se.get_swa_storage_handle(DEVICE_ID)]},
         swa_cpu_handle=se.get_storage_handle(DeviceType.CPU, device_id=0, is_swa=True),
+        swa_ssd_handle=se.get_storage_handle(DeviceType.SSD, device_id=0, is_swa=True),
     )
     te.start()
-    print("[verify] TransferEngine started (main-KV + SWA workers)", flush=True)
+    print("[verify] TransferEngine started (main-KV + SWA CPU/SSD workers)", flush=True)
 
-    # ---- the control-plane engine (radix + SWA host pool), sharing num_cpu_blocks
     engine = GlobalCacheEngine(cache_config, model_config)
+    assert engine.ssd_cache_engine is not None and engine.ssd_cache_engine.swa_enabled, \
+        "engine SSD SWA tier not enabled"
 
-    tok = np.arange(1, TOKENS_PER_BLOCK + 1, dtype=np.int64)  # 1 block
+    tok = np.arange(1, TOKENS_PER_BLOCK + 1, dtype=np.int64)
     put_slot_mapping = np.arange(PUT_FULL_GPU * TOKENS_PER_BLOCK,
                                  (PUT_FULL_GPU + 1) * TOKENS_PER_BLOCK, dtype=np.int64)
     mask = np.ones_like(tok, dtype=np.int64)
 
-    # ===== PUT via GlobalCacheEngine.put() (real _swa_put_slots) ================
+    # ===== PUT: full D2H + SWA D2H + SWA H2DISK write-through ====================
     put_graph, _rm, put_cb, put_op_cb, put_end = engine.put(
         request_id=1, token_ids=tok, token_mask=mask,
         slot_mapping=put_slot_mapping, dp_client_id=0)
     swa_put_ops = [o for o in put_graph._op_map.values() if getattr(o, "is_swa", False)]
-    assert len(swa_put_ops) == 1, f"expected 1 SWA D2H, got {len(swa_put_ops)}"
-    reported = {put_end}
-    reported |= {o.op_id for o in swa_put_ops}
-    print(f"[verify] PUT graph from engine: {len(put_graph._op_map)} ops, "
-          f"1 SWA D2H (cpu_slot={swa_put_ops[0].dst_block_ids.tolist()})", flush=True)
-    # PUT full GPU src = block 0 (already in slot_mapping); SWA GPU src = SWA_GPU_SLOT.
-    _run_graph(te, engine, put_graph, put_op_cb, put_cb,
+    kinds = sorted(o.transfer_type.name for o in swa_put_ops)
+    assert "D2H" in kinds and "H2DISK" in kinds, f"expected SWA D2H + H2DISK, got {kinds}"
+    assert engine.ssd_cache_engine.swa_pool.num_used == 1, "SSD SWA slot not allocated on put"
+    reported = {put_end} | {o.op_id for o in swa_put_ops if o.transfer_type.name == "D2H"}
+    print(f"[verify] PUT graph: SWA ops={kinds} (write-through to SSD)", flush=True)
+    _run_graph(te, put_graph, put_op_cb, put_cb,
                full_gpu_blocks=[PUT_FULL_GPU], swa_gpu_slot=SWA_GPU_SLOT,
                reported_op_ids=reported)
-    print("[verify] PUT done (full + SWA D2H committed to CPU pools)", flush=True)
+    print("[verify] PUT done (SWA in CPU pool + SSD files)", flush=True)
 
-    # zero the GPU pools so GET must source from CPU
-    mk_pool.zero_(); sw_pool.zero_(); torch.cuda.synchronize()
+    # ===== EVICT the CPU SWA so the window survives only on SSD =================
+    n_cpu = engine.cpu_cache_engine.swa_pool.num_used
+    engine.cpu_cache_engine._evict_swa(n_cpu)
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); seq.gen_hashes()
+    cpu_hit, _s, _k = engine.cpu_cache_engine.match_swa(seq, upper_bound_blocks=1)
+    ssd_hit, _s2, _k2 = engine.ssd_cache_engine.match_swa(seq, upper_bound_blocks=1)
+    assert cpu_hit == 0 and ssd_hit > 0, f"precondition failed: cpu_hit={cpu_hit} ssd_hit={ssd_hit}"
+    print(f"[verify] evicted CPU SWA (cpu_hit=0, ssd_hit={ssd_hit}); GET must stage from SSD", flush=True)
 
-    # ===== GET via GlobalCacheEngine.get() (real _swa_get_slots) ===============
+    # zero the GPU SWA pool so GET must restore from SSD->CPU->GPU
+    sw_pool.zero_(); mk_pool.zero_(); torch.cuda.synchronize()
+
+    # ===== GET: SWA DISK2H (SSD->CPU staging) -> SWA H2D (CPU->GPU) =============
     get_slot_mapping = np.arange(GET_FULL_GPU * TOKENS_PER_BLOCK,
                                  (GET_FULL_GPU + 1) * TOKENS_PER_BLOCK, dtype=np.int64)
     get_graph, _rm2, get_cb, get_op_cb, get_end = engine.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
         slot_mapping=get_slot_mapping, dp_client_id=0)
     swa_get_ops = [o for o in get_graph._op_map.values() if getattr(o, "is_swa", False)]
-    assert len(swa_get_ops) == 1 and swa_get_ops[0].transfer_type.name == "H2D", \
-        f"expected 1 SWA H2D, got {[o.transfer_type.name for o in swa_get_ops]}"
-    reported2 = {swa_get_ops[0].op_id}
-    # the full-KV H2D reported op(s): everything appended to finished except swa
-    # is inside the graph; wait on the barrier's predecessors (full H2D + SWA H2D).
+    gkinds = sorted(o.transfer_type.name for o in swa_get_ops)
+    assert "DISK2H" in gkinds and "H2D" in gkinds, f"expected SWA DISK2H+H2D staging, got {gkinds}"
+    swa_h2d = [o for o in swa_get_ops if o.transfer_type.name == "H2D"][0]
+    swa_disk2h = [o for o in swa_get_ops if o.transfer_type.name == "DISK2H"][0]
+    assert swa_disk2h.op_id in swa_h2d.predecessors, "SWA H2D must depend on SSD DISK2H"
     barrier = get_graph._op_map[get_end]
-    reported2 |= set(barrier.predecessors)
-    print(f"[verify] GET graph from engine: {len(get_graph._op_map)} ops, "
-          f"1 SWA H2D (cpu_slot={swa_get_ops[0].src_block_ids.tolist()})", flush=True)
-    _run_graph(te, engine, get_graph, get_op_cb, get_cb,
+    reported2 = {swa_h2d.op_id} | set(barrier.predecessors)
+    print(f"[verify] GET graph: SWA ops={gkinds} (SSD staging chain)", flush=True)
+    _run_graph(te, get_graph, get_op_cb, get_cb,
                full_gpu_blocks=[GET_FULL_GPU], swa_gpu_slot=SWA_GPU_SLOT,
                reported_op_ids=reported2)
-    print("[verify] GET done (full + SWA H2D restored to GPU)", flush=True)
+    print("[verify] GET done (SWA restored via SSD->CPU->GPU)", flush=True)
 
     # ===== byte-exact compare ==================================================
-    actual_mk = block_bytes(mk_pool, GET_FULL_GPU)
     actual_sw = block_bytes(sw_pool, SWA_GPU_SLOT)
-    failed = False
-    if actual_mk != expected_mk:
-        print("[verify] FAIL main-KV byte mismatch", flush=True); failed = True
+    failed = actual_sw != expected_sw
+    if failed:
+        print("[verify] FAIL SWA byte mismatch after SSD staging", flush=True)
     else:
-        print(f"[verify] OK    main-KV: {len(expected_mk)} bytes match "
-              f"GPU[{PUT_FULL_GPU}]->CPU->GPU[{GET_FULL_GPU}]", flush=True)
-    if actual_sw != expected_sw:
-        print("[verify] FAIL SWA byte mismatch", flush=True); failed = True
-    else:
-        print(f"[verify] OK    SWA    : {len(expected_sw)} bytes match "
-              f"GPU[{SWA_GPU_SLOT}]->CPU(host pool)->GPU[{SWA_GPU_SLOT}]", flush=True)
+        print(f"[verify] OK    SWA: {len(expected_sw)} bytes match "
+              f"GPU->CPU/SSD->(evict CPU)->DISK2H->H2D->GPU", flush=True)
 
-    # SWA lock released by the H2D callback (no leak).
-    sm = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); sm.gen_hashes()
-    hit, slot, key, node = engine.cpu_cache_engine.match_swa_locked(sm, upper_bound_blocks=1)
-    if node is not None:
-        lock_ok = (node.swa_lock_ref == 1)  # our fresh probe lock; prior load lock released
-        node.dec_swa_lock_ref()
-        print(f"[verify] {'OK   ' if lock_ok else 'FAIL '} SWA load lock released "
-              f"(lock_ref after fresh probe == 1: {lock_ok})", flush=True)
-        failed = failed or not lock_ok
+    # transient CPU staging slot must be freed on H2D completion (no leak).
+    staging_used = engine.cpu_cache_engine.swa_pool.num_used
+    if staging_used != 0:
+        print(f"[verify] FAIL transient CPU staging slot leaked (num_used={staging_used})", flush=True)
+        failed = True
+    else:
+        print("[verify] OK    transient CPU staging slot freed (no leak)", flush=True)
 
     te.shutdown()
+    if os.path.isdir(SSD_CACHE_DIR):
+        shutil.rmtree(SSD_CACHE_DIR)
     if failed:
         return 4
-    print("[verify] PASS: engine control-plane graph moved main-KV + SWA byte-exact, "
-          "no stub, lock released", flush=True)
+    print("[verify] PASS: SSD SWA staging byte-exact, transient slot freed", flush=True)
     return 0
 
 
 @pytest.mark.e2e
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="SWA byte-exact e2e needs a GPU")
-def test_swa_control_plane_e2e_byte_exact():
-    """pytest entry: run the byte-exact GPU->CPU->GPU roundtrip (main() returns 0
-    on success). Collected by `pytest -m e2e`; also runnable standalone."""
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="SWA SSD staging e2e needs a GPU")
+def test_swa_ssd_staging_e2e_byte_exact():
+    """pytest entry: SSD SWA write-through + staged GET byte-exact roundtrip."""
     assert main() == 0
 
 

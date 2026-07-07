@@ -29,7 +29,6 @@ from flexkv.server.request import (
     GetRequest,
     PutMatchRequest,
     GetMatchRequest,
-    GetMatchSwaRequest,
     LaunchTaskRequest,
     CancelTaskRequest,
     WaitRequest,
@@ -198,7 +197,6 @@ class KVServer:
             GetRequest: self._handle_get_request,
             PutRequest: self._handle_put_request,
             GetMatchRequest: self._handle_get_match_request,
-            GetMatchSwaRequest: self._handle_get_match_swa_request,
             PutMatchRequest: self._handle_put_match_request,
             PrefetchRequest: self._handle_prefetch_request,
             WaitRequest: self._handle_wait_request,
@@ -423,31 +421,10 @@ class KVServer:
             cpu_only=req.cpu_only,
             task_id=req.task_id,
             namespace=req.namespace,
+            swa_aware=req.swa_aware,
         )
         response = Response(dp_client_id=req.dp_client_id,
                             task_id=req_id, mask=mask)
-        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
-        result_zmq.send_pyobj(response)
-
-    def _handle_get_match_swa_request(self, req: GetMatchSwaRequest) -> None:
-        """Handle SWA-aware dual-mask GetMatch request (DSv4 server mode).
-
-        Mirrors :meth:`_handle_get_match_request`: runs the same in-process
-        get_match_swa and replies with return_mask_full in ``mask`` and
-        return_mask_swa in ``mask_swa``.
-        """
-        req_id, mask_full, mask_swa = self.kv_task_engine.get_match_swa(
-            token_ids=req.token_ids,
-            full_mask=req.full_mask,
-            swa_mask=req.swa_mask,
-            dp_client_id=req.dp_client_id,
-            cpu_only=req.cpu_only,
-            task_id=req.task_id,
-            namespace=req.namespace,
-            update_state_for_load=req.update_state_for_load,
-        )
-        response = Response(dp_client_id=req.dp_client_id,
-                            task_id=req_id, mask=mask_full, mask_swa=mask_swa)
         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
         result_zmq.send_pyobj(response)
 

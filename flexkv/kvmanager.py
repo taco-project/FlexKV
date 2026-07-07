@@ -187,7 +187,15 @@ class KVManager:
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   cpu_only: bool = False,
                   namespace: Optional[List[str]] = None,
+                  swa_aware: bool = False,
                   ) -> Tuple[int, np.ndarray]:
+        """Match a prefix and build the load graph; return (task_id, mask).
+
+        ``swa_aware=True`` clamps the Full-KV transfer to the reusable SWA window
+        (from the same single match); the SWA window is the trailing block of the
+        returned mask, which the caller reads directly. ``swa_aware=False``
+        (default) is the plain path.
+        """
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if isinstance(token_mask, torch.Tensor):
@@ -196,70 +204,17 @@ class KVManager:
             task_id, mask = self.dp_client.get_match(token_ids,
                                                      token_mask,
                                                      cpu_only=cpu_only,
-                                                     namespace=namespace)
+                                                     namespace=namespace,
+                                                     swa_aware=swa_aware)
         else:
             task_id, mask = self.kv_task_engine.get_match(
                 token_ids=token_ids,
                 token_mask=token_mask,
                 cpu_only=cpu_only,
                 namespace=namespace,
+                swa_aware=swa_aware,
             )
         return task_id, mask
-
-    def get_match_swa(self,
-                      token_ids: Union[torch.Tensor, np.ndarray],
-                      full_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                      swa_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                      cpu_only: bool = False,
-                      namespace: Optional[List[str]] = None,
-                      update_state_for_load: bool = True,
-                      ) -> Tuple[int, np.ndarray, np.ndarray]:
-        """Dual-mask SWA-aware match — deployment-dispatch wrapper.
-
-        Mirrors :meth:`get_match`'s wrapper exactly: convert tensors to numpy and
-        dispatch on ``server_client_mode``. ``full_mask`` is the original
-        token_mask (1 = token not on GPU full pool, needs transfer); ``swa_mask``
-        marks tokens missing on the GPU SWA pool.  Returns
-        ``(task_id, return_mask_full, return_mask_swa)``; the matching itself lives
-        in :meth:`KVTaskEngine.get_match_swa`.
-
-        Both deployment forms are supported (this is the SWA analogue of
-        ``get_match``'s ``if server_client_mode`` branch): in-process calls
-        ``kv_task_engine.get_match_swa``; server mode forwards over the SWA RPC
-        (``dp_client.get_match_swa`` → ``GetMatchSwaRequest`` →
-        ``_handle_get_match_swa_request``).  If the RPC fails, it falls back to a
-        no-hit reply (matching ``get_match``'s None-on-error tolerance) rather than
-        crashing the scheduler.
-        """
-        if isinstance(token_ids, torch.Tensor):
-            token_ids = token_ids.numpy()
-        if isinstance(full_mask, torch.Tensor):
-            full_mask = full_mask.numpy()
-        if isinstance(swa_mask, torch.Tensor):
-            swa_mask = swa_mask.numpy()
-        if self.server_client_mode:
-            result = self.dp_client.get_match_swa(
-                token_ids,
-                full_mask,
-                swa_mask,
-                cpu_only=cpu_only,
-                namespace=namespace,
-                update_state_for_load=update_state_for_load,
-            )
-            if result is None:
-                # RPC failed on the server; degrade to a no-hit reply so the
-                # caller never unpacks None (same tolerance as get_match).
-                empty = np.zeros_like(token_ids, dtype=np.bool_)
-                return -1, empty, empty
-            return result
-        return self.kv_task_engine.get_match_swa(
-            token_ids=token_ids,
-            full_mask=full_mask,
-            swa_mask=swa_mask,
-            cpu_only=cpu_only,
-            namespace=namespace,
-            update_state_for_load=update_state_for_load,
-        )
 
     def put_async(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
@@ -403,7 +358,7 @@ class KVManager:
     # ===== SWA (Sliding Window Attention) =====
     #
     # SWA is NODE-MOUNTED on the Full-KV radix tree and matched via
-    # ``get_match_swa`` (see above); SWA bytes move through the FlexKV transfer
+    # ``get_match(swa_aware=True)``; SWA bytes move through the FlexKV transfer
     # engine (data plane). The legacy standalone-index / blob API (SWAIndex,
     # swa_put / swa_get / swa_available + node_swa_ops + SWAProductionManager)
     # has been removed. See deployments/swa_design/08_节点挂载SWA架构.md.

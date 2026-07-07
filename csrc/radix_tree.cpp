@@ -755,6 +755,16 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
 
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
   auto empty_uint32 = torch::Tensor();
+  // Read-hit heat update: on a real match (update_cache_info=true), promote the
+  // matched SWA node to its SWA-LRU MRU — the SWA peer of the per-node Full-KV
+  // update_time() bump above, so a reused SWA copy survives eviction over a
+  // never-reused one. last_swa_node is the deepest fully-matched ready node with
+  // a live SWA slot (or nullptr); promote_swa no-ops on root / no-SWA. A probe
+  // (update_cache_info=false) must NOT touch the SWA-LRU. Mirrors Python
+  // RadixTreeIndex.match_prefix.
+  if (update_cache_info && last_swa_node != nullptr) {
+    promote_swa(last_swa_node);
+  }
   return std::make_shared<CMatchResult>(
       ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
       last_ready_node, current_node, physical_blocks, empty_uint32,

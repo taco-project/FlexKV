@@ -145,6 +145,47 @@ def test_py_evict_swa_leaf_with_full_lock_keeps_full():
     assert not idx.is_empty()
 
 
+def test_py_match_probe_does_not_promote_swa_lru():
+    """M1.5 (regression guard): a match-only PROBE (update_cache_info=False) must
+    NOT reorder the SWA-LRU. A probe may never lead to actual reuse
+    (usable=min(full,swa) can clamp it to 0), so promoting on a probe would
+    pollute eviction. Passes today; must keep passing after the reuse-promotion
+    fix (which should gate on update_cache_info=True only)."""
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    a = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    idx.set_swa(a, slot=10)
+    b = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3), is_ready=True)
+    idx.set_swa(b, slot=11)
+    # SWA-LRU order (LRU tail -> MRU head): A, B. Probe A without cache-info update.
+    idx.match_prefix(_seq([1, 2, 3, 4]), update_cache_info=False)
+    # A must still be the LRU victim — the probe did not promote it.
+    assert idx._swa_lru_get_lru_unlocked() is a
+
+
+def test_py_reuse_promotes_swa_over_never_reused():
+    """M6.6: the SWA-LRU reuse contract — a real match promotes the reused SWA
+    node to MRU, so a never-reused node becomes the eviction victim instead.
+
+    A (older) and B (newer) each hold an SWA slot; SWA-LRU order tail->head = A,B.
+    We then REUSE A via a real match (update_cache_info=True — the actual-reuse
+    path, mirroring how full-KV match already bumps its own last_access_time). A
+    correct SWA-LRU promotes the reused node to MRU, making B (never reused) the
+    true LRU victim. On the next single-slot SWA eviction, B must go and A must
+    survive."""
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    a = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    idx.set_swa(a, slot=10)
+    b = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3), is_ready=True)
+    idx.set_swa(b, slot=11)
+    # Reuse A (real match, not a probe).
+    mr = idx.match_prefix(_seq([1, 2, 3, 4]), update_cache_info=True)
+    assert mr.last_swa_node is a  # A was indeed matched/reused
+    # Evict one SWA slot: must drop the never-reused B, not the just-reused A.
+    idx.evict_swa(1)
+    assert a.has_swa(), "reused SWA A was evicted (SWA-LRU not promoted on match)"
+    assert not b.has_swa()
+
+
 def test_py_dual_lock_invariant():
     """I3: full_lock_ref (lock_cnt) >= swa_lock_ref, with paired inc/dec."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
@@ -372,6 +413,46 @@ def test_cpp_match_reports_last_swa_node():
     assert mr.last_swa_node is not None
     assert mr.last_swa_node.swa_host_slot == 100
     assert mr.swa_hit_blocks == 4
+
+
+@cext
+def test_cpp_reuse_promotes_swa_over_never_reused():
+    """C++ peer of test_py_reuse_promotes_swa_over_never_reused: a real match
+    (update_cache_info=True) promotes the reused SWA node to MRU, so the
+    never-reused node is evicted instead. Observed via evict_swa (the SWA-LRU is
+    not directly bound to Python)."""
+    t = _tree()
+    a = _insert(t, [1, 2, 3, 4], 0)
+    t.set_swa(a, 10)
+    b = _insert(t, [5, 6, 7, 8], 4)
+    t.set_swa(b, 11)
+    # SWA-LRU order (LRU tail -> MRU head): A, B. Reuse A with a REAL match.
+    mr = t.match_prefix(_hashes([1, 2, 3, 4]), 2, True)
+    assert mr.last_swa_node is not None and mr.last_swa_node.swa_host_slot == 10
+    # Evict one SWA slot: B (never reused) must go, A (just reused) survives.
+    _evf, nfreed = _evict_swa(t, 1)
+    assert nfreed == 1
+    assert a.has_swa(), "reused SWA A was evicted (C++ match did not promote)"
+    assert not b.has_swa()
+
+
+@cext
+def test_cpp_match_probe_does_not_promote_swa_lru():
+    """C++ peer of test_py_match_probe_does_not_promote_swa_lru: a probe
+    (update_cache_info=False) must NOT reorder the SWA-LRU, so the older node A
+    stays the eviction victim even after being probed."""
+    t = _tree()
+    a = _insert(t, [1, 2, 3, 4], 0)
+    t.set_swa(a, 10)
+    b = _insert(t, [5, 6, 7, 8], 4)
+    t.set_swa(b, 11)
+    # Probe A without cache-info update — must not promote it.
+    t.match_prefix(_hashes([1, 2, 3, 4]), 2, False)
+    # A is still the LRU victim: evicting one drops A, keeps B.
+    _evf, nfreed = _evict_swa(t, 1)
+    assert nfreed == 1
+    assert not a.has_swa(), "probe wrongly promoted A (should stay LRU victim)"
+    assert b.has_swa()
 
 
 @cext
