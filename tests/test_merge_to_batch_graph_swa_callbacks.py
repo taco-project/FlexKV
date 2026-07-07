@@ -1,5 +1,6 @@
 """merge_to_batch_graph: SWA + main per-op callbacks survive fusion."""
 import numpy as np
+import pytest
 
 from flexkv.common.transfer import (
     LayerwiseTransferOp,
@@ -8,6 +9,9 @@ from flexkv.common.transfer import (
     TransferType,
     merge_to_batch_graph,
 )
+
+# Pure numpy graph-fusion logic (no torch / c_ext / GPU) -> unit tier.
+pytestmark = pytest.mark.unit
 
 
 def _graph_with_get_ops(*, with_swa: bool) -> tuple[TransferOpGraph, dict[int, object]]:

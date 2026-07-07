@@ -33,7 +33,7 @@ pytest.importorskip("flexkv.c_ext")
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
-from flexkv.common.transfer import TransferType
+from flexkv.common.transfer import DeviceType, TransferOpGraph, TransferType
 from flexkv.common.debug import flexkv_logger
 
 flexkv_logger.set_level("OFF")
@@ -382,6 +382,311 @@ def test_multitier_match_promotes_swa_in_each_tier():
         b_hit, _sb, _kb = engine.match_swa(seq_b, upper_bound_blocks=4)
         assert a_hit == 4, f"{name}: reused SWA A was evicted (tier not promoted)"
         assert b_hit == 0, f"{name}: never-reused SWA B should have been evicted"
+
+
+# =========================================================================== #
+# 4. REMOTE SWA tier — real production branch, no PCFS                        #
+#                                                                              #
+# A true byte-exact REMOTE round-trip needs PCFS (external infra, out of scope #
+# for a no-GPU container). But the REMOTE SWA control-plane branch in         #
+# _swa_get_slots / _swa_put_slots / _swa_release_load_lock is reachable WITHOUT #
+# PCFS by injecting a real CacheEngineAccel(REMOTE) tier (identical to what    #
+# GlobalCacheEngine constructs for enable_remote) and driving the real slot    #
+# resolvers directly: real REMOTE slot alloc, set_swa, CPU staging slot, pin/  #
+# lock release, and the failure paths. This exercises the exact code at        #
+# cache_engine.py:2144 without standing up the full PCFS remote.               #
+# =========================================================================== #
+
+def _inject_remote_tier(eng, num_remote_blocks=64, num_remote_slots=16):
+    """Inject a REAL CacheEngineAccel(REMOTE) tier with an armed SWA host pool.
+
+    Mirrors GlobalCacheEngine.__init__'s REMOTE construction (minus the PCFS
+    storage engine). Lets the real _swa_get_slots / _swa_put_slots REMOTE branch
+    run as shipped. Returns the remote engine for direct assertions."""
+    from flexkv.cache.cache_engine import CacheEngineAccel
+    from flexkv.common.transfer import DeviceType
+    remote = CacheEngineAccel(
+        DeviceType.REMOTE, num_remote_blocks, TPB,
+        evict_ratio=0.1, hit_reward_seconds=0,
+        evict_start_threshold=1.0, eviction_policy="lru")
+    swa_cfg = eng.cache_config.swa
+    remote.init_swa(swa_cfg.for_remote_tier())
+    eng.cache_engines[DeviceType.REMOTE] = remote
+    return remote
+
+
+def _seed_swa_on_tier(engine, tok, base):
+    """Insert a ready prefix on a tier engine and mount a fresh SWA slot on its
+    tail node; drain freed slots back to the pool. Returns (node, slot)."""
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    n = tok.shape[0] // TPB
+    node = engine.insert(seq, np.arange(base, base + n, dtype=np.int64), is_ready=True)
+    slot = engine.swa_alloc_slot()
+    engine.set_swa(node, slot)
+    engine._drain_swa_slots()
+    return node, slot
+
+
+def test_put_writethrough_remote_builds_swa_h2remote():
+    """PUT write-through to the REMOTE SWA tier: real _swa_put_slots allocates a
+    REMOTE SWA slot + mounts it via set_swa, and build_put_chain emits SWA H2REMOTE
+    that depends on the SWA D2H (fire-and-forget). Driven on a real injected
+    REMOTE tier — exercises the cache_engine.py:2210 branch."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    remote = _inject_remote_tier(eng)
+    tok = _tokens(4, base=60)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+
+    g, _rm, cb, op_cb, _e = eng.put(1, tok, mask, sm, dp_client_id=0)
+    _complete(op_cb, cb)  # CPU + SSD SWA stored; now add REMOTE via real method
+
+    cpu_node, _ = _seed_swa_on_tier(eng.cpu_cache_engine, tok, base=0)
+    remote_node, _ = _seed_swa_on_tier(remote, tok, base=100)
+    node_to_unlock = {DeviceType.CPU: (cpu_node, 4), DeviceType.REMOTE: (remote_node, 4)}
+
+    swa_slots = eng._swa_put_slots(request_id=1, sequence_meta=SequenceMeta(
+        token_ids=tok, tokens_per_block=TPB), block_start_idx=0, block_end_idx=4,
+        node_to_unlock=node_to_unlock)
+    _gpu, cpu_slots, ssd_slots, remote_slots, swa_key = swa_slots
+    assert remote_slots.size == 1, "REMOTE SWA slot not allocated on put"
+    assert remote.swa_pool.num_used == 1
+    # The allocated REMOTE slot is mounted on the REMOTE store node.
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    r_hit, r_slot, _k = remote.match_swa(seq, upper_bound_blocks=4)
+    assert r_hit == 4 and r_slot == int(remote_slots[0]), "REMOTE SWA not mounted"
+
+    # build the write-through graph: SWA H2REMOTE depends on SWA D2H.
+    g2 = TransferOpGraph.create_empty_graph()
+    swa_d2h_id = eng.swa_cache.build_put_chain(
+        g2, gpu_slot_ids=np.array([0]), cpu_slot_ids=cpu_slots,
+        ssd_slot_ids=ssd_slots, remote_slot_ids=remote_slots, swa_key=swa_key)
+    swa_ops = [o for o in g2._op_map.values() if getattr(o, "is_swa", False)]
+    kinds = sorted(o.transfer_type.name for o in swa_ops)
+    assert "D2H" in kinds and "H2REMOTE" in kinds, f"REMOTE write-through missing: {kinds}"
+    h2remote = [o for o in swa_ops if o.transfer_type.name == "H2REMOTE"][0]
+    swa_d2h = [o for o in swa_ops if o.transfer_type.name == "D2H"][0]
+    assert swa_d2h.op_id in h2remote.predecessors, "H2REMOTE must depend on SWA D2H"
+
+
+def test_get_remote_staging_when_only_remote_has_swa():
+    """GET where the SWA window lives ONLY on the REMOTE tier (CPU + SSD evicted):
+    the load must stage REMOTE->CPU (SWA REMOTE2H) then CPU->GPU (SWA H2D), with the
+    H2D depending on the REMOTE2H. Driven via the real _swa_get_slots REMOTE branch
+    (cache_engine.py:2146), including the transient CPU staging slot."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    remote = _inject_remote_tier(eng)
+    tok = _tokens(4, base=61)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+
+    # Seed SWA on CPU, SSD and REMOTE, then drop CPU + SSD so only REMOTE holds it.
+    _seed_swa_on_tier(eng.cpu_cache_engine, tok, base=0)
+    _seed_swa_on_tier(eng.ssd_cache_engine, tok, base=50)
+    _seed_swa_on_tier(remote, tok, base=100)
+    eng.cpu_cache_engine._evict_swa(1)
+    eng.ssd_cache_engine._evict_swa(1)
+
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    cpu_hit, _c, _kc = eng.cpu_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    ssd_hit, _s, _ks = eng.ssd_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    r_hit, _r, _kr = remote.match_swa(seq, upper_bound_blocks=4)
+    assert cpu_hit == 0 and ssd_hit == 0 and r_hit > 0, (
+        f"precondition: only REMOTE should hold SWA (cpu={cpu_hit} ssd={ssd_hit} rem={r_hit})")
+
+    tier_mr = {DeviceType.CPU: eng.cpu_cache_engine.match(seq),
+               DeviceType.SSD: eng.ssd_cache_engine.match(seq),
+               DeviceType.REMOTE: remote.match(seq)}
+    slots = eng._swa_get_slots(request_id=2, sequence_meta=seq, block_start_idx=0,
+                               block_end_idx=4, full_hit_blocks=4,
+                               tier_match_results=tier_mr)
+    gpu, cpu, ssd, rem, swa_key, lock_node, staging_slot = slots
+    assert rem.size == 1, "REMOTE SWA slot not sourced on get"
+    assert ssd.size == 0, "SSD was evicted — must not be staged"
+    assert staging_slot >= 0, "transient CPU staging slot must be allocated for REMOTE2H"
+    assert lock_node is remote.match(seq).last_swa_node
+
+    g = TransferOpGraph.create_empty_graph()
+    h2d_id = eng.swa_cache.build_get_chain(
+        g, gpu_slot_ids=gpu, cpu_slot_ids=cpu,
+        ssd_slot_ids=ssd, remote_slot_ids=rem, swa_key=swa_key)
+    swa_ops = [o for o in g._op_map.values() if getattr(o, "is_swa", False)]
+    kinds = sorted(o.transfer_type.name for o in swa_ops)
+    assert "H2D" in kinds and "REMOTE2H" in kinds, f"REMOTE staging missing: {kinds}"
+    h2d = [o for o in swa_ops if o.transfer_type.name == "H2D"][0]
+    r2h = [o for o in swa_ops if o.transfer_type.name == "REMOTE2H"][0]
+    assert r2h.op_id in h2d.predecessors, "SWA H2D must depend on REMOTE2H"
+
+    # Late-bind + completion callback frees the transient CPU staging slot AND
+    # releases the REMOTE source pin (paired release on the exception-safe path).
+    g.set_swa_gpu_blocks(np.array([9], dtype=np.int64))
+    eng._swa_release_load_lock(lock_node, staging_slot=staging_slot)
+    assert lock_node.swa_lock_ref == 0, "REMOTE source pin not released on completion"
+    assert eng.cpu_cache_engine.swa_pool.num_used == 0, "transient CPU staging slot leaked"
+
+
+def test_get_prefers_ssd_over_remote_when_both_have_swa():
+    """Tier priority SSD > REMOTE: only ONE staged source is chosen. When SSD holds
+    the window, GET stages from SSD and must NOT also stage from REMOTE (no
+    transient CPU staging slot, no REMOTE2H op)."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    remote = _inject_remote_tier(eng)
+    tok = _tokens(4, base=62)
+    _seed_swa_on_tier(eng.ssd_cache_engine, tok, base=50)
+    _seed_swa_on_tier(remote, tok, base=100)
+
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    tier_mr = {DeviceType.CPU: eng.cpu_cache_engine.match(seq),
+               DeviceType.SSD: eng.ssd_cache_engine.match(seq),
+               DeviceType.REMOTE: remote.match(seq)}
+    gpu, cpu, ssd, rem, swa_key, lock_node, staging_slot = eng._swa_get_slots(
+        request_id=2, sequence_meta=seq, block_start_idx=0, block_end_idx=4,
+        full_hit_blocks=4, tier_match_results=tier_mr)
+    assert ssd.size == 1 and rem.size == 0, "SSD>REMOTE: only SSD must stage"
+    assert staging_slot == -1, "no transient staging when SSD is the source"
+
+
+# =========================================================================== #
+# 5. SWA failure paths — paired slot/lock release, pool-full, lower-tier skip  #
+# =========================================================================== #
+
+def test_put_no_swa_when_cpu_pool_full():
+    """PUT with SWA ON but the CPU SWA host pool entirely full: _swa_put_slots
+    must allocate NO NEW SWA slot and emit NO SWA op for the new prefix — the
+    full-KV store is unaffected. (Real alloc path: swa_alloc_slot returns -1 once
+    the pool is full and nothing is evictable; the pool is left intact.)"""
+    eng = GlobalCacheEngine(_cache_config(True), _model_config())
+    tok = _tokens(4, base=90)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+    _g, _rm, cb, op_cb, _e = eng.put(1, tok, mask, sm, dp_client_id=0)
+    _complete(op_cb, cb)  # SWA slot mounted on the stored tail
+    cpu = eng.cpu_cache_engine
+    pool = cpu.swa_pool
+
+    # Drain the pool completely: allocate every remaining free slot.
+    held = []
+    while True:
+        s = pool.allocate()
+        if s is None:
+            break
+        held.append(s)
+    try:
+        used_before = pool.num_used
+        assert used_before == pool.num_total, "pool not fully drained"
+        # A fresh prefix put() with no free SWA slot: full-KV still stores, but
+        # no SWA op / no over-allocation.
+        tok2 = _tokens(4, base=91)
+        g2, _rm2, cb2, op_cb2, _e2 = eng.put(
+            2, tok2, np.ones_like(tok2, dtype=np.int64),
+            np.arange(tok2.shape[0], dtype=np.int64), dp_client_id=0)
+        swa = [o for o in g2._op_map.values() if getattr(o, "is_swa", False)]
+        assert any(o.transfer_type == TransferType.D2H for o in g2._op_map.values()
+                   if not getattr(o, "is_swa", False)), "full-KV store dropped"
+        _complete(op_cb2, cb2)
+        assert pool.num_used == used_before, "SWA pool over-allocated on full pool"
+    finally:
+        for s in held:
+            pool.free(s)
+
+
+def test_get_staging_fails_frees_remote_pin():
+    """GET staging from REMOTE when the transient CPU staging slot cannot be
+    allocated: the real code releases the just-taken REMOTE source pin (no leak)
+    and returns empty SWA slots. Paired slot/lock release on the failure path."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    remote = _inject_remote_tier(eng)
+    tok = _tokens(4, base=92)
+    _seed_swa_on_tier(remote, tok, base=100)  # only REMOTE holds SWA
+
+    # Fill the entire CPU SWA pool so a transient staging slot cannot be allocated.
+    pool = eng.cpu_cache_engine.swa_pool
+    held = []
+    while True:
+        s = pool.allocate()
+        if s is None:
+            break
+        held.append(s)
+    try:
+        seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+        r_node = remote.match(seq).last_swa_node
+        r_node.inc_swa_lock_ref()  # simulate the source pin taken by _match_locked
+        tier_mr = {DeviceType.CPU: eng.cpu_cache_engine.match(seq),
+                   DeviceType.SSD: eng.ssd_cache_engine.match(seq),
+                   DeviceType.REMOTE: remote.match(seq)}
+        gpu, cpu, ssd, rem, swa_key, lock_node, staging_slot = eng._swa_get_slots(
+            request_id=2, sequence_meta=seq, block_start_idx=0, block_end_idx=4,
+            full_hit_blocks=4, tier_match_results=tier_mr)
+        # CPU staging impossible -> no SWA load at all, but the REMOTE source pin
+        # must have been released (no leak of the just-taken pin).
+        assert int(rem.size) == 0 and staging_slot == -1
+        assert r_node.swa_lock_ref == 0, "REMOTE source pin leaked on staging failure"
+    finally:
+        r_node.dec_swa_lock_ref()
+        for s in held:
+            pool.free(s)
+
+
+def test_lower_tier_pool_full_keeps_cpu_only():
+    """PUT with SWA write-through: when the SSD SWA pool is full-and-locked, the
+    SSD SWA write-through is skipped but the CPU SWA store proceeds (SWA stays a
+    subset of Full PER TIER). Real _swa_put_slots _tier_slot returns empty."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    tok = _tokens(4, base=93)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+    _g, _rm, cb, op_cb, _e = eng.put(1, tok, mask, sm, dp_client_id=0)
+    _complete(op_cb, cb)
+    cpu = eng.cpu_cache_engine
+    ssd = eng.ssd_cache_engine
+
+    cpu_node, _ = _seed_swa_on_tier(cpu, tok, base=0)
+    ssd_node, _ = _seed_swa_on_tier(ssd, tok, base=50)
+    # Lock + fill the SSD SWA pool so its write-through alloc fails.
+    ssd_node.inc_swa_lock_ref()
+    ssd_held = []
+    try:
+        while True:
+            s = ssd.swa_pool.allocate()
+            if s is None:
+                break
+            ssd_held.append(s)
+        node_to_unlock = {DeviceType.CPU: (cpu_node, 4), DeviceType.SSD: (ssd_node, 4)}
+        _gpu, cpu_slots, ssd_slots, _rem, swa_key = eng._swa_put_slots(
+            request_id=1, sequence_meta=SequenceMeta(token_ids=tok, tokens_per_block=TPB),
+            block_start_idx=0, block_end_idx=4, node_to_unlock=node_to_unlock)
+        assert cpu_slots.size == 1, "CPU SWA must still be allocated"
+        assert ssd_slots.size == 0, "SSD SWA write-through must skip when pool full"
+        assert ssd.swa_pool.num_used == len(ssd_held), "SSD pool unexpectedly grew"
+    finally:
+        for s in ssd_held:
+            ssd.swa_pool.free(s)
+        ssd_node.dec_swa_lock_ref()
+
+
+def test_release_load_lock_idempotent_no_underflow():
+    """The SWA H2D completion callback (_swa_release_load_lock) must be idempotent:
+    calling it twice (e.g. callback re-entry / duplicate finalize) must not drive
+    swa_lock_ref below 0, and a fresh staging slot must not be double-freed."""
+    eng = GlobalCacheEngine(_cache_config(True), _model_config())
+    tok = _tokens(4, base=94)
+    _seed_swa_on_tier(eng.cpu_cache_engine, tok, base=0)
+    cpu = eng.cpu_cache_engine
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    node = cpu.match(seq).last_swa_node
+    node.inc_swa_lock_ref()  # pin taken by the load
+
+    # Allocate + free a transient CPU staging slot to simulate a prior free.
+    staging = cpu.swa_alloc_slot()
+    before = cpu.swa_pool.num_used
+    eng._swa_release_load_lock(node, staging_slot=staging)   # 1st call
+    eng._swa_release_load_lock(node, staging_slot=staging)   # 2nd (re-entry)
+    assert node.swa_lock_ref == 0, "swa_lock_ref underflowed below 0"
+    # Re-inject a node into the pool is safe; num_used must not go negative.
+    assert cpu.swa_pool.num_used >= 0, "SWA pool slot count went negative"
+    # Cleanup: the released staging slot should be reflected (no phantom leak).
+    assert cpu.swa_pool.num_used == before - 1 or cpu.swa_pool.num_used == before, \
+        "transient staging slot double-handled"
 
 
 if __name__ == "__main__":

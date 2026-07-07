@@ -37,6 +37,10 @@ from test_layerwise_multi_group_swa import (
     _make_multi_group_cpu_layout,
 )
 
+# Real DSv4 layerwise byte-exact roundtrip on a GPU -> e2e tier (combines with
+# the per-class skipif(not cuda) below). Selected by `pytest -m e2e`.
+pytestmark = pytest.mark.e2e
+
 IOURING_ENTRIES = 512
 IOURING_FLAGS = 0
 

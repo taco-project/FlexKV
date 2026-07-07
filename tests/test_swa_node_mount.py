@@ -865,19 +865,188 @@ def test_full_evict_no_cascade_when_swa_disabled():
 
 # --------------------------------------------------------------------------- #
 # Double-match elimination: match_swa_from_result reuse + fallback             #
+#                                                                              #
+# These drive the PRODUCTION engine method CacheEngine.match_swa_from_result   #
+# (the single-pass fold's core: reuse the Full-KV MatchResult instead of a     #
+# second tree walk). The pure-Python CacheEngine mirror runs without c_ext;    #
+# a c_ext peer (CacheEngineAccel) covers the shipped CRadixTreeIndex path.     #
 # --------------------------------------------------------------------------- #
 
-def test_match_swa_from_result_reuses_within_bound():
-    """match_swa_from_result reuses the Full-KV match when swa_hit <= bound."""
-    idx = RadixTreeIndex(tokens_per_block=TPB)
-    n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
-    idx.set_swa(n1, slot=100)
-    mr = idx.match_prefix(_seq([1, 2, 3, 4, 5, 6, 7, 8]))
-    assert mr.swa_hit_blocks == 4 and mr.last_swa_node is n1
-    # Simulate the reuse logic directly on the match result (engine-independent):
-    # within a bound >= swa_hit, the slot is read straight from last_swa_node.
-    assert mr.swa_hit_blocks <= 4
-    assert int(mr.last_swa_node.swa_host_slot) == 100
+def _py_swa_engine(num_blocks=4096):
+    """A standalone pure-Python CacheEngine (RadixTreeIndex mirror) with an SWA
+    host pool armed — no c_ext, no GPU."""
+    from flexkv.cache.cache_engine import CacheEngine
+    from flexkv.common.config import SWAPoolConfig
+    from flexkv.common.transfer import DeviceType
+    eng = CacheEngine(
+        DeviceType.CPU, num_blocks, TPB,
+        evict_ratio=0.1, hit_reward_seconds=0,
+        evict_start_threshold=1.0, eviction_policy="lru",
+    )
+    eng.init_swa(SWAPoolConfig(
+        enabled=True, num_slots=256, window_size=TPB,
+        num_swa_layers=1, bytes_per_token_per_layer=64,
+    ))
+    return eng
+
+
+def _store_with_swa(eng, ids, base):
+    """Insert a ready prefix and mount a fresh SWA slot on its tail node."""
+    seq = _seq(ids)
+    n = len(ids) // TPB
+    node = eng.insert(seq, _phys(*range(base, base + n)), is_ready=True)
+    slot = eng.swa_alloc_slot()
+    eng.set_swa(node, slot)
+    eng._drain_swa_slots()
+    return node, slot
+
+
+def test_match_swa_from_result_reuses_within_bound_calls_production():
+    """REUSE branch: when swa_hit <= upper_bound, match_swa_from_result reads the
+    slot straight off the match result's last_swa_node — no re-probe — and
+    returns the real slot. This calls the PRODUCTION engine method (the old test
+    only read MatchResult fields)."""
+    eng = _py_swa_engine()
+    node, slot = _store_with_swa(eng, [1, 2, 3, 4, 5, 6, 7, 8], base=0)
+    seq = _seq([1, 2, 3, 4, 5, 6, 7, 8]); seq.gen_hashes()
+    mr = eng.match(seq)
+    assert mr.swa_hit_blocks == 4 and mr.last_swa_node is node
+    swa_hit, got_slot, key, pinned = eng.match_swa_from_result(
+        mr, seq, upper_bound_blocks=4, lock_for_load=False)
+    assert swa_hit == 4 and got_slot == slot and key == slot
+    assert pinned is None  # lock_for_load=False -> nothing pinned
+
+
+def test_match_swa_from_result_reuse_locks_and_returns_node():
+    """REUSE branch with lock_for_load=True pins the reused node and returns it so
+    the H2D-completion callback can release the pin."""
+    eng = _py_swa_engine()
+    node, slot = _store_with_swa(eng, [1, 2, 3, 4, 5, 6, 7, 8], base=0)
+    seq = _seq([1, 2, 3, 4, 5, 6, 7, 8]); seq.gen_hashes()
+    mr = eng.match(seq)
+    swa_hit, got_slot, key, pinned = eng.match_swa_from_result(
+        mr, seq, upper_bound_blocks=4, lock_for_load=True)
+    assert swa_hit == 4 and got_slot == slot and pinned is node
+    assert node.swa_lock_ref == 1
+    node.dec_swa_lock_ref()  # release (mirrors the H2D callback)
+
+
+def test_match_swa_from_result_fallback_reprobes_when_hit_exceeds_bound():
+    """FALLBACK branch: the deepest SWA node lies PAST the reusable Full hit
+    (upper_bound < swa_hit). A plain min() would point past the reusable prefix,
+    so match_swa_from_result must re-probe clamped to the bound and return the
+    deepest SWA node WITHIN it.
+
+    Setup: two nested prefixes, each with its own SWA (a shallow node at 1 block,
+    the deep tail at 3). The full match's last_swa_node is the DEEP one (hit=3),
+    but we pass upper_bound=1 -> fallback must find the shallow SWA at block 1."""
+    eng = _py_swa_engine()
+    shallow, shallow_slot = _store_with_swa(eng, [1, 2], base=0)          # 1 block
+    seq_deep = _seq([1, 2, 3, 4, 5, 6])
+    # nested insert: [1,2] already matched -> supply only the 2 NEW blocks.
+    deep = eng.insert(seq_deep, _phys(10, 11), is_ready=True,
+                      match_result=eng.match(_seq([1, 2, 3, 4, 5, 6])))
+    deep_slot = eng.swa_alloc_slot(); eng.set_swa(deep, deep_slot); eng._drain_swa_slots()
+
+    seq = _seq([1, 2, 3, 4, 5, 6]); seq.gen_hashes()
+    mr = eng.match(seq)
+    assert mr.swa_hit_blocks == 3 and mr.last_swa_node is deep  # deepest = 3 blocks
+    # Bound the reusable Full hit to 1 block: fallback re-probes and finds the
+    # shallow SWA at block 1, NOT the out-of-bound deep one.
+    swa_hit, got_slot, key, pinned = eng.match_swa_from_result(
+        mr, seq, upper_bound_blocks=1, lock_for_load=False)
+    assert swa_hit == 1, "fallback must clamp the SWA hit to the upper bound"
+    assert got_slot == shallow_slot, "fallback must return the in-bound shallow SWA"
+
+
+def test_match_swa_from_result_fallback_locked_pins_inbound_node():
+    """FALLBACK branch with lock_for_load=True delegates to match_swa_locked and
+    returns the pinned IN-BOUND node (not the out-of-bound deep one)."""
+    eng = _py_swa_engine()
+    shallow, shallow_slot = _store_with_swa(eng, [1, 2], base=0)
+    seq_deep = _seq([1, 2, 3, 4, 5, 6])
+    deep = eng.insert(seq_deep, _phys(10, 11), is_ready=True,
+                      match_result=eng.match(_seq([1, 2, 3, 4, 5, 6])))
+    deep_slot = eng.swa_alloc_slot(); eng.set_swa(deep, deep_slot); eng._drain_swa_slots()
+
+    seq = _seq([1, 2, 3, 4, 5, 6]); seq.gen_hashes()
+    mr = eng.match(seq)
+    swa_hit, got_slot, key, pinned = eng.match_swa_from_result(
+        mr, seq, upper_bound_blocks=1, lock_for_load=True)
+    assert swa_hit == 1 and got_slot == shallow_slot
+    assert pinned is shallow and shallow.swa_lock_ref == 1
+    assert deep.swa_lock_ref == 0, "out-of-bound deep node must NOT be pinned"
+    shallow.dec_swa_lock_ref()
+
+
+def test_match_swa_from_result_miss_returns_empty():
+    """MISS: a match result with no SWA node (nothing stored an SWA slot) yields
+    (0, -1, -1, None) and pins nothing."""
+    eng = _py_swa_engine()
+    seq = _seq([1, 2, 3, 4]); seq.gen_hashes()
+    eng.insert(seq, _phys(0, 1), is_ready=True)  # full-KV only, no set_swa
+    mr = eng.match(seq)
+    assert mr.swa_hit_blocks == 0 and mr.last_swa_node is None
+    swa_hit, got_slot, key, pinned = eng.match_swa_from_result(
+        mr, seq, upper_bound_blocks=2, lock_for_load=True)
+    assert (swa_hit, got_slot, key, pinned) == (0, -1, -1, None)
+
+
+def test_match_swa_from_result_reuse_promotes_once_not_twice():
+    """The REUSE branch promotes the node to SWA-LRU MRU exactly once (it does not
+    also fall through to match_swa, which would double-promote). Verified by
+    eviction order: after reusing A within bound, a never-reused B is the victim."""
+    eng = _py_swa_engine()
+    a, a_slot = _store_with_swa(eng, [1, 2, 3, 4], base=0)
+    b, b_slot = _store_with_swa(eng, [5, 6, 7, 8], base=10)
+    # SWA-LRU tail->head: A, B. Reuse A within bound via the production method.
+    seq_a = _seq([1, 2, 3, 4]); seq_a.gen_hashes()
+    mr = eng.match(seq_a)
+    eng.match_swa_from_result(mr, seq_a, upper_bound_blocks=2, lock_for_load=False)
+    # One SWA eviction: A was promoted (reused) so B is the victim.
+    eng._evict_swa(1)
+    assert a.has_swa(), "reused A was evicted (reuse branch did not promote)"
+    assert not b.has_swa(), "never-reused B should be the SWA victim"
+
+
+@cext
+def test_cpp_match_swa_from_result_reuse_and_fallback():
+    """C++ peer: CacheEngineAccel.match_swa_from_result on the shipped
+    CRadixTreeIndex — reuse within bound returns the real slot; an out-of-bound
+    hit re-probes clamped to the bound."""
+    from flexkv.cache.cache_engine import CacheEngineAccel
+    from flexkv.common.config import SWAPoolConfig
+    from flexkv.common.transfer import DeviceType
+    eng = CacheEngineAccel(DeviceType.CPU, 4096, TPB, evict_ratio=0.1,
+                           hit_reward_seconds=0, evict_start_threshold=1.0,
+                           eviction_policy="lru")
+    eng.init_swa(SWAPoolConfig(enabled=True, num_slots=256, window_size=TPB,
+                               num_swa_layers=1, bytes_per_token_per_layer=64))
+
+    def _store(ids, base, match=None):
+        seq = SequenceMeta(np.array(ids, dtype=np.int64), tokens_per_block=TPB)
+        seq.gen_hashes()
+        n = len(ids) // TPB
+        phys = np.arange(base, base + n, dtype=np.int64)
+        node = eng.insert(seq, phys, is_ready=True, match_result=match)
+        slot = eng.swa_alloc_slot(); eng.set_swa(node, slot); eng._drain_swa_slots()
+        return node, slot
+
+    shallow, shallow_slot = _store([1, 2], base=0)
+    seq_deep = SequenceMeta(np.array([1, 2, 3, 4, 5, 6], dtype=np.int64), tokens_per_block=TPB)
+    seq_deep.gen_hashes()
+    deep, deep_slot = _store([1, 2, 3, 4, 5, 6], base=0, match=eng.match(seq_deep))
+
+    seq = SequenceMeta(np.array([1, 2, 3, 4, 5, 6], dtype=np.int64), tokens_per_block=TPB)
+    seq.gen_hashes()
+    mr = eng.match(seq)
+    assert mr.swa_hit_blocks == 3
+    # reuse within bound (>= hit): real slot, no re-probe.
+    hit, slot, key, node = eng.match_swa_from_result(mr, seq, upper_bound_blocks=3)
+    assert hit == 3 and slot == deep_slot
+    # out-of-bound: re-probe clamped to 1 -> shallow SWA.
+    hit1, slot1, key1, node1 = eng.match_swa_from_result(mr, seq, upper_bound_blocks=1)
+    assert hit1 == 1 and slot1 == shallow_slot
 
 
 if __name__ == "__main__":

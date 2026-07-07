@@ -156,6 +156,101 @@ def test_swa_aware_get_clamps_full_to_usable():
 # Guardrail — the plain (non-SWA) path must be untouched                      #
 # =========================================================================== #
 
+def test_swa_aware_get_clamps_when_full_beats_swa():
+    """REAL production path (eng.get(swa_aware=True)) where full_hit > swa_hit.
+
+    Construct full=4 / swa=2 by storing two nested prefixes (SWA at block 2 and
+    block 4), locking the deep tail's Full KV, promoting the shallow node, then
+    evicting one SWA so the deep leaf KEEPS its Full KV but loses its SWA
+    (full-locked-leaf drop). The real get() must clamp usable = min(4, 2) = 2,
+    exercising _clamp_end_to_swa — not a re-implemented formula.
+
+    The original test_swa_level2 single-pass contract is preserved: still ONE
+    match round, and the SWA H2D slot still attaches (now for 2 blocks)."""
+    eng = GlobalCacheEngine(_cache_config(), _model_config())
+    tpb = TPB
+
+    # PUT 4-block prefix with SWA at block 2 (shallow) and block 4 (deep tail).
+    tok4 = _tokens(4, base=70)
+    mask4 = np.ones_like(tok4, dtype=np.int64)
+    sm4 = np.arange(tok4.shape[0], dtype=np.int64)
+    eng.put(1, tok4, mask4, sm4, dp_client_id=0)
+    # PUT a 2-block prefix (shares [1..2*TPB]) with its own SWA slot.
+    tok2 = _tokens(2, base=71)
+    mask2 = np.ones_like(tok2, dtype=np.int64)
+    sm2 = np.arange(tok2.shape[0], dtype=np.int64)
+    eng.put(2, tok2, mask2, sm2, dp_client_id=0)
+
+    cpu = eng.cpu_cache_engine
+    # Lock the deep tail's Full KV so its SWA-only eviction keeps the Full KV.
+    seq4 = SequenceMeta(token_ids=tok4, tokens_per_block=tpb); seq4.gen_hashes()
+    deep_mr = cpu.match(seq4)
+    deep_node = deep_mr.last_node
+    cpu.lock_node(deep_node)
+    # Promote the shallow node to SWA-LRU MRU, then evict one SWA slot: the LRU
+    # victim is the deep leaf (never promoted) -> it loses SWA but keeps Full.
+    seq2 = SequenceMeta(token_ids=tok2, tokens_per_block=tpb); seq2.gen_hashes()
+    cpu.match_swa(seq2, upper_bound_blocks=2)
+    cpu._evict_swa(1)
+
+    # Precondition: full hit still 4, SWA hit dropped to 2.
+    f_hit = cpu.match(seq4).num_ready_matched_blocks
+    s_hit, _s, _k = cpu.match_swa(seq4, upper_bound_blocks=4)
+    assert f_hit == 4, f"precondition full hit={f_hit}"
+    assert s_hit == 2, f"precondition swa hit={s_hit}"
+
+    with _MatchCounter(eng) as mc:
+        graph, return_mask, cb, op_cb, end_id = eng.get(
+            request_id=3, token_ids=tok4,
+            token_mask=np.ones_like(tok4, dtype=np.int64),
+            slot_mapping=sm4, dp_client_id=0, swa_aware=True)
+    assert mc.n == 1, f"SWA-aware get still matches once; got {mc.n} rounds"
+    # usable = min(4, 2) = 2 -> only 2 blocks resident in the returned mask.
+    assert int(return_mask.sum()) == 2 * tpb, (
+        f"clamp to min(full,swa) failed: got {int(return_mask.sum())} tokens")
+    swa = [o for o in graph._op_map.values() if getattr(o, "is_swa", False)]
+    assert len(swa) == 1, "SWA H2D must still attach (now for the in-window block)"
+    _complete(op_cb, cb)
+    cpu.unlock(deep_node)
+
+
+def test_swa_aware_get_empty_when_no_swa_hit():
+    """REAL production path where swa_hit == 0 but full_hit > 0.
+
+    Store 4 blocks with SWA, lock the tail's Full KV, then evict its SWA so the
+    window survives ONLY as Full KV. The real get(swa_aware=True) must clamp
+    usable = min(4, 0) = 0 -> empty Full-KV window (no stale KV fed to the
+    SWA-layer attention) and NO SWA op. Driven through eng.get, not a formula."""
+    eng = GlobalCacheEngine(_cache_config(), _model_config())
+    tpb = TPB
+
+    tok = _tokens(4, base=72)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+    eng.put(1, tok, mask, sm, dp_client_id=0)
+
+    cpu = eng.cpu_cache_engine
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=tpb); seq.gen_hashes()
+    node = cpu.match(seq).last_node
+    cpu.lock_node(node)            # full-locked leaf -> SWA drop keeps Full
+    cpu._evict_swa(1)             # drop the only SWA slot, keep Full KV
+
+    f_hit = cpu.match(seq).num_ready_matched_blocks
+    s_hit, _s, _k = cpu.match_swa(seq, upper_bound_blocks=4)
+    assert f_hit == 4 and s_hit == 0, f"precondition full={f_hit} swa={s_hit}"
+
+    graph, return_mask, cb, op_cb, end_id = eng.get(
+        request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
+        slot_mapping=sm, dp_client_id=0, swa_aware=True)
+    # usable = min(4, 0) = 0 -> no resident blocks reported, no SWA op.
+    assert int(return_mask.sum()) == 0, (
+        f"swa_hit=0 must clamp full window to empty; got {int(return_mask.sum())}")
+    swa = [o for o in graph._op_map.values() if getattr(o, "is_swa", False)]
+    assert len(swa) == 0, "no SWA op when swa_hit == 0"
+    _complete(op_cb, cb)
+    cpu.unlock(node)
+
+
 def test_plain_get_on_swa_cache_matches_once_and_unclamped():
     """A plain get() (swa_aware defaults False) on an SWA-enabled cache matches
     exactly once and is NOT clamped by any SWA window — the shared _get_impl_*

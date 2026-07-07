@@ -1,0 +1,70 @@
+# Fast SWA test gate for the node-mounted SWA control plane.
+#
+# Runs the no-GPU SWA suites (unit + smoke) on every push/PR that touches the
+# SWA control plane or its tests. These tests need the production c_ext
+# (CacheEngineAccel / CRadixTreeIndex) but NOT a GPU, so a CUDA *toolkit* is
+# required only to compile the extension — nvidia-smi is not.
+#
+# GPU-bearing (e2e) SWA tests are deliberately excluded: they run on dedicated
+# GPU nodes (e.g. the dsv4-* 2-node containers) and are triggered out-of-band.
+name: SWA Unit & Smoke Tests
+
+on:
+  push:
+    branches: ["main", "dev", "feature/swa_ssd_remote_multitier"]
+    paths:
+      - "flexkv/**"
+      - "tests/**"
+  pull_request:
+    branches: ["main", "dev", "feature/swa_ssd_remote_multitier"]
+    paths:
+      - "flexkv/**"
+      - "tests/**"
+  workflow_dispatch:
+
+jobs:
+  swa-unit-smoke:
+    name: SWA pytest (markers unit+smoke)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout FlexKV
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install system deps (CUDA toolkit to compile c_ext; no GPU needed)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake liburing-dev libxxhash-dev
+          # CUDA toolkit (compiler/headers only) — required to build flexkv.c_ext.
+          # Pinned minor; adjust if the repo's build.sh expects a different one.
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-12-4 || \
+            sudo apt-get install -y --no-install-recommends cuda-toolkit
+          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+          echo "PATH=/usr/local/cuda/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Install FlexKV (no metrics, local build)
+        run: |
+          # Disable prometheus-cpp to keep CI deps light.
+          FLEXKV_ENABLE_METRICS=0 pip install -e . --no-build-isolation
+
+      - name: Verify c_ext is importable
+        run: |
+          python -c "import flexkv.c_ext as c; print('c_ext OK:', c.__file__)"
+
+      - name: Run SWA unit + smoke tests
+        run: |
+          python -m pytest tests/ \
+            -m "unit or smoke" \
+            -k "swa" \
+            -q --no-header -p no:cacheprovider

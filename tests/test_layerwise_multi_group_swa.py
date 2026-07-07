@@ -20,6 +20,10 @@ from flexkv.c_ext import LayerwiseTransferGroup
 from flexkv.common.config import LayerGroupSpec, build_layer_member_map
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
+# Real layerwise KV byte movement on a GPU -> e2e tier (combines with the
+# per-class skipif(not cuda) below). Selected by `pytest -m e2e`.
+pytestmark = pytest.mark.e2e
+
 # -------------------------- shared geometry --------------------------
 DEVICE_ID = 0
 NUM_GPU_BLOCKS = 8
