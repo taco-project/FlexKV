@@ -509,6 +509,23 @@ class SWAPoolConfig:
         REMOTE SWA slots are not pinned host memory; pin_memory is forced off."""
         return replace(self, num_slots=self.num_remote_slots, pin_memory=False)
 
+    def for_cache_tier(self, device_type) -> Optional["SWAPoolConfig"]:
+        """Return the SWA config this cache tier should own, or None.
+
+        CPU uses the primary pool config. SSD and REMOTE use their tier-specific
+        slot counts and are disabled when that tier's slot count is zero.
+        """
+        if not self.enabled:
+            return None
+        device_name = getattr(device_type, "name", str(device_type))
+        if device_name == "CPU":
+            return self
+        if device_name == "SSD" and self.num_ssd_slots > 0:
+            return self.for_ssd_tier()
+        if device_name == "REMOTE" and self.num_remote_slots > 0:
+            return self.for_remote_tier()
+        return None
+
 
 @dataclass
 class CacheConfig:

@@ -38,7 +38,8 @@ class HierarchyLRCacheEngine:
                  evict_start_threshold: float = 1.0,
                  hit_reward_seconds: int = 0,
                  eviction_policy: str = "lru",
-                 meta: Optional[RedisMeta] = None) -> None:
+                 meta: Optional[RedisMeta] = None,
+                 swa_config: Optional[SWAPoolConfig] = None) -> None:
         if num_total_blocks <= 0:
             raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
@@ -106,6 +107,10 @@ class HierarchyLRCacheEngine:
         # only reports a hit when the underlying index exposes last_swa_node.
         # DSv4 uses CacheEngineAccel (index_accel), not this engine.
         self.swa_pool = None
+        tier_swa_config = (swa_config.for_cache_tier(device_type)
+                           if swa_config is not None else None)
+        if tier_swa_config is not None:
+            self.init_swa(tier_swa_config)
 
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
         """Initialize the SWA host pool for node-mounted SWA on this engine."""
@@ -566,6 +571,7 @@ class HierarchyLRCacheEngine:
             local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
             eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
             meta=meta,
+            swa_config=getattr(cache_config, "swa", None),
         )
 
     #TODO is this enough for peercpu and peerssd?
@@ -607,5 +613,6 @@ class HierarchyLRCacheEngine:
                 hit_reward_seconds=int(GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds),
                 eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
                 meta=meta,
+                swa_config=getattr(cache_config, "swa", None),
             )
             raise ValueError("Invalid device type: {cache_config.device_type}")

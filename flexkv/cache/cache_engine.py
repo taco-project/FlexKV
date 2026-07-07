@@ -55,7 +55,8 @@ class CacheEngineAccel:
                  evict_start_threshold: float = 1.0,
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
-                 metrics_collector = None):
+                 metrics_collector = None,
+                 swa_config: Optional["SWAPoolConfig"] = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -87,9 +88,14 @@ class CacheEngineAccel:
         # flexkv/cache/radixtree.py); this engine only owns the SWA host-pool
         # (slot bytes + free-list) and the slot alloc/free/drain plumbing. SWA
         # and Full eviction are UNIFIED through the one tree so the two pools
-        # never drift (see deployments/swa_design/08_节点挂载SWA架构.md). Created
-        # lazily via init_swa(); None until then.
+        # never drift (see deployments/swa_design/08_节点挂载SWA架构.md). This
+        # engine owns SWA initialization for its tier; init_swa() remains public
+        # for tests and explicit embedding.
         self.swa_pool = None
+        tier_swa_config = (swa_config.for_cache_tier(device_type)
+                           if swa_config is not None else None)
+        if tier_swa_config is not None:
+            self.init_swa(tier_swa_config)
 
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
         """Initialize the SWA host pool for node-mounted SWA on this engine.
@@ -427,7 +433,8 @@ class CacheEngine:
                  evict_start_threshold: float = 1.0,
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
-                 metrics_collector = None):
+                 metrics_collector = None,
+                 swa_config: Optional["SWAPoolConfig"] = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -453,9 +460,13 @@ class CacheEngine:
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
-        # Node-mounted SWA host pool (non-accel Python RadixTreeIndex mirror);
-        # None until init_swa(). See CacheEngineAccel for the semantics.
+        # Node-mounted SWA host pool (non-accel Python RadixTreeIndex mirror).
+        # See CacheEngineAccel for the semantics.
         self.swa_pool = None
+        tier_swa_config = (swa_config.for_cache_tier(device_type)
+                           if swa_config is not None else None)
+        if tier_swa_config is not None:
+            self.init_swa(tier_swa_config)
 
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
         """Initialize the SWA host pool for node-mounted SWA on this engine."""
@@ -750,7 +761,8 @@ class GlobalCacheEngine:
                                                 self.evict_start_threshold,
                                                 self.eviction_policy,
                                                 event_collector,
-                                                self._metrics_collector)
+                                                self._metrics_collector,
+                                                swa_config=cache_config.swa)
             else:
                 self.cpu_cache_engine = CacheEngine(DeviceType.CPU,
                                                 cache_config.num_cpu_blocks,
@@ -760,22 +772,9 @@ class GlobalCacheEngine:
                                                 self.evict_start_threshold,
                                                 self.eviction_policy,
                                                 event_collector,
-                                                self._metrics_collector)
+                                                self._metrics_collector,
+                                                swa_config=cache_config.swa)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
-            # Initialize the node-mounted SWA host pool on the CPU engine when SWA
-            # is enabled (DSv4). Without this the SWA pool is never constructed and
-            # a SWA-aware get finds no SWA. Guarded by hasattr because the non-accel
-            # CacheEngine fallback (Python RadixTreeIndex) also supports it.
-            swa_config = getattr(cache_config, "swa", None)
-            if swa_config is not None and getattr(swa_config, "enabled", False):
-                if hasattr(self.cpu_cache_engine, "init_swa"):
-                    self.cpu_cache_engine.init_swa(swa_config)
-                else:
-                    flexkv_logger.warning(
-                        "[SWA] cache_config.swa is enabled but the CPU cache "
-                        f"engine {type(self.cpu_cache_engine).__name__} has no "
-                        "init_swa(); SWA matching disabled."
-                    )
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
                 self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta)
@@ -788,7 +787,8 @@ class GlobalCacheEngine:
                                                 self.evict_start_threshold,
                                                 self.eviction_policy,
                                                 event_collector,
-                                                self._metrics_collector)
+                                                self._metrics_collector,
+                                                swa_config=cache_config.swa)
             else:
                 self.ssd_cache_engine = CacheEngine(DeviceType.SSD,
                                                 cache_config.num_ssd_blocks,
@@ -798,22 +798,9 @@ class GlobalCacheEngine:
                                                 self.evict_start_threshold,
                                                 self.eviction_policy,
                                                 event_collector,
-                                                self._metrics_collector)
+                                                self._metrics_collector,
+                                                swa_config=cache_config.swa)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
-            # SSD SWA tier (mirrors the CPU SWA tier above): a node-mounted SWA
-            # host pool on the SSD engine, num_ssd_slots slots. Enables CPU<->SSD SWA tiering (write-through on
-            # store, SWA_SSD2H->SWA_H2D on load). Skipped when num_ssd_slots == 0.
-            swa_config_ssd = getattr(cache_config, "swa", None)
-            if (swa_config_ssd is not None and getattr(swa_config_ssd, "enabled", False)
-                    and getattr(swa_config_ssd, "num_ssd_slots", 0) > 0):
-                if hasattr(self.ssd_cache_engine, "init_swa"):
-                    self.ssd_cache_engine.init_swa(swa_config_ssd.for_ssd_tier())
-                else:
-                    flexkv_logger.warning(
-                        "[SWA] SSD SWA requested but the SSD cache engine "
-                        f"{type(self.ssd_cache_engine).__name__} has no init_swa(); "
-                        "SSD SWA tier disabled."
-                    )
         if cache_config.enable_remote:
             if cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
@@ -827,7 +814,8 @@ class GlobalCacheEngine:
                                                    self.evict_start_threshold,
                                                    self.eviction_policy,
                                                    None,
-                                                   self._metrics_collector)
+                                                   self._metrics_collector,
+                                                   swa_config=cache_config.swa)
             else:
                 self.remote_cache_engine = CacheEngine(DeviceType.REMOTE,
                                                    cache_config.num_remote_blocks,
@@ -837,21 +825,9 @@ class GlobalCacheEngine:
                                                    self.evict_start_threshold,
                                                    self.eviction_policy,
                                                    None,
-                                                   self._metrics_collector)
+                                                   self._metrics_collector,
+                                                   swa_config=cache_config.swa)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
-            # REMOTE SWA tier (mirrors the CPU/SSD SWA tiers): a node-mounted SWA
-            # host pool on the REMOTE engine, num_remote_slots slots. Skipped when 0.
-            swa_config_remote = getattr(cache_config, "swa", None)
-            if (swa_config_remote is not None and getattr(swa_config_remote, "enabled", False)
-                    and getattr(swa_config_remote, "num_remote_slots", 0) > 0):
-                if hasattr(self.remote_cache_engine, "init_swa"):
-                    self.remote_cache_engine.init_swa(swa_config_remote.for_remote_tier())
-                else:
-                    flexkv_logger.warning(
-                        "[SWA] REMOTE SWA requested but the REMOTE cache engine "
-                        f"{type(self.remote_cache_engine).__name__} has no init_swa(); "
-                        "REMOTE SWA tier disabled."
-                    )
 
         # SWA control plane: multi-tier match + peer-op graph construction. Built
         # after the per-tier cache engines (and their swa_pool) exist; reaches
