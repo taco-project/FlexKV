@@ -8,9 +8,9 @@ Enters from the top (GlobalCacheEngine), NOT the data plane, using the REAL
 into a Full+SWA transfer graph + masks against the node-mounted radix tree:
 
     put()       -> full-KV D2H graph + SWA peer D2H (alloc slot + set_swa)
-    swa_align() -> full_hit, swa_hit, usable = min(full, swa)
-    get()       -> full-KV H2D graph + SWA peer H2D (matched slot), joined by
-                   the VIRTUAL barrier; the matched CPU SWA node is pinned for
+    get(swa_aware=True) -> full-KV H2D clamped to usable=min(full,swa) + SWA peer
+                   H2D (matched slot), joined by the VIRTUAL barrier; the matched
+                   CPU SWA node is pinned for
                    load and released by the H2D completion callback.
 
 The launch-time bind path mirrors what the connector triggers via
@@ -114,7 +114,7 @@ def _seed_swa_hit(eng, tok):
 
 
 # =========================================================================== #
-# 1. control-plane graph build (put / swa_align / get)                        #
+# 1. control-plane graph build (put / get)                                    #
 # =========================================================================== #
 
 def test_put_builds_full_plus_swa_store_chain():
@@ -140,22 +140,6 @@ def test_put_builds_full_plus_swa_store_chain():
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     hit, slot, key = eng.cpu_cache_engine.match_swa(sm, upper_bound_blocks=4)
     assert hit == 4 and slot >= 0
-
-
-def test_swa_align_clamps_full_to_swa_hit():
-    eng = GlobalCacheEngine(_cache_config(True), _model_config())
-    tok = _tokens(4, base=2)
-    mask = np.ones_like(tok, dtype=np.int64)
-    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
-
-    _g, _rm, cb, op_cb, _e = eng.put(1, tok, mask, slot_mapping, dp_client_id=0)
-    _complete(op_cb, cb)
-
-    # swa_align: full_hit=4, swa_hit=4 (SWA on the stored tail), usable=min=4.
-    full_hit, swa_hit = eng.swa_align(tok, np.ones_like(tok, dtype=np.bool_))
-    assert full_hit == 4, f"full_hit={full_hit}"
-    assert swa_hit == 4, f"swa_hit={swa_hit}"
-    assert min(full_hit, swa_hit) == 4
 
 
 def test_get_builds_full_plus_swa_load_chain():
@@ -363,26 +347,6 @@ def test_get_prefers_cpu_when_both_tiers_have_swa():
     assert "H2D" in kinds, kinds
     assert "DISK2H" not in kinds, f"CPU-resident SWA must not stage from SSD: {kinds}"
     _complete(gop, gcb)
-
-
-def test_swa_align_uses_best_across_tiers():
-    """Supersedes the #196 CPU-clamp guard: now that GET fetches all tiers,
-    swa_align must return the best (longest) reusable SWA hit across tiers, not
-    clamp to CPU. Here SSD holds a window CPU lost -> swa_align must still report
-    it (best == ssd_hit), so the graph is shaped to reuse it."""
-    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
-    tok = _tokens(4, base=24)
-    mask = np.ones_like(tok, dtype=np.int64)
-    sm = np.arange(tok.shape[0], dtype=np.int64)
-    _pg, _rm, pcb, pop, _pe = eng.put(1, tok, mask, sm, dp_client_id=0)
-    _complete(pop, pcb)
-    eng.cpu_cache_engine._evict_swa(eng.cpu_cache_engine.swa_pool.num_used)
-
-    full_hit, swa_hit = eng.swa_align(tok, np.ones_like(tok, dtype=np.bool_))
-    assert full_hit == 4
-    assert swa_hit == 4, (
-        f"swa_align must report the SSD SWA hit (best across tiers), got {swa_hit} "
-        f"(the #196 CPU clamp would return 0 here)")
 
 
 if __name__ == "__main__":

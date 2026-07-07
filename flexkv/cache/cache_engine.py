@@ -30,7 +30,7 @@ from flexkv.cache.redis_meta import RedisMeta, dist_available
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
-from flexkv.cache.swa_cache_engine import SWACacheManager, SWAMatchResult
+from flexkv.cache.swa_cache_engine import SWACacheManager
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import (
@@ -297,8 +297,8 @@ class CacheEngineAccel:
             physical_blocks=phys,
             block_node_ids=bnids_np,
             matched_pos="remote" if self.device_type == DeviceType.REMOTE else "local",
-            # SWA node-mount: pass through the SWA hit found in the SAME forward
-            # pass so swa_align can reuse it (no second match_prefix walk).
+            # SWA node-mount: carry the SWA hit found on the SAME forward pass so
+            # the SWA-aware get can reuse it (no second match_prefix walk).
             last_swa_node=getattr(match_result, "last_swa_node", None),
             swa_hit_blocks=int(getattr(match_result, "swa_hit_blocks", 0) or 0),
         )
@@ -764,7 +764,7 @@ class GlobalCacheEngine:
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
             # Initialize the node-mounted SWA host pool on the CPU engine when SWA
             # is enabled (DSv4). Without this the SWA pool is never constructed and
-            # get_match_swa finds no SWA. Guarded by hasattr because the non-accel
+            # a SWA-aware get finds no SWA. Guarded by hasattr because the non-accel
             # CacheEngine fallback (Python RadixTreeIndex) also supports it.
             swa_config = getattr(cache_config, "swa", None)
             if swa_config is not None and getattr(swa_config, "enabled", False):
@@ -941,11 +941,10 @@ class GlobalCacheEngine:
 
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
         # block_end_idx is the block just past the LAST True in token_mask. On the
-        # plain get() path the caller marks every non-resident token up to the
-        # aligned end, so this equals aligned_length // tokens_per_block. The
-        # SWA-aware caller (kvtask.get_match_swa) deliberately truncates the mask
-        # to usable = min(full_hit, swa_hit), leaving trailing False when the full
-        # hit runs past the reusable SWA window — a legitimate short match. So the
+        # plain path the caller marks every non-resident token up to the aligned
+        # end, so this equals aligned_length // tokens_per_block. On the SWA-aware
+        # path (swa_aware=True) _get_impl_* clamps the window to usable = min(full,
+        # swa) after matching, which can end before the aligned length. So the
         # invariant is <= (can never exceed the aligned length), not ==. Nothing
         # below uses aligned_length; all downstream sizing keys off block_end_idx.
         assert block_end_idx <= aligned_length // self.tokens_per_block
@@ -2033,144 +2032,6 @@ class GlobalCacheEngine:
                     ssd_matched_result = self.ssd_cache_engine.match_all(sequence_meta, gpu_matched_blocks)
 
         return cpu_matched_result, ssd_matched_result
-
-    # ===== SWA control plane (delegated to SWACacheManager) ===================
-    # The multi-tier SWA match and the SWA peer-op graph construction live in
-    # flexkv/cache/swa_cache_engine.py (self.swa_cache). This thin delegate keeps
-    # the call sites (kvtask.get_match_swa) reading the same as the full-KV path.
-
-    def match_swa_prefix(self,
-                         sequence_meta: SequenceMeta,
-                         max_full_hit_blocks: int,
-                         lock_for_load: bool = False,
-                         cpu_match_result=None,
-                         ssd_match_result=None,
-                         remote_match_result=None) -> SWAMatchResult:
-        """Multi-tier SWA prefix match (delegates to SWACacheManager.match_prefix).
-
-        Per-tier ``*_match_result`` (from the SAME forward pass that produced the
-        full hit) let the SWA match REUSE that pass instead of re-walking. Every
-        tier is clamped to the single ``max_full_hit_blocks`` upper bound.
-        """
-        return self.swa_cache.match_prefix(
-            sequence_meta,
-            max_full_hit_blocks=max_full_hit_blocks,
-            lock_for_load=lock_for_load,
-            cpu_match_result=cpu_match_result,
-            ssd_match_result=ssd_match_result,
-            remote_match_result=remote_match_result,
-        )
-
-    def swa_align(self,
-                  token_ids: np.ndarray,
-                  full_mask: np.ndarray,
-                  namespace: Optional[List[str]] = None,
-                  cpu_only: bool = False,
-                  lock_for_load: bool = False) -> Tuple[int, int]:
-        """Match-only SWA alignment: return ``(full_hit_blocks, swa_hit_blocks)``
-        without allocating or building any transfer op.
-
-        Owns all SWA tier access (per-tier node-mounted SWA via
-        :meth:`match_swa_prefix`). Used by the SWA-only get path
-        (kvtask.get_match_swa when the GPU already holds the full prefix), where
-        there is no Full-KV transfer to ride and the SWA window must be looked up
-        directly. The main get path resolves the SWA hit inside a single match in
-        :meth:`get` and does not call this.
-
-        Args:
-            token_ids: the request's full token ids (token-length, unaligned).
-            full_mask: token_mask (1 = token not on the GPU full pool). The leading
-                run of 0s is the device-resident full prefix.
-            namespace: optional cache namespace (folded into the prefix hash).
-            cpu_only: restrict to the CPU tier (mirrors get_match's cpu_only).
-            lock_for_load: pin matched SWA entries against eviction until the load.
-
-        Returns:
-            ``full_hit_blocks``: the Full-KV prefix resident after this get (the
-                SWA upper bound, since SWA is a subset of Full).
-            ``swa_hit_blocks``: longest reusable trailing-SWA prefix within the
-                full hit (0 when no SWA). SWA is page-granular, so this bounds a
-                single-block window.
-        """
-        tokens_per_block = self.tokens_per_block
-        if full_mask is None:
-            full_mask = np.ones_like(token_ids, dtype=np.bool_)
-
-        aligned_length = (token_ids.shape[0] // tokens_per_block) * tokens_per_block
-        if aligned_length == 0:
-            return 0, 0
-        aligned_mask = full_mask.copy()
-        aligned_mask[aligned_length:] = False
-
-        # Device-resident full prefix = leading run of 0s in full_mask, plus the
-        # ready matched transfer span — exactly the prefix get() will make resident.
-        block_start_idx, block_end_idx = self._get_block_range(aligned_mask)
-        if not aligned_mask.any():
-            # SWA-only: full_mask all-0 means the GPU holds the entire aligned
-            # prefix, so there is no transfer span but the full hit is the whole
-            # resident prefix (the SWA upper bound). Set the window to the aligned
-            # length so the SWA match below is not disabled by an empty range.
-            num_aligned_blocks = aligned_length // tokens_per_block
-            block_start_idx = block_end_idx = num_aligned_blocks
-        sequence_meta = SequenceMeta(token_ids=token_ids[:aligned_length],
-                                     tokens_per_block=tokens_per_block,
-                                     namespace=namespace)
-
-        temp_cache_strategy = CPUONLY_CACHE_STRATEGY if cpu_only else DEFAULT_CACHE_STRATEGY
-
-        # --- ready Full-KV hit within [block_start, block_end) -----------------
-        # Mirrors the fragment accounting in _get_impl_local / _get_impl_global:
-        # per tier, the reusable span is the ready-matched blocks clamped to the
-        # query window; the full hit is the max across tiers. We only read lengths
-        # here (no take / insert / op build).
-        def _ready_span(match_result) -> int:
-            ready = getattr(match_result, "num_ready_matched_blocks", 0)
-            return max(0, min(int(ready), block_end_idx) - block_start_idx)
-
-        remote_mr = None
-        if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
-            if self.index_accel:
-                cpu_mr, ssd_mr = self.match_local_accel(
-                    sequence_meta, temp_cache_strategy, is_put=False,
-                    gpu_matched_blocks=block_start_idx)
-            else:
-                cpu_mr, ssd_mr = self.match_local(sequence_meta, temp_cache_strategy)
-            ready_span = max(_ready_span(cpu_mr), _ready_span(ssd_mr))
-        else:
-            if self.index_accel:
-                cpu_mr, ssd_mr, remote_mr = self.match_all_accel(sequence_meta)
-            else:
-                cpu_mr, ssd_mr, remote_mr = self.match_all(sequence_meta)
-            ready_span = max(_ready_span(cpu_mr), _ready_span(ssd_mr), _ready_span(remote_mr))
-
-        full_hit_blocks = block_start_idx + ready_span
-        if full_hit_blocks == 0:
-            return 0, 0
-
-        # --- SWA prefix match clamped to the full hit (SWA subset of Full) -----
-        # Node-mount: SWA state lives on the radix nodes, so a tier has SWA iff
-        # its engine has an SWA host pool (swa_enabled). match_swa_prefix reads
-        # the SWA hit from the same radix match_prefix.
-        cpu_engine = self.cpu_cache_engine
-        if cpu_engine is None or not getattr(cpu_engine, "swa_enabled", False):
-            return full_hit_blocks, 0
-
-        swa_match = self.match_swa_prefix(
-            sequence_meta, max_full_hit_blocks=full_hit_blocks,
-            lock_for_load=lock_for_load,
-            # Reuse the Full-KV matches computed above so no tier re-walks the tree.
-            cpu_match_result=cpu_mr,
-            ssd_match_result=ssd_mr,
-            remote_match_result=remote_mr)
-
-        # Best (longest) reusable SWA hit across tiers. Each tier is already
-        # clamped to its Full-KV hit inside match_swa_prefix (SWA subset of Full),
-        # so best <= full_hit_blocks always holds.
-        best_hit = swa_match.best_hit_blocks
-        assert best_hit <= full_hit_blocks, (
-            f"SWA hit {best_hit} exceeds Full-KV hit {full_hit_blocks} "
-            "(SWA-subset-of-Full violated)")
-        return full_hit_blocks, best_hit
 
     def _swa_hit_from_match_results(self, tier_match_results: Dict) -> int:
         """Best (max) SWA hit across tiers, read from already-computed Full-KV

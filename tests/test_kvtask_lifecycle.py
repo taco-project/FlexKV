@@ -83,13 +83,13 @@ def test_shed_heavy_resources_keeps_status():
     assert t.return_mask is not None
 
 
-# --- M15/M16: get_match_swa's core arithmetic (pure, mirrors kvtask logic) --- #
+# --- M15/M16: SWA-aware get's core arithmetic (pure, mirrors kvtask logic) --- #
 
 def _usable_and_swa_mask(full_hit, swa_hit, num_tokens, tpb):
-    """Replicate the arithmetic in KVTaskEngine.get_match_swa (② + ③) so the
-    contract is pinned without standing up a KVTaskEngine (which needs a GPU
-    TransferManager subprocess). usable=min(full,swa) truncates the full_mask
-    BEFORE the graph is built; return_mask_swa marks the trailing SWA window."""
+    """Replicate the SWA-aware get arithmetic so the contract is pinned without
+    standing up a KVTaskEngine (which needs a GPU TransferManager subprocess).
+    usable=min(full,swa) clamps the full transfer; the trailing SWA window is
+    the last block of the clamped hit."""
     usable = min(full_hit, swa_hit)
     full_mask = np.ones(num_tokens, dtype=np.bool_)
     truncated = full_mask.copy()

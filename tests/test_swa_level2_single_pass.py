@@ -130,11 +130,11 @@ def test_swa_aware_get_matches_once():
 
 
 def test_swa_aware_get_clamps_full_to_usable():
-    """The folded path must still clamp the full-KV transfer to usable =
-    min(full_hit, swa_hit) — the behavior swa_align+truncate used to provide.
+    """The SWA-aware path clamps the full-KV transfer to usable = min(full_hit,
+    swa_hit).
 
     With SWA on the full stored tail, full_hit == swa_hit == 4, so return_mask
-    covers all 4 blocks. This pins that the fold does not over- or under-clamp.
+    covers all 4 blocks. This pins that the clamp does not over- or under-clamp.
     """
     eng = GlobalCacheEngine(_cache_config(), _model_config())
     tok = _tokens(4, base=32)
@@ -177,89 +177,38 @@ def test_plain_get_on_swa_cache_matches_once_and_unclamped():
 
 
 # =========================================================================== #
-# kvtask dispatch — get_match_swa main path resolves in a single match        #
+# kvtask dispatch — get_match threads swa_aware into the single match         #
 # =========================================================================== #
 
-def test_get_match_swa_main_path_no_swa_align():
-    """KVTaskEngine.get_match_swa on the main path (mask has 1s) must NOT call
-    swa_align and must drive exactly ONE _get_match_impl with swa_aware=True.
-    Exercised via the real unbound method on a fake self — no GPU subprocess,
-    mirroring the pure-logic tests in test_kvtask_lifecycle.py."""
+def test_get_match_threads_swa_aware():
+    """KVTaskEngine.get_match(swa_aware=True) drives exactly ONE _get_match_impl
+    with swa_aware=True. Exercised via the real unbound method on a fake self —
+    no GPU subprocess, mirroring the pure-logic tests in test_kvtask_lifecycle.py."""
     import types
     from flexkv.kvtask import KVTaskEngine
 
-    calls = {"swa_align": 0, "get_match_impl": [], "update": 0, "trace": 0}
+    calls = {"swa_aware": [], "task": None}
     tok = np.arange(4 * TPB, dtype=np.int64)
 
-    class _FakeCacheEngine:
-        tokens_per_block = TPB
-        def swa_align(self, *a, **k):
-            calls["swa_align"] += 1
-            return 4, 4
-
     def _fake_get_match_impl(token_ids, slot_mapping, **kw):
-        calls["get_match_impl"].append(kw.get("swa_aware"))
-        # emulate a clamped return_mask_full covering all 4 blocks (usable=4)
+        calls["swa_aware"].append(kw.get("swa_aware"))
         rm = np.zeros(token_ids.shape[0], dtype=np.bool_)
         rm[:4 * TPB] = True
         return 7, rm
 
     fake = types.SimpleNamespace(
-        cache_engine=_FakeCacheEngine(),
-        _update_tasks=lambda timeout=0: calls.__setitem__("update", calls["update"] + 1),
-        _get_match_impl=_fake_get_match_impl,
-        tracer=types.SimpleNamespace(
-            trace_request=lambda **k: calls.__setitem__("trace", calls["trace"] + 1)),
-    )
-    full_mask = np.ones(4 * TPB, dtype=np.bool_)
-
-    tid, rm_full, rm_swa = KVTaskEngine.get_match_swa(
-        fake, tok, full_mask=full_mask, dp_client_id=0)
-
-    assert calls["swa_align"] == 0, "main path must NOT call swa_align"
-    assert calls["get_match_impl"] == [True], \
-        "must drive exactly one _get_match_impl with swa_aware=True"
-    assert tid == 7
-    assert int(rm_full.sum()) == 4 * TPB
-    # SWA window = trailing single block of the clamped full hit.
-    assert int(rm_swa.sum()) == TPB
-    assert rm_swa[3 * TPB:4 * TPB].all()
-
-
-def test_get_match_swa_only_path_keeps_single_swa_align():
-    """The SWA-only branch (full_mask all-0: GPU already holds full prefix) keeps
-    ONE swa_align probe — there is no Full-KV match to ride, so this single match
-    is necessary, not redundant. It must still report the trailing SWA window."""
-    import types
-    from flexkv.kvtask import KVTaskEngine
-
-    calls = {"swa_align": 0, "get_match_impl": 0}
-    tok = np.arange(4 * TPB, dtype=np.int64)
-
-    class _FakeCacheEngine:
-        tokens_per_block = TPB
-        def swa_align(self, *a, **k):
-            calls["swa_align"] += 1
-            return 4, 4   # full_hit=4 (resident), swa_hit=4
-
-    def _fake_get_match_impl(token_ids, slot_mapping, **kw):
-        calls["get_match_impl"] += 1
-        return 9, np.zeros(token_ids.shape[0], dtype=np.bool_)  # empty full graph
-
-    fake = types.SimpleNamespace(
-        cache_engine=_FakeCacheEngine(),
+        cache_engine=types.SimpleNamespace(tokens_per_block=TPB),
         _update_tasks=lambda timeout=0: None,
         _get_match_impl=_fake_get_match_impl,
         tracer=types.SimpleNamespace(trace_request=lambda **k: None),
     )
-    full_mask = np.zeros(4 * TPB, dtype=np.bool_)   # all-0: SWA-only
+    full_mask = np.ones(4 * TPB, dtype=np.bool_)
 
-    tid, rm_full, rm_swa = KVTaskEngine.get_match_swa(
-        fake, tok, full_mask=full_mask, dp_client_id=0)
+    tid, mask = KVTaskEngine.get_match(
+        fake, tok, token_mask=full_mask, dp_client_id=0, swa_aware=True)
 
-    assert calls["swa_align"] == 1, "SWA-only path resolves via one swa_align"
-    assert tid == 9
-    assert int(rm_full.sum()) == 0, "no Full-KV transfer when GPU holds full prefix"
-    # SWA window still reported (trailing block at swa_hit=4).
-    assert int(rm_swa.sum()) == TPB
-    assert rm_swa[3 * TPB:4 * TPB].all()
+    assert calls["swa_aware"] == [True], \
+        "must drive exactly one _get_match_impl with swa_aware=True"
+    assert tid == 7
+    assert int(mask.sum()) == 4 * TPB
+

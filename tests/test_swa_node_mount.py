@@ -146,11 +146,11 @@ def test_py_evict_swa_leaf_with_full_lock_keeps_full():
 
 
 def test_py_match_probe_does_not_promote_swa_lru():
-    """M1.5 (regression guard): a match-only PROBE (update_cache_info=False, the
-    engine's swa_align path) must NOT reorder the SWA-LRU. A probe may never lead
-    to actual reuse (usable=min(full,swa) can truncate it to 0), so promoting on a
-    probe would pollute eviction. Passes today; must keep passing after the
-    reuse-promotion fix (which should gate on update_cache_info=True only)."""
+    """M1.5 (regression guard): a match-only PROBE (update_cache_info=False) must
+    NOT reorder the SWA-LRU. A probe may never lead to actual reuse
+    (usable=min(full,swa) can clamp it to 0), so promoting on a probe would
+    pollute eviction. Passes today; must keep passing after the reuse-promotion
+    fix (which should gate on update_cache_info=True only)."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
     a = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
     idx.set_swa(a, slot=10)

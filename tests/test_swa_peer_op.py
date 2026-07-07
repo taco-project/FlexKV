@@ -33,7 +33,7 @@ from flexkv.common.transfer import (
     TransferOpGraph, TransferOp, TransferType, DeviceType,
 )
 from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
-from flexkv.cache.swa_cache_engine import SWACacheManager, SWAMatchResult
+from flexkv.cache.swa_cache_engine import SWACacheManager
 
 pytestmark = pytest.mark.unit
 
@@ -185,17 +185,6 @@ def test_get_full_plus_swa_ssd_and_remote_staging():
     assert all(g._op_map[p].is_swa for p in swa_h2d.predecessors)
 
 
-def test_get_swa_only():
-    """GPU has full, only the trailing SWA window slid out: SWA-only graph."""
-    mgr = _mgr(enabled=True)
-    g, swa_id = mgr.build_swa_only_graph(TransferType.H2D, SWA_CPU, SWA_GPU, swa_key=9)
-    g, end = add_virtual_op_for_multiple_finished_ops(g, [swa_id], 0)
-    _print_scenario("GET SWA-only", g, end)
-    assert len(_full_ops(g)) == 0
-    assert len(_swa_ops(g)) == 1
-    assert end == swa_id            # sole op, no VIRTUAL needed
-
-
 # ============================================================================
 # PUT scenarios (store) — write-through fire-and-forget
 # ============================================================================
@@ -276,106 +265,3 @@ def test_set_gpu_blocks_does_not_touch_swa_slots():
     # full H2D dst rebound to the new gpu blocks; SWA H2D dst still SWA_GPU
     assert g._op_map[full.op_id].dst_block_ids.tolist() == [900, 901]
     np.testing.assert_array_equal(g._op_map[swa_id].dst_block_ids, SWA_GPU)
-
-
-# ============================================================================
-# multi-tier match (SWAMatchResult)
-# ============================================================================
-
-class _FakeSWANode:
-    """A fake node-mounted SWA source: reports a fixed (hit, slot, key)."""
-    def __init__(self, hit_blocks, slot, key):
-        self._hit, self._slot, self._key = hit_blocks, slot, key
-
-    def match(self, block_hashes, upper_bound_blocks, lock_for_load=False):
-        hit = min(self._hit, int(upper_bound_blocks))
-        return (hit, self._slot, self._key) if hit > 0 else (0, -1, -1)
-
-
-def _engine_for(idx):
-    return SimpleNamespace(
-        swa_enabled=True,
-        match_swa=lambda seq, upper_bound_blocks, lock_for_load=False:
-            idx.match(None, upper_bound_blocks, lock_for_load),
-    )
-
-
-def _mgr_tiers(cpu=None, ssd=None, remote=None):
-    engines = {}
-    if cpu is not None:
-        engines[DeviceType.CPU] = _engine_for(cpu)
-    if ssd is not None:
-        engines[DeviceType.SSD] = _engine_for(ssd)
-    if remote is not None:
-        engines[DeviceType.REMOTE] = _engine_for(remote)
-    gce = SimpleNamespace(cache_engines=engines,
-                          cache_config=SimpleNamespace(enable_swa_transfer=True))
-    return SWACacheManager(gce)
-
-
-class _Seq:
-    def gen_hashes(self):
-        pass
-
-
-def test_match_cpu_preferred_then_ssd_then_remote():
-    mgr = _mgr_tiers(cpu=_FakeSWANode(0, -1, -1),
-                     ssd=_FakeSWANode(2, 22, 222),
-                     remote=_FakeSWANode(5, 33, 333))
-    r = mgr.match_prefix(_Seq(), 6)
-    assert r.cpu_hit_blocks == 0
-    assert r.ssd_hit_blocks == 2 and r.ssd_slot == 22
-    assert r.remote_hit_blocks == 5 and r.remote_slot == 33
-    assert r.best_hit_blocks == 5
-
-
-def test_match_clamp_to_full_hit():
-    """Every tier's SWA hit is clamped to the single ``max_full_hit_blocks``
-    upper bound (SWA subset of Full)."""
-    mgr = _mgr_tiers(cpu=_FakeSWANode(0, -1, -1),
-                     ssd=_FakeSWANode(9, 22, 222),
-                     remote=_FakeSWANode(9, 33, 333))
-    r = mgr.match_prefix(_Seq(), max_full_hit_blocks=3)
-    assert r.ssd_hit_blocks == 3 and r.remote_hit_blocks == 3
-
-
-def test_match_no_cpu_index_empty():
-    gce = SimpleNamespace(cache_engines={}, cache_config=SimpleNamespace(enable_swa_transfer=True))
-    r = SWACacheManager(gce).match_prefix(_Seq(), 4)
-    assert r.best_hit_blocks == 0 and r.cpu_slot == -1
-
-
-def test_match_propagates_per_tier_keys():
-    """Per-tier hit/slot/key propagate so the data plane can drive
-    set_ready/unlock for each tier; best_hit_blocks is the cross-tier max."""
-    mgr = _mgr_tiers(cpu=_FakeSWANode(1, 10, 100),
-                     ssd=_FakeSWANode(2, 22, 222),
-                     remote=_FakeSWANode(5, 33, 333))
-    r = mgr.match_prefix(_Seq(), 6)
-    assert r.cpu_hit_blocks == 1 and r.cpu_slot == 10 and r.cpu_key == 100
-    assert r.ssd_key == 222 and r.remote_key == 333
-    assert r.best_hit_blocks == 5        # cross-tier max (REMOTE here)
-
-
-def test_match_forwards_upper_bound_and_lock_per_tier():
-    """Each tier's match_swa is called with the single ``max_full_hit_blocks``
-    upper bound (SWA subset of Full) and the caller's lock_for_load is forwarded."""
-    calls = {}
-
-    def _engine(tier):
-        def _match(seq, upper_bound_blocks, lock_for_load=False):
-            calls[tier] = (upper_bound_blocks, lock_for_load)
-            return (1, 0, 0)
-        return SimpleNamespace(swa_enabled=True,
-                               match_swa=_match)
-
-    engines = {DeviceType.CPU: _engine("cpu"),
-               DeviceType.SSD: _engine("ssd"),
-               DeviceType.REMOTE: _engine("remote")}
-    gce = SimpleNamespace(cache_engines=engines,
-                          cache_config=SimpleNamespace(enable_swa_transfer=True))
-    SWACacheManager(gce).match_prefix(_Seq(), max_full_hit_blocks=5,
-                                      lock_for_load=True)
-    assert calls["cpu"] == (5, True)
-    assert calls["ssd"] == (5, True)
-    assert calls["remote"] == (5, True)

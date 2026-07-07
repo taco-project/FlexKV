@@ -54,46 +54,11 @@ movement, kernels, SWA SSD/remote storage and completion callbacks are the data
 plane's responsibility.
 """
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
-from flexkv.common.block import SequenceMeta
 from flexkv.common.transfer import DeviceType, TransferOp, TransferOpGraph, TransferType
-
-
-@dataclass
-class SWAMatchResult:
-    """Per-tier SWA prefix-match result (control plane).
-
-    Each tier (CPU, SSD, REMOTE) is matched independently against its own
-    node-mounted SWA (on the radix tree) and clamped to that tier's Full-KV hit. SWA is page-granular:
-    one slot holds exactly one swa_page window, so the trailing SWA window is
-    always a single block (``window_size == tokens_per_block`` on DSv4) — there
-    is no separate window length to carry. Slots/keys are for the data-plane
-    transfer + set_ready/unlock bookkeeping (-1 when that tier missed).
-    """
-    cpu_hit_blocks: int = 0
-    ssd_hit_blocks: int = 0
-    remote_hit_blocks: int = 0
-    cpu_slot: int = -1
-    ssd_slot: int = -1
-    remote_slot: int = -1
-    cpu_key: int = -1
-    ssd_key: int = -1
-    remote_key: int = -1
-
-    @property
-    def best_hit_blocks(self) -> int:
-        """Longest reusable SWA prefix length (in blocks) across all tiers.
-
-        This is a length only — it does NOT pick a tier. The data-plane loader
-        decides which tier to source from (CPU > SSD > REMOTE) when building the
-        transfer; the current consumer (sizing return_mask_swa) needs only the
-        length.
-        """
-        return max(self.cpu_hit_blocks, self.ssd_hit_blocks, self.remote_hit_blocks)
 
 
 class SWACacheManager:
@@ -129,72 +94,6 @@ class SWACacheManager:
         cfg = getattr(self._gce, "cache_config", None)
         return bool(getattr(cfg, "enable_swa_transfer", False)) and \
             self._swa_enabled_tier(DeviceType.CPU)
-
-    # --- multi-tier match --------------------------------------------------
-
-    def match_prefix(self,
-                     sequence_meta: SequenceMeta,
-                     max_full_hit_blocks: int,
-                     lock_for_load: bool = False,
-                     cpu_match_result=None,
-                     ssd_match_result=None,
-                     remote_match_result=None) -> SWAMatchResult:
-        """Match the trailing-SWA prefix on each tier, clamped to the Full-KV hit.
-
-        Each tier's node-mounted SWA (on its radix tree) is matched independently
-        within the (already cross-tier max'd) Full-KV hit ``max_full_hit_blocks``
-        (SWA subset of Full). CPU is preferred; SSD then REMOTE are the fallbacks
-        whose load needs a staging chain (SWA DISK2H / REMOTE2H -> SWA H2D, all
-        is_swa=True).
-
-        When a tier's Full-KV ``*_match_result`` is supplied (from the SAME
-        forward pass that produced ``max_full_hit_blocks``), the SWA hit is
-        REUSED from it via ``match_swa_from_result`` — no second tree walk. When
-        omitted, it falls back to the standalone ``match_swa`` probe.
-
-        Args:
-            sequence_meta: the (page-aligned) query prefix.
-            max_full_hit_blocks: Full-KV hit length in blocks, the single upper
-                bound applied to every tier (the caller has already collapsed the
-                per-tier Full hits to their cross-tier max).
-            lock_for_load: pin the matched SWA entries against eviction until load.
-            cpu_match_result / ssd_match_result / remote_match_result: the tier's
-                Full-KV match to reuse (optional; carries last_swa_node/swa_hit_blocks).
-
-        Returns:
-            SWAMatchResult with per-tier hit lengths / slots / keys. SWA is
-            page-granular (one slot = one swa_page window = one block).
-        """
-        result = SWAMatchResult()
-        if not self._swa_enabled_tier(DeviceType.CPU):
-            return result
-        sequence_meta.gen_hashes()
-
-        def _match(engine, upper_bound, match_result):
-            """Reuse the Full-KV match when given, else probe. Returns
-            (hit, slot, key) — drops the node handle (callers that need the
-            pinned node use engine.match_swa_locked directly)."""
-            if match_result is not None:
-                hit, slot, key, _node = engine.match_swa_from_result(
-                    match_result, sequence_meta, upper_bound_blocks=upper_bound,
-                    lock_for_load=lock_for_load)
-                return hit, slot, key
-            return engine.match_swa(
-                sequence_meta, upper_bound_blocks=upper_bound,
-                lock_for_load=lock_for_load)
-
-        if max_full_hit_blocks > 0:
-            result.cpu_hit_blocks, result.cpu_slot, result.cpu_key = \
-                _match(self._engine(DeviceType.CPU), max_full_hit_blocks, cpu_match_result)
-
-            if self._swa_enabled_tier(DeviceType.SSD):
-                result.ssd_hit_blocks, result.ssd_slot, result.ssd_key = \
-                    _match(self._engine(DeviceType.SSD), max_full_hit_blocks, ssd_match_result)
-
-            if self._swa_enabled_tier(DeviceType.REMOTE):
-                result.remote_hit_blocks, result.remote_slot, result.remote_key = \
-                    _match(self._engine(DeviceType.REMOTE), max_full_hit_blocks, remote_match_result)
-        return result
 
     # --- peer-op graph construction (gated) --------------------------------
 
@@ -310,24 +209,3 @@ class SWACacheManager:
             if h2remote_id is not None:
                 graph.add_dependency(h2remote_id, d2h_id)
         return d2h_id
-
-    def build_swa_only_graph(self,
-                             transfer_type: TransferType,
-                             src_slot_ids: np.ndarray,
-                             dst_slot_ids: np.ndarray,
-                             swa_key: int = -1,
-                             dp_client_id: int = 0) -> Tuple[TransferOpGraph, int]:
-        """Build a graph containing ONLY an SWA op (the SWA-only form).
-
-        Returns (graph, swa_op_id); swa_op_id is -1 (empty graph) when SWA
-        transfer is disabled or the slots are empty. This is the form the
-        derivation model could not express (no full op to derive from), e.g. the
-        GPU already holds the full prefix and only the trailing SWA window slid
-        out and must be reloaded.
-        """
-        graph = TransferOpGraph()
-        op_id = self.build_swa_op(
-            graph, transfer_type, src_slot_ids, dst_slot_ids,
-            swa_key=swa_key, dp_client_id=dp_client_id,
-        )
-        return graph, (op_id if op_id is not None else -1)

@@ -12,7 +12,7 @@ match, plus the size-1 GPU placeholder), the GPU sides are bound LATE via
 ``TransferEngine`` with GPU pools. We then assert a byte-exact main-KV + SWA
 GPU->CPU->GPU roundtrip.
 
-Flow (mirrors KVManager get_match_swa + launch, minus the tp_client subprocess):
+Flow (mirrors KVManager get_match(swa_aware=True) + launch, minus the tp_client subprocess):
   PUT : engine.put() -> graph {full D2H, SWA D2H} -> bind GPU slots -> submit
         -> full+SWA bytes land in the shared CPU pool + SWA host pool
   GET : engine.get() -> graph {full H2D, SWA H2D} -> bind GPU slots -> submit

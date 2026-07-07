@@ -84,20 +84,9 @@ class GetMatchRequest:
     cpu_only: bool = False
     task_id: int = -1
     namespace: Optional[List[str]] = None
-
-
-@dataclass
-class GetMatchSwaRequest:
-    # SWA-aware match (DSv4). Mirrors GetMatchRequest; ``full_mask`` (== the
-    # single-mask token_mask) drives the match. The reply uses Response.mask for
-    # return_mask_full and Response.mask_swa for return_mask_swa.
-    dp_client_id: int
-    token_ids: np.ndarray
-    full_mask: Optional[np.ndarray]
-    cpu_only: bool = False
-    task_id: int = -1
-    namespace: Optional[List[str]] = None
-    update_state_for_load: bool = True
+    # SWA-aware match: clamp the Full-KV transfer to the reusable SWA window; the
+    # SWA window is the trailing block of the returned mask.
+    swa_aware: bool = False
 
 
 @dataclass
@@ -140,11 +129,6 @@ class Response:
     status: Optional[Dict[int, KVResponseStatus]] = None
     is_ready: bool = False
     error_msg: Optional[str] = None
-    # SWA dual-mask reply: ``mask`` carries return_mask_full, ``mask_swa`` carries
-    # return_mask_swa (the trailing reusable SWA window). Only set by the
-    # get_match_swa handler; None for every other request so existing handlers
-    # stay backward-compatible.
-    mask_swa: Optional[np.ndarray] = None
 
     @property
     def success(self) -> bool:
