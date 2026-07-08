@@ -159,9 +159,12 @@ def test_put_builds_full_plus_swa_store_chain():
     # size-1 placeholder (bound late via set_swa_gpu_blocks).
     assert swa[0].op_id in graph._swa_gpu_transfer_op_id
     assert eng.cpu_cache_engine.swa_pool.num_used == 1  # one slot allocated
+    sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
+    hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
+        sm, upper_bound_blocks=4)
+    assert hit == 0 and slot < 0, "SWA PUT slot became visible before completion"
     _complete(op_cb, cb)
     # after completion the SWA slot is mounted on the stored tail node.
-    sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
         sm, upper_bound_blocks=4)
     assert hit == 4 and slot >= 0
@@ -193,7 +196,9 @@ def test_get_builds_full_plus_swa_load_chain():
     hit, slot, node = eng.cpu_cache_engine._resolve_swa_read_source(
         sm, upper_bound_blocks=4, lock_for_load=True)
     assert node is not None and node.swa_lock_ref == 1
-    node.dec_swa_lock_ref()
+    assert node.get_lock_cnt() >= node.swa_lock_ref
+    eng._swa_release_load_lock(node, engine=eng.cpu_cache_engine)
+    assert node.swa_lock_ref == 0
 
 
 def test_gate_off_no_swa_ops_in_control_plane_graph():
@@ -304,7 +309,7 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
     """PUT with an SSD tier: SWA store must write through to SSD, mirroring the
     full-KV H2DISK. The SWA graph should carry a SWA D2H (GPU->CPU) AND a SWA
     H2DISK (CPU->SSD) that depends on the D2H (fire-and-forget), and an SSD SWA
-    slot must be allocated + mounted on the SSD store node."""
+    slot must be allocated but not mounted until the PUT graph completes."""
     eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
     tok = _tokens(4, base=21)
     mask = np.ones_like(tok, dtype=np.int64)
@@ -318,9 +323,16 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
     swa_d2h = [o for o in swa if o.transfer_type == TransferType.D2H][0]
     swa_h2disk = [o for o in swa if o.transfer_type == TransferType.H2DISK][0]
     assert swa_d2h.op_id in swa_h2disk.predecessors, "H2DISK must depend on SWA D2H"
-    # an SSD SWA slot was allocated (mounted on the SSD store node)
+    # SSD SWA is reserved but not yet visible while the write-through op is in flight.
     assert eng.ssd_cache_engine.swa_pool.num_used == 1
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    ssd_hit, _slot, _node = eng.ssd_cache_engine._resolve_swa_read_source(
+        seq, upper_bound_blocks=4)
+    assert ssd_hit == 0
     _complete(op_cb, cb)
+    ssd_hit, _slot, _node = eng.ssd_cache_engine._resolve_swa_read_source(
+        seq, upper_bound_blocks=4)
+    assert ssd_hit == 4
 
 
 def test_get_ssd_staging_when_only_ssd_has_swa():
@@ -354,6 +366,48 @@ def test_get_ssd_staging_when_only_ssd_has_swa():
     swa_h2d = [o for o in swa if o.transfer_type == TransferType.H2D][0]
     swa_disk2h = [o for o in swa if o.transfer_type == TransferType.DISK2H][0]
     assert swa_disk2h.op_id in swa_h2d.predecessors, "H2D must depend on SSD DISK2H"
+    _complete(gop, gcb)
+
+
+def test_swa_aware_get_uses_exact_source_for_final_usable_end():
+    """CPU may have a shorter SWA hit than SSD. The SWA-aware clamp must choose
+    the final usable end and source together; a shorter CPU hit must not shadow
+    the longer SSD source selected for the Full-KV window."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    tok = _tokens(4, base=24)
+    tok_div = np.concatenate([tok[:2 * TPB], _tokens(2, base=25)])
+    mask4 = np.ones_like(tok, dtype=np.int64)
+    sm4 = np.arange(tok.shape[0], dtype=np.int64)
+
+    # Full 4-block store reaches CPU+SSD, then remove only CPU SWA.
+    _pg, _rm, pcb, pop, _pe = eng.put(1, tok, mask4, sm4, dp_client_id=0)
+    _complete(pop, pcb)
+    eng.cpu_cache_engine._evict_swa_slots(eng.cpu_cache_engine.swa_pool.num_used)
+
+    # Split the CPU radix at the shared 2-block prefix with a divergent sequence.
+    eng.cache_config.enable_ssd = False
+    _pg2, _rm2, pcb2, pop2, _pe2 = eng.put(2, tok_div, mask4, sm4, dp_client_id=0)
+    _complete(pop2, pcb2)
+    eng.cache_config.enable_ssd = True
+    seq_prefix = SequenceMeta(token_ids=tok[:2 * TPB], tokens_per_block=TPB)
+    prefix_node = eng.cpu_cache_engine.match(seq_prefix).last_node
+    prefix_slot = eng.cpu_cache_engine._reserve_unmounted_swa_slot()
+    eng.cpu_cache_engine._mount_reserved_swa_slot(prefix_node, prefix_slot)
+
+    graph, return_mask, gcb, gop, _ge = eng.get(
+        request_id=3,
+        token_ids=tok,
+        token_mask=mask4.copy(),
+        slot_mapping=sm4,
+        dp_client_id=0,
+        swa_aware=True,
+    )
+
+    assert return_mask[:4 * TPB].all()
+    swa = _swa_ops(graph)
+    kinds = sorted(o.transfer_type.name for o in swa)
+    assert "H2D" in kinds and "DISK2H" in kinds, (
+        f"expected SSD exact source for 4-block usable end, got {kinds}")
     _complete(gop, gcb)
 
 

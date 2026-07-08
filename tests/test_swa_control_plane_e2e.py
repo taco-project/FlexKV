@@ -233,7 +233,7 @@ def main() -> int:
         sm, upper_bound_blocks=1, lock_for_load=True)
     if node is not None:
         lock_ok = (node.swa_lock_ref == 1)  # our fresh probe lock; prior load lock released
-        node.dec_swa_lock_ref()
+        engine._swa_release_load_lock(node, engine=engine.cpu_cache_engine)
         print(f"[verify] {'OK   ' if lock_ok else 'FAIL '} SWA load lock released "
               f"(lock_ref after fresh probe == 1: {lock_ok})", flush=True)
         failed = failed or not lock_ok

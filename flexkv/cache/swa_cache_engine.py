@@ -49,11 +49,19 @@ movement, kernels, SWA SSD/remote storage and completion callbacks are the data
 plane's responsibility.
 """
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Union
 
 import numpy as np
 
 from flexkv.common.transfer import DeviceType, TransferOp, TransferOpGraph, TransferType
+
+
+@dataclass
+class SWAPutChainOpIds:
+    d2h_id: Optional[int] = None
+    h2disk_id: Optional[int] = None
+    h2remote_id: Optional[int] = None
 
 
 class SWACacheManager:
@@ -168,7 +176,8 @@ class SWACacheManager:
                         cpu_slot_ids: np.ndarray,
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
-                        dp_client_id: int = 0) -> Optional[int]:
+                        dp_client_id: int = 0,
+                        return_op_ids: bool = False) -> Union[Optional[int], SWAPutChainOpIds]:
         """Build the PUT-side SWA store chain into ``graph``; return the SWA
         ``D2H`` op_id (to be appended to the graph's finished_ops_ids).
 
@@ -183,7 +192,8 @@ class SWACacheManager:
             dp_client_id=dp_client_id,
         )
         if d2h_id is None:
-            return None
+            return SWAPutChainOpIds() if return_op_ids else None
+        h2ssd_id = None
         if ssd_slot_ids is not None and np.asarray(ssd_slot_ids).size > 0:
             h2ssd_id = self.build_swa_op(
                 graph, TransferType.H2DISK, cpu_slot_ids, ssd_slot_ids,
@@ -191,6 +201,7 @@ class SWACacheManager:
             )
             if h2ssd_id is not None:
                 graph.add_dependency(h2ssd_id, d2h_id)
+        h2remote_id = None
         if remote_slot_ids is not None and np.asarray(remote_slot_ids).size > 0:
             h2remote_id = self.build_swa_op(
                 graph, TransferType.H2REMOTE, cpu_slot_ids, remote_slot_ids,
@@ -198,4 +209,10 @@ class SWACacheManager:
             )
             if h2remote_id is not None:
                 graph.add_dependency(h2remote_id, d2h_id)
+        if return_op_ids:
+            return SWAPutChainOpIds(
+                d2h_id=d2h_id,
+                h2disk_id=h2ssd_id,
+                h2remote_id=h2remote_id,
+            )
         return d2h_id

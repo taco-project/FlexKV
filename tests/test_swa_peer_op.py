@@ -202,23 +202,26 @@ def test_put_full_plus_swa_cpu_only():
     assert len(swa) == 1 and swa[0].transfer_type == TransferType.D2H and swa[0].is_swa
 
 
-def test_put_swa_writethrough_ssd_remote_fire_and_forget():
-    """Write-through: SWA H2DISK/H2REMOTE depend on SWA D2H but are NOT reported."""
+def test_put_swa_writethrough_ssd_remote_can_join_completion_barrier():
+    """Write-through: SWA H2DISK/H2REMOTE depend on SWA D2H and may join the
+    completion barrier when the control plane defers set_swa() until bytes land."""
     mgr = _mgr(enabled=True, ssd=True, remote=True)
     g = TransferOpGraph()
     full = _full_d2h(g)
     swa_d2h_id = mgr.build_put_chain(g, gpu_slot_ids=SWA_GPU, cpu_slot_ids=SWA_CPU,
                                      ssd_slot_ids=SWA_SSD, remote_slot_ids=SWA_REMOTE)
-    finished = [full.op_id, swa_d2h_id]   # only D2H ops reported
+    wt_ids = [op.op_id for op in _swa_ops(g) if op.op_id != swa_d2h_id]
+    finished = [full.op_id, swa_d2h_id] + wt_ids
     g, end = add_virtual_op_for_multiple_finished_ops(g, finished, 0)
     _print_scenario("PUT full + SWA write-through(SSD+REMOTE)", g, end)
     wt = [op for op in _swa_ops(g) if op.op_id != swa_d2h_id]
     assert {o.transfer_type for o in wt} == {TransferType.H2DISK, TransferType.H2REMOTE}
     for o in wt:
         assert o.is_swa and swa_d2h_id in o.predecessors   # depend on SWA D2H
-    # write-through ops are fire-and-forget: NOT predecessors of the barrier
+    # write-through ops can be barrier predecessors so delayed SWA mount happens
+    # only after CPU/SSD/REMOTE copies are complete.
     barrier = g._op_map[end]
-    assert all(o.op_id not in barrier.predecessors for o in wt)
+    assert all(o.op_id in barrier.predecessors for o in wt)
     assert swa_d2h_id in barrier.predecessors
 
 
