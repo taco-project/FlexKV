@@ -102,7 +102,11 @@ class KVTaskManager:
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
-        if cache_config.enable_remote and not cache_config.enable_ssd:
+        if (
+            cache_config.enable_remote
+            and not cache_config.enable_ssd
+            and not cache_config.use_mooncake_store_backend
+        ):
             raise ValueError("enable_ssd must be True if enable_remote is True")
         if not cache_config.enable_cpu and not cache_config.enable_gds:
             raise ValueError("enable_gds must be True if enable_cpu is False")
