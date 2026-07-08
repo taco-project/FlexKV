@@ -134,13 +134,22 @@ class HierarchyLRCacheEngine:
     def match_swa(self,
                   sequence_meta: "SequenceMeta",
                   upper_bound_blocks: int,
-                  lock_for_load: bool = False):
-        """Node-mounted SWA match. Returns no-hit unless the (remote) radix index
-        exposes last_swa_node on its match result."""
+                  lock_for_load: bool = False,
+                  match_result=None,
+                  return_node: bool = False):
+        """Node-mounted SWA match no-op for hierarchical remote indexes.
+
+        Kept signature-compatible with CacheEngine[Accel].match_swa so callers can
+        resolve SWA slots without branching on the concrete tier engine.
+        """
         if self.swa_pool is None or upper_bound_blocks <= 0:
+            if return_node or lock_for_load:
+                return 0, -1, None
             return 0, -1
         # The distributed/remote radix index does not surface node-mounted SWA
         # yet; report no hit (SWA is served by the accel CPU tier for DSv4).
+        if return_node or lock_for_load:
+            return 0, -1, None
         return 0, -1
 
     def start(self) -> None:

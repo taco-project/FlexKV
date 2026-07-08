@@ -5,7 +5,7 @@
 
 This is the production-path proof for the SWA data plane: the transfer graph is
 produced by ``GlobalCacheEngine.put()`` / ``get()`` (which call the now-wired
-``_swa_put_slots`` / ``_swa_get_slots`` — real SWA-pool alloc + node-mounted
+``_swa_put_slots`` / ``_resolve_swa_get_source`` — real SWA-pool alloc + node-mounted
 match, plus the size-1 GPU placeholder), the GPU sides are bound LATE via
 ``set_gpu_blocks`` (full-KV) and ``set_swa_gpu_blocks`` (SWA) exactly as
 ``KVTaskEngine.launch`` does, and the resulting graph is submitted to a real
@@ -191,7 +191,7 @@ def main() -> int:
     # zero the GPU pools so GET must source from CPU
     mk_pool.zero_(); sw_pool.zero_(); torch.cuda.synchronize()
 
-    # ===== GET via GlobalCacheEngine.get() (real _swa_get_slots) ===============
+    # ===== GET via GlobalCacheEngine.get() (real _resolve_swa_get_source) ======
     get_slot_mapping = np.arange(GET_FULL_GPU * TOKENS_PER_BLOCK,
                                  (GET_FULL_GPU + 1) * TOKENS_PER_BLOCK, dtype=np.int64)
     get_graph, _rm2, get_cb, get_op_cb, get_end = engine.get(
@@ -229,7 +229,8 @@ def main() -> int:
 
     # SWA lock released by the H2D callback (no leak).
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); sm.gen_hashes()
-    hit, slot, node = engine.cpu_cache_engine.match_swa_locked(sm, upper_bound_blocks=1)
+    hit, slot, node = engine.cpu_cache_engine.match_swa(
+        sm, upper_bound_blocks=1, lock_for_load=True, return_node=True)
     if node is not None:
         lock_ok = (node.swa_lock_ref == 1)  # our fresh probe lock; prior load lock released
         node.dec_swa_lock_ref()

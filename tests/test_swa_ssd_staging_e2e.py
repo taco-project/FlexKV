@@ -14,9 +14,9 @@ does not cover:
   GET : engine.get() -> graph {full H2D, SWA DISK2H (SSD->CPU staging) -> SWA H2D
         (CPU->GPU)} -> bytes restored to a fresh GPU SWA slot -> byte-exact.
 
-This exercises the multi-tier _swa_put_slots (write-through) and _swa_get_slots
-(SSD->CPU transient staging slot + H2D), plus the transient staging slot free on
-H2D completion.
+This exercises the multi-tier _swa_put_slots (write-through) and
+_resolve_swa_get_source (SSD->CPU transient staging slot + H2D), plus the
+transient staging slot free on H2D completion.
 
 Run INSIDE the container on a free GPU:
     CUDA_VISIBLE_DEVICES=0 python3 tests/test_swa_ssd_staging_e2e.py

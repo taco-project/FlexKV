@@ -870,11 +870,11 @@ def test_full_evict_no_cascade_when_swa_disabled():
 
 
 # --------------------------------------------------------------------------- #
-# Double-match elimination: match_swa_from_result reuse + fallback             #
+# Double-match elimination: match_swa(match_result=...) reuse + fallback       #
 # --------------------------------------------------------------------------- #
 
-def test_match_swa_from_result_reuses_within_bound():
-    """match_swa_from_result reuses the Full-KV match when swa_hit <= bound."""
+def test_match_swa_match_result_reuses_within_bound():
+    """match_swa(match_result=...) reuses the Full-KV match when swa_hit <= bound."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
     n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
     idx.set_swa(n1, slot=100)

@@ -70,7 +70,7 @@ def _cache_config_ssd(enable_swa_transfer: bool = True):
     """CPU + SSD tiers, both with an SWA host pool. The SSD cache engine is an
     in-memory radix+mempool+swa_pool (no real SSD files at construction — files
     are only touched by the data-plane worker at transfer time), so multi-tier
-    SWA orchestration (_swa_put_slots / _swa_get_slots) is testable at smoke
+    SWA orchestration (_swa_put_slots / _resolve_swa_get_source) is testable at smoke
     level without disk I/O."""
     cc = CacheConfig(
         tokens_per_block=TPB,
@@ -189,9 +189,36 @@ def test_get_builds_full_plus_swa_load_chain():
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     _complete(gop_cb, gcb)
     # after release, the node's SWA is unlocked (a fresh match can lock again).
-    hit, slot, node = eng.cpu_cache_engine.match_swa_locked(sm, upper_bound_blocks=4)
+    hit, slot, node = eng.cpu_cache_engine.match_swa(
+        sm, upper_bound_blocks=4, lock_for_load=True, return_node=True)
     assert node is not None and node.swa_lock_ref == 1
     node.dec_swa_lock_ref()
+
+
+def test_match_swa_canonical_reuses_match_result_and_clamps():
+    eng = GlobalCacheEngine(_cache_config(True), _model_config())
+    tok = _tokens(4, base=31)
+    mask = np.ones_like(tok, dtype=np.int64)
+    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
+    _g, _rm, cb, op_cb, _e = eng.put(
+        request_id=1, token_ids=tok, token_mask=mask,
+        slot_mapping=slot_mapping, dp_client_id=0)
+    _complete(op_cb, cb)
+
+    sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
+    mr = eng.cpu_cache_engine.match(sm)
+
+    hit, slot, node = eng.cpu_cache_engine.match_swa(
+        sm, upper_bound_blocks=4, match_result=mr,
+        lock_for_load=True, return_node=True)
+    assert hit == 4 and slot >= 0
+    assert node is not None and node.swa_lock_ref == 1
+    node.dec_swa_lock_ref()
+
+    hit2, slot2, node2 = eng.cpu_cache_engine.match_swa(
+        sm, upper_bound_blocks=2, match_result=mr,
+        lock_for_load=True, return_node=True)
+    assert (hit2, slot2, node2) == (0, -1, None)
 
 
 def test_gate_off_no_swa_ops_in_control_plane_graph():
@@ -295,7 +322,7 @@ def test_no_swa_slot_mapping_leaves_placeholder():
 
 # =========================================================================== #
 # 3. multi-tier SWA orchestration (CPU + SSD): write-through + get staging     #
-#    These exercise _swa_put_slots / _swa_get_slots across tiers (the layer    #
+#    These exercise _swa_put_slots / _resolve_swa_get_source across tiers.     #
 #    that was CPU-only). Written TDD-first: they FAIL against CPU-only code.    #
 # =========================================================================== #
 

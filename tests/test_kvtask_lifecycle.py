@@ -8,8 +8,8 @@ Two concerns, both cheap (no TransferManager subprocess, no GPU):
    the new ``swa_slot_mapping`` field, and shed_heavy_resources.
 
 2. The SWA load-lock lifecycle on ``GlobalCacheEngine``: a GET pins the matched
-   CPU SWA node (``_swa_get_slots`` -> match_swa_locked), and the SWA H2D
-   completion callback releases it (``_swa_release_load_lock``), leaving the
+   CPU SWA node (``_resolve_swa_get_source`` -> match_swa(lock_for_load=True)),
+   and the SWA H2D completion callback releases it (``_swa_release_load_lock``), leaving the
    node cached (dec_swa_lock_ref, NOT dec_swa_lock_only). This documents that
    the SWA lock follows the SAME lifecycle as the full-KV node lock (both taken
    in get()/put(), both released via the op/transfer callbacks) — so a fresh
@@ -191,7 +191,7 @@ def test_get_pins_then_releases_swa_lock():
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     hit, slot = eng.cpu_cache_engine.match_swa(sm, upper_bound_blocks=4)
     assert hit == 4
-    # The node carries the load pin (>=1) taken by _swa_get_slots.
+    # The node carries the load pin (>=1) taken by _resolve_swa_get_source.
     node = eng.cpu_cache_engine.index.match_prefix(
         torch.from_numpy(sm.block_hashes[:4]).to(torch.int64), 4, False).last_swa_node
     assert node.swa_lock_ref >= 1
