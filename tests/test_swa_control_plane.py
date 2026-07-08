@@ -30,10 +30,10 @@ import torch
 
 pytest.importorskip("flexkv.c_ext")
 
-from flexkv.cache.cache_engine import GlobalCacheEngine
+from flexkv.cache.cache_engine import CacheEngineAccel, GlobalCacheEngine
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
-from flexkv.common.transfer import TransferType
+from flexkv.common.transfer import DeviceType, TransferType
 from flexkv.common.debug import flexkv_logger
 
 flexkv_logger.set_level("OFF")
@@ -102,6 +102,25 @@ def _full_ops(graph):
 def _tokens(n_blocks, base):
     rs = np.random.RandomState(base)
     return rs.randint(0, 30000, size=n_blocks * TPB, dtype=np.int64)
+
+
+def test_cpu_cache_engine_initializes_swa_pool_from_constructor():
+    swa_config = SWAPoolConfig(
+        enabled=True,
+        num_slots=7,
+        num_swa_layers=1,
+        bytes_per_token_per_layer=64,
+    )
+    eng = CacheEngineAccel(
+        DeviceType.CPU,
+        num_total_blocks=32,
+        tokens_per_block=TPB,
+        evict_ratio=0.1,
+        swa_config=swa_config,
+    )
+
+    assert eng.swa_enabled
+    assert eng.swa_pool.num_slots == 7
 
 
 def _complete(op_cb, cb):

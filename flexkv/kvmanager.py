@@ -380,5 +380,5 @@ class KVManager:
         if engine is None:
             return "cpu_cache_engine missing (no in-process engine)"
         if not getattr(engine, "swa_enabled", False):
-            return "SWA host pool not initialized (call init_swa)"
+            return "SWA host pool not initialized on cpu_cache_engine"
         return None
