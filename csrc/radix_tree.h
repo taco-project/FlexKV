@@ -246,7 +246,7 @@ public:
   // locked (I3: swa_lock_ref>0 implies it must stay), or it is not ready.
   bool in_use() { return lock_cnt > 0 || swa_lock_ref > 0 || !ready; }
 
-  bool evictable() { return is_leaf() && !in_use(); }
+  bool evictable() { return !index->is_root(this) && is_leaf() && !in_use(); }
 
   int get_lock_cnt() const { return lock_cnt; }
 

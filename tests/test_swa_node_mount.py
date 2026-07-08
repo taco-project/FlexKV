@@ -240,6 +240,15 @@ def test_py_swa_locked_node_not_full_evictable():
     assert not n.evictable()
 
 
+def test_py_root_is_not_evictable():
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    assert idx.root_node.is_leaf()
+    assert not idx.root_node.evictable()
+    evicted, hashes = idx.evict(1)
+    assert evicted.size == 0
+    assert hashes.size == 0
+
+
 def test_py_reset_rearms_swa_pool_via_host_pool():
     """SWAHostPool.reset re-arms every slot free (tree reset drops all nodes)."""
     from flexkv.swa.swa_host_pool import SWAHostPool
@@ -366,7 +375,8 @@ def test_promote_swa_ignores_dead_node():
 c_ext = pytest.importorskip("flexkv.c_ext")
 
 _CEXT_OK = "swa_host_slot" in dir(c_ext.CRadixNode) and all(
-    n in dir(c_ext.CRadixNode) for n in ("is_leaf", "get_lock_cnt", "has_swa")
+    n in dir(c_ext.CRadixNode)
+    for n in ("is_leaf", "get_lock_cnt", "has_swa", "lock", "unlock")
 )
 _cext_reason = "CRadixNode SWA/structural bindings not present (rebuild c_ext)"
 cext = pytest.mark.skipif(not _CEXT_OK, reason=_cext_reason)
@@ -614,6 +624,14 @@ def test_cpp_swa_locked_node_not_full_evictable():
     assert len(ev) == 0            # locked -> not evicted
     assert not t.is_empty()
     n.dec_swa_lock_ref()
+
+
+@cext
+def test_cpp_root_is_not_evictable():
+    t = _tree()
+    ev = _evict_full(t, 1)
+    assert len(ev) == 0
+    assert t.is_empty()
 
 
 @cext

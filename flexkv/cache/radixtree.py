@@ -142,6 +142,14 @@ class RadixNode:
         assert self.swa_lock_ref > 0
         self.swa_lock_ref -= 1
 
+    def lock(self) -> None:
+        assert self.lock_cnt >= 0
+        self.lock_cnt += 1
+
+    def unlock(self) -> None:
+        assert self.lock_cnt > 0
+        self.lock_cnt -= 1
+
     def split(self, prefix_length: int) -> 'RadixNode':
         assert prefix_length < self.size()
         assert prefix_length > 0
