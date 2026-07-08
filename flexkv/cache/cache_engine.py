@@ -95,15 +95,10 @@ class CacheEngineAccel:
         """Initialize the SWA host pool for node-mounted SWA on this engine.
 
         Node-mount: the radix tree nodes hold the SWA state; this pool only
-        supplies slot bytes + a free-list. The window must be a whole number of
-        blocks (page-granular SWA); DSv4 has window_size == tokens_per_block.
+        supplies slot bytes + a free-list. SWA is page-granular, so the physical
+        SWA page size must match ``tokens_per_block``.
         """
         from flexkv.swa.swa_host_pool import SWAHostPool
-        if swa_config.window_size % self.tokens_per_block != 0:
-            raise ValueError(
-                f"SWAPoolConfig.window_size ({swa_config.window_size}) must be a "
-                f"multiple of tokens_per_block ({self.tokens_per_block})"
-            )
         self.swa_pool = SWAHostPool(swa_config)
 
     @property
@@ -155,7 +150,7 @@ class CacheEngineAccel:
     def match_swa(self,
                   sequence_meta: SequenceMeta,
                   upper_bound_blocks: int,
-                  lock_for_load: bool = False) -> Tuple[int, int, int]:
+                  lock_for_load: bool = False) -> Tuple[int, int]:
         """Match the longest reusable trailing-SWA prefix within an upper bound.
 
         Node-mount: the SWA hit is read from the Full-KV radix ``match_prefix``
@@ -163,15 +158,14 @@ class CacheEngineAccel:
         the prefix truncated to ``upper_bound_blocks`` (this tier's Full-KV hit)
         so the SWA hit is naturally clamped, enforcing SWA-subset-of-Full.
 
-        Returns ``(swa_hit_blocks, slot_id, swa_key)``. ``swa_key`` is the slot id
-        (the completion-callback handle); -1 / 0 when no SWA on the path.
+        Returns ``(swa_hit_blocks, slot_id)``; -1 / 0 when no SWA on the path.
         """
         if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, -1
+            return 0, -1
         sequence_meta.gen_hashes()
         num_blocks = min(int(upper_bound_blocks), sequence_meta.num_blocks)
         if num_blocks <= 0:
-            return 0, -1, -1
+            return 0, -1
         block_hashes = torch.from_numpy(
             sequence_meta.block_hashes[:num_blocks]).to(torch.int64)
         # update_cache_info=False: a match-only probe must not bump LRU here.
@@ -179,10 +173,10 @@ class CacheEngineAccel:
         swa_node = getattr(mr, "last_swa_node", None)
         swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0)
         if swa_node is None or swa_hit <= 0:
-            return 0, -1, -1
+            return 0, -1
         slot = int(swa_node.swa_host_slot)
         if slot < 0:
-            return 0, -1, -1
+            return 0, -1
         # Read-hit保温: move the hit node to SWA-LRU MRU (a match-only probe is a
         # real "use" — this is the LRU-thrash fix). Independent of lock_for_load.
         self.index.promote_swa(swa_node)
@@ -190,42 +184,42 @@ class CacheEngineAccel:
             # Pin the SWA against eviction until the load completes. Paired
             # unlock is the data-plane completion callback (kept off until wired).
             swa_node.inc_swa_lock_ref()
-        return swa_hit, slot, slot
+        return swa_hit, slot
 
     def match_swa_locked(self,
                          sequence_meta: SequenceMeta,
-                         upper_bound_blocks: int) -> Tuple[int, int, int, "CRadixNode"]:
+                         upper_bound_blocks: int) -> Tuple[int, int, Optional["CRadixNode"]]:
         """Like match_swa(lock_for_load=True) but ALSO returns the pinned node.
 
         The data plane needs the node handle to release the pin (dec_swa_lock_ref)
-        when the SWA H2D completes. Returns ``(swa_hit, slot, swa_key, node)``;
-        ``(0, -1, -1, None)`` on miss (nothing pinned)."""
+        when the SWA H2D completes. Returns ``(swa_hit, slot, node)``;
+        ``(0, -1, None)`` on miss (nothing pinned)."""
         if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         sequence_meta.gen_hashes()
         num_blocks = min(int(upper_bound_blocks), sequence_meta.num_blocks)
         if num_blocks <= 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         block_hashes = torch.from_numpy(
             sequence_meta.block_hashes[:num_blocks]).to(torch.int64)
         mr = self.index.match_prefix(block_hashes, num_blocks, False)
         swa_node = getattr(mr, "last_swa_node", None)
         swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0)
         if swa_node is None or swa_hit <= 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         slot = int(swa_node.swa_host_slot)
         if slot < 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         self.index.promote_swa(swa_node)  # read-hit保温 (before pin)
         swa_node.inc_swa_lock_ref()
-        return swa_hit, slot, slot, swa_node
+        return swa_hit, slot, swa_node
 
     def match_swa_from_result(self,
                               match_result,
                               sequence_meta: SequenceMeta,
                               upper_bound_blocks: int,
                               lock_for_load: bool = False,
-                              ) -> Tuple[int, int, int, "CRadixNode"]:
+                              ) -> Tuple[int, int, Optional["CRadixNode"]]:
         """Resolve the SWA hit by REUSING an already-computed Full-KV match
         instead of re-walking the radix tree.
 
@@ -238,32 +232,32 @@ class CacheEngineAccel:
         so we fall back to the clamped ``match_swa`` probe to find the deepest SWA
         node WITHIN the bound.
 
-        Returns ``(swa_hit, slot, swa_key, node)`` (node is the pinned node when
-        ``lock_for_load`` else None); ``(0, -1, -1, None)`` on miss.
+        Returns ``(swa_hit, slot, node)`` (node is the pinned node when
+        ``lock_for_load`` else None); ``(0, -1, None)`` on miss.
         """
         if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         swa_node = getattr(match_result, "last_swa_node", None) if match_result is not None else None
         swa_hit = int(getattr(match_result, "swa_hit_blocks", 0) or 0) if match_result is not None else 0
         if swa_node is None or swa_hit <= 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         if swa_hit > upper_bound_blocks:
             # Deepest SWA lies past the reusable Full hit — re-probe clamped.
             if lock_for_load:
                 return self.match_swa_locked(sequence_meta, upper_bound_blocks)
-            swa_hit2, slot2, key2 = self.match_swa(
+            swa_hit2, slot2 = self.match_swa(
                 sequence_meta, upper_bound_blocks, lock_for_load=False)
-            return swa_hit2, slot2, key2, None
+            return swa_hit2, slot2, None
         slot = int(swa_node.swa_host_slot)
         if slot < 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         # REUSE branch: promote here. The fallback branch above delegates to
         # match_swa[_locked], which promote internally — do NOT double-promote.
         self.index.promote_swa(swa_node)
         if lock_for_load:
             swa_node.inc_swa_lock_ref()
-            return swa_hit, slot, slot, swa_node
-        return swa_hit, slot, slot, None
+            return swa_hit, slot, swa_node
+        return swa_hit, slot, None
 
     def reset(self) -> None:
         self.index.reset()
@@ -460,11 +454,6 @@ class CacheEngine:
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
         """Initialize the SWA host pool for node-mounted SWA on this engine."""
         from flexkv.swa.swa_host_pool import SWAHostPool
-        if swa_config.window_size % self.tokens_per_block != 0:
-            raise ValueError(
-                f"SWAPoolConfig.window_size ({swa_config.window_size}) must be a "
-                f"multiple of tokens_per_block ({self.tokens_per_block})"
-            )
         self.swa_pool = SWAHostPool(swa_config)
 
     @property
@@ -503,88 +492,88 @@ class CacheEngine:
     def match_swa(self,
                   sequence_meta: SequenceMeta,
                   upper_bound_blocks: int,
-                  lock_for_load: bool = False) -> Tuple[int, int, int]:
+                  lock_for_load: bool = False) -> Tuple[int, int]:
         """Node-mounted SWA match on the Python RadixTreeIndex mirror.
 
-        Returns ``(swa_hit_blocks, slot_id, swa_key)``; -1/0 when no SWA.
+        Returns ``(swa_hit_blocks, slot_id)``; -1/0 when no SWA.
         """
         if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, -1
+            return 0, -1
         sequence_meta.gen_hashes()
         num_blocks = min(int(upper_bound_blocks), sequence_meta.num_blocks)
         if num_blocks <= 0:
-            return 0, -1, -1
+            return 0, -1
         clamped = SequenceMeta(token_ids=sequence_meta.token_ids[:num_blocks * self.tokens_per_block],
                                tokens_per_block=self.tokens_per_block)
         mr = self.index.match_prefix(clamped, update_cache_info=False)
         swa_node = getattr(mr, "last_swa_node", None)
         swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0)
         if swa_node is None or swa_hit <= 0:
-            return 0, -1, -1
+            return 0, -1
         slot = int(swa_node.swa_host_slot)
         if slot < 0:
-            return 0, -1, -1
+            return 0, -1
         self.index.promote_swa(swa_node)  # read-hit保温 (before pin)
         if lock_for_load:
             swa_node.swa_lock_ref += 1
-        return swa_hit, slot, slot
+        return swa_hit, slot
 
     def match_swa_locked(self,
                          sequence_meta: SequenceMeta,
-                         upper_bound_blocks: int) -> Tuple[int, int, int, "RadixNode"]:
+                         upper_bound_blocks: int) -> Tuple[int, int, Optional["RadixNode"]]:
         """Like match_swa(lock_for_load=True) but ALSO returns the pinned node
         (mirror of CacheEngineAccel.match_swa_locked)."""
         if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         sequence_meta.gen_hashes()
         num_blocks = min(int(upper_bound_blocks), sequence_meta.num_blocks)
         if num_blocks <= 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         clamped = SequenceMeta(token_ids=sequence_meta.token_ids[:num_blocks * self.tokens_per_block],
                                tokens_per_block=self.tokens_per_block)
         mr = self.index.match_prefix(clamped, update_cache_info=False)
         swa_node = getattr(mr, "last_swa_node", None)
         swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0)
         if swa_node is None or swa_hit <= 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         slot = int(swa_node.swa_host_slot)
         if slot < 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         self.index.promote_swa(swa_node)  # read-hit保温 (before pin)
         swa_node.swa_lock_ref += 1
-        return swa_hit, slot, slot, swa_node
+        return swa_hit, slot, swa_node
 
     def match_swa_from_result(self,
                               match_result,
                               sequence_meta: SequenceMeta,
                               upper_bound_blocks: int,
                               lock_for_load: bool = False,
-                              ) -> Tuple[int, int, int, "RadixNode"]:
+                              ) -> Tuple[int, int, Optional["RadixNode"]]:
         """Reuse an already-computed Full-KV match to resolve the SWA hit without
         re-walking the tree (mirror of CacheEngineAccel.match_swa_from_result;
         see it for the fallback rationale)."""
         if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         swa_node = getattr(match_result, "last_swa_node", None) if match_result is not None else None
         swa_hit = int(getattr(match_result, "swa_hit_blocks", 0) or 0) if match_result is not None else 0
         if swa_node is None or swa_hit <= 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         if swa_hit > upper_bound_blocks:
             if lock_for_load:
                 return self.match_swa_locked(sequence_meta, upper_bound_blocks)
-            swa_hit2, slot2, key2 = self.match_swa(
+            swa_hit2, slot2 = self.match_swa(
                 sequence_meta, upper_bound_blocks, lock_for_load=False)
-            return swa_hit2, slot2, key2, None
+            return swa_hit2, slot2, None
         slot = int(swa_node.swa_host_slot)
         if slot < 0:
-            return 0, -1, -1, None
+            return 0, -1, None
         # REUSE branch: promote here. The fallback branch above delegates to
         # match_swa[_locked], which promote internally — do NOT double-promote.
         self.index.promote_swa(swa_node)
         if lock_for_load:
             swa_node.swa_lock_ref += 1
-            return swa_hit, slot, slot, swa_node
-        return swa_hit, slot, slot, None
+            return swa_hit, slot, swa_node
+        return swa_hit, slot, None
 
     def reset(self) -> None:
         self.index.reset()
@@ -996,7 +985,7 @@ class GlobalCacheEngine:
         # full-KV prefix resident after this get (the SWA hit's upper bound).
         num_full_hit = block_start_idx + num_gpu_blocks_to_transfer
         (swa_gpu_slots, swa_cpu_slots, swa_ssd_slots, swa_remote_slots,
-         swa_key, swa_lock_node, swa_staging_slot) = \
+         swa_lock_node, swa_staging_slot) = \
             self._swa_get_slots(request_id, sequence_meta, block_start_idx,
                                 block_end_idx, num_full_hit,
                                 tier_match_results=tier_match_results)
@@ -1006,7 +995,6 @@ class GlobalCacheEngine:
             cpu_slot_ids=swa_cpu_slots,
             ssd_slot_ids=swa_ssd_slots,
             remote_slot_ids=swa_remote_slots,
-            swa_key=swa_key,
             dp_client_id=dp_client_id,
         )
         if swa_h2d_id is not None:
@@ -1573,7 +1561,7 @@ class GlobalCacheEngine:
         # set_swa); the GPU slot is a placeholder bound LATE from the request's
         # swa_slot_mapping. The stored tail node is node_to_unlock[CPU] (the new
         # ready prefix's deepest node); its trailing page is the SWA window.
-        swa_gpu_slots, swa_cpu_slots, swa_ssd_slots, swa_remote_slots, swa_key = \
+        swa_gpu_slots, swa_cpu_slots, swa_ssd_slots, swa_remote_slots = \
             self._swa_put_slots(request_id, sequence_meta, block_start_idx,
                                 block_end_idx, node_to_unlock)
         swa_d2h_id = self.swa_cache.build_put_chain(
@@ -1582,7 +1570,6 @@ class GlobalCacheEngine:
             cpu_slot_ids=swa_cpu_slots,
             ssd_slot_ids=swa_ssd_slots,
             remote_slot_ids=swa_remote_slots,
-            swa_key=swa_key,
             dp_client_id=dp_client_id,
         )
         if swa_d2h_id is not None:
@@ -2083,10 +2070,9 @@ class GlobalCacheEngine:
     def _empty_swa_slots(self, with_node: bool = False):
         empty = np.array([], dtype=np.int64)
         if with_node:
-            # (gpu, cpu, ssd, remote, swa_key, lock_node, staging_slot)
-            return empty, empty, empty, empty, -1, None, -1
-        # (gpu, cpu, ssd, remote, swa_key)
-        return empty, empty, empty, empty, -1
+            # (gpu, cpu, ssd, remote, lock_node, staging_slot)
+            return empty, empty, empty, empty, None, -1
+        return empty, empty, empty, empty
 
     def _swa_get_slots(self, request_id, sequence_meta, block_start_idx,
                        block_end_idx, full_hit_blocks, tier_match_results=None):
@@ -2109,7 +2095,7 @@ class GlobalCacheEngine:
         slot via ``match_swa_from_result`` (reuse it, no re-walk). When None, each
         tier falls back to a fresh ``match_swa_locked`` probe.
 
-        Returns ``(gpu, cpu, ssd, remote, swa_key, lock_node, staging_slot)``.
+        Returns ``(gpu, cpu, ssd, remote, lock_node, staging_slot)``.
         ``cpu`` is always the SWA H2D source (matched CPU slot OR staging slot);
         ``ssd``/``remote`` are non-empty only for a staged source; ``staging_slot``
         is the transient CPU slot to free on H2D completion (-1 when CPU-sourced).
@@ -2123,7 +2109,7 @@ class GlobalCacheEngine:
         empty = np.array([], dtype=np.int64)
 
         def _match_locked(engine, device_type):
-            """Resolve (hit, slot, key, node) for a tier, pinned for load. Reuse
+            """Resolve (hit, slot, node) for a tier, pinned for load. Reuse
             the given match result when available, else probe the tree."""
             mr = tier_match_results.get(device_type) if tier_match_results else None
             if mr is not None:
@@ -2135,11 +2121,11 @@ class GlobalCacheEngine:
 
         # 1) CPU tier first (preferred, no staging). The matched CPU SWA node is
         #    pinned; the H2D completion callback releases the pin.
-        swa_hit, cpu_slot, swa_key, lock_node = \
+        swa_hit, cpu_slot, lock_node = \
             _match_locked(cpu_engine, DeviceType.CPU)
         if swa_hit > 0 and cpu_slot >= 0:
             cpu = np.array([cpu_slot], dtype=np.int64)
-            return gpu, cpu, empty, empty, swa_key, lock_node, -1
+            return gpu, cpu, empty, empty, lock_node, -1
 
         # 2) Fall back to SSD then REMOTE: source tier stages into a transient
         #    CPU SWA slot (DISK2H/REMOTE2H -> CPU) that the SWA H2D then reads.
@@ -2147,7 +2133,7 @@ class GlobalCacheEngine:
             engine = self.cache_engines.get(device_type)
             if engine is None or not getattr(engine, "swa_enabled", False):
                 continue
-            tier_hit, tier_slot, tier_key, tier_node = \
+            tier_hit, tier_slot, tier_node = \
                 _match_locked(engine, device_type)
             if tier_hit <= 0 or tier_slot < 0:
                 continue
@@ -2164,7 +2150,7 @@ class GlobalCacheEngine:
             tier = np.array([tier_slot], dtype=np.int64)
             ssd = tier if device_type == DeviceType.SSD else empty
             remote = tier if device_type == DeviceType.REMOTE else empty
-            return gpu, cpu, ssd, remote, tier_key, tier_node, staging_slot
+            return gpu, cpu, ssd, remote, tier_node, staging_slot
 
         return self._empty_swa_slots(with_node=True)
 
@@ -2181,7 +2167,7 @@ class GlobalCacheEngine:
         ``node_to_unlock`` keeps SWA a subset of Full PER TIER: SWA is written to
         a tier iff full-KV was.
 
-        Returns ``(gpu_placeholder, cpu=[slot], ssd, remote, swa_key)``. The CPU
+        Returns ``(gpu_placeholder, cpu=[slot], ssd, remote)``. The CPU
         slot is required (the D2H target); ssd/remote are non-empty only when
         that tier both stored full-KV and has an SWA host pool. All empty when
         SWA is disabled, there is no CPU store node, or the CPU pool is full and
@@ -2222,7 +2208,7 @@ class GlobalCacheEngine:
 
         ssd = _tier_slot(DeviceType.SSD)
         remote = _tier_slot(DeviceType.REMOTE)
-        return gpu, cpu, ssd, remote, slot
+        return gpu, cpu, ssd, remote
 
 
     def _swa_release_load_lock(self, node, staging_slot: int = -1) -> None:
@@ -2325,18 +2311,8 @@ class GlobalCacheEngine:
         return block_ids
 
     def swa_slot_mapping_to_slot_ids(self, swa_slot_mapping: np.ndarray) -> np.ndarray:
-        """Convert the connector's SWA slot_mapping (SWA-pool token index space)
-        into SWA-pool slot ids, one per window/page.
-
-        Mirror of slot_mapping_to_block_ids but folded by the SWA window size
-        (== one swa_page == one slot). On DSv4 window_size == tokens_per_block, so
-        this reduces to the same stride; kept separate so the two pools can have
-        different page geometry without coupling. Returns int64 slot ids."""
-        cpu = self.cpu_cache_engine
+        """Convert an SWA slot_mapping into page-granular SWA pool slot ids."""
         window = self.tokens_per_block
-        pool = getattr(cpu, "swa_pool", None) if cpu is not None else None
-        if pool is not None:
-            window = pool.config.window_size
         sm = np.asarray(swa_slot_mapping, dtype=np.int64)
         return sm[::window] // window
 

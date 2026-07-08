@@ -1,14 +1,13 @@
 """SWA Host Pool — CPU-side slot-id allocator for SWA pages.
 
-SWA is managed at PAGE granularity: each slot denotes exactly one swa_page of
-window KV = swa_page_size tokens x num_swa_layers layers x bytes_per_token_per_layer
-(``window_size`` in SWAPoolConfig carries the physical swa_page_size). All SWA
-IO addresses a whole slot (= one page) at a time.
+SWA is managed at PAGE granularity: each slot denotes exactly one cache page of
+SWA KV. Cache/storage code derives the page size from ``tokens_per_block`` and
+all SWA IO addresses a whole slot (= one page) at a time.
 
 This pool is purely a slot-id allocator / free-list (stack): it hands out and
 reclaims integer slot ids and keeps the used/free accounting. It does NOT hold
 the SWA KV bytes — those live in the ``StorageEngine`` buffer allocated with
-``is_swa=True`` (sized from the SAME SWAPoolConfig geometry) and are read/written
+``is_swa=True`` (sized from the cache page geometry) and are read/written
 by the transfer worker via the storage handle, addressed by slot id. When the
 pool is full, the caller (cache engine) triggers SWA-LRU eviction before retrying.
 """
@@ -61,15 +60,6 @@ class SWAHostPool:
     @property
     def num_slots(self) -> int:
         return self._num_slots
-
-    @property
-    def slot_size_bytes(self) -> int:
-        """Bytes per slot (= one swa_page), forwarded from the config.
-
-        The bytes themselves live in the StorageEngine ``is_swa=True`` buffer,
-        not here; this is exposed only so callers can size that buffer / slot.
-        """
-        return self._config.slot_size_bytes
 
     @property
     def config(self) -> SWAPoolConfig:

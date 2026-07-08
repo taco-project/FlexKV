@@ -136,15 +136,17 @@ class StorageEngine:
         # SWA pool allocate
         self._swa_cpu_layout: Optional[KVCacheLayout] = None
         self._swa_ssd_layout: Optional[KVCacheLayout] = None
+        self._swa_remote_layout: Optional[KVCacheLayout] = None
         swa_cfg = getattr(self._cache_config, "swa", None)
         if swa_cfg is not None and swa_cfg.enabled:
+            swa_tokens_per_block = self._cache_config.tokens_per_block
             if self._cache_config.enable_cpu:
                 # uint8, num_head=1, is_mla=True; per-token-per-layer bytes -> head_size.
                 self._swa_cpu_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
                     num_layer=swa_cfg.num_swa_layers,
                     num_block=swa_cfg.num_slots,
-                    tokens_per_block=swa_cfg.window_size,
+                    tokens_per_block=swa_tokens_per_block,
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
                     is_mla=True,
@@ -160,7 +162,9 @@ class StorageEngine:
                 )
 
 
-            if self._cache_config.enable_ssd:
+            if self._cache_config.enable_ssd and swa_cfg.num_ssd_slots > 0:
+                if self._swa_cpu_layout is None:
+                    raise ValueError("SWA SSD tier requires the SWA CPU tier")
                 if not GLOBAL_CONFIG_FROM_ENV.ssd_layout_type == self._swa_cpu_layout.type:
                     raise ValueError(
                         f"SWA SSD layout type must match SWA CPU layout type: "
@@ -169,8 +173,8 @@ class StorageEngine:
                 self._swa_ssd_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
                     num_layer=swa_cfg.num_swa_layers,
-                    num_block=swa_cfg.num_slots,
-                    tokens_per_block=swa_cfg.window_size,
+                    num_block=swa_cfg.num_ssd_slots,
+                    tokens_per_block=swa_tokens_per_block,
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
                     is_mla=True,
@@ -186,7 +190,9 @@ class StorageEngine:
                     max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
                 )
 
-            if self._cache_config.enable_remote:
+            if self._cache_config.enable_remote and swa_cfg.num_remote_slots > 0:
+                if self._swa_cpu_layout is None:
+                    raise ValueError("SWA REMOTE tier requires the SWA CPU tier")
                 if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._swa_cpu_layout.type:
                     raise ValueError(
                         f"SWA Remote layout type must match SWA CPU layout type: "
@@ -195,8 +201,8 @@ class StorageEngine:
                 self._swa_remote_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
                     num_layer=swa_cfg.num_swa_layers,
-                    num_block=swa_cfg.num_slots,
-                    tokens_per_block=swa_cfg.window_size,
+                    num_block=swa_cfg.num_remote_slots,
+                    tokens_per_block=swa_tokens_per_block,
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
                     is_mla=True,

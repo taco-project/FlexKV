@@ -112,11 +112,8 @@ class TransferOp:
     # its own slot-id space), so the transfer engine routes it to the dedicated
     # SWA worker (_swa_worker_map) instead of the main-KV worker. The op reuses the
     # standard transfer_type (D2H/H2D/DISK2H/H2DISK/REMOTE2H/H2REMOTE); src/dst
-    # block ids are SWA-pool slot ids, NOT full-KV block ids. ``swa_key`` is the
-    # SWA slot key the completion callback uses to drive set_ready (store) /
-    # unlock (load).
+    # block ids are SWA-pool slot ids, NOT full-KV block ids.
     is_swa: bool = False
-    swa_key: int = -1
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
@@ -318,6 +315,7 @@ class TransferOpGraph:
     def set_gpu_blocks(self,
                        gpu_blocks: np.ndarray,
                        swa_gpu_blocks: Optional[np.ndarray] = None) -> None:
+        swa_offset = 0
         for op_id in self._gpu_transfer_op_id:
             op = self._op_map[op_id]
             target_gpu_blocks = gpu_blocks
@@ -327,8 +325,18 @@ class TransferOpGraph:
             if getattr(op, "is_swa", False):
                 if swa_gpu_blocks is None:
                     continue
-                target_gpu_blocks = swa_gpu_blocks
             transfer_type = op.transfer_type
+            if getattr(op, "is_swa", False):
+                count = op.dst_block_ids.size if transfer_type.name.endswith("2D") \
+                    else op.src_block_ids.size
+                next_swa_offset = swa_offset + count
+                if next_swa_offset > swa_gpu_blocks.size:
+                    raise ValueError(
+                        f"not enough SWA GPU blocks to bind op {op_id}: "
+                        f"need {next_swa_offset}, got {swa_gpu_blocks.size}"
+                    )
+                target_gpu_blocks = swa_gpu_blocks[swa_offset:next_swa_offset]
+                swa_offset = next_swa_offset
             if transfer_type.name.endswith("2D"):
                 if transfer_type == TransferType.DISK2D:
                     op.dst_block_ids = target_gpu_blocks[-op.dst_block_ids.size:]
@@ -363,12 +371,23 @@ class TransferOpGraph:
         ``swa_gpu_blocks`` are SWA-pool slot ids (already converted from the
         connector's swa_slot_mapping). The CPU/SSD/REMOTE side of each SWA op was
         set at build time (node-mounted radix slot) and is left untouched."""
+        offset = 0
         for op_id in self._swa_gpu_transfer_op_id:
             op = self._op_map[op_id]
+            count = op.dst_block_ids.size if op.transfer_type.name.endswith("2D") \
+                else op.src_block_ids.size
+            next_offset = offset + count
+            if next_offset > swa_gpu_blocks.size:
+                raise ValueError(
+                    f"not enough SWA GPU blocks to bind op {op_id}: "
+                    f"need {next_offset}, got {swa_gpu_blocks.size}"
+                )
+            gpu_slice = swa_gpu_blocks[offset:next_offset]
             if op.transfer_type.name.endswith("2D"):   # H2D: GPU is dst
-                op.dst_block_ids = swa_gpu_blocks[:op.dst_block_ids.size]
+                op.dst_block_ids = gpu_slice
             else:                                       # D2H: GPU is src
-                op.src_block_ids = swa_gpu_blocks[:op.src_block_ids.size]
+                op.src_block_ids = gpu_slice
+            offset = next_offset
             assert op.src_block_ids.size == op.dst_block_ids.size, \
                 f"swa src.size={op.src_block_ids.size}, dst.size={op.dst_block_ids.size}"
 

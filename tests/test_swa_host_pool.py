@@ -12,7 +12,6 @@ def small_config():
     return SWAPoolConfig(
         enabled=True,
         num_slots=8,
-        window_size=4,
         num_swa_layers=2,
         bytes_per_token_per_layer=8,
         pin_memory=False,  # CPU-only tests
@@ -66,8 +65,12 @@ class TestSWAHostPoolAllocation:
         assert pool.num_free == 8
         assert pool.num_used == 0
 
-    def test_slot_size_bytes_forwarded_from_config(self, pool, small_config):
-        # slot_size_bytes is a pure forward of the config geometry; the pool
-        # holds no bytes (those live in the StorageEngine is_swa buffer).
-        expected = 4 * 2 * 8  # window_size * layers * bytes_per_token_per_layer
-        assert pool.slot_size_bytes == expected == small_config.slot_size_bytes
+    def test_config_rejects_legacy_window_size(self):
+        with pytest.raises(TypeError):
+            SWAPoolConfig(
+                enabled=True,
+                num_slots=8,
+                window_size=4,
+                num_swa_layers=2,
+                bytes_per_token_per_layer=8,
+            )

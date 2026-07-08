@@ -122,7 +122,7 @@ def main() -> int:
         num_ssd_blocks=NUM_BLOCKS_SSD, ssd_cache_dir=SSD_CACHE_DIR,
         swa=SWAPoolConfig(enabled=True, num_slots=NUM_SWA_SLOTS,
                           num_ssd_slots=NUM_SWA_SSD_SLOTS,
-                          window_size=TOKENS_PER_BLOCK, num_swa_layers=NUM_LAYERS,
+                          num_swa_layers=NUM_LAYERS,
                           bytes_per_token_per_layer=BYTES_PER_TOKEN_PER_LAYER,
                           pin_memory=True))
     cache_config.enable_swa_transfer = True
@@ -188,8 +188,8 @@ def main() -> int:
     n_cpu = engine.cpu_cache_engine.swa_pool.num_used
     engine.cpu_cache_engine._evict_swa(n_cpu)
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); seq.gen_hashes()
-    cpu_hit, _s, _k = engine.cpu_cache_engine.match_swa(seq, upper_bound_blocks=1)
-    ssd_hit, _s2, _k2 = engine.ssd_cache_engine.match_swa(seq, upper_bound_blocks=1)
+    cpu_hit, _s = engine.cpu_cache_engine.match_swa(seq, upper_bound_blocks=1)
+    ssd_hit, _s2 = engine.ssd_cache_engine.match_swa(seq, upper_bound_blocks=1)
     assert cpu_hit == 0 and ssd_hit > 0, f"precondition failed: cpu_hit={cpu_hit} ssd_hit={ssd_hit}"
     print(f"[verify] evicted CPU SWA (cpu_hit=0, ssd_hit={ssd_hit}); GET must stage from SSD", flush=True)
 

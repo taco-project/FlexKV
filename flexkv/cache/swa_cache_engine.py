@@ -102,7 +102,6 @@ class SWACacheManager:
                      transfer_type: TransferType,
                      src_slot_ids: np.ndarray,
                      dst_slot_ids: np.ndarray,
-                     swa_key: int = -1,
                      dp_client_id: int = 0) -> Optional[int]:
         """Add one peer SWA transfer op (``is_swa=True``) to ``graph``; return op_id.
 
@@ -126,7 +125,6 @@ class SWACacheManager:
             dst_block_ids=dst,
             dp_client_id=dp_client_id,
             is_swa=True,
-            swa_key=int(swa_key),
         )
         graph.add_transfer_op(op)
         return op.op_id
@@ -137,7 +135,6 @@ class SWACacheManager:
                         cpu_slot_ids: np.ndarray,
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
-                        swa_key: int = -1,
                         dp_client_id: int = 0) -> Optional[int]:
         """Build the GET-side SWA load chain into ``graph``; return the terminal
         SWA ``H2D`` op_id (to be appended to the graph's finished_ops_ids so it
@@ -151,21 +148,21 @@ class SWACacheManager:
         """
         h2d_id = self.build_swa_op(
             graph, TransferType.H2D, cpu_slot_ids, gpu_slot_ids,
-            swa_key=swa_key, dp_client_id=dp_client_id,
+            dp_client_id=dp_client_id,
         )
         if h2d_id is None:
             return None
         if ssd_slot_ids is not None and np.asarray(ssd_slot_ids).size > 0:
             ssd2h_id = self.build_swa_op(
                 graph, TransferType.DISK2H, ssd_slot_ids, cpu_slot_ids,
-                swa_key=swa_key, dp_client_id=dp_client_id,
+                dp_client_id=dp_client_id,
             )
             if ssd2h_id is not None:
                 graph.add_dependency(h2d_id, ssd2h_id)
         if remote_slot_ids is not None and np.asarray(remote_slot_ids).size > 0:
             remote2h_id = self.build_swa_op(
                 graph, TransferType.REMOTE2H, remote_slot_ids, cpu_slot_ids,
-                swa_key=swa_key, dp_client_id=dp_client_id,
+                dp_client_id=dp_client_id,
             )
             if remote2h_id is not None:
                 graph.add_dependency(h2d_id, remote2h_id)
@@ -177,7 +174,6 @@ class SWACacheManager:
                         cpu_slot_ids: np.ndarray,
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
-                        swa_key: int = -1,
                         dp_client_id: int = 0) -> Optional[int]:
         """Build the PUT-side SWA store chain into ``graph``; return the SWA
         ``D2H`` op_id (to be appended to the graph's finished_ops_ids).
@@ -190,21 +186,21 @@ class SWACacheManager:
         """
         d2h_id = self.build_swa_op(
             graph, TransferType.D2H, gpu_slot_ids, cpu_slot_ids,
-            swa_key=swa_key, dp_client_id=dp_client_id,
+            dp_client_id=dp_client_id,
         )
         if d2h_id is None:
             return None
         if ssd_slot_ids is not None and np.asarray(ssd_slot_ids).size > 0:
             h2ssd_id = self.build_swa_op(
                 graph, TransferType.H2DISK, cpu_slot_ids, ssd_slot_ids,
-                swa_key=swa_key, dp_client_id=dp_client_id,
+                dp_client_id=dp_client_id,
             )
             if h2ssd_id is not None:
                 graph.add_dependency(h2ssd_id, d2h_id)
         if remote_slot_ids is not None and np.asarray(remote_slot_ids).size > 0:
             h2remote_id = self.build_swa_op(
                 graph, TransferType.H2REMOTE, cpu_slot_ids, remote_slot_ids,
-                swa_key=swa_key, dp_client_id=dp_client_id,
+                dp_client_id=dp_client_id,
             )
             if h2remote_id is not None:
                 graph.add_dependency(h2remote_id, d2h_id)

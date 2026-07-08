@@ -394,8 +394,8 @@ class KVTaskManager:
         graph_ids = self.cache_engine.slot_mapping_to_block_ids(slot_mapping,
                                                                 self.cache_config.tokens_per_block)
         # Late-bind the GPU-side SWA slots via the unified set_gpu_blocks(gpu,
-        # swa_gpu) path (PR#191). On DSv4 window == tokens_per_block, so the SWA
-        # mapping folds by the same stride as full-KV (slot_mapping_to_block_ids).
+        # swa_gpu) path (PR#191). SWA is page-granular, so the mapping folds by
+        # the same stride as full-KV (slot_mapping_to_block_ids).
         # A None swa_slot_mapping leaves the graph's SWA ops at their built ids.
         swa_sm = swa_slot_mapping if swa_slot_mapping is not None else task.swa_slot_mapping
         swa_graph_ids = None
