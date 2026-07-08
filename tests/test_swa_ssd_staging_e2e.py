@@ -14,9 +14,9 @@ does not cover:
   GET : engine.get() -> graph {full H2D, SWA DISK2H (SSD->CPU staging) -> SWA H2D
         (CPU->GPU)} -> bytes restored to a fresh GPU SWA slot -> byte-exact.
 
-This exercises the multi-tier _swa_put_slots (write-through) and _swa_get_slots
-(SSD->CPU transient staging slot + H2D), plus the transient staging slot free on
-H2D completion.
+This exercises SWA graph append inside _put_impl_* (write-through) and
+_get_impl_* (SSD->CPU transient staging slot + H2D), plus the transient staging
+slot free on H2D completion.
 
 Run INSIDE the container on a free GPU:
     CUDA_VISIBLE_DEVICES=0 python3 tests/test_swa_ssd_staging_e2e.py
@@ -186,10 +186,12 @@ def main() -> int:
 
     # ===== EVICT the CPU SWA so the window survives only on SSD =================
     n_cpu = engine.cpu_cache_engine.swa_pool.num_used
-    engine.cpu_cache_engine._evict_swa(n_cpu)
+    engine.cpu_cache_engine._evict_swa_slots(n_cpu)
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); seq.gen_hashes()
-    cpu_hit, _s = engine.cpu_cache_engine.match_swa(seq, upper_bound_blocks=1)
-    ssd_hit, _s2 = engine.ssd_cache_engine.match_swa(seq, upper_bound_blocks=1)
+    cpu_hit, _s, _n = engine.cpu_cache_engine._resolve_swa_read_source(
+        seq, upper_bound_blocks=1)
+    ssd_hit, _s2, _n2 = engine.ssd_cache_engine._resolve_swa_read_source(
+        seq, upper_bound_blocks=1)
     assert cpu_hit == 0 and ssd_hit > 0, f"precondition failed: cpu_hit={cpu_hit} ssd_hit={ssd_hit}"
     print(f"[verify] evicted CPU SWA (cpu_hit=0, ssd_hit={ssd_hit}); GET must stage from SSD", flush=True)
 

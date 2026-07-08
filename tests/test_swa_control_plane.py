@@ -70,8 +70,8 @@ def _cache_config_ssd(enable_swa_transfer: bool = True):
     """CPU + SSD tiers, both with an SWA host pool. The SSD cache engine is an
     in-memory radix+mempool+swa_pool (no real SSD files at construction — files
     are only touched by the data-plane worker at transfer time), so multi-tier
-    SWA orchestration (_swa_put_slots / _swa_get_slots) is testable at smoke
-    level without disk I/O."""
+    SWA orchestration is built inside _put_impl_* / _get_impl_* and is testable
+    at smoke level without disk I/O."""
     cc = CacheConfig(
         tokens_per_block=TPB,
         enable_cpu=True, enable_ssd=True, enable_remote=False,
@@ -162,7 +162,8 @@ def test_put_builds_full_plus_swa_store_chain():
     _complete(op_cb, cb)
     # after completion the SWA slot is mounted on the stored tail node.
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
-    hit, slot = eng.cpu_cache_engine.match_swa(sm, upper_bound_blocks=4)
+    hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
+        sm, upper_bound_blocks=4)
     assert hit == 4 and slot >= 0
 
 
@@ -189,7 +190,8 @@ def test_get_builds_full_plus_swa_load_chain():
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     _complete(gop_cb, gcb)
     # after release, the node's SWA is unlocked (a fresh match can lock again).
-    hit, slot, node = eng.cpu_cache_engine.match_swa_locked(sm, upper_bound_blocks=4)
+    hit, slot, node = eng.cpu_cache_engine._resolve_swa_read_source(
+        sm, upper_bound_blocks=4, lock_for_load=True)
     assert node is not None and node.swa_lock_ref == 1
     node.dec_swa_lock_ref()
 
@@ -295,8 +297,7 @@ def test_no_swa_slot_mapping_leaves_placeholder():
 
 # =========================================================================== #
 # 3. multi-tier SWA orchestration (CPU + SSD): write-through + get staging     #
-#    These exercise _swa_put_slots / _swa_get_slots across tiers (the layer    #
-#    that was CPU-only). Written TDD-first: they FAIL against CPU-only code.    #
+#    These exercise SWA graph append inside _put_impl_* / _get_impl_*.         #
 # =========================================================================== #
 
 def test_put_writethrough_ssd_builds_swa_h2disk():
@@ -334,12 +335,14 @@ def test_get_ssd_staging_when_only_ssd_has_swa():
     _pg, _rm, pcb, pop, _pe = eng.put(1, tok, mask, sm, dp_client_id=0)
     _complete(pop, pcb)
     # evict the CPU SWA (SWA-only eviction) so the CPU tier no longer matches it
-    eng.cpu_cache_engine._evict_swa(eng.cpu_cache_engine.swa_pool.num_used)
+    eng.cpu_cache_engine._evict_swa_slots(eng.cpu_cache_engine.swa_pool.num_used)
 
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
-    cpu_hit, _s = eng.cpu_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    cpu_hit, _s, _n = eng.cpu_cache_engine._resolve_swa_read_source(
+        seq, upper_bound_blocks=4)
     assert cpu_hit == 0, "precondition: CPU SWA must be gone"
-    ssd_hit, _s2 = eng.ssd_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    ssd_hit, _s2, _n2 = eng.ssd_cache_engine._resolve_swa_read_source(
+        seq, upper_bound_blocks=4)
     assert ssd_hit > 0, "precondition: SSD SWA must still hold the window"
 
     graph, _rm2, gcb, gop, _ge = eng.get(
@@ -397,13 +400,13 @@ def test_multitier_match_promotes_swa_in_each_tier():
     eng.ssd_cache_engine.match(seq_a)
 
     # Evict one SWA slot per tier: B (never reused) must go, A (reused) survives.
-    eng.cpu_cache_engine._evict_swa(1)
-    eng.ssd_cache_engine._evict_swa(1)
+    eng.cpu_cache_engine._evict_swa_slots(1)
+    eng.ssd_cache_engine._evict_swa_slots(1)
 
     seq_b = SequenceMeta(token_ids=tok_b, tokens_per_block=TPB); seq_b.gen_hashes()
     for name, engine in (("cpu", eng.cpu_cache_engine), ("ssd", eng.ssd_cache_engine)):
-        a_hit, _sa = engine.match_swa(seq_a, upper_bound_blocks=4)
-        b_hit, _sb = engine.match_swa(seq_b, upper_bound_blocks=4)
+        a_hit, _sa, _na = engine._resolve_swa_read_source(seq_a, upper_bound_blocks=4)
+        b_hit, _sb, _nb = engine._resolve_swa_read_source(seq_b, upper_bound_blocks=4)
         assert a_hit == 4, f"{name}: reused SWA A was evicted (tier not promoted)"
         assert b_hit == 0, f"{name}: never-reused SWA B should have been evicted"
 

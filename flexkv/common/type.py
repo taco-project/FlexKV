@@ -17,7 +17,7 @@ class MatchResultAccel:
     insert_to_local_cpu_index: bool = True
     # ===== SWA (node-mounted) — passed through from CMatchResult so the SWA
     # slot resolution can reuse the SAME forward match instead of re-walking the
-    # tree (see CacheEngineAccel.match_swa_from_result). The deepest
+    # tree (see CacheEngineAccel._resolve_swa_read_source(..., match_result=...)). The deepest
     # fully-matched ready node carrying a live SWA slot, and the ready-prefix
     # block count ending at it. None / 0 when no SWA on the matched path.
     last_swa_node: Optional['CRadixNode'] = None

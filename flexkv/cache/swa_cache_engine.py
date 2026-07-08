@@ -13,20 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SWACacheManager — control-plane orchestration of multi-tier SWA caching.
+"""SWACacheManager — SWA peer-op graph builder.
 
-This module owns the *global* SWA control plane over the node-mounted SWA state
-(the Full-KV radix nodes carry the SWA slot / tombstone / lock; each
-``CacheEngineAccel`` / ``HierarchyLRCacheEngine`` owns an SWA host pool as
-``engine.swa_pool`` and exposes ``engine.match_swa`` / ``engine.set_swa``). It is
-the SWA counterpart to the full-KV orchestration in
-:class:`~flexkv.cache.cache_engine.GlobalCacheEngine`,
-and is deliberately kept in a separate module so the SWA peer-op logic does not
-clutter the (already large) full-KV engine.
+The node-mounted SWA state lives on the Full-KV radix nodes; per-tier match,
+slot allocation, pinning, and ready-node ownership are resolved inside
+``GlobalCacheEngine._get_impl_*`` / ``_put_impl_*`` alongside the Full-KV plan.
+This module is intentionally narrower: given resolved SWA slot ids, it appends
+the peer SWA ops into the same ``TransferOpGraph`` as the Full-KV ops.
 
 Responsibilities (control plane only — no byte movement):
-  * Multi-tier prefix match (CPU / SSD / REMOTE), each clamped to that tier's
-    Full-KV hit (SWA must be a subset of Full at every tier).
   * Build SWA *peer* ops into the SAME ``TransferOpGraph`` as the full-KV ops,
     with tier dependencies that mirror the full-KV graph exactly. SWA ops reuse
     the STANDARD transfer types (H2D / D2H / DISK2H / H2DISK / REMOTE2H /
@@ -62,13 +57,12 @@ from flexkv.common.transfer import DeviceType, TransferOp, TransferOpGraph, Tran
 
 
 class SWACacheManager:
-    """Global SWA control plane: multi-tier match + peer-op graph construction.
+    """SWA peer-op graph construction.
 
     Holds a back-reference to the owning ``GlobalCacheEngine`` to reach the
-    per-tier cache engines (and their node-mounted SWA state / ``swa_pool``) and
-    the cache config. The per-tier SWA primitives (match_swa / set_swa / evict_swa
-    via the radix tree) live on the engines themselves; this class only
-    orchestrates across tiers.
+    cache config. Per-tier SWA primitives live on the engines themselves; the
+    Full-KV get/put implementations choose the source/destination slots and this
+    class only appends the corresponding SWA peer ops.
     """
 
     def __init__(self, global_cache_engine) -> None:

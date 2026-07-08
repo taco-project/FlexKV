@@ -36,6 +36,11 @@ class SWAHostPool:
 
     def free(self, slot_id: int) -> None:
         """Return a slot to the free list."""
+        slot_id = int(slot_id)
+        if slot_id < 0 or slot_id >= self._num_slots:
+            raise ValueError(f"Invalid SWA slot id: {slot_id}")
+        if slot_id in self._free_slots:
+            return
         self._free_slots.append(slot_id)
 
     def reset(self) -> None:
