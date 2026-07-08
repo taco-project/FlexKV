@@ -297,15 +297,14 @@ class KVManager:
                 for sm in swa_slot_mappings
             ]
         if self.server_client_mode:
-            # server mode: forward SWA only if the RPC client supports it, else
-            # degrade to full-KV launch (SWA stays CPU-resident) rather than crash.
-            try:
-                return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch,
-                                                   layerwise_transfer, counter_id,
-                                                   swa_slot_mappings=swa_slot_mappings)
-            except TypeError:
-                return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch,
-                                                   layerwise_transfer, counter_id)
+            return self.dp_client.launch_tasks(
+                task_ids=task_ids,
+                slot_mappings=slot_mappings,
+                swa_slot_mappings=swa_slot_mappings,
+                as_batch=as_batch,
+                layerwise_transfer=layerwise_transfer,
+                counter_id=counter_id,
+            )
         else:
             return self.kv_task_engine.launch_tasks(
                 task_ids,
