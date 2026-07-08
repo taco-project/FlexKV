@@ -23,7 +23,15 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-if 'flexkv.c_ext' not in sys.modules:
+# flexkv.cache.__init__ eagerly runs ``import flexkv.c_ext``, so importing the
+# pure control-plane symbols below pulls in c_ext. This file exercises only the
+# transfer-graph logic and never calls into c_ext, so we stub it just long enough
+# to satisfy that import. Crucially we then DROP the stub: if it leaked into
+# sys.modules it would defeat ``pytest.importorskip('flexkv.c_ext')`` in sibling
+# test files sharing this pytest process (they would run against the mock instead
+# of skipping when the extension isn't built).
+_c_ext_was_absent = 'flexkv.c_ext' not in sys.modules
+if _c_ext_was_absent:
     sys.modules['flexkv.c_ext'] = MagicMock()
 
 import numpy as np
@@ -34,6 +42,9 @@ from flexkv.common.transfer import (
 )
 from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
 from flexkv.cache.swa_cache_engine import SWACacheManager
+
+if _c_ext_was_absent:
+    del sys.modules['flexkv.c_ext']
 
 pytestmark = pytest.mark.unit
 

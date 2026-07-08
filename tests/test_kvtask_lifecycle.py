@@ -22,6 +22,12 @@ import numpy as np
 import pytest
 import torch
 
+# ``flexkv.kvtask`` imports flexkv.cache.cache_engine, whose package __init__
+# eagerly runs ``import flexkv.c_ext``. Skip the whole module (incl. the pure
+# KVTask state-machine tests) when the extension isn't built, instead of erroring
+# at collection. c_ext is present in every real dev/test env.
+pytest.importorskip("flexkv.c_ext")
+
 from flexkv.kvtask import KVTask, TaskType, TaskStatus
 
 pytestmark = pytest.mark.unit

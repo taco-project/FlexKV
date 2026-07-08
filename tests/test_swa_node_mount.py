@@ -34,6 +34,12 @@ from typing import Dict, List
 import numpy as np
 import pytest
 
+# ``flexkv.cache.radixtree`` pulls flexkv.cache.__init__, which eagerly runs
+# ``import flexkv.c_ext``. Skip the whole module (incl. the pure-Python spec) when
+# the extension isn't built, rather than erroring at collection. c_ext is present
+# in every real dev/test env; only the no-c_ext CI gate skips here.
+pytest.importorskip("flexkv.c_ext")
+
 from flexkv.common.block import SequenceMeta
 from flexkv.cache.radixtree import RadixTreeIndex
 
