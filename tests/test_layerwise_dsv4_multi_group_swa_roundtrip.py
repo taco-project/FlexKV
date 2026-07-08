@@ -37,6 +37,8 @@ from test_layerwise_multi_group_swa import (
     _make_multi_group_cpu_layout,
 )
 
+pytestmark = pytest.mark.e2e
+
 IOURING_ENTRIES = 512
 IOURING_FLAGS = 0
 

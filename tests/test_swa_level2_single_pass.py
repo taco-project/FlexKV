@@ -25,6 +25,7 @@ pytest.importorskip("flexkv.c_ext")
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
+from flexkv.common.transfer import TransferType
 from flexkv.common.debug import flexkv_logger
 
 flexkv_logger.set_level("OFF")
@@ -151,6 +152,49 @@ def test_swa_aware_get_clamps_full_to_usable():
     assert int(return_mask.sum()) == 4 * TPB
     swa = [o for o in graph._op_map.values() if getattr(o, "is_swa", False)]
     assert len(swa) == 1, "SWA H2D must still attach to the same graph"
+    _complete(op_cb, cb)
+
+
+def test_swa_aware_get_clamps_when_full_hit_exceeds_swa_hit():
+    """Production path: full_hit can be longer than swa_hit.
+
+    Store a 2-block prefix with SWA, then store a 4-block extension with SWA
+    transfer temporarily disabled. The Full-KV tree can then serve 4 blocks,
+    while the deepest live SWA page remains at block 2. A SWA-aware GET must
+    clamp the real transfer window to 2 blocks and still attach an SWA H2D.
+    """
+    eng = GlobalCacheEngine(_cache_config(), _model_config())
+    tok4 = _tokens(4, base=34)
+    tok2 = tok4[:2 * TPB]
+    _put(eng, tok2, req=1)
+
+    eng.cache_config.enable_swa_transfer = False
+    _put(eng, tok4, req=2)
+    eng.cache_config.enable_swa_transfer = True
+
+    seq = SequenceMeta(token_ids=tok4, tokens_per_block=TPB)
+    full_hit = eng.cpu_cache_engine.match(seq).num_ready_matched_blocks
+    swa_hit, _slot = eng.cpu_cache_engine.match_swa(seq, upper_bound_blocks=full_hit)
+    assert full_hit == 4
+    assert swa_hit == 2
+
+    graph, return_mask, cb, op_cb, _end_id = eng.get(
+        request_id=3,
+        token_ids=tok4,
+        token_mask=np.ones_like(tok4, dtype=np.int64),
+        slot_mapping=np.arange(tok4.shape[0], dtype=np.int64),
+        dp_client_id=0,
+        swa_aware=True,
+    )
+
+    assert int(return_mask.sum()) == 2 * TPB
+    full_h2d = [
+        op for op in graph._op_map.values()
+        if not op.is_swa and op.transfer_type == TransferType.H2D
+    ]
+    assert full_h2d and full_h2d[0].src_block_ids.size == 2
+    swa = [op for op in graph._op_map.values() if getattr(op, "is_swa", False)]
+    assert len(swa) == 1 and swa[0].transfer_type == TransferType.H2D
     _complete(op_cb, cb)
 
 

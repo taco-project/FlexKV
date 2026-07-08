@@ -66,6 +66,17 @@ def _cache_config(enable_swa_transfer: bool = True):
     return cc
 
 
+def _cache_config_small_swa(num_slots: int):
+    cc = _cache_config()
+    cc.swa = SWAPoolConfig(
+        enabled=True,
+        num_slots=num_slots,
+        num_swa_layers=1,
+        bytes_per_token_per_layer=64,
+    )
+    return cc
+
+
 def _cache_config_ssd(enable_swa_transfer: bool = True):
     """CPU + SSD tiers, both with an SWA host pool. The SSD cache engine is an
     in-memory radix+mempool+swa_pool (no real SSD files at construction — files
@@ -82,6 +93,47 @@ def _cache_config_ssd(enable_swa_transfer: bool = True):
         enabled=True,
         num_slots=256,
         num_ssd_slots=256,
+        num_swa_layers=1,
+        bytes_per_token_per_layer=64,
+    )
+    cc.enable_swa_transfer = enable_swa_transfer
+    return cc
+
+
+def _cache_config_small_swa_ssd(num_slots: int, num_ssd_slots: int):
+    cc = _cache_config_ssd()
+    cc.swa = SWAPoolConfig(
+        enabled=True,
+        num_slots=num_slots,
+        num_ssd_slots=num_ssd_slots,
+        num_swa_layers=1,
+        bytes_per_token_per_layer=64,
+    )
+    return cc
+
+
+def _cache_config_remote(enable_swa_transfer: bool = True):
+    """CPU + REMOTE tiers using the local REMOTE cache engine.
+
+    This exercises the production REMOTE control-plane graph and SWA slot
+    lifecycle without requiring a PCFS server; byte movement remains covered by
+    explicitly gated E2E environments.
+    """
+    cc = CacheConfig(
+        tokens_per_block=TPB,
+        enable_cpu=True,
+        enable_remote=True,
+        enable_3rd_remote=False,
+        enable_kv_sharing=False,
+        num_cpu_blocks=4096,
+        num_remote_blocks=4096,
+    )
+    cc.enable_remote = True
+    cc.enable_kv_sharing = False
+    cc.swa = SWAPoolConfig(
+        enabled=True,
+        num_slots=256,
+        num_remote_slots=256,
         num_swa_layers=1,
         bytes_per_token_per_layer=64,
     )
@@ -354,6 +406,99 @@ def test_get_ssd_staging_when_only_ssd_has_swa():
     _complete(gop, gcb)
 
 
+def test_put_writethrough_remote_builds_swa_h2remote():
+    """REMOTE write-through: SWA store allocates a REMOTE SWA slot and emits
+    H2REMOTE dependent on the SWA D2H, mirroring full-KV remote write-through."""
+    eng = GlobalCacheEngine(_cache_config_remote(), _model_config())
+    tok = _tokens(4, base=24)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+
+    graph, _rm, cb, op_cb, _e = eng.put(1, tok, mask, sm, dp_client_id=0)
+    swa = _swa_ops(graph)
+    kinds = sorted(o.transfer_type.name for o in swa)
+    assert "D2H" in kinds, kinds
+    assert "H2REMOTE" in kinds, f"SWA remote write-through missing: {kinds}"
+    swa_d2h = [o for o in swa if o.transfer_type == TransferType.D2H][0]
+    swa_h2remote = [o for o in swa if o.transfer_type == TransferType.H2REMOTE][0]
+    assert swa_d2h.op_id in swa_h2remote.predecessors
+    assert eng.remote_cache_engine.swa_pool.num_used == 1
+    _complete(op_cb, cb)
+
+
+def test_get_remote_staging_when_only_remote_has_swa():
+    """REMOTE-sourced GET stages REMOTE->CPU then CPU->GPU and releases both
+    source pin and transient CPU staging slot on the H2D completion callback."""
+    eng = GlobalCacheEngine(_cache_config_remote(), _model_config())
+    tok = _tokens(4, base=25)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+    _pg, _rm, pcb, pop, _pe = eng.put(1, tok, mask, sm, dp_client_id=0)
+    _complete(pop, pcb)
+    eng.cpu_cache_engine._evict_swa(eng.cpu_cache_engine.swa_pool.num_used)
+
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    cpu_hit, _ = eng.cpu_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    remote_hit, _ = eng.remote_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    assert cpu_hit == 0
+    assert remote_hit > 0
+    before_cpu_used = eng.cpu_cache_engine.swa_pool.num_used
+
+    graph, _rm2, gcb, gop, _ge = eng.get(
+        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm, dp_client_id=0)
+    swa = _swa_ops(graph)
+    kinds = sorted(o.transfer_type.name for o in swa)
+    assert "H2D" in kinds and "REMOTE2H" in kinds, kinds
+    swa_h2d = [o for o in swa if o.transfer_type == TransferType.H2D][0]
+    swa_remote2h = [o for o in swa if o.transfer_type == TransferType.REMOTE2H][0]
+    assert swa_remote2h.op_id in swa_h2d.predecessors
+    assert eng.cpu_cache_engine.swa_pool.num_used == before_cpu_used + 1
+
+    remote_mr = eng.remote_cache_engine.match(seq)
+    remote_node = getattr(remote_mr, "last_swa_node", None)
+    assert remote_node is not None
+    assert remote_node.swa_lock_ref == 1
+
+    _complete(gop, gcb)
+    assert remote_node.swa_lock_ref == 0
+    assert eng.cpu_cache_engine.swa_pool.num_used == before_cpu_used
+
+
+def test_remote_source_pin_released_when_cpu_staging_slot_unavailable():
+    """If a lower-tier SWA hit is pinned but no CPU staging slot is available,
+    _swa_get_slots must drop the source pin and emit no SWA ops."""
+    eng = GlobalCacheEngine(_cache_config_remote(), _model_config())
+    tok = _tokens(4, base=26)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+    _pg, _rm, pcb, pop, _pe = eng.put(1, tok, mask, sm, dp_client_id=0)
+    _complete(pop, pcb)
+    eng.cpu_cache_engine._evict_swa(eng.cpu_cache_engine.swa_pool.num_used)
+    held_slots = []
+    while True:
+        slot = eng.cpu_cache_engine.swa_alloc_slot()
+        if slot < 0:
+            break
+        held_slots.append(slot)
+    assert eng.cpu_cache_engine.swa_pool.num_free == 0
+
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    remote_hit, _ = eng.remote_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    assert remote_hit > 0
+
+    graph, _rm2, gcb, gop, _ge = eng.get(
+        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm, dp_client_id=0)
+    assert _swa_ops(graph) == []
+    remote_hit2, _slot, remote_node = eng.remote_cache_engine.match_swa_locked(
+        seq, upper_bound_blocks=4)
+    assert remote_hit2 > 0 and remote_node is not None
+    assert remote_node.swa_lock_ref == 1
+    remote_node.dec_swa_lock_ref()
+    _complete(gop, gcb)
+    for slot in held_slots:
+        eng.cpu_cache_engine.swa_pool.free(slot)
+
+
 def test_get_prefers_cpu_when_both_tiers_have_swa():
     """Tier priority CPU>SSD: when CPU still holds the SWA window, GET sources
     from CPU (plain H2D, no staging) even though SSD also has it."""
@@ -371,6 +516,157 @@ def test_get_prefers_cpu_when_both_tiers_have_swa():
     assert "H2D" in kinds, kinds
     assert "DISK2H" not in kinds, f"CPU-resident SWA must not stage from SSD: {kinds}"
     _complete(gop, gcb)
+
+
+def test_put_skips_swa_when_all_cpu_swa_nodes_are_locked():
+    """When every CPU SWA slot is locked and no eviction is possible, PUT should
+    leave full-KV store intact but emit no SWA store ops."""
+    eng = GlobalCacheEngine(_cache_config_small_swa(num_slots=3), _model_config())
+    locked_nodes = []
+    for req in range(1, eng.cpu_cache_engine.swa_pool.num_slots + 1):
+        tok = _tokens(4, base=1000 + req)
+        _pg, _rm, cb, op_cb, _e = eng.put(
+            req, tok, np.ones_like(tok, dtype=np.int64),
+            np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0)
+        _complete(op_cb, cb)
+        seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
+        hit, _slot, node = eng.cpu_cache_engine.match_swa_locked(seq, upper_bound_blocks=4)
+        assert hit == 4 and node is not None
+        locked_nodes.append(node)
+    assert eng.cpu_cache_engine.swa_pool.num_free == 0
+
+    tok = _tokens(4, base=2000)
+    graph, _rm, cb, op_cb, _e = eng.put(
+        9999, tok, np.ones_like(tok, dtype=np.int64),
+        np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0)
+    assert any(op.transfer_type == TransferType.D2H for op in _full_ops(graph))
+    assert _swa_ops(graph) == []
+    _complete(op_cb, cb)
+    for node in locked_nodes:
+        node.dec_swa_lock_ref()
+
+
+def test_put_keeps_cpu_swa_when_lower_tier_pool_full_and_locked():
+    """A full locked lower-tier SWA pool should skip write-through only; the CPU
+    SWA copy still gets allocated and mounted."""
+    eng = GlobalCacheEngine(
+        _cache_config_small_swa_ssd(num_slots=8, num_ssd_slots=3),
+        _model_config(),
+    )
+    locked_nodes = []
+    for req in range(1, eng.ssd_cache_engine.swa_pool.num_slots + 1):
+        tok = _tokens(4, base=3000 + req)
+        _pg, _rm, cb, op_cb, _e = eng.put(
+            req, tok, np.ones_like(tok, dtype=np.int64),
+            np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0)
+        _complete(op_cb, cb)
+        seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
+        hit, _slot, node = eng.ssd_cache_engine.match_swa_locked(seq, upper_bound_blocks=4)
+        assert hit == 4 and node is not None
+        locked_nodes.append(node)
+    assert eng.ssd_cache_engine.swa_pool.num_free == 0
+
+    tok = _tokens(4, base=4000)
+    graph, _rm, cb, op_cb, _e = eng.put(
+        9999, tok, np.ones_like(tok, dtype=np.int64),
+        np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0)
+    kinds = sorted(op.transfer_type.name for op in _swa_ops(graph))
+    assert "D2H" in kinds
+    assert "H2DISK" not in kinds
+    _complete(op_cb, cb)
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
+    cpu_hit, _slot = eng.cpu_cache_engine.match_swa(seq, upper_bound_blocks=4)
+    assert cpu_hit == 4
+    for node in locked_nodes:
+        node.dec_swa_lock_ref()
+
+
+def test_swa_load_release_callback_is_idempotent_for_staging_slot():
+    """Callback re-entry must not double-free transient staging slots."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    slot = eng.cpu_cache_engine.swa_alloc_slot()
+    assert slot >= 0
+    free_before = eng.cpu_cache_engine.swa_pool.num_free
+    cb = eng._make_swa_release_load_callback(node=None, staging_slot=slot)
+
+    cb()
+    assert eng.cpu_cache_engine.swa_pool.num_free == free_before + 1
+    cb()
+    assert eng.cpu_cache_engine.swa_pool.num_free == free_before + 1
+
+
+def test_swa_load_release_callback_frees_staging_even_if_source_unlock_raises(monkeypatch):
+    """Source unlock exceptions must not leak the transient CPU staging slot."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    slot = eng.cpu_cache_engine.swa_alloc_slot()
+    assert slot >= 0
+    free_before = eng.cpu_cache_engine.swa_pool.num_free
+
+    class BadNode:
+        swa_lock_ref = 1
+
+        def dec_swa_lock_ref(self):
+            raise RuntimeError("boom")
+
+    eng._swa_release_load_lock(BadNode(), staging_slot=slot)
+    assert eng.cpu_cache_engine.swa_pool.num_free == free_before + 1
+
+
+def test_remote_worker_successful_launch_reports_completion(monkeypatch):
+    """REMOTE worker launch_transfer must return True after a successful copy.
+
+    The base worker only posts completed op ids when launch_transfer returns
+    True. A missing return here makes REMOTE2H/H2REMOTE look hung even if the C++
+    transfer completed.
+    """
+    from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+
+    worker_mod = pytest.importorskip("flexkv.transfer.worker")
+    layout = KVCacheLayout(
+        type=KVCacheLayoutType.LAYERFIRST,
+        num_layer=1,
+        num_block=4,
+        tokens_per_block=TPB,
+        num_head=1,
+        head_size=64,
+        is_mla=True,
+    )
+    worker = worker_mod.CPURemoteTransferWorker.__new__(worker_mod.CPURemoteTransferWorker)
+    worker.cpu_kv_layout = layout
+    worker.remote_kv_layout = layout
+    worker.dtype = torch.uint8
+    worker.chunk_size_in_bytes = TPB * 64
+    worker.num_layers = 1
+    worker.kv_dim = 1
+
+    seen = {}
+
+    def fake_get_transfer_block_ids(_op):
+        return (
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([1], dtype=torch.int64),
+        )
+
+    def fake_transfer_impl(src_block_ids, dst_block_ids, transfer_type, **kwargs):
+        seen["src"] = src_block_ids
+        seen["dst"] = dst_block_ids
+        seen["type"] = transfer_type
+        seen["kwargs"] = kwargs
+
+    monkeypatch.setattr(worker, "get_transfer_block_ids", fake_get_transfer_block_ids)
+    monkeypatch.setattr(worker, "_transfer_impl", fake_transfer_impl)
+    monkeypatch.setattr(worker, "_log_transfer_performance", lambda *args, **kwargs: None)
+
+    class DummyOp:
+        transfer_op_id = 123
+        transfer_graph_id = 456
+        transfer_type = TransferType.REMOTE2H
+        valid_block_num = 1
+        src_block_node_ids = np.array([7], dtype=np.int64)
+
+    assert worker.launch_transfer(DummyOp()) is True
+    assert seen["type"] == TransferType.REMOTE2H
+    assert seen["kwargs"]["src_block_node_ids"].tolist() == [7]
 
 
 def test_multitier_match_promotes_swa_in_each_tier():

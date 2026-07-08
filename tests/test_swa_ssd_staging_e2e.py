@@ -86,6 +86,8 @@ def wait_for_op(te, op_ids, timeout_s=30.0):
     while pending and time.monotonic() < deadline:
         for c in te.get_completed_graphs_and_ops(timeout=1.0):
             pending.discard(c.op_id)
+        if pending:
+            time.sleep(0.01)
     if pending:
         raise TimeoutError(f"Ops {pending} did not complete in {timeout_s}s")
 
@@ -177,7 +179,7 @@ def main() -> int:
     kinds = sorted(o.transfer_type.name for o in swa_put_ops)
     assert "D2H" in kinds and "H2DISK" in kinds, f"expected SWA D2H + H2DISK, got {kinds}"
     assert engine.ssd_cache_engine.swa_pool.num_used == 1, "SSD SWA slot not allocated on put"
-    reported = {put_end} | {o.op_id for o in swa_put_ops if o.transfer_type.name == "D2H"}
+    reported = {put_end} | {o.op_id for o in swa_put_ops}
     print(f"[verify] PUT graph: SWA ops={kinds} (write-through to SSD)", flush=True)
     _run_graph(te, put_graph, put_op_cb, put_cb,
                full_gpu_blocks=[PUT_FULL_GPU], swa_gpu_slot=SWA_GPU_SLOT,
@@ -205,6 +207,9 @@ def main() -> int:
     swa_get_ops = [o for o in get_graph._op_map.values() if getattr(o, "is_swa", False)]
     gkinds = sorted(o.transfer_type.name for o in swa_get_ops)
     assert "DISK2H" in gkinds and "H2D" in gkinds, f"expected SWA DISK2H+H2D staging, got {gkinds}"
+    ssd_mr = engine.ssd_cache_engine.match(seq)
+    ssd_node = getattr(ssd_mr, "last_swa_node", None)
+    assert ssd_node is not None and ssd_node.swa_lock_ref == 1
     swa_h2d = [o for o in swa_get_ops if o.transfer_type.name == "H2D"][0]
     swa_disk2h = [o for o in swa_get_ops if o.transfer_type.name == "DISK2H"][0]
     assert swa_disk2h.op_id in swa_h2d.predecessors, "SWA H2D must depend on SSD DISK2H"
@@ -215,11 +220,18 @@ def main() -> int:
                full_gpu_blocks=[GET_FULL_GPU], swa_gpu_slot=SWA_GPU_SLOT,
                reported_op_ids=reported2)
     print("[verify] GET done (SWA restored via SSD->CPU->GPU)", flush=True)
+    failed = False
+    if ssd_node.swa_lock_ref != 0:
+        print(f"[verify] FAIL SSD source SWA lock leaked (lock_ref={ssd_node.swa_lock_ref})", flush=True)
+        failed = True
+    else:
+        print("[verify] OK    SSD source SWA lock released", flush=True)
 
     # ===== byte-exact compare ==================================================
     actual_sw = block_bytes(sw_pool, SWA_GPU_SLOT)
-    failed = actual_sw != expected_sw
-    if failed:
+    byte_failed = actual_sw != expected_sw
+    failed = failed or byte_failed
+    if byte_failed:
         print("[verify] FAIL SWA byte mismatch after SSD staging", flush=True)
     else:
         print(f"[verify] OK    SWA: {len(expected_sw)} bytes match "

@@ -53,6 +53,8 @@ from test_layerwise_multi_group_swa import (
     _seed_swa_cpu_layer,
 )
 
+pytestmark = pytest.mark.e2e
+
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 _EFD_SEMAPHORE = 0x1
 

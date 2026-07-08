@@ -16,14 +16,26 @@ class cudaIpcMemHandle_t(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_byte * 64)]
 
 
-# Load CUDA runtime library
-try:
-    cudart = ctypes.CDLL("libcudart.so")
-except:
-    try:
-        cudart = ctypes.CDLL("libcudart.so.12")
-    except:
-        cudart = ctypes.CDLL("libcudart.so.11")
+_cudart = None
+_cudart_load_error = None
+
+
+def _get_cudart():
+    """Load CUDA runtime lazily so CPU-only tests can import this module."""
+    global _cudart, _cudart_load_error
+    if _cudart is None and _cudart_load_error is None:
+        errors = []
+        for name in ("libcudart.so", "libcudart.so.12", "libcudart.so.11"):
+            try:
+                _cudart = ctypes.CDLL(name)
+                break
+            except OSError as exc:
+                errors.append(f"{name}: {exc}")
+        if _cudart is None:
+            _cudart_load_error = OSError("; ".join(errors))
+    if _cudart is None:
+        raise RuntimeError(f"CUDA runtime library is unavailable: {_cudart_load_error}")
+    return _cudart
 
 # CUDA IPC handle size (64 bytes on Linux)
 CUDA_IPC_HANDLE_SIZE = 64
@@ -354,6 +366,7 @@ class TensorSharedHandle:
         ipc_handle = cudaIpcMemHandle_t()
 
         # Call cudaIpcGetMemHandle
+        cudart = _get_cudart()
         result = cudart.cudaIpcGetMemHandle(
             ctypes.byref(ipc_handle), ctypes.c_void_p(data_ptr)
         )
@@ -410,6 +423,7 @@ class TensorSharedHandle:
         ctypes.memmove(ctypes.byref(handle), ipc_handle, 64)
 
         # Open IPC memory handle to get base pointer
+        cudart = _get_cudart()
         base_ptr = ctypes.c_void_p()
         result = cudart.cudaIpcOpenMemHandle(
             ctypes.byref(base_ptr),

@@ -1,7 +1,10 @@
 """set_gpu_blocks must not overwrite SWA ops with main-KV slot_mapping slices."""
 import numpy as np
+import pytest
 
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType
+
+pytestmark = pytest.mark.unit
 
 
 def test_set_gpu_blocks_skips_swa_h2d():

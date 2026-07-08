@@ -1014,9 +1014,8 @@ class GlobalCacheEngine:
         # on the SWA H2D op so it fires exactly once, alongside the full-KV ops.
         if swa_h2d_id is not None and (swa_lock_node is not None
                                        or swa_staging_slot >= 0):
-            op_callback_dict[swa_h2d_id] = partial(
-                self._swa_release_load_lock, node=swa_lock_node,
-                staging_slot=swa_staging_slot)
+            op_callback_dict[swa_h2d_id] = self._make_swa_release_load_callback(
+                node=swa_lock_node, staging_slot=swa_staging_slot)
 
         # Record metrics for GET operation
         if self._metrics_collector is not None:
@@ -2210,6 +2209,24 @@ class GlobalCacheEngine:
                     cpu_engine.swa_pool.free(int(staging_slot))
         except Exception:  # noqa: BLE001
             pass
+
+    def _make_swa_release_load_callback(self, node, staging_slot: int = -1):
+        """Return a one-shot SWA load completion callback.
+
+        The transfer scheduler should fire each op callback exactly once, but
+        failure/retry paths and tests can re-enter callbacks. A second release
+        must not free the same transient staging slot twice.
+        """
+        called = False
+
+        def _callback() -> None:
+            nonlocal called
+            if called:
+                return
+            called = True
+            self._swa_release_load_lock(node=node, staging_slot=staging_slot)
+
+        return _callback
 
     @nvtx.annotate("Match Prefix", color="yellow")
     def match_local(self,

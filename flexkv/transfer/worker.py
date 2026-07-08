@@ -1622,6 +1622,8 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             end_time,
         )
 
+        return True
+
 class GDSTransferWorker(TransferWorkerBase):
     def __init__(
         self,
