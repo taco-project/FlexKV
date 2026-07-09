@@ -173,10 +173,8 @@ class CacheEngineAccel:
         slot = self.swa_pool.allocate()
         return slot if slot is not None else -1
 
-    def _free_unmounted_swa_slot(self, slot: int) -> None:
-        """Return a slot that is not mounted on any radix node."""
-        if self.swa_pool is None or slot is None or slot < 0:
-            return
+    def _free_swa_slot(self, slot: int) -> None:
+        """Return one detached SWA slot to this tier's pool."""
         self.swa_pool.free(int(slot))
 
     def _drain_unmounted_swa_slots(self) -> None:
@@ -184,46 +182,14 @@ class CacheEngineAccel:
         if self.swa_pool is None:
             return
         for slot in self.index.drain_freed_swa_slots():
-            self._free_unmounted_swa_slot(slot)
-
-    @staticmethod
-    def _get_mounted_swa_slot(node) -> int:
-        if node is None:
-            return -1
-        try:
-            if not node.has_swa():
-                return -1
-        except Exception:
-            return -1
-        return int(getattr(node, "swa_host_slot", -1))
+            self._free_swa_slot(slot)
 
     def _pin_swa_node(self, node) -> None:
-        if node is None:
-            return
-        full_locked = False
-        try:
-            self.index.lock(node)
-            full_locked = True
-        except Exception:
-            try:
-                node.lock()
-                full_locked = True
-            except AttributeError:
-                node.lock_cnt += 1
-                full_locked = True
+        self.index.lock(node)
         try:
             node.inc_swa_lock_ref()
-        except AttributeError:
-            node.swa_lock_ref += 1
         except Exception:
-            if full_locked:
-                try:
-                    self.index.unlock(node)
-                except Exception:
-                    try:
-                        node.unlock()
-                    except AttributeError:
-                        node.lock_cnt -= 1
+            self.index.unlock(node)
             raise
 
     def _resolve_swa_read_source(self,
@@ -242,28 +208,24 @@ class CacheEngineAccel:
             if required_hit_blocks <= 0 or required_hit_blocks > upper_bound_blocks:
                 return 0, -1, None
 
+        def usable(mr) -> bool:
+            if mr is None or mr.last_swa_node is None or mr.swa_hit_blocks <= 0:
+                return False
+            if mr.swa_hit_blocks > upper_bound_blocks:
+                return False
+            return required_hit_blocks is None or mr.swa_hit_blocks == required_hit_blocks
+
         mr = match_result
-        swa_node = getattr(mr, "last_swa_node", None) if mr is not None else None
-        swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0) if mr is not None else 0
-
-        if (swa_node is not None and swa_hit > upper_bound_blocks) or \
-                (required_hit_blocks is not None and swa_hit != required_hit_blocks):
-            mr = None
-
-        if mr is None:
+        if not usable(mr):
             probe_bound = required_hit_blocks if required_hit_blocks is not None else upper_bound_blocks
             mr = self._probe_swa_source(sequence_meta, probe_bound)
-            swa_node = getattr(mr, "last_swa_node", None) if mr is not None else None
-            swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0) if mr is not None else 0
-
-        if swa_node is None or swa_hit <= 0 or swa_hit > upper_bound_blocks:
-            return 0, -1, None
-        if required_hit_blocks is not None and swa_hit != required_hit_blocks:
-            return 0, -1, None
-        slot = self._get_mounted_swa_slot(swa_node)
-        if slot < 0:
+        if not usable(mr):
             return 0, -1, None
 
+        swa_node = mr.last_swa_node
+        swa_hit = int(mr.swa_hit_blocks)
+        slot = int(swa_node.swa_host_slot)
+        assert slot >= 0
         self.index.promote_swa(swa_node)
         if lock_for_load:
             self._pin_swa_node(swa_node)
@@ -509,10 +471,8 @@ class CacheEngine:
         slot = self.swa_pool.allocate()
         return slot if slot is not None else -1
 
-    def _free_unmounted_swa_slot(self, slot: int) -> None:
-        """Return a slot that is not mounted on any radix node."""
-        if self.swa_pool is None or slot is None or slot < 0:
-            return
+    def _free_swa_slot(self, slot: int) -> None:
+        """Return one detached SWA slot to this tier's pool."""
         self.swa_pool.free(int(slot))
 
     def _drain_unmounted_swa_slots(self) -> None:
@@ -520,46 +480,14 @@ class CacheEngine:
         if self.swa_pool is None:
             return
         for slot in self.index.drain_freed_swa_slots():
-            self._free_unmounted_swa_slot(slot)
-
-    @staticmethod
-    def _get_mounted_swa_slot(node) -> int:
-        if node is None:
-            return -1
-        try:
-            if not node.has_swa():
-                return -1
-        except Exception:
-            return -1
-        return int(getattr(node, "swa_host_slot", -1))
+            self._free_swa_slot(slot)
 
     def _pin_swa_node(self, node) -> None:
-        if node is None:
-            return
-        full_locked = False
-        try:
-            self.index.lock(node)
-            full_locked = True
-        except Exception:
-            try:
-                node.lock()
-                full_locked = True
-            except AttributeError:
-                node.lock_cnt += 1
-                full_locked = True
+        self.index.lock(node)
         try:
             node.inc_swa_lock_ref()
-        except AttributeError:
-            node.swa_lock_ref += 1
         except Exception:
-            if full_locked:
-                try:
-                    self.index.unlock(node)
-                except Exception:
-                    try:
-                        node.unlock()
-                    except AttributeError:
-                        node.lock_cnt -= 1
+            self.index.unlock(node)
             raise
 
     def _resolve_swa_read_source(self,
@@ -578,28 +506,24 @@ class CacheEngine:
             if required_hit_blocks <= 0 or required_hit_blocks > upper_bound_blocks:
                 return 0, -1, None
 
+        def usable(mr) -> bool:
+            if mr is None or mr.last_swa_node is None or mr.swa_hit_blocks <= 0:
+                return False
+            if mr.swa_hit_blocks > upper_bound_blocks:
+                return False
+            return required_hit_blocks is None or mr.swa_hit_blocks == required_hit_blocks
+
         mr = match_result
-        swa_node = getattr(mr, "last_swa_node", None) if mr is not None else None
-        swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0) if mr is not None else 0
-
-        if (swa_node is not None and swa_hit > upper_bound_blocks) or \
-                (required_hit_blocks is not None and swa_hit != required_hit_blocks):
-            mr = None
-
-        if mr is None:
+        if not usable(mr):
             probe_bound = required_hit_blocks if required_hit_blocks is not None else upper_bound_blocks
             mr = self._probe_swa_source(sequence_meta, probe_bound)
-            swa_node = getattr(mr, "last_swa_node", None) if mr is not None else None
-            swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0) if mr is not None else 0
-
-        if swa_node is None or swa_hit <= 0 or swa_hit > upper_bound_blocks:
-            return 0, -1, None
-        if required_hit_blocks is not None and swa_hit != required_hit_blocks:
-            return 0, -1, None
-        slot = self._get_mounted_swa_slot(swa_node)
-        if slot < 0:
+        if not usable(mr):
             return 0, -1, None
 
+        swa_node = mr.last_swa_node
+        swa_hit = int(mr.swa_hit_blocks)
+        slot = int(swa_node.swa_host_slot)
+        assert slot >= 0
         self.index.promote_swa(swa_node)
         if lock_for_load:
             self._pin_swa_node(swa_node)
@@ -1045,11 +969,11 @@ class GlobalCacheEngine:
             f"remote_swa_slot={remote_swa_slot}"
         )
         if cpu_swa_slot >= 0:
-            self.cpu_cache_engine._free_unmounted_swa_slot(cpu_swa_slot)
+            self.cpu_cache_engine._free_swa_slot(cpu_swa_slot)
         if ssd_swa_slot >= 0:
-            self.ssd_cache_engine._free_unmounted_swa_slot(ssd_swa_slot)
+            self.ssd_cache_engine._free_swa_slot(ssd_swa_slot)
         if remote_swa_slot >= 0:
-            self.remote_cache_engine._free_unmounted_swa_slot(remote_swa_slot)
+            self.remote_cache_engine._free_swa_slot(remote_swa_slot)
         self.cpu_cache_engine.recycle(cpu_blocks)
         if ssd_blocks is not None:
             self.ssd_cache_engine.recycle(ssd_blocks)
@@ -1091,13 +1015,11 @@ class GlobalCacheEngine:
         swa_read_source = SWAReadSource()
         if swa_aware:
             block_mask_end, swa_read_source = self._select_swa_read_source(
-                sequence_meta,
                 block_mask_start,
                 block_mask_end,
                 {DeviceType.CPU: cpu_matched_result,
                  DeviceType.SSD: ssd_matched_result,
                  DeviceType.REMOTE: remote_matched_result},
-                lock_for_load=False,
             )
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
@@ -1361,12 +1283,10 @@ class GlobalCacheEngine:
         swa_read_source = SWAReadSource()
         if swa_aware:
             block_mask_end, swa_read_source = self._select_swa_read_source(
-                sequence_meta,
                 block_mask_start,
                 block_mask_end,
                 {DeviceType.CPU: cpu_matched_result,
                  DeviceType.SSD: ssd_matched_result},
-                lock_for_load=False,
             )
 
         # DEBUG: Log GET operation with hash info
@@ -2212,11 +2132,9 @@ class GlobalCacheEngine:
 
     def _select_swa_read_source(
         self,
-        sequence_meta: SequenceMeta,
         block_mask_start: int,
         block_mask_end: int,
         tier_match_results: Dict[DeviceType, object],
-        lock_for_load: bool = False,
     ) -> Tuple[int, SWAReadSource]:
         """Return the largest usable SWA-aware Full-KV end and its exact SWA source."""
         if not self.swa_cache.enabled or not tier_match_results:
@@ -2227,13 +2145,14 @@ class GlobalCacheEngine:
             if match_result is None:
                 continue
 
-            swa_hit = int(getattr(match_result, "swa_hit_blocks", 0) or 0)
+            swa_hit = int(match_result.swa_hit_blocks)
             if swa_hit <= block_mask_start:
                 continue
 
             assert swa_hit <= block_mask_end, (
                 "SWA hit must not exceed the Full-KV match window"
             )
+            assert match_result.last_swa_node is not None
             candidates.append((swa_hit, device_type, match_result))
 
         for usable_end, device_type, match_result in sorted(
@@ -2245,24 +2164,19 @@ class GlobalCacheEngine:
             if engine is None or not getattr(engine, "swa_enabled", False):
                 continue
 
-            hit, source_slot, source_node = engine._resolve_swa_read_source(
-                sequence_meta,
-                upper_bound_blocks=usable_end,
-                match_result=match_result,
-                required_hit_blocks=usable_end,
-                lock_for_load=lock_for_load,
-            )
+            source_node = match_result.last_swa_node
+            source_slot = int(source_node.swa_host_slot)
+            assert source_slot >= 0
 
             source = SWAReadSource(
-                hit_blocks=hit,
+                hit_blocks=usable_end,
                 host_slot=source_slot,
                 node=source_node,
                 device_type=device_type,
                 engine=engine,
             )
 
-            if source.found and hit == usable_end:
-                return usable_end, source
+            return usable_end, source
 
         return block_mask_start, SWAReadSource()
 
@@ -2299,7 +2213,7 @@ class GlobalCacheEngine:
             if staging_slot is not None and staging_slot >= 0:
                 cpu_engine = self.cpu_cache_engine
                 if cpu_engine is not None:
-                    cpu_engine._free_unmounted_swa_slot(int(staging_slot))
+                    cpu_engine._free_swa_slot(int(staging_slot))
         except Exception:  # noqa: BLE001
             pass
 

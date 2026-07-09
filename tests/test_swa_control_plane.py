@@ -164,7 +164,7 @@ def test_put_builds_full_plus_swa_store_chain():
         sm, upper_bound_blocks=4)
     pending = eng.cpu_cache_engine.match(sm)
     assert pending.num_ready_matched_blocks == 0
-    assert eng.cpu_cache_engine._get_mounted_swa_slot(pending.last_node) >= 0
+    assert pending.last_node.swa_host_slot >= 0
     assert hit == 0 and slot < 0, "unready mounted SWA became readable before completion"
     _complete(op_cb, cb)
     # after completion the mounted SWA slot becomes visible through ready matching.
@@ -384,7 +384,7 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
         seq, upper_bound_blocks=4)
     pending = eng.ssd_cache_engine.match(seq)
     assert pending.num_ready_matched_blocks == 0
-    assert eng.ssd_cache_engine._get_mounted_swa_slot(pending.last_node) >= 0
+    assert pending.last_node.swa_host_slot >= 0
     assert ssd_hit == 0
     _complete(op_cb, cb)
     ssd_hit, _slot, _node = eng.ssd_cache_engine._resolve_swa_read_source(
