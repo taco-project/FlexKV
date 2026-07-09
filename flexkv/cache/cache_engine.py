@@ -211,7 +211,6 @@ class CacheEngineAccel:
         if node is None or slot is None or slot < 0:
             return
         self._mount_swa_slot(node, slot)
-        self._drain_unmounted_swa_slots()
 
     @staticmethod
     def _get_mounted_swa_slot(node) -> int:
@@ -577,7 +576,6 @@ class CacheEngine:
         if node is None or slot is None or slot < 0:
             return
         self._mount_swa_slot(node, slot)
-        self._drain_unmounted_swa_slots()
 
     @staticmethod
     def _get_mounted_swa_slot(node) -> int:

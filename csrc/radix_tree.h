@@ -520,9 +520,9 @@ public:
   void set_swa(CRadixNode *node, int slot) {
     assert(node != root);
     int old = node->get_swa_host_slot();
-    if (old != -1 && old != slot) {
-      freed_swa_slots.push_back(old);
-    }
+    // A different existing slot means the caller is overwriting a live SWA
+    // mount. Unmount via record_freed_swa_slot() first instead of hiding it here.
+    assert(old == -1 || old == slot);
     node->set_swa_host_slot(slot);
     node->set_swa_tombstone(false);
     struct timeval now;

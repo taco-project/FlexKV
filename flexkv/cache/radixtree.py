@@ -318,12 +318,12 @@ class RadixTreeIndex:
         """Mount an SWA slot on ``node``'s trailing page (store side).
 
         The caller guarantees ``node`` is the node whose LAST page is the target
-        window (split first if not — see insert / I0). Replacing an existing slot
-        buffers the old one for draining.
+        window (split first if not — see insert / I0). A different existing slot
+        must be explicitly unmounted first; remounting the same slot refreshes
+        SWA-LRU recency.
         """
         assert node is not self.root_node
-        if node.swa_host_slot >= 0 and node.swa_host_slot != slot:
-            self._freed_swa_slots.append(node.swa_host_slot)
+        assert node.swa_host_slot < 0 or node.swa_host_slot == slot
         node.swa_host_slot = slot
         node.swa_tombstone = False
         node.swa_last_access_time = time.time()
