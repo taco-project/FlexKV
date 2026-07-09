@@ -230,9 +230,10 @@ def main() -> int:
 
     # SWA lock released by the H2D callback (no leak).
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); sm.gen_hashes()
-    hit, slot, node = engine.cpu_cache_engine._resolve_swa_read_source(
-        sm, upper_bound_blocks=1, lock_for_load=True)
+    mr = engine.cpu_cache_engine.match(sm)
+    node = mr.last_swa_node if mr.swa_hit_blocks == 1 else None
     if node is not None:
+        engine.cpu_cache_engine._pin_swa_node(node)
         lock_ok = (node.swa_lock_ref == 1)  # our fresh probe lock; prior load lock released
         engine._swa_release_load_lock(node, engine=engine.cpu_cache_engine)
         print(f"[verify] {'OK   ' if lock_ok else 'FAIL '} SWA load lock released "

@@ -190,12 +190,11 @@ def test_get_pins_then_releases_swa_lock():
 
     # After building the GET graph, the matched CPU SWA node is pinned.
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
-    hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
-        sm, upper_bound_blocks=4)
-    assert hit == 4
+    mr = eng.cpu_cache_engine.match(sm)
+    assert mr.swa_hit_blocks == 4
     # The node carries the load pin (>=1) taken while building the GET plan.
-    node = eng.cpu_cache_engine.index.match_prefix(
-        torch.from_numpy(sm.block_hashes[:4]).to(torch.int64), 4, False).last_swa_node
+    node = mr.last_swa_node
+    assert node is not None
     assert node.swa_lock_ref >= 1
 
     # Complete the ops: the SWA H2D callback releases the pin.

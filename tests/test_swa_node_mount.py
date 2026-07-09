@@ -734,8 +734,9 @@ class _SWAWorkloadDriver:
         mr = self.engine.match(sm)
         full_hit = int(mr.num_ready_matched_blocks)
         if full_hit > 0:
-            swa_hit, slot, _node = self.engine._resolve_swa_read_source(
-                sm, upper_bound_blocks=full_hit, lock_for_load=False)
+            swa_hit = int(mr.swa_hit_blocks)
+            node = mr.last_swa_node
+            slot = int(node.swa_host_slot) if node is not None else -1
             if swa_hit > 0 and slot >= 0:
                 self.swa_hits += 1
 
@@ -888,11 +889,11 @@ def test_full_evict_no_cascade_when_swa_disabled():
 
 
 # --------------------------------------------------------------------------- #
-# Double-walk elimination: _resolve_swa_read_source(match_result=...) reuse + fallback #
+# SWA source is exposed directly on match results                          #
 # --------------------------------------------------------------------------- #
 
-def test_resolve_swa_read_source_reuses_match_result_within_bound():
-    """_resolve_swa_read_source(match_result=...) reuses Full-KV match within bound."""
+def test_match_result_exposes_swa_source_within_bound():
+    """match_prefix exposes the SWA source without a second read-source probe."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
     n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
     idx.set_swa(n1, slot=100)

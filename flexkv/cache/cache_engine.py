@@ -192,45 +192,6 @@ class CacheEngineAccel:
             self.index.unlock(node)
             raise
 
-    def _resolve_swa_read_source(self,
-                                 sequence_meta: SequenceMeta,
-                                 upper_bound_blocks: int,
-                                 match_result=None,
-                                 required_hit_blocks: Optional[int] = None,
-                                 lock_for_load: bool = False,
-                                 ) -> Tuple[int, int, Optional[object]]:
-        """Return (hit blocks, host slot, source node) for a bounded SWA GET."""
-        if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, None
-        upper_bound_blocks = int(upper_bound_blocks)
-        if required_hit_blocks is not None:
-            required_hit_blocks = int(required_hit_blocks)
-            if required_hit_blocks <= 0 or required_hit_blocks > upper_bound_blocks:
-                return 0, -1, None
-
-        def usable(mr) -> bool:
-            if mr is None or mr.last_swa_node is None or mr.swa_hit_blocks <= 0:
-                return False
-            if mr.swa_hit_blocks > upper_bound_blocks:
-                return False
-            return required_hit_blocks is None or mr.swa_hit_blocks == required_hit_blocks
-
-        mr = match_result
-        if not usable(mr):
-            probe_bound = required_hit_blocks if required_hit_blocks is not None else upper_bound_blocks
-            mr = self._probe_swa_source(sequence_meta, probe_bound)
-        if not usable(mr):
-            return 0, -1, None
-
-        swa_node = mr.last_swa_node
-        swa_hit = int(mr.swa_hit_blocks)
-        slot = int(swa_node.swa_host_slot)
-        assert slot >= 0
-        self.index.promote_swa(swa_node)
-        if lock_for_load:
-            self._pin_swa_node(swa_node)
-        return swa_hit, slot, swa_node
-
     def _evict_swa_slots(self, num_swa_evicted: int) -> int:
         """Evict node-mounted SWA slots through the C++ radix tree."""
         if self.swa_pool is None:
@@ -241,17 +202,6 @@ class CacheEngineAccel:
             self.mempool.recycle_blocks(evicted_full.numpy())
         self._drain_unmounted_swa_slots()
         return num_freed
-
-    def _probe_swa_source(self, sequence_meta: SequenceMeta,
-                          upper_bound_blocks: int):
-        """Run a bounded SWA source probe without updating Full-KV heat."""
-        sequence_meta.gen_hashes()
-        num_blocks = min(int(upper_bound_blocks), sequence_meta.num_blocks)
-        if num_blocks <= 0:
-            return None
-        block_hashes = torch.from_numpy(
-            sequence_meta.block_hashes[:num_blocks]).to(torch.int64)
-        return self.index.match_prefix(block_hashes, num_blocks, False)
 
     def reset(self) -> None:
         self.index.reset()
@@ -490,45 +440,6 @@ class CacheEngine:
             self.index.unlock(node)
             raise
 
-    def _resolve_swa_read_source(self,
-                                 sequence_meta: SequenceMeta,
-                                 upper_bound_blocks: int,
-                                 match_result=None,
-                                 required_hit_blocks: Optional[int] = None,
-                                 lock_for_load: bool = False,
-                                 ) -> Tuple[int, int, Optional[object]]:
-        """Return (hit blocks, host slot, source node) for a bounded SWA GET."""
-        if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, None
-        upper_bound_blocks = int(upper_bound_blocks)
-        if required_hit_blocks is not None:
-            required_hit_blocks = int(required_hit_blocks)
-            if required_hit_blocks <= 0 or required_hit_blocks > upper_bound_blocks:
-                return 0, -1, None
-
-        def usable(mr) -> bool:
-            if mr is None or mr.last_swa_node is None or mr.swa_hit_blocks <= 0:
-                return False
-            if mr.swa_hit_blocks > upper_bound_blocks:
-                return False
-            return required_hit_blocks is None or mr.swa_hit_blocks == required_hit_blocks
-
-        mr = match_result
-        if not usable(mr):
-            probe_bound = required_hit_blocks if required_hit_blocks is not None else upper_bound_blocks
-            mr = self._probe_swa_source(sequence_meta, probe_bound)
-        if not usable(mr):
-            return 0, -1, None
-
-        swa_node = mr.last_swa_node
-        swa_hit = int(mr.swa_hit_blocks)
-        slot = int(swa_node.swa_host_slot)
-        assert slot >= 0
-        self.index.promote_swa(swa_node)
-        if lock_for_load:
-            self._pin_swa_node(swa_node)
-        return swa_hit, slot, swa_node
-
     def _evict_swa_slots(self, num_swa_evicted: int) -> int:
         """Evict node-mounted SWA slots through the Python radix tree."""
         if self.swa_pool is None:
@@ -538,20 +449,6 @@ class CacheEngine:
             self.mempool.recycle_blocks(evicted_full)
         self._drain_unmounted_swa_slots()
         return num_freed
-
-    def _probe_swa_source(self, sequence_meta: SequenceMeta,
-                          upper_bound_blocks: int):
-        """Run a bounded SWA source probe without updating Full-KV heat."""
-        sequence_meta.gen_hashes()
-        num_blocks = min(int(upper_bound_blocks), sequence_meta.num_blocks)
-        if num_blocks <= 0:
-            return None
-        clamped = SequenceMeta(
-            token_ids=sequence_meta.token_ids[:num_blocks * self.tokens_per_block],
-            tokens_per_block=self.tokens_per_block,
-            namespace=getattr(sequence_meta, "_namespace", None),
-        )
-        return self.index.match_prefix(clamped, update_cache_info=False)
 
     def reset(self) -> None:
         self.index.reset()

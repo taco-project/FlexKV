@@ -189,10 +189,8 @@ def main() -> int:
     n_cpu = engine.cpu_cache_engine.swa_pool.num_used
     engine.cpu_cache_engine._evict_swa_slots(n_cpu)
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); seq.gen_hashes()
-    cpu_hit, _s, _n = engine.cpu_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=1)
-    ssd_hit, _s2, _n2 = engine.ssd_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=1)
+    cpu_hit = engine.cpu_cache_engine.match(seq).swa_hit_blocks
+    ssd_hit = engine.ssd_cache_engine.match(seq).swa_hit_blocks
     assert cpu_hit == 0 and ssd_hit > 0, f"precondition failed: cpu_hit={cpu_hit} ssd_hit={ssd_hit}"
     print(f"[verify] evicted CPU SWA (cpu_hit=0, ssd_hit={ssd_hit}); GET must stage from SSD", flush=True)
 

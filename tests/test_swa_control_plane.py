@@ -160,17 +160,16 @@ def test_put_builds_full_plus_swa_store_chain():
     assert swa[0].op_id in graph._swa_gpu_transfer_op_id
     assert eng.cpu_cache_engine.swa_pool.num_used == 1  # one slot allocated
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
-    hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
-        sm, upper_bound_blocks=4)
     pending = eng.cpu_cache_engine.match(sm)
     assert pending.num_ready_matched_blocks == 0
     assert pending.last_node.swa_host_slot >= 0
-    assert hit == 0 and slot < 0, "unready mounted SWA became readable before completion"
+    assert pending.swa_hit_blocks == 0, "unready mounted SWA became readable before completion"
     _complete(op_cb, cb)
     # after completion the mounted SWA slot becomes visible through ready matching.
-    hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
-        sm, upper_bound_blocks=4)
-    assert hit == 4 and slot >= 0
+    ready = eng.cpu_cache_engine.match(sm)
+    assert ready.swa_hit_blocks == 4
+    assert ready.last_swa_node is not None
+    assert ready.last_swa_node.swa_host_slot >= 0
 
 
 def test_get_builds_full_plus_swa_load_chain():
@@ -196,8 +195,11 @@ def test_get_builds_full_plus_swa_load_chain():
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     _complete(gop_cb, gcb)
     # after release, the node's SWA is unlocked (a fresh match can lock again).
-    hit, slot, node = eng.cpu_cache_engine._resolve_swa_read_source(
-        sm, upper_bound_blocks=4, lock_for_load=True)
+    ready = eng.cpu_cache_engine.match(sm)
+    assert ready.swa_hit_blocks == 4
+    node = ready.last_swa_node
+    assert node is not None
+    eng.cpu_cache_engine._pin_swa_node(node)
     assert node is not None and node.swa_lock_ref == 1
     assert node.get_lock_cnt() >= node.swa_lock_ref
     eng._swa_release_load_lock(node, engine=eng.cpu_cache_engine)
@@ -380,16 +382,14 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
     # SSD SWA is mounted but not yet visible while the write-through op is in flight.
     assert eng.ssd_cache_engine.swa_pool.num_used == 1
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
-    ssd_hit, _slot, _node = eng.ssd_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=4)
     pending = eng.ssd_cache_engine.match(seq)
     assert pending.num_ready_matched_blocks == 0
     assert pending.last_node.swa_host_slot >= 0
-    assert ssd_hit == 0
+    assert pending.swa_hit_blocks == 0
     _complete(op_cb, cb)
-    ssd_hit, _slot, _node = eng.ssd_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=4)
-    assert ssd_hit == 4
+    ready = eng.ssd_cache_engine.match(seq)
+    assert ready.swa_hit_blocks == 4
+    assert ready.last_swa_node is not None
 
 
 def test_get_ssd_staging_when_only_ssd_has_swa():
@@ -407,11 +407,9 @@ def test_get_ssd_staging_when_only_ssd_has_swa():
     eng.cpu_cache_engine._evict_swa_slots(eng.cpu_cache_engine.swa_pool.num_used)
 
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
-    cpu_hit, _s, _n = eng.cpu_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=4)
+    cpu_hit = eng.cpu_cache_engine.match(seq).swa_hit_blocks
     assert cpu_hit == 0, "precondition: CPU SWA must be gone"
-    ssd_hit, _s2, _n2 = eng.ssd_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=4)
+    ssd_hit = eng.ssd_cache_engine.match(seq).swa_hit_blocks
     assert ssd_hit > 0, "precondition: SSD SWA must still hold the window"
 
     graph, _rm2, gcb, gop, _ge = eng.get(
@@ -518,8 +516,8 @@ def test_multitier_match_promotes_swa_in_each_tier():
 
     seq_b = SequenceMeta(token_ids=tok_b, tokens_per_block=TPB); seq_b.gen_hashes()
     for name, engine in (("cpu", eng.cpu_cache_engine), ("ssd", eng.ssd_cache_engine)):
-        a_hit, _sa, _na = engine._resolve_swa_read_source(seq_a, upper_bound_blocks=4)
-        b_hit, _sb, _nb = engine._resolve_swa_read_source(seq_b, upper_bound_blocks=4)
+        a_hit = engine.match(seq_a).swa_hit_blocks
+        b_hit = engine.match(seq_b).swa_hit_blocks
         assert a_hit == 4, f"{name}: reused SWA A was evicted (tier not promoted)"
         assert b_hit == 0, f"{name}: never-reused SWA B should have been evicted"
 
