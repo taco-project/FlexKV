@@ -1026,6 +1026,37 @@ class GlobalCacheEngine:
                                               ready_length=ready_length)
         return op_callback_dict
 
+    def _fail_put_before_insert(
+            self,
+            request_id: int,
+            reason: str,
+            cpu_blocks: np.ndarray,
+            cpu_swa_slot: int = -1,
+            ssd_blocks: Optional[np.ndarray] = None,
+            ssd_swa_slot: int = -1,
+            remote_blocks: Optional[np.ndarray] = None,
+            remote_swa_slot: int = -1) -> PutTransferPlan:
+        flexkv_logger.warning(
+            "[FlexKV-SWA] PUT request failed before radix insert; "
+            f"request_id={request_id}, reason={reason}, "
+            f"cpu_blocks={len(cpu_blocks)}, ssd_blocks={0 if ssd_blocks is None else len(ssd_blocks)}, "
+            f"remote_blocks={0 if remote_blocks is None else len(remote_blocks)}, "
+            f"cpu_swa_slot={cpu_swa_slot}, ssd_swa_slot={ssd_swa_slot}, "
+            f"remote_swa_slot={remote_swa_slot}"
+        )
+        if cpu_swa_slot >= 0:
+            self.cpu_cache_engine._free_unmounted_swa_slot(cpu_swa_slot)
+        if ssd_swa_slot >= 0:
+            self.ssd_cache_engine._free_unmounted_swa_slot(ssd_swa_slot)
+        if remote_swa_slot >= 0:
+            self.remote_cache_engine._free_unmounted_swa_slot(remote_swa_slot)
+        self.cpu_cache_engine.recycle(cpu_blocks)
+        if ssd_blocks is not None:
+            self.ssd_cache_engine.recycle(ssd_blocks)
+        if remote_blocks is not None:
+            self.remote_cache_engine.recycle(remote_blocks)
+        return self._empty_put_return(request_id)
+
     def _get_impl_global(self,
             request_id: int,
             sequence_meta: SequenceMeta,
@@ -1745,35 +1776,28 @@ class GlobalCacheEngine:
         cpu_swa_slot = -1
         ssd_swa_slot = -1
         remote_swa_slot = -1
+
         if self.swa_cache.enabled:
             cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot()
-            if cpu_swa_slot < 0:
-                self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
-                if put_to_ssd:
-                    self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
-                if put_to_remote:
-                    self.remote_cache_engine.recycle(fragment3_remote_blocks)
-                return self._empty_put_return(request_id)
-            if put_to_ssd:
+            if cpu_swa_slot >= 0 and put_to_ssd:
                 ssd_swa_slot = self.ssd_cache_engine._alloc_swa_slot()
-                if ssd_swa_slot < 0:
-                    self.cpu_cache_engine._free_unmounted_swa_slot(cpu_swa_slot)
-                    self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
-                    self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
-                    if put_to_remote:
-                        self.remote_cache_engine.recycle(fragment3_remote_blocks)
-                    return self._empty_put_return(request_id)
-            if put_to_remote:
+            if (cpu_swa_slot >= 0 and
+                    (not put_to_ssd or ssd_swa_slot >= 0) and
+                    put_to_remote):
                 remote_swa_slot = self.remote_cache_engine._alloc_swa_slot()
-                if remote_swa_slot < 0:
-                    self.cpu_cache_engine._free_unmounted_swa_slot(cpu_swa_slot)
-                    if ssd_swa_slot >= 0:
-                        self.ssd_cache_engine._free_unmounted_swa_slot(ssd_swa_slot)
-                    self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
-                    if put_to_ssd:
-                        self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
-                    self.remote_cache_engine.recycle(fragment3_remote_blocks)
-                    return self._empty_put_return(request_id)
+            if (cpu_swa_slot < 0 or
+                    (put_to_ssd and ssd_swa_slot < 0) or
+                    (put_to_remote and remote_swa_slot < 0)):
+                return self._fail_put_before_insert(
+                    request_id=request_id,
+                    reason="swa_slot_alloc_failed",
+                    cpu_blocks=fragment12_cpu_blocks,
+                    cpu_swa_slot=cpu_swa_slot,
+                    ssd_blocks=fragment2_ssd_blocks if put_to_ssd else None,
+                    ssd_swa_slot=ssd_swa_slot,
+                    remote_blocks=fragment3_remote_blocks if put_to_remote else None,
+                    remote_swa_slot=remote_swa_slot,
+                )
 
         transfer_graph = TransferOpGraph()
         finished_ops_ids = []
@@ -1846,23 +1870,11 @@ class GlobalCacheEngine:
                 dp_client_id=dp_client_id,
                 return_op_ids=True,
             )
-            swa_chain_complete = (
-                swa_ops.d2h_id is not None and
-                (not put_to_ssd or swa_ops.h2disk_id is not None) and
-                (not put_to_remote or swa_ops.h2remote_id is not None)
-            )
-            if not swa_chain_complete:
-                self.cpu_cache_engine._free_unmounted_swa_slot(cpu_swa_slot)
-                if ssd_swa_slot >= 0:
-                    self.ssd_cache_engine._free_unmounted_swa_slot(ssd_swa_slot)
-                if remote_swa_slot >= 0:
-                    self.remote_cache_engine._free_unmounted_swa_slot(remote_swa_slot)
-                self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
-                if put_to_ssd:
-                    self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
-                if put_to_remote:
-                    self.remote_cache_engine.recycle(fragment3_remote_blocks)
-                return self._empty_put_return(request_id)
+            assert swa_ops.d2h_id is not None
+            if put_to_ssd:
+                assert swa_ops.h2disk_id is not None
+            if put_to_remote:
+                assert swa_ops.h2remote_id is not None
             finished_ops_ids.append(swa_ops.d2h_id)
             if swa_ops.h2disk_id is not None:
                 finished_ops_ids.append(swa_ops.h2disk_id)
@@ -1892,20 +1904,11 @@ class GlobalCacheEngine:
                 match_result=remote_matched_result,
             )
         if cpu_swa_slot >= 0:
-            if cpu_node_to_unlock is not None:
-                self.cpu_cache_engine.index.set_swa(cpu_node_to_unlock, int(cpu_swa_slot))
-            else:
-                self.cpu_cache_engine._free_unmounted_swa_slot(cpu_swa_slot)
+            self.cpu_cache_engine.index.set_swa(cpu_node_to_unlock, int(cpu_swa_slot))
         if ssd_swa_slot >= 0:
-            if ssd_node_to_unlock is not None:
-                self.ssd_cache_engine.index.set_swa(ssd_node_to_unlock, int(ssd_swa_slot))
-            else:
-                self.ssd_cache_engine._free_unmounted_swa_slot(ssd_swa_slot)
+            self.ssd_cache_engine.index.set_swa(ssd_node_to_unlock, int(ssd_swa_slot))
         if remote_swa_slot >= 0:
-            if remote_node_to_unlock is not None:
-                self.remote_cache_engine.index.set_swa(remote_node_to_unlock, int(remote_swa_slot))
-            else:
-                self.remote_cache_engine._free_unmounted_swa_slot(remote_swa_slot)
+            self.remote_cache_engine.index.set_swa(remote_node_to_unlock, int(remote_swa_slot))
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
@@ -2006,20 +2009,21 @@ class GlobalCacheEngine:
 
         cpu_swa_slot = -1
         ssd_swa_slot = -1
+
         if self.swa_cache.enabled:
             cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot()
-            if cpu_swa_slot < 0:
-                self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
-                if enable_ssd:
-                    self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
-                return self._empty_put_return(request_id)
-            if fragment2_num_blocks > 0:
+            if cpu_swa_slot >= 0 and fragment2_num_blocks > 0:
                 ssd_swa_slot = self.ssd_cache_engine._alloc_swa_slot()
-                if ssd_swa_slot < 0:
-                    self.cpu_cache_engine._free_unmounted_swa_slot(cpu_swa_slot)
-                    self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
-                    self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
-                    return self._empty_put_return(request_id)
+            if (cpu_swa_slot < 0 or
+                    (fragment2_num_blocks > 0 and ssd_swa_slot < 0)):
+                return self._fail_put_before_insert(
+                    request_id=request_id,
+                    reason="swa_slot_alloc_failed",
+                    cpu_blocks=fragment12_cpu_blocks,
+                    cpu_swa_slot=cpu_swa_slot,
+                    ssd_blocks=fragment2_ssd_blocks if enable_ssd else None,
+                    ssd_swa_slot=ssd_swa_slot,
+                )
 
         transfer_graph = TransferOpGraph()
         finished_ops_ids = []
@@ -2078,18 +2082,9 @@ class GlobalCacheEngine:
                 dp_client_id=dp_client_id,
                 return_op_ids=True,
             )
-            swa_chain_complete = (
-                swa_ops.d2h_id is not None and
-                (fragment2_num_blocks == 0 or swa_ops.h2disk_id is not None)
-            )
-            if not swa_chain_complete:
-                self.cpu_cache_engine._free_unmounted_swa_slot(cpu_swa_slot)
-                if ssd_swa_slot >= 0:
-                    self.ssd_cache_engine._free_unmounted_swa_slot(ssd_swa_slot)
-                self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
-                if enable_ssd:
-                    self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
-                return self._empty_put_return(request_id)
+            assert swa_ops.d2h_id is not None
+            if fragment2_num_blocks > 0:
+                assert swa_ops.h2disk_id is not None
             finished_ops_ids.append(swa_ops.d2h_id)
             if swa_ops.h2disk_id is not None:
                 finished_ops_ids.append(swa_ops.h2disk_id)
@@ -2112,15 +2107,9 @@ class GlobalCacheEngine:
             )
             op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
         if cpu_swa_slot >= 0:
-            if cpu_node_to_unlock is not None:
-                self.cpu_cache_engine.index.set_swa(cpu_node_to_unlock, int(cpu_swa_slot))
-            else:
-                self.cpu_cache_engine._free_unmounted_swa_slot(cpu_swa_slot)
+            self.cpu_cache_engine.index.set_swa(cpu_node_to_unlock, int(cpu_swa_slot))
         if ssd_swa_slot >= 0:
-            if ssd_node_to_unlock is not None:
-                self.ssd_cache_engine.index.set_swa(ssd_node_to_unlock, int(ssd_swa_slot))
-            else:
-                self.ssd_cache_engine._free_unmounted_swa_slot(ssd_swa_slot)
+            self.ssd_cache_engine.index.set_swa(ssd_node_to_unlock, int(ssd_swa_slot))
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
