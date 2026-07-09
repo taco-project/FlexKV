@@ -204,7 +204,7 @@ def test_put_full_plus_swa_cpu_only():
 
 def test_put_swa_writethrough_ssd_remote_can_join_completion_barrier():
     """Write-through: SWA H2DISK/H2REMOTE depend on SWA D2H and may join the
-    completion barrier when the control plane defers set_swa() until bytes land."""
+    completion barrier so ready publication can wait for all SWA copies."""
     mgr = _mgr(enabled=True, ssd=True, remote=True)
     g = TransferOpGraph()
     full = _full_d2h(g)
@@ -218,7 +218,7 @@ def test_put_swa_writethrough_ssd_remote_can_join_completion_barrier():
     assert {o.transfer_type for o in wt} == {TransferType.H2DISK, TransferType.H2REMOTE}
     for o in wt:
         assert o.is_swa and swa_d2h_id in o.predecessors   # depend on SWA D2H
-    # write-through ops can be barrier predecessors so delayed SWA mount happens
+    # write-through ops can be barrier predecessors so ready publication happens
     # only after CPU/SSD/REMOTE copies are complete.
     barrier = g._op_map[end]
     assert all(o.op_id in barrier.predecessors for o in wt)

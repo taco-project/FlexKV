@@ -162,9 +162,12 @@ def test_put_builds_full_plus_swa_store_chain():
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
         sm, upper_bound_blocks=4)
-    assert hit == 0 and slot < 0, "SWA PUT slot became visible before completion"
+    pending = eng.cpu_cache_engine.match(sm)
+    assert pending.num_ready_matched_blocks == 0
+    assert eng.cpu_cache_engine._get_mounted_swa_slot(pending.last_node) >= 0
+    assert hit == 0 and slot < 0, "unready mounted SWA became readable before completion"
     _complete(op_cb, cb)
-    # after completion the SWA slot is mounted on the stored tail node.
+    # after completion the mounted SWA slot becomes visible through ready matching.
     hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
         sm, upper_bound_blocks=4)
     assert hit == 4 and slot >= 0
@@ -211,6 +214,56 @@ def test_gate_off_no_swa_ops_in_control_plane_graph():
     assert len(_swa_ops(graph)) == 0, "SWA ops emitted with enable_swa_transfer=False"
     assert eng.cpu_cache_engine.swa_pool.num_used == 0  # no slot allocated
     _complete(op_cb, cb)
+
+
+def test_put_fails_when_cpu_swa_slot_unavailable():
+    """SWA-enabled PUT must not degrade into a ready full-only CPU leaf."""
+    cc = _cache_config(True)
+    cc.swa.num_slots = 0
+    eng = GlobalCacheEngine(cc, _model_config())
+    tok = _tokens(4, base=5)
+    mask = np.ones_like(tok, dtype=np.int64)
+    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
+
+    graph, return_mask, cb, op_cb, end_id = eng.put(
+        request_id=1, token_ids=tok, token_mask=mask,
+        slot_mapping=slot_mapping, dp_client_id=0)
+
+    assert end_id == -1
+    assert not return_mask.any()
+    assert len(graph._op_map) == 0
+    assert len(op_cb) == 0
+    assert eng.cpu_cache_engine.mempool.num_free_blocks == \
+        eng.cpu_cache_engine.mempool.num_total_blocks
+    assert eng.cpu_cache_engine.index.total_cached_blocks() == 0
+    cb()
+
+
+def test_put_fails_when_ssd_swa_slot_unavailable():
+    """If SSD gets a full node, its SWA slot is mandatory too."""
+    cc = _cache_config_ssd(True)
+    cc.swa.num_ssd_slots = 0
+    eng = GlobalCacheEngine(cc, _model_config())
+    tok = _tokens(4, base=6)
+    mask = np.ones_like(tok, dtype=np.int64)
+    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
+
+    graph, return_mask, cb, op_cb, end_id = eng.put(
+        request_id=1, token_ids=tok, token_mask=mask,
+        slot_mapping=slot_mapping, dp_client_id=0)
+
+    assert end_id == -1
+    assert not return_mask.any()
+    assert len(graph._op_map) == 0
+    assert len(op_cb) == 0
+    assert eng.cpu_cache_engine.swa_pool.num_used == 0
+    assert eng.cpu_cache_engine.mempool.num_free_blocks == \
+        eng.cpu_cache_engine.mempool.num_total_blocks
+    assert eng.ssd_cache_engine.mempool.num_free_blocks == \
+        eng.ssd_cache_engine.mempool.num_total_blocks
+    assert eng.cpu_cache_engine.index.total_cached_blocks() == 0
+    assert eng.ssd_cache_engine.index.total_cached_blocks() == 0
+    cb()
 
 
 # =========================================================================== #
@@ -308,8 +361,9 @@ def test_no_swa_slot_mapping_leaves_placeholder():
 def test_put_writethrough_ssd_builds_swa_h2disk():
     """PUT with an SSD tier: SWA store must write through to SSD, mirroring the
     full-KV H2DISK. The SWA graph should carry a SWA D2H (GPU->CPU) AND a SWA
-    H2DISK (CPU->SSD) that depends on the D2H (fire-and-forget), and an SSD SWA
-    slot must be allocated but not mounted until the PUT graph completes."""
+    H2DISK (CPU->SSD) that depends on the D2H (fire-and-forget). The SSD SWA
+    slot is mounted on the unready full node immediately, then becomes readable
+    only after the PUT graph completes and marks the node ready."""
     eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
     tok = _tokens(4, base=21)
     mask = np.ones_like(tok, dtype=np.int64)
@@ -323,11 +377,14 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
     swa_d2h = [o for o in swa if o.transfer_type == TransferType.D2H][0]
     swa_h2disk = [o for o in swa if o.transfer_type == TransferType.H2DISK][0]
     assert swa_d2h.op_id in swa_h2disk.predecessors, "H2DISK must depend on SWA D2H"
-    # SSD SWA is reserved but not yet visible while the write-through op is in flight.
+    # SSD SWA is mounted but not yet visible while the write-through op is in flight.
     assert eng.ssd_cache_engine.swa_pool.num_used == 1
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
     ssd_hit, _slot, _node = eng.ssd_cache_engine._resolve_swa_read_source(
         seq, upper_bound_blocks=4)
+    pending = eng.ssd_cache_engine.match(seq)
+    assert pending.num_ready_matched_blocks == 0
+    assert eng.ssd_cache_engine._get_mounted_swa_slot(pending.last_node) >= 0
     assert ssd_hit == 0
     _complete(op_cb, cb)
     ssd_hit, _slot, _node = eng.ssd_cache_engine._resolve_swa_read_source(
