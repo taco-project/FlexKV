@@ -34,8 +34,8 @@ Responsibilities (control plane only — no byte movement):
         ``D2H`` but are fire-and-forget (NOT reported), only the SWA ``D2H`` is
         reported — exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2REMOTE``.
 
-SWA is a first-class PEER op, NOT a child derived from the full-KV op (see
-the swa_design docs): the full-KV ``pending_count`` child model is PP-sibling
+SWA is a first-class PEER op, NOT a child derived from the full-KV op: the
+full-KV ``pending_count`` child model is PP-sibling
 replica fan-out, the indexer rides the full op as a layer-group sharing block
 ids, and neither fits SWA (independent slot space; the SWA-only case has no full
 op to derive from). The data-plane colleague aligned on the ``is_swa`` flag (a

@@ -147,9 +147,8 @@ class CacheEngineAccel:
         # flexkv/cache/radixtree.py); this engine only owns the SWA host-pool
         # (slot bytes + free-list) and the slot alloc/free/drain plumbing. SWA
         # and Full eviction are UNIFIED through the one tree so the two pools
-        # never drift (see deployments/swa_design/08_节点挂载SWA架构.md). This
-        # engine owns SWA initialization for its tier; init_swa() remains public
-        # for tests and explicit embedding.
+        # never drift. Thisengine owns SWA initialization for its tier; init_swa()
+        #  remains public for tests and explicit embedding.
         self.swa_pool = None
         tier_swa_config = (swa_config.for_cache_tier(device_type)
                            if swa_config is not None else None)
@@ -2325,21 +2324,10 @@ class GlobalCacheEngine:
                     )
         return block_mask_start, SWAReadSource()
 
-    def _clamp_end_to_swa(self, block_mask_start: int, block_mask_end: int,
-                          tier_match_results: Dict) -> int:
-        if not self.swa_cache.enabled or not tier_match_results:
-            return block_mask_start
-        best = 0
-        for mr in tier_match_results.values():
-            hit = int(getattr(mr, "swa_hit_blocks", 0) or 0) if mr is not None else 0
-            best = max(best, hit)
-        return max(block_mask_start, min(block_mask_end, best))
-
     # The GPU-side SWA slot is a size-1 placeholder here (window == one page ==
     # one slot on DSv4). It is rebound late from the request's swa_slot_mapping
     # via TransferOpGraph.set_swa_gpu_blocks() in launch, mirroring the Full-KV
     # GPU late-bind.
-    # See deployments/swa_design/08_节点挂载SWA架构.md §10.
 
     _SWA_GPU_PLACEHOLDER = np.array([0], dtype=np.int64)
 

@@ -18,7 +18,7 @@ SWA (sliding-window-attention) KV snapshots are mounted directly on the Full-KV
 radix nodes (hicache / sglang swa_radix_cache.py style) rather than living in a
 separate hash-keyed index. This unifies SWA and Full eviction so the two pools
 never drift apart (which would erode the reusable prefix computed as
-``usable = min(full_hit, swa_hit)``). See deployments/swa_design/08_节点挂载SWA架构.md.
+``usable = min(full_hit, swa_hit)``). 
 
 Core invariants (enforced here):
 * I0: each node holds at most one SWA, at its LAST page (its trailing window).

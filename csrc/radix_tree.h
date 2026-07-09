@@ -57,8 +57,7 @@ private:
   uint64_t swa_last_access_time = 0; // SWA LRU timestamp
   // Intrusive SWA-only LRU doubly-linked list pointers (independent of the
   // Full-KV leaf_list). Nodes carrying a live SWA slot are threaded on the
-  // tree's swa_lru list; SWA-only eviction walks it from the LRU end. See
-  // deployments/swa_design/08_节点挂载SWA架构.md §6.2.
+  // tree's swa_lru list; SWA-only eviction walks it from the LRU end.
   CRadixNode *swa_lru_prev = nullptr;
   CRadixNode *swa_lru_next = nullptr;
   bool on_swa_lru = false;

@@ -360,7 +360,7 @@ class KVManager:
     # ``get_match(swa_aware=True)``; SWA bytes move through the FlexKV transfer
     # engine (data plane). The legacy standalone-index / blob API (SWAIndex,
     # swa_put / swa_get / swa_available + node_swa_ops + SWAProductionManager)
-    # has been removed. See deployments/swa_design/08_节点挂载SWA架构.md.
+    # has been removed. 
 
     def _get_cpu_cache_engine(self):
         """Return the in-process CPU cache engine (owns the radix tree + SWA pool)."""

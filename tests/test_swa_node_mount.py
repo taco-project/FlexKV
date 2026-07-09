@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Node-mounted SWA on the radix tree — invariants I0-I4 + a workload stress run.
 
-The node-mount re-architecture (deployments/swa_design/02_控制面_节点挂载匹配与驱逐.md)
+The node-mount re-architecture
 mounts SWA on radix nodes. This file is the single home for its invariant
 coverage, in three sections:
 
