@@ -104,8 +104,57 @@ class SWAReadSource:
         return self.hit_blocks > 0 and self.host_slot >= 0 and self.node is not None
 
 
-class _NodeMountedSWAEngineMixin:
-    """Shared control-plane helpers for SWA mounted on Full-KV radix nodes."""
+class CacheEngineAccel:
+    def __init__(self,
+                 device_type: DeviceType,
+                 num_total_blocks: int,
+                 tokens_per_block: int,
+                 evict_ratio: float,
+                 hit_reward_seconds: int = 0,
+                 evict_start_threshold: float = 1.0,
+                 eviction_policy: str = "lru",
+                 event_collector: Optional[KVEventCollector] = None,
+                 metrics_collector = None,
+                 swa_config: Optional["SWAPoolConfig"] = None):
+        if not isinstance(device_type, DeviceType):
+            raise ValueError(f"Unknown device type: {device_type}")
+        if num_total_blocks <= 0:
+            raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
+        if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
+            raise ValueError(f"Invalid tokens_per_block: {tokens_per_block}, "
+                              f"tokens_per_block must be a power of 2")
+        if eviction_policy not in _VALID_EVICTION_POLICIES:
+            raise ValueError(f"Invalid eviction_policy: '{eviction_policy}'. "
+                              f"Supported policies: {sorted(_VALID_EVICTION_POLICIES)}")
+
+        self.device_type = device_type
+
+        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy)
+
+        self.mempool = Mempool(num_total_blocks=num_total_blocks)
+
+        self.tokens_per_block = tokens_per_block
+        self.num_total_blocks = num_total_blocks
+        self.evict_ratio = evict_ratio
+        self.evict_start_threshold = evict_start_threshold
+
+        self.event_collector = event_collector
+        self._metrics_collector = metrics_collector
+
+        # SWA (Sliding Window Attention) — NODE-MOUNTED on the Full-KV radix
+        # tree (hicache / sglang style), NOT a standalone index. The radix nodes
+        # carry the SWA slot / tombstone / lock (see csrc/radix_tree.h and
+        # flexkv/cache/radixtree.py); this engine only owns the SWA host-pool
+        # (slot bytes + free-list) and the slot alloc/free/drain plumbing. SWA
+        # and Full eviction are UNIFIED through the one tree so the two pools
+        # never drift (see deployments/swa_design/08_节点挂载SWA架构.md). This
+        # engine owns SWA initialization for its tier; init_swa() remains public
+        # for tests and explicit embedding.
+        self.swa_pool = None
+        tier_swa_config = (swa_config.for_cache_tier(device_type)
+                           if swa_config is not None else None)
+        if tier_swa_config is not None:
+            self.init_swa(tier_swa_config)
 
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
         """Initialize the SWA host pool for node-mounted SWA on this engine."""
@@ -116,8 +165,6 @@ class _NodeMountedSWAEngineMixin:
     def swa_enabled(self) -> bool:
         return self.swa_pool is not None
 
-    # Slot-pool lifecycle. Mounted slots are detached by the radix tree first;
-    # only unmounted slots are returned directly to the host pool here.
     def _alloc_swa_slot(self) -> int:
         """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
         if self.swa_pool is None:
@@ -142,11 +189,6 @@ class _NodeMountedSWAEngineMixin:
         for slot in self.index.drain_freed_swa_slots():
             self._free_unmounted_swa_slot(slot)
 
-    def _evict_swa_slots(self, num_swa_evicted: int) -> int:
-        raise NotImplementedError
-
-    # Store path. A SWA slot is reserved only after Full-KV insert returns the
-    # radix node whose trailing page owns the SWA window.
     def _mount_swa_slot(self, node, slot: int) -> None:
         """Mount ``slot`` on the node whose last page owns the SWA window."""
         if node is None:
@@ -182,12 +224,6 @@ class _NodeMountedSWAEngineMixin:
         except Exception:
             return -1
         return int(getattr(node, "swa_host_slot", -1))
-
-    # Read path. The normal path reuses the SWA metadata already produced by the
-    # Full-KV match; _probe_swa_source is only the bounded fallback.
-    def _probe_swa_source(self, sequence_meta: SequenceMeta,
-                          upper_bound_blocks: int):
-        raise NotImplementedError
 
     def _pin_swa_node(self, node) -> None:
         if node is None:
@@ -260,59 +296,6 @@ class _NodeMountedSWAEngineMixin:
         if lock_for_load:
             self._pin_swa_node(swa_node)
         return swa_hit, slot, swa_node
-
-
-class CacheEngineAccel(_NodeMountedSWAEngineMixin):
-    def __init__(self,
-                 device_type: DeviceType,
-                 num_total_blocks: int,
-                 tokens_per_block: int,
-                 evict_ratio: float,
-                 hit_reward_seconds: int = 0,
-                 evict_start_threshold: float = 1.0,
-                 eviction_policy: str = "lru",
-                 event_collector: Optional[KVEventCollector] = None,
-                 metrics_collector = None,
-                 swa_config: Optional["SWAPoolConfig"] = None):
-        if not isinstance(device_type, DeviceType):
-            raise ValueError(f"Unknown device type: {device_type}")
-        if num_total_blocks <= 0:
-            raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
-        if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
-            raise ValueError(f"Invalid tokens_per_block: {tokens_per_block}, "
-                              f"tokens_per_block must be a power of 2")
-        if eviction_policy not in _VALID_EVICTION_POLICIES:
-            raise ValueError(f"Invalid eviction_policy: '{eviction_policy}'. "
-                              f"Supported policies: {sorted(_VALID_EVICTION_POLICIES)}")
-
-        self.device_type = device_type
-
-        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy)
-
-        self.mempool = Mempool(num_total_blocks=num_total_blocks)
-
-        self.tokens_per_block = tokens_per_block
-        self.num_total_blocks = num_total_blocks
-        self.evict_ratio = evict_ratio
-        self.evict_start_threshold = evict_start_threshold
-
-        self.event_collector = event_collector
-        self._metrics_collector = metrics_collector
-
-        # SWA (Sliding Window Attention) — NODE-MOUNTED on the Full-KV radix
-        # tree (hicache / sglang style), NOT a standalone index. The radix nodes
-        # carry the SWA slot / tombstone / lock (see csrc/radix_tree.h and
-        # flexkv/cache/radixtree.py); this engine only owns the SWA host-pool
-        # (slot bytes + free-list) and the slot alloc/free/drain plumbing. SWA
-        # and Full eviction are UNIFIED through the one tree so the two pools
-        # never drift (see deployments/swa_design/08_节点挂载SWA架构.md). This
-        # engine owns SWA initialization for its tier; init_swa() remains public
-        # for tests and explicit embedding.
-        self.swa_pool = None
-        tier_swa_config = (swa_config.for_cache_tier(device_type)
-                           if swa_config is not None else None)
-        if tier_swa_config is not None:
-            self.init_swa(tier_swa_config)
 
     def _evict_swa_slots(self, num_swa_evicted: int) -> int:
         """Evict node-mounted SWA slots through the C++ radix tree."""
@@ -494,7 +477,7 @@ class CacheEngineAccel(_NodeMountedSWAEngineMixin):
         self.mempool.recycle_blocks(physical_blocks)
         self._drain_unmounted_swa_slots()
 
-class CacheEngine(_NodeMountedSWAEngineMixin):
+class CacheEngine:
     def __init__(self,
                  device_type: DeviceType,
                  num_total_blocks: int,
@@ -531,13 +514,154 @@ class CacheEngine(_NodeMountedSWAEngineMixin):
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
-        # Node-mounted SWA host pool (non-accel Python RadixTreeIndex mirror).
-        # See CacheEngineAccel for the semantics.
+        # Legacy Python mirror. Keep the SWA helpers local to this class; the
+        # C++ CacheEngineAccel path is the maintained path.
         self.swa_pool = None
         tier_swa_config = (swa_config.for_cache_tier(device_type)
                            if swa_config is not None else None)
         if tier_swa_config is not None:
             self.init_swa(tier_swa_config)
+
+    def init_swa(self, swa_config: "SWAPoolConfig") -> None:
+        """Initialize the SWA host pool for node-mounted SWA on this engine."""
+        from flexkv.swa.swa_host_pool import SWAHostPool
+        self.swa_pool = SWAHostPool(swa_config)
+
+    @property
+    def swa_enabled(self) -> bool:
+        return self.swa_pool is not None
+
+    def _alloc_swa_slot(self) -> int:
+        """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
+        if self.swa_pool is None:
+            return -1
+        slot = self.swa_pool.allocate()
+        if slot is not None:
+            return slot
+        self._evict_swa_slots(1)
+        slot = self.swa_pool.allocate()
+        return slot if slot is not None else -1
+
+    def _free_unmounted_swa_slot(self, slot: int) -> None:
+        """Return a slot that is not mounted on any radix node."""
+        if self.swa_pool is None or slot is None or slot < 0:
+            return
+        self.swa_pool.free(int(slot))
+
+    def _drain_unmounted_swa_slots(self) -> None:
+        """Return slots detached by radix-tree structural changes to the pool."""
+        if self.swa_pool is None:
+            return
+        for slot in self.index.drain_freed_swa_slots():
+            self._free_unmounted_swa_slot(slot)
+
+    def _mount_swa_slot(self, node, slot: int) -> None:
+        """Mount ``slot`` on the node whose last page owns the SWA window."""
+        if node is None:
+            return
+        self.index.set_swa(node, int(slot))
+
+    def _reserve_swa_tail_slot(self, node) -> int:
+        """Allocate and mount an SWA slot for a newly inserted Full-KV tail."""
+        slot = self._reserve_unmounted_swa_slot()
+        if slot >= 0:
+            self._mount_reserved_swa_slot(node, slot)
+        return slot
+
+    def _reserve_unmounted_swa_slot(self) -> int:
+        """Reserve an SWA slot without making it visible in the radix tree."""
+        if self.swa_pool is None:
+            return -1
+        return self._alloc_swa_slot()
+
+    def _mount_reserved_swa_slot(self, node, slot: int) -> None:
+        if node is None or slot is None or slot < 0:
+            return
+        self._mount_swa_slot(node, slot)
+        self._drain_unmounted_swa_slots()
+
+    @staticmethod
+    def _get_mounted_swa_slot(node) -> int:
+        if node is None:
+            return -1
+        try:
+            if not node.has_swa():
+                return -1
+        except Exception:
+            return -1
+        return int(getattr(node, "swa_host_slot", -1))
+
+    def _pin_swa_node(self, node) -> None:
+        if node is None:
+            return
+        full_locked = False
+        try:
+            self.index.lock(node)
+            full_locked = True
+        except Exception:
+            try:
+                node.lock()
+                full_locked = True
+            except AttributeError:
+                node.lock_cnt += 1
+                full_locked = True
+        try:
+            node.inc_swa_lock_ref()
+        except AttributeError:
+            node.swa_lock_ref += 1
+        except Exception:
+            if full_locked:
+                try:
+                    self.index.unlock(node)
+                except Exception:
+                    try:
+                        node.unlock()
+                    except AttributeError:
+                        node.lock_cnt -= 1
+            raise
+
+    def _resolve_swa_read_source(self,
+                                 sequence_meta: SequenceMeta,
+                                 upper_bound_blocks: int,
+                                 match_result=None,
+                                 required_hit_blocks: Optional[int] = None,
+                                 lock_for_load: bool = False,
+                                 ) -> Tuple[int, int, Optional[object]]:
+        """Return (hit blocks, host slot, source node) for a bounded SWA GET."""
+        if self.swa_pool is None or upper_bound_blocks <= 0:
+            return 0, -1, None
+        upper_bound_blocks = int(upper_bound_blocks)
+        if required_hit_blocks is not None:
+            required_hit_blocks = int(required_hit_blocks)
+            if required_hit_blocks <= 0 or required_hit_blocks > upper_bound_blocks:
+                return 0, -1, None
+
+        mr = match_result
+        swa_node = getattr(mr, "last_swa_node", None) if mr is not None else None
+        swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0) if mr is not None else 0
+
+        if (swa_node is not None and swa_hit > upper_bound_blocks) or \
+                (required_hit_blocks is not None and swa_hit != required_hit_blocks):
+            mr = None
+
+        if mr is None:
+            probe_bound = required_hit_blocks if required_hit_blocks is not None else upper_bound_blocks
+            mr = self._probe_swa_source(sequence_meta, probe_bound)
+            swa_node = getattr(mr, "last_swa_node", None) if mr is not None else None
+            swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0) if mr is not None else 0
+
+        if swa_node is None or swa_hit <= 0 or swa_hit > upper_bound_blocks:
+            return 0, -1, None
+        if required_hit_blocks is not None and swa_hit != required_hit_blocks:
+            return 0, -1, None
+        slot = self._get_mounted_swa_slot(swa_node)
+        if slot < 0:
+            return 0, -1, None
+
+        self.index.promote_swa(swa_node)
+        if lock_for_load:
+            self._pin_swa_node(swa_node)
+        return swa_hit, slot, swa_node
 
     def _evict_swa_slots(self, num_swa_evicted: int) -> int:
         """Evict node-mounted SWA slots through the Python radix tree."""
@@ -2201,6 +2325,16 @@ class GlobalCacheEngine:
                     )
         return block_mask_start, SWAReadSource()
 
+    def _clamp_end_to_swa(self, block_mask_start: int, block_mask_end: int,
+                          tier_match_results: Dict) -> int:
+        if not self.swa_cache.enabled or not tier_match_results:
+            return block_mask_start
+        best = 0
+        for mr in tier_match_results.values():
+            hit = int(getattr(mr, "swa_hit_blocks", 0) or 0) if mr is not None else 0
+            best = max(best, hit)
+        return max(block_mask_start, min(block_mask_end, best))
+
     # The GPU-side SWA slot is a size-1 placeholder here (window == one page ==
     # one slot on DSv4). It is rebound late from the request's swa_slot_mapping
     # via TransferOpGraph.set_swa_gpu_blocks() in launch, mirroring the Full-KV
@@ -2213,12 +2347,13 @@ class GlobalCacheEngine:
         """SWA H2D completion callback: release the source pin and free any
         transient CPU staging slot.
 
-        For a CPU-sourced load, ``node`` is the matched CPU SWA node. For a
-        staged (SSD/REMOTE) source, ``node`` is the source-tier node and
-        ``staging_slot`` is the transient CPU SWA slot used as the DISK2H/
-        REMOTE2H destination. The load pin is a paired Full+SWA lock, so release
-        both refs together; use dec_swa_lock_ref rather than dec_swa_lock_only so
-        the loaded window stays cached for future reuse. No-op on absent parts."""
+        For a CPU-sourced load, ``node`` is the matched CPU SWA node and its pin
+        is dropped with the plain dec (dec_swa_lock_ref, NOT dec_swa_lock_only):
+        the loaded window stays cached for future reuse. For a staged
+        (SSD/REMOTE) source, ``node`` is the source-tier node (same pin release)
+        and ``staging_slot`` is the transient CPU SWA slot used as the DISK2H/
+        REMOTE2H destination — it is unmounted (not a cached entry), so free it
+        back to the CPU SWA pool. No-op on parts that are absent."""
         try:
             if node is not None and getattr(node, "swa_lock_ref", 0) > 0:
                 node.dec_swa_lock_ref()

@@ -144,10 +144,11 @@ class HierarchyLRCacheEngine:
             self._free_unmounted_swa_slot(slot)
 
     def _resolve_swa_read_source(self,
-                         sequence_meta: "SequenceMeta",
-                         upper_bound_blocks: int,
-                         lock_for_load: bool = False,
-                         match_result=None):
+                                 sequence_meta: "SequenceMeta",
+                                 upper_bound_blocks: int,
+                                 match_result=None,
+                                 required_hit_blocks: Optional[int] = None,
+                                 lock_for_load: bool = False):
         """Node-mounted SWA hit resolver no-op for hierarchical remote indexes."""
         if self.swa_pool is None or upper_bound_blocks <= 0:
             return 0, -1, None
