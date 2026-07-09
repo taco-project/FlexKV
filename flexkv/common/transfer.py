@@ -610,6 +610,19 @@ def _merge_swa_ops(ops: List[TransferOp], transfer_type: TransferType,
             op_callback_dict[merged_op.op_id] = _make_combined_callback(callbacks)
     return merged_op
 
+def _bucket_has(*types: TransferType, ops_by_type: Dict[TransferType, List[TransferOp]],
+                     swa_ops_by_type: Dict[TransferType, List[TransferOp]]) -> bool:
+    return any(ops_by_type[t] or swa_ops_by_type[t] for t in types)
+
+# dp_client_id for VIRTUAL sinks. Prefer main-KV, fall back to SWA.
+def _pick_dp_client_id(ops_by_type: Dict[TransferType, List[TransferOp]],
+                       swa_ops_by_type: Dict[TransferType, List[TransferOp]]) -> int:
+    for tt in (TransferType.H2D, TransferType.D2H):
+        if ops_by_type[tt]:
+            return ops_by_type[tt][0].dp_client_id
+        if swa_ops_by_type[tt]:
+            return swa_ops_by_type[tt][0].dp_client_id
+    return 0
 
 def merge_to_batch_graph(batch_id: int,
                          transfer_graphs: List[TransferOpGraph],
@@ -645,15 +658,7 @@ def merge_to_batch_graph(batch_id: int,
 
     ops_by_type: Dict[TransferType, List[TransferOp]] = {}
     callbacks_by_type: Dict[TransferType, List[Callable]] = {}
-    swa_h2d_ops: List[TransferOp] = []
-    swa_disk2h_ops: List[TransferOp] = []
-    swa_d2h_ops: List[TransferOp] = []
-    swa_h2disk_ops: List[TransferOp] = []
-    # Mooncake SWA lanes: one tail-hash key + one CPU slot per request. Never
-    # enter the layerwise fused op — mooncake traffic is scheduled ahead of the
-    # layerwise stage as a separate prefetch / write-back batch.
-    swa_h2remote_ops: List[TransferOp] = []
-    swa_remote2h_ops: List[TransferOp] = []
+    swa_ops_by_type: Dict[TransferType, List[TransferOp]] = {}
     swa_callbacks_by_type: Dict[TransferType, List[Callable]] = {}
     supported_types = {TransferType.DISK2H, TransferType.H2D,
                        TransferType.D2H, TransferType.H2DISK,
@@ -662,234 +667,287 @@ def merge_to_batch_graph(batch_id: int,
     for tt in supported_types:
         ops_by_type[tt] = []
         callbacks_by_type[tt] = []
+        swa_ops_by_type[tt] = []
         swa_callbacks_by_type[tt] = []
 
     for graph in transfer_graphs:
         for op_id, op in graph._op_map.items():
             if op.transfer_type == TransferType.VIRTUAL:
                 continue
-            if getattr(op, "is_swa", False):
-                if op.transfer_type == TransferType.H2D:
-                    swa_h2d_ops.append(op)
-                elif op.transfer_type == TransferType.DISK2H:
-                    swa_disk2h_ops.append(op)
-                elif op.transfer_type == TransferType.D2H:
-                    swa_d2h_ops.append(op)
-                elif op.transfer_type == TransferType.H2DISK:
-                    swa_h2disk_ops.append(op)
-                elif op.transfer_type == TransferType.H2REMOTE:
-                    swa_h2remote_ops.append(op)
-                elif op.transfer_type == TransferType.REMOTE2H:
-                    swa_remote2h_ops.append(op)
-                else:
-                    raise NotImplementedError(
-                        f"Batch merge does not support SWA transfer type: {op.transfer_type}."
-                    )
-                if op.op_id in op_callback_dict:
-                    swa_callbacks_by_type[op.transfer_type].append(
-                        op_callback_dict[op.op_id])
-                continue
+ 
             if op.transfer_type not in supported_types:
                 raise NotImplementedError(
                     f"Batch merge does not support transfer type: {op.transfer_type}. "
                     f"Only DISK2H, H2D, D2H, H2DISK, REMOTE2H, and H2REMOTE are supported."
                 )
-            ops_by_type[op.transfer_type].append(op)
-            if op.op_id in op_callback_dict:
-                callbacks_by_type[op.transfer_type].append(op_callback_dict[op.op_id])
+            if getattr(op, "is_swa", False):
+                # swa path
+                swa_ops_by_type[op.transfer_type].append(op)
+                if op.op_id in op_callback_dict:
+                    swa_callbacks_by_type[op.transfer_type].append(op_callback_dict[op.op_id])
+            else:
+                # main kv path
+                ops_by_type[op.transfer_type].append(op)
+                if op.op_id in op_callback_dict:
+                    callbacks_by_type[op.transfer_type].append(op_callback_dict[op.op_id])
 
     new_op_callback_dict: Dict[int, Callable] = {}
-    # Layerwise path builds a LAYERWISE op (not standalone DISK2H/H2D); avoid
-    # registering callbacks on throwaway merged ops.
+    # Layerwise fuses local DISK2H/H2D into a single LAYERWISE op and
+    # re-attaches a combined callback on that op, so per-op callbacks land in
+    # a throwaway dict here.
     layerwise_tmp_callback_dict: Dict[int, Callable] = {}
+    local_get_cb_dict = layerwise_tmp_callback_dict if layerwise_transfer \
+        else new_op_callback_dict
 
-    def _concat_swa_block_ids(ops: List[TransferOp]) -> Tuple[np.ndarray, np.ndarray]:
-        if not ops:
-            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
-        return (
-            np.concatenate([op.src_block_ids for op in ops]),
-            np.concatenate([op.dst_block_ids for op in ops]),
-        )
 
-    # GET path: DISK2H -> H2D
-    merged_disk2h_op = _merge_ops(
-        ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
-        merged_graph, callbacks_by_type[TransferType.DISK2H],
-        layerwise_tmp_callback_dict if layerwise_transfer else new_op_callback_dict)
-    merged_h2d_op = _merge_ops(
-        ops_by_type[TransferType.H2D], TransferType.H2D,
-        merged_graph, callbacks_by_type[TransferType.H2D],
-        layerwise_tmp_callback_dict if layerwise_transfer else new_op_callback_dict)
+    has_get = _bucket_has(TransferType.H2D, TransferType.DISK2H, TransferType.REMOTE2H,
+                          ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
+    has_put = _bucket_has(TransferType.D2H, TransferType.H2DISK, TransferType.H2REMOTE,
+                          ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
+    has_mooncake = _bucket_has(TransferType.REMOTE2H, TransferType.H2REMOTE,
+                              ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
 
     if layerwise_transfer:
-        if merged_h2d_op is not None or swa_h2d_ops or swa_disk2h_ops:
-            swa_h2d_src, swa_h2d_dst = _concat_swa_block_ids(swa_h2d_ops)
-            swa_disk2h_src, swa_disk2h_dst = _concat_swa_block_ids(swa_disk2h_ops)
-            if ops_by_type[TransferType.H2D]:
-                dp_client_id = ops_by_type[TransferType.H2D][0].dp_client_id
-            elif swa_h2d_ops:
-                dp_client_id = swa_h2d_ops[0].dp_client_id
-            elif swa_disk2h_ops:
-                dp_client_id = swa_disk2h_ops[0].dp_client_id
-            else:
-                dp_client_id = 0
-            layerwise_transfer_op = LayerwiseTransferOp(
-                graph_id=merged_graph.graph_id,
-                src_block_ids_h2d=merged_h2d_op.src_block_ids if merged_h2d_op is not None
-                    else np.array([], dtype=np.int64),
-                dst_block_ids_h2d=merged_h2d_op.dst_block_ids if merged_h2d_op is not None
-                    else np.array([], dtype=np.int64),
-                src_block_ids_disk2h=merged_disk2h_op.src_block_ids \
-                    if merged_disk2h_op is not None \
-                    else np.array([], dtype=np.int64),
-                dst_block_ids_disk2h=merged_disk2h_op.dst_block_ids \
-                    if merged_disk2h_op is not None \
-                    else np.array([], dtype=np.int64),
-                swa_src_block_ids_h2d=swa_h2d_src,
-                swa_dst_block_ids_h2d=swa_h2d_dst,
-                swa_src_block_ids_disk2h=swa_disk2h_src,
-                swa_dst_block_ids_disk2h=swa_disk2h_dst,
-                dp_client_id=dp_client_id,
-                counter_id=counter_id,
-            )
-            merged_graph.add_transfer_op(layerwise_transfer_op)
-            # LAYERWISE completes atomically in the worker; fire main + SWA
-            # per-op readiness callbacks together on the fused op id.
-            layerwise_callbacks: List[Callable] = []
-            layerwise_callbacks.extend(callbacks_by_type[TransferType.DISK2H])
-            layerwise_callbacks.extend(callbacks_by_type[TransferType.H2D])
-            layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.DISK2H])
-            layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.H2D])
-            _attach_combined_callback(
-                layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
-        batch_end_op_id = -1
-        # new_op_callback_dict.clear()
+        assert has_get, "layerwise batch must contain GET ops"
+        assert not has_put, "layerwise batch must not mix PUT ops"
+        assert not has_mooncake, \
+            "layerwise batch must not carry mooncake ops (routed via prefetch stage)"
     else:
-        if merged_disk2h_op is not None:
-            merged_graph.add_transfer_op(merged_disk2h_op)
-        if merged_h2d_op is not None:
-            merged_graph.add_transfer_op(merged_h2d_op)
-        if merged_disk2h_op is not None and merged_h2d_op is not None:
-            merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
+        # Non-layerwise: either GET or PUT, never both.
+        assert not (has_get and has_put), \
+            "batch merge does not support mixed GET/PUT ops in the same batch"
 
-        # Main-KV mooncake lanes (H2REMOTE / REMOTE2H). Hashes are preserved
-        # by _merge_ops in block-id order.
+
+
+    dp_client_id = _pick_dp_client_id(ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
+
+    # ==================================================================
+    # GET path (layerwise or non-layerwise)
+    # ==================================================================
+    if has_get and layerwise_transfer:
+        # Layerwise GET: fuse local main + SWA (DISK2H/H2D) into one
+        # LAYERWISE op. Per upstream contract there is at least H2D on
+        # either the main or SWA side; DISK2H may or may not be present.
+        merged_disk2h_op = _merge_ops(
+            ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
+            merged_graph, callbacks_by_type[TransferType.DISK2H],
+            local_get_cb_dict)
+        merged_h2d_op = _merge_ops(
+            ops_by_type[TransferType.H2D], TransferType.H2D,
+            merged_graph, callbacks_by_type[TransferType.H2D],
+            local_get_cb_dict)
+        merged_swa_disk2h_op = _merge_swa_ops(
+            swa_ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
+            merged_graph, swa_callbacks_by_type[TransferType.DISK2H],
+            local_get_cb_dict)
+        merged_swa_h2d_op = _merge_swa_ops(
+            swa_ops_by_type[TransferType.H2D], TransferType.H2D,
+            merged_graph, swa_callbacks_by_type[TransferType.H2D],
+            local_get_cb_dict)
+
+        assert merged_h2d_op is not None or merged_swa_h2d_op is not None, \
+            "layerwise GET requires an H2D (main or SWA)"
+
+        layerwise_transfer_op = LayerwiseTransferOp(
+            graph_id=merged_graph.graph_id,
+            src_block_ids_h2d=merged_h2d_op.src_block_ids if merged_h2d_op is not None
+                else np.array([], dtype=np.int64),
+            dst_block_ids_h2d=merged_h2d_op.dst_block_ids if merged_h2d_op is not None
+                else np.array([], dtype=np.int64),
+            src_block_ids_disk2h=merged_disk2h_op.src_block_ids
+                if merged_disk2h_op is not None
+                else np.array([], dtype=np.int64),
+            dst_block_ids_disk2h=merged_disk2h_op.dst_block_ids
+                if merged_disk2h_op is not None
+                else np.array([], dtype=np.int64),
+            swa_src_block_ids_h2d=merged_swa_h2d_op.src_block_ids
+                if merged_swa_h2d_op is not None
+                else np.array([], dtype=np.int64),
+            swa_dst_block_ids_h2d=merged_swa_h2d_op.dst_block_ids
+                if merged_swa_h2d_op is not None
+                else np.array([], dtype=np.int64),
+            swa_src_block_ids_disk2h=merged_swa_disk2h_op.src_block_ids
+                if merged_swa_disk2h_op is not None
+                else np.array([], dtype=np.int64),
+            swa_dst_block_ids_disk2h=merged_swa_disk2h_op.dst_block_ids
+                if merged_swa_disk2h_op is not None
+                else np.array([], dtype=np.int64),
+            dp_client_id=dp_client_id,
+            counter_id=counter_id,
+        )
+        merged_graph.add_transfer_op(layerwise_transfer_op)
+        # LAYERWISE completes atomically in the worker; fire main + SWA
+        # per-op readiness callbacks together on the fused op id.
+        layerwise_callbacks: List[Callable] = []
+        layerwise_callbacks.extend(callbacks_by_type[TransferType.DISK2H])
+        layerwise_callbacks.extend(callbacks_by_type[TransferType.H2D])
+        layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.DISK2H])
+        layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.H2D])
+        _attach_combined_callback(
+            layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
+        # Single sink: no VIRTUAL needed. Mooncake ops never coexist here.
+        batch_end_op_id = layerwise_transfer_op.op_id
+
+    elif has_get:
+        # Non-layerwise GET: separate lanes.
+        merged_disk2h_op = _merge_ops(
+            ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
+            merged_graph, callbacks_by_type[TransferType.DISK2H],
+            new_op_callback_dict)
+        merged_h2d_op = _merge_ops(
+            ops_by_type[TransferType.H2D], TransferType.H2D,
+            merged_graph, callbacks_by_type[TransferType.H2D],
+            new_op_callback_dict)
         merged_remote2h_op = _merge_ops(
             ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
             merged_graph, callbacks_by_type[TransferType.REMOTE2H],
+            new_op_callback_dict)
+        merged_swa_disk2h_op = _merge_swa_ops(
+            swa_ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
+            merged_graph, swa_callbacks_by_type[TransferType.DISK2H],
+            new_op_callback_dict)
+        merged_swa_h2d_op = _merge_swa_ops(
+            swa_ops_by_type[TransferType.H2D], TransferType.H2D,
+            merged_graph, swa_callbacks_by_type[TransferType.H2D],
+            new_op_callback_dict)
+        merged_swa_remote2h_op = _merge_swa_ops(
+            swa_ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
+            merged_graph, swa_callbacks_by_type[TransferType.REMOTE2H],
+            new_op_callback_dict)
+
+        # Attach ops to graph.
+        for op in (merged_disk2h_op, merged_h2d_op, merged_remote2h_op,
+                   merged_swa_disk2h_op, merged_swa_h2d_op, merged_swa_remote2h_op):
+            if op is not None:
+                merged_graph.add_transfer_op(op)
+
+        # Dependency edges. Main-KV: (DISK2H, REMOTE2H) -> H2D; SWA analog.
+        if merged_h2d_op is not None:
+            if merged_disk2h_op is not None:
+                merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
+            if merged_remote2h_op is not None:
+                merged_graph.add_dependency(merged_h2d_op.op_id, merged_remote2h_op.op_id)
+        if merged_swa_h2d_op is not None:
+            if merged_swa_disk2h_op is not None:
+                merged_graph.add_dependency(
+                    merged_swa_h2d_op.op_id, merged_swa_disk2h_op.op_id)
+            if merged_swa_remote2h_op is not None:
+                merged_graph.add_dependency(
+                    merged_swa_h2d_op.op_id, merged_swa_remote2h_op.op_id)
+
+        # GET sinks are H2D (main / SWA). Staging ops (DISK2H / REMOTE2H) are
+        # upstream and covered by the dependency edges above.
+        get_sinks: List[int] = []
+        if merged_h2d_op is not None:
+            get_sinks.append(merged_h2d_op.op_id)
+        if merged_swa_h2d_op is not None:
+            get_sinks.append(merged_swa_h2d_op.op_id)
+        # Fallback: if the batch had ONLY prefetch-side (mooncake REMOTE2H)
+        # with no H2D — treat REMOTE2H as the sink.
+        if not get_sinks:
+            for op in (merged_remote2h_op, merged_swa_remote2h_op,
+                       merged_disk2h_op, merged_swa_disk2h_op):
+                if op is not None:
+                    get_sinks.append(op.op_id)
+                    break
+        batch_end_op_id = _add_batch_sink(merged_graph, get_sinks, dp_client_id)
+
+    # ==================================================================
+    # PUT path
+    # ==================================================================
+    elif has_put:
+        merged_d2h_op = _merge_ops(
+            ops_by_type[TransferType.D2H], TransferType.D2H,
+            merged_graph, callbacks_by_type[TransferType.D2H],
+            new_op_callback_dict)
+        merged_h2disk_op = _merge_ops(
+            ops_by_type[TransferType.H2DISK], TransferType.H2DISK,
+            merged_graph, callbacks_by_type[TransferType.H2DISK],
             new_op_callback_dict)
         merged_h2remote_op = _merge_ops(
             ops_by_type[TransferType.H2REMOTE], TransferType.H2REMOTE,
             merged_graph, callbacks_by_type[TransferType.H2REMOTE],
             new_op_callback_dict)
-        if merged_remote2h_op is not None:
-            merged_graph.add_transfer_op(merged_remote2h_op)
-        if merged_h2remote_op is not None:
-            merged_graph.add_transfer_op(merged_h2remote_op)
-
-        merged_swa_disk2h_op = _merge_swa_ops(
-            swa_disk2h_ops, TransferType.DISK2H,
-            merged_graph, swa_callbacks_by_type[TransferType.DISK2H],
-            new_op_callback_dict)
-        merged_swa_h2d_op = _merge_swa_ops(
-            swa_h2d_ops, TransferType.H2D,
-            merged_graph, swa_callbacks_by_type[TransferType.H2D],
-            new_op_callback_dict)
-        if merged_swa_disk2h_op is not None:
-            merged_graph.add_transfer_op(merged_swa_disk2h_op)
-        if merged_swa_h2d_op is not None:
-            merged_graph.add_transfer_op(merged_swa_h2d_op)
-        if merged_swa_disk2h_op is not None and merged_swa_h2d_op is not None:
-            merged_graph.add_dependency(
-                merged_swa_h2d_op.op_id, merged_swa_disk2h_op.op_id)
-
-        # SWA mooncake lanes — dedicated merger preserves tail-hash lists.
-        merged_swa_remote2h_op = _merge_swa_ops(
-            swa_remote2h_ops, TransferType.REMOTE2H,
-            merged_graph, swa_callbacks_by_type[TransferType.REMOTE2H],
-            new_op_callback_dict)
-        merged_swa_h2remote_op = _merge_swa_ops(
-            swa_h2remote_ops, TransferType.H2REMOTE,
-            merged_graph, swa_callbacks_by_type[TransferType.H2REMOTE],
-            new_op_callback_dict)
-        if merged_swa_remote2h_op is not None:
-            merged_graph.add_transfer_op(merged_swa_remote2h_op)
-        if merged_swa_h2remote_op is not None:
-            merged_graph.add_transfer_op(merged_swa_h2remote_op)
-
-        # PUT path: D2H -> H2DISK
-        merged_d2h_op = _merge_ops(ops_by_type[TransferType.D2H], TransferType.D2H,
-                                   merged_graph, callbacks_by_type[TransferType.D2H], new_op_callback_dict)
-        merged_h2disk_op = _merge_ops(ops_by_type[TransferType.H2DISK], TransferType.H2DISK,
-                                      merged_graph, callbacks_by_type[TransferType.H2DISK], new_op_callback_dict)
         merged_swa_d2h_op = _merge_swa_ops(
-            swa_d2h_ops, TransferType.D2H,
+            swa_ops_by_type[TransferType.D2H], TransferType.D2H,
             merged_graph, swa_callbacks_by_type[TransferType.D2H],
             new_op_callback_dict)
         merged_swa_h2disk_op = _merge_swa_ops(
-            swa_h2disk_ops, TransferType.H2DISK,
+            swa_ops_by_type[TransferType.H2DISK], TransferType.H2DISK,
             merged_graph, swa_callbacks_by_type[TransferType.H2DISK],
             new_op_callback_dict)
+        merged_swa_h2remote_op = _merge_swa_ops(
+            swa_ops_by_type[TransferType.H2REMOTE], TransferType.H2REMOTE,
+            merged_graph, swa_callbacks_by_type[TransferType.H2REMOTE],
+            new_op_callback_dict)
+
+        for op in (merged_d2h_op, merged_h2disk_op, merged_h2remote_op,
+                   merged_swa_d2h_op, merged_swa_h2disk_op, merged_swa_h2remote_op):
+            if op is not None:
+                merged_graph.add_transfer_op(op)
+
+        # Dependency edges. Main-KV: D2H -> (H2DISK, H2REMOTE); SWA analog.
         if merged_d2h_op is not None:
-            merged_graph.add_transfer_op(merged_d2h_op)
-        if merged_h2disk_op is not None:
-            merged_graph.add_transfer_op(merged_h2disk_op)
+            if merged_h2disk_op is not None:
+                merged_graph.add_dependency(merged_h2disk_op.op_id, merged_d2h_op.op_id)
+            if merged_h2remote_op is not None:
+                merged_graph.add_dependency(merged_h2remote_op.op_id, merged_d2h_op.op_id)
         if merged_swa_d2h_op is not None:
-            merged_graph.add_transfer_op(merged_swa_d2h_op)
-        if merged_swa_h2disk_op is not None:
-            merged_graph.add_transfer_op(merged_swa_h2disk_op)
-        if merged_d2h_op is not None and merged_h2disk_op is not None:
-            merged_graph.add_dependency(merged_h2disk_op.op_id, merged_d2h_op.op_id)
-        if merged_swa_d2h_op is not None and merged_swa_h2disk_op is not None:
-            merged_graph.add_dependency(merged_swa_h2disk_op.op_id, merged_swa_d2h_op.op_id)
+            if merged_swa_h2disk_op is not None:
+                merged_graph.add_dependency(
+                    merged_swa_h2disk_op.op_id, merged_swa_d2h_op.op_id)
+            if merged_swa_h2remote_op is not None:
+                merged_graph.add_dependency(
+                    merged_swa_h2remote_op.op_id, merged_swa_d2h_op.op_id)
 
-        # Mooncake dependency edges.
-        # GET: REMOTE2H -> H2D so the GPU write waits for remote data landing in CPU.
-        if merged_remote2h_op is not None and merged_h2d_op is not None:
-            merged_graph.add_dependency(merged_h2d_op.op_id, merged_remote2h_op.op_id)
-        # PUT: D2H -> H2REMOTE so the remote upload waits for CPU data landing.
-        if merged_d2h_op is not None and merged_h2remote_op is not None:
-            merged_graph.add_dependency(merged_h2remote_op.op_id, merged_d2h_op.op_id)
-        # GET (SWA): SWA REMOTE2H -> SWA H2D.
-        if merged_swa_remote2h_op is not None and merged_swa_h2d_op is not None:
-            merged_graph.add_dependency(
-                merged_swa_h2d_op.op_id, merged_swa_remote2h_op.op_id)
-        # PUT (SWA): SWA D2H -> SWA H2REMOTE.
-        if merged_swa_d2h_op is not None and merged_swa_h2remote_op is not None:
-            merged_graph.add_dependency(
-                merged_swa_h2remote_op.op_id, merged_swa_d2h_op.op_id)
+        # PUT sinks are D2H (main / SWA). H2DISK / H2REMOTE are fire-and-forget
+        # after D2H completes (per design doc).
+        put_sinks: List[int] = []
+        if merged_d2h_op is not None:
+            put_sinks.append(merged_d2h_op.op_id)
+        if merged_swa_d2h_op is not None:
+            put_sinks.append(merged_swa_d2h_op.op_id)
+        # Fallback: only write-back staging (rare, e.g. write-through-only).
+        if not put_sinks:
+            for op in (merged_h2disk_op, merged_swa_h2disk_op,
+                       merged_h2remote_op, merged_swa_h2remote_op):
+                if op is not None:
+                    put_sinks.append(op.op_id)
+                    break
+        batch_end_op_id = _add_batch_sink(merged_graph, put_sinks, dp_client_id)
 
-        # batch_end_op_id: GET terminates at H2D lane; PUT at H2DISK/H2REMOTE lane;
-        # main-KV before SWA; mooncake included alongside its local counterpart.
-        if merged_h2d_op is not None:
-            batch_end_op_id = merged_h2d_op.op_id
-        elif merged_disk2h_op is not None:
-            batch_end_op_id = merged_disk2h_op.op_id
-        elif merged_remote2h_op is not None:
-            batch_end_op_id = merged_remote2h_op.op_id
-        elif merged_swa_h2d_op is not None:
-            batch_end_op_id = merged_swa_h2d_op.op_id
-        elif merged_swa_disk2h_op is not None:
-            batch_end_op_id = merged_swa_disk2h_op.op_id
-        elif merged_swa_remote2h_op is not None:
-            batch_end_op_id = merged_swa_remote2h_op.op_id
-        elif merged_h2disk_op is not None:
-            batch_end_op_id = merged_h2disk_op.op_id
-        elif merged_d2h_op is not None:
-            batch_end_op_id = merged_d2h_op.op_id
-        elif merged_h2remote_op is not None:
-            batch_end_op_id = merged_h2remote_op.op_id
-        elif merged_swa_h2disk_op is not None:
-            batch_end_op_id = merged_swa_h2disk_op.op_id
-        elif merged_swa_d2h_op is not None:
-            batch_end_op_id = merged_swa_d2h_op.op_id
-        elif merged_swa_h2remote_op is not None:
-            batch_end_op_id = merged_swa_h2remote_op.op_id
-        else:
-            batch_end_op_id = -1
+    else:
+        # Empty batch (no known ops).
+        batch_end_op_id = -1
 
     return merged_graph, batch_end_op_id, new_op_callback_dict
+    
+def _add_batch_sink(graph: TransferOpGraph, terminals: List[int],
+                    dp_client_id: int) -> int:
+    """Materialize the batch sink.
 
+    * 0 terminals    -> -1 (nothing scheduled).
+    * 1 terminal     -> return it directly (no VIRTUAL needed).
+    * >= 2 terminals -> add a VIRTUAL op depending on all of them and return
+      its op_id. Ensures the batch is "done" only when every parallel sink
+      has landed, per the design doc's batch_end_op_id semantics.
+    """
+    terminals = [t for t in terminals if t is not None and t >= 0]
+    if not terminals:
+        return -1
+    if len(terminals) == 1:
+        return terminals[0]
+    sink = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=TransferType.VIRTUAL,
+        src_block_ids=np.array([], dtype=np.int64),
+        dst_block_ids=np.array([], dtype=np.int64),
+        dp_client_id=dp_client_id,
+    )
+    graph.add_transfer_op(sink)
+    for term in terminals:
+        graph.add_dependency(sink.op_id, term)
+    return sink.op_id
 
 def get_nvtx_default_color() -> int:
     return 0xD3D3D3
