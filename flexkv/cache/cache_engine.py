@@ -1293,68 +1293,56 @@ class GlobalCacheEngine:
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
         num_gpu_blocks_to_transfer = len(fragment123_gpu_blocks) if enable_gpu else 0
         op_callback_dict = {}
-        if self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0:
+        if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
+                and swa_read_source.found):
             swa_empty = np.array([], dtype=np.int64)
-            if not swa_aware:
-                swa_full_hit = block_mask_start + num_gpu_blocks_to_transfer
-                _usable, swa_read_source = self._select_swa_read_source(
-                    sequence_meta,
-                    block_mask_start,
-                    swa_full_hit,
-                    {DeviceType.CPU: cpu_matched_result,
-                     DeviceType.SSD: ssd_matched_result,
-                     DeviceType.REMOTE: remote_matched_result},
-                    lock_for_load=False,
-                )
-
-            if swa_read_source.found:
-                device_type = swa_read_source.device_type
-                source_engine = swa_read_source.engine
-                source_slot = swa_read_source.host_slot
-                source_node = swa_read_source.node
-                source_engine._pin_swa_node(source_node)
-                staging_slot = -1
-                cpu_swa_slots = np.array([source_slot], dtype=np.int64)
-                ssd_swa_slots = swa_empty
-                remote_swa_slots = swa_empty
-                if device_type != DeviceType.CPU:
-                    staging_slot = self.cpu_cache_engine._alloc_swa_slot()
-                    if staging_slot < 0:
-                        self._swa_release_load_lock(
-                            node=source_node, engine=source_engine)
-                        swa_h2d_id = None
-                    else:
-                        cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
-                        source_slots = np.array([source_slot], dtype=np.int64)
-                        if device_type == DeviceType.SSD:
-                            ssd_swa_slots = source_slots
-                        else:
-                            remote_swa_slots = source_slots
-                else:
+            device_type = swa_read_source.device_type
+            source_engine = swa_read_source.engine
+            source_slot = swa_read_source.host_slot
+            source_node = swa_read_source.node
+            source_engine._pin_swa_node(source_node)
+            staging_slot = -1
+            cpu_swa_slots = np.array([source_slot], dtype=np.int64)
+            ssd_swa_slots = swa_empty
+            remote_swa_slots = swa_empty
+            if device_type != DeviceType.CPU:
+                staging_slot = self.cpu_cache_engine._alloc_swa_slot()
+                if staging_slot < 0:
+                    self._swa_release_load_lock(
+                        node=source_node, engine=source_engine)
                     swa_h2d_id = None
-
-                if staging_slot >= 0 or device_type == DeviceType.CPU:
-                    swa_h2d_id = self.swa_cache.build_get_chain(
-                        transfer_graph,
-                        gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
-                        cpu_slot_ids=cpu_swa_slots,
-                        ssd_slot_ids=ssd_swa_slots,
-                        remote_slot_ids=remote_swa_slots,
-                        dp_client_id=dp_client_id,
-                    )
-                    if swa_h2d_id is None:
-                        self._swa_release_load_lock(
-                            node=source_node,
-                            staging_slot=staging_slot,
-                            engine=source_engine)
+                else:
+                    cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
+                    source_slots = np.array([source_slot], dtype=np.int64)
+                    if device_type == DeviceType.SSD:
+                        ssd_swa_slots = source_slots
                     else:
-                        finished_ops_ids.append(swa_h2d_id)
-                        op_callback_dict[swa_h2d_id] = partial(
-                            self._swa_release_load_lock,
-                            node=source_node,
-                            staging_slot=staging_slot,
-                            engine=source_engine,
-                        )
+                        remote_swa_slots = source_slots
+            else:
+                swa_h2d_id = None
+
+            if staging_slot >= 0 or device_type == DeviceType.CPU:
+                swa_h2d_id = self.swa_cache.build_get_chain(
+                    transfer_graph,
+                    gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+                    cpu_slot_ids=cpu_swa_slots,
+                    ssd_slot_ids=ssd_swa_slots,
+                    remote_slot_ids=remote_swa_slots,
+                    dp_client_id=dp_client_id,
+                )
+                if swa_h2d_id is None:
+                    self._swa_release_load_lock(
+                        node=source_node,
+                        staging_slot=staging_slot,
+                        engine=source_engine)
+                else:
+                    finished_ops_ids.append(swa_h2d_id)
+                    op_callback_dict[swa_h2d_id] = partial(
+                        self._swa_release_load_lock,
+                        node=source_node,
+                        staging_slot=staging_slot,
+                        engine=source_engine,
+                    )
 
         return GetTransferPlan(
             transfer_graph=transfer_graph,
@@ -1591,62 +1579,51 @@ class GlobalCacheEngine:
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
         num_gpu_blocks_to_transfer = len(fragment12_gpu_blocks) if enable_gpu else 0
         op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
-        if self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0:
+        if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
+                and swa_read_source.found):
             swa_empty = np.array([], dtype=np.int64)
-            if not swa_aware:
-                swa_full_hit = block_mask_start + num_gpu_blocks_to_transfer
-                _usable, swa_read_source = self._select_swa_read_source(
-                    sequence_meta,
-                    block_mask_start,
-                    swa_full_hit,
-                    {DeviceType.CPU: cpu_matched_result,
-                     DeviceType.SSD: ssd_matched_result},
-                    lock_for_load=False,
-                )
-
-            if swa_read_source.found:
-                device_type = swa_read_source.device_type
-                source_engine = swa_read_source.engine
-                source_slot = swa_read_source.host_slot
-                source_node = swa_read_source.node
-                source_engine._pin_swa_node(source_node)
-                staging_slot = -1
-                cpu_swa_slots = np.array([source_slot], dtype=np.int64)
-                ssd_swa_slots = swa_empty
-                if device_type == DeviceType.SSD:
-                    staging_slot = self.cpu_cache_engine._alloc_swa_slot()
-                    if staging_slot < 0:
-                        self._swa_release_load_lock(
-                            node=source_node, engine=source_engine)
-                        swa_h2d_id = None
-                    else:
-                        cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
-                        ssd_swa_slots = np.array([source_slot], dtype=np.int64)
-                else:
+            device_type = swa_read_source.device_type
+            source_engine = swa_read_source.engine
+            source_slot = swa_read_source.host_slot
+            source_node = swa_read_source.node
+            source_engine._pin_swa_node(source_node)
+            staging_slot = -1
+            cpu_swa_slots = np.array([source_slot], dtype=np.int64)
+            ssd_swa_slots = swa_empty
+            if device_type == DeviceType.SSD:
+                staging_slot = self.cpu_cache_engine._alloc_swa_slot()
+                if staging_slot < 0:
+                    self._swa_release_load_lock(
+                        node=source_node, engine=source_engine)
                     swa_h2d_id = None
+                else:
+                    cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
+                    ssd_swa_slots = np.array([source_slot], dtype=np.int64)
+            else:
+                swa_h2d_id = None
 
-                if staging_slot >= 0 or device_type == DeviceType.CPU:
-                    swa_h2d_id = self.swa_cache.build_get_chain(
-                        transfer_graph,
-                        gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
-                        cpu_slot_ids=cpu_swa_slots,
-                        ssd_slot_ids=ssd_swa_slots,
-                        remote_slot_ids=swa_empty,
-                        dp_client_id=dp_client_id,
+            if staging_slot >= 0 or device_type == DeviceType.CPU:
+                swa_h2d_id = self.swa_cache.build_get_chain(
+                    transfer_graph,
+                    gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+                    cpu_slot_ids=cpu_swa_slots,
+                    ssd_slot_ids=ssd_swa_slots,
+                    remote_slot_ids=swa_empty,
+                    dp_client_id=dp_client_id,
+                )
+                if swa_h2d_id is None:
+                    self._swa_release_load_lock(
+                        node=source_node,
+                        staging_slot=staging_slot,
+                        engine=source_engine)
+                else:
+                    finished_ops_ids.append(swa_h2d_id)
+                    op_callback_dict[swa_h2d_id] = partial(
+                        self._swa_release_load_lock,
+                        node=source_node,
+                        staging_slot=staging_slot,
+                        engine=source_engine,
                     )
-                    if swa_h2d_id is None:
-                        self._swa_release_load_lock(
-                            node=source_node,
-                            staging_slot=staging_slot,
-                            engine=source_engine)
-                    else:
-                        finished_ops_ids.append(swa_h2d_id)
-                        op_callback_dict[swa_h2d_id] = partial(
-                            self._swa_release_load_lock,
-                            node=source_node,
-                            staging_slot=staging_slot,
-                            engine=source_engine,
-                        )
         nvtx.end_range(nvtx_range)
         return GetTransferPlan(
             transfer_graph=transfer_graph,
@@ -2270,56 +2247,60 @@ class GlobalCacheEngine:
 
         return cpu_matched_result, ssd_matched_result
 
-    def _select_swa_read_source(self,
-                                sequence_meta: SequenceMeta,
-                                block_mask_start: int,
-                                block_mask_end: int,
-                                tier_match_results: Dict[DeviceType, object],
-                                lock_for_load: bool = False) -> Tuple[int, SWAReadSource]:
-        """Return the final SWA-aware Full end and the exact matching source.
-
-        The Full-KV transfer and SWA H2D must describe the same prefix window.
-        This helper makes that a single decision: choose the best same-pass SWA
-        hit across tiers, clamp Full-KV to that hit, then require the selected
-        source's actual hit to equal the final usable end. If the exact source
-        cannot be resolved, collapse to an empty SWA-aware window rather than
-        loading Full-KV for a different SWA snapshot.
-        """
+    def _select_swa_read_source(
+        self,
+        sequence_meta: SequenceMeta,
+        block_mask_start: int,
+        block_mask_end: int,
+        tier_match_results: Dict[DeviceType, object],
+        lock_for_load: bool = False,
+    ) -> Tuple[int, SWAReadSource]:
+        """Return the largest usable SWA-aware Full-KV end and its exact SWA source."""
         if not self.swa_cache.enabled or not tier_match_results:
             return block_mask_start, SWAReadSource()
 
         candidates: List[Tuple[int, DeviceType, object]] = []
-        for device_type, mr in tier_match_results.items():
-            hit = int(getattr(mr, "swa_hit_blocks", 0) or 0) if mr is not None else 0
-            if hit > 0:
-                candidates.append((hit, device_type, mr))
-        if not candidates:
-            return block_mask_start, SWAReadSource()
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        for swa_hit, _device_type, _mr in candidates:
-            usable_end = max(block_mask_start, min(block_mask_end, swa_hit))
-            if usable_end <= block_mask_start:
+        for device_type, match_result in tier_match_results.items():
+            if match_result is None:
                 continue
-            for _candidate_hit, device_type, mr in candidates:
-                engine = self.cache_engines.get(device_type)
-                if engine is None or not getattr(engine, "swa_enabled", False):
-                    continue
-                hit, source_slot, source_node = engine._resolve_swa_read_source(
-                    sequence_meta,
-                    upper_bound_blocks=usable_end,
-                    match_result=mr,
-                    required_hit_blocks=usable_end,
-                    lock_for_load=lock_for_load,
-                )
-                if hit == usable_end and source_slot >= 0:
-                    return usable_end, SWAReadSource(
-                        hit_blocks=hit,
-                        host_slot=source_slot,
-                        node=source_node,
-                        device_type=device_type,
-                        engine=engine,
-                    )
+
+            swa_hit = int(getattr(match_result, "swa_hit_blocks", 0) or 0)
+            if swa_hit <= block_mask_start:
+                continue
+
+            assert swa_hit <= block_mask_end, (
+                "SWA hit must not exceed the Full-KV match window"
+            )
+            candidates.append((swa_hit, device_type, match_result))
+
+        for usable_end, device_type, match_result in sorted(
+            candidates,
+            key=lambda item: item[0],
+            reverse=True,
+        ):
+            engine = self.cache_engines.get(device_type)
+            if engine is None or not getattr(engine, "swa_enabled", False):
+                continue
+
+            hit, source_slot, source_node = engine._resolve_swa_read_source(
+                sequence_meta,
+                upper_bound_blocks=usable_end,
+                match_result=match_result,
+                required_hit_blocks=usable_end,
+                lock_for_load=lock_for_load,
+            )
+
+            source = SWAReadSource(
+                hit_blocks=hit,
+                host_slot=source_slot,
+                node=source_node,
+                device_type=device_type,
+                engine=engine,
+            )
+
+            if source.found and hit == usable_end:
+                return usable_end, source
+
         return block_mask_start, SWAReadSource()
 
     # The GPU-side SWA slot is a size-1 placeholder here (window == one page ==

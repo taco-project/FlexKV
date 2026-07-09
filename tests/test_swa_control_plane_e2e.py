@@ -15,7 +15,8 @@ GPU->CPU->GPU roundtrip.
 Flow (mirrors KVManager get_match(swa_aware=True) + launch, minus the tp_client subprocess):
   PUT : engine.put() -> graph {full D2H, SWA D2H} -> bind GPU slots -> submit
         -> full+SWA bytes land in the shared CPU pool + SWA host pool
-  GET : engine.get() -> graph {full H2D, SWA H2D} -> bind GPU slots -> submit
+  GET : engine.get(swa_aware=True) -> graph {full H2D, SWA H2D}
+        -> bind GPU slots -> submit
         -> bytes restored to fresh GPU blocks -> byte-exact compare
 
 Run INSIDE the container on a free GPU:
@@ -191,12 +192,12 @@ def main() -> int:
     # zero the GPU pools so GET must source from CPU
     mk_pool.zero_(); sw_pool.zero_(); torch.cuda.synchronize()
 
-    # ===== GET via GlobalCacheEngine.get() (SWA append inside _get_impl_*) ======
+    # ===== GET via GlobalCacheEngine.get(swa_aware=True) ========================
     get_slot_mapping = np.arange(GET_FULL_GPU * TOKENS_PER_BLOCK,
                                  (GET_FULL_GPU + 1) * TOKENS_PER_BLOCK, dtype=np.int64)
     get_graph, _rm2, get_cb, get_op_cb, get_end = engine.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=get_slot_mapping, dp_client_id=0)
+        slot_mapping=get_slot_mapping, dp_client_id=0, swa_aware=True)
     swa_get_ops = [o for o in get_graph._op_map.values() if getattr(o, "is_swa", False)]
     assert len(swa_get_ops) == 1 and swa_get_ops[0].transfer_type.name == "H2D", \
         f"expected 1 SWA H2D, got {[o.transfer_type.name for o in swa_get_ops]}"

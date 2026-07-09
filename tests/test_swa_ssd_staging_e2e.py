@@ -11,8 +11,9 @@ does not cover:
            files (write-through).
   EVICT: drop the CPU SWA slot (SWA-only eviction) so the window survives ONLY
          on SSD — forcing the GET to stage from SSD.
-  GET : engine.get() -> graph {full H2D, SWA DISK2H (SSD->CPU staging) -> SWA H2D
-        (CPU->GPU)} -> bytes restored to a fresh GPU SWA slot -> byte-exact.
+  GET : engine.get(swa_aware=True) -> graph {full H2D, SWA DISK2H
+        (SSD->CPU staging) -> SWA H2D (CPU->GPU)} -> bytes restored to a fresh
+        GPU SWA slot -> byte-exact.
 
 This exercises SWA graph append inside _put_impl_* (write-through) and
 _get_impl_* (SSD->CPU transient staging slot + H2D), plus the transient staging
@@ -203,7 +204,7 @@ def main() -> int:
                                  (GET_FULL_GPU + 1) * TOKENS_PER_BLOCK, dtype=np.int64)
     get_graph, _rm2, get_cb, get_op_cb, get_end = engine.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=get_slot_mapping, dp_client_id=0)
+        slot_mapping=get_slot_mapping, dp_client_id=0, swa_aware=True)
     swa_get_ops = [o for o in get_graph._op_map.values() if getattr(o, "is_swa", False)]
     gkinds = sorted(o.transfer_type.name for o in swa_get_ops)
     assert "DISK2H" in gkinds and "H2D" in gkinds, f"expected SWA DISK2H+H2D staging, got {gkinds}"

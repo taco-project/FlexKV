@@ -181,7 +181,7 @@ def test_get_builds_full_plus_swa_load_chain():
     # GET the same prefix: full-KV H2D + SWA peer H2D, joined by VIRTUAL barrier.
     graph, return_mask, gcb, gop_cb, end_id = eng.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=slot_mapping, dp_client_id=0)
+        slot_mapping=slot_mapping, dp_client_id=0, swa_aware=True)
     swa = _swa_ops(graph)
     assert len(swa) == 1 and swa[0].transfer_type == TransferType.H2D and swa[0].is_swa
     assert swa[0].op_id in graph._swa_gpu_transfer_op_id
@@ -240,7 +240,7 @@ def test_launch_bind_get_rebinds_swa_gpu_only():
     fake_sm = np.zeros_like(tok)
     graph, _rm, cb, op_cb, end_id = eng.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=fake_sm, dp_client_id=0)
+        slot_mapping=fake_sm, dp_client_id=0, swa_aware=True)
     full_h2d = [o for o in graph._op_map.values()
                 if not o.is_swa and o.transfer_type == TransferType.H2D]
     swa_h2d = [o for o in graph._op_map.values()
@@ -358,7 +358,8 @@ def test_get_ssd_staging_when_only_ssd_has_swa():
     assert ssd_hit > 0, "precondition: SSD SWA must still hold the window"
 
     graph, _rm2, gcb, gop, _ge = eng.get(
-        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm, dp_client_id=0)
+        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm,
+        dp_client_id=0, swa_aware=True)
     swa = _swa_ops(graph)
     kinds = sorted(o.transfer_type.name for o in swa)
     assert "H2D" in kinds and "DISK2H" in kinds, (
@@ -422,7 +423,8 @@ def test_get_prefers_cpu_when_both_tiers_have_swa():
     _complete(pop, pcb)
 
     graph, _rm2, gcb, gop, _ge = eng.get(
-        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm, dp_client_id=0)
+        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm,
+        dp_client_id=0, swa_aware=True)
     swa = _swa_ops(graph)
     kinds = sorted(o.transfer_type.name for o in swa)
     assert "H2D" in kinds, kinds

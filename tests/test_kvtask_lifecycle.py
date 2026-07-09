@@ -184,7 +184,8 @@ def test_get_pins_then_releases_swa_lock():
 
     graph, _rm, cb, op_cb, end_id = eng.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0)
+        slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0,
+        swa_aware=True)
     swa_h2d = [o for o in graph._op_map.values() if o.is_swa][0]
 
     # After building the GET graph, the matched CPU SWA node is pinned.
@@ -221,7 +222,8 @@ def test_repeated_get_relocks_cleanly():
         _g, _rm, cb, op_cb, _e = eng.get(
             request_id=req, token_ids=tok,
             token_mask=np.ones_like(tok, dtype=np.int64),
-            slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0)
+            slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0,
+            swa_aware=True)
         for c in op_cb.values():
             c()
         cb()
