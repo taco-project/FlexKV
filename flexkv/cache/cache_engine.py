@@ -188,30 +188,6 @@ class CacheEngineAccel:
         for slot in self.index.drain_freed_swa_slots():
             self._free_unmounted_swa_slot(slot)
 
-    def _mount_swa_slot(self, node, slot: int) -> None:
-        """Mount ``slot`` on the node whose last page owns the SWA window."""
-        if node is None:
-            return
-        self.index.set_swa(node, int(slot))
-
-    def _reserve_swa_tail_slot(self, node) -> int:
-        """Allocate and mount an SWA slot for a newly inserted Full-KV tail."""
-        slot = self._reserve_unmounted_swa_slot()
-        if slot >= 0:
-            self._mount_reserved_swa_slot(node, slot)
-        return slot
-
-    def _reserve_unmounted_swa_slot(self) -> int:
-        """Reserve an SWA slot without making it visible in the radix tree."""
-        if self.swa_pool is None:
-            return -1
-        return self._alloc_swa_slot()
-
-    def _mount_reserved_swa_slot(self, node, slot: int) -> None:
-        if node is None or slot is None or slot < 0:
-            return
-        self._mount_swa_slot(node, slot)
-
     @staticmethod
     def _get_mounted_swa_slot(node) -> int:
         if node is None:
@@ -388,7 +364,11 @@ class CacheEngineAccel:
             )
 
         if swa_store and swa_store_visible:
-            self._reserve_swa_tail_slot(node)
+            slot = self._alloc_swa_slot()
+            if slot >= 0 and node is not None:
+                self.index.set_swa(node, int(slot))
+            elif slot >= 0:
+                self._free_unmounted_swa_slot(slot)
 
         return node
 
@@ -553,30 +533,6 @@ class CacheEngine:
         for slot in self.index.drain_freed_swa_slots():
             self._free_unmounted_swa_slot(slot)
 
-    def _mount_swa_slot(self, node, slot: int) -> None:
-        """Mount ``slot`` on the node whose last page owns the SWA window."""
-        if node is None:
-            return
-        self.index.set_swa(node, int(slot))
-
-    def _reserve_swa_tail_slot(self, node) -> int:
-        """Allocate and mount an SWA slot for a newly inserted Full-KV tail."""
-        slot = self._reserve_unmounted_swa_slot()
-        if slot >= 0:
-            self._mount_reserved_swa_slot(node, slot)
-        return slot
-
-    def _reserve_unmounted_swa_slot(self) -> int:
-        """Reserve an SWA slot without making it visible in the radix tree."""
-        if self.swa_pool is None:
-            return -1
-        return self._alloc_swa_slot()
-
-    def _mount_reserved_swa_slot(self, node, slot: int) -> None:
-        if node is None or slot is None or slot < 0:
-            return
-        self._mount_swa_slot(node, slot)
-
     @staticmethod
     def _get_mounted_swa_slot(node) -> int:
         if node is None:
@@ -713,7 +669,11 @@ class CacheEngine:
                                                 block_size=self.tokens_per_block,
                                                 medium=DEVICE_TYPE[self.device_type])
         if swa_store and swa_store_visible:
-            self._reserve_swa_tail_slot(node)
+            slot = self._alloc_swa_slot()
+            if slot >= 0 and node is not None:
+                self.index.set_swa(node, int(slot))
+            elif slot >= 0:
+                self._free_unmounted_swa_slot(slot)
         return node
 
     def lock_node(self, node: RadixNode) -> None:
@@ -1870,12 +1830,12 @@ class GlobalCacheEngine:
             swa_store=self.swa_cache.enabled,
             swa_store_visible=False,
         )
-        cpu_swa_slot = (self.cpu_cache_engine._reserve_unmounted_swa_slot()
+        cpu_swa_slot = (self.cpu_cache_engine._alloc_swa_slot()
                         if self.swa_cache.enabled and cpu_node_to_unlock is not None else -1)
-        write_swa_through = self.swa_cache.enabled and cpu_swa_slot >= 0
+        write_swa_through = self.swa_cache.enabled and cpu_swa_slot >= 0 # TODO：分配不出来就fail掉
         ssd_node_to_unlock = None
         if put_to_ssd:
-            ssd_node_to_unlock = self.ssd_cache_engine.insert(
+            ssd_node_to_unlock = self.ssd_cache_engine.insert( #TODO：先分配，再insert，同时mount，最后回调成ready
                 sequence_meta,
                 fragment2_ssd_blocks,
                 is_ready=False,
@@ -1904,9 +1864,9 @@ class GlobalCacheEngine:
         swa_mounts = []
         if write_swa_through:
             empty = np.array([], dtype=np.int64)
-            ssd_swa_slot = (self.ssd_cache_engine._reserve_unmounted_swa_slot()
+            ssd_swa_slot = (self.ssd_cache_engine._alloc_swa_slot()
                             if ssd_node_to_unlock is not None else -1)
-            remote_swa_slot = (self.remote_cache_engine._reserve_unmounted_swa_slot()
+            remote_swa_slot = (self.remote_cache_engine._alloc_swa_slot()
                                if remote_node_to_unlock is not None else -1)
             swa_ops = self.swa_cache.build_put_chain(
                 transfer_graph,
@@ -1940,7 +1900,7 @@ class GlobalCacheEngine:
                     self.remote_cache_engine._free_unmounted_swa_slot(remote_swa_slot)
         op_callback_dict = {}
         post_barrier_callback = (partial(self._finalize_swa_put_mounts, swa_mounts)
-                                 if swa_mounts else None)
+                                 if swa_mounts else None) # ？？？
         skipped_gpu_blocks = len(cpu_matched_blocks)
         return PutTransferPlan(
             transfer_graph=transfer_graph,
@@ -2085,7 +2045,7 @@ class GlobalCacheEngine:
             swa_store=self.swa_cache.enabled,
             swa_store_visible=False,
         )
-        cpu_swa_slot = (self.cpu_cache_engine._reserve_unmounted_swa_slot()
+        cpu_swa_slot = (self.cpu_cache_engine._alloc_swa_slot()
                         if self.swa_cache.enabled and cpu_node_to_unlock is not None else -1)
         write_swa_through = self.swa_cache.enabled and cpu_swa_slot >= 0
         op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
@@ -2109,7 +2069,7 @@ class GlobalCacheEngine:
         swa_mounts = []
         if write_swa_through:
             empty = np.array([], dtype=np.int64)
-            ssd_swa_slot = (self.ssd_cache_engine._reserve_unmounted_swa_slot()
+            ssd_swa_slot = (self.ssd_cache_engine._alloc_swa_slot()
                             if ssd_node_to_unlock is not None else -1)
             swa_ops = self.swa_cache.build_put_chain(
                 transfer_graph,
@@ -2195,23 +2155,19 @@ class GlobalCacheEngine:
             assert self.remote_cache_engine is not None
             self.remote_cache_engine.set_ready(node_to_ready, True, ready_length)
 
-    def _finalize_swa_put_mount(self,
-                                device_type: DeviceType,
-                                node,
-                                slot: int) -> None:
-        engine = self.cache_engines.get(device_type)
-        if engine is None:
-            return
-        try:
-            engine._mount_reserved_swa_slot(node, slot)
-        except Exception:  # noqa: BLE001
-            if slot is not None and slot >= 0:
-                engine._free_unmounted_swa_slot(int(slot))
-
     def _finalize_swa_put_mounts(
             self, mounts: List[Tuple[DeviceType, object, int]]) -> None:
         for device_type, node, slot in mounts:
-            self._finalize_swa_put_mount(device_type, node, slot)
+            engine = self.cache_engines.get(device_type)
+            if engine is None or slot is None or slot < 0:
+                continue
+            try:
+                if node is not None:
+                    engine.index.set_swa(node, int(slot))
+                else:
+                    engine._free_unmounted_swa_slot(int(slot))
+            except Exception:  # noqa: BLE001
+                engine._free_unmounted_swa_slot(int(slot))
 
     @nvtx.annotate("Match Prefix Accel", color="yellow")
     def match_local_accel(self,

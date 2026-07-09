@@ -761,7 +761,7 @@ class _SWAWorkloadDriver:
             return
         tail_hash = int(sm.block_hashes[nblocks - 1])
         self._slot_expect[int(slot)] = tail_hash
-        self.engine._mount_swa_slot(node, slot)
+        self.engine.index.set_swa(node, int(slot))
         self._reconcile()
 
     def check_invariants(self):

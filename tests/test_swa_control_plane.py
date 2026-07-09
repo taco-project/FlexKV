@@ -392,8 +392,8 @@ def test_swa_aware_get_uses_exact_source_for_final_usable_end():
     eng.cache_config.enable_ssd = True
     seq_prefix = SequenceMeta(token_ids=tok[:2 * TPB], tokens_per_block=TPB)
     prefix_node = eng.cpu_cache_engine.match(seq_prefix).last_node
-    prefix_slot = eng.cpu_cache_engine._reserve_unmounted_swa_slot()
-    eng.cpu_cache_engine._mount_reserved_swa_slot(prefix_node, prefix_slot)
+    prefix_slot = eng.cpu_cache_engine._alloc_swa_slot()
+    eng.cpu_cache_engine.index.set_swa(prefix_node, int(prefix_slot))
 
     graph, return_mask, gcb, gop, _ge = eng.get(
         request_id=3,
