@@ -246,7 +246,7 @@ public:
   // locked (I3: swa_lock_ref>0 implies it must stay), or it is not ready.
   bool in_use() { return lock_cnt > 0 || swa_lock_ref > 0 || !ready; }
 
-  bool evictable() { return !index->is_root(this) && is_leaf() && !in_use(); }
+  bool evictable();
 
   int get_lock_cnt() const { return lock_cnt; }
 
@@ -656,5 +656,9 @@ public:
                              int num_matched_blocks = -1,
                              int last_node_matched_length = -1);
 };
+
+inline bool CRadixNode::evictable() {
+  return !index->is_root(this) && is_leaf() && !in_use();
+}
 
 } // namespace flexkv
