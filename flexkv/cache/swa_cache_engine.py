@@ -54,7 +54,7 @@ movement, kernels, SWA SSD/remote storage and completion callbacks are the data
 plane's responsibility.
 """
 
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -102,7 +102,8 @@ class SWACacheManager:
                      transfer_type: TransferType,
                      src_slot_ids: np.ndarray,
                      dst_slot_ids: np.ndarray,
-                     dp_client_id: int = 0) -> Optional[int]:
+                     dp_client_id: int = 0,
+                     mooncake_tail_hashes: Optional[List[str]] = None) -> Optional[int]:
         """Add one peer SWA transfer op (``is_swa=True``) to ``graph``; return op_id.
 
         ``transfer_type`` is a STANDARD type (H2D / D2H / DISK2H / H2DISK /
@@ -118,6 +119,12 @@ class SWACacheManager:
         dst = np.asarray(dst_slot_ids, dtype=np.int64)
         if src.size == 0 or dst.size == 0:
             return None
+        is_remote = transfer_type in (TransferType.H2REMOTE, TransferType.REMOTE2H)
+        tail_hashes = (
+            [str(h) for h in mooncake_tail_hashes]
+            if (is_remote and mooncake_tail_hashes)
+            else None
+        )
         op = TransferOp(
             graph_id=graph.graph_id,
             transfer_type=transfer_type,
@@ -125,6 +132,7 @@ class SWACacheManager:
             dst_block_ids=dst,
             dp_client_id=dp_client_id,
             is_swa=True,
+            mooncake_store_swa_block_hashes=tail_hashes,
         )
         graph.add_transfer_op(op)
         return op.op_id
@@ -135,7 +143,8 @@ class SWACacheManager:
                         cpu_slot_ids: np.ndarray,
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
-                        dp_client_id: int = 0) -> Optional[int]:
+                        dp_client_id: int = 0,
+                        mooncake_tail_hashes: Optional[List[str]] = None) -> Optional[int]:
         """Build the GET-side SWA load chain into ``graph``; return the terminal
         SWA ``H2D`` op_id (to be appended to the graph's finished_ops_ids so it
         joins the VIRTUAL barrier alongside the full-KV H2D).
@@ -163,6 +172,7 @@ class SWACacheManager:
             remote2h_id = self.build_swa_op(
                 graph, TransferType.REMOTE2H, remote_slot_ids, cpu_slot_ids,
                 dp_client_id=dp_client_id,
+                mooncake_tail_hashes=mooncake_tail_hashes,
             )
             if remote2h_id is not None:
                 graph.add_dependency(h2d_id, remote2h_id)
@@ -174,7 +184,8 @@ class SWACacheManager:
                         cpu_slot_ids: np.ndarray,
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
-                        dp_client_id: int = 0) -> Optional[int]:
+                        dp_client_id: int = 0,
+                        mooncake_tail_hashes: Optional[List[str]] = None) -> Optional[int]:
         """Build the PUT-side SWA store chain into ``graph``; return the SWA
         ``D2H`` op_id (to be appended to the graph's finished_ops_ids).
 
@@ -201,6 +212,7 @@ class SWACacheManager:
             h2remote_id = self.build_swa_op(
                 graph, TransferType.H2REMOTE, cpu_slot_ids, remote_slot_ids,
                 dp_client_id=dp_client_id,
+                mooncake_tail_hashes=mooncake_tail_hashes,
             )
             if h2remote_id is not None:
                 graph.add_dependency(h2remote_id, d2h_id)

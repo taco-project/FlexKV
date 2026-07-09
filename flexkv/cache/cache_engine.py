@@ -721,6 +721,8 @@ class GlobalCacheEngine:
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
         self.eviction_policy = GLOBAL_CONFIG_FROM_ENV.eviction_policy
 
+        self.use_mooncake_store_backend = cache_config.use_mooncake_store_backend
+
         # Initialize metrics collector for cache engine monitoring (before creating CacheEngines)
         self._metrics_collector = get_global_collector()
         if self._metrics_collector is None:
@@ -791,7 +793,12 @@ class GlobalCacheEngine:
                                                 swa_config=cache_config.swa)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
-            if cache_config.enable_kv_sharing:
+            if self.use_mooncake_store_backend:
+                from flexkv.external.mooncake_store_utils import MooncakeStoreCacheEngine
+                self.remote_cache_engine = MooncakeStoreCacheEngine(
+                    cache_config=cache_config,
+                )
+            elif cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
                 self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
             elif self.index_accel:
@@ -961,7 +968,7 @@ class GlobalCacheEngine:
         # full-KV prefix resident after this get (the SWA hit's upper bound).
         num_full_hit = block_start_idx + num_gpu_blocks_to_transfer
         (swa_gpu_slots, swa_cpu_slots, swa_ssd_slots, swa_remote_slots,
-         swa_lock_node, swa_staging_slot) = \
+         swa_lock_node, swa_staging_slot, swa_mooncake_tail_hashes) = \
             self._swa_get_slots(request_id, sequence_meta, block_start_idx,
                                 block_end_idx, num_full_hit,
                                 tier_match_results=tier_match_results)
@@ -972,6 +979,7 @@ class GlobalCacheEngine:
             ssd_slot_ids=swa_ssd_slots,
             remote_slot_ids=swa_remote_slots,
             dp_client_id=dp_client_id,
+            mooncake_tail_hashes=swa_mooncake_tail_hashes,
         )
         if swa_h2d_id is not None:
             finished_ops_ids.append(swa_h2d_id)
@@ -982,7 +990,16 @@ class GlobalCacheEngine:
             )
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
-        return_mask[block_start_idx* self.tokens_per_block:
+        if temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
+            prefetch_blocks = 0
+            for op in transfer_graph._op_map.values():
+                if op.transfer_type == TransferType.REMOTE2H:
+                    prefetch_blocks += len(op.src_block_ids)
+            if prefetch_blocks > 0:
+                return_mask[block_start_idx * self.tokens_per_block:
+                            (block_start_idx + prefetch_blocks) * self.tokens_per_block] = True
+        else:        
+            return_mask[block_start_idx* self.tokens_per_block:
                     (block_start_idx + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 
         # if layer_num // layer_granularity != 1:
@@ -1070,7 +1087,8 @@ class GlobalCacheEngine:
             :ssd_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         remote_matched_blocks = remote_matched_result.physical_blocks[
             :remote_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-        shared_pcfs_read = self.cache_config.enable_kv_sharing and self.index_accel
+        shared_pcfs_read = (self.cache_config.enable_kv_sharing and self.index_accel
+                            and not self.use_mooncake_store_backend)
         remote_file_nodeids = None
         if shared_pcfs_read:
             remote_file_nodeids = remote_matched_result.block_node_ids
@@ -1161,6 +1179,12 @@ class GlobalCacheEngine:
 
         op_remote2h = None
         if fragment3_num_blocks > 0:
+            mooncake_block_hashes = None
+            if self.use_mooncake_store_backend:
+                mooncake_block_hashes = sequence_meta.block_hashes[
+                    block_mask_start + fragment12_num_blocks:
+                    block_mask_start + fragment12_num_blocks + fragment3_num_blocks
+                ]
             op_remote2h = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.REMOTE2H,
@@ -1168,6 +1192,7 @@ class GlobalCacheEngine:
                 dst_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
                 src_block_node_ids = fragment3_remote_file_nodeids,
                 dp_client_id = dp_client_id,
+                mooncake_store_block_hashes = mooncake_block_hashes,
             )
             transfer_graph.add_transfer_op(op_remote2h)
 
@@ -1537,7 +1562,7 @@ class GlobalCacheEngine:
         # set_swa); the GPU slot is a placeholder bound LATE from the request's
         # swa_slot_mapping. The stored tail node is node_to_unlock[CPU] (the new
         # ready prefix's deepest node); its trailing page is the SWA window.
-        swa_gpu_slots, swa_cpu_slots, swa_ssd_slots, swa_remote_slots = \
+        swa_gpu_slots, swa_cpu_slots, swa_ssd_slots, swa_remote_slots, swa_mooncake_tail_hashes = \
             self._swa_put_slots(request_id, sequence_meta, block_start_idx,
                                 block_end_idx, node_to_unlock)
         swa_d2h_id = self.swa_cache.build_put_chain(
@@ -1547,6 +1572,7 @@ class GlobalCacheEngine:
             ssd_slot_ids=swa_ssd_slots,
             remote_slot_ids=swa_remote_slots,
             dp_client_id=dp_client_id,
+            mooncake_tail_hashes=swa_mooncake_tail_hashes,
         )
         if swa_d2h_id is not None:
             finished_ops_ids.append(swa_d2h_id)
@@ -1636,7 +1662,14 @@ class GlobalCacheEngine:
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
             fragment2_num_blocks = 0
-        fragment3_num_blocks = len(gpu_block_ids) - len(remote_matched_blocks)
+        if self.use_mooncake_store_backend:
+            kv_hit = int(getattr(remote_matched_result, "kv_matched_blocks", 0)
+                         or remote_matched_result.num_matched_blocks)
+            remote_put_hit_blocks = max(0, min(len(gpu_block_ids), kv_hit - block_mask_start))
+            fragment3_num_blocks = len(gpu_block_ids) - remote_put_hit_blocks
+        else:
+            remote_put_hit_blocks = len(remote_matched_blocks)
+            fragment3_num_blocks = len(gpu_block_ids) - len(remote_matched_blocks)
 
         fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
 
@@ -1726,12 +1759,19 @@ class GlobalCacheEngine:
                                                   cpu_matched_blocks[-extra_num_cpu_blocks:]])
             else:
                 fragment3_cpu_blocks = fragment12_cpu_blocks[-fragment3_num_blocks:]
+            mooncake_block_hashes = None
+            if self.use_mooncake_store_backend:
+                mooncake_block_hashes = sequence_meta.block_hashes[
+                    block_mask_start + remote_put_hit_blocks:
+                    block_mask_start + remote_put_hit_blocks + fragment3_num_blocks
+                ]
             op_h2remote = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2REMOTE,
                 src_block_ids = fragment3_cpu_blocks,
                 dst_block_ids = fragment3_remote_blocks,
                 dp_client_id = dp_client_id,
+                mooncake_store_block_hashes = mooncake_block_hashes,
             )
             transfer_graph.add_transfer_op(op_h2remote)
             transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)
@@ -2046,9 +2086,22 @@ class GlobalCacheEngine:
     def _empty_swa_slots(self, with_node: bool = False):
         empty = np.array([], dtype=np.int64)
         if with_node:
-            # (gpu, cpu, ssd, remote, lock_node, staging_slot)
-            return empty, empty, empty, empty, None, -1
-        return empty, empty, empty, empty
+            return empty, empty, empty, empty, None, -1, None
+        return empty, empty, empty, empty, None
+
+    def _mooncake_remote_engine(self):
+        if not self.use_mooncake_store_backend:
+            return None
+        return self.cache_engines.get(DeviceType.REMOTE)
+
+    @staticmethod
+    def _mooncake_swa_tail_hashes(sequence_meta, swa_hit_blocks: int):
+        if swa_hit_blocks <= 0:
+            return None
+        tail_abs = swa_hit_blocks - 1
+        if tail_abs < 0 or tail_abs >= sequence_meta.num_blocks:
+            return None
+        return [str(sequence_meta.block_hashes[tail_abs])]
 
     def _swa_get_slots(self, request_id, sequence_meta, block_start_idx,
                        block_end_idx, full_hit_blocks, tier_match_results=None):
@@ -2101,23 +2154,39 @@ class GlobalCacheEngine:
             _match_locked(cpu_engine, DeviceType.CPU)
         if swa_hit > 0 and cpu_slot >= 0:
             cpu = np.array([cpu_slot], dtype=np.int64)
-            return gpu, cpu, empty, empty, lock_node, -1
+            return gpu, cpu, empty, empty, lock_node, -1, None
 
-        # 2) Fall back to SSD then REMOTE: source tier stages into a transient
-        #    CPU SWA slot (DISK2H/REMOTE2H -> CPU) that the SWA H2D then reads.
+        mooncake_engine = self._mooncake_remote_engine()
         for device_type in (DeviceType.SSD, DeviceType.REMOTE):
             engine = self.cache_engines.get(device_type)
             if engine is None or not getattr(engine, "swa_enabled", False):
                 continue
             tier_hit, tier_slot, tier_node = \
                 _match_locked(engine, device_type)
-            if tier_hit <= 0 or tier_slot < 0:
+            if tier_hit <= 0:
                 continue
-            # Transient CPU staging slot (unmounted; freed on H2D completion).
+            mooncake_tails = None
+            is_mooncake = mooncake_engine is not None and engine is mooncake_engine
+            if is_mooncake:
+                # Pull-threshold: only reuse the remote SWA snapshot when its
+                # joint hit covers the full GET prefix. A partial SWA prefix
+                # would leave the trailing SWA window empty on GPU — worse
+                # than rebuilding the entire window locally. ``tier_hit`` is
+                # already clamped to ``full_hit_blocks`` by
+                # match_swa_from_result, so equality means "covers the GET".
+                if tier_hit < full_hit_blocks:
+                    if tier_node is not None and getattr(tier_node, "swa_lock_ref", 0) > 0:
+                        tier_node.dec_swa_lock_ref()
+                    continue
+                mooncake_tails = self._mooncake_swa_tail_hashes(
+                    sequence_meta, tier_hit)
+                if mooncake_tails is None:
+                    continue
+                tier_slot = 0
+            elif tier_slot < 0:
+                continue
             staging_slot = cpu_engine.swa_alloc_slot()
             if staging_slot < 0:
-                # No CPU room to stage: release the just-taken source pin and
-                # skip SWA reuse for this get (full-KV load is unaffected).
                 if tier_node is not None and getattr(tier_node, "swa_lock_ref", 0) > 0:
                     tier_node.dec_swa_lock_ref()
                 cpu_engine._drain_swa_slots()
@@ -2126,7 +2195,7 @@ class GlobalCacheEngine:
             tier = np.array([tier_slot], dtype=np.int64)
             ssd = tier if device_type == DeviceType.SSD else empty
             remote = tier if device_type == DeviceType.REMOTE else empty
-            return gpu, cpu, ssd, remote, tier_node, staging_slot
+            return gpu, cpu, ssd, remote, tier_node, staging_slot, mooncake_tails
 
         return self._empty_swa_slots(with_node=True)
 
@@ -2184,7 +2253,19 @@ class GlobalCacheEngine:
 
         ssd = _tier_slot(DeviceType.SSD)
         remote = _tier_slot(DeviceType.REMOTE)
-        return gpu, cpu, ssd, remote
+        mooncake_tail_hashes = None
+        mooncake_engine = self._mooncake_remote_engine()
+        if (remote.size == 0 and mooncake_engine is not None
+                and getattr(mooncake_engine, "swa_enabled", False)
+                and DeviceType.REMOTE in node_to_unlock
+                and sequence_meta.num_blocks > 0):
+            tail_abs = min(block_end_idx, sequence_meta.num_blocks) - 1
+            if tail_abs >= 0:
+                tail_hash = str(sequence_meta.block_hashes[tail_abs])
+                if not mooncake_engine.swa_tail_key_exists(tail_hash):
+                    remote = np.array([0], dtype=np.int64)
+                    mooncake_tail_hashes = [tail_hash]
+        return gpu, cpu, ssd, remote, mooncake_tail_hashes
 
 
     def _swa_release_load_lock(self, node, staging_slot: int = -1) -> None:

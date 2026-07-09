@@ -39,7 +39,9 @@ from flexkv.transfer.worker import (
     GDSTransferWorker,
     tpGDSTransferWorker,
     PEER2CPUTransferWorker,
+    MooncakeStoreTransferWorker,
 )
+from flexkv.external.mooncake_store_keys import PoolKind
 from flexkv.transfer.layerwise import (
     LayerwiseTransferWorker,
     build_layerwise_eventfd_socket_path,
@@ -420,6 +422,22 @@ class TransferEngine:
             )
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
+        elif (getattr(self.cache_config, 'use_mooncake_store_backend', False)
+              and self._cpu_handle is not None):
+            self.mooncake_store_worker: WorkerHandle = MooncakeStoreTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
+                cache_config=self.cache_config,
+                pool_kind=PoolKind.KV,
+            )
+            self._worker_map[TransferType.H2REMOTE] = self.mooncake_store_worker
+            self._worker_map[TransferType.REMOTE2H] = self.mooncake_store_worker
+            flexkv_logger.info(
+                "[TransferEngine] mooncake-store workers created for H2REMOTE/REMOTE2H")
         if self.cache_config.enable_gds:
             if self.model_config.effective_tp_size_per_node == 1:
                 self.gds_workers: Dict[WorkerKey, WorkerHandle] = {
@@ -674,8 +692,26 @@ class TransferEngine:
                 flexkv_logger.info("TransferEngine: swa CPU<->SSD workers initialized")
 
 
-            # ---- SWA CPU<->Remote workers (single CPURemoteTransferWorker per dir) ----
-            if self._swa_remote_handle is not None and self._swa_cpu_handle is not None:
+            # ---- SWA CPU<->Remote workers -----------------------------------
+            if (getattr(self.cache_config, 'use_mooncake_store_backend', False)
+                    and self._swa_cpu_handle is not None):
+                self.swa_mooncake_store_worker: WorkerHandle = (
+                    MooncakeStoreTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
+                        cpu_kv_layout=self._swa_cpu_handle.kv_layout,
+                        dtype=self._swa_cpu_handle.dtype,
+                        cache_config=self.cache_config,
+                        pool_kind=PoolKind.SWA,
+                        override_global_segment_size=0,
+                    ))
+                self._swa_worker_map[TransferType.REMOTE2H] = self.swa_mooncake_store_worker
+                self._swa_worker_map[TransferType.H2REMOTE] = self.swa_mooncake_store_worker
+                flexkv_logger.info(
+                    "TransferEngine: swa mooncake-store workers initialized")
+            elif self._swa_remote_handle is not None and self._swa_cpu_handle is not None:
                 self.swa_remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
@@ -1090,6 +1126,8 @@ class TransferEngine:
                     dst_block_ids=op.dst_block_ids.copy(),
                     dp_client_id=op.dp_client_id,
                     is_swa=True,
+                    mooncake_store_swa_block_hashes=op.mooncake_store_swa_block_hashes.copy()
+                        if op.mooncake_store_swa_block_hashes is not None else None,
                 )
                 register_op_to_buffer(replica, self.pin_buffer)
                 self._child_id_to_child[replica.op_id] = replica
@@ -1163,6 +1201,8 @@ class TransferEngine:
                     src_block_ids=op.src_block_ids.copy(),
                     dst_block_ids=op.dst_block_ids.copy(),
                     dp_client_id=op.dp_client_id,
+                    mooncake_store_block_hashes=op.mooncake_store_block_hashes.copy() 
+                        if op.mooncake_store_block_hashes is not None else None,
                 )
                 if op.transfer_type in (TransferType.D2H, TransferType.H2D):
                     flexkv_logger.info(
