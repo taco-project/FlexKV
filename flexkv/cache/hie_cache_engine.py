@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, TYPE_CHECKING, List, Dict
+from typing import Optional, List, Dict
 
 import time
 import numpy as np
@@ -11,7 +11,6 @@ from flexkv.cache.radix_remote import LocalRadixTree, DistributedRadixTree
 from flexkv.cache.redis_meta import RedisMetaChannel as _PyRedisMetaChannel
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.block import SequenceMeta
-#if TYPE_CHECKING:
 from flexkv.common.config import CacheConfig, SWAPoolConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import DeviceType
 from flexkv.common.type import MatchResultAccel
@@ -100,13 +99,10 @@ class HierarchyLRCacheEngine:
         self._stats_distributed_matched_tokens = 0 # total tokens matched in FlexKV global (distributed reuse)
         self._stats_match_count = 0                # match_all call count
 
-        # SWA (Sliding Window Attention) — node-mounted on the radix tree (see
-        # CacheEngineAccel). This hierarchical/distributed tier does not (yet)
-        # carry node-mounted SWA state in its remote radix index, so SWA stays
-        # effectively disabled here: init_swa builds the host pool but
-        # _resolve_swa_read_source only reports a hit when the underlying index exposes
-        # last_swa_node.
-        # DSv4 uses CacheEngineAccel (index_accel), not this engine.
+        # SWA (Sliding Window Attention) is node-mounted on the radix tree in
+        # CacheEngineAccel. This hierarchical/distributed tier does not carry
+        # node-mounted SWA state in its remote radix index, so SWA stays
+        # effectively disabled here.
         self.swa_pool = None
         tier_swa_config = (swa_config.for_cache_tier(device_type)
                            if swa_config is not None else None)
@@ -142,19 +138,6 @@ class HierarchyLRCacheEngine:
             return
         for slot in drain():
             self._free_unmounted_swa_slot(slot)
-
-    def _resolve_swa_read_source(self,
-                                 sequence_meta: "SequenceMeta",
-                                 upper_bound_blocks: int,
-                                 match_result=None,
-                                 required_hit_blocks: Optional[int] = None,
-                                 lock_for_load: bool = False):
-        """Node-mounted SWA hit resolver no-op for hierarchical remote indexes."""
-        if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, None
-        # The distributed/remote radix index does not surface node-mounted SWA
-        # yet; report no hit (SWA is served by the accel CPU tier for DSv4).
-        return 0, -1, None
 
     def start(self) -> None:
         if self._meta is None:

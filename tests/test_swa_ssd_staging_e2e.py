@@ -11,8 +11,9 @@ does not cover:
            files (write-through).
   EVICT: drop the CPU SWA slot (SWA-only eviction) so the window survives ONLY
          on SSD — forcing the GET to stage from SSD.
-  GET : engine.get() -> graph {full H2D, SWA DISK2H (SSD->CPU staging) -> SWA H2D
-        (CPU->GPU)} -> bytes restored to a fresh GPU SWA slot -> byte-exact.
+  GET : engine.get(swa_aware=True) -> graph {full H2D, SWA DISK2H
+        (SSD->CPU staging) -> SWA H2D (CPU->GPU)} -> bytes restored to a fresh
+        GPU SWA slot -> byte-exact.
 
 This exercises SWA graph append inside _put_impl_* (write-through) and
 _get_impl_* (SSD->CPU transient staging slot + H2D), plus the transient staging
@@ -188,10 +189,8 @@ def main() -> int:
     n_cpu = engine.cpu_cache_engine.swa_pool.num_used
     engine.cpu_cache_engine._evict_swa_slots(n_cpu)
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); seq.gen_hashes()
-    cpu_hit, _s, _n = engine.cpu_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=1)
-    ssd_hit, _s2, _n2 = engine.ssd_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=1)
+    cpu_hit = engine.cpu_cache_engine.match(seq).swa_hit_blocks
+    ssd_hit = engine.ssd_cache_engine.match(seq).swa_hit_blocks
     assert cpu_hit == 0 and ssd_hit > 0, f"precondition failed: cpu_hit={cpu_hit} ssd_hit={ssd_hit}"
     print(f"[verify] evicted CPU SWA (cpu_hit=0, ssd_hit={ssd_hit}); GET must stage from SSD", flush=True)
 
@@ -203,7 +202,7 @@ def main() -> int:
                                  (GET_FULL_GPU + 1) * TOKENS_PER_BLOCK, dtype=np.int64)
     get_graph, _rm2, get_cb, get_op_cb, get_end = engine.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=get_slot_mapping, dp_client_id=0)
+        slot_mapping=get_slot_mapping, dp_client_id=0, swa_aware=True)
     swa_get_ops = [o for o in get_graph._op_map.values() if getattr(o, "is_swa", False)]
     gkinds = sorted(o.transfer_type.name for o in swa_get_ops)
     assert "DISK2H" in gkinds and "H2D" in gkinds, f"expected SWA DISK2H+H2D staging, got {gkinds}"

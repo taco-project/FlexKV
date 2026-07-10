@@ -160,14 +160,16 @@ def test_put_builds_full_plus_swa_store_chain():
     assert swa[0].op_id in graph._swa_gpu_transfer_op_id
     assert eng.cpu_cache_engine.swa_pool.num_used == 1  # one slot allocated
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
-    hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
-        sm, upper_bound_blocks=4)
-    assert hit == 0 and slot < 0, "SWA PUT slot became visible before completion"
+    pending = eng.cpu_cache_engine.match(sm)
+    assert pending.num_ready_matched_blocks == 0
+    assert pending.last_node.swa_host_slot >= 0
+    assert pending.swa_hit_blocks == 0, "unready mounted SWA became readable before completion"
     _complete(op_cb, cb)
-    # after completion the SWA slot is mounted on the stored tail node.
-    hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
-        sm, upper_bound_blocks=4)
-    assert hit == 4 and slot >= 0
+    # after completion the mounted SWA slot becomes visible through ready matching.
+    ready = eng.cpu_cache_engine.match(sm)
+    assert ready.swa_hit_blocks == 4
+    assert ready.last_swa_node is not None
+    assert ready.last_swa_node.swa_host_slot >= 0
 
 
 def test_get_builds_full_plus_swa_load_chain():
@@ -181,7 +183,7 @@ def test_get_builds_full_plus_swa_load_chain():
     # GET the same prefix: full-KV H2D + SWA peer H2D, joined by VIRTUAL barrier.
     graph, return_mask, gcb, gop_cb, end_id = eng.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=slot_mapping, dp_client_id=0)
+        slot_mapping=slot_mapping, dp_client_id=0, swa_aware=True)
     swa = _swa_ops(graph)
     assert len(swa) == 1 and swa[0].transfer_type == TransferType.H2D and swa[0].is_swa
     assert swa[0].op_id in graph._swa_gpu_transfer_op_id
@@ -193,8 +195,11 @@ def test_get_builds_full_plus_swa_load_chain():
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     _complete(gop_cb, gcb)
     # after release, the node's SWA is unlocked (a fresh match can lock again).
-    hit, slot, node = eng.cpu_cache_engine._resolve_swa_read_source(
-        sm, upper_bound_blocks=4, lock_for_load=True)
+    ready = eng.cpu_cache_engine.match(sm)
+    assert ready.swa_hit_blocks == 4
+    node = ready.last_swa_node
+    assert node is not None
+    eng.cpu_cache_engine._pin_swa_node(node)
     assert node is not None and node.swa_lock_ref == 1
     assert node.get_lock_cnt() >= node.swa_lock_ref
     eng._swa_release_load_lock(node, engine=eng.cpu_cache_engine)
@@ -211,6 +216,56 @@ def test_gate_off_no_swa_ops_in_control_plane_graph():
     assert len(_swa_ops(graph)) == 0, "SWA ops emitted with enable_swa_transfer=False"
     assert eng.cpu_cache_engine.swa_pool.num_used == 0  # no slot allocated
     _complete(op_cb, cb)
+
+
+def test_put_fails_when_cpu_swa_slot_unavailable():
+    """SWA-enabled PUT must not degrade into a ready full-only CPU leaf."""
+    cc = _cache_config(True)
+    cc.swa.num_slots = 0
+    eng = GlobalCacheEngine(cc, _model_config())
+    tok = _tokens(4, base=5)
+    mask = np.ones_like(tok, dtype=np.int64)
+    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
+
+    graph, return_mask, cb, op_cb, end_id = eng.put(
+        request_id=1, token_ids=tok, token_mask=mask,
+        slot_mapping=slot_mapping, dp_client_id=0)
+
+    assert end_id == -1
+    assert not return_mask.any()
+    assert len(graph._op_map) == 0
+    assert len(op_cb) == 0
+    assert eng.cpu_cache_engine.mempool.num_free_blocks == \
+        eng.cpu_cache_engine.mempool.num_total_blocks
+    assert eng.cpu_cache_engine.index.total_cached_blocks() == 0
+    cb()
+
+
+def test_put_fails_when_ssd_swa_slot_unavailable():
+    """If SSD gets a full node, its SWA slot is mandatory too."""
+    cc = _cache_config_ssd(True)
+    cc.swa.num_ssd_slots = 0
+    eng = GlobalCacheEngine(cc, _model_config())
+    tok = _tokens(4, base=6)
+    mask = np.ones_like(tok, dtype=np.int64)
+    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
+
+    graph, return_mask, cb, op_cb, end_id = eng.put(
+        request_id=1, token_ids=tok, token_mask=mask,
+        slot_mapping=slot_mapping, dp_client_id=0)
+
+    assert end_id == -1
+    assert not return_mask.any()
+    assert len(graph._op_map) == 0
+    assert len(op_cb) == 0
+    assert eng.cpu_cache_engine.swa_pool.num_used == 0
+    assert eng.cpu_cache_engine.mempool.num_free_blocks == \
+        eng.cpu_cache_engine.mempool.num_total_blocks
+    assert eng.ssd_cache_engine.mempool.num_free_blocks == \
+        eng.ssd_cache_engine.mempool.num_total_blocks
+    assert eng.cpu_cache_engine.index.total_cached_blocks() == 0
+    assert eng.ssd_cache_engine.index.total_cached_blocks() == 0
+    cb()
 
 
 # =========================================================================== #
@@ -240,7 +295,7 @@ def test_launch_bind_get_rebinds_swa_gpu_only():
     fake_sm = np.zeros_like(tok)
     graph, _rm, cb, op_cb, end_id = eng.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=fake_sm, dp_client_id=0)
+        slot_mapping=fake_sm, dp_client_id=0, swa_aware=True)
     full_h2d = [o for o in graph._op_map.values()
                 if not o.is_swa and o.transfer_type == TransferType.H2D]
     swa_h2d = [o for o in graph._op_map.values()
@@ -308,8 +363,9 @@ def test_no_swa_slot_mapping_leaves_placeholder():
 def test_put_writethrough_ssd_builds_swa_h2disk():
     """PUT with an SSD tier: SWA store must write through to SSD, mirroring the
     full-KV H2DISK. The SWA graph should carry a SWA D2H (GPU->CPU) AND a SWA
-    H2DISK (CPU->SSD) that depends on the D2H (fire-and-forget), and an SSD SWA
-    slot must be allocated but not mounted until the PUT graph completes."""
+    H2DISK (CPU->SSD) that depends on the D2H (fire-and-forget). The SSD SWA
+    slot is mounted on the unready full node immediately, then becomes readable
+    only after the PUT graph completes and marks the node ready."""
     eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
     tok = _tokens(4, base=21)
     mask = np.ones_like(tok, dtype=np.int64)
@@ -323,16 +379,17 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
     swa_d2h = [o for o in swa if o.transfer_type == TransferType.D2H][0]
     swa_h2disk = [o for o in swa if o.transfer_type == TransferType.H2DISK][0]
     assert swa_d2h.op_id in swa_h2disk.predecessors, "H2DISK must depend on SWA D2H"
-    # SSD SWA is reserved but not yet visible while the write-through op is in flight.
+    # SSD SWA is mounted but not yet visible while the write-through op is in flight.
     assert eng.ssd_cache_engine.swa_pool.num_used == 1
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
-    ssd_hit, _slot, _node = eng.ssd_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=4)
-    assert ssd_hit == 0
+    pending = eng.ssd_cache_engine.match(seq)
+    assert pending.num_ready_matched_blocks == 0
+    assert pending.last_node.swa_host_slot >= 0
+    assert pending.swa_hit_blocks == 0
     _complete(op_cb, cb)
-    ssd_hit, _slot, _node = eng.ssd_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=4)
-    assert ssd_hit == 4
+    ready = eng.ssd_cache_engine.match(seq)
+    assert ready.swa_hit_blocks == 4
+    assert ready.last_swa_node is not None
 
 
 def test_get_ssd_staging_when_only_ssd_has_swa():
@@ -350,15 +407,14 @@ def test_get_ssd_staging_when_only_ssd_has_swa():
     eng.cpu_cache_engine._evict_swa_slots(eng.cpu_cache_engine.swa_pool.num_used)
 
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
-    cpu_hit, _s, _n = eng.cpu_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=4)
+    cpu_hit = eng.cpu_cache_engine.match(seq).swa_hit_blocks
     assert cpu_hit == 0, "precondition: CPU SWA must be gone"
-    ssd_hit, _s2, _n2 = eng.ssd_cache_engine._resolve_swa_read_source(
-        seq, upper_bound_blocks=4)
+    ssd_hit = eng.ssd_cache_engine.match(seq).swa_hit_blocks
     assert ssd_hit > 0, "precondition: SSD SWA must still hold the window"
 
     graph, _rm2, gcb, gop, _ge = eng.get(
-        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm, dp_client_id=0)
+        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm,
+        dp_client_id=0, swa_aware=True)
     swa = _swa_ops(graph)
     kinds = sorted(o.transfer_type.name for o in swa)
     assert "H2D" in kinds and "DISK2H" in kinds, (
@@ -391,8 +447,8 @@ def test_swa_aware_get_uses_exact_source_for_final_usable_end():
     eng.cache_config.enable_ssd = True
     seq_prefix = SequenceMeta(token_ids=tok[:2 * TPB], tokens_per_block=TPB)
     prefix_node = eng.cpu_cache_engine.match(seq_prefix).last_node
-    prefix_slot = eng.cpu_cache_engine._reserve_unmounted_swa_slot()
-    eng.cpu_cache_engine._mount_reserved_swa_slot(prefix_node, prefix_slot)
+    prefix_slot = eng.cpu_cache_engine._alloc_swa_slot()
+    eng.cpu_cache_engine.index.set_swa(prefix_node, int(prefix_slot))
 
     graph, return_mask, gcb, gop, _ge = eng.get(
         request_id=3,
@@ -422,7 +478,8 @@ def test_get_prefers_cpu_when_both_tiers_have_swa():
     _complete(pop, pcb)
 
     graph, _rm2, gcb, gop, _ge = eng.get(
-        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm, dp_client_id=0)
+        request_id=2, token_ids=tok, token_mask=mask, slot_mapping=sm,
+        dp_client_id=0, swa_aware=True)
     swa = _swa_ops(graph)
     kinds = sorted(o.transfer_type.name for o in swa)
     assert "H2D" in kinds, kinds
@@ -459,8 +516,8 @@ def test_multitier_match_promotes_swa_in_each_tier():
 
     seq_b = SequenceMeta(token_ids=tok_b, tokens_per_block=TPB); seq_b.gen_hashes()
     for name, engine in (("cpu", eng.cpu_cache_engine), ("ssd", eng.ssd_cache_engine)):
-        a_hit, _sa, _na = engine._resolve_swa_read_source(seq_a, upper_bound_blocks=4)
-        b_hit, _sb, _nb = engine._resolve_swa_read_source(seq_b, upper_bound_blocks=4)
+        a_hit = engine.match(seq_a).swa_hit_blocks
+        b_hit = engine.match(seq_b).swa_hit_blocks
         assert a_hit == 4, f"{name}: reused SWA A was evicted (tier not promoted)"
         assert b_hit == 0, f"{name}: never-reused SWA B should have been evicted"
 

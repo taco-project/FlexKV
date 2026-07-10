@@ -184,17 +184,17 @@ def test_get_pins_then_releases_swa_lock():
 
     graph, _rm, cb, op_cb, end_id = eng.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0)
+        slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0,
+        swa_aware=True)
     swa_h2d = [o for o in graph._op_map.values() if o.is_swa][0]
 
     # After building the GET graph, the matched CPU SWA node is pinned.
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
-    hit, slot, _node = eng.cpu_cache_engine._resolve_swa_read_source(
-        sm, upper_bound_blocks=4)
-    assert hit == 4
+    mr = eng.cpu_cache_engine.match(sm)
+    assert mr.swa_hit_blocks == 4
     # The node carries the load pin (>=1) taken while building the GET plan.
-    node = eng.cpu_cache_engine.index.match_prefix(
-        torch.from_numpy(sm.block_hashes[:4]).to(torch.int64), 4, False).last_swa_node
+    node = mr.last_swa_node
+    assert node is not None
     assert node.swa_lock_ref >= 1
 
     # Complete the ops: the SWA H2D callback releases the pin.
@@ -221,7 +221,8 @@ def test_repeated_get_relocks_cleanly():
         _g, _rm, cb, op_cb, _e = eng.get(
             request_id=req, token_ids=tok,
             token_mask=np.ones_like(tok, dtype=np.int64),
-            slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0)
+            slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0,
+            swa_aware=True)
         for c in op_cb.values():
             c()
         cb()
