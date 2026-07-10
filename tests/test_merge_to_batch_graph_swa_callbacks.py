@@ -174,8 +174,13 @@ def _graph_with_put_ops(*, with_swa: bool) -> tuple[TransferOpGraph, dict[int, o
         finished.append(swa_d2h.op_id)
         callbacks[swa_d2h.op_id] = lambda: fired.append("swa_d2h")
 
-    graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(graph, finished, 0)
-    return graph, {"fired": fired, "callbacks": callbacks, "task_end_op_id": task_end_op_id}
+    graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
+        graph, finished, 0)
+    return graph, {
+        "fired": fired,
+        "callbacks": callbacks,
+        "task_end_op_id": task_end_op_id,
+    }
 
 
 def test_non_layerwise_put_full_and_swa_use_virtual_barrier():
@@ -196,21 +201,22 @@ def test_non_layerwise_put_full_and_swa_use_virtual_barrier():
         if not op.is_swa and op.transfer_type != TransferType.VIRTUAL
     }
     swa_ops = {op.transfer_type: op for op in merged._op_map.values() if op.is_swa}
-    assert {merged_ops[TransferType.D2H].op_id, swa_ops[TransferType.D2H].op_id} <= barrier.predecessors
+    assert barrier.predecessors == {
+        merged_ops[TransferType.D2H].op_id,
+        swa_ops[TransferType.D2H].op_id,
+    }
 
 
 def test_non_layerwise_get_full_and_swa_use_virtual_barrier():
     graph, ctx = _graph_with_get_ops(with_swa=True)
-    finished = [
-        op.op_id
-        for op in graph._op_map.values()
-        if op.transfer_type in (TransferType.H2D,) or (
-            op.is_swa and op.transfer_type == TransferType.H2D
-        )
+    finished_ops_ids = [
+        op.op_id for op in graph._op_map.values()
+        if op.transfer_type == TransferType.H2D
     ]
-    graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(graph, finished, 0)
+    graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
+        graph, finished_ops_ids, 0)
 
-    merged, batch_end_op_id, _ = merge_to_batch_graph(
+    merged, batch_end_op_id, _callbacks = merge_to_batch_graph(
         batch_id=103,
         transfer_graphs=[graph],
         task_end_op_ids=[task_end_op_id],
@@ -228,4 +234,35 @@ def test_non_layerwise_get_full_and_swa_use_virtual_barrier():
         op for op in merged._op_map.values()
         if op.is_swa and op.transfer_type == TransferType.H2D
     )
-    assert {merged_h2d.op_id, swa_h2d.op_id} <= barrier.predecessors
+    assert barrier.predecessors == {merged_h2d.op_id, swa_h2d.op_id}
+
+
+def test_non_layerwise_batch_rejects_mixed_get_and_put_terminals():
+    graph = TransferOpGraph()
+    h2d = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=TransferType.H2D,
+        src_block_ids=np.array([10], dtype=np.int64),
+        dst_block_ids=np.array([0], dtype=np.int64),
+    )
+    d2h = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=TransferType.D2H,
+        src_block_ids=np.array([1], dtype=np.int64),
+        dst_block_ids=np.array([20], dtype=np.int64),
+    )
+    graph.add_transfer_op(h2d)
+    graph.add_transfer_op(d2h)
+
+    try:
+        merge_to_batch_graph(
+            batch_id=104,
+            transfer_graphs=[graph],
+            task_end_op_ids=[h2d.op_id],
+            op_callback_dict={},
+            layerwise_transfer=False,
+        )
+    except ValueError as exc:
+        assert "cannot mix GET and PUT" in str(exc)
+    else:
+        raise AssertionError("mixed GET/PUT batch must be rejected")

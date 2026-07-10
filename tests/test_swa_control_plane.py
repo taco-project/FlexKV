@@ -7,7 +7,8 @@ Enters from the top (GlobalCacheEngine), NOT the data plane, using the REAL
 (de-stubbed) SWA slot sources — the control plane's job is to turn a request
 into a Full+SWA transfer graph + masks against the node-mounted radix tree:
 
-    put()       -> full-KV D2H graph + SWA peer D2H (alloc slot + set_swa)
+    put()       -> full-KV D2H graph + SWA peer D2H (reserve slot, publish the
+                   node mount from the SWA op completion callback)
     get(swa_aware=True) -> full-KV H2D clamped to usable=min(full,swa) + SWA peer
                    H2D (matched slot), joined by the VIRTUAL barrier; the matched
                    CPU SWA node is pinned for
@@ -162,14 +163,63 @@ def test_put_builds_full_plus_swa_store_chain():
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     pending = eng.cpu_cache_engine.match(sm)
     assert pending.num_ready_matched_blocks == 0
-    assert pending.last_node.swa_host_slot >= 0
-    assert pending.swa_hit_blocks == 0, "unready mounted SWA became readable before completion"
-    _complete(op_cb, cb)
-    # after completion the mounted SWA slot becomes visible through ready matching.
+    assert pending.last_node.swa_host_slot == -1
+    assert pending.swa_hit_blocks == 0
+
+    full_d2h = next(o for o in full if o.transfer_type == TransferType.D2H)
+    swa_d2h = swa[0]
+    barrier = graph._op_map[end_id]
+    assert barrier.transfer_type == TransferType.VIRTUAL
+    assert barrier.predecessors == {full_d2h.op_id, swa_d2h.op_id}
+
+    # Full-KV may become readable first, but the reserved SWA slot must remain a
+    # miss until its independent sibling D2H completes.
+    op_cb[full_d2h.op_id]()
+    full_only = eng.cpu_cache_engine.match(sm)
+    assert full_only.num_ready_matched_blocks == 4
+    assert full_only.swa_hit_blocks == 0
+    assert full_only.last_node.swa_host_slot == -1
+
+    op_cb[swa_d2h.op_id]()
+    cb()
+    # SWA completion publishes the reserved slot independently.
     ready = eng.cpu_cache_engine.match(sm)
     assert ready.swa_hit_blocks == 4
     assert ready.last_swa_node is not None
     assert ready.last_swa_node.swa_host_slot >= 0
+
+
+def test_put_swa_first_stays_hidden_until_full_kv_is_ready():
+    eng = GlobalCacheEngine(_cache_config(True), _model_config())
+    tok = _tokens(4, base=2)
+    mask = np.ones_like(tok, dtype=np.int64)
+    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
+    graph, _return_mask, cb, op_cb, _end_id = eng.put(
+        request_id=1,
+        token_ids=tok,
+        token_mask=mask,
+        slot_mapping=slot_mapping,
+        dp_client_id=0,
+    )
+    full_d2h = next(o for o in _full_ops(graph)
+                    if o.transfer_type == TransferType.D2H)
+    swa_d2h = next(o for o in _swa_ops(graph)
+                   if o.transfer_type == TransferType.D2H)
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+
+    # The SWA bytes may land first.  Mounting the completed slot is safe because
+    # match_prefix still requires the owning Full-KV node to be ready.
+    op_cb[swa_d2h.op_id]()
+    swa_only = eng.cpu_cache_engine.match(seq)
+    assert swa_only.num_ready_matched_blocks == 0
+    assert swa_only.swa_hit_blocks == 0
+    assert swa_only.last_node.swa_host_slot >= 0
+
+    op_cb[full_d2h.op_id]()
+    cb()
+    ready = eng.cpu_cache_engine.match(seq)
+    assert ready.num_ready_matched_blocks == 4
+    assert ready.swa_hit_blocks == 4
 
 
 def test_get_builds_full_plus_swa_load_chain():
@@ -364,8 +414,7 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
     """PUT with an SSD tier: SWA store must write through to SSD, mirroring the
     full-KV H2DISK. The SWA graph should carry a SWA D2H (GPU->CPU) AND a SWA
     H2DISK (CPU->SSD) that depends on the D2H (fire-and-forget). The SSD SWA
-    slot is mounted on the unready full node immediately, then becomes readable
-    only after the PUT graph completes and marks the node ready."""
+    slot remains reserved and invisible until its own write-through completes."""
     eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
     tok = _tokens(4, base=21)
     mask = np.ones_like(tok, dtype=np.int64)
@@ -379,14 +428,40 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
     swa_d2h = [o for o in swa if o.transfer_type == TransferType.D2H][0]
     swa_h2disk = [o for o in swa if o.transfer_type == TransferType.H2DISK][0]
     assert swa_d2h.op_id in swa_h2disk.predecessors, "H2DISK must depend on SWA D2H"
-    # SSD SWA is mounted but not yet visible while the write-through op is in flight.
+    full_d2h = next(o for o in _full_ops(graph)
+                    if o.transfer_type == TransferType.D2H)
+    full_h2disk = next(o for o in _full_ops(graph)
+                       if o.transfer_type == TransferType.H2DISK)
+    barrier = graph._op_map[_e]
+    assert barrier.transfer_type == TransferType.VIRTUAL
+    assert barrier.predecessors == {full_d2h.op_id, swa_d2h.op_id}
+    assert swa_h2disk.op_id not in barrier.predecessors
+
+    # SSD SWA is allocated but is not mounted while write-through is in flight.
     assert eng.ssd_cache_engine.swa_pool.num_used == 1
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
     pending = eng.ssd_cache_engine.match(seq)
     assert pending.num_ready_matched_blocks == 0
-    assert pending.last_node.swa_host_slot >= 0
+    assert pending.last_node.swa_host_slot == -1
     assert pending.swa_hit_blocks == 0
-    _complete(op_cb, cb)
+
+    op_cb[full_d2h.op_id]()
+    op_cb[full_h2disk.op_id]()
+    full_only = eng.ssd_cache_engine.match(seq)
+    assert full_only.num_ready_matched_blocks == 4
+    assert full_only.swa_hit_blocks == 0
+
+    op_cb[swa_d2h.op_id]()
+    op_cb[swa_h2disk.op_id]()
+    for op_id, callback in op_cb.items():
+        if op_id not in {
+            full_d2h.op_id,
+            full_h2disk.op_id,
+            swa_d2h.op_id,
+            swa_h2disk.op_id,
+        }:
+            callback()
+    cb()
     ready = eng.ssd_cache_engine.match(seq)
     assert ready.swa_hit_blocks == 4
     assert ready.last_swa_node is not None

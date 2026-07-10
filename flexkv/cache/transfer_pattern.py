@@ -1,12 +1,14 @@
 from typing import List, Tuple
 
-import numpy as np
-
 from flexkv.common.transfer import TransferType
 from flexkv.common.transfer import TransferOp, TransferOpGraph
-from flexkv.common.transfer import add_virtual_op_for_multiple_finished_ops  # noqa: F401
+from flexkv.common.transfer import add_virtual_op_for_multiple_finished_ops
 
-__all__ = ["add_virtual_op_for_multiple_finished_ops", "convert_read_graph_to_layer_wise_graph"]
+__all__ = [
+    "add_virtual_op_for_multiple_finished_ops",
+    "convert_read_graph_to_layer_wise_graph",
+]
+
 
 def convert_read_graph_to_layer_wise_graph(
     transfer_graph: TransferOpGraph,

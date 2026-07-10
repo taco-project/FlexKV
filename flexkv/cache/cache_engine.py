@@ -29,12 +29,15 @@ from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
-from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
 from flexkv.cache.swa_cache_engine import SWACacheManager
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import (
-    DeviceType, TransferOpGraph, TransferOp, TransferType
+    DeviceType,
+    TransferOpGraph,
+    TransferOp,
+    TransferType,
+    add_virtual_op_for_multiple_finished_ops,
 )
 from flexkv.common.debug import flexkv_logger, summarize_id_tensor
 from flexkv.common.type import MatchResultAccel
@@ -847,6 +850,39 @@ class GlobalCacheEngine:
                                               ready_length=ready_length)
         return op_callback_dict
 
+    @staticmethod
+    def _append_op_callback(op_callback_dict: Dict[int, Callable],
+                            op_id: int,
+                            callback: Callable) -> None:
+        """Append ``callback`` without overwriting another completion action."""
+        previous = op_callback_dict.get(op_id)
+        if previous is None:
+            op_callback_dict[op_id] = callback
+            return
+
+        def combined_callback() -> None:
+            previous()
+            callback()
+
+        op_callback_dict[op_id] = combined_callback
+
+    def _publish_swa_put_slot(self,
+                              device_type: DeviceType,
+                              node,
+                              slot: int) -> None:
+        """Make a reserved PUT slot readable after its tier transfer completes.
+
+        The slot id is allocated before graph construction so the data plane can
+        address it, but it is deliberately not mounted on the radix node until
+        this callback.  Full-KV and SWA publication therefore remain independent:
+        either transfer may finish first without exposing unfilled SWA bytes.
+        """
+        assert node is not None
+        assert slot >= 0
+        engine = self.cache_engines[device_type]
+        engine.index.set_swa(node, int(slot))
+        engine._drain_unmounted_swa_slots()
+
     def _fail_put_before_insert(
             self,
             request_id: int,
@@ -1618,6 +1654,7 @@ class GlobalCacheEngine:
 
         transfer_graph = TransferOpGraph()
         finished_ops_ids = []
+        op_node_to_ready = {}
 
         op_d2h = TransferOp(
             graph_id = transfer_graph.graph_id,
@@ -1693,10 +1730,6 @@ class GlobalCacheEngine:
             if put_to_remote:
                 assert swa_ops.h2remote_id is not None
             finished_ops_ids.append(swa_ops.d2h_id)
-            if swa_ops.h2disk_id is not None:
-                finished_ops_ids.append(swa_ops.h2disk_id)
-            if swa_ops.h2remote_id is not None:
-                finished_ops_ids.append(swa_ops.h2remote_id)
 
         cpu_node_to_unlock = self.cpu_cache_engine.insert(
             sequence_meta,
@@ -1704,6 +1737,8 @@ class GlobalCacheEngine:
             is_ready=False,
             match_result=cpu_matched_result,
         )
+        op_node_to_ready[op_d2h.op_id] = (
+            DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         ssd_node_to_unlock = None
         if put_to_ssd:
             ssd_node_to_unlock = self.ssd_cache_engine.insert(
@@ -1712,6 +1747,8 @@ class GlobalCacheEngine:
                 is_ready=False,
                 match_result=ssd_matched_result,
             )
+            op_node_to_ready[op_h2disk.op_id] = (
+                DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
         remote_node_to_unlock = None
         if put_to_remote:
             remote_node_to_unlock = self.remote_cache_engine.insert(
@@ -1720,12 +1757,11 @@ class GlobalCacheEngine:
                 is_ready=False,
                 match_result=remote_matched_result,
             )
-        if cpu_swa_slot >= 0:
-            self.cpu_cache_engine.index.set_swa(cpu_node_to_unlock, int(cpu_swa_slot))
-        if ssd_swa_slot >= 0:
-            self.ssd_cache_engine.index.set_swa(ssd_node_to_unlock, int(ssd_swa_slot))
-        if remote_swa_slot >= 0:
-            self.remote_cache_engine.index.set_swa(remote_node_to_unlock, int(remote_swa_slot))
+            op_node_to_ready[op_h2remote.op_id] = (
+                DeviceType.REMOTE,
+                remote_node_to_unlock,
+                remote_node_to_unlock.size(),
+            )
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
@@ -1734,7 +1770,28 @@ class GlobalCacheEngine:
         if remote_node_to_unlock is not None:
             node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
 
-        op_callback_dict = {}
+        op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+        if cpu_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.d2h_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.CPU, cpu_node_to_unlock, cpu_swa_slot),
+            )
+        if ssd_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.h2disk_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.SSD, ssd_node_to_unlock, ssd_swa_slot),
+            )
+        if remote_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.h2remote_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.REMOTE, remote_node_to_unlock, remote_swa_slot),
+            )
         skipped_gpu_blocks = len(cpu_matched_blocks)
         return PutTransferPlan(
             transfer_graph=transfer_graph,
@@ -1903,8 +1960,6 @@ class GlobalCacheEngine:
             if fragment2_num_blocks > 0:
                 assert swa_ops.h2disk_id is not None
             finished_ops_ids.append(swa_ops.d2h_id)
-            if swa_ops.h2disk_id is not None:
-                finished_ops_ids.append(swa_ops.h2disk_id)
 
         """insert and lock"""
         cpu_node_to_unlock = self.cpu_cache_engine.insert(
@@ -1923,10 +1978,6 @@ class GlobalCacheEngine:
                 match_result=ssd_matched_result,
             )
             op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
-        if cpu_swa_slot >= 0:
-            self.cpu_cache_engine.index.set_swa(cpu_node_to_unlock, int(cpu_swa_slot))
-        if ssd_swa_slot >= 0:
-            self.ssd_cache_engine.index.set_swa(ssd_node_to_unlock, int(ssd_swa_slot))
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
@@ -1934,6 +1985,20 @@ class GlobalCacheEngine:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
 
         op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+        if cpu_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.d2h_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.CPU, cpu_node_to_unlock, cpu_swa_slot),
+            )
+        if ssd_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.h2disk_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.SSD, ssd_node_to_unlock, ssd_swa_slot),
+            )
         skipped_gpu_blocks = len(cpu_matched_blocks)
         return PutTransferPlan(
             transfer_graph=transfer_graph,

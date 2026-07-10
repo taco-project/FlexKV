@@ -178,7 +178,11 @@ def main() -> int:
     kinds = sorted(o.transfer_type.name for o in swa_put_ops)
     assert "D2H" in kinds and "H2DISK" in kinds, f"expected SWA D2H + H2DISK, got {kinds}"
     assert engine.ssd_cache_engine.swa_pool.num_used == 1, "SSD SWA slot not allocated on put"
-    reported = {put_end} | {o.op_id for o in swa_put_ops if o.transfer_type.name == "D2H"}
+    # This helper invokes every per-op callback manually, so wait for every op
+    # carrying one.  The production KVTask loop invokes each callback from its
+    # own completion event; task_end intentionally does not wait for SSD
+    # write-through.
+    reported = {put_end} | set(put_op_cb)
     print(f"[verify] PUT graph: SWA ops={kinds} (write-through to SSD)", flush=True)
     _run_graph(te, put_graph, put_op_cb, put_cb,
                full_gpu_blocks=[PUT_FULL_GPU], swa_gpu_slot=SWA_GPU_SLOT,
