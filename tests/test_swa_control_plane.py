@@ -25,6 +25,8 @@ CPU-only (the GPU SWA slot is a placeholder bound late); byte movement is the
 data plane's job (test_swa_control_plane_e2e.py / the KVManager GPU e2e).
 Requires flexkv.c_ext (production CacheEngineAccel / CRadixTreeIndex).
 """
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -540,6 +542,32 @@ def test_swa_aware_get_uses_exact_source_for_final_usable_end():
     assert "H2D" in kinds and "DISK2H" in kinds, (
         f"expected SSD exact source for 4-block usable end, got {kinds}")
     _complete(gop, gcb)
+
+
+def test_swa_source_selection_skips_hits_past_request_end():
+    eng = GlobalCacheEngine(_cache_config_ssd(True), _model_config())
+    too_deep = SimpleNamespace(
+        swa_hit_blocks=4,
+        last_swa_node=SimpleNamespace(swa_host_slot=3),
+    )
+    usable = SimpleNamespace(
+        swa_hit_blocks=2,
+        last_swa_node=SimpleNamespace(swa_host_slot=7),
+    )
+
+    usable_end, source = eng._select_swa_read_source(
+        block_mask_start=0,
+        block_mask_end=2,
+        tier_match_results={
+            DeviceType.CPU: too_deep,
+            DeviceType.SSD: usable,
+        },
+    )
+
+    assert usable_end == 2
+    assert source.found
+    assert source.device_type == DeviceType.SSD
+    assert source.host_slot == 7
 
 
 def test_get_prefers_cpu_when_both_tiers_have_swa():

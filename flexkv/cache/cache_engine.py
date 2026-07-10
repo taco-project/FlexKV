@@ -2111,9 +2111,11 @@ class GlobalCacheEngine:
             if swa_hit <= block_mask_start:
                 continue
 
-            assert swa_hit <= block_mask_end, (
-                "SWA hit must not exceed the Full-KV match window"
-            )
+            if swa_hit > block_mask_end:
+                # The radix match covers the complete token sequence, while the
+                # request mask may stop earlier. A snapshot for a deeper trailing
+                # window cannot serve this request window; try another tier.
+                continue
             assert match_result.last_swa_node is not None
             candidates.append((swa_hit, device_type, match_result))
 
