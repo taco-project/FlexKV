@@ -34,6 +34,7 @@ import torch
 pytest.importorskip("flexkv.c_ext")
 
 from flexkv.cache.cache_engine import CacheEngineAccel, GlobalCacheEngine
+from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
 from flexkv.common.transfer import DeviceType, TransferType
@@ -124,6 +125,15 @@ def test_cpu_cache_engine_initializes_swa_pool_from_constructor():
 
     assert eng.swa_enabled
     assert eng.swa_pool.num_slots == 7
+
+
+def test_hierarchy_engine_does_not_advertise_swa_support():
+    eng = HierarchyLRCacheEngine.__new__(HierarchyLRCacheEngine)
+    eng.swa_pool = object()
+
+    assert not eng.swa_enabled
+    with pytest.raises(NotImplementedError):
+        eng.init_swa(_cache_config().swa)
 
 
 def _complete(op_cb, cb):
@@ -222,6 +232,36 @@ def test_put_swa_first_stays_hidden_until_full_kv_is_ready():
     ready = eng.cpu_cache_engine.match(seq)
     assert ready.num_ready_matched_blocks == 4
     assert ready.swa_hit_blocks == 4
+
+
+def test_put_full_swa_pool_keeps_match_node_alive_until_insert():
+    """Allocating a replacement SWA slot must not evict the match_result node."""
+    cc = _cache_config(True)
+    cc.swa.num_slots = 1
+    eng = GlobalCacheEngine(cc, _model_config())
+    prefix = _tokens(2, base=26)
+    extended = np.concatenate([prefix, _tokens(2, base=27)])
+
+    mask2 = np.ones_like(prefix, dtype=np.int64)
+    sm2 = np.arange(prefix.shape[0], dtype=np.int64)
+    _g1, _rm1, cb1, op_cb1, _e1 = eng.put(
+        1, prefix, mask2, sm2, dp_client_id=0)
+    _complete(op_cb1, cb1)
+    assert eng.cpu_cache_engine.swa_pool.num_used == 1
+
+    mask4 = np.ones_like(extended, dtype=np.int64)
+    sm4 = np.arange(extended.shape[0], dtype=np.int64)
+    graph, return_mask, cb2, op_cb2, _e2 = eng.put(
+        2, extended, mask4, sm4, dp_client_id=0)
+    assert graph.num_ops > 0
+    assert return_mask[2 * TPB:4 * TPB].all()
+    _complete(op_cb2, cb2)
+
+    seq = SequenceMeta(token_ids=extended, tokens_per_block=TPB)
+    ready = eng.cpu_cache_engine.match(seq)
+    assert ready.num_ready_matched_blocks == 4
+    assert ready.swa_hit_blocks == 4
+    assert eng.cpu_cache_engine.swa_pool.num_used == 1
 
 
 def test_get_builds_full_plus_swa_load_chain():

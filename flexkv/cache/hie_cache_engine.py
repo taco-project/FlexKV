@@ -112,7 +112,7 @@ class HierarchyLRCacheEngine:
     def swa_enabled(self) -> bool:
         return False
 
-    def _alloc_swa_slot(self) -> int:
+    def _alloc_swa_slot(self, protected_node=None) -> int:
         return -1
 
     def _free_unmounted_swa_slot(self, slot: int) -> None:

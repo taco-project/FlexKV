@@ -165,14 +165,20 @@ class CacheEngineAccel:
     def swa_enabled(self) -> bool:
         return self.swa_pool is not None
 
-    def _alloc_swa_slot(self) -> int:
+    def _alloc_swa_slot(self, protected_node=None) -> int:
         """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
         if self.swa_pool is None:
             return -1
         slot = self.swa_pool.allocate()
         if slot is not None:
             return slot
-        self._evict_swa_slots(1)
+        if protected_node is not None:
+            self.lock_node(protected_node)
+        try:
+            self._evict_swa_slots(1)
+        finally:
+            if protected_node is not None:
+                self.unlock(protected_node)
         slot = self.swa_pool.allocate()
         return slot if slot is not None else -1
 
@@ -413,14 +419,20 @@ class CacheEngine:
     def swa_enabled(self) -> bool:
         return self.swa_pool is not None
 
-    def _alloc_swa_slot(self) -> int:
+    def _alloc_swa_slot(self, protected_node=None) -> int:
         """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
         if self.swa_pool is None:
             return -1
         slot = self.swa_pool.allocate()
         if slot is not None:
             return slot
-        self._evict_swa_slots(1)
+        if protected_node is not None:
+            self.lock_node(protected_node)
+        try:
+            self._evict_swa_slots(1)
+        finally:
+            if protected_node is not None:
+                self.unlock(protected_node)
         slot = self.swa_pool.allocate()
         return slot if slot is not None else -1
 
@@ -1631,13 +1643,16 @@ class GlobalCacheEngine:
         remote_swa_slot = -1
 
         if self.swa_cache.enabled:
-            cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot()
+            cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
+                cpu_matched_result.last_node)
             if cpu_swa_slot >= 0 and put_to_ssd:
-                ssd_swa_slot = self.ssd_cache_engine._alloc_swa_slot()
+                ssd_swa_slot = self.ssd_cache_engine._alloc_swa_slot(
+                    ssd_matched_result.last_node)
             if (cpu_swa_slot >= 0 and
                     (not put_to_ssd or ssd_swa_slot >= 0) and
                     put_to_remote):
-                remote_swa_slot = self.remote_cache_engine._alloc_swa_slot()
+                remote_swa_slot = self.remote_cache_engine._alloc_swa_slot(
+                    remote_matched_result.last_node)
             if (cpu_swa_slot < 0 or
                     (put_to_ssd and ssd_swa_slot < 0) or
                     (put_to_remote and remote_swa_slot < 0)):
@@ -1885,9 +1900,11 @@ class GlobalCacheEngine:
         ssd_swa_slot = -1
 
         if self.swa_cache.enabled:
-            cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot()
+            cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
+                cpu_matched_result.last_node)
             if cpu_swa_slot >= 0 and fragment2_num_blocks > 0:
-                ssd_swa_slot = self.ssd_cache_engine._alloc_swa_slot()
+                ssd_swa_slot = self.ssd_cache_engine._alloc_swa_slot(
+                    ssd_matched_result.last_node)
             if (cpu_swa_slot < 0 or
                     (fragment2_num_blocks > 0 and ssd_swa_slot < 0)):
                 return self._fail_put_before_insert(
