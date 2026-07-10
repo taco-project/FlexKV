@@ -893,7 +893,6 @@ class GlobalCacheEngine:
         assert slot >= 0
         engine = self.cache_engines[device_type]
         engine.index.set_swa(node, int(slot))
-        engine._drain_unmounted_swa_slots()
 
     def _fail_put_before_insert(
             self,
