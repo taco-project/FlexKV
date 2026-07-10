@@ -99,24 +99,18 @@ class HierarchyLRCacheEngine:
         self._stats_distributed_matched_tokens = 0 # total tokens matched in FlexKV global (distributed reuse)
         self._stats_match_count = 0                # match_all call count
 
-        # SWA (Sliding Window Attention) is node-mounted on the radix tree in
-        # CacheEngineAccel. This hierarchical/distributed tier does not carry
-        # node-mounted SWA state in its remote radix index, so SWA stays
-        # effectively disabled here.
+        # Hierarchical/distributed radix indexes do not expose the node-mounted
+        # SWA match and lifecycle contract yet. Keep the capability disabled
+        # instead of creating a pool that makes callers believe SWA is usable.
         self.swa_pool = None
-        tier_swa_config = (swa_config.for_cache_tier(device_type)
-                           if swa_config is not None else None)
-        if tier_swa_config is not None:
-            self.init_swa(tier_swa_config)
 
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
-        """Initialize the SWA host pool for node-mounted SWA on this engine."""
-        from flexkv.swa.swa_host_pool import SWAHostPool
-        self.swa_pool = SWAHostPool(swa_config)
+        raise NotImplementedError(
+            "HierarchyLRCacheEngine does not support node-mounted SWA")
 
     @property
     def swa_enabled(self) -> bool:
-        return self.swa_pool is not None
+        return False
 
     def _alloc_swa_slot(self) -> int:
         return -1
@@ -131,13 +125,7 @@ class HierarchyLRCacheEngine:
         return -1
 
     def _drain_unmounted_swa_slots(self) -> None:
-        if self.swa_pool is None:
-            return
-        drain = getattr(self.index, "drain_freed_swa_slots", None)
-        if drain is None:
-            return
-        for slot in drain():
-            self._free_unmounted_swa_slot(slot)
+        return
 
     def start(self) -> None:
         if self._meta is None:
