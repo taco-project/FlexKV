@@ -16,14 +16,18 @@ class cudaIpcMemHandle_t(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_byte * 64)]
 
 
-# Load CUDA runtime library
-try:
-    cudart = ctypes.CDLL("libcudart.so")
-except:
-    try:
-        cudart = ctypes.CDLL("libcudart.so.12")
-    except:
-        cudart = ctypes.CDLL("libcudart.so.11")
+# PyTorch exposes ROCm devices through the torch.cuda API, but ROCm hosts do
+# not ship libcudart.  PyTorch reduction IPC works on both backends; direct
+# CUDA IPC remains an NVIDIA-only fallback.
+IS_ROCM = getattr(torch.version, "hip", None) is not None
+cudart = None
+if not IS_ROCM:
+    for _library in ("libcudart.so", "libcudart.so.12", "libcudart.so.11"):
+        try:
+            cudart = ctypes.CDLL(_library)
+            break
+        except OSError:
+            continue
 
 # CUDA IPC handle size (64 bytes on Linux)
 CUDA_IPC_HANDLE_SIZE = 64
@@ -94,6 +98,9 @@ class TensorSharedHandle:
         if not tensor.is_cuda:
             raise ValueError("Only support CUDA tensor sharing")
 
+        if force_direct_ipc and IS_ROCM:
+            raise RuntimeError("Direct CUDA IPC is not available on ROCm; use PyTorch IPC")
+
         if not force_direct_ipc:
             ## Try PyTorch's built-in method first
             try:
@@ -116,6 +123,12 @@ class TensorSharedHandle:
             except RuntimeError as e:
                 flexkv_logger.warning(f"PyTorch CUDA IPC export failed: {e}")
                 flexkv_logger.info("Attempting direct CUDA IPC export...")
+
+        if cudart is None:
+            backend = "ROCm" if IS_ROCM else "CUDA"
+            raise RuntimeError(
+                f"PyTorch {backend} IPC export failed and direct CUDA IPC is unavailable"
+            )
 
         try:
             ## Try direct CUDA IPC export
@@ -144,6 +157,8 @@ class TensorSharedHandle:
         tensor_dtype: Optional[Union[torch.dtype, str]],
         offset: int = 0,
     ) -> None:
+        if IS_ROCM:
+            raise RuntimeError("External direct CUDA IPC handles are not supported on ROCm")
         if ipc_handle is None:
             raise ValueError("ipc_handle is required when constructing from external handle")
         if tensor_shape is None:
@@ -338,6 +353,8 @@ class TensorSharedHandle:
         """
         Use CUDA IPC API to export the tensor's IPC handle
         """
+        if cudart is None:
+            raise RuntimeError("Direct CUDA IPC requires the NVIDIA CUDA runtime")
         # Get device pointer
         data_ptr = tensor.data_ptr()
         device = tensor.device
@@ -390,6 +407,8 @@ class TensorSharedHandle:
             device: Target CUDA device
             offset: Offset in bytes from the base pointer (for memory pool allocations)
         """
+        if cudart is None:
+            raise RuntimeError("Direct CUDA IPC requires the NVIDIA CUDA runtime")
         # Ensure CUDA is initialized in this process
         if not torch.cuda.is_initialized():
             flexkv_logger.info("Initializing CUDA in subprocess")
