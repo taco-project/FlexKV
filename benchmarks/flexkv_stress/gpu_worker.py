@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import multiprocessing as mp
+import os
 import traceback
 from typing import Any
 
@@ -52,6 +53,7 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
 
         backend = DeviceBackend.detect(torch)
         backend.set_device(device_id)
+        kv_tp_rank, cp_rank = config.worker_ranks(effective_rank)
         groups = config.preset.groups
         num_blocks = config.model.gpu_blocks_per_rank
         layer_specs = []
@@ -129,6 +131,9 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
             "ok": True,
             "backend": backend.name,
             "device_id": device_id,
+            "pid": os.getpid(),
+            "kv_tp_rank": kv_tp_rank,
+            "cp_rank": cp_rank,
             "groups": [tuple(tensor.shape) for tensor in (group[0] for group in tensors_per_group)],
         })
 
@@ -142,13 +147,14 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
             patterns = [int(v) for v in command.get("patterns", [])]
             if operation == "seed":
                 for group_id, tensors in enumerate(tensors_per_group):
-                    _fill_blocks(tensors, block_ids, patterns, effective_rank, group_id)
+                    _fill_blocks(tensors, block_ids, patterns, kv_tp_rank, group_id)
                 if swa_tensors is not None and command.get("swa_block_ids"):
+                    swa_patterns = [int(v) for v in command.get("swa_patterns", patterns[-1:])]
                     _fill_blocks(
                         swa_tensors,
                         [int(v) for v in command["swa_block_ids"]],
-                        [patterns[-1]],
-                        effective_rank,
+                        swa_patterns,
+                        kv_tp_rank,
                         len(tensors_per_group),
                     )
                 backend.synchronize(device_id)
@@ -169,14 +175,15 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
                 max_bytes = int(command.get("max_bytes", 256))
                 for group_id, tensors in enumerate(tensors_per_group):
                     errors.extend(_verify_blocks(
-                        tensors, block_ids, patterns, effective_rank, group_id, max_layers, max_bytes
+                        tensors, block_ids, patterns, kv_tp_rank, group_id, max_layers, max_bytes
                     ))
                 if swa_tensors is not None and command.get("swa_block_ids"):
+                    swa_patterns = [int(v) for v in command.get("swa_patterns", patterns[-1:])]
                     errors.extend(_verify_blocks(
                         swa_tensors,
                         [int(v) for v in command["swa_block_ids"]],
-                        [patterns[-1]],
-                        effective_rank,
+                        swa_patterns,
+                        kv_tp_rank,
                         len(tensors_per_group),
                         max_layers,
                         max_bytes,
@@ -201,6 +208,8 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
 class GpuWorker:
     dp_rank: int
     effective_rank: int
+    kv_tp_rank: int
+    cp_rank: int
     device_id: int
     process: mp.Process
     connection: Any
@@ -231,7 +240,7 @@ class GpuWorker:
 def start_gpu_workers(config, gpu_register_port: str) -> list[GpuWorker]:
     context = mp.get_context("spawn")
     workers = []
-    effective_size = config.model.tp_size * config.model.cp_size
+    effective_size = config.workers_per_dp
     for dp_rank in range(config.model.dp_size):
         for effective_rank in range(effective_size):
             device_id = dp_rank * effective_size + effective_rank
@@ -242,11 +251,17 @@ def start_gpu_workers(config, gpu_register_port: str) -> list[GpuWorker]:
                 daemon=False,
             )
             process.start()
-            worker = GpuWorker(dp_rank, effective_rank, device_id, process, parent)
             if not parent.poll(180):
-                worker.shutdown()
+                process.terminate()
+                process.join(timeout=5)
                 raise TimeoutError(f"GPU worker {device_id} did not register in 180 seconds")
             response = parent.recv()
+            worker = GpuWorker(
+                dp_rank, effective_rank,
+                int(response.get("kv_tp_rank", effective_rank)),
+                int(response.get("cp_rank", 0)),
+                device_id, process, parent,
+            )
             if not response.get("ok"):
                 worker.shutdown()
                 raise RuntimeError(response.get("traceback", response.get("error", str(response))))

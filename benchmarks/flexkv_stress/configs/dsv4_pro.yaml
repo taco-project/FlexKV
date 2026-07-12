@@ -19,11 +19,19 @@ features:
   concurrency: true
 
 run:
+  mode: latency_hit
   warmup_rounds: 1
   rounds: 1000
   duration_seconds: 86400
   stop_when: either
   seed: 42
+
+bandwidth:
+  concurrency_levels: [1, 2, 4, 8, 16]
+  target_payload_gb: 0
+  min_duration_seconds: 30
+  min_operations: 100
+  window_seconds: 5
 
 conversation:
   conversations_per_round: 16

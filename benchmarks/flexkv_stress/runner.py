@@ -48,7 +48,7 @@ def build_flexkv_configs(config):
         head_size=config.preset.head_size,
         use_mla=config.preset.use_mla,
         dtype=torch_dtype(config.model.dtype or config.preset.dtype),
-        tp_size=config.model.tp_size,
+        tp_size=config.kv_tp_size,
         dp_size=config.model.dp_size,
         cp_size=config.model.cp_size,
         layer_groups=groups,
@@ -143,7 +143,9 @@ class FlexKVRuntime:
             raise RuntimeError("No CUDA/ROCm device is available; use --dry-run in this environment")
         if torch.cuda.device_count() < self.config.required_gpus:
             raise RuntimeError(
-                f"Need {self.config.required_gpus} GPUs for TP×DP×CP, found {torch.cuda.device_count()}"
+                f"Need {self.config.required_gpus} GPUs for composite-TP×DP "
+                f"(kv_tp={self.config.kv_tp_size}, cp={self.config.model.cp_size}), "
+                f"found {torch.cuda.device_count()}"
             )
         base_socket = os.environ.setdefault(
             "FLEXKV_LAYERWISE_EVENTFD_SOCKET",
@@ -159,7 +161,7 @@ class FlexKVRuntime:
         self.model_config, self.cache_config = build_flexkv_configs(self.config)
 
         if self.config.features.layerwise:
-            effective_size = self.config.model.tp_size * self.config.model.cp_size
+            effective_size = self.config.workers_per_dp
             for dp_rank in range(self.config.model.dp_size):
                 group = EventfdGroup(
                     _socket_path(base_socket, dp_rank, self.config.model.dp_size),
@@ -214,22 +216,46 @@ class ManagerDriver:
         self.eventfds = eventfds
         self.oracle = PrefixOracle(config.tokens_per_block, oracle_capacity_blocks)
         self.slots = SlotAllocator(config.model.gpu_blocks_per_rank, config.tokens_per_block)
-        self.swa_slots = SlotAllocator(config.cache.swa_num_slots, 1)
+        self.swa_slots = SlotAllocator(config.cache.swa_num_slots, config.tokens_per_block)
         self.counter_id = 0
         self.last_stored: tuple[object, list[int]] | None = None
 
     def _operation(self, operations: list[OperationResult], name: str, started: float,
-                   success: bool, tokens: int = 0, hit_tokens: int = 0, error: str = "") -> None:
+                   success: bool, tokens: int = 0, hit_tokens: int = 0,
+                   transfer_bytes: int = 0, error: str = "") -> None:
         operations.append(OperationResult(
             name, success, (time.perf_counter() - started) * 1000,
-            tokens=tokens, hit_tokens=hit_tokens, error=error,
+            tokens=tokens, hit_tokens=hit_tokens,
+            transfer_bytes=transfer_bytes, error=error,
         ))
+
+    def _swa_mapping(self):
+        blocks, slots = self.swa_slots.allocate(self.config.tokens_per_block)
+        return blocks.tolist(), slots
+
+    def _launch_bytes(self, pending: list[_Launch]) -> int:
+        import numpy as np
+
+        tpb = self.config.tokens_per_block
+        main_blocks = sum(
+            len(np.unique(np.asarray(item.slots, dtype=np.int64).reshape(-1) // tpb))
+            for item in pending
+        )
+        swa_blocks = sum(
+            len(np.unique(np.asarray(item.swa_slots, dtype=np.int64).reshape(-1) // tpb))
+            for item in pending if item.swa_slots is not None
+        )
+        return (
+            main_blocks * self.config.bytes_per_block
+            + swa_blocks * self.config.swa_bytes_per_block
+        )
 
     def _launch(self, pending: list[_Launch], operation: str,
                 operations: list[OperationResult], layerwise: bool = False) -> bool:
         if not pending:
             return True
         started = time.perf_counter()
+        transfer_bytes = self._launch_bytes(pending)
         try:
             as_batch = len(pending) > 1 or layerwise
             returned = self.manager.launch(
@@ -253,10 +279,16 @@ class ManagerDriver:
                 values = self.eventfds.read_counter(self.counter_id) if self.eventfds else []
                 success = success and (not values or all(sum(rank) > 0 for rank in values))
                 self.counter_id = (self.counter_id + 1) % 3
-            self._operation(operations, operation, started, success)
+            self._operation(
+                operations, operation, started, success,
+                transfer_bytes=transfer_bytes,
+            )
             return success
         except Exception as exc:
-            self._operation(operations, operation, started, False, error=str(exc))
+            self._operation(
+                operations, operation, started, False,
+                transfer_bytes=transfer_bytes, error=str(exc),
+            )
             return False
 
     def _match_get(self, tokens, operations: list[OperationResult]):
@@ -304,8 +336,7 @@ class ManagerDriver:
                 blocks, slots = self.slots.allocate(actual)
                 swa_mapping = None
                 if self.config.features.swa:
-                    swa_block, _ = self.swa_slots.allocate(1)
-                    swa_mapping = np.asarray(swa_block, dtype=np.int64)
+                    _swa_blocks, swa_mapping = self._swa_mapping()
                 get_pending.append(_Launch(task_id, slots, swa_mapping))
             states.append(state)
         get_started = time.perf_counter()
@@ -330,14 +361,13 @@ class ManagerDriver:
             swa_mapping = None
             swa_blocks = []
             if self.config.features.swa:
-                swa_block, _ = self.swa_slots.allocate(1)
-                swa_blocks = [int(swa_block[0])]
-                swa_mapping = np.asarray(swa_blocks, dtype=np.int64)
+                swa_blocks, swa_mapping = self._swa_mapping()
             command_dp(self.workers, self.dp_rank, {
                 "operation": "seed", "block_ids": blocks.tolist(), "patterns": patterns,
-                "swa_block_ids": swa_blocks,
+                "swa_block_ids": swa_blocks, "swa_patterns": patterns[-1:],
             })
             started = time.perf_counter()
+            state["save_started"] = started
             try:
                 result = self.manager.put_match(np.asarray(tokens, dtype=np.int64))
                 if result is None:
@@ -352,12 +382,11 @@ class ManagerDriver:
             except Exception as exc:
                 state["put_ok"] = False
                 self._operation(operations, "put_match", started, False, aligned, error=str(exc))
-        put_started = time.perf_counter()
         put_ok = self._launch(put_pending, "launch_put", operations)
-        put_ms = (time.perf_counter() - put_started) * 1000
         for state, tokens, _patterns in put_metadata:
             state["put_ok"] = state["put_ok"] and put_ok
-            state["put_ms"] = put_ms
+            # Service save latency starts at put_match and ends after launch_put/wait.
+            state["put_ms"] = (time.perf_counter() - state["save_started"]) * 1000
             if state["put_ok"]:
                 self.oracle.put(tokens)
                 self.last_stored = (tokens, _patterns)
@@ -376,9 +405,7 @@ class ManagerDriver:
                 swa_mapping = None
                 swa_blocks = []
                 if self.config.features.swa:
-                    swa_block, _ = self.swa_slots.allocate(1)
-                    swa_blocks = [int(swa_block[0])]
-                    swa_mapping = np.asarray(swa_blocks, dtype=np.int64)
+                    swa_blocks, swa_mapping = self._swa_mapping()
                 if state["sample"]:
                     command_dp(self.workers, self.dp_rank, {
                         "operation": "zero", "block_ids": blocks.tolist(),
@@ -399,7 +426,7 @@ class ManagerDriver:
                         "operation": "verify",
                         "block_ids": blocks[:self.config.validation.sampled_blocks_per_request],
                         "patterns": patterns[:self.config.validation.sampled_blocks_per_request],
-                        "swa_block_ids": swa_blocks,
+                        "swa_block_ids": swa_blocks, "swa_patterns": patterns[-1:],
                         "max_layers": self.config.validation.sampled_layers_per_group,
                         "max_bytes": self.config.validation.bytes_per_sample,
                     })
@@ -429,8 +456,10 @@ class ManagerDriver:
                 hit_delta_tokens=state["actual"] - state["expected"],
                 put_unmatched_tokens=state["put_unmatched"],
                 match_ms=state["match_ms"], get_ms=state["get_ms"], put_ms=state["put_ms"],
-                success=success, validation_sampled=state["sample"],
+                success=success,
+                validation_sampled=state["sample"] and self.config.conversation.read_after_put,
                 validation_ok=state["validation_ok"],
+                query_tokens=len(turn.get_tokens),
             ))
         return results, operations
 
@@ -455,7 +484,10 @@ class ManagerDriver:
                 getattr(value.status, "name", str(value.status)) == "SUCCESS"
                 for value in put_response.values()
             )
-            self._operation(operations, "put_async", started, put_ok, tokens=length)
+            self._operation(
+                operations, "put_async", started, put_ok, tokens=length,
+                transfer_bytes=(length // self.config.tokens_per_block) * self.config.bytes_per_block,
+            )
         except Exception as exc:
             self._operation(operations, "put_async", started, False, tokens=length, error=str(exc))
             return operations
@@ -474,7 +506,11 @@ class ManagerDriver:
                 getattr(value.status, "name", str(value.status)) == "SUCCESS"
                 for value in get_response.values()
             )
-            self._operation(operations, "get_async", started, get_ok, tokens=length, hit_tokens=length)
+            self._operation(
+                operations, "get_async", started, get_ok, tokens=length,
+                hit_tokens=length,
+                transfer_bytes=(length // self.config.tokens_per_block) * self.config.bytes_per_block,
+            )
             if get_ok:
                 verified = command_dp(self.workers, self.dp_rank, {
                     "operation": "verify", "block_ids": target_blocks.tolist(), "patterns": patterns,
@@ -507,9 +543,7 @@ class ManagerDriver:
             swa_mapping = None
             swa_blocks = []
             if self.config.features.swa:
-                swa_block, _ = self.swa_slots.allocate(1)
-                swa_blocks = [int(swa_block[0])]
-                swa_mapping = np.asarray(swa_blocks, dtype=np.int64)
+                swa_blocks, swa_mapping = self._swa_mapping()
             command_dp(self.workers, self.dp_rank, {
                 "operation": "zero", "block_ids": blocks.tolist(),
                 "swa_block_ids": swa_blocks,
@@ -526,7 +560,7 @@ class ManagerDriver:
                     "operation": "verify",
                     "block_ids": blocks[:self.config.validation.sampled_blocks_per_request].tolist(),
                     "patterns": patterns[:self.config.validation.sampled_blocks_per_request],
-                    "swa_block_ids": swa_blocks,
+                    "swa_block_ids": swa_blocks, "swa_patterns": patterns[-1:],
                     "max_layers": self.config.validation.sampled_layers_per_group,
                     "max_bytes": self.config.validation.bytes_per_sample,
                 })

@@ -1,9 +1,10 @@
 model:
   preset: glm5
-  tp_size: 2
-  dp_size: 2
-  cp_size: 1
-  gpu_blocks_per_rank: 64
+  # Four physical workers per DP: KV TP=2, duplicated across two q-split CP ranks.
+  tp_size: 4
+  dp_size: 1
+  cp_size: 2
+  gpu_blocks_per_rank: 16
   tokens_per_block: 8
   layer_groups:
     - name: tiny_main
@@ -11,8 +12,15 @@ model:
       num_kv_heads: 1
       head_size: 8
       dtype: float32
+    - name: tiny_indexer
+      layers: [0, 1]
+      num_kv_heads: 1
+      head_size: 4
+      dtype: uint8
+
 cache:
-  num_cpu_blocks: 512
+  num_cpu_blocks: 128
+
 features:
   cpu_stub: true
   layerwise: false
@@ -20,42 +28,44 @@ features:
   ssd: false
   concurrency: true
   async_api_probe_interval_rounds: 1
+
 run:
   mode: latency_hit
   warmup_rounds: 1
-  rounds: 5
+  rounds: 2
   duration_seconds: 0
-  stop_when: either
-  seed: 42
-  log_every_rounds: 1
+  seed: 55
+
 bandwidth:
-  concurrency_levels: [1, 2, 4]
+  concurrency_levels: [1, 2]
   min_duration_seconds: 0
   min_operations: 1
   window_seconds: 0
   validation_interval_operations: 1
+
 conversation:
-  conversations_per_round: 6
-  turns_min: 3
-  turns_max: 3
-  system_prompt_blocks: 2
+  conversations_per_round: 2
+  turns_min: 2
+  turns_max: 2
+  system_prompt_blocks: 1
   first_input_blocks: 1
   added_input_blocks: 1
   output_blocks: 1
-  shared_system_prompt: true
   read_after_put: true
+
 concurrency:
-  max_inflight_per_dp: 4
+  max_inflight_per_dp: 2
   batch_size: 2
   request_timeout_seconds: 10
+
 validation:
   sample_rate: 1.0
   min_samples_per_round: 1
-  sampled_layers_per_group: 2
-  sampled_blocks_per_request: 2
-  bytes_per_sample: 256
-  hit_tolerance_blocks: 0
-  stop_on_mismatch: true
+  sampled_layers_per_group: 1
+  sampled_blocks_per_request: 1
+  bytes_per_sample: 64
   minimum_success_rate: 1.0
+
 output:
-  directory: ./benchmark_results/flexkv_stress/cpu_stub
+  directory: ./benchmark_results/flexkv_stress/glm5_cpu_smoke
+  resource_interval_seconds: 0

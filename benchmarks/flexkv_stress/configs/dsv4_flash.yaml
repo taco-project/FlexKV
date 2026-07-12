@@ -11,7 +11,7 @@ cache:
   swa_num_slots: 128
   swa_ssd_slots: 512
 features: {layerwise: true, swa: true, ssd: true, concurrency: true}
-run: {warmup_rounds: 1, rounds: 1000, duration_seconds: 86400, stop_when: either, seed: 42}
+run: {mode: latency_hit, warmup_rounds: 1, rounds: 1000, duration_seconds: 86400, stop_when: either, seed: 42}
 conversation:
   conversations_per_round: 16
   turns_min: 2

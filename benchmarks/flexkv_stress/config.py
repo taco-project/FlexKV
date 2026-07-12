@@ -13,12 +13,29 @@ from .models import LayerGroup, ModelPreset, get_preset, model_bytes_per_block, 
 
 @dataclass
 class RunConfig:
+    mode: str = "latency_hit"
     warmup_rounds: int = 1
     rounds: int = 100
     duration_seconds: float = 0
     stop_when: str = "either"
     seed: int = 42
     log_every_rounds: int = 1
+
+
+@dataclass
+class BandwidthConfig:
+    paths: list[str] = field(default_factory=lambda: [
+        "gpu_to_cpu_save",
+        "cpu_to_gpu_load",
+        "gpu_to_ssd_save_e2e",
+        "ssd_to_gpu_reload_e2e",
+    ])
+    concurrency_levels: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
+    target_payload_gb: float = 0
+    min_duration_seconds: float = 30
+    min_operations: int = 100
+    window_seconds: float = 5
+    validation_interval_operations: int = 100
 
 
 @dataclass
@@ -101,6 +118,7 @@ class OutputConfig:
 @dataclass
 class StressConfig:
     run: RunConfig
+    bandwidth: BandwidthConfig
     model: ModelBenchConfig
     cache: CacheBenchConfig
     features: FeatureConfig
@@ -117,34 +135,107 @@ class StressConfig:
 
     @property
     def required_gpus(self) -> int:
-        return self.model.tp_size * self.model.dp_size * self.model.cp_size
+        return self.workers_per_dp * self.model.dp_size
+
+    @property
+    def kv_tp_size(self) -> int:
+        """Attention/KV TP width after SGLang carves CP out of composite TP."""
+        return self.model.tp_size // self.model.cp_size
+
+    @property
+    def workers_per_dp(self) -> int:
+        """Physical SGLang ranks per DP shard (TP and CP ranks overlap)."""
+        return self.model.tp_size
+
+    def worker_ranks(self, worker_rank: int) -> tuple[int, int]:
+        """Return ``(kv_tp_rank, cp_rank)`` for a flattened physical rank."""
+        return worker_rank % self.kv_tp_size, worker_rank // self.kv_tp_size
 
     @property
     def bytes_per_block(self) -> int:
-        # FlexKV's heterogeneous host block stores all TP slices.
-        return self.bytes_per_gpu_block * self.model.tp_size
+        # CP is q-split and duplicates KV. Host blocks store only unique KV-TP slices.
+        return self.bytes_per_gpu_block * self.kv_tp_size
 
     @property
     def bytes_per_gpu_block(self) -> int:
         return model_bytes_per_block(self.preset, self.tokens_per_block)
 
+    @property
+    def swa_bytes_per_block(self) -> int:
+        if not self.features.swa:
+            return 0
+        return (
+            self.tokens_per_block
+            * self.preset.swa_num_layers
+            * self.preset.swa_head_size
+        )
+
     def validate(self) -> None:
+        if self.run.mode not in {"bandwidth", "latency_hit"}:
+            raise ValueError("run.mode must be 'bandwidth' or 'latency_hit'")
         if self.run.rounds <= 0 and self.run.duration_seconds <= 0:
             raise ValueError("Set run.rounds or run.duration_seconds")
+        if self.run.warmup_rounds < 0:
+            raise ValueError("run.warmup_rounds must be >= 0")
+        if self.run.log_every_rounds < 1:
+            raise ValueError("run.log_every_rounds must be >= 1")
         if self.run.stop_when not in {"either", "both"}:
             raise ValueError("run.stop_when must be 'either' or 'both'")
         if min(self.model.tp_size, self.model.dp_size, self.model.cp_size) < 1:
             raise ValueError("TP, DP and CP sizes must be >= 1")
+        if self.model.tp_size % self.model.cp_size:
+            raise ValueError(
+                "model.tp_size is the composite SGLang TP world size per DP and "
+                "must be divisible by model.cp_size"
+            )
         if self.model.gpu_blocks_per_rank < 1:
             raise ValueError("model.gpu_blocks_per_rank must be >= 1")
+        if self.tokens_per_block < 1:
+            raise ValueError("tokens_per_block must be >= 1")
         if not 0 <= self.validation.sample_rate <= 1:
             raise ValueError("validation.sample_rate must be in [0, 1]")
+        if not 0 <= self.validation.minimum_success_rate <= 1:
+            raise ValueError("validation.minimum_success_rate must be in [0, 1]")
+        if min(
+            self.validation.min_samples_per_round,
+            self.validation.sampled_layers_per_group,
+            self.validation.sampled_blocks_per_request,
+            self.validation.bytes_per_sample,
+        ) < 0:
+            raise ValueError("validation sample counts and bytes must be >= 0")
+        if min(self.concurrency.max_inflight_per_dp, self.concurrency.batch_size) < 1:
+            raise ValueError("concurrency batch_size and max_inflight_per_dp must be >= 1")
+        if self.concurrency.request_timeout_seconds <= 0:
+            raise ValueError("concurrency.request_timeout_seconds must be > 0")
+        if self.output.resource_interval_seconds < 0:
+            raise ValueError("output.resource_interval_seconds must be >= 0")
+        valid_paths = {
+            "gpu_to_cpu_save", "cpu_to_gpu_load",
+            "gpu_to_ssd_save_e2e", "ssd_to_gpu_reload_e2e",
+        }
+        unknown_paths = set(self.bandwidth.paths) - valid_paths
+        if unknown_paths:
+            raise ValueError(f"Unknown bandwidth paths: {sorted(unknown_paths)}")
+        if not self.bandwidth.concurrency_levels or any(
+            value < 1 for value in self.bandwidth.concurrency_levels
+        ):
+            raise ValueError("bandwidth.concurrency_levels must contain positive integers")
+        if min(
+            self.bandwidth.target_payload_gb,
+            self.bandwidth.min_duration_seconds,
+            self.bandwidth.min_operations,
+            self.bandwidth.window_seconds,
+            self.bandwidth.validation_interval_operations,
+        ) < 0:
+            raise ValueError("bandwidth targets and window settings must be >= 0")
         if self.conversation.turns_min < 1 or self.conversation.turns_max < self.conversation.turns_min:
             raise ValueError("Invalid conversation turn range")
         if self.features.swa and not self.preset.swa_enabled:
             raise ValueError(f"Preset {self.preset.name} does not define an SWA pool")
         if self.features.ssd and self.cache.ssd_cache_gb <= 0 and self.cache.num_ssd_blocks <= 0:
             raise ValueError("SSD is enabled but neither ssd_cache_gb nor num_ssd_blocks is set")
+        if self.features.ssd and not self.cache.ssd_cache_dir:
+            raise ValueError("SSD is enabled but cache.ssd_cache_dir is empty")
         if self.features.cpu_stub and self.features.ssd:
             raise ValueError("CPU stub mode does not emulate the FlexKV SSD tier")
         for group in self.preset.groups:
@@ -213,6 +304,7 @@ def load_config(path: str | os.PathLike[str]) -> StressConfig:
         preset = _override_groups(preset, model.layer_groups)
     config = StressConfig(
         run=_section(RunConfig, raw, "run"),
+        bandwidth=_section(BandwidthConfig, raw, "bandwidth"),
         model=model,
         cache=_section(CacheBenchConfig, raw, "cache"),
         features=_section(FeatureConfig, raw, "features"),
@@ -235,4 +327,9 @@ def config_as_dict(config: StressConfig) -> dict[str, Any]:
     from dataclasses import asdict
     result = asdict(config)
     result["source_path"] = str(config.source_path)
+    result["derived_parallelism"] = {
+        "kv_tp_size": config.kv_tp_size,
+        "workers_per_dp": config.workers_per_dp,
+        "required_gpus": config.required_gpus,
+    }
     return copy.deepcopy(result)

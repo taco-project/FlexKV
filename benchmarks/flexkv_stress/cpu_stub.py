@@ -47,6 +47,7 @@ class CpuTorchWorker:
         self.config = config
         self.dp_rank = dp_rank
         self.effective_rank = effective_rank
+        self.kv_tp_rank, self.cp_rank = config.worker_ranks(effective_rank)
         self.device_id = device_id
         self.tensors_per_group: list[list[torch.Tensor]] = []
         for group in config.preset.groups:
@@ -81,13 +82,16 @@ class CpuTorchWorker:
         patterns = [int(value) for value in command.get("patterns", [])]
         if operation == "seed":
             for group_id, tensors in enumerate(self.tensors_per_group):
-                _fill_blocks(tensors, block_ids, patterns, self.effective_rank, group_id)
+                _fill_blocks(tensors, block_ids, patterns, self.kv_tp_rank, group_id)
             if self.swa_tensors is not None and command.get("swa_block_ids"):
+                swa_patterns = [
+                    int(value) for value in command.get("swa_patterns", patterns[-1:])
+                ]
                 _fill_blocks(
                     self.swa_tensors,
                     [int(value) for value in command["swa_block_ids"]],
-                    [patterns[-1]],
-                    self.effective_rank,
+                    swa_patterns,
+                    self.kv_tp_rank,
                     len(self.tensors_per_group),
                 )
             return {"ok": True}
@@ -111,17 +115,20 @@ class CpuTorchWorker:
                     tensors,
                     block_ids,
                     patterns,
-                    self.effective_rank,
+                    self.kv_tp_rank,
                     group_id,
                     max_layers,
                     max_bytes,
                 ))
             if self.swa_tensors is not None and command.get("swa_block_ids"):
+                swa_patterns = [
+                    int(value) for value in command.get("swa_patterns", patterns[-1:])
+                ]
                 errors.extend(_verify_blocks(
                     self.swa_tensors,
                     [int(value) for value in command["swa_block_ids"]],
-                    [patterns[-1]],
-                    self.effective_rank,
+                    swa_patterns,
+                    self.kv_tp_rank,
                     len(self.tensors_per_group),
                     max_layers,
                     max_bytes,
@@ -274,7 +281,10 @@ class CpuStubManager:
                     self._copy_worker_block_to_node(worker, block_id, child)
             node = child
         if swa_slot_mapping is not None and len(np.asarray(swa_slot_mapping).reshape(-1)):
-            swa_block = int(np.asarray(swa_slot_mapping).reshape(-1)[0])
+            swa_block = int(
+                np.asarray(swa_slot_mapping).reshape(-1)[0]
+                // self.config.tokens_per_block
+            )
             for worker in self.workers:
                 if worker.swa_tensors is not None:
                     node.swa_data[worker.effective_rank] = [
@@ -310,7 +320,10 @@ class CpuStubManager:
                 self._copy_node_to_worker_block(node, worker, block_id)
         if task.nodes and swa_slot_mapping is not None and len(np.asarray(swa_slot_mapping).reshape(-1)):
             terminal = task.nodes[-1]
-            swa_block = int(np.asarray(swa_slot_mapping).reshape(-1)[0])
+            swa_block = int(
+                np.asarray(swa_slot_mapping).reshape(-1)[0]
+                // self.config.tokens_per_block
+            )
             for worker in self.workers:
                 cached = terminal.swa_data.get(worker.effective_rank)
                 if cached is None or worker.swa_tensors is None:
@@ -351,7 +364,7 @@ class CpuStubManager:
 
 def start_cpu_workers(config) -> list[CpuTorchWorker]:
     workers = []
-    effective_size = config.model.tp_size * config.model.cp_size
+    effective_size = config.workers_per_dp
     for dp_rank in range(config.model.dp_size):
         for effective_rank in range(effective_size):
             device_id = dp_rank * effective_size + effective_rank

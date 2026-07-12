@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import csv
 import json
+import csv
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from xml.etree import ElementTree
 
 import numpy as np
 import torch
@@ -13,7 +15,10 @@ import torch
 from benchmarks.flexkv_stress.config import ConversationConfig, load_config
 from benchmarks.flexkv_stress.device import DeviceBackend
 from benchmarks.flexkv_stress.main import _should_stop
-from benchmarks.flexkv_stress.metrics import OperationResult, Reporter, TurnResult, percentile
+from benchmarks.flexkv_stress.metrics import (
+    LogHistogram, OperationResult, Reporter, TurnResult, decimal_gb, percentile,
+    throughput_gb_s,
+)
 from benchmarks.flexkv_stress.models import (
     DSV4_FLASH_RATIOS,
     GLM52_INDEXER_TYPES,
@@ -110,6 +115,29 @@ run: {rounds: 1}
         self.assertFalse(_should_stop(config, 10, 1))
         self.assertTrue(_should_stop(config, 10, 100))
 
+    def test_composite_tp_cp_overlap_matches_sglang_topology(self):
+        config = load_config(CONFIG_DIR / "glm5_cpu_smoke.yaml")
+        self.assertEqual(config.model.tp_size, 4)
+        self.assertEqual(config.model.cp_size, 2)
+        self.assertEqual(config.kv_tp_size, 2)
+        self.assertEqual(config.workers_per_dp, 4)
+        self.assertEqual(config.required_gpus, 4)
+        self.assertEqual(config.bytes_per_block, config.bytes_per_gpu_block * 2)
+        self.assertEqual(
+            [config.worker_ranks(rank) for rank in range(config.workers_per_dp)],
+            [(0, 0), (1, 0), (0, 1), (1, 1)],
+        )
+
+    def test_composite_tp_must_be_divisible_by_cp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid.yaml"
+            path.write_text("""
+model: {preset: glm5, tp_size: 3, cp_size: 2}
+run: {rounds: 1}
+""")
+            with self.assertRaisesRegex(ValueError, "must be divisible"):
+                load_config(path)
+
 
 class WorkloadTests(unittest.TestCase):
     def test_multiturn_lengths_and_oracle(self):
@@ -169,21 +197,78 @@ class MetricsAndDeviceTests(unittest.TestCase):
         self.assertEqual(percentile([1, 2, 3, 4], 0.50), 2)
         self.assertEqual(percentile([1, 2, 3, 4], 0.99), 4)
 
-    def test_reporter_writes_csvs(self):
+    def test_log_histogram_is_mergeable(self):
+        left, right = LogHistogram(), LogHistogram()
+        for value in (1, 2):
+            left.record(value)
+        for value in (3, 4):
+            right.record(value)
+        left.merge(right)
+        self.assertEqual(left.count, 4)
+        self.assertGreaterEqual(left.percentile(.99), 3.9)
+
+    def test_decimal_gb_and_bandwidth_units(self):
+        self.assertEqual(decimal_gb(1_000_000_000), 1)
+        self.assertEqual(throughput_gb_s(2_000_000_000, 2), 1)
+
+    def test_latency_reporter_writes_stable_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
-            reporter = Reporter(directory)
-            result = TurnResult(0, 1, 0, 16, 16, 32, 0, 0, 0, 32, 1, 2, 3, True, True, True)
-            reporter.write_round(0, __import__("time").perf_counter(), [result], [OperationResult("put", True, 1)])
+            config = load_config(CONFIG_DIR / "glm5_cpu_smoke.yaml")
+            config.output.directory = directory
+            reporter = Reporter(config)
+            result = TurnResult(
+                0, 1, 0, 16, 16, 32, 12, 8, -4, 24,
+                1, 2, 3, True, True, True, query_tokens=16,
+            )
+            reporter.write_latency_window(
+                "unloaded", 0, __import__("datetime").datetime.now().astimezone(),
+                1, [result], [], batch_size=1, concurrency=1,
+            )
             output = reporter.directory
             reporter.close()
-            for name in (
-                "rounds.csv", "windows.csv", "turns.csv", "operations.csv",
-                "validation_samples.csv", "resources.csv", "errors.csv", "summary.csv",
-            ):
+            for name in ("summary.csv", "metrics.csv", "summary.json", "charts.svg"):
                 self.assertTrue((output / name).exists(), name)
+            self.assertFalse((output / "errors.csv").exists())
+            with (output / "summary.json").open() as handle:
+                summary = json.load(handle)
+            self.assertEqual(summary["schema_version"], "1.0")
+            self.assertFalse(summary["run"]["performance_valid"])
+            self.assertEqual(summary["scenarios"][0]["hit"]["ratio"], .5)
+            self.assertEqual(summary["scenarios"][0]["hit"]["exact_rate"], 0)
+            self.assertEqual(summary["scenarios"][0]["hit"]["token_accuracy"], .75)
             with (output / "summary.csv").open() as handle:
-                summary = next(csv.DictReader(handle))
-            self.assertEqual(summary["turns"], "1")
+                row = next(csv.DictReader(handle))
+            self.assertEqual(float(row["hit_ratio"]), summary["scenarios"][0]["hit"]["ratio"])
+            self.assertNotIn("transfer_bytes", row)
+            root = ElementTree.parse(output / "charts.svg").getroot()
+            text = "".join(root.itertext())
+            self.assertIn("CPU STUB — PERFORMANCE NUMBERS ARE NOT VALID", text)
+            self.assertEqual(len([node for node in root.iter() if node.attrib.get("id", "").startswith("panel-")]), 4)
+
+    def test_bandwidth_reporter_uses_mode_specific_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(CONFIG_DIR / "glm5_cpu_smoke.yaml")
+            config.run.mode = "bandwidth"
+            config.output.directory = directory
+            reporter = Reporter(config)
+            reporter.write_bandwidth_window(
+                "cpu_to_gpu_load", 2, 0,
+                __import__("datetime").datetime.now().astimezone(), 2,
+                [OperationResult("launch_get", True, 10, transfer_bytes=2_000_000_000)],
+                1, 1, [],
+            )
+            output = reporter.directory
+            reporter.close()
+            with (output / "summary.csv").open() as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(float(row["throughput_gb_s"]), 1)
+            self.assertNotIn("hit_ratio", row)
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["scenarios"][0]["throughput_gb_s"], 1)
+            root = ElementTree.parse(output / "charts.svg").getroot()
+            self.assertTrue(any(
+                node.attrib.get("class") == "highest-stable-bandwidth" for node in root.iter()
+            ))
 
     def test_backend_detection(self):
         fake_rocm = type("Torch", (), {"version": type("Version", (), {"hip": "6.0"})()})()
@@ -272,11 +357,86 @@ class RunnerLogicTests(unittest.TestCase):
         driver = ManagerDriver(config, 0, self.FakeManager(), workers=[])
         fake_command = lambda *_args, **_kwargs: [{"ok": True}]
         with patch("benchmarks.flexkv_stress.runner.command_dp", fake_command):
-            first, _ = driver.execute_batch([turns[0]], 0, set())
-            second, _ = driver.execute_batch([turns[1]], 0, set())
+            first, first_operations = driver.execute_batch([turns[0]], 0, set())
+            second, second_operations = driver.execute_batch([turns[1]], 0, set())
         self.assertTrue(first[0].success)
         self.assertTrue(second[0].success)
         self.assertEqual(second[0].actual_hit_tokens, second[0].expected_hit_tokens)
+        put_match = next(item for item in first_operations if item.operation == "put_match")
+        launch_get = next(item for item in second_operations if item.operation == "launch_get")
+        self.assertGreaterEqual(first[0].put_ms, put_match.latency_ms)
+        self.assertGreaterEqual(second[0].get_ms, launch_get.latency_ms)
+
+    def test_swa_mapping_uses_token_slots_and_rotates_pages(self):
+        from benchmarks.flexkv_stress.runner import ManagerDriver
+
+        config = load_config(CONFIG_DIR / "dsv4_pro.yaml")
+        driver = ManagerDriver(config, 0, self.FakeManager(), workers=[])
+        first_blocks, first_mapping = driver._swa_mapping()
+        second_blocks, second_mapping = driver._swa_mapping()
+        self.assertEqual(first_blocks, [0])
+        self.assertEqual(second_blocks, [1])
+        self.assertEqual(len(first_mapping), config.tokens_per_block)
+        self.assertEqual(int(second_mapping[0] // config.tokens_per_block), 1)
+
+    def test_swa_validation_uses_terminal_pattern_when_main_is_sampled(self):
+        from benchmarks.flexkv_stress.cpu_stub import CpuTorchWorker
+
+        config = load_config(CONFIG_DIR / "cpu_stub.yaml")
+        config.features.swa = True
+        config.cache.swa_num_slots = 2
+        config.preset = replace(
+            config.preset,
+            swa_enabled=True,
+            swa_num_layers=1,
+            swa_head_size=2,
+        )
+        worker = CpuTorchWorker(config, dp_rank=0, effective_rank=0, device_id=0)
+        worker.request({
+            "operation": "seed",
+            "block_ids": [0],
+            "patterns": [11],
+            "swa_block_ids": [0],
+            "swa_patterns": [99],
+        })
+        response = worker.request({
+            "operation": "verify",
+            "block_ids": [0],
+            "patterns": [11],
+            "swa_block_ids": [0],
+            "swa_patterns": [99],
+            "max_layers": 1,
+            "max_bytes": 8,
+        })
+        self.assertTrue(response["ok"], response["errors"])
+
+    def test_cp_workers_hold_full_duplicate_kv_for_each_kv_tp_rank(self):
+        from benchmarks.flexkv_stress.cpu_stub import start_cpu_workers
+        from benchmarks.flexkv_stress.gpu_worker import command_dp
+
+        config = load_config(CONFIG_DIR / "glm5_cpu_smoke.yaml")
+        workers = start_cpu_workers(config)
+        self.assertEqual(len(workers), 4)
+        self.assertEqual(
+            [(worker.kv_tp_rank, worker.cp_rank) for worker in workers],
+            [(0, 0), (1, 0), (0, 1), (1, 1)],
+        )
+        command_dp(workers, 0, {
+            "operation": "seed", "block_ids": [0], "patterns": [1234],
+        })
+        for group_index in range(len(workers[0].tensors_per_group)):
+            self.assertTrue(torch.equal(
+                workers[0].tensors_per_group[group_index][0][0],
+                workers[2].tensors_per_group[group_index][0][0],
+            ))
+            self.assertTrue(torch.equal(
+                workers[1].tensors_per_group[group_index][0][0],
+                workers[3].tensors_per_group[group_index][0][0],
+            ))
+            self.assertFalse(torch.equal(
+                workers[0].tensors_per_group[group_index][0][0],
+                workers[1].tensors_per_group[group_index][0][0],
+            ))
 
     def test_cpu_stub_copies_real_torch_blocks(self):
         from benchmarks.flexkv_stress.cpu_stub import CpuStubManager, start_cpu_workers

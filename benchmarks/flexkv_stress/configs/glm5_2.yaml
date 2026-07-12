@@ -9,7 +9,7 @@ cache:
   ssd_cache_gb: 16
   ssd_cache_dir: [./flexkv_stress_ssd/glm5_2]
 features: {layerwise: true, swa: false, ssd: true, concurrency: true}
-run: {warmup_rounds: 1, rounds: 1000, duration_seconds: 86400, stop_when: either, seed: 52}
+run: {mode: latency_hit, warmup_rounds: 1, rounds: 1000, duration_seconds: 86400, stop_when: either, seed: 52}
 conversation:
   conversations_per_round: 16
   turns_min: 2
