@@ -50,6 +50,13 @@ class TestSWAHostPoolAllocation:
         pool.free(slot)
         assert pool.num_free == 8
 
+    def test_duplicate_free_is_idempotent(self, pool):
+        slot = pool.allocate()
+        assert pool.num_free == 7
+        pool.free(slot)
+        pool.free(slot)
+        assert pool.num_free == 8
+
     def test_allocate_after_free(self, pool):
         slots = [pool.allocate() for _ in range(8)]
         assert pool.allocate() is None

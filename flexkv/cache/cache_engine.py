@@ -29,12 +29,15 @@ from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
-from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
 from flexkv.cache.swa_cache_engine import SWACacheManager
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import (
-    DeviceType, TransferOpGraph, TransferOp, TransferType
+    DeviceType,
+    TransferOpGraph,
+    TransferOp,
+    TransferType,
+    add_virtual_op_for_multiple_finished_ops,
 )
 from flexkv.common.debug import flexkv_logger, summarize_id_tensor
 from flexkv.common.type import MatchResultAccel
@@ -43,6 +46,63 @@ from flexkv.metrics import FlexKVMetricsCollector, init_global_collector, get_gl
 
 DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
 _VALID_EVICTION_POLICIES = {'lru', 'lfu', 'fifo', 'mru', 'filo'}
+
+
+@dataclass
+class GetTransferPlan:
+    transfer_graph: TransferOpGraph
+    finished_ops_ids: List[int]
+    node_to_unlock: Dict[DeviceType, Tuple[object, int]]
+    op_callback_dict: Dict[int, Callable]
+    buffer_to_free: Dict[DeviceType, np.ndarray]
+    num_gpu_blocks_to_transfer: int
+
+    @classmethod
+    def empty(cls) -> "GetTransferPlan":
+        return cls(
+            transfer_graph=TransferOpGraph.create_empty_graph(),
+            finished_ops_ids=[],
+            node_to_unlock={},
+            op_callback_dict={},
+            buffer_to_free={},
+            num_gpu_blocks_to_transfer=0,
+        )
+
+
+@dataclass
+class PutTransferPlan:
+    transfer_graph: TransferOpGraph
+    finished_ops_ids: List[int]
+    node_to_unlock: Dict[DeviceType, Tuple[object, int]]
+    op_callback_dict: Dict[int, Callable]
+    buffer_to_free: Dict[DeviceType, np.ndarray]
+    num_gpu_blocks_to_transfer: int
+    skipped_gpu_blocks: int
+
+    @classmethod
+    def empty(cls) -> "PutTransferPlan":
+        return cls(
+            transfer_graph=TransferOpGraph.create_empty_graph(),
+            finished_ops_ids=[],
+            node_to_unlock={},
+            op_callback_dict={},
+            buffer_to_free={},
+            num_gpu_blocks_to_transfer=0,
+            skipped_gpu_blocks=0,
+        )
+
+
+@dataclass
+class SWAReadSource:
+    hit_blocks: int = 0
+    host_slot: int = -1
+    node: Optional[object] = None
+    device_type: Optional[DeviceType] = None
+    engine: Optional[object] = None
+
+    @property
+    def found(self) -> bool:
+        return self.hit_blocks > 0 and self.host_slot >= 0 and self.node is not None
 
 
 class CacheEngineAccel:
@@ -88,9 +148,8 @@ class CacheEngineAccel:
         # flexkv/cache/radixtree.py); this engine only owns the SWA host-pool
         # (slot bytes + free-list) and the slot alloc/free/drain plumbing. SWA
         # and Full eviction are UNIFIED through the one tree so the two pools
-        # never drift (see deployments/swa_design/08_节点挂载SWA架构.md). This
-        # engine owns SWA initialization for its tier; init_swa() remains public
-        # for tests and explicit embedding.
+        # never drift. Thisengine owns SWA initialization for its tier; init_swa()
+        #  remains public for tests and explicit embedding.
         self.swa_pool = None
         tier_swa_config = (swa_config.for_cache_tier(device_type)
                            if swa_config is not None else None)
@@ -98,12 +157,7 @@ class CacheEngineAccel:
             self.init_swa(tier_swa_config)
 
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
-        """Initialize the SWA host pool for node-mounted SWA on this engine.
-
-        Node-mount: the radix tree nodes hold the SWA state; this pool only
-        supplies slot bytes + a free-list. SWA is page-granular, so the physical
-        SWA page size must match ``tokens_per_block``.
-        """
+        """Initialize the SWA host pool for node-mounted SWA on this engine."""
         from flexkv.swa.swa_host_pool import SWAHostPool
         self.swa_pool = SWAHostPool(swa_config)
 
@@ -111,159 +165,52 @@ class CacheEngineAccel:
     def swa_enabled(self) -> bool:
         return self.swa_pool is not None
 
-    def swa_alloc_slot(self) -> int:
-        """Allocate a free SWA host-pool slot, evicting SWA-LRU when full.
-
-        Returns the slot id, or -1 when the pool is full and every SWA entry is
-        locked (cannot make space). Drains any slots freed by the SWA eviction
-        back to the pool first.
-        """
+    def _alloc_swa_slot(self, protected_node=None) -> int:
+        """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
         if self.swa_pool is None:
             return -1
         slot = self.swa_pool.allocate()
         if slot is not None:
             return slot
-        # Pool full: evict one SWA (node-mounted, watermark-driven) then retry.
-        self._evict_swa(1)
+        if protected_node is not None:
+            self.lock_node(protected_node)
+        try:
+            self._evict_swa_slots(1)
+        finally:
+            if protected_node is not None:
+                self.unlock(protected_node)
         slot = self.swa_pool.allocate()
         return slot if slot is not None else -1
 
-    def _drain_swa_slots(self) -> None:
-        """Return SWA slots freed by tree structural changes to the host pool."""
+    def _free_swa_slot(self, slot: int) -> None:
+        """Return one detached SWA slot to this tier's pool."""
+        self.swa_pool.free(int(slot))
+
+    def _drain_unmounted_swa_slots(self) -> None:
+        """Return slots detached by radix-tree structural changes to the pool."""
         if self.swa_pool is None:
             return
         for slot in self.index.drain_freed_swa_slots():
-            if slot is not None and slot >= 0:
-                self.swa_pool.free(int(slot))
+            self._free_swa_slot(slot)
 
-    def _evict_swa(self, num_swa_evicted: int) -> int:
-        """SWA-only eviction on the node-mounted tree, then drain freed slots and
-        recycle any full blocks freed by leaf deletions. Returns # SWA freed."""
+    def _pin_swa_node(self, node) -> None:
+        self.index.lock(node)
+        try:
+            node.inc_swa_lock_ref()
+        except Exception:
+            self.index.unlock(node)
+            raise
+
+    def _evict_swa_slots(self, num_swa_evicted: int) -> int:
+        """Evict node-mounted SWA slots through the C++ radix tree."""
         if self.swa_pool is None:
             return 0
         evicted_full = torch.zeros(0, dtype=torch.int64)
         num_freed = self.index.evict_swa(evicted_full, num_swa_evicted)
-        # Full blocks freed by leaf/tombstone deletions go back to the mempool.
         if evicted_full.numel() > 0:
             self.mempool.recycle_blocks(evicted_full.numpy())
-        self._drain_swa_slots()
+        self._drain_unmounted_swa_slots()
         return num_freed
-
-    def set_swa(self, node: "CRadixNode", slot: int) -> None:
-        """Mount an SWA slot on ``node``'s trailing page (store side)."""
-        self.index.set_swa(node, int(slot))
-
-    def match_swa(self,
-                  sequence_meta: SequenceMeta,
-                  upper_bound_blocks: int,
-                  lock_for_load: bool = False) -> Tuple[int, int]:
-        """Match the longest reusable trailing-SWA prefix within an upper bound.
-
-        Node-mount: the SWA hit is read from the Full-KV radix ``match_prefix``
-        (the deepest fully-matched, ready node carrying a live SWA slot). We match
-        the prefix truncated to ``upper_bound_blocks`` (this tier's Full-KV hit)
-        so the SWA hit is naturally clamped, enforcing SWA-subset-of-Full.
-
-        Returns ``(swa_hit_blocks, slot_id)``; -1 / 0 when no SWA on the path.
-        """
-        if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1
-        sequence_meta.gen_hashes()
-        num_blocks = min(int(upper_bound_blocks), sequence_meta.num_blocks)
-        if num_blocks <= 0:
-            return 0, -1
-        block_hashes = torch.from_numpy(
-            sequence_meta.block_hashes[:num_blocks]).to(torch.int64)
-        # update_cache_info=False: a match-only probe must not bump LRU here.
-        mr = self.index.match_prefix(block_hashes, num_blocks, False)
-        swa_node = getattr(mr, "last_swa_node", None)
-        swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0)
-        if swa_node is None or swa_hit <= 0:
-            return 0, -1
-        slot = int(swa_node.swa_host_slot)
-        if slot < 0:
-            return 0, -1
-        # Read-hit保温: move the hit node to SWA-LRU MRU (a match-only probe is a
-        # real "use" — this is the LRU-thrash fix). Independent of lock_for_load.
-        self.index.promote_swa(swa_node)
-        if lock_for_load:
-            # Pin the SWA against eviction until the load completes. Paired
-            # unlock is the data-plane completion callback (kept off until wired).
-            swa_node.inc_swa_lock_ref()
-        return swa_hit, slot
-
-    def match_swa_locked(self,
-                         sequence_meta: SequenceMeta,
-                         upper_bound_blocks: int) -> Tuple[int, int, Optional["CRadixNode"]]:
-        """Like match_swa(lock_for_load=True) but ALSO returns the pinned node.
-
-        The data plane needs the node handle to release the pin (dec_swa_lock_ref)
-        when the SWA H2D completes. Returns ``(swa_hit, slot, node)``;
-        ``(0, -1, None)`` on miss (nothing pinned)."""
-        if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, None
-        sequence_meta.gen_hashes()
-        num_blocks = min(int(upper_bound_blocks), sequence_meta.num_blocks)
-        if num_blocks <= 0:
-            return 0, -1, None
-        block_hashes = torch.from_numpy(
-            sequence_meta.block_hashes[:num_blocks]).to(torch.int64)
-        mr = self.index.match_prefix(block_hashes, num_blocks, False)
-        swa_node = getattr(mr, "last_swa_node", None)
-        swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0)
-        if swa_node is None or swa_hit <= 0:
-            return 0, -1, None
-        slot = int(swa_node.swa_host_slot)
-        if slot < 0:
-            return 0, -1, None
-        self.index.promote_swa(swa_node)  # read-hit保温 (before pin)
-        swa_node.inc_swa_lock_ref()
-        return swa_hit, slot, swa_node
-
-    def match_swa_from_result(self,
-                              match_result,
-                              sequence_meta: SequenceMeta,
-                              upper_bound_blocks: int,
-                              lock_for_load: bool = False,
-                              ) -> Tuple[int, int, Optional["CRadixNode"]]:
-        """Resolve the SWA hit by REUSING an already-computed Full-KV match
-        instead of re-walking the radix tree.
-
-        ``match_result`` is the tier's Full-KV match (carrying ``last_swa_node`` /
-        ``swa_hit_blocks`` from the same single forward pass). When the SWA hit
-        fits within ``upper_bound_blocks`` (the tier's clamped Full-KV hit) we use
-        it directly — the common case, zero extra traversal. When it EXCEEDS the
-        bound (a masked prefix gap made the reusable Full hit shallower than the
-        deepest SWA node), a plain ``min()`` would point past the reusable prefix,
-        so we fall back to the clamped ``match_swa`` probe to find the deepest SWA
-        node WITHIN the bound.
-
-        Returns ``(swa_hit, slot, node)`` (node is the pinned node when
-        ``lock_for_load`` else None); ``(0, -1, None)`` on miss.
-        """
-        if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, None
-        swa_node = getattr(match_result, "last_swa_node", None) if match_result is not None else None
-        swa_hit = int(getattr(match_result, "swa_hit_blocks", 0) or 0) if match_result is not None else 0
-        if swa_node is None or swa_hit <= 0:
-            return 0, -1, None
-        if swa_hit > upper_bound_blocks:
-            # Deepest SWA lies past the reusable Full hit — re-probe clamped.
-            if lock_for_load:
-                return self.match_swa_locked(sequence_meta, upper_bound_blocks)
-            swa_hit2, slot2 = self.match_swa(
-                sequence_meta, upper_bound_blocks, lock_for_load=False)
-            return swa_hit2, slot2, None
-        slot = int(swa_node.swa_host_slot)
-        if slot < 0:
-            return 0, -1, None
-        # REUSE branch: promote here. The fallback branch above delegates to
-        # match_swa[_locked], which promote internally — do NOT double-promote.
-        self.index.promote_swa(swa_node)
-        if lock_for_load:
-            swa_node.inc_swa_lock_ref()
-            return swa_hit, slot, swa_node
-        return swa_hit, slot, None
 
     def reset(self) -> None:
         self.index.reset()
@@ -387,7 +334,7 @@ class CacheEngineAccel:
                 # slots (record_freed_swa_slot in split/evict). Return them to the
                 # SWA host pool so the two pools stay in lock-step (I1). No-op when
                 # SWA is disabled.
-                self._drain_swa_slots()
+                self._drain_unmounted_swa_slots()
 
                 # Record eviction metrics
                 if self._metrics_collector is not None and num_evicted > 0:
@@ -416,6 +363,7 @@ class CacheEngineAccel:
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
+        self._drain_unmounted_swa_slots()
 
 class CacheEngine:
     def __init__(self,
@@ -454,8 +402,8 @@ class CacheEngine:
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
-        # Node-mounted SWA host pool (non-accel Python RadixTreeIndex mirror).
-        # See CacheEngineAccel for the semantics.
+        # Legacy Python mirror. Keep the SWA helpers local to this class; the
+        # C++ CacheEngineAccel path is the maintained path.
         self.swa_pool = None
         tier_swa_config = (swa_config.for_cache_tier(device_type)
                            if swa_config is not None else None)
@@ -471,120 +419,51 @@ class CacheEngine:
     def swa_enabled(self) -> bool:
         return self.swa_pool is not None
 
-    def swa_alloc_slot(self) -> int:
+    def _alloc_swa_slot(self, protected_node=None) -> int:
+        """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
         if self.swa_pool is None:
             return -1
         slot = self.swa_pool.allocate()
         if slot is not None:
             return slot
-        self._evict_swa(1)
+        if protected_node is not None:
+            self.lock_node(protected_node)
+        try:
+            self._evict_swa_slots(1)
+        finally:
+            if protected_node is not None:
+                self.unlock(protected_node)
         slot = self.swa_pool.allocate()
         return slot if slot is not None else -1
 
-    def _drain_swa_slots(self) -> None:
+    def _free_swa_slot(self, slot: int) -> None:
+        """Return one detached SWA slot to this tier's pool."""
+        self.swa_pool.free(int(slot))
+
+    def _drain_unmounted_swa_slots(self) -> None:
+        """Return slots detached by radix-tree structural changes to the pool."""
         if self.swa_pool is None:
             return
         for slot in self.index.drain_freed_swa_slots():
-            if slot is not None and slot >= 0:
-                self.swa_pool.free(int(slot))
+            self._free_swa_slot(slot)
 
-    def _evict_swa(self, num_swa_evicted: int) -> int:
+    def _pin_swa_node(self, node) -> None:
+        self.index.lock(node)
+        try:
+            node.inc_swa_lock_ref()
+        except Exception:
+            self.index.unlock(node)
+            raise
+
+    def _evict_swa_slots(self, num_swa_evicted: int) -> int:
+        """Evict node-mounted SWA slots through the Python radix tree."""
         if self.swa_pool is None:
             return 0
         evicted_full, num_freed = self.index.evict_swa(num_swa_evicted)
         if evicted_full.size > 0:
             self.mempool.recycle_blocks(evicted_full)
-        self._drain_swa_slots()
+        self._drain_unmounted_swa_slots()
         return num_freed
-
-    def set_swa(self, node: "RadixNode", slot: int) -> None:
-        self.index.set_swa(node, int(slot))
-
-    def match_swa(self,
-                  sequence_meta: SequenceMeta,
-                  upper_bound_blocks: int,
-                  lock_for_load: bool = False) -> Tuple[int, int]:
-        """Node-mounted SWA match on the Python RadixTreeIndex mirror.
-
-        Returns ``(swa_hit_blocks, slot_id)``; -1/0 when no SWA.
-        """
-        if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1
-        sequence_meta.gen_hashes()
-        num_blocks = min(int(upper_bound_blocks), sequence_meta.num_blocks)
-        if num_blocks <= 0:
-            return 0, -1
-        clamped = SequenceMeta(token_ids=sequence_meta.token_ids[:num_blocks * self.tokens_per_block],
-                               tokens_per_block=self.tokens_per_block)
-        mr = self.index.match_prefix(clamped, update_cache_info=False)
-        swa_node = getattr(mr, "last_swa_node", None)
-        swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0)
-        if swa_node is None or swa_hit <= 0:
-            return 0, -1
-        slot = int(swa_node.swa_host_slot)
-        if slot < 0:
-            return 0, -1
-        self.index.promote_swa(swa_node)  # read-hit保温 (before pin)
-        if lock_for_load:
-            swa_node.swa_lock_ref += 1
-        return swa_hit, slot
-
-    def match_swa_locked(self,
-                         sequence_meta: SequenceMeta,
-                         upper_bound_blocks: int) -> Tuple[int, int, Optional["RadixNode"]]:
-        """Like match_swa(lock_for_load=True) but ALSO returns the pinned node
-        (mirror of CacheEngineAccel.match_swa_locked)."""
-        if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, None
-        sequence_meta.gen_hashes()
-        num_blocks = min(int(upper_bound_blocks), sequence_meta.num_blocks)
-        if num_blocks <= 0:
-            return 0, -1, None
-        clamped = SequenceMeta(token_ids=sequence_meta.token_ids[:num_blocks * self.tokens_per_block],
-                               tokens_per_block=self.tokens_per_block)
-        mr = self.index.match_prefix(clamped, update_cache_info=False)
-        swa_node = getattr(mr, "last_swa_node", None)
-        swa_hit = int(getattr(mr, "swa_hit_blocks", 0) or 0)
-        if swa_node is None or swa_hit <= 0:
-            return 0, -1, None
-        slot = int(swa_node.swa_host_slot)
-        if slot < 0:
-            return 0, -1, None
-        self.index.promote_swa(swa_node)  # read-hit保温 (before pin)
-        swa_node.swa_lock_ref += 1
-        return swa_hit, slot, swa_node
-
-    def match_swa_from_result(self,
-                              match_result,
-                              sequence_meta: SequenceMeta,
-                              upper_bound_blocks: int,
-                              lock_for_load: bool = False,
-                              ) -> Tuple[int, int, Optional["RadixNode"]]:
-        """Reuse an already-computed Full-KV match to resolve the SWA hit without
-        re-walking the tree (mirror of CacheEngineAccel.match_swa_from_result;
-        see it for the fallback rationale)."""
-        if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1, None
-        swa_node = getattr(match_result, "last_swa_node", None) if match_result is not None else None
-        swa_hit = int(getattr(match_result, "swa_hit_blocks", 0) or 0) if match_result is not None else 0
-        if swa_node is None or swa_hit <= 0:
-            return 0, -1, None
-        if swa_hit > upper_bound_blocks:
-            if lock_for_load:
-                return self.match_swa_locked(sequence_meta, upper_bound_blocks)
-            swa_hit2, slot2 = self.match_swa(
-                sequence_meta, upper_bound_blocks, lock_for_load=False)
-            return swa_hit2, slot2, None
-        slot = int(swa_node.swa_host_slot)
-        if slot < 0:
-            return 0, -1, None
-        # REUSE branch: promote here. The fallback branch above delegates to
-        # match_swa[_locked], which promote internally — do NOT double-promote.
-        self.index.promote_swa(swa_node)
-        if lock_for_load:
-            swa_node.swa_lock_ref += 1
-            return swa_hit, slot, swa_node
-        return swa_hit, slot, None
 
     def reset(self) -> None:
         self.index.reset()
@@ -652,7 +531,7 @@ class CacheEngine:
                 self.mempool.recycle_blocks(evicted_blocks)
 
                 # SWA node-mount: return connected-freed SWA slots to the pool (I1).
-                self._drain_swa_slots()
+                self._drain_unmounted_swa_slots()
 
                 # Record eviction metrics
                 if self._metrics_collector is not None and len(evicted_blocks) > 0:
@@ -679,6 +558,7 @@ class CacheEngine:
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
+        self._drain_unmounted_swa_slots()
 
 @dataclass
 class CacheStrategy:
@@ -818,21 +698,17 @@ class GlobalCacheEngine:
                                                    swa_config=cache_config.swa)
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
-        # SWA control plane: multi-tier match + peer-op graph construction. Built
-        # after the per-tier cache engines (and their swa_pool) exist; reaches
-        # them via this GlobalCacheEngine. Gated by cache_config.enable_swa_transfer.
+        # SWA peer-op builder. Per-tier match/slot resolution is fused into the
+        # Full-KV get/put implementations; this helper only appends SWA ops.
         self.swa_cache = SWACacheManager(self)
 
         #TODO move this to kvmanager.start()
         self.start()
 
-        # The trailing dict is the per-tier Full-KV match results (DeviceType ->
-        # MatchResult), so SWA slot resolution can reuse them (no re-walk).
-        # Empty on a full miss.
-        self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, Dict]] = \
-            lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0, {})
-        self._empty_put_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]] = \
-            lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0, 0)
+        self._empty_get_return: Callable[[int], GetTransferPlan] = \
+            lambda request_id: GetTransferPlan.empty()
+        self._empty_put_return: Callable[[int], PutTransferPlan] = \
+            lambda request_id: PutTransferPlan.empty()
 
         # Update initial mempool stats
         self._update_mempool_metrics()
@@ -922,68 +798,38 @@ class GlobalCacheEngine:
 
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             # from this entrance, we will also handle the case of peer_cpu and peer_ssd
-            (transfer_graph, finished_ops_ids, node_to_unlock,
-             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer,
-             tier_match_results) = \
-                self._get_impl_local(
-                    request_id,
-                    sequence_meta,
-                    block_start_idx,
-                    block_end_idx,
-                    gpu_block_ids,
-                    temp_cache_strategy,
-                    dp_client_id,
-                    swa_aware=swa_aware,
-                )
+            plan = self._get_impl_local(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+                swa_aware=swa_aware,
+            )
         else:
             #TODO pcfs will be supported later
-            (transfer_graph, finished_ops_ids, node_to_unlock,
-             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer,
-             tier_match_results) = \
-                self._get_impl_global(
-                    request_id,
-                    sequence_meta,
-                    block_start_idx,
-                    block_end_idx,
-                    gpu_block_ids,
-                    temp_cache_strategy,
-                    dp_client_id,
-                    swa_aware=swa_aware,
-                )
+            plan = self._get_impl_global(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+                swa_aware=swa_aware,
+            )
 
-        # SWA peer-op: build the SWA load chain into the SAME graph as the full-KV
-        # ops and append its terminal SWA H2D to finished_ops_ids, so the VIRTUAL
-        # barrier waits for full AND SWA. SWA ops carry is_swa=True (routed to the
-        # SWA worker) and use SWA-pool slot ids: the CPU slot is the node-mounted
-        # radix match, the GPU slot is a placeholder bound late at launch
-        # (graph.set_swa_gpu_blocks). build_get_chain is a no-op unless SWA
-        # transfer is on and a tier has a live SWA hit. num_full_hit = the ready
-        # full-KV prefix resident after this get (the SWA hit's upper bound).
-        num_full_hit = block_start_idx + num_gpu_blocks_to_transfer
-        (swa_gpu_slots, swa_cpu_slots, swa_ssd_slots, swa_remote_slots,
-         swa_lock_node, swa_staging_slot) = \
-            self._swa_get_slots(request_id, sequence_meta, block_start_idx,
-                                block_end_idx, num_full_hit,
-                                tier_match_results=tier_match_results)
-        swa_h2d_id = self.swa_cache.build_get_chain(
-            transfer_graph,
-            gpu_slot_ids=swa_gpu_slots,
-            cpu_slot_ids=swa_cpu_slots,
-            ssd_slot_ids=swa_ssd_slots,
-            remote_slot_ids=swa_remote_slots,
-            dp_client_id=dp_client_id,
-        )
-        if swa_h2d_id is not None:
-            finished_ops_ids.append(swa_h2d_id)
         transfer_graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
-            transfer_graph,
-            finished_ops_ids,
+            plan.transfer_graph,
+            plan.finished_ops_ids,
             dp_client_id,
             )
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         return_mask[block_start_idx* self.tokens_per_block:
-                    (block_start_idx + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
+                    (block_start_idx + plan.num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 
         # if layer_num // layer_granularity != 1:
         #     transfer_graph, finished_ops_ids = convert_read_graph_to_layer_wise_graph(transfer_graph=transfer_graph,
@@ -991,32 +837,14 @@ class GlobalCacheEngine:
         #                                                                         layer_num=layer_num,
         #                                                                         layer_granularity=layer_granularity)
 
-        for device_type in node_to_unlock:
-            self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
+        for device_type in plan.node_to_unlock:
+            self.cache_engines[device_type].lock_node(plan.node_to_unlock[device_type][0])
 
         callback = partial(self._transfer_callback,
-                           node_to_unlock=node_to_unlock,
-                           buffer_to_free=buffer_to_free)
+                           node_to_unlock=plan.node_to_unlock,
+                           buffer_to_free=plan.buffer_to_free)
 
-        op_callback_dict = {} # dict, op_id -> callback
-        for op_id in op_node_to_ready:
-            op_callback_dict[op_id] = partial(self._op_callback,
-                                              device_type=op_node_to_ready[op_id][0],
-                                              node_to_ready=op_node_to_ready[op_id][1],
-                                              ready_length=op_node_to_ready[op_id][2])
-
-        # SWA load lock release: _swa_get_slots pinned the matched CPU SWA node
-        # (lock_for_load) so it can't be evicted before the SWA H2D reads it. When
-        # that H2D completes, release the pin. Keyed on the SWA H2D op so it fires
-        # exactly once on completion, alongside the full-KV op callbacks.
-        # The SWA H2D completion callback releases the source-tier pin and, for a
-        # staged (SSD/REMOTE) source, frees the transient CPU staging slot. Keyed
-        # on the SWA H2D op so it fires exactly once, alongside the full-KV ops.
-        if swa_h2d_id is not None and (swa_lock_node is not None
-                                       or swa_staging_slot >= 0):
-            op_callback_dict[swa_h2d_id] = partial(
-                self._swa_release_load_lock, node=swa_lock_node,
-                staging_slot=swa_staging_slot)
+        op_callback_dict = plan.op_callback_dict
 
         # Record metrics for GET operation
         if self._metrics_collector is not None:
@@ -1024,6 +852,78 @@ class GlobalCacheEngine:
             self._update_mempool_metrics()
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
+
+    def _build_op_callback_dict(self, op_node_to_ready: Dict) -> Dict[int, Callable]:
+        op_callback_dict = {}
+        for op_id, (device_type, node_to_ready, ready_length) in op_node_to_ready.items():
+            op_callback_dict[op_id] = partial(self._op_callback,
+                                              device_type=device_type,
+                                              node_to_ready=node_to_ready,
+                                              ready_length=ready_length)
+        return op_callback_dict
+
+    @staticmethod
+    def _append_op_callback(op_callback_dict: Dict[int, Callable],
+                            op_id: int,
+                            callback: Callable) -> None:
+        """Append ``callback`` without overwriting another completion action."""
+        previous = op_callback_dict.get(op_id)
+        if previous is None:
+            op_callback_dict[op_id] = callback
+            return
+
+        def combined_callback() -> None:
+            previous()
+            callback()
+
+        op_callback_dict[op_id] = combined_callback
+
+    def _publish_swa_put_slot(self,
+                              device_type: DeviceType,
+                              node,
+                              slot: int) -> None:
+        """Make a reserved PUT slot readable after its tier transfer completes.
+
+        The slot id is allocated before graph construction so the data plane can
+        address it, but it is deliberately not mounted on the radix node until
+        this callback.  Full-KV and SWA publication therefore remain independent:
+        either transfer may finish first without exposing unfilled SWA bytes.
+        """
+        assert node is not None
+        assert slot >= 0
+        engine = self.cache_engines[device_type]
+        engine.index.set_swa(node, int(slot))
+
+    def _fail_put_before_insert(
+            self,
+            request_id: int,
+            reason: str,
+            cpu_blocks: np.ndarray,
+            cpu_swa_slot: int = -1,
+            ssd_blocks: Optional[np.ndarray] = None,
+            ssd_swa_slot: int = -1,
+            remote_blocks: Optional[np.ndarray] = None,
+            remote_swa_slot: int = -1) -> PutTransferPlan:
+        flexkv_logger.warning(
+            "[FlexKV-SWA] PUT request failed before radix insert; "
+            f"request_id={request_id}, reason={reason}, "
+            f"cpu_blocks={len(cpu_blocks)}, ssd_blocks={0 if ssd_blocks is None else len(ssd_blocks)}, "
+            f"remote_blocks={0 if remote_blocks is None else len(remote_blocks)}, "
+            f"cpu_swa_slot={cpu_swa_slot}, ssd_swa_slot={ssd_swa_slot}, "
+            f"remote_swa_slot={remote_swa_slot}"
+        )
+        if cpu_swa_slot >= 0:
+            self.cpu_cache_engine._free_swa_slot(cpu_swa_slot)
+        if ssd_swa_slot >= 0:
+            self.ssd_cache_engine._free_swa_slot(ssd_swa_slot)
+        if remote_swa_slot >= 0:
+            self.remote_cache_engine._free_swa_slot(remote_swa_slot)
+        self.cpu_cache_engine.recycle(cpu_blocks)
+        if ssd_blocks is not None:
+            self.ssd_cache_engine.recycle(ssd_blocks)
+        if remote_blocks is not None:
+            self.remote_cache_engine.recycle(remote_blocks)
+        return self._empty_put_return(request_id)
 
     def _get_impl_global(self,
             request_id: int,
@@ -1034,7 +934,7 @@ class GlobalCacheEngine:
             temp_cache_strategy: CacheStrategy,
             dp_client_id: int,
             swa_aware: bool = False) \
-                 -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
+                 -> GetTransferPlan:
         """
         transfer pattern:
 
@@ -1056,14 +956,15 @@ class GlobalCacheEngine:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
         else:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
-        # SWA-aware: clamp the Full-KV transfer to usable = min(full, swa) read
-        # from this same match. See _get_impl_local for rationale.
+        swa_read_source = SWAReadSource()
         if swa_aware:
-            block_mask_end = self._clamp_end_to_swa(
-                block_mask_start, block_mask_end,
+            block_mask_end, swa_read_source = self._select_swa_read_source(
+                block_mask_start,
+                block_mask_end,
                 {DeviceType.CPU: cpu_matched_result,
                  DeviceType.SSD: ssd_matched_result,
-                 DeviceType.REMOTE: remote_matched_result})
+                 DeviceType.REMOTE: remote_matched_result},
+            )
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
@@ -1228,16 +1129,66 @@ class GlobalCacheEngine:
             node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
 
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
+        num_gpu_blocks_to_transfer = len(fragment123_gpu_blocks) if enable_gpu else 0
+        op_callback_dict = {}
+        if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
+                and swa_read_source.found):
+            swa_empty = np.array([], dtype=np.int64)
+            device_type = swa_read_source.device_type
+            source_engine = swa_read_source.engine
+            source_slot = swa_read_source.host_slot
+            source_node = swa_read_source.node
+            source_engine._pin_swa_node(source_node)
+            staging_slot = -1
+            cpu_swa_slots = np.array([source_slot], dtype=np.int64)
+            ssd_swa_slots = swa_empty
+            remote_swa_slots = swa_empty
+            if device_type != DeviceType.CPU:
+                staging_slot = self.cpu_cache_engine._alloc_swa_slot()
+                if staging_slot < 0:
+                    self._swa_release_load_lock(
+                        node=source_node, engine=source_engine)
+                    swa_h2d_id = None
+                else:
+                    cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
+                    source_slots = np.array([source_slot], dtype=np.int64)
+                    if device_type == DeviceType.SSD:
+                        ssd_swa_slots = source_slots
+                    else:
+                        remote_swa_slots = source_slots
+            else:
+                swa_h2d_id = None
 
-        # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
-        # Trailing dict: per-tier Full-KV match results, so SWA slot resolution
-        # reuses them instead of re-walking the tree.
-        return (
-            transfer_graph, finished_ops_ids, node_to_unlock, {}, buffer_to_free,
-            len(fragment123_gpu_blocks) if enable_gpu else 0,  # op_node_to_ready: {}
-            {DeviceType.CPU: cpu_matched_result,
-             DeviceType.SSD: ssd_matched_result,
-             DeviceType.REMOTE: remote_matched_result},
+            if staging_slot >= 0 or device_type == DeviceType.CPU:
+                swa_h2d_id = self.swa_cache.build_get_chain(
+                    transfer_graph,
+                    gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+                    cpu_slot_ids=cpu_swa_slots,
+                    ssd_slot_ids=ssd_swa_slots,
+                    remote_slot_ids=remote_swa_slots,
+                    dp_client_id=dp_client_id,
+                )
+                if swa_h2d_id is None:
+                    self._swa_release_load_lock(
+                        node=source_node,
+                        staging_slot=staging_slot,
+                        engine=source_engine)
+                else:
+                    finished_ops_ids.append(swa_h2d_id)
+                    op_callback_dict[swa_h2d_id] = partial(
+                        self._swa_release_load_lock,
+                        node=source_node,
+                        staging_slot=staging_slot,
+                        engine=source_engine,
+                    )
+
+        return GetTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free=buffer_to_free,
+            num_gpu_blocks_to_transfer=num_gpu_blocks_to_transfer,
         )
 
     def _get_impl_local(self,
@@ -1249,7 +1200,7 @@ class GlobalCacheEngine:
                         temp_cache_strategy: CacheStrategy,
                         dp_client_id: int,
                         swa_aware: bool = False) \
-                            -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
+                            -> GetTransferPlan:
         """
         transfer pattern:
 
@@ -1273,16 +1224,14 @@ class GlobalCacheEngine:
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
 
-        # SWA-aware: clamp the Full-KV transfer to usable = min(full, swa). The
-        # SWA window past `usable` has no reusable KV, so loading Full past it
-        # would feed stale KV to the SWA-layer attention. The SWA hit is read from
-        # this same match (no re-walk); block_mask_end is the sole knob — every
-        # fragment below slices [block_mask_start:block_mask_end].
+        swa_read_source = SWAReadSource()
         if swa_aware:
-            block_mask_end = self._clamp_end_to_swa(
-                block_mask_start, block_mask_end,
+            block_mask_end, swa_read_source = self._select_swa_read_source(
+                block_mask_start,
+                block_mask_end,
                 {DeviceType.CPU: cpu_matched_result,
-                 DeviceType.SSD: ssd_matched_result})
+                 DeviceType.SSD: ssd_matched_result},
+            )
 
         # DEBUG: Log GET operation with hash info
         #if len(sequence_meta.block_hashes) > 0:
@@ -1464,14 +1413,61 @@ class GlobalCacheEngine:
         if ssd_node_to_unlock is not None:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
+        num_gpu_blocks_to_transfer = len(fragment12_gpu_blocks) if enable_gpu else 0
+        op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+        if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
+                and swa_read_source.found):
+            swa_empty = np.array([], dtype=np.int64)
+            device_type = swa_read_source.device_type
+            source_engine = swa_read_source.engine
+            source_slot = swa_read_source.host_slot
+            source_node = swa_read_source.node
+            source_engine._pin_swa_node(source_node)
+            staging_slot = -1
+            cpu_swa_slots = np.array([source_slot], dtype=np.int64)
+            ssd_swa_slots = swa_empty
+            if device_type == DeviceType.SSD:
+                staging_slot = self.cpu_cache_engine._alloc_swa_slot()
+                if staging_slot < 0:
+                    self._swa_release_load_lock(
+                        node=source_node, engine=source_engine)
+                    swa_h2d_id = None
+                else:
+                    cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
+                    ssd_swa_slots = np.array([source_slot], dtype=np.int64)
+            else:
+                swa_h2d_id = None
+
+            if staging_slot >= 0 or device_type == DeviceType.CPU:
+                swa_h2d_id = self.swa_cache.build_get_chain(
+                    transfer_graph,
+                    gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+                    cpu_slot_ids=cpu_swa_slots,
+                    ssd_slot_ids=ssd_swa_slots,
+                    remote_slot_ids=swa_empty,
+                    dp_client_id=dp_client_id,
+                )
+                if swa_h2d_id is None:
+                    self._swa_release_load_lock(
+                        node=source_node,
+                        staging_slot=staging_slot,
+                        engine=source_engine)
+                else:
+                    finished_ops_ids.append(swa_h2d_id)
+                    op_callback_dict[swa_h2d_id] = partial(
+                        self._swa_release_load_lock,
+                        node=source_node,
+                        staging_slot=staging_slot,
+                        engine=source_engine,
+                    )
         nvtx.end_range(nvtx_range)
-        # Trailing dict: per-tier Full-KV match results, so SWA slot resolution
-        # reuses them instead of re-walking the tree.
-        return (
-            transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
-            buffer_to_free, len(fragment12_gpu_blocks) if enable_gpu else 0,
-            {DeviceType.CPU: cpu_matched_result,
-             DeviceType.SSD: ssd_matched_result},
+        return GetTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free=buffer_to_free,
+            num_gpu_blocks_to_transfer=num_gpu_blocks_to_transfer,
         )
 
     def put(self,
@@ -1502,78 +1498,44 @@ class GlobalCacheEngine:
 
         assert not temp_cache_strategy.ignore_gpu
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
-            (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
-             buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
-                self._put_impl_local(
-                    request_id,
-                    sequence_meta,
-                    block_start_idx,
-                    block_end_idx,
-                    gpu_block_ids,
-                    temp_cache_strategy,
-                    dp_client_id,
-                )
+            plan = self._put_impl_local(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+            )
         else:
-            (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
-             buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
-                self._put_impl_global(
-                    request_id,
-                    sequence_meta,
-                    block_start_idx,
-                    block_end_idx,
-                    gpu_block_ids,
-                    temp_cache_strategy,
-                    dp_client_id,
-                )
+            plan = self._put_impl_global(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+            )
 
-        # SWA peer-op (data plane): build the SWA store chain into THIS graph
-        # alongside the full-KV ops, then append its SWA D2H op to
-        # finished_ops_ids (joins the VIRTUAL barrier alongside the full-KV D2H).
-        # The SWA H2DISK/H2REMOTE write-through ops depend on the SWA D2H but are
-        # fire-and-forget (not reported), exactly like the full-KV path. is_swa=True
-        # routes them to the SWA worker; SWA-pool slot ids. build_put_chain returns
-        # None (no-op) unless enable_swa_transfer is on. The CPU slot is a freshly
-        # allocated SWA-pool slot mounted on the stored tail node (node-mounted
-        # set_swa); the GPU slot is a placeholder bound LATE from the request's
-        # swa_slot_mapping. The stored tail node is node_to_unlock[CPU] (the new
-        # ready prefix's deepest node); its trailing page is the SWA window.
-        swa_gpu_slots, swa_cpu_slots, swa_ssd_slots, swa_remote_slots = \
-            self._swa_put_slots(request_id, sequence_meta, block_start_idx,
-                                block_end_idx, node_to_unlock)
-        swa_d2h_id = self.swa_cache.build_put_chain(
-            transfer_graph,
-            gpu_slot_ids=swa_gpu_slots,
-            cpu_slot_ids=swa_cpu_slots,
-            ssd_slot_ids=swa_ssd_slots,
-            remote_slot_ids=swa_remote_slots,
-            dp_client_id=dp_client_id,
-        )
-        if swa_d2h_id is not None:
-            finished_ops_ids.append(swa_d2h_id)
         transfer_graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
-            transfer_graph,
-            finished_ops_ids,
+            plan.transfer_graph,
+            plan.finished_ops_ids,
             dp_client_id,
         )
-
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
-        return_mask[(block_start_idx + skipped_gpu_blocks)* self.tokens_per_block:
-                    (block_start_idx + skipped_gpu_blocks + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
+        return_mask[(block_start_idx + plan.skipped_gpu_blocks)* self.tokens_per_block:
+                    (block_start_idx + plan.skipped_gpu_blocks + plan.num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 
-        for device_type in node_to_unlock:
-            self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
+        for device_type in plan.node_to_unlock:
+            self.cache_engines[device_type].lock_node(plan.node_to_unlock[device_type][0])
 
         callback = partial(self._transfer_callback,
-                           node_to_unlock=node_to_unlock,
-                           buffer_to_free=buffer_to_free,
+                           node_to_unlock=plan.node_to_unlock,
+                           buffer_to_free=plan.buffer_to_free,
                            is_put=True)
 
-        op_callback_dict = {}
-        for op_id in op_node_to_ready:
-            op_callback_dict[op_id] = partial(self._op_callback,
-                                              device_type=op_node_to_ready[op_id][0],
-                                              node_to_ready=op_node_to_ready[op_id][1],
-                                              ready_length=op_node_to_ready[op_id][2])
+        op_callback_dict = plan.op_callback_dict
 
         # Record metrics for PUT operation
         if self._metrics_collector is not None:
@@ -1590,7 +1552,7 @@ class GlobalCacheEngine:
             gpu_block_ids: np.ndarray,
             temp_cache_strategy: CacheStrategy,
             dp_client_id: int) \
-                -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
+                -> PutTransferPlan:
         """
         transfer pattern:
 
@@ -1675,8 +1637,38 @@ class GlobalCacheEngine:
         else:
             fragment3_remote_blocks = np.array([], dtype=np.int64)
 
+        cpu_swa_slot = -1
+        ssd_swa_slot = -1
+        remote_swa_slot = -1
+
+        if self.swa_cache.enabled:
+            cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
+                cpu_matched_result.last_node)
+            if cpu_swa_slot >= 0 and put_to_ssd:
+                ssd_swa_slot = self.ssd_cache_engine._alloc_swa_slot(
+                    ssd_matched_result.last_node)
+            if (cpu_swa_slot >= 0 and
+                    (not put_to_ssd or ssd_swa_slot >= 0) and
+                    put_to_remote):
+                remote_swa_slot = self.remote_cache_engine._alloc_swa_slot(
+                    remote_matched_result.last_node)
+            if (cpu_swa_slot < 0 or
+                    (put_to_ssd and ssd_swa_slot < 0) or
+                    (put_to_remote and remote_swa_slot < 0)):
+                return self._fail_put_before_insert(
+                    request_id=request_id,
+                    reason="swa_slot_alloc_failed",
+                    cpu_blocks=fragment12_cpu_blocks,
+                    cpu_swa_slot=cpu_swa_slot,
+                    ssd_blocks=fragment2_ssd_blocks if put_to_ssd else None,
+                    ssd_swa_slot=ssd_swa_slot,
+                    remote_blocks=fragment3_remote_blocks if put_to_remote else None,
+                    remote_swa_slot=remote_swa_slot,
+                )
+
         transfer_graph = TransferOpGraph()
         finished_ops_ids = []
+        op_node_to_ready = {}
 
         op_d2h = TransferOp(
             graph_id = transfer_graph.graph_id,
@@ -1697,9 +1689,6 @@ class GlobalCacheEngine:
         )
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
-
-        # (SWA store chain is built once in the put() wrapper via
-        # self.swa_cache.build_put_chain, peer to this full-KV graph.)
 
         if put_to_ssd:
             if len(fragment12_cpu_blocks) < fragment2_num_blocks:
@@ -1736,22 +1725,57 @@ class GlobalCacheEngine:
             transfer_graph.add_transfer_op(op_h2remote)
             transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)
 
-        cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
-                                                          fragment12_cpu_blocks,
-                                                          is_ready=False,
-                                                          match_result=cpu_matched_result)
+        if cpu_swa_slot >= 0:
+            empty = np.array([], dtype=np.int64)
+            swa_ops = self.swa_cache.build_put_chain(
+                transfer_graph,
+                gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+                cpu_slot_ids=np.array([cpu_swa_slot], dtype=np.int64),
+                ssd_slot_ids=(np.array([ssd_swa_slot], dtype=np.int64)
+                              if ssd_swa_slot >= 0 else empty),
+                remote_slot_ids=(np.array([remote_swa_slot], dtype=np.int64)
+                                 if remote_swa_slot >= 0 else empty),
+                dp_client_id=dp_client_id,
+                return_op_ids=True,
+            )
+            assert swa_ops.d2h_id is not None
+            if put_to_ssd:
+                assert swa_ops.h2disk_id is not None
+            if put_to_remote:
+                assert swa_ops.h2remote_id is not None
+            finished_ops_ids.append(swa_ops.d2h_id)
+
+        cpu_node_to_unlock = self.cpu_cache_engine.insert(
+            sequence_meta,
+            fragment12_cpu_blocks,
+            is_ready=False,
+            match_result=cpu_matched_result,
+        )
+        op_node_to_ready[op_d2h.op_id] = (
+            DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         ssd_node_to_unlock = None
         if put_to_ssd:
-            ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
-                                                            fragment2_ssd_blocks,
-                                                            is_ready=False,
-                                                            match_result=ssd_matched_result)
+            ssd_node_to_unlock = self.ssd_cache_engine.insert(
+                sequence_meta,
+                fragment2_ssd_blocks,
+                is_ready=False,
+                match_result=ssd_matched_result,
+            )
+            op_node_to_ready[op_h2disk.op_id] = (
+                DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
         remote_node_to_unlock = None
         if put_to_remote:
-            remote_node_to_unlock = self.remote_cache_engine.insert(sequence_meta,
-                                                                    fragment3_remote_blocks,
-                                                                    is_ready=False,
-                                                                    match_result=remote_matched_result)
+            remote_node_to_unlock = self.remote_cache_engine.insert(
+                sequence_meta,
+                fragment3_remote_blocks,
+                is_ready=False,
+                match_result=remote_matched_result,
+            )
+            op_node_to_ready[op_h2remote.op_id] = (
+                DeviceType.REMOTE,
+                remote_node_to_unlock,
+                remote_node_to_unlock.size(),
+            )
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
             node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
@@ -1760,10 +1784,37 @@ class GlobalCacheEngine:
         if remote_node_to_unlock is not None:
             node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
 
+        op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+        if cpu_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.d2h_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.CPU, cpu_node_to_unlock, cpu_swa_slot),
+            )
+        if ssd_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.h2disk_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.SSD, ssd_node_to_unlock, ssd_swa_slot),
+            )
+        if remote_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.h2remote_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.REMOTE, remote_node_to_unlock, remote_swa_slot),
+            )
         skipped_gpu_blocks = len(cpu_matched_blocks)
-        return (
-            transfer_graph, finished_ops_ids, node_to_unlock, {}, {},
-            len(fragment12_gpu_blocks), skipped_gpu_blocks  # op_node_to_ready: {}
+        return PutTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free={},
+            num_gpu_blocks_to_transfer=len(fragment12_gpu_blocks),
+            skipped_gpu_blocks=skipped_gpu_blocks,
         )
 
     def _put_impl_local(self,
@@ -1774,7 +1825,7 @@ class GlobalCacheEngine:
             gpu_block_ids: np.ndarray,
             temp_cache_strategy: CacheStrategy,
             dp_client_id: int) \
-                -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
+                -> PutTransferPlan:
         """
         transfer pattern:
 
@@ -1844,6 +1895,26 @@ class GlobalCacheEngine:
                 self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
             return self._empty_put_return(request_id)
 
+        cpu_swa_slot = -1
+        ssd_swa_slot = -1
+
+        if self.swa_cache.enabled:
+            cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
+                cpu_matched_result.last_node)
+            if cpu_swa_slot >= 0 and fragment2_num_blocks > 0:
+                ssd_swa_slot = self.ssd_cache_engine._alloc_swa_slot(
+                    ssd_matched_result.last_node)
+            if (cpu_swa_slot < 0 or
+                    (fragment2_num_blocks > 0 and ssd_swa_slot < 0)):
+                return self._fail_put_before_insert(
+                    request_id=request_id,
+                    reason="swa_slot_alloc_failed",
+                    cpu_blocks=fragment12_cpu_blocks,
+                    cpu_swa_slot=cpu_swa_slot,
+                    ssd_blocks=fragment2_ssd_blocks if enable_ssd else None,
+                    ssd_swa_slot=ssd_swa_slot,
+                )
+
         transfer_graph = TransferOpGraph()
         finished_ops_ids = []
         op_node_to_ready = {}
@@ -1889,18 +1960,39 @@ class GlobalCacheEngine:
 
             transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
 
+        if cpu_swa_slot >= 0:
+            empty = np.array([], dtype=np.int64)
+            swa_ops = self.swa_cache.build_put_chain(
+                transfer_graph,
+                gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+                cpu_slot_ids=np.array([cpu_swa_slot], dtype=np.int64),
+                ssd_slot_ids=(np.array([ssd_swa_slot], dtype=np.int64)
+                              if ssd_swa_slot >= 0 else empty),
+                remote_slot_ids=empty,
+                dp_client_id=dp_client_id,
+                return_op_ids=True,
+            )
+            assert swa_ops.d2h_id is not None
+            if fragment2_num_blocks > 0:
+                assert swa_ops.h2disk_id is not None
+            finished_ops_ids.append(swa_ops.d2h_id)
+
         """insert and lock"""
-        cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
-                                                          fragment12_cpu_blocks,
-                                                          is_ready=False,
-                                                          match_result=cpu_matched_result)
+        cpu_node_to_unlock = self.cpu_cache_engine.insert(
+            sequence_meta,
+            fragment12_cpu_blocks,
+            is_ready=False,
+            match_result=cpu_matched_result,
+        )
         op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         ssd_node_to_unlock = None
         if len(fragment2_ssd_blocks) > 0:
-            ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
-                                                            fragment2_ssd_blocks,
-                                                            is_ready=False,
-                                                            match_result=ssd_matched_result)
+            ssd_node_to_unlock = self.ssd_cache_engine.insert(
+                sequence_meta,
+                fragment2_ssd_blocks,
+                is_ready=False,
+                match_result=ssd_matched_result,
+            )
             op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
@@ -1908,10 +2000,30 @@ class GlobalCacheEngine:
         if ssd_node_to_unlock is not None:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
 
+        op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+        if cpu_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.d2h_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.CPU, cpu_node_to_unlock, cpu_swa_slot),
+            )
+        if ssd_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.h2disk_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.SSD, ssd_node_to_unlock, ssd_swa_slot),
+            )
         skipped_gpu_blocks = len(cpu_matched_blocks)
-        return (
-            transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready, {},
-            len(fragment12_gpu_blocks), skipped_gpu_blocks
+        return PutTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free={},
+            num_gpu_blocks_to_transfer=len(fragment12_gpu_blocks),
+            skipped_gpu_blocks=skipped_gpu_blocks,
         )
 
     def _transfer_callback(self,
@@ -1996,198 +2108,66 @@ class GlobalCacheEngine:
 
         return cpu_matched_result, ssd_matched_result
 
-    def _swa_hit_from_match_results(self, tier_match_results: Dict) -> int:
-        """Best (max) SWA hit across tiers, read from already-computed Full-KV
-        match results — no tree walk, no promote, no pin.
-
-        Each tier's match_prefix returned ``swa_hit_blocks`` on the same pass that
-        produced its Full-KV hit, already <= that tier's Full-KV hit (SWA subset
-        of Full). Returns 0 when SWA is disabled or no tier has a live SWA hit.
-        Read-only: the promote/pin happens later in _swa_get_slots.
-        """
+    def _select_swa_read_source(
+        self,
+        block_mask_start: int,
+        block_mask_end: int,
+        tier_match_results: Dict[DeviceType, object],
+    ) -> Tuple[int, SWAReadSource]:
+        """Return the largest usable SWA-aware Full-KV end and its exact SWA source."""
         if not self.swa_cache.enabled or not tier_match_results:
-            return 0
-        best = 0
-        for mr in tier_match_results.values():
-            hit = int(getattr(mr, "swa_hit_blocks", 0) or 0) if mr is not None else 0
-            if hit > best:
-                best = hit
-        return best
+            return block_mask_start, SWAReadSource()
 
-    def _clamp_end_to_swa(self, block_mask_start: int, block_mask_end: int,
-                          tier_match_results: Dict) -> int:
-        """Clamp block_mask_end to usable = min(full_hit, swa_hit).
+        candidates: List[Tuple[int, DeviceType, object]] = []
+        for device_type, match_result in tier_match_results.items():
+            if match_result is None:
+                continue
 
-        All three are absolute block counts from prefix block 0. ``block_mask_end``
-        is the Full-KV query-window end (the full hit); ``swa_hit`` comes from the
-        same-pass match results. When there is no SWA hit, usable collapses to
-        block_mask_start (empty Full-KV window) — loading Full past the reusable
-        SWA window would feed stale KV to the SWA-layer attention. Never widens the
-        window and never drops below block_mask_start.
-        """
-        swa_hit = self._swa_hit_from_match_results(tier_match_results)
-        usable = min(block_mask_end, swa_hit)
-        return max(block_mask_start, usable)
+            swa_hit = int(match_result.swa_hit_blocks)
+            if swa_hit <= block_mask_start:
+                continue
 
-    # --- SWA slot sources for the get()/put() build chains --------------------
-    # Resolve the per-tier SWA-pool slot ids for the current request so the SWA
-    # build chains can wire ops into the transfer graph. GET reads the matched
-    # node's swa_host_slot (node-mounted radix); PUT allocates a fresh slot and
-    # mounts it on the stored tail node (set_swa). The GPU-side slot is a
-    # size-1 PLACEHOLDER here (window == one page == one slot on DSv4); it is
-    # rebound LATE from the request's swa_slot_mapping via
-    # TransferOpGraph.set_swa_gpu_blocks() in launch (mirror of the full-KV
-    # late-bind). All are no-ops (empty) unless swa_cache.enabled (i.e.
-    # enable_swa_transfer AND the CPU tier has an SWA host pool).
-    # See deployments/swa_design/08_节点挂载SWA架构.md §10.
+            if swa_hit > block_mask_end:
+                # The radix match covers the complete token sequence, while the
+                # request mask may stop earlier. A snapshot for a deeper trailing
+                # window cannot serve this request window; try another tier.
+                continue
+            assert match_result.last_swa_node is not None
+            candidates.append((swa_hit, device_type, match_result))
+
+        for usable_end, device_type, match_result in sorted(
+            candidates,
+            key=lambda item: item[0],
+            reverse=True,
+        ):
+            engine = self.cache_engines.get(device_type)
+            if engine is None or not getattr(engine, "swa_enabled", False):
+                continue
+
+            source_node = match_result.last_swa_node
+            source_slot = int(source_node.swa_host_slot)
+            assert source_slot >= 0
+
+            source = SWAReadSource(
+                hit_blocks=usable_end,
+                host_slot=source_slot,
+                node=source_node,
+                device_type=device_type,
+                engine=engine,
+            )
+
+            return usable_end, source
+
+        return block_mask_start, SWAReadSource()
+
+    # The GPU-side SWA slot is a size-1 placeholder here (window == one page ==
+    # one slot on DSv4). It is rebound late from the request's swa_slot_mapping
+    # via TransferOpGraph.set_swa_gpu_blocks() in launch, mirroring the Full-KV
+    # GPU late-bind.
 
     _SWA_GPU_PLACEHOLDER = np.array([0], dtype=np.int64)
 
-    def _empty_swa_slots(self, with_node: bool = False):
-        empty = np.array([], dtype=np.int64)
-        if with_node:
-            # (gpu, cpu, ssd, remote, lock_node, staging_slot)
-            return empty, empty, empty, empty, None, -1
-        return empty, empty, empty, empty
-
-    def _swa_get_slots(self, request_id, sequence_meta, block_start_idx,
-                       block_end_idx, full_hit_blocks, tier_match_results=None):
-        """Resolve SWA-pool slots for a GET (load), sourced across tiers.
-
-        Mirrors full-KV multi-tier staging: the trailing SWA window (page
-        granular, one slot) is sourced from the highest-priority tier that holds
-        it (CPU > SSD > REMOTE), matching full-KV's loader preference.
-
-        * CPU source: the matched CPU SWA slot feeds the SWA H2D directly (no
-          staging), and the CPU node is pinned (released on H2D completion).
-        * SSD/REMOTE source: there is no CPU-resident window, so a TRANSIENT CPU
-          SWA staging slot is allocated as the DISK2H/REMOTE2H destination and
-          the SWA H2D source (mirrors full-KV's fragment23 CPU staging blocks).
-          The source-tier node is pinned; the staging slot is freed on H2D
-          completion (it is unmounted — not a cached entry).
-
-        ``tier_match_results`` (DeviceType -> MatchResult), when provided, is the
-        Full-KV match already computed for this get; each tier resolves its SWA
-        slot via ``match_swa_from_result`` (reuse it, no re-walk). When None, each
-        tier falls back to a fresh ``match_swa_locked`` probe.
-
-        Returns ``(gpu, cpu, ssd, remote, lock_node, staging_slot)``.
-        ``cpu`` is always the SWA H2D source (matched CPU slot OR staging slot);
-        ``ssd``/``remote`` are non-empty only for a staged source; ``staging_slot``
-        is the transient CPU slot to free on H2D completion (-1 when CPU-sourced).
-        Empty when SWA is disabled or no tier holds the window."""
-        if not self.swa_cache.enabled or full_hit_blocks <= 0:
-            return self._empty_swa_slots(with_node=True)
-        cpu_engine = self.cpu_cache_engine
-        if cpu_engine is None or not getattr(cpu_engine, "swa_enabled", False):
-            return self._empty_swa_slots(with_node=True)
-        gpu = self._SWA_GPU_PLACEHOLDER.copy()
-        empty = np.array([], dtype=np.int64)
-
-        def _match_locked(engine, device_type):
-            """Resolve (hit, slot, node) for a tier, pinned for load. Reuse
-            the given match result when available, else probe the tree."""
-            mr = tier_match_results.get(device_type) if tier_match_results else None
-            if mr is not None:
-                return engine.match_swa_from_result(
-                    mr, sequence_meta, upper_bound_blocks=full_hit_blocks,
-                    lock_for_load=True)
-            return engine.match_swa_locked(
-                sequence_meta, upper_bound_blocks=full_hit_blocks)
-
-        # 1) CPU tier first (preferred, no staging). The matched CPU SWA node is
-        #    pinned; the H2D completion callback releases the pin.
-        swa_hit, cpu_slot, lock_node = \
-            _match_locked(cpu_engine, DeviceType.CPU)
-        if swa_hit > 0 and cpu_slot >= 0:
-            cpu = np.array([cpu_slot], dtype=np.int64)
-            return gpu, cpu, empty, empty, lock_node, -1
-
-        # 2) Fall back to SSD then REMOTE: source tier stages into a transient
-        #    CPU SWA slot (DISK2H/REMOTE2H -> CPU) that the SWA H2D then reads.
-        for device_type in (DeviceType.SSD, DeviceType.REMOTE):
-            engine = self.cache_engines.get(device_type)
-            if engine is None or not getattr(engine, "swa_enabled", False):
-                continue
-            tier_hit, tier_slot, tier_node = \
-                _match_locked(engine, device_type)
-            if tier_hit <= 0 or tier_slot < 0:
-                continue
-            # Transient CPU staging slot (unmounted; freed on H2D completion).
-            staging_slot = cpu_engine.swa_alloc_slot()
-            if staging_slot < 0:
-                # No CPU room to stage: release the just-taken source pin and
-                # skip SWA reuse for this get (full-KV load is unaffected).
-                if tier_node is not None and getattr(tier_node, "swa_lock_ref", 0) > 0:
-                    tier_node.dec_swa_lock_ref()
-                cpu_engine._drain_swa_slots()
-                return self._empty_swa_slots(with_node=True)
-            cpu = np.array([staging_slot], dtype=np.int64)
-            tier = np.array([tier_slot], dtype=np.int64)
-            ssd = tier if device_type == DeviceType.SSD else empty
-            remote = tier if device_type == DeviceType.REMOTE else empty
-            return gpu, cpu, ssd, remote, tier_node, staging_slot
-
-        return self._empty_swa_slots(with_node=True)
-
-    def _swa_put_slots(self, request_id, sequence_meta, block_start_idx,
-                       block_end_idx, node_to_unlock):
-        """Resolve SWA-pool slots for a PUT (store), across all stored tiers.
-
-        Mirrors full-KV write-through: the SWA D2H lands the window in the CPU
-        SWA pool, and — for every tier full-KV ALSO stored to (CPU/SSD/REMOTE,
-        i.e. present in ``node_to_unlock``) — allocate that tier's SWA slot and
-        mount it on that tier's store node (set_swa). build_put_chain then emits
-        the SWA H2DISK / H2REMOTE write-through ops (CPU SWA slot -> tier slot),
-        fire-and-forget, exactly like the full-KV H2DISK/H2REMOTE. Gating on
-        ``node_to_unlock`` keeps SWA a subset of Full PER TIER: SWA is written to
-        a tier iff full-KV was.
-
-        Returns ``(gpu_placeholder, cpu=[slot], ssd, remote)``. The CPU
-        slot is required (the D2H target); ssd/remote are non-empty only when
-        that tier both stored full-KV and has an SWA host pool. All empty when
-        SWA is disabled, there is no CPU store node, or the CPU pool is full and
-        fully locked (full-KV store is unaffected)."""
-        empty = np.array([], dtype=np.int64)
-        cpu_store_node = (node_to_unlock[DeviceType.CPU][0]
-                          if node_to_unlock and DeviceType.CPU in node_to_unlock
-                          else None)
-        if not self.swa_cache.enabled or cpu_store_node is None:
-            return self._empty_swa_slots()
-        cpu_engine = self.cpu_cache_engine
-        if cpu_engine is None or not getattr(cpu_engine, "swa_enabled", False):
-            return self._empty_swa_slots()
-        slot = cpu_engine.swa_alloc_slot()
-        if slot < 0:
-            return self._empty_swa_slots()
-        cpu_engine.set_swa(cpu_store_node, slot)
-        cpu_engine._drain_swa_slots()
-        cpu = np.array([slot], dtype=np.int64)
-        gpu = self._SWA_GPU_PLACEHOLDER.copy()
-
-        # Write-through to a lower tier iff full-KV stored there AND that tier
-        # has an SWA host pool. One slot per tier (page-granular window). A tier
-        # whose SWA pool is full-and-locked simply skips write-through (its slot
-        # stays empty) — the CPU SWA store is unaffected.
-        def _tier_slot(device_type):
-            if device_type not in node_to_unlock:
-                return empty
-            engine = self.cache_engines.get(device_type)
-            if engine is None or not getattr(engine, "swa_enabled", False):
-                return empty
-            tier_slot = engine.swa_alloc_slot()
-            if tier_slot < 0:
-                return empty
-            engine.set_swa(node_to_unlock[device_type][0], tier_slot)
-            engine._drain_swa_slots()
-            return np.array([tier_slot], dtype=np.int64)
-
-        ssd = _tier_slot(DeviceType.SSD)
-        remote = _tier_slot(DeviceType.REMOTE)
-        return gpu, cpu, ssd, remote
-
-
-    def _swa_release_load_lock(self, node, staging_slot: int = -1) -> None:
+    def _swa_release_load_lock(self, node, staging_slot: int = -1, engine=None) -> None:
         """SWA H2D completion callback: release the source pin and free any
         transient CPU staging slot.
 
@@ -2201,13 +2181,19 @@ class GlobalCacheEngine:
         try:
             if node is not None and getattr(node, "swa_lock_ref", 0) > 0:
                 node.dec_swa_lock_ref()
+                if engine is not None:
+                    engine.index.unlock(node)
+                elif hasattr(node, "unlock"):
+                    node.unlock()
+                else:
+                    node.lock_cnt -= 1
         except Exception:  # noqa: BLE001 — never let a callback crash the loop
             pass
         try:
             if staging_slot is not None and staging_slot >= 0:
                 cpu_engine = self.cpu_cache_engine
-                if cpu_engine is not None and cpu_engine.swa_pool is not None:
-                    cpu_engine.swa_pool.free(int(staging_slot))
+                if cpu_engine is not None:
+                    cpu_engine._free_swa_slot(int(staging_slot))
         except Exception:  # noqa: BLE001
             pass
 

@@ -11,12 +11,13 @@ does not cover:
            files (write-through).
   EVICT: drop the CPU SWA slot (SWA-only eviction) so the window survives ONLY
          on SSD — forcing the GET to stage from SSD.
-  GET : engine.get() -> graph {full H2D, SWA DISK2H (SSD->CPU staging) -> SWA H2D
-        (CPU->GPU)} -> bytes restored to a fresh GPU SWA slot -> byte-exact.
+  GET : engine.get(swa_aware=True) -> graph {full H2D, SWA DISK2H
+        (SSD->CPU staging) -> SWA H2D (CPU->GPU)} -> bytes restored to a fresh
+        GPU SWA slot -> byte-exact.
 
-This exercises the multi-tier _swa_put_slots (write-through) and _swa_get_slots
-(SSD->CPU transient staging slot + H2D), plus the transient staging slot free on
-H2D completion.
+This exercises SWA graph append inside _put_impl_* (write-through) and
+_get_impl_* (SSD->CPU transient staging slot + H2D), plus the transient staging
+slot free on H2D completion.
 
 Run INSIDE the container on a free GPU:
     CUDA_VISIBLE_DEVICES=0 python3 tests/test_swa_ssd_staging_e2e.py
@@ -177,7 +178,11 @@ def main() -> int:
     kinds = sorted(o.transfer_type.name for o in swa_put_ops)
     assert "D2H" in kinds and "H2DISK" in kinds, f"expected SWA D2H + H2DISK, got {kinds}"
     assert engine.ssd_cache_engine.swa_pool.num_used == 1, "SSD SWA slot not allocated on put"
-    reported = {put_end} | {o.op_id for o in swa_put_ops if o.transfer_type.name == "D2H"}
+    # This helper invokes every per-op callback manually, so wait for every op
+    # carrying one.  The production KVTask loop invokes each callback from its
+    # own completion event; task_end intentionally does not wait for SSD
+    # write-through.
+    reported = {put_end} | set(put_op_cb)
     print(f"[verify] PUT graph: SWA ops={kinds} (write-through to SSD)", flush=True)
     _run_graph(te, put_graph, put_op_cb, put_cb,
                full_gpu_blocks=[PUT_FULL_GPU], swa_gpu_slot=SWA_GPU_SLOT,
@@ -186,10 +191,10 @@ def main() -> int:
 
     # ===== EVICT the CPU SWA so the window survives only on SSD =================
     n_cpu = engine.cpu_cache_engine.swa_pool.num_used
-    engine.cpu_cache_engine._evict_swa(n_cpu)
+    engine.cpu_cache_engine._evict_swa_slots(n_cpu)
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); seq.gen_hashes()
-    cpu_hit, _s = engine.cpu_cache_engine.match_swa(seq, upper_bound_blocks=1)
-    ssd_hit, _s2 = engine.ssd_cache_engine.match_swa(seq, upper_bound_blocks=1)
+    cpu_hit = engine.cpu_cache_engine.match(seq).swa_hit_blocks
+    ssd_hit = engine.ssd_cache_engine.match(seq).swa_hit_blocks
     assert cpu_hit == 0 and ssd_hit > 0, f"precondition failed: cpu_hit={cpu_hit} ssd_hit={ssd_hit}"
     print(f"[verify] evicted CPU SWA (cpu_hit=0, ssd_hit={ssd_hit}); GET must stage from SSD", flush=True)
 
@@ -201,7 +206,7 @@ def main() -> int:
                                  (GET_FULL_GPU + 1) * TOKENS_PER_BLOCK, dtype=np.int64)
     get_graph, _rm2, get_cb, get_op_cb, get_end = engine.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=get_slot_mapping, dp_client_id=0)
+        slot_mapping=get_slot_mapping, dp_client_id=0, swa_aware=True)
     swa_get_ops = [o for o in get_graph._op_map.values() if getattr(o, "is_swa", False)]
     gkinds = sorted(o.transfer_type.name for o in swa_get_ops)
     assert "DISK2H" in gkinds and "H2D" in gkinds, f"expected SWA DISK2H+H2D staging, got {gkinds}"

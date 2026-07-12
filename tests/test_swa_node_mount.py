@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Node-mounted SWA on the radix tree — invariants I0-I4 + a workload stress run.
 
-The node-mount re-architecture (deployments/swa_design/02_控制面_节点挂载匹配与驱逐.md)
+The node-mount re-architecture
 mounts SWA on radix nodes. This file is the single home for its invariant
 coverage, in three sections:
 
@@ -240,6 +240,15 @@ def test_py_swa_locked_node_not_full_evictable():
     assert not n.evictable()
 
 
+def test_py_root_is_not_evictable():
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    assert idx.root_node.is_leaf()
+    assert not idx.root_node.evictable()
+    evicted, hashes = idx.evict(1)
+    assert evicted.size == 0
+    assert hashes.size == 0
+
+
 def test_py_reset_rearms_swa_pool_via_host_pool():
     """SWAHostPool.reset re-arms every slot free (tree reset drops all nodes)."""
     from flexkv.swa.swa_host_pool import SWAHostPool
@@ -366,7 +375,8 @@ def test_promote_swa_ignores_dead_node():
 c_ext = pytest.importorskip("flexkv.c_ext")
 
 _CEXT_OK = "swa_host_slot" in dir(c_ext.CRadixNode) and all(
-    n in dir(c_ext.CRadixNode) for n in ("is_leaf", "get_lock_cnt", "has_swa")
+    n in dir(c_ext.CRadixNode)
+    for n in ("is_leaf", "get_lock_cnt", "has_swa", "lock", "unlock")
 )
 _cext_reason = "CRadixNode SWA/structural bindings not present (rebuild c_ext)"
 cext = pytest.mark.skipif(not _CEXT_OK, reason=_cext_reason)
@@ -617,6 +627,14 @@ def test_cpp_swa_locked_node_not_full_evictable():
 
 
 @cext
+def test_cpp_root_is_not_evictable():
+    t = _tree()
+    ev = _evict_full(t, 1)
+    assert len(ev) == 0
+    assert t.is_empty()
+
+
+@cext
 def test_cpp_reset_clears_tree():
     t = _tree()
     n = _insert(t, [1, 2, 3, 4], 0)
@@ -716,8 +734,9 @@ class _SWAWorkloadDriver:
         mr = self.engine.match(sm)
         full_hit = int(mr.num_ready_matched_blocks)
         if full_hit > 0:
-            swa_hit, slot = self.engine.match_swa(
-                sm, upper_bound_blocks=full_hit, lock_for_load=False)
+            swa_hit = int(mr.swa_hit_blocks)
+            node = mr.last_swa_node
+            slot = int(node.swa_host_slot) if node is not None else -1
             if swa_hit > 0 and slot >= 0:
                 self.swa_hits += 1
 
@@ -737,13 +756,13 @@ class _SWAWorkloadDriver:
             node = mr.last_node
         if node is None:
             return
-        slot = self.engine.swa_alloc_slot()
+        slot = self.engine._alloc_swa_slot()
         self._reconcile()
         if slot == -1:
             return
         tail_hash = int(sm.block_hashes[nblocks - 1])
         self._slot_expect[int(slot)] = tail_hash
-        self.engine.set_swa(node, slot)
+        self.engine.index.set_swa(node, int(slot))
         self._reconcile()
 
     def check_invariants(self):
@@ -870,11 +889,11 @@ def test_full_evict_no_cascade_when_swa_disabled():
 
 
 # --------------------------------------------------------------------------- #
-# Double-match elimination: match_swa_from_result reuse + fallback             #
+# SWA source is exposed directly on match results                          #
 # --------------------------------------------------------------------------- #
 
-def test_match_swa_from_result_reuses_within_bound():
-    """match_swa_from_result reuses the Full-KV match when swa_hit <= bound."""
+def test_match_result_exposes_swa_source_within_bound():
+    """match_prefix exposes the SWA source without a second read-source probe."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
     n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
     idx.set_swa(n1, slot=100)

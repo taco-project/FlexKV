@@ -57,8 +57,7 @@ private:
   uint64_t swa_last_access_time = 0; // SWA LRU timestamp
   // Intrusive SWA-only LRU doubly-linked list pointers (independent of the
   // Full-KV leaf_list). Nodes carrying a live SWA slot are threaded on the
-  // tree's swa_lru list; SWA-only eviction walks it from the LRU end. See
-  // deployments/swa_design/08_节点挂载SWA架构.md §6.2.
+  // tree's swa_lru list; SWA-only eviction walks it from the LRU end.
   CRadixNode *swa_lru_prev = nullptr;
   CRadixNode *swa_lru_next = nullptr;
   bool on_swa_lru = false;
@@ -246,7 +245,7 @@ public:
   // locked (I3: swa_lock_ref>0 implies it must stay), or it is not ready.
   bool in_use() { return lock_cnt > 0 || swa_lock_ref > 0 || !ready; }
 
-  bool evictable() { return is_leaf() && !in_use(); }
+  bool evictable();
 
   int get_lock_cnt() const { return lock_cnt; }
 
@@ -521,9 +520,9 @@ public:
   void set_swa(CRadixNode *node, int slot) {
     assert(node != root);
     int old = node->get_swa_host_slot();
-    if (old != -1 && old != slot) {
-      freed_swa_slots.push_back(old);
-    }
+    // A different existing slot means the caller is overwriting a live SWA
+    // mount. Unmount via record_freed_swa_slot() first instead of hiding it here.
+    assert(old == -1 || old == slot);
     node->set_swa_host_slot(slot);
     node->set_swa_tombstone(false);
     struct timeval now;
@@ -656,5 +655,9 @@ public:
                              int num_matched_blocks = -1,
                              int last_node_matched_length = -1);
 };
+
+inline bool CRadixNode::evictable() {
+  return !index->is_root(this) && is_leaf() && !in_use();
+}
 
 } // namespace flexkv

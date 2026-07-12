@@ -748,6 +748,8 @@ PYBIND11_MODULE(c_ext, m) {
       .def("is_leaf", &flexkv::CRadixNode::is_leaf)
       .def("num_children", &flexkv::CRadixNode::get_num_children)
       .def("get_lock_cnt", &flexkv::CRadixNode::get_lock_cnt)
+      .def("lock", &flexkv::CRadixNode::lock)
+      .def("unlock", &flexkv::CRadixNode::unlock)
       .def("has_swa", &flexkv::CRadixNode::has_swa)
       .def_property_readonly("parent", &flexkv::CRadixNode::get_parent,
                              py::return_value_policy::reference)

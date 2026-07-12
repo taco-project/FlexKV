@@ -18,7 +18,7 @@ SWA (sliding-window-attention) KV snapshots are mounted directly on the Full-KV
 radix nodes (hicache / sglang swa_radix_cache.py style) rather than living in a
 separate hash-keyed index. This unifies SWA and Full eviction so the two pools
 never drift apart (which would erode the reusable prefix computed as
-``usable = min(full_hit, swa_hit)``). See deployments/swa_design/08_节点挂载SWA架构.md.
+``usable = min(full_hit, swa_hit)``). 
 
 Core invariants (enforced here):
 * I0: each node holds at most one SWA, at its LAST page (its trailing window).
@@ -141,6 +141,14 @@ class RadixNode:
         SWA); used to drop a load-time pin once the SWA H2D has read the slot."""
         assert self.swa_lock_ref > 0
         self.swa_lock_ref -= 1
+
+    def lock(self) -> None:
+        assert self.lock_cnt >= 0
+        self.lock_cnt += 1
+
+    def unlock(self) -> None:
+        assert self.lock_cnt > 0
+        self.lock_cnt -= 1
 
     def split(self, prefix_length: int) -> 'RadixNode':
         assert prefix_length < self.size()
@@ -310,12 +318,12 @@ class RadixTreeIndex:
         """Mount an SWA slot on ``node``'s trailing page (store side).
 
         The caller guarantees ``node`` is the node whose LAST page is the target
-        window (split first if not — see insert / I0). Replacing an existing slot
-        buffers the old one for draining.
+        window (split first if not — see insert / I0). A different existing slot
+        must be explicitly unmounted first; remounting the same slot refreshes
+        SWA-LRU recency.
         """
         assert node is not self.root_node
-        if node.swa_host_slot >= 0 and node.swa_host_slot != slot:
-            self._freed_swa_slots.append(node.swa_host_slot)
+        assert node.swa_host_slot < 0 or node.swa_host_slot == slot
         node.swa_host_slot = slot
         node.swa_tombstone = False
         node.swa_last_access_time = time.time()

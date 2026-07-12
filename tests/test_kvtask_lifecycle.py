@@ -8,8 +8,8 @@ Two concerns, both cheap (no TransferManager subprocess, no GPU):
    the new ``swa_slot_mapping`` field, and shed_heavy_resources.
 
 2. The SWA load-lock lifecycle on ``GlobalCacheEngine``: a GET pins the matched
-   CPU SWA node (``_swa_get_slots`` -> match_swa_locked), and the SWA H2D
-   completion callback releases it (``_swa_release_load_lock``), leaving the
+   CPU SWA node while building the GET plan, and the SWA H2D completion callback
+   releases it (``_swa_release_load_lock``), leaving the
    node cached (dec_swa_lock_ref, NOT dec_swa_lock_only). This documents that
    the SWA lock follows the SAME lifecycle as the full-KV node lock (both taken
    in get()/put(), both released via the op/transfer callbacks) — so a fresh
@@ -105,7 +105,7 @@ def _usable_and_swa_mask(full_hit, swa_hit, num_tokens, tpb):
     (6, 6, 6),    # M15.4: SWA covers whole full hit -> no truncation loss
     (10, 0, 0),   # M15.3: no SWA hit -> usable 0 -> empty full graph
 ])
-def test_get_match_swa_usable_is_min(full_hit, swa_hit, exp_usable):
+def test_get_swa_usable_is_min(full_hit, swa_hit, exp_usable):
     tpb, num_tokens = 16, 10 * 16
     usable, truncated, _ = _usable_and_swa_mask(full_hit, swa_hit, num_tokens, tpb)
     assert usable == exp_usable
@@ -114,7 +114,7 @@ def test_get_match_swa_usable_is_min(full_hit, swa_hit, exp_usable):
 
 
 @pytest.mark.parametrize("swa_hit", [1, 3, 6])
-def test_get_match_swa_trailing_window_is_one_block(swa_hit):
+def test_get_swa_trailing_window_is_one_block(swa_hit):
     """M16.1: SWA is page-granular, so return_mask_swa
     marks exactly ONE block, ending at swa_hit."""
     tpb, num_tokens = 16, 6 * 16
@@ -123,7 +123,7 @@ def test_get_match_swa_trailing_window_is_one_block(swa_hit):
     assert swa_mask[(swa_hit - 1) * tpb: swa_hit * tpb].all()  # the trailing one
 
 
-def test_get_match_swa_no_hit_empty_window_no_underflow():
+def test_get_swa_no_hit_empty_window_no_underflow():
     """M16.2: swa_hit=0 -> return_mask_swa all-zero, and the (swa_hit-1) index is
     never evaluated (no negative-index wraparound marking the last block)."""
     tpb, num_tokens = 16, 6 * 16
@@ -184,16 +184,17 @@ def test_get_pins_then_releases_swa_lock():
 
     graph, _rm, cb, op_cb, end_id = eng.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0)
+        slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0,
+        swa_aware=True)
     swa_h2d = [o for o in graph._op_map.values() if o.is_swa][0]
 
     # After building the GET graph, the matched CPU SWA node is pinned.
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
-    hit, slot = eng.cpu_cache_engine.match_swa(sm, upper_bound_blocks=4)
-    assert hit == 4
-    # The node carries the load pin (>=1) taken by _swa_get_slots.
-    node = eng.cpu_cache_engine.index.match_prefix(
-        torch.from_numpy(sm.block_hashes[:4]).to(torch.int64), 4, False).last_swa_node
+    mr = eng.cpu_cache_engine.match(sm)
+    assert mr.swa_hit_blocks == 4
+    # The node carries the load pin (>=1) taken while building the GET plan.
+    node = mr.last_swa_node
+    assert node is not None
     assert node.swa_lock_ref >= 1
 
     # Complete the ops: the SWA H2D callback releases the pin.
@@ -220,7 +221,8 @@ def test_repeated_get_relocks_cleanly():
         _g, _rm, cb, op_cb, _e = eng.get(
             request_id=req, token_ids=tok,
             token_mask=np.ones_like(tok, dtype=np.int64),
-            slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0)
+            slot_mapping=np.arange(tok.shape[0], dtype=np.int64), dp_client_id=0,
+            swa_aware=True)
         for c in op_cb.values():
             c()
         cb()

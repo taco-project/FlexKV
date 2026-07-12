@@ -175,6 +175,7 @@ def test_plain_get_on_swa_cache_matches_once_and_unclamped():
     assert mc.n == 1, f"plain get matched {mc.n} rounds; must be 1"
     # full 4-block hit, unclamped by SWA.
     assert int(return_mask.sum()) == 4 * TPB
+    assert not any(getattr(o, "is_swa", False) for o in graph._op_map.values())
     _complete(op_cb, cb)
 
 
