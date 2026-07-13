@@ -1088,3 +1088,68 @@ class KVTaskEngine(KVTaskManager):
 
     def _clear_cpu_cache(self) -> None:
         self.cache_engine.cpu_cache_engine.reset()
+
+    def reset_cache(self, drain: str = "wait", timeout: float = 20.0) -> None:
+        """Fully invalidate the cache across ALL tiers (CPU + SSD + remote):
+        drop the whole prefix tree and return every block to the mempool.
+
+        Used after a weight update (e.g. verl RL rollout) so that KV computed
+        against stale weights is never reused.
+
+        Because ``GlobalCacheEngine.reset()`` and the underlying
+        ``index.reset()`` / ``mempool.reset()`` take NO lock, and the real data
+        transfers run asynchronously in the TransferManager processes, we must
+        quiesce in-flight tasks BEFORE resetting; otherwise a late transfer
+        would read/write a block that has already been freed/rebuilt.
+
+        Args:
+            drain: "wait" waits for in-flight tasks to land (default, keeps
+                already-put data consistent); "cancel" aborts them (faster,
+                loses in-flight puts).
+            timeout: wait timeout (seconds) when ``drain == "wait"``.
+        """
+        # ---- part 4: quiesce in-flight tasks ----
+        # Snapshot incomplete task_ids (self.tasks is an ExpiringDict; copy the
+        # items to avoid mutation during iteration). When ② clear_kv_cache has
+        # already drained everything, ③'s snapshot is empty and this is a no-op,
+        # so the §2.5 triple-call collapses to one real drain.
+        pending = [tid for tid, t in list(self.tasks.items()) if not t.is_completed()]
+        if pending:
+            if drain == "cancel":
+                self.cancel_tasks(pending)
+            else:
+                # wait() drives _update_tasks() internally; completely=True
+                # blocks until the transfers have fully landed.
+                try:
+                    self.wait(pending, timeout=timeout, completely=True)
+                except Exception as e:  # noqa: BLE001
+                    flexkv_logger.warning(
+                        f"reset_cache: waiting for in-flight tasks failed ({e}); "
+                        f"forcing cancel before reset."
+                    )
+            # Defensive second pass: force-cancel any task that survived wait
+            # (e.g. timeout) so no TransferManager process still holds a block.
+            still = [tid for tid, t in list(self.tasks.items()) if not t.is_completed()]
+            if still:
+                self.cancel_tasks(still)
+
+        # ---- parts 1+2+3: drop index + mempool on every tier ----
+        self.cache_engine.reset()  # GlobalCacheEngine.reset()
+
+        # ---- part 5: clear task bookkeeping ----
+        # These dicts are NOT inside the cache engine; they track "who is moving
+        # what". drain() only removes entries from self.tasks (via _release_task),
+        # and cancelled tasks may leave stale counters in the *_ops/*_graphs maps
+        # and stale prefetch keys pointing at now-invalid cache. Clear them so no
+        # bookkeeping survives that references the just-reset cache.
+        # self.tasks / self.prefetch_tasks are ExpiringDict (third-party); guard
+        # in case .clear() is not proxied, falling back to per-key deletion.
+        for d in (self.tasks, self.prefetch_tasks):
+            try:
+                d.clear()
+            except AttributeError:
+                for k in list(d.keys()):
+                    d.pop(k, None)
+        self.graph_to_task.clear()
+        self.uncompleted_ops.clear()
+        self.uncompleted_graphs.clear()

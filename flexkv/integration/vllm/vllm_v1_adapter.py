@@ -284,6 +284,23 @@ class FlexKVSchedulerConnector:
         if self.collector is not None:
             self.collector.close()
 
+    def reset_cache(self) -> bool:
+        """Fully invalidate the FlexKV cache (all tiers).
+
+        Invoked from vLLM's scheduler via reset_prefix_cache(reset_connector=True)
+        after a weight update, so KV computed against stale weights is dropped.
+        Also clears local scheduler-side task bookkeeping.
+        """
+        self.flexkv_manager.reset()
+        # Drop stale local bookkeeping so no dangling task refs survive the reset.
+        self.req_id_to_task_dict.clear()
+        self.get_tasks.clear()
+        self.put_tasks.clear()
+        self.tasks_to_launch.clear()
+        self.tasks_to_cancel.clear()
+        self.failed_block_ids.clear()
+        return True
+
     ####################
     #### Get Method ####
     ####################
@@ -962,6 +979,14 @@ class FlexKVConnectorV1Impl:
     def shutdown(self):
         if self.role == KVConnectorRole.SCHEDULER:
             self.connector.shutdown()
+
+    def reset_cache(self) -> Optional[bool]:
+        """Reset the FlexKV cache. Only meaningful on the scheduler side
+        (vLLM invokes connector.reset_cache() from the scheduler process).
+        """
+        if self.role == KVConnectorRole.SCHEDULER:
+            return self.connector.reset_cache()
+        return None
 
     # ==============================
     # Worker-side methods

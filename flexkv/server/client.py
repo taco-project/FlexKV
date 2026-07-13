@@ -30,6 +30,7 @@ from flexkv.server.request import (
     CheckRunningRequest,
     StartRequest,
     ShutdownRequest,
+    ResetRequest,
     PrefetchRequest,
     Response
 )
@@ -92,6 +93,19 @@ class KVDPClient:
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
         return response.is_ready
+
+    def reset(self, timeout: float = 20.0) -> None:
+        """Fully invalidate the shared FlexKV cache on the server.
+
+        Synchronous round-trip (mirrors is_ready): blocks until the server has
+        finished draining in-flight tasks and resetting every tier. Only ONE
+        client needs to call this — the cache is global to the server process.
+        """
+        req = ResetRequest(self.dp_client_id)
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.error_msg:
+            raise RuntimeError(f"flexkv reset failed on server: {response.error_msg}")
 
     def put_async(
         self,

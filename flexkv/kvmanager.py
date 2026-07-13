@@ -350,3 +350,15 @@ class KVManager:
             return
         else:
             self.kv_task_engine._clear_cpu_cache()
+
+    def reset(self, timeout: float = 20.0) -> None:
+        """Fully invalidate the cache across all tiers (CPU + SSD + remote).
+
+        Call after a weight update so KV computed against stale weights is not
+        reused. Works in both in-process and server-client mode. Idempotent and
+        cheap when the cache is already empty / has no in-flight tasks.
+        """
+        if self.server_client_mode:
+            self.dp_client.reset(timeout=timeout)
+        else:
+            self.kv_task_engine.reset_cache(drain="wait", timeout=timeout)

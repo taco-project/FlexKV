@@ -36,6 +36,7 @@ from flexkv.server.request import (
     Response,
     StartRequest,
     ShutdownRequest,
+    ResetRequest,
     CheckRunningRequest,
     PrefetchRequest,
 )
@@ -201,6 +202,7 @@ class KVServer:
             CancelTaskRequest: self._handle_cancel_task_request,
             TryWaitRequest: self._handle_try_wait_request,
             ShutdownRequest: self._handle_shutdown_request,
+            ResetRequest: self._handle_reset_request,
         }
 
     def is_ready(self) -> bool:
@@ -477,6 +479,24 @@ class KVServer:
         flexkv_logger.info(f"Received shutdown request from DP client "
                            f"(dp_client_id={req.dp_client_id})")
         self._running = False
+
+    def _handle_reset_request(self, req: ResetRequest) -> None:
+        """Handle cache-reset request: drain in-flight tasks and drop all tiers.
+
+        Synchronous (mirrors _handle_is_ready_request): replies only after the
+        reset has completed, so the client's reset() blocks until done.
+        """
+        flexkv_logger.info(f"Received reset request from DP client "
+                           f"(dp_client_id={req.dp_client_id})")
+        error_msg = None
+        try:
+            self.kv_task_engine.reset_cache(drain="wait")
+        except Exception as e:  # noqa: BLE001
+            error_msg = str(e)
+            flexkv_logger.error(f"reset_cache failed on server: {error_msg}")
+        response = Response(dp_client_id=req.dp_client_id, error_msg=error_msg)
+        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+        result_zmq.send_pyobj(response)
 
     def __del__(self) -> None:
         self.kv_task_engine.shutdown()
