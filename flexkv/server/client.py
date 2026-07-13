@@ -94,12 +94,13 @@ class KVDPClient:
         response: Response = self.recv_from_server.recv_pyobj()
         return response.is_ready
 
-    def reset(self, timeout: float = 20.0) -> None:
-        """Fully invalidate the shared FlexKV cache on the server.
+    def reset(self) -> None:
+        """Invalidate the shared FlexKV cache on the server (drop radix tree +
+        mempool on every tier).
 
         Synchronous round-trip (mirrors is_ready): blocks until the server has
-        finished draining in-flight tasks and resetting every tier. Only ONE
-        client needs to call this — the cache is global to the server process.
+        finished resetting. Only ONE client needs to call this — the cache is
+        global to the server process.
         """
         req = ResetRequest(self.dp_client_id)
         self.send_to_server.send_pyobj(req)

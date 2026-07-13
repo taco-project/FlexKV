@@ -285,14 +285,20 @@ class FlexKVSchedulerConnector:
             self.collector.close()
 
     def reset_cache(self) -> bool:
-        """Fully invalidate the FlexKV cache (all tiers).
+        """Invalidate the FlexKV cache: drop the radix tree + mempool on every
+        tier, so KV computed against stale weights can no longer be matched.
 
         Invoked from vLLM's scheduler via reset_prefix_cache(reset_connector=True)
-        after a weight update, so KV computed against stale weights is dropped.
-        Also clears local scheduler-side task bookkeeping.
+        after a weight update. Safety relies only on the radix tree being
+        cleared (get_match can no longer hit stale KV); in-flight transfers need
+        not be drained.
+
+        We also clear this connector's own per-request bookkeeping. These dicts
+        map vLLM request_id -> flexkv task_id for requests currently in flight;
+        after a reset those task_ids reference dropped cache, so we clear them to
+        avoid dangling references (they are normally empty at a reset boundary).
         """
         self.flexkv_manager.reset()
-        # Drop stale local bookkeeping so no dangling task refs survive the reset.
         self.req_id_to_task_dict.clear()
         self.get_tasks.clear()
         self.put_tasks.clear()

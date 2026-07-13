@@ -351,14 +351,15 @@ class KVManager:
         else:
             self.kv_task_engine._clear_cpu_cache()
 
-    def reset(self, timeout: float = 20.0) -> None:
-        """Fully invalidate the cache across all tiers (CPU + SSD + remote).
+    def reset(self) -> None:
+        """Invalidate the cache across all tiers (CPU + SSD + remote): drop the
+        radix tree and free the mempool.
 
         Call after a weight update so KV computed against stale weights is not
-        reused. Works in both in-process and server-client mode. Idempotent and
-        cheap when the cache is already empty / has no in-flight tasks.
+        reused. Works in both in-process and server-client mode. Cheap and
+        idempotent (resetting an already-empty tree/mempool is a no-op).
         """
         if self.server_client_mode:
-            self.dp_client.reset(timeout=timeout)
+            self.dp_client.reset()
         else:
-            self.kv_task_engine.reset_cache(drain="wait", timeout=timeout)
+            self.kv_task_engine.reset_cache()

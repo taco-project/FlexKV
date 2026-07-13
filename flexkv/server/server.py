@@ -481,7 +481,7 @@ class KVServer:
         self._running = False
 
     def _handle_reset_request(self, req: ResetRequest) -> None:
-        """Handle cache-reset request: drain in-flight tasks and drop all tiers.
+        """Handle cache-reset request: drop radix tree + mempool on all tiers.
 
         Synchronous (mirrors _handle_is_ready_request): replies only after the
         reset has completed, so the client's reset() blocks until done.
@@ -490,7 +490,7 @@ class KVServer:
                            f"(dp_client_id={req.dp_client_id})")
         error_msg = None
         try:
-            self.kv_task_engine.reset_cache(drain="wait")
+            self.kv_task_engine.reset_cache()
         except Exception as e:  # noqa: BLE001
             error_msg = str(e)
             flexkv_logger.error(f"reset_cache failed on server: {error_msg}")
