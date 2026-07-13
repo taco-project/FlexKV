@@ -1137,13 +1137,13 @@ class TransferEngine:
 
 
         if op.transfer_type == TransferType.LAYERWISE:
-            if hasattr(op, "dst_block_ids_h2d"):
-                flexkv_logger.info(
-                    "[FlexKV-SEGV-DEBUG] schedule LAYERWISE parent op "
-                    f"op_id={op.op_id}, graph_id={op.graph_id}, "
-                    f"num_h2d_blocks={len(op.dst_block_ids_h2d)}, "
-                    f"{summarize_id_tensor('dst_h2d', op.dst_block_ids_h2d)}"
-                )
+            # if hasattr(op, "dst_block_ids_h2d"):
+            #     flexkv_logger.info(
+            #         "[FlexKV-SEGV-DEBUG] schedule LAYERWISE parent op "
+            #         f"op_id={op.op_id}, graph_id={op.graph_id}, "
+            #         f"num_h2d_blocks={len(op.dst_block_ids_h2d)}, "
+            #         f"{summarize_id_tensor('dst_h2d', op.dst_block_ids_h2d)}"
+            #     )
             self._assign_layerwise_op_to_workers(op)
             return
 

@@ -173,32 +173,32 @@ void TPTransferThreadGroup::tp_group_transfer(
   const int num_blocks = gpu_block_id_tensor.numel();
   const auto xfer_t0 = std::chrono::steady_clock::now();
 
-  FLEXKV_D2H_LOG(
-      "tp_group_transfer ENTER backend=%s num_gpus=%d blocks=%d "
-      "h2d=%d ce=%d mla=%d sharded_d2h=%d layer_id=%d layer_gran=%d cta=%d "
-      "cpu_strides(kv/layer/block/tp)=%lld/%lld/%lld/%lld cpu_base=%p",
-      backend_name(backend_type_), num_gpus_, num_blocks,
-      is_host_to_device ? 1 : 0, use_ce_transfer ? 1 : 0, is_mla ? 1 : 0,
-      enable_sharded_d2h ? 1 : 0, layer_id, layer_granularity, transfer_num_cta,
-      static_cast<long long>(cpu_kv_stride_in_bytes),
-      static_cast<long long>(cpu_layer_stride_in_bytes),
-      static_cast<long long>(cpu_block_stride_in_bytes),
-      static_cast<long long>(cpu_tp_stride_in_bytes), cpu_blocks_);
+  // FLEXKV_D2H_LOG(
+  //     "tp_group_transfer ENTER backend=%s num_gpus=%d blocks=%d "
+  //     "h2d=%d ce=%d mla=%d sharded_d2h=%d layer_id=%d layer_gran=%d cta=%d "
+  //     "cpu_strides(kv/layer/block/tp)=%lld/%lld/%lld/%lld cpu_base=%p",
+  //     backend_name(backend_type_), num_gpus_, num_blocks,
+  //     is_host_to_device ? 1 : 0, use_ce_transfer ? 1 : 0, is_mla ? 1 : 0,
+  //     enable_sharded_d2h ? 1 : 0, layer_id, layer_granularity, transfer_num_cta,
+  //     static_cast<long long>(cpu_kv_stride_in_bytes),
+  //     static_cast<long long>(cpu_layer_stride_in_bytes),
+  //     static_cast<long long>(cpu_block_stride_in_bytes),
+  //     static_cast<long long>(cpu_tp_stride_in_bytes), cpu_blocks_);
 
   if (num_blocks > 0) {
     const int64_t *gpu_ids =
         static_cast<const int64_t *>(gpu_block_id_tensor.data_ptr());
     const int64_t *cpu_ids =
         static_cast<const int64_t *>(cpu_block_id_tensor.data_ptr());
-    FLEXKV_D2H_LOG(
-        "tp_group_transfer block_ids gpu=[%lld,%lld] cpu=[%lld,%lld]",
-        static_cast<long long>(min_block_id(gpu_ids, num_blocks)),
-        static_cast<long long>(max_block_id(gpu_ids, num_blocks)),
-        static_cast<long long>(min_block_id(cpu_ids, num_blocks)),
-        static_cast<long long>(max_block_id(cpu_ids, num_blocks)));
-    log_pointer_attributes("gpu_block_ids", gpu_ids);
-    log_pointer_attributes("cpu_block_ids", cpu_ids);
-    log_pointer_attributes("cpu_base", cpu_blocks_);
+    // FLEXKV_D2H_LOG(
+    //     "tp_group_transfer block_ids gpu=[%lld,%lld] cpu=[%lld,%lld]",
+    //     static_cast<long long>(min_block_id(gpu_ids, num_blocks)),
+    //     static_cast<long long>(max_block_id(gpu_ids, num_blocks)),
+    //     static_cast<long long>(min_block_id(cpu_ids, num_blocks)),
+    //     static_cast<long long>(max_block_id(cpu_ids, num_blocks)));
+    // log_pointer_attributes("gpu_block_ids", gpu_ids);
+    // log_pointer_attributes("cpu_block_ids", cpu_ids);
+    // log_pointer_attributes("cpu_base", cpu_blocks_);
   }
 
   for (int i = 0; i < num_gpus_; ++i) {
@@ -225,13 +225,13 @@ void TPTransferThreadGroup::tp_group_transfer(
                                  ? gpu_chunk_sizes_in_bytes_[i] / num_gpus_
                                  : gpu_chunk_sizes_in_bytes_[i];
 
-        FLEXKV_D2H_LOG(
-            "tp_group_transfer gpu=%d dev=%d chunk=%lld gpu_off=%lld "
-            "cpu_off=%lld stream=%p",
-            i, gpu_device_ids_[i], static_cast<long long>(chunk_size),
-            static_cast<long long>(gpu_startoff_inside_chunks),
-            static_cast<long long>(cpu_startoff_inside_chunks),
-            static_cast<void *>(streams_[i]));
+        // FLEXKV_D2H_LOG(
+        //     "tp_group_transfer gpu=%d dev=%d chunk=%lld gpu_off=%lld "
+        //     "cpu_off=%lld stream=%p",
+        //     i, gpu_device_ids_[i], static_cast<long long>(chunk_size),
+        //     static_cast<long long>(gpu_startoff_inside_chunks),
+        //     static_cast<long long>(cpu_startoff_inside_chunks),
+        //     static_cast<void *>(streams_[i]));
 
         const auto gpu_t0 = std::chrono::steady_clock::now();
         // Dispatch to the appropriate template based on backend type
@@ -276,23 +276,23 @@ void TPTransferThreadGroup::tp_group_transfer(
           error_msg = std::string("gpu=") + std::to_string(i) + " dev=" +
                       std::to_string(gpu_device_ids_[i]) + " " +
                       cudaGetErrorString(err);
-          FLEXKV_D2H_LOG("tp_group_transfer gpu=%d FAIL elapsed_ms=%lld err=%s",
-                         i, static_cast<long long>(gpu_ms),
-                         cudaGetErrorString(err));
+          // FLEXKV_D2H_LOG("tp_group_transfer gpu=%d FAIL elapsed_ms=%lld err=%s",
+          //                i, static_cast<long long>(gpu_ms),
+          //                cudaGetErrorString(err));
         } else {
-          FLEXKV_D2H_LOG("tp_group_transfer gpu=%d thread done elapsed_ms=%lld",
-                         i, static_cast<long long>(gpu_ms));
+          // FLEXKV_D2H_LOG("tp_group_transfer gpu=%d thread done elapsed_ms=%lld",
+          //                i, static_cast<long long>(gpu_ms));
         }
       } catch (const std::exception &e) {
         failed = true;
         error_msg = std::string("gpu=") + std::to_string(i) + " exception: " +
                     e.what();
-        FLEXKV_D2H_LOG("tp_group_transfer gpu=%d exception: %s", i, e.what());
+        // FLEXKV_D2H_LOG("tp_group_transfer gpu=%d exception: %s", i, e.what());
       }
     }));
   }
 
-  FLEXKV_D2H_LOG("tp_group_transfer waiting for %d gpu futures", num_gpus_);
+  // FLEXKV_D2H_LOG("tp_group_transfer waiting for %d gpu futures", num_gpus_);
   for (int i = 0; i < static_cast<int>(futures.size()); ++i) {
     const auto wait_t0 = std::chrono::steady_clock::now();
     futures[i].get();
@@ -300,8 +300,8 @@ void TPTransferThreadGroup::tp_group_transfer(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - wait_t0)
             .count();
-    FLEXKV_D2H_LOG("tp_group_transfer future gpu=%d joined wait_ms=%lld", i,
-                   static_cast<long long>(wait_ms));
+    // FLEXKV_D2H_LOG("tp_group_transfer future gpu=%d joined wait_ms=%lld", i,
+    //                static_cast<long long>(wait_ms));
   }
 
   const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -309,13 +309,13 @@ void TPTransferThreadGroup::tp_group_transfer(
                             .count();
 
   if (failed) {
-    FLEXKV_D2H_LOG("tp_group_transfer LEAVE FAIL total_ms=%lld err=%s",
-                   static_cast<long long>(total_ms), error_msg.c_str());
+    // FLEXKV_D2H_LOG("tp_group_transfer LEAVE FAIL total_ms=%lld err=%s",
+    //                static_cast<long long>(total_ms), error_msg.c_str());
     throw std::runtime_error("tp_group_transfer failed: " + error_msg);
   }
 
-  FLEXKV_D2H_LOG("tp_group_transfer LEAVE OK total_ms=%lld",
-                 static_cast<long long>(total_ms));
+  // FLEXKV_D2H_LOG("tp_group_transfer LEAVE OK total_ms=%lld",
+  //                static_cast<long long>(total_ms));
 }
 
 } // namespace flexkv
