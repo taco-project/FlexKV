@@ -719,6 +719,12 @@ PYBIND11_MODULE(c_ext, m) {
       .def("drain_freed_swa_slots",
            &flexkv::CRadixTreeIndex::drain_freed_swa_slots)
       // ===== SWA node-mount: store-side mount + SWA-only eviction =====
+      .def("mount_swa", &flexkv::CRadixTreeIndex::mount_swa, py::arg("node"),
+           py::arg("slot"))
+      .def("publish_swa", &flexkv::CRadixTreeIndex::publish_swa,
+           py::arg("node"))
+      .def("unmount_swa", &flexkv::CRadixTreeIndex::unmount_swa,
+           py::arg("node"))
       .def("set_swa", &flexkv::CRadixTreeIndex::set_swa, py::arg("node"),
            py::arg("slot"))
       .def("promote_swa", &flexkv::CRadixTreeIndex::promote_swa,
@@ -751,6 +757,7 @@ PYBIND11_MODULE(c_ext, m) {
       .def("lock", &flexkv::CRadixNode::lock)
       .def("unlock", &flexkv::CRadixNode::unlock)
       .def("has_swa", &flexkv::CRadixNode::has_swa)
+      .def("is_swa_readable", &flexkv::CRadixNode::is_swa_readable)
       .def_property_readonly("parent", &flexkv::CRadixNode::get_parent,
                              py::return_value_policy::reference)
       // ===== SWA accessors (node-attached SWA state) =====
@@ -758,6 +765,8 @@ PYBIND11_MODULE(c_ext, m) {
                     &flexkv::CRadixNode::set_swa_host_slot)
       .def_property("swa_tombstone", &flexkv::CRadixNode::get_swa_tombstone,
                     &flexkv::CRadixNode::set_swa_tombstone)
+      .def_property("swa_ready", &flexkv::CRadixNode::swa_ready,
+                    &flexkv::CRadixNode::set_swa_ready)
       .def_property_readonly("swa_lock_ref",
                              &flexkv::CRadixNode::get_swa_lock_ref)
       .def("inc_swa_lock_ref", &flexkv::CRadixNode::inc_swa_lock_ref)
