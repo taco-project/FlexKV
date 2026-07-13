@@ -172,36 +172,36 @@ void transfer_kv_blocks(
 
   const int kv_dim = is_mla ? 1 : 2;
   const int gpu_idx = d2h_debug_gpu_index;
-  const int64_t gpu_blk_min = min_block_id(gpu_block_ids, num_blocks);
-  const int64_t gpu_blk_max = max_block_id(gpu_block_ids, num_blocks);
-  const int64_t cpu_blk_min = min_block_id(cpu_block_ids, num_blocks);
-  const int64_t cpu_blk_max = max_block_id(cpu_block_ids, num_blocks);
-  const int64_t est_cpu_end_bytes =
-      (static_cast<int64_t>(start_layer_id) + num_layers) *
-          cpu_layer_stride_in_bytes +
-      cpu_blk_max * cpu_block_stride_in_bytes + cpu_startoff_inside_chunks +
-      chunk_size_in_bytes;
+  // const int64_t gpu_blk_min = min_block_id(gpu_block_ids, num_blocks);
+  // const int64_t gpu_blk_max = max_block_id(gpu_block_ids, num_blocks);
+  // const int64_t cpu_blk_min = min_block_id(cpu_block_ids, num_blocks);
+  // const int64_t cpu_blk_max = max_block_id(cpu_block_ids, num_blocks);
+  // const int64_t est_cpu_end_bytes =
+  //     (static_cast<int64_t>(start_layer_id) + num_layers) *
+  //         cpu_layer_stride_in_bytes +
+  //     cpu_blk_max * cpu_block_stride_in_bytes + cpu_startoff_inside_chunks +
+  //     chunk_size_in_bytes;
 
-  FLEXKV_D2H_LOG(
-      "transfer_kv_blocks ENTER gpu=%d backend=%s ce=%d h2d=%d mla=%d "
-      "blocks=%d layers=[%d,%d) chunk=%lld gpu_off=%lld cpu_off=%lld "
-      "cpu_strides(kv/layer/block)=%lld/%lld/%lld gpu_blk=[%lld,%lld] "
-      "cpu_blk=[%lld,%lld] est_cpu_end=%lld sync=%d",
-      gpu_idx, backend_name(Type), use_ce_transfer ? 1 : 0,
-      is_host_to_device ? 1 : 0, is_mla ? 1 : 0, num_blocks, start_layer_id,
-      start_layer_id + num_layers, static_cast<long long>(chunk_size_in_bytes),
-      static_cast<long long>(gpu_startoff_inside_chunks),
-      static_cast<long long>(cpu_startoff_inside_chunks),
-      static_cast<long long>(cpu_kv_stride_in_bytes),
-      static_cast<long long>(cpu_layer_stride_in_bytes),
-      static_cast<long long>(cpu_block_stride_in_bytes),
-      static_cast<long long>(gpu_blk_min), static_cast<long long>(gpu_blk_max),
-      static_cast<long long>(cpu_blk_min), static_cast<long long>(cpu_blk_max),
-      static_cast<long long>(est_cpu_end_bytes), sync ? 1 : 0);
+  // FLEXKV_D2H_LOG(
+  //     "transfer_kv_blocks ENTER gpu=%d backend=%s ce=%d h2d=%d mla=%d "
+  //     "blocks=%d layers=[%d,%d) chunk=%lld gpu_off=%lld cpu_off=%lld "
+  //     "cpu_strides(kv/layer/block)=%lld/%lld/%lld gpu_blk=[%lld,%lld] "
+  //     "cpu_blk=[%lld,%lld] est_cpu_end=%lld sync=%d",
+  //     gpu_idx, backend_name(Type), use_ce_transfer ? 1 : 0,
+  //     is_host_to_device ? 1 : 0, is_mla ? 1 : 0, num_blocks, start_layer_id,
+  //     start_layer_id + num_layers, static_cast<long long>(chunk_size_in_bytes),
+  //     static_cast<long long>(gpu_startoff_inside_chunks),
+  //     static_cast<long long>(cpu_startoff_inside_chunks),
+  //     static_cast<long long>(cpu_kv_stride_in_bytes),
+  //     static_cast<long long>(cpu_layer_stride_in_bytes),
+  //     static_cast<long long>(cpu_block_stride_in_bytes),
+  //     static_cast<long long>(gpu_blk_min), static_cast<long long>(gpu_blk_max),
+  //     static_cast<long long>(cpu_blk_min), static_cast<long long>(cpu_blk_max),
+  //     static_cast<long long>(est_cpu_end_bytes), sync ? 1 : 0);
 
-  log_pointer_attributes("cpu_base", cpu_ptr);
-  log_pointer_attributes("gpu_block_ids", gpu_block_ids);
-  log_pointer_attributes("cpu_block_ids", cpu_block_ids);
+  // log_pointer_attributes("cpu_base", cpu_ptr);
+  // log_pointer_attributes("gpu_block_ids", gpu_block_ids);
+  // log_pointer_attributes("cpu_block_ids", cpu_block_ids);
 
   // CE transfer mode (Copy Engine using cudaMemcpyAsync)
   if (use_ce_transfer) {
@@ -245,13 +245,13 @@ void transfer_kv_blocks(
           if (d2h_debug_enabled() &&
               (memcpy_idx == 0 || memcpy_idx == total_memcpy / 2 ||
                memcpy_idx == total_memcpy - 1)) {
-            FLEXKV_D2H_LOG(
-                "CE sample gpu=%d idx=%d/%d layer=%d kv=%d blk=%d "
-                "gpu_blk=%lld cpu_blk=%lld src=%p dst=%p bytes=%lld",
-                gpu_idx, memcpy_idx, total_memcpy, i + start_layer_id, j, k,
-                static_cast<long long>(gpu_block_idx),
-                static_cast<long long>(cpu_block_idx), src, dst,
-                static_cast<long long>(chunk_size_in_bytes));
+            // FLEXKV_D2H_LOG(
+            //     "CE sample gpu=%d idx=%d/%d layer=%d kv=%d blk=%d "
+            //     "gpu_blk=%lld cpu_blk=%lld src=%p dst=%p bytes=%lld",
+            //     gpu_idx, memcpy_idx, total_memcpy, i + start_layer_id, j, k,
+            //     static_cast<long long>(gpu_block_idx),
+            //     static_cast<long long>(cpu_block_idx), src, dst,
+            //     static_cast<long long>(chunk_size_in_bytes));
           }
 
           cudaError_t memcpy_err =
@@ -273,32 +273,32 @@ void transfer_kv_blocks(
       }
     }
 
-    FLEXKV_D2H_LOG("CE submitted gpu=%d memcpy_count=%d first_async_err=%s",
-                   gpu_idx, total_memcpy,
-                   cudaGetErrorString(first_async_err));
+    // FLEXKV_D2H_LOG("CE submitted gpu=%d memcpy_count=%d first_async_err=%s",
+    //                gpu_idx, total_memcpy,
+    //                cudaGetErrorString(first_async_err));
 
     if (first_async_err != cudaSuccess) {
-      FLEXKV_D2H_LOG(
-          "CE memcpyAsync FAIL gpu=%d layer=%d kv=%d blk_idx=%d "
-          "gpu_blk=%lld cpu_blk=%lld src=%p dst=%p err=%s",
-          gpu_idx, fail_layer, fail_kv, fail_block,
-          static_cast<long long>(fail_gpu_blk),
-          static_cast<long long>(fail_cpu_blk), fail_src, fail_dst,
-          cudaGetErrorString(first_async_err));
+      // FLEXKV_D2H_LOG(
+      //     "CE memcpyAsync FAIL gpu=%d layer=%d kv=%d blk_idx=%d "
+      //     "gpu_blk=%lld cpu_blk=%lld src=%p dst=%p err=%s",
+      //     gpu_idx, fail_layer, fail_kv, fail_block,
+      //     static_cast<long long>(fail_gpu_blk),
+      //     static_cast<long long>(fail_cpu_blk), fail_src, fail_dst,
+      //     cudaGetErrorString(first_async_err));
     }
   } else {
     const bool float4_path = use_float4_kernel_path(
         chunk_size_in_bytes, gpu_startoff_inside_chunks,
         cpu_startoff_inside_chunks);
 
-    FLEXKV_D2H_LOG(
-        "kernel path gpu=%d float4=%d align(chunk/gpu/cpu)=%lld/%lld/%lld "
-        "cta=%d",
-        gpu_idx, float4_path ? 1 : 0,
-        static_cast<long long>(chunk_size_in_bytes % kFloat4AlignBytes),
-        static_cast<long long>(gpu_startoff_inside_chunks % kFloat4AlignBytes),
-        static_cast<long long>(cpu_startoff_inside_chunks % kFloat4AlignBytes),
-        block_count);
+    // FLEXKV_D2H_LOG(
+    //     "kernel path gpu=%d float4=%d align(chunk/gpu/cpu)=%lld/%lld/%lld "
+    //     "cta=%d",
+    //     gpu_idx, float4_path ? 1 : 0,
+    //     static_cast<long long>(chunk_size_in_bytes % kFloat4AlignBytes),
+    //     static_cast<long long>(gpu_startoff_inside_chunks % kFloat4AlignBytes),
+    //     static_cast<long long>(cpu_startoff_inside_chunks % kFloat4AlignBytes),
+    //     block_count);
 
     if (float4_path) {
       transfer_kv_blocks_kernel<Type><<<gridDim, blockDim, 0, stream>>>(
@@ -318,11 +318,11 @@ void transfer_kv_blocks(
 
     cudaError_t launch_err = cudaGetLastError();
     if (launch_err != cudaSuccess) {
-      FLEXKV_D2H_LOG("kernel launch FAIL gpu=%d err=%s", gpu_idx,
-                     cudaGetErrorString(launch_err));
+      // FLEXKV_D2H_LOG("kernel launch FAIL gpu=%d err=%s", gpu_idx,
+      //                cudaGetErrorString(launch_err));
     } else {
-      FLEXKV_D2H_LOG("kernel launched gpu=%d variant=%s", gpu_idx,
-                     float4_path ? "float4" : "8b");
+      // FLEXKV_D2H_LOG("kernel launched gpu=%d variant=%s", gpu_idx,
+      //                float4_path ? "float4" : "8b");
     }
 
     int64_t actual_chunk_bytes = float4_path
@@ -337,8 +337,8 @@ void transfer_kv_blocks(
 
   if (sync) {
     const auto sync_t0 = std::chrono::steady_clock::now();
-    FLEXKV_D2H_LOG("stream sync BEGIN gpu=%d ce=%d stream=%p", gpu_idx,
-                   use_ce_transfer ? 1 : 0, static_cast<void *>(stream));
+    // FLEXKV_D2H_LOG("stream sync BEGIN gpu=%d ce=%d stream=%p", gpu_idx,
+    //                use_ce_transfer ? 1 : 0, static_cast<void *>(stream));
     cudaError_t sync_err = cudaStreamSynchronize(stream);
     const auto sync_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - sync_t0)
@@ -346,23 +346,23 @@ void transfer_kv_blocks(
     cudaError_t post_sync_err = cudaGetLastError();
 
     if (sync_err != cudaSuccess) {
-      FLEXKV_D2H_LOG(
-          "stream sync FAIL gpu=%d ce=%d elapsed_ms=%lld sync_err=%s post_err=%s",
-          gpu_idx, use_ce_transfer ? 1 : 0, static_cast<long long>(sync_ms),
-          cudaGetErrorString(sync_err), cudaGetErrorString(post_sync_err));
+      // FLEXKV_D2H_LOG(
+      //     "stream sync FAIL gpu=%d ce=%d elapsed_ms=%lld sync_err=%s post_err=%s",
+      //     gpu_idx, use_ce_transfer ? 1 : 0, static_cast<long long>(sync_ms),
+      //     cudaGetErrorString(sync_err), cudaGetErrorString(post_sync_err));
     } else if (post_sync_err != cudaSuccess) {
-      FLEXKV_D2H_LOG(
-          "stream sync OK but pending err gpu=%d ce=%d elapsed_ms=%lld err=%s",
-          gpu_idx, use_ce_transfer ? 1 : 0, static_cast<long long>(sync_ms),
-          cudaGetErrorString(post_sync_err));
+      // FLEXKV_D2H_LOG(
+      //     "stream sync OK but pending err gpu=%d ce=%d elapsed_ms=%lld err=%s",
+      //     gpu_idx, use_ce_transfer ? 1 : 0, static_cast<long long>(sync_ms),
+      //     cudaGetErrorString(post_sync_err));
     } else {
-      FLEXKV_D2H_LOG("stream sync END gpu=%d ce=%d elapsed_ms=%lld ok", gpu_idx,
-                     use_ce_transfer ? 1 : 0, static_cast<long long>(sync_ms));
+      // FLEXKV_D2H_LOG("stream sync END gpu=%d ce=%d elapsed_ms=%lld ok", gpu_idx,
+      //                use_ce_transfer ? 1 : 0, static_cast<long long>(sync_ms));
     }
   }
 
-  FLEXKV_D2H_LOG("transfer_kv_blocks LEAVE gpu=%d ce=%d", gpu_idx,
-                 use_ce_transfer ? 1 : 0);
+  // FLEXKV_D2H_LOG("transfer_kv_blocks LEAVE gpu=%d ce=%d", gpu_idx,
+  //                use_ce_transfer ? 1 : 0);
 }
 
 // Explicit template instantiations

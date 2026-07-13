@@ -148,20 +148,21 @@ class SWACacheManager:
         op, like a CPU full-KV hit.) All ops carry ``is_swa=True``. Returns None
         when disabled / empty.
         """
+        assert gpu_slot_ids >0 and gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
         h2d_id = self.build_swa_op(
             graph, TransferType.H2D, cpu_slot_ids, gpu_slot_ids,
             dp_client_id=dp_client_id,
         )
         if h2d_id is None:
             return None
-        if ssd_slot_ids is not None and np.asarray(ssd_slot_ids).size > 0:
+        if ssd_slot_ids is not None and ssd_slot_ids.size == cpu_slot_ids.size:
             ssd2h_id = self.build_swa_op(
                 graph, TransferType.DISK2H, ssd_slot_ids, cpu_slot_ids,
                 dp_client_id=dp_client_id,
             )
             if ssd2h_id is not None:
                 graph.add_dependency(h2d_id, ssd2h_id)
-        if remote_slot_ids is not None and np.asarray(remote_slot_ids).size > 0:
+        if remote_slot_ids is not None and remote_slot_ids.size == cpu_slot_ids.size:
             remote2h_id = self.build_swa_op(
                 graph, TransferType.REMOTE2H, remote_slot_ids, cpu_slot_ids,
                 dp_client_id=dp_client_id,
@@ -187,6 +188,7 @@ class SWACacheManager:
         exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2REMOTE``. All ops
         carry ``is_swa=True``. Returns None when disabled / empty.
         """
+        assert gpu_slot_ids >0 and gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
         d2h_id = self.build_swa_op(
             graph, TransferType.D2H, gpu_slot_ids, cpu_slot_ids,
             dp_client_id=dp_client_id,
@@ -194,7 +196,7 @@ class SWACacheManager:
         if d2h_id is None:
             return SWAPutChainOpIds() if return_op_ids else None
         h2ssd_id = None
-        if ssd_slot_ids is not None and np.asarray(ssd_slot_ids).size > 0:
+        if ssd_slot_ids is not None and ssd_slot_ids.size == cpu_slot_ids.size:
             h2ssd_id = self.build_swa_op(
                 graph, TransferType.H2DISK, cpu_slot_ids, ssd_slot_ids,
                 dp_client_id=dp_client_id,
@@ -202,7 +204,7 @@ class SWACacheManager:
             if h2ssd_id is not None:
                 graph.add_dependency(h2ssd_id, d2h_id)
         h2remote_id = None
-        if remote_slot_ids is not None and np.asarray(remote_slot_ids).size > 0:
+        if remote_slot_ids is not None and remote_slot_ids.size == cpu_slot_ids.size:
             h2remote_id = self.build_swa_op(
                 graph, TransferType.H2REMOTE, cpu_slot_ids, remote_slot_ids,
                 dp_client_id=dp_client_id,
