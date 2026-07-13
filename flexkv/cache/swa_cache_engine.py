@@ -148,7 +148,7 @@ class SWACacheManager:
         op, like a CPU full-KV hit.) All ops carry ``is_swa=True``. Returns None
         when disabled / empty.
         """
-        assert gpu_slot_ids >0 and gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
+        assert gpu_slot_ids.size > 0 and gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
         h2d_id = self.build_swa_op(
             graph, TransferType.H2D, cpu_slot_ids, gpu_slot_ids,
             dp_client_id=dp_client_id,
@@ -188,7 +188,7 @@ class SWACacheManager:
         exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2REMOTE``. All ops
         carry ``is_swa=True``. Returns None when disabled / empty.
         """
-        assert gpu_slot_ids >0 and gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
+        assert gpu_slot_ids.size > 0 and gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
         d2h_id = self.build_swa_op(
             graph, TransferType.D2H, gpu_slot_ids, cpu_slot_ids,
             dp_client_id=dp_client_id,
