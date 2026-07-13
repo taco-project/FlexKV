@@ -98,11 +98,11 @@ class SWAReadSource:
     host_slot: int = -1
     node: Optional[object] = None
     device_type: Optional[DeviceType] = None
-    engine: Optional[object] = None
 
     @property
     def found(self) -> bool:
-        return self.hit_blocks > 0 and self.host_slot >= 0 and self.node is not None
+        return (self.hit_blocks > 0 and self.host_slot >= 0
+                and self.node is not None and self.device_type is not None)
 
 
 class CacheEngineAccel:
@@ -1135,54 +1135,13 @@ class GlobalCacheEngine:
         op_callback_dict = {}
         if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
                 and swa_read_source.found):
-            swa_empty = np.array([], dtype=np.int64)
-            device_type = swa_read_source.device_type
-            source_engine = swa_read_source.engine
-            source_slot = swa_read_source.host_slot
-            source_node = swa_read_source.node
-            source_engine._pin_swa_node(source_node)
-            staging_slot = -1
-            cpu_swa_slots = np.array([source_slot], dtype=np.int64)
-            ssd_swa_slots = swa_empty
-            remote_swa_slots = swa_empty
-            if device_type != DeviceType.CPU:
-                staging_slot = self.cpu_cache_engine._alloc_swa_slot()
-                if staging_slot < 0:
-                    self._swa_release_load_lock(
-                        node=source_node, engine=source_engine)
-                    swa_h2d_id = None
-                else:
-                    cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
-                    source_slots = np.array([source_slot], dtype=np.int64)
-                    if device_type == DeviceType.SSD:
-                        ssd_swa_slots = source_slots
-                    else:
-                        remote_swa_slots = source_slots
-            else:
-                swa_h2d_id = None
-
-            if staging_slot >= 0 or device_type == DeviceType.CPU:
-                swa_h2d_id = self.swa_cache.build_get_chain(
-                    transfer_graph,
-                    gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
-                    cpu_slot_ids=cpu_swa_slots,
-                    ssd_slot_ids=ssd_swa_slots,
-                    remote_slot_ids=remote_swa_slots,
-                    dp_client_id=dp_client_id,
-                )
-                if swa_h2d_id is None:
-                    self._swa_release_load_lock(
-                        node=source_node,
-                        staging_slot=staging_slot,
-                        engine=source_engine)
-                else:
-                    finished_ops_ids.append(swa_h2d_id)
-                    op_callback_dict[swa_h2d_id] = partial(
-                        self._swa_release_load_lock,
-                        node=source_node,
-                        staging_slot=staging_slot,
-                        engine=source_engine,
-                    )
+            self._append_swa_get_ops(
+                transfer_graph,
+                finished_ops_ids,
+                op_callback_dict,
+                swa_read_source,
+                dp_client_id,
+            )
 
         return GetTransferPlan(
             transfer_graph=transfer_graph,
@@ -1421,51 +1380,13 @@ class GlobalCacheEngine:
 
         if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
                 and swa_read_source.found):
-            swa_empty = np.array([], dtype=np.int64)
-            device_type = swa_read_source.device_type
-            source_engine = swa_read_source.engine ## NOTE: do we need to pass this engine?
-            source_slot = swa_read_source.host_slot
-            source_node = swa_read_source.node
-            source_engine._pin_swa_node(source_node)
-            staging_slot = -1
-            cpu_swa_slots = np.array([source_slot], dtype=np.int64)
-            ssd_swa_slots = swa_empty
-
-            # if device is SSD, we need to allocate a cpu slot for SWA
-            if device_type == DeviceType.SSD:
-                staging_slot = self.cpu_cache_engine._alloc_swa_slot()
-                if staging_slot < 0:
-                    self._swa_release_load_lock(
-                        node=source_node, engine=source_engine)
-                    swa_h2d_id = None
-                else:
-                    cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
-                    ssd_swa_slots = np.array([source_slot], dtype=np.int64)
-            else:
-                swa_h2d_id = None
-
-            if staging_slot >= 0 or device_type == DeviceType.CPU:
-                swa_h2d_id = self.swa_cache.build_get_chain(
-                    transfer_graph,
-                    gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
-                    cpu_slot_ids=cpu_swa_slots,
-                    ssd_slot_ids=ssd_swa_slots,
-                    remote_slot_ids=swa_empty,
-                    dp_client_id=dp_client_id,
-                )
-                if swa_h2d_id is None:
-                    self._swa_release_load_lock(
-                        node=source_node,
-                        staging_slot=staging_slot,
-                        engine=source_engine)
-                else:
-                    finished_ops_ids.append(swa_h2d_id)
-                    op_callback_dict[swa_h2d_id] = partial(
-                        self._swa_release_load_lock,
-                        node=source_node,
-                        staging_slot=staging_slot,
-                        engine=source_engine,
-                    )
+            self._append_swa_get_ops(
+                transfer_graph,
+                finished_ops_ids,
+                op_callback_dict,
+                swa_read_source,
+                dp_client_id,
+            )
         nvtx.end_range(nvtx_range)
         return GetTransferPlan(
             transfer_graph=transfer_graph,
@@ -2159,7 +2080,6 @@ class GlobalCacheEngine:
                 host_slot=source_slot,
                 node=source_node,
                 device_type=device_type,
-                engine=engine,
             )
 
             return usable_end, source
@@ -2173,7 +2093,71 @@ class GlobalCacheEngine:
 
     _SWA_GPU_PLACEHOLDER = np.array([0], dtype=np.int64)
 
-    def _swa_release_load_lock(self, node, staging_slot: int = -1, engine=None) -> None:
+    def _append_swa_get_ops(self,
+                            transfer_graph: TransferOpGraph,
+                            finished_ops_ids: List[int],
+                            op_callback_dict: Dict[int, Callable],
+                            swa_read_source: SWAReadSource,
+                            dp_client_id: int) -> None:
+        """Pin the SWA source node and append SWA GET peer ops to ``transfer_graph``."""
+        assert swa_read_source.found
+        device_type = swa_read_source.device_type
+        source_engine = self.cache_engines[device_type]
+        source_node = swa_read_source.node
+        source_slot = swa_read_source.host_slot
+
+        source_engine._pin_swa_node(source_node)
+        swa_empty = np.array([], dtype=np.int64)
+        staging_slot = -1
+        cpu_swa_slots = np.array([source_slot], dtype=np.int64)
+        ssd_swa_slots = swa_empty
+        remote_swa_slots = swa_empty
+
+        if device_type != DeviceType.CPU:
+            staging_slot = self.cpu_cache_engine._alloc_swa_slot()
+            if staging_slot < 0:
+                self._swa_release_load_lock(
+                    node=source_node, source_device_type=device_type)
+                return
+            cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
+            source_slots = np.array([source_slot], dtype=np.int64)
+            if device_type == DeviceType.SSD:
+                ssd_swa_slots = source_slots
+            else:
+                remote_swa_slots = source_slots
+
+        swa_h2d_id = self.swa_cache.build_get_chain(
+            transfer_graph,
+            gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+            cpu_slot_ids=cpu_swa_slots,
+            ssd_slot_ids=ssd_swa_slots,
+            remote_slot_ids=remote_swa_slots,
+            dp_client_id=dp_client_id,
+        )
+        if swa_h2d_id is None:
+            self._swa_release_load_lock(
+                node=source_node,
+                staging_slot=staging_slot,
+                source_device_type=device_type,
+            )
+            return
+
+        finished_ops_ids.append(swa_h2d_id)
+        self._append_op_callback(
+            op_callback_dict,
+            swa_h2d_id,
+            partial(
+                self._swa_release_load_lock,
+                node=source_node,
+                staging_slot=staging_slot,
+                source_device_type=device_type,
+            ),
+        )
+
+    def _swa_release_load_lock(self,
+                               node,
+                               staging_slot: int = -1,
+                               source_device_type: Optional[DeviceType] = None) -> None:
         """SWA H2D completion callback: release the source pin and free any
         transient CPU staging slot.
 
@@ -2187,8 +2171,10 @@ class GlobalCacheEngine:
         try:
             if node is not None and getattr(node, "swa_lock_ref", 0) > 0:
                 node.dec_swa_lock_ref()
-                if engine is not None:
-                    engine.index.unlock(node)
+                if source_device_type is not None:
+                    engine = self.cache_engines.get(source_device_type)
+                    if engine is not None:
+                        engine.index.unlock(node)
                 elif hasattr(node, "unlock"):
                     node.unlock()
                 else:
