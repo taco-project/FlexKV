@@ -1683,16 +1683,16 @@ class GlobalCacheEngine:
             dst_block_ids = fragment12_cpu_blocks,
             dp_client_id = dp_client_id,
         )
-        flexkv_logger.info(
-            "[FlexKV-SEGV-DEBUG] cache_engine create D2H op (global_put) "
-            f"request_id={request_id}, op_id={op_d2h.op_id}, "
-            f"graph_id={transfer_graph.graph_id}, dp_client_id={dp_client_id}, "
-            f"fragment12_num_blocks={fragment12_num_blocks}, "
-            f"fragment2_num_blocks={fragment2_num_blocks}, "
-            f"fragment3_num_blocks={fragment3_num_blocks}, "
-            f"{summarize_id_tensor('gpu_src', fragment12_gpu_blocks)}, "
-            f"{summarize_id_tensor('cpu_dst', fragment12_cpu_blocks)}"
-        )
+        # flexkv_logger.info(
+        #     "[FlexKV-SEGV-DEBUG] cache_engine create D2H op (global_put) "
+        #     f"request_id={request_id}, op_id={op_d2h.op_id}, "
+        #     f"graph_id={transfer_graph.graph_id}, dp_client_id={dp_client_id}, "
+        #     f"fragment12_num_blocks={fragment12_num_blocks}, "
+        #     f"fragment2_num_blocks={fragment2_num_blocks}, "
+        #     f"fragment3_num_blocks={fragment3_num_blocks}, "
+        #     f"{summarize_id_tensor('gpu_src', fragment12_gpu_blocks)}, "
+        #     f"{summarize_id_tensor('cpu_dst', fragment12_cpu_blocks)}"
+        # )
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
 
@@ -1932,15 +1932,15 @@ class GlobalCacheEngine:
             dst_block_ids = fragment12_cpu_blocks,
             dp_client_id = dp_client_id,
         )
-        flexkv_logger.info(
-            "[FlexKV-SEGV-DEBUG] cache_engine create D2H op (local_put) "
-            f"request_id={request_id}, op_id={op_d2h.op_id}, "
-            f"graph_id={transfer_graph.graph_id}, dp_client_id={dp_client_id}, "
-            f"fragment12_num_blocks={fragment12_num_blocks}, "
-            f"fragment2_num_blocks={fragment2_num_blocks}, "
-            f"{summarize_id_tensor('gpu_src', fragment12_gpu_blocks)}, "
-            f"{summarize_id_tensor('cpu_dst', fragment12_cpu_blocks)}"
-        )
+        # flexkv_logger.info(
+        #     "[FlexKV-SEGV-DEBUG] cache_engine create D2H op (local_put) "
+        #     f"request_id={request_id}, op_id={op_d2h.op_id}, "
+        #     f"graph_id={transfer_graph.graph_id}, dp_client_id={dp_client_id}, "
+        #     f"fragment12_num_blocks={fragment12_num_blocks}, "
+        #     f"fragment2_num_blocks={fragment2_num_blocks}, "
+        #     f"{summarize_id_tensor('gpu_src', fragment12_gpu_blocks)}, "
+        #     f"{summarize_id_tensor('cpu_dst', fragment12_cpu_blocks)}"
+        # )
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
 

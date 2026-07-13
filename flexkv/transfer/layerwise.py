@@ -876,15 +876,15 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             swa_dst_disk2h = None
 
         num_h2d_blocks = len(src_block_ids_h2d)
-        flexkv_logger.info(
-            "[FlexKV-SEGV-DEBUG] LAYERWISE before transfer "
-            f"op_id={transfer_op.transfer_op_id}, graph_id={transfer_op.transfer_graph_id}, "
-            f"worker_id={self.worker_id}, pid={os.getpid()}, counter_id={transfer_op.counter_id}, "
-            f"num_h2d_blocks={num_h2d_blocks}, "
-            f"{summarize_id_tensor('src_h2d', src_block_ids_h2d)}, "
-            f"{summarize_id_tensor('dst_h2d', dst_block_ids_h2d)}, "
-            f"gpu_capacity={self._layerwise_gpu_capacity_hint()}"
-        )
+        # flexkv_logger.info(
+        #     "[FlexKV-SEGV-DEBUG] LAYERWISE before transfer "
+        #     f"op_id={transfer_op.transfer_op_id}, graph_id={transfer_op.transfer_graph_id}, "
+        #     f"worker_id={self.worker_id}, pid={os.getpid()}, counter_id={transfer_op.counter_id}, "
+        #     f"num_h2d_blocks={num_h2d_blocks}, "
+        #     f"{summarize_id_tensor('src_h2d', src_block_ids_h2d)}, "
+        #     f"{summarize_id_tensor('dst_h2d', dst_block_ids_h2d)}, "
+        #     f"gpu_capacity={self._layerwise_gpu_capacity_hint()}"
+        # )
 
         start_time = time.time()
         try:
@@ -907,11 +907,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             )
             raise
         end_time = time.time()
-        flexkv_logger.info(
-            "[FlexKV-SEGV-DEBUG] LAYERWISE after transfer "
-            f"op_id={transfer_op.transfer_op_id}, pid={os.getpid()}, "
-            f"elapsed={end_time - start_time:.4f}s"
-        )
+        # flexkv_logger.info(
+        #     "[FlexKV-SEGV-DEBUG] LAYERWISE after transfer "
+        #     f"op_id={transfer_op.transfer_op_id}, pid={os.getpid()}, "
+        #     f"elapsed={end_time - start_time:.4f}s"
+        # )
 
         if self.has_multi_group:
             # Multi-group: full block byte size already accounts for tp_size and all groups
