@@ -528,7 +528,7 @@ class FlexKVConfig:
             # become no-ops). Default ON for DSv4 (the SWA-native arch).
             self.cache_config.enable_swa_transfer = bool(
                 int(os.getenv("FLEXKV_ENABLE_SWA_TRANSFER", "1"))
-            )
+            ) or self.cache_config.swa.enabled
             logger.info(
                 f"[FlexKV sglang] Constructed SWAPoolConfig for DSv4: "
                 f"swa_page_size={swa_page_size}, "

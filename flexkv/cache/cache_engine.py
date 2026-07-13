@@ -172,6 +172,7 @@ class CacheEngineAccel:
         slot = self.swa_pool.allocate()
         if slot is not None:
             return slot
+        # can not allocate SWA slot, evict SWA-LRU once
         if protected_node is not None:
             self.lock_node(protected_node)
         try:
@@ -405,10 +406,10 @@ class CacheEngine:
         # Legacy Python mirror. Keep the SWA helpers local to this class; the
         # C++ CacheEngineAccel path is the maintained path.
         self.swa_pool = None
-        tier_swa_config = (swa_config.for_cache_tier(device_type)
+        self.tier_swa_config = (swa_config.for_cache_tier(device_type)
                            if swa_config is not None else None)
-        if tier_swa_config is not None:
-            self.init_swa(tier_swa_config)
+        if self.tier_swa_config is not None:
+            self.init_swa(self.tier_swa_config)
 
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
         """Initialize the SWA host pool for node-mounted SWA on this engine."""
@@ -417,7 +418,8 @@ class CacheEngine:
 
     @property
     def swa_enabled(self) -> bool:
-        return self.swa_pool is not None
+        return self.tier_swa_config is not None and self.tier_swa_config.enabled \
+               and self.swa_pool is not None
 
     def _alloc_swa_slot(self, protected_node=None) -> int:
         """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
@@ -1226,6 +1228,7 @@ class GlobalCacheEngine:
 
         swa_read_source = SWAReadSource()
         if swa_aware:
+            # find the longest swa read source
             block_mask_end, swa_read_source = self._select_swa_read_source(
                 block_mask_start,
                 block_mask_end,
@@ -1415,17 +1418,20 @@ class GlobalCacheEngine:
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
         num_gpu_blocks_to_transfer = len(fragment12_gpu_blocks) if enable_gpu else 0
         op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+
         if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
                 and swa_read_source.found):
             swa_empty = np.array([], dtype=np.int64)
             device_type = swa_read_source.device_type
-            source_engine = swa_read_source.engine
+            source_engine = swa_read_source.engine ## NOTE: do we need to pass this engine?
             source_slot = swa_read_source.host_slot
             source_node = swa_read_source.node
             source_engine._pin_swa_node(source_node)
             staging_slot = -1
             cpu_swa_slots = np.array([source_slot], dtype=np.int64)
             ssd_swa_slots = swa_empty
+
+            # if device is SSD, we need to allocate a cpu slot for SWA
             if device_type == DeviceType.SSD:
                 staging_slot = self.cpu_cache_engine._alloc_swa_slot()
                 if staging_slot < 0:
