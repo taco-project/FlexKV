@@ -1,30 +1,40 @@
-"""Level B: end-to-end vLLM + FlexKV reset test.
+"""Level B: end-to-end vLLM + FlexKV cache-reset test.
 
-This exercises the EXACT call verl makes after a weight update
-(vllm_async_server.py: `await self.engine.reset_prefix_cache(reset_connector=True)`)
-against a real vLLM engine configured with the FlexKV connector, and asserts
-that FlexKV's external cache is actually invalidated (not the §3 silent
-false-success).
+Exercises the EXACT call verl makes after a weight update
+(vllm_async_server.py clear_kv_cache: `reset_prefix_cache(reset_connector=True)`)
+against a real vLLM engine configured with the FlexKV connector, and asserts —
+via vLLM's own Prometheus counters — that FlexKV's EXTERNAL prefix cache is
+actually invalidated (not the silent base-class no-op).
 
-We use the OFFLINE `LLM` (synchronous) rather than the async server because it
-exposes the identical `reset_prefix_cache(reset_connector=...)` API with far
-less setup — the connector code path hit is the same one verl drives.
+Why counters and not RequestOutput.num_cached_tokens:
+    num_cached_tokens = local_gpu_hits + external(FlexKV)_hits, summed — it
+    cannot isolate FlexKV. vLLM keeps them as SEPARATE cumulative counters:
+        vllm:prefix_cache_hits / _queries            -> local GPU
+        vllm:external_prefix_cache_hits / _queries   -> KV connector (FlexKV)
+    We diff the EXTERNAL counters around each generate() to get per-run hits.
+    (reset_prefix_cache does NOT zero these counters, so we must diff, not read
+    absolute values.)
+
+Test protocol (why it proves the reset works):
+    warm  : generate(A)                      -> FlexKV gets populated
+    CLEAR : reset_prefix_cache(reset_connector=True) [+ reset_mm_cache]  (verl call)
+    run1  : generate(A)  -> external hits ~= 0   (FlexKV was cleared)
+    run2  : generate(A)  -> external hits  > 0   (run1 re-populated FlexKV)
+    Assert: run1 external hit-rate is ~0 AND run2 > run1.
+    If the reset did NOT reach FlexKV, run1 would already hit -> test fails.
 
 Requirements:
   - 1 GPU
   - vLLM >= 0.13.0 (older versions don't forward reset_connector)
-  - FlexKV installed/importable
+  - FlexKV installed/importable (with the reset_cache changes in this branch)
   - A small model (default: Qwen/Qwen2.5-0.5B-Instruct)
-  - FLEXKV_CONFIG_PATH pointing at a JSON with a cpu cache_config, e.g.:
-        {"cache_config": {"enable_cpu": true, "num_cpu_blocks": 4096}}
-    (this fixture writes one automatically to a temp file if unset)
+  - FlexKV cache config: set FLEXKV_CPU_CACHE_GB (e.g. 8) or FLEXKV_CONFIG_PATH.
+    If neither is set, this test defaults FLEXKV_CPU_CACHE_GB=8.
 
 Run:
-    pytest -s tests/test_reset_cache_vllm_e2e.py
+    FLEXKV_CPU_CACHE_GB=8 pytest -s tests/test_reset_cache_vllm_e2e.py
 """
-import json
 import os
-import tempfile
 
 import pytest
 
@@ -35,6 +45,11 @@ pytest.importorskip("flexkv")
 from packaging import version
 
 MODEL = os.environ.get("FLEXKV_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+
+# Prometheus counter names (vllm/v1/metrics/loggers.py).
+_EXT_HITS = "vllm:external_prefix_cache_hits"
+_EXT_QUERIES = "vllm:external_prefix_cache_queries"
+_LOCAL_HITS = "vllm:prefix_cache_hits"
 
 
 def _skip_if_no_gpu():
@@ -47,21 +62,57 @@ def _skip_if_vllm_too_old():
         pytest.skip(f"vLLM {vllm.__version__} < 0.13.0 does not forward reset_connector")
 
 
-@pytest.fixture(scope="module")
-def flexkv_config_path(tmp_path_factory):
-    """Ensure FLEXKV_CONFIG_PATH points at a minimal CPU-only cache config."""
-    existing = os.environ.get("FLEXKV_CONFIG_PATH")
-    if existing:
-        return existing
-    cfg = {"cache_config": {"enable_cpu": True, "num_cpu_blocks": 4096}}
-    p = tmp_path_factory.mktemp("flexkv") / "flexkv_config.json"
-    p.write_text(json.dumps(cfg))
-    os.environ["FLEXKV_CONFIG_PATH"] = str(p)
-    return str(p)
+def _counter(llm, name):
+    """Read a cumulative Prometheus counter value (0 if absent)."""
+    for m in llm.get_metrics():
+        if m.name == name:
+            return getattr(m, "value", 0)
+    return 0
+
+
+def _reset_kwargs():
+    """Mirror verl's _RESET_PREFIX_CACHE_KWARGS gating (vllm_async_server.py:59-62)."""
+    kw = {}
+    if version.parse(vllm.__version__) >= version.parse("0.13.0"):
+        kw["reset_connector"] = True
+    return kw
+
+
+def _verl_clear(llm):
+    """Reproduce verl's clear_kv_cache() (vllm_async_server.py:809-820)."""
+    ok = llm.reset_prefix_cache(**_reset_kwargs())
+    if version.parse(vllm.__version__) >= version.parse("0.9.0"):
+        llm.reset_mm_cache()
+    # reset_encoder_cache is multimodal-only; skipped for a text model.
+    return ok
+
+
+def _run_A(llm, prompt, sp):
+    """Generate once; return per-run deltas (ext_hits, ext_queries, local_hits)."""
+    eh0, eq0, lh0 = (_counter(llm, _EXT_HITS),
+                     _counter(llm, _EXT_QUERIES),
+                     _counter(llm, _LOCAL_HITS))
+    llm.generate([prompt], sp)
+    return (_counter(llm, _EXT_HITS) - eh0,
+            _counter(llm, _EXT_QUERIES) - eq0,
+            _counter(llm, _LOCAL_HITS) - lh0)
 
 
 @pytest.fixture(scope="module")
-def llm(flexkv_config_path):
+def flexkv_config():
+    """Ensure FlexKV has a CPU-cache config.
+
+    FlexKV reads either FLEXKV_CPU_CACHE_GB (simplest) or FLEXKV_CONFIG_PATH
+    (yaml/json). If the user set neither, default to a small CPU cache via the
+    env-var route (per docs/vllm_adapter/README_en.md).
+    """
+    if os.environ.get("FLEXKV_CONFIG_PATH") or os.environ.get("FLEXKV_CPU_CACHE_GB"):
+        return
+    os.environ["FLEXKV_CPU_CACHE_GB"] = "8"
+
+
+@pytest.fixture(scope="module")
+def llm(flexkv_config):
     _skip_if_no_gpu()
     _skip_if_vllm_too_old()
     from vllm import LLM
@@ -71,7 +122,8 @@ def llm(flexkv_config_path):
         model=MODEL,
         enforce_eager=True,
         gpu_memory_utilization=0.5,
-        enable_prefix_caching=True,
+        enable_prefix_caching=True,   # required: no reuse without it
+        disable_log_stats=False,      # required: get_metrics() asserts otherwise
         kv_transfer_config=KVTransferConfig(
             kv_connector="FlexKVConnectorV1",
             kv_role="kv_both",
@@ -81,96 +133,73 @@ def llm(flexkv_config_path):
     del llm
 
 
-def _reset_kwargs():
-    """Mirror verl's _RESET_PREFIX_CACHE_KWARGS gating."""
-    kw = {}
-    if version.parse(vllm.__version__) >= version.parse("0.13.0"):
-        kw["reset_connector"] = True
-    return kw
+# A long prompt so it spans many KV blocks and actually gets offloaded to FlexKV.
+_PROMPT_A = "Tell me about the history of the Roman Empire in detail. " * 40
 
 
 def test_reset_prefix_cache_reset_connector_succeeds(llm):
-    """Smoke: the exact verl call must return without error.
-
-    Weak assertion (returns True / no exception) — proves the reset_cache()
-    override is wired end-to-end (not the base-class no-op path). Stronger
-    behavioral assertion is in the next test.
-    """
+    """Smoke: the exact verl call returns without error (wire is connected)."""
     from vllm import SamplingParams
 
-    prompt = "The capital of France is " * 40  # long enough to span many blocks
-    llm.generate([prompt], SamplingParams(max_tokens=8, temperature=0))
-
-    # ★ This is the verl call (vllm_async_server.py clear_kv_cache line 815).
-    ok = llm.reset_prefix_cache(**_reset_kwargs())
-    # vLLM's reset_prefix_cache returns True on success; scheduler treats only a
-    # literal False as failure. With the FlexKV reset_cache() override wired,
-    # this should be truthy.
+    llm.generate([_PROMPT_A], SamplingParams(max_tokens=8, temperature=0))
+    ok = _verl_clear(llm)
+    # Scheduler treats only a literal False as failure.
     assert ok is not False
 
 
-def test_reset_invalidates_flexkv_hits(llm):
-    """Behavioral: after reset, re-running the same prompt must NOT get external
-    (FlexKV) cache hits — proving the offloaded KV was actually dropped.
+def test_flexkv_populates_before_asserting_reset(llm):
+    """Sanity: without any reset, re-running A must produce EXTERNAL hits.
 
-    We compare FlexKV connector stats across two runs of the same prompt with a
-    reset in between. Without a working reset, the 2nd run would hit FlexKV.
-
-    NOTE: connector stats plumbing differs across vLLM versions; if stats are
-    unavailable this test degrades to a structural check and is skipped with a
-    clear message rather than silently passing.
+    If this fails, FlexKV isn't actually engaged (prompt too short / connector
+    not mounted), and the reset test below would be meaningless. This guards
+    against a false-pass where '0 hits after reset' is really '0 hits ever'.
     """
     from vllm import SamplingParams
 
-    prompt = "Tell me about the history of the Roman Empire. " * 40
     sp = SamplingParams(max_tokens=8, temperature=0)
-
-    # Warm-up run -> FlexKV gets populated on request_finished.
-    llm.generate([prompt], sp)
-
-    # Reset BOTH the local prefix cache and (via reset_connector) FlexKV.
-    llm.reset_prefix_cache(**_reset_kwargs())
-
-    # Re-run the identical prompt. If FlexKV was correctly invalidated, the
-    # connector must recompute (0 external matched tokens) rather than load
-    # stale blocks.
-    #
-    # Observing "external matched tokens" requires connector stats; the exact
-    # accessor is version-specific. We surface whatever the engine exposes and
-    # assert it does not indicate a fresh external hit. If we can't read it,
-    # skip loudly (do not false-pass).
-    stats = _try_get_connector_prefix_hits(llm)
-    if stats is None:
-        pytest.skip(
-            "connector prefix-cache stats not accessible on this vLLM build; "
-            "use the FlexKV-side spy (see README) to assert reset_cache() was called"
-        )
-    external_hits_after_reset = stats
-    assert external_hits_after_reset == 0, (
-        f"expected 0 external FlexKV hits after reset, got {external_hits_after_reset}"
+    _run_A(llm, _PROMPT_A, sp)                 # populate FlexKV
+    llm.reset_prefix_cache(**_reset_kwargs())  # clear LOCAL only-ish; also clears FlexKV
+    # After clear FlexKV is empty; this run repopulates it (few/no ext hits)...
+    _run_A(llm, _PROMPT_A, sp)
+    # ...and THIS run should hit FlexKV (no reset in between).
+    eh, eq, _ = _run_A(llm, _PROMPT_A, sp)
+    assert eh > 0, (
+        f"no external FlexKV hits even without reset (hits={eh}/{eq}); FlexKV not "
+        f"engaged — check prompt length / connector mount before trusting reset test"
     )
 
 
-def _try_get_connector_prefix_hits(llm):
-    """Best-effort read of external (connector) prefix-cache hit count.
+def test_reset_invalidates_flexkv_hits(llm):
+    """Behavioral: verl's clear must drop FlexKV so the next A does NOT hit it.
 
-    Returns an int, or None if the metric can't be located on this vLLM build.
-    Kept intentionally defensive: vLLM's stats API is still moving.
+    Protocol: warm -> CLEAR -> run1 (expect ~0 ext hits) -> run2 (expect > run1).
     """
-    try:
-        # V1 engine path: metrics live on the engine core's scheduler stats.
-        # This is best-effort and may need adjustment for your vLLM version.
-        engine = getattr(llm, "llm_engine", None)
-        if engine is None:
-            return None
-        # Try a few known-ish locations; return None if none present.
-        get_metrics = getattr(engine, "get_metrics", None)
-        if callable(get_metrics):
-            metrics = get_metrics()
-            for m in metrics:
-                name = getattr(m, "name", "")
-                if "connector" in name and "hit" in name:
-                    return int(getattr(m, "value", 0))
-        return None
-    except Exception:
-        return None
+    from vllm import SamplingParams
+
+    sp = SamplingParams(max_tokens=8, temperature=0)
+
+    # warm: make sure A is in FlexKV before we clear.
+    _run_A(llm, _PROMPT_A, sp)
+
+    # CLEAR: exactly what verl's clear_kv_cache does.
+    _verl_clear(llm)
+
+    # run1: right after clear -> FlexKV empty -> external hits ~= 0.
+    eh1, eq1, _ = _run_A(llm, _PROMPT_A, sp)
+    # run2: no clear in between -> run1 refilled FlexKV -> external hits climb.
+    eh2, eq2, _ = _run_A(llm, _PROMPT_A, sp)
+
+    print(f"[reset-test] run1 ext={eh1}/{eq1}  run2 ext={eh2}/{eq2}")
+
+    rate1 = eh1 / max(eq1, 1)
+    # Assert 1: cleared cache does not serve stale external hits.
+    assert rate1 < 0.1, (
+        f"external FlexKV hit-rate after clear is {rate1:.2f} (hits={eh1}/{eq1}); "
+        f"reset did NOT propagate to FlexKV (stale KV still served)"
+    )
+    # Assert 2: cache is functional again afterwards (proves we measured a real
+    # cache, not a permanently-dead one).
+    assert eh2 > eh1, (
+        f"external hits did not recover after refill (run1={eh1}, run2={eh2}); "
+        f"FlexKV may not be working at all"
+    )
