@@ -141,16 +141,15 @@ traffic 仍应由系统 profiler 测量。
 
 ## 输出设计
 
-每次运行固定生成五个文件：
+每次运行固定生成四个文件：
 
 - `summary.csv`：给人查看的最终结论，按 mode 使用不同 schema；
 - `metrics.csv`：每个统计窗口的同名指标和资源趋势；
 - `summary.json`：schema `1.0` 的正式机器接口；
-- `charts.svg`：标准库生成的单文件四面板 Dashboard；
 - `effective_config.yaml`：完全展开、可复现的运行配置；
 
 只有发生错误时才创建 `errors.csv`，不生成 turn/operation/resource 中间 CSV。CPU stub
-也生成完整结果，但 `performance_valid=false`，SVG 顶部显示性能数字无效的醒目标记。
+也生成完整结果，但 `performance_valid=false`。
 
 结果目录使用 `YYYYmmdd_HHMMSS_PID`，避免同一秒启动的任务相互覆盖。
 Reporter 使用固定大小、可合并的对数 histogram 汇总 p50/p95/p99，不在内存中保留长跑

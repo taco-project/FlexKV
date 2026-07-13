@@ -73,10 +73,9 @@ CUDA and ROCm both use PyTorch's `cuda:N` API. On ROCm, tensor sharing uses
 PyTorch IPC and never attempts to load or call `libcudart`. The FlexKV transfer
 extension itself must still have been built for HIP.
 
-Every run produces exactly `summary.csv`, `metrics.csv`, `summary.json`,
-`charts.svg`, and `effective_config.yaml`. `summary.csv` and `metrics.csv` use a
-mode-specific schema, while `summary.json` is the versioned (`1.0`) machine
-interface. `charts.svg` is a dependency-free four-panel dashboard. An
+Every run produces exactly `summary.csv`, `metrics.csv`, `summary.json`, and
+`effective_config.yaml`. `summary.csv` and `metrics.csv` use a mode-specific
+schema, while `summary.json` is the versioned (`1.0`) machine interface. An
 `errors.csv` file is added only when an error occurs; intermediate operation or
 turn CSV files are not emitted.
 

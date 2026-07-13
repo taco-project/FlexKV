@@ -7,7 +7,6 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from xml.etree import ElementTree
 
 import numpy as np
 import torch
@@ -226,7 +225,7 @@ class MetricsAndDeviceTests(unittest.TestCase):
             )
             output = reporter.directory
             reporter.close()
-            for name in ("summary.csv", "metrics.csv", "summary.json", "charts.svg"):
+            for name in ("summary.csv", "metrics.csv", "summary.json"):
                 self.assertTrue((output / name).exists(), name)
             self.assertFalse((output / "errors.csv").exists())
             with (output / "summary.json").open() as handle:
@@ -240,10 +239,6 @@ class MetricsAndDeviceTests(unittest.TestCase):
                 row = next(csv.DictReader(handle))
             self.assertEqual(float(row["hit_ratio"]), summary["scenarios"][0]["hit"]["ratio"])
             self.assertNotIn("transfer_bytes", row)
-            root = ElementTree.parse(output / "charts.svg").getroot()
-            text = "".join(root.itertext())
-            self.assertIn("CPU STUB — PERFORMANCE NUMBERS ARE NOT VALID", text)
-            self.assertEqual(len([node for node in root.iter() if node.attrib.get("id", "").startswith("panel-")]), 4)
 
     def test_bandwidth_reporter_uses_mode_specific_schema(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -265,10 +260,6 @@ class MetricsAndDeviceTests(unittest.TestCase):
             self.assertNotIn("hit_ratio", row)
             summary = json.loads((output / "summary.json").read_text())
             self.assertEqual(summary["scenarios"][0]["throughput_gb_s"], 1)
-            root = ElementTree.parse(output / "charts.svg").getroot()
-            self.assertTrue(any(
-                node.attrib.get("class") == "highest-stable-bandwidth" for node in root.iter()
-            ))
 
     def test_backend_detection(self):
         fake_rocm = type("Torch", (), {"version": type("Version", (), {"hip": "6.0"})()})()

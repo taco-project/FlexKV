@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
-from xml.sax.saxutils import escape
 import csv
 import json
 import math
@@ -231,7 +230,7 @@ class _BandwidthAggregate:
 
 
 class Reporter:
-    """Mode-aware stable CSV/JSON/SVG reporter with bounded-memory histograms."""
+    """Mode-aware stable CSV/JSON reporter with bounded-memory histograms."""
 
     def __init__(self, config, output_dir: str | Path | None = None):
         self.config = config
@@ -496,108 +495,6 @@ class Reporter:
                 "topology": topology, "cache": cache, "workload": workload,
                 "scenarios": scenarios}
 
-    def _write_svg(self, rows: list[dict[str, Any]]) -> None:
-        title = (
-            f"FlexKV Stress — {self.config.preset.name} — {self.mode} — {self.backend} — "
-            f"TP/CP/DP {self.config.model.tp_size}/{self.config.model.cp_size}/{self.config.model.dp_size}"
-        )
-        if self.mode == "bandwidth":
-            panels = ["Throughput (GB/s)", "Operation latency p50/p95/p99 (ms)",
-                      "Success and byte validation accuracy", "GPU / RSS / SSD usage (GB)"]
-        else:
-            panels = ["Match / load / save latency p50/p95/p99 (ms)", "QPS",
-                      "Hit and byte accuracy", "GPU / RSS / SSD usage (GB)"]
-        parts = [
-            '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="820" viewBox="0 0 1200 820">',
-            '<rect width="1200" height="820" fill="#0b1220"/>',
-            f'<text x="40" y="38" fill="#f8fafc" font-size="22">{escape(title)}</text>',
-        ]
-        if not self.performance_valid:
-            parts.append('<text id="cpu-stub-watermark" x="600" y="70" text-anchor="middle" '
-                         'fill="#ff5a5f" font-size="20" font-weight="bold">'
-                         'CPU STUB — PERFORMANCE NUMBERS ARE NOT VALID</text>')
-        colors = ["#38bdf8", "#fb7185", "#a3e635", "#fbbf24", "#c084fc"]
-        stable_peaks: set[str] = set()
-        if self.mode == "bandwidth":
-            by_path: dict[str, list[dict[str, Any]]] = {}
-            for row in rows:
-                if row["operation_success_rate"] == 1 and row["byte_validation_accuracy"] == 1:
-                    by_path.setdefault(str(row["scenario"]), []).append(row)
-            for path, candidates in by_path.items():
-                best = max(candidates, key=lambda item: item["throughput_gb_s"])
-                stable_peaks.add(f'{path}@{best["concurrency"]}:throughput_gb_s')
-        for panel_id, panel_title in enumerate(panels):
-            x = 35 + (panel_id % 2) * 580
-            y = 90 + (panel_id // 2) * 350
-            parts.extend([
-                f'<g id="panel-{panel_id + 1}" data-panel="{escape(panel_title)}">',
-                f'<rect x="{x}" y="{y}" width="550" height="320" rx="8" fill="#111c2e" stroke="#334155"/>',
-                f'<text x="{x + 18}" y="{y + 28}" fill="#e2e8f0" font-size="16">{escape(panel_title)}</text>',
-                f'<line class="x-axis" x1="{x + 55}" y1="{y + 275}" x2="{x + 525}" y2="{y + 275}" stroke="#64748b"/>',
-                f'<line class="y-axis" x1="{x + 55}" y1="{y + 55}" x2="{x + 55}" y2="{y + 275}" stroke="#64748b"/>',
-            ])
-            values: list[tuple[str, float]] = []
-            if self.mode == "bandwidth":
-                fields = [
-                    ("throughput_gb_s",),
-                    ("latency_p50_ms", "latency_p95_ms", "latency_p99_ms"),
-                    ("operation_success_rate", "byte_validation_accuracy"),
-                    ("gpu_memory_gb", "rss_gb", "ssd_used_gb"),
-                ][panel_id]
-            else:
-                fields = [
-                    tuple(f"{operation}_{quantile}_ms" for operation in ("match", "load", "save")
-                          for quantile in ("p50", "p95", "p99")),
-                    ("qps",),
-                    ("hit_ratio", "hit_exact_rate", "hit_token_accuracy", "byte_validation_accuracy"),
-                    ("gpu_memory_gb", "rss_gb", "ssd_used_gb"),
-                ][panel_id]
-            plot_rows = self.windows if panel_id == 3 and self.windows else rows
-            for row in plot_rows:
-                base = (f'{row["scenario"]}@{row["concurrency"]}'
-                        if self.mode == "bandwidth" else str(row["scenario"]))
-                if panel_id == 3 and "window_id" in row:
-                    base += f'#window-{row["window_id"]}'
-                values.extend((f"{base}:{field}", float(row[field])) for field in fields)
-            positive = [(label, value) for label, value in values if value > 0]
-            maximum = max((value for _, value in positive), default=1.0)
-            points = []
-            point_records: list[tuple[str, str]] = []
-            for index, (label, value) in enumerate(positive):
-                px = x + 75 + index * (430 / max(1, len(positive) - 1))
-                py = y + 270 - 200 * value / maximum
-                points.append(f"{px:.1f},{py:.1f}")
-                point_records.append((label, points[-1]))
-                peak = label in stable_peaks
-                bar_panel = (
-                    (self.mode == "bandwidth" and panel_id in (1, 2))
-                    or (self.mode == "latency_hit" and panel_id in (0, 1, 2))
-                )
-                if bar_panel:
-                    parts.append(f'<rect class="grouped-bar" data-series="{escape(label)}" '
-                                 f'x="{px - 3:.1f}" y="{py:.1f}" width="6" '
-                                 f'height="{max(0.0, y + 275 - py):.1f}" '
-                                 f'fill="{colors[index % len(colors)]}" opacity="0.55"/>')
-                parts.append(f'<circle data-series="{escape(label)}" '
-                             f'class="{"highest-stable-bandwidth" if peak else "data-point"}" '
-                             f'cx="{px:.1f}" cy="{py:.1f}" r="{8 if peak else 5}" '
-                             f'fill="{colors[index % len(colors)]}"/>')
-                parts.append(f'<text x="{px:.1f}" y="{py - 9:.1f}" text-anchor="middle" fill="#cbd5e1" '
-                             f'font-size="10">{value:.3g}</text>')
-            if points and self.mode == "bandwidth" and panel_id == 0:
-                for path in self.config.bandwidth.paths:
-                    path_points = [point for label, point in point_records if label.startswith(path + "@")]
-                    if path_points:
-                        parts.append(f'<polyline data-series="{escape(path)}" '
-                                     f'points="{" ".join(path_points)}" fill="none" '
-                                     'stroke="#38bdf8" stroke-width="2"/>')
-            elif points:
-                parts.append(f'<polyline data-series="{panel_id + 1}" points="{" ".join(points)}" '
-                             'fill="none" stroke="#38bdf8" stroke-width="2"/>')
-            parts.append('</g>')
-        parts.append('</svg>')
-        (self.directory / "charts.svg").write_text("\n".join(parts) + "\n", encoding="utf-8")
-
     def close(self) -> None:
         rows = self._summary_rows()
         fields = LATENCY_FIELDS if self.mode == "latency_hit" else BANDWIDTH_FIELDS
@@ -612,6 +509,5 @@ class Reporter:
         (self.directory / "summary.json").write_text(
             json.dumps(self._json(rows), indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
-        self._write_svg(rows)
         if self.errors is not None:
             self.errors.close()
