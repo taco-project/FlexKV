@@ -1,0 +1,63 @@
+# DSv4-Pro long-stability stress: DP2 / CP2 / TP4 (= 8 GPUs).
+# Tuned to trigger CPU eviction + SSD demotion within the first few rounds:
+#   host main block @ kv_tp=2 ≈ 2.77 MB. 512 CPU blocks ≈ 1.42 GB fills in ~2 rounds;
+#   1536 SSD blocks ≈ 4.25 GB starts SSD-tier eviction after ~5-6 rounds.
+# latency_hit runs unloaded + loaded, each for duration_seconds → ~1h wall @ 1800s.
+model:
+  preset: dsv4_pro
+  tp_size: 4                   # composite SGLang TP world per DP shard
+  cp_size: 2                   # q-split CP → kv_tp = 4/2 = 2
+  dp_size: 2                   # required_gpus = dp × tp = 8
+  gpu_blocks_per_rank: 2048    # must hold one batch's live blocks (batch_size ×
+                               # max seq). 128 was too small for batch_size=8 →
+                               # batched read-back slots wrapped & self-collided
+                               # → FALSE byte-validation failures under load.
+
+cache:
+  num_cpu_blocks: 512          # explicit → eviction pace independent of page size
+  num_ssd_blocks: 1536
+  ssd_cache_dir: [./flexkv_stress_ssd/dsv4_pro_dp2cp2tp4]
+  swa_num_slots: 256           # SWA CPU pool ≈ 2.34 GB (9.14 MB/slot)
+  swa_ssd_slots: 512
+  eviction_policy: lru
+
+features:
+  layerwise: true
+  swa: true
+  ssd: true
+  concurrency: true
+
+run:
+  mode: latency_hit
+  warmup_rounds: 1
+  rounds: 0                    # duration-bound only
+  duration_seconds: 1800       # 2 scenarios × 30 min ≈ 1h wall
+  stop_when: either
+  seed: 42
+
+conversation:
+  conversations_per_round: 32  # bumped for pressure: ~500 unique blocks/round → CPU (512) evicts every round
+  turns_min: 2
+  turns_max: 6
+  system_prompt_blocks: 4      # shared prefix trunk in the radix tree
+  first_input_blocks: [1, 4]
+  added_input_blocks: {mode: range, blocks: [1, 4]}
+  output_blocks: {mode: range, blocks: [1, 2]}
+  read_after_put: true
+
+concurrency:
+  max_inflight_per_dp: 32      # bumped for pressure
+  batch_size: 16               # bumped for pressure; needed gpu blocks = 16×40 = 640 << 2048, no self-collision
+  request_timeout_seconds: 60
+
+validation:
+  sample_rate: 0.01            # bumped: actually catch rare corruption over 1h
+  min_samples_per_round: 2
+  sampled_layers_per_group: 2
+  sampled_blocks_per_request: 2
+  bytes_per_sample: 256
+  hit_tolerance_blocks: 2      # absorb dp>1 per-DP-oracle vs shared-global-cache jitter
+  minimum_success_rate: 0.99
+
+output:
+  directory: ./benchmark_results/flexkv_stress/dsv4_pro_dp2cp2tp4

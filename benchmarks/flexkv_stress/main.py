@@ -5,6 +5,7 @@ import argparse
 import logging
 import os
 from pathlib import Path
+import shutil
 import signal
 import sys
 import time
@@ -20,17 +21,49 @@ LOG = logging.getLogger("flexkv_stress")
 
 
 def _directory_bytes(paths: list[str]) -> int:
+    """Real on-disk usage of the run's SSD cache dirs.
+
+    SSD .bin files are sparsely pre-allocated, so sum actually-allocated blocks
+    (st_blocks * 512) rather than apparent size (st_size), which over-reports by
+    the whole pre-allocation. Paths here are the per-run subdirs from
+    _isolate_ssd_dirs(), so this never counts stale .bin left behind by earlier
+    runs that share the same parent cache dir."""
     total = 0
     for raw_path in paths:
         path = Path(raw_path)
-        if path.exists():
-            for file in path.rglob("*"):
-                try:
-                    if file.is_file():
-                        total += file.stat().st_size
-                except OSError:
+        if not path.exists():
+            continue
+        for file in path.rglob("*"):
+            try:
+                if not file.is_file():
                     continue
+                st = file.stat()
+                blocks = getattr(st, "st_blocks", 0)
+                total += blocks * 512 if blocks else st.st_size
+            except OSError:
+                continue
     return total
+
+
+def _isolate_ssd_dirs(config, run_id: str) -> list[str]:
+    """Point this run's SSD cache at per-run subdirs (named by run_id) so
+    ssd_used_gb counts only this run's files and cleanup can delete just this
+    run's cache without touching a concurrent run sharing the same parent dir.
+    Mutates config.cache.ssd_cache_dir in place and returns the subdirs."""
+    if not (config.features.ssd and config.cache.ssd_cache_dir):
+        return []
+    run_dirs = [str(Path(raw) / run_id) for raw in config.cache.ssd_cache_dir]
+    for run_dir in run_dirs:
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+    config.cache.ssd_cache_dir = run_dirs
+    return run_dirs
+
+
+def _cleanup_ssd_dirs(run_dirs: list[str]) -> None:
+    """Remove this run's SSD cache subdirs so pre-allocated .bin don't pile up
+    across runs. Best-effort: missing dirs and races are ignored."""
+    for run_dir in run_dirs:
+        shutil.rmtree(run_dir, ignore_errors=True)
 
 
 def _describe(config) -> None:
@@ -336,6 +369,7 @@ def run(argv=None) -> int:
     from .runner import FlexKVRuntime
 
     reporter = Reporter(config)
+    ssd_run_dirs = _isolate_ssd_dirs(config, reporter.run_id)
     (reporter.directory / "effective_config.yaml").write_text(
         yaml.safe_dump(config_as_dict(config), sort_keys=False), encoding="utf-8"
     )
@@ -367,6 +401,9 @@ def run(argv=None) -> int:
     finally:
         if runtime is not None:
             runtime.close()
+        _cleanup_ssd_dirs(ssd_run_dirs)
+        if ssd_run_dirs:
+            LOG.info("removed SSD cache dir(s): %s", ", ".join(ssd_run_dirs))
         reporter.close()
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)

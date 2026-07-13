@@ -84,6 +84,15 @@ page 传入连续的 `page_tokens` 个 slot；FlexKV 再将其折叠为 SWA slot
 运行时异常，退出码即为 `1`，否则为 `0`。warmup 轮的失败同样只记录并计入退出码，不中断
 后续测量场景。
 
+**GPU 池尺寸与批量回读**：`model.gpu_blocks_per_rank` 是模拟推理引擎的 GPU KV 池块数。
+批量回读校验会把一个 batch 内所有在途 turn 的数据载入一段**连续**的 GPU slot；当这段长度
+超过池容量时会绕回，导致同 batch 内不同 turn 的 slot 相互覆盖，被抽样的 turn 便会读到别的
+turn 的字节，**报出假的 byte-validation 失败**（仅在 `batch_size>1` 且命中抽样时发生）。因此
+`gpu_blocks_per_rank` 必须 ≥ 一个 batch 的最坏在途块数，约
+`batch_size × (system_prompt_blocks + turns_max × (max_input_blocks + max_output_blocks))`。
+配置低于该值时启动会打 WARNING。空载（`batch_size=1`）不受影响，所以「unloaded 全绿、loaded
+零星 byte 失败」这一模式通常是 GPU 池偏小，而非 FlexKV 传输 bug。
+
 ## 双模式与计时口径
 
 `latency_hit` 模式会**依次**跑两个 profile，两者共用同一套 workload、各自跑满
@@ -200,7 +209,7 @@ observation，内存占用不随运行时长增长。CSV 与 JSON 从同一语�
 | `byte_validation_accuracy` | 被抽样请求中 byte pattern 完全一致的比例；`1.0` = 传输零损坏 |
 | `gpu_memory_gb` | 采样到的 GPU 显存占用峰值（所有 worker 之和） |
 | `rss_gb` | 主机 RSS（加速卡模式为各 worker 进程之和） |
-| `ssd_used_gb` | SSD cache 目录实际占用 |
+| `ssd_used_gb` | 本 run SSD cache 的实际磁盘占用。每个 run 独占 `<ssd_cache_dir>/<run_id>/` 子目录，故只统计本 run 自己的 .bin（不含同目录下历史 run 残留）；按实际分配块（`st_blocks×512`）计，而非稀疏文件的 apparent size，避免虚高。run 结束（含异常/中断）在 `finally` 里删除该子目录，不再攒盘。 |
 
 命中与精度公式见上一节「双模式与计时口径」。
 

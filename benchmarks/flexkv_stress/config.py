@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import copy
+import logging
 import os
 
 import yaml
@@ -189,6 +190,30 @@ class StressConfig:
             )
         if self.model.gpu_blocks_per_rank < 1:
             raise ValueError("model.gpu_blocks_per_rank must be >= 1")
+        # GPU pool sizing vs batching. The batched read-back verification stages
+        # every in-flight turn's data into a CONTIGUOUS run of GPU slots; a run
+        # longer than the pool wraps and turns' slots collide, so a sampled
+        # read-back verifies against another turn's bytes and reports a FALSE
+        # byte-validation failure (only under batch_size>1, only when sampled).
+        # Warn when the pool cannot hold one batch's worst-case live blocks.
+        max_input = max(
+            _spec_max_blocks(self.conversation.first_input_blocks),
+            _spec_max_blocks(self.conversation.added_input_blocks),
+        )
+        max_output = _spec_max_blocks(self.conversation.output_blocks)
+        max_seq_blocks = self.conversation.system_prompt_blocks + self.conversation.turns_max * (
+            max_input + max_output
+        )
+        needed_blocks = self.concurrency.batch_size * max_seq_blocks
+        if self.model.gpu_blocks_per_rank < needed_blocks:
+            logging.getLogger("flexkv_stress").warning(
+                "gpu_blocks_per_rank=%d may be too small for batch_size=%d: a batch "
+                "can stage up to ~%d live GPU blocks, so the batched read-back slots "
+                "wrap and collide, producing FALSE byte-validation failures under load. "
+                "Set model.gpu_blocks_per_rank >= %d.",
+                self.model.gpu_blocks_per_rank, self.concurrency.batch_size,
+                needed_blocks, needed_blocks,
+            )
         if self.tokens_per_block < 1:
             raise ValueError("tokens_per_block must be >= 1")
         if not 0 <= self.validation.sample_rate <= 1:
@@ -249,6 +274,21 @@ class StressConfig:
 
 def _section(cls, raw: dict[str, Any], name: str):
     return cls(**(raw.get(name) or {}))
+
+
+def _spec_max_blocks(spec: Any) -> int:
+    """Upper bound (in blocks) of a workload length spec (int / [lo,hi] /
+    {mode, blocks|values|value})."""
+    if isinstance(spec, int):
+        return spec
+    if isinstance(spec, list):
+        return max((int(v) for v in spec), default=0)
+    if isinstance(spec, dict):
+        values = spec.get("values", spec.get("blocks", spec.get("value", 0)))
+        if isinstance(values, list):
+            return max((int(v) for v in values), default=0)
+        return int(values)
+    return 0
 
 
 def _parse_layers(value: Any, num_layers: int, metadata: dict[str, Any]) -> tuple[int, ...]:
