@@ -153,6 +153,16 @@ class ModelConfig:
         return max(1, self.cp_size // self.nnodes_per_pp_rank)
 
     @property
+    def attn_tp_size(self) -> int:
+        """Compatibility alias for integrations that still use attn_* names."""
+        return self.tp_size
+
+    @property
+    def attn_cp_size(self) -> int:
+        """Compatibility alias for integrations that still use attn_* names."""
+        return self.cp_size
+
+    @property
     def effective_tp_size(self) -> int:
         """Number of CPU block slices = tp_size × cp_size."""
         return max(1, self.tp_size) * max(1, self.cp_size)
@@ -213,6 +223,16 @@ class RankInfo:
     def tp_rank_per_node(self) -> int:
         """TP rank index within the local node (within one TP group)."""
         return self.tp_rank % self.model_config.tp_size_per_node
+
+    @property
+    def attn_tp_rank(self) -> int:
+        """Compatibility alias for integrations that still use attn_* names."""
+        return self.tp_rank
+
+    @property
+    def attn_cp_rank(self) -> int:
+        """Compatibility alias for integrations that still use attn_* names."""
+        return self.cp_rank
 
     @property
     def dp_client_id(self) -> int:
