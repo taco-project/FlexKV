@@ -253,11 +253,7 @@ class Reporter:
     def _backend_name(self) -> str:
         if self.config.features.cpu_stub:
             return "cpu_stub"
-        try:
-            import torch
-            return "rocm" if getattr(torch.version, "hip", None) else "cuda"
-        except Exception:
-            return "cuda"
+        return "cuda"
 
     def write_error(self, window_id: int, operation: str, error: str,
                     conversation_id: int = -1, turn_id: int = -1,

@@ -7,7 +7,7 @@ load/store、layerwise、SWA、并发和异步接口，重点验证长时间运�
 有效载荷吞吐。它不模拟模型计算，也不把 token 生成时间计入 FlexKV 传输性能。
 
 CPU stub 用于无加速卡环境下的控制流回归。它会真实分配 CPU PyTorch tensor，并验证
-TP/DP 路由、prefix、PUT/GET、readback 和 byte pattern，但不覆盖 CUDA/ROCm IPC、原生
+TP/DP 路由、prefix、PUT/GET、readback 和 byte pattern，但不覆盖 CUDA IPC、原生
 kernel、eventfd 或 SSD，因此不能替代硬件压力测试。
 
 ## 执行链路
@@ -127,13 +127,13 @@ operation 和可选目标 payload 后停止；match、workload 生成和 readbac
 
 ## 带宽与容量口径
 
-`transfer_bytes` 是 FlexKV launch 的逻辑有效载荷，不是 PCIe/ROCm profiler 读到的总线
+`transfer_bytes` 是 FlexKV launch 的逻辑有效载荷，不是 PCIe profiler 读到的总线
 transaction bytes。主 KV 按去重后的物理 page 数乘 `main_page_bytes`；SWA 按 SWA page
 数乘 `swa_page_bytes`。因此该口径包含压缩后的 group 和 SWA 数据，但不包含协议头、对齐
 padding、重试或设备驱动开销。
 
 对于 q-split CP，该口径统计 cache 中的唯一 payload，不重复计算广播到多个 CP GPU 的
-副本；若需要 PCIe/ROCm aggregate traffic，必须以硬件 profiler 为准。
+副本；若需要 PCIe aggregate traffic，必须以硬件 profiler 为准。
 
 所有容量使用十进制 GB（`bytes / 1e9`），带宽使用十进制 GB/s（不是 Gb/s），时延使用
 ms，比例使用 `[0,1]`。DP/CP 广播副本不重复计入逻辑 cache payload；硬件 aggregate
@@ -169,8 +169,8 @@ observation，内存占用不随运行时长增长。CSV 与 JSON 从同一语�
 | `run_id` | 运行 ID（`时间戳_PID`），也是结果目录名 |
 | `mode` | `latency_hit` 或 `bandwidth` |
 | `scenario` | 场景名。`latency_hit` 下为 `unloaded`/`loaded`；`bandwidth` 下为 path 名（`gpu_to_cpu_save` 等） |
-| `backend` | `cuda` / `rocm` / `cpu_stub` |
-| `performance_valid` | 性能数字是否可信；CPU stub 下为 `false`（SVG 顶部会加醒目水印） |
+| `backend` | `cuda` / `cpu_stub` |
+| `performance_valid` | 性能数字是否可信；CPU stub 下为 `false` |
 | `model` / `architecture` | preset 名与架构标识 |
 | `composite_tp` | SGLang composite TP world size（每个 DP shard 的物理 worker 数） |
 | `kv_tp` | KV/attention TP 宽度 = `composite_tp / cp` |
@@ -247,8 +247,8 @@ observation，内存占用不随运行时长增长。CSV 与 JSON 从同一语�
 1. `--dry-run`：校验 preset、压缩比、layer group、page 大小、容量和 GPU 数量。
 2. `dsv4_cpu_smoke.yaml`：在无 GPU 主机上跑通多 group + SWA 的完整控制流。
 3. `glm5_cpu_smoke.yaml`：验证 composite TP=4、KV TP=2、CP=2 的重叠 rank 和异步接口。
-4. `dsv4_pro.yaml` / `dsv4_flash.yaml`：在目标 CUDA/ROCm 节点验证 IPC、layerwise、
+4. `dsv4_pro.yaml` / `dsv4_flash.yaml`：在目标 CUDA 节点验证 IPC、layerwise、
    eventfd、SSD 和真实传输带宽。
 
-硬件运行前应确认 FlexKV extension 与当前 CUDA/ROCm 匹配、SSD 目录容量充足，并根据
+硬件运行前应确认 FlexKV extension 与当前 CUDA 匹配、SSD 目录容量充足，并根据
 机器显存调整 `gpu_blocks_per_rank` 与 `swa_num_slots`。

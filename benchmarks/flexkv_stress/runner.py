@@ -136,11 +136,11 @@ class FlexKVRuntime:
                 manager.start()
             logging.getLogger("flexkv_stress").warning(
                 "CPU stub mode: exercising stress control flow and PyTorch byte copies; "
-                "CUDA/ROCm IPC, native transfers, SSD, and eventfd signaling are not under test"
+                "CUDA IPC, native transfers, SSD, and eventfd signaling are not under test"
             )
             return
         if not torch.cuda.is_available():
-            raise RuntimeError("No CUDA/ROCm device is available; use --dry-run in this environment")
+            raise RuntimeError("No CUDA device is available; use --dry-run in this environment")
         if torch.cuda.device_count() < self.config.required_gpus:
             raise RuntimeError(
                 f"Need {self.config.required_gpus} GPUs for composite-TP×DP "

@@ -12,7 +12,6 @@ import numpy as np
 import torch
 
 from benchmarks.flexkv_stress.config import ConversationConfig, load_config
-from benchmarks.flexkv_stress.device import DeviceBackend
 from benchmarks.flexkv_stress.main import _should_stop
 from benchmarks.flexkv_stress.metrics import (
     LogHistogram, OperationResult, Reporter, TurnResult, decimal_gb, percentile,
@@ -260,18 +259,6 @@ class MetricsAndDeviceTests(unittest.TestCase):
             self.assertNotIn("hit_ratio", row)
             summary = json.loads((output / "summary.json").read_text())
             self.assertEqual(summary["scenarios"][0]["throughput_gb_s"], 1)
-
-    def test_backend_detection(self):
-        fake_rocm = type("Torch", (), {"version": type("Version", (), {"hip": "6.0"})()})()
-        fake_cuda = type("Torch", (), {"version": type("Version", (), {"hip": None})()})()
-        self.assertEqual(DeviceBackend.detect(fake_rocm).name, "rocm")
-        self.assertEqual(DeviceBackend.detect(fake_cuda).name, "cuda")
-
-    def test_memory_handle_gates_direct_cuda_ipc(self):
-        source = (ROOT / "flexkv" / "common" / "memory_handle.py").read_text()
-        self.assertIn("IS_ROCM = getattr(torch.version, \"hip\", None) is not None", source)
-        self.assertIn("Direct CUDA IPC is not available on ROCm", source)
-
 
 class RunnerLogicTests(unittest.TestCase):
     class FakeManager:

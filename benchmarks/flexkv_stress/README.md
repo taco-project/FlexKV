@@ -69,9 +69,8 @@ stores only `put_match` misses, and performs an immediate read-back. Input and
 output lengths accept a fixed block count, a two-element range, or an explicit
 `{mode: list, blocks: [...]}` sequence. Cache state is retained across rounds.
 
-CUDA and ROCm both use PyTorch's `cuda:N` API. On ROCm, tensor sharing uses
-PyTorch IPC and never attempts to load or call `libcudart`. The FlexKV transfer
-extension itself must still have been built for HIP.
+The accelerator path uses PyTorch's `cuda:N` API and requires the FlexKV
+transfer extension to be built for CUDA.
 
 Every run produces exactly `summary.csv`, `metrics.csv`, `summary.json`, and
 `effective_config.yaml`. `summary.csv` and `metrics.csv` use a mode-specific
@@ -100,10 +99,9 @@ For logic checks on a host without an accelerator, `--cpu-stub` replaces the
 FlexKV manager and inference-engine workers with an in-memory implementation.
 It still allocates real CPU PyTorch KV tensors and validates prefix matching,
 batch launch, PUT/GET, async APIs, TP/DP routing, and byte-level readback. It
-does not validate CUDA/ROCm IPC, native transfer kernels, SSD, or eventfd
-signaling, and the reported latency is not a FlexKV performance measurement.
-CPU-stub runs still produce every report and chart, but set
-`performance_valid=false` and watermark the dashboard.
+does not validate CUDA IPC, native transfer kernels, SSD, or eventfd signaling,
+and the reported latency is not a FlexKV performance measurement. CPU-stub
+runs still produce every report, but set `performance_valid=false`.
 The real accelerator path launches one OS process per GPU and pins it to one
 `cuda:N` device. CPU stub uses lightweight in-process virtual workers, so it
 checks topology/routing and duplicated CP KV contents but not process or CUDA

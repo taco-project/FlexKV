@@ -51,7 +51,7 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
 
         from .device import DeviceBackend, torch_dtype
 
-        backend = DeviceBackend.detect(torch)
+        backend = DeviceBackend.detect()
         backend.set_device(device_id)
         kv_tp_rank, cp_rank = config.worker_ranks(effective_rank)
         groups = config.preset.groups

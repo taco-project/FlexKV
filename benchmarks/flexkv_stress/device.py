@@ -1,20 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 
 @dataclass(frozen=True)
 class DeviceBackend:
-    name: str
-    is_rocm: bool
+    name: str = "cuda"
 
     @classmethod
-    def detect(cls, torch_module: Any = None) -> "DeviceBackend":
-        if torch_module is None:
-            import torch as torch_module
-        is_rocm = getattr(torch_module.version, "hip", None) is not None
-        return cls(name="rocm" if is_rocm else "cuda", is_rocm=is_rocm)
+    def detect(cls) -> "DeviceBackend":
+        return cls()
 
     def device(self, device_id: int):
         import torch
