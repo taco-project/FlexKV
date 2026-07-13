@@ -117,9 +117,30 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
 
         tp_client = KVTPClient(gpu_register_port, dp_rank, device_id, pp_rank=0)
         flat_tensors = [tensor for group in tensors_per_group for tensor in group]
+        # Whole-stage representative layout. FlexKV derives num_layers_per_pp_stage
+        # from this singular kv_layout's num_layer (transfer_manager.py), and that
+        # becomes the main-KV layer count the fused-layerwise SWA path asserts
+        # against (swa_num_layers == num_layers). It must span the full
+        # attention-layer index space shared by all groups + SWA
+        # (== preset.num_layers == swa_num_layers), NOT a single group's subset.
+        # layouts[0] is only the primary (first) pool — for multi-pool models like
+        # DSv4 its num_layer is a subset (e.g. c4=29 of 61), which mis-sets the
+        # stage count and trips the SWA assertion. Build a separate layout so the
+        # per-group entries in ``gpu_layouts`` keep their own counts. Mirrors the
+        # sglang connector, which registers num_layer=num_layers_per_pp_stage.
+        primary = groups[0]
+        main_layout = KVCacheLayout(
+            type=KVCacheLayoutType.LAYERFIRST,
+            num_layer=config.preset.num_layers,
+            num_block=num_blocks,
+            tokens_per_block=config.tokens_per_block // primary.compress_ratio,
+            num_head=primary.num_kv_heads,
+            head_size=primary.head_size,
+            is_mla=True,
+        )
         tp_client.register_to_server(
             kv_caches=flat_tensors,
-            kv_layout=layouts[0],
+            kv_layout=main_layout,
             layer_groups=layer_specs,
             gpu_layouts=layouts,
             handles_per_group=tensors_per_group,
@@ -137,6 +158,14 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
             "groups": [tuple(tensor.shape) for tensor in (group[0] for group in tensors_per_group)],
         })
 
+        # MLA (use_mla) KV is a shared latent that is TP-replicated, NOT sharded
+        # across ranks: every TP rank holds an identical copy, and FlexKV stores
+        # one copy per block. So seed/verify must be rank-independent for MLA —
+        # otherwise rank>0 verifies against a rank-specific value it never had
+        # (it legitimately holds rank 0's bytes). For non-MLA (head-sharded) KV
+        # the per-rank value is meaningful.
+        seed_rank = 0 if config.preset.use_mla else kv_tp_rank
+
         while True:
             command = connection.recv()
             operation = command["operation"]
@@ -147,14 +176,14 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
             patterns = [int(v) for v in command.get("patterns", [])]
             if operation == "seed":
                 for group_id, tensors in enumerate(tensors_per_group):
-                    _fill_blocks(tensors, block_ids, patterns, kv_tp_rank, group_id)
+                    _fill_blocks(tensors, block_ids, patterns, seed_rank, group_id)
                 if swa_tensors is not None and command.get("swa_block_ids"):
                     swa_patterns = [int(v) for v in command.get("swa_patterns", patterns[-1:])]
                     _fill_blocks(
                         swa_tensors,
                         [int(v) for v in command["swa_block_ids"]],
                         swa_patterns,
-                        kv_tp_rank,
+                        seed_rank,
                         len(tensors_per_group),
                     )
                 backend.synchronize(device_id)
@@ -175,7 +204,7 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
                 max_bytes = int(command.get("max_bytes", 256))
                 for group_id, tensors in enumerate(tensors_per_group):
                     errors.extend(_verify_blocks(
-                        tensors, block_ids, patterns, kv_tp_rank, group_id, max_layers, max_bytes
+                        tensors, block_ids, patterns, seed_rank, group_id, max_layers, max_bytes
                     ))
                 if swa_tensors is not None and command.get("swa_block_ids"):
                     swa_patterns = [int(v) for v in command.get("swa_patterns", patterns[-1:])]
@@ -183,7 +212,7 @@ def _worker_main(connection, config, dp_rank: int, effective_rank: int, device_i
                         swa_tensors,
                         [int(v) for v in command["swa_block_ids"]],
                         swa_patterns,
-                        kv_tp_rank,
+                        seed_rank,
                         len(tensors_per_group),
                         max_layers,
                         max_bytes,

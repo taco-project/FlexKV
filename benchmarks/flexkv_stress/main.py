@@ -109,6 +109,10 @@ def _run_latency_hit(config, runtime, reporter, stop_requested) -> bool:
 
     runner = StressRunner(config, runtime)
     workload = WorkloadGenerator(config.conversation, config.tokens_per_block, config.run.seed)
+    # Warm the shared prefix so its boundary carries an SWA snapshot before any
+    # conversation matches it (cross-conversation SWA reuse). No-op without a
+    # shared system prompt.
+    runner.warm_shared_prefix(workload.shared_system)
     _warmup(config, runner, workload, reporter)
     original = (
         config.features.concurrency,
@@ -184,6 +188,10 @@ def _run_bandwidth(config, runtime, reporter, stop_requested) -> bool:
 
     runner = StressRunner(config, runtime)
     workload = WorkloadGenerator(config.conversation, config.tokens_per_block, config.run.seed)
+    # Warm the shared prefix so its boundary carries an SWA snapshot before any
+    # conversation matches it (cross-conversation SWA reuse). No-op without a
+    # shared system prompt.
+    runner.warm_shared_prefix(workload.shared_system)
     _warmup(config, runner, workload, reporter)
     failed = False
     window_id = 0

@@ -463,6 +463,50 @@ class ManagerDriver:
             ))
         return results, operations
 
+    def warm_shared_prefix(self, tokens) -> list[OperationResult]:
+        """Commit a shared prefix (e.g. the shared system prompt) as its own
+        sequence so a trailing SWA snapshot lands on its block boundary.
+
+        Real serving warms a shared prompt this way (its first commit becomes a
+        reusable prefix). Without it, a prefix that is only ever an interior span
+        of longer PUTs has no SWA snapshot at its boundary, so an ``swa_aware``
+        GET matching just that prefix finds swa_hit=0 and cannot reuse it — even
+        though the Full-KV bytes are cached. Mirrors ``execute_batch``'s PUT path
+        and records the same commit in the oracle so expected==actual.
+        """
+        import numpy as np
+        operations: list[OperationResult] = []
+        aligned = align_down(len(tokens), self.config.tokens_per_block)
+        if aligned == 0:
+            return operations
+        tokens = tuple(tokens[:aligned])
+        blocks, slots = self.slots.allocate(aligned)
+        patterns = _block_patterns(tokens, self.config.tokens_per_block)
+        swa_mapping = None
+        swa_blocks = []
+        if self.config.features.swa:
+            swa_blocks, swa_mapping = self._swa_mapping()
+        command_dp(self.workers, self.dp_rank, {
+            "operation": "seed", "block_ids": blocks.tolist(), "patterns": patterns,
+            "swa_block_ids": swa_blocks, "swa_patterns": patterns[-1:],
+        })
+        started = time.perf_counter()
+        try:
+            result = self.manager.put_match(np.asarray(tokens, dtype=np.int64))
+            if result is None:
+                raise RuntimeError("put_match returned None")
+            task_id, unmatched = result
+            unmatched = np.asarray(unmatched, dtype=bool)
+            self._operation(operations, "put_match", started, True, aligned, 0)
+            put_pending = []
+            if unmatched.any():
+                put_pending.append(_Launch(task_id, slots[unmatched], swa_mapping))
+            if self._launch(put_pending, "launch_put", operations):
+                self.oracle.put(tokens)
+        except Exception as exc:
+            self._operation(operations, "put_match", started, False, aligned, error=str(exc))
+        return operations
+
     def async_probe(self, round_id: int) -> list[OperationResult]:
         """Exercise KVManager's direct put/get APIs with a small unique sequence."""
         import numpy as np
@@ -592,6 +636,17 @@ class StressRunner:
             for dp_rank in range(config.model.dp_size)
         ]
         self.rng = random.Random(config.run.seed ^ 0xF1E5)
+
+    def warm_shared_prefix(self, tokens) -> list[OperationResult]:
+        """Warm a shared prefix on every DP driver so cross-conversation SWA
+        reuse finds a snapshot at the prefix boundary. No-op when there is no
+        shared prefix (``shared_system_prompt=False`` -> empty tokens)."""
+        operations: list[OperationResult] = []
+        if not tokens:
+            return operations
+        for driver in self.drivers:
+            operations.extend(driver.warm_shared_prefix(tokens))
+        return operations
 
     def _sample_keys(self, turns: list[Turn]) -> set[tuple[int, int]]:
         sampled = {
