@@ -3,7 +3,6 @@
  * All rights reserved. SPDX-License-Identifier: Apache-2.0
  */
 #include "compression/common/packed_ssd.h"
-#include "monitoring/metrics_manager.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -123,7 +122,6 @@ void do_transfer_packed_blocks(
     }
   }
 
-  FLEXKV_CPU_SSD_TRANSFER(is_read, transfer_bytes);
 }
 
 // One worker thread of the packed nvcomp SSD path, shared by BLOCKFIRST and

@@ -63,23 +63,41 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
   ctx->max_chunk_size = max_chunk_size;
 
   try {
-    ctx->opts = nvcompBatchedANSDefaultOpts;
     // data_type: 0 = FLOAT16 (bf16/fp16), 1 = UCHAR/UINT8 (fp8)
-    ctx->opts.data_type = (data_type == 0) ? float16 : uint8;
+#if FLEXKV_NVCOMP_MAJOR >= 5
+    ctx->compress_opts = nvcompBatchedANSCompressDefaultOpts;
+    ctx->decompress_opts = nvcompBatchedANSDecompressDefaultOpts;
+    ctx->compress_opts.data_type =
+        (data_type == 0) ? NVCOMP_TYPE_FLOAT16 : NVCOMP_TYPE_UCHAR;
+#else
+    ctx->compress_opts = nvcompBatchedANSDefaultOpts;
+    ctx->decompress_opts = nvcompBatchedANSDefaultOpts;
+    ctx->compress_opts.data_type = (data_type == 0) ? float16 : uint8;
+#endif
 
     const size_t max_total = max_num_chunks * max_chunk_size;
 
     ANS_NVCOMP_CHECK(nvcompBatchedANSCompressGetMaxOutputChunkSize(
-        max_chunk_size, ctx->opts, &ctx->max_comp_chunk_bytes));
+        max_chunk_size, ctx->compress_opts, &ctx->max_comp_chunk_bytes));
     // Round up to 16-byte alignment so the CPU read/write kernel can use
     // float4 (16-byte) loads/stores on d_comp_staging + i * max_comp_chunk_bytes.
     // nvcomp only guarantees 8-byte alignment for output chunk pointers.
     ctx->max_comp_chunk_bytes = (ctx->max_comp_chunk_bytes + 15) & ~size_t(15);
+#if FLEXKV_NVCOMP_MAJOR >= 5
+    ANS_NVCOMP_CHECK(nvcompBatchedANSCompressGetTempSizeAsync(
+        max_num_chunks, max_chunk_size, ctx->compress_opts,
+        &ctx->comp_temp_bytes, max_total));
+    ANS_NVCOMP_CHECK(nvcompBatchedANSDecompressGetTempSizeAsync(
+        max_num_chunks, max_chunk_size, ctx->decompress_opts,
+        &ctx->decomp_temp_bytes, max_total));
+#else
     ANS_NVCOMP_CHECK(nvcompBatchedANSCompressGetTempSizeEx(
-        max_num_chunks, max_chunk_size, ctx->opts, &ctx->comp_temp_bytes,
+        max_num_chunks, max_chunk_size, ctx->compress_opts,
+        &ctx->comp_temp_bytes,
         max_total));
     ANS_NVCOMP_CHECK(nvcompBatchedANSDecompressGetTempSizeEx(
         max_num_chunks, max_chunk_size, &ctx->decomp_temp_bytes, max_total));
+#endif
 
     const size_t comp_staging_total =
         max_num_chunks * ctx->max_comp_chunk_bytes;
@@ -209,7 +227,8 @@ void ans_ctx_destroy(ANSTransferContext* ctx) {
   ctx->max_comp_chunk_bytes = 0;
   ctx->comp_temp_bytes = 0;
   ctx->decomp_temp_bytes = 0;
-  ctx->opts = {};
+  ctx->compress_opts = {};
+  ctx->decompress_opts = {};
   ctx->d_comp_temp = nullptr;
   ctx->d_comp_staging_base = nullptr;
   ctx->d_uncomp_ptrs = nullptr;
@@ -328,10 +347,19 @@ size_t transfer_kv_blocks_ans_comp(
           ctx->d_uncomp_ptrs, gpu_handler, gpu_block_ids, start_layer_id,
           kv_dim, num_blocks, bs, bsz);
 
+#if FLEXKV_NVCOMP_MAJOR >= 5
       ANS_NVCOMP_CHECK(nvcompBatchedANSCompressAsync(
           (const void* const*)ctx->d_uncomp_ptrs, ctx->d_uncomp_sizes,
           chunk_size_in_bytes, bsz, ctx->d_comp_temp, ctx->comp_temp_bytes,
-          ctx->d_comp_ptrs[cur], ctx->d_comp_sizes[cur], ctx->opts, stream));
+          ctx->d_comp_ptrs[cur], ctx->d_comp_sizes[cur],
+          ctx->compress_opts, ctx->d_statuses, stream));
+#else
+      ANS_NVCOMP_CHECK(nvcompBatchedANSCompressAsync(
+          (const void* const*)ctx->d_uncomp_ptrs, ctx->d_uncomp_sizes,
+          chunk_size_in_bytes, bsz, ctx->d_comp_temp, ctx->comp_temp_bytes,
+          ctx->d_comp_ptrs[cur], ctx->d_comp_sizes[cur],
+          ctx->compress_opts, stream));
+#endif
       CUDA_CHECK(cudaEventRecord(ctx->compress_done[cur], stream));
     }
 
@@ -444,11 +472,19 @@ size_t transfer_kv_blocks_ans_decomp(
 
     {
       CUDA_CHECK(cudaStreamWaitEvent(stream, ctx->compress_done[cur], 0));
+#if FLEXKV_NVCOMP_MAJOR >= 5
+      ANS_NVCOMP_CHECK(nvcompBatchedANSDecompressAsync(
+          (const void* const*)ctx->d_comp_ptrs[cur], ctx->d_comp_sizes[cur],
+          ctx->d_decomp_buf_sizes[cur], ctx->d_decomp_act_sizes, bsz,
+          ctx->d_decomp_temp, ctx->decomp_temp_bytes, ctx->d_decomp_ptrs[cur],
+          ctx->decompress_opts, ctx->d_statuses, stream));
+#else
       ANS_NVCOMP_CHECK(nvcompBatchedANSDecompressAsync(
           (const void* const*)ctx->d_comp_ptrs[cur], ctx->d_comp_sizes[cur],
           ctx->d_decomp_buf_sizes[cur], ctx->d_decomp_act_sizes, bsz,
           ctx->d_decomp_temp, ctx->decomp_temp_bytes, ctx->d_decomp_ptrs[cur],
           ctx->d_statuses, stream));
+#endif
       CUDA_CHECK(cudaEventRecord(ctx->slot_done[cur], stream));
     }
   }
