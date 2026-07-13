@@ -576,7 +576,12 @@ class CacheStrategy:
 DEFAULT_CACHE_STRATEGY = CacheStrategy()
 
 CPUONLY_CACHE_STRATEGY = CacheStrategy(ignore_gpu=False, ignore_ssd=True, ignore_remote=True, ignore_gds=True)
+# The GPU-side SWA slot is a size-1 placeholder here (window == one page ==
+# one slot on DSv4). It is rebound late from the request's swa_slot_mapping
+# via TransferOpGraph.set_swa_gpu_blocks() in launch, mirroring the Full-KV
+# GPU late-bind.
 
+_SWA_GPU_PLACEHOLDER = np.array([0], dtype=np.int64)
 class GlobalCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None,
                  event_collector: Optional[KVEventCollector] = None):
@@ -2086,20 +2091,19 @@ class GlobalCacheEngine:
 
         return block_mask_start, SWAReadSource()
 
-    # The GPU-side SWA slot is a size-1 placeholder here (window == one page ==
-    # one slot on DSv4). It is rebound late from the request's swa_slot_mapping
-    # via TransferOpGraph.set_swa_gpu_blocks() in launch, mirroring the Full-KV
-    # GPU late-bind.
-
-    _SWA_GPU_PLACEHOLDER = np.array([0], dtype=np.int64)
-
     def _append_swa_get_ops(self,
                             transfer_graph: TransferOpGraph,
                             finished_ops_ids: List[int],
                             op_callback_dict: Dict[int, Callable],
                             swa_read_source: SWAReadSource,
                             dp_client_id: int) -> None:
-        """Pin the SWA source node and append SWA GET peer ops to ``transfer_graph``."""
+        """
+        Pin the SWA source node and append SWA GET peer ops to ``transfer_graph``.
+        Now we only support CPU, SSD and REMOTE as SWA sourc.
+        NOTE:
+        - if device_type is SSD, we need to allocate a cpu slot for SWA
+        - if device_type is REMOTE, we need to allocate a cpu slot for SWA
+        """
         assert swa_read_source.found
         device_type = swa_read_source.device_type
         source_engine = self.cache_engines[device_type]
@@ -2118,6 +2122,7 @@ class GlobalCacheEngine:
             if staging_slot < 0:
                 self._swa_release_load_lock(
                     node=source_node, source_device_type=device_type)
+                flexkv_logger.warning(f"Failed to allocate CPU SWA slot for device {device_type}")
                 return
             cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
             source_slots = np.array([source_slot], dtype=np.int64)
@@ -2140,6 +2145,7 @@ class GlobalCacheEngine:
                 staging_slot=staging_slot,
                 source_device_type=device_type,
             )
+            flexkv_logger.warning(f"Failed to build SWA H2D chain for device {device_type}")
             return
 
         finished_ops_ids.append(swa_h2d_id)
