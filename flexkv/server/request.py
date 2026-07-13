@@ -20,6 +20,7 @@ class RegisterDPClientRequest:
 class RegisterTPClientRequest:
     dp_client_id: int
     pp_rank: int
+    pp_start_layer: int
     device_id: int
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout

@@ -80,6 +80,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  h2d_cta_num: int = 4,
                  d2h_cta_num: int = 4,
                  enable_eventfd: bool = True,
+                 start_layer_id: int = 0,
                  indexer_gpu_blocks: Optional[List[List[TensorSharedHandle]]] = None,
                  indexer_cpu_blocks: Optional[Union[torch.Tensor, HugePageTensorHandle]] = None,
                  indexer_gpu_kv_layouts: Optional[List[KVCacheLayout]] = None,
@@ -149,14 +150,16 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                            f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
         flexkv_logger.debug("[LayerwiseWorker] CPU memory pinned successfully")
-        self.cpu_blocks = cpu_blocks
 
         self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
         # Full CPU strides (for SSD->CPU, which transfers all TP ranks' data)
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+
         # TP-divided CPU strides (for CPU->GPU, each rank reads its own portion)
+        # Must be computed BEFORE the cpu_blocks offset below, because the offset
+        # must use the same (post-div_head) stride that the C++ H2D kernel uses.
         if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and not self.is_mla:
             cpu_kv_layout_tp = cpu_kv_layout.div_head(self.tp_group_size)
         else:
@@ -164,6 +167,29 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
         self.h2d_cpu_kv_stride_in_bytes = cpu_kv_layout_tp.get_kv_stride() * self.dtype.itemsize
         self.h2d_cpu_layer_stride_in_bytes = cpu_kv_layout_tp.get_layer_stride() * self.dtype.itemsize
+
+        # Offset cpu_blocks by start_layer_id so that the C++ kernel always uses
+        # layer_id=0 on the GPU side (GPU tensor is PP-stage-local, 0-indexed)
+        # while writing to the correct slice of the shared per-node CPU pool.
+        # The CPU pool covers all PP stages on this node; each PP stage's worker
+        # advances the base pointer by (start_layer_id * cpu_layer_stride) bytes.
+        # Must use the post-div_head h2d_cpu_layer_stride_in_bytes here, because
+        # the C++ H2D kernel uses that same stride for layer-wise addressing.
+        self.start_layer_id = start_layer_id
+        if start_layer_id > 0:
+            layer_offset_elems = start_layer_id * (self.h2d_cpu_layer_stride_in_bytes // self.dtype.itemsize)
+            cpu_blocks = cpu_blocks.flatten()[layer_offset_elems:]
+            flexkv_logger.debug(
+                f"[LayerwiseWorker] worker_id={worker_id}: "
+                f"start_layer_id={start_layer_id}, num_layers={self.num_layers}, "
+                f"cpu_ptr_offset={start_layer_id * self.h2d_cpu_layer_stride_in_bytes} bytes"
+            )
+        else:
+            flexkv_logger.debug(
+                f"[LayerwiseWorker] worker_id={worker_id}: "
+                f"start_layer_id=0, num_layers={self.num_layers} (no cpu_ptr offset)"
+            )
+        self.cpu_blocks = cpu_blocks
 
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
@@ -386,7 +412,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
                 try:
                     with conn:
-                        # Receive 16-byte metadata: tp_rank_per_node, tp_size_per_node,
+                        # Receive 16-byte metadata: effective_tp_rank, effective_tp_size_per_node,
                         # num_layers, num_counters
                         metadata = conn.recv(16)
                         if len(metadata) < 16:
@@ -395,7 +421,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                                 f"expected 16 bytes, got {len(metadata)}")
                             continue
 
-                        rank_key, tp_size_per_node_recv, recv_num_layers, recv_num_counters = \
+                        rank_key, effective_tp_size_per_node_recv, recv_num_layers, recv_num_counters = \
                             struct.unpack("iiii", metadata[:16])
 
                         if not all_rank_eventfds:
@@ -403,8 +429,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
                         flexkv_logger.debug(
                             f"[LayerwiseWorker] Connection {conn_idx}: "
-                            f"tp_rank_per_node={rank_key}, "
-                            f"tp_size_per_node={tp_size_per_node_recv}, "
+                            f"effective_tp_rank={rank_key}, "
+                            f"effective_tp_size_per_node={effective_tp_size_per_node_recv}, "
                             f"num_layers={recv_num_layers}, "
                             f"num_counters={recv_num_counters}")
 
@@ -424,7 +450,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                         except Exception:
                             pass
                         flexkv_logger.info(
-                            f"[LayerwiseWorker] Received all eventfds from tp_rank_per_node={rank_key} "
+                            f"[LayerwiseWorker] Received all eventfds from effective_tp_rank={rank_key} "
                             f"on {socket_path}")
                 except Exception as e:
                     # Send NACK so client knows to retry

@@ -40,6 +40,7 @@ from flexkv.transfer.worker import (
     tpGDSTransferWorker,
     NixlTransferWorker,
     PEER2CPUTransferWorker,
+    MooncakeStoreTransferWorker,
 )
 from flexkv.transfer.compression import build_compressors
 from flexkv.transfer.layerwise import (
@@ -48,6 +49,7 @@ from flexkv.transfer.layerwise import (
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
+from flexkv.external.mooncake_store_keys import PoolKind
 
 
 def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
@@ -95,6 +97,7 @@ class TransferEngine:
         cpu_handle: Optional[StorageHandle] = None,
         ssd_handle: Optional[StorageHandle] = None,
         remote_handle: Optional[StorageHandle] = None,
+        worker_key_to_start_layer_id: Optional[Dict[WorkerKey, int]] = None,
         indexer_gpu_handles: Optional[Dict[WorkerKey, List[StorageHandle]]] = None,
         indexer_cpu_handle: Optional[StorageHandle] = None,
         indexer_ssd_handle: Optional[StorageHandle] = None,
@@ -109,12 +112,22 @@ class TransferEngine:
             cpu_handle: CPU handle
             ssd_handle: Optional SSD handle
             remote_handle: Optional remote handle
+            worker_key_to_start_layer_id: Optional mapping from WorkerKey to the
+                CPU-pool-local start_layer_id (global pp_start_layer minus the minimum
+                pp_start_layer on this node). Required for single-node PP>1 deployments
+                where multiple PP stages share one TransferManager and CPU pool.
         """
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
 
         first_handles = next(iter(gpu_handles.values()))
         self._num_layers_for_local_pp_stage = first_handles[0].kv_layout.num_layer
+
+        # start_layer_id per WorkerKey: defaults to 0 for all keys if not provided
+        self._worker_key_to_start_layer_id: Dict[WorkerKey, int] = (
+            worker_key_to_start_layer_id if worker_key_to_start_layer_id is not None
+            else {wk: 0 for wk in gpu_handles.keys()}
+        )
 
         # Use spawn context for CUDA compatibility
         self.mp_ctx = mp.get_context('spawn')
@@ -172,6 +185,10 @@ class TransferEngine:
 
         assert self._cpu_handle is not None
         _enable_layerwise = GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
+        # PP isolation note: pp_rank/pp_size flow through cache_config
+        # (populated by update_default_config_from_user_config from
+        # RankInfo). Workers read from cache_config; we don't need to
+        # derive a node-local _local_pp_rank here anymore.
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
         
@@ -189,6 +206,7 @@ class TransferEngine:
                         cpu_kv_layout=self._cpu_handle.kv_layout,
                         dtype=gpu_handles[0].dtype,
                         gpu_device_id=gpu_handles[0].gpu_device_id,
+                        start_layer_id=self._worker_key_to_start_layer_id.get(worker_key, 0),
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -198,6 +216,7 @@ class TransferEngine:
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
             else:
+                flexkv_logger.info(f"[TransferEngine] self._cpu_handle.kv_layout: {self._cpu_handle.kv_layout}")
                 self.h2d_workers = {
                     worker_key: tpGPUCPUTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
@@ -209,6 +228,7 @@ class TransferEngine:
                         cpu_kv_layout=self._cpu_handle.kv_layout,
                         dtype=gpu_handles[0].dtype,
                         tp_group_size=self.model_config.effective_tp_size_per_node,
+                        start_layer_id=self._worker_key_to_start_layer_id.get(worker_key, 0),
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -232,6 +252,7 @@ class TransferEngine:
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=gpu_handles[0].dtype,
                     gpu_device_id=gpu_handles[0].gpu_device_id,
+                    start_layer_id=self._worker_key_to_start_layer_id.get(worker_key, 0),
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -252,6 +273,7 @@ class TransferEngine:
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=gpu_handles[0].dtype,
                     tp_group_size=self.model_config.effective_tp_size_per_node,
+                    start_layer_id=self._worker_key_to_start_layer_id.get(worker_key, 0),
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -321,6 +343,26 @@ class TransferEngine:
             )
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
+        elif (getattr(self.cache_config, 'use_mooncake_store_backend', False) 
+              and self._cpu_handle is not None):
+            # mooncake-store backend: no _remote_handle (StorageEngine skips RemoteAllocator),
+            # but we still need workers for H2REMOTE and REMOTE2H.
+  
+            self.mooncake_store_worker: WorkerHandle = MooncakeStoreTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
+                cache_config=self.cache_config,
+                pool_kind=PoolKind.KV,
+            )
+     
+            self._worker_map[TransferType.H2REMOTE] = self.mooncake_store_worker
+            self._worker_map[TransferType.REMOTE2H] = self.mooncake_store_worker
+            flexkv_logger.info("[TransferEngine] mooncake-store workers created for H2REMOTE/REMOTE2H")
+
         if self.cache_config.enable_gds:
             assert self._ssd_handle is not None
             if self.cache_config.enable_nixl:
@@ -363,6 +405,7 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         gpu_device_id=gpu_handles[0].gpu_device_id,
+                        start_layer_id=self._worker_key_to_start_layer_id.get(worker_key, 0),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
@@ -379,6 +422,7 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         tp_group_size=self.model_config.effective_tp_size_per_node,
+                        start_layer_id=self._worker_key_to_start_layer_id.get(worker_key, 0),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
@@ -425,6 +469,7 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                    start_layer_id=self._worker_key_to_start_layer_id.get(worker_key, 0),
                     indexer_gpu_blocks=[h.get_tensor_handle_list() for h in idx_handles] if idx_handles else None,
                     indexer_cpu_blocks=self._indexer_cpu_handle.get_worker_tensor() if idx_handles else None,
                     indexer_gpu_kv_layouts=[h.kv_layout for h in idx_handles] if idx_handles else None,
@@ -621,6 +666,27 @@ class TransferEngine:
                 self._indexer_worker_map[TransferType.H2REMOTE] = self._indexer_h2remote_worker
                 self._indexer_worker_map[TransferType.REMOTE2H] = self._indexer_remote2h_worker
                 flexkv_logger.info("TransferEngine: indexer Remote workers initialized")
+            elif (getattr(self.cache_config, 'use_mooncake_store_backend', False)
+                  and self._indexer_cpu_handle is not None):
+                # mooncake-store backend for indexer.
+                self._indexer_mooncake_store_worker: WorkerHandle = MooncakeStoreTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self._indexer_finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    cpu_blocks=self._indexer_cpu_handle.get_worker_tensor(),
+                    cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
+                    dtype=self._indexer_cpu_handle.dtype,
+                    cache_config=self.cache_config,
+                    pool_kind=PoolKind.INDEXER,
+                    override_global_segment_size=0,
+                )
+                self._indexer_worker_map[TransferType.H2REMOTE] = self._indexer_mooncake_store_worker
+                self._indexer_worker_map[TransferType.REMOTE2H] = self._indexer_mooncake_store_worker
+                flexkv_logger.info(
+                    f"[TransferEngine] indexer mooncake-store worker initialized "
+                    f"(pool_kind={PoolKind.INDEXER.name}/'{PoolKind.INDEXER.value}', "
+                    f"global_segment_size=0 / pure-client mode)"
+                )
             if self.cache_config.enable_gds and self._indexer_ssd_handle is not None:
                 if self.model_config.effective_tp_size_per_node == 1:
                     self._indexer_gds_workers: Dict[WorkerKey, WorkerHandle] = {
@@ -635,6 +701,7 @@ class TransferEngine:
                             ssd_kv_layout=self._indexer_ssd_handle.kv_layout,
                             dtype=self._indexer_ssd_handle.dtype,
                             gpu_device_id=indexer_gpu_handles_list[0].gpu_device_id,
+                            start_layer_id=self._worker_key_to_start_layer_id.get(worker_key, 0),
                         )
                         for worker_key, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
                     }
@@ -651,6 +718,7 @@ class TransferEngine:
                             ssd_kv_layout=self._indexer_ssd_handle.kv_layout,
                             dtype=self._indexer_ssd_handle.dtype,
                             tp_group_size=self.model_config.effective_tp_size_per_node,
+                            start_layer_id=self._worker_key_to_start_layer_id.get(worker_key, 0),
                         )
                         for worker_key, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
                     }
@@ -996,6 +1064,14 @@ class TransferEngine:
                             src_block_ids=op.src_block_ids.copy(),
                             dst_block_ids=op.dst_block_ids.copy(),
                             dp_client_id=op.dp_client_id,
+                            # Forward mooncake-store block hashes so that the
+                            # indexer worker can build the same per-block keys
+                            # (with its own suffix) for batch_put / batch_get.
+                            mooncake_store_block_hashes=(
+                                op.mooncake_store_block_hashes.copy()
+                                if op.mooncake_store_block_hashes is not None
+                                else None
+                            ),
                         )
                         register_op_to_buffer(indexer_replica, self.pin_buffer)
                         self._child_id_to_child[indexer_replica.op_id] = indexer_replica
@@ -1018,6 +1094,14 @@ class TransferEngine:
                         src_block_ids=op.src_block_ids.copy(),
                         dst_block_ids=op.dst_block_ids.copy(),
                         dp_client_id=op.dp_client_id,
+                        # Forward mooncake-store block hashes so that the
+                        # indexer worker can build the same per-block keys
+                        # (with its own suffix) for batch_put / batch_get.
+                        mooncake_store_block_hashes=(
+                            op.mooncake_store_block_hashes.copy()
+                            if op.mooncake_store_block_hashes is not None
+                            else None
+                        ),
                     )
                     register_op_to_buffer(indexer_op, self.pin_buffer)
                     self._child_id_to_child[indexer_op.op_id] = indexer_op

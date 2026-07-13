@@ -149,11 +149,15 @@ class GPUKVCacheVerifier:
         elif isinstance(shared_gpu_blocks[0], TensorSharedHandle):
              self.gpu_blocks = [wrapper.get_tensor() for wrapper in shared_gpu_blocks]
         else:
+            # List[List[torch.Tensor]] or List[List[TensorSharedHandle]]
             imported_gpu_blocks = []
-            for handles_in_one_gpu in shared_gpu_blocks:
+            for items_in_one_gpu in shared_gpu_blocks:
                 blocks_in_one_gpu = []
-                for handle in handles_in_one_gpu:
-                    blocks_in_one_gpu.append(handle.get_tensor())
+                for item in items_in_one_gpu:
+                    if isinstance(item, torch.Tensor):
+                        blocks_in_one_gpu.append(item)
+                    else:
+                        blocks_in_one_gpu.append(item.get_tensor())
                 imported_gpu_blocks.append(blocks_in_one_gpu)
             self.gpu_blocks = imported_gpu_blocks
         self.gpu_block_num = gpu_kv_layout.num_block

@@ -137,37 +137,57 @@ class FlexKVConfig:
             logger.info(f"[FlexKV] Using kv_cache_dtype from framework config: '{framework_dtype_str}' -> {resolved}")
             return
 
+        # --- Priority 3: fallback ---
         self.model_config.dtype = fallback_dtype
         logger.warning(
             f"[FlexKV] No kv_cache_dtype from user/framework config, "
-            f"falling back to {fallback_dtype}."
+            f"falling back to {fallback_dtype}. "
+            f"Set FLEXKV_KV_CACHE_DTYPE env var or pass --kv-cache-dtype to be explicit."
         )
 
     def _detect_indexer_config_from_hf(
         self,
         hf_config,
+        source: str = "",
         indexer_head_size: Optional[int] = None,
         indexer_dtype: Optional[torch.dtype] = None,
     ) -> None:
+        """Detect and configure indexer from HuggingFace model config.
+
+        All three frameworks store the indexer K cache in an FP8-quantized
+        layout with ``quant_block_size = 128`` (hardcoded in each):
+
+        - vLLM (``DeepseekV32IndexerCache`` / ``deepseek_v4_attention.py``):
+            head_dim = index_head_dim + index_head_dim // 128 * 4, dtype=uint8
+        - TRT-LLM (``DSACacheManager``, ``dsa.py``):
+            per_token_size = index_head_dim + index_head_dim // 128 * 4
+        - sglang (``NSATokenToKVPool``, ``memory_pool.py``):
+            index_k_with_scale_buffer_dtype = torch.uint8  (class constant)
+            shape: page_size * (index_head_dim + index_head_dim // 128 * 4)
+
+        Formula:
+            head_size = tpb * (index_head_dim + index_head_dim // 128 * 4)
+            dtype     = torch.uint8
+
+        where ``+ index_head_dim // 128 * 4`` is the per-block FP32 scale
+        overhead (4 bytes per 128-element block).
+        """
         if hf_config is None:
             return
 
         try:
-            qk_rope_head_dim = getattr(hf_config, 'qk_rope_head_dim', None)
-            if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
-                return
+            if indexer_head_size is not None and indexer_head_size > 0:
+                head_size = indexer_head_size
+            else:
+                index_head_dim = getattr(hf_config, 'index_head_dim', None)
+                if index_head_dim is None or index_head_dim <= 0:
+                    # This model has no sparse attention indexer — skip.
+                    return
 
-            index_head_dim = getattr(hf_config, 'index_head_dim', None)
-            if index_head_dim is not None and index_head_dim > 0:
                 quant_block_size = 128
                 head_size = self.cache_config.tokens_per_block * (
                     index_head_dim + index_head_dim // quant_block_size * 4
                 )
-            else:
-                head_size = qk_rope_head_dim
-
-            if indexer_head_size is not None and indexer_head_size > 0:
-                head_size = indexer_head_size
 
             dtype = indexer_dtype if indexer_dtype is not None else torch.uint8
 
@@ -176,12 +196,13 @@ class FlexKVConfig:
                 num_kv_heads=1,
                 dtype=dtype,
             )
+            source_label = f" ({source})" if source else ""
             logger.info(
-                f"Detected sparse attention indexer config: "
+                f"Detected sparse attention indexer config{source_label}: "
                 f"head_size={head_size}, dtype={dtype}, "
                 f"tokens_per_block={self.cache_config.tokens_per_block}")
         except Exception as e:
-            logger.debug(f"Could not detect indexer config: {e}")
+            logger.debug(f"Could not detect indexer config ({source}): {e}")
 
     @classmethod
     def from_env(cls) -> 'FlexKVConfig':
@@ -203,9 +224,11 @@ class FlexKVConfig:
         self,
         vllm_config: "VllmConfig",
         ) -> RankInfo:
-        tp_rank = getattr(vllm_config.parallel_config, 'tensor_parallel_rank', 0)
-        dp_rank = getattr(vllm_config.parallel_config, 'data_parallel_rank', 0)
-        node_rank = getattr(vllm_config.parallel_config, 'node_rank', 0)
+        parallel_config = vllm_config.parallel_config
+        tp_rank = int(getattr(parallel_config, 'tensor_parallel_rank', 0))
+        pp_rank = int(getattr(parallel_config, 'pipeline_parallel_rank', 0))
+        dp_rank = int(getattr(parallel_config, 'data_parallel_rank', 0))
+        node_rank = int(getattr(parallel_config, 'node_rank', 0))
         self.cache_config.tokens_per_block = vllm_config.cache_config.block_size
 
         self.model_config.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
@@ -217,6 +240,7 @@ class FlexKVConfig:
         )
         is_mla = vllm_config.model_config.is_deepseek_mla
         self.model_config.use_mla = is_mla
+        self._hf_text_config = getattr(vllm_config.model_config, 'hf_text_config', None)
 
         # NVFP4: vLLM stores the packed fp4 data + fp8 block scales in a single
         # uint8 tensor whose per-head last dim is head_size//2 + head_size//16.
@@ -245,12 +269,14 @@ class FlexKVConfig:
                 "skipping the nvfp4 head_size fold. If vLLM rejects this "
                 "config, use fp8/fp8_ds_mla for MLA instead."
             )
-        self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
-        self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
-        self.model_config.pp_size = vllm_config.parallel_config.pipeline_parallel_size
-        self.model_config.nnodes = max(1, getattr(vllm_config.parallel_config, 'nnodes', 1))
+        self.model_config.tp_size = int(parallel_config.tensor_parallel_size)
+        self.model_config.dp_size = int(parallel_config.data_parallel_size)
+        self.model_config.pp_size = int(parallel_config.pipeline_parallel_size)
+        # vLLM CP (context parallel) support: read cp_size from parallel_config.
+        # Falls back to 1 if the attribute is not present (older vLLM versions).
+        self.model_config.cp_size = max(1, int(getattr(parallel_config, 'context_parallel_size', 1)))
+        self.model_config.nnodes = max(1, int(getattr(parallel_config, 'nnodes', 1)))
 
-        pp_rank = getattr(vllm_config.parallel_config, 'pipeline_parallel_rank', 0)
 
         if self.model_config.pp_size > 1:
             from vllm.distributed.utils import get_pp_indices as vllm_get_pp_indices
@@ -282,15 +308,29 @@ class FlexKVConfig:
             instance_id=instance_id,
             pp_start_layer=pp_start_layer,
             pp_end_layer=pp_end_layer,
+            # vLLM sets LOCAL_RANK env var (= rank % gpus_per_node) before
+            # launching each worker process.  Use it directly as the
+            # authoritative physical device index.
+            local_rank=int(os.environ.get('LOCAL_RANK', -1)),
         )
+        # Detect indexer config from HuggingFace model config.
+        # vLLM exposes hf_config via vllm_config.model_config.hf_config.
+        hf_config = getattr(vllm_config.model_config, 'hf_config', None)
+        self._detect_indexer_config_from_hf(hf_config)
+
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
-        hf_config = getattr(vllm_config.model_config, 'hf_config', None)
-        self._detect_indexer_config_from_hf(hf_config)
-
         logger.info(f"[FlexKV vllm] {self.model_config}, {rank_info}")
+
+
+        if self.cache_config.indexer is not None:
+            logger.info(
+                f"[FlexKV vLLM] Indexer config detected: "
+                f"head_size={self.cache_config.indexer.head_size}, "
+                f"dtype={self.cache_config.indexer.dtype}"
+            )
 
         # Freeze model_config — no further mutations allowed
         self.model_config.freeze()
@@ -322,19 +362,41 @@ class FlexKVConfig:
             page_size: KV block size (tokens per block) used by sglang
             tp_rank: physical tensor parallel rank (runtime, from process group)
             pp_rank: pipeline parallel rank (runtime, from process group)
-            dp_rank: data parallel rank (runtime, from process group)
-            attn_cp_rank: attention-level context parallel rank (runtime)
+            dp_rank: logical DP shard index for this worker.
+                - plain DP (``enable_dp_attention=False``): the regular
+                  ``dp_rank`` passed to the scheduler process (0, 1, …).
+                - DP Attention (``enable_dp_attention=True``): the
+                  ``attn_dp_rank`` derived from ``tp_rank`` via
+                  ``compute_dp_attention_world_info`` (already converted
+                  by the sglang scheduler before calling this method).
+                In both cases this value is stored directly as
+                ``RankInfo.dp_rank`` and ``ModelConfig.dp_size`` is set
+                to the true ``sglang_dp_size`` so that
+                ``dp_client_id = instance_id * dp_size + dp_rank`` is
+                globally unique across all DP shards and instances.
+            attn_cp_rank: sglang's ``attn_cp_rank`` — attention-level context
+                parallel rank within the CP group.
         """
+        # sglang uses attn_cp_rank; map to FlexKV's generic cp_rank here so
+        # the rest of the function and all downstream code stays framework-agnostic.
+        cp_rank = attn_cp_rank
         # Extract parallelism params from server_args
-        tp_size = server_args.tp_size
-        pp_size = server_args.pp_size
-        dp_size = server_args.dp_size
+        sglang_tp_size = int(server_args.tp_size)  # raw sglang tp_size (composite)
+        pp_size = int(server_args.pp_size)
+        sglang_dp_size = int(server_args.dp_size if server_args.dp_size is not None else 1)
         nnodes = server_args.nnodes
         node_rank = server_args.node_rank
-        enable_dp_attention = server_args.enable_dp_attention
-        attn_cp_size = getattr(server_args, 'attn_cp_size', 1)
+        enable_dp_attention = bool(server_args.enable_dp_attention)
+        attn_cp_size = int(getattr(server_args, 'attn_cp_size', 1))
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
+
         dp_rank = 0 if dp_rank is None else int(dp_rank)
+        cp_rank = 0 if cp_rank is None else int(cp_rank)
+
+        attn_dp_size = sglang_dp_size if enable_dp_attention else 1
+        attn_tp_size = max(1, sglang_tp_size // (attn_dp_size * attn_cp_size))
+        # attn_tp_rank: derived from physical tp_rank
+        attn_tp_rank = int(tp_rank) % attn_tp_size
 
         # cache config: use page_size as tokens_per_block so that FlexKV's
         # CPU radix tree manages blocks at page granularity, ensuring that
@@ -360,8 +422,8 @@ class FlexKVConfig:
                     self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
             elif hasattr(sglang_config, "get_num_kv_heads"):
                 try:
-                    per_rank = int(sglang_config.get_num_kv_heads(tp_size))
-                    self.model_config.num_kv_heads = per_rank * tp_size
+                    per_rank = int(sglang_config.get_num_kv_heads(sglang_tp_size))
+                    self.model_config.num_kv_heads = per_rank * sglang_tp_size
                 except Exception:
                     self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
             else:
@@ -396,8 +458,25 @@ class FlexKVConfig:
 
         self.model_config.use_mla = use_mla
 
-        self.model_config.tp_size = int(tp_size)
-        self.model_config.dp_size = int(dp_size if dp_size is not None else 1)
+        # Fill FlexKV parallel config.
+        #
+        # model_config.tp_size = attn_tp_size (innermost TP dimension).
+        #   - plain DP:       attn_tp_size == sglang_tp_size  (dp is orthogonal)
+        #   - DP Attention:   attn_tp_size == sglang_tp_size / (dp_size * cp_size)
+        #
+        # model_config.dp_size = sglang_dp_size in BOTH modes.
+        #   - plain DP:       each dp shard is an independent process; dp_size
+        #                     is the true number of DP shards so that dp_client_id
+        #                     = instance_id * dp_size + dp_rank is globally unique.
+        #   - DP Attention:   attn_dp_size == sglang_dp_size; same formula applies.
+        #
+        # FlexKV does not distinguish between "plain DP" and "DP Attention" —
+        # both are represented as dp_size > 1 with each shard owning its own
+        # KVManager (identified by dp_client_id).  The difference is only in
+        # how sglang derives dp_rank (scheduler arg vs attn_dp_rank from tp_rank).
+        self.model_config.tp_size = int(attn_tp_size)
+        self.model_config.dp_size = int(sglang_dp_size)
+        self.model_config.cp_size = int(attn_cp_size)
         self.model_config.pp_size = int(pp_size)
 
         if pp_size > 1:
@@ -408,8 +487,6 @@ class FlexKVConfig:
         else:
             pp_start_layer = 0
             pp_end_layer = self.model_config.num_layers
-        self.model_config.enable_dp_attention = bool(enable_dp_attention)
-        self.model_config.attn_cp_size = int(attn_cp_size)
         self.model_config.nnodes = max(1, int(nnodes))
         _dist_init_addr = getattr(server_args, 'dist_init_addr', None)
         if _dist_init_addr and int(nnodes) > 1:
@@ -425,19 +502,24 @@ class FlexKVConfig:
 
         rank_info = RankInfo(
             model_config=self.model_config,
-            tp_rank=tp_rank,
+            tp_rank=attn_tp_rank,   # sglang attn_tp_rank = tp_rank % attn_tp_size
             pp_rank=pp_rank,
-            dp_rank=dp_rank,
-            attn_cp_rank=attn_cp_rank,
+            dp_rank=dp_rank,        # sglang attn_dp_rank (already computed by scheduler)
+            cp_rank=cp_rank,        # sglang attn_cp_rank
             node_rank=node_rank,
             instance_id=instance_id,
             pp_start_layer=pp_start_layer,
             pp_end_layer=pp_end_layer,
+            # Use torch.cuda.current_device()
+            # which reflects the physical GPU index set by sglang's worker launcher
+            # via torch.cuda.set_device(gpu_id) before this point.
+            local_rank=torch.cuda.current_device(),
         )
-        update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
-
         hf_config = getattr(sglang_config, 'hf_config', None)
+
         self._detect_indexer_config_from_hf(hf_config)
+
+        update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
 
         if self.cache_config.indexer is not None:
             logger.info(
@@ -458,44 +540,44 @@ class FlexKVConfig:
         self,
         config,
     ) -> RankInfo:
-        tp_rank = config.mapping.tp_rank
-        dp_rank = getattr(config.mapping, 'dp_rank', 0)
-        node_rank = config.mapping.node_rank
+        mapping = config.mapping
+        tp_rank = mapping.tp_rank
+        node_rank = mapping.node_rank
         self.cache_config.tokens_per_block = config.tokens_per_block
-        # Convert dtype string to torch.dtype
-        dtype_str = config.pytorch_backend_config.kv_cache_dtype
-        flexkv_logger.info(f"[FlexKVConfig] dtype_str from TRT config: {dtype_str}")
+        # Resolve KV cache dtype via unified priority logic.
+        _pytorch_backend = getattr(config, 'pytorch_backend_config', None)
+        trt_dtype_str = getattr(_pytorch_backend, 'kv_cache_dtype', 'auto') if _pytorch_backend else 'auto'
+        self._resolve_dtype(
+            framework_dtype_str=trt_dtype_str if isinstance(trt_dtype_str, str) else None,
+            fallback_dtype=torch.bfloat16,
+        )
 
-        if dtype_str == "auto":
-            self._resolve_dtype(
-                framework_dtype_str=None,
-                fallback_dtype=torch.bfloat16,
-            )
-        elif isinstance(dtype_str, str):
-            self.model_config.dtype = self._parse_dtype_str(dtype_str)
-        else:
-            self.model_config.dtype = dtype_str
         # NVFP4 packed head_size fold is only implemented/verified for vLLM.
         _warn_nvfp4_unsupported_framework(
             self.user_config.kv_cache_dtype
             if self.user_config.kv_cache_dtype is not None
-            else (dtype_str if isinstance(dtype_str, str) else None),
+            else (trt_dtype_str if isinstance(trt_dtype_str, str) else None),
             framework="trtllm",
         )
 
-        # Set model config (parallel configs part)
-        if config.mapping.enable_attention_dp:
+        # Set model config (parallel configs part).
+        enable_attention_dp = bool(getattr(mapping, 'enable_attention_dp', False))
+        if enable_attention_dp:
             self.model_config.tp_size = 1
-            self.model_config.dp_size = config.mapping.tp_size
-            dp_rank = config.mapping.rank
+            self.model_config.dp_size = int(mapping.tp_size)
+            dp_rank = int(mapping.tp_rank)
         else:
-            self.model_config.tp_size = config.mapping.tp_size
-            self.model_config.dp_size = 1
+            self.model_config.tp_size = int(mapping.tp_size)
+            self.model_config.dp_size = int(getattr(mapping, 'dp_size', 1))
             dp_rank = 0
-        self.model_config.pp_size = getattr(config.mapping, 'pp_size', 1)
-        pp_rank = getattr(config.mapping, 'pp_rank', 0)
+        pp_rank = int(getattr(mapping, 'pp_rank', 0))
+        # TRT-LLM CP size: read from mapping.cp_size (available in TRT-LLM >= 0.15).
+        # Falls back to 1 if not present.
+        self.model_config.cp_size = max(1, int(getattr(mapping, 'cp_size', 1)))
+        # TRT-LLM CP rank: read from mapping.cp_rank.
+        cp_rank = int(getattr(mapping, 'cp_rank', 0))
 
-        self.model_config.nnodes = max(1, getattr(config.mapping, 'nnodes', 1))
+        self.model_config.nnodes = max(1, getattr(mapping, 'nnodes', 1))
         # self.model_config (model configs part)
         try:
             model_path = getattr(config, 'hf_model_dir', None)
@@ -526,7 +608,7 @@ class FlexKVConfig:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
 
         if self.model_config.pp_size > 1:
-            layers_range = config.mapping.pp_layers(self.model_config.num_layers)
+            layers_range = mapping.pp_layers(self.model_config.num_layers)
             pp_start_layer = layers_range[0]
             pp_end_layer = layers_range[-1] + 1
         else:
@@ -549,22 +631,30 @@ class FlexKVConfig:
         self.model_config.master_ports = tuple(
             os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558").split(",")
         )
-
         rank_info = RankInfo(
             model_config=self.model_config,
             tp_rank=tp_rank,
             pp_rank=pp_rank,
             dp_rank=dp_rank,
+            cp_rank=cp_rank,
             node_rank=node_rank,
             instance_id=instance_id,
             pp_start_layer=pp_start_layer,
             pp_end_layer=pp_end_layer,
+            local_rank=mapping.local_rank,
         )
 
         # Update cache config with user config after model config is initialized
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
 
         logger.info(f"[FlexKV TRT-LLM] {self.model_config}, {rank_info}")
+
+        if self.cache_config.indexer is not None:
+            logger.info(
+                f"[FlexKV TRT-LLM] Indexer config detected: "
+                f"head_size={self.cache_config.indexer.head_size}, "
+                f"dtype={self.cache_config.indexer.dtype}"
+            )
 
         # Freeze model_config — no further mutations allowed
         self.model_config.freeze()
