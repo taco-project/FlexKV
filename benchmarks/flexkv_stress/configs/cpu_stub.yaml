@@ -55,7 +55,6 @@ validation:
   sampled_blocks_per_request: 2
   bytes_per_sample: 256
   hit_tolerance_blocks: 0
-  stop_on_mismatch: true
   minimum_success_rate: 1.0
 output:
   directory: ./benchmark_results/flexkv_stress/cpu_stub

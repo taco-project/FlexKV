@@ -78,7 +78,6 @@ class ValidationConfig:
     sampled_blocks_per_request: int = 2
     bytes_per_sample: int = 256
     hit_tolerance_blocks: int = 0
-    stop_on_mismatch: bool = True
     minimum_success_rate: float = 0.999
 
 

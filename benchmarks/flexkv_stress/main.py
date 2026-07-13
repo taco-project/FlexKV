@@ -95,13 +95,20 @@ def _record_failures(reporter, scenario, window_id, results, operations) -> bool
     return failed
 
 
-def _warmup(config, runner, workload, reporter) -> None:
+def _warmup(config, runner, workload, reporter) -> bool:
+    """Run warmup rounds. Failures are recorded to errors.csv and folded into
+    the exit code, but never abort the run: a diagnostic run should surface
+    every failure across the full workload rather than stop at a warmup miss.
+    Returns True if any warmup round had failures."""
+    failed = False
     for warmup in range(config.run.warmup_rounds):
         LOG.info("warmup round %d/%d", warmup + 1, config.run.warmup_rounds)
         conversations = workload.generate_round(1_000_000_000 + warmup)
         results, operations = runner.run_round(conversations, -1)
         if _record_failures(reporter, "warmup", -1, results, operations):
-            raise RuntimeError("warmup failed; inspect errors.csv")
+            LOG.warning("warmup round %d had failures; see errors.csv (continuing)", warmup + 1)
+            failed = True
+    return failed
 
 
 def _run_latency_hit(config, runtime, reporter, stop_requested) -> bool:
@@ -113,13 +120,12 @@ def _run_latency_hit(config, runtime, reporter, stop_requested) -> bool:
     # conversation matches it (cross-conversation SWA reuse). No-op without a
     # shared system prompt.
     runner.warm_shared_prefix(workload.shared_system)
-    _warmup(config, runner, workload, reporter)
+    failed = _warmup(config, runner, workload, reporter)
     original = (
         config.features.concurrency,
         config.concurrency.batch_size,
         config.concurrency.max_inflight_per_dp,
     )
-    failed = False
     global_window = 0
     round_offset = 0
     for scenario in ("unloaded", "loaded"):
@@ -149,8 +155,10 @@ def _run_latency_hit(config, runtime, reporter, stop_requested) -> bool:
             failed |= _record_failures(reporter, scenario, global_window, results, operations)
             if row["request_success_rate"] < config.validation.minimum_success_rate:
                 failed = True
-            if row["byte_validation_accuracy"] < 1 and config.validation.stop_on_mismatch:
-                return True
+            if row["byte_validation_accuracy"] < 1:
+                # Record the mismatch and keep going. A diagnostic run must expose
+                # every failure across the full workload, not stop at the first one.
+                failed = True
             LOG.info(
                 "scenario=%s window=%d requests=%d qps=%.2f hit=%.5f "
                 "match/load/save_p99_ms=%.3f/%.3f/%.3f",
@@ -192,8 +200,7 @@ def _run_bandwidth(config, runtime, reporter, stop_requested) -> bool:
     # conversation matches it (cross-conversation SWA reuse). No-op without a
     # shared system prompt.
     runner.warm_shared_prefix(workload.shared_system)
-    _warmup(config, runner, workload, reporter)
-    failed = False
+    failed = _warmup(config, runner, workload, reporter)
     window_id = 0
     round_id = 0
     original_ssd_interval = config.cache.force_ssd_reload_interval_rounds

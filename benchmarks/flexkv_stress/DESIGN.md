@@ -76,13 +76,30 @@ page 传入连续的 `page_tokens` 个 slot；FlexKV 再将其折叠为 SWA slot
 - 被抽样的 byte pattern 完全一致；
 - async/SSD probe（启用时）成功。
 
-`minimum_success_rate` 决定进程最终退出码，`stop_on_mismatch` 决定 byte mismatch 后是否
-立即停止。运行时异常和失败操作写入按需创建的 `errors.csv`。
+运行**永不因为校验失败而提前中断**。byte mismatch、hit 偏差、失败的 transfer 都会把
+对应请求计为失败、写入按需创建的 `errors.csv`，并拉低所在窗口的
+`byte_validation_accuracy` / `request_success_rate`，但测试会继续跑完整个 workload，
+以便一次性暴露所有问题，而不是停在第一个错误上。校验结果只影响进程**最终退出码**：任一
+场景的 `request_success_rate` 低于 `minimum_success_rate`、出现任何 byte mismatch、或发生
+运行时异常，退出码即为 `1`，否则为 `0`。warmup 轮的失败同样只记录并计入退出码，不中断
+后续测量场景。
 
 ## 双模式与计时口径
 
-`latency_hit` 自动运行两种 profile：`unloaded` 固定 batch/concurrency 为 1，`loaded`
-使用配置值。match 是 `get_match`；load 是 `launch_get + wait(completely=True)`；save 从
+`latency_hit` 模式会**依次**跑两个 profile，两者共用同一套 workload、各自跑满
+`duration_seconds`（或 `rounds`）。因此一次 `latency_hit` 的墙上时间约为
+`2 × duration_seconds`：
+
+- **`unloaded`（空载）**：强制 `batch_size=1`、`max_inflight_per_dp=1`，任一时刻只有一个
+  请求在途。测的是**单请求最优延迟**——没有排队、没有争用时 match/load/save 各自要多久，
+  是延迟的下界基线。
+- **`loaded`（满载）**：使用配置里的 `concurrency.batch_size` 与 `max_inflight_per_dp`
+  并发打流。测的是**并发压力下的延迟与吞吐**——排队、锁争用、传输带宽饱和都会体现在这里，
+  更接近线上高负载表现。
+
+把两个场景对照，就能看出并发把延迟抬高了多少、把吞吐（QPS）提升了多少。
+
+计时口径：match 是 `get_match`；load 是 `launch_get + wait(completely=True)`；save 从
 `put_match` 开始，到 `launch_put + wait` 结束。readback 只判定正确性，不进入这三段时延。
 
 命中和精度公式为：
@@ -129,6 +146,93 @@ traffic 仍应由系统 profiler 测量。
 结果目录使用 `YYYYmmdd_HHMMSS_PID`，避免同一秒启动的任务相互覆盖。
 Reporter 使用固定大小、可合并的对数 histogram 汇总 p50/p95/p99，不在内存中保留长跑
 observation，内存占用不随运行时长增长。CSV 与 JSON 从同一语义汇总对象生成。
+
+## 指标字段说明
+
+`summary.csv` 是每个场景跑完后的最终汇总，`metrics.csv` 是同名字段的逐窗口趋势（多出
+`window_id` / `window_started_at` / `window_duration_s` 三个前缀列），`summary.json` 是把
+同一批字段按语义分组后的机器接口。字段随 `mode` 不同：`latency_hit` 与 `bandwidth` 各有
+一套。下面按分组解释。
+
+### 通用标识与拓扑（两种 mode 共有）
+
+| 字段 | 含义 |
+| --- | --- |
+| `run_id` | 运行 ID（`时间戳_PID`），也是结果目录名 |
+| `mode` | `latency_hit` 或 `bandwidth` |
+| `scenario` | 场景名。`latency_hit` 下为 `unloaded`/`loaded`；`bandwidth` 下为 path 名（`gpu_to_cpu_save` 等） |
+| `backend` | `cuda` / `rocm` / `cpu_stub` |
+| `performance_valid` | 性能数字是否可信；CPU stub 下为 `false`（SVG 顶部会加醒目水印） |
+| `model` / `architecture` | preset 名与架构标识 |
+| `composite_tp` | SGLang composite TP world size（每个 DP shard 的物理 worker 数） |
+| `kv_tp` | KV/attention TP 宽度 = `composite_tp / cp` |
+| `cp` / `dp` | q-split CP 宽度 / DP 副本数 |
+| `gpu_count` | 实际使用的 GPU 数 = `dp × workers_per_dp` |
+| `page_tokens` | 每个 block 的 token 数（`tokens_per_block`） |
+| `main_page_gb` | 主 KV 单个 host page 的字节数（十进制 GB，含全部 KV-TP slice） |
+| `cpu_cache_gb` / `ssd_cache_gb` | CPU / SSD cache 容量 |
+| `layerwise` / `ssd_enabled` / `swa` | 是否启用 fused layerwise 传输 / SSD tier / SWA pool |
+
+### workload 参数（回显配置，让结果自解释）
+
+`conversations_per_round`、`turns_min`、`turns_max`、`system_prompt_blocks`、
+`first_input_blocks`、`added_input_blocks`、`output_blocks`、`partial_block_tokens`、
+`shared_system_prompt`、`read_after_put` 均直接回显对应的 `conversation.*` 配置。此外每行还带：
+
+| 字段 | 含义 |
+| --- | --- |
+| `batch_size` | 该场景每批提交的请求数 |
+| `concurrency` | 该场景每 DP 的最大在途请求数（`max_inflight_per_dp`） |
+
+### `latency_hit` 专有：延迟 / 命中 / 正确性 / 资源
+
+| 字段 | 含义 |
+| --- | --- |
+| `requests` | 该场景累计请求（turn）数 |
+| `qps` | `requests / 累计计时秒数` |
+| `match_p50/p95/p99_ms` | `get_match`（prefix 查询）延迟分位 |
+| `load_p50/p95/p99_ms` | `launch_get + wait`（H2D 读取命中 block）延迟分位 |
+| `save_p50/p95/p99_ms` | `put_match → launch_put + wait`（D2H 写入新 KV）延迟分位 |
+| `hit_ratio` | `actual_hit_tokens / query_tokens`，实际 prefix 命中占查询 token 的比例 |
+| `hit_exact_rate` | 命中量落在容差内的请求占比（命中 block 数是否与 oracle 精确一致） |
+| `hit_token_accuracy` | `1 - Σ\|actual-expected\| / Σquery_tokens`，命中 token 数的整体准确度 |
+| `request_success_rate` | success 请求 / 总请求（match+get+put+byte 校验全过才算 success） |
+| `byte_validation_accuracy` | 被抽样请求中 byte pattern 完全一致的比例；`1.0` = 传输零损坏 |
+| `gpu_memory_gb` | 采样到的 GPU 显存占用峰值（所有 worker 之和） |
+| `rss_gb` | 主机 RSS（加速卡模式为各 worker 进程之和） |
+| `ssd_used_gb` | SSD cache 目录实际占用 |
+
+命中与精度公式见上一节「双模式与计时口径」。
+
+### `bandwidth` 专有：吞吐 / 延迟 / 正确性 / 资源
+
+标识、拓扑、workload、`batch_size`/`concurrency`、资源字段与上面一致，差异部分：
+
+| 字段 | 含义 |
+| --- | --- |
+| `payload_gb` | 该 path×并发档累计的逻辑有效载荷（十进制 GB，去重后的物理 page） |
+| `operations` | 计入该 path 的传输 operation 数 |
+| `duration_s` | 该 path 累计的**活跃传输时间**（各 operation latency 之和，**非**墙上时间） |
+| `throughput_gb_s` | `payload_gb / duration_s`（十进制 GB/s） |
+| `latency_p50/p95/p99_ms` | 单次传输 operation 的延迟分位 |
+| `operation_success_rate` | 成功 operation / 总 operation |
+
+四条 path：`gpu_to_cpu_save`（D2H 存）、`cpu_to_gpu_load`（H2D 载）、
+`gpu_to_ssd_save_e2e`、`ssd_to_gpu_reload_e2e`（后两者为端到端口径）。
+
+### `summary.json`（schema `1.0`）分组
+
+同一批字段按语义嵌套为：`run`（run_id/mode/backend/started_at/duration_s）、`model`、
+`topology`、`cache`、`workload`，以及 `scenarios[]`。每个 scenario 内把延迟收进
+`latency_ms.{match,load,save}.{p50,p95,p99}`，命中收进 `hit.{ratio,exact_rate,token_accuracy}`，
+正确性收进 `correctness.{request_success_rate,byte_validation_accuracy,validation_samples}`，
+资源收进 `resources_gb.{gpu_memory,rss,ssd_used}`。
+
+### `errors.csv`（仅出错时创建）
+
+列为 `time` / `scenario` / `window_id` / `operation` / `error`。既然运行不再提前中断，出现问题时
+这里会累积**所有**失败记录——排查时先看它，再对照 `metrics.csv` 里哪个窗口的
+`byte_validation_accuracy` / `request_success_rate` 掉了。
 
 ## DSv4 验证层级
 
