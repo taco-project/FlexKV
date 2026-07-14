@@ -12,6 +12,68 @@ TensorRT-LLM 环境权限的测试 agent 使用。所有测试结果必须回填
 - 主干基线：`origin/main@3c968fc09c3d3b4f3f46bd0fcc9c4d6d9bb94ca8`
 - 目标：保留主干能力，同时加入 DSv4、LayerGroup、DP/TP/PP/CP、layerwise 和 SWA。
 
+### 当前状态
+
+该分支是 **Draft 集成候选**，不是已验证完成的发布版本：
+
+- 已完成：Git 三方合并、冲突标记清理、`git diff --check`、Python `compileall`。
+- 未完成：Linux C++/CUDA 构建、pytest 门禁、GPU 和框架验证。
+- 优先风险：Layerwise C++/pybind/Python 参数一致性，以及 SGLang patch 中旧
+  Indexer/`attn_*` 接口到 LayerGroup/`cp_*` 的迁移。
+
+## 2. 分阶段执行与停止门槛
+
+不要让一个 agent 一次执行全文。每个阶段单独分配；前一阶段通过后才进入下一阶段。
+
+| 阶段 | 目标 | 预计范围 | 停止门槛 |
+|---|---|---|---|
+| Phase 0 | 合并与接口审计 | 无 GPU，静态检查和旧接口搜索 | 任一冲突、语法或明确旧接口问题即停止 |
+| Phase 1 | Linux 基础构建与 CPU 测试 | 默认 C++/CUDA 构建、import、unit/smoke | 构建、收集或核心单测失败即停止 |
+| Phase 2 | 单机 GPU 核心链路 | 单卡 Full-KV；多卡 Layerwise/MLA/LayerGroup/SWA | 数据不一致、死锁、泄漏即停止 |
+| Phase 3 | 框架和多节点 | vLLM、SGLang DSv4、TRT-LLM、Redis/Mooncake | 核心集成失败即停止 |
+| Phase 4 | 性能与稳定性 | benchmark、1 小时 soak、AMD 矩阵 | 只在 Phase 0-3 全部通过后执行 |
+
+### Phase 0：只做快速审计
+
+```bash
+git diff --check origin/main...HEAD
+python -m compileall -q flexkv tests benchmarks
+rg -n '^(<<<<<<< |>>>>>>> |=======$)' --glob '!docs/pr_analysis/**' .
+rg -n 'IndexerCacheConfig|cache_config\.indexer|model_config\.attn_|rank_info\.attn_' \
+  flexkv --glob '!integration/sglang/sglang_flexkv_connector.patch'
+rg -n 'cache_config\.indexer|model_config\.attn_|rank_info\.attn_' \
+  flexkv/integration/sglang/sglang_flexkv_connector.patch
+```
+
+同时人工核对以下调用的声明、pybind 参数和 Python 调用顺序：
+
+- `LayerwiseTransferGroup::layerwise_transfer`
+- `LayerwiseTransferGroup::layerwise_transfer_multi_group`
+- `mla_d2h_mode`
+- `notify_mode`
+- SWA tensor/stride 参数
+
+发现明确旧接口或签名不一致时，记录一个 blocker 并停止；不要继续构建或跑 GPU。
+
+### Phase 1：基础构建与轻量测试
+
+仅在 Phase 0 通过后执行：
+
+```bash
+FLEXKV_ENABLE_METRICS=0 bash build.sh --debug
+python -c 'import flexkv.c_ext; print("c_ext import OK")'
+pytest --collect-only -q
+pytest -q \
+  tests/test_recompute_block_counts.py \
+  tests/test_merge_to_batch_graph_swa_callbacks.py \
+  tests/test_set_gpu_blocks_swa.py \
+  tests/test_swa_host_pool.py \
+  tests/test_swa_peer_op.py \
+  tests/test_swa_rpc_launch.py
+```
+
+Phase 1 不运行 GDS、NIXL、nvCOMP、多节点、框架 E2E 或性能测试。
+
 开始测试前记录实际提交：
 
 ```bash
@@ -25,7 +87,7 @@ git submodule update --init --recursive
 测试期间不要直接修改集成分支。发现问题时记录命令、完整堆栈、GPU/驱动/框架版本及
 最小复现；修复应另开分支和 PR。
 
-## 2. 环境信息
+## 3. 环境信息
 
 每台机器先保存以下信息：
 
@@ -56,7 +118,7 @@ PY
 | Linux + NVIDIA 多节点 | Redis/P2P、Mooncake、DP/PP/CP 拓扑、SGLang DSv4 |
 | Linux + AMD/ROCm | 使用项目内部 AMD 构建链执行与 NVIDIA 相同的核心回归；当前公开 `setup.py` 仍是 CUDA 构建入口，若无内部构建链必须标记 `BLOCKED`，不可记为通过 |
 
-## 3. 静态检查与构建
+## 4. 完整静态检查与构建（Phase 1 后续）
 
 在干净环境中安装依赖：
 
@@ -107,7 +169,7 @@ GDS、NIXL、nvCOMP 构建前需按仓库文档安装对应系统库。NIXL 还�
 - effective TP 大于 1 或启用 heterogeneous `layer_groups` 时必须明确报“不支持”，不能静默走错误路径。
 - TP=1、无 `layer_groups` 的 `GDS_MT` PUT/GET 必须字节一致。
 
-## 4. Python 与控制面回归
+## 5. Python 与控制面回归（Phase 1/2）
 
 先执行测试分层：
 
@@ -140,9 +202,9 @@ pytest -q \
 - 主干 SLRU、Redis TTL/heartbeat、CPU-only match、LAYERBLOCK、HugePage、NIXL、NVFP4、nvCOMP 路径仍可用。
 - `IndexerCacheConfig`、`enable_dp_attention`、`attn_cp_size`、`attn_cp_rank` 不再作为公开配置；调用方应迁移到 `LayerGroupSpec`、`cp_size`、`cp_rank`。旧字段必须产生可诊断错误，不能被静默忽略。
 
-## 5. GPU 数据面回归
+## 6. GPU 数据面回归（Phase 2）
 
-### 5.1 Full-KV 与主干能力
+### 6.1 Full-KV 与主干能力
 
 ```bash
 pytest -q tests/test_kv_transfer_correctness.py -ra
@@ -163,7 +225,7 @@ for mode in sharded all_write rank0_only; do
 done
 ```
 
-### 5.2 LayerGroup、layerwise 与 SWA
+### 6.2 LayerGroup、layerwise 与 SWA
 
 ```bash
 pytest -q \
@@ -197,7 +259,7 @@ done
 member、所有 GPU 及 SWA sidecar 完成后触发。`polling` 不得丢通知、重复通知、死锁或
 在析构时遗留线程/CUDA event。
 
-## 6. 框架与分布式集成
+## 7. 框架与分布式集成（Phase 3）
 
 ### vLLM
 
@@ -220,7 +282,7 @@ member、所有 GPU 及 SWA sidecar 完成后触发。`polling` 不得丢通知�
 - Mooncake：跨节点 PUT/GET、buffer 注册/注销和失败重试。
 - 至少进行一次进程中断测试，确认 KVTask、锁、SWA slot 和临时 buffer 均释放。
 
-## 7. 性能与稳定性
+## 8. 性能与稳定性（Phase 4）
 
 以相同硬件、模型、请求集分别测试 `origin/main` 与集成提交：
 
@@ -234,7 +296,7 @@ python benchmarks/microbenchmark_notify_mode.py --help
 - 分别记录 `hostfunc` 与 `polling` 的每层通知延迟、CPU 占用和吞吐。
 - DSv4/SWA 端到端持续运行至少 1 小时；不得出现数据不一致、slot 泄漏、任务增长、死锁或显存/主存持续增长。
 
-## 8. 结果回填
+## 9. 结果回填
 
 统一回填文件：`docs/dpskv4_main_merge_validation_results.md`。
 

@@ -6,9 +6,9 @@
 
 ## 汇总
 
-| Commit | 环境 | Agent | Static | Build | Unit/Smoke | GPU | Framework | Multi-node | Soak | Overall |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 待填写 | 待填写 | 待填写 | BLOCKED | BLOCKED | BLOCKED | BLOCKED | BLOCKED | BLOCKED | BLOCKED | BLOCKED |
+| Commit | 环境 | Agent | Phase 0 | Phase 1 | Phase 2 | Phase 3 | Phase 4 | Overall |
+|---|---|---|---|---|---|---|---|---|
+| `3f4767f` | 待填写 | 待填写 | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | DRAFT |
 
 ## 环境记录
 
@@ -22,6 +22,10 @@ Host/GPU:
 OS/driver/toolkit:
 Python/PyTorch:
 Framework versions:
+
+Assigned phase: Phase 0 / 1 / 2 / 3 / 4
+Phase result: PASS / FAIL / BLOCKED
+Stop reason (if stopped):
 
 Static checks: PASS / FAIL / BLOCKED
 Default build: PASS / FAIL / BLOCKED
