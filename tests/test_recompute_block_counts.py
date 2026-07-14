@@ -8,13 +8,15 @@ from flexkv.common.config import (
     ModelConfig,
     RankInfo,
     UserConfig,
+    convert_to_block_num,
     recompute_cache_block_counts,
     update_default_config_from_user_config,
 )
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 
-def test_recompute_shrinks_cpu_blocks_for_heterogeneous_layer_groups() -> None:
-    """Uniform init over-estimates block count; layer_groups correct it."""
+def test_recompute_matches_heterogeneous_layout_block_size() -> None:
+    """Deferred sizing must use the same bytes per block as KVCacheLayout."""
     model_config = ModelConfig(
         num_layers=62,
         num_kv_heads=8,
@@ -29,7 +31,6 @@ def test_recompute_shrinks_cpu_blocks_for_heterogeneous_layer_groups() -> None:
     rank_info = RankInfo(model_config=model_config)
     update_default_config_from_user_config(rank_info, cache_config, user_config)
     uniform_blocks = cache_config.num_cpu_blocks
-    assert uniform_blocks > 9000
 
     model_config.layer_groups = [
         LayerGroupSpec(
@@ -58,6 +59,20 @@ def test_recompute_shrinks_cpu_blocks_for_heterogeneous_layer_groups() -> None:
         ),
     ]
 
+    layout = KVCacheLayout(
+        type=KVCacheLayoutType.BLOCKFIRST,
+        num_layer=model_config.num_layers,
+        num_block=1,
+        tokens_per_block=cache_config.tokens_per_block,
+        num_head=model_config.num_kv_heads,
+        head_size=model_config.head_size,
+        is_mla=model_config.use_mla,
+        layer_groups=model_config.layer_groups,
+        tp_size=model_config.tp_size,
+    )
+    expected_blocks = convert_to_block_num(
+        user_config.cpu_cache_gb, layout.kv_shape[1])
+
     assert recompute_cache_block_counts(model_config, cache_config) is True
-    assert cache_config.num_cpu_blocks < uniform_blocks
-    assert 6500 < cache_config.num_cpu_blocks < 7000
+    assert cache_config.num_cpu_blocks == expected_blocks
+    assert cache_config.num_cpu_blocks != uniform_blocks
