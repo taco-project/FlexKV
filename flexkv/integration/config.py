@@ -17,6 +17,30 @@ if TYPE_CHECKING:
 logger = flexkv_logger
 
 
+def _is_nvfp4_dtype_str(dtype_str: Optional[str]) -> bool:
+    """Return whether a dtype string selects vLLM's packed NVFP4 layout."""
+    return isinstance(dtype_str, str) and dtype_str.lower() in (
+        "nvfp4", "fp4", "e2m1", "fp4_e2m1")
+
+
+def nvfp4_kv_cache_full_dim(head_size: int) -> int:
+    """Return the packed uint8 width for an NVFP4 KV-cache head."""
+    return head_size // 2 + head_size // 16
+
+
+def _warn_nvfp4_unsupported_framework(
+    dtype_str: Optional[str], framework: str
+) -> None:
+    """Warn when an adapter has not implemented the packed-width transform."""
+    if not _is_nvfp4_dtype_str(dtype_str):
+        return
+    logger.warning(
+        f"[FlexKV {framework}] kv_cache_dtype='{dtype_str}' requests NVFP4, "
+        "but the packed head-size transform is currently verified only for "
+        "the vLLM adapter; offload/reload correctness is not guaranteed."
+    )
+
+
 def _dsv4_swa_padded_bytes_per_token(swa_page_size: int,
                                      logical_bytes_per_token: int = 584) -> int:
     """Effective per-token byte width of the DSv4 SWA GPU buffer, INCLUDING the
@@ -97,6 +121,10 @@ class FlexKVConfig:
             "float8": torch.float8_e4m3fn,
             "e4m3": torch.float8_e4m3fn,
             "fp8_e4m3": torch.float8_e4m3fn,
+            "nvfp4": torch.uint8,
+            "fp4": torch.uint8,
+            "e2m1": torch.uint8,
+            "fp4_e2m1": torch.uint8,
         }
 
         def _parse(s: str) -> torch.dtype:
@@ -168,6 +196,26 @@ class FlexKVConfig:
             fallback_dtype=getattr(vllm_config.model_config, 'dtype', torch.bfloat16),
         )
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
+        effective_dtype_str = (
+            self.user_config.kv_cache_dtype
+            if self.user_config.kv_cache_dtype is not None
+            else (vllm_kv_cache_dtype
+                  if isinstance(vllm_kv_cache_dtype, str) else None)
+        )
+        if _is_nvfp4_dtype_str(effective_dtype_str):
+            if self.model_config.use_mla:
+                logger.warning(
+                    "[FlexKV vllm] NVFP4 is not supported by current MLA "
+                    "backends; leaving the logical head size unchanged."
+                )
+            else:
+                logical_head_size = self.model_config.head_size
+                self.model_config.head_size = nvfp4_kv_cache_full_dim(
+                    logical_head_size)
+                logger.info(
+                    "[FlexKV vllm] NVFP4 packed head size: "
+                    f"{logical_head_size} -> {self.model_config.head_size}"
+                )
         self._hf_text_config = getattr(vllm_config.model_config, 'hf_text_config', None)
         self.model_config.tp_size = int(parallel_config.tensor_parallel_size)
         self.model_config.dp_size = int(parallel_config.data_parallel_size)
@@ -418,6 +466,12 @@ class FlexKVConfig:
             framework_dtype_str=kv_cache_dtype,
             fallback_dtype=getattr(sglang_config, "dtype", torch.bfloat16),
         )
+        _warn_nvfp4_unsupported_framework(
+            self.user_config.kv_cache_dtype
+            if self.user_config.kv_cache_dtype is not None
+            else kv_cache_dtype,
+            framework="sglang",
+        )
 
         if use_mla and getattr(sglang_config, "index_head_dim", None) is not None:
             kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
@@ -558,6 +612,12 @@ class FlexKVConfig:
         self._resolve_dtype(
             framework_dtype_str=trt_dtype_str if isinstance(trt_dtype_str, str) else None,
             fallback_dtype=torch.bfloat16,
+        )
+        _warn_nvfp4_unsupported_framework(
+            self.user_config.kv_cache_dtype
+            if self.user_config.kv_cache_dtype is not None
+            else (trt_dtype_str if isinstance(trt_dtype_str, str) else None),
+            framework="trtllm",
         )
 
         # Set model config (parallel configs part).

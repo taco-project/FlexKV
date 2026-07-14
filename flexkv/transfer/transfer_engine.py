@@ -38,6 +38,7 @@ from flexkv.transfer.worker import (
     tpGPUCPUTransferWorker,
     GDSTransferWorker,
     tpGDSTransferWorker,
+    NixlTransferWorker,
     PEER2CPUTransferWorker,
 )
 from flexkv.transfer.layerwise import (
@@ -161,6 +162,19 @@ class TransferEngine:
 
         self.num_gpu_groups = len(self.gpu_handle_groups)
         self._running = False
+        self._has_indexer = False
+
+        self._child_id_to_child: Dict[int, TransferOp] = {}
+        self._child_to_parent_op_id: Dict[int, int] = {}
+
+        self._compressors = build_compressors(
+            cpu_handle=self._cpu_handle,
+            ssd_handle=self._ssd_handle,
+            cache_config=self.cache_config,
+            model_config=self.model_config,
+            gpu_handle_groups=self.gpu_handle_groups,
+            layerwise_enabled=GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer,
+        )
 
         # Used for LAYERWISE PP fan-out: a parent op spawns one replica per PP
         # sibling worker; each replica's completion decrements the parent's
@@ -421,7 +435,34 @@ class TransferEngine:
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
         if self.cache_config.enable_gds:
-            if self.model_config.effective_tp_size_per_node == 1:
+            assert self._ssd_handle is not None
+            if self.cache_config.enable_nixl:
+                if self.model_config.effective_tp_size_per_node != 1:
+                    raise RuntimeError(
+                        "enable_nixl currently requires effective TP size 1")
+                if self.model_config.layer_groups is not None:
+                    raise RuntimeError(
+                        "enable_nixl does not yet support heterogeneous layer_groups")
+                self.gds_workers = {
+                    worker_key: NixlTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        nixl_backend="GDS_MT",
+                        ssd_files=self._ssd_handle.get_file_list(),
+                        num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                        dtype=self._ssd_handle.dtype,
+                        ssd_kv_layout=self._ssd_handle.kv_layout,
+                        gpu_kv_layout=gpu_handles[0].kv_layout,
+                        cpu_kv_layout=self._cpu_handle.kv_layout,
+                        nixl_extra_config=self.cache_config.nixl_extra_config,
+                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
+                        cpu_blocks=None,
+                        gpu_device_id=gpu_handles[0].gpu_device_id,
+                    )
+                    for worker_key, gpu_handles in self.gpu_handle_groups.items()
+                }
+            elif self.model_config.effective_tp_size_per_node == 1:
                 self.gds_workers: Dict[WorkerKey, WorkerHandle] = {
                     worker_key: GDSTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
@@ -809,6 +850,10 @@ class TransferEngine:
         sel.register(self.task_queue._reader, selectors.EVENT_READ, data="new_graph")
         sel.register(self.finished_ops_queue._reader, selectors.EVENT_READ, data="finished_op")
 
+        # Register indexer finished_ops_queue when indexer is enabled
+        if self._has_indexer:
+            sel.register(self._indexer_finished_ops_queue._reader, selectors.EVENT_READ, data="indexer_finished_op")
+
         # Register shutdown pipe for zero-latency shutdown
         sel.register(self.shutdown_read_fd, selectors.EVENT_READ, data="shutdown")
 
@@ -878,6 +923,30 @@ class TransferEngine:
                             except queue.Empty:
                                 break
                         nvtx.end_range(nvtx_r2)
+
+                    elif key.data == "indexer_finished_op":
+                        # Collect finished ops from indexer worker (batch get all available)
+                        nvtx_r2i = nvtx.start_range(message="transfer scheduler. collect indexer finished ops", color="blue")
+                        while True:
+                            try:
+                                op_id = self._indexer_finished_ops_queue.get_nowait()
+                                assert op_id in self._child_to_parent_op_id, (
+                                    f"[TransferEngine] Indexer op {op_id} not found in "
+                                    f"_child_to_parent_op_id. All indexer ops must be "
+                                    f"registered with a parent op."
+                                )
+                                parent_op_id = self._child_to_parent_op_id.pop(op_id)
+                                indexer_op = self._child_id_to_child.pop(op_id)
+                                free_op_from_buffer(indexer_op, self.pin_buffer)
+                                if op_id in self.op_id_to_nvtx_range:
+                                    nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
+                                parent_op = self.op_id_to_op[parent_op_id]
+                                parent_op.pending_count -= 1
+                                if parent_op.pending_count == 0:
+                                    self._finalize_op(parent_op, finished_ops)
+                            except queue.Empty:
+                                break
+                        nvtx.end_range(nvtx_r2i)
 
                 # Exit loop if shutdown requested
                 if should_shutdown:
@@ -1258,7 +1327,15 @@ class TransferEngine:
                 else:
                     flexkv_logger.debug(f"Shutdown pipes already closed: {e}")
 
-            # shutdown all workers
+            # shutdown indexer workers first
+            if self._has_indexer:
+                for worker in self._indexer_worker_map.values():
+                    if isinstance(worker, dict):
+                        for w in worker.values():
+                            w.shutdown()
+                    else:
+                        worker.shutdown()
+            # shutdown main KV workers
             for worker in self._worker_map.values():
                 if isinstance(worker, dict):
                     for w in worker.values():

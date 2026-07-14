@@ -96,8 +96,6 @@ public:
         if (cqes[i]->res < 0) {
           cqe_err++;
         }
-        iov2 = reinterpret_cast<iovec *>(io_uring_cqe_get_data(cqes[i]));
-        delete iov2;
       }
       total_completed += count;
       inflight -= count;
@@ -123,14 +121,12 @@ public:
       return -1;
     }
 
-    iov = new iovec;
-    iov->iov_base = ptr;
-    iov->iov_len = size;
-    io_uring_prep_readv(sqe, fd, iov, 1, offset);
+    // Single-segment I/O: io_uring_prep_read takes (buf, len) directly, so we
+    // avoid a per-I/O heap iovec (and the matching delete on completion).
+    io_uring_prep_read(sqe, fd, ptr, size, offset);
 
     sqe->ioprio = read_ioprio;
 
-    io_uring_sqe_set_data(sqe, iov);
     prepared++;
     return 0;
   }
@@ -146,14 +142,12 @@ public:
       return -1;
     }
 
-    iov = new iovec;
-    iov->iov_base = ptr;
-    iov->iov_len = size;
-    io_uring_prep_writev(sqe, fd, iov, 1, offset);
+    // Single-segment I/O: io_uring_prep_write takes (buf, len) directly, so we
+    // avoid a per-I/O heap iovec (and the matching delete on completion).
+    io_uring_prep_write(sqe, fd, ptr, size, offset);
 
     sqe->ioprio = write_ioprio;
 
-    io_uring_sqe_set_data(sqe, iov);
     prepared++;
     return 0;
   }
@@ -184,16 +178,13 @@ private:
         cqe_err++;
       }
 
-      iov2 = reinterpret_cast<iovec *>(io_uring_cqe_get_data(cqe));
       io_uring_cqe_seen(&ring, cqe);
       total_completed++;
       inflight--;
-      delete iov2;
     }
     return 0;
   }
 
-  iovec *iov, *iov2;
   io_uring ring;
   io_uring_sqe *sqe;
   io_uring_cqe *cqe;

@@ -45,7 +45,7 @@ from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics import FlexKVMetricsCollector, init_global_collector, get_global_collector
 
 DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
-_VALID_EVICTION_POLICIES = {'lru', 'lfu', 'fifo', 'mru', 'filo'}
+_VALID_EVICTION_POLICIES = {'lru', 'lfu', 'slru', 'fifo', 'mru', 'filo'}
 
 
 @dataclass
@@ -127,10 +127,14 @@ class CacheEngineAccel:
         if eviction_policy not in _VALID_EVICTION_POLICIES:
             raise ValueError(f"Invalid eviction_policy: '{eviction_policy}'. "
                               f"Supported policies: {sorted(_VALID_EVICTION_POLICIES)}")
+        if not isinstance(protected_threshold, int) or protected_threshold < 1:
+            raise ValueError(f"Invalid protected_threshold: {protected_threshold}. "
+                              f"protected_threshold must be an integer >= 1")
 
         self.device_type = device_type
 
-        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy)
+        self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy,
+                                     protected_threshold)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
@@ -295,7 +299,7 @@ class CacheEngineAccel:
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
-             strict: bool = True) -> torch.Tensor:
+             strict: bool = True) -> np.ndarray:
         # Calculate current utilization
         utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
 
@@ -388,10 +392,14 @@ class CacheEngine:
         if eviction_policy not in _VALID_EVICTION_POLICIES:
             raise ValueError(f"Invalid eviction_policy: '{eviction_policy}'. "
                               f"Supported policies: {sorted(_VALID_EVICTION_POLICIES)}")
+        if not isinstance(protected_threshold, int) or protected_threshold < 1:
+            raise ValueError(f"Invalid protected_threshold: {protected_threshold}. "
+                              f"protected_threshold must be an integer >= 1")
 
         self.device_type = device_type
 
-        self.index = RadixTreeIndex(tokens_per_block=tokens_per_block, hit_reward_seconds=hit_reward_seconds, eviction_policy=eviction_policy)
+        self.index = RadixTreeIndex(tokens_per_block=tokens_per_block, hit_reward_seconds=hit_reward_seconds, eviction_policy=eviction_policy,
+                                       protected_threshold=protected_threshold)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
@@ -602,6 +610,7 @@ class GlobalCacheEngine:
         self.evict_start_threshold = GLOBAL_CONFIG_FROM_ENV.evict_start_threshold
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
         self.eviction_policy = GLOBAL_CONFIG_FROM_ENV.eviction_policy
+        self.protected_threshold = GLOBAL_CONFIG_FROM_ENV.slru_protected_threshold
 
         # Initialize metrics collector for cache engine monitoring (before creating CacheEngines)
         self._metrics_collector = get_global_collector()
@@ -850,7 +859,6 @@ class GlobalCacheEngine:
 
         # Record metrics for GET operation
         if self._metrics_collector is not None:
-            self._record_transfer_ops(transfer_graph, "get")
             self._update_mempool_metrics()
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
@@ -1543,9 +1551,8 @@ class GlobalCacheEngine:
 
         op_callback_dict = plan.op_callback_dict
 
-        # Record metrics for PUT operation
+        # Update mempool metrics after PUT operation
         if self._metrics_collector is not None:
-            self._record_transfer_ops(transfer_graph, "put")
             self._update_mempool_metrics()
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
@@ -1717,8 +1724,8 @@ class GlobalCacheEngine:
         if put_to_remote:
             if fragment3_num_blocks > fragment12_num_blocks:
                 extra_num_cpu_blocks = fragment3_num_blocks - fragment12_num_blocks
-                fragment3_cpu_blocks = np.concatenate([fragment12_cpu_blocks,
-                                                  cpu_matched_blocks[-extra_num_cpu_blocks:]])
+                fragment3_cpu_blocks = np.concatenate([cpu_matched_blocks[-extra_num_cpu_blocks:],
+                                                       fragment12_cpu_blocks])
             else:
                 fragment3_cpu_blocks = fragment12_cpu_blocks[-fragment3_num_blocks:]
             op_h2remote = TransferOp(

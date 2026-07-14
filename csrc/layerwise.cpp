@@ -505,7 +505,77 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
                     num_original_layers, iouring_entries, iouring_flags);
 }
 
+void LayerwiseTransferGroup::notify_layer_batch(int start_layer,
+                                                int layers_this_batch) {
+  if (!enable_eventfd_ || layer_eventfds_.empty() || num_counters_ <= 0) {
+    return;
+  }
+  const int offset = current_counter_id_ * tp_size_ * num_layers_;
+  int *eventfds_ptr = layer_eventfds_.data() + offset;
+  for (int layer = start_layer; layer < start_layer + layers_this_batch;
+       ++layer) {
+    for (int tp_rank = 0; tp_rank < tp_size_; ++tp_rank) {
+      int fd = eventfds_ptr[tp_rank * num_layers_ + layer];
+      if (fd >= 0) {
+        uint64_t val = 2;
+        ssize_t ret = write(fd, &val, sizeof(val));
+        (void)ret;
+      }
+    }
+  }
+}
+
+void LayerwiseTransferGroup::event_polling_loop() {
+  while (!poll_stop_.load(std::memory_order_acquire)) {
+    const int next = poll_next_batch_.load(std::memory_order_acquire);
+    if (next >= static_cast<int>(poll_batches_.size())) {
+      std::this_thread::yield();
+      continue;
+    }
+
+    PollBatchInfo &batch = poll_batches_[next];
+    bool ready = true;
+    for (int d = 0; d < num_gpus_; ++d) {
+      cudaSetDevice(gpu_device_ids_[d]);
+      cudaError_t err = cudaEventQuery(batch.per_gpu_events[d]);
+      if (err == cudaErrorNotReady) {
+        ready = false;
+        break;
+      }
+      if (err != cudaSuccess) {
+        fprintf(stderr,
+                "[LayerwiseTransferGroup] cudaEventQuery failed: %s\n",
+                cudaGetErrorString(err));
+        poll_stop_.store(true, std::memory_order_release);
+        return;
+      }
+    }
+    if (ready) {
+      notify_layer_batch(batch.start_layer, batch.layers_this_batch);
+      poll_next_batch_.fetch_add(1, std::memory_order_acq_rel);
+    } else {
+      std::this_thread::yield();
+    }
+  }
+}
+
+void LayerwiseTransferGroup::stop_polling_() {
+  poll_stop_.store(true, std::memory_order_release);
+  if (poll_thread_.joinable()) {
+    poll_thread_.join();
+  }
+  for (auto &batch : poll_batches_) {
+    for (int d = 0; d < static_cast<int>(batch.per_gpu_events.size()); ++d) {
+      cudaSetDevice(gpu_device_ids_[d]);
+      cudaEventDestroy(batch.per_gpu_events[d]);
+    }
+  }
+  poll_batches_.clear();
+  poll_next_batch_.store(0, std::memory_order_release);
+}
+
 LayerwiseTransferGroup::~LayerwiseTransferGroup() {
+  stop_polling_();
   for (int i = 0; i < num_gpus_; i++) {
     cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamDestroy(streams_[i]);
@@ -544,12 +614,12 @@ void LayerwiseTransferGroup::layer_done_callback(
     int start_layer, int layers_this_batch, int expected_count,
     nvtxRangeId_t *current_range_id_ptr, bool is_last_batch,
     const char *next_range_name, nvtxRangeId_t *next_range_id_ptr,
-    int callbacks_per_gpu) {
+    int callbacks_per_gpu, bool notify_eventfd) {
   std::atomic<int> *counter = new std::atomic<int>(0);
 
   // Get eventfd pointer for current counter set
   int *eventfds_ptr = nullptr;
-  if (enable_eventfd_ && num_counters_ > 0) {
+  if (enable_eventfd_ && notify_eventfd && num_counters_ > 0) {
     int offset = current_counter_id_ * tp_size_ * num_layers_;
     eventfds_ptr = layer_eventfds_.data() + offset;
   }
@@ -560,7 +630,8 @@ void LayerwiseTransferGroup::layer_done_callback(
                                                       layers_this_batch,
                                                       expected_count,
                                                       counter,
-                                                      enable_eventfd_,
+                                                      enable_eventfd_ &&
+                                                          notify_eventfd,
                                                       tp_size_,
                                                       num_layers_,
                                                       eventfds_ptr,
@@ -604,7 +675,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t swa_cpu_tp_stride_in_bytes,
     const int64_t swa_ssd_layer_stride_in_bytes,
     const int64_t swa_ssd_kv_stride_in_bytes,
-    const int swa_num_blocks_per_file) {
+    const int swa_num_blocks_per_file, const std::string &mla_d2h_mode,
+    const std::string &notify_mode) {
 
   if (has_multi_group_) {
     throw std::runtime_error(
@@ -614,6 +686,9 @@ void LayerwiseTransferGroup::layerwise_transfer(
 
   // Set current counter ID for eventfd notification
   current_counter_id_ = counter_id;
+  notify_mode_ = notify_mode == "polling" ? NotifyMode::POLLING
+                                           : NotifyMode::HOSTFUNC;
+  stop_polling_();
 
   int num_blocks = gpu_block_id_tensor.numel();
   int64_t *gpu_block_ids =
@@ -631,6 +706,21 @@ void LayerwiseTransferGroup::layerwise_transfer(
   cudaSetDevice(gpu_device_ids_[0]);
   for (int i = 0; i <= num_batches; ++i) {
     cudaEventCreate(&timing_events[i]);
+  }
+
+  if (notify_mode_ == NotifyMode::POLLING) {
+    poll_batches_.resize(num_batches);
+    for (int b = 0; b < num_batches; ++b) {
+      poll_batches_[b].start_layer = b * layer_granularity;
+      poll_batches_[b].layers_this_batch =
+          std::min(layer_granularity, num_layers - b * layer_granularity);
+      poll_batches_[b].per_gpu_events.resize(num_gpus_);
+      for (int d = 0; d < num_gpus_; ++d) {
+        cudaSetDevice(gpu_device_ids_[d]);
+        cudaEventCreateWithFlags(&poll_batches_[b].per_gpu_events[d],
+                                 cudaEventDisableTiming);
+      }
+    }
   }
 
   // Record start event
@@ -716,6 +806,14 @@ void LayerwiseTransferGroup::layerwise_transfer(
   }
 
   int batch_idx = 0;
+  std::string mode = mla_d2h_mode;
+  if (is_mla && mode != "sharded" && mode != "all_write" &&
+      mode != "rank0_only") {
+    fprintf(stderr,
+            "[FlexKV] Invalid mla_d2h_mode='%s'; using 'sharded'\n",
+            mode.c_str());
+    mode = "sharded";
+  }
   for (int start_layer = 0; start_layer < num_layers;
        start_layer += layer_granularity) {
     int layers_this_batch =
@@ -732,7 +830,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
       cudaSetDevice(gpu_device_ids_[i]);
       int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
       if (is_mla) {
-        cpu_startoff_inside_chunks = 0;
+        cpu_startoff_inside_chunks =
+            mode == "all_write"
+                ? i * num_blocks * cpu_block_stride_in_bytes
+                : 0;
       }
       int64_t gpu_startoff_inside_chunks = 0;
       int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
@@ -781,6 +882,14 @@ void LayerwiseTransferGroup::layerwise_transfer(
     cudaSetDevice(gpu_device_ids_[0]);
     cudaEventRecord(timing_events[batch_idx + 1], streams_[0]);
 
+    if (notify_mode_ == NotifyMode::POLLING) {
+      for (int d = 0; d < num_gpus_; ++d) {
+        cudaSetDevice(gpu_device_ids_[d]);
+        cudaEventRecord(poll_batches_[batch_idx].per_gpu_events[d],
+                        streams_[d]);
+      }
+    }
+
     // NVTX: current range ends in callback, next range starts in callback
     bool is_last_batch = (batch_idx == num_batches - 1);
     const char *next_name =
@@ -788,10 +897,18 @@ void LayerwiseTransferGroup::layerwise_transfer(
     nvtxRangeId_t *next_id_ptr =
         is_last_batch ? nullptr : &h2d_range_ids[batch_idx + 1];
 
-    layer_done_callback(start_layer, layers_this_batch, num_gpus_,
-                        &h2d_range_ids[batch_idx], is_last_batch, next_name,
-                        next_id_ptr);
+    if (notify_mode_ == NotifyMode::HOSTFUNC) {
+      layer_done_callback(start_layer, layers_this_batch, num_gpus_,
+                          &h2d_range_ids[batch_idx], is_last_batch, next_name,
+                          next_id_ptr);
+    }
     batch_idx++;
+  }
+  if (notify_mode_ == NotifyMode::POLLING && num_batches > 0) {
+    poll_stop_.store(false, std::memory_order_release);
+    poll_next_batch_.store(0, std::memory_order_release);
+    poll_thread_ =
+        std::thread(&LayerwiseTransferGroup::event_polling_loop, this);
   }
   for (int i = 0; i < num_gpus_; ++i) {
     cudaError_t err = cudaStreamSynchronize(streams_[i]);
@@ -799,6 +916,19 @@ void LayerwiseTransferGroup::layerwise_transfer(
       throw std::runtime_error("layerwise_transfer failed on GPU " +
                                std::to_string(i) + ": " +
                                cudaGetErrorString(err));
+    }
+  }
+  if (notify_mode_ == NotifyMode::POLLING) {
+    while (!poll_stop_.load(std::memory_order_acquire) &&
+           poll_next_batch_.load(std::memory_order_acquire) < num_batches) {
+      std::this_thread::yield();
+    }
+    const bool polling_failed =
+        poll_next_batch_.load(std::memory_order_acquire) < num_batches;
+    stop_polling_();
+    if (polling_failed) {
+      throw std::runtime_error(
+          "layerwise polling notification failed before all batches completed");
     }
   }
 
@@ -868,7 +998,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     const int64_t swa_cpu_tp_stride_in_bytes,
     const int64_t swa_ssd_layer_stride_in_bytes,
     const int64_t swa_ssd_kv_stride_in_bytes,
-    const int swa_num_blocks_per_file) {
+    const int swa_num_blocks_per_file, const std::string &mla_d2h_mode,
+    const std::string &notify_mode) {
   (void)swa_cpu_tp_stride_in_bytes;
 
   if (!has_multi_group_) {
@@ -878,12 +1009,24 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   }
 
   current_counter_id_ = counter_id;
+  notify_mode_ = notify_mode == "polling" ? NotifyMode::POLLING
+                                           : NotifyMode::HOSTFUNC;
+  stop_polling_();
 
   int num_blocks = gpu_block_id_tensor.numel();
   int64_t *gpu_block_ids =
       static_cast<int64_t *>(gpu_block_id_tensor.data_ptr());
   int64_t *cpu_block_ids =
       static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
+
+  std::string mode = mla_d2h_mode;
+  if (is_mla && mode != "sharded" && mode != "all_write" &&
+      mode != "rank0_only") {
+    fprintf(stderr,
+            "[FlexKV] Invalid mla_d2h_mode='%s'; using 'sharded'\n",
+            mode.c_str());
+    mode = "sharded";
+  }
 
   const bool swa_active = has_swa_ && (swa_h2d_src.numel() > 0);
   int64_t *swa_gpu_block_ids = nullptr;
@@ -964,6 +1107,20 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     }
   }
 
+  if (notify_mode_ == NotifyMode::POLLING) {
+    poll_batches_.resize(work_origs.size());
+    for (size_t ai = 0; ai < work_origs.size(); ++ai) {
+      poll_batches_[ai].start_layer = work_origs[ai];
+      poll_batches_[ai].layers_this_batch = 1;
+      poll_batches_[ai].per_gpu_events.resize(num_gpus_);
+      for (int d = 0; d < num_gpus_; ++d) {
+        cudaSetDevice(gpu_device_ids_[d]);
+        cudaEventCreateWithFlags(&poll_batches_[ai].per_gpu_events[d],
+                                 cudaEventDisableTiming);
+      }
+    }
+  }
+
   std::vector<nvtxRangeId_t> h2d_range_ids(num_original_layers_, 0);
   std::vector<std::string> h2d_range_names(num_original_layers_);
   for (int orig : work_origs) {
@@ -992,7 +1149,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
         cudaSetDevice(gpu_device_ids_[d]);
         int64_t cpu_startoff_inside_chunks = d * gp.cpu_tp_stride;
         if (is_mla) {
-          cpu_startoff_inside_chunks = 0;
+          cpu_startoff_inside_chunks =
+              mode == "all_write" ? d * num_blocks * gp.cpu_block_stride : 0;
         }
         int64_t gpu_startoff_inside_chunks = 0;
         int64_t chunk_size = gp.gpu_chunk_sizes[d];
@@ -1039,6 +1197,13 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
                             use_ce_transfer);
     }
 
+    if (notify_mode_ == NotifyMode::POLLING) {
+      for (int d = 0; d < num_gpus_; ++d) {
+        cudaSetDevice(gpu_device_ids_[d]);
+        cudaEventRecord(poll_batches_[ai].per_gpu_events[d], streams_[d]);
+      }
+    }
+
     bool is_last_active = (ai + 1 == work_origs.size());
     int next_orig = is_last_active ? -1 : work_origs[ai + 1];
     const char *next_name =
@@ -1046,12 +1211,21 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     nvtxRangeId_t *next_id_ptr =
         is_last_active ? nullptr : &h2d_range_ids[next_orig];
 
-    int slots_per_gpu = members_this_layer + (swa_active ? 1 : 0);
-    layer_done_callback(/*start_layer=*/orig, /*layers_this_batch=*/1,
-                        /*expected_count=*/slots_per_gpu * num_gpus_,
-                        &h2d_range_ids[orig], is_last_active, next_name,
-                        next_id_ptr,
-                        /*callbacks_per_gpu=*/slots_per_gpu);
+    if (notify_mode_ == NotifyMode::HOSTFUNC) {
+      int slots_per_gpu = members_this_layer + (swa_active ? 1 : 0);
+      layer_done_callback(/*start_layer=*/orig, /*layers_this_batch=*/1,
+                          /*expected_count=*/slots_per_gpu * num_gpus_,
+                          &h2d_range_ids[orig], is_last_active, next_name,
+                          next_id_ptr,
+                          /*callbacks_per_gpu=*/slots_per_gpu);
+    }
+  }
+
+  if (notify_mode_ == NotifyMode::POLLING && !work_origs.empty()) {
+    poll_stop_.store(false, std::memory_order_release);
+    poll_next_batch_.store(0, std::memory_order_release);
+    poll_thread_ =
+        std::thread(&LayerwiseTransferGroup::event_polling_loop, this);
   }
 
   for (int d = 0; d < num_gpus_; ++d) {
@@ -1060,6 +1234,20 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
       throw std::runtime_error("layerwise_transfer_multi_group failed on GPU " +
                                std::to_string(d) + ": " +
                                cudaGetErrorString(err));
+    }
+  }
+  if (notify_mode_ == NotifyMode::POLLING) {
+    const int expected = static_cast<int>(work_origs.size());
+    while (!poll_stop_.load(std::memory_order_acquire) &&
+           poll_next_batch_.load(std::memory_order_acquire) < expected) {
+      std::this_thread::yield();
+    }
+    const bool polling_failed =
+        poll_next_batch_.load(std::memory_order_acquire) < expected;
+    stop_polling_();
+    if (polling_failed) {
+      throw std::runtime_error(
+          "multi-group polling notification failed before all layers completed");
     }
   }
 }

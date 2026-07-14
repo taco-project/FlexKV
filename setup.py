@@ -1,33 +1,196 @@
+import importlib.util
 import os
 import shutil
-import sys
+from pathlib import Path
+from typing import NamedTuple
 
 
 from setuptools import find_packages, setup
-from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
 
 
+class NvcompInfo(NamedTuple):
+    include_dirs: list
+    lib_dir: str
+    link_name: str
+    source: str
+
+
+NVCOMP_SOURCES = [
+    "csrc/compression/common/packed_ssd.cpp",
+    "csrc/compression/common/transfer_ssd_packed.cpp",
+    "csrc/compression/common/common_bindings.cpp",
+    "csrc/compression/ans/nvcomp_ans.cu",
+    "csrc/compression/ans/nvcomp_ans_tp.cpp",
+    "csrc/compression/ans/ans_bindings.cpp",
+]
+
+NVCOMP_HEADERS = [
+    "csrc/compression/common/staging_transfer.cuh",
+    "csrc/compression/common/packed_ssd.h",
+    "csrc/compression/common/transfer_ssd_packed.h",
+    "csrc/compression/ans/nvcomp_ans.cuh",
+    "csrc/compression/ans/nvcomp_ans_tp.h",
+]
+
+
+# Mainstream datacenter + workstation architectures we want the shipped
+# c_ext.so to run on out of the box (Ampere -> Hopper -> Blackwell). The final
+# list is intersected with what the local nvcc actually supports, so this stays
+# buildable on older CUDA toolkits that lack sm_100/sm_120.
+MAINSTREAM_ARCHS = ["8.0", "8.6", "8.9", "9.0", "10.0", "12.0"]
+
+
+def _nvcc_supported_archs():
+    """Return the set of 'major.minor' arches the local nvcc can target.
+
+    Parses ``nvcc --list-gpu-arch`` (lines like ``compute_90``). Returns an
+    empty set if nvcc is unavailable, in which case callers should not filter."""
+    import re
+    import shutil
+    import subprocess
+    nvcc = shutil.which("nvcc") or os.path.join(
+        os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "nvcc")
+    try:
+        out = subprocess.run([nvcc, "--list-gpu-arch"],
+                             capture_output=True, text=True, check=True).stdout
+    except Exception as e:
+        print(f"Could not query nvcc for supported arches: {e}")
+        return set()
+    archs = set()
+    for m in re.finditer(r"compute_(\d+)", out):
+        code = m.group(1)  # e.g. "90" -> 9.0, "100" -> 10.0, "120" -> 12.0
+        archs.add(f"{int(code[:-1])}.{code[-1]}")
+    return archs
+
+
 def detect_cuda_arch():
-    """Auto-detect GPU compute capability. Returns a semicolon-separated arch list.
-    Falls back to a safe default when no GPU is available."""
+    """Return a semicolon-separated TORCH_CUDA_ARCH_LIST.
+
+    By default we build a *multi-arch* binary covering mainstream datacenter and
+    workstation GPUs so a single c_ext.so is portable across machines (this
+    avoids the "no kernel image is available for execution on the device" error
+    that a single-arch build hits when moved to a different GPU). The mainstream
+    set is filtered to what the local nvcc supports, the locally-detected arch is
+    always added, and +PTX is appended to the newest arch for forward-compat JIT
+    onto future GPUs."""
+    supported = _nvcc_supported_archs()
+
+    # Start from the mainstream set, filtered by what nvcc can actually build.
+    archs = {a for a in MAINSTREAM_ARCHS if not supported or a in supported}
+
+    # Always cover the GPU(s) present on the build host, even if not mainstream.
+    local = set()
     try:
         import torch
         if torch.cuda.is_available():
-            archs = set()
             for i in range(torch.cuda.device_count()):
                 major, minor = torch.cuda.get_device_capability(i)
-                archs.add(f"{major}.{minor}")
-            if archs:
-                arch_list = ";".join(sorted(archs))
-                print(f"Auto-detected GPU architectures: {arch_list}")
-                return arch_list
+                local.add(f"{major}.{minor}")
     except Exception as e:
         print(f"GPU architecture auto-detection failed: {e}")
-    # Fallback: common architectures (Ampere + Hopper)
-    fallback = "8.0;8.6;9.0"
-    print(f"No GPU detected, using fallback architectures: {fallback}")
-    return fallback
+    archs |= {a for a in local if not supported or a in supported}
+
+    if not archs:
+        # nvcc query failed AND no torch/GPU: fall back to a broad static list.
+        fallback = "8.0;8.6;9.0"
+        print(f"No arch info available, using fallback architectures: {fallback}")
+        return fallback
+
+    ordered = sorted(archs, key=lambda a: tuple(int(x) for x in a.split(".")))
+    # Emit PTX for the newest arch so unknown future GPUs can JIT from PTX.
+    arch_list = ";".join(ordered[:-1] + [f"{ordered[-1]}+PTX"])
+    print(f"Building for architectures: {arch_list} "
+          f"(mainstream default + local {sorted(local) or 'none'})")
+    return arch_list
+
+
+def _probe_nvcomp_root(root, source):
+    root = Path(root)
+    include_dirs = [
+        str(path)
+        for path in (root / "include", root / "build" / "include")
+        if path.is_dir()
+    ]
+    if not any((Path(path) / "nvcomp" / "ans.h").exists()
+               for path in include_dirs):
+        return None
+
+    for subdir in ("build/lib", "lib/x86_64-linux-gnu", "lib64", "lib", ""):
+        lib_dir = root / subdir if subdir else root
+        if not lib_dir.is_dir():
+            continue
+        if (lib_dir / "libnvcomp.so").exists():
+            return NvcompInfo(include_dirs, str(lib_dir), "nvcomp", source)
+        versioned = sorted(lib_dir.glob("libnvcomp.so.*"))
+        if versioned:
+            return NvcompInfo(
+                include_dirs,
+                str(lib_dir),
+                ":" + versioned[-1].name,
+                source,
+            )
+    return None
+
+
+def _find_nvcomp(nvcomp_root):
+    """Locate public nvcomp headers and library.
+
+    Probing priority:
+      1. NVCOMP_ROOT (error if set but not usable; no silent fallback).
+      2. pip-installed nvidia-nvcomp-cu12 (via importlib.find_spec).
+      3. System /usr.
+    """
+    if nvcomp_root:
+        if not os.path.exists(nvcomp_root):
+            raise ValueError(f"NVCOMP_ROOT={nvcomp_root} does not exist")
+        result = _probe_nvcomp_root(nvcomp_root, f"NVCOMP_ROOT={nvcomp_root}")
+        if not result:
+            raise ValueError(
+                f"NVCOMP_ROOT={nvcomp_root} does not contain a usable nvcomp "
+                "install (need include/nvcomp/ans.h and libnvcomp.so*)"
+            )
+        return result
+
+    spec = importlib.util.find_spec("nvidia.nvcomp")
+    if spec and spec.origin:
+        pip_root = os.path.dirname(spec.origin)
+        result = _probe_nvcomp_root(
+            pip_root,
+            f"pip nvidia-nvcomp-cu12 ({pip_root})",
+        )
+        if result:
+            return result
+
+    result = _probe_nvcomp_root("/usr", "system (/usr)")
+    if result:
+        return result
+
+    raise ValueError(
+        "nvcomp not found. Install via one of:\n"
+        "  pip install nvidia-nvcomp-cu12==4.2.0.14   (recommended)\n"
+        "  a system/distro nvcomp package\n"
+        "Or set NVCOMP_ROOT=/path/to/nvcomp manually."
+    )
+
+
+def _enable_nvcomp_build(cpp_sources, hpp_sources, include_dirs, library_dirs,
+                         extra_link_args, extra_compile_args,
+                         nvcc_compile_args):
+    nvcomp = _find_nvcomp(os.environ.get("NVCOMP_ROOT"))
+    print(f"ENABLE_NVCOMP = true: Compiling with nvcomp ANS support "
+          f"(source={nvcomp.source}, lib={nvcomp.lib_dir})")
+
+    cpp_sources.extend(NVCOMP_SOURCES)
+    hpp_sources.extend(NVCOMP_HEADERS)
+    include_dirs.extend(nvcomp.include_dirs)
+    library_dirs.append(nvcomp.lib_dir)
+    extra_link_args.extend([
+        f"-l{nvcomp.link_name}",
+        f"-Wl,-rpath,{nvcomp.lib_dir}",
+    ])
+    extra_compile_args.append("-DFLEXKV_ENABLE_NVCOMP")
+    nvcc_compile_args.append("-DFLEXKV_ENABLE_NVCOMP")
 
 def get_version():
     import subprocess
@@ -63,6 +226,7 @@ enable_cfs = os.environ.get("FLEXKV_ENABLE_CFS", "0") == "1"
 enable_gds = os.environ.get("FLEXKV_ENABLE_GDS", "0") == "1"
 enable_p2p = os.environ.get("FLEXKV_ENABLE_P2P", "0") == "1"
 enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
+enable_nvcomp = os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") == "1"
 # FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
 enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 
@@ -74,6 +238,7 @@ cpp_sources = [
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/eviction_strategy.cpp",
     "csrc/layerwise.cpp",
     "csrc/monitoring/metrics_manager.cpp",  # Monitoring support
 ]
@@ -83,11 +248,14 @@ hpp_sources = [
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
+    "csrc/eviction_strategy.h",
     "csrc/layerwise.h",
     "csrc/monitoring/metrics_manager.h",  # Monitoring support
 ]
 
 # extra_link_args: dist/Redis (libhiredis) only when FLEXKV_ENABLE_P2P=1
+lib_dir = os.path.join(build_dir, "lib")
+library_dirs = [lib_dir]
 extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
 if enable_p2p:
     extra_link_args.append("-lhiredis")
@@ -111,10 +279,12 @@ print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
 extra_compile_args = ["-std=c++17", "-O3"]
 if enable_metrics:
     extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
-include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
+include_dirs = [
+    os.path.abspath(os.path.join(build_dir, "include")),
+    os.path.abspath("csrc"),
+]
 
 # Add rpath to find libraries at runtime
-lib_dir = os.path.join(build_dir, "lib")
 if os.path.exists(lib_dir):
     extra_link_args.extend([f"-Wl,-rpath,{lib_dir}", "-Wl,-rpath,$ORIGIN"])
     # Also add the current package directory to rpath for installed libraries
@@ -155,6 +325,12 @@ if enable_p2p:
         "csrc/dist/lease_meta_mempool.cpp",
     ])
     extra_compile_args.append("-DFLEXKV_ENABLE_P2P")
+if enable_nvcomp:
+    _enable_nvcomp_build(cpp_sources, hpp_sources, include_dirs, library_dirs,
+                         extra_link_args, extra_compile_args,
+                         nvcc_compile_args)
+else:
+    print("ENABLE_NVCOMP = false: Skipping nvcomp ANS compression")
 if not enable_gds:
     print("ENABLE_GDS = false: Skipping GDS code")
 if not enable_p2p:
@@ -164,7 +340,7 @@ cpp_extensions = [
     cpp_extension.CUDAExtension(
         name="flexkv.c_ext",
         sources=cpp_sources,
-        library_dirs=[os.path.join(build_dir, "lib")],
+        library_dirs=library_dirs,
         include_dirs=include_dirs,
         depends=hpp_sources,
         extra_compile_args={"nvcc": nvcc_compile_args, "cxx": extra_compile_args},

@@ -757,17 +757,23 @@ class RedisMeta:
     def regist_node_meta(self, node_id: int, addr: str, zmq_addr: str, cpu_buffer_ptr: int, ssd_buffer_ptr: int) -> None:
         """Register node meta information as a Redis hash.
 
-        Key: meta:<node_id>
+        Key: meta:<node_id>[:pp<pp_rank>]
+        When pp_size > 1, pp_rank is included in the key for PP rank isolation.
         Fields: node_id (int), addr (str), cpu_buffer_ptr (int), ssd_buffer_ptr (int)
         """
         r = self._client()
-        key = f"meta:{int(node_id)}"
+        if pp_size > 1:
+            key = f"meta:{int(node_id)}:pp{pp_rank}"
+        else:
+            key = f"meta:{int(node_id)}"
         r.hset(key, mapping={
             "node_id": int(node_id),
             "addr": str(addr),
             "zmq_addr": str(zmq_addr),
             "cpu_buffer_ptr": int(cpu_buffer_ptr),
             "ssd_buffer_ptr": int(ssd_buffer_ptr),
+            "pp_rank": int(pp_rank),
+            "pp_size": int(pp_size),
         })
         # No TTL on meta keys.  Liveness is guarded by get_node_meta()
         # which calls is_node_active() (checking the heartbeat-protected
@@ -799,10 +805,16 @@ class RedisMeta:
         out["ssd_buffer_ptr"] = int(sb) if sb is not None and sb != "" else 0
         return out
 
-    def unregist_node_meta(self, node_id: int) -> bool:
-        """Unregister node meta by node_id. Returns True if deleted."""
+    def unregist_node_meta(self, node_id: int, pp_rank: int = 0, pp_size: int = 1) -> bool:
+        """Unregister node meta by node_id. Returns True if deleted.
+
+        When pp_size > 1, only deletes the key for the specified pp_rank.
+        """
         r = self._client()
-        key = f"meta:{int(node_id)}"
+        if pp_size > 1:
+            key = f"meta:{int(node_id)}:pp{pp_rank}"
+        else:
+            key = f"meta:{int(node_id)}"
         return bool(r.delete(key))
 
 

@@ -1,4 +1,5 @@
 import ctypes
+import ctypes.util
 import mmap
 import os
 import weakref
@@ -152,7 +153,7 @@ _PROT_WRITE = 0x2
 _MAP_FAILED = ctypes.c_void_p(-1).value  # (void*)-1
 _HUGETLBFS_MAGIC = 0x958458F6
 
-_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+_libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
 _libc.mmap.restype = ctypes.c_void_p
 _libc.mmap.argtypes = [
     ctypes.c_void_p,

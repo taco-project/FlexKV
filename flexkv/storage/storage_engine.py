@@ -132,6 +132,34 @@ class StorageEngine:
                 file_path=self._cache_config.remote_cache_path,
                 remote_config_custom = self._cache_config.remote_config_custom
             )
+            if self._indexer_config is not None:
+                indexer_remote_layout = KVCacheLayout(
+                    type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                    num_layer=num_layers_per_pp_stage,
+                    num_block=self._cache_config.num_remote_blocks,
+                    tokens_per_block=1,
+                    num_head=self._indexer_config.num_kv_heads,
+                    head_size=self._indexer_config.head_size,
+                    is_mla=True
+                )
+                indexer_remote_path = self._cache_config.remote_cache_path
+                if isinstance(indexer_remote_path, str):
+                    indexer_remote_path = indexer_remote_path + "_indexer"
+                elif isinstance(indexer_remote_path, list):
+                    indexer_remote_path = [p + "_indexer" for p in indexer_remote_path]
+                self.allocate(
+                    device_type=DeviceType.REMOTE,
+                    layout=indexer_remote_layout,
+                    dtype=self._indexer_config.dtype,
+                    file_path=indexer_remote_path,
+                    remote_config_custom=self._cache_config.remote_config_custom,
+                    is_indexer=True,
+                )
+
+    @property
+    def _has_indexer(self) -> bool:
+        """True when indexer is configured and CPU buffer is allocated."""
+        return (DeviceType.CPU, 0) in self._indexer_storage_handles
 
         # SWA pool allocate
         self._swa_cpu_layout: Optional[KVCacheLayout] = None
@@ -229,7 +257,10 @@ class StorageEngine:
                             gpu_blocks: List[TensorSharedHandle],
                             gpu_layout: KVCacheLayout,
                             device_id: int = 0,
-                            dtype: torch.dtype = torch.float16) -> None:
+                            dtype: torch.dtype = torch.float16,
+                            indexer_gpu_blocks: Optional[List[TensorSharedHandle]] = None,
+                            indexer_gpu_layout: Optional[KVCacheLayout] = None,
+                            indexer_dtype: Optional[torch.dtype] = None) -> None:
         self.allocate(
             device_type=DeviceType.GPU,
             layout=gpu_layout,
@@ -237,6 +268,29 @@ class StorageEngine:
             device_id=device_id,
             raw_data=gpu_blocks
         )
+        if indexer_gpu_blocks is not None:
+            # Indexer maps 1:1 with main KV blocks; validate consistency.
+            flexkv_logger.info(
+                f"[StorageEngine] Registering indexer GPU buffer: "
+                f"num_block={indexer_gpu_layout.num_block}, "
+                f"head_size={indexer_gpu_layout.head_size}, "
+                f"num_head={indexer_gpu_layout.num_head}, "
+                f"dtype={indexer_dtype}"
+            )
+            if indexer_gpu_layout.num_block != gpu_layout.num_block:
+                flexkv_logger.warning(
+                    f"[StorageEngine] Indexer GPU num_block mismatch: "
+                    f"indexer_num_block={indexer_gpu_layout.num_block}, "
+                    f"expected={gpu_layout.num_block} (1:1 with main KV blocks)"
+                )
+            self.allocate(
+                device_type=DeviceType.GPU,
+                layout=indexer_gpu_layout,
+                dtype=indexer_dtype if indexer_dtype is not None else dtype,
+                device_id=device_id,
+                raw_data=indexer_gpu_blocks,
+                is_indexer=True,
+            )
 
     def register_swa_gpu_blocks(self,
                                 swa_blocks: List[TensorSharedHandle],
@@ -279,6 +333,7 @@ class StorageEngine:
                  dtype: torch.dtype,
                  device_id: int = 0,
                  raw_data: Optional[Union[List[TensorSharedHandle], List[str], str]] = None,
+                 is_indexer: bool = False,
                  **kwargs: Any) -> bool:
         """
         Create and add an allocator for specified device.

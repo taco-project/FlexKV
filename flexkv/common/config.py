@@ -517,6 +517,10 @@ class CacheConfig:
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_gds: bool = False # Requires enable_ssd=True
+    # When True with enable_gds, GPU<->SSD uses NIXL (GDS_MT) instead of cuFile GDS worker.
+    enable_nixl: bool = False
+    # Optional plugin dict for NixlAgentSession (see nixl README); only used if enable_nixl.
+    nixl_extra_config: Optional[Dict[str, Any]] = None
     enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
                                 # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
     enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
@@ -640,10 +644,11 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     max_file_size_gb=float(os.getenv('FLEXKV_MAX_FILE_SIZE_GB', -1)),  # -1 means no limit
 
-    evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0.1)),
-    evict_start_threshold=float(os.getenv('FLEXKV_EVICT_START_THRESHOLD', 0.7)),
+    evict_ratio=float(os.getenv('FLEXKV_EVICT_RATIO', 0)),
+    evict_start_threshold=float(os.getenv('FLEXKV_EVICT_START_THRESHOLD', 1.0)),
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
     eviction_policy=os.getenv('FLEXKV_EVICTION_POLICY', 'lru'),
+    slru_protected_threshold=int(os.getenv('FLEXKV_SLRU_PROTECTED_THRESHOLD', 2)),
 
     enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
 
@@ -660,6 +665,17 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     lease_ttl_ms=int(os.getenv('FLEXKV_LEASE_TTL_MS', 30000)),
     safety_ttl_ms=int(os.getenv('FLEXKV_SAFETY_TTL_MS', 100)),
     renew_lease_ms=int(os.getenv('FLEXKV_RENEW_LEASE_MS', 4000)),
+
+    nvcomp_batch_size=int(os.getenv('FLEXKV_NVCOMP_BATCH_SIZE', '0')),  # 0 = auto
+
+    # MLA D2H transfer mode (only effective when kv_heads=1)
+    # Available modes: "sharded" (default), "all_write", "rank0_only"
+    mla_d2h_mode=os.getenv('FLEXKV_MLA_D2H_MODE', 'sharded'),
+
+    # Layerwise notification mode
+    # "hostfunc" (default): notify via cudaLaunchHostFunc callback
+    # "polling": notify via cudaEventRecord + polling thread
+    layerwise_notify_mode=os.getenv('FLEXKV_LAYERWISE_NOTIFY_MODE', 'hostfunc'),
 )
 
 @dataclass
@@ -668,6 +684,7 @@ class UserConfig:
     ssd_cache_gb: int = 0  # 0 means disable ssd
     ssd_cache_dir: Union[str, List[str]] = "./ssd_cache"
     enable_gds: bool = False
+    enable_nixl: bool = False
     use_hugepage_cpu_buffer: bool = False
     use_hugepage_tmp_buffer: bool = False
     hugepage_size_bytes: int = 2 * 1024 * 1024
@@ -684,7 +701,7 @@ class UserConfig:
     local_ip: Optional[str] = None
     redis_password: Optional[str] = None
     node_ttl_seconds: Optional[int] = None
-    kv_cache_dtype: Optional[str] = None  # Override kv_cache_dtype when TRT config uses "auto". Supported values: "fp8", "float8", "e4m3", "fp16", "float16", "bf16", "bfloat16", "fp32", "float32"
+    kv_cache_dtype: Optional[str] = None  # Also accepts "nvfp4"/"fp4"/"e2m1" for packed uint8 KV.
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
@@ -730,6 +747,7 @@ def load_user_config_from_env() -> UserConfig:
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
         ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./flexkv_ssd")),
         enable_gds=bool(int(os.getenv('FLEXKV_ENABLE_GDS', 0))),
+        enable_nixl=bool(int(os.getenv('FLEXKV_ENABLE_NIXL', 0))),
         use_hugepage_cpu_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_CPU_BUFFER', 0))),
         use_hugepage_tmp_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_TMP_BUFFER', 0))),
         hugepage_size_bytes=int(os.getenv('FLEXKV_HUGEPAGE_SIZE_BYTES', 2 * 1024 * 1024)),
@@ -819,12 +837,26 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     assert user_config.cpu_cache_gb > 0
     assert user_config.ssd_cache_gb >= 0
 
+    # MLA all_write keeps one complete physical copy per local effective-TP
+    # rank. Preserve the configured byte budget by reducing logical capacity.
+    capacity_divisor = 1
+    if (rank_info.model_config.use_mla
+            and GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode == "all_write"):
+        capacity_divisor = max(
+            1, rank_info.model_config.effective_tp_size_per_node)
+
     # Store original GB values for deferred recomputation (when layer_groups become known)
     cache_config._user_cpu_cache_gb = user_config.cpu_cache_gb
     cache_config._user_ssd_cache_gb = user_config.ssd_cache_gb
 
-    cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
-    cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)
+    cache_config.num_cpu_blocks = (
+        convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
+        // capacity_divisor
+    )
+    cache_config.num_ssd_blocks = (
+        convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)
+        // capacity_divisor
+    )
 
     flexkv_logger.info(
         f"[CacheConfig] GB->blocks conversion: "
@@ -836,6 +868,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
     cache_config.enable_gds = user_config.enable_gds
+    cache_config.enable_nixl = user_config.enable_nixl
     cache_config.use_hugepage_cpu_buffer = user_config.use_hugepage_cpu_buffer
     cache_config.use_hugepage_tmp_buffer = user_config.use_hugepage_tmp_buffer
     cache_config.hugepage_size_bytes = user_config.hugepage_size_bytes

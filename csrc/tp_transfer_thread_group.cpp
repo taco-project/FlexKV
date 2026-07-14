@@ -20,6 +20,7 @@
 
 #include <chrono>
 #include <stdexcept>
+#include <type_traits>
 
 namespace flexkv {
 
@@ -30,7 +31,10 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     const std::vector<int64_t> &gpu_block_strides_in_bytes,
     const std::vector<int64_t> &gpu_layer_strides_in_bytes,
     const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
-    const std::vector<int64_t> &gpu_device_ids) {
+    const std::vector<int64_t> &gpu_device_ids,
+    bool enable_nvcomp, int nvcomp_batch_size, int nvcomp_data_type) {
+  const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
+
   num_gpus_ = num_gpus;
   num_tensors_per_gpu_ = num_tensors_per_gpu;
 
@@ -119,9 +123,18 @@ TPTransferThreadGroup::TPTransferThreadGroup(
       }
     });
   }
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  if (enable_nvcomp) {
+    init_nvcomp(nvcomp_batch_size, nvcomp_data_type);
+  }
+#endif
+
 }
 
 TPTransferThreadGroup::~TPTransferThreadGroup() {
+  const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
+
   stop_pool_ = true;
   for (auto &cv : cvs_)
     cv.notify_all();
@@ -130,6 +143,10 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
       t.join();
 
   cudaFreeHost(gpu_blocks_);
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  destroy_nvcomp_state();
+#endif
 
   gpu_tensor_handlers_.clear();
   delete[] gpu_kv_strides_in_bytes_;
@@ -158,7 +175,8 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_block_stride_in_bytes,
     const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
-    const int layer_id, const int layer_granularity, const bool is_mla) {
+    const int layer_id, const int layer_granularity, const bool is_mla,
+    const std::string &mla_d2h_mode) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -202,6 +220,15 @@ void TPTransferThreadGroup::tp_group_transfer(
   }
 
   for (int i = 0; i < num_gpus_; ++i) {
+    // For rank0_only mode in D2H: only rank 0 performs transfer
+    if (is_mla && !is_host_to_device && mode == "rank0_only" && i != 0) {
+      // Skip D2H transfer for non-rank0 GPUs
+      futures.emplace_back(enqueue_for_gpu(i, [i]() {
+        // Empty task - non-rank0 GPUs do nothing in rank0_only D2H mode
+      }));
+      continue;
+    }
+
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       D2hDebugGpuScope gpu_scope(i);
       try {

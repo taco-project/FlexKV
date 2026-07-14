@@ -182,8 +182,8 @@ class FlexKVSchedulerConnector:
         # request_id -> task_id
         self.req_id_to_task_dict: dict[str, int] = {}
         # launched but unfinished tasks
-        self.get_tasks: dict[int, FlexKVGetTask] = {}
-        self.put_tasks: dict[int, FlexKVPutTask] = {}
+        self.get_tasks: dict[int, list[FlexKVGetTask]] = {}
+        self.put_tasks: dict[int, list[FlexKVPutTask]] = {}
         # unlaunched tasks
         self.tasks_to_launch: dict[int, FlexKVTask] = {}
         self.tasks_to_cancel: dict[int, FlexKVTask] = {}
@@ -504,7 +504,8 @@ class FlexKVSchedulerConnector:
                                                         match_start_time=match_start_time,
                                                         match_end_time=match_end_time)
             # logger.debug(f"FlexKV create put task: {self.tasks_to_cancel[task_id]}")
-
+        else:
+            self.flexkv_manager.cancel(task_ids=[task_id])
         return task_id, num_matched_tokens, num_unmatched_tokens
 
     def _need_to_put(
@@ -554,27 +555,43 @@ class FlexKVSchedulerConnector:
         task_launch_time = time.perf_counter()
         get_task_ids: list[int] = []
         get_slot_mappings: list[np.ndarray] = []
+        get_tasks_to_launch: list[FlexKVGetTask] = []
         put_task_ids: list[int] = []
         put_slot_mappings: list[np.ndarray] = []
+        put_tasks_to_launch: list[FlexKVPutTask] = []
 
         for task_id, task in self.tasks_to_launch.items():
             task.task_launch_time = task_launch_time
             if isinstance(task, FlexKVGetTask):
                 get_task_ids.append(task_id)
                 get_slot_mappings.append(task.slot_mapping)
-                self.get_tasks[task_id] = task
+                get_tasks_to_launch.append(task)
             else:
                 put_task_ids.append(task_id)
                 put_slot_mappings.append(task.slot_mapping)
-                self.put_tasks[task_id] = task
+                put_tasks_to_launch.append(task)
         if get_task_ids:
-            self.flexkv_manager.launch(task_ids=get_task_ids,
+            launched_get_task_ids = self.flexkv_manager.launch(task_ids=get_task_ids,
                                        slot_mappings=get_slot_mappings,
                                        as_batch=self.enable_batch)
+            if len(launched_get_task_ids) == 1 and len(get_tasks_to_launch) > 1:
+                self.get_tasks[launched_get_task_ids[0]] = get_tasks_to_launch
+            elif len(launched_get_task_ids) == len(get_tasks_to_launch):
+                for launched_task_id, task in zip(launched_get_task_ids, get_tasks_to_launch):
+                    self.get_tasks[launched_task_id] = [task]
+            else:
+                raise ValueError("KVTaskManager returned unexpected number of launched get task ids.")
         if put_task_ids:
-            self.flexkv_manager.launch(task_ids=put_task_ids,
+            launched_put_task_ids = self.flexkv_manager.launch(task_ids=put_task_ids,
                                        slot_mappings=put_slot_mappings,
                                        as_batch=self.enable_batch)
+            if len(launched_put_task_ids) == 1 and len(put_tasks_to_launch) > 1:
+                self.put_tasks[launched_put_task_ids[0]] = put_tasks_to_launch
+            elif len(launched_put_task_ids) == len(put_tasks_to_launch):
+                for launched_task_id, task in zip(launched_put_task_ids, put_tasks_to_launch):
+                    self.put_tasks[launched_task_id] = [task]
+            else:
+                raise ValueError("KVTaskManager returned unexpected number of launched put task ids.")
         self.tasks_to_launch.clear()
 
     def query_finished_task(self) -> tuple[set[str], set[str]]:
@@ -597,20 +614,21 @@ class FlexKVSchedulerConnector:
         for task_id, response in responses_from_manager.items():
             success = (response.status == KVResponseStatus.SUCCESS)
             if task_id in self.get_tasks:
-                task = self.get_tasks.pop(task_id)
-                finished_recving.add(task.request.request_id)
+                tasks = self.get_tasks.pop(task_id)
+                finished_recving.update(task.request.request_id for task in tasks)
             else:
-                task = self.put_tasks.pop(task_id)
-                finished_sending.add(task.request.request_id)
-            del self.req_id_to_task_dict[task.request.request_id]
-            task.task_finished_time = task_finished_time
-            if not success:
-                logger.error(f"{task} failed, status: {response.status}.")
-                num_failed_tasks += 1
-                if isinstance(task, FlexKVGetTask):
-                    self.failed_block_ids.update(task.block_ids)
-            # responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
-            #                                             request=task.request, success=success))
+                tasks = self.put_tasks.pop(task_id)
+                finished_sending.update(task.request.request_id for task in tasks)
+            for task in tasks:
+                del self.req_id_to_task_dict[task.request.request_id]
+                task.task_finished_time = task_finished_time
+                if not success:
+                    logger.error(f"{task} failed, status: {response.status}.")
+                    num_failed_tasks += 1
+                    if isinstance(task, FlexKVGetTask):
+                        self.failed_block_ids.update(task.block_ids)
+                # responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
+                #                                             request=task.request, success=success))
         self.flexkv_stats.record_faild(num_failed_requests=num_failed_tasks)
         return finished_sending, finished_recving
 
@@ -656,12 +674,14 @@ class FlexKVSchedulerConnector:
         responses_to_return: list[FlexKVResponse] = []
         for task_id, response in response_from_manager.items():
             success = (response.status == KVResponseStatus.SUCCESS)
-            task = task_dict.pop(task_id)
-            task.task_finished_time = task_finished_time
-            if not success:
-                logger.error(f"{task} failed, status: {response.status}.")
-            responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
-                                                      request=task.request, success=success))
+            tasks = task_dict.pop(task_id)
+            for task in tasks:
+                del self.req_id_to_task_dict[task.request.request_id]
+                task.task_finished_time = task_finished_time
+                if not success:
+                    logger.error(f"{task} failed, status: {response.status}.")
+                responses_to_return.append(FlexKVResponse(task_id=task.task_id, task_type=task.task_type,
+                                           request=task.request, success=success))
         return responses_to_return
 
 

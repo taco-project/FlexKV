@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <map>
@@ -7,6 +8,7 @@
 #include <nvtx3/nvToolsExt.h>
 #include <string>
 #include <sys/eventfd.h>
+#include <thread>
 #include <torch/extension.h>
 #include <unistd.h>
 #include <vector>
@@ -160,7 +162,9 @@ public:
       const int64_t swa_cpu_tp_stride_in_bytes = 0,
       const int64_t swa_ssd_layer_stride_in_bytes = 0,
       const int64_t swa_ssd_kv_stride_in_bytes = 0,
-      const int swa_num_blocks_per_file = 0);
+      const int swa_num_blocks_per_file = 0,
+      const std::string &mla_d2h_mode = "sharded",
+      const std::string &notify_mode = "hostfunc");
 
   // Multi-group layerwise transfer: SSD->CPU per group, CPU->GPU per original
   // layer (expanding the CSR to fire one transfer kernel per group member).
@@ -187,7 +191,9 @@ public:
       const int64_t swa_cpu_tp_stride_in_bytes = 0,
       const int64_t swa_ssd_layer_stride_in_bytes = 0,
       const int64_t swa_ssd_kv_stride_in_bytes = 0,
-      const int swa_num_blocks_per_file = 0);
+      const int swa_num_blocks_per_file = 0,
+      const std::string &mla_d2h_mode = "sharded",
+      const std::string &notify_mode = "hostfunc");
 
 private:
   int num_gpus_;
@@ -236,6 +242,19 @@ private:
   std::vector<int> layer_eventfds_; // Flat array
   int current_counter_id_; // Current counter set index for this transfer
 
+  enum class NotifyMode { HOSTFUNC, POLLING };
+  NotifyMode notify_mode_ = NotifyMode::HOSTFUNC;
+
+  struct PollBatchInfo {
+    int start_layer = 0;
+    int layers_this_batch = 0;
+    std::vector<cudaEvent_t> per_gpu_events;
+  };
+  std::vector<PollBatchInfo> poll_batches_;
+  std::atomic<bool> poll_stop_{false};
+  std::atomic<int> poll_next_batch_{0};
+  std::thread poll_thread_;
+
   // ---- Multi-group state ----
   bool has_multi_group_;
   std::vector<GroupParams> groups_;
@@ -252,7 +271,12 @@ private:
                            nvtxRangeId_t *current_range_id_ptr,
                            bool is_last_batch, const char *next_range_name,
                            nvtxRangeId_t *next_range_id_ptr,
-                           int callbacks_per_gpu = 1);
+                           int callbacks_per_gpu = 1,
+                           bool notify_eventfd = true);
+
+  void notify_layer_batch(int start_layer, int layers_this_batch);
+  void event_polling_loop();
+  void stop_polling_();
 
   void init_swa_sidecar_(
       bool has_swa,

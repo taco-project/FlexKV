@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+# TODO(nvfp4): Dynamo integration currently drives FlexKV through the vLLM
+# adapter (post_init_from_vllm_config), which is the only path that applies the
+# nvfp4 packed head_size fold (head_size -> head_size//2 + head_size//16). If a
+# Dynamo-specific FlexKVConfig init path is ever added, mirror that fold there
+# (see _warn_nvfp4_unsupported_framework in flexkv/integration/config.py);
+# otherwise NVFP4 KV cache is only verified via the vLLM adapter.
+
 from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
 from queue import Queue
 import threading

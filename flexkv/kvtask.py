@@ -102,6 +102,15 @@ class KVTaskManager:
                  redis_meta: RedisMeta = None,
                  event_collector: Optional[KVEventCollector] = None
                  ):
+        if cache_config.enable_nixl and not cache_config.enable_gds:
+            raise ValueError("enable_nixl requires enable_gds=True")
+        if (cache_config.enable_nixl
+                and model_config.effective_tp_size_per_node != 1):
+            raise ValueError(
+                "enable_nixl currently requires effective TP size 1")
+        if cache_config.enable_nixl and model_config.layer_groups is not None:
+            raise ValueError(
+                "enable_nixl does not yet support heterogeneous layer_groups")
         self.model_config = model_config
         self.cache_config = cache_config
 
@@ -363,8 +372,6 @@ class KVTaskManager:
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
         task = self.tasks[task_id]
-        if task.batch_task_id is not None:
-            return self.check_completed(task.batch_task_id, completely)
         self._process_empty_graph(task_id)
         if completely:
             return task.is_completed()
@@ -575,9 +582,8 @@ class KVTaskEngine(KVTaskManager):
                     )
                     break
                 elif self.check_completed(task_id, completely=completely):
-                    effective_id = self.tasks[task_id].batch_task_id or task_id
                     return_responses[task_id] = KVResponse(
-                        status=convert_to_response_status(self.tasks[effective_id].status),
+                        status=convert_to_response_status(self.tasks[task_id].status),
                         task_id=task_id,
                         return_mask=self.tasks[task_id].return_mask
                     )
@@ -839,8 +845,10 @@ class KVTaskEngine(KVTaskManager):
         self.graph_to_task[batch_task_graph.graph_id] = batch_id
         self.tasks[batch_id].pending_sub_count = len(task_ids)
         for task_id in task_ids:
-            self.graph_to_task.pop(self.tasks[task_id].graph.graph_id, None)
-            self.tasks[task_id].batch_task_id = batch_id
+            child_task = self.tasks[task_id]
+            if child_task.graph is not None:
+                self.graph_to_task.pop(child_task.graph.graph_id, None)
+            self.tasks.pop(task_id, None)
         return batch_task_graph
 
     def launch_tasks(self,

@@ -215,6 +215,18 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
         self.h2d_cta_num = h2d_cta_num
         self.d2h_cta_num = d2h_cta_num
+        self.mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
+        if self.mla_d2h_mode not in ("sharded", "all_write", "rank0_only"):
+            raise ValueError(
+                "FLEXKV_MLA_D2H_MODE must be 'sharded', 'all_write', or "
+                f"'rank0_only', got {self.mla_d2h_mode!r}"
+            )
+        self.layerwise_notify_mode = GLOBAL_CONFIG_FROM_ENV.layerwise_notify_mode
+        if self.layerwise_notify_mode not in ("hostfunc", "polling"):
+            raise ValueError(
+                "FLEXKV_LAYERWISE_NOTIFY_MODE must be 'hostfunc' or "
+                f"'polling', got {self.layerwise_notify_mode!r}"
+            )
 
         # initialize SSD storage (file count etc. — strides handled per-group below)
         self.enable_ssd = len(ssd_files) > 0
@@ -801,6 +813,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 use_ce_transfer=self.use_ce_transfer_h2d,
                 is_mla=self.is_mla,
                 counter_id=counter_id,
+                mla_d2h_mode=self.mla_d2h_mode,
+                notify_mode=self.layerwise_notify_mode,
                 **swa_kwargs,
             )
             return
@@ -828,6 +842,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
             self.is_mla,
             counter_id,
+            mla_d2h_mode=self.mla_d2h_mode,
+            notify_mode=self.layerwise_notify_mode,
             **swa_kwargs,
         )
 

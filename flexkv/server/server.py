@@ -149,7 +149,6 @@ class KVServer:
         cache_config: CacheConfig,
         gpu_register_port: str,
         server_recv_port: str,
-        total_clients: int = 0,
     ):
 
         self.model_config = model_config

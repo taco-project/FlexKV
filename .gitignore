@@ -76,3 +76,18 @@ cover/
 
 # logs
 *.log
+
+# virtual environments
+.venv/
+venv/
+
+# test-generated SSD cache dirs
+ssd_cache*/
+.nfs*
+
+.misc/
+.claude/
+*cache*/
+benchmarks/nvcomp_benchmarks/inputs
+benchmarks/nvcomp_benchmarks/runs
+uv.lock

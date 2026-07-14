@@ -19,11 +19,16 @@ class cudaIpcMemHandle_t(ctypes.Structure):
 # Load CUDA runtime library
 try:
     cudart = ctypes.CDLL("libcudart.so")
-except:
+except OSError:
     try:
         cudart = ctypes.CDLL("libcudart.so.12")
-    except:
-        cudart = ctypes.CDLL("libcudart.so.11")
+    except OSError:
+        try:
+            cudart = ctypes.CDLL("libcudart.so.11")
+        except OSError:
+            # Allow pure configuration/control-plane imports on CPU-only hosts.
+            # Direct CUDA IPC operations below still fail explicitly.
+            cudart = None
 
 # CUDA IPC handle size (64 bytes on Linux)
 CUDA_IPC_HANDLE_SIZE = 64
@@ -338,6 +343,9 @@ class TensorSharedHandle:
         """
         Use CUDA IPC API to export the tensor's IPC handle
         """
+        if cudart is None:
+            raise RuntimeError("CUDA runtime is unavailable; cannot export IPC handle")
+
         # Get device pointer
         data_ptr = tensor.data_ptr()
         device = tensor.device
@@ -390,6 +398,9 @@ class TensorSharedHandle:
             device: Target CUDA device
             offset: Offset in bytes from the base pointer (for memory pool allocations)
         """
+        if cudart is None:
+            raise RuntimeError("CUDA runtime is unavailable; cannot open IPC handle")
+
         # Ensure CUDA is initialized in this process
         if not torch.cuda.is_initialized():
             flexkv_logger.info("Initializing CUDA in subprocess")
