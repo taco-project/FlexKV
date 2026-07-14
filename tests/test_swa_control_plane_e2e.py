@@ -22,6 +22,7 @@ Flow (mirrors KVManager get_match(swa_aware=True) + launch, minus the tp_client 
 Run INSIDE the container on a free GPU:
     CUDA_VISIBLE_DEVICES=0 python3 tests/test_swa_control_plane_e2e.py
 """
+import gc
 import sys
 import time
 
@@ -106,7 +107,7 @@ def _run_graph(te, engine, graph, op_cb, cb, full_gpu_blocks, swa_gpu_slot,
     cb()
 
 
-def main() -> int:
+def _run(transfer_engines) -> int:
     if not torch.cuda.is_available():
         print("[verify] CUDA not available", flush=True)
         return 2
@@ -162,6 +163,7 @@ def main() -> int:
         swa_gpu_handles={worker_key: [se.get_swa_storage_handle(DEVICE_ID)]},
         swa_cpu_handle=se.get_storage_handle(DeviceType.CPU, device_id=0, is_swa=True),
     )
+    transfer_engines.append(te)
     te.start()
     print("[verify] TransferEngine started (main-KV + SWA workers)", flush=True)
 
@@ -240,12 +242,24 @@ def main() -> int:
               f"(lock_ref after fresh probe == 1: {lock_ok})", flush=True)
         failed = failed or not lock_ok
 
-    te.shutdown()
     if failed:
         return 4
     print("[verify] PASS: engine control-plane graph moved main-KV + SWA byte-exact, "
           "no stub, lock released", flush=True)
     return 0
+
+
+def main() -> int:
+    """Run the E2E flow and always tear down spawned CUDA workers."""
+    transfer_engines = []
+    try:
+        return _run(transfer_engines)
+    finally:
+        for transfer_engine in reversed(transfer_engines):
+            transfer_engine.shutdown()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 @pytest.mark.e2e

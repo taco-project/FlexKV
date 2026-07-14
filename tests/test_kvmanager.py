@@ -1,3 +1,4 @@
+import contextlib
 import time
 import os
 import shutil
@@ -200,6 +201,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
         )
         tp_client_processes.append(tp_client_process)
         tp_client_process.start()
+        child_conn.close()
 
     # Collect GPU blocks from all tp_client processes
     print(f"[Main Process] Waiting to receive GPU blocks from {tp_size} TP client processes...")
@@ -697,7 +699,11 @@ def run_tp_client_with_indexer(dp_client_id,
             child_conn.close()
 
 
+INDEXER_STARTUP_TIMEOUT_S = 60.0
+
+
 def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
+                      request,
                       test_label="indexer", layerwise=False,
                       indexer_compress_ratio: int = 1):
     """Core test logic for KVManager with indexer shadow transfer.
@@ -745,16 +751,28 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
     )
     model_config.layer_groups = [main_group, indexer_group]
 
+    pipe_connections = []
+    tp_client_processes = []
     kvmanager = KVManager(
         model_config=model_config,
         cache_config=cache_config,
         dp_client_id=0,
     )
+
+    def cleanup():
+        for conn in pipe_connections:
+            with contextlib.suppress(OSError):
+                conn.close()
+        shutdown_tp_client(tp_client_processes)
+        kvmanager.shutdown()
+
+    # pytest finalizers run even when an assertion or timeout interrupts the
+    # test, preventing failed cases from leaking CUDA workers into the next
+    # parametrized case.
+    request.addfinalizer(cleanup)
     kvmanager.start()
 
     mp_ctx = mp.get_context('spawn')
-    pipe_connections = []
-    tp_client_processes = []
 
     for tp_rank in range(tp_size):
         parent_conn, child_conn = mp_ctx.Pipe()
@@ -769,11 +787,19 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
         )
         tp_client_processes.append(tp_client_process)
         tp_client_process.start()
+        child_conn.close()
 
     all_gpu_blocks = []
     all_indexer_blocks = []
     for tp_rank, parent_conn in enumerate(pipe_connections):
         try:
+            if not parent_conn.poll(INDEXER_STARTUP_TIMEOUT_S):
+                process = tp_client_processes[tp_rank]
+                raise TimeoutError(
+                    f"TP client {tp_rank} registration timed out after "
+                    f"{INDEXER_STARTUP_TIMEOUT_S}s "
+                    f"(alive={process.is_alive()}, exitcode={process.exitcode})"
+                )
             shared_payload = parent_conn.recv()
             if shared_payload is not None:
                 if isinstance(shared_payload, dict):
@@ -787,9 +813,11 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
                     print(f"[Main Process] Received GPU blocks from TP client {tp_rank}")
                 if shared_indexer_blocks is not None:
                     all_indexer_blocks.append(shared_indexer_blocks)
-            parent_conn.close()
         except Exception as e:
             print(f"[Main Process] Error receiving from TP client {tp_rank}: {e}")
+            raise
+        finally:
+            parent_conn.close()
 
     gpu_kv_verifier = None
     if all_gpu_blocks and len(all_gpu_blocks) == tp_size:
@@ -829,8 +857,22 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
             dtype=indexer_cfg.dtype,
         )
 
+    ready_deadline = time.monotonic() + INDEXER_STARTUP_TIMEOUT_S
     while not kvmanager.is_ready():
-        time.sleep(1)
+        dead_clients = [
+            (idx, process.exitcode)
+            for idx, process in enumerate(tp_client_processes)
+            if not process.is_alive()
+        ]
+        if dead_clients:
+            raise RuntimeError(
+                f"TP clients exited before KVManager became ready: "
+                f"{dead_clients}")
+        if time.monotonic() >= ready_deadline:
+            raise TimeoutError(
+                f"KVManager ({test_label}) did not become ready within "
+                f"{INDEXER_STARTUP_TIMEOUT_S}s")
+        time.sleep(0.2)
         flexkv_logger.info(f"waiting for flexkv ({test_label}) to be ready")
     print(f"[Test] KVManager ({test_label}) is ready")
 
@@ -972,8 +1014,6 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
        (enable_ssd and num_ssd_blocks >= num_gpu_blocks):
         assert total_cache_miss == 0, f"Expected 0 cache miss, got {total_cache_miss}"
 
-    shutdown_tp_client(tp_client_processes)
-    kvmanager.shutdown()
     print(f"[Test] {test_label} PASSED")
 
 
@@ -995,11 +1035,13 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
 @pytest.mark.parametrize("gpu_layout_type", [0])
 @pytest.mark.parametrize("indexer_compress_ratio", [1, 4])
 def test_kvmanager_with_indexer(model_config, cache_config, test_config,
-                                gpu_layout_type, indexer_compress_ratio):
+                                gpu_layout_type, indexer_compress_ratio,
+                                request):
     """Test KVManager with indexer: GPU↔CPU (and optionally ↔SSD) data correctness."""
     ssd_label = "+ssd" if cache_config.enable_ssd else ""
     cr_label = f"+cr{indexer_compress_ratio}" if indexer_compress_ratio != 1 else ""
     _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
+                      request,
                       test_label=f"indexer{ssd_label}{cr_label}",
                       indexer_compress_ratio=indexer_compress_ratio)
 
@@ -1037,26 +1079,30 @@ def _mock_sglang_eventfd_client(socket_path: str,
                                 tp_rank: int,
                                 tp_size: int,
                                 num_layers: int,
+                                handshake_done: threading.Event,
+                                stop_requested: threading.Event,
+                                errors: list,
                                 num_counters: int = 3,
                                 max_retries: int = 120,
                                 retry_interval: float = 0.5):
     """Simulate SGLang sending eventfds to the LayerwiseTransferWorker.
 
-    Runs in a background thread.  Creates real eventfds so the C++
-    LayerwiseTransferGroup receives valid file descriptors.  The eventfds
-    are never read by anyone in the test, but that is fine: the C++
-    ``enable_eventfd_`` flag will be ``true`` and ``eventfd_write`` will
-    simply increment the counter without blocking.
+    Runs in a background thread. Creates real eventfds so the C++
+    LayerwiseTransferGroup receives valid file descriptors. The worker gets
+    its own copies through SCM_RIGHTS; the sender copies are closed after the
+    handshake.
     """
     created_fds = []
+    sock = None
     try:
         # Create real eventfds
         for _ in range(num_counters * num_layers):
             created_fds.append(_sys_eventfd(0, _EFD_SEMAPHORE))
 
         # Retry connecting until the worker process binds the socket
-        sock = None
         for attempt in range(max_retries):
+            if stop_requested.is_set():
+                return
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 sock.connect(socket_path)
@@ -1066,12 +1112,13 @@ def _mock_sglang_eventfd_client(socket_path: str,
             except (FileNotFoundError, ConnectionRefusedError):
                 sock.close()
                 sock = None
-                time.sleep(retry_interval)
+                if stop_requested.wait(retry_interval):
+                    return
 
         if sock is None:
-            print(f"[MockEventfdClient] FAILED to connect to {socket_path} "
-                  f"after {max_retries} attempts")
-            return
+            raise TimeoutError(
+                f"Failed to connect to {socket_path} after "
+                f"{max_retries} attempts")
 
         metadata = struct.pack("iiii",
                                tp_rank, tp_size,
@@ -1091,16 +1138,21 @@ def _mock_sglang_eventfd_client(socket_path: str,
         if ack and ack[0] == 1:
             print(f"[MockEventfdClient] Eventfd handshake OK "
                   f"(counters={num_counters}, layers={num_layers})")
+            handshake_done.set()
         else:
-            print(f"[MockEventfdClient] Unexpected ACK: {ack!r}")
-        sock.close()
+            raise RuntimeError(f"Unexpected eventfd ACK: {ack!r}")
     except Exception as e:
+        errors.append(e)
         print(f"[MockEventfdClient] Error: {e}")
         traceback.print_exc()
-    # Note: we intentionally do NOT close the eventfds here.
-    # They must remain valid for the lifetime of the LayerwiseTransferGroup
-    # in the worker subprocess.  They will be cleaned up when the worker
-    # process exits and the OS reclaims the file descriptors.
+    finally:
+        if sock is not None:
+            sock.close()
+        # SCM_RIGHTS duplicates descriptors into the receiving worker, so the
+        # sender must close its copies or every parametrized case leaks fds.
+        for fd in created_fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 @pytest.mark.parametrize(
@@ -1120,7 +1172,8 @@ def _mock_sglang_eventfd_client(socket_path: str,
 @pytest.mark.parametrize("gpu_layout_type", [0])
 @pytest.mark.parametrize("indexer_compress_ratio", [1, 4])
 def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_config,
-                                          gpu_layout_type, indexer_compress_ratio):
+                                          gpu_layout_type, indexer_compress_ratio,
+                                          request):
     """Test KVManager with indexer in LAYERWISE mode.
 
     Validates the full round-trip:
@@ -1137,23 +1190,30 @@ def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_confi
 
     # Save original values
     orig_layerwise_env = os.environ.get('FLEXKV_ENABLE_LAYERWISE_TRANSFER')
+    orig_socket_env = os.environ.get('FLEXKV_LAYERWISE_EVENTFD_SOCKET')
     orig_layerwise_flag = GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
 
-    # Determine the socket path that the worker will listen on.
-    # For tp_size=1, pp_size=1, dp_size=1, there is no suffix.
-    socket_path = os.environ.get('FLEXKV_LAYERWISE_EVENTFD_SOCKET',
-                                 '/tmp/flexkv_layerwise_eventfd.sock')
+    # A unique path prevents stale workers or parametrized cases from binding
+    # or connecting to one another's eventfd socket.
+    socket_path = (
+        f"/tmp/flexkv_layerwise_eventfd_{os.getpid()}_{time.time_ns()}.sock")
+    handshake_done = threading.Event()
+    stop_requested = threading.Event()
+    eventfd_errors = []
+    eventfd_thread = None
 
     try:
         # Enable layerwise transfer
         os.environ['FLEXKV_ENABLE_LAYERWISE_TRANSFER'] = '1'
+        os.environ['FLEXKV_LAYERWISE_EVENTFD_SOCKET'] = socket_path
         GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = True
 
         # Start mock SGLang eventfd client thread BEFORE kvmanager.start()
         # so it is ready to connect once the worker process binds the socket.
         eventfd_thread = threading.Thread(
             target=_mock_sglang_eventfd_client,
-            args=(socket_path, 0, 1, model_config.num_layers),
+            args=(socket_path, 0, 1, model_config.num_layers,
+                  handshake_done, stop_requested, eventfd_errors),
             daemon=True,
         )
         eventfd_thread.start()
@@ -1161,15 +1221,30 @@ def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_confi
         ssd_label = "+ssd" if cache_config.enable_ssd else ""
         cr_label = f"+cr{indexer_compress_ratio}" if indexer_compress_ratio != 1 else ""
         _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
+                          request,
                           test_label=f"layerwise+indexer{ssd_label}{cr_label}",
                           layerwise=True,
                           indexer_compress_ratio=indexer_compress_ratio)
 
         eventfd_thread.join(timeout=10)
+        assert not eventfd_thread.is_alive(), \
+            "mock eventfd client did not exit after the layerwise test"
+        assert not eventfd_errors, \
+            f"mock eventfd handshake failed: {eventfd_errors!r}"
+        assert handshake_done.is_set(), "mock eventfd handshake did not complete"
     finally:
+        stop_requested.set()
+        if eventfd_thread is not None and eventfd_thread.is_alive():
+            eventfd_thread.join(timeout=2)
         # Restore original environment and config
         if orig_layerwise_env is None:
             os.environ.pop('FLEXKV_ENABLE_LAYERWISE_TRANSFER', None)
         else:
             os.environ['FLEXKV_ENABLE_LAYERWISE_TRANSFER'] = orig_layerwise_env
+        if orig_socket_env is None:
+            os.environ.pop('FLEXKV_LAYERWISE_EVENTFD_SOCKET', None)
+        else:
+            os.environ['FLEXKV_LAYERWISE_EVENTFD_SOCKET'] = orig_socket_env
         GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = orig_layerwise_flag
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(socket_path)
