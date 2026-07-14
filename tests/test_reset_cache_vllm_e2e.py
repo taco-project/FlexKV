@@ -44,7 +44,9 @@ pytest.importorskip("flexkv")
 
 from packaging import version
 
-MODEL = os.environ.get("FLEXKV_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+# Default matches the user's `vllm serve` command; override with FLEXKV_TEST_MODEL.
+MODEL = os.environ.get("FLEXKV_TEST_MODEL", "/raid/model/Qwen3-8B")
+MAX_MODEL_LEN = int(os.environ.get("FLEXKV_TEST_MAX_MODEL_LEN", "8192"))
 
 # Prometheus counter names (vllm/v1/metrics/loggers.py).
 _EXT_HITS = "vllm:external_prefix_cache_hits"
@@ -118,12 +120,19 @@ def llm(flexkv_config):
     from vllm import LLM
     from vllm.config import KVTransferConfig
 
+    # Mirror the user's `vllm serve` command as closely as the offline LLM API
+    # allows (same model, TP, prefix caching, chunked prefill, FlexKV connector).
     llm = LLM(
         model=MODEL,
-        enforce_eager=True,
-        gpu_memory_utilization=0.5,
-        enable_prefix_caching=True,   # required: no reuse without it
-        disable_log_stats=False,      # required: get_metrics() asserts otherwise
+        tensor_parallel_size=1,
+        trust_remote_code=True,           # Qwen3 needs this
+        max_model_len=MAX_MODEL_LEN,      # 8192, matches --max_model_len
+        max_num_seqs=128,                 # matches --max-num-seqs
+        max_num_batched_tokens=8192,      # matches --max-num-batched-tokens
+        gpu_memory_utilization=0.5,       # matches --gpu-memory-utilization
+        enable_prefix_caching=True,       # matches --enable-prefix-caching (required)
+        enable_chunked_prefill=True,      # matches --enable-chunked-prefill
+        disable_log_stats=False,          # required: get_metrics() asserts otherwise
         kv_transfer_config=KVTransferConfig(
             kv_connector="FlexKVConnectorV1",
             kv_role="kv_both",
