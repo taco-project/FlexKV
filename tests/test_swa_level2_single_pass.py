@@ -45,11 +45,13 @@ def _cache_config():
     cc = CacheConfig(
         tokens_per_block=TPB,
         enable_cpu=True, enable_ssd=False, enable_remote=False,
-        num_cpu_blocks=4096,
+        # These tests store at most four blocks.  Keeping the pools small avoids
+        # retaining hundreds of megabytes across the parametrized smoke suite.
+        num_cpu_blocks=32,
     )
     cc.swa = SWAPoolConfig(
         enabled=True,
-        num_slots=256,
+        num_slots=8,
         num_swa_layers=1,
         bytes_per_token_per_layer=64,
     )
@@ -123,12 +125,14 @@ def test_swa_aware_get_matches_once():
     _put(eng, tok)
 
     with _MatchCounter(eng) as mc:
-        eng.get(request_id=2, token_ids=tok,
-                token_mask=np.ones_like(tok, dtype=np.int64),
-                slot_mapping=np.arange(tok.shape[0], dtype=np.int64),
-                dp_client_id=0, swa_aware=True)
+        _graph, _return_mask, cb, op_cb, _end_id = eng.get(
+            request_id=2, token_ids=tok,
+            token_mask=np.ones_like(tok, dtype=np.int64),
+            slot_mapping=np.arange(tok.shape[0], dtype=np.int64),
+            dp_client_id=0, swa_aware=True)
     assert mc.n == 1, (
         f"SWA-aware get matched {mc.n} rounds; must be exactly 1")
+    _complete(op_cb, cb)
 
 
 def test_swa_aware_get_clamps_full_to_usable():

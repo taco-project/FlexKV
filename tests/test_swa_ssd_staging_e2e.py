@@ -22,6 +22,7 @@ slot free on H2D completion.
 Run INSIDE the container on a free GPU:
     CUDA_VISIBLE_DEVICES=0 python3 tests/test_swa_ssd_staging_e2e.py
 """
+import gc
 import os
 import shutil
 import sys
@@ -103,7 +104,7 @@ def _run_graph(te, graph, op_cb, cb, full_gpu_blocks, swa_gpu_slot, reported_op_
     cb()
 
 
-def main() -> int:
+def _run(transfer_engines) -> int:
     if not torch.cuda.is_available():
         print("[verify] CUDA not available", flush=True)
         return 2
@@ -158,6 +159,7 @@ def main() -> int:
         swa_cpu_handle=se.get_storage_handle(DeviceType.CPU, device_id=0, is_swa=True),
         swa_ssd_handle=se.get_storage_handle(DeviceType.SSD, device_id=0, is_swa=True),
     )
+    transfer_engines.append(te)
     te.start()
     print("[verify] TransferEngine started (main-KV + SWA CPU/SSD workers)", flush=True)
 
@@ -238,13 +240,24 @@ def main() -> int:
     else:
         print("[verify] OK    transient CPU staging slot freed (no leak)", flush=True)
 
-    te.shutdown()
-    if os.path.isdir(SSD_CACHE_DIR):
-        shutil.rmtree(SSD_CACHE_DIR)
     if failed:
         return 4
     print("[verify] PASS: SSD SWA staging byte-exact, transient slot freed", flush=True)
     return 0
+
+
+def main() -> int:
+    """Run the E2E flow and always release workers and temporary SSD data."""
+    transfer_engines = []
+    try:
+        return _run(transfer_engines)
+    finally:
+        for transfer_engine in reversed(transfer_engines):
+            transfer_engine.shutdown()
+        shutil.rmtree(SSD_CACHE_DIR, ignore_errors=True)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 @pytest.mark.e2e
