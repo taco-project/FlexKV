@@ -60,13 +60,16 @@ class GetTransferPlan:
     # _transfer_callback (mirrors Full-KV lock_node / unlock).
     swa_nodes_to_unlock: Dict[DeviceType, object] = field(default_factory=dict) # target node to unlock and set ready
     # GET source nodes pinned via _pin_swa_node during plan build; Full+swa
-    # unlock deferred to _transfer_callback (op callbacks only publish / free
-    # transient staging).
+    # unlock deferred to _transfer_callback (op callbacks only publish).
     swa_source_pins: List[Tuple[DeviceType, object]] = field(default_factory=list) # source node pin
     # Global GET: SWA publish deferred to _transfer_callback (same place Full
     # set_ready runs). Local GET leaves this empty and publishes on the SWA
     # H2D op callback instead.
     swa_publications: Dict[DeviceType, object] = field(default_factory=dict) # only used for global get
+    # Transient CPU SWA staging slots (promotion mount lost the race, slot was
+    # NOT mounted onto a radix node). Freed in _transfer_callback, mirroring
+    # the Full-KV buffer_to_free lifecycle.
+    swa_slot_to_free: List[int] = field(default_factory=list)
 
     @classmethod
     def empty(cls) -> "GetTransferPlan":
@@ -80,6 +83,7 @@ class GetTransferPlan:
             swa_nodes_to_unlock={},
             swa_source_pins=[],
             swa_publications={},
+            swa_slot_to_free=[],
         )
 
 
@@ -874,7 +878,8 @@ class GlobalCacheEngine:
                            buffer_to_free=plan.buffer_to_free,
                            swa_nodes_to_unlock=plan.swa_nodes_to_unlock,
                            swa_source_pins=plan.swa_source_pins,
-                           swa_publications=plan.swa_publications)
+                           swa_publications=plan.swa_publications,
+                           swa_slot_to_free=plan.swa_slot_to_free)
 
         op_callback_dict = plan.op_callback_dict
 
@@ -1241,6 +1246,7 @@ class GlobalCacheEngine:
         swa_nodes_to_unlock: Dict[DeviceType, RadixNode] = {}
         swa_source_pins: List[Tuple[DeviceType, RadixNode]] = []
         swa_publications: Dict[DeviceType, RadixNode] = {}
+        swa_slot_to_free: List[int] = []
         if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
                 and swa_read_source.found):
             self._append_swa_get_ops(
@@ -1255,6 +1261,7 @@ class GlobalCacheEngine:
                 # Global GET: Full set_ready only in _transfer_callback — match that.
                 defer_swa_publish=True,
                 swa_publications=swa_publications,
+                swa_slot_to_free=swa_slot_to_free,
             )
 
         return GetTransferPlan(
@@ -1267,6 +1274,7 @@ class GlobalCacheEngine:
             swa_nodes_to_unlock=swa_nodes_to_unlock,
             swa_source_pins=swa_source_pins,
             swa_publications=swa_publications,
+            swa_slot_to_free=swa_slot_to_free,
         )
 
     def _get_impl_local(self,
@@ -1497,6 +1505,7 @@ class GlobalCacheEngine:
 
         swa_nodes_to_unlock: Dict[DeviceType, RadixNode] = {}
         swa_source_pins: List[Tuple[DeviceType, RadixNode]] = []
+        swa_slot_to_free: List[int] = []
         if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
                 and swa_read_source.found):
             self._append_swa_get_ops(
@@ -1511,6 +1520,7 @@ class GlobalCacheEngine:
                 # Local GET: Full set_ready on staging op callbacks — publish
                 # SWA when DISK2H/REMOTE2H lands on CPU.
                 defer_swa_publish=False,
+                swa_slot_to_free=swa_slot_to_free,
             )
         nvtx.end_range(nvtx_range)
         return GetTransferPlan(
@@ -1522,6 +1532,7 @@ class GlobalCacheEngine:
             num_gpu_blocks_to_transfer=num_gpu_blocks_to_transfer,
             swa_nodes_to_unlock=swa_nodes_to_unlock,
             swa_source_pins=swa_source_pins,
+            swa_slot_to_free=swa_slot_to_free,
         )
 
     def put(self,
@@ -2045,7 +2056,8 @@ class GlobalCacheEngine:
                            is_put: bool = False,
                            swa_nodes_to_unlock: Optional[Dict[DeviceType, RadixNode]] = None,
                            swa_source_pins: Optional[List[Tuple[DeviceType, RadixNode]]] = None,
-                           swa_publications: Optional[Dict[DeviceType, RadixNode]] = None) -> None:
+                           swa_publications: Optional[Dict[DeviceType, RadixNode]] = None,
+                           swa_slot_to_free: Optional[List[int]] = None) -> None:
         # SWA unlocks before Full unlock to preserve I3 (lock_cnt >= swa_lock_cnt).
         # Deferred Global-GET publications stay !swa_ready until after set_ready
         # below, so unlocking here is still safe w.r.t. SWA-LRU eviction.
@@ -2100,6 +2112,15 @@ class GlobalCacheEngine:
             if DeviceType.REMOTE in buffer_to_free:
                 assert self.remote_cache_engine is not None
                 self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
+
+        # Transient SWA staging slots (mount-race losers) are private one-shot
+        # buffers; their last consumer is the SWA H2D, so releasing at graph
+        # completion is safe — same lifecycle as buffer_to_free above.
+        if swa_slot_to_free:
+            assert self.cpu_cache_engine is not None
+            for slot in swa_slot_to_free:
+                if slot is not None and slot >= 0:
+                    self.cpu_cache_engine._free_swa_slot(int(slot))
 
     def _op_callback(self, device_type: DeviceType, node_to_ready: RadixNode, ready_length: int) -> None:
         if device_type == DeviceType.CPU:
@@ -2207,7 +2228,8 @@ class GlobalCacheEngine:
                             swa_nodes_to_unlock: Optional[Dict[DeviceType, RadixNode]] = None,
                             swa_source_pins: Optional[List[Tuple[DeviceType, RadixNode]]] = None,
                             defer_swa_publish: bool = False,
-                            swa_publications: Optional[Dict[DeviceType, RadixNode]] = None) -> None:
+                            swa_publications: Optional[Dict[DeviceType, RadixNode]] = None,
+                            swa_slot_to_free: Optional[List[int]] = None) -> None:
         """Pin the SWA source and append SWA GET peer ops.
 
         SSD/REMOTE promotion mounts onto ``cpu_node_for_promotion`` before
@@ -2261,8 +2283,8 @@ class GlobalCacheEngine:
             # a shared resource. Degrade to transient staging: leave
             # mount_success=False, keep staging_slot alive, let build_get_chain
             # use it as a one-shot CPU buffer for this SWA H2D. The staging
-            # slot is freed in the SWA H2D completion callback below
-            # (cleanup_staging = staging_slot when !mount_success).
+            # slot is registered in swa_slot_to_free and reclaimed in
+            # _transfer_callback (same lifecycle as Full-KV buffer_to_free).
             #
             # Skipping SWA here would hand the caller a graph with no SWA ops,
             # leaving the GPU SWA slot uninitialised for this request.
@@ -2335,22 +2357,17 @@ class GlobalCacheEngine:
                         cpu_node_for_promotion,
                     ),
                 )
-        # Transient staging (no mount) is freed when H2D completes.
-        # TODO: if the task is cancelled, the staging slot will be freed here, 
-        # but the node is not unlocked and set ready, slot will be leaked, 
-        # so we need to handle this case.
+        # Transient staging (no mount) is freed in _transfer_callback together
+        # with the Full-KV buffer_to_free, keeping one single release point at
+        # graph completion.
+        # TODO: if the task is cancelled the transfer callback never runs and
+        # the slot leaks (same gap as node unlock / set_ready) — needs a
+        # dedicated cancellation rollback.
         cleanup_staging = -1 if mount_success else staging_slot
         if cleanup_staging >= 0:
-            self._append_op_callback(
-                op_callback_dict,
-                swa_h2d_id,
-                partial[None](
-                    self._swa_release_load_lock,
-                    node=None,
-                    staging_slot=cleanup_staging,
-                    source_device_type=None,
-                ),
-            )
+            assert swa_slot_to_free is not None, (
+                "transient SWA staging requires a swa_slot_to_free list")
+            swa_slot_to_free.append(cleanup_staging)
 
     def _append_swa_put_ops(self,
                             transfer_graph: TransferOpGraph,
@@ -2442,8 +2459,7 @@ class GlobalCacheEngine:
                                node,
                                staging_slot: int = -1,
                                source_device_type: Optional[DeviceType] = None) -> None:
-        """SWA H2D completion callback: release the source-tier pin (and, in
-        legacy paths, free a transient staging slot).
+        """Release an SWA source-tier pin (and optionally free a staging slot).
 
         ``node`` is the source-tier SWA node (CPU / SSD / REMOTE) that was pinned
         by ``_pin_swa_node`` before the H2D. The pin is released with the plain
@@ -2451,9 +2467,11 @@ class GlobalCacheEngine:
         for future reuse.
 
         ``staging_slot``:
-          * ``>= 0`` (legacy path): the transient CPU SWA slot used as DISK2H/
-            REMOTE2H destination was NOT mounted onto a radix node; free it
-            back to the CPU SWA pool here (op-callback path).
+          * ``>= 0``: free the given CPU SWA slot back to the host pool. Only
+            used by synchronous early-fail cleanup (alloc / graph-build failure
+            before launch). In-flight transient staging is instead registered
+            in ``swa_slot_to_free`` and reclaimed in ``_transfer_callback``
+            (mirrors Full-KV buffer_to_free).
           * ``-1``: no staging free (promoted slot belongs to the radix /
             unlock is handled by the caller).
         Successful GET plans defer node unlock to ``_transfer_callback``; this
