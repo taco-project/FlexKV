@@ -32,6 +32,52 @@ def nvfp4_kv_cache_full_dim(head_size: int) -> int:
     return head_size // 2 + head_size // 16
 
 
+def _derive_full_layer_indices(hf_config, num_hidden_layers):
+    """Derive the list of Full-indexer layer ids from a DSA HF config.
+
+    Three encodings are recognized, in priority order:
+      1. ``indexer_types``: explicit per-layer ["full"|"shared"] list.
+         GLM-5.2 exposes this as the authoritative field; prefer it when
+         present so we do not depend on freq/offset conventions.
+      2. ``index_topk_pattern``: per-layer 'F'/'S' string (mirrors sglang).
+      3. ``index_topk_freq`` (+ optional ``index_skip_topk_offset``):
+         layer ``i`` is Full iff ``max(i - offset + 1, 0) % freq == 0``.
+
+    Returns ``None`` for vanilla DSA (every layer is Full) or when
+    ``num_hidden_layers`` is missing.
+    """
+    if not num_hidden_layers or num_hidden_layers <= 0:
+        return None
+
+    indexer_types = getattr(hf_config, 'indexer_types', None)
+    if indexer_types is not None and len(indexer_types) > 0:
+        full = [i for i, t in enumerate(indexer_types) if t == 'full']
+        full.extend(range(len(indexer_types), num_hidden_layers))
+        if len(full) == num_hidden_layers:
+            return None
+        return full
+
+    pattern = getattr(hf_config, 'index_topk_pattern', None)
+    if pattern is not None:
+        full = [i for i, ch in enumerate(pattern) if ch != 'S']
+        full.extend(range(len(pattern), num_hidden_layers))
+        if len(full) == num_hidden_layers:
+            return None
+        return full
+
+    freq = getattr(hf_config, 'index_topk_freq', 1)
+    if freq is None or freq <= 1:
+        return None
+    offset = getattr(hf_config, 'index_skip_topk_offset', None)
+    if offset is None:
+        return [i for i in range(num_hidden_layers)
+                if max(i - 1, 0) % freq == 0]
+    if offset <= 0:
+        return None
+    return [i for i in range(num_hidden_layers)
+            if max(i - offset + 1, 0) % freq == 0]
+
+
 def _warn_nvfp4_unsupported_framework(dtype_str: Optional[str], framework: str) -> None:
     """Warn if NVFP4 KV cache is requested from a framework whose FlexKV adapter
     has not yet implemented the nvfp4 packed-layout ``head_size`` fold.
@@ -148,6 +194,7 @@ class FlexKVConfig:
         hf_config,
         indexer_head_size: Optional[int] = None,
         indexer_dtype: Optional[torch.dtype] = None,
+        source: str = "",
     ) -> None:
         if hf_config is None:
             return
@@ -171,17 +218,31 @@ class FlexKVConfig:
 
             dtype = indexer_dtype if indexer_dtype is not None else torch.uint8
 
+            num_hidden_layers = getattr(hf_config, 'num_hidden_layers', None)
+            full_layer_indices = _derive_full_layer_indices(
+                hf_config, num_hidden_layers
+            )
+
             self.cache_config.indexer = IndexerCacheConfig(
                 head_size=head_size,
                 num_kv_heads=1,
                 dtype=dtype,
+                full_layer_indices=full_layer_indices,
             )
+            source_label = f" ({source})" if source else ""
             logger.info(
-                f"Detected sparse attention indexer config: "
+                f"Detected sparse attention indexer config{source_label}: "
                 f"head_size={head_size}, dtype={dtype}, "
                 f"tokens_per_block={self.cache_config.tokens_per_block}")
+            if full_layer_indices is not None and num_hidden_layers:
+                logger.info(
+                    f"Detected IndexShare layer partition{source_label}: "
+                    f"num_full={len(full_layer_indices)}/{num_hidden_layers} "
+                    f"(first_full={full_layer_indices[:8]}"
+                    f"{'...' if len(full_layer_indices) > 8 else ''})"
+                )
         except Exception as e:
-            logger.debug(f"Could not detect indexer config: {e}")
+            logger.debug(f"Could not detect indexer config ({source}): {e}")
 
     @classmethod
     def from_env(cls) -> 'FlexKVConfig':

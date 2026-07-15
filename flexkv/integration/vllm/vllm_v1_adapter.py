@@ -775,6 +775,19 @@ class FlexKVWorkerConnector:
             first_indexer_buffer = indexer_buffers[0]
             assert first_indexer_buffer.ndim == 3, (
                 f"expect indexer cache tensor has 3 dim but get shape={first_indexer_buffer.shape}.")
+            # GLM-5.2 IndexShare: vLLM allocates one k_cache per Full layer;
+            # Shared layers reuse a prior Full layer's top-k and thus have no
+            # k_cache. Sanity-check the two views agree.
+            indexer_cfg = self.flexkv_config.cache_config.indexer
+            if (indexer_cfg is not None
+                    and indexer_cfg.full_layer_indices is not None):
+                expected = len(indexer_cfg.full_layer_indices)
+                if len(indexer_buffers) != expected:
+                    logger.warning(
+                        f"[FlexKV vllm] Indexer buffer count ({len(indexer_buffers)}) "
+                        f"does not match Full-layer count from HF config "
+                        f"({expected}); IndexShare metadata may be stale."
+                    )
             indexer_layout = KVCacheLayout(
                 type=KVCacheLayoutType.LAYERFIRST,
                 num_layer=len(indexer_buffers),
