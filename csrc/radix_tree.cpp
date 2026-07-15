@@ -186,6 +186,8 @@ void CRadixNode::merge_child() {
 
   assert(get_num_children() == 1);
   assert(child->is_leaf());
+  // Parent SWA (if any) is freed below; do not free a still-pinned slot.
+  assert(swa_lock_cnt == 0);
 
   block_hashes.insert(block_hashes.end(), child->get_block_hashes().cbegin(),
                       child->get_block_hashes().cend());
@@ -198,6 +200,8 @@ void CRadixNode::merge_child() {
       std::max(get_last_access_time(), child->get_last_access_time()));
   set_creation_time(std::min(get_creation_time(), child->get_creation_time()));
   set_hit_count(std::max(get_hit_count(), child->get_hit_count()));
+  // Combined node is ready only if both halves are ready.
+  set_ready(is_ready() && child->is_ready());
   if (block_node_ids != nullptr) {
     block_node_ids->insert(block_node_ids->end(),
                            child->get_block_node_ids()->cbegin(),
@@ -211,17 +215,27 @@ void CRadixNode::merge_child() {
           std::min(lease_meta->lease_time, child_lm->lease_time);
     }
   }
+
+  // Absorb child's Full locks onto the surviving node; clear child so
+  // remove_node does not destroy a still-pinned object.
+  lock_cnt += child->lock_cnt;
+  child->lock_cnt = 0;
+
   children.clear();
 
   // SWA (node-mount, I0): after merging, the combined node's LAST page is the
-  // child's last page. So the SWA snapshot should follow the child: free the
-  // parent's own (now-stale) SWA, then move the child's SWA onto `this`. The
-  // child is about to be deleted, so unthread it from the SWA-LRU without
-  // buffering its slot for release (the slot is being kept, not freed).
+  // child's last page. Free the parent's own (now-stale) SWA, then move the
+  // child's SWA onto `this`. Child is deleted below, so detach it from the
+  // SWA-LRU without buffering its slot for release (slot is kept, not freed).
   index->record_freed_swa_slot(this); // release parent's old SWA (if any)
-  int child_slot = child->get_swa_host_slot();
-  bool child_published = child->swa_ready();
-  if (child_slot != -1) {
+
+  const bool child_has_swa = child->has_swa();
+  const int child_slot = child->get_swa_host_slot();
+  const bool child_published = child->is_swa_ready();
+  const int child_swa_locks = child->swa_lock_cnt;
+  child->swa_lock_cnt = 0;
+
+  if (child_has_swa) {
     index->swa_lru_remove(child); // detach child from SWA-LRU
     child->set_swa_host_slot(-1); // child no longer owns it
     child->set_swa_tombstone(true);
@@ -231,15 +245,29 @@ void CRadixNode::merge_child() {
       if (child_published) {
         index->publish_swa(this);
       }
+      // SWA pins follow the slot onto the merged node.
+      swa_lock_cnt += child_swa_locks;
+      assert(lock_cnt >= swa_lock_cnt); // I3
     } else {
       // root cannot carry SWA; free the slot rather than leak it.
+      assert(child_swa_locks == 0);
       index->buffer_freed_swa_slot(child_slot);
     }
+  } else {
+    assert(child_swa_locks == 0);
   }
 
   child->clear_parent();
   index->remove_leaf(child);
   index->remove_node(child);
+
+  // Parent was internal; after absorbing its only child it becomes a leaf and
+  // must re-enter the Full-KV leaf list so eviction can see it.
+  if (!index->is_root(this)) {
+    assert(is_leaf());
+    assert(!get_leaf_state());
+    index->add_leaf(this);
+  }
 }
 
 std::pair<std::deque<int64_t> *, std::deque<HashType> *>
@@ -569,8 +597,8 @@ CRadixNode *CRadixTreeIndex::inc_lock_ref(CRadixNode *node) {
     cur->lock(); // full_lock on every node from [node, root)
     // SWA-lock only the single deepest node carrying a live SWA.
     if (swa_boundary == nullptr && cur->has_swa()) {
-      cur->inc_swa_lock_ref();
-      assert(cur->get_lock_cnt() >= cur->get_swa_lock_ref()); // I3
+      cur->swa_lock();
+      assert(cur->get_lock_cnt() >= cur->get_swa_lock_cnt()); // I3
       swa_boundary = cur;
     }
     cur = cur->get_parent();
@@ -584,10 +612,10 @@ void CRadixTreeIndex::dec_lock_ref(CRadixNode *node, CRadixNode *swa_boundary,
   while (cur != nullptr && !is_root(cur)) {
     cur->unlock(); // asserts lock_cnt > 0
     // Release the SWA lock only on the exact boundary node inc_lock_ref locked.
-    if (!skip_swa && cur == swa_boundary && cur->get_swa_lock_ref() > 0) {
-      cur->dec_swa_lock_ref();
+    if (!skip_swa && cur == swa_boundary && cur->get_swa_lock_cnt() > 0) {
+      cur->swa_unlock();
     }
-    assert(cur->get_lock_cnt() >= cur->get_swa_lock_ref()); // I3
+    assert(cur->get_lock_cnt() >= cur->get_swa_lock_cnt()); // I3
     cur = cur->get_parent();
   }
 }
@@ -596,9 +624,9 @@ void CRadixTreeIndex::dec_swa_lock_only(CRadixNode *swa_boundary) {
   if (swa_boundary == nullptr) {
     return;
   }
-  assert(swa_boundary->get_swa_lock_ref() > 0);
-  swa_boundary->dec_swa_lock_ref();
-  if (swa_boundary->get_swa_lock_ref() == 0 && swa_boundary->has_swa()) {
+  assert(swa_boundary->get_swa_lock_cnt() > 0);
+  swa_boundary->swa_unlock();
+  if (swa_boundary->get_swa_lock_cnt() == 0 && swa_boundary->has_swa()) {
     if (swa_boundary->is_leaf()) {
       // Leaf: free SWA now (Full stays until the full lock drops).
       record_freed_swa_slot(swa_boundary);

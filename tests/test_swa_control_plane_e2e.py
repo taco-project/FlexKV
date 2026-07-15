@@ -234,7 +234,7 @@ def main() -> int:
     node = mr.last_swa_node if mr.swa_hit_blocks == 1 else None
     if node is not None:
         engine.cpu_cache_engine._pin_swa_node(node)
-        lock_ok = (node.swa_lock_ref == 1)  # our fresh probe lock; prior load lock released
+        lock_ok = (node.swa_lock_cnt == 1)  # our fresh probe lock; prior load lock released
         engine._swa_release_load_lock(node, source_device_type=DeviceType.CPU)
         print(f"[verify] {'OK   ' if lock_ok else 'FAIL '} SWA load lock released "
               f"(lock_ref after fresh probe == 1: {lock_ok})", flush=True)

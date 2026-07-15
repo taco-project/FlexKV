@@ -53,7 +53,7 @@ private:
   // i.e. a node may have full KV without SWA (tombstone), but never the reverse.
   int swa_host_slot = -1;          // CPU SWA host pool slot id (-1 = no backup)
   bool swa_tombstone = true;       // true = no SWA data available (default)
-  int swa_lock_ref = 0;            // SWA lock reference count
+  int swa_lock_cnt = 0;            // SWA lock count (mirror of lock_cnt)
   bool swa_ready = false;       // true once SWA bytes are published (readable)
   uint64_t swa_last_access_time = 0; // SWA LRU timestamp
   // Intrusive SWA-only LRU doubly-linked list pointers (independent of the
@@ -139,13 +139,13 @@ public:
 
   void set_swa_tombstone(bool tombstone) { swa_tombstone = tombstone; }
 
-  int get_swa_lock_ref() { return swa_lock_ref; }
+  int get_swa_lock_cnt() { return swa_lock_cnt; }
 
-  void inc_swa_lock_ref() { swa_lock_ref++; }
+  void swa_lock() { swa_lock_cnt++; }
 
-  void dec_swa_lock_ref() {
-    assert(swa_lock_ref > 0);
-    swa_lock_ref--;
+  void swa_unlock() {
+    assert(swa_lock_cnt > 0);
+    swa_lock_cnt--;
   }
 
   void set_swa_last_access_time(uint64_t time) { swa_last_access_time = time; }
@@ -251,8 +251,12 @@ public:
   bool is_leaf() { return get_num_children() == 0; }
 
   // A node is in use (not full-evictable) if its Full KV is locked, its SWA is
-  // locked (I3: swa_lock_ref>0 implies it must stay), or it is not ready.
-  bool in_use() { return lock_cnt > 0 || swa_lock_ref > 0 || !ready; }
+  // locked (I3: swa_lock_cnt>0 implies it must stay), it is not ready, or it
+  // still has a pending (mounted-but-unpublished) SWA transfer.
+  bool in_use() {
+    return lock_cnt > 0 || swa_lock_cnt > 0 || !ready ||
+           (has_swa() && !swa_ready);
+  }
 
   bool evictable();
 
@@ -514,12 +518,12 @@ public:
     node->set_on_swa_lru(false);
   }
 
-  // Least-recently-used published SWA node with swa_lock_ref == 0. Pending
+  // Least-recently-used published SWA node with swa_lock_cnt == 0. Pending
   // mounts (!swa_ready) are not on the SWA-LRU and are skipped here.
   CRadixNode *swa_lru_get_lru_unlocked() {
     CRadixNode *x = swa_lru_tail->get_swa_lru_prev();
     while (x != swa_lru_head &&
-           (x->get_swa_lock_ref() > 0 || !x->swa_ready())) {
+           (x->get_swa_lock_cnt() > 0 || !x->is_swa_ready())) {
       x = x->get_swa_lru_prev();
     }
     return x != swa_lru_head ? x : nullptr;
@@ -542,10 +546,14 @@ public:
   }
 
   // Publish a previously mounted SWA slot: matchable and on the SWA-LRU.
+  // Does NOT require is_ready (the SWA data plane may complete before Full-KV).
+  // match_prefix gates SWA hits on is_swa_readable() = has_swa && is_ready &&
+  // swa_ready, so a transient (is_ready=false, swa_ready=true) state is
+  // invisible to GETs until Full-KV also becomes ready.
   void publish_swa(CRadixNode *node) {
     assert(node != root);
     assert(node->has_swa());
-    if (node->swa_ready()) {
+    if (node->is_swa_ready()) {
       return;
     }
     node->set_swa_ready(true);
@@ -607,7 +615,7 @@ public:
   // RadixTreeIndex methods and sglang inc/dec_lock_ref (design §7). FlexKV's SWA
   // window == one page == one node's trailing page, so exactly the single
   // deepest node with a live SWA on [node, root) is SWA-locked; full_lock (the
-  // node lock_cnt) is taken on every node. Invariant I3: lock_cnt >= swa_lock_ref.
+  // node lock_cnt) is taken on every node. Invariant I3: lock_cnt >= swa_lock_cnt.
   //
   // inc_lock_ref returns the SWA boundary node (or nullptr) — pass it back to
   // dec_lock_ref / dec_swa_lock_only so the release is symmetric.

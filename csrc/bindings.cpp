@@ -756,6 +756,8 @@ PYBIND11_MODULE(c_ext, m) {
       .def("get_lock_cnt", &flexkv::CRadixNode::get_lock_cnt)
       .def("lock", &flexkv::CRadixNode::lock)
       .def("unlock", &flexkv::CRadixNode::unlock)
+      .def("is_ready", &flexkv::CRadixNode::is_ready)
+      .def("merge_child", &flexkv::CRadixNode::merge_child)
       .def("has_swa", &flexkv::CRadixNode::has_swa)
       .def("is_swa_readable", &flexkv::CRadixNode::is_swa_readable)
       .def_property_readonly("parent", &flexkv::CRadixNode::get_parent,
@@ -765,12 +767,12 @@ PYBIND11_MODULE(c_ext, m) {
                     &flexkv::CRadixNode::set_swa_host_slot)
       .def_property("swa_tombstone", &flexkv::CRadixNode::get_swa_tombstone,
                     &flexkv::CRadixNode::set_swa_tombstone)
-      .def_property("swa_ready", &flexkv::CRadixNode::swa_ready,
+      .def_property("swa_ready", &flexkv::CRadixNode::is_swa_ready,
                     &flexkv::CRadixNode::set_swa_ready)
-      .def_property_readonly("swa_lock_ref",
-                             &flexkv::CRadixNode::get_swa_lock_ref)
-      .def("inc_swa_lock_ref", &flexkv::CRadixNode::inc_swa_lock_ref)
-      .def("dec_swa_lock_ref", &flexkv::CRadixNode::dec_swa_lock_ref);
+      .def_property_readonly("swa_lock_cnt",
+                             &flexkv::CRadixNode::get_swa_lock_cnt)
+      .def("swa_lock", &flexkv::CRadixNode::swa_lock)
+      .def("swa_unlock", &flexkv::CRadixNode::swa_unlock);
 
   py::class_<flexkv::CMatchResult, std::shared_ptr<flexkv::CMatchResult>>(
       m, "CMatchResult")

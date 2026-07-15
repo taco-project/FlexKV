@@ -16,8 +16,9 @@ does not cover:
         GPU SWA slot -> byte-exact.
 
 This exercises SWA graph append inside _put_impl_* (write-through) and
-_get_impl_* (SSD->CPU transient staging slot + H2D), plus the transient staging
-slot free on H2D completion.
+_get_impl_* (SSD->CPU staging slot promoted onto the fragment123 CPU node
+via mount_swa + publish_swa on H2D completion), aligning SWA GET with
+Full-KV GET fragment23 (SSD/REMOTE data cached in CPU on the way through).
 
 Run INSIDE the container on a free GPU:
     CUDA_VISIBLE_DEVICES=0 python3 tests/test_swa_ssd_staging_e2e.py
@@ -230,20 +231,30 @@ def main() -> int:
         print(f"[verify] OK    SWA: {len(expected_sw)} bytes match "
               f"GPU->CPU/SSD->(evict CPU)->DISK2H->H2D->GPU", flush=True)
 
-    # transient CPU staging slot must be freed on H2D completion (no leak).
+    # After GET, the SSD->CPU staging slot must have been PROMOTED onto the
+    # fragment123 CPU node (mount_swa + publish_swa on SWA DISK2H completion),
+    # mirroring Full-KV GET fragment23 which caches SSD/REMOTE data in CPU.
+    # Post-conditions:
+    #   (a) CPU SWA pool holds exactly 1 slot (the promoted one)
+    #   (b) CPU tier match now returns swa_hit > 0 (the window is visible)
+    seq_after = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); seq_after.gen_hashes()
+    cpu_hit_after = engine.cpu_cache_engine.match(seq_after).swa_hit_blocks
     staging_used = engine.cpu_cache_engine.swa_pool.num_used
-    if staging_used != 0:
-        print(f"[verify] FAIL transient CPU staging slot leaked (num_used={staging_used})", flush=True)
+    if staging_used != 1:
+        print(f"[verify] FAIL CPU SWA promotion did not stick (num_used={staging_used}, expected 1)", flush=True)
+        failed = True
+    elif cpu_hit_after == 0:
+        print(f"[verify] FAIL CPU SWA promotion mounted but did not publish (cpu_hit={cpu_hit_after})", flush=True)
         failed = True
     else:
-        print("[verify] OK    transient CPU staging slot freed (no leak)", flush=True)
+        print(f"[verify] OK    SSD staging slot promoted to CPU (num_used=1, cpu_hit={cpu_hit_after})", flush=True)
 
     te.shutdown()
     if os.path.isdir(SSD_CACHE_DIR):
         shutil.rmtree(SSD_CACHE_DIR)
     if failed:
         return 4
-    print("[verify] PASS: SSD SWA staging byte-exact, transient slot freed", flush=True)
+    print("[verify] PASS: SSD SWA staging byte-exact, staging slot promoted to CPU", flush=True)
     return 0
 
 

@@ -27,7 +27,7 @@ Core invariants (enforced here):
 * I1: SWA subset of Full. Freeing a node's Full KV always frees its SWA slot.
 * I2: every leaf must have SWA unless its Full is locked (a leaf that lost its
       SWA and is not full-locked is meaningless and gets deleted).
-* I3: full_lock_ref (== node.lock_cnt here) >= swa_lock_ref always.
+* I3: lock_cnt >= swa_lock_cnt always.
 * I4: a non-tombstone node is homogeneous (whole node SWA-mapped, or tombstone).
 
 This module is the non-accel mirror; DSv4 uses the C++ CRadixTreeIndex. Kept
@@ -88,7 +88,7 @@ class RadixNode:
     # ===== SWA (node-mounted) state — mirrors CRadixNode =====
     swa_host_slot: int = -1            # CPU SWA host-pool slot id (-1 = no SWA)
     swa_tombstone: bool = True         # True = no live SWA on this node
-    swa_lock_ref: int = 0              # SWA lock ref (invariant: <= lock_cnt)
+    swa_lock_cnt: int = 0              # SWA lock count (invariant: <= lock_cnt)
     swa_ready: bool = False            # True once SWA bytes are published
     swa_last_access_time: float = 0.0  # SWA-LRU timestamp
     # intrusive SWA-LRU doubly-linked list pointers (independent of full LRU)
@@ -124,8 +124,12 @@ class RadixNode:
 
     def in_use(self) -> bool:
         # A node is in use (not full-evictable) if its Full KV is locked, its SWA
-        # is locked (I3: swa_lock_ref>0 implies it must stay), or it is not ready.
-        return self.lock_cnt > 0 or self.swa_lock_ref > 0 or not self.is_ready
+        # is locked (I3: swa_lock_cnt>0 implies it must stay), it is not ready, or
+        # it still has a pending (mounted-but-unpublished) SWA transfer — mirror
+        # of CRadixNode::in_use in csrc/radix_tree.h.
+        return (self.lock_cnt > 0 or self.swa_lock_cnt > 0
+                or not self.is_ready
+                or (self.has_swa() and not self.swa_ready))
 
     def has_swa(self) -> bool:
         """True iff this node carries a live (non-tombstone) SWA slot."""
@@ -135,17 +139,17 @@ class RadixNode:
         """True once mounted SWA is published on a ready Full-KV node."""
         return self.has_swa() and self.is_ready and self.swa_ready
 
-    def inc_swa_lock_ref(self) -> None:
-        """Pin the SWA against eviction (mirror of CRadixNode.inc_swa_lock_ref)."""
-        self.swa_lock_ref += 1
+    def swa_lock(self) -> None:
+        """Pin the SWA against eviction (mirror of CRadixNode.swa_lock)."""
+        self.swa_lock_cnt += 1
 
-    def dec_swa_lock_ref(self) -> None:
-        """Release one SWA eviction pin (mirror of CRadixNode.dec_swa_lock_ref).
+    def swa_unlock(self) -> None:
+        """Release one SWA eviction pin (mirror of CRadixNode.swa_unlock).
 
         Keeps the SWA slot cached (unlike dec_swa_lock_only, which frees a leaf's
         SWA); used to drop a load-time pin once the SWA H2D has read the slot."""
-        assert self.swa_lock_ref > 0
-        self.swa_lock_ref -= 1
+        assert self.swa_lock_cnt > 0
+        self.swa_lock_cnt -= 1
 
     def lock(self) -> None:
         assert self.lock_cnt >= 0
@@ -294,9 +298,9 @@ class RadixTreeIndex:
         node.on_swa_lru = False
 
     def _swa_lru_get_lru_unlocked(self) -> Optional[RadixNode]:
-        """LRU published SWA node with swa_lock_ref == 0 (pending mounts skipped)."""
+        """LRU published SWA node with swa_lock_cnt == 0 (pending mounts skipped)."""
         x = self._swa_lru_tail.swa_lru_prev
-        while x is not self._swa_lru_head and (x.swa_lock_ref > 0 or not x.swa_ready):
+        while x is not self._swa_lru_head and (x.swa_lock_cnt > 0 or not x.swa_ready):
             x = x.swa_lru_prev
         return x if x is not self._swa_lru_head else None
 
@@ -331,7 +335,15 @@ class RadixTreeIndex:
         node.swa_last_access_time = time.time()
 
     def publish_swa(self, node: RadixNode) -> None:
-        """Publish a mounted SWA slot: matchable and on the SWA-LRU."""
+        """Publish a mounted SWA slot: matchable and on the SWA-LRU.
+
+        NOTE: does not require ``node.is_ready`` — the SWA data plane may
+        complete before Full-KV. ``match_prefix`` gates SWA hits on
+        ``is_swa_readable() = has_swa && is_ready && swa_ready``, so any
+        temporary ``(is_ready=False, swa_ready=True)`` state stays invisible
+        to GETs until Full-KV also becomes ready. eviction is likewise safe
+        (Full-KV lock keeps unready nodes pinned; SWA-LRU skips locked nodes).
+        """
         assert node is not self.root_node
         assert node.has_swa()
         if node.swa_ready:
@@ -669,8 +681,8 @@ class RadixTreeIndex:
         while cur is not None and not cur.is_root():
             cur.lock_cnt += 1
             if swa_boundary is None and cur.has_swa():
-                cur.swa_lock_ref += 1
-                assert cur.lock_cnt >= cur.swa_lock_ref  # I3
+                cur.swa_lock()
+                assert cur.lock_cnt >= cur.swa_lock_cnt  # I3
                 swa_boundary = cur
             cur = cur.parent
         return swa_boundary
@@ -687,9 +699,9 @@ class RadixTreeIndex:
             cur.lock_cnt -= 1
             # Release the SWA lock only on the exact boundary node (symmetric
             # with inc_lock_ref, which locked only that one node).
-            if not skip_swa and cur is swa_boundary and cur.swa_lock_ref > 0:
-                cur.swa_lock_ref -= 1
-            assert cur.lock_cnt >= cur.swa_lock_ref  # I3
+            if not skip_swa and cur is swa_boundary and cur.swa_lock_cnt > 0:
+                cur.swa_unlock()
+            assert cur.lock_cnt >= cur.swa_lock_cnt  # I3
             cur = cur.parent
 
     def dec_swa_lock_only(self, swa_boundary: Optional[RadixNode]) -> None:
@@ -704,9 +716,9 @@ class RadixTreeIndex:
         if swa_boundary is None:
             return
         cur = swa_boundary
-        assert cur.swa_lock_ref > 0, "dec_swa_lock_only on an unlocked SWA node"
-        cur.swa_lock_ref -= 1
-        if cur.swa_lock_ref == 0 and cur.has_swa():
+        assert cur.swa_lock_cnt > 0, "dec_swa_lock_only on an unlocked SWA node"
+        cur.swa_unlock()
+        if cur.swa_lock_cnt == 0 and cur.has_swa():
             if cur.is_leaf():
                 # Leaf: free SWA now (Full stays until the full lock drops).
                 self.record_freed_swa_slot(cur)

@@ -175,7 +175,9 @@ def test_put_builds_full_plus_swa_store_chain():
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     pending = eng.cpu_cache_engine.match(sm)
     assert pending.num_ready_matched_blocks == 0
-    assert pending.last_node.swa_host_slot == -1
+    # Mount-first: the SWA slot is already attached to the node, but not yet
+    # published (swa_ready=False) — so match still sees no readable SWA.
+    assert pending.last_node.swa_host_slot >= 0
     assert pending.swa_hit_blocks == 0
 
     full_d2h = next(o for o in full if o.transfer_type == TransferType.D2H)
@@ -184,17 +186,24 @@ def test_put_builds_full_plus_swa_store_chain():
     assert barrier.transfer_type == TransferType.VIRTUAL
     assert barrier.predecessors == {full_d2h.op_id, swa_d2h.op_id}
 
-    # Full-KV may become readable first, but the reserved SWA slot must remain a
-    # miss until its independent sibling D2H completes.
+    # Full-KV may become readable first; SWA publishes from the SWA D2H op
+    # callback (not the task-level transfer callback).
     op_cb[full_d2h.op_id]()
     full_only = eng.cpu_cache_engine.match(sm)
     assert full_only.num_ready_matched_blocks == 4
     assert full_only.swa_hit_blocks == 0
-    assert full_only.last_node.swa_host_slot == -1
+    assert full_only.last_node.swa_host_slot >= 0
+    assert not full_only.last_node.swa_ready
 
+    # SWA D2H completion publishes; with Full already ready, SWA is matchable
+    # before the task-level callback runs.
     op_cb[swa_d2h.op_id]()
+    ready_before_task_cb = eng.cpu_cache_engine.match(sm)
+    assert ready_before_task_cb.swa_hit_blocks == 4
+    assert ready_before_task_cb.last_swa_node is not None
+    assert ready_before_task_cb.last_swa_node.swa_host_slot >= 0
+
     cb()
-    # SWA completion publishes the reserved slot independently.
     ready = eng.cpu_cache_engine.match(sm)
     assert ready.swa_hit_blocks == 4
     assert ready.last_swa_node is not None
@@ -219,13 +228,14 @@ def test_put_swa_first_stays_hidden_until_full_kv_is_ready():
                    if o.transfer_type == TransferType.D2H)
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
 
-    # The SWA bytes may land first.  Mounting the completed slot is safe because
-    # match_prefix still requires the owning Full-KV node to be ready.
-    op_cb[swa_d2h.op_id]()
+    # Mount-first: SWA D2H publishes swa_ready, but is_swa_readable still
+    # requires Full-KV is_ready — so match stays a SWA miss until Full D2H.
+    op_cb.get(swa_d2h.op_id, lambda: None)()
     swa_only = eng.cpu_cache_engine.match(seq)
     assert swa_only.num_ready_matched_blocks == 0
     assert swa_only.swa_hit_blocks == 0
     assert swa_only.last_node.swa_host_slot >= 0
+    assert swa_only.last_node.swa_ready
 
     op_cb[full_d2h.op_id]()
     cb()
@@ -292,10 +302,10 @@ def test_get_builds_full_plus_swa_load_chain():
     node = ready.last_swa_node
     assert node is not None
     eng.cpu_cache_engine._pin_swa_node(node)
-    assert node is not None and node.swa_lock_ref == 1
-    assert node.get_lock_cnt() >= node.swa_lock_ref
+    assert node is not None and node.swa_lock_cnt == 1
+    assert node.get_lock_cnt() >= node.swa_lock_cnt
     eng._swa_release_load_lock(node, source_device_type=DeviceType.CPU)
-    assert node.swa_lock_ref == 0
+    assert node.swa_lock_cnt == 0
 
 
 def test_gate_off_no_swa_ops_in_control_plane_graph():
@@ -479,12 +489,14 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
     assert barrier.predecessors == {full_d2h.op_id, swa_d2h.op_id}
     assert swa_h2disk.op_id not in barrier.predecessors
 
-    # SSD SWA is allocated but is not mounted while write-through is in flight.
+    # Mount-first: SSD SWA slot is attached at graph-build time; match_prefix
+    # remains a miss until SWA H2DISK publishes (and Full is ready).
     assert eng.ssd_cache_engine.swa_pool.num_used == 1
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
     pending = eng.ssd_cache_engine.match(seq)
     assert pending.num_ready_matched_blocks == 0
-    assert pending.last_node.swa_host_slot == -1
+    assert pending.last_node.swa_host_slot >= 0
+    assert not pending.last_node.swa_ready
     assert pending.swa_hit_blocks == 0
 
     op_cb[full_d2h.op_id]()
@@ -492,17 +504,16 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
     full_only = eng.ssd_cache_engine.match(seq)
     assert full_only.num_ready_matched_blocks == 4
     assert full_only.swa_hit_blocks == 0
+    assert not full_only.last_node.swa_ready
 
+    # CPU SWA publishes on D2H; SSD SWA publishes on its own H2DISK — no need
+    # to wait for the task-level callback.
     op_cb[swa_d2h.op_id]()
     op_cb[swa_h2disk.op_id]()
-    for op_id, callback in op_cb.items():
-        if op_id not in {
-            full_d2h.op_id,
-            full_h2disk.op_id,
-            swa_d2h.op_id,
-            swa_h2disk.op_id,
-        }:
-            callback()
+    ready_before_task_cb = eng.ssd_cache_engine.match(seq)
+    assert ready_before_task_cb.swa_hit_blocks == 4
+    assert ready_before_task_cb.last_swa_node is not None
+
     cb()
     ready = eng.ssd_cache_engine.match(seq)
     assert ready.swa_hit_blocks == 4

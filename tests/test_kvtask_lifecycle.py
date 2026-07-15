@@ -10,7 +10,7 @@ Two concerns, both cheap (no TransferManager subprocess, no GPU):
 2. The SWA load-lock lifecycle on ``GlobalCacheEngine``: a GET pins the matched
    CPU SWA node while building the GET plan, and the SWA H2D completion callback
    releases it (``_swa_release_load_lock``), leaving the
-   node cached (dec_swa_lock_ref, NOT dec_swa_lock_only). This documents that
+   node cached (swa_unlock, NOT dec_swa_lock_only). This documents that
    the SWA lock follows the SAME lifecycle as the full-KV node lock (both taken
    in get()/put(), both released via the op/transfer callbacks) — so a fresh
    GET after a completed GET re-locks cleanly with no residual pin.
@@ -177,7 +177,7 @@ def _put(eng, tok):
 
 def test_get_pins_then_releases_swa_lock():
     """GET pins the matched CPU SWA node; the SWA H2D callback releases it
-    (dec_swa_lock_ref -> node stays cached, lock back to 0)."""
+    (swa_unlock -> node stays cached, lock back to 0)."""
     eng = _engine()
     tok = _tokens(21)
     _put(eng, tok)
@@ -195,7 +195,7 @@ def test_get_pins_then_releases_swa_lock():
     # The node carries the load pin (>=1) taken while building the GET plan.
     node = mr.last_swa_node
     assert node is not None
-    assert node.swa_lock_ref >= 1
+    assert node.swa_lock_cnt >= 1
 
     # Complete the ops: the SWA H2D callback releases the pin.
     for c in op_cb.values():
@@ -203,8 +203,8 @@ def test_get_pins_then_releases_swa_lock():
     cb()
     node2 = eng.cpu_cache_engine.index.match_prefix(
         torch.from_numpy(sm.block_hashes[:4]).to(torch.int64), 4, False).last_swa_node
-    assert node2.swa_lock_ref == 0, "SWA load lock not released on H2D completion"
-    # slot still live (dec_swa_lock_ref keeps the cache, unlike dec_swa_lock_only)
+    assert node2.swa_lock_cnt == 0, "SWA load lock not released on H2D completion"
+    # slot still live (swa_unlock keeps the cache, unlike dec_swa_lock_only)
     assert node2.has_swa()
 
 
@@ -227,7 +227,7 @@ def test_repeated_get_relocks_cleanly():
             c()
         cb()
         node = eng.cpu_cache_engine.index.match_prefix(bh, 4, False).last_swa_node
-        assert node.swa_lock_ref == 0, f"residual SWA lock after GET {req}"
+        assert node.swa_lock_cnt == 0, f"residual SWA lock after GET {req}"
 
 
 if __name__ == "__main__":

@@ -64,6 +64,13 @@ class SWAPutChainOpIds:
     h2remote_id: Optional[int] = None
 
 
+@dataclass
+class SWAGetChainOpIds:
+    h2d_id: Optional[int] = None
+    disk2h_id: Optional[int] = None
+    remote2h_id: Optional[int] = None
+
+
 class SWACacheManager:
     """SWA peer-op graph construction.
 
@@ -137,38 +144,54 @@ class SWACacheManager:
                         cpu_slot_ids: np.ndarray,
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
-                        dp_client_id: int = 0) -> Optional[int]:
-        """Build the GET-side SWA load chain into ``graph``; return the terminal
-        SWA ``H2D`` op_id (to be appended to the graph's finished_ops_ids so it
-        joins the VIRTUAL barrier alongside the full-KV H2D).
+                        dp_client_id: int = 0,
+                        return_op_ids: bool = False) -> Union[Optional[int], SWAGetChainOpIds]:
+        """Build the GET-side SWA load chain into ``graph``.
+
+        Returns the terminal SWA ``H2D`` op_id by default (for finished_ops /
+        VIRTUAL barrier). With ``return_op_ids=True``, returns ``SWAGetChainOpIds``
+        including staging ``DISK2H`` / ``REMOTE2H`` ids for CPU-ready publish.
 
         Mirrors the full-KV GET graph: the SWA ``H2D`` (CPU SWA slot -> GPU swa
         pool) depends on the staging ops ``DISK2H`` / ``REMOTE2H`` when the SWA
         bytes are sourced from SSD / REMOTE. (CPU-resident SWA needs no staging
         op, like a CPU full-KV hit.) All ops carry ``is_swa=True``. Returns None
-        when disabled / empty.
+        when disabled / empty (or empty ``SWAGetChainOpIds`` with return_op_ids).
         """
-        assert gpu_slot_ids.size > 0 and gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
-        h2d_id = self.build_swa_op(
-            graph, TransferType.H2D, cpu_slot_ids, gpu_slot_ids,
-            dp_client_id=dp_client_id,
-        )
-        if h2d_id is None:
-            return None
-        if ssd_slot_ids is not None and ssd_slot_ids.size == cpu_slot_ids.size:
+        assert cpu_slot_ids.size > 0 and cpu_slot_ids.size == gpu_slot_ids.size, \
+            "CPU and GPU SWA slot ids must have the same size"
+        ssd2h_id = None
+        remote2h_id = None
+        h2d_id = None
+        if (ssd_slot_ids is not None and ssd_slot_ids.size > 0
+                and ssd_slot_ids.size == cpu_slot_ids.size):
             ssd2h_id = self.build_swa_op(
                 graph, TransferType.DISK2H, ssd_slot_ids, cpu_slot_ids,
                 dp_client_id=dp_client_id,
             )
-            if ssd2h_id is not None:
-                graph.add_dependency(h2d_id, ssd2h_id)
-        if remote_slot_ids is not None and remote_slot_ids.size == cpu_slot_ids.size:
+
+        if (remote_slot_ids is not None and remote_slot_ids.size > 0
+                and remote_slot_ids.size == cpu_slot_ids.size):
             remote2h_id = self.build_swa_op(
                 graph, TransferType.REMOTE2H, remote_slot_ids, cpu_slot_ids,
                 dp_client_id=dp_client_id,
             )
-            if remote2h_id is not None:
-                graph.add_dependency(h2d_id, remote2h_id)
+
+        h2d_id = self.build_swa_op(
+            graph, TransferType.H2D, cpu_slot_ids, gpu_slot_ids,
+            dp_client_id=dp_client_id,
+        )
+        if h2d_id is not None and ssd2h_id is not None:
+            graph.add_dependency(h2d_id, ssd2h_id)
+        if h2d_id is not None and remote2h_id is not None:
+            graph.add_dependency(h2d_id, remote2h_id)
+
+        if return_op_ids:
+            return SWAGetChainOpIds(
+                h2d_id=h2d_id,
+                disk2h_id=ssd2h_id,
+                remote2h_id=remote2h_id,
+            )
         return h2d_id
 
     def build_put_chain(self,
