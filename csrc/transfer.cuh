@@ -40,6 +40,6 @@ void transfer_kv_blocks_fp4(
     int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_block_stride_in_bytes, int tokens_per_block,
     cudaStream_t stream, int transfer_num_cta, bool is_host_to_device,
-    bool sync = true);
+    bool is_mla = false, bool sync = true);
 
 } // namespace flexkv

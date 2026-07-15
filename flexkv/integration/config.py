@@ -442,20 +442,14 @@ class FlexKVConfig:
             if self.user_config.kv_cache_dtype is not None
             else kv_cache_dtype
         )
-        if _is_nvfp4_dtype_str(effective_dtype_str) and not use_mla:
+        if _is_nvfp4_dtype_str(effective_dtype_str):
             logical_head_size = self.model_config.head_size
             packed_head_size = nvfp4_kv_cache_full_dim(logical_head_size)
             self.model_config.head_size = packed_head_size
             logger.info(
                 f"[FlexKV sglang] NVFP4 KV cache detected: folding packed "
                 f"layout into head_size (logical={logical_head_size} -> "
-                f"packed={packed_head_size}, dtype=uint8)"
-            )
-        elif _is_nvfp4_dtype_str(effective_dtype_str) and use_mla:
-            logger.warning(
-                "[FlexKV sglang] kv_cache_dtype selects NVFP4 for an MLA "
-                "model. MLA backends do NOT support nvfp4 KV cache; "
-                "skipping the nvfp4 head_size fold."
+                f"packed={packed_head_size}, dtype=uint8, mla={use_mla})"
             )
 
         if use_mla and getattr(sglang_config, "index_head_dim", None) is not None:

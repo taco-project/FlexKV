@@ -73,7 +73,8 @@ TPTransferThreadGroup::TPTransferThreadGroup(
   if (num_tensors_per_gpu_ == 1) {
     backend_type_ = BackendType::TRTLLM;
   } else if (num_tensors_per_gpu_ == num_layers) {
-    backend_type_ = BackendType::VLLM;
+    backend_type_ = has_scale_buffers ? BackendType::SGLANG_FP4
+                                     : BackendType::VLLM;
   } else if (num_tensors_per_gpu_ == num_layers * 2) {
     backend_type_ = has_scale_buffers ? BackendType::SGLANG_FP4
                                      : BackendType::SGLANG;
@@ -354,7 +355,7 @@ void TPTransferThreadGroup::tp_group_transfer(
               gpu_tensor_handlers_[i], cpu_block_ids, cpu_ptr,
               cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
               cpu_block_stride_in_bytes, tokens_per_block_, streams_[i],
-              transfer_num_cta, is_host_to_device);
+              transfer_num_cta, is_host_to_device, is_mla);
           break;
         }
 

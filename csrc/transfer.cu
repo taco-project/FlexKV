@@ -225,7 +225,7 @@ __global__ void transfer_kv_blocks_fp4_kernel(
     int64_t *cpu_block_ids, int64_t *cpu_ptr,
     int64_t cpu_kv_stride, int64_t cpu_layer_stride,
     int64_t cpu_block_stride,
-    int tokens_per_block, bool is_host_to_device) {
+    int tokens_per_block, int num_kv, bool is_host_to_device) {
 
   int num_heads = data_handler.fp4_num_heads;
   int data_per_head = data_handler.fp4_data_per_head;
@@ -235,9 +235,9 @@ __global__ void transfer_kv_blocks_fp4_kernel(
   int64_t scale_blk_stride = data_handler.scale_block_stride;
   int64_t num_layers_i64 = data_handler.num_layers;
 
-  // Total work items: num_layers * num_blocks * 2(kv) * tokens_per_block * num_heads
-  // Each thread copies one (data_per_head + scale_per_head) chunk.
-  int total_items = num_layers * num_blocks * 2 * tokens_per_block * num_heads;
+  // Total work items: num_layers * num_blocks * num_kv * tokens_per_block * num_heads
+  // num_kv = 2 for MHA (separate K/V), 1 for MLA (joint KV)
+  int total_items = num_layers * num_blocks * num_kv * tokens_per_block * num_heads;
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
 
@@ -247,8 +247,8 @@ __global__ void transfer_kv_blocks_fp4_kernel(
     remaining /= num_heads;
     int tok = remaining % tokens_per_block;
     remaining /= tokens_per_block;
-    int kv_idx = remaining % 2;
-    remaining /= 2;
+    int kv_idx = remaining % num_kv;
+    remaining /= num_kv;
     int block_pos = remaining % num_blocks;
     int layer_off = remaining / num_blocks;
     int layer_idx = start_layer_id + layer_off;
@@ -315,8 +315,9 @@ void transfer_kv_blocks_fp4(
     int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_block_stride_in_bytes, int tokens_per_block,
     cudaStream_t stream, int transfer_num_cta,
-    bool is_host_to_device, bool sync) {
+    bool is_host_to_device, bool is_mla, bool sync) {
 
+  int num_kv = is_mla ? 1 : 2;
   int64_t *cpu_ptr_int64 = reinterpret_cast<int64_t *>(cpu_ptr);
   int64_t cpu_kv_stride_int64 = cpu_kv_stride_in_bytes / sizeof(int64_t);
   int64_t cpu_layer_stride_int64 = cpu_layer_stride_in_bytes / sizeof(int64_t);
@@ -329,7 +330,7 @@ void transfer_kv_blocks_fp4(
       num_blocks, start_layer_id, num_layers, gpu_block_ids, data_handler,
       cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64,
       cpu_layer_stride_int64, cpu_block_stride_int64, tokens_per_block,
-      is_host_to_device);
+      num_kv, is_host_to_device);
 
   if (sync) {
     cudaStreamSynchronize(stream);
