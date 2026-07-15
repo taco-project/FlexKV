@@ -750,6 +750,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
             self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
             self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+            self.chunk_size_in_bytes = self.cpu_chunk_size_in_bytes
             # tp has effect on the layout of the cpu tensor
             # the tp dim should always be right after the block dim
             # on both blockfirst layout and layerfirst layout
