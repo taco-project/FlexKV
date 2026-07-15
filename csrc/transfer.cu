@@ -197,4 +197,143 @@ template void transfer_kv_blocks<BackendType::SGLANG>(
     int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool,
     bool, bool);
 
+// SGLANG_FP4 uses the same kernel template as SGLANG for non-FP4 fallback
+template void transfer_kv_blocks<BackendType::SGLANG_FP4>(
+    int, int, int, int64_t *, GTensorHandler, int64_t, int64_t *, void *,
+    int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool,
+    bool, bool);
+
+// ---------------------------------------------------------------------------
+// FP4 pack/unpack transfer kernel
+//
+// SGLang stores FP4 KV data and fp8 block-scales in separate GPU buffers:
+//   data[layer]:  (num_tokens, num_heads, data_per_head)   -- 3D, uint8
+//   scale[layer]: (num_tokens, num_heads * scale_per_head)  -- 2D, uint8
+//
+// FlexKV CPU mirror uses a packed layout per head:
+//   cpu[layer, kv, block, token, head, 0:packed_head_size]
+// where packed_head_size = data_per_head + scale_per_head.
+//
+// This kernel fuses the pack/unpack with the D2H/H2D transfer so no
+// intermediate staging buffers are needed on the GPU.
+// ---------------------------------------------------------------------------
+
+__global__ void transfer_kv_blocks_fp4_kernel(
+    int num_blocks, int start_layer_id, int num_layers,
+    int64_t *gpu_block_ids,
+    GTensorHandler data_handler,
+    int64_t *cpu_block_ids, int64_t *cpu_ptr,
+    int64_t cpu_kv_stride, int64_t cpu_layer_stride,
+    int64_t cpu_block_stride,
+    int tokens_per_block, bool is_host_to_device) {
+
+  int num_heads = data_handler.fp4_num_heads;
+  int data_per_head = data_handler.fp4_data_per_head;
+  int scale_per_head = data_handler.fp4_scale_per_head;
+  int packed_head_size = data_per_head + scale_per_head;
+  int64_t **scale_ptrs = data_handler.scale_tensor_ptrs;
+  int64_t scale_blk_stride = data_handler.scale_block_stride;
+  int64_t num_layers_i64 = data_handler.num_layers;
+
+  // Total work items: num_layers * num_blocks * 2(kv) * tokens_per_block * num_heads
+  // Each thread copies one (data_per_head + scale_per_head) chunk.
+  int total_items = num_layers * num_blocks * 2 * tokens_per_block * num_heads;
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = gridDim.x * blockDim.x;
+
+  for (int idx = tid; idx < total_items; idx += stride) {
+    int remaining = idx;
+    int head = remaining % num_heads;
+    remaining /= num_heads;
+    int tok = remaining % tokens_per_block;
+    remaining /= tokens_per_block;
+    int kv_idx = remaining % 2;
+    remaining /= 2;
+    int block_pos = remaining % num_blocks;
+    int layer_off = remaining / num_blocks;
+    int layer_idx = start_layer_id + layer_off;
+
+    int gpu_block_idx = static_cast<int>(gpu_block_ids[block_pos]);
+    int cpu_block_idx = static_cast<int>(cpu_block_ids[block_pos]);
+
+    // GPU data pointer: data_handler layout is SGLang style
+    // gpu_tensor_ptrs[kv_idx * num_layers + layer_idx] points to
+    // (num_tokens, num_heads, data_per_head) stored as uint8
+    int8_t *gpu_data_base = reinterpret_cast<int8_t *>(
+        data_handler.gpu_tensor_ptrs[kv_idx * num_layers_i64 + layer_idx]);
+    int data_token_stride = num_heads * data_per_head;
+    int8_t *gpu_data = gpu_data_base +
+                       static_cast<int64_t>(gpu_block_idx) * tokens_per_block *
+                           data_token_stride +
+                       tok * data_token_stride + head * data_per_head;
+
+    // GPU scale pointer: scale_ptrs[kv_idx * num_layers + layer_idx]
+    // shape (num_tokens, num_heads * scale_per_head) stored as uint8
+    int8_t *gpu_scale_base = reinterpret_cast<int8_t *>(
+        scale_ptrs[kv_idx * num_layers_i64 + layer_idx]);
+    int scale_token_stride = num_heads * scale_per_head;
+    int8_t *gpu_scale = gpu_scale_base +
+                        static_cast<int64_t>(gpu_block_idx) * tokens_per_block *
+                            scale_token_stride +
+                        tok * scale_token_stride + head * scale_per_head;
+
+    // CPU packed pointer:
+    // cpu_ptr + layer_idx * cpu_layer_stride + kv_idx * cpu_kv_stride
+    //         + cpu_block_idx * cpu_block_stride
+    //         + (tok * num_heads + head) * packed_head_size
+    // (strides are in int64_t units, packed_head_size in bytes)
+    int8_t *cpu_packed =
+        reinterpret_cast<int8_t *>(
+            cpu_ptr + layer_idx * cpu_layer_stride + kv_idx * cpu_kv_stride +
+            cpu_block_idx * cpu_block_stride) +
+        static_cast<int64_t>(tok * num_heads + head) * packed_head_size;
+
+    if (is_host_to_device) {
+      // CPU packed -> GPU data + scale
+      for (int b = 0; b < data_per_head; b++) {
+        gpu_data[b] = cpu_packed[b];
+      }
+      for (int b = 0; b < scale_per_head; b++) {
+        gpu_scale[b] = cpu_packed[data_per_head + b];
+      }
+    } else {
+      // GPU data + scale -> CPU packed
+      for (int b = 0; b < data_per_head; b++) {
+        cpu_packed[b] = gpu_data[b];
+      }
+      for (int b = 0; b < scale_per_head; b++) {
+        cpu_packed[data_per_head + b] = gpu_scale[b];
+      }
+    }
+  }
+}
+
+void transfer_kv_blocks_fp4(
+    int num_blocks, int start_layer_id, int num_layers,
+    int64_t *gpu_block_ids, GTensorHandler data_handler,
+    int64_t *cpu_block_ids, void *cpu_ptr,
+    int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
+    int64_t cpu_block_stride_in_bytes, int tokens_per_block,
+    cudaStream_t stream, int transfer_num_cta,
+    bool is_host_to_device, bool sync) {
+
+  int64_t *cpu_ptr_int64 = reinterpret_cast<int64_t *>(cpu_ptr);
+  int64_t cpu_kv_stride_int64 = cpu_kv_stride_in_bytes / sizeof(int64_t);
+  int64_t cpu_layer_stride_int64 = cpu_layer_stride_in_bytes / sizeof(int64_t);
+  int64_t cpu_block_stride_int64 = cpu_block_stride_in_bytes / sizeof(int64_t);
+
+  int block_size = 256;
+  int grid_size = transfer_num_cta;
+
+  transfer_kv_blocks_fp4_kernel<<<grid_size, block_size, 0, stream>>>(
+      num_blocks, start_layer_id, num_layers, gpu_block_ids, data_handler,
+      cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64,
+      cpu_layer_stride_int64, cpu_block_stride_int64, tokens_per_block,
+      is_host_to_device);
+
+  if (sync) {
+    cudaStreamSynchronize(stream);
+  }
+}
+
 } // namespace flexkv

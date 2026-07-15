@@ -26,6 +26,9 @@ class RegisterTPClientRequest:
     # --- Indexer shadow transfer fields ---
     indexer_handles: Optional[List[TensorSharedHandle]] = None
     indexer_gpu_layout: Optional[KVCacheLayout] = None
+    # --- FP4 scale buffer fields ---
+    scale_handles: Optional[List[TensorSharedHandle]] = None
+    scale_gpu_layout: Optional[KVCacheLayout] = None
 
 
 @dataclass

@@ -51,6 +51,10 @@ class TransferManager:
         self.all_indexer_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> indexer_gpu_blocks
         self.all_indexer_gpu_layouts: Dict[int, KVCacheLayout] = {}
 
+        # FP4 scale buffer registration data
+        self.all_scale_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}
+        self.all_scale_gpu_layouts: Dict[int, KVCacheLayout] = {}
+
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
             self.context, zmq.SocketType.PULL, gpu_register_port, True)
@@ -80,6 +84,13 @@ class TransferManager:
                     flexkv_logger.info(
                         f"GPU {device_id}: registered indexer handles "
                         f"({len(req.indexer_handles)} layers)")
+                # Store FP4 scale GPU data if present
+                if req.scale_handles is not None:
+                    self.all_scale_gpu_blocks[device_id] = req.scale_handles
+                    self.all_scale_gpu_layouts[device_id] = req.scale_gpu_layout
+                    flexkv_logger.info(
+                        f"GPU {device_id}: registered FP4 scale handles "
+                        f"({len(req.scale_handles)} buffers)")
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
 
@@ -206,6 +217,22 @@ class TransferManager:
             else None
         )
 
+        # Group FP4 scale handles by WorkerKey (scale buffers bypass
+        # StorageEngine — they are packed into the main CPU mirror on-the-fly
+        # by the FP4 transfer kernel).
+        grouped_scale_gpu: Optional[Dict[WorkerKey, List]] = None
+        grouped_scale_layouts: Optional[Dict[WorkerKey, KVCacheLayout]] = None
+        if self.all_scale_gpu_blocks:
+            grouped_scale_gpu = {}
+            grouped_scale_layouts = {}
+            for device_id in sorted(self.all_scale_gpu_blocks.keys()):
+                worker_key = self.gpu_worker_key_mapping[device_id]
+                if worker_key not in grouped_scale_gpu:
+                    grouped_scale_gpu[worker_key] = []
+                grouped_scale_gpu[worker_key].append(
+                    self.all_scale_gpu_blocks[device_id])
+                grouped_scale_layouts[worker_key] = self.all_scale_gpu_layouts[device_id]
+
         self.transfer_engine = TransferEngine(
             gpu_handles=grouped_gpu_handles,
             model_config=self.model_config,
@@ -217,6 +244,8 @@ class TransferManager:
             indexer_cpu_handle=indexer_cpu_handle,
             indexer_ssd_handle=indexer_ssd_handle,
             indexer_remote_handle=indexer_remote_handle,
+            scale_gpu_blocks=grouped_scale_gpu,
+            scale_gpu_layouts=grouped_scale_layouts,
         )
 
         flexkv_logger.info(f"Initialized TransferEngine successfully, "

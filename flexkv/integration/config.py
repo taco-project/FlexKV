@@ -19,7 +19,7 @@ logger = flexkv_logger
 
 def _is_nvfp4_dtype_str(dtype_str: Optional[str]) -> bool:
     """Return True if *dtype_str* selects the NVFP4 packed KV cache layout."""
-    return isinstance(dtype_str, str) and dtype_str.lower() in ("nvfp4", "fp4", "e2m1")
+    return isinstance(dtype_str, str) and dtype_str.lower() in ("nvfp4", "fp4", "e2m1", "fp4_e2m1")
 
 
 def nvfp4_kv_cache_full_dim(head_size: int) -> int:
@@ -373,12 +373,29 @@ class FlexKVConfig:
             framework_dtype_str=kv_cache_dtype,
             fallback_dtype=getattr(sglang_config, "dtype", torch.bfloat16),
         )
-        # NVFP4 packed head_size fold is only implemented/verified for vLLM.
-        _warn_nvfp4_unsupported_framework(
+        # NVFP4: fold the packed width (data + block-scale bytes per head)
+        # into head_size so the CPU/SSD mirror matches the packed GPU layout
+        # byte-for-byte — same logic as ``post_init_from_vllm_config``.
+        effective_dtype_str = (
             self.user_config.kv_cache_dtype
-            if self.user_config.kv_cache_dtype is not None else kv_cache_dtype,
-            framework="sglang",
+            if self.user_config.kv_cache_dtype is not None
+            else kv_cache_dtype
         )
+        if _is_nvfp4_dtype_str(effective_dtype_str) and not use_mla:
+            logical_head_size = self.model_config.head_size
+            packed_head_size = nvfp4_kv_cache_full_dim(logical_head_size)
+            self.model_config.head_size = packed_head_size
+            logger.info(
+                f"[FlexKV sglang] NVFP4 KV cache detected: folding packed "
+                f"layout into head_size (logical={logical_head_size} -> "
+                f"packed={packed_head_size}, dtype=uint8)"
+            )
+        elif _is_nvfp4_dtype_str(effective_dtype_str) and use_mla:
+            logger.warning(
+                "[FlexKV sglang] kv_cache_dtype selects NVFP4 for an MLA "
+                "model. MLA backends do NOT support nvfp4 KV cache; "
+                "skipping the nvfp4 head_size fold."
+            )
 
         if use_mla and getattr(sglang_config, "index_head_dim", None) is not None:
             kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
