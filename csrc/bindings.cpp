@@ -437,13 +437,13 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("has_swa") = false,
            py::arg("swa_gpu_blocks") =
                std::vector<std::vector<torch::Tensor>>(),
-           py::arg("swa_cpu_blocks") = torch::Tensor(),
+           py::arg("swa_cpu_blocks") = torch::empty({0}),
            py::arg("swa_ssd_files") =
                std::map<int, std::vector<std::string>>(),
-           py::arg("swa_gpu_kv_strides_tensor") = torch::Tensor(),
-           py::arg("swa_gpu_block_strides_tensor") = torch::Tensor(),
-           py::arg("swa_gpu_layer_strides_tensor") = torch::Tensor(),
-           py::arg("swa_gpu_chunk_sizes_tensor") = torch::Tensor())
+           py::arg("swa_gpu_kv_strides_tensor") = torch::empty({0}),
+           py::arg("swa_gpu_block_strides_tensor") = torch::empty({0}),
+           py::arg("swa_gpu_layer_strides_tensor") = torch::empty({0}),
+           py::arg("swa_gpu_chunk_sizes_tensor") = torch::empty({0}))
       .def(
           py::init<
               int, const std::vector<std::vector<std::vector<torch::Tensor>>> &,
@@ -478,13 +478,13 @@ PYBIND11_MODULE(c_ext, m) {
           py::arg("has_swa") = false,
           py::arg("swa_gpu_blocks") =
               std::vector<std::vector<torch::Tensor>>(),
-          py::arg("swa_cpu_blocks") = torch::Tensor(),
+          py::arg("swa_cpu_blocks") = torch::empty({0}),
           py::arg("swa_ssd_files") =
               std::map<int, std::vector<std::string>>(),
-          py::arg("swa_gpu_kv_strides_tensor") = torch::Tensor(),
-          py::arg("swa_gpu_block_strides_tensor") = torch::Tensor(),
-          py::arg("swa_gpu_layer_strides_tensor") = torch::Tensor(),
-          py::arg("swa_gpu_chunk_sizes_tensor") = torch::Tensor())
+          py::arg("swa_gpu_kv_strides_tensor") = torch::empty({0}),
+          py::arg("swa_gpu_block_strides_tensor") = torch::empty({0}),
+          py::arg("swa_gpu_layer_strides_tensor") = torch::empty({0}),
+          py::arg("swa_gpu_chunk_sizes_tensor") = torch::empty({0}))
       .def("layerwise_transfer",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
