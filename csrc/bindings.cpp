@@ -429,10 +429,10 @@ PYBIND11_MODULE(c_ext, m) {
                     torch::Tensor &, std::map<int, std::vector<std::string>> &,
                     int, torch::Tensor &, torch::Tensor &, torch::Tensor &,
                     torch::Tensor &, int, int, torch::Tensor &, int,
-                    const std::vector<std::vector<torch::Tensor>> &,
+                    bool, const std::vector<std::vector<torch::Tensor>> &,
+                    torch::Tensor, std::map<int, std::vector<std::string>>,
                     torch::Tensor, torch::Tensor, torch::Tensor,
-                    torch::Tensor, torch::Tensor,
-                    std::map<int, std::vector<std::string>>>(),
+                    torch::Tensor>(),
            py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("cpu_blocks"),
            py::arg("ssd_files"), py::arg("num_layers"),
            py::arg("gpu_kv_strides_tensor"),
@@ -441,13 +441,57 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("gpu_chunk_sizes_tensor"), py::arg("iouring_entries"),
            py::arg("iouring_flags"), py::arg("layer_eventfds_tensor"),
            py::arg("tp_size"),
-           py::arg("indexer_gpu_blocks") = std::vector<std::vector<torch::Tensor>>{},
-           py::arg("indexer_cpu_blocks") = torch::Tensor(),
-           py::arg("indexer_gpu_kv_strides_tensor") = torch::Tensor(),
-           py::arg("indexer_gpu_block_strides_tensor") = torch::Tensor(),
-           py::arg("indexer_gpu_layer_strides_tensor") = torch::Tensor(),
-           py::arg("indexer_gpu_chunk_sizes_tensor") = torch::Tensor(),
-           py::arg("indexer_ssd_files") = std::map<int, std::vector<std::string>>{})
+           py::arg("has_swa") = false,
+           py::arg("swa_gpu_blocks") =
+               std::vector<std::vector<torch::Tensor>>(),
+           py::arg("swa_cpu_blocks") = torch::empty({0}),
+           py::arg("swa_ssd_files") =
+               std::map<int, std::vector<std::string>>(),
+           py::arg("swa_gpu_kv_strides_tensor") = torch::empty({0}),
+           py::arg("swa_gpu_block_strides_tensor") = torch::empty({0}),
+           py::arg("swa_gpu_layer_strides_tensor") = torch::empty({0}),
+           py::arg("swa_gpu_chunk_sizes_tensor") = torch::empty({0}))
+      .def(
+          py::init<
+              int, const std::vector<std::vector<std::vector<torch::Tensor>>> &,
+              torch::Tensor &, std::map<int, std::vector<std::string>> &, int,
+              const std::vector<std::vector<std::pair<int, int>>> &,
+              const std::vector<int> &,
+              const std::vector<int64_t> &, const std::vector<int64_t> &,
+              const std::vector<int64_t> &, const std::vector<int64_t> &,
+              const std::vector<int64_t> &, const std::vector<int64_t> &,
+              const std::vector<int64_t> &, const std::vector<int64_t> &,
+              const std::vector<int64_t> &, const std::vector<int64_t> &,
+              const std::vector<int64_t> &, const std::vector<int64_t> &,
+              const std::vector<int64_t> &, const std::vector<int64_t> &,
+              const std::vector<int64_t> &, int, int, torch::Tensor &, int,
+              bool, const std::vector<std::vector<torch::Tensor>> &,
+              torch::Tensor, std::map<int, std::vector<std::string>>,
+              torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(),
+          py::arg("num_gpus"), py::arg("gpu_blocks_per_group"),
+          py::arg("cpu_blocks"), py::arg("ssd_files"),
+          py::arg("num_original_layers"), py::arg("layer_members"),
+          py::arg("group_num_layers"), py::arg("group_cpu_offset_bytes"),
+          py::arg("group_ssd_offset_bytes"), py::arg("group_cpu_layer_strides"),
+          py::arg("group_cpu_kv_strides"), py::arg("group_ssd_layer_strides"),
+          py::arg("group_ssd_kv_strides"), py::arg("group_chunk_sizes"),
+          py::arg("group_h2d_cpu_kv_strides"),
+          py::arg("group_h2d_cpu_layer_strides"),
+          py::arg("group_cpu_block_strides"), py::arg("group_cpu_tp_strides"),
+          py::arg("group_gpu_kv_strides"), py::arg("group_gpu_block_strides"),
+          py::arg("group_gpu_layer_strides"), py::arg("group_gpu_chunk_sizes"),
+          py::arg("iouring_entries"), py::arg("iouring_flags"),
+          py::arg("layer_eventfds_tensor"), py::arg("tp_size"),
+          py::arg("has_swa") = false,
+          py::arg("swa_gpu_blocks") =
+              std::vector<std::vector<torch::Tensor>>(),
+          py::arg("swa_cpu_blocks") = torch::empty({0}),
+          py::arg("swa_ssd_files") =
+              std::map<int, std::vector<std::string>>(),
+          py::arg("swa_gpu_kv_strides_tensor") = torch::empty({0}),
+          py::arg("swa_gpu_block_strides_tensor") = torch::empty({0}),
+          py::arg("swa_gpu_layer_strides_tensor") = torch::empty({0}),
+          py::arg("swa_gpu_chunk_sizes_tensor") = torch::empty({0}))
       .def("layerwise_transfer",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -465,20 +509,47 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("use_ce_transfer"), py::arg("num_layers"),
            py::arg("layer_granularity"), py::arg("is_mla"),
            py::arg("counter_id") = 0,
-           py::arg("indexer_gpu_block_id_tensor") = torch::Tensor(),
-           py::arg("indexer_cpu_block_id_tensor") = torch::Tensor(),
-           py::arg("indexer_cpu_block_stride_in_bytes") = 0,
-           py::arg("indexer_cpu_layer_stride_in_bytes") = 0,
-           py::arg("indexer_h2d_cpu_kv_stride_in_bytes") = 0,
-           py::arg("indexer_h2d_cpu_layer_stride_in_bytes") = 0,
-           py::arg("indexer_ssd_block_ids") = torch::Tensor(),
-           py::arg("indexer_cpu_block_ids_d2h") = torch::Tensor(),
-           py::arg("indexer_ssd_layer_stride_in_bytes") = 0,
-           py::arg("indexer_ssd_kv_stride_in_bytes") = 0,
-           py::arg("indexer_cpu_chunk_size_in_bytes") = 0,
-           py::arg("indexer_num_blocks_per_file") = 0,
+           py::arg("swa_h2d_src") = torch::Tensor(),
+           py::arg("swa_h2d_dst") = torch::Tensor(),
+           py::arg("swa_disk2h_src") = torch::Tensor(),
+           py::arg("swa_disk2h_dst") = torch::Tensor(),
+           py::arg("swa_cpu_kv_stride_in_bytes") = 0,
+           py::arg("swa_cpu_layer_stride_in_bytes") = 0,
+           py::arg("swa_cpu_block_stride_in_bytes") = 0,
+           py::arg("swa_cpu_chunk_size_in_bytes") = 0,
+           py::arg("swa_h2d_cpu_kv_stride_in_bytes") = 0,
+           py::arg("swa_h2d_cpu_layer_stride_in_bytes") = 0,
+           py::arg("swa_cpu_tp_stride_in_bytes") = 0,
+           py::arg("swa_ssd_layer_stride_in_bytes") = 0,
+           py::arg("swa_ssd_kv_stride_in_bytes") = 0,
+           py::arg("swa_num_blocks_per_file") = 0,
+           py::arg("mla_d2h_mode") = "sharded",
+           py::arg("notify_mode") = "hostfunc")
+      .def("layerwise_transfer_multi_group",
+           &flexkv::LayerwiseTransferGroup::layerwise_transfer_multi_group,
+           py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
+           py::arg("num_blocks_per_file"), py::arg("round_robin"),
+           py::arg("num_threads_per_device"), py::arg("gpu_block_id_tensor"),
+           py::arg("cpu_block_id_tensor"), py::arg("transfer_cta_num"),
+           py::arg("use_ce_transfer"), py::arg("is_mla"),
+           py::arg("counter_id") = 0,
+           py::arg("swa_h2d_src") = torch::Tensor(),
+           py::arg("swa_h2d_dst") = torch::Tensor(),
+           py::arg("swa_disk2h_src") = torch::Tensor(),
+           py::arg("swa_disk2h_dst") = torch::Tensor(),
+           py::arg("swa_cpu_kv_stride_in_bytes") = 0,
+           py::arg("swa_cpu_layer_stride_in_bytes") = 0,
+           py::arg("swa_cpu_block_stride_in_bytes") = 0,
+           py::arg("swa_cpu_chunk_size_in_bytes") = 0,
+           py::arg("swa_h2d_cpu_kv_stride_in_bytes") = 0,
+           py::arg("swa_h2d_cpu_layer_stride_in_bytes") = 0,
+           py::arg("swa_cpu_tp_stride_in_bytes") = 0,
+           py::arg("swa_ssd_layer_stride_in_bytes") = 0,
+           py::arg("swa_ssd_kv_stride_in_bytes") = 0,
+           py::arg("swa_num_blocks_per_file") = 0,
            py::arg("mla_d2h_mode") = "sharded",
            py::arg("notify_mode") = "hostfunc");
+
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
         "Transfer KV blocks between remote and CPU memory",
@@ -685,15 +756,53 @@ PYBIND11_MODULE(c_ext, m) {
       .def("match_prefix", &flexkv::CRadixTreeIndex::match_prefix,
            py::arg("block_hashes"), py::arg("num_blocks"),
            py::arg("update_cache_info"),
-           py::call_guard<py::gil_scoped_release>());
+           py::call_guard<py::gil_scoped_release>())
+      .def("drain_freed_swa_slots",
+           &flexkv::CRadixTreeIndex::drain_freed_swa_slots)
+      // ===== SWA node-mount: store-side mount + SWA-only eviction =====
+      .def("set_swa", &flexkv::CRadixTreeIndex::set_swa, py::arg("node"),
+           py::arg("slot"))
+      .def("promote_swa", &flexkv::CRadixTreeIndex::promote_swa,
+           py::arg("node"))
+      .def("evict_swa", &flexkv::CRadixTreeIndex::evict_swa,
+           py::arg("evicted_full_blocks"), py::arg("num_swa_evicted"),
+           py::call_guard<py::gil_scoped_release>())
+      // ===== SWA dual lock (full + swa), tree-level walk (design §7) =====
+      .def("inc_lock_ref", &flexkv::CRadixTreeIndex::inc_lock_ref,
+           py::arg("node"), py::return_value_policy::reference)
+      .def("dec_lock_ref", &flexkv::CRadixTreeIndex::dec_lock_ref,
+           py::arg("node"), py::arg("swa_boundary") = nullptr,
+           py::arg("skip_swa") = false)
+      .def("dec_swa_lock_only", &flexkv::CRadixTreeIndex::dec_swa_lock_only,
+           py::arg("swa_boundary"));
 
   py::class_<flexkv::CRadixNode>(m, "CRadixNode")
       .def(py::init<flexkv::CRadixTreeIndex *, bool, int>())
       .def(py::init<flexkv::CRadixTreeIndex *, bool, int, bool>())
       .def("size", &flexkv::CRadixNode::size)
       .def("has_block_node_ids", &flexkv::CRadixNode::has_block_node_ids)
+      // Structural / lock accessors — needed to assert the node-mount SWA
+      // invariants (I1/I2/I3) from Python against the production CRadixTreeIndex
+      // path (see tests/test_swa_node_mount.py). Previously only bound for
+      // the P2P LocalRadixTree, so the non-P2P DSv4 build had no way to read
+      // them and the C++ node-mount SWA path went untested.
+      .def("is_leaf", &flexkv::CRadixNode::is_leaf)
+      .def("num_children", &flexkv::CRadixNode::get_num_children)
+      .def("get_lock_cnt", &flexkv::CRadixNode::get_lock_cnt)
+      .def("lock", &flexkv::CRadixNode::lock)
+      .def("unlock", &flexkv::CRadixNode::unlock)
+      .def("has_swa", &flexkv::CRadixNode::has_swa)
       .def_property_readonly("parent", &flexkv::CRadixNode::get_parent,
-                             py::return_value_policy::reference);
+                             py::return_value_policy::reference)
+      // ===== SWA accessors (node-attached SWA state) =====
+      .def_property("swa_host_slot", &flexkv::CRadixNode::get_swa_host_slot,
+                    &flexkv::CRadixNode::set_swa_host_slot)
+      .def_property("swa_tombstone", &flexkv::CRadixNode::get_swa_tombstone,
+                    &flexkv::CRadixNode::set_swa_tombstone)
+      .def_property_readonly("swa_lock_ref",
+                             &flexkv::CRadixNode::get_swa_lock_ref)
+      .def("inc_swa_lock_ref", &flexkv::CRadixNode::inc_swa_lock_ref)
+      .def("dec_swa_lock_ref", &flexkv::CRadixNode::dec_swa_lock_ref);
 
   py::class_<flexkv::CMatchResult, std::shared_ptr<flexkv::CMatchResult>>(
       m, "CMatchResult")
@@ -708,7 +817,11 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readonly("num_matched_blocks",
                     &flexkv::CMatchResult::num_matched_blocks)
       .def_readonly("last_node_matched_length",
-                    &flexkv::CMatchResult::last_node_matched_length);
+                    &flexkv::CMatchResult::last_node_matched_length)
+      // ===== SWA node-mount: deepest ready node carrying a live SWA slot =====
+      .def_readonly("last_swa_node", &flexkv::CMatchResult::last_swa_node,
+                    py::return_value_policy::reference)
+      .def_readonly("swa_hit_blocks", &flexkv::CMatchResult::swa_hit_blocks);
 #ifdef FLEXKV_ENABLE_GDS
   // Add GDS Manager class binding
   py::class_<GDSManager>(m, "GDSManager")

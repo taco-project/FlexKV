@@ -91,13 +91,41 @@ class HierarchyLRCacheEngine:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
-        
+
         # cumulative statistics: for analyzing distributed KV reuse benefits
         self._stats_total_queried_tokens = 0       # total tokens queried
         self._stats_gpu_matched_tokens = 0         # total tokens matched in GPU memory
         self._stats_local_matched_tokens = 0       # total tokens matched in FlexKV local
         self._stats_distributed_matched_tokens = 0 # total tokens matched in FlexKV global (distributed reuse)
         self._stats_match_count = 0                # match_all call count
+
+        # Hierarchical/distributed radix indexes do not expose the node-mounted
+        # SWA match and lifecycle contract yet. Keep the capability disabled
+        # instead of creating a pool that makes callers believe SWA is usable.
+        self.swa_pool = None
+
+    def init_swa(self, swa_config: "SWAPoolConfig") -> None:
+        raise NotImplementedError(
+            "HierarchyLRCacheEngine does not support node-mounted SWA")
+
+    @property
+    def swa_enabled(self) -> bool:
+        return False
+
+    def _alloc_swa_slot(self, protected_node=None) -> int:
+        return -1
+
+    def _free_unmounted_swa_slot(self, slot: int) -> None:
+        if self.swa_pool is None or slot is None or slot < 0:
+            return
+        self.swa_pool.free(int(slot))
+
+    @staticmethod
+    def _get_mounted_swa_slot(node: Optional["CRadixNode"]) -> int:
+        return -1
+
+    def _drain_unmounted_swa_slots(self) -> None:
+        return
 
     def start(self) -> None:
         if self._meta is None:
@@ -143,13 +171,13 @@ class HierarchyLRCacheEngine:
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
         """Match a sequence against the cache index.
-        
+
         This method provides a simple interface similar to CacheEngine.match(),
         delegating to match_all() for consistency.
-        
+
         Args:
             sequence_meta: The sequence metadata to match
-            
+
         Returns:
             MatchResultAccel: The match result
         """
@@ -173,31 +201,31 @@ class HierarchyLRCacheEngine:
         remote_key = (int(mr_remote.num_matched_blocks), int(mr_remote.num_ready_matched_blocks))
         matched_pos = "local" if local_key >= remote_key else "remote"
         chosen = mr_local if local_key >= remote_key else mr_remote
-        
+
         # update cumulative statistics
         queried_tokens = num_blocks * self.tokens_per_block
         gpu_matched_tokens = gpu_matched_blocks * self.tokens_per_block
         local_matched_tokens = int(mr_local.num_matched_blocks) * self.tokens_per_block
         distributed_matched_tokens = int(chosen.num_matched_blocks) * self.tokens_per_block
-        
+
         self._stats_total_queried_tokens += queried_tokens
         self._stats_gpu_matched_tokens += gpu_matched_tokens
         self._stats_local_matched_tokens += local_matched_tokens
         self._stats_distributed_matched_tokens += distributed_matched_tokens
         self._stats_match_count += 1
-        
+
         # calculate hit ratio for each level
         total = self._stats_total_queried_tokens
         gpu_pct = (self._stats_gpu_matched_tokens * 100 / total) if total > 0 else 0
         local_pct = (self._stats_local_matched_tokens * 100 / total) if total > 0 else 0
         distributed_pct = (self._stats_distributed_matched_tokens * 100 / total) if total > 0 else 0
-        
+
         # calculate extra benefits for each level
         extra_from_local = self._stats_local_matched_tokens - self._stats_gpu_matched_tokens
         extra_from_distributed = self._stats_distributed_matched_tokens - self._stats_local_matched_tokens
         extra_local_pct = (extra_from_local * 100 / total) if total > 0 else 0
         extra_distributed_pct = (extra_from_distributed * 100 / total) if total > 0 else 0
-        
+
         print(
             f"[STATS][REUSE] cnt={self._stats_match_count}, queried={total}, "
             f"gpu={self._stats_gpu_matched_tokens} ({gpu_pct:.2f}%), "
@@ -205,7 +233,7 @@ class HierarchyLRCacheEngine:
             f"flexkv_global={self._stats_distributed_matched_tokens} ({distributed_pct:.2f}%, "
             f"+{extra_distributed_pct:.2f}%)"
         )
-        
+
         # physical blocks
         bnids_np = None
         if chosen is mr_remote:
@@ -275,7 +303,7 @@ class HierarchyLRCacheEngine:
             return None
         out = np.full(phys_np.shape, fill_value=0, dtype=np.uint32)
         rr = max(1, int(self.round_robin))
-        
+
         for i in range(bnids_np.shape[0]):
             nid = int(bnids_np[i])
             #check if node is active
@@ -320,11 +348,12 @@ class HierarchyLRCacheEngine:
                physical_block_ids: torch.Tensor,
                num_insert_blocks: int = -1,
                is_ready: bool = True,
-               match_result: Optional[MatchResultAccel] = None) -> Optional[CRadixNode]:
+               match_result: Optional[MatchResultAccel] = None,
+               swa_store: bool = False) -> Optional[CRadixNode]:
         sequence_meta.gen_hashes()
         phys_t = torch.from_numpy(physical_block_ids).to(torch.int64) if isinstance(physical_block_ids, np.ndarray) else physical_block_ids.to(torch.int64)
         hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
-        
+
         if match_result is None:
             node = self.local_index.insert(
                 phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks), bool(is_ready)
@@ -352,7 +381,7 @@ class HierarchyLRCacheEngine:
 
     def unlock(self, node: CRadixNode) -> None:
         """Unlock a node in the appropriate index (local or remote).
-        
+
         Args:
             node: The radix node to unlock
         """
@@ -383,7 +412,7 @@ class HierarchyLRCacheEngine:
 
     def set_ready(self, node: CRadixNode, ready: bool = True, ready_length: int = -1) -> None:
         """Set the ready state of a node in the appropriate index (local or remote).
-        
+
         Args:
             node: The radix node to set ready state
             ready: Whether the node is ready (default: True)
@@ -406,36 +435,39 @@ class HierarchyLRCacheEngine:
              strict: bool = True) -> torch.Tensor:
         # Calculate current utilization
         utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
-        
+
         # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
         should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
-        
+
         if should_evict:
             if protected_node is not None:
                 self.local_index.lock(protected_node)
-            
+
             # Calculate how many blocks to evict
             # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
             target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
             evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
-            
+
             evict_block_num = max(
                 num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
                 evict_to_reach_target,                               # Or reach target free ratio
                 int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
             )
-            
+
             if evict_block_num > 0:
                 target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
+                # evict() resizes target_blocks in-place to the actual freed count
+                # (may EXCEED evict_block_num when the I2 tombstone cascade frees
+                # ancestors) and returns it — trust the returned count.
                 num_evicted = self.local_index.evict(target_blocks, evict_block_num)
-                if num_evicted != evict_block_num:
+                if target_blocks.numel() != num_evicted:
                     target_blocks.resize_(num_evicted)
                 evicted_np = target_blocks.numpy()
                 self.mempool.recycle_blocks(evicted_np)
-            
+
             if protected_node is not None:
                 self.local_index.unlock(protected_node)
-        
+
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise ValueError(
                 f"Not enough free blocks to take, required: {num_required_blocks}, available: {self.mempool.num_free_blocks}"
@@ -448,6 +480,7 @@ class HierarchyLRCacheEngine:
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
+        self._drain_unmounted_swa_slots()
 
     #TODO pfcs may not work now
     @classmethod
@@ -547,7 +580,7 @@ class HierarchyLRCacheEngine:
             else:
                 raise ValueError(f"Invalid device type: {device_type}")
                 #local_max_num_blocks = int(cache_config.num_local_blocks or 0)
-            
+
             return cls(
                 num_total_blocks=int(local_max_num_blocks or 0),
                 tokens_per_block=int(cache_config.tokens_per_block),

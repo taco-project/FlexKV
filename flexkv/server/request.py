@@ -3,7 +3,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from flexkv.common.config import ModelConfig
+from flexkv.common.config import ModelConfig, LayerGroupSpec
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
 from flexkv.common.request import KVResponseStatus
@@ -23,9 +23,15 @@ class RegisterTPClientRequest:
     device_id: int
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
-    # --- Indexer shadow transfer fields ---
-    indexer_handles: Optional[List[TensorSharedHandle]] = None
-    indexer_gpu_layout: Optional[KVCacheLayout] = None
+    # Multi-group fields for heterogeneous KV cache layouts (including
+    # DSA/NSA indexer-as-group). When None, the request describes a uniform
+    # single-shape model and the legacy ``handles``/``gpu_layout`` path is used.
+    layer_groups: Optional[List[LayerGroupSpec]] = None
+    gpu_layouts: Optional[List[KVCacheLayout]] = None
+    handles_per_group: Optional[List[List[TensorSharedHandle]]] = None
+    # SWA transfer fileds
+    swa_handles: Optional[List[TensorSharedHandle]] = None
+    swa_layout: Optional[KVCacheLayout] = None
 
 
 @dataclass
@@ -78,6 +84,10 @@ class GetMatchRequest:
     cpu_only: bool = False
     task_id: int = -1
     namespace: Optional[List[str]] = None
+    # SWA-aware match: clamp the Full-KV transfer to the reusable SWA window; the
+    # SWA window is the trailing block of the returned mask.
+    swa_aware: bool = False
+
 
 
 @dataclass
@@ -89,6 +99,7 @@ class LaunchTaskRequest:
     batch_id: int = -1
     layerwise_transfer: bool = False
     counter_id: int = 0  # Counter set index for triple buffering eventfd notification
+    swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None
 
 
 @dataclass

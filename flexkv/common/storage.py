@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Union, List, Optional, Any, Dict
+from typing import Union, List, Optional, Any, Dict, TYPE_CHECKING
 
 import torch
 
 from flexkv.common.memory_handle import TensorSharedHandle
+
+if TYPE_CHECKING:
+    from flexkv.common.config import LayerGroupSpec
 
 
 class AccessHandleType(Enum):
@@ -33,6 +38,12 @@ class KVCacheLayout:
     head_size: int
     is_mla: bool
     _kv_shape: Optional[torch.Size] = None
+    # Multi-group support: when set, the layout represents a heterogeneous block
+    # where different layer groups have different (num_kv_heads, head_size).
+    layer_groups: Optional[List[LayerGroupSpec]] = None
+    # TP size: when > 1 and layer_groups is set, elements_per_block is scaled
+    # so that each CPU/SSD block can hold data for all TP ranks.
+    tp_size: int = 1
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, KVCacheLayout):
@@ -44,6 +55,8 @@ class KVCacheLayout:
                 self.num_head == other.num_head and
                 self.head_size == other.head_size and
                 self.is_mla == other.is_mla and
+                self.layer_groups == other.layer_groups and
+                self.tp_size == other.tp_size and
                 self.kv_shape == other.kv_shape)
 
     @property
@@ -62,7 +75,42 @@ class KVCacheLayout:
 
     def _compute_kv_shape(self) -> None:
         if self._kv_shape is None:
-            if self.type == KVCacheLayoutType.LAYERFIRST:  # for Layerwise transfer
+            if self.layer_groups is not None and self.type == KVCacheLayoutType.BLOCKFIRST:
+                # Multi-group: kv_shape's second dim is BYTES per block, not
+                # element count.  Groups may carry different dtypes (e.g. bf16
+                # main KV + uint8 indexer in DSv4), so we cannot factor out a
+                # single dtype_size.  Each group contributes
+                #   num_layers * kv_dim * tokens_per_block * num_kv_heads *
+                #   head_size * dtype.itemsize
+                # bytes.  kv_dim and tokens_per_block are taken from the layout
+                # top level (uniform across groups in supported configs).
+                # layer_groups store per-GPU num_kv_heads (after TP split);
+                # tp_size multiplies so each block holds data for ALL TP ranks.
+                if any(g.dtype is None for g in self.layer_groups):
+                    raise ValueError(
+                        "Multi-group KVCacheLayout requires LayerGroupSpec.dtype "
+                        "to be set on every group (resolve None to ModelConfig.dtype "
+                        "before constructing the layout)."
+                    )
+                # Per-group tokens_per_block after compression. The CPU/SSD block
+                # only stores ``tpb_g`` compressed tokens per group, matching the
+                # shrunk shape sglang allocates on the GPU for that group.
+                for gi, g in enumerate(self.layer_groups):
+                    if self.tokens_per_block % g.compress_ratio != 0:
+                        raise ValueError(
+                            f"KVCacheLayout: layer_groups[{gi}].compress_ratio="
+                            f"{g.compress_ratio} does not divide tokens_per_block="
+                            f"{self.tokens_per_block}. Choose a page_size that is a "
+                            f"multiple of every group's compress_ratio."
+                        )
+                bytes_per_block = self.tp_size * sum(
+                    g.num_layers * self.kv_dim *
+                    (self.tokens_per_block // g.compress_ratio) *
+                    g.num_kv_heads * g.head_size * g.dtype.itemsize
+                    for g in self.layer_groups
+                )
+                self._kv_shape = torch.Size([self.num_block, bytes_per_block])
+            elif self.type == KVCacheLayoutType.LAYERFIRST:  # for Layerwise transfer
                 self._kv_shape = torch.Size([self.num_layer,
                                              self.kv_dim,
                                              self.num_block,
@@ -86,7 +134,7 @@ class KVCacheLayout:
             else:
                 raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
 
-    def div_block(self, num_chunks: int, padding: bool = False) -> 'KVCacheLayout':
+    def div_block(self, num_chunks: int, padding: bool = False) -> KVCacheLayout:
         if padding:
             num_blocks = (self.num_block + num_chunks - 1) // num_chunks
         else:
@@ -101,10 +149,12 @@ class KVCacheLayout:
             num_head=self.num_head,
             head_size=self.head_size,
             is_mla=self.is_mla,
+            layer_groups=self.layer_groups,
+            tp_size=self.tp_size,
         )
         return new_layout
 
-    def div_layer(self, num_chunks: int) -> 'KVCacheLayout':
+    def div_layer(self, num_chunks: int) -> KVCacheLayout:
         assert self.num_layer % num_chunks == 0, \
             f"num_layer {self.num_layer} must be divisible by num_chunks {num_chunks}"
         new_layout = KVCacheLayout(
@@ -118,7 +168,7 @@ class KVCacheLayout:
         )
         return new_layout
 
-    def div_head(self, num_chunks: int) -> 'KVCacheLayout':
+    def div_head(self, num_chunks: int) -> KVCacheLayout:
         assert self.num_head % num_chunks == 0, \
             f"num_head {self.num_head} must be divisible by num_chunks {num_chunks}"
         new_layout = KVCacheLayout(
@@ -133,9 +183,15 @@ class KVCacheLayout:
         return new_layout
 
     def get_chunk_size(self) -> int:
+        if self.layer_groups is not None:
+            raise ValueError("get_chunk_size() is not valid for multi-group layout; "
+                             "use per-group strides instead")
         return self.tokens_per_block * self.num_head * self.head_size
 
     def get_layer_stride(self) -> int:
+        if self.layer_groups is not None:
+            raise ValueError("get_layer_stride() is not valid for multi-group layout; "
+                             "use per-group strides instead")
         if self.type == KVCacheLayoutType.LAYERFIRST:
             return self.kv_shape[1:].numel()
         elif self.type == KVCacheLayoutType.BLOCKFIRST:
@@ -146,6 +202,10 @@ class KVCacheLayout:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
 
     def get_block_stride(self) -> int:
+        if self.layer_groups is not None:
+            # For multi-group BLOCKFIRST, kv_shape is [num_block, bytes_per_block]
+            # — the value is already in BYTES, do not multiply by dtype.itemsize.
+            return self.kv_shape[1]
         if self.type == KVCacheLayoutType.LAYERFIRST:
             return self.kv_shape[3:].numel()
         elif self.type == KVCacheLayoutType.BLOCKFIRST:
@@ -156,6 +216,9 @@ class KVCacheLayout:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
 
     def get_kv_stride(self) -> int:
+        if self.layer_groups is not None:
+            raise ValueError("get_kv_stride() is not valid for multi-group layout; "
+                             "use per-group strides instead")
         if self.type == KVCacheLayoutType.LAYERFIRST:
             return self.kv_shape[2:].numel()
         elif self.type == KVCacheLayoutType.BLOCKFIRST:
@@ -164,6 +227,45 @@ class KVCacheLayout:
             return self.kv_shape[3:].numel()
         else:
             raise ValueError(f"Invalid KVCacheLayoutType: {self.type}")
+
+    def get_group_strides(self) -> List[Dict[str, int]]:
+        """Compute per-group stride info for multi-group BLOCKFIRST layout.
+
+        Returns a list of dicts, one per group, each containing:
+            - num_layers: number of layers in this group
+            - offset_elements: element offset of this group within a block
+            - layer_stride: elements per layer (kv_dim * tpb_g * num_kv_heads * head_size)
+            - kv_stride: elements per KV half (tpb_g * num_kv_heads * head_size)
+            - chunk_size: elements per K or V chunk (tpb_g * num_kv_heads * head_size)
+
+        ``tpb_g = tokens_per_block // g.compress_ratio`` — compressed groups
+        store only ``1/compress_ratio`` tokens per block in this group's region.
+        """
+        if self.layer_groups is None:
+            raise ValueError("get_group_strides() requires layer_groups to be set")
+        if self.type != KVCacheLayoutType.BLOCKFIRST:
+            raise ValueError("get_group_strides() only supports BLOCKFIRST layout")
+
+        result = []
+        offset = 0
+        for g in self.layer_groups:
+            tpb_g = self.tokens_per_block // g.compress_ratio
+            chunk = tpb_g * g.num_kv_heads * g.head_size
+            kv_stride = chunk  # tpb_g * num_kv_heads * head_size
+            layer_stride = self.kv_dim * kv_stride
+            group_elements = g.num_layers * layer_stride
+            result.append({
+                'num_layers': g.num_layers,
+                'num_kv_heads': g.num_kv_heads,
+                'head_size': g.head_size,
+                'layer_indices': g.layer_indices,
+                'offset_elements': offset,
+                'layer_stride': layer_stride,
+                'kv_stride': kv_stride,
+                'chunk_size': chunk,
+            })
+            offset += group_elements
+        return result
 
     def get_total_elements(self) -> int:
         return self.kv_shape.numel()

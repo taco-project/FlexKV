@@ -1,8 +1,9 @@
 import os
 import json
 import yaml
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
+from functools import cached_property
 from typing import Optional, List, Tuple, Union, Dict, Any
 from argparse import Namespace
 import copy
@@ -14,12 +15,93 @@ from flexkv.common.debug import flexkv_logger
 
 
 @dataclass
-class IndexerCacheConfig:
-    """Indexer-specific cache configuration, embedded inside CacheConfig."""
-    # Indexer head layout
-    head_size: int = 0          # qk_rope_head_dim for DSA/NSA models
-    num_kv_heads: int = 1       # typically 1 for MLA-style indexer
-    dtype: torch.dtype = torch.uint8  # indexer storage dtype (fp8 quantized)
+class LayerGroupSpec:
+    """One group of layers sharing the same KV cache shape.
+
+    ``layer_indices[k]`` is the *original layer id* (index into the full
+    ``model_config.num_layers`` range) that this group's k-th local layer
+    (local_id = k) maps to.  Multiple groups MAY share the same original
+    layer id — this expresses heterogeneous KV at one transformer block
+    (e.g. DSv4: main KV bf16 and indexer uint8 both attached to the same
+    layer).
+
+    Invariants (enforced by ``ModelConfig._validate_layer_groups``):
+
+    * ``num_layers == len(layer_indices)``
+    * ``layer_indices`` has no internal duplicates
+    * every element of ``layer_indices`` is in ``[0, model_config.num_layers)``
+    * original layers may be omitted when they have no cached state, and may
+      appear in multiple groups when they have multiple cache members
+    """
+    num_layers: int
+    num_kv_heads: int
+    head_size: int
+    layer_indices: List[int]
+    # Per-group storage dtype. None = inherit ModelConfig.dtype.
+    # Indexer groups use a different dtype (e.g. fp8/uint8) than main KV (bf16).
+    dtype: Optional[torch.dtype] = None
+    # Per-group KV compression along the tokens_per_block dimension. The CPU/SSD
+    # block stores ``tokens_per_block // compress_ratio`` tokens worth of data
+    # for this group (the GPU tensor sglang allocates is already compressed to
+    # the same shrunk shape). ``1`` = uncompressed (legacy behavior). Used by
+    # DSv4-style models where different layer roles compress at different ratios
+    # (e.g. CSA at 4x, HCA at 128x). ``tokens_per_block % compress_ratio == 0``
+    # is enforced when the KVCacheLayout is built.
+    compress_ratio: int = 1
+
+
+@dataclass(frozen=True)
+class LayerMemberMap:
+    """Dense mapping from original layer id -> tuple of (group_idx, local_layer_id).
+
+    ``members[i]`` is the tuple of ``(group_idx, local_layer_id)`` pairs for
+    original layer ``i``, ordered by ascending ``group_idx`` (main KV before
+    auxiliary groups like indexer).
+
+    Examples:
+
+      Single group (uniform model): every layer has 1 member.
+        members = (((0, 0),), ((0, 1),), ..., ((0, N-1),))
+
+      DSv4 (main + indexer share every layer): every layer has 2 members.
+        members = (((0, 0), (1, 0)), ((0, 1), (1, 1)), ...)
+
+      Alternating partition: each layer belongs to exactly one group.
+        members = (((0, 0),), ((1, 0),), ((0, 1),), ((1, 1),), ...)
+    """
+    members: Tuple[Tuple[Tuple[int, int], ...], ...]
+
+    @property
+    def num_original_layers(self) -> int:
+        return len(self.members)
+
+    @property
+    def total_members(self) -> int:
+        return sum(len(m) for m in self.members)
+
+    def members_of(self, original_layer_id: int) -> Tuple[Tuple[int, int], ...]:
+        """Return ((group_idx, local_id), ...) for one original layer."""
+        return self.members[original_layer_id]
+
+
+def build_layer_member_map(
+    layer_groups: List[LayerGroupSpec],
+    num_original_layers: int,
+) -> LayerMemberMap:
+    """Construct a ``LayerMemberMap`` from ``layer_groups``.
+
+    Members within one original layer are ordered by ascending ``group_idx``
+    (i.e., the order in which groups appear in ``model_config.layer_groups``).
+    By convention main KV should be group 0 so that on the stream it always
+    fires before any auxiliary group (e.g., indexer).
+    """
+    buckets: List[List[Tuple[int, int]]] = [[] for _ in range(num_original_layers)]
+    for gi, g in enumerate(layer_groups):
+        for local_id, orig in enumerate(g.layer_indices):
+            buckets[orig].append((gi, local_id))
+    for b in buckets:
+        b.sort(key=lambda x: x[0])
+    return LayerMemberMap(members=tuple(tuple(b) for b in buckets))
 
 
 @dataclass
@@ -40,14 +122,13 @@ class ModelConfig:
     # ------------------------------------------------------------------
     # Attention-level parallel configs
     # ------------------------------------------------------------------
-    # enable_dp_attention: whether DP-attention is enabled (sglang
-    # ``--enable-dp-attention`` or TRT-LLM ``enable_attention_dp``).
-    # When True, the physical TP group is split into
-    # attn_tp × attn_cp × attn_dp.
+    # Compatibility flag retained for framework adapters. ``tp_size`` is the
+    # normalized attention TP size and ``cp_size`` is represented separately.
     enable_dp_attention: bool = False
-
-    # attn_cp_size: context-parallel size (global).
+    # Compatibility mirror of cp_size for existing SGLang connector callers.
     attn_cp_size: int = 1
+    # cp_size: context-parallel size (global), default 1.
+    cp_size: int = 1
 
     # ------------------------------------------------------------------
     # Topology configs (global)
@@ -82,45 +163,122 @@ class ModelConfig:
     instance_num: int = 1
 
     # ------------------------------------------------------------------
+    # Heterogeneous KV cache layers (including Indexer-as-group)
+    # ------------------------------------------------------------------
+    # When None, all layers share the same (num_kv_heads, head_size, dtype).
+    # When set, each group carries its own shape (and optionally its own dtype),
+    # and token_size_in_bytes/num_cpu_blocks are computed by summing across groups.
+    layer_groups: Optional[List[LayerGroupSpec]] = None
+
+    # ------------------------------------------------------------------
     # Freeze mechanism: after post_init, ModelConfig must not be mutated
     # ------------------------------------------------------------------
     _frozen: bool = field(default=False, init=False, repr=False)
 
     def freeze(self) -> None:
         """Lock the config so that any subsequent __setattr__ raises an error."""
+        if self.cp_size == 1 and self.attn_cp_size != 1:
+            self.cp_size = self.attn_cp_size
+        elif self.attn_cp_size == 1 and self.cp_size != 1:
+            self.attn_cp_size = self.cp_size
+        elif self.cp_size != self.attn_cp_size:
+            raise ValueError(
+                f"[ModelConfig] cp_size={self.cp_size} and "
+                f"attn_cp_size={self.attn_cp_size} disagree"
+            )
         # ---- Topology validation ----
         if self.total_gpus % self.nnodes != 0:
             raise ValueError(
                 f"[ModelConfig] cannot derive gpus_per_node: "
                 f"total_gpus={self.total_gpus} not divisible by nnodes={self.nnodes}"
             )
-        if self.nnodes_per_tp_group > 2:
+        if self.nnodes_per_pp_rank > 2:
             raise ValueError(
                 f"[ModelConfig] only support 2-nodes TP for now, but got "
-                f"nnodes_per_tp_group={self.nnodes_per_tp_group} "
+                f"nnodes_per_pp_rank={self.nnodes_per_pp_rank} "
                 f"(tp_size={self.tp_size}, gpus_per_node={self.gpus_per_node})"
-            )
-        if self.tp_size % self.nnodes_per_tp_group != 0:
-            raise ValueError(
-                f"[ModelConfig] tp_size={self.tp_size} not divisible by "
-                f"nnodes_per_tp_group={self.nnodes_per_tp_group}"
             )
         if self.instance_num < 1:
             raise ValueError(
                 f"[ModelConfig] instance_num must be >= 1, got {self.instance_num}"
             )
 
+        # ---- LayerGroup invariants ----
+        self._validate_layer_groups()
+
         object.__setattr__(self, '_frozen', True)
+
+    def _validate_layer_groups(self) -> None:
+        """Validate ``layer_groups`` against ``num_layers``.
+
+        No-op when ``layer_groups`` is None (uniform model). Enforces:
+
+        * ``g.num_layers == len(g.layer_indices)`` for every group.
+        * No internal duplicate ``layer_indices`` within one group.
+        * Every ``layer_indices`` entry lies in ``[0, num_layers)``.
+        * ``g.compress_ratio >= 1`` for every group.
+
+        Uncached layers (e.g. DSv4 layers 0/1 with ``compress_ratio == 0`` at
+        the model level) simply do not appear in any group's ``layer_indices``
+        and produce empty member lists in the resulting :class:`LayerMemberMap`;
+        the union is therefore *not* required to cover every original layer.
+        """
+        if not self.layer_groups:
+            return
+        N = self.num_layers
+        for gi, g in enumerate(self.layer_groups):
+            if g.num_layers != len(g.layer_indices):
+                raise ValueError(
+                    f"[ModelConfig] layer_groups[{gi}].num_layers={g.num_layers} "
+                    f"does not match len(layer_indices)={len(g.layer_indices)}"
+                )
+            if len(set(g.layer_indices)) != len(g.layer_indices):
+                raise ValueError(
+                    f"[ModelConfig] layer_groups[{gi}].layer_indices has duplicates: "
+                    f"{g.layer_indices}"
+                )
+            if g.compress_ratio < 1:
+                raise ValueError(
+                    f"[ModelConfig] layer_groups[{gi}].compress_ratio must be >= 1, "
+                    f"got {g.compress_ratio}"
+                )
+            for orig in g.layer_indices:
+                if not 0 <= orig < N:
+                    raise ValueError(
+                        f"[ModelConfig] layer_groups[{gi}] has out-of-range "
+                        f"layer index {orig} (must be in [0, {N}))"
+                    )
+
+    @cached_property
+    def layer_member_map(self) -> Optional[LayerMemberMap]:
+        """CSR mapping from original layer id -> [(group_idx, local_id), ...].
+
+        Returns ``None`` when ``layer_groups`` is not set (uniform model — the
+        layerwise transfer path then uses the legacy single-group code path).
+        Computed once on first access and cached in ``__dict__`` via
+        ``functools.cached_property`` (write bypasses the frozen
+        ``__setattr__``).
+        """
+        if not self.layer_groups:
+            return None
+        return build_layer_member_map(self.layer_groups, self.num_layers)
 
     def __setattr__(self, name: str, value) -> None:
         if name == '_frozen':
+            return object.__setattr__(self, name, value)
+        # ``layer_groups`` is a derived field that is sometimes discovered late
+        # (e.g. DeepSeek V4 sub-pool layout is only known once SGLang has built
+        # the GPU KV pools, which happens after FlexKVConfig.from_env()/post_init
+        # have already called freeze()). Allow late assignment of this field
+        # specifically so multi-group registration paths work.
+        if name == 'layer_groups':
             return object.__setattr__(self, name, value)
         if getattr(self, '_frozen', False):
             raise AttributeError(
                 f"ModelConfig is frozen — cannot set '{name}'. "
                 f"All primitive fields must be set during post_init_from_*(), "
-                f"after which freeze() is called.  Derived fields (attn_tp_size, "
-                f"tp_size_per_node) are @property "
+                f"after which freeze() is called.  Derived fields (effective_tp_size, "
+                f"tp_size_per_node, cp_size_per_node, nnodes_per_pp_rank) are @property "
                 f"and cannot be set at all."
             )
         object.__setattr__(self, name, value)
@@ -130,8 +288,10 @@ class ModelConfig:
     # ------------------------------------------------------------------
     @property
     def total_gpus(self) -> int:
-        """Total GPUs across all nodes for one FlexKV instance."""
-        return self.dp_size * self.tp_size * self.pp_size
+        """Total GPU worker registration slots across all nodes for one FlexKV instance.
+
+        Unified formula: dp_size × tp_size × cp_size × pp_size."""
+        return self.dp_size * self.tp_size * self.cp_size * self.pp_size
 
     @property
     def total_clients(self) -> int:
@@ -140,7 +300,7 @@ class ModelConfig:
 
     @property
     def gpus_per_node(self) -> int:
-        """Total GPUs on this node (across all DP, PP stages and TP groups)."""
+        """GPU worker registration slots on this node (across all DP shards, PP stages and TP groups)."""
         return self.total_gpus // self.nnodes
 
     @property
@@ -156,7 +316,7 @@ class ModelConfig:
     @property
     def tp_size_per_node(self) -> int:
         """Number of TP ranks on this node within one TP group."""
-        return self.tp_size // self.nnodes_per_tp_group
+        return max(1, self.tp_size // self.nnodes_per_pp_rank)
 
     @property
     def attn_dp_size(self) -> int:
@@ -165,37 +325,43 @@ class ModelConfig:
 
     @property
     def attn_tp_size(self) -> int:
-        """Attention-level TP size derived from tp / attn_dp / attn_cp."""
-        attn_dp = self.attn_dp_size
-        cp = max(1, self.attn_cp_size)
-        return max(1, max(1, self.tp_size) // (attn_dp * cp))
+        """Compatibility alias for the normalized attention TP size."""
+        return max(1, self.tp_size)
 
     @property
     def attn_tp_size_per_node(self) -> int:
         """Attention-level TP size per node."""
-        return self.attn_tp_size // self.nnodes_per_tp_group
+        return self.tp_size_per_node
 
     @property
     def attn_cp_size_per_node(self) -> int:
-        """Attention-level CP size on this node for a single pp stage. """
-        return max(1, self.attn_cp_size // self.nnodes_per_pp_rank)
+        """Compatibility alias for per-node context parallel size."""
+        return self.cp_size_per_node
+
+    @property
+    def cp_size_per_node(self) -> int:
+        """CP size on this node for a single PP stage.
+
+        Used for multi-node scenarios where the CP group spans multiple nodes.
+        """
+        return max(1, self.cp_size // self.nnodes_per_pp_rank)
 
     @property
     def effective_tp_size(self) -> int:
-        """Effective tp-group size used for *data-plane* CPU slicing."""
-        return max(1, self.attn_tp_size) * max(1, self.attn_cp_size)
+        """Number of CPU block slices = tp_size × cp_size."""
+        return max(1, self.tp_size) * max(1, self.cp_size)
 
     @property
     def effective_tp_size_per_node(self) -> int:
         """Per-node counterpart of :pyattr:`effective_tp_size`."""
-        return self.attn_tp_size_per_node * self.attn_cp_size_per_node
+        return self.tp_size_per_node * self.cp_size_per_node
 
     @property
     def num_kv_heads_per_node(self) -> int:
         """Number of KV heads visible to a single node."""
         if self.use_mla:
             return self.num_kv_heads
-        return self.num_kv_heads * self.tp_size_per_node // max(1, self.attn_tp_size)
+        return self.num_kv_heads * self.tp_size_per_node // max(1, self.tp_size)
 
     @property
     def kv_dim(self) -> int:
@@ -204,23 +370,50 @@ class ModelConfig:
 
     @property
     def bytes_per_token_per_layer(self) -> int:
-        """Raw byte footprint of a single (layer, token) KV slot."""
+        """Raw byte footprint of a single (layer, token) KV slot.
+
+        NOTE: assumes uniform (num_kv_heads, head_size, dtype) across layers.
+        Not meaningful when ``layer_groups`` is set — callers in that path must
+        use ``token_size_in_bytes`` instead.
+        """
         return self.num_kv_heads * self.head_size * self.kv_dim * self.dtype.itemsize
 
     @property
     def token_size_in_bytes(self) -> int:
-        """Whole-model token footprint (bytes) — all layers combined."""
-        return self.num_layers * self.bytes_per_token_per_layer
+        """Whole-model per-token KV footprint (bytes) across all layers/groups."""
+        kv_dim = 1 if self.use_mla else 2
+        if self.layer_groups:
+            # layer_groups store per-GPU num_kv_heads; multiply by tp_size
+            # to get full-model per-token size (matching CPU/SSD block sizing).
+            # Each group may carry its own dtype (None = inherit ModelConfig.dtype),
+            # so indexer-as-group (fp8/uint8) and main KV (bf16) sum correctly.
+            # ``compress_ratio`` shrinks the per-token contribution. This
+            # integer property is suitable for aggregate metrics; exact block
+            # allocation must use block_size_in_bytes_for_cache so division is
+            # applied to tokens_per_block before rounding.
+            return sum(
+                g.num_layers * g.num_kv_heads * g.head_size * kv_dim
+                * (g.dtype or self.dtype).itemsize
+                // g.compress_ratio
+                for g in self.layer_groups
+            ) * self.tp_size
+        return self.num_layers * self.num_kv_heads * self.head_size * kv_dim * self.dtype.itemsize
 
     def __str__(self) -> str:
+        layer_groups_str = (
+            f", layer_groups={len(self.layer_groups)}groups"
+            if self.layer_groups else ""
+        )
         return (
             f"ModelConfig(num_layers={self.num_layers}, num_kv_heads={self.num_kv_heads}"
             f", head_size={self.head_size}, use_mla={self.use_mla}"
             f", dtype={self.dtype}"
             f", tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}"
-            f", attn_cp_size={self.attn_cp_size}"
+            f", cp_size={self.cp_size}"
+            f", total_gpus={self.total_gpus}"
             f", nnodes={self.nnodes}, master_host={self.master_host!r}"
             f", instance_num={self.instance_num}"
+            f"{layer_groups_str}"
         )
 
 
@@ -230,11 +423,49 @@ class RankInfo:
     tp_rank: int = 0
     pp_rank: int = 0
     dp_rank: int = 0
+    cp_rank: int = 0
+    # Compatibility mirror for origin/main's SGLang-facing API.
     attn_cp_rank: int = 0
     node_rank: int = 0
     instance_id: int = 0
     pp_start_layer: int = 0
     pp_end_layer: int = -1
+    local_rank: int = -1
+
+    def __post_init__(self) -> None:
+        if self.cp_rank == 0 and self.attn_cp_rank != 0:
+            object.__setattr__(self, "cp_rank", self.attn_cp_rank)
+        elif self.attn_cp_rank == 0 and self.cp_rank != 0:
+            object.__setattr__(self, "attn_cp_rank", self.cp_rank)
+        elif self.cp_rank != self.attn_cp_rank:
+            raise ValueError(
+                f"cp_rank={self.cp_rank} and attn_cp_rank={self.attn_cp_rank} disagree"
+            )
+        if self.local_rank < 0:
+            model_config = self.model_config
+            tp_cp_rank = (
+                self.cp_rank * model_config.tp_size_per_node
+                + self.tp_rank_per_node
+            )
+            if model_config.enable_dp_attention:
+                local_rank = (
+                    self.pp_rank_per_node
+                    * model_config.cp_size_per_node
+                    * model_config.tp_size_per_node
+                    + tp_cp_rank
+                )
+            else:
+                local_rank = (
+                    (
+                        self.dp_rank_per_node * self.pp_size_per_node
+                        + self.pp_rank_per_node
+                    )
+                    * model_config.cp_size_per_node
+                    * model_config.tp_size_per_node
+                    + tp_cp_rank
+                )
+            object.__setattr__(self, "local_rank", local_rank)
+
     @property
     def tp_rank_per_node(self) -> int:
         """TP rank index within the local node (within one TP group)."""
@@ -254,16 +485,23 @@ class RankInfo:
 
     @property
     def attn_tp_rank(self) -> int:
-        """Attention-level TP rank derived from tp_rank / attn_tp_size."""
-        return self.tp_rank % max(1, self.model_config.attn_tp_size)
+        """Compatibility alias for the normalized attention TP rank."""
+        return self.tp_rank
 
     @property
     def effective_tp_rank(self) -> int:
-        """Effective tp-rank in the *data-plane* segmentation space."""
+        """Effective tp-rank in the *data-plane* segmentation space.
+
+        For MLA models, every CP rank holds the same KV pages (the MLA latent
+        is not split along the sequence axis from a KV perspective), so
+        ``cp_rank`` must NOT participate in slice indexing — otherwise a CP rank
+        would write to a non-existent CPU slice and corrupt block accounting.
+        For non-MLA models, CP shards along the sequence dimension and each
+        ``(cp_rank, tp_rank)`` pair owns a unique slice.
+        """
         if self.model_config.use_mla:
-            return self.attn_tp_rank
-        attn_tp_size = max(1, self.model_config.attn_tp_size)
-        return self.attn_cp_rank * attn_tp_size + self.attn_tp_rank
+            return self.tp_rank
+        return self.cp_rank * max(1, self.model_config.tp_size) + self.tp_rank
 
     @property
     def pp_size_per_node(self) -> int:
@@ -280,20 +518,20 @@ class RankInfo:
     def dp_size_per_node(self) -> int:
         """Number of DP replicas co-located on a single node."""
         model_config = self.model_config
-        return model_config.gpus_per_node // (self.pp_size_per_node * model_config.tp_size_per_node)
+        return max(
+            1,
+            model_config.gpus_per_node
+            // (
+                self.pp_size_per_node
+                * model_config.tp_size_per_node
+                * model_config.cp_size_per_node
+            ),
+        )
 
     @property
     def dp_rank_per_node(self) -> int:
-        """This rank's DP index *within* its node (non-DP-attention layout)."""
+        """This rank's DP index within its node."""
         return self.dp_rank % self.dp_size_per_node
-
-    @property
-    def local_rank(self) -> int:
-        model_config = self.model_config
-        if model_config.enable_dp_attention:
-            return self.pp_rank_per_node * model_config.tp_size_per_node + self.tp_rank_per_node
-        return (self.dp_rank_per_node * self.pp_size_per_node + self.pp_rank_per_node) \
-               * model_config.tp_size_per_node + self.tp_rank_per_node
 
     @property
     def num_layers_per_pp_stage(self) -> int:
@@ -315,9 +553,56 @@ class RankInfo:
         """
         return (
             f"RankInfo(tp_rank={self.tp_rank}, pp_rank={self.pp_rank}"
-            f", dp_rank={self.dp_rank}, attn_cp_rank={self.attn_cp_rank}"
+            f", dp_rank={self.dp_rank}, cp_rank={self.cp_rank}"
             f", node_rank={self.node_rank}, instance_id={self.instance_id}"
+            f", local_rank={self.local_rank}, effective_tp_rank={self.effective_tp_rank}"
         )
+
+@dataclass
+class SWAPoolConfig:
+    """Configuration for SWA (Sliding Window Attention) host pool(s).
+
+    SWA is managed at PAGE granularity: one pool slot stores exactly one
+    ``tokens_per_block`` page of SWA KV, and all SWA IO moves a whole page
+    (one slot) at a time.
+    """
+    enabled: bool = False
+    num_slots: int = 1024              # Number of CPU SWA pool slots
+    num_ssd_slots: int = 0             # Number of SSD SWA pool slots (0 = no SSD SWA tier)
+    num_remote_slots: int = 0          # Number of REMOTE SWA pool slots (0 = no REMOTE SWA tier)
+    num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
+    bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
+    evict_ratio: float = 0.1           # Fraction of pool to evict when full
+    pin_memory: bool = True            # Use pinned memory for async DMA
+
+    def for_ssd_tier(self) -> "SWAPoolConfig":
+        """Derive the SSD-tier SWA config (same slot geometry, num_ssd_slots slots).
+
+        SSD SWA slots are not pinned host memory; pin_memory is forced off."""
+        return replace(self, num_slots=self.num_ssd_slots, pin_memory=False)
+
+    def for_remote_tier(self) -> "SWAPoolConfig":
+        """Derive the REMOTE-tier SWA config (same slot geometry, num_remote_slots).
+
+        REMOTE SWA slots are not pinned host memory; pin_memory is forced off."""
+        return replace(self, num_slots=self.num_remote_slots, pin_memory=False)
+
+    def for_cache_tier(self, device_type) -> Optional["SWAPoolConfig"]:
+        """Return the SWA config this cache tier should own, or None.
+
+        CPU uses the primary pool config. SSD and REMOTE use their tier-specific
+        slot counts and are disabled when that tier's slot count is zero.
+        """
+        if not self.enabled:
+            return None
+        device_name = getattr(device_type, "name", str(device_type))
+        if device_name == "CPU":
+            return self
+        if device_name == "SSD" and self.num_ssd_slots > 0:
+            return self.for_ssd_tier()
+        if device_name == "REMOTE" and self.num_remote_slots > 0:
+            return self.for_remote_tier()
+        return None
 
 
 @dataclass
@@ -352,10 +637,6 @@ class CacheConfig:
     use_hugepage_tmp_buffer: bool = False
     hugepage_size_bytes: int = 2 * 1024 * 1024  # 2 MiB by default; set to 1<<30 for 1GiB
 
-
-    # Indexer configuration
-    indexer: Optional[IndexerCacheConfig] = None
-
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
@@ -388,6 +669,21 @@ class CacheConfig:
 
     # Mooncake transfer engine config path (serialized via pickle to survive spawn subprocesses)
     mooncake_config_path: Optional[str] = None
+
+    # Stored for deferred recomputation when layer_groups become known
+    _user_cpu_cache_gb: float = 0
+    _user_ssd_cache_gb: float = 0
+
+    # SWA pool config (DeepSeek V4)
+    swa: Optional['SWAPoolConfig'] = None
+
+    # Gate for the SWA peer-op DATA-PLANE transfer (SWA_H2D/SWA_D2H ops built into
+    # the transfer graph). Default False: the SWA control plane (node-mounted match /
+    # capacity / lock) works regardless, but the actual async SWA byte transfer
+    # requires the dedicated SWA transfer worker (data plane). Keep this False
+    # until that worker is registered, otherwise SWA ops would hit "Unsupported
+    # transfer type" in the transfer engine. Flip to True once the worker lands.
+    enable_swa_transfer: bool = False
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
@@ -555,29 +851,112 @@ def load_user_config_from_env() -> UserConfig:
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
     return int(size_in_GB * 1024 * 1024 * 1024 / block_size_in_bytes)
 
+
+def block_size_in_bytes_for_cache(
+    model_config: ModelConfig,
+    cache_config: CacheConfig,
+    rank_info: Optional["RankInfo"] = None,
+) -> int:
+    """Bytes per CPU/SSD block for pool sizing.
+
+    When ``layer_groups`` is set, sum exact per-group bytes after applying each
+    group's block compression. Otherwise fall back to the uniform per-PP-stage
+    estimate from ``rank_info``.
+    """
+    if model_config.layer_groups is not None:
+        # Match KVCacheLayout._compute_kv_shape exactly.  Computing a rounded
+        # per-token size first and multiplying it by tokens_per_block loses
+        # bytes for compressed groups whenever the group contribution is not
+        # divisible by compress_ratio.
+        for gi, group in enumerate(model_config.layer_groups):
+            if cache_config.tokens_per_block % group.compress_ratio != 0:
+                raise ValueError(
+                    f"layer_groups[{gi}].compress_ratio={group.compress_ratio} "
+                    f"does not divide tokens_per_block="
+                    f"{cache_config.tokens_per_block}"
+                )
+        return model_config.tp_size * sum(
+            group.num_layers
+            * model_config.kv_dim
+            * (cache_config.tokens_per_block // group.compress_ratio)
+            * group.num_kv_heads
+            * group.head_size
+            * (group.dtype or model_config.dtype).itemsize
+            for group in model_config.layer_groups
+        )
+    if rank_info is None:
+        raise ValueError(
+            "rank_info is required when model_config.layer_groups is None")
+    return rank_info.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
+
+
+def recompute_cache_block_counts(
+    model_config: ModelConfig,
+    cache_config: CacheConfig,
+) -> bool:
+    """Recompute ``num_cpu_blocks`` / ``num_ssd_blocks`` from stored GB budgets.
+
+    No-op when ``layer_groups`` is unset (initial uniform estimate is final).
+    Returns True if any block count changed.
+    """
+    if model_config.layer_groups is None:
+        return False
+
+    block_size_in_bytes = block_size_in_bytes_for_cache(
+        model_config, cache_config)
+    capacity_divisor = 1
+    if (model_config.use_mla
+            and GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode == "all_write"):
+        capacity_divisor = max(
+            1, model_config.effective_tp_size_per_node)
+
+    changed = False
+
+    if cache_config._user_cpu_cache_gb > 0:
+        old_cpu = cache_config.num_cpu_blocks
+        new_cpu = (
+            convert_to_block_num(
+                cache_config._user_cpu_cache_gb, block_size_in_bytes)
+            // capacity_divisor
+        )
+        if new_cpu != old_cpu:
+            flexkv_logger.info(
+                f"Recomputed num_cpu_blocks with layer_groups: "
+                f"{old_cpu} -> {new_cpu} "
+                f"(block_size={block_size_in_bytes} B)")
+            cache_config.num_cpu_blocks = new_cpu
+            changed = True
+
+    if cache_config._user_ssd_cache_gb > 0:
+        old_ssd = cache_config.num_ssd_blocks
+        new_ssd = (
+            convert_to_block_num(
+                cache_config._user_ssd_cache_gb, block_size_in_bytes)
+            // capacity_divisor
+        )
+        if new_ssd != old_ssd:
+            flexkv_logger.info(
+                f"Recomputed num_ssd_blocks with layer_groups: "
+                f"{old_ssd} -> {new_ssd} "
+                f"(block_size={block_size_in_bytes} B)")
+            cache_config.num_ssd_blocks = new_ssd
+            changed = True
+            if (cache_config.num_ssd_blocks
+                    % len(cache_config.ssd_cache_dir) != 0):
+                cache_config.num_ssd_blocks = (
+                    (cache_config.num_ssd_blocks
+                     // len(cache_config.ssd_cache_dir) + 1)
+                    * len(cache_config.ssd_cache_dir)
+                )
+
+    return changed
+
+
 def update_default_config_from_user_config(rank_info: RankInfo,
                                            cache_config: CacheConfig,
                                            user_config: UserConfig) -> None:
-    main_block_size_in_bytes = (
-        rank_info.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
-    )
-    indexer_block_size_in_bytes = 0
-    if cache_config.indexer is not None:
-        indexer_cfg = cache_config.indexer
-        # Indexer is MLA-style (single shared head set, no TP head split).
-        # head_size already includes page_stride_size (main tokens_per_block ×
-        # index_head_dim), so per-block bytes = num_kv_heads × head_size ×
-        # dtype.itemsize — no additional tokens_per_block multiplication.
-        indexer_bytes_per_token_per_layer = (
-            indexer_cfg.num_kv_heads
-            * indexer_cfg.head_size
-            * indexer_cfg.dtype.itemsize
-        )
-        indexer_block_size_in_bytes = (
-            rank_info.num_layers_per_pp_stage
-            * indexer_bytes_per_token_per_layer
-        )
-    block_size_in_bytes = main_block_size_in_bytes + indexer_block_size_in_bytes
+    block_size_in_bytes = block_size_in_bytes_for_cache(
+        rank_info.model_config, cache_config, rank_info)
 
     assert user_config.cpu_cache_gb > 0
     assert user_config.ssd_cache_gb >= 0
@@ -601,21 +980,25 @@ def update_default_config_from_user_config(rank_info: RankInfo,
                 f"physical space, total memory budget unchanged)"
             )
 
-    cache_config.num_cpu_blocks = convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes) // capacity_divisor
-    cache_config.num_ssd_blocks = convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes) // capacity_divisor
+    # Store original GB values for deferred recomputation (when layer_groups become known)
+    cache_config._user_cpu_cache_gb = user_config.cpu_cache_gb
+    cache_config._user_ssd_cache_gb = user_config.ssd_cache_gb
 
-    if cache_config.indexer is not None:
-        flexkv_logger.info(
-            f"[CacheConfig] GB->blocks conversion (with indexer): "
-            f"main_block_size={main_block_size_in_bytes} B, "
-            f"indexer_block_size={indexer_block_size_in_bytes} B, "
-            f"total_block_size={block_size_in_bytes} B"
-        )
-    else:
-        flexkv_logger.info(
-            f"[CacheConfig] GB->blocks conversion: "
-            f"block_size={block_size_in_bytes} B"
-        )
+    cache_config.num_cpu_blocks = (
+        convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
+        // capacity_divisor
+    )
+    cache_config.num_ssd_blocks = (
+        convert_to_block_num(user_config.ssd_cache_gb, block_size_in_bytes)
+        // capacity_divisor
+    )
+
+    flexkv_logger.info(
+        f"[CacheConfig] GB->blocks conversion: "
+        f"block_size={block_size_in_bytes} B; "
+        f"cpu_cache_gb={user_config.cpu_cache_gb} -> num_cpu_blocks={cache_config.num_cpu_blocks}, "
+        f"ssd_cache_gb={user_config.ssd_cache_gb} -> num_ssd_blocks={cache_config.num_ssd_blocks}"
+    )
 
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0

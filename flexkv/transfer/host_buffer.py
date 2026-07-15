@@ -1,39 +1,71 @@
 from __future__ import annotations
 
+import ctypes
+import weakref
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 import torch
 
 from flexkv.common.debug import flexkv_logger
-from flexkv.storage.allocator import alloc_hugepage_tensor, free_hugepage_tensor
+from flexkv.storage.allocator import (
+    alloc_hugepage_tensor,
+    free_hugepage_tensor,
+)
+
+_cudart = None
+_cudart_load_error: Optional[OSError] = None
+
+
+def _get_cudart():
+    global _cudart
+    global _cudart_load_error
+
+    if _cudart is None and _cudart_load_error is None:
+        try:
+            _cudart = ctypes.CDLL("libcudart.so")
+        except OSError as e:
+            _cudart_load_error = e
+
+    if _cudart is None:
+        raise RuntimeError(f"libcudart.so is unavailable: {_cudart_load_error}")
+    return _cudart
 
 
 def cuda_host_registration_available() -> bool:
     try:
-        torch.cuda.cudart()
-        return True
-    except Exception:
+        _get_cudart()
+    except RuntimeError:
         return False
+    return True
+
+
+# Portable + Mapped: required for custom D2H kernels that store into host pointers.
+CUDA_HOST_REGISTER_PORTABLE = 0x01
+CUDA_HOST_REGISTER_MAPPED = 0x02
+CUDA_HOST_ALLOC_PORTABLE = 0x01
+CUDA_HOST_ALLOC_MAPPED = 0x02
 
 
 def cudaHostRegister(tensor: torch.Tensor) -> None:
+    cudart = _get_cudart()
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
-    err = torch.cuda.cudart().cudaHostRegister(ptr, size, 1)
-    if isinstance(err, tuple):
-        err = err[0]
-    if err != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {err}")
+    flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED
+    ret = cudart.cudaHostRegister(
+        ctypes.c_void_p(ptr), ctypes.c_size_t(size), ctypes.c_uint(flags)
+    )
+    if ret != 0:
+        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
 
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
+    cudart = _get_cudart()
     ptr = tensor.data_ptr()
-    err = torch.cuda.cudart().cudaHostUnregister(ptr)
-    if isinstance(err, tuple):
-        err = err[0]
-    if err != 0:
-        raise RuntimeError(f"cudaHostUnregister failed with error code {err}")
+    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
+    if ret != 0:
+        raise RuntimeError(f"cudaHostUnregister failed with error code {ret}")
 
 
 @dataclass
@@ -72,15 +104,33 @@ class HostBufferHandle:
         self.is_hugepage = False
 
 
-def _allocate_pinned_cpu_tensor(num_elements: int, dtype: torch.dtype) -> HostBufferHandle:
-    return HostBufferHandle.pinned(
-        torch.empty(
-            num_elements,
-            dtype=dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Tensor:
+    """cudaHostAlloc(PORTABLE|MAPPED) buffer writable from device kernels."""
+    cudart = _get_cudart()
+    num_bytes = num_elements * dtype.itemsize
+    host_ptr = ctypes.c_void_p()
+    flags = CUDA_HOST_ALLOC_PORTABLE | CUDA_HOST_ALLOC_MAPPED
+    err = cudart.cudaHostAlloc(
+        ctypes.byref(host_ptr),
+        ctypes.c_size_t(num_bytes),
+        ctypes.c_uint(flags),
     )
+    if err != 0:
+        raise RuntimeError(f"cudaHostAlloc(mapped) failed with error code {err}")
+
+    buf_type = ctypes.c_uint8 * num_bytes
+    raw = buf_type.from_address(host_ptr.value)
+    np_arr = np.frombuffer(raw, dtype=np.uint8, count=num_bytes)
+    tensor = (
+        torch.frombuffer(np_arr, dtype=torch.uint8, count=num_bytes)
+        .view(dtype)[:num_elements]
+    )
+    weakref.finalize(tensor, lambda p=host_ptr: cudart.cudaFreeHost(p))
+    return tensor
+
+
+def _allocate_pinned_cpu_tensor(num_elements: int, dtype: torch.dtype) -> HostBufferHandle:
+    return HostBufferHandle.pinned(alloc_mapped_host_tensor(num_elements, dtype))
 
 
 def _fallback_to_pinned(

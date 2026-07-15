@@ -9,7 +9,7 @@ import torch
 
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
-from flexkv.common.config import RankInfo
+from flexkv.common.config import LayerGroupSpec, RankInfo
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.debug import flexkv_logger
@@ -767,10 +767,12 @@ class FlexKVWorkerConnector:
             is_mla=self.flexkv_config.model_config.use_mla,
         )
 
-        # Build indexer layout if indexer caches are present
-        indexer_buffers = None
-        indexer_layout = None
-        if indexer_kv_caches:
+        if not indexer_kv_caches:
+            self.tp_client.register_to_server(
+                kv_caches=gpu_blocks,
+                kv_layout=gpu_layout,
+            )
+        else:
             indexer_buffers = list(indexer_kv_caches.values())
             first_indexer_buffer = indexer_buffers[0]
             assert first_indexer_buffer.ndim == 3, (
@@ -785,12 +787,34 @@ class FlexKVWorkerConnector:
                 is_mla=True,
             )
 
-        self.tp_client.register_to_server(
-            kv_caches=gpu_blocks,
-            kv_layout=gpu_layout,
-            indexer_buffers=indexer_buffers,
-            indexer_layout=indexer_layout,
-        )
+            layer_groups = [
+                LayerGroupSpec(
+                    num_layers=num_layer,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    layer_indices=list(range(num_layer)),
+                    dtype=gpu_blocks[0].dtype,
+                ),
+                LayerGroupSpec(
+                    num_layers=len(indexer_buffers),
+                    num_kv_heads=1,
+                    head_size=first_indexer_buffer.shape[2],
+                    layer_indices=list(range(len(indexer_buffers))),
+                    dtype=first_indexer_buffer.dtype,
+                    compress_ratio=(
+                        block_size // first_indexer_buffer.shape[1]
+                    ),
+                ),
+            ]
+            self.flexkv_config.model_config.layer_groups = layer_groups
+
+            self.tp_client.register_to_server(
+                kv_caches=gpu_blocks,
+                kv_layout=gpu_layout,
+                layer_groups=layer_groups,
+                gpu_layouts=[gpu_layout, indexer_layout],
+                handles_per_group=[gpu_blocks, indexer_buffers],
+            )
 
         logger.info("Finish register kv_caches")
 

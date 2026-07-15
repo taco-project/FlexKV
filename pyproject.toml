@@ -75,3 +75,10 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "flexkv.c_ext.*"
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+    "unit: pure-logic / c_ext logic unit tests (no GPU)",
+    "smoke: control-plane / graph-build / late-bind (no GPU)",
+    "e2e: end-to-end tests requiring a GPU",
+]

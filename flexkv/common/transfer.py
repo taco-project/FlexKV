@@ -107,6 +107,13 @@ class TransferOp:
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
     pending_count: int = 0
+    # ---- SWA (Sliding Window Attention) routing -------------------------------
+    # When True, this op moves SWA KV (an independent GPU/CPU/SSD/REMOTE pool with
+    # its own slot-id space), so the transfer engine routes it to the dedicated
+    # SWA worker (_swa_worker_map) instead of the main-KV worker. The op reuses the
+    # standard transfer_type (D2H/H2D/DISK2H/H2DISK/REMOTE2H/H2REMOTE); src/dst
+    # block ids are SWA-pool slot ids, NOT full-KV block ids.
+    is_swa: bool = False
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
@@ -128,10 +135,12 @@ class LayerwiseTransferOp(TransferOp):
     dst_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     src_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     dst_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    # SWA fields
+    swa_src_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    swa_dst_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    swa_src_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    swa_dst_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     counter_id: int = 0  # Counter set index for triple buffering eventfd notification
-    # Indexer block_ids for fused indexer transfer (1:1 with main KV block_ids)
-    indexer_src_block_ids: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
-    indexer_dst_block_ids: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
 
     def __init__(self,
                 graph_id: int,
@@ -139,19 +148,26 @@ class LayerwiseTransferOp(TransferOp):
                 dst_block_ids_h2d: np.ndarray,
                 src_block_ids_disk2h: np.ndarray,
                 dst_block_ids_disk2h: np.ndarray,
+                swa_src_block_ids_h2d: Optional[np.ndarray] = None,
+                swa_dst_block_ids_h2d: Optional[np.ndarray] = None,
+                swa_src_block_ids_disk2h: Optional[np.ndarray] = None,
+                swa_dst_block_ids_disk2h: Optional[np.ndarray] = None,
                 dp_client_id: int = 0,
-                counter_id: int = 0,
-                indexer_src_block_ids: Optional[np.ndarray] = None,
-                indexer_dst_block_ids: Optional[np.ndarray] = None) -> None:
+                counter_id: int = 0) -> None:
         self.src_block_ids_h2d = src_block_ids_h2d
         self.dst_block_ids_h2d = dst_block_ids_h2d
         self.src_block_ids_disk2h = src_block_ids_disk2h
         self.dst_block_ids_disk2h = dst_block_ids_disk2h
+        # SWA ids default to empty arrays so callers that only need the main-KV
+        # path can omit them and __post_init__ assertions still hold (.size on None
+        # would AttributeError). Empty SWA arrays drive the cpp fused layer loop
+        # to skip the SWA branch entirely (has_swa=False at submit time).
+        _empty = lambda: np.array([], dtype=np.int64)
+        self.swa_src_block_ids_h2d = swa_src_block_ids_h2d if swa_src_block_ids_h2d is not None else _empty()
+        self.swa_dst_block_ids_h2d = swa_dst_block_ids_h2d if swa_dst_block_ids_h2d is not None else _empty()
+        self.swa_src_block_ids_disk2h = swa_src_block_ids_disk2h if swa_src_block_ids_disk2h is not None else _empty()
+        self.swa_dst_block_ids_disk2h = swa_dst_block_ids_disk2h if swa_dst_block_ids_disk2h is not None else _empty()
         self.counter_id = counter_id
-        self.indexer_src_block_ids = indexer_src_block_ids if indexer_src_block_ids is not None \
-            else np.array([], dtype=np.int64)
-        self.indexer_dst_block_ids = indexer_dst_block_ids if indexer_dst_block_ids is not None \
-            else np.array([], dtype=np.int64)
 
         super().__init__(
             graph_id=graph_id,
@@ -166,14 +182,18 @@ class LayerwiseTransferOp(TransferOp):
 
         assert self.src_block_ids_h2d.size == self.dst_block_ids_h2d.size
         assert self.src_block_ids_disk2h.size == self.dst_block_ids_disk2h.size
-        assert self.indexer_src_block_ids.size == self.indexer_dst_block_ids.size
+        assert self.swa_src_block_ids_h2d.size == self.swa_dst_block_ids_h2d.size
+        assert self.swa_src_block_ids_disk2h.size == self.swa_dst_block_ids_disk2h.size
 
         assert self.src_block_ids_h2d.dtype == np.int64
         assert self.dst_block_ids_h2d.dtype == np.int64
         assert self.src_block_ids_disk2h.dtype == np.int64
         assert self.dst_block_ids_disk2h.dtype == np.int64
-        assert self.indexer_src_block_ids.dtype == np.int64
-        assert self.indexer_dst_block_ids.dtype == np.int64
+        assert self.swa_src_block_ids_h2d.dtype == np.int64
+        assert self.swa_dst_block_ids_h2d.dtype == np.int64
+        assert self.swa_src_block_ids_disk2h.dtype == np.int64
+        assert self.swa_dst_block_ids_disk2h.dtype == np.int64
+
 
 class TransferOpGraph:
     _next_graph_id = 0
@@ -185,6 +205,12 @@ class TransferOpGraph:
         self._ready_ops: Set[int] = set()
         self._trigger_ops: Set[int] = set()
         self._gpu_transfer_op_id: List[int] = []
+        # SWA GPU-transfer ops (is_swa=True, GPU on one side). Bound LATE via
+        # set_swa_gpu_blocks() from the request's SWA-pool slot_mapping, exactly
+        # as _gpu_transfer_op_id is bound from the full-KV slot_mapping. Kept in a
+        # SEPARATE list because SWA lives in its own GPU pool / slot-id space and
+        # must never be rebound with full-KV block ids (see add_transfer_op).
+        self._swa_gpu_transfer_op_id: List[int] = []
 
     @classmethod
     def _get_graph_id(cls) -> int:
@@ -217,11 +243,28 @@ class TransferOpGraph:
     def add_transfer_op(self, op: TransferOp) -> None:
         op.graph_id = self.graph_id
         self._op_map[op.op_id] = op
+        # Unified GPU-transfer list (colleague's PR#191 model): every op that
+        # touches a GPU pool — full-KV OR SWA — is tracked in _gpu_transfer_op_id,
+        # and set_gpu_blocks(gpu_blocks, swa_gpu_blocks) sorts them by op.is_swa at
+        # bind time (full-KV <- gpu_blocks; SWA <- swa_gpu_blocks, or preserved when
+        # swa_gpu_blocks is None). This is what test_set_gpu_blocks_swa exercises.
         if op.transfer_type == TransferType.H2D or \
             op.transfer_type == TransferType.D2H or \
             op.transfer_type == TransferType.D2DISK or \
             op.transfer_type == TransferType.DISK2D:
             self._gpu_transfer_op_id.append(op.op_id)
+        # SWA GPU-transfer ops are ALSO tracked separately so the node-mount
+        # late-bind entry point set_swa_gpu_blocks() (used by kvtask + the
+        # control-plane unit tests) keeps working. Only H2D (GPU dst) / D2H
+        # (GPU src) touch the GPU SWA pool; CPU<->SSD/REMOTE staging has no GPU slot.
+        # Membership in BOTH lists is safe: set_gpu_blocks() leaves is_swa ops
+        # untouched when swa_gpu_blocks is None (the kvtask two-call path), so only
+        # set_swa_gpu_blocks() binds them there; set_gpu_blocks(gpu, swa_gpu) binds
+        # them directly when a caller supplies the second arg.
+        if op.is_swa and (
+            op.transfer_type == TransferType.H2D or
+            op.transfer_type == TransferType.D2H):
+            self._swa_gpu_transfer_op_id.append(op.op_id)
         self._ready_ops.add(op.op_id)
 
     def add_dependency(self, successor_op_id: int, predecessor_op_id: int) -> None:
@@ -269,20 +312,41 @@ class TransferOpGraph:
         return all(op.status == TransferOpStatus.COMPLETED
                    for op in self._op_map.values())
 
-    def set_gpu_blocks(self, gpu_blocks: np.ndarray) -> None:
+    def set_gpu_blocks(self,
+                       gpu_blocks: np.ndarray,
+                       swa_gpu_blocks: Optional[np.ndarray] = None) -> None:
+        swa_offset = 0
         for op_id in self._gpu_transfer_op_id:
-            transfer_type = self._op_map[op_id].transfer_type
             op = self._op_map[op_id]
+            target_gpu_blocks = gpu_blocks
+            # Optional SWA launch-time binding path: if caller passes
+            # swa_gpu_blocks, fill SWA ops from that array; otherwise preserve
+            # graph-built SWA ids.
+            if getattr(op, "is_swa", False):
+                if swa_gpu_blocks is None:
+                    continue
+            transfer_type = op.transfer_type
+            if getattr(op, "is_swa", False):
+                count = op.dst_block_ids.size if transfer_type.name.endswith("2D") \
+                    else op.src_block_ids.size
+                next_swa_offset = swa_offset + count
+                if next_swa_offset > swa_gpu_blocks.size:
+                    raise ValueError(
+                        f"not enough SWA GPU blocks to bind op {op_id}: "
+                        f"need {next_swa_offset}, got {swa_gpu_blocks.size}"
+                    )
+                target_gpu_blocks = swa_gpu_blocks[swa_offset:next_swa_offset]
+                swa_offset = next_swa_offset
             if transfer_type.name.endswith("2D"):
                 if transfer_type == TransferType.DISK2D:
-                    op.dst_block_ids = gpu_blocks[-op.dst_block_ids.size:]
+                    op.dst_block_ids = target_gpu_blocks[-op.dst_block_ids.size:]
                 else:
-                    op.dst_block_ids = gpu_blocks[:op.dst_block_ids.size]
+                    op.dst_block_ids = target_gpu_blocks[:op.dst_block_ids.size]
             else:
                 if transfer_type == TransferType.D2DISK:
-                    op.src_block_ids = gpu_blocks[-op.src_block_ids.size:]
+                    op.src_block_ids = target_gpu_blocks[-op.src_block_ids.size:]
                 else:
-                    op.src_block_ids = gpu_blocks[:op.src_block_ids.size]
+                    op.src_block_ids = target_gpu_blocks[:op.src_block_ids.size]
             assert op.src_block_ids.size == op.dst_block_ids.size, \
                 f"src_block_ids.size={op.src_block_ids.size}, dst_block_ids.size={op.dst_block_ids.size}"
 
@@ -291,11 +355,52 @@ class TransferOpGraph:
         """
         for op_id in self._gpu_transfer_op_id:
             op = self._op_map[op_id]
+            if getattr(op, "is_swa", False):
+                continue
             # Replace with empty arrays; set_gpu_blocks() will fill them later
             if op.src_block_ids.size > 0:
                 op.src_block_ids = np.array([], dtype=op.src_block_ids.dtype)
             if op.dst_block_ids.size > 0:
                 op.dst_block_ids = np.array([], dtype=op.dst_block_ids.dtype)
+
+    def set_swa_gpu_blocks(self, swa_gpu_blocks: np.ndarray) -> None:
+        """Bind the GPU-side SWA-pool slot ids for every SWA GPU-transfer op.
+
+        Mirror of :meth:`set_gpu_blocks` for the SWA channel: for an SWA ``H2D``
+        the GPU pool is the destination, for an SWA ``D2H`` it is the source.
+        ``swa_gpu_blocks`` are SWA-pool slot ids (already converted from the
+        connector's swa_slot_mapping). The CPU/SSD/REMOTE side of each SWA op was
+        set at build time (node-mounted radix slot) and is left untouched."""
+        offset = 0
+        for op_id in self._swa_gpu_transfer_op_id:
+            op = self._op_map[op_id]
+            count = op.dst_block_ids.size if op.transfer_type.name.endswith("2D") \
+                else op.src_block_ids.size
+            next_offset = offset + count
+            if next_offset > swa_gpu_blocks.size:
+                raise ValueError(
+                    f"not enough SWA GPU blocks to bind op {op_id}: "
+                    f"need {next_offset}, got {swa_gpu_blocks.size}"
+                )
+            gpu_slice = swa_gpu_blocks[offset:next_offset]
+            if op.transfer_type.name.endswith("2D"):   # H2D: GPU is dst
+                op.dst_block_ids = gpu_slice
+            else:                                       # D2H: GPU is src
+                op.src_block_ids = gpu_slice
+            offset = next_offset
+            assert op.src_block_ids.size == op.dst_block_ids.size, \
+                f"swa src.size={op.src_block_ids.size}, dst.size={op.dst_block_ids.size}"
+
+    def clear_swa_gpu_blocks(self) -> None:
+        """Clear the GPU-side SWA slot ids (mirror of clear_gpu_blocks for SWA)."""
+        for op_id in self._swa_gpu_transfer_op_id:
+            op = self._op_map[op_id]
+            if op.transfer_type.name.endswith("2D"):
+                if op.dst_block_ids.size > 0:
+                    op.dst_block_ids = np.array([], dtype=op.dst_block_ids.dtype)
+            else:
+                if op.src_block_ids.size > 0:
+                    op.src_block_ids = np.array([], dtype=op.src_block_ids.dtype)
 
     @property
     def num_ops(self) -> int:
@@ -385,6 +490,41 @@ def _make_combined_callback(callbacks: List[Callable]) -> Callable:
     return combined_callback
 
 
+def _attach_combined_callback(op: TransferOp,
+                              callbacks: List[Callable],
+                              op_callback_dict: Dict[int, Callable]) -> None:
+    if not callbacks:
+        return
+    if len(callbacks) == 1:
+        op_callback_dict[op.op_id] = callbacks[0]
+    else:
+        op_callback_dict[op.op_id] = _make_combined_callback(callbacks)
+
+
+def add_virtual_op_for_multiple_finished_ops(
+    graph: TransferOpGraph,
+    finished_ops_ids: List[int],
+    dp_client_id: int,
+) -> Tuple[TransferOpGraph, int]:
+    """Return one task-end op for zero, one, or multiple terminal ops."""
+    if len(finished_ops_ids) == 0:
+        return graph, -1
+    if len(finished_ops_ids) == 1:
+        return graph, finished_ops_ids[0]
+
+    op = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=TransferType.VIRTUAL,
+        src_block_ids=np.array([], dtype=np.int64),
+        dst_block_ids=np.array([], dtype=np.int64),
+        dp_client_id=dp_client_id,
+    )
+    graph.add_transfer_op(op)
+    for op_id in finished_ops_ids:
+        graph.add_dependency(op.op_id, op_id)
+    return graph, op.op_id
+
+
 def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
                graph: TransferOpGraph, callbacks: List[Callable],
                op_callback_dict: Dict[int, Callable]) -> Optional[TransferOp]:
@@ -430,27 +570,60 @@ def merge_to_batch_graph(batch_id: int,
 
     Returns:
         (merged_graph, batch_end_op_id, new_op_callback_dict)
+
+    The input task-end ids belong to graphs that are discarded during fusion;
+    they are retained in the API for caller compatibility.  The merged graph
+    rebuilds its completion contract from its supported shape:
+      GET: full H2D + SWA H2D
+      PUT: full D2H + SWA D2H
+      layerwise GET: the fused LAYERWISE op
     """
     if not transfer_graphs:
         empty_graph = TransferOpGraph()
         empty_graph.set_graph_id(batch_id)
         return empty_graph, -1, {}
+    if len(transfer_graphs) != len(task_end_op_ids):
+        raise ValueError(
+            "transfer_graphs and task_end_op_ids must have the same length")
 
     merged_graph = TransferOpGraph()
     merged_graph.set_graph_id(batch_id)
 
     ops_by_type: Dict[TransferType, List[TransferOp]] = {}
     callbacks_by_type: Dict[TransferType, List[Callable]] = {}
+    swa_h2d_ops: List[TransferOp] = []
+    swa_disk2h_ops: List[TransferOp] = []
+    swa_d2h_ops: List[TransferOp] = []
+    swa_h2disk_ops: List[TransferOp] = []
+    swa_callbacks_by_type: Dict[TransferType, List[Callable]] = {}
     supported_types = {TransferType.DISK2H, TransferType.H2D,
                        TransferType.D2H, TransferType.H2DISK}
 
     for tt in supported_types:
         ops_by_type[tt] = []
         callbacks_by_type[tt] = []
+        swa_callbacks_by_type[tt] = []
 
     for graph in transfer_graphs:
         for op_id, op in graph._op_map.items():
             if op.transfer_type == TransferType.VIRTUAL:
+                continue
+            if getattr(op, "is_swa", False):
+                if op.transfer_type == TransferType.H2D:
+                    swa_h2d_ops.append(op)
+                elif op.transfer_type == TransferType.DISK2H:
+                    swa_disk2h_ops.append(op)
+                elif op.transfer_type == TransferType.D2H:
+                    swa_d2h_ops.append(op)
+                elif op.transfer_type == TransferType.H2DISK:
+                    swa_h2disk_ops.append(op)
+                else:
+                    raise NotImplementedError(
+                        f"Batch merge does not support SWA transfer type: {op.transfer_type}."
+                    )
+                if op.op_id in op_callback_dict:
+                    swa_callbacks_by_type[op.transfer_type].append(
+                        op_callback_dict[op.op_id])
                 continue
             if op.transfer_type not in supported_types:
                 raise NotImplementedError(
@@ -462,35 +635,73 @@ def merge_to_batch_graph(batch_id: int,
                 callbacks_by_type[op.transfer_type].append(op_callback_dict[op.op_id])
 
     new_op_callback_dict: Dict[int, Callable] = {}
+    # Layerwise path builds a LAYERWISE op (not standalone DISK2H/H2D); avoid
+    # registering callbacks on throwaway merged ops.
+    layerwise_tmp_callback_dict: Dict[int, Callable] = {}
+
+    def _concat_swa_block_ids(ops: List[TransferOp]) -> Tuple[np.ndarray, np.ndarray]:
+        if not ops:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+        return (
+            np.concatenate([op.src_block_ids for op in ops]),
+            np.concatenate([op.dst_block_ids for op in ops]),
+        )
 
     # GET path: DISK2H -> H2D
-    merged_disk2h_op = _merge_ops(ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
-                                  merged_graph, callbacks_by_type[TransferType.DISK2H], new_op_callback_dict)
-    merged_h2d_op = _merge_ops(ops_by_type[TransferType.H2D], TransferType.H2D,
-                               merged_graph, callbacks_by_type[TransferType.H2D], new_op_callback_dict)
+    merged_disk2h_op = _merge_ops(
+        ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
+        merged_graph, callbacks_by_type[TransferType.DISK2H],
+        layerwise_tmp_callback_dict if layerwise_transfer else new_op_callback_dict)
+    merged_h2d_op = _merge_ops(
+        ops_by_type[TransferType.H2D], TransferType.H2D,
+        merged_graph, callbacks_by_type[TransferType.H2D],
+        layerwise_tmp_callback_dict if layerwise_transfer else new_op_callback_dict)
 
     if layerwise_transfer:
-        if merged_h2d_op is not None:
+        batch_end_op_id = -1
+        if merged_h2d_op is not None or swa_h2d_ops or swa_disk2h_ops:
+            swa_h2d_src, swa_h2d_dst = _concat_swa_block_ids(swa_h2d_ops)
+            swa_disk2h_src, swa_disk2h_dst = _concat_swa_block_ids(swa_disk2h_ops)
+            if ops_by_type[TransferType.H2D]:
+                dp_client_id = ops_by_type[TransferType.H2D][0].dp_client_id
+            elif swa_h2d_ops:
+                dp_client_id = swa_h2d_ops[0].dp_client_id
+            elif swa_disk2h_ops:
+                dp_client_id = swa_disk2h_ops[0].dp_client_id
+            else:
+                dp_client_id = 0
             layerwise_transfer_op = LayerwiseTransferOp(
                 graph_id=merged_graph.graph_id,
-                src_block_ids_h2d=merged_h2d_op.src_block_ids,
-                dst_block_ids_h2d=merged_h2d_op.dst_block_ids,
+                src_block_ids_h2d=merged_h2d_op.src_block_ids if merged_h2d_op is not None
+                    else np.array([], dtype=np.int64),
+                dst_block_ids_h2d=merged_h2d_op.dst_block_ids if merged_h2d_op is not None
+                    else np.array([], dtype=np.int64),
                 src_block_ids_disk2h=merged_disk2h_op.src_block_ids \
                     if merged_disk2h_op is not None \
                     else np.array([], dtype=np.int64),
                 dst_block_ids_disk2h=merged_disk2h_op.dst_block_ids \
                     if merged_disk2h_op is not None \
                     else np.array([], dtype=np.int64),
-                dp_client_id=ops_by_type[TransferType.H2D][0].dp_client_id,
+                swa_src_block_ids_h2d=swa_h2d_src,
+                swa_dst_block_ids_h2d=swa_h2d_dst,
+                swa_src_block_ids_disk2h=swa_disk2h_src,
+                swa_dst_block_ids_disk2h=swa_disk2h_dst,
+                dp_client_id=dp_client_id,
                 counter_id=counter_id,
-                # Indexer maps 1:1 with main KV blocks, use same block_ids
-                # CPU side (src) and GPU side (dst) for H2D direction
-                indexer_src_block_ids=merged_h2d_op.src_block_ids.copy(),
-                indexer_dst_block_ids=merged_h2d_op.dst_block_ids.copy(),
             )
             merged_graph.add_transfer_op(layerwise_transfer_op)
-        batch_end_op_id = -1
-        new_op_callback_dict.clear()
+            # LAYERWISE completes atomically in the worker; fire main + SWA
+            # per-op readiness callbacks together on the fused op id.
+            layerwise_callbacks: List[Callable] = []
+            layerwise_callbacks.extend(callbacks_by_type[TransferType.DISK2H])
+            layerwise_callbacks.extend(callbacks_by_type[TransferType.H2D])
+            layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.DISK2H])
+            layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.H2D])
+            _attach_combined_callback(
+                layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
+            batch_end_op_id = layerwise_transfer_op.op_id
+        else:
+            batch_end_op_id = -1
     else:
         if merged_disk2h_op is not None:
             merged_graph.add_transfer_op(merged_disk2h_op)
@@ -499,29 +710,75 @@ def merge_to_batch_graph(batch_id: int,
         if merged_disk2h_op is not None and merged_h2d_op is not None:
             merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
 
+        merged_swa_disk2h_op = _merge_ops(
+            swa_disk2h_ops, TransferType.DISK2H,
+            merged_graph, swa_callbacks_by_type[TransferType.DISK2H],
+            new_op_callback_dict)
+        merged_swa_h2d_op = _merge_ops(
+            swa_h2d_ops, TransferType.H2D,
+            merged_graph, swa_callbacks_by_type[TransferType.H2D],
+            new_op_callback_dict)
+        if merged_swa_disk2h_op is not None:
+            merged_swa_disk2h_op.is_swa = True
+            merged_graph.add_transfer_op(merged_swa_disk2h_op)
+        if merged_swa_h2d_op is not None:
+            merged_swa_h2d_op.is_swa = True
+            merged_graph.add_transfer_op(merged_swa_h2d_op)
+        if merged_swa_disk2h_op is not None and merged_swa_h2d_op is not None:
+            merged_graph.add_dependency(
+                merged_swa_h2d_op.op_id, merged_swa_disk2h_op.op_id)
+
         # PUT path: D2H -> H2DISK
         merged_d2h_op = _merge_ops(ops_by_type[TransferType.D2H], TransferType.D2H,
                                    merged_graph, callbacks_by_type[TransferType.D2H], new_op_callback_dict)
         merged_h2disk_op = _merge_ops(ops_by_type[TransferType.H2DISK], TransferType.H2DISK,
                                       merged_graph, callbacks_by_type[TransferType.H2DISK], new_op_callback_dict)
+        merged_swa_d2h_op = _merge_ops(
+            swa_d2h_ops, TransferType.D2H,
+            merged_graph, swa_callbacks_by_type[TransferType.D2H],
+            new_op_callback_dict)
+        merged_swa_h2disk_op = _merge_ops(
+            swa_h2disk_ops, TransferType.H2DISK,
+            merged_graph, swa_callbacks_by_type[TransferType.H2DISK],
+            new_op_callback_dict)
         if merged_d2h_op is not None:
             merged_graph.add_transfer_op(merged_d2h_op)
         if merged_h2disk_op is not None:
             merged_graph.add_transfer_op(merged_h2disk_op)
+        if merged_swa_d2h_op is not None:
+            merged_swa_d2h_op.is_swa = True
+            merged_graph.add_transfer_op(merged_swa_d2h_op)
+        if merged_swa_h2disk_op is not None:
+            merged_swa_h2disk_op.is_swa = True
+            merged_graph.add_transfer_op(merged_swa_h2disk_op)
         if merged_d2h_op is not None and merged_h2disk_op is not None:
             merged_graph.add_dependency(merged_h2disk_op.op_id, merged_d2h_op.op_id)
+        if merged_swa_d2h_op is not None and merged_swa_h2disk_op is not None:
+            merged_graph.add_dependency(merged_swa_h2disk_op.op_id, merged_swa_d2h_op.op_id)
 
-        # batch_end_op_id: GET: H2D > DISK2H; PUT: H2DISK > D2H
-        if merged_h2d_op is not None:
-            batch_end_op_id = merged_h2d_op.op_id
-        elif merged_disk2h_op is not None:
-            batch_end_op_id = merged_disk2h_op.op_id
-        elif merged_h2disk_op is not None:
-            batch_end_op_id = merged_h2disk_op.op_id
-        elif merged_d2h_op is not None:
-            batch_end_op_id = merged_d2h_op.op_id
-        else:
-            batch_end_op_id = -1
+        get_finished_ops = [
+            op.op_id for op in (merged_h2d_op, merged_swa_h2d_op)
+            if op is not None
+        ]
+        put_finished_ops = [
+            op.op_id for op in (merged_d2h_op, merged_swa_d2h_op)
+            if op is not None
+        ]
+        if get_finished_ops and put_finished_ops:
+            raise ValueError("Batch graph cannot mix GET and PUT terminal ops")
+
+        finished_ops_ids = get_finished_ops or put_finished_ops
+        terminal_op = next((
+            op for op in (
+                merged_h2d_op,
+                merged_swa_h2d_op,
+                merged_d2h_op,
+                merged_swa_d2h_op,
+            ) if op is not None
+        ), None)
+        dp_client_id = terminal_op.dp_client_id if terminal_op is not None else 0
+        merged_graph, batch_end_op_id = add_virtual_op_for_multiple_finished_ops(
+            merged_graph, finished_ops_ids, dp_client_id)
 
     return merged_graph, batch_end_op_id, new_op_callback_dict
 

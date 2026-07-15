@@ -257,16 +257,6 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
     if layer_eventfds_tensor is None:
         layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
     ssd_files = {}
-    # C++ ctor takes non-const refs, so all args must be lvalues.
-    # Also pybind11's default-value filling for trailing indexer params is
-    # unreliable, so pass all 20 args explicitly (mirrors production layerwise.py).
-    indexer_gpu_blocks = []
-    indexer_cpu_blocks = torch.Tensor()
-    indexer_gpu_kv_strides = torch.Tensor()
-    indexer_gpu_block_strides = torch.Tensor()
-    indexer_gpu_layer_strides = torch.Tensor()
-    indexer_gpu_chunk_sizes = torch.Tensor()
-    indexer_ssd_files = {}
 
     return LayerwiseTransferGroup(
         num_gpus, all_gpu, cpu_tensor, ssd_files,
@@ -276,9 +266,6 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
         strides_tensor(gpu_layout.get_layer_stride),
         strides_tensor(gpu_layout.get_chunk_size),
         0, 0, layer_eventfds_tensor, num_gpus,
-        indexer_gpu_blocks, indexer_cpu_blocks, indexer_gpu_kv_strides,
-        indexer_gpu_block_strides, indexer_gpu_layer_strides,
-        indexer_gpu_chunk_sizes, indexer_ssd_files,
     )
 
 

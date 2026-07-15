@@ -1,5 +1,5 @@
 """
-Unit tests for atomic indexer eviction in TransferEngine.
+Unit tests for TransferEngine dispatch completion accounting.
 
 These tests verify that:
 1. TransferOp.pending_count defaults to 0 (pure-counter semantics: it counts
@@ -7,10 +7,8 @@ These tests verify that:
    never submitted to a worker).
 2. _finalize_op is called only when pending_count reaches 0 again (i.e. every
    submitted task has reported back).
-3. With indexer enabled: CompletedOp is NOT emitted until both main KV and
-   indexer workers complete (pending_count back to 0).
-4. With indexer disabled: behavior is identical to the original (one main-KV
-   task is submitted, pending_count goes 0→1→0, then _finalize_op).
+3. Extra LayerGroupSpec entries are handled inside the unified worker and do
+   not add Python worker submissions or completion events.
 """
 import queue
 import unittest
@@ -19,7 +17,7 @@ from unittest.mock import MagicMock, patch, call
 
 import numpy as np
 
-from flexkv.common.config import ModelConfig, RankInfo, CacheConfig
+from flexkv.common.config import ModelConfig, RankInfo, CacheConfig, LayerGroupSpec
 from flexkv.common.transfer import (
     TransferOp,
     TransferType,
@@ -114,12 +112,11 @@ class TestTransferOpPendingCount(unittest.TestCase):
     def test_default_pending_count_is_zero(self):
         """pending_count SHALL default to 0 (pure-counter semantics, req 5.1).
 
-        Rationale: every actual unit of work is a replica/indexer-op
+        Rationale: every actual unit of work is a replica
         submitted to a worker, accounted for via an explicit ``+= 1`` at
         submission time. The parent op itself is never submitted, so it
         contributes nothing to the count. Defaulting to 0 removes the
-        old "self-counts-as-one" special case that mis-counted in mixed
-        main-KV-fan-out + indexer-fan-out paths.
+        old "self-counts-as-one" special case that mis-counted fan-out paths.
         """
         op = _make_op()
         self.assertEqual(op.pending_count, 0)
@@ -143,7 +140,7 @@ class TestTransferOpPendingCount(unittest.TestCase):
 
 class TestFinalizeOpLogic(unittest.TestCase):
     """
-    Requirement 1, 3, 4: _finalize_op is called only when pending_count == 0.
+    _finalize_op is called only when pending_count == 0.
     We test the logic directly by simulating what _scheduler_loop does.
 
     Pure-counter semantics: every submission to a worker bumps pending_count
@@ -159,8 +156,8 @@ class TestFinalizeOpLogic(unittest.TestCase):
         if op.pending_count == 0:
             finalize_fn(op, finished_ops)
 
-    def test_no_indexer_finalize_called_after_main_kv(self):
-        """Without indexer: one main-KV submission → one completion → finalize (req 6.1)."""
+    def test_finalize_called_after_worker_completion(self):
+        """One worker submission followed by one completion finalizes the op."""
         op = _make_op()
         # Simulate _assign_op_to_worker submitting to the (sole) main-KV worker.
         op.pending_count += 1
@@ -175,66 +172,6 @@ class TestFinalizeOpLogic(unittest.TestCase):
         # pending_count should be 0 and finalize should have been called once
         self.assertEqual(op.pending_count, 0)
         finalize_mock.assert_called_once_with(op, finished_ops)
-
-    def test_with_indexer_finalize_not_called_after_main_kv_only(self):
-        """With indexer: finalize NOT called when only main KV completes (req 3.1, 4.1)."""
-        op = _make_op()
-        # Simulate _assign_op_to_worker submitting BOTH main-KV and indexer tasks.
-        op.pending_count += 1  # main KV
-        op.pending_count += 1  # indexer
-        self.assertEqual(op.pending_count, 2)
-
-        finalize_mock = MagicMock()
-        finished_ops: List[TransferOp] = []
-
-        # Main KV worker completes first
-        self._simulate_worker_done(op, finished_ops, finalize_mock)
-
-        # pending_count should be 1, finalize should NOT have been called
-        self.assertEqual(op.pending_count, 1)
-        finalize_mock.assert_not_called()
-        self.assertEqual(len(finished_ops), 0)
-
-    def test_with_indexer_finalize_called_after_both_complete(self):
-        """With indexer: finalize called exactly once when both workers complete (req 3.2, 4.2)."""
-        op = _make_op()
-        op.pending_count += 1  # main KV
-        op.pending_count += 1  # indexer
-        self.assertEqual(op.pending_count, 2)
-
-        finalize_mock = MagicMock()
-        finished_ops: List[TransferOp] = []
-
-        # Main KV worker completes first
-        self._simulate_worker_done(op, finished_ops, finalize_mock)
-        self.assertEqual(op.pending_count, 1)
-        finalize_mock.assert_not_called()
-
-        # Indexer worker completes
-        self._simulate_worker_done(op, finished_ops, finalize_mock)
-        self.assertEqual(op.pending_count, 0)
-        finalize_mock.assert_called_once_with(op, finished_ops)
-
-    def test_with_indexer_finalize_called_once_regardless_of_order(self):
-        """Finalize called exactly once even if indexer completes before main KV (req 3.2, 4.2)."""
-        op = _make_op()
-        op.pending_count += 1  # main KV
-        op.pending_count += 1  # indexer
-        self.assertEqual(op.pending_count, 2)
-
-        finalize_mock = MagicMock()
-        finished_ops: List[TransferOp] = []
-
-        # Indexer worker completes first
-        self._simulate_worker_done(op, finished_ops, finalize_mock)
-        self.assertEqual(op.pending_count, 1)
-        finalize_mock.assert_not_called()
-
-        # Main KV worker completes
-        self._simulate_worker_done(op, finished_ops, finalize_mock)
-        self.assertEqual(op.pending_count, 0)
-        finalize_mock.assert_called_once_with(op, finished_ops)
-
 
 # ---------------------------------------------------------------------------
 # Tests – _finalize_op method behavior
@@ -326,29 +263,17 @@ class TestFinalizeOpMethod(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests – Indexer Layerwise Worker initialization and op dispatch
+# Tests – Layerwise worker dispatch
 # ---------------------------------------------------------------------------
 
-class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
-    """
-    Tests for indexer LayerwiseTransferWorker initialization and LAYERWISE op dispatch.
-    Verifies requirements 1.1, 1.3, 2.1, 2.2, 5.1, 5.3.
-    """
+class TestLayerwiseWorkerDispatch(unittest.TestCase):
+    """Tests for unified LAYERWISE op dispatch."""
 
-    def _make_engine_stub_with_indexer(self, enable_layerwise: bool = True):
-        """
-        Create a minimal TransferEngine stub with _has_indexer=True and
-        a pre-populated _indexer_worker_map (simulating post-_init_workers state).
-        """
+    def _make_engine_stub(self):
         from flexkv.transfer.transfer_engine import TransferEngine
 
         engine = object.__new__(TransferEngine)
-        engine._has_indexer = True
         engine._worker_map = {}
-        engine._indexer_worker_map = {}
-        # Unified child tracking (replaces _indexer_op_to_parent_op /
-        # _indexer_op_map / _pp_replica_to_parent_op after the slot
-        # ownership refactor).
         engine._child_id_to_child = {}
         engine._child_to_parent_op_id = {}
         engine.op_id_to_op = {}
@@ -360,56 +285,22 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1)
         engine.rank_info = RankInfo(model_config=engine.model_config)
 
-        # Create mock workers for main KV
-        main_layerwise_worker = MagicMock()
-        engine._worker_map[TransferType.H2D] = [MagicMock()]
-        engine._worker_map[TransferType.D2H] = [MagicMock()]
-        if enable_layerwise:
-            # LAYERWISE worker map must be Dict[WorkerKey, WorkerHandle].
-            wk0 = WorkerKey(dp_client_id=0, pp_rank=0)
-            engine._worker_map[TransferType.LAYERWISE] = {wk0: main_layerwise_worker}
+        layerwise_worker = MagicMock()
+        worker_key = WorkerKey(dp_client_id=0, pp_rank=0)
+        engine._worker_map[TransferType.LAYERWISE] = {
+            worker_key: layerwise_worker,
+        }
 
-        # Create mock workers for indexer
-        indexer_h2d_worker = MagicMock()
-        indexer_layerwise_worker = MagicMock()
-        engine._indexer_worker_map[TransferType.H2D] = [indexer_h2d_worker]
-        engine._indexer_worker_map[TransferType.D2H] = [MagicMock()]
-        if enable_layerwise:
-            engine._indexer_worker_map[TransferType.LAYERWISE] = [indexer_layerwise_worker]
-
-        # PP replica tracking (needed by _assign_layerwise_op_to_workers)
-        engine._pp_replica_to_parent_op = {}
-        engine._pp_replica_op_map = {}
-
-        return engine, main_layerwise_worker, indexer_layerwise_worker
-
-    def test_indexer_worker_map_contains_layerwise_when_enabled(self):
-        """
-        WHEN enable_layerwise_transfer=True AND indexer handles exist
-        THEN _indexer_worker_map SHALL contain TransferType.LAYERWISE (req 1.1).
-        """
-        engine, _, _ = self._make_engine_stub_with_indexer(enable_layerwise=True)
-        self.assertIn(TransferType.LAYERWISE, engine._indexer_worker_map)
-
-    def test_indexer_worker_map_no_layerwise_when_disabled(self):
-        """
-        IF enable_layerwise_transfer=False
-        THEN _indexer_worker_map SHALL NOT contain TransferType.LAYERWISE (req 5.1).
-        """
-        engine, _, _ = self._make_engine_stub_with_indexer(enable_layerwise=False)
-        self.assertNotIn(TransferType.LAYERWISE, engine._indexer_worker_map)
+        return engine, layerwise_worker
 
     def test_layerwise_op_pending_count_equals_sibling_count(self):
         """
         WHEN _assign_op_to_worker processes a LAYERWISE op with one matching PP-stage sibling
         THEN op.pending_count SHALL be 1 (one replica submitted → one outstanding completion).
         Pure-counter semantics: pending_count == number of submitted-but-not-completed
-        worker tasks. LAYERWISE indexer is fused inside the worker, not dispatched separately.
+        worker tasks. Layer groups are handled inside that worker.
         """
-        from flexkv.transfer.transfer_engine import register_op_to_buffer
-        import nvtx
-
-        engine, main_worker, indexer_worker = self._make_engine_stub_with_indexer(enable_layerwise=True)
+        engine, _ = self._make_engine_stub()
 
         op = _make_op(TransferType.LAYERWISE)
         op.dp_client_id = 0
@@ -425,18 +316,16 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         # Single matching sibling → exactly one submission → pending_count == 1.
         self.assertEqual(op.pending_count, 1)
 
-    def test_layerwise_op_submitted_to_main_worker(self):
+    def test_layerwise_op_submitted_to_worker(self):
         """
         WHEN _assign_op_to_worker processes a LAYERWISE op
         THEN exactly one replica SHALL be submitted to the only matching
         layerwise worker, and that replica SHALL be tracked as a
         PP-replica of the parent op (parent op itself is never
         submitted to any worker — it is a pending_count anchor only).
-        LAYERWISE indexer is fused inside the worker, not dispatched separately.
+        Layer-group fan-out remains internal to the worker.
         """
-        from flexkv.transfer.transfer_engine import register_op_to_buffer
-
-        engine, main_worker, indexer_worker = self._make_engine_stub_with_indexer(enable_layerwise=True)
+        engine, worker = self._make_engine_stub()
 
         op = _make_op(TransferType.LAYERWISE)
         op.dp_client_id = 0
@@ -447,8 +336,8 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
             engine._assign_op_to_worker(op)
 
         # Exactly one replica was submitted (only one matching sibling).
-        self.assertEqual(main_worker.submit_transfer.call_count, 1)
-        submitted = main_worker.submit_transfer.call_args[0][0]
+        self.assertEqual(worker.submit_transfer.call_count, 1)
+        submitted = worker.submit_transfer.call_args[0][0]
         self.assertIsInstance(submitted, LayerwiseTransferOp)
         self.assertIsNot(submitted, op,
                          "parent op MUST NOT be submitted directly; only replicas reach workers")
@@ -458,81 +347,6 @@ class TestIndexerLayerwiseWorkerInit(unittest.TestCase):
         np.testing.assert_array_equal(submitted.dst_block_ids_h2d, op.dst_block_ids_h2d)
         # The replica is tracked as a child of the parent.
         self.assertEqual(engine._child_to_parent_op_id[submitted.op_id], op.op_id)
-
-    def test_layerwise_op_no_indexer_pending_count_equals_sibling_count(self):
-        """
-        WHEN no indexer exists and LAYERWISE op is dispatched to N matching siblings
-        THEN pending_count SHALL equal N (req 5.3): pure counter semantics, every
-        submitted replica is an outstanding completion event. With a single
-        matching sibling, that's exactly 1.
-        """
-        from flexkv.transfer.transfer_engine import TransferEngine
-
-        engine = object.__new__(TransferEngine)
-        engine._has_indexer = False
-        engine._worker_map = {}
-        engine._indexer_worker_map = {}
-        engine.op_id_to_op = {}
-        engine.op_id_to_nvtx_range = {}
-        engine._child_id_to_child = {}
-        engine._child_to_parent_op_id = {}
-        # The inlined fan-out path calls `register_op_to_buffer`
-        # unconditionally for symmetry; the call short-circuits inside
-        # for LAYERWISE, but Python still needs the attribute to exist.
-        engine.pin_buffer = MagicMock()
-
-        main_layerwise_worker = MagicMock()
-        wk0 = WorkerKey(dp_client_id=0, pp_rank=0)
-        engine._worker_map[TransferType.LAYERWISE] = {wk0: main_layerwise_worker}
-
-        op = _make_op(TransferType.LAYERWISE)
-        op.dp_client_id = 0
-        engine.op_id_to_op[op.op_id] = op
-
-        self.assertEqual(op.pending_count, 0,
-                         "fresh op must default to 0 (pure-counter semantics)")
-
-        with patch('flexkv.transfer.transfer_engine.register_op_to_buffer'), \
-             patch('nvtx.start_range', return_value=MagicMock()):
-            engine._assign_op_to_worker(op)
-
-        # One matching sibling → one submitted replica → pending_count == 1.
-        self.assertEqual(op.pending_count, 1)
-        # And the worker received exactly one (replica) op, not the parent itself.
-        self.assertEqual(main_layerwise_worker.submit_transfer.call_count, 1)
-        submitted = main_layerwise_worker.submit_transfer.call_args[0][0]
-        self.assertIsNot(submitted, op)
-        self.assertEqual(engine._child_to_parent_op_id[submitted.op_id], op.op_id)
-
-    def test_finalize_called_after_both_layerwise_workers_complete(self):
-        """
-        WHEN both main KV and indexer layerwise workers complete
-        THEN _finalize_op SHALL be called exactly once (req 3.2, 4.2).
-        """
-        op = _make_op(TransferType.LAYERWISE)
-        # Simulate _assign_op_to_worker submitting BOTH main-KV and indexer tasks.
-        op.pending_count += 1  # main KV
-        op.pending_count += 1  # indexer
-        self.assertEqual(op.pending_count, 2)
-
-        finalize_mock = MagicMock()
-        finished_ops: List[TransferOp] = []
-
-        def simulate_done(o, fo, fn):
-            o.pending_count -= 1
-            if o.pending_count == 0:
-                fn(o, fo)
-
-        # Main KV layerwise worker completes
-        simulate_done(op, finished_ops, finalize_mock)
-        self.assertEqual(op.pending_count, 1)
-        finalize_mock.assert_not_called()
-
-        # Indexer layerwise worker completes
-        simulate_done(op, finished_ops, finalize_mock)
-        self.assertEqual(op.pending_count, 0)
-        finalize_mock.assert_called_once_with(op, finished_ops)
-
 
 # ---------------------------------------------------------------------------
 # Tests – Routing-id dispatch across the flat dp_client_id matrix.
@@ -559,9 +373,7 @@ class TestWorkerKeyRouting(unittest.TestCase):
         from flexkv.transfer.transfer_engine import TransferEngine
 
         engine = object.__new__(TransferEngine)
-        engine._has_indexer = False
         engine._worker_map = {}
-        engine._indexer_worker_map = {}
         engine.op_id_to_op = {}
         engine.op_id_to_nvtx_range = {}
         engine.completed_queue = MagicMock()
@@ -690,44 +502,45 @@ class TestWorkerKeyInvariants(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests – pending_count bookkeeping across the 4 main×indexer worker shapes.
+# Tests – pending_count bookkeeping across worker and layer-group shapes.
 #
 # Pure-counter invariant: after dispatch, ``op.pending_count`` MUST equal
 # the total number of worker tasks actually submitted on the op's behalf
-# (main-KV replicas + indexer replicas), regardless of which side is a
-# WorkerKey-indexed dict and which is a singleton WorkerHandle.
+# regardless of whether the worker entry is a WorkerKey-indexed dict or a
+# singleton WorkerHandle.
 #
 # Pre-refactor this was wrong by 1 in two of the four shapes, because
 # ``_fan_out_to_pp_siblings`` skipped the "first" replica's += under the
 # (now-removed) assumption that the parent op carried a self-counted +1.
-# These subtests lock the new invariant in across all four shapes so the
-# old bug cannot silently come back.
+# These subtests lock the new invariant across worker and group counts.
 # ---------------------------------------------------------------------------
 
 class TestPendingCountBookkeepingMatrix(unittest.TestCase):
     """``pending_count`` MUST equal the number of submitted worker tasks
-    for every main×indexer worker-shape combination."""
+    for every (main_shape, n_pp_siblings, n_layer_groups) combination.
+
+    Main KV and auxiliary indexer pools are expressed as LayerGroupSpec
+    entries. The worker absorbs group fan-out, so Python dispatch sees
+    ``pending_count`` grow only with PP siblings.
+    """
 
     def _make_engine(
         self,
         *,
         main_dict: bool,
-        indexer: str,  # "none" | "dict" | "singleton"
         n_main_siblings: int = 1,
-        n_indexer_siblings: int = 1,
+        n_layer_groups: int = 1,
     ):
-        """Build a TransferEngine stub with exactly the requested shapes.
+        """Build a TransferEngine stub with the requested worker shape and
+        ``n_layer_groups`` LayerGroupSpec entries on the model_config.
 
-        For dict shapes, sibling WorkerKeys all share the same
-        flat ``dp_client_id`` and only differ in ``pp_rank`` so
-        every sibling matches the op's dp_client_id.
+        ``n_layer_groups`` is varied to lock in that pending_count does NOT
+        depend on it (the worker collapses group fan-out internally).
         """
         from flexkv.transfer.transfer_engine import TransferEngine
 
         engine = object.__new__(TransferEngine)
-        engine._has_indexer = (indexer != "none")
         engine._worker_map = {}
-        engine._indexer_worker_map = {}
         engine.op_id_to_op = {}
         engine.op_id_to_nvtx_range = {}
         engine.completed_queue = MagicMock()
@@ -735,13 +548,20 @@ class TestPendingCountBookkeepingMatrix(unittest.TestCase):
         engine.cache_config = MagicMock()
         engine.cache_config.tokens_per_block = 16
         engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1)
+        # Synthesize N overlapping groups, as used by main KV + indexer.
+        engine.model_config.layer_groups = [
+            LayerGroupSpec(
+                num_layers=2,
+                num_kv_heads=1,
+                head_size=1,
+                layer_indices=[0, 1],
+            )
+            for g in range(n_layer_groups)
+        ]
         engine.rank_info = RankInfo(model_config=engine.model_config)
-        # Unified child tracking (replaces _indexer_op_to_parent_op /
-        # _indexer_op_map / _pp_replica_to_parent_op).
         engine._child_id_to_child = {}
         engine._child_to_parent_op_id = {}
 
-        # Main KV side: dict (n siblings, all matching) or a single singleton handle.
         if main_dict:
             engine._worker_map[TransferType.D2H] = {
                 WorkerKey(dp_client_id=0, pp_rank=pp): MagicMock(
@@ -751,17 +571,6 @@ class TestPendingCountBookkeepingMatrix(unittest.TestCase):
         else:
             engine._worker_map[TransferType.D2H] = MagicMock(name="main_singleton")
 
-        # Indexer side: absent / dict / singleton.
-        if indexer == "dict":
-            engine._indexer_worker_map[TransferType.D2H] = {
-                WorkerKey(dp_client_id=0, pp_rank=pp): MagicMock(
-                    name=f"indexer_pp{pp}")
-                for pp in range(n_indexer_siblings)
-            }
-        elif indexer == "singleton":
-            engine._indexer_worker_map[TransferType.D2H] = MagicMock(name="indexer_singleton")
-        # else: indexer == "none" → no entry, _has_indexer=False already
-
         return engine
 
     def _dispatch(self, engine, op):
@@ -770,46 +579,43 @@ class TestPendingCountBookkeepingMatrix(unittest.TestCase):
             engine._assign_op_to_worker(op)
 
     def _expected_submissions(self, engine) -> int:
-        """Count the unique submit_transfer calls actually issued, by walking
-        every worker mock in both maps. This is the ground-truth number the
-        invariant requires ``op.pending_count`` to equal."""
+        """
+        Count submit_transfer calls actually issued, walking only
+        """
         total = 0
-        for tt_map in (engine._worker_map, engine._indexer_worker_map):
-            for entry in tt_map.values():
-                if isinstance(entry, dict):
-                    for w in entry.values():
-                        total += w.submit_transfer.call_count
-                else:
-                    total += entry.submit_transfer.call_count
+        for entry in engine._worker_map.values():
+            if isinstance(entry, dict):
+                for w in entry.values():
+                    total += w.submit_transfer.call_count
+            else:
+                total += entry.submit_transfer.call_count
         return total
 
     def test_pending_count_matches_submissions_across_all_shapes(self):
-        """The invariant: ``op.pending_count == #submitted worker tasks``,
-        for every (main_shape, indexer_shape, fan-out widths) combination."""
-        cases = [
-            # (label, main_dict, indexer, n_main, n_indexer, expected_total)
-            ("dict-main(1)+no-indexer",        True,  "none",      1, 0, 1),
-            ("dict-main(3)+no-indexer",        True,  "none",      3, 0, 3),
-            ("singleton-main+no-indexer",      False, "none",      0, 0, 1),
-            ("dict-main(1)+singleton-indexer", True,  "singleton", 1, 0, 2),
-            ("dict-main(3)+singleton-indexer", True,  "singleton", 3, 0, 4),
-            ("singleton-main+singleton-indexer", False, "singleton", 0, 0, 2),
-            # The two shapes the OLD code under-counted by 1:
-            ("dict-main(2)+dict-indexer(2)",   True,  "dict",      2, 2, 4),
-            ("dict-main(3)+dict-indexer(2)",   True,  "dict",      3, 2, 5),
-            ("singleton-main+dict-indexer(2)", False, "dict",      0, 2, 3),
-            ("singleton-main+dict-indexer(3)", False, "dict",      0, 3, 4),
-        ]
-        for label, main_dict, indexer, n_main, n_indexer, expected in cases:
+        """``op.pending_count == #submitted worker tasks`` for every
+        (main_shape × n_pp_siblings × n_layer_groups) combo.
+
+        The ``n_layer_groups`` axis is the fence: any regression
+        that re-introduces group-level fan-out in ``_assign_op_to_worker``
+        will make the dict shapes overshoot by ``n_layer_groups - 1``.
+        """
+        cases = []
+        for main_dict, label_main in [(True, "dict-main"), (False, "singleton-main")]:
+            sibling_counts = [1, 2, 3] if main_dict else [0]
+            for n_main in sibling_counts:
+                for n_groups in (1, 2, 3):
+                    expected = n_main if main_dict else 1
+                    label = f"{label_main}({n_main})+groups={n_groups}"
+                    cases.append((label, main_dict, n_main, n_groups, expected))
+
+        for label, main_dict, n_main, n_groups, expected in cases:
             with self.subTest(case=label):
                 engine = self._make_engine(
                     main_dict=main_dict,
-                    indexer=indexer,
                     n_main_siblings=n_main,
-                    n_indexer_siblings=n_indexer,
+                    n_layer_groups=n_groups,
                 )
-                op = _make_op(TransferType.D2H,
-                              dp_client_id=0)
+                op = _make_op(TransferType.D2H, dp_client_id=0)
                 engine.op_id_to_op[op.op_id] = op
                 self.assertEqual(op.pending_count, 0,
                                  "fresh op must default to 0 (pure-counter semantics)")
@@ -823,36 +629,28 @@ class TestPendingCountBookkeepingMatrix(unittest.TestCase):
                     op.pending_count, expected,
                     f"[{label}] pending_count ({op.pending_count}) MUST equal "
                     f"the number of submitted worker tasks ({expected}). "
-                    f"If this fails, the pre-refactor 'self-counts-as-one' "
-                    f"bug has come back."
+                    f"pending_count must be independent of n_layer_groups."
                 )
 
     def test_simulating_all_completions_finalizes_exactly_once(self):
-        """End-to-end: after dispatch, simulating one completion per submitted
-        task MUST drive pending_count back to 0 and trigger _finalize_op
-        exactly once. This is the property the bug actually broke (with
-        the old code, pending_count would underflow or never hit 0 in
-        the dict+dict and singleton-main+dict-indexer shapes)."""
-        # Pick the previously-buggy shape as the canary.
+        """After dispatch, simulating one completion per submitted task
+        MUST drive pending_count back to 0.
+
+        Uses n_layer_groups=3 to also assert that extra groups don't
+        sneak in spurious pending_count increments.
+        """
         engine = self._make_engine(
-            main_dict=True, indexer="dict",
-            n_main_siblings=2, n_indexer_siblings=2,
+            main_dict=True, n_main_siblings=2, n_layer_groups=3,
         )
-        op = _make_op(TransferType.D2H,
-                      dp_client_id=0)
+        op = _make_op(TransferType.D2H, dp_client_id=0)
         engine.op_id_to_op[op.op_id] = op
 
         self._dispatch(engine, op)
-        self.assertEqual(op.pending_count, 4)
+        # Independent of n_layer_groups (= 3 here); only n_pp_siblings matters.
+        self.assertEqual(op.pending_count, 2)
 
-        # Drain: 4 completions → pending_count should land exactly at 0.
-        finalize_mock = MagicMock()
-        finished_ops: List[TransferOp] = []
-        for _ in range(op.pending_count):  # snapshot since we mutate it
+        for _ in range(op.pending_count):
             op.pending_count -= 1
-        # Simulating the scheduler-loop's "if 0 then finalize" check once
-        # per worker completion is what TestFinalizeOpLogic covers; here
-        # we only care that the target lands cleanly at 0.
         self.assertEqual(op.pending_count, 0)
 
 

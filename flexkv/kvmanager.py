@@ -175,7 +175,15 @@ class KVManager:
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   cpu_only: bool = False,
                   namespace: Optional[List[str]] = None,
+                  swa_aware: bool = False,
                   ) -> Tuple[int, np.ndarray]:
+        """Match a prefix and build the load graph; return (task_id, mask).
+
+        ``swa_aware=True`` clamps the Full-KV transfer to the reusable SWA window
+        (from the same single match); the SWA window is the trailing block of the
+        returned mask, which the caller reads directly. ``swa_aware=False``
+        (default) is the plain path.
+        """
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if isinstance(token_mask, torch.Tensor):
@@ -184,13 +192,15 @@ class KVManager:
             task_id, mask = self.dp_client.get_match(token_ids,
                                                      token_mask,
                                                      cpu_only=cpu_only,
-                                                     namespace=namespace)
+                                                     namespace=namespace,
+                                                     swa_aware=swa_aware)
         else:
             task_id, mask = self.kv_task_engine.get_match(
                 token_ids=token_ids,
                 token_mask=token_mask,
                 cpu_only=cpu_only,
                 namespace=namespace,
+                swa_aware=swa_aware,
             )
         return task_id, mask
 
@@ -255,6 +265,7 @@ class KVManager:
     def launch(self,
                task_ids: Union[int, List[int]],
                slot_mappings: Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]],
+               swa_slot_mappings: Optional[Union[np.ndarray, List[Optional[np.ndarray]], torch.Tensor, List[Optional[torch.Tensor]]]] = None,
                as_batch: bool = False,
                layerwise_transfer: bool = False,
                counter_id: int = 0) -> List[int]:
@@ -264,15 +275,32 @@ class KVManager:
             slot_mappings = [slot_mappings]
         if isinstance(slot_mappings[0], torch.Tensor):
             slot_mappings = [slot_mapping.numpy() for slot_mapping in slot_mappings]
+        # SWA GPU slot_mappings (optional): the connector supplies these only when
+        # it registered an SWA GPU pool and the request has an SWA reuse window.
+        if swa_slot_mappings is not None and not isinstance(swa_slot_mappings, List):
+            swa_slot_mappings = [swa_slot_mappings]
+        if isinstance(swa_slot_mappings, List):
+            swa_slot_mappings = [
+                sm.numpy() if isinstance(sm, torch.Tensor) else sm
+                for sm in swa_slot_mappings
+            ]
         if self.server_client_mode:
-            return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch, layerwise_transfer, counter_id)
+            return self.dp_client.launch_tasks(
+                task_ids=task_ids,
+                slot_mappings=slot_mappings,
+                swa_slot_mappings=swa_slot_mappings,
+                as_batch=as_batch,
+                layerwise_transfer=layerwise_transfer,
+                counter_id=counter_id,
+            )
         else:
             return self.kv_task_engine.launch_tasks(
                 task_ids,
                 slot_mappings,
+                swa_slot_mappings=swa_slot_mappings,
                 as_batch=as_batch,
                 layerwise_transfer=layerwise_transfer,
-                counter_id=counter_id
+                counter_id=counter_id,
             )
 
     def cancel(self, task_ids: Union[int, List[int]]) -> None:

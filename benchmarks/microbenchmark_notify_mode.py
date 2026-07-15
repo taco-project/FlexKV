@@ -69,13 +69,6 @@ def make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers):
     def strides_tensor(getter):
         return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
     ssd_files = {}
-    indexer_gpu_blocks = []
-    indexer_cpu_blocks = torch.Tensor()
-    indexer_gpu_kv_strides = torch.Tensor()
-    indexer_gpu_block_strides = torch.Tensor()
-    indexer_gpu_layer_strides = torch.Tensor()
-    indexer_gpu_chunk_sizes = torch.Tensor()
-    indexer_ssd_files = {}
     layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
 
     return LayerwiseTransferGroup(
@@ -85,9 +78,6 @@ def make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers):
         strides_tensor(gpu_layout.get_layer_stride),
         strides_tensor(gpu_layout.get_chunk_size),
         0, 0, layer_eventfds_tensor, num_gpus,
-        indexer_gpu_blocks, indexer_cpu_blocks, indexer_gpu_kv_strides,
-        indexer_gpu_block_strides, indexer_gpu_layer_strides,
-        indexer_gpu_chunk_sizes, indexer_ssd_files,
     )
 
 

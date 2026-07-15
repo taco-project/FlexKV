@@ -69,6 +69,13 @@ class KVTask:
     callback: Optional[Union[Callable, List[Callable]]]
     op_callback_dict: Dict[int, Callable]
 
+    # batch: points to the batch task id if this task was merged into a batch
+    batch_task_id: Optional[int] = None
+    # ref count: number of sub-tasks referencing this batch task
+    pending_sub_count: int = 0
+    # SWA GPU slot_mapping (SWA-pool token index space), bound LATE at launch —
+    # the SWA counterpart to slot_mapping. None when the request has no SWA ops.
+    swa_slot_mapping: Optional[np.ndarray] = None
 
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
@@ -213,6 +220,7 @@ class KVTaskManager:
                         is_fake_slot_mapping: bool = False,
                         temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
                         namespace: Optional[List[str]] = None,
+                        swa_aware: bool = False,
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
@@ -223,7 +231,8 @@ class KVTaskManager:
             slot_mapping=slot_mapping,
             dp_client_id=dp_client_id,
             temp_cache_strategy=temp_cache_strategy,
-            namespace=namespace)
+            namespace=namespace,
+            swa_aware=swa_aware)
         self.tasks[task_id] = KVTask(
             task_id=task_id,
             task_type=TaskType.GET,
@@ -363,7 +372,8 @@ class KVTaskManager:
                 self._mark_completed(task_id)
             elif completed_op.op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
-            if completed_op.op_id in task.op_callback_dict:
+            has_callback = completed_op.op_id in task.op_callback_dict
+            if has_callback:
                 task.op_callback_dict[completed_op.op_id]()
 
     def _cancel_task(self, task_id: int) -> None:
@@ -376,6 +386,8 @@ class KVTaskManager:
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
         task = self.tasks[task_id]
+        if task.batch_task_id is not None:
+            return self.check_completed(task.batch_task_id, completely)
         self._process_empty_graph(task_id)
         if completely:
             return task.is_completed()
@@ -388,17 +400,32 @@ class KVTaskManager:
 
     def set_slot_mappings(self,
                           task_ids: List[int],
-                          slot_mappings: List[np.ndarray]) -> None:
-        for task_id, slot_mapping in zip(task_ids, slot_mappings):
-            self._set_slot_mapping_impl(task_id, slot_mapping)
+                          slot_mappings: List[np.ndarray],
+                          swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None) -> None:
+        if swa_slot_mappings is None:
+            swa_slot_mappings = [None] * len(task_ids)
+        for task_id, slot_mapping, swa_slot_mapping in zip(task_ids, slot_mappings, swa_slot_mappings):
+            self._set_slot_mapping_impl(task_id, slot_mapping, swa_slot_mapping)
 
-    def _set_slot_mapping_impl(self, task_id: int, slot_mapping: np.ndarray) -> None:
+    def _set_slot_mapping_impl(self,
+                               task_id: int,
+                               slot_mapping: np.ndarray,
+                               swa_slot_mapping: Optional[np.ndarray] = None) -> None:
         task = self.tasks[task_id]
         if task.status != TaskStatus.UNREADY:
             return
         graph_ids = self.cache_engine.slot_mapping_to_block_ids(slot_mapping,
                                                                 self.cache_config.tokens_per_block)
-        task.graph.set_gpu_blocks(graph_ids)
+        # Late-bind the GPU-side SWA slots via the unified set_gpu_blocks(gpu,
+        # swa_gpu) path (PR#191). SWA is page-granular, so the mapping folds by
+        # the same stride as full-KV (slot_mapping_to_block_ids).
+        # A None swa_slot_mapping leaves the graph's SWA ops at their built ids.
+        swa_sm = swa_slot_mapping if swa_slot_mapping is not None else task.swa_slot_mapping
+        swa_graph_ids = None
+        if swa_sm is not None:
+            swa_graph_ids = self.cache_engine.slot_mapping_to_block_ids(
+                swa_sm, self.cache_config.tokens_per_block)
+        task.graph.set_gpu_blocks(graph_ids, swa_graph_ids)
         task.slot_mapping = slot_mapping
         task.status = TaskStatus.READY
 
@@ -423,9 +450,14 @@ class KVTaskManager:
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]
+        batch_id = task.batch_task_id
         if task.graph is not None:
             self.graph_to_task.pop(task.graph.graph_id, None)
         self.tasks.pop(task_id, None)
+        if batch_id is not None and batch_id in self.tasks:
+            self.tasks[batch_id].pending_sub_count -= 1
+            if self.tasks[batch_id].pending_sub_count <= 0:
+                self._release_task(batch_id)
 
     def _mark_completed(self, task_id: int) -> None:
         task = self.tasks[task_id]
@@ -567,12 +599,13 @@ class KVTaskEngine(KVTaskManager):
                     )
                     break
                 elif self.check_completed(task_id, completely=completely):
+                    effective_id = self.tasks[task_id].batch_task_id or task_id
                     return_responses[task_id] = KVResponse(
-                        status=convert_to_response_status(self.tasks[task_id].status),
+                        status=convert_to_response_status(self.tasks[effective_id].status),
                         task_id=task_id,
                         return_mask=self.tasks[task_id].return_mask
                     )
-                    if self.tasks[task_id].is_completed():
+                    if self.tasks[effective_id].is_completed():
                         self._release_task(task_id)
                     break
                 elif only_return_finished:
@@ -638,9 +671,25 @@ class KVTaskEngine(KVTaskManager):
                   token_mask: Optional[np.ndarray] = None,
                   cpu_only: bool = False,
                   task_id: int = -1,
-                  namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                  namespace: Optional[List[str]] = None,
+                  swa_aware: bool = False) -> Tuple[int, np.ndarray]:
+        """Match a prefix and build the load graph; return (task_id, return_mask).
+
+        With ``swa_aware=True`` the Full-KV transfer is clamped to the reusable
+        SWA window (``usable = min(full_hit, swa_hit)``) from the same single radix
+        match: past that window the Full-KV bytes would feed stale KV to the
+        SWA-layer attention. The SWA window is the trailing block of the returned
+        mask (page-granular), which the caller reads directly — there is no
+        separate SWA mask. ``swa_aware=False`` (default) is the plain path,
+        untouched.
+        """
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
         # self._sync_prefetch(token_ids, namespace)
+        # Flush pending D2H completions so set_ready callbacks run before
+        # we check the radix tree.  Without this, blocks offloaded between
+        # scheduler steps remain "not ready" until the next try_wait call,
+        # which comes too late (after get_match).
+        self._update_tasks(timeout=0)
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
         fake_slot_mapping = np.zeros_like(token_ids[token_mask])
@@ -651,7 +700,8 @@ class KVTaskEngine(KVTaskManager):
                                                            dp_client_id=dp_client_id,
                                                            cpu_only=cpu_only,
                                                            task_id=task_id,
-                                                           namespace=namespace)
+                                                           namespace=namespace,
+                                                           swa_aware=swa_aware)
         # trace get match request
         self.tracer.trace_request(
             request_type="GET_MATCH",
@@ -672,7 +722,8 @@ class KVTaskEngine(KVTaskManager):
                   token_mask: Optional[np.ndarray] = None,
                   cpu_only: bool = False,
                   task_id: int = -1,
-                  namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                  namespace: Optional[List[str]] = None,
+                  swa_aware: bool = False) -> Tuple[int, np.ndarray]:
         if token_mask is None:
             token_mask = np.ones_like(token_ids)
         if task_id == -1:
@@ -688,7 +739,8 @@ class KVTaskEngine(KVTaskManager):
                              token_mask=token_mask,
                              is_fake_slot_mapping=is_fake_slot_mapping,
                              temp_cache_strategy=temp_cache_strategy,
-                             namespace=namespace)
+                             namespace=namespace,
+                             swa_aware=swa_aware)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
@@ -699,6 +751,7 @@ class KVTaskEngine(KVTaskManager):
                   token_mask: Optional[np.ndarray] = None,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+        self._update_tasks(timeout=0)
         fake_slot_mapping = np.zeros_like(token_ids)
         result_task_id, return_mask = self._put_match_impl(token_ids,
                                                            fake_slot_mapping,
@@ -808,16 +861,16 @@ class KVTaskEngine(KVTaskManager):
             op_callback_dict=op_callback_dict,
         )
         self.graph_to_task[batch_task_graph.graph_id] = batch_id
+        self.tasks[batch_id].pending_sub_count = len(task_ids)
         for task_id in task_ids:
-            child_task = self.tasks[task_id]
-            if child_task.graph is not None:
-                self.graph_to_task.pop(child_task.graph.graph_id, None)
-            self.tasks.pop(task_id, None)
+            self.graph_to_task.pop(self.tasks[task_id].graph.graph_id, None)
+            self.tasks[task_id].batch_task_id = batch_id
         return batch_task_graph
 
     def launch_tasks(self,
                     task_ids: List[int],
                     slot_mappings: List[np.ndarray],
+                    swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None,
                     as_batch: bool = False,
                     batch_id: int = -1,
                     layerwise_transfer: bool = False,
@@ -825,7 +878,7 @@ class KVTaskEngine(KVTaskManager):
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
-        self.set_slot_mappings(task_ids, slot_mappings)
+        self.set_slot_mappings(task_ids, slot_mappings, swa_slot_mappings)
 
         # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")

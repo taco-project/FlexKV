@@ -13,9 +13,6 @@ WORKER_KINDS = (
     "gpu_cpu",
     "gpu_cpu_tp",
     "cpu_ssd",
-    "indexer_gpu_cpu",
-    "indexer_gpu_cpu_tp",
-    "indexer_cpu_ssd",
 )
 
 

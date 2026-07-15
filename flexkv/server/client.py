@@ -9,7 +9,7 @@ import torch
 import zmq
 import numpy as np
 
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import ModelConfig, CacheConfig, LayerGroupSpec
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
@@ -170,6 +170,7 @@ class KVDPClient:
         token_mask: Optional[np.ndarray],
         cpu_only: bool = False,
         namespace: Optional[List[str]] = None,
+        swa_aware: bool = False,
     ) -> Optional[Tuple[int, np.ndarray]]:
         req = GetMatchRequest(
             dp_client_id=self.dp_client_id,
@@ -178,6 +179,7 @@ class KVDPClient:
             cpu_only=cpu_only,
             task_id=self._get_task_id(),
             namespace=namespace,
+            swa_aware=swa_aware,
         )
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
@@ -194,11 +196,21 @@ class KVDPClient:
         as_batch: bool = False,
         layerwise_transfer: bool = False,
         counter_id: int = 0,
+        swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None,
     ) -> List[int]:
         batch_id = -1
         if as_batch:
             batch_id = self._get_task_id()
-        req = LaunchTaskRequest(self.dp_client_id, task_ids, slot_mappings, as_batch, batch_id, layerwise_transfer, counter_id)
+        req = LaunchTaskRequest(
+            dp_client_id=self.dp_client_id,
+            task_ids=task_ids,
+            slot_mappings=slot_mappings,
+            swa_slot_mappings=swa_slot_mappings,
+            as_batch=as_batch,
+            batch_id=batch_id,
+            layerwise_transfer=layerwise_transfer,
+            counter_id=counter_id,
+        )
         self.send_to_server.send_pyobj(req)
         return [batch_id] if as_batch else task_ids
 
@@ -304,8 +316,11 @@ class KVTPClient:
         kv_caches: List[torch.Tensor],
         kv_layout: KVCacheLayout,
         override_device_id: Optional[int] = None,
-        indexer_buffers: Optional[List[torch.Tensor]] = None,
-        indexer_layout: Optional[KVCacheLayout] = None,
+        layer_groups: Optional[List[LayerGroupSpec]] = None,
+        gpu_layouts: Optional[List[KVCacheLayout]] = None,
+        handles_per_group: Optional[List[List[torch.Tensor]]] = None,
+        swa_caches: Optional[List[torch.Tensor]] = None,
+        swa_layout: Optional[KVCacheLayout] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
@@ -318,12 +333,23 @@ class KVTPClient:
             handle = TensorSharedHandle(tensor, device_id)
             handles.append(handle)
 
-        # Build optional indexer handles
-        indexer_handles = None
-        if indexer_buffers is not None and len(indexer_buffers) > 0:
-            indexer_handles = []
-            for tensor in indexer_buffers:
-                indexer_handles.append(TensorSharedHandle(tensor, device_id))
+        # Build per-group shared handles when multi-group registration is requested
+        # (heterogeneous KV layouts, including DSA/NSA indexer-as-group).
+        handles_per_group_shared: Optional[List[List[TensorSharedHandle]]] = None
+        if handles_per_group is not None:
+            handles_per_group_shared = []
+            for group_tensors in handles_per_group:
+                group_handles = [TensorSharedHandle(t, device_id) for t in group_tensors]
+                handles_per_group_shared.append(group_handles)
+
+        # SWA dedicated pool handles (channel B): build CUDA IPC handles for
+        # the sliding-window-attention GPU buffers so the FlexKV worker process
+        # can map them independently of the main-KV pool.
+        swa_handles_shared: Optional[List[TensorSharedHandle]] = None
+        if swa_caches is not None and len(swa_caches) > 0:
+            if not swa_caches[0].is_cuda:
+                raise ValueError("SWA blocks must be CUDA tensors")
+            swa_handles_shared = [TensorSharedHandle(t, device_id) for t in swa_caches]
 
         register_req = RegisterTPClientRequest(
             dp_client_id=self.dp_client_id,
@@ -331,8 +357,11 @@ class KVTPClient:
             device_id=device_id,
             handles=handles,
             gpu_layout=kv_layout,
-            indexer_handles=indexer_handles,
-            indexer_gpu_layout=indexer_layout,
+            layer_groups=layer_groups,
+            gpu_layouts=gpu_layouts,
+            handles_per_group=handles_per_group_shared,
+            swa_handles=swa_handles_shared,
+            swa_layout=swa_layout,
         )
 
         try:

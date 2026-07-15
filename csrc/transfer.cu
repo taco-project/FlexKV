@@ -23,6 +23,69 @@ namespace flexkv {
 
 #define FLOAT4_PTR(ptr) reinterpret_cast<float4 *>(ptr)
 
+constexpr int kFloat4AlignBytes = 16;
+constexpr int kInt64AlignBytes = 8;
+
+static bool use_float4_kernel_path(int64_t chunk_size_in_bytes,
+                                   int64_t gpu_startoff_inside_chunks,
+                                   int64_t cpu_startoff_inside_chunks) {
+  return (chunk_size_in_bytes % kFloat4AlignBytes == 0) &&
+         (gpu_startoff_inside_chunks % kFloat4AlignBytes == 0) &&
+         (cpu_startoff_inside_chunks % kFloat4AlignBytes == 0);
+}
+
+// 8-byte (int64) copy path for MLA-sharded D2H where per-TP shard offsets are
+// 8-aligned but not 16-aligned (e.g. DSv4 bytes_per_page_padded=37440, TP=8).
+template <BackendType Type>
+__global__ void transfer_kv_blocks_kernel_8b(
+    int num_blocks, int start_layer_id, int num_layers, int64_t *gpu_block_ids,
+    GTensorHandler gpu_handler, int64_t gpu_startoff_inside_chunks,
+    int64_t *cpu_block_ids, int64_t *cpu_ptr, int64_t cpu_kv_stride,
+    int64_t cpu_layer_stride, int64_t cpu_block_stride,
+    int64_t cpu_startoff_inside_chunks, int64_t copy_size, bool is_mla,
+    bool is_host_to_device) {
+  int kv_dim = is_mla ? 1 : 2;
+  int num_chunks = num_layers * kv_dim * num_blocks;
+
+  int warp_id = threadIdx.x / 32;
+  int lane_id = threadIdx.x % 32;
+  int warps_per_block = blockDim.x / 32;
+  int total_warps = gridDim.x * warps_per_block;
+
+  for (int chunk_idx = blockIdx.x * warps_per_block + warp_id;
+       chunk_idx < num_chunks; chunk_idx += total_warps) {
+    int layer_idx = start_layer_id + chunk_idx / (num_blocks * kv_dim);
+    int kv_idx = (chunk_idx % (num_blocks * kv_dim)) / num_blocks;
+    int gpu_block_idx = gpu_block_ids[chunk_idx % num_blocks];
+    int cpu_block_idx = cpu_block_ids[chunk_idx % num_blocks];
+
+    int64_t *cpu_chunk_ptr =
+        cpu_ptr + layer_idx * cpu_layer_stride + kv_idx * cpu_kv_stride +
+        cpu_block_idx * cpu_block_stride + cpu_startoff_inside_chunks;
+
+    int64_t *gpu_ptr =
+        ptr_at<Type>(gpu_handler, layer_idx, kv_idx, gpu_block_idx);
+    int64_t *gpu_chunk_ptr =
+        reinterpret_cast<int64_t *>(gpu_ptr) + gpu_startoff_inside_chunks;
+
+    int64_t *src_chunk_ptr = is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
+    int64_t *dst_chunk_ptr = is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
+
+    // Use explicit PTX ld/st (same as float4 path) so D2H can write pinned host
+    // memory from device; plain C++ stores may fault on unmapped host pointers.
+    for (int64_t idx = lane_id; idx < copy_size; idx += 32) {
+      int64_t element;
+      asm volatile("ld.global.nc.u64 %0, [%1];"
+                   : "=l"(element)
+                   : "l"(&src_chunk_ptr[idx])
+                   : "memory");
+      asm volatile("st.global.cg.u64 [%0], %1;"
+                   :: "l"(&dst_chunk_ptr[idx]), "l"(element)
+                   : "memory");
+    }
+  }
+}
+
 // Templated CUDA kernel - backend type determined at compile time
 template <BackendType Type>
 __global__ void transfer_kv_blocks_kernel(
@@ -117,9 +180,10 @@ void transfer_kv_blocks(
   dim3 blockDim(block_size);
   dim3 gridDim(block_count);
 
+  const int kv_dim = is_mla ? 1 : 2;
+
   // CE transfer mode (Copy Engine using cudaMemcpyAsync)
   if (use_ce_transfer) {
-    int kv_dim = is_mla ? 1 : 2;
     // Merge consecutive blocks whose GPU and CPU IDs are both contiguous into
     // a single cudaMemcpyAsync, collapsing the innermost loop from
     // O(num_blocks) to O(num_runs). Requires cpu_block_stride == chunk_size
@@ -166,13 +230,28 @@ void transfer_kv_blocks(
       }
     }
   } else {
-    // Custom kernel transfer
-    transfer_kv_blocks_kernel<Type><<<gridDim, blockDim, 0, stream>>>(
-        num_blocks, start_layer_id, num_layers, gpu_block_ids,
-        gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
-        cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
-        cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-        chunk_size_in_int64, is_mla, is_host_to_device);
+    // Custom kernel transfer. Choose the float4 (16B) vs int64 (8B) copy path
+    // based on alignment; the 8b path handles MLA-sharded D2H where per-TP
+    // shard offsets are 8-aligned but not 16-aligned (e.g. DSv4).
+    const bool float4_path = use_float4_kernel_path(
+        chunk_size_in_bytes, gpu_startoff_inside_chunks,
+        cpu_startoff_inside_chunks);
+
+    if (float4_path) {
+      transfer_kv_blocks_kernel<Type><<<gridDim, blockDim, 0, stream>>>(
+          num_blocks, start_layer_id, num_layers, gpu_block_ids,
+          gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
+          cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
+          cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+          chunk_size_in_int64, is_mla, is_host_to_device);
+    } else {
+      transfer_kv_blocks_kernel_8b<Type><<<gridDim, blockDim, 0, stream>>>(
+          num_blocks, start_layer_id, num_layers, gpu_block_ids,
+          gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
+          cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
+          cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+          chunk_size_in_int64, is_mla, is_host_to_device);
+    }
   }
   if (sync) {
     cudaStreamSynchronize(stream);
