@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Node-mounted SWA on the radix tree — invariants I0-I4 + a workload stress run.
 
-The node-mount re-architecture (deployments/swa_design/02_控制面_节点挂载匹配与驱逐.md)
+The node-mount re-architecture
 mounts SWA on radix nodes. This file is the single home for its invariant
 coverage, in three sections:
 
@@ -23,7 +23,7 @@ Invariants:
   I1  SWA ⊆ Full: freeing a node's Full KV frees its SWA slot (drained to pool).
   I2  SWA-only eviction prefers interior nodes; a leaf that loses its SWA with no
       full lock is deleted, with a full lock its Full KV is kept.
-  I3  full_lock_ref (lock_cnt) ≥ swa_lock_ref, symmetric inc/dec.
+  I3  lock_cnt ≥ swa_lock_cnt, symmetric lock/unlock.
   I4  match returns the deepest fully-matched ready node with a live SWA in one
       pass; a partial node match must not expose its trailing-page SWA.
 """
@@ -65,6 +65,35 @@ def test_py_match_returns_last_swa_node():
     assert mr.num_matched_blocks == 4
     assert mr.last_swa_node is n1
     assert mr.swa_hit_blocks == 4
+
+
+def test_py_mount_without_publish_is_structurally_visible_not_readable():
+    """Mounted-but-unpublished SWA is structurally visible but not readable."""
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    idx.mount_swa(n1, slot=101)
+    assert n1.has_swa() and not n1.swa_ready and not n1.on_swa_lru
+
+    mr = idx.match_prefix(_seq([1, 2, 3, 4]))
+    assert mr.swa_hit_blocks == 0 and mr.last_swa_node is n1
+
+    idx.publish_swa(n1)
+    assert n1.swa_ready and n1.on_swa_lru
+    mr2 = idx.match_prefix(_seq([1, 2, 3, 4]))
+    assert mr2.swa_hit_blocks == 2 and mr2.last_swa_node is n1
+
+
+def test_py_pending_mount_survives_swa_evict_pressure():
+    """Pending mounts must not be reclaimed by evict_swa (not on LRU)."""
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    published = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3), is_ready=True)
+    idx.set_swa(published, slot=10)
+    pending_node = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    idx.mount_swa(pending_node, slot=11)
+    idx.evict_swa(1)  # drops published (LRU), not pending
+    assert not published.has_swa()
+    assert pending_node.has_swa() and not pending_node.swa_ready
+    assert pending_node.swa_host_slot == 11
 
 
 def test_py_split_preserves_swa_on_suffix_half():
@@ -187,15 +216,15 @@ def test_py_reuse_promotes_swa_over_never_reused():
 
 
 def test_py_dual_lock_invariant():
-    """I3: full_lock_ref (lock_cnt) >= swa_lock_ref, with paired inc/dec."""
+    """I3: lock_cnt >= swa_lock_cnt, with paired lock/unlock."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
     n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
     idx.set_swa(n1, slot=700)
     b = idx.inc_lock_ref(n1)
-    assert n1.lock_cnt == 1 and n1.swa_lock_ref == 1 and b is n1
-    assert n1.lock_cnt >= n1.swa_lock_ref
+    assert n1.lock_cnt == 1 and n1.swa_lock_cnt == 1 and b is n1
+    assert n1.lock_cnt >= n1.swa_lock_cnt
     idx.dec_lock_ref(n1, swa_boundary=b)
-    assert n1.lock_cnt == 0 and n1.swa_lock_ref == 0
+    assert n1.lock_cnt == 0 and n1.swa_lock_cnt == 0
 
 
 def test_py_dec_swa_lock_only_early_release():
@@ -204,7 +233,7 @@ def test_py_dec_swa_lock_only_early_release():
     idx.set_swa(n1, slot=701)
     b = idx.inc_lock_ref(n1)
     idx.dec_swa_lock_only(b)
-    assert n1.swa_lock_ref == 0 and n1.swa_tombstone  # leaf SWA freed early
+    assert n1.swa_lock_cnt == 0 and n1.swa_tombstone  # leaf SWA freed early
     assert n1.lock_cnt == 1  # full lock still held
     assert idx.drain_freed_swa_slots() == [701]
     idx.dec_lock_ref(n1, swa_boundary=b, skip_swa=True)
@@ -223,21 +252,30 @@ def test_py_dual_lock_only_deepest_swa_node_locked():
     idx.set_swa(A, slot=11)  # both internal A and leaf a carry SWA
     b = idx.inc_lock_ref(a)
     assert b is a  # deepest SWA node
-    assert a.swa_lock_ref == 1 and A.swa_lock_ref == 0  # only deepest SWA locked
+    assert a.swa_lock_cnt == 1 and A.swa_lock_cnt == 0  # only deepest SWA locked
     assert a.lock_cnt == 1 and A.lock_cnt == 1  # full locked on both
     idx.dec_lock_ref(a, swa_boundary=b)
-    assert a.swa_lock_ref == 0 and A.swa_lock_ref == 0
+    assert a.swa_lock_cnt == 0 and A.swa_lock_cnt == 0
     assert a.lock_cnt == 0 and A.lock_cnt == 0
 
 
 def test_py_swa_locked_node_not_full_evictable():
-    """in_use() includes swa_lock_ref: a SWA-locked node is not full-evictable."""
+    """in_use() includes swa_lock_cnt: a SWA-locked node is not full-evictable."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
     n = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
     idx.set_swa(n, slot=5)
-    n.swa_lock_ref = 1
+    n.swa_lock_cnt = 1
     assert n.in_use()
     assert not n.evictable()
+
+
+def test_py_root_is_not_evictable():
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    assert idx.root_node.is_leaf()
+    assert not idx.root_node.evictable()
+    evicted, hashes = idx.evict(1)
+    assert evicted.size == 0
+    assert hashes.size == 0
 
 
 def test_py_reset_rearms_swa_pool_via_host_pool():
@@ -366,7 +404,9 @@ def test_promote_swa_ignores_dead_node():
 c_ext = pytest.importorskip("flexkv.c_ext")
 
 _CEXT_OK = "swa_host_slot" in dir(c_ext.CRadixNode) and all(
-    n in dir(c_ext.CRadixNode) for n in ("is_leaf", "get_lock_cnt", "has_swa")
+    n in dir(c_ext.CRadixNode)
+    for n in ("is_leaf", "get_lock_cnt", "has_swa", "lock", "unlock",
+              "merge_child", "is_ready", "swa_lock", "swa_unlock")
 )
 _cext_reason = "CRadixNode SWA/structural bindings not present (rebuild c_ext)"
 cext = pytest.mark.skipif(not _CEXT_OK, reason=_cext_reason)
@@ -491,6 +531,76 @@ def test_cpp_split_preserves_swa_on_suffix():
 
 
 @cext
+def test_cpp_merge_child_swa_locks_ready_and_leaf():
+    """C++ merge_child: SWA follows child (I0), locks migrate, ready ANDs,
+    and the surviving parent re-enters the Full-KV leaf list."""
+    t = _tree()
+    a = _insert(t, [1, 2, 3, 4, 5, 6, 7, 8], 0)
+    t.set_swa(a, 901)
+    sd = [1, 2, 3, 4, 55, 66, 77, 88]
+    m = t.match_prefix(_hashes(sd), 4, False)
+    sib = _insert(t, sd, 8, match=m)
+    A = a.parent
+    assert A is not None and not A.is_leaf() and A.num_children() == 2
+    t.set_swa(A, 900)
+
+    # Pin the kept branch so eviction reclaims the divergent sibling.
+    boundary = t.inc_lock_ref(a)
+    assert boundary is a
+    ev = _evict_full(t, 2)
+    assert len(ev) == 2
+    assert A.num_children() == 1
+
+    # Child carries Full+SWA locks; parent Full lock only (I3 deepest SWA).
+    assert a.get_lock_cnt() == 1 and a.swa_lock_cnt == 1
+    assert A.get_lock_cnt() == 1 and A.swa_lock_cnt == 0
+
+    A.merge_child()
+    # Surviving node is a leaf again; SWA followed the child's last page.
+    assert A.is_leaf() and A.num_children() == 0
+    assert A.has_swa() and A.swa_host_slot == 901 and A.swa_ready
+    assert 900 in t.drain_freed_swa_slots()
+    # Child locks absorbed onto A (Full: 1+1, SWA: 0+1).
+    assert A.get_lock_cnt() == 2 and A.swa_lock_cnt == 1
+    assert A.is_ready()
+
+    A.swa_unlock()
+    A.unlock()
+    A.unlock()
+    # Leaf bookkeeping restored: full eviction can reclaim the merged node.
+    ev2 = _evict_full(t, 4)
+    assert len(ev2) == 4
+    assert 901 in t.drain_freed_swa_slots()
+    assert t.is_empty()
+
+
+@cext
+def test_cpp_merge_child_ready_is_and():
+    """Merged node is ready only if both parent and child were ready."""
+    t = _tree()
+    a = _insert(t, [1, 2, 3, 4, 5, 6, 7, 8], 0, ready=False)
+    t.mount_swa(a, 70)  # unpublished pending SWA
+    sd = [1, 2, 3, 4, 55, 66, 77, 88]
+    m = t.match_prefix(_hashes(sd), 4, False)
+    # Divergent insert ready; shared prefix half inherits a's unready bit on split.
+    _insert(t, sd, 8, ready=True, match=m)
+    A = a.parent
+    assert A is not None and not A.is_ready()
+    assert not a.is_ready() and a.has_swa() and not a.swa_ready
+
+    boundary = t.inc_lock_ref(a)
+    assert boundary is a
+    _evict_full(t, 2)
+    assert A.num_children() == 1
+    t.dec_lock_ref(a, boundary)
+
+    A.merge_child()
+    assert A.is_leaf()
+    assert not A.is_ready()  # unready child => unready merged node
+    assert A.has_swa() and A.swa_host_slot == 70 and not A.swa_ready
+
+
+@cext
 def test_cpp_full_evict_frees_swa_slot():
     t = _tree()
     n = _insert(t, [1, 2, 3, 4], 0)
@@ -563,10 +673,10 @@ def test_cpp_dual_lock_symmetric():
     t.set_swa(n, 700)
     b = t.inc_lock_ref(n)
     assert b is not None
-    assert n.get_lock_cnt() == 1 and n.swa_lock_ref == 1
-    assert n.get_lock_cnt() >= n.swa_lock_ref     # I3
+    assert n.get_lock_cnt() == 1 and n.swa_lock_cnt == 1
+    assert n.get_lock_cnt() >= n.swa_lock_cnt     # I3
     t.dec_lock_ref(n, b, False)
-    assert n.get_lock_cnt() == 0 and n.swa_lock_ref == 0
+    assert n.get_lock_cnt() == 0 and n.swa_lock_cnt == 0
 
 
 @cext
@@ -582,10 +692,10 @@ def test_cpp_only_deepest_swa_node_locked():
     b = t.inc_lock_ref(a)
     assert b is not None
     # deepest SWA node (the leaf a) is the boundary; only it is SWA-locked.
-    assert a.swa_lock_ref == 1 and A.swa_lock_ref == 0
+    assert a.swa_lock_cnt == 1 and A.swa_lock_cnt == 0
     assert a.get_lock_cnt() == 1 and A.get_lock_cnt() == 1   # full on both
     t.dec_lock_ref(a, b, False)
-    assert a.swa_lock_ref == 0 and A.swa_lock_ref == 0
+    assert a.swa_lock_cnt == 0 and A.swa_lock_cnt == 0
     assert a.get_lock_cnt() == 0 and A.get_lock_cnt() == 0
 
 
@@ -596,7 +706,7 @@ def test_cpp_dec_swa_lock_only_early_release():
     t.set_swa(n, 701)
     b = t.inc_lock_ref(n)
     t.dec_swa_lock_only(b)
-    assert n.swa_lock_ref == 0 and n.swa_tombstone   # leaf SWA freed early
+    assert n.swa_lock_cnt == 0 and n.swa_tombstone   # leaf SWA freed early
     assert n.get_lock_cnt() == 1                      # full lock still held
     assert 701 in t.drain_freed_swa_slots()
     t.dec_lock_ref(n, b, True)                         # skip_swa
@@ -605,15 +715,23 @@ def test_cpp_dec_swa_lock_only_early_release():
 
 @cext
 def test_cpp_swa_locked_node_not_full_evictable():
-    """in_use() includes swa_lock_ref: SWA-locked node survives full eviction."""
+    """in_use() includes swa_lock_cnt: SWA-locked node survives full eviction."""
     t = _tree()
     n = _insert(t, [1, 2, 3, 4], 0)
     t.set_swa(n, 5)
-    n.inc_swa_lock_ref()
+    n.swa_lock()
     ev = _evict_full(t, 2)
     assert len(ev) == 0            # locked -> not evicted
     assert not t.is_empty()
-    n.dec_swa_lock_ref()
+    n.swa_unlock()
+
+
+@cext
+def test_cpp_root_is_not_evictable():
+    t = _tree()
+    ev = _evict_full(t, 1)
+    assert len(ev) == 0
+    assert t.is_empty()
 
 
 @cext
@@ -716,8 +834,9 @@ class _SWAWorkloadDriver:
         mr = self.engine.match(sm)
         full_hit = int(mr.num_ready_matched_blocks)
         if full_hit > 0:
-            swa_hit, slot = self.engine.match_swa(
-                sm, upper_bound_blocks=full_hit, lock_for_load=False)
+            swa_hit = int(mr.swa_hit_blocks)
+            node = mr.last_swa_node
+            slot = int(node.swa_host_slot) if node is not None else -1
             if swa_hit > 0 and slot >= 0:
                 self.swa_hits += 1
 
@@ -737,13 +856,13 @@ class _SWAWorkloadDriver:
             node = mr.last_node
         if node is None:
             return
-        slot = self.engine.swa_alloc_slot()
+        slot = self.engine._alloc_swa_slot()
         self._reconcile()
         if slot == -1:
             return
         tail_hash = int(sm.block_hashes[nblocks - 1])
         self._slot_expect[int(slot)] = tail_hash
-        self.engine.set_swa(node, slot)
+        self.engine.index.set_swa(node, int(slot))
         self._reconcile()
 
     def check_invariants(self):
@@ -870,11 +989,11 @@ def test_full_evict_no_cascade_when_swa_disabled():
 
 
 # --------------------------------------------------------------------------- #
-# Double-match elimination: match_swa_from_result reuse + fallback             #
+# SWA source is exposed directly on match results                          #
 # --------------------------------------------------------------------------- #
 
-def test_match_swa_from_result_reuses_within_bound():
-    """match_swa_from_result reuses the Full-KV match when swa_hit <= bound."""
+def test_match_result_exposes_swa_source_within_bound():
+    """match_prefix exposes the SWA source without a second read-source probe."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
     n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
     idx.set_swa(n1, slot=100)

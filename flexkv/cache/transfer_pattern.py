@@ -1,32 +1,14 @@
 from typing import List, Tuple
 
-import numpy as np
-
 from flexkv.common.transfer import TransferType
 from flexkv.common.transfer import TransferOp, TransferOpGraph
+from flexkv.common.transfer import add_virtual_op_for_multiple_finished_ops
 
+__all__ = [
+    "add_virtual_op_for_multiple_finished_ops",
+    "convert_read_graph_to_layer_wise_graph",
+]
 
-def add_virtual_op_for_multiple_finished_ops(
-    graph: TransferOpGraph,
-    finished_ops_ids: List[int],
-    dp_client_id: int,
-) -> Tuple[TransferOpGraph, int]:
-    if len(finished_ops_ids) == 0:
-        return graph, -1
-    if len(finished_ops_ids) == 1:
-        return graph, finished_ops_ids[0]
-
-    op = TransferOp(
-        graph_id=graph.graph_id,
-        transfer_type=TransferType.VIRTUAL,
-        src_block_ids=np.array([], dtype=np.int64),
-        dst_block_ids=np.array([], dtype=np.int64),
-        dp_client_id=dp_client_id,
-    )
-    graph.add_transfer_op(op)
-    for op_id in finished_ops_ids:
-        graph.add_dependency(op.op_id, op_id)
-    return graph, op.op_id
 
 def convert_read_graph_to_layer_wise_graph(
     transfer_graph: TransferOpGraph,

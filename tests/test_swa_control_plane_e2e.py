@@ -4,8 +4,8 @@
 (GlobalCacheEngine.put/get), with real byte movement — NO stubs.
 
 This is the production-path proof for the SWA data plane: the transfer graph is
-produced by ``GlobalCacheEngine.put()`` / ``get()`` (which call the now-wired
-``_swa_put_slots`` / ``_swa_get_slots`` — real SWA-pool alloc + node-mounted
+produced by ``GlobalCacheEngine.put()`` / ``get()`` (which append SWA peer ops
+inside ``_put_impl_*`` / ``_get_impl_*`` — real SWA-pool alloc + node-mounted
 match, plus the size-1 GPU placeholder), the GPU sides are bound LATE via
 ``set_gpu_blocks`` (full-KV) and ``set_swa_gpu_blocks`` (SWA) exactly as
 ``KVTaskEngine.launch`` does, and the resulting graph is submitted to a real
@@ -15,12 +15,14 @@ GPU->CPU->GPU roundtrip.
 Flow (mirrors KVManager get_match(swa_aware=True) + launch, minus the tp_client subprocess):
   PUT : engine.put() -> graph {full D2H, SWA D2H} -> bind GPU slots -> submit
         -> full+SWA bytes land in the shared CPU pool + SWA host pool
-  GET : engine.get() -> graph {full H2D, SWA H2D} -> bind GPU slots -> submit
+  GET : engine.get(swa_aware=True) -> graph {full H2D, SWA H2D}
+        -> bind GPU slots -> submit
         -> bytes restored to fresh GPU blocks -> byte-exact compare
 
 Run INSIDE the container on a free GPU:
     CUDA_VISIBLE_DEVICES=0 python3 tests/test_swa_control_plane_e2e.py
 """
+import gc
 import sys
 import time
 
@@ -105,7 +107,7 @@ def _run_graph(te, engine, graph, op_cb, cb, full_gpu_blocks, swa_gpu_slot,
     cb()
 
 
-def main() -> int:
+def _run(transfer_engines) -> int:
     if not torch.cuda.is_available():
         print("[verify] CUDA not available", flush=True)
         return 2
@@ -161,6 +163,7 @@ def main() -> int:
         swa_gpu_handles={worker_key: [se.get_swa_storage_handle(DEVICE_ID)]},
         swa_cpu_handle=se.get_storage_handle(DeviceType.CPU, device_id=0, is_swa=True),
     )
+    transfer_engines.append(te)
     te.start()
     print("[verify] TransferEngine started (main-KV + SWA workers)", flush=True)
 
@@ -172,7 +175,7 @@ def main() -> int:
                                  (PUT_FULL_GPU + 1) * TOKENS_PER_BLOCK, dtype=np.int64)
     mask = np.ones_like(tok, dtype=np.int64)
 
-    # ===== PUT via GlobalCacheEngine.put() (real _swa_put_slots) ================
+    # ===== PUT via GlobalCacheEngine.put() (SWA append inside _put_impl_*) ======
     put_graph, _rm, put_cb, put_op_cb, put_end = engine.put(
         request_id=1, token_ids=tok, token_mask=mask,
         slot_mapping=put_slot_mapping, dp_client_id=0)
@@ -191,12 +194,12 @@ def main() -> int:
     # zero the GPU pools so GET must source from CPU
     mk_pool.zero_(); sw_pool.zero_(); torch.cuda.synchronize()
 
-    # ===== GET via GlobalCacheEngine.get() (real _swa_get_slots) ===============
+    # ===== GET via GlobalCacheEngine.get(swa_aware=True) ========================
     get_slot_mapping = np.arange(GET_FULL_GPU * TOKENS_PER_BLOCK,
                                  (GET_FULL_GPU + 1) * TOKENS_PER_BLOCK, dtype=np.int64)
     get_graph, _rm2, get_cb, get_op_cb, get_end = engine.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=get_slot_mapping, dp_client_id=0)
+        slot_mapping=get_slot_mapping, dp_client_id=0, swa_aware=True)
     swa_get_ops = [o for o in get_graph._op_map.values() if getattr(o, "is_swa", False)]
     assert len(swa_get_ops) == 1 and swa_get_ops[0].transfer_type.name == "H2D", \
         f"expected 1 SWA H2D, got {[o.transfer_type.name for o in swa_get_ops]}"
@@ -229,20 +232,34 @@ def main() -> int:
 
     # SWA lock released by the H2D callback (no leak).
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); sm.gen_hashes()
-    hit, slot, node = engine.cpu_cache_engine.match_swa_locked(sm, upper_bound_blocks=1)
+    mr = engine.cpu_cache_engine.match(sm)
+    node = mr.last_swa_node if mr.swa_hit_blocks == 1 else None
     if node is not None:
-        lock_ok = (node.swa_lock_ref == 1)  # our fresh probe lock; prior load lock released
-        node.dec_swa_lock_ref()
+        engine.cpu_cache_engine._pin_swa_node(node)
+        lock_ok = (node.swa_lock_cnt == 1)  # our fresh probe lock; prior load lock released
+        engine._swa_release_load_lock(node, source_device_type=DeviceType.CPU)
         print(f"[verify] {'OK   ' if lock_ok else 'FAIL '} SWA load lock released "
               f"(lock_ref after fresh probe == 1: {lock_ok})", flush=True)
         failed = failed or not lock_ok
 
-    te.shutdown()
     if failed:
         return 4
     print("[verify] PASS: engine control-plane graph moved main-KV + SWA byte-exact, "
           "no stub, lock released", flush=True)
     return 0
+
+
+def main() -> int:
+    """Run the E2E flow and always tear down spawned CUDA workers."""
+    transfer_engines = []
+    try:
+        return _run(transfer_engines)
+    finally:
+        for transfer_engine in reversed(transfer_engines):
+            transfer_engine.shutdown()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 @pytest.mark.e2e

@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, TYPE_CHECKING, List, Dict
+from typing import Optional, List, Dict
 
 import time
 import numpy as np
@@ -11,7 +11,6 @@ from flexkv.cache.radix_remote import LocalRadixTree, DistributedRadixTree
 from flexkv.cache.redis_meta import RedisMetaChannel as _PyRedisMetaChannel
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.block import SequenceMeta
-#if TYPE_CHECKING:
 from flexkv.common.config import CacheConfig, SWAPoolConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import DeviceType
 from flexkv.common.type import MatchResultAccel
@@ -100,48 +99,33 @@ class HierarchyLRCacheEngine:
         self._stats_distributed_matched_tokens = 0 # total tokens matched in FlexKV global (distributed reuse)
         self._stats_match_count = 0                # match_all call count
 
-        # SWA (Sliding Window Attention) — node-mounted on the radix tree (see
-        # CacheEngineAccel). This hierarchical/distributed tier does not (yet)
-        # carry node-mounted SWA state in its remote radix index, so SWA stays
-        # effectively disabled here: init_swa builds the host pool but match_swa
-        # only reports a hit when the underlying index exposes last_swa_node.
-        # DSv4 uses CacheEngineAccel (index_accel), not this engine.
+        # Hierarchical/distributed radix indexes do not expose the node-mounted
+        # SWA match and lifecycle contract yet. Keep the capability disabled
+        # instead of creating a pool that makes callers believe SWA is usable.
         self.swa_pool = None
-        tier_swa_config = (swa_config.for_cache_tier(device_type)
-                           if swa_config is not None else None)
-        if tier_swa_config is not None:
-            self.init_swa(tier_swa_config)
 
     def init_swa(self, swa_config: "SWAPoolConfig") -> None:
-        """Initialize the SWA host pool for node-mounted SWA on this engine."""
-        from flexkv.swa.swa_host_pool import SWAHostPool
-        self.swa_pool = SWAHostPool(swa_config)
+        raise NotImplementedError(
+            "HierarchyLRCacheEngine does not support node-mounted SWA")
 
     @property
     def swa_enabled(self) -> bool:
-        return self.swa_pool is not None
+        return False
 
-    def _drain_swa_slots(self) -> None:
-        if self.swa_pool is None:
-            return
-        drain = getattr(self.index, "drain_freed_swa_slots", None)
-        if drain is None:
-            return
-        for slot in drain():
-            if slot is not None and slot >= 0:
-                self.swa_pool.free(int(slot))
+    def _alloc_swa_slot(self, protected_node=None) -> int:
+        return -1
 
-    def match_swa(self,
-                  sequence_meta: "SequenceMeta",
-                  upper_bound_blocks: int,
-                  lock_for_load: bool = False):
-        """Node-mounted SWA match. Returns no-hit unless the (remote) radix index
-        exposes last_swa_node on its match result."""
-        if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1
-        # The distributed/remote radix index does not surface node-mounted SWA
-        # yet; report no hit (SWA is served by the accel CPU tier for DSv4).
-        return 0, -1
+    def _free_unmounted_swa_slot(self, slot: int) -> None:
+        if self.swa_pool is None or slot is None or slot < 0:
+            return
+        self.swa_pool.free(int(slot))
+
+    @staticmethod
+    def _get_mounted_swa_slot(node: Optional["CRadixNode"]) -> int:
+        return -1
+
+    def _drain_unmounted_swa_slots(self) -> None:
+        return
 
     def start(self) -> None:
         if self._meta is None:
@@ -357,7 +341,8 @@ class HierarchyLRCacheEngine:
                physical_block_ids: torch.Tensor,
                num_insert_blocks: int = -1,
                is_ready: bool = True,
-               match_result: Optional[MatchResultAccel] = None) -> Optional[CRadixNode]:
+               match_result: Optional[MatchResultAccel] = None,
+               swa_store: bool = False) -> Optional[CRadixNode]:
         sequence_meta.gen_hashes()
         phys_t = torch.from_numpy(physical_block_ids).to(torch.int64) if isinstance(physical_block_ids, np.ndarray) else physical_block_ids.to(torch.int64)
         hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
@@ -489,6 +474,7 @@ class HierarchyLRCacheEngine:
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
+        self._drain_unmounted_swa_slots()
 
     #TODO pfcs may not work now
     @classmethod

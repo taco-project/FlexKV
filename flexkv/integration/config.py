@@ -515,8 +515,7 @@ class FlexKVConfig:
             # The FlexKV host SWA pool must use the SAME 585 so H2D/D2H byte offsets
             # line up with the GPU buffer stride; a 584 host layout would shear the
             # bytes by 1/token/page and corrupt the SWA KV. See connector
-            # _register_to_server_dsv4 (swa_layout head_size) and deployments/
-            # swa_design/process/实现计划_SWA数据面端到端_connector.md.
+            # _register_to_server_dsv4 (swa_layout head_size) 
             swa_bytes_per_token = _dsv4_swa_padded_bytes_per_token(swa_page_size, 584)
             self.cache_config.swa = SWAPoolConfig(
                 enabled=True,
@@ -529,7 +528,7 @@ class FlexKVConfig:
             # become no-ops). Default ON for DSv4 (the SWA-native arch).
             self.cache_config.enable_swa_transfer = bool(
                 int(os.getenv("FLEXKV_ENABLE_SWA_TRANSFER", "1"))
-            )
+            ) or self.cache_config.swa.enabled
             logger.info(
                 f"[FlexKV sglang] Constructed SWAPoolConfig for DSv4: "
                 f"swa_page_size={swa_page_size}, "

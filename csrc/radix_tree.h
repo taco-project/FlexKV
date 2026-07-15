@@ -53,12 +53,12 @@ private:
   // i.e. a node may have full KV without SWA (tombstone), but never the reverse.
   int swa_host_slot = -1;          // CPU SWA host pool slot id (-1 = no backup)
   bool swa_tombstone = true;       // true = no SWA data available (default)
-  int swa_lock_ref = 0;            // SWA lock reference count
+  int swa_lock_cnt = 0;            // SWA lock count (mirror of lock_cnt)
+  bool swa_ready = false;       // true once SWA bytes are published (readable)
   uint64_t swa_last_access_time = 0; // SWA LRU timestamp
   // Intrusive SWA-only LRU doubly-linked list pointers (independent of the
   // Full-KV leaf_list). Nodes carrying a live SWA slot are threaded on the
-  // tree's swa_lru list; SWA-only eviction walks it from the LRU end. See
-  // deployments/swa_design/08_节点挂载SWA架构.md §6.2.
+  // tree's swa_lru list; SWA-only eviction walks it from the LRU end.
   CRadixNode *swa_lru_prev = nullptr;
   CRadixNode *swa_lru_next = nullptr;
   bool on_swa_lru = false;
@@ -139,13 +139,13 @@ public:
 
   void set_swa_tombstone(bool tombstone) { swa_tombstone = tombstone; }
 
-  int get_swa_lock_ref() { return swa_lock_ref; }
+  int get_swa_lock_cnt() { return swa_lock_cnt; }
 
-  void inc_swa_lock_ref() { swa_lock_ref++; }
+  void swa_lock() { swa_lock_cnt++; }
 
-  void dec_swa_lock_ref() {
-    assert(swa_lock_ref > 0);
-    swa_lock_ref--;
+  void swa_unlock() {
+    assert(swa_lock_cnt > 0);
+    swa_lock_cnt--;
   }
 
   void set_swa_last_access_time(uint64_t time) { swa_last_access_time = time; }
@@ -154,6 +154,14 @@ public:
 
   // True iff this node carries a live (non-tombstone) SWA slot.
   bool has_swa() { return !swa_tombstone && swa_host_slot >= 0; }
+
+  // True once the mounted SWA slot is published and safe to match / LRU-evict.
+  bool is_swa_ready() { return swa_ready; }
+
+  void set_swa_ready(bool ready) { swa_ready = ready; }
+
+  // Readable SWA: mounted, published, on a ready Full-KV node (data-plane hit).
+  bool is_swa_readable() { return has_swa() && is_ready() && is_swa_ready(); }
 
   // ===== SWA-LRU intrusive list accessors =====
   CRadixNode *get_swa_lru_prev() { return swa_lru_prev; }
@@ -243,10 +251,14 @@ public:
   bool is_leaf() { return get_num_children() == 0; }
 
   // A node is in use (not full-evictable) if its Full KV is locked, its SWA is
-  // locked (I3: swa_lock_ref>0 implies it must stay), or it is not ready.
-  bool in_use() { return lock_cnt > 0 || swa_lock_ref > 0 || !ready; }
+  // locked (I3: swa_lock_cnt>0 implies it must stay), it is not ready, or it
+  // still has a pending (mounted-but-unpublished) SWA transfer.
+  bool in_use() {
+    return lock_cnt > 0 || swa_lock_cnt > 0 || !ready ||
+           (has_swa() && !swa_ready);
+  }
 
-  bool evictable() { return is_leaf() && !in_use(); }
+  bool evictable();
 
   int get_lock_cnt() const { return lock_cnt; }
 
@@ -282,10 +294,10 @@ public:
   torch::Tensor block_node_ids;
 
   // ===== SWA (node-mounted) =====
-  // Deepest fully-matched, ready node carrying a live SWA slot, and the
-  // ready-prefix block count ending at that node. This is the SWA hit (longest
-  // reusable trailing-SWA prefix) found in the SAME single forward pass as the
-  // Full-KV match — no backtracking. nullptr / 0 when no SWA on the path.
+  // last_swa_node: deepest fully-matched node with a mounted SWA slot (structural
+  // dedup / coalesce; independent of either ready bit). nullptr when none.
+  // swa_hit_blocks: ready-prefix depth where SWA bytes are readable
+  // (has_swa && is_ready && swa_ready on a full node match); 0 when none.
   CRadixNode *last_swa_node = nullptr;
   int swa_hit_blocks = 0;
 
@@ -506,26 +518,45 @@ public:
     node->set_on_swa_lru(false);
   }
 
-  // Least-recently-used SWA node with swa_lock_ref == 0 (any node, not just
-  // leaves). Returns nullptr when every SWA node is locked / list is empty.
+  // Least-recently-used published SWA node with swa_lock_cnt == 0. Pending
+  // mounts (!swa_ready) are not on the SWA-LRU and are skipped here.
   CRadixNode *swa_lru_get_lru_unlocked() {
     CRadixNode *x = swa_lru_tail->get_swa_lru_prev();
-    while (x != swa_lru_head && x->get_swa_lock_ref() > 0) {
+    while (x != swa_lru_head &&
+           (x->get_swa_lock_cnt() > 0 || !x->is_swa_ready())) {
       x = x->get_swa_lru_prev();
     }
     return x != swa_lru_head ? x : nullptr;
   }
 
-  // Mount an SWA slot on node's trailing page (store side). Caller guarantees
-  // node's LAST page is the target window (split first if not — see I0).
-  void set_swa(CRadixNode *node, int slot) {
+  // Mount an SWA slot on node's trailing page without publishing it. The slot is
+  // addressable for in-flight transfers but not matchable until publish_swa().
+  void mount_swa(CRadixNode *node, int slot) {
     assert(node != root);
     int old = node->get_swa_host_slot();
-    if (old != -1 && old != slot) {
-      freed_swa_slots.push_back(old);
-    }
+    assert(old == -1 || old == slot);
     node->set_swa_host_slot(slot);
     node->set_swa_tombstone(false);
+    node->set_swa_ready(false);
+    struct timeval now;
+    gettimeofday(&now, nullptr);
+    node->set_swa_last_access_time((uint64_t)now.tv_sec * 1000000 +
+                                   (uint64_t)now.tv_usec);
+    // Pending mounts stay off the SWA-LRU until publish_swa().
+  }
+
+  // Publish a previously mounted SWA slot: matchable and on the SWA-LRU.
+  // Does NOT require is_ready (the SWA data plane may complete before Full-KV).
+  // match_prefix gates SWA hits on is_swa_readable() = has_swa && is_ready &&
+  // swa_ready, so a transient (is_ready=false, swa_ready=true) state is
+  // invisible to GETs until Full-KV also becomes ready.
+  void publish_swa(CRadixNode *node) {
+    assert(node != root);
+    assert(node->has_swa());
+    if (node->is_swa_ready()) {
+      return;
+    }
+    node->set_swa_ready(true);
     struct timeval now;
     gettimeofday(&now, nullptr);
     node->set_swa_last_access_time((uint64_t)now.tv_sec * 1000000 +
@@ -534,14 +565,22 @@ public:
     swa_enabled_ = true;  // arm the I2 cascade in full-KV evict()
   }
 
+  // Detach and buffer a node's SWA slot (rollback / eviction helper).
+  void unmount_swa(CRadixNode *node) { record_freed_swa_slot(node); }
+
+  // Mount + publish (legacy immediate-publish semantics for tests / compat).
+  void set_swa(CRadixNode *node, int slot) {
+    mount_swa(node, slot);
+    publish_swa(node);
+  }
+
   // Refresh a node's SWA recency on read-hit: splice it to the SWA-LRU MRU.
   // SWA recency lives in the LRU list position (evict_swa walks the list, never
   // reads swa_last_access_time), so a hit that only bumped the timestamp would
   // NOT survive eviction — we must actually move the node. Mirror of the Python
-  // RadixTreeIndex.promote_swa. No-op for root or a node with no live SWA (a
-  // tombstone is not on the SWA-LRU; re-adding it would corrupt the list).
+  // RadixTreeIndex.promote_swa. No-op for root or unpublished SWA.
   void promote_swa(CRadixNode *node) {
-    if (node == root || !node->has_swa()) {
+    if (node == root || !node->is_swa_readable()) {
       return;
     }
     struct timeval now;
@@ -560,6 +599,7 @@ public:
       freed_swa_slots.push_back(slot);
       node->set_swa_host_slot(-1);
       node->set_swa_tombstone(true);
+      node->set_swa_ready(false);
     }
     // Always unlink from the SWA-LRU (idempotent) so a freed/invalidated node
     // is never left threaded on the list.
@@ -575,7 +615,7 @@ public:
   // RadixTreeIndex methods and sglang inc/dec_lock_ref (design §7). FlexKV's SWA
   // window == one page == one node's trailing page, so exactly the single
   // deepest node with a live SWA on [node, root) is SWA-locked; full_lock (the
-  // node lock_cnt) is taken on every node. Invariant I3: lock_cnt >= swa_lock_ref.
+  // node lock_cnt) is taken on every node. Invariant I3: lock_cnt >= swa_lock_cnt.
   //
   // inc_lock_ref returns the SWA boundary node (or nullptr) — pass it back to
   // dec_lock_ref / dec_swa_lock_only so the release is symmetric.
@@ -656,5 +696,9 @@ public:
                              int num_matched_blocks = -1,
                              int last_node_matched_length = -1);
 };
+
+inline bool CRadixNode::evictable() {
+  return !index->is_root(this) && is_leaf() && !in_use();
+}
 
 } // namespace flexkv

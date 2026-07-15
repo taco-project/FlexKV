@@ -505,6 +505,30 @@ def _attach_combined_callback(op: TransferOp,
         op_callback_dict[op.op_id] = _make_combined_callback(callbacks)
 
 
+def add_virtual_op_for_multiple_finished_ops(
+    graph: TransferOpGraph,
+    finished_ops_ids: List[int],
+    dp_client_id: int,
+) -> Tuple[TransferOpGraph, int]:
+    """Return one task-end op for zero, one, or multiple terminal ops."""
+    if len(finished_ops_ids) == 0:
+        return graph, -1
+    if len(finished_ops_ids) == 1:
+        return graph, finished_ops_ids[0]
+
+    op = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=TransferType.VIRTUAL,
+        src_block_ids=np.array([], dtype=np.int64),
+        dst_block_ids=np.array([], dtype=np.int64),
+        dp_client_id=dp_client_id,
+    )
+    graph.add_transfer_op(op)
+    for op_id in finished_ops_ids:
+        graph.add_dependency(op.op_id, op_id)
+    return graph, op.op_id
+
+
 def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
                graph: TransferOpGraph, callbacks: List[Callable],
                op_callback_dict: Dict[int, Callable]) -> Optional[TransferOp]:
@@ -647,11 +671,21 @@ def merge_to_batch_graph(batch_id: int,
 
     Returns:
         (merged_graph, batch_end_op_id, new_op_callback_dict)
+
+    The input task-end ids belong to graphs that are discarded during fusion;
+    they are retained in the API for caller compatibility.  The merged graph
+    rebuilds its completion contract from its supported shape:
+      GET: full H2D + SWA H2D
+      PUT: full D2H + SWA D2H
+      layerwise GET: the fused LAYERWISE op
     """
     if not transfer_graphs:
         empty_graph = TransferOpGraph()
         empty_graph.set_graph_id(batch_id)
         return empty_graph, -1, {}
+    if len(transfer_graphs) != len(task_end_op_ids):
+        raise ValueError(
+            "transfer_graphs and task_end_op_ids must have the same length")
 
     merged_graph = TransferOpGraph()
     merged_graph.set_graph_id(batch_id)
@@ -712,6 +746,50 @@ def merge_to_batch_graph(batch_id: int,
         assert not has_put, "layerwise batch must not mix PUT ops"
         assert not has_mooncake, \
             "layerwise batch must not carry mooncake ops (routed via prefetch stage)"
+        batch_end_op_id = -1
+        if merged_h2d_op is not None or swa_h2d_ops or swa_disk2h_ops:
+            swa_h2d_src, swa_h2d_dst = _concat_swa_block_ids(swa_h2d_ops)
+            swa_disk2h_src, swa_disk2h_dst = _concat_swa_block_ids(swa_disk2h_ops)
+            if ops_by_type[TransferType.H2D]:
+                dp_client_id = ops_by_type[TransferType.H2D][0].dp_client_id
+            elif swa_h2d_ops:
+                dp_client_id = swa_h2d_ops[0].dp_client_id
+            elif swa_disk2h_ops:
+                dp_client_id = swa_disk2h_ops[0].dp_client_id
+            else:
+                dp_client_id = 0
+            layerwise_transfer_op = LayerwiseTransferOp(
+                graph_id=merged_graph.graph_id,
+                src_block_ids_h2d=merged_h2d_op.src_block_ids if merged_h2d_op is not None
+                    else np.array([], dtype=np.int64),
+                dst_block_ids_h2d=merged_h2d_op.dst_block_ids if merged_h2d_op is not None
+                    else np.array([], dtype=np.int64),
+                src_block_ids_disk2h=merged_disk2h_op.src_block_ids \
+                    if merged_disk2h_op is not None \
+                    else np.array([], dtype=np.int64),
+                dst_block_ids_disk2h=merged_disk2h_op.dst_block_ids \
+                    if merged_disk2h_op is not None \
+                    else np.array([], dtype=np.int64),
+                swa_src_block_ids_h2d=swa_h2d_src,
+                swa_dst_block_ids_h2d=swa_h2d_dst,
+                swa_src_block_ids_disk2h=swa_disk2h_src,
+                swa_dst_block_ids_disk2h=swa_disk2h_dst,
+                dp_client_id=dp_client_id,
+                counter_id=counter_id,
+            )
+            merged_graph.add_transfer_op(layerwise_transfer_op)
+            # LAYERWISE completes atomically in the worker; fire main + SWA
+            # per-op readiness callbacks together on the fused op id.
+            layerwise_callbacks: List[Callable] = []
+            layerwise_callbacks.extend(callbacks_by_type[TransferType.DISK2H])
+            layerwise_callbacks.extend(callbacks_by_type[TransferType.H2D])
+            layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.DISK2H])
+            layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.H2D])
+            _attach_combined_callback(
+                layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
+            batch_end_op_id = layerwise_transfer_op.op_id
+        else:
+            batch_end_op_id = -1
     else:
         # Non-layerwise: either GET or PUT, never both.
         assert not (has_get and has_put), \
@@ -881,44 +959,29 @@ def merge_to_batch_graph(batch_id: int,
             merged_graph, swa_callbacks_by_type[TransferType.H2REMOTE],
             new_op_callback_dict)
 
-        for op in (merged_d2h_op, merged_h2disk_op, merged_h2remote_op,
-                   merged_swa_d2h_op, merged_swa_h2disk_op, merged_swa_h2remote_op):
-            if op is not None:
-                merged_graph.add_transfer_op(op)
+        get_finished_ops = [
+            op.op_id for op in (merged_h2d_op, merged_swa_h2d_op)
+            if op is not None
+        ]
+        put_finished_ops = [
+            op.op_id for op in (merged_d2h_op, merged_swa_d2h_op)
+            if op is not None
+        ]
+        if get_finished_ops and put_finished_ops:
+            raise ValueError("Batch graph cannot mix GET and PUT terminal ops")
 
-        # Dependency edges. Main-KV: D2H -> (H2DISK, H2REMOTE); SWA analog.
-        if merged_d2h_op is not None:
-            if merged_h2disk_op is not None:
-                merged_graph.add_dependency(merged_h2disk_op.op_id, merged_d2h_op.op_id)
-            if merged_h2remote_op is not None:
-                merged_graph.add_dependency(merged_h2remote_op.op_id, merged_d2h_op.op_id)
-        if merged_swa_d2h_op is not None:
-            if merged_swa_h2disk_op is not None:
-                merged_graph.add_dependency(
-                    merged_swa_h2disk_op.op_id, merged_swa_d2h_op.op_id)
-            if merged_swa_h2remote_op is not None:
-                merged_graph.add_dependency(
-                    merged_swa_h2remote_op.op_id, merged_swa_d2h_op.op_id)
-
-        # PUT sinks are D2H (main / SWA). H2DISK / H2REMOTE are fire-and-forget
-        # after D2H completes (per design doc).
-        put_sinks: List[int] = []
-        if merged_d2h_op is not None:
-            put_sinks.append(merged_d2h_op.op_id)
-        if merged_swa_d2h_op is not None:
-            put_sinks.append(merged_swa_d2h_op.op_id)
-        # Fallback: only write-back staging (rare, e.g. write-through-only).
-        if not put_sinks:
-            for op in (merged_h2disk_op, merged_swa_h2disk_op,
-                       merged_h2remote_op, merged_swa_h2remote_op):
-                if op is not None:
-                    put_sinks.append(op.op_id)
-                    break
-        batch_end_op_id = _add_batch_sink(merged_graph, put_sinks, dp_client_id)
-
-    else:
-        # Empty batch (no known ops).
-        batch_end_op_id = -1
+        finished_ops_ids = get_finished_ops or put_finished_ops
+        terminal_op = next((
+            op for op in (
+                merged_h2d_op,
+                merged_swa_h2d_op,
+                merged_d2h_op,
+                merged_swa_d2h_op,
+            ) if op is not None
+        ), None)
+        dp_client_id = terminal_op.dp_client_id if terminal_op is not None else 0
+        merged_graph, batch_end_op_id = add_virtual_op_for_multiple_finished_ops(
+            merged_graph, finished_ops_ids, dp_client_id)
 
     return merged_graph, batch_end_op_id, new_op_callback_dict
     

@@ -352,11 +352,10 @@ class ModelConfig:
             # to get full-model per-token size (matching CPU/SSD block sizing).
             # Each group may carry its own dtype (None = inherit ModelConfig.dtype),
             # so indexer-as-group (fp8/uint8) and main KV (bf16) sum correctly.
-            # ``compress_ratio`` shrinks the per-token contribution: a compressed
-            # group only stores ``1/compress_ratio`` tokens per uncompressed token
-            # slot, so ``token_size_in_bytes * tokens_per_block`` keeps matching
-            # bytes_per_block (the divisibility ``tpb % compress_ratio == 0`` is
-            # enforced when the KVCacheLayout is built).
+            # ``compress_ratio`` shrinks the per-token contribution. This
+            # integer property is suitable for aggregate metrics; exact block
+            # allocation must use block_size_in_bytes_for_cache so division is
+            # applied to tokens_per_block before rounding.
             return sum(
                 g.num_layers * g.num_kv_heads * g.head_size * kv_dim
                 * (g.dtype or self.dtype).itemsize
@@ -775,12 +774,31 @@ def block_size_in_bytes_for_cache(
 ) -> int:
     """Bytes per CPU/SSD block for pool sizing.
 
-  When ``layer_groups`` is set, use the whole-model ``token_size_in_bytes``
-  (heterogeneous / multi-pool layout).  Otherwise fall back to the uniform
-  per-PP-stage estimate from ``rank_info``.
+    When ``layer_groups`` is set, sum exact per-group bytes after applying each
+    group's block compression. Otherwise fall back to the uniform per-PP-stage
+    estimate from ``rank_info``.
     """
     if model_config.layer_groups is not None:
-        return model_config.token_size_in_bytes * cache_config.tokens_per_block
+        # Match KVCacheLayout._compute_kv_shape exactly.  Computing a rounded
+        # per-token size first and multiplying it by tokens_per_block loses
+        # bytes for compressed groups whenever the group contribution is not
+        # divisible by compress_ratio.
+        for gi, group in enumerate(model_config.layer_groups):
+            if cache_config.tokens_per_block % group.compress_ratio != 0:
+                raise ValueError(
+                    f"layer_groups[{gi}].compress_ratio={group.compress_ratio} "
+                    f"does not divide tokens_per_block="
+                    f"{cache_config.tokens_per_block}"
+                )
+        return model_config.tp_size * sum(
+            group.num_layers
+            * model_config.kv_dim
+            * (cache_config.tokens_per_block // group.compress_ratio)
+            * group.num_kv_heads
+            * group.head_size
+            * (group.dtype or model_config.dtype).itemsize
+            for group in model_config.layer_groups
+        )
     if rank_info is None:
         raise ValueError(
             "rank_info is required when model_config.layer_groups is None")
@@ -799,9 +817,8 @@ def recompute_cache_block_counts(
     if model_config.layer_groups is None:
         return False
 
-    block_size_in_bytes = (
-        model_config.token_size_in_bytes * cache_config.tokens_per_block
-    )
+    block_size_in_bytes = block_size_in_bytes_for_cache(
+        model_config, cache_config)
     changed = False
 
     if cache_config._user_cpu_cache_gb > 0:

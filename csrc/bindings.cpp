@@ -437,13 +437,13 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("has_swa") = false,
            py::arg("swa_gpu_blocks") =
                std::vector<std::vector<torch::Tensor>>(),
-           py::arg("swa_cpu_blocks") = torch::Tensor(),
+           py::arg("swa_cpu_blocks") = torch::empty({0}),
            py::arg("swa_ssd_files") =
                std::map<int, std::vector<std::string>>(),
-           py::arg("swa_gpu_kv_strides_tensor") = torch::Tensor(),
-           py::arg("swa_gpu_block_strides_tensor") = torch::Tensor(),
-           py::arg("swa_gpu_layer_strides_tensor") = torch::Tensor(),
-           py::arg("swa_gpu_chunk_sizes_tensor") = torch::Tensor())
+           py::arg("swa_gpu_kv_strides_tensor") = torch::empty({0}),
+           py::arg("swa_gpu_block_strides_tensor") = torch::empty({0}),
+           py::arg("swa_gpu_layer_strides_tensor") = torch::empty({0}),
+           py::arg("swa_gpu_chunk_sizes_tensor") = torch::empty({0}))
       .def(
           py::init<
               int, const std::vector<std::vector<std::vector<torch::Tensor>>> &,
@@ -478,13 +478,13 @@ PYBIND11_MODULE(c_ext, m) {
           py::arg("has_swa") = false,
           py::arg("swa_gpu_blocks") =
               std::vector<std::vector<torch::Tensor>>(),
-          py::arg("swa_cpu_blocks") = torch::Tensor(),
+          py::arg("swa_cpu_blocks") = torch::empty({0}),
           py::arg("swa_ssd_files") =
               std::map<int, std::vector<std::string>>(),
-          py::arg("swa_gpu_kv_strides_tensor") = torch::Tensor(),
-          py::arg("swa_gpu_block_strides_tensor") = torch::Tensor(),
-          py::arg("swa_gpu_layer_strides_tensor") = torch::Tensor(),
-          py::arg("swa_gpu_chunk_sizes_tensor") = torch::Tensor())
+          py::arg("swa_gpu_kv_strides_tensor") = torch::empty({0}),
+          py::arg("swa_gpu_block_strides_tensor") = torch::empty({0}),
+          py::arg("swa_gpu_layer_strides_tensor") = torch::empty({0}),
+          py::arg("swa_gpu_chunk_sizes_tensor") = torch::empty({0}))
       .def("layerwise_transfer",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -719,6 +719,12 @@ PYBIND11_MODULE(c_ext, m) {
       .def("drain_freed_swa_slots",
            &flexkv::CRadixTreeIndex::drain_freed_swa_slots)
       // ===== SWA node-mount: store-side mount + SWA-only eviction =====
+      .def("mount_swa", &flexkv::CRadixTreeIndex::mount_swa, py::arg("node"),
+           py::arg("slot"))
+      .def("publish_swa", &flexkv::CRadixTreeIndex::publish_swa,
+           py::arg("node"))
+      .def("unmount_swa", &flexkv::CRadixTreeIndex::unmount_swa,
+           py::arg("node"))
       .def("set_swa", &flexkv::CRadixTreeIndex::set_swa, py::arg("node"),
            py::arg("slot"))
       .def("promote_swa", &flexkv::CRadixTreeIndex::promote_swa,
@@ -748,7 +754,12 @@ PYBIND11_MODULE(c_ext, m) {
       .def("is_leaf", &flexkv::CRadixNode::is_leaf)
       .def("num_children", &flexkv::CRadixNode::get_num_children)
       .def("get_lock_cnt", &flexkv::CRadixNode::get_lock_cnt)
+      .def("lock", &flexkv::CRadixNode::lock)
+      .def("unlock", &flexkv::CRadixNode::unlock)
+      .def("is_ready", &flexkv::CRadixNode::is_ready)
+      .def("merge_child", &flexkv::CRadixNode::merge_child)
       .def("has_swa", &flexkv::CRadixNode::has_swa)
+      .def("is_swa_readable", &flexkv::CRadixNode::is_swa_readable)
       .def_property_readonly("parent", &flexkv::CRadixNode::get_parent,
                              py::return_value_policy::reference)
       // ===== SWA accessors (node-attached SWA state) =====
@@ -756,10 +767,12 @@ PYBIND11_MODULE(c_ext, m) {
                     &flexkv::CRadixNode::set_swa_host_slot)
       .def_property("swa_tombstone", &flexkv::CRadixNode::get_swa_tombstone,
                     &flexkv::CRadixNode::set_swa_tombstone)
-      .def_property_readonly("swa_lock_ref",
-                             &flexkv::CRadixNode::get_swa_lock_ref)
-      .def("inc_swa_lock_ref", &flexkv::CRadixNode::inc_swa_lock_ref)
-      .def("dec_swa_lock_ref", &flexkv::CRadixNode::dec_swa_lock_ref);
+      .def_property("swa_ready", &flexkv::CRadixNode::is_swa_ready,
+                    &flexkv::CRadixNode::set_swa_ready)
+      .def_property_readonly("swa_lock_cnt",
+                             &flexkv::CRadixNode::get_swa_lock_cnt)
+      .def("swa_lock", &flexkv::CRadixNode::swa_lock)
+      .def("swa_unlock", &flexkv::CRadixNode::swa_unlock);
 
   py::class_<flexkv::CMatchResult, std::shared_ptr<flexkv::CMatchResult>>(
       m, "CMatchResult")

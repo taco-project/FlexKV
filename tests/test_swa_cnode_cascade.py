@@ -64,7 +64,7 @@ class TestStep1Fields:
         assert node is not None
         assert node.swa_host_slot == -1
         assert node.swa_tombstone is True
-        assert node.swa_lock_ref == 0
+        assert node.swa_lock_cnt == 0
 
     def test_setters_roundtrip(self):
         tree = _make_tree()
@@ -79,11 +79,11 @@ class TestStep1Fields:
         tree = _make_tree()
         tokens = np.arange(0, TPB * 3, dtype=np.int64)
         node, _ = _insert(tree, tokens, 0)
-        node.inc_swa_lock_ref()
-        node.inc_swa_lock_ref()
-        assert node.swa_lock_ref == 2
-        node.dec_swa_lock_ref()
-        assert node.swa_lock_ref == 1
+        node.swa_lock()
+        node.swa_lock()
+        assert node.swa_lock_cnt == 2
+        node.swa_unlock()
+        assert node.swa_lock_cnt == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +153,21 @@ class TestStep2Cascade:
 # --------------------------------------------------------------------------- #
 
 class TestStep3TreeLevel:
+    def test_mount_publish_and_match_reports_last_swa_node(self):
+        tree = _make_tree()
+        tokens = np.arange(0, TPB * 3, dtype=np.int64)
+        node, block_hashes = _insert(tree, tokens, 0)
+        tree.mount_swa(node, 42)
+        mr_pending = tree.match_prefix(block_hashes, len(tokens) // TPB, False)
+        assert mr_pending.swa_hit_blocks == 0
+        assert mr_pending.last_swa_node is not None
+        assert mr_pending.last_swa_node.swa_host_slot == 42
+        tree.publish_swa(node)
+        mr = tree.match_prefix(block_hashes, len(tokens) // TPB, False)
+        assert mr.last_swa_node is not None
+        assert mr.last_swa_node.swa_host_slot == 42
+        assert mr.swa_hit_blocks == len(tokens) // TPB
+
     def test_set_swa_and_match_reports_last_swa_node(self):
         tree = _make_tree()
         tokens = np.arange(0, TPB * 3, dtype=np.int64)
@@ -190,10 +205,10 @@ class TestStep3TreeLevel:
         boundary = tree.inc_lock_ref(node)
         assert boundary is not None
         assert node.get_lock_cnt() >= 1
-        assert node.swa_lock_ref == 1
-        assert node.get_lock_cnt() >= node.swa_lock_ref  # I3
+        assert node.swa_lock_cnt == 1
+        assert node.get_lock_cnt() >= node.swa_lock_cnt  # I3
         tree.dec_lock_ref(node, boundary)
-        assert node.get_lock_cnt() == 0 and node.swa_lock_ref == 0
+        assert node.get_lock_cnt() == 0 and node.swa_lock_cnt == 0
 
     def test_dec_swa_lock_only_then_skip(self):
         tree = _make_tree()
@@ -203,7 +218,7 @@ class TestStep3TreeLevel:
         boundary = tree.inc_lock_ref(node)
         tree.dec_swa_lock_only(boundary)
         # leaf: SWA freed early + tombstone; full lock still held
-        assert node.swa_lock_ref == 0
+        assert node.swa_lock_cnt == 0
         assert node.swa_tombstone is True
         assert node.get_lock_cnt() == 1
         assert 66 in tree.drain_freed_swa_slots()

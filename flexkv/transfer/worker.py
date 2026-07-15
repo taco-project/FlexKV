@@ -185,17 +185,17 @@ class TransferWorkerBase(ABC):
         # Note: MPI initialization prevention is handled by create_safe_process
         # Environment variables are set before this function is called
         install_worker_crash_diagnostics(cls.__name__, worker_id)
-        flexkv_logger.info(
-            "[FlexKV-SEGV-DEBUG] worker process boot: "
-            f"class={cls.__name__}, worker_id={worker_id}, pid={os.getpid()}"
-        )
+        # flexkv_logger.info(
+        #     "[FlexKV-SEGV-DEBUG] worker process boot: "
+        #     f"class={cls.__name__}, worker_id={worker_id}, pid={os.getpid()}"
+        # )
         worker = cls(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs)
         ready_event.set()
-        flexkv_logger.info(
-            "[FlexKV-SEGV-DEBUG] worker ready: "
-            f"class={cls.__name__}, worker_id={worker_id}, pid={os.getpid()}, "
-            f"gpu_capacity={worker._gpu_capacity_hint()}"
-        )
+        # flexkv_logger.info(
+        #     "[FlexKV-SEGV-DEBUG] worker ready: "
+        #     f"class={cls.__name__}, worker_id={worker_id}, pid={os.getpid()}, "
+        #     f"gpu_capacity={worker._gpu_capacity_hint()}"
+        # )
         worker.run()
 
     @abstractmethod

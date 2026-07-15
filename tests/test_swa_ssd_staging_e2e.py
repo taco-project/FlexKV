@@ -11,16 +11,19 @@ does not cover:
            files (write-through).
   EVICT: drop the CPU SWA slot (SWA-only eviction) so the window survives ONLY
          on SSD — forcing the GET to stage from SSD.
-  GET : engine.get() -> graph {full H2D, SWA DISK2H (SSD->CPU staging) -> SWA H2D
-        (CPU->GPU)} -> bytes restored to a fresh GPU SWA slot -> byte-exact.
+  GET : engine.get(swa_aware=True) -> graph {full H2D, SWA DISK2H
+        (SSD->CPU staging) -> SWA H2D (CPU->GPU)} -> bytes restored to a fresh
+        GPU SWA slot -> byte-exact.
 
-This exercises the multi-tier _swa_put_slots (write-through) and _swa_get_slots
-(SSD->CPU transient staging slot + H2D), plus the transient staging slot free on
-H2D completion.
+This exercises SWA graph append inside _put_impl_* (write-through) and
+_get_impl_* (SSD->CPU staging slot promoted onto the fragment123 CPU node
+via mount_swa + publish_swa on H2D completion), aligning SWA GET with
+Full-KV GET fragment23 (SSD/REMOTE data cached in CPU on the way through).
 
 Run INSIDE the container on a free GPU:
     CUDA_VISIBLE_DEVICES=0 python3 tests/test_swa_ssd_staging_e2e.py
 """
+import gc
 import os
 import shutil
 import sys
@@ -102,7 +105,7 @@ def _run_graph(te, graph, op_cb, cb, full_gpu_blocks, swa_gpu_slot, reported_op_
     cb()
 
 
-def main() -> int:
+def _run(transfer_engines) -> int:
     if not torch.cuda.is_available():
         print("[verify] CUDA not available", flush=True)
         return 2
@@ -157,6 +160,7 @@ def main() -> int:
         swa_cpu_handle=se.get_storage_handle(DeviceType.CPU, device_id=0, is_swa=True),
         swa_ssd_handle=se.get_storage_handle(DeviceType.SSD, device_id=0, is_swa=True),
     )
+    transfer_engines.append(te)
     te.start()
     print("[verify] TransferEngine started (main-KV + SWA CPU/SSD workers)", flush=True)
 
@@ -177,7 +181,11 @@ def main() -> int:
     kinds = sorted(o.transfer_type.name for o in swa_put_ops)
     assert "D2H" in kinds and "H2DISK" in kinds, f"expected SWA D2H + H2DISK, got {kinds}"
     assert engine.ssd_cache_engine.swa_pool.num_used == 1, "SSD SWA slot not allocated on put"
-    reported = {put_end} | {o.op_id for o in swa_put_ops if o.transfer_type.name == "D2H"}
+    # This helper invokes every per-op callback manually, so wait for every op
+    # carrying one.  The production KVTask loop invokes each callback from its
+    # own completion event; task_end intentionally does not wait for SSD
+    # write-through.
+    reported = {put_end} | set(put_op_cb)
     print(f"[verify] PUT graph: SWA ops={kinds} (write-through to SSD)", flush=True)
     _run_graph(te, put_graph, put_op_cb, put_cb,
                full_gpu_blocks=[PUT_FULL_GPU], swa_gpu_slot=SWA_GPU_SLOT,
@@ -186,10 +194,10 @@ def main() -> int:
 
     # ===== EVICT the CPU SWA so the window survives only on SSD =================
     n_cpu = engine.cpu_cache_engine.swa_pool.num_used
-    engine.cpu_cache_engine._evict_swa(n_cpu)
+    engine.cpu_cache_engine._evict_swa_slots(n_cpu)
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); seq.gen_hashes()
-    cpu_hit, _s = engine.cpu_cache_engine.match_swa(seq, upper_bound_blocks=1)
-    ssd_hit, _s2 = engine.ssd_cache_engine.match_swa(seq, upper_bound_blocks=1)
+    cpu_hit = engine.cpu_cache_engine.match(seq).swa_hit_blocks
+    ssd_hit = engine.ssd_cache_engine.match(seq).swa_hit_blocks
     assert cpu_hit == 0 and ssd_hit > 0, f"precondition failed: cpu_hit={cpu_hit} ssd_hit={ssd_hit}"
     print(f"[verify] evicted CPU SWA (cpu_hit=0, ssd_hit={ssd_hit}); GET must stage from SSD", flush=True)
 
@@ -201,7 +209,7 @@ def main() -> int:
                                  (GET_FULL_GPU + 1) * TOKENS_PER_BLOCK, dtype=np.int64)
     get_graph, _rm2, get_cb, get_op_cb, get_end = engine.get(
         request_id=2, token_ids=tok, token_mask=np.ones_like(tok, dtype=np.int64),
-        slot_mapping=get_slot_mapping, dp_client_id=0)
+        slot_mapping=get_slot_mapping, dp_client_id=0, swa_aware=True)
     swa_get_ops = [o for o in get_graph._op_map.values() if getattr(o, "is_swa", False)]
     gkinds = sorted(o.transfer_type.name for o in swa_get_ops)
     assert "DISK2H" in gkinds and "H2D" in gkinds, f"expected SWA DISK2H+H2D staging, got {gkinds}"
@@ -225,21 +233,42 @@ def main() -> int:
         print(f"[verify] OK    SWA: {len(expected_sw)} bytes match "
               f"GPU->CPU/SSD->(evict CPU)->DISK2H->H2D->GPU", flush=True)
 
-    # transient CPU staging slot must be freed on H2D completion (no leak).
+    # After GET, the SSD->CPU staging slot must have been PROMOTED onto the
+    # fragment123 CPU node (mount_swa + publish_swa on SWA DISK2H completion),
+    # mirroring Full-KV GET fragment23 which caches SSD/REMOTE data in CPU.
+    # Post-conditions:
+    #   (a) CPU SWA pool holds exactly 1 slot (the promoted one)
+    #   (b) CPU tier match now returns swa_hit > 0 (the window is visible)
+    seq_after = SequenceMeta(token_ids=tok, tokens_per_block=TOKENS_PER_BLOCK); seq_after.gen_hashes()
+    cpu_hit_after = engine.cpu_cache_engine.match(seq_after).swa_hit_blocks
     staging_used = engine.cpu_cache_engine.swa_pool.num_used
-    if staging_used != 0:
-        print(f"[verify] FAIL transient CPU staging slot leaked (num_used={staging_used})", flush=True)
+    if staging_used != 1:
+        print(f"[verify] FAIL CPU SWA promotion did not stick (num_used={staging_used}, expected 1)", flush=True)
+        failed = True
+    elif cpu_hit_after == 0:
+        print(f"[verify] FAIL CPU SWA promotion mounted but did not publish (cpu_hit={cpu_hit_after})", flush=True)
         failed = True
     else:
-        print("[verify] OK    transient CPU staging slot freed (no leak)", flush=True)
+        print(f"[verify] OK    SSD staging slot promoted to CPU (num_used=1, cpu_hit={cpu_hit_after})", flush=True)
 
-    te.shutdown()
-    if os.path.isdir(SSD_CACHE_DIR):
-        shutil.rmtree(SSD_CACHE_DIR)
     if failed:
         return 4
-    print("[verify] PASS: SSD SWA staging byte-exact, transient slot freed", flush=True)
+    print("[verify] PASS: SSD SWA staging byte-exact, staging slot promoted to CPU", flush=True)
     return 0
+
+
+def main() -> int:
+    """Run the E2E flow and always release workers and temporary SSD data."""
+    transfer_engines = []
+    try:
+        return _run(transfer_engines)
+    finally:
+        for transfer_engine in reversed(transfer_engines):
+            transfer_engine.shutdown()
+        shutil.rmtree(SSD_CACHE_DIR, ignore_errors=True)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 @pytest.mark.e2e

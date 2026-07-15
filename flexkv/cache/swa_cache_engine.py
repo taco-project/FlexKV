@@ -13,20 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SWACacheManager — control-plane orchestration of multi-tier SWA caching.
+"""SWACacheManager — SWA peer-op graph builder.
 
-This module owns the *global* SWA control plane over the node-mounted SWA state
-(the Full-KV radix nodes carry the SWA slot / tombstone / lock; each
-``CacheEngineAccel`` / ``HierarchyLRCacheEngine`` owns an SWA host pool as
-``engine.swa_pool`` and exposes ``engine.match_swa`` / ``engine.set_swa``). It is
-the SWA counterpart to the full-KV orchestration in
-:class:`~flexkv.cache.cache_engine.GlobalCacheEngine`,
-and is deliberately kept in a separate module so the SWA peer-op logic does not
-clutter the (already large) full-KV engine.
+The node-mounted SWA state lives on the Full-KV radix nodes; per-tier match,
+slot allocation, pinning, and ready-node ownership are resolved inside
+``GlobalCacheEngine._get_impl_*`` / ``_put_impl_*`` alongside the Full-KV plan.
+This module is intentionally narrower: given resolved SWA slot ids, it appends
+the peer SWA ops into the same ``TransferOpGraph`` as the Full-KV ops.
 
 Responsibilities (control plane only — no byte movement):
-  * Multi-tier prefix match (CPU / SSD / REMOTE), each clamped to that tier's
-    Full-KV hit (SWA must be a subset of Full at every tier).
   * Build SWA *peer* ops into the SAME ``TransferOpGraph`` as the full-KV ops,
     with tier dependencies that mirror the full-KV graph exactly. SWA ops reuse
     the STANDARD transfer types (H2D / D2H / DISK2H / H2DISK / REMOTE2H /
@@ -39,8 +34,8 @@ Responsibilities (control plane only — no byte movement):
         ``D2H`` but are fire-and-forget (NOT reported), only the SWA ``D2H`` is
         reported — exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2REMOTE``.
 
-SWA is a first-class PEER op, NOT a child derived from the full-KV op (see
-the swa_design docs): the full-KV ``pending_count`` child model is PP-sibling
+SWA is a first-class PEER op, NOT a child derived from the full-KV op: the
+full-KV ``pending_count`` child model is PP-sibling
 replica fan-out, the indexer rides the full op as a layer-group sharing block
 ids, and neither fits SWA (independent slot space; the SWA-only case has no full
 op to derive from). The data-plane colleague aligned on the ``is_swa`` flag (a
@@ -54,21 +49,35 @@ movement, kernels, SWA SSD/remote storage and completion callbacks are the data
 plane's responsibility.
 """
 
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Optional, Union, List
 
 import numpy as np
 
 from flexkv.common.transfer import DeviceType, TransferOp, TransferOpGraph, TransferType
 
 
+@dataclass
+class SWAPutChainOpIds:
+    d2h_id: Optional[int] = None
+    h2disk_id: Optional[int] = None
+    h2remote_id: Optional[int] = None
+
+
+@dataclass
+class SWAGetChainOpIds:
+    h2d_id: Optional[int] = None
+    disk2h_id: Optional[int] = None
+    remote2h_id: Optional[int] = None
+
+
 class SWACacheManager:
-    """Global SWA control plane: multi-tier match + peer-op graph construction.
+    """SWA peer-op graph construction.
 
     Holds a back-reference to the owning ``GlobalCacheEngine`` to reach the
-    per-tier cache engines (and their node-mounted SWA state / ``swa_pool``) and
-    the cache config. The per-tier SWA primitives (match_swa / set_swa / evict_swa
-    via the radix tree) live on the engines themselves; this class only
-    orchestrates across tiers.
+    cache config. Per-tier SWA primitives live on the engines themselves; the
+    Full-KV get/put implementations choose the source/destination slots and this
+    class only appends the corresponding SWA peer ops.
     """
 
     def __init__(self, global_cache_engine) -> None:
@@ -145,37 +154,53 @@ class SWACacheManager:
                         remote_slot_ids: Optional[np.ndarray] = None,
                         dp_client_id: int = 0,
                         mooncake_tail_hashes: Optional[List[str]] = None) -> Optional[int]:
-        """Build the GET-side SWA load chain into ``graph``; return the terminal
-        SWA ``H2D`` op_id (to be appended to the graph's finished_ops_ids so it
-        joins the VIRTUAL barrier alongside the full-KV H2D).
+        """Build the GET-side SWA load chain into ``graph``.
+
+        Returns the terminal SWA ``H2D`` op_id by default (for finished_ops /
+        VIRTUAL barrier). With ``return_op_ids=True``, returns ``SWAGetChainOpIds``
+        including staging ``DISK2H`` / ``REMOTE2H`` ids for CPU-ready publish.
 
         Mirrors the full-KV GET graph: the SWA ``H2D`` (CPU SWA slot -> GPU swa
         pool) depends on the staging ops ``DISK2H`` / ``REMOTE2H`` when the SWA
         bytes are sourced from SSD / REMOTE. (CPU-resident SWA needs no staging
         op, like a CPU full-KV hit.) All ops carry ``is_swa=True``. Returns None
-        when disabled / empty.
+        when disabled / empty (or empty ``SWAGetChainOpIds`` with return_op_ids).
         """
-        h2d_id = self.build_swa_op(
-            graph, TransferType.H2D, cpu_slot_ids, gpu_slot_ids,
-            dp_client_id=dp_client_id,
-        )
-        if h2d_id is None:
-            return None
-        if ssd_slot_ids is not None and np.asarray(ssd_slot_ids).size > 0:
+        assert cpu_slot_ids.size > 0 and cpu_slot_ids.size == gpu_slot_ids.size, \
+            "CPU and GPU SWA slot ids must have the same size"
+        ssd2h_id = None
+        remote2h_id = None
+        h2d_id = None
+        if (ssd_slot_ids is not None and ssd_slot_ids.size > 0
+                and ssd_slot_ids.size == cpu_slot_ids.size):
             ssd2h_id = self.build_swa_op(
                 graph, TransferType.DISK2H, ssd_slot_ids, cpu_slot_ids,
                 dp_client_id=dp_client_id,
             )
-            if ssd2h_id is not None:
-                graph.add_dependency(h2d_id, ssd2h_id)
-        if remote_slot_ids is not None and np.asarray(remote_slot_ids).size > 0:
+
+        if (remote_slot_ids is not None and remote_slot_ids.size > 0
+                and remote_slot_ids.size == cpu_slot_ids.size):
             remote2h_id = self.build_swa_op(
                 graph, TransferType.REMOTE2H, remote_slot_ids, cpu_slot_ids,
                 dp_client_id=dp_client_id,
                 mooncake_tail_hashes=mooncake_tail_hashes,
             )
-            if remote2h_id is not None:
-                graph.add_dependency(h2d_id, remote2h_id)
+
+        h2d_id = self.build_swa_op(
+            graph, TransferType.H2D, cpu_slot_ids, gpu_slot_ids,
+            dp_client_id=dp_client_id,
+        )
+        if h2d_id is not None and ssd2h_id is not None:
+            graph.add_dependency(h2d_id, ssd2h_id)
+        if h2d_id is not None and remote2h_id is not None:
+            graph.add_dependency(h2d_id, remote2h_id)
+
+        if return_op_ids:
+            return SWAGetChainOpIds(
+                h2d_id=h2d_id,
+                disk2h_id=ssd2h_id,
+                remote2h_id=remote2h_id,
+            )
         return h2d_id
 
     def build_put_chain(self,
@@ -185,7 +210,7 @@ class SWACacheManager:
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
                         dp_client_id: int = 0,
-                        mooncake_tail_hashes: Optional[List[str]] = None) -> Optional[int]:
+                        return_op_ids: bool = False) -> Union[Optional[int], SWAPutChainOpIds]:
         """Build the PUT-side SWA store chain into ``graph``; return the SWA
         ``D2H`` op_id (to be appended to the graph's finished_ops_ids).
 
@@ -195,20 +220,23 @@ class SWACacheManager:
         exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2REMOTE``. All ops
         carry ``is_swa=True``. Returns None when disabled / empty.
         """
+        assert gpu_slot_ids.size > 0 and gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
         d2h_id = self.build_swa_op(
             graph, TransferType.D2H, gpu_slot_ids, cpu_slot_ids,
             dp_client_id=dp_client_id,
         )
         if d2h_id is None:
-            return None
-        if ssd_slot_ids is not None and np.asarray(ssd_slot_ids).size > 0:
+            return SWAPutChainOpIds() if return_op_ids else None
+        h2ssd_id = None
+        if ssd_slot_ids is not None and ssd_slot_ids.size == cpu_slot_ids.size:
             h2ssd_id = self.build_swa_op(
                 graph, TransferType.H2DISK, cpu_slot_ids, ssd_slot_ids,
                 dp_client_id=dp_client_id,
             )
             if h2ssd_id is not None:
                 graph.add_dependency(h2ssd_id, d2h_id)
-        if remote_slot_ids is not None and np.asarray(remote_slot_ids).size > 0:
+        h2remote_id = None
+        if remote_slot_ids is not None and remote_slot_ids.size == cpu_slot_ids.size:
             h2remote_id = self.build_swa_op(
                 graph, TransferType.H2REMOTE, cpu_slot_ids, remote_slot_ids,
                 dp_client_id=dp_client_id,
@@ -216,4 +244,10 @@ class SWACacheManager:
             )
             if h2remote_id is not None:
                 graph.add_dependency(h2remote_id, d2h_id)
+        if return_op_ids:
+            return SWAPutChainOpIds(
+                d2h_id=d2h_id,
+                h2disk_id=h2ssd_id,
+                h2remote_id=h2remote_id,
+            )
         return d2h_id
