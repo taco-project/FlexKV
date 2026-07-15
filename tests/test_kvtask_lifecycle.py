@@ -49,7 +49,6 @@ def test_task_defaults_and_swa_field():
     t = _make_task()
     assert t.status == TaskStatus.UNREADY
     assert t.swa_slot_mapping is None          # new field defaults None
-    assert t.batch_task_id is None and t.pending_sub_count == 0
     assert not t.is_completed()
 
 
