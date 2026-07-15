@@ -67,6 +67,35 @@ def test_py_match_returns_last_swa_node():
     assert mr.swa_hit_blocks == 4
 
 
+def test_py_mount_without_publish_is_structurally_visible_not_readable():
+    """Mounted-but-unpublished SWA is structurally visible but not readable."""
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    idx.mount_swa(n1, slot=101)
+    assert n1.has_swa() and not n1.swa_ready and not n1.on_swa_lru
+
+    mr = idx.match_prefix(_seq([1, 2, 3, 4]))
+    assert mr.swa_hit_blocks == 0 and mr.last_swa_node is n1
+
+    idx.publish_swa(n1)
+    assert n1.swa_ready and n1.on_swa_lru
+    mr2 = idx.match_prefix(_seq([1, 2, 3, 4]))
+    assert mr2.swa_hit_blocks == 2 and mr2.last_swa_node is n1
+
+
+def test_py_pending_mount_survives_swa_evict_pressure():
+    """Pending mounts must not be reclaimed by evict_swa (not on LRU)."""
+    idx = RadixTreeIndex(tokens_per_block=TPB)
+    published = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3), is_ready=True)
+    idx.set_swa(published, slot=10)
+    pending_node = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    idx.mount_swa(pending_node, slot=11)
+    idx.evict_swa(1)  # drops published (LRU), not pending
+    assert not published.has_swa()
+    assert pending_node.has_swa() and not pending_node.swa_ready
+    assert pending_node.swa_host_slot == 11
+
+
 def test_py_split_preserves_swa_on_suffix_half():
     """I0/I4: split keeps the SWA on the half that owns the original last page."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
