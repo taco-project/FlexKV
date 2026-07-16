@@ -153,21 +153,6 @@ class TestStep2Cascade:
 # --------------------------------------------------------------------------- #
 
 class TestStep3TreeLevel:
-    def test_mount_publish_and_match_reports_last_swa_node(self):
-        tree = _make_tree()
-        tokens = np.arange(0, TPB * 3, dtype=np.int64)
-        node, block_hashes = _insert(tree, tokens, 0)
-        tree.mount_swa(node, 42)
-        mr_pending = tree.match_prefix(block_hashes, len(tokens) // TPB, False)
-        assert mr_pending.swa_hit_blocks == 0
-        assert mr_pending.last_swa_node is not None
-        assert mr_pending.last_swa_node.swa_host_slot == 42
-        tree.publish_swa(node)
-        mr = tree.match_prefix(block_hashes, len(tokens) // TPB, False)
-        assert mr.last_swa_node is not None
-        assert mr.last_swa_node.swa_host_slot == 42
-        assert mr.swa_hit_blocks == len(tokens) // TPB
-
     def test_set_swa_and_match_reports_last_swa_node(self):
         tree = _make_tree()
         tokens = np.arange(0, TPB * 3, dtype=np.int64)

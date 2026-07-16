@@ -220,17 +220,12 @@ void CRadixNode::merge_child() {
   // buffering its slot for release (the slot is being kept, not freed).
   index->record_freed_swa_slot(this); // release parent's old SWA (if any)
   int child_slot = child->get_swa_host_slot();
-  bool child_published = child->swa_ready();
   if (child_slot != -1) {
     index->swa_lru_remove(child); // detach child from SWA-LRU
     child->set_swa_host_slot(-1); // child no longer owns it
     child->set_swa_tombstone(true);
-    child->set_swa_ready(false);
     if (!index->is_root(this)) {
-      index->mount_swa(this, child_slot);
-      if (child_published) {
-        index->publish_swa(this);
-      }
+      index->set_swa(this, child_slot); // remount on the merged node
     } else {
       // root cannot carry SWA; free the slot rather than leak it.
       index->buffer_freed_swa_slot(child_slot);
@@ -615,9 +610,9 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
   auto prefix_blocks_num = 0;
   auto ready_prefix_blocks_num = 0;
   auto last_node_matched_length = 0;
-  // SWA (node-mount): structural mount node + deepest readable SWA hit.
+  // SWA (node-mount): deepest fully-matched ready node carrying a live SWA
+  // slot.
   CRadixNode *last_swa_node = nullptr;
-  CRadixNode *last_swa_hit_node = nullptr;
   int swa_hit_blocks = 0;
   auto physical_blocks_tensor =
       torch::empty({num_blocks}, torch::dtype(torch::kInt64));
@@ -653,18 +648,14 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
           break;
         }
       }
-      // Structural SWA mount: visible for dedup once the whole node matched.
-      if (matched_length == current_node->size() && current_node->has_swa()) {
-        last_swa_node = current_node;
-      }
       if (current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += matched_length;
-        // Readable SWA hit only on a full node match (trailing page exposed).
-        if (matched_length == current_node->size() &&
-            current_node->is_swa_readable()) {
+        // SWA hit only when the WHOLE node matched (its trailing page is
+        // exposed); a partial match must not claim the node's tail window.
+        if (matched_length == current_node->size() && current_node->has_swa()) {
+          last_swa_node = current_node;
           swa_hit_blocks = ready_prefix_blocks_num;
-          last_swa_hit_node = current_node;
         }
       }
       last_node_matched_length = matched_length;
@@ -681,15 +672,13 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
     if (child_hash_opt.has_value() &&
         current_node->lookup_child(child_hash_opt.value())) {
       child_hash = child_hash_opt.value();
-      if (current_node->has_swa()) {
-        last_swa_node = current_node;
-      }
       if (current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += current_node->size();
-        if (current_node->is_swa_readable()) {
+        // Whole node matched (we are descending into a child): expose its SWA.
+        if (current_node->has_swa()) {
+          last_swa_node = current_node;
           swa_hit_blocks = ready_prefix_blocks_num;
-          last_swa_hit_node = current_node;
         }
       }
       prefix_blocks_num += current_node->size();
@@ -729,16 +718,13 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
         matched_length = 0;
       }
 
-      if (matched_length == current_node->size() && current_node->has_swa()) {
-        last_swa_node = current_node;
-      }
       if (current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += matched_length;
-        if (matched_length == current_node->size() &&
-            current_node->is_swa_readable()) {
+        // Only a full node match exposes the trailing page's SWA.
+        if (matched_length == current_node->size() && current_node->has_swa()) {
+          last_swa_node = current_node;
           swa_hit_blocks = ready_prefix_blocks_num;
-          last_swa_hit_node = current_node;
         }
       }
 
@@ -772,11 +758,12 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
   // Read-hit heat update: on a real match (update_cache_info=true), promote the
   // matched SWA node to its SWA-LRU MRU — the SWA peer of the per-node Full-KV
   // update_time() bump above, so a reused SWA copy survives eviction over a
-  // never-reused one. Only a readable SWA hit (swa_hit_blocks>0) is promoted.
-  // A probe (update_cache_info=false) must NOT touch the SWA-LRU. Mirrors Python
+  // never-reused one. last_swa_node is the deepest fully-matched ready node with
+  // a live SWA slot (or nullptr); promote_swa no-ops on root / no-SWA. A probe
+  // (update_cache_info=false) must NOT touch the SWA-LRU. Mirrors Python
   // RadixTreeIndex.match_prefix.
-  if (update_cache_info && last_swa_hit_node != nullptr) {
-    promote_swa(last_swa_hit_node);
+  if (update_cache_info && last_swa_node != nullptr) {
+    promote_swa(last_swa_node);
   }
   return std::make_shared<CMatchResult>(
       ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,

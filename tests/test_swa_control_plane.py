@@ -294,7 +294,7 @@ def test_get_builds_full_plus_swa_load_chain():
     eng.cpu_cache_engine._pin_swa_node(node)
     assert node is not None and node.swa_lock_ref == 1
     assert node.get_lock_cnt() >= node.swa_lock_ref
-    eng._swa_release_load_lock(node, source_device_type=DeviceType.CPU)
+    eng._swa_release_load_lock(node, engine=eng.cpu_cache_engine)
     assert node.swa_lock_ref == 0
 
 
