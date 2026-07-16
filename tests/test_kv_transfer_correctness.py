@@ -552,6 +552,14 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
         cpu_stride_kv, cpu_stride_layer, cpu_stride_tp,
         4, use_ce, num_layers, 1, True,
         counter_id=0,
+        # pybind cannot fill the SWA tensor defaults (torch::Tensor() -> None
+        # can't cast back to a non-optional `torch.Tensor` param), so the four
+        # swa_* tensors must be passed explicitly even for this non-SWA test.
+        # Mirrors production LayerwiseTransfer._swa_transfer_kwargs().
+        swa_h2d_src=torch.empty(0, dtype=torch.int64),
+        swa_h2d_dst=torch.empty(0, dtype=torch.int64),
+        swa_disk2h_src=torch.empty(0, dtype=torch.int64),
+        swa_disk2h_dst=torch.empty(0, dtype=torch.int64),
         mla_d2h_mode="sharded",
         notify_mode=notify_mode,
     )
