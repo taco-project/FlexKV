@@ -17,6 +17,10 @@ if TYPE_CHECKING:
 logger = flexkv_logger
 
 
+def _dsv4_swa_transfer_enabled_from_env() -> bool:
+    return bool(int(os.getenv("FLEXKV_ENABLE_SWA_TRANSFER", "1")))
+
+
 def _is_nvfp4_dtype_str(dtype_str: Optional[str]) -> bool:
     """Return True if *dtype_str* selects the NVFP4 packed KV cache layout."""
     return isinstance(dtype_str, str) and dtype_str.lower() in ("nvfp4", "fp4", "e2m1")
@@ -489,7 +493,7 @@ class FlexKVConfig:
         # stays None -> the cache engine never builds an SWA pool -> a SWA-aware
         # get finds no SWA, so SWA KV is never matched/reused for this all-SWA model.
         is_dsv4 = bool(getattr(sglang_config, "is_deepseek_v4_arch", False))
-        if is_dsv4 and self.cache_config.swa is None:
+        if is_dsv4:
             swa_page_size = self.cache_config.tokens_per_block
             # bytes_per_token_per_layer MUST match the GPU SWA buffer's *padded*
             # per-token stride, not the logical 584. DeepSeekV4SingleKVPool packs
@@ -501,24 +505,26 @@ class FlexKVConfig:
             # line up with the GPU buffer stride; a 584 host layout would shear the
             # bytes by 1/token/page and corrupt the SWA KV. See connector
             # _register_to_server_dsv4 (swa_layout head_size)
-            swa_bytes_per_token = _dsv4_swa_padded_bytes_per_token(swa_page_size, 584)
-            self.cache_config.swa = SWAPoolConfig(
-                enabled=True,
-                num_swa_layers=self.model_config.num_layers,
-                bytes_per_token_per_layer=swa_bytes_per_token,
-            )
+            if self.cache_config.swa is None:
+                swa_bytes_per_token = _dsv4_swa_padded_bytes_per_token(
+                    swa_page_size, 584)
+                self.cache_config.swa = SWAPoolConfig(
+                    enabled=True,
+                    num_swa_layers=self.model_config.num_layers,
+                    bytes_per_token_per_layer=swa_bytes_per_token,
+                )
             # Gate the SWA data plane (byte movement) behind an env switch so it
             # can be turned off for A/B or if a byte-layout issue surfaces in
             # production, degrading cleanly to full-KV-only (all build_*_chain
             # become no-ops). Default ON for DSv4 (the SWA-native arch).
-            self.cache_config.enable_swa_transfer = bool(
-                int(os.getenv("FLEXKV_ENABLE_SWA_TRANSFER", "1"))
-            ) or self.cache_config.swa.enabled
+            self.cache_config.enable_swa_transfer = \
+                _dsv4_swa_transfer_enabled_from_env()
             logger.info(
                 f"[FlexKV sglang] Constructed SWAPoolConfig for DSv4: "
                 f"swa_page_size={swa_page_size}, "
                 f"num_swa_layers={self.model_config.num_layers}, "
-                f"bytes_per_token_per_layer={swa_bytes_per_token} (padded), "
+                f"bytes_per_token_per_layer="
+                f"{self.cache_config.swa.bytes_per_token_per_layer} (padded), "
                 f"num_slots={self.cache_config.swa.num_slots}, "
                 f"enable_swa_transfer={self.cache_config.enable_swa_transfer}"
             )

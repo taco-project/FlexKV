@@ -4,7 +4,7 @@ Bypasses the SGLang socket handshake by injecting real semaphore eventfds
 directly into ``LayerwiseTransferGroup``.  Verifies:
 
   - fds are silent before ``layerwise_transfer_multi_group``
-  - each original layer receives exactly one ``write(2)`` (K/V wait semantics)
+  - each original layer receives exactly one ``write(1)`` semaphore signal
   - empty-member layers without SWA get an immediate post
   - empty-member layers with SWA wait for the SWA H2D callback
 
@@ -345,8 +345,8 @@ class TestLayerwiseEventfdTiming:
         for fd in _layer_fds(fx, owned):
             assert _eventfd_is_idle(fd), f"eventfd {fd} should be idle before transfer"
 
-    def test_eventfd_posts_two_units_per_layer_after_swa_h2d(self) -> None:
-        """Each layer gets a single write(2) — drainable as two semaphore reads."""
+    def test_eventfd_posts_one_unit_per_layer_after_swa_h2d(self) -> None:
+        """Each layer gets one signal, matching SGLang's one semaphore read."""
         num_layers = 8
         groups = _dsv4_like_groups(num_c4_layers=4)
         fx, owned = _build_fixture_with_eventfds(groups, num_layers)
@@ -359,8 +359,8 @@ class TestLayerwiseEventfdTiming:
 
         for layer, fd in enumerate(_layer_fds(fx, owned)):
             units = _drain_eventfd_units(fd)
-            assert units == 2, (
-                f"layer {layer}: expected 2 semaphore units (one write(2)), got {units}"
+            assert units == 1, (
+                f"layer {layer}: expected one semaphore unit, got {units}"
             )
             assert _eventfd_is_idle(fd), f"layer {layer}: extra signal after drain"
 
@@ -387,8 +387,8 @@ class TestLayerwiseEventfdTiming:
 
         for orig in range(num_layers):
             fd = _layer_fds(fx, owned)[orig]
-            assert _drain_eventfd_units(fd) == 2, (
-                f"orig layer {orig}: dual-member+SWA must still post exactly once (val=2)"
+            assert _drain_eventfd_units(fd) == 1, (
+                f"orig layer {orig}: dual-member+SWA must post exactly once"
             )
 
     def test_empty_member_immediate_eventfd_without_swa(self) -> None:
@@ -421,8 +421,8 @@ class TestLayerwiseEventfdTiming:
         _run_h2d(fx, with_swa=False)
 
         # Immediate post for empty member happens synchronously at transfer entry.
-        assert _drain_eventfd_units(layer0_fd) == 2
-        assert _drain_eventfd_units(layer1_fd) == 2
+        assert _drain_eventfd_units(layer0_fd) == 1
+        assert _drain_eventfd_units(layer1_fd) == 1
 
     def test_empty_member_waits_for_swa_before_eventfd(self) -> None:
         """Layer 0 has no members but SWA is active — no early post at step 0b."""
@@ -446,6 +446,6 @@ class TestLayerwiseEventfdTiming:
 
         for orig in range(num_layers):
             fd = _layer_fds(fx, owned)[orig]
-            assert _drain_eventfd_units(fd) == 2, (
+            assert _drain_eventfd_units(fd) == 1, (
                 f"orig {orig}: SWA-inclusive layer must post after H2D completes"
             )

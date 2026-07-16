@@ -24,7 +24,7 @@ void LayerwiseTransferGroup::notify_layer_batch(int start_layer,
     for (int tp_rank = 0; tp_rank < tp_size_; ++tp_rank) {
       int fd = eventfds_base[tp_rank * num_layers_ + layer];
       if (fd >= 0) {
-        uint64_t val = 2;
+        uint64_t val = 1;
         ssize_t ret = write(fd, &val, sizeof(val));
         (void)ret;
       }
@@ -113,8 +113,8 @@ static void CUDART_CB layer_done_host_callback(void *userData) {
         for (int tp_rank = 0; tp_rank < data->tp_size; ++tp_rank) {
           int fd = data->layer_eventfds[tp_rank * data->num_layers + layer];
           if (fd >= 0) {
-            // Write 2 to support both get_key_buffer and get_value_buffer waits
-            uint64_t val = 2;
+            // SGLang consumes one semaphore token per layer and transfer.
+            uint64_t val = 1;
             ssize_t ret = write(fd, &val, sizeof(val));
           }
         }
@@ -1137,7 +1137,7 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
       for (int tp_rank = 0; tp_rank < tp_size_; ++tp_rank) {
         int fd = eventfds_ptr[tp_rank * num_layers_ + orig];
         if (fd >= 0) {
-          uint64_t val = 2;
+          uint64_t val = 1;
           ssize_t ret = write(fd, &val, sizeof(val));
           (void)ret;
         }
