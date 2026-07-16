@@ -444,7 +444,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
                  transfer_num_cta_d2h: int = 4,
-                 compressor: Optional[CompressionStrategy] = None):
+                 compressor: Optional[CompressionStrategy] = None,
+                 scale_blocks: Optional[List[List[TensorSharedHandle]]] = None,
+                 scale_layout: Optional[KVCacheLayout] = None):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
@@ -463,6 +465,17 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
+
+        # Import FP4 scale buffers if present
+        self.is_fp4 = scale_blocks is not None and len(scale_blocks) > 0
+        imported_scale_blocks = None
+        if self.is_fp4:
+            imported_scale_blocks = []
+            for handles_in_one_gpu in scale_blocks:
+                blocks_in_one_gpu = []
+                for handle in handles_in_one_gpu:
+                    blocks_in_one_gpu.append(handle.get_tensor())
+                imported_scale_blocks.append(blocks_in_one_gpu)
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
@@ -514,6 +527,36 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         flexkv_logger.info(f"num_tensors_per_gpu: {num_tensors_per_gpu}")
 
+        # Resolve FP4 scale buffer pointers and strides
+        scale_block_ptrs_flat = []
+        scale_block_stride_in_bytes = 0
+        fp4_num_heads = 0
+        fp4_data_per_head = 0
+        fp4_scale_per_head = 0
+        if self.is_fp4 and imported_scale_blocks is not None and scale_layout is not None:
+            scale_block_ptrs_flat = [
+                imported_scale_blocks[i][j].data_ptr()
+                for i in range(self.num_gpus)
+                for j in range(len(imported_scale_blocks[i]))
+            ]
+            # scale_layout: LAYERFIRST with num_head=1,
+            # head_size = n*k//16 (flat per-token scale)
+            scale_block_stride_in_bytes = (
+                scale_layout.get_block_stride() * self.dtype.itemsize
+            )
+            # Derive FP4 per-head dimensions from the data layout:
+            # gpu_kv_layouts has LAYERFIRST with num_head=N, head_size=data_per_head (k//2)
+            fp4_num_heads = gpu_kv_layouts[0].num_head
+            fp4_data_per_head = gpu_kv_layouts[0].head_size
+            # scale_per_head = total_scale_per_token / num_heads
+            total_scale_per_token = scale_layout.head_size  # n*k//16
+            fp4_scale_per_head = total_scale_per_token // fp4_num_heads
+            flexkv_logger.info(
+                f"[tpGPUCPUTransferWorker] FP4 mode: num_heads={fp4_num_heads}, "
+                f"data_per_head={fp4_data_per_head}, scale_per_head={fp4_scale_per_head}, "
+                f"scale_block_stride={scale_block_stride_in_bytes}B"
+            )
+
         self.tp_transfer_thread_group = TPTransferThreadGroup(
             self.num_gpus,
             gpu_block_ptrs_flat,
@@ -525,6 +568,11 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.gpu_layer_strides_in_bytes,
             self.gpu_chunk_sizes_in_bytes,
             gpu_device_ids,
+            scale_block_ptrs_flat=scale_block_ptrs_flat,
+            scale_block_stride_in_bytes=scale_block_stride_in_bytes,
+            fp4_num_heads=fp4_num_heads,
+            fp4_data_per_head=fp4_data_per_head,
+            fp4_scale_per_head=fp4_scale_per_head,
         )
 
         self._compressor = compressor or NullCompressionStrategy()

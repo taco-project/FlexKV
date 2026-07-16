@@ -34,7 +34,10 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     const std::vector<int64_t> &gpu_layer_strides_in_bytes,
     const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
     const std::vector<int64_t> &gpu_device_ids,
-    bool enable_nvcomp, int nvcomp_batch_size, int nvcomp_data_type) {
+    bool enable_nvcomp, int nvcomp_batch_size, int nvcomp_data_type,
+    const std::vector<int64_t> &scale_block_ptrs_flat,
+    int64_t scale_block_stride_in_bytes,
+    int fp4_num_heads, int fp4_data_per_head, int fp4_scale_per_head) {
   const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
 
   num_gpus_ = num_gpus;
@@ -65,24 +68,65 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     gpu_blocks_[i] = reinterpret_cast<void *>(gpu_block_ptrs_flat[i]);
   }
 
+  bool has_scale_buffers = !scale_block_ptrs_flat.empty();
+
   if (num_tensors_per_gpu_ == 1) {
     backend_type_ = BackendType::TRTLLM;
   } else if (num_tensors_per_gpu_ == num_layers) {
-    backend_type_ = BackendType::VLLM;
+    backend_type_ = has_scale_buffers ? BackendType::SGLANG_FP4
+                                     : BackendType::VLLM;
   } else if (num_tensors_per_gpu_ == num_layers * 2) {
-    backend_type_ = BackendType::SGLANG;
+    backend_type_ = has_scale_buffers ? BackendType::SGLANG_FP4
+                                     : BackendType::SGLANG;
   } else {
     throw std::runtime_error("Unsupported GPU block type: " +
                              std::to_string(num_tensors_per_gpu_));
+  }
+
+  // Allocate scale_blocks_ if FP4
+  scale_blocks_ = nullptr;
+  tokens_per_block_ = 0;
+  if (has_scale_buffers) {
+    int num_scale_tensors = static_cast<int>(scale_block_ptrs_flat.size()) / num_gpus_;
+    cudaError_t scale_err = cudaMallocHost(
+        (void **)&scale_blocks_,
+        scale_block_ptrs_flat.size() * sizeof(void *));
+    if (scale_err != cudaSuccess) {
+      throw std::runtime_error(
+          std::string("cudaMallocHost (scale) failed: ") +
+          cudaGetErrorString(scale_err));
+    }
+    for (size_t i = 0; i < scale_block_ptrs_flat.size(); ++i) {
+      scale_blocks_[i] = reinterpret_cast<void *>(scale_block_ptrs_flat[i]);
+    }
+    // Derive tokens_per_block from data block stride:
+    // gpu_block_stride_in_bytes = tokens_per_block * num_heads * data_per_head
+    if (fp4_num_heads > 0 && fp4_data_per_head > 0) {
+      tokens_per_block_ = static_cast<int>(
+          gpu_block_strides_in_bytes[0] / (fp4_num_heads * fp4_data_per_head));
+    }
   }
 
   gpu_tensor_handlers_.reserve(num_gpus_);
   for (int i = 0; i < num_gpus_; i++) {
     int64_t **gpu_blocks_ptr =
         reinterpret_cast<int64_t **>(gpu_blocks_ + i * num_tensors_per_gpu_);
-    gpu_tensor_handlers_.emplace_back(
+    GTensorHandler handler(
         backend_type_, gpu_blocks_ptr, num_layers, gpu_kv_strides_in_bytes_[i],
         gpu_block_strides_in_bytes_[i], gpu_layer_strides_in_bytes_[i]);
+
+    if (has_scale_buffers) {
+      int num_scale_tensors = static_cast<int>(scale_block_ptrs_flat.size()) / num_gpus_;
+      handler.scale_tensor_ptrs =
+          reinterpret_cast<int64_t **>(scale_blocks_ + i * num_scale_tensors);
+      handler.scale_block_stride =
+          scale_block_stride_in_bytes / static_cast<int64_t>(sizeof(int64_t));
+      handler.fp4_num_heads = fp4_num_heads;
+      handler.fp4_data_per_head = fp4_data_per_head;
+      handler.fp4_scale_per_head = fp4_scale_per_head;
+    }
+
+    gpu_tensor_handlers_.emplace_back(handler);
   }
 
   cpu_blocks_ = reinterpret_cast<void *>(cpu_blocks_ptr);
@@ -145,6 +189,9 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
       t.join();
 
   cudaFreeHost(gpu_blocks_);
+  if (scale_blocks_) {
+    cudaFreeHost(scale_blocks_);
+  }
 
 #ifdef FLEXKV_ENABLE_NVCOMP
   destroy_nvcomp_state();
@@ -301,6 +348,14 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
               transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+          break;
+        case BackendType::SGLANG_FP4:
+          flexkv::transfer_kv_blocks_fp4(
+              num_blocks, layer_id, layer_granularity, gpu_block_ids,
+              gpu_tensor_handlers_[i], cpu_block_ids, cpu_ptr,
+              cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+              cpu_block_stride_in_bytes, tokens_per_block_, streams_[i],
+              transfer_num_cta, is_host_to_device, is_mla);
           break;
         }
 

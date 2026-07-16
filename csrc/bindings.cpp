@@ -525,7 +525,8 @@ PYBIND11_MODULE(c_ext, m) {
       .def(py::init<int, const std::vector<int64_t> &, int, int64_t, int,
                     const std::vector<int64_t> &, const std::vector<int64_t> &,
                     const std::vector<int64_t> &, const std::vector<int64_t> &,
-                    const std::vector<int64_t> &, bool, int, int>(),
+                    const std::vector<int64_t> &, bool, int, int,
+                    const std::vector<int64_t> &, int64_t, int, int, int>(),
            py::arg("num_gpus"), py::arg("gpu_block_ptrs_flat"),
            py::arg("num_tensors_per_gpu"), py::arg("cpu_blocks_ptr"),
            py::arg("num_layers"),
@@ -535,7 +536,12 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("gpu_chunk_sizes_in_bytes"), py::arg("gpu_device_ids"),
            py::arg("enable_nvcomp") = false,
            py::arg("nvcomp_batch_size") = 0,
-           py::arg("nvcomp_data_type") = 0)
+           py::arg("nvcomp_data_type") = 0,
+           py::arg("scale_block_ptrs_flat") = std::vector<int64_t>{},
+           py::arg("scale_block_stride_in_bytes") = 0,
+           py::arg("fp4_num_heads") = 0,
+           py::arg("fp4_data_per_head") = 0,
+           py::arg("fp4_scale_per_head") = 0)
       .def("tp_group_transfer",
            &flexkv::TPTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),

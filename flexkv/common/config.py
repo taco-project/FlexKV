@@ -21,6 +21,29 @@ class IndexerCacheConfig:
     num_kv_heads: int = 1       # typically 1 for MLA-style indexer
     dtype: torch.dtype = torch.uint8  # indexer storage dtype (fp8 quantized)
 
+    # IndexShare (GLM-5.2 / DSA training-free variant, arxiv 2603.12201):
+    # ``full_layer_indices`` lists the global layer ids of *Full* layers that
+    # run their own lightning indexer top-k. When ``None`` every layer is a
+    # Full layer (vanilla DSA), which is the safe default and preserves the
+    # existing 1:1 layer→indexer-slot mapping used by the storage engine and
+    # transfer paths. When populated the remaining layers are Shared: they
+    # reuse a prior Full layer's top-k selection and never need their own
+    # Index K read on cache hits, so callers may skip transferring those
+    # layers to save bandwidth. Storage allocation still uses one slot per
+    # layer today (the field is metadata-only) so downstream code paths
+    # remain unchanged; skipping is an opt-in optimization at the transfer
+    # layer.
+    full_layer_indices: Optional[List[int]] = None
+
+    def is_full_layer(self, global_layer_id: int) -> bool:
+        """True when ``global_layer_id`` runs its own indexer top-k.
+
+        When ``full_layer_indices`` is None every layer is Full (vanilla DSA).
+        """
+        if self.full_layer_indices is None:
+            return True
+        return global_layer_id in self.full_layer_indices
+
 
 @dataclass
 class ModelConfig:

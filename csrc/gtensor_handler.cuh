@@ -5,7 +5,7 @@
 namespace flexkv {
 
 // Backend type enumeration
-enum class BackendType { VLLM, TRTLLM, SGLANG };
+enum class BackendType { VLLM, TRTLLM, SGLANG, SGLANG_FP4 };
 
 // Simplified GTensorHandler - no inheritance, just a data structure
 struct GTensorHandler {
@@ -16,9 +16,18 @@ struct GTensorHandler {
   int64_t gpu_block_stride;
   int64_t gpu_layer_stride;
 
+  // FP4 scale buffer fields (used only for SGLANG_FP4)
+  int64_t **scale_tensor_ptrs;
+  int64_t scale_block_stride;
+  int fp4_num_heads;
+  int fp4_data_per_head;
+  int fp4_scale_per_head;
+
   __host__ __device__ GTensorHandler()
       : type(BackendType::VLLM), gpu_tensor_ptrs(nullptr), num_layers(0),
-        gpu_kv_stride(0), gpu_block_stride(0), gpu_layer_stride(0) {}
+        gpu_kv_stride(0), gpu_block_stride(0), gpu_layer_stride(0),
+        scale_tensor_ptrs(nullptr), scale_block_stride(0),
+        fp4_num_heads(0), fp4_data_per_head(0), fp4_scale_per_head(0) {}
 
   __host__ __device__ GTensorHandler(BackendType type,
                                      int64_t **gpu_tensor_ptrs,
@@ -29,7 +38,9 @@ struct GTensorHandler {
       : type(type), gpu_tensor_ptrs(gpu_tensor_ptrs), num_layers(num_layers),
         gpu_kv_stride(gpu_kv_stride_in_bytes / sizeof(int64_t)),
         gpu_block_stride(gpu_block_stride_in_bytes / sizeof(int64_t)),
-        gpu_layer_stride(gpu_layer_stride_in_bytes / sizeof(int64_t)) {}
+        gpu_layer_stride(gpu_layer_stride_in_bytes / sizeof(int64_t)),
+        scale_tensor_ptrs(nullptr), scale_block_stride(0),
+        fp4_num_heads(0), fp4_data_per_head(0), fp4_scale_per_head(0) {}
 };
 
 // Template specialization for different backends
@@ -62,6 +73,16 @@ template <>
 __device__ __host__ inline int64_t *
 ptr_at<BackendType::SGLANG>(const GTensorHandler &handler, int64_t layer_idx,
                             int64_t kv_idx, int64_t block_idx) {
+  return handler.gpu_tensor_ptrs[kv_idx * handler.num_layers + layer_idx] +
+         block_idx * handler.gpu_block_stride;
+}
+
+// SGLang FP4 specialization (data buffer — same layout as SGLANG)
+template <>
+__device__ __host__ inline int64_t *
+ptr_at<BackendType::SGLANG_FP4>(const GTensorHandler &handler,
+                                int64_t layer_idx, int64_t kv_idx,
+                                int64_t block_idx) {
   return handler.gpu_tensor_ptrs[kv_idx * handler.num_layers + layer_idx] +
          block_idx * handler.gpu_block_stride;
 }

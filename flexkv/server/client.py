@@ -306,6 +306,8 @@ class KVTPClient:
         override_device_id: Optional[int] = None,
         indexer_buffers: Optional[List[torch.Tensor]] = None,
         indexer_layout: Optional[KVCacheLayout] = None,
+        scale_buffers: Optional[List[torch.Tensor]] = None,
+        scale_layout: Optional[KVCacheLayout] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
@@ -325,6 +327,13 @@ class KVTPClient:
             for tensor in indexer_buffers:
                 indexer_handles.append(TensorSharedHandle(tensor, device_id))
 
+        # Build optional FP4 scale handles
+        scale_handles = None
+        if scale_buffers is not None and len(scale_buffers) > 0:
+            scale_handles = []
+            for tensor in scale_buffers:
+                scale_handles.append(TensorSharedHandle(tensor, device_id))
+
         register_req = RegisterTPClientRequest(
             dp_client_id=self.dp_client_id,
             pp_rank=self.pp_rank,
@@ -333,6 +342,8 @@ class KVTPClient:
             gpu_layout=kv_layout,
             indexer_handles=indexer_handles,
             indexer_gpu_layout=indexer_layout,
+            scale_handles=scale_handles,
+            scale_gpu_layout=scale_layout,
         )
 
         try:

@@ -36,6 +36,17 @@ class StorageEngine:
         self._cache_config = cache_config
         self._indexer_config = cache_config.indexer
 
+        if (self._indexer_config is not None
+                and self._indexer_config.full_layer_indices is not None):
+            flexkv_logger.info(
+                f"[StorageEngine] IndexShare-aware indexer: "
+                f"num_full={len(self._indexer_config.full_layer_indices)}"
+                f"/{num_layers_per_pp_stage} layers (per pp stage). "
+                f"Buffers are still allocated per-layer; transfer callers "
+                f"may skip Shared layers using "
+                f"cache_config.indexer.is_full_layer(layer_id)."
+            )
+
         if self._cache_config.enable_cpu:
             self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,

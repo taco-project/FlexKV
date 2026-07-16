@@ -50,7 +50,12 @@ public:
                         const std::vector<int64_t> &gpu_device_ids,
                         bool enable_nvcomp = false,
                         int nvcomp_batch_size = 0,
-                        int nvcomp_data_type = 0);
+                        int nvcomp_data_type = 0,
+                        const std::vector<int64_t> &scale_block_ptrs_flat = {},
+                        int64_t scale_block_stride_in_bytes = 0,
+                        int fp4_num_heads = 0,
+                        int fp4_data_per_head = 0,
+                        int fp4_scale_per_head = 0);
 
   ~TPTransferThreadGroup();
 
@@ -105,6 +110,10 @@ private:
   // Simplified: just one vector of handlers, runtime backend type selection
   BackendType backend_type_;
   std::vector<GTensorHandler> gpu_tensor_handlers_;
+
+  // FP4 scale buffer pointers (pinned host copy, one per GPU)
+  void **scale_blocks_;
+  int tokens_per_block_;
 
   std::vector<std::thread> threads_;
   std::vector<cudaStream_t> streams_;

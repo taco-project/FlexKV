@@ -33,4 +33,13 @@ void transfer_kv_blocks(
     bool is_host_to_device, bool use_ce_transfer, bool is_mla,
     bool sync = true);
 
+// FP4 pack/unpack transfer (SGLang split data+scale buffers)
+void transfer_kv_blocks_fp4(
+    int num_blocks, int start_layer_id, int num_layers, int64_t *gpu_block_ids,
+    GTensorHandler data_handler, int64_t *cpu_block_ids, void *cpu_ptr,
+    int64_t cpu_kv_stride_in_bytes, int64_t cpu_layer_stride_in_bytes,
+    int64_t cpu_block_stride_in_bytes, int tokens_per_block,
+    cudaStream_t stream, int transfer_num_cta, bool is_host_to_device,
+    bool is_mla = false, bool sync = true);
+
 } // namespace flexkv

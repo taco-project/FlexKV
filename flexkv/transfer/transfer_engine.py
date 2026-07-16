@@ -98,7 +98,9 @@ class TransferEngine:
         indexer_gpu_handles: Optional[Dict[WorkerKey, List[StorageHandle]]] = None,
         indexer_cpu_handle: Optional[StorageHandle] = None,
         indexer_ssd_handle: Optional[StorageHandle] = None,
-        indexer_remote_handle: Optional[StorageHandle] = None):
+        indexer_remote_handle: Optional[StorageHandle] = None,
+        scale_gpu_blocks: Optional[Dict] = None,
+        scale_gpu_layouts: Optional[Dict] = None):
         """
         Initialize transfer engine
 
@@ -144,6 +146,8 @@ class TransferEngine:
         self._indexer_cpu_handle = indexer_cpu_handle
         self._indexer_ssd_handle = indexer_ssd_handle
         self._indexer_remote_handle = indexer_remote_handle
+        self._scale_gpu_blocks = scale_gpu_blocks
+        self._scale_gpu_layouts = scale_gpu_layouts
 
         self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 
@@ -152,6 +156,7 @@ class TransferEngine:
         self.num_gpu_groups = len(self.gpu_handle_groups)
         self._running = False
         self._has_indexer = False
+        self._is_fp4 = scale_gpu_blocks is not None and len(scale_gpu_blocks) > 0
 
         self._child_id_to_child: Dict[int, TransferOp] = {}
         self._child_to_parent_op_id: Dict[int, int] = {}
@@ -214,6 +219,10 @@ class TransferEngine:
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                         compressor=self._compressors["gpu_cpu_tp"],
+                        scale_blocks=(self._scale_gpu_blocks[worker_key]
+                                      if self._is_fp4 else None),
+                        scale_layout=(self._scale_gpu_layouts[worker_key]
+                                      if self._is_fp4 else None),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
@@ -257,6 +266,10 @@ class TransferEngine:
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                     compressor=self._compressors["gpu_cpu_tp"],
+                    scale_blocks=(self._scale_gpu_blocks[worker_key]
+                                  if self._is_fp4 else None),
+                    scale_layout=(self._scale_gpu_layouts[worker_key]
+                                  if self._is_fp4 else None),
                 )
                 for worker_key, gpu_handles in self.gpu_handle_groups.items()
             }
