@@ -144,7 +144,7 @@ def shutdown_tp_client(tp_client_processes):
     1,
     2,
 ])
-def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
+def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type, request):
     tp_size = model_config.tp_size
     dp_size = model_config.dp_size
 
@@ -182,12 +182,24 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
         cache_config=cache_config,
         dp_client_id=0,
     )
-    kvmanager.start()
 
     # Create pipes for each tp_client to send GPU blocks back
     mp_ctx = mp.get_context('spawn')
     pipe_connections = []
     tp_client_processes = []
+
+    def cleanup():
+        for conn in pipe_connections:
+            with contextlib.suppress(OSError):
+                conn.close()
+        shutdown_tp_client(tp_client_processes)
+        kvmanager.shutdown()
+
+    # pytest finalizers run even when an assertion or timeout interrupts the
+    # test, preventing a failed case from leaking CUDA workers/contexts into
+    # the next parametrized case (the ISSUE#4 full-file cascade).
+    request.addfinalizer(cleanup)
+    kvmanager.start()
 
     for tp_rank in range(tp_size):
         parent_conn, child_conn = mp_ctx.Pipe()
@@ -201,6 +213,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
         )
         tp_client_processes.append(tp_client_process)
         tp_client_process.start()
+        child_conn.close()
 
     # Collect GPU blocks from all tp_client processes
     print(f"[Main Process] Waiting to receive GPU blocks from {tp_size} TP client processes...")
@@ -208,15 +221,24 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
 
     for tp_rank, parent_conn in enumerate(pipe_connections):
         try:
+            if not parent_conn.poll(INDEXER_STARTUP_TIMEOUT_S):
+                process = tp_client_processes[tp_rank]
+                raise TimeoutError(
+                    f"TP client {tp_rank} registration timed out after "
+                    f"{INDEXER_STARTUP_TIMEOUT_S}s "
+                    f"(alive={process.is_alive()}, exitcode={process.exitcode})"
+                )
             shared_gpu_blocks = parent_conn.recv()
             if shared_gpu_blocks is not None:
                 all_gpu_blocks.append(shared_gpu_blocks)
                 print(f"[Main Process] Received GPU blocks from TP client {tp_rank}")
             else:
                 print(f"[Main Process] TP client {tp_rank} failed to create GPU blocks")
-            parent_conn.close()
         except Exception as e:
             print(f"[Main Process] Error receiving from TP client {tp_rank}: {e}")
+        finally:
+            with contextlib.suppress(OSError):
+                parent_conn.close()
 
     # Create GPUKVCacheVerifier with collected GPU blocks
     if all_gpu_blocks and len(all_gpu_blocks) == tp_size:
@@ -447,8 +469,8 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
         enable_remote and num_remote_blocks >= num_gpu_blocks or \
         enable_gds and num_ssd_blocks >= num_gpu_blocks:
         assert total_cache_miss == 0
-    shutdown_tp_client(tp_client_processes)
-    kvmanager.shutdown()
+    # tp_client + kvmanager shutdown is handled by the request finalizer above,
+    # so it runs even if the assertion or an earlier step fails.
 
     # Only verify data in direct mode
     # verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers, use_mla)
