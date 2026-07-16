@@ -431,6 +431,12 @@ class KVTaskManager:
                     completed_op.num_bytes,
                     operation,
                 )
+            if task.status == TaskStatus.CANCELLED and task.callback is None:
+                # Cache was reset while this task was in flight: reset_cache() cleared its callbacks and freed the radix nodes / mempool blocks
+                flexkv_logger.warning(
+                    f"task {task_id}: transfer op {completed_op.op_id} completed after reset_cache(), callback no longer exists and will be skipped."
+                )
+                continue
             if completed_op.is_graph_completed():
                 self._mark_completed(task_id)
             elif completed_op.op_id == task.task_end_op_id:
@@ -1111,6 +1117,22 @@ class KVTaskEngine(KVTaskManager):
                 f"resetting anyway. In-flight transfers may target blocks that are "
                 f"being freed — ensure reset is issued at a quiesced boundary."
             )
+
+        # Invalidate in-flight tasks' callbacks BEFORE dropping the cache. The
+        # callback / op_callback_dict partials close over the exact radix nodes
+        # and mempool blocks we are about to free; if a late transfer fired them
+        # after reset they would unlock/set_ready a deleted node, or recycle a
+        # block into the freshly-emptied mempool (which raises "already free").
+        # Clear them here so the dispatch in _update_tasks has nothing to fire.
+        # Note: reset_cache() runs on the same thread as the callback dispatch
+        # (_update_tasks), so no lock is needed. We keep the graph_to_task
+        # mapping so a late-completing op still resolves to its task and warns.
+        for task_id, task in list(self.tasks.items()):
+            if task.is_completed():
+                continue  # already-fired callbacks are harmless
+            task.callback = None
+            task.op_callback_dict = {}
+            task.status = TaskStatus.CANCELLED
 
         # Drop index (radix tree) + mempool on every tier. CRadixTreeIndex (C++)
         # and the pure-Python RadixTreeIndex both expose reset(); GlobalCacheEngine
