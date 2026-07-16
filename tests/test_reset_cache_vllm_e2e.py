@@ -29,9 +29,11 @@ torch = pytest.importorskip("torch")
 vllm = pytest.importorskip("vllm")
 pytest.importorskip("flexkv")
 
+from vllm import SamplingParams  # noqa: E402  (guarded by importorskip above)
+
 # Default matches the user's `vllm serve` command; override with FLEXKV_TEST_MODEL.
 MODEL = "/raid/model/Qwen3-8B"
-MAX_MODEL_LEN = "8192"
+MAX_MODEL_LEN = 8192
 
 # Prometheus counter names (vllm/v1/metrics/loggers.py).
 _EXT_HITS = "vllm:external_prefix_cache_hits"
@@ -66,8 +68,8 @@ def generate(llm, prompts, sp):
     """Generate the whole batch once; return per-run external-counter deltas.
 
     Returns (ext_hits, ext_queries) as counter deltas around the generate()
-    call. Sleeps afterwards so FlexKV's async put has time to land before the
-    next run reads it back.
+    call. Callers that need FlexKV's async put to land before the next read use
+    _reset_local_prefix_cache(), which polls instead of sleeping a fixed time.
     """
     eh0, eq0 = _counter(llm, _EXT_HITS), _counter(llm, _EXT_QUERIES)
     llm.generate(prompts, sp)
@@ -125,6 +127,7 @@ def llm(flexkv_config):
         gpu_memory_utilization=0.5,       # matches --gpu-memory-utilization
         enable_prefix_caching=True,       # matches --enable-prefix-caching (required)
         enable_chunked_prefill=True,      # matches --enable-chunked-prefill
+        enable_sleep_mode=True,           # verl frees GPU mem between rollouts (sleep/wake)
         disable_log_stats=False,          # required: get_metrics() asserts otherwise
         kv_transfer_config=KVTransferConfig(
             kv_connector="FlexKVConnectorV1",
@@ -153,8 +156,6 @@ PROMPTS = [f"[{turn}] {prompt * 800}" for turn, prompt in enumerate(_DATASET)]
 
 def test_reset_prefix_cache_reset_connector_succeeds(llm):
     """Smoke: the exact verl call returns without error (wire is connected)."""
-    from vllm import SamplingParams
-
     llm.generate(PROMPTS, SamplingParams(max_tokens=8, temperature=0))
     # time.sleep(5)  # drain FlexKV's async D2H put -> quiesced boundary before reset
     ok = _verl_clear(llm)
@@ -172,8 +173,6 @@ def test_flexkv_populates_before_asserting_reset(llm):
     and query FlexKV for the full prefix. If external hits stay 0 here, the
     connector isn't really working and the reset test below is meaningless.
     """
-    from vllm import SamplingParams
-
     sp = SamplingParams(max_tokens=8, temperature=0)
     generate(llm, PROMPTS, sp)                       # populate FlexKV (+ local)
     # Clear LOCAL only (keep FlexKV) so the next run can't be served from GPU.
@@ -191,8 +190,6 @@ def test_reset_invalidates_flexkv_hits(llm):
 
     Protocol: warm -> CLEAR -> run1 (expect ~0 ext hits) -> run2 (expect > run1).
     """
-    from vllm import SamplingParams
-
     sp = SamplingParams(max_tokens=8, temperature=0)
 
     def _rate(h, q):
@@ -234,4 +231,69 @@ def test_reset_invalidates_flexkv_hits(llm):
     assert eh2 > eh1, (
         f"external hits did not recover after refill (run1={eh1}, run2={eh2}); "
         f"FlexKV may not be working at all"
+    )
+
+
+def test_sleep_wake_drops_flexkv_but_stays_mounted(llm):
+    """Characterize FlexKV's behavior across vLLM sleep(level=1)/wake.
+
+    level=1 DISCARDS the KV cache -- this is not FlexKV-specific, it's how vLLM's
+    CuMem sleep works. Chain (paths in the sibling vllm checkout):
+      gpu_worker.sleep -> SleepModeBackend.suspend:
+          allocator.sleep(offload_tags=("weights",) if level == 1 else ())
+      CuMemAllocator.sleep: tags in offload_tags are copied to a CPU backup;
+          every other allocation is unmap_and_release'd WITHOUT backup, i.e.
+          "discarded directly" (see its docstring + log line).
+      The KV cache is allocated under tag="kv_cache" (gpu_worker
+          _maybe_get_memory_pool_context(tag="kv_cache")), which is NOT in
+          ("weights",) at level=1 -> the GPU KV cache is dropped on sleep.
+    The FlexKV connector also has no sleep/wake hook (vllm_v1_adapter.py), and
+    the GPU KV buffers it registered are among those unmapped, so post-wake
+    lookups miss. Net effect matches verl's post-weight-update clear.
+
+    Observable contract after sleep(level=1)/wake:
+      - connector stays MOUNTED and is still queried (queries > 0), but
+      - all prior content misses (hits == 0 on the first post-wake run), then
+      - a second post-wake run re-hits, proving clean re-population (not
+        permanently dead / no stale-pointer corruption).
+
+    If a future vLLM tags the KV cache for offload at level=1, or FlexKV adds a
+    sleep/wake hook that preserves its cache, flip the run1 hit assertion.
+
+    Protocol: warm -> sleep(level=1) -> wake_up -> run1 (expect 0 hits, but
+    queried) -> run2 (expect hits > 0, re-populated).
+    """
+    sp = SamplingParams(max_tokens=8, temperature=0)
+
+    # warm: populate FlexKV (+ local GPU cache).
+    generate(llm, PROMPTS, sp)
+    # Drain FlexKV's async D2H put before we free GPU blocks out from under it.
+    assert _reset_local_prefix_cache(llm), "local prefix cache reset failed"
+
+    # sleep: free GPU KV memory (level=1 keeps weights on GPU; verl's default).
+    llm.sleep(level=1)
+    llm.wake_up()
+
+    # run1: local GPU cache is cold after sleep -> full ext query. FlexKV's
+    # content was dropped by sleep/wake, so this misses (hits == 0) while still
+    # querying (queries > 0) -> connector is mounted, just empty.
+    eh1, eq1 = generate(llm, PROMPTS, sp)
+    assert eq1 > 0, (
+        f"connector not queried after wake (hits={eh1}/{eq1}); "
+        f"FlexKV unmounted by sleep/wake rather than just emptied"
+    )
+    assert eh1 == 0, (
+        f"unexpected external hits after sleep/wake (hits={eh1}/{eq1}); "
+        f"FlexKV now PRESERVES content across sleep -- update this test's "
+        f"expectation (see docstring)"
+    )
+
+    # run2: run1 re-populated FlexKV. Clear LOCAL only so run2 is forced to
+    # query FlexKV for the full prefix and can register hits -> proves the
+    # connector cleanly recovered (no stale-pointer corruption / permadeath).
+    assert _reset_local_prefix_cache(llm), "local prefix cache reset failed"
+    eh2, eq2 = generate(llm, PROMPTS, sp)
+    assert eh2 > 0, (
+        f"external hits did not recover after sleep/wake refill "
+        f"(run1={eh1}/{eq1}, run2={eh2}/{eq2}); FlexKV broken post-wake"
     )
