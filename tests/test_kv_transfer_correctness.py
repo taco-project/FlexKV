@@ -550,10 +550,10 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block,
         gpu_layout.get_chunk_size() * ES,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_tp,
-        4, use_ce, num_layers, 1, True, 0,
-        torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
-        torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
-        "sharded", notify_mode,
+        4, use_ce, num_layers, 1, True,
+        counter_id=0,
+        mla_d2h_mode="sharded",
+        notify_mode=notify_mode,
     )
     sync_all(num_gpus)
 
