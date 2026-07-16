@@ -120,11 +120,22 @@ class SWAReadSource:
     host_slot: int = -1
     node: Optional[object] = None
     device_type: Optional[DeviceType] = None
+    # Key-addressed REMOTE tier (mooncake-store): the tail hash of the hit
+    # block is the sole remote handle — no radix node / host slot exists on
+    # that tier, so pin / unlock / evict do not apply to the source.
+    mooncake_tail_hash: Optional[str] = None
+
+    @property
+    def is_mooncake(self) -> bool:
+        return self.mooncake_tail_hash is not None
 
     @property
     def found(self) -> bool:
-        return (self.hit_blocks > 0 and self.host_slot >= 0
-                and self.node is not None and self.device_type is not None)
+        if self.hit_blocks <= 0 or self.device_type is None:
+            return False
+        if self.is_mooncake:
+            return self.device_type == DeviceType.REMOTE
+        return self.host_slot >= 0 and self.node is not None
 
 
 class CacheEngineAccel:
@@ -874,7 +885,7 @@ class GlobalCacheEngine:
                             (block_start_idx + prefetch_blocks) * self.tokens_per_block] = True
         else:        
             return_mask[block_start_idx* self.tokens_per_block:
-                    (block_start_idx + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
+                    (block_start_idx + plan.num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 
         # if layer_num // layer_granularity != 1:
         #     transfer_graph, finished_ops_ids = convert_read_graph_to_layer_wise_graph(transfer_graph=transfer_graph,
@@ -1092,6 +1103,7 @@ class GlobalCacheEngine:
                 {DeviceType.CPU: cpu_matched_result,
                  DeviceType.SSD: ssd_matched_result,
                  DeviceType.REMOTE: remote_matched_result},
+                sequence_meta=sequence_meta,
             )
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
@@ -1342,6 +1354,7 @@ class GlobalCacheEngine:
                 block_mask_end,
                 {DeviceType.CPU: cpu_matched_result,
                  DeviceType.SSD: ssd_matched_result},
+                sequence_meta=sequence_meta,
             )
 
         # DEBUG: Log GET operation with hash info
@@ -1743,6 +1756,7 @@ class GlobalCacheEngine:
         cpu_swa_slot = -1
         ssd_swa_slot = -1
         remote_swa_slot = -1
+        mooncake_swa_tail_hash: Optional[str] = None
 
         # SWA slot alloc before Full insert (peer of mempool.take). A failed
         # alloc on a required tier aborts before any radix mutation.
@@ -1758,14 +1772,24 @@ class GlobalCacheEngine:
                     self.ssd_cache_engine, ssd_target)
 
             if put_to_remote:
-                # the remote parent node that need to be protected.
-                remote_target = remote_matched_result.last_node
-                remote_swa_slot = self._reserve_swa_slot(
-                    self.remote_cache_engine, remote_target)
+                if self.use_mooncake_store_backend:
+                    # Key-addressed store: no remote slot to reserve / mount.
+                    # The SWA snapshot is keyed by the tail hash of the full
+                    # written prefix (snapshot-at-prefix-L => SWA(hash[L-1])),
+                    # carried on the SWA H2REMOTE op.
+                    tail_idx = block_mask_start + len(gpu_block_ids) - 1
+                    mooncake_swa_tail_hash = str(
+                        sequence_meta.block_hashes[tail_idx])
+                else:
+                    # the remote parent node that need to be protected.
+                    remote_target = remote_matched_result.last_node
+                    remote_swa_slot = self._reserve_swa_slot(
+                        self.remote_cache_engine, remote_target)
 
             if ((cpu_swa_slot < 0)
                     or (put_to_ssd and ssd_swa_slot < 0)
-                    or (put_to_remote and remote_swa_slot < 0)):
+                    or (put_to_remote and remote_swa_slot < 0
+                        and mooncake_swa_tail_hash is None)):
                 return self._fail_put_before_insert(
                     request_id=request_id,
                     reason="swa_slot_alloc_failed",
@@ -1887,6 +1911,7 @@ class GlobalCacheEngine:
             cpu_node=cpu_node_to_unlock,
             ssd_node=ssd_node_to_unlock,
             remote_node=remote_node_to_unlock,
+            mooncake_swa_tail_hash=mooncake_swa_tail_hash,
         )
 
         skipped_gpu_blocks = len(cpu_matched_blocks)
@@ -2205,11 +2230,18 @@ class GlobalCacheEngine:
 
         return cpu_matched_result, ssd_matched_result
 
+    def _is_mooncake_swa_tier(self, device_type: DeviceType) -> bool:
+        """True for the key-addressed mooncake-store REMOTE tier: SWA hits are
+        keyed by the hit block's tail hash instead of a node-mounted slot."""
+        return (self.use_mooncake_store_backend
+                and device_type == DeviceType.REMOTE)
+
     def _select_swa_read_source(
         self,
         block_mask_start: int,
         block_mask_end: int,
         tier_match_results: Dict[DeviceType, object],
+        sequence_meta: Optional[SequenceMeta] = None,
     ) -> Tuple[int, SWAReadSource]:
         """Return the largest usable SWA-aware Full-KV end and its exact SWA source."""
         if not self.swa_cache.enabled or not tier_match_results:
@@ -2229,7 +2261,10 @@ class GlobalCacheEngine:
                 # request mask may stop earlier. A snapshot for a deeper trailing
                 # window cannot serve this request window; try another tier.
                 continue
-            assert match_result.last_swa_node is not None
+
+            # Common Remote case，the data is stored in the remote cache engine.
+            if not self._is_mooncake_swa_tier(device_type):
+                assert match_result.last_swa_node is not None
             candidates.append((swa_hit, device_type, match_result))
 
         for usable_end, device_type, match_result in sorted(
@@ -2240,6 +2275,21 @@ class GlobalCacheEngine:
             engine = self.cache_engines.get(device_type)
             if engine is None or not getattr(engine, "swa_enabled", False):
                 continue
+            
+            # Mooncake store case.
+            if self._is_mooncake_swa_tier(device_type):
+                # Key-addressed remote hit: the SWA snapshot lives under the
+                # tail hash of the hit prefix (block index usable_end - 1);
+                # carry it so the graph builder can key the SWA REMOTE2H op.
+                assert sequence_meta is not None, (
+                    "mooncake SWA source selection requires sequence_meta "
+                    "for the tail hash")
+                tail_hash = str(sequence_meta.block_hashes[usable_end - 1])
+                return usable_end, SWAReadSource(
+                    hit_blocks=usable_end,
+                    device_type=device_type,
+                    mooncake_tail_hash=tail_hash,
+                )
 
             source_node = match_result.last_swa_node
             source_slot = int(source_node.swa_host_slot)
@@ -2284,11 +2334,15 @@ class GlobalCacheEngine:
         """
         assert swa_read_source.found
         device_type = swa_read_source.device_type
-        source_engine = self.cache_engines[device_type]
         source_node = swa_read_source.node
         source_slot = swa_read_source.host_slot
-        # pin the source node (SSD、REMOTE or CPU)
-        source_engine._pin_swa_node(source_node)
+        is_mooncake_source = swa_read_source.is_mooncake
+        if not is_mooncake_source:
+            # pin the source node (SSD、REMOTE or CPU). The mooncake-store
+            # REMOTE tier is key-addressed: no node / slot to pin, the tail
+            # hash is the whole remote handle and the store manages its own
+            # eviction.
+            self.cache_engines[device_type]._pin_swa_node(source_node)
 
         swa_empty = np.array([], dtype=np.int64)
         staging_slot = -1
@@ -2307,11 +2361,17 @@ class GlobalCacheEngine:
                 flexkv_logger.warning(f"Failed to allocate CPU SWA slot for device {device_type}")
                 return
             cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
-            source_slots = np.array([source_slot], dtype=np.int64)
-            if device_type == DeviceType.SSD:
-                ssd_swa_slots = source_slots
+            if is_mooncake_source:
+                # Key-addressed store: the SWA REMOTE2H worker resolves the
+                # source from the tail hash and only uses dst (CPU) slot ids;
+                # the remote slot id is a shape-keeping placeholder.
+                remote_swa_slots = np.array([0], dtype=np.int64)
             else:
-                remote_swa_slots = source_slots
+                source_slots = np.array([source_slot], dtype=np.int64)
+                if device_type == DeviceType.SSD:
+                    ssd_swa_slots = source_slots
+                else:
+                    remote_swa_slots = source_slots
 
             # Try to promote onto the CPU fragment123 node.
             #
@@ -2345,6 +2405,9 @@ class GlobalCacheEngine:
             remote_slot_ids=remote_swa_slots,
             dp_client_id=dp_client_id,
             return_op_ids=True,
+            mooncake_tail_hashes=(
+                [swa_read_source.mooncake_tail_hash]
+                if is_mooncake_source else None),
         )
         swa_h2d_id = swa_ops.h2d_id
 
@@ -2366,8 +2429,9 @@ class GlobalCacheEngine:
             return
 
         finished_ops_ids.append(swa_h2d_id)
-        # Defer source Full+swa unlock to _transfer_callback.
-        if swa_source_pins is not None:
+        # Defer source Full+swa unlock to _transfer_callback. Mooncake sources
+        # took no pin (key-addressed, nothing to unlock).
+        if swa_source_pins is not None and not is_mooncake_source:
             swa_source_pins.append((device_type, source_node))
         # Destination flight lock is taken at transfer launch (after Full lock).
         if mount_success:
@@ -2417,12 +2481,18 @@ class GlobalCacheEngine:
                             remote_swa_slot: int,
                             cpu_node,
                             ssd_node,
-                            remote_node) -> Dict[DeviceType, "RadixNode"]:
+                            remote_node,
+                            mooncake_swa_tail_hash: Optional[str] = None
+                            ) -> Dict[DeviceType, "RadixNode"]:
         """Mount reserved PUT SWA slots, build the put chain, publish per tier.
 
         Op callbacks only ``publish_swa`` (set ``swa_ready``). Mounted nodes are
         returned for ``swa_lock`` at transfer launch and ``swa_unlock`` in
         ``_transfer_callback``, covering write-through after early publish.
+
+        ``mooncake_swa_tail_hash``: key-addressed REMOTE tier — build the SWA
+        ``H2REMOTE`` keyed by the tail hash with a placeholder remote slot id;
+        no remote mount / publish / unlock (the store owns that state).
         """
         swa_nodes_to_unlock: Dict[DeviceType, RadixNode] = {}
 
@@ -2448,10 +2518,24 @@ class GlobalCacheEngine:
             else:
                 remote_swa_slot = -1
 
-        if cpu_swa_slot < 0 and ssd_swa_slot < 0 and remote_swa_slot < 0:
+        # Mooncake H2REMOTE sources from the CPU SWA slot; without a mounted
+        # CPU slot there is nothing to write through.
+        put_remote_via_mooncake = (
+            mooncake_swa_tail_hash is not None and cpu_swa_slot >= 0)
+
+        if (cpu_swa_slot < 0 and ssd_swa_slot < 0 and remote_swa_slot < 0
+                and not put_remote_via_mooncake):
             return swa_nodes_to_unlock
 
         empty = np.array([], dtype=np.int64)
+        if remote_swa_slot >= 0:
+            remote_slot_ids = np.array([remote_swa_slot], dtype=np.int64)
+        elif put_remote_via_mooncake:
+            # Key-addressed store: the worker keys by the tail hash and only
+            # uses src (CPU) slot ids; the remote slot id is a placeholder.
+            remote_slot_ids = np.array([0], dtype=np.int64)
+        else:
+            remote_slot_ids = empty
         swa_ops = self.swa_cache.build_put_chain(
             transfer_graph,
             gpu_slot_ids=_SWA_GPU_PLACEHOLDER.copy(),
@@ -2459,10 +2543,11 @@ class GlobalCacheEngine:
                           if cpu_swa_slot >= 0 else empty),
             ssd_slot_ids=(np.array([ssd_swa_slot], dtype=np.int64)
                           if ssd_swa_slot >= 0 else empty),
-            remote_slot_ids=(np.array([remote_swa_slot], dtype=np.int64)
-                             if remote_swa_slot >= 0 else empty),
+            remote_slot_ids=remote_slot_ids,
             dp_client_id=dp_client_id,
             return_op_ids=True,
+            mooncake_tail_hashes=(
+                [mooncake_swa_tail_hash] if put_remote_via_mooncake else None),
         )
         if cpu_swa_slot >= 0:
             assert swa_ops.d2h_id is not None

@@ -153,7 +153,9 @@ class SWACacheManager:
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
                         dp_client_id: int = 0,
-                        mooncake_tail_hashes: Optional[List[str]] = None) -> Optional[int]:
+                        return_op_ids: bool = False,
+                        mooncake_tail_hashes: Optional[List[str]] = None
+                        ) -> Union[Optional[int], SWAGetChainOpIds]:
         """Build the GET-side SWA load chain into ``graph``.
 
         Returns the terminal SWA ``H2D`` op_id by default (for finished_ops /
@@ -165,6 +167,10 @@ class SWACacheManager:
         bytes are sourced from SSD / REMOTE. (CPU-resident SWA needs no staging
         op, like a CPU full-KV hit.) All ops carry ``is_swa=True``. Returns None
         when disabled / empty (or empty ``SWAGetChainOpIds`` with return_op_ids).
+
+        ``mooncake_tail_hashes``: mooncake-store REMOTE tier is key-addressed;
+        the tail hash of the hit block is the sole remote handle and is carried
+        on the SWA ``REMOTE2H`` op (one entry per CPU staging slot).
         """
         assert cpu_slot_ids.size > 0 and cpu_slot_ids.size == gpu_slot_ids.size, \
             "CPU and GPU SWA slot ids must have the same size"
@@ -210,7 +216,9 @@ class SWACacheManager:
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
                         dp_client_id: int = 0,
-                        return_op_ids: bool = False) -> Union[Optional[int], SWAPutChainOpIds]:
+                        return_op_ids: bool = False,
+                        mooncake_tail_hashes: Optional[List[str]] = None
+                        ) -> Union[Optional[int], SWAPutChainOpIds]:
         """Build the PUT-side SWA store chain into ``graph``; return the SWA
         ``D2H`` op_id (to be appended to the graph's finished_ops_ids).
 
@@ -219,6 +227,10 @@ class SWACacheManager:
         ops depend on the SWA ``D2H`` but are fire-and-forget (NOT reported),
         exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2REMOTE``. All ops
         carry ``is_swa=True``. Returns None when disabled / empty.
+
+        ``mooncake_tail_hashes``: for the key-addressed mooncake-store REMOTE
+        tier, the sequence tail hash keys the SWA snapshot and is carried on
+        the SWA ``H2REMOTE`` op (one entry per CPU slot).
         """
         assert gpu_slot_ids.size > 0 and gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
         d2h_id = self.build_swa_op(
