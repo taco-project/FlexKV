@@ -1,10 +1,14 @@
 import logging
 import os
+import signal
 import sys
 import time
 import inspect
 from functools import wraps
-from typing import Optional, Callable, Any
+from typing import Any, Callable, Dict, Optional, Union
+
+import numpy as np
+import torch
 
 
 FLEXKV_LOGGING_PREFIX = os.getenv("FLEXKV_LOGGING_PREFIX", "FLEXKV")
@@ -102,6 +106,95 @@ class FlexkvLogger:
             self._log(logging.CRITICAL, msg, args, kwargs)
 
 flexkv_logger = FlexkvLogger(os.getenv("FLEXKV_LOG_LEVEL", "INFO"))
+
+
+def format_process_exit(exitcode: Optional[int]) -> str:
+    if exitcode is None:
+        return "running"
+    if exitcode < 0:
+        sig = -exitcode
+        try:
+            sig_name = signal.Signals(sig).name
+        except ValueError:
+            sig_name = f"SIG{sig}"
+        return f"signal {sig} ({sig_name})"
+    return f"exit {exitcode}"
+
+
+def summarize_id_tensor(
+    name: str,
+    ids: Union[torch.Tensor, np.ndarray],
+) -> str:
+    if isinstance(ids, torch.Tensor):
+        arr = ids.detach().cpu().numpy()
+    else:
+        arr = np.asarray(ids)
+    if arr.size == 0:
+        return f"{name}: empty"
+    return (
+        f"{name}: count={arr.size}, min={int(arr.min())}, max={int(arr.max())}, "
+        f"dtype={arr.dtype}"
+    )
+
+
+def install_worker_crash_diagnostics(worker_class_name: str, worker_id: int) -> None:
+    """Best-effort crash breadcrumbs inside FlexKV transfer worker subprocesses."""
+    import faulthandler
+
+    flexkv_logger.info(
+        "[FlexKV-SEGV-DEBUG] install_worker_crash_diagnostics: "
+        f"class={worker_class_name}, worker_id={worker_id}, pid={os.getpid()}"
+    )
+    try:
+        faulthandler.enable(all_threads=True, file=sys.stderr)
+    except Exception as e:
+        flexkv_logger.warning(
+            f"[FlexKV-SEGV-DEBUG] faulthandler.enable failed pid={os.getpid()}: {e}"
+        )
+
+    def _fatal_signal_handler(signum: int, frame: Any) -> None:
+        try:
+            sig_name = signal.Signals(signum).name
+        except ValueError:
+            sig_name = f"SIG{signum}"
+        flexkv_logger.critical(
+            "[FlexKV-SEGV-DEBUG] worker fatal signal: "
+            f"class={worker_class_name}, worker_id={worker_id}, pid={os.getpid()}, "
+            f"signum={signum} ({sig_name})"
+        )
+        try:
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGSEGV, signal.SIGABRT, signal.SIGBUS, signal.SIGFPE):
+        try:
+            signal.signal(sig, _fatal_signal_handler)
+        except (OSError, ValueError, RuntimeError):
+            pass
+
+
+def summarize_block_ids_from_slots(
+    slot_mapping: Union[torch.Tensor, np.ndarray],
+    tokens_per_block: int,
+) -> Dict[str, int]:
+    if isinstance(slot_mapping, torch.Tensor):
+        slots = slot_mapping.detach().cpu().numpy()
+    else:
+        slots = np.asarray(slot_mapping)
+    if slots.size == 0 or tokens_per_block <= 0:
+        return {"slot_count": int(slots.size), "block_count": 0}
+    block_ids = slots[::tokens_per_block] // tokens_per_block
+    return {
+        "slot_count": int(slots.size),
+        "slot_min": int(slots.min()),
+        "slot_max": int(slots.max()),
+        "block_count": int(block_ids.size),
+        "block_min": int(block_ids.min()),
+        "block_max": int(block_ids.max()),
+    }
 
 
 def debug_timing(name: Optional[str] = None) -> Callable:
