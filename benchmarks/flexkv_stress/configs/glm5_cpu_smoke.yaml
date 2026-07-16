@@ -1,0 +1,71 @@
+model:
+  preset: glm5
+  # Four physical workers per DP: KV TP=2, duplicated across two q-split CP ranks.
+  tp_size: 4
+  dp_size: 1
+  cp_size: 2
+  gpu_blocks_per_rank: 16
+  tokens_per_block: 8
+  layer_groups:
+    - name: tiny_main
+      layers: [0, 1]
+      num_kv_heads: 1
+      head_size: 8
+      dtype: float32
+    - name: tiny_indexer
+      layers: [0, 1]
+      num_kv_heads: 1
+      head_size: 4
+      dtype: uint8
+
+cache:
+  num_cpu_blocks: 128
+
+features:
+  cpu_stub: true
+  layerwise: false
+  swa: false
+  ssd: false
+  concurrency: true
+  async_api_probe_interval_rounds: 1
+
+run:
+  mode: latency_hit
+  warmup_rounds: 1
+  rounds: 2
+  duration_seconds: 0
+  seed: 55
+
+bandwidth:
+  concurrency_levels: [1, 2]
+  min_duration_seconds: 0
+  min_operations: 1
+  window_seconds: 0
+  validation_interval_operations: 1
+
+conversation:
+  conversations_per_round: 2
+  turns_min: 2
+  turns_max: 2
+  system_prompt_blocks: 1
+  first_input_blocks: 1
+  added_input_blocks: 1
+  output_blocks: 1
+  read_after_put: true
+
+concurrency:
+  max_inflight_per_dp: 2
+  batch_size: 2
+  request_timeout_seconds: 10
+
+validation:
+  sample_rate: 1.0
+  min_samples_per_round: 1
+  sampled_layers_per_group: 1
+  sampled_blocks_per_request: 1
+  bytes_per_sample: 64
+  minimum_success_rate: 1.0
+
+output:
+  directory: ./benchmark_results/flexkv_stress/glm5_cpu_smoke
+  resource_interval_seconds: 0

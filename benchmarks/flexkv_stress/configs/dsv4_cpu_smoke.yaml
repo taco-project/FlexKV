@@ -1,0 +1,60 @@
+model:
+  preset: dsv4_pro
+  # SGLang composite TP=2 with CP=2 => KV TP=1 and two full-KV CP workers.
+  tp_size: 2
+  dp_size: 1
+  cp_size: 2
+  gpu_blocks_per_rank: 8
+
+cache:
+  num_cpu_blocks: 32
+  swa_num_slots: 4
+
+features:
+  cpu_stub: true
+  layerwise: false
+  swa: true
+  ssd: false
+  concurrency: true
+  async_api_probe_interval_rounds: 0
+
+run:
+  mode: latency_hit
+  warmup_rounds: 1
+  rounds: 2
+  duration_seconds: 0
+  seed: 44
+
+bandwidth:
+  concurrency_levels: [1, 2]
+  min_duration_seconds: 0
+  min_operations: 1
+  window_seconds: 0
+  validation_interval_operations: 1
+
+conversation:
+  conversations_per_round: 1
+  turns_min: 2
+  turns_max: 2
+  system_prompt_blocks: 1
+  first_input_blocks: 1
+  added_input_blocks: 1
+  output_blocks: 1
+  read_after_put: true
+
+concurrency:
+  max_inflight_per_dp: 2
+  batch_size: 1
+  request_timeout_seconds: 10
+
+validation:
+  sample_rate: 1.0
+  min_samples_per_round: 1
+  sampled_layers_per_group: 1
+  sampled_blocks_per_request: 1
+  bytes_per_sample: 64
+  minimum_success_rate: 1.0
+
+output:
+  directory: ./benchmark_results/flexkv_stress/dsv4_cpu_smoke
+  resource_interval_seconds: 0

@@ -1,0 +1,24 @@
+model:
+  preset: glm5_2
+  tp_size: 1
+  dp_size: 1
+  cp_size: 1
+  gpu_blocks_per_rank: 128
+cache:
+  cpu_cache_gb: 4
+  ssd_cache_gb: 16
+  ssd_cache_dir: [./flexkv_stress_ssd/glm5_2]
+features: {layerwise: true, swa: false, ssd: true, concurrency: true}
+run: {mode: latency_hit, warmup_rounds: 1, rounds: 1000, duration_seconds: 86400, stop_when: either, seed: 52}
+conversation:
+  conversations_per_round: 16
+  turns_min: 2
+  turns_max: 8
+  system_prompt_blocks: 8
+  first_input_blocks: [2, 8]
+  added_input_blocks: {mode: list, blocks: [2, 4, 1, 8]}
+  output_blocks: {mode: range, blocks: [1, 2]}
+  read_after_put: true
+concurrency: {max_inflight_per_dp: 16, batch_size: 4, request_timeout_seconds: 60}
+validation: {sample_rate: 0.001, min_samples_per_round: 1}
+output: {directory: ./benchmark_results/flexkv_stress/glm5_2}

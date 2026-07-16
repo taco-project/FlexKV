@@ -1,0 +1,60 @@
+model:
+  preset: glm5
+  tp_size: 2
+  dp_size: 2
+  cp_size: 1
+  gpu_blocks_per_rank: 64
+  tokens_per_block: 8
+  layer_groups:
+    - name: tiny_main
+      layers: [0, 1]
+      num_kv_heads: 1
+      head_size: 8
+      dtype: float32
+cache:
+  num_cpu_blocks: 512
+features:
+  cpu_stub: true
+  layerwise: false
+  swa: false
+  ssd: false
+  concurrency: true
+  async_api_probe_interval_rounds: 1
+run:
+  mode: latency_hit
+  warmup_rounds: 1
+  rounds: 5
+  duration_seconds: 0
+  stop_when: either
+  seed: 42
+  log_every_rounds: 1
+bandwidth:
+  concurrency_levels: [1, 2, 4]
+  min_duration_seconds: 0
+  min_operations: 1
+  window_seconds: 0
+  validation_interval_operations: 1
+conversation:
+  conversations_per_round: 6
+  turns_min: 3
+  turns_max: 3
+  system_prompt_blocks: 2
+  first_input_blocks: 1
+  added_input_blocks: 1
+  output_blocks: 1
+  shared_system_prompt: true
+  read_after_put: true
+concurrency:
+  max_inflight_per_dp: 4
+  batch_size: 2
+  request_timeout_seconds: 10
+validation:
+  sample_rate: 1.0
+  min_samples_per_round: 1
+  sampled_layers_per_group: 2
+  sampled_blocks_per_request: 2
+  bytes_per_sample: 256
+  hit_tolerance_blocks: 0
+  minimum_success_rate: 1.0
+output:
+  directory: ./benchmark_results/flexkv_stress/cpu_stub
