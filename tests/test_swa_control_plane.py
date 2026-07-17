@@ -33,7 +33,11 @@ import torch
 
 pytest.importorskip("flexkv.c_ext")
 
-from flexkv.cache.cache_engine import CacheEngineAccel, GlobalCacheEngine
+from flexkv.cache.cache_engine import (
+    CPUONLY_CACHE_STRATEGY,
+    CacheEngineAccel,
+    GlobalCacheEngine,
+)
 from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
@@ -148,6 +152,41 @@ def _seed_swa_hit(eng, tok):
     sm = np.arange(tok.shape[0], dtype=np.int64)
     _g, _rm, cb, op_cb, _e = eng.put(1, tok, mask, sm, dp_client_id=0)
     _complete(op_cb, cb)
+
+
+def _seed_long_ssd_short_cpu_hit(eng, tok):
+    """Seed a 4-block SSD hit and a 2-block CPU hit, both with SWA."""
+    mask = np.ones_like(tok, dtype=np.int64)
+    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
+    _g, _rm, cb, op_cb, _e = eng.put(
+        1, tok, mask.copy(), slot_mapping, dp_client_id=0)
+    _complete(op_cb, cb)
+
+    # Keep the SSD copy, but rebuild CPU with only the shorter prefix. This
+    # makes the CPU SWA node a leaf: evicting its SWA without protecting the
+    # node also recycles the Full-KV blocks that a concurrent GET may reference.
+    eng.cpu_cache_engine.reset()
+    prefix = tok[:2 * TPB]
+    prefix_mask = np.ones_like(prefix, dtype=np.int64)
+    prefix_mapping = np.arange(prefix.shape[0], dtype=np.int64)
+    _g2, _rm2, cb2, op_cb2, _e2 = eng.put(
+        2,
+        prefix,
+        prefix_mask,
+        prefix_mapping,
+        dp_client_id=0,
+        temp_cache_strategy=CPUONLY_CACHE_STRATEGY,
+    )
+    _complete(op_cb2, cb2)
+
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
+    cpu_match = eng.cpu_cache_engine.match(seq)
+    ssd_match = eng.ssd_cache_engine.match(seq)
+    assert cpu_match.num_ready_matched_blocks == 2
+    assert cpu_match.swa_hit_blocks == 2
+    assert ssd_match.num_ready_matched_blocks == 4
+    assert ssd_match.swa_hit_blocks == 4
+    return cpu_match, ssd_match
 
 
 # =========================================================================== #
@@ -540,6 +579,91 @@ def test_get_ssd_staging_when_only_ssd_has_swa():
     swa_disk2h = [o for o in swa if o.transfer_type == TransferType.DISK2H][0]
     assert swa_disk2h.op_id in swa_h2d.predecessors, "H2D must depend on SSD DISK2H"
     _complete(gop, gcb)
+
+
+def test_get_ssd_staging_failure_does_not_report_fullkv_hit(monkeypatch):
+    """An SWA-aware GET must fail closed when no SWA restore can be staged."""
+    eng = GlobalCacheEngine(_cache_config_ssd(), _model_config())
+    tok = _tokens(4, base=42)
+    cpu_match, ssd_match = _seed_long_ssd_short_cpu_hit(eng, tok)
+    cpu_blocks = cpu_match.physical_blocks[:2].copy()
+    ssd_swa_node = ssd_match.last_swa_node
+
+    monkeypatch.setattr(
+        eng.cpu_cache_engine,
+        "_alloc_swa_slot",
+        lambda protected_node=None: -1,
+    )
+    mask = np.ones_like(tok, dtype=np.int64)
+    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
+    graph, return_mask, cb, op_cb, end_id = eng.get(
+        request_id=3,
+        token_ids=tok,
+        token_mask=mask,
+        slot_mapping=slot_mapping,
+        dp_client_id=0,
+        swa_aware=True,
+    )
+
+    assert end_id == -1
+    assert not return_mask.any()
+    assert graph.num_ops == 0
+    assert op_cb == {}
+    assert ssd_swa_node.swa_lock_ref == 0, "failed source pin leaked"
+    cpu_after = eng.cpu_cache_engine.match(
+        SequenceMeta(token_ids=tok, tokens_per_block=TPB))
+    assert cpu_after.num_ready_matched_blocks == 2
+    assert cpu_after.swa_hit_blocks == 2
+    assert np.array_equal(cpu_after.physical_blocks[:2], cpu_blocks)
+    cb()
+
+
+def test_get_ssd_staging_protects_referenced_cpu_fullkv(monkeypatch):
+    """SWA staging pressure must not recycle CPU Full-KV used by this GET."""
+    cc = _cache_config_ssd()
+    cc.swa.num_slots = 1
+    eng = GlobalCacheEngine(cc, _model_config())
+    tok = _tokens(4, base=44)
+    cpu_match, _ssd_match = _seed_long_ssd_short_cpu_hit(eng, tok)
+    cpu_blocks = cpu_match.physical_blocks[:2].copy()
+
+    seen_protected_nodes = []
+    original_alloc = eng.cpu_cache_engine._alloc_swa_slot
+
+    def recording_alloc(protected_node=None):
+        seen_protected_nodes.append(protected_node)
+        return original_alloc(protected_node=protected_node)
+
+    monkeypatch.setattr(
+        eng.cpu_cache_engine, "_alloc_swa_slot", recording_alloc)
+    mask = np.ones_like(tok, dtype=np.int64)
+    slot_mapping = np.arange(tok.shape[0], dtype=np.int64)
+    graph, return_mask, cb, op_cb, _end_id = eng.get(
+        request_id=3,
+        token_ids=tok,
+        token_mask=mask,
+        slot_mapping=slot_mapping,
+        dp_client_id=0,
+        swa_aware=True,
+    )
+
+    assert return_mask.all()
+    assert len(seen_protected_nodes) == 1
+    assert seen_protected_nodes[0] is not None
+    assert seen_protected_nodes[0].size() == 2
+    swa_kinds = {op.transfer_type for op in _swa_ops(graph)}
+    assert swa_kinds == {TransferType.DISK2H, TransferType.H2D}
+    full_h2d = next(
+        op for op in _full_ops(graph) if op.transfer_type == TransferType.H2D)
+    assert np.array_equal(full_h2d.src_block_ids[:2], cpu_blocks)
+
+    # The staging allocation evicted the CPU leaf's SWA, but the protected leaf
+    # and its Full-KV blocks must still exist until the GET finishes.
+    cpu_during_get = eng.cpu_cache_engine.match(
+        SequenceMeta(token_ids=tok, tokens_per_block=TPB))
+    assert cpu_during_get.num_ready_matched_blocks == 2
+    assert np.array_equal(cpu_during_get.physical_blocks[:2], cpu_blocks)
+    _complete(op_cb, cb)
 
 
 def test_swa_aware_get_uses_exact_source_for_final_usable_end():

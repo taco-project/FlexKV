@@ -105,6 +105,14 @@ class SWAReadSource:
         return self.hit_blocks > 0 and self.host_slot >= 0 and self.node is not None
 
 
+@dataclass(frozen=True)
+class SWAReadReservation:
+    """Pinned SWA source plus any transient CPU staging slot and graph op."""
+    source: SWAReadSource
+    staging_slot: int
+    h2d_id: int
+
+
 class CacheEngineAccel:
     def __init__(self,
                  device_type: DeviceType,
@@ -971,7 +979,8 @@ class GlobalCacheEngine:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
         else:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
-        swa_read_source = SWAReadSource()
+        transfer_graph = TransferOpGraph()
+        swa_reservation: Optional[SWAReadReservation] = None
         if swa_aware:
             block_mask_end, swa_read_source = self._select_swa_read_source(
                 block_mask_start,
@@ -980,6 +989,19 @@ class GlobalCacheEngine:
                  DeviceType.SSD: ssd_matched_result,
                  DeviceType.REMOTE: remote_matched_result},
             )
+            protected_cpu_node = (
+                cpu_matched_result.last_ready_node
+                if cpu_matched_result.num_ready_matched_blocks > block_mask_start
+                else None
+            )
+            if enable_gpu:
+                swa_reservation = self._reserve_swa_read_source(
+                    transfer_graph, swa_read_source, protected_cpu_node, dp_client_id)
+            if swa_read_source.found and swa_reservation is None:
+                block_mask_end = block_mask_start
+            if (enable_gpu and swa_read_source.found and swa_reservation is None
+                    and self._metrics_collector is not None):
+                self._metrics_collector.record_allocation_failure("global")
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
@@ -993,6 +1015,7 @@ class GlobalCacheEngine:
         fragment123_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks), len(remote_matched_blocks))
         #early return if no blocks to transfer
         if fragment123_num_blocks == 0:
+            self._release_swa_read_reservation(swa_reservation)
             # All cache levels missed - record miss for all requested blocks
             if self._metrics_collector is not None:
                 total_query_blocks = block_mask_end - block_mask_start
@@ -1001,7 +1024,6 @@ class GlobalCacheEngine:
             return self._empty_get_return(request_id)
         assert fragment123_num_blocks <= len(gpu_block_ids)
 
-        transfer_graph = TransferOpGraph()
         finished_ops_ids = []
 
         fragment1_num_blocks = len(cpu_matched_blocks)
@@ -1024,13 +1046,20 @@ class GlobalCacheEngine:
 
         if fragment23_num_blocks > 0:
             num_extra_required_blocks = fragment23_num_blocks
-            fragment23_cpu_blocks = self.cpu_cache_engine.take(
-                num_required_blocks=num_extra_required_blocks,
-                protected_node=cpu_matched_result.last_node,
-                strict=True
-            )
+            try:
+                fragment23_cpu_blocks = self.cpu_cache_engine.take(
+                    num_required_blocks=num_extra_required_blocks,
+                    protected_node=cpu_matched_result.last_node,
+                    strict=True
+                )
+            except RuntimeError:
+                self._release_swa_read_reservation(swa_reservation)
+                if self._metrics_collector is not None:
+                    self._metrics_collector.record_allocation_failure("global")
+                return self._empty_get_return(request_id)
             if len(fragment23_cpu_blocks) < num_extra_required_blocks:
                 self.cpu_cache_engine.recycle(fragment23_cpu_blocks)
+                self._release_swa_read_reservation(swa_reservation)
                 # Record allocation failure (resource unavailable, not cache miss)
                 if self._metrics_collector is not None:
                     self._metrics_collector.record_allocation_failure("global")
@@ -1146,56 +1175,15 @@ class GlobalCacheEngine:
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
         num_gpu_blocks_to_transfer = len(fragment123_gpu_blocks) if enable_gpu else 0
         op_callback_dict = {}
-        if (self.swa_op_constructor.enabled and num_gpu_blocks_to_transfer > 0
-                and swa_read_source.found):
-            swa_empty = np.array([], dtype=np.int64)
-            device_type = swa_read_source.device_type
-            source_engine = swa_read_source.engine
-            source_slot = swa_read_source.host_slot
-            source_node = swa_read_source.node
-            source_engine._pin_swa_node(source_node)
-            staging_slot = -1
-            cpu_swa_slots = np.array([source_slot], dtype=np.int64)
-            ssd_swa_slots = swa_empty
-            remote_swa_slots = swa_empty
-            if device_type != DeviceType.CPU:
-                staging_slot = self.cpu_cache_engine._alloc_swa_slot()
-                if staging_slot < 0:
-                    self._swa_release_load_lock(
-                        node=source_node, engine=source_engine)
-                    swa_h2d_id = None
-                else:
-                    cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
-                    source_slots = np.array([source_slot], dtype=np.int64)
-                    if device_type == DeviceType.SSD:
-                        ssd_swa_slots = source_slots
-                    else:
-                        remote_swa_slots = source_slots
-            else:
-                swa_h2d_id = None
-
-            if staging_slot >= 0 or device_type == DeviceType.CPU:
-                swa_h2d_id = self.swa_op_constructor.build_get_chain(
-                    transfer_graph,
-                    gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
-                    cpu_slot_ids=cpu_swa_slots,
-                    ssd_slot_ids=ssd_swa_slots,
-                    remote_slot_ids=remote_swa_slots,
-                    dp_client_id=dp_client_id,
-                )
-                if swa_h2d_id is None:
-                    self._swa_release_load_lock(
-                        node=source_node,
-                        staging_slot=staging_slot,
-                        engine=source_engine)
-                else:
-                    finished_ops_ids.append(swa_h2d_id)
-                    op_callback_dict[swa_h2d_id] = partial(
-                        self._swa_release_load_lock,
-                        node=source_node,
-                        staging_slot=staging_slot,
-                        engine=source_engine,
-                    )
+        if swa_reservation is not None:
+            assert num_gpu_blocks_to_transfer > 0
+            finished_ops_ids.append(swa_reservation.h2d_id)
+            op_callback_dict[swa_reservation.h2d_id] = partial(
+                self._swa_release_load_lock,
+                node=swa_reservation.source.node,
+                staging_slot=swa_reservation.staging_slot,
+                engine=swa_reservation.source.engine,
+            )
 
         return GetTransferPlan(
             transfer_graph=transfer_graph,
@@ -1239,15 +1227,28 @@ class GlobalCacheEngine:
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
 
-        swa_read_source = SWAReadSource()
+        transfer_graph = TransferOpGraph()
+        swa_reservation: Optional[SWAReadReservation] = None
         if swa_aware:
-            # find the longest swa read source
             block_mask_end, swa_read_source = self._select_swa_read_source(
                 block_mask_start,
                 block_mask_end,
                 {DeviceType.CPU: cpu_matched_result,
                  DeviceType.SSD: ssd_matched_result},
             )
+            protected_cpu_node = (
+                cpu_matched_result.last_ready_node
+                if cpu_matched_result.num_ready_matched_blocks > block_mask_start
+                else None
+            )
+            if enable_gpu:
+                swa_reservation = self._reserve_swa_read_source(
+                    transfer_graph, swa_read_source, protected_cpu_node, dp_client_id)
+            if swa_read_source.found and swa_reservation is None:
+                block_mask_end = block_mask_start
+            if (enable_gpu and swa_read_source.found and swa_reservation is None
+                    and self._metrics_collector is not None):
+                self._metrics_collector.record_allocation_failure("local")
 
         # DEBUG: Log GET operation with hash info
         #if len(sequence_meta.block_hashes) > 0:
@@ -1270,6 +1271,7 @@ class GlobalCacheEngine:
         fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
         #early return if no blocks to transfer
         if fragment12_num_blocks == 0:
+            self._release_swa_read_reservation(swa_reservation)
             # All cache levels missed - record miss for all requested blocks
             if self._metrics_collector is not None:
                 total_query_blocks = block_mask_end - block_mask_start
@@ -1279,7 +1281,6 @@ class GlobalCacheEngine:
             return self._empty_get_return(request_id)
         assert fragment12_num_blocks <= len(gpu_block_ids)
 
-        transfer_graph = TransferOpGraph()
         finished_ops_ids = []
         op_node_to_ready = {}
 
@@ -1313,6 +1314,7 @@ class GlobalCacheEngine:
         # there might be a better way to handle this
         if len(allocated_cpu_blocks) < allocated_cpu_block_num:
             self.cpu_cache_engine.recycle(allocated_cpu_blocks)
+            self._release_swa_read_reservation(swa_reservation)
             # Record allocation failure (resource unavailable, not cache miss)
             if self._metrics_collector is not None:
                 self._metrics_collector.record_allocation_failure("local")
@@ -1432,53 +1434,15 @@ class GlobalCacheEngine:
         num_gpu_blocks_to_transfer = len(fragment12_gpu_blocks) if enable_gpu else 0
         op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
 
-        if (self.swa_op_constructor.enabled and num_gpu_blocks_to_transfer > 0
-                and swa_read_source.found):
-            swa_empty = np.array([], dtype=np.int64)
-            device_type = swa_read_source.device_type
-            source_engine = swa_read_source.engine
-            source_slot = swa_read_source.host_slot
-            source_node = swa_read_source.node
-            source_engine._pin_swa_node(source_node)
-            staging_slot = -1
-            cpu_swa_slots = np.array([source_slot], dtype=np.int64)
-            ssd_swa_slots = swa_empty
-
-            # if device is SSD, we need to allocate a cpu slot for SWA
-            if device_type == DeviceType.SSD:
-                staging_slot = self.cpu_cache_engine._alloc_swa_slot()
-                if staging_slot < 0:
-                    self._swa_release_load_lock(
-                        node=source_node, engine=source_engine)
-                    swa_h2d_id = None
-                else:
-                    cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
-                    ssd_swa_slots = np.array([source_slot], dtype=np.int64)
-            else:
-                swa_h2d_id = None
-
-            if staging_slot >= 0 or device_type == DeviceType.CPU:
-                swa_h2d_id = self.swa_op_constructor.build_get_chain(
-                    transfer_graph,
-                    gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
-                    cpu_slot_ids=cpu_swa_slots,
-                    ssd_slot_ids=ssd_swa_slots,
-                    remote_slot_ids=swa_empty,
-                    dp_client_id=dp_client_id,
-                )
-                if swa_h2d_id is None:
-                    self._swa_release_load_lock(
-                        node=source_node,
-                        staging_slot=staging_slot,
-                        engine=source_engine)
-                else:
-                    finished_ops_ids.append(swa_h2d_id)
-                    op_callback_dict[swa_h2d_id] = partial(
-                        self._swa_release_load_lock,
-                        node=source_node,
-                        staging_slot=staging_slot,
-                        engine=source_engine,
-                    )
+        if swa_reservation is not None:
+            assert num_gpu_blocks_to_transfer > 0
+            finished_ops_ids.append(swa_reservation.h2d_id)
+            op_callback_dict[swa_reservation.h2d_id] = partial(
+                self._swa_release_load_lock,
+                node=swa_reservation.source.node,
+                staging_slot=swa_reservation.staging_slot,
+                engine=swa_reservation.source.engine,
+            )
         nvtx.end_range(nvtx_range)
         return GetTransferPlan(
             transfer_graph=transfer_graph,
@@ -2166,7 +2130,7 @@ class GlobalCacheEngine:
             source_slot = int(source_node.swa_host_slot)
             assert source_slot >= 0
 
-            source = SWAReadSource(
+            return usable_end, SWAReadSource(
                 hit_blocks=usable_end,
                 host_slot=source_slot,
                 node=source_node,
@@ -2174,9 +2138,81 @@ class GlobalCacheEngine:
                 engine=engine,
             )
 
-            return usable_end, source
-
         return block_mask_start, SWAReadSource()
+
+    def _reserve_swa_read_source(
+        self,
+        graph: TransferOpGraph,
+        source: SWAReadSource,
+        protected_cpu_node,
+        dp_client_id: int,
+    ) -> Optional[SWAReadReservation]:
+        """Pin a source and build its SWA load chain before committing a Full hit.
+
+        Non-CPU sources need a transient CPU SWA staging slot. Allocation may
+        evict through the CPU radix, so protect the CPU Full-KV node referenced by
+        this GET. Returning ``None`` means the caller must report no cache hit;
+        Full-only restore is invalid for an SWA-aware GET.
+        """
+        assert self.cpu_cache_engine is not None
+        if not source.found:
+            return None
+
+        source.engine._pin_swa_node(source.node)
+        staging_slot = -1
+        cpu_swa_slots = np.array([source.host_slot], dtype=np.int64)
+        ssd_swa_slots = np.array([], dtype=np.int64)
+        remote_swa_slots = np.array([], dtype=np.int64)
+
+        if source.device_type != DeviceType.CPU:
+            staging_slot = self.cpu_cache_engine._alloc_swa_slot(
+                protected_node=protected_cpu_node)
+            if staging_slot < 0:
+                self._swa_release_load_lock(
+                    node=source.node, engine=source.engine)
+                flexkv_logger.warning(
+                    "[FlexKV-SWA] GET staging allocation failed; "
+                    f"source={source.device_type}, hit_blocks={source.hit_blocks}"
+                )
+                return None
+            cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
+            source_slots = np.array([source.host_slot], dtype=np.int64)
+            if source.device_type == DeviceType.SSD:
+                ssd_swa_slots = source_slots
+            else:
+                remote_swa_slots = source_slots
+
+        h2d_id = self.swa_op_constructor.build_get_chain(
+            graph,
+            gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+            cpu_slot_ids=cpu_swa_slots,
+            ssd_slot_ids=ssd_swa_slots,
+            remote_slot_ids=remote_swa_slots,
+            dp_client_id=dp_client_id,
+        )
+        if h2d_id is None:
+            self._swa_release_load_lock(
+                node=source.node,
+                staging_slot=staging_slot,
+                engine=source.engine,
+            )
+            return None
+
+        return SWAReadReservation(
+            source=source,
+            staging_slot=staging_slot,
+            h2d_id=h2d_id,
+        )
+
+    def _release_swa_read_reservation(
+        self, reservation: Optional[SWAReadReservation]) -> None:
+        if reservation is None:
+            return
+        self._swa_release_load_lock(
+            node=reservation.source.node,
+            staging_slot=reservation.staging_slot,
+            engine=reservation.source.engine,
+        )
 
     # The GPU-side SWA slot is a size-1 placeholder here (window == one page ==
     # one slot on DSv4). It is rebound late from the request's swa_slot_mapping
