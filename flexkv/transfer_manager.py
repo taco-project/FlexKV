@@ -190,6 +190,8 @@ class TransferManager:
                         indexer_gpu_handles[worker_key] = []
                     indexer_gpu_handles[worker_key].append(
                         self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_indexer=True))
+            if len(indexer_gpu_handles) == 0:
+                indexer_gpu_handles = None
         indexer_cpu_handle = (
             self.storage_engine.get_storage_handle(DeviceType.CPU, is_indexer=True)
             if self.storage_engine.has_storage_handle(DeviceType.CPU, is_indexer=True)

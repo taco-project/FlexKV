@@ -356,6 +356,10 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
+        self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
+        self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
+        self.ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
+
         self._compressor = compressor or NullCompressionStrategy()
         self._compressor.attach(self)
 
@@ -409,6 +413,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             use_ce_transfer,
             self.is_mla,
             self.gpu_block_type_,
+            True,  # sync
+            self.ce_path_opt,
+            self.ce_segment_threshold,
+            -1,  # ce_force_path
+            self.ce_enable_memcpy2d,
+            False,  # is_blockfirst (single-GPU, not applicable)
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -525,6 +535,11 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.gpu_layer_strides_in_bytes,
             self.gpu_chunk_sizes_in_bytes,
             gpu_device_ids,
+            ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
+            ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
+            ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+            is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
+            is_mla=self.is_mla,
         )
 
         self._compressor = compressor or NullCompressionStrategy()

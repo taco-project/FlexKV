@@ -437,6 +437,10 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_num_cta_h2d=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_H2D', 4)),
     transfer_num_cta_d2h=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_D2H', 4)),
 
+    transfer_segment_threshold=int(os.getenv('FLEXKV_TRANSFER_SEGMENT_THRESHOLD', 8)),
+    transfer_path_opt=bool(int(os.getenv('FLEXKV_TRANSFER_PATH_OPT', 1))),
+    enable_ce_memcpy2d=bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', 1))),
+
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),
 
@@ -466,13 +470,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     nvcomp_batch_size=int(os.getenv('FLEXKV_NVCOMP_BATCH_SIZE', '0')),  # 0 = auto
 
-    # MLA D2H transfer mode (only effective when kv_heads=1)
-    # Available modes: "sharded" (default), "all_write", "rank0_only"
     mla_d2h_mode=os.getenv('FLEXKV_MLA_D2H_MODE', 'sharded'),
 
-    # Layerwise notification mode
-    # "hostfunc" (default): notify via cudaLaunchHostFunc callback
-    # "polling": notify via cudaEventRecord + polling thread
     layerwise_notify_mode=os.getenv('FLEXKV_LAYERWISE_NOTIFY_MODE', 'hostfunc'),
 )
 

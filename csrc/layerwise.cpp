@@ -129,7 +129,9 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     torch::Tensor indexer_gpu_block_strides_tensor,
     torch::Tensor indexer_gpu_layer_strides_tensor,
     torch::Tensor indexer_gpu_chunk_sizes_tensor,
-    std::map<int, std::vector<std::string>> indexer_ssd_files) {
+    std::map<int, std::vector<std::string>> indexer_ssd_files,
+    CETransferConfig ce_config)
+    : ce_config_(ce_config) {
 
   num_gpus_ = num_gpus;
   num_layers_ = num_layers;
@@ -216,12 +218,16 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
   // Get highest priority (lowest value)
   int leastPriority, greatestPriority;
   cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority);
-  
+
+  // Save/restore device: a leaked current-device causes cross-case segfaults.
+  int prev_device_ctor = 0;
+  cudaGetDevice(&prev_device_ctor);
   for (int i = 0; i < num_gpus_; i++) {
     cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamCreateWithPriority(&streams_[i], cudaStreamNonBlocking, greatestPriority);
     cudaEventCreate(&events_[i]);
   }
+  cudaSetDevice(prev_device_ctor);
 
   // Initialize SSD IO context if ssd_files is not empty
   enable_ssd_ = !ssd_files.empty();
@@ -309,13 +315,30 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
     if (poll_thread_.joinable()) {
       poll_thread_.join();
     }
+    // Sync streams: async polling path returns without sync.
+    for (int i = 0; i < num_gpus_; ++i) {
+      cudaSetDevice(gpu_device_ids_[i]);
+      cudaStreamSynchronize(streams_[i]);
+    }
+    // Destroy poll batch events (deferred from layerwise_transfer)
+    for (int b = 0; b < (int)poll_batches_.size(); ++b) {
+      for (int g = 0; g < num_gpus_; ++g) {
+        cudaSetDevice(gpu_device_ids_[g]);
+        cudaEventDestroy(poll_batches_[b].per_gpu_events[g]);
+      }
+    }
   }
 
+  // Save/restore device: a leaked current-device makes the device-keyed
+  // ping-pong event cache in ce_transfer.cu hit the wrong GPU → segfault.
+  int prev_device = 0;
+  cudaGetDevice(&prev_device);
   for (int i = 0; i < num_gpus_; i++) {
     cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamDestroy(streams_[i]);
     cudaEventDestroy(events_[i]);
   }
+  cudaSetDevice(prev_device);
 
   cudaFreeHost(gpu_blocks_);
 
@@ -572,7 +595,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
     
     // Validate mla_d2h_mode once before the per-GPU loop
     std::string mode = mla_d2h_mode;
-    if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only") {
+    if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
+        && mode != "layer_parallel" && mode != "rank_rotate") {
       fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'sharded'\n",
               mode.c_str());
       mode = "sharded";
@@ -586,17 +610,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
 
       // Handle MLA D2H mode for H2D transfer (inlined logic)
       if (is_mla) {
-        if (mode == "sharded") {
-          cpu_startoff_inside_chunks = 0;
-          gpu_startoff_inside_chunks = 0;
-        } else if (mode == "all_write") {
-          // Each rank's complete KV occupies num_blocks blocks on CPU.
-          // Use cpu_block_stride (not gpu_chunk_size) because BLOCKFIRST's
-          // block_stride includes all layers+kv_dims, while LAYERFIRST's
-          // block_stride == chunk_size (same result).
+        if (mode == "all_write") {
           cpu_startoff_inside_chunks = i * num_blocks * cpu_block_stride_in_bytes;
           gpu_startoff_inside_chunks = 0;
-        } else if (mode == "rank0_only") {
+        } else {
           cpu_startoff_inside_chunks = 0;
           gpu_startoff_inside_chunks = 0;
         }
@@ -609,7 +626,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
             cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
+            streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
+            use_ce_transfer, is_mla,
+            /*gpu_block_stride_in_bytes=*/0,  // 0 = GPU stride == chunk_size (GPU physically contiguous)
+            /*sync=*/false, ce_config_);
         break;
       case BackendType::TRTLLM:
         flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
@@ -617,7 +637,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
             cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
+            streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
+            use_ce_transfer, is_mla,
+            /*gpu_block_stride_in_bytes=*/0,  // 0 = GPU stride == chunk_size (GPU physically contiguous)
+            /*sync=*/false, ce_config_);
         break;
       case BackendType::SGLANG:
         flexkv::transfer_kv_blocks<BackendType::SGLANG>(
@@ -625,7 +648,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
             cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
+            streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
+            use_ce_transfer, is_mla,
+            /*gpu_block_stride_in_bytes=*/0,  // 0 = GPU stride == chunk_size (GPU physically contiguous)
+            /*sync=*/false, ce_config_);
         break;
       }
 
@@ -652,7 +678,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
               indexer_cpu_block_stride_in_bytes,
               idx_cpu_startoff, idx_chunk_size,
               streams_[i], transfer_cta_num, true /* h2d */,
-              use_ce_transfer, true /* is_mla */, false /* sync */);
+              use_ce_transfer, true /* is_mla */, 0, false /* sync */, ce_config_);
           break;
         case BackendType::TRTLLM:
           flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
@@ -665,7 +691,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
               indexer_cpu_block_stride_in_bytes,
               idx_cpu_startoff, idx_chunk_size,
               streams_[i], transfer_cta_num, true /* h2d */,
-              use_ce_transfer, true /* is_mla */, false /* sync */);
+              use_ce_transfer, true /* is_mla */, 0, false /* sync */, ce_config_);
           break;
         case BackendType::SGLANG:
           flexkv::transfer_kv_blocks<BackendType::SGLANG>(
@@ -678,7 +704,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
               indexer_cpu_block_stride_in_bytes,
               idx_cpu_startoff, idx_chunk_size,
               streams_[i], transfer_cta_num, true /* h2d */,
-              use_ce_transfer, true /* is_mla */, false /* sync */);
+              use_ce_transfer, true /* is_mla */, 0, false /* sync */, ce_config_);
           break;
         }
       }
@@ -707,7 +733,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
     batch_idx++;
   }
 
-  // POLLING mode: clean up any lingering thread, then start polling + sync.
+  // POLLING: start poll thread, return now (no sync — sync would deadlock SGLang
+  // waiting on eventfds). Lazy sync in dtor / next call.
   if (notify_mode_ == NotifyMode::POLLING) {
     // Defensive cleanup: stop any lingering polling thread from a prior call.
     poll_stop_.store(true, std::memory_order_release);
@@ -720,31 +747,6 @@ void LayerwiseTransferGroup::layerwise_transfer(
     poll_next_batch_.store(0, std::memory_order_release);
     poll_thread_ = std::thread(&LayerwiseTransferGroup::event_polling_loop, this);
 
-    // Block until all GPU work is complete. The polling thread will have
-    // fired all eventfds by the time sync returns.
-    for (int i = 0; i < num_gpus_; ++i) {
-      cudaSetDevice(gpu_device_ids_[i]);
-      cudaError_t err = cudaStreamSynchronize(streams_[i]);
-      if (err != cudaSuccess) {
-        poll_stop_.store(true, std::memory_order_release);
-        if (poll_thread_.joinable()) poll_thread_.join();
-        throw std::runtime_error("layerwise_transfer failed on GPU " +
-                                 std::to_string(i) + ": " +
-                                 cudaGetErrorString(err));
-      }
-    }
-    poll_stop_.store(true, std::memory_order_release);
-    if (poll_thread_.joinable()) {
-      poll_thread_.join();
-    }
-
-    // Destroy poll batch events
-    for (int b = 0; b < (int)poll_batches_.size(); ++b) {
-      for (int g = 0; g < num_gpus_; ++g) {
-        cudaSetDevice(gpu_device_ids_[g]);
-        cudaEventDestroy(poll_batches_[b].per_gpu_events[g]);
-      }
-    }
   } else {
     for (int i = 0; i < num_gpus_; ++i) {
       cudaError_t err = cudaStreamSynchronize(streams_[i]);

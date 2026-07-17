@@ -15,6 +15,7 @@
 
 #include "gtensor_handler.cuh"
 #include "transfer.cuh"
+#include "ce_transfer.h"
 #include "transfer_ssd.h"
 
 namespace flexkv {
@@ -36,7 +37,8 @@ public:
       torch::Tensor indexer_gpu_block_strides_tensor = torch::Tensor(),
       torch::Tensor indexer_gpu_layer_strides_tensor = torch::Tensor(),
       torch::Tensor indexer_gpu_chunk_sizes_tensor = torch::Tensor(),
-      std::map<int, std::vector<std::string>> indexer_ssd_files = {});
+      std::map<int, std::vector<std::string>> indexer_ssd_files = {},
+      CETransferConfig ce_config = CETransferConfig{});
 
   ~LayerwiseTransferGroup();
 
@@ -123,6 +125,7 @@ private:
   int num_layers_;
   std::vector<int> layer_eventfds_;  // Flat array
   int current_counter_id_;  // Current counter set index for this transfer
+  CETransferConfig ce_config_;
 
   void layer_done_callback(int start_layer, int layers_this_batch,
                            nvtxRangeId_t *current_range_id_ptr,

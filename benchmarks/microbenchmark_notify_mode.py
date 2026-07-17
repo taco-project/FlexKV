@@ -65,7 +65,8 @@ def make_tensors(num_layers, num_blocks, tpb, head_dim, num_gpus):
     return gpu_layout, cpu_layout, all_gpu, cpu_kv
 
 
-def make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers):
+def make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
+                         is_mla=False, is_blockfirst=False):
     def strides_tensor(getter):
         return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
     ssd_files = {}
@@ -88,7 +89,8 @@ def make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers):
         indexer_gpu_blocks, indexer_cpu_blocks, indexer_gpu_kv_strides,
         indexer_gpu_block_strides, indexer_gpu_layer_strides,
         indexer_gpu_chunk_sizes, indexer_ssd_files,
-    )
+        is_mla=is_mla,
+        is_blockfirst=is_blockfirst)
 
 
 def bench_one(num_layers, num_blocks, tpb, head_dim, num_gpus, use_ce,

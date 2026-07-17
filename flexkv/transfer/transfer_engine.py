@@ -472,6 +472,7 @@ class TransferEngine:
 
         # Initialize indexer workers
         if (self._indexer_gpu_handles is not None
+                and len(self._indexer_gpu_handles) > 0
                 and self._indexer_cpu_handle is not None):
             self._indexer_finished_ops_queue = self.mp_ctx.Queue()
             self._indexer_worker_map: Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]] = {}

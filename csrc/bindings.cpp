@@ -55,7 +55,10 @@ void transfer_kv_blocks_binding(
     int64_t chunk_size_in_bytes, int start_layer_id, int num_layers,
     int transfer_num_cta = 4, bool is_host_to_device = true,
     bool use_ce_transfer = false, bool is_mla = false, int gpu_block_type = 0,
-    bool sync = true) {
+    bool sync = true,
+    bool ce_path_opt = false,
+    int ce_segment_threshold = 8, int ce_force_path = -1,
+    bool ce_enable_memcpy2d = false, bool is_blockfirst = false) {
   int num_blocks = gpu_block_id_tensor.numel();
 
   int64_t *gpu_block_ids =
@@ -81,6 +84,15 @@ void transfer_kv_blocks_binding(
                              std::to_string(gpu_block_type));
   }
 
+  // Build CE config from kwargs.
+  flexkv::CETransferConfig ce_config;
+  ce_config.path_opt_enabled = ce_path_opt;
+  ce_config.segment_threshold = ce_segment_threshold;
+  ce_config.force_path = ce_force_path;
+  ce_config.enable_memcpy2d = ce_enable_memcpy2d;
+  ce_config.is_blockfirst = is_blockfirst;
+  ce_config.is_mla = is_mla;
+
   // Create GTensorHandler
   flexkv::GTensorHandler handler(
       backend_type, reinterpret_cast<int64_t **>(gpu_tensor_ptrs), num_layers,
@@ -91,27 +103,33 @@ void transfer_kv_blocks_binding(
   switch (backend_type) {
   case flexkv::BackendType::VLLM:
     flexkv::transfer_kv_blocks<flexkv::BackendType::VLLM>(
-        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
-        cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
-        cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes, 0,
+        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
+        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
+        cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+        cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
-        use_ce_transfer, is_mla, sync);
+        use_ce_transfer, is_mla,
+        /*gpu_block_stride_in_bytes=*/0, sync, ce_config);
     break;
   case flexkv::BackendType::TRTLLM:
     flexkv::transfer_kv_blocks<flexkv::BackendType::TRTLLM>(
-        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
-        cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
-        cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes, 0,
+        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
+        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
+        cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+        cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
-        use_ce_transfer, is_mla, sync);
+        use_ce_transfer, is_mla,
+        /*gpu_block_stride_in_bytes=*/0, sync, ce_config);
     break;
   case flexkv::BackendType::SGLANG:
     flexkv::transfer_kv_blocks<flexkv::BackendType::SGLANG>(
-        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
-        cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
-        cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes, 0,
+        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
+        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
+        cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+        cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
-        use_ce_transfer, is_mla, sync);
+        use_ce_transfer, is_mla,
+        /*gpu_block_stride_in_bytes=*/0, sync, ce_config);
     break;
   }
 
@@ -413,7 +431,11 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("start_layer_id"), py::arg("num_layers"),
         py::arg("transfer_num_cta") = 4, py::arg("is_host_to_device") = true,
         py::arg("use_ce_transfer") = false, py::arg("is_mla") = false,
-        py::arg("gpu_block_type") = 0, py::arg("sync") = true);
+        py::arg("gpu_block_type") = 0, py::arg("sync") = true,
+        py::arg("ce_path_opt") = false,
+        py::arg("ce_segment_threshold") = 8, py::arg("ce_force_path") = -1,
+        py::arg("ce_enable_memcpy2d") = false,
+        py::arg("is_blockfirst") = false);
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory", py::arg("ioctx"),
         py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),
@@ -425,14 +447,46 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
         py::arg("is_mla") = false);
   py::class_<flexkv::LayerwiseTransferGroup>(m, "LayerwiseTransferGroup")
-      .def(py::init<int, const std::vector<std::vector<torch::Tensor>> &,
-                    torch::Tensor &, std::map<int, std::vector<std::string>> &,
-                    int, torch::Tensor &, torch::Tensor &, torch::Tensor &,
-                    torch::Tensor &, int, int, torch::Tensor &, int,
-                    const std::vector<std::vector<torch::Tensor>> &,
-                    torch::Tensor, torch::Tensor, torch::Tensor,
-                    torch::Tensor, torch::Tensor,
-                    std::map<int, std::vector<std::string>>>(),
+      .def(py::init([](int num_gpus,
+                       const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
+                       torch::Tensor &cpu_blocks,
+                       std::map<int, std::vector<std::string>> &ssd_files,
+                       int num_layers, torch::Tensor &gpu_kv_strides_tensor,
+                       torch::Tensor &gpu_block_strides_tensor,
+                       torch::Tensor &gpu_layer_strides_tensor,
+                       torch::Tensor &gpu_chunk_sizes_tensor, int iouring_entries,
+                       int iouring_flags, torch::Tensor &layer_eventfds_tensor,
+                       int tp_size,
+                       const std::vector<std::vector<torch::Tensor>> &indexer_gpu_blocks,
+                       torch::Tensor indexer_cpu_blocks,
+                       torch::Tensor indexer_gpu_kv_strides_tensor,
+                       torch::Tensor indexer_gpu_block_strides_tensor,
+                       torch::Tensor indexer_gpu_layer_strides_tensor,
+                       torch::Tensor indexer_gpu_chunk_sizes_tensor,
+                       std::map<int, std::vector<std::string>> indexer_ssd_files,
+                       int64_t ce_segment_threshold,
+                       bool ce_path_opt,
+                       int ce_force_path,
+                       bool ce_enable_memcpy2d,
+                       bool is_blockfirst,
+                       bool is_mla) {
+            flexkv::CETransferConfig cfg;
+            cfg.segment_threshold = ce_segment_threshold;
+            cfg.path_opt_enabled = ce_path_opt;
+            cfg.force_path = ce_force_path;
+            cfg.enable_memcpy2d = ce_enable_memcpy2d;
+            cfg.is_blockfirst = is_blockfirst;
+            cfg.is_mla = is_mla;
+             return new flexkv::LayerwiseTransferGroup(
+                 num_gpus, gpu_blocks, cpu_blocks, ssd_files, num_layers,
+                 gpu_kv_strides_tensor, gpu_block_strides_tensor,
+                 gpu_layer_strides_tensor, gpu_chunk_sizes_tensor,
+                 iouring_entries, iouring_flags, layer_eventfds_tensor,
+                 tp_size, indexer_gpu_blocks, indexer_cpu_blocks,
+                 indexer_gpu_kv_strides_tensor, indexer_gpu_block_strides_tensor,
+                 indexer_gpu_layer_strides_tensor, indexer_gpu_chunk_sizes_tensor,
+                 indexer_ssd_files, cfg);
+           }),
            py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("cpu_blocks"),
            py::arg("ssd_files"), py::arg("num_layers"),
            py::arg("gpu_kv_strides_tensor"),
@@ -447,7 +501,13 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("indexer_gpu_block_strides_tensor") = torch::Tensor(),
            py::arg("indexer_gpu_layer_strides_tensor") = torch::Tensor(),
            py::arg("indexer_gpu_chunk_sizes_tensor") = torch::Tensor(),
-           py::arg("indexer_ssd_files") = std::map<int, std::vector<std::string>>{})
+           py::arg("indexer_ssd_files") = std::map<int, std::vector<std::string>>{},
+           py::arg("ce_segment_threshold") = 8,
+           py::arg("ce_path_opt") = true,
+           py::arg("ce_force_path") = -1,
+           py::arg("ce_enable_memcpy2d") = false,
+           py::arg("is_blockfirst") = false,
+           py::arg("is_mla") = false)
       .def("layerwise_transfer",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -522,10 +582,36 @@ PYBIND11_MODULE(c_ext, m) {
   py::class_<flexkv::TPTransferThreadGroup> tp_thread_group(
       m, "TPTransferThreadGroup");
   tp_thread_group
-      .def(py::init<int, const std::vector<int64_t> &, int, int64_t, int,
-                    const std::vector<int64_t> &, const std::vector<int64_t> &,
-                    const std::vector<int64_t> &, const std::vector<int64_t> &,
-                    const std::vector<int64_t> &, bool, int, int>(),
+      .def(py::init([](int num_gpus, const std::vector<int64_t> &gpu_block_ptrs_flat,
+                       int num_tensors_per_gpu, int64_t cpu_blocks_ptr,
+                       int num_layers,
+                       const std::vector<int64_t> &gpu_kv_strides_in_bytes,
+                       const std::vector<int64_t> &gpu_block_strides_in_bytes,
+                       const std::vector<int64_t> &gpu_layer_strides_in_bytes,
+                       const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
+                       const std::vector<int64_t> &gpu_device_ids,
+                       bool enable_nvcomp, int nvcomp_batch_size,
+                       int nvcomp_data_type,
+                       int64_t ce_segment_threshold,
+                       bool ce_path_opt,
+                       int ce_force_path,
+                       bool ce_enable_memcpy2d,
+                       bool is_blockfirst,
+                       bool is_mla) {
+            flexkv::CETransferConfig cfg;
+            cfg.segment_threshold = ce_segment_threshold;
+            cfg.path_opt_enabled = ce_path_opt;
+            cfg.force_path = ce_force_path;
+            cfg.enable_memcpy2d = ce_enable_memcpy2d;
+            cfg.is_blockfirst = is_blockfirst;
+            cfg.is_mla = is_mla;
+             return new flexkv::TPTransferThreadGroup(
+                 num_gpus, gpu_block_ptrs_flat, num_tensors_per_gpu,
+                 cpu_blocks_ptr, num_layers, gpu_kv_strides_in_bytes,
+                 gpu_block_strides_in_bytes, gpu_layer_strides_in_bytes,
+                 gpu_chunk_sizes_in_bytes, gpu_device_ids, enable_nvcomp,
+                 nvcomp_batch_size, nvcomp_data_type, cfg);
+           }),
            py::arg("num_gpus"), py::arg("gpu_block_ptrs_flat"),
            py::arg("num_tensors_per_gpu"), py::arg("cpu_blocks_ptr"),
            py::arg("num_layers"),
@@ -535,7 +621,13 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("gpu_chunk_sizes_in_bytes"), py::arg("gpu_device_ids"),
            py::arg("enable_nvcomp") = false,
            py::arg("nvcomp_batch_size") = 0,
-           py::arg("nvcomp_data_type") = 0)
+           py::arg("nvcomp_data_type") = 0,
+           py::arg("ce_segment_threshold") = 8,
+           py::arg("ce_path_opt") = true,
+           py::arg("ce_force_path") = -1,
+           py::arg("ce_enable_memcpy2d") = false,
+           py::arg("is_blockfirst") = false,
+           py::arg("is_mla") = false)
       .def("tp_group_transfer",
            &flexkv::TPTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),
@@ -545,7 +637,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"),
-           py::arg("is_mla"), py::arg("mla_d2h_mode") = "sharded");
+           py::arg("is_mla"), py::arg("mla_d2h_mode") = "sharded",
+           py::arg("designated_rank") = 0);
 #ifdef FLEXKV_ENABLE_NVCOMP
   // nvcomp ANS variant: tp_group_transfer_ans() lazily initializes from the
   // constructor config and returns total compressed bytes across ranks.

@@ -169,17 +169,17 @@ class FlexKVConfig:
             if indexer_head_size is not None and indexer_head_size > 0:
                 head_size = indexer_head_size
 
-            dtype = indexer_dtype if indexer_dtype is not None else torch.uint8
+                dtype = indexer_dtype if indexer_dtype is not None else torch.uint8
 
-            self.cache_config.indexer = IndexerCacheConfig(
-                head_size=head_size,
-                num_kv_heads=1,
-                dtype=dtype,
-            )
-            logger.info(
-                f"Detected sparse attention indexer config: "
-                f"head_size={head_size}, dtype={dtype}, "
-                f"tokens_per_block={self.cache_config.tokens_per_block}")
+                self.cache_config.indexer = IndexerCacheConfig(
+                    head_size=head_size,
+                    num_kv_heads=1,
+                    dtype=dtype,
+                )
+                logger.info(
+                    f"Detected sparse attention indexer config: "
+                    f"head_size={head_size}, dtype={dtype}, "
+                    f"tokens_per_block={self.cache_config.tokens_per_block}")
         except Exception as e:
             logger.debug(f"Could not detect indexer config: {e}")
 
