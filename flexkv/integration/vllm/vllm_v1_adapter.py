@@ -22,6 +22,7 @@ from flexkv.transfer_manager import TransferManagerOnRemote
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata, KVConnectorRole)
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.v1.engine import FinishReason
 
 # KVConnectorStats: available since v0.11.0
 try:
@@ -518,8 +519,15 @@ class FlexKVSchedulerConnector:
         if request.request_id in self.req_id_to_task_dict:
             return True
 
-        # Abnormal finished, don't put
-        if not (request.is_finished() and request.get_finished_reason() < 2):
+        finish_reason = request.get_finished_reason()
+        normal_finish = finish_reason in (FinishReason.STOP, FinishReason.LENGTH)
+        requested_abort_offload = (
+            finish_reason == FinishReason.ABORT
+            and bool(getattr(request, "offload_kv_on_finish", False))
+        )
+        if not request.is_finished() or not (
+            normal_finish or requested_abort_offload
+        ):
             return False
 
         if self.maybe_skip_put and os.path.exists('/tmp/flexkv_skip_put'):
