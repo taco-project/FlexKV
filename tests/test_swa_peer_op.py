@@ -16,7 +16,7 @@ Tier dependencies mirror the full-KV graph:
   GET  load:  SWA H2D depends on SWA DISK2H / REMOTE2H staging ops (only H2D reported)
   PUT  store: SWA H2DISK / H2REMOTE depend on SWA D2H, fire-and-forget (only D2H reported)
 
-Sandbox note: SWACacheManager imports only flexkv.common.* (no torch/c_ext), but
+Sandbox note: SWAOpConstructor imports only flexkv.common.* (no torch/c_ext), but
 flexkv.common.block pulls torch, so run in the real env: pytest tests/test_swa_peer_op.py
 """
 import sys
@@ -33,7 +33,7 @@ from flexkv.common.transfer import (
     TransferOpGraph, TransferOp, TransferType, DeviceType,
 )
 from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
-from flexkv.cache.swa_cache_engine import SWACacheManager
+from flexkv.cache.swa_cache_engine import SWAOpConstructor
 
 pytestmark = pytest.mark.unit
 
@@ -85,7 +85,7 @@ def _mgr(enabled=True, cpu=True, ssd=False, remote=False):
         cache_engines=engines,
         cache_config=SimpleNamespace(enable_swa_transfer=enabled),
     )
-    return SWACacheManager(gce)
+    return SWAOpConstructor(gce)
 
 
 def _full_h2d(graph, n=2):

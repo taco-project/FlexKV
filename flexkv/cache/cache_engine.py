@@ -29,7 +29,7 @@ from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
-from flexkv.cache.swa_cache_engine import SWACacheManager
+from flexkv.cache.swa_cache_engine import SWAOpConstructor
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import (
@@ -731,7 +731,7 @@ class GlobalCacheEngine:
 
         # SWA peer-op builder. Per-tier match/slot resolution is fused into the
         # Full-KV get/put implementations; this helper only appends SWA ops.
-        self.swa_cache = SWACacheManager(self)
+        self.swa_op_constructor = SWAOpConstructor(self)
 
         #TODO move this to kvmanager.start()
         self.start()
@@ -1146,7 +1146,7 @@ class GlobalCacheEngine:
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
         num_gpu_blocks_to_transfer = len(fragment123_gpu_blocks) if enable_gpu else 0
         op_callback_dict = {}
-        if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
+        if (self.swa_op_constructor.enabled and num_gpu_blocks_to_transfer > 0
                 and swa_read_source.found):
             swa_empty = np.array([], dtype=np.int64)
             device_type = swa_read_source.device_type
@@ -1175,7 +1175,7 @@ class GlobalCacheEngine:
                 swa_h2d_id = None
 
             if staging_slot >= 0 or device_type == DeviceType.CPU:
-                swa_h2d_id = self.swa_cache.build_get_chain(
+                swa_h2d_id = self.swa_op_constructor.build_get_chain(
                     transfer_graph,
                     gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
                     cpu_slot_ids=cpu_swa_slots,
@@ -1432,7 +1432,7 @@ class GlobalCacheEngine:
         num_gpu_blocks_to_transfer = len(fragment12_gpu_blocks) if enable_gpu else 0
         op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
 
-        if (self.swa_cache.enabled and num_gpu_blocks_to_transfer > 0
+        if (self.swa_op_constructor.enabled and num_gpu_blocks_to_transfer > 0
                 and swa_read_source.found):
             swa_empty = np.array([], dtype=np.int64)
             device_type = swa_read_source.device_type
@@ -1458,7 +1458,7 @@ class GlobalCacheEngine:
                 swa_h2d_id = None
 
             if staging_slot >= 0 or device_type == DeviceType.CPU:
-                swa_h2d_id = self.swa_cache.build_get_chain(
+                swa_h2d_id = self.swa_op_constructor.build_get_chain(
                     transfer_graph,
                     gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
                     cpu_slot_ids=cpu_swa_slots,
@@ -1659,7 +1659,7 @@ class GlobalCacheEngine:
         ssd_swa_slot = -1
         remote_swa_slot = -1
 
-        if self.swa_cache.enabled:
+        if self.swa_op_constructor.enabled:
             cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
                 cpu_matched_result.last_node)
             if cpu_swa_slot >= 0 and put_to_ssd:
@@ -1745,7 +1745,7 @@ class GlobalCacheEngine:
 
         if cpu_swa_slot >= 0:
             empty = np.array([], dtype=np.int64)
-            swa_ops = self.swa_cache.build_put_chain(
+            swa_ops = self.swa_op_constructor.build_put_chain(
                 transfer_graph,
                 gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
                 cpu_slot_ids=np.array([cpu_swa_slot], dtype=np.int64),
@@ -1916,7 +1916,7 @@ class GlobalCacheEngine:
         cpu_swa_slot = -1
         ssd_swa_slot = -1
 
-        if self.swa_cache.enabled:
+        if self.swa_op_constructor.enabled:
             cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
                 cpu_matched_result.last_node)
             if cpu_swa_slot >= 0 and fragment2_num_blocks > 0:
@@ -1980,7 +1980,7 @@ class GlobalCacheEngine:
 
         if cpu_swa_slot >= 0:
             empty = np.array([], dtype=np.int64)
-            swa_ops = self.swa_cache.build_put_chain(
+            swa_ops = self.swa_op_constructor.build_put_chain(
                 transfer_graph,
                 gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
                 cpu_slot_ids=np.array([cpu_swa_slot], dtype=np.int64),
@@ -2133,7 +2133,7 @@ class GlobalCacheEngine:
         tier_match_results: Dict[DeviceType, object],
     ) -> Tuple[int, SWAReadSource]:
         """Return the largest usable SWA-aware Full-KV end and its exact SWA source."""
-        if not self.swa_cache.enabled or not tier_match_results:
+        if not self.swa_op_constructor.enabled or not tier_match_results:
             return block_mask_start, SWAReadSource()
 
         candidates: List[Tuple[int, DeviceType, object]] = []

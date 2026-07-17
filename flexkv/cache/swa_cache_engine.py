@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SWACacheManager — SWA peer-op graph builder.
+"""SWAOpConstructor — SWA peer-op graph builder.
 
 The node-mounted SWA state lives on the Full-KV radix nodes; per-tier match,
 slot allocation, pinning, and ready-node ownership are resolved inside
@@ -64,7 +64,7 @@ class SWAPutChainOpIds:
     h2remote_id: Optional[int] = None
 
 
-class SWACacheManager:
+class SWAOpConstructor:
     """SWA peer-op graph construction.
 
     Holds a back-reference to the owning ``GlobalCacheEngine`` to reach the
