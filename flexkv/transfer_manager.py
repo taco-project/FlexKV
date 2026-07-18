@@ -32,7 +32,7 @@ from flexkv.common.storage import KVCacheLayout
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.server.utils import get_zmq_socket
-from flexkv.server.request import RegisterTPClientRequest, Response
+from flexkv.server.request import RegistrationKey, RegisterTPClientRequest, Response
 
 
 class TransferManager:
@@ -47,25 +47,30 @@ class TransferManager:
         # Calculate total expected GPUs on this node across all instances
         self.expected_gpus = self.instance_num * self.model_config.gpus_per_node
 
-        self.all_gpu_layouts: Dict[int, KVCacheLayout] = {}
-        self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks
-        self.gpu_worker_key_mapping: Dict[int, WorkerKey] = {}
+        self.all_gpu_layouts: Dict[RegistrationKey, KVCacheLayout] = {}
+        self.all_gpu_blocks: Dict[RegistrationKey, List[TensorSharedHandle]] = {}
+        self.gpu_worker_key_mapping: Dict[RegistrationKey, WorkerKey] = {}
+        self.gpu_device_id_mapping: Dict[RegistrationKey, int] = {}
 
         # Multi-group storage for heterogeneous KV shapes, including DSA/NSA
         # indexer-as-group. None for uniform single-shape registrations.
-        self.all_gpu_layouts_per_group: Dict[int, Optional[List[KVCacheLayout]]] = {}
-        self.all_gpu_blocks_per_group: Dict[int, Optional[List[List[TensorSharedHandle]]]] = {}
+        self.all_gpu_layouts_per_group: Dict[
+            RegistrationKey, Optional[List[KVCacheLayout]]
+        ] = {}
+        self.all_gpu_blocks_per_group: Dict[
+            RegistrationKey, Optional[List[List[TensorSharedHandle]]]
+        ] = {}
 
         # SWA dedicated GPU pool (channel B): independent of the main-KV pool.
-        # device_id -> SWA handles / layout. Populated only when the registering
-        # client provides swa_handles (DSv4 sliding-window-attention pool).
-        self.all_swa_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}
-        self.all_swa_gpu_layouts: Dict[int, KVCacheLayout] = {}
+        # Logical registration key -> SWA handles / layout. Populated only when
+        # the client provides swa_handles (DSv4 sliding-window-attention pool).
+        self.all_swa_gpu_blocks: Dict[RegistrationKey, List[TensorSharedHandle]] = {}
+        self.all_swa_gpu_layouts: Dict[RegistrationKey, KVCacheLayout] = {}
         self.all_swa_gpu_layouts_per_group: Dict[
-            int, Optional[List[KVCacheLayout]]
+            RegistrationKey, Optional[List[KVCacheLayout]]
         ] = {}
         self.all_swa_gpu_blocks_per_group: Dict[
-            int, Optional[List[List[TensorSharedHandle]]]
+            RegistrationKey, Optional[List[List[TensorSharedHandle]]]
         ] = {}
         self.swa_layer_groups: Optional[List[LayerGroupSpec]] = None
 
@@ -79,40 +84,32 @@ class TransferManager:
                            f"instance_num={self.instance_num}, expected_gpus={self.expected_gpus}")
 
     def _handle_gpu_blocks_registration(self, req: RegisterTPClientRequest) -> None:
-        device_id = req.device_id
+        registration_key = req.registration_key
 
-        if device_id in self.all_gpu_blocks:
-            # A duplicate device_id means the framework adapter handed us the
-            # same id for two different workers.  Registration can then never
-            # reach expected_gpus, so _register_gpu_blocks_via_socket spins
-            # forever printing "Still waiting for GPU registrations: k/N".
-            # Say so explicitly instead of leaving an unexplained hang.
+        if registration_key in self.all_gpu_blocks:
             flexkv_logger.error(
-                f"GPU {device_id} has already registered. Duplicate device_id "
-                f"from a different worker: registration cannot reach "
-                f"{self.expected_gpus}/{self.expected_gpus} and init will hang. "
-                f"Check that the framework adapter passes a per-worker-unique "
-                f"device_id (registered so far: {sorted(self.all_gpu_blocks)}).")
+                f"GPU worker {registration_key} has already registered.")
         else:
             try:
-                self.all_gpu_blocks[device_id] = req.handles
-                self.all_gpu_layouts[device_id] = req.gpu_layout
-                self.gpu_worker_key_mapping[device_id] = WorkerKey(
+                self.all_gpu_blocks[registration_key] = req.handles
+                self.all_gpu_layouts[registration_key] = req.gpu_layout
+                self.gpu_device_id_mapping[registration_key] = req.device_id
+                self.gpu_worker_key_mapping[registration_key] = WorkerKey(
                     dp_client_id=req.dp_client_id,
                     pp_rank=req.pp_rank,
                 )
                 # Store multi-group info (None when uniform single-shape registration).
                 # This covers heterogeneous shapes and DSA/NSA indexer-as-group.
-                self.all_gpu_layouts_per_group[device_id] = req.gpu_layouts
-                self.all_gpu_blocks_per_group[device_id] = req.handles_per_group
-                # Store SWA GPU data if present
+                self.all_gpu_layouts_per_group[registration_key] = req.gpu_layouts
+                self.all_gpu_blocks_per_group[registration_key] = req.handles_per_group
+                # Store SWA GPU data if present.
                 if getattr(req, "swa_handles", None) is not None and req.swa_layout is not None:
-                    self.all_swa_gpu_blocks[device_id] = req.swa_handles
-                    self.all_swa_gpu_layouts[device_id] = req.swa_layout
-                    self.all_swa_gpu_layouts_per_group[device_id] = (
+                    self.all_swa_gpu_blocks[registration_key] = req.swa_handles
+                    self.all_swa_gpu_layouts[registration_key] = req.swa_layout
+                    self.all_swa_gpu_layouts_per_group[registration_key] = (
                         req.swa_gpu_layouts
                     )
-                    self.all_swa_gpu_blocks_per_group[device_id] = (
+                    self.all_swa_gpu_blocks_per_group[registration_key] = (
                         req.swa_handles_per_group
                     )
                     if req.swa_layer_groups is not None:
@@ -123,7 +120,7 @@ class TransferManager:
                                 "SWA layer groups differ across GPU registrations"
                             )
                     flexkv_logger.info(
-                        f"GPU {device_id}: registered SWA handles "
+                        f"GPU worker {registration_key}: registered SWA handles "
                         f"({len(req.swa_handles)} tensors, "
                         f"groups={len(req.swa_layer_groups or [])})"
                     )
@@ -132,11 +129,13 @@ class TransferManager:
                 if req.layer_groups is not None and self.model_config.layer_groups is None:
                     self.model_config.layer_groups = req.layer_groups
                     flexkv_logger.info(
-                        f"Set model_config.layer_groups from GPU {device_id}: "
+                        f"Set model_config.layer_groups from GPU worker "
+                        f"{registration_key}: "
                         f"{[(g.num_layers, g.num_kv_heads, g.head_size) for g in req.layer_groups]}"
                     )
             except Exception as e:
-                flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
+                flexkv_logger.error(
+                    f"Failed to register GPU worker {registration_key}: {e}")
 
     def _register_gpu_blocks_via_socket(self) -> None:
         try:
@@ -153,11 +152,11 @@ class TransferManager:
                     # Periodically log waiting status for debugging
                     now = time.time()
                     if now - last_log_time >= 5.0:
-                        registered_ids = sorted(self.all_gpu_blocks.keys())
+                        registered_keys = sorted(self.all_gpu_blocks.keys())
                         flexkv_logger.info(
                             f"Still waiting for GPU registrations: "
                             f"{len(self.all_gpu_blocks)}/{self.expected_gpus} registered "
-                            f"(registered_device_ids={registered_ids}, "
+                            f"(registered_keys={registered_keys}, "
                             f"port={self.gpu_register_port})")
                         last_log_time = now
                     time.sleep(0.001)
@@ -165,10 +164,11 @@ class TransferManager:
 
                 if isinstance(req, RegisterTPClientRequest):
                     flexkv_logger.info(f"Received GPU blocks registration request: {type(req)}, "
+                                       f"registration_key={req.registration_key}, "
                                        f"device_id={req.device_id}, "
                                        f"dp_client_id={req.dp_client_id}, pp_rank={req.pp_rank}")
                     self._handle_gpu_blocks_registration(req)
-                    flexkv_logger.info(f"GPU {req.device_id} registered successfully, "
+                    flexkv_logger.info(f"GPU worker {req.registration_key} registered successfully, "
                                        f"waiting for {self.expected_gpus - len(self.all_gpu_blocks)} GPUs to register")
                 else:
                     flexkv_logger.error(f"Unrecognized RequestType in SchedulerServer: {type(req)}")
@@ -207,20 +207,22 @@ class TransferManager:
             swa_layer_groups=self.swa_layer_groups,
         )
 
-        # Register GPU blocks with their global device IDs
-        for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
+        # Logical registration identity is separate from the CUDA device ID.
+        for registration_key, gpu_blocks_wrapper in self.all_gpu_blocks.items():
+            device_id = self.gpu_device_id_mapping[registration_key]
             self.storage_engine.register_gpu_blocks(
                 gpu_blocks_wrapper,
-                self.all_gpu_layouts[device_id],
+                self.all_gpu_layouts[registration_key],
                 device_id,
                 dtype=self.model_config.dtype,
             )
 
         # Register SWA dedicated GPU pool.
-        for device_id, swa_blocks in self.all_swa_gpu_blocks.items():
+        for registration_key, swa_blocks in self.all_swa_gpu_blocks.items():
+            device_id = self.gpu_device_id_mapping[registration_key]
             self.storage_engine.register_swa_gpu_blocks(
                 swa_blocks,
-                self.all_swa_gpu_layouts[device_id],
+                self.all_swa_gpu_layouts[registration_key],
                 device_id,
                 dtype=torch.uint8,
             )
@@ -239,8 +241,9 @@ class TransferManager:
             grouped_gpu_blocks_per_group = {}
             grouped_gpu_layouts_per_group = {}
 
-        for device_id in sorted(self.all_gpu_blocks.keys()):
-            worker_key = self.gpu_worker_key_mapping[device_id]
+        for registration_key in sorted(self.all_gpu_blocks.keys()):
+            worker_key = self.gpu_worker_key_mapping[registration_key]
+            device_id = self.gpu_device_id_mapping[registration_key]
             if worker_key not in grouped_gpu_handles:
                 grouped_gpu_handles[worker_key] = []
             grouped_gpu_handles[worker_key].append(
@@ -251,9 +254,9 @@ class TransferManager:
                     grouped_gpu_blocks_per_group[worker_key] = []
                     grouped_gpu_layouts_per_group[worker_key] = []
                 grouped_gpu_blocks_per_group[worker_key].append(
-                    self.all_gpu_blocks_per_group[device_id])
+                    self.all_gpu_blocks_per_group[registration_key])
                 grouped_gpu_layouts_per_group[worker_key].append(
-                    self.all_gpu_layouts_per_group[device_id])
+                    self.all_gpu_layouts_per_group[registration_key])
 
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None
@@ -275,9 +278,10 @@ class TransferManager:
             swa_grouped_gpu_layouts_per_group = {}
         if self.storage_engine.has_storage_handle(DeviceType.CPU, is_swa=True):
             swa_gpu_handles = {}
-            for device_id in sorted(self.all_swa_gpu_blocks.keys()):
+            for registration_key in sorted(self.all_swa_gpu_blocks.keys()):
+                device_id = self.gpu_device_id_mapping[registration_key]
                 if self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_swa=True):
-                    worker_key = self.gpu_worker_key_mapping[device_id]
+                    worker_key = self.gpu_worker_key_mapping[registration_key]
                     if worker_key not in swa_gpu_handles:
                         swa_gpu_handles[worker_key] = []
                     swa_gpu_handles[worker_key].append(
@@ -285,10 +289,10 @@ class TransferManager:
                     if self.swa_layer_groups is not None:
                         swa_grouped_gpu_blocks_per_group.setdefault(
                             worker_key, []
-                        ).append(self.all_swa_gpu_blocks_per_group[device_id])
+                        ).append(self.all_swa_gpu_blocks_per_group[registration_key])
                         swa_grouped_gpu_layouts_per_group.setdefault(
                             worker_key, []
-                        ).append(self.all_swa_gpu_layouts_per_group[device_id])
+                        ).append(self.all_swa_gpu_layouts_per_group[registration_key])
 
         swa_cpu_handle =(
          self.storage_engine.get_storage_handle(DeviceType.CPU, is_swa=True)

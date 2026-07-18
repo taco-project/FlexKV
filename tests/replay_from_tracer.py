@@ -235,6 +235,8 @@ class FlexKVReplayEngine:
             # Create registration request
             register_req = RegisterTPClientRequest(
                 dp_client_id=gpu_id // self.model_config.tp_size,  # DP client ID
+                pp_rank=0,
+                intra_client_id=gpu_id % self.model_config.tp_size,
                 device_id=gpu_id,
                 handles=handles,
                 gpu_layout=self.gpu_layout

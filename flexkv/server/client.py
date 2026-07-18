@@ -282,6 +282,7 @@ class KVTPClient:
         dp_client_id: int,
         device_id: int,
         pp_rank: int = 0,
+        intra_client_id: int = 0,
     ):
         """A TP-level GPU registration client."""
         # Init inter-process communication
@@ -292,12 +293,14 @@ class KVTPClient:
 
         self.dp_client_id = dp_client_id
         self.pp_rank = pp_rank
+        self.intra_client_id = intra_client_id
         self.device_id = device_id
 
         flexkv_logger.info(
             f"KVTPClient {device_id} Initialized! "
             f"(gpu_register_port={gpu_register_port}, "
-            f"dp_client_id={dp_client_id}, pp_rank={pp_rank})")
+            f"dp_client_id={dp_client_id}, pp_rank={pp_rank}, "
+            f"intra_client_id={intra_client_id})")
 
     def set_slot_mapping(self, task_id: int, slot_mapping: np.ndarray) -> None:
         """Send set_slot_mapping message to TransferManagerOnRemote via existing ZMQ channel.
@@ -402,6 +405,7 @@ class KVTPClient:
         register_req = RegisterTPClientRequest(
             dp_client_id=self.dp_client_id,
             pp_rank=self.pp_rank,
+            intra_client_id=self.intra_client_id,
             device_id=device_id,
             handles=handles,
             gpu_layout=kv_layout,
@@ -420,6 +424,7 @@ class KVTPClient:
             flexkv_logger.info(
                 f"KVTPClient {device_id}: registration message sent "
                 f"(dp_client_id={self.dp_client_id}, pp_rank={self.pp_rank}, "
+                f"intra_client_id={self.intra_client_id}, "
                 f"num_kv_caches={len(kv_caches)})")
         except zmq.Again:
             flexkv_logger.error(

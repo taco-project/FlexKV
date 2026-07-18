@@ -506,6 +506,14 @@ class RankInfo:
         return self.cp_rank * max(1, self.model_config.tp_size) + self.tp_rank
 
     @property
+    def intra_client_id(self) -> int:
+        """Unique data-plane worker ID within one DP client."""
+        return (
+            self.pp_rank * self.model_config.effective_tp_size
+            + self.effective_tp_rank
+        )
+
+    @property
     def pp_size_per_node(self) -> int:
         """Number of PP stages co-located on a single node."""
         model_config = self.model_config
