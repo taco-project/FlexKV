@@ -30,6 +30,7 @@ from flexkv.server.request import (
     CheckRunningRequest,
     StartRequest,
     ShutdownRequest,
+    UnregisterDPClientRequest,
     ResetRequest,
     PrefetchRequest,
     Response
@@ -274,6 +275,12 @@ class KVDPClient:
     def shutdown(self) -> None:
         req = ShutdownRequest(self.dp_client_id)
         self.send_to_server.send_pyobj(req)
+
+    def unregister(self) -> None:
+        """Detach this client without stopping the shared KVServer."""
+        req = UnregisterDPClientRequest(self.dp_client_id)
+        self.send_to_server.send_pyobj(req)
+
 
 class KVTPClient:
     def __init__(

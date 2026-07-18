@@ -36,6 +36,7 @@ from flexkv.server.request import (
     Response,
     StartRequest,
     ShutdownRequest,
+    UnregisterDPClientRequest,
     ResetRequest,
     CheckRunningRequest,
     PrefetchRequest,
@@ -202,6 +203,7 @@ class KVServer:
             CancelTaskRequest: self._handle_cancel_task_request,
             TryWaitRequest: self._handle_try_wait_request,
             ShutdownRequest: self._handle_shutdown_request,
+            UnregisterDPClientRequest: self._handle_unregister_dp_client_request,
             ResetRequest: self._handle_reset_request,
         }
 
@@ -479,6 +481,12 @@ class KVServer:
         flexkv_logger.info(f"Received shutdown request from DP client "
                            f"(dp_client_id={req.dp_client_id})")
         self._running = False
+
+    def _handle_unregister_dp_client_request(self, req: UnregisterDPClientRequest) -> None:
+        """Detach one client while leaving the shared server running."""
+        flexkv_logger.info(f"Received unregister request from DP client "
+                           f"(dp_client_id={req.dp_client_id})")
+        self.client_manager.delete_dp_client(req.dp_client_id)
 
     def _handle_reset_request(self, req: ResetRequest) -> None:
         """Handle cache-reset request: drop radix tree + mempool on all tiers.

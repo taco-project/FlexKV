@@ -69,17 +69,29 @@ class KVManager:
         self.server_client_mode = (model_config.dp_size > 1 or
                                    model_config.instance_num > 1 or
                                    GLOBAL_CONFIG_FROM_ENV.server_client_mode)
+        self.server_launch_mode = GLOBAL_CONFIG_FROM_ENV.server_launch_mode
+        if self.server_launch_mode not in ("embedded", "external"):
+            raise ValueError(
+                "FLEXKV_SERVER_LAUNCH_MODE must be embedded or external, "
+                f"got {self.server_launch_mode!r}"
+            )
+        if self.server_launch_mode == "external" and not self.server_client_mode:
+            raise ValueError(
+                "FLEXKV_SERVER_LAUNCH_MODE=external requires server-client mode"
+            )
 
         flexkv_logger.info(
             f"[KVManager] instance_num={model_config.instance_num}, dp_size={model_config.dp_size}, "
-            f"server_client_mode={self.server_client_mode}"
+            f"server_client_mode={self.server_client_mode}, "
+            f"server_launch_mode={self.server_launch_mode}"
         )
 
         self.redis_meta_client = None
         self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
+        self.owns_mps = self.enable_mps and self.server_launch_mode != "external"
 
         if self.server_client_mode:
-            if dp_client_id == 0:
+            if self.server_launch_mode == "embedded" and dp_client_id == 0:
                 self.server_handle = KVServer.create_server(model_config=model_config,
                                                             cache_config=cache_config,
                                                             gpu_register_port=self.gpu_register_port,
@@ -119,7 +131,7 @@ class KVManager:
             )
 
     def start(self) -> None:
-        if self.enable_mps:
+        if self.owns_mps:
             # try to start MPS
             subprocess.run(['nvidia-cuda-mps-control', '-d'], check=False)
             flexkv_logger.debug("MPS started")
@@ -140,15 +152,18 @@ class KVManager:
         flexkv_logger.info("[FLEXKV] KVManager.shutdown begin.")
         eviction_log_aggregator.flush()
         if self.server_client_mode:
-            self.dp_client.shutdown()
-            # Wait for the server process to exit after sending shutdown request
-            if self.server_handle is not None:
-                self.server_handle.shutdown()
-                self.server_handle = None
+            if self.server_launch_mode == "external":
+                self.dp_client.unregister()
+            else:
+                self.dp_client.shutdown()
+                # Wait for the server process to exit after sending shutdown request
+                if self.server_handle is not None:
+                    self.server_handle.shutdown()
+                    self.server_handle = None
         else:
             self.kv_task_engine.shutdown()
 
-        if self.enable_mps:
+        if self.owns_mps:
             flexkv_logger.info(
                 "MPS is enabled. To stop MPS daemon manually, run: "
                 "'echo quit | nvidia-cuda-mps-control'"

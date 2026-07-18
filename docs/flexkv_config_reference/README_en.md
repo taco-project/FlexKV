@@ -84,6 +84,7 @@ Some configurations can only be set through environment variables.
 | Environment Variable | Type | Default | Description |
 |---------------------|------|---------|-------------|
 | `FLEXKV_SERVER_CLIENT_MODE` | bool | 0 | `server_client_mode`: Whether to force enable server-client mode |
+| `FLEXKV_SERVER_LAUNCH_MODE` | str | "embedded" | Shared-server ownership: `embedded` lets client 0 launch it; `external` makes every instance client-only |
 | `FLEXKV_SERVER_RECV_PORT` | str | "ipc:///tmp/flexkv_server" | `server_recv_port`: Server receive port configuration. Different instances in multi-instance mode should use the same port |
 | `FLEXKV_INSTANCE_NUM` | int | 1 | Number of inference engine instances |
 | `FLEXKV_INSTANCE_ID` | int | 0 | Inference engine instance ID |

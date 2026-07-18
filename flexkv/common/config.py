@@ -752,6 +752,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     # Server-client mode configuration
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
+    server_launch_mode=os.getenv('FLEXKV_SERVER_LAUNCH_MODE', 'embedded').lower(),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
