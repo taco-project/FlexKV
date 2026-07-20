@@ -195,6 +195,8 @@ def _build_fixture_with_eventfds(
         iouring_flags=IOURING_FLAGS,
         layer_eventfds_tensor=eventfds_tensor,
         tp_size=1,
+        is_blockfirst=True,
+        is_mla=True,
         **swa_ctor,
     )
 

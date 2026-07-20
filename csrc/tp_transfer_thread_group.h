@@ -18,6 +18,7 @@
 
 #include "gtensor_handler.cuh"
 #include "transfer.cuh"
+#include "ce_transfer.h"
 #include <atomic>
 #include <condition_variable>
 #include <cuda_runtime.h>
@@ -50,7 +51,8 @@ public:
                         const std::vector<int64_t> &gpu_device_ids,
                         bool enable_nvcomp = false,
                         int nvcomp_batch_size = 0,
-                        int nvcomp_data_type = 0);
+                        int nvcomp_data_type = 0,
+                        CETransferConfig ce_config = CETransferConfig{});
 
   ~TPTransferThreadGroup();
 
@@ -64,7 +66,8 @@ public:
                          const bool is_host_to_device,
                          const bool use_ce_transfer, const int layer_id,
                          const int layer_granularity, const bool is_mla,
-                         const std::string &mla_d2h_mode = "sharded");
+                         const std::string &mla_d2h_mode = "sharded",
+                         const int designated_rank = 0);
 
 #ifdef FLEXKV_ENABLE_NVCOMP
 
@@ -106,6 +109,8 @@ private:
   BackendType backend_type_;
   std::vector<GTensorHandler> gpu_tensor_handlers_;
 
+  CETransferConfig ce_config_;
+
   std::vector<std::thread> threads_;
   std::vector<cudaStream_t> streams_;
 
@@ -113,6 +118,9 @@ private:
   std::vector<std::mutex> mtxs_;
   std::vector<std::condition_variable> cvs_;
   std::atomic<bool> stop_pool_;
+
+  // rank_rotate mode: request-level round-robin counter, incremented each D2H call.
+  int rotate_counter_ = 0;
 
 #ifdef FLEXKV_ENABLE_NVCOMP
   std::unique_ptr<NvcompTPState> nvcomp_state_;

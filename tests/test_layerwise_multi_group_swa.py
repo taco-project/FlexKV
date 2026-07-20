@@ -346,6 +346,8 @@ def _build_fixture(
         iouring_flags=IOURING_FLAGS,
         layer_eventfds_tensor=empty_eventfds,
         tp_size=1,
+        is_blockfirst=True,
+        is_mla=True,
     )
 
     swa_layout = _make_swa_layout(

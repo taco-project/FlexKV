@@ -260,6 +260,8 @@ def _build_dsv4_fixture(layer_groups: List[LayerGroupSpec]) -> MultiGroupFixture
         swa_gpu_block_strides_tensor=swa_strides["swa_gpu_block_strides_tensor"],
         swa_gpu_layer_strides_tensor=swa_strides["swa_gpu_layer_strides_tensor"],
         swa_gpu_chunk_sizes_tensor=swa_strides["swa_gpu_chunk_sizes_tensor"],
+        is_blockfirst=True,
+        is_mla=True,
     )
 
     return MultiGroupFixture(
