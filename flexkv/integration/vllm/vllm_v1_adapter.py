@@ -667,7 +667,7 @@ class FlexKVSchedulerConnector:
         if get_task_ids:
             launched_get_task_ids = self.flexkv_manager.launch(task_ids=get_task_ids,
                                        slot_mappings=get_slot_mappings,
-                                       as_batch=self.enable_batch)
+                                       as_batch=self.enable_batch and len(get_task_ids) > 1)
             if len(launched_get_task_ids) == 1 and len(get_tasks_to_launch) > 1:
                 self.get_tasks[launched_get_task_ids[0]] = get_tasks_to_launch
             elif len(launched_get_task_ids) == len(get_tasks_to_launch):
@@ -678,7 +678,7 @@ class FlexKVSchedulerConnector:
         if put_task_ids:
             launched_put_task_ids = self.flexkv_manager.launch(task_ids=put_task_ids,
                                        slot_mappings=put_slot_mappings,
-                                       as_batch=self.enable_batch)
+                                       as_batch=self.enable_batch and len(put_task_ids) > 1)
             if len(launched_put_task_ids) == 1 and len(put_tasks_to_launch) > 1:
                 self.put_tasks[launched_put_task_ids[0]] = put_tasks_to_launch
             elif len(launched_put_task_ids) == len(put_tasks_to_launch):
