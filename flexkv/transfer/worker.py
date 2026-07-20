@@ -3210,7 +3210,6 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.num_layers: int = cpu_kv_layout.num_layer
         self.num_cpu_blocks: int = cpu_kv_layout.num_block
-        self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
         self.cpu_kv_layout = cpu_kv_layout
         assert self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
@@ -3219,6 +3218,9 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         self.cpu_blocks = cpu_blocks
         self.cache_config = cache_config
         self._cpu_buffer = cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks
+        # Opaque whole-block I/O: multi-group CPU layout is byte-flat
+        # ([num_block, bytes_per_block]); get_chunk_size() is invalid there.
+        self.block_size_bytes = self._block_size_bytes(cpu_kv_layout, dtype)
 
         from flexkv.external.mooncake_store_utils import MooncakeStoreClient, MooncakeStoreConfig
         store_config = MooncakeStoreConfig.from_file(
@@ -3227,6 +3229,19 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         )
         self.mooncake_client = MooncakeStoreClient(store_config)
         self.mooncake_client.register_buffer(self._cpu_buffer)
+
+    @staticmethod
+    def _block_size_bytes(cpu_kv_layout: "KVCacheLayout", dtype: torch.dtype) -> int:
+        """Bytes per CPU block for mooncake put/get addressing.
+
+        Multi-group BLOCKFIRST stores ``bytes_per_block`` directly in
+        ``kv_shape[1]`` (via ``get_block_stride()``) — do not multiply by
+        ``dtype.itemsize``. Single-group layouts still use element count ×
+        itemsize.
+        """
+        if cpu_kv_layout.layer_groups is not None:
+            return int(cpu_kv_layout.get_block_stride())
+        return int(cpu_kv_layout.get_elements_per_block() * dtype.itemsize)
 
     def _transfer_impl(self, cpu_ptrs, block_sizes, keys, transfer_type: TransferType) -> None:
         if transfer_type == TransferType.H2REMOTE:
@@ -3256,8 +3271,7 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
             else transfer_op.src_block_ids
         )
         assert transfer_op.mooncake_store_block_hashes is not None
-        elements_per_block = self.cpu_kv_layout.get_elements_per_block()
-        block_size_bytes = elements_per_block * self.dtype.itemsize
+        block_size_bytes = self.block_size_bytes
         base_ptr = self._cpu_buffer.data_ptr()
         cpu_ptrs, block_sizes, keys = [], [], []
         for i, blk_id in enumerate(cpu_block_ids):
@@ -3295,8 +3309,7 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
             raise ValueError(
                 "SWA mooncake transfer requires len(swa_block_hashes) == "
                 f"len(cpu_block_ids): got {len(tail_hashes)} vs {len(cpu_block_ids)}")
-        elements_per_block = self.cpu_kv_layout.get_elements_per_block()
-        block_size_bytes = elements_per_block * self.dtype.itemsize
+        block_size_bytes = self.block_size_bytes
         base_ptr = self._cpu_buffer.data_ptr()
         cpu_ptrs: List[int] = []
         block_sizes: List[int] = []
