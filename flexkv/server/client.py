@@ -230,7 +230,7 @@ class KVDPClient:
         self.send_to_server.send_pyobj(req)
         return [batch_id] if as_batch else task_ids
 
-    def cancel_task(
+    def cancel_tasks(
         self,
         task_ids: List[int],
     ) -> None:
