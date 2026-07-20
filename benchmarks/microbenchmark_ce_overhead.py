@@ -93,7 +93,8 @@ def make_cpu_tensor(cpu_layout):
     return torch.empty(tuple(cpu_layout.kv_shape), dtype=DTYPE, pin_memory=True)
 
 
-def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers):
+def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
+                  is_mla=False, is_blockfirst=False):
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -111,7 +112,9 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers):
         gpu_layer_strides_in_bytes=[gpu_layout.get_layer_stride() * ES] * num_gpus,
         gpu_chunk_sizes_in_bytes=[gpu_layout.get_chunk_size() * ES] * num_gpus,
         gpu_device_ids=list(range(num_gpus)),
-        enable_nvcomp=False)
+        enable_nvcomp=False,
+        is_mla=is_mla,
+        is_blockfirst=is_blockfirst)
 
 
 def block_ids(n):
@@ -138,37 +141,21 @@ def bench_transfer(tp, gpu_ids, cpu_ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp
     for _ in range(WARMUP_ITERS):
         do_transfer()
 
-    # Use CUDA events for GPU-side timing
-    start_ev = [torch.cuda.Event(enable_timing=True) for _ in range(num_gpus)]
-    end_ev = [torch.cuda.Event(enable_timing=True) for _ in range(num_gpus)]
-
-    gpu_times_ms = []
+    # Wall-clock timing via time.perf_counter(). torch.cuda.Event.elapsed_time
+    # returns 0 on non-NVIDIA backends, so it cannot be used for portable
+    # benchmarking; wall-clock around the synchronous transfer + synchronize
+    # captures the full host-observed transfer time.
     wall_times_ms = []
-
     for _ in range(iters):
         t0 = time.perf_counter()
-        for g in range(num_gpus):
-            start_ev[g].record()
         do_transfer()
-        for g in range(num_gpus):
-            end_ev[g].record()
         torch.cuda.synchronize()
         wall_ms = (time.perf_counter() - t0) * 1000
-
-        # Take max GPU time across all devices
-        max_gpu_ms = 0.0
-        for g in range(num_gpus):
-            gpu_ms = start_ev[g].elapsed_time(end_ev[g])
-            if gpu_ms > max_gpu_ms:
-                max_gpu_ms = gpu_ms
-        gpu_times_ms.append(max_gpu_ms)
         wall_times_ms.append(wall_ms)
 
     return {
-        "gpu_avg_ms": float(np.mean(gpu_times_ms)),
-        "gpu_p99_ms": float(np.percentile(gpu_times_ms, 99)),
-        "wall_avg_ms": float(np.mean(wall_times_ms)),
-        "wall_p99_ms": float(np.percentile(wall_times_ms, 99)),
+        "avg_ms": float(np.mean(wall_times_ms)),
+        "p99_ms": float(np.percentile(wall_times_ms, 99)),
     }
 
 
@@ -264,7 +251,7 @@ def main():
                             num_gpus, args.iters, is_mla,
                             transfer_num_cta=args.cta)
 
-                        bw = total_bytes / (r["gpu_avg_ms"] / 1000) / 1e9  # GB/s
+                        bw = total_bytes / (r["avg_ms"] / 1000) / 1e9  # GB/s
 
                         r.update({
                             "config": cfg_label,
@@ -277,8 +264,8 @@ def main():
                             "bw_gbps": bw,
                         })
                         results.append(r)
-                        print("GPU={:.3f}ms  Wall={:.3f}ms  BW={:.2f} GB/s".format(
-                            r["gpu_avg_ms"], r["wall_avg_ms"], bw))
+                        print("Avg={:.3f}ms  P99={:.3f}ms  BW={:.2f} GB/s".format(
+                            r["avg_ms"], r["p99_ms"], bw))
 
                     except Exception as e:
                         print("FAILED: {}".format(e))
@@ -346,11 +333,11 @@ def main():
                       and r["engine"] == "Kernel"
                       and r["direction"] == dir_name]
                 if ce and kw:
-                    delta_ms = ce[0]["wall_avg_ms"] - kw[0]["wall_avg_ms"]
+                    delta_ms = ce[0]["avg_ms"] - kw[0]["avg_ms"]
                     n = ce[0]["n_calls"]
                     overhead_us = (delta_ms * 1000) / n  # microseconds per call
                     print("  {:>8d}  {:>12.3f}  {:>12.3f}  {:>12.3f} µs".format(
-                        num_blocks, ce[0]["wall_avg_ms"], kw[0]["wall_avg_ms"],
+                        num_blocks, ce[0]["avg_ms"], kw[0]["avg_ms"],
                         overhead_us))
 
     print("\n  Note: CE path calls cudaMemcpyAsync once per (layer, kv, block).")

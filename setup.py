@@ -234,6 +234,7 @@ enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 cpp_sources = [
     "csrc/bindings.cpp",
     "csrc/transfer.cu",  # Skip CUDA file for now
+    "csrc/ce_transfer.cu",
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
@@ -250,6 +251,7 @@ hpp_sources = [
     "csrc/radix_tree.h",
     "csrc/eviction_strategy.h",
     "csrc/layerwise.h",
+    "csrc/ce_transfer.h",
     "csrc/monitoring/metrics_manager.h",  # Monitoring support
 ]
 
