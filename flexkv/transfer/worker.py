@@ -1882,8 +1882,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 num_tensors = None
 
                 for gpu_idx in range(self.num_gpus):
-                    grp_layout = gpu_layouts_per_group[gpu_idx][gi]
-                    grp_handles = gpu_blocks_per_group[gpu_idx][gi]
+                    grp_layout = gpu_layouts_per_group[gi][gpu_idx]
+                    grp_handles = gpu_blocks_per_group[gi][gpu_idx]
                     grp_tensors = [h.get_tensor() for h in grp_handles]
 
                     gpu_strides = self._get_gpu_strides_from_tensor(

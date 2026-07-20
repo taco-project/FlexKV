@@ -183,7 +183,7 @@ class TransferEngine:
         self._child_to_parent_op_id: Dict[int, int] = {}
 
     def _get_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
-        """Get multi-group kwargs for GPUCPUTransferWorker (TP=1)."""
+        """Get multi-group kwargs for TP=1 workers (GPUCPU / GDS)."""
         if (self.model_config.layer_groups is None or
                 self._gpu_blocks_per_group is None or
                 worker_key not in self._gpu_blocks_per_group):
@@ -201,7 +201,7 @@ class TransferEngine:
         )
 
     def _get_multi_group_kwargs_tp(self, worker_key: WorkerKey) -> dict:
-        """Get multi-group kwargs for tpGPUCPUTransferWorker (TP>1)."""
+        """Get multi-group kwargs for TP>1 workers (tpGPUCPU / tpGDS)."""
         if (self.model_config.layer_groups is None or
                 self._gpu_blocks_per_group is None or
                 worker_key not in self._gpu_blocks_per_group):
@@ -218,51 +218,6 @@ class TransferEngine:
 
         # Restructure: from [device][group] -> [group][device]
         # gpu_blocks_per_group[group_idx][device_idx] = handles for that group on that device
-        blocks_by_group = []
-        layouts_by_group = []
-        for gi in range(num_groups):
-            group_blocks_per_device = [per_device_data[di][gi] for di in range(num_devices)]
-            group_layouts_per_device = [per_device_layouts[di][gi] for di in range(num_devices)]
-            blocks_by_group.append(group_blocks_per_device)
-            layouts_by_group.append(group_layouts_per_device)
-
-        return dict(
-            layer_groups=self.model_config.layer_groups,
-            gpu_blocks_per_group=blocks_by_group,
-            gpu_layouts_per_group=layouts_by_group,
-        )
-
-    def _get_gds_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
-        """Get multi-group kwargs for GDSTransferWorker (TP=1)."""
-        if (self.model_config.layer_groups is None or
-                self._gpu_blocks_per_group is None or
-                worker_key not in self._gpu_blocks_per_group):
-            return {}
-        per_device_group_blocks = self._gpu_blocks_per_group[worker_key][0]
-        per_device_group_layouts = self._gpu_layouts_per_group[worker_key][0]
-        if per_device_group_blocks is None or per_device_group_layouts is None:
-            return {}
-        return dict(
-            layer_groups=self.model_config.layer_groups,
-            gpu_blocks_per_group=per_device_group_blocks,
-            gpu_layouts_per_group=per_device_group_layouts,
-        )
-
-    def _get_gds_multi_group_kwargs_tp(self, worker_key: WorkerKey) -> dict:
-        """Get multi-group kwargs for tpGDSTransferWorker (TP>1)."""
-        if (self.model_config.layer_groups is None or
-                self._gpu_blocks_per_group is None or
-                worker_key not in self._gpu_blocks_per_group):
-            return {}
-        per_device_data = self._gpu_blocks_per_group[worker_key]
-        per_device_layouts = self._gpu_layouts_per_group[worker_key]
-        if per_device_data[0] is None or per_device_layouts[0] is None:
-            return {}
-
-        num_groups = len(self.model_config.layer_groups)
-        num_devices = len(per_device_data)
-
-        # Restructure: from [device][group] -> [group][device]
         blocks_by_group = []
         layouts_by_group = []
         for gi in range(num_groups):
@@ -482,7 +437,7 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         gpu_device_id=gpu_handles[0].gpu_device_id,
-                        **self._get_gds_multi_group_kwargs_tp1(worker_key),
+                        **self._get_multi_group_kwargs_tp1(worker_key),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
@@ -499,7 +454,7 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         tp_group_size=self.model_config.effective_tp_size_per_node,
-                        **self._get_gds_multi_group_kwargs_tp(worker_key),
+                        **self._get_multi_group_kwargs_tp(worker_key),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }

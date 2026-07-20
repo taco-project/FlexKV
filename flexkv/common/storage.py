@@ -40,6 +40,7 @@ class KVCacheLayout:
     _kv_shape: Optional[torch.Size] = None
     # Multi-group support: when set, the layout represents a heterogeneous block
     # where different layer groups have different (num_kv_heads, head_size).
+    # Requires type == BLOCKFIRST (enforced in __post_init__).
     layer_groups: Optional[List[LayerGroupSpec]] = None
     # TP size: when > 1 and layer_groups is set, elements_per_block is scaled
     # so that each CPU/SSD block can hold data for all TP ranks.
@@ -71,11 +72,27 @@ class KVCacheLayout:
         return self._kv_shape
 
     def __post_init__(self) -> None:
+        self._validate_layout()
         self._compute_kv_shape()
+
+    def _validate_layout(self) -> None:
+        """Fail fast on unsupported layout combinations."""
+        if self.layer_groups is not None and self.type != KVCacheLayoutType.BLOCKFIRST:
+            raise ValueError(
+                "Multi-group KVCacheLayout (layer_groups is set) only supports "
+                f"BLOCKFIRST layout, got {self.type.value}. "
+                "Heterogeneous layer groups pack per-group regions into a single "
+                "block in byte-flat BLOCKFIRST order; LAYERFIRST/LAYERBLOCK are "
+                "not defined for this mode."
+            )
 
     def _compute_kv_shape(self) -> None:
         if self._kv_shape is None:
-            if self.layer_groups is not None and self.type == KVCacheLayoutType.BLOCKFIRST:
+            if self.layer_groups is not None:
+                assert self.type == KVCacheLayoutType.BLOCKFIRST, (
+                    "multi-group layout requires BLOCKFIRST; "
+                    "call _validate_layout() before _compute_kv_shape()"
+                )
                 # Multi-group: kv_shape's second dim is BYTES per block, not
                 # element count.  Groups may carry different dtypes (e.g. bf16
                 # main KV + uint8 indexer in DSv4), so we cannot factor out a
