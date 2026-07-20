@@ -96,7 +96,19 @@ cache_config.swa.multi_group = True
 
 这个标志还用于选择正确的 layerwise GET 时序，见第 6 节。
 
-### 3.3 生成 page mapping
+### 3.3 用户配置开关
+
+用户配置项为 `swa_multi_group`：
+
+| 配置 | 行为 |
+|---|---|
+| 不配置 | 默认启用：SWA KV + attention/indexer state |
+| `swa_multi_group: true` | 显式启用：SWA KV + attention/indexer state |
+| `swa_multi_group: false` | SWA-only：保留 SWA KV，不注册、不存取 state |
+
+也可以在未使用配置文件时通过环境变量 `FLEXKV_SWA_MULTI_GROUP=0/1` 设置。用户配置和内部运行标记是分开的：只有 state groups 实际构造成功后，Connector 才会设置 `cache_config.swa.multi_group = True`；SWA-only 路径始终保持 `False`。
+
+### 3.4 生成 page mapping
 
 PUT 和 GET 都调用 `_build_swa_slot_mapping`：
 
@@ -267,6 +279,7 @@ main layerwise op 显式依赖完整的 SWA/state H2D。这样第一层 ready ev
 | 三个 multi-group 注册字段同时出现 | 防止 metadata 与 handle 不完整 |
 | 各 GPU 的 group spec 一致 | TP/CP worker 必须使用相同 byte layout |
 | restore 测试必须关闭 `FLEXKV_P3_CLEAR` | restore 后清零会覆盖刚恢复的 state |
+| `swa_multi_group: false` | 只存取 SWA KV，不注册或搬运 compress state |
 
 当前实现不会自动重算 state，也不会在 state pool 缺失时伪造零值。
 

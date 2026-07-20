@@ -32,6 +32,13 @@ enable_gds: false
 - `ssd_cache_gb`：SSD 缓存层容量，单位为 GB。建议大于 `cpu_cache_gb`并为`FLEXKV_MAX_FILE_SIZE_GB`的整数倍，若仅用CPU缓存则设为 0（此时不启用 SSD 缓存）。
 - `ssd_cache_dir`：SSD 缓存数据的存放目录。若有多块 SSD，可通过分号 `;` 分隔多个挂载路径。例如 `ssd_cache_dir: /data0/flexkv_ssd/;/data1/flexkv_ssd/`，以提升带宽。
 - `enable_gds`：是否启用 GPU Direct Storage（GDS）。如硬件和驱动支持，开启后可提升 SSD 到 GPU 的数据吞吐能力。默认关闭。
+- `swa_multi_group`：DeepSeek-V4 SWA sidecar 开关。未配置或设为 `true` 时，SWA KV 会与 attention/indexer compress state 一起存取；显式设为 `false` 时保留 SWA KV 存取，但不注册或存取 state。
+
+如需切换到 SWA-only，可在配置文件中显式添加：
+
+```yml
+swa_multi_group: false
+```
 
 ---
 
@@ -50,6 +57,7 @@ enable_gds: false
 | `FLEXKV_USE_HUGEPAGE_CPU_BUFFER` | bool | 0 | 是否为通用 CPU KV cache 启用 HugePage。默认关闭，开启请设为 1 |
 | `FLEXKV_USE_HUGEPAGE_TMP_BUFFER` | bool | 0 | 是否为 `enable_p2p_ssd` 场景下的 tmp CPU staging buffer 启用 HugePage。默认关闭，开启请设为 1 |
 | `FLEXKV_HUGEPAGE_SIZE_BYTES` | int | 2097152 | HugePage 大小，默认 2 MiB。如果宿主机准备的是 1 GiB HugePage，可设为 `1073741824` |
+| `FLEXKV_SWA_MULTI_GROUP` | bool | 未设置（自动开启） | DeepSeek-V4 下未设置或设为 `1` 时，SWA KV 与 attention/indexer compress state 一起存取；设为 `0` 时只保留 SWA KV 存取 |
 
 ---
 
