@@ -47,7 +47,7 @@ from flexkv.transfer.layerwise import (
     build_layerwise_eventfd_socket_path,
 )
 from flexkv.common.config import (
-    CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV,
+    CacheConfig, LayerGroupSpec, ModelConfig, GLOBAL_CONFIG_FROM_ENV,
 )
 from flexkv.common.ring_buffer import SharedOpPool
 
@@ -103,6 +103,9 @@ class TransferEngine:
         swa_cpu_handle: Optional[StorageHandle] = None,
         swa_ssd_handle: Optional[StorageHandle] = None,
         swa_remote_handle: Optional[StorageHandle] = None,
+        swa_layer_groups: Optional[List[LayerGroupSpec]] = None,
+        swa_gpu_blocks_per_group: Optional[Dict[WorkerKey, List]] = None,
+        swa_gpu_layouts_per_group: Optional[Dict[WorkerKey, List]] = None,
         ):
         """
         Initialize transfer engine
@@ -149,6 +152,21 @@ class TransferEngine:
         self._swa_cpu_handle = swa_cpu_handle
         self._swa_ssd_handle = swa_ssd_handle
         self._swa_remote_handle = swa_remote_handle
+        self._swa_layer_groups = (
+            swa_cpu_handle.kv_layout.layer_groups
+            if swa_cpu_handle is not None
+            and swa_cpu_handle.kv_layout.layer_groups is not None
+            else swa_layer_groups
+        )
+        self._swa_gpu_blocks_per_group = swa_gpu_blocks_per_group
+        self._swa_gpu_layouts_per_group = swa_gpu_layouts_per_group
+        if self._swa_layer_groups is not None and (
+            self._swa_gpu_blocks_per_group is None
+            or self._swa_gpu_layouts_per_group is None
+        ):
+            raise ValueError(
+                "SWA multi-group layout is missing per-group GPU handles/layouts"
+            )
         self._has_swa = (swa_gpu_handles is not None and len(swa_gpu_handles) > 0
                          and swa_cpu_handle is not None)
         self._cache_config = cache_config
@@ -230,6 +248,52 @@ class TransferEngine:
             layer_groups=self.model_config.layer_groups,
             gpu_blocks_per_group=blocks_by_group,
             gpu_layouts_per_group=layouts_by_group,
+        )
+
+    def _get_swa_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
+        """Return DSv4 SWA/state sidecar groups for a one-device worker."""
+        if (
+            self._swa_layer_groups is None
+            or self._swa_gpu_blocks_per_group is None
+            or self._swa_gpu_layouts_per_group is None
+            or worker_key not in self._swa_gpu_blocks_per_group
+        ):
+            return {}
+        per_device_blocks = self._swa_gpu_blocks_per_group[worker_key][0]
+        per_device_layouts = self._swa_gpu_layouts_per_group[worker_key][0]
+        if per_device_blocks is None or per_device_layouts is None:
+            return {}
+        return dict(
+            layer_groups=self._swa_layer_groups,
+            gpu_blocks_per_group=per_device_blocks,
+            gpu_layouts_per_group=per_device_layouts,
+        )
+
+    def _get_swa_multi_group_kwargs_tp(self, worker_key: WorkerKey) -> dict:
+        """Return SWA/state sidecar groups reshaped as [group][device]."""
+        if (
+            self._swa_layer_groups is None
+            or self._swa_gpu_blocks_per_group is None
+            or self._swa_gpu_layouts_per_group is None
+            or worker_key not in self._swa_gpu_blocks_per_group
+        ):
+            return {}
+        per_device_blocks = self._swa_gpu_blocks_per_group[worker_key]
+        per_device_layouts = self._swa_gpu_layouts_per_group[worker_key]
+        if per_device_blocks[0] is None or per_device_layouts[0] is None:
+            return {}
+        num_groups = len(self._swa_layer_groups)
+        num_devices = len(per_device_blocks)
+        return dict(
+            layer_groups=self._swa_layer_groups,
+            gpu_blocks_per_group=[
+                [per_device_blocks[di][gi] for di in range(num_devices)]
+                for gi in range(num_groups)
+            ],
+            gpu_layouts_per_group=[
+                [per_device_layouts[di][gi] for di in range(num_devices)]
+                for gi in range(num_groups)
+            ],
         )
 
     def _init_workers(self) -> None:
@@ -496,21 +560,24 @@ class TransferEngine:
                     # worker stays in pure main-KV mode (has_swa=False inside).
                     swa_gpu_blocks=(
                         [h.get_tensor_handle_list() for h in self._swa_gpu_handles[worker_key]]
-                        if self._has_swa else None),
+                        if self._has_swa and self._swa_layer_groups is None else None),
                     swa_cpu_blocks=(self._swa_cpu_handle.get_worker_tensor()
-                                    if self._has_swa else None),
+                                    if self._has_swa and self._swa_layer_groups is None else None),
                     swa_gpu_kv_layouts=([h.kv_layout for h in self._swa_gpu_handles[worker_key]]
-                                        if self._has_swa else None),
+                                        if self._has_swa and self._swa_layer_groups is None else None),
                     swa_cpu_kv_layout=(self._swa_cpu_handle.kv_layout
-                                       if self._has_swa else None),
+                                       if self._has_swa and self._swa_layer_groups is None else None),
                     swa_dtype=(self._swa_gpu_handles[worker_key][0].dtype
-                               if self._has_swa else None),
+                               if self._has_swa and self._swa_layer_groups is None else None),
                     swa_ssd_files=(self._swa_ssd_handle.get_file_list()
-                                   if self._has_swa and self._swa_ssd_handle is not None else None),
+                                   if self._has_swa and self._swa_layer_groups is None
+                                   and self._swa_ssd_handle is not None else None),
                     swa_ssd_kv_layout=(self._swa_ssd_handle.kv_layout
-                                       if self._has_swa and self._swa_ssd_handle is not None else None),
+                                       if self._has_swa and self._swa_layer_groups is None
+                                       and self._swa_ssd_handle is not None else None),
                     swa_num_blocks_per_file=(self._swa_ssd_handle.num_blocks_per_file
-                                             if self._has_swa and self._swa_ssd_handle is not None else 0),
+                                             if self._has_swa and self._swa_layer_groups is None
+                                             and self._swa_ssd_handle is not None else 0),
                     **self._get_multi_group_kwargs_tp(worker_key),
                 )
                 self.layerwise_workers[worker_key] = worker
@@ -554,10 +621,11 @@ class TransferEngine:
         # Reuses GPUCPUTransferWorker / tpGPUCPUTransferWorker exactly like the
         # main-KV H2D/D2H workers, but bound to the dedicated SWA GPU/CPU pools
         # and submitting completion onto the shared finished_ops_queue.
-        # SWA is a single MLA pool (num_head=1), so no multi-group kwargs.
+        # Uniform SWA uses the legacy single-group worker. DSv4 state sidecars
+        # reuse this channel with heterogeneous multi-group worker arguments.
         if self._has_swa:
             self._swa_worker_map: Dict[TransferType, Dict[WorkerKey, WorkerHandle]] = {}
-            if not _enable_layerwise:
+            if not _enable_layerwise or self._swa_layer_groups is not None:
                 if self.model_config.effective_tp_size_per_node == 1:
                     self._swa_h2d_workers: Dict[WorkerKey, WorkerHandle] = {
                         worker_key: GPUCPUTransferWorker.create_worker(
@@ -574,6 +642,7 @@ class TransferEngine:
                             use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                             transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                             transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                            **self._get_swa_multi_group_kwargs_tp1(worker_key),
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()
                     }
@@ -593,6 +662,7 @@ class TransferEngine:
                             use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                             transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                             transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                            **self._get_swa_multi_group_kwargs_tp(worker_key),
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()
                     }
@@ -615,6 +685,7 @@ class TransferEngine:
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                        **self._get_swa_multi_group_kwargs_tp1(worker_key),
                     )
                     for worker_key, swa_handles in self._swa_gpu_handles.items()
                 }
@@ -634,6 +705,7 @@ class TransferEngine:
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                        **self._get_swa_multi_group_kwargs_tp(worker_key),
                         )
                     for worker_key, swa_handles in self._swa_gpu_handles.items()
                 }
@@ -653,6 +725,7 @@ class TransferEngine:
                     dtype=self._swa_cpu_handle.dtype,
                     num_blocks_per_file=self._swa_ssd_handle.num_blocks_per_file,
                     cache_config=self._cache_config,
+                    layer_groups=self._swa_layer_groups,
                 )
                 self._swa_worker_map[TransferType.H2DISK] = self.swa_h2disk_worker
 
@@ -667,6 +740,7 @@ class TransferEngine:
                     dtype=self._swa_cpu_handle.dtype,
                     num_blocks_per_file=self._swa_ssd_handle.num_blocks_per_file,
                     cache_config=self._cache_config,
+                    layer_groups=self._swa_layer_groups,
                 )
                 self._swa_worker_map[TransferType.DISK2H] = self.swa_disk2h_worker
                 flexkv_logger.info("TransferEngine: swa CPU<->SSD workers initialized")
@@ -716,6 +790,7 @@ class TransferEngine:
                             ssd_kv_layout=self._swa_ssd_handle.kv_layout,
                             dtype=swa_handles[0].dtype,
                             gpu_device_id=swa_handles[0].gpu_device_id,
+                            **self._get_swa_multi_group_kwargs_tp1(worker_key),
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()
                     }
@@ -732,6 +807,7 @@ class TransferEngine:
                             ssd_kv_layout=self._swa_ssd_handle.kv_layout,
                             dtype=swa_handles[0].dtype,
                             tp_group_size=self.model_config.effective_tp_size_per_node,
+                            **self._get_swa_multi_group_kwargs_tp(worker_key),
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()
                     }
@@ -739,7 +815,7 @@ class TransferEngine:
                 self._swa_worker_map[TransferType.D2DISK] = self._swa_gds_workers
                 flexkv_logger.info("TransferEngine: swa GDS workers initialized")
             self._has_swa = True
-            if not _enable_layerwise:
+            if not _enable_layerwise or self._swa_layer_groups is not None:
                 flexkv_logger.info(
                 f"TransferEngine: swa inline workers initialized "
                 f"({len(self._swa_h2d_workers)} H2D + {len(self._swa_d2h_workers)} D2H)")

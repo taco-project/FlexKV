@@ -572,6 +572,11 @@ class SWAPoolConfig:
     num_remote_slots: int = 0          # Number of REMOTE SWA pool slots (0 = no REMOTE SWA tier)
     num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
     bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
+    # True when the SWA page also carries heterogeneous sidecar groups (for
+    # example DeepSeek-V4 attention/indexer compress states).  The flag keeps
+    # layerwise GET from fusing SWA into the legacy uniform-layout kernel; the
+    # dedicated multi-group SWA worker completes first instead.
+    multi_group: bool = False
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
     pin_memory: bool = True            # Use pinned memory for async DMA
 
@@ -795,6 +800,11 @@ class UserConfig:
     redis_password: Optional[str] = None
     node_ttl_seconds: Optional[int] = None
     kv_cache_dtype: Optional[str] = None  # Override kv_cache_dtype when TRT config uses "auto". Supported values: "fp8", "float8", "e4m3", "fp16", "float16", "bf16", "bfloat16", "fp32", "float32", "nvfp4" (packed fp4+fp8-scale, stored as uint8)
+    # DeepSeek-V4 SWA sidecar policy. None/True enables attention and indexer
+    # compress-state I/O together with SWA; False keeps the legacy SWA-only
+    # path. None is intentionally distinct from False so old configs default
+    # to the correctness-preserving state restore path.
+    swa_multi_group: Optional[bool] = None
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
@@ -804,6 +814,13 @@ class UserConfig:
         if self.ssd_cache_gb > 0 and self.ssd_cache_gb <= self.cpu_cache_gb:
             raise ValueError(f"Invalid ssd_cache_gb: {self.ssd_cache_gb}, "
                              f"must be greater than cpu_cache_gb: {self.cpu_cache_gb}.")
+        if self.swa_multi_group is not None and not isinstance(
+            self.swa_multi_group, bool
+        ):
+            raise ValueError(
+                "swa_multi_group must be a boolean when configured, "
+                f"got {self.swa_multi_group!r}"
+            )
 
 def parse_path_list(path_str: str) -> List[str]:
     paths = [p.strip() for p in path_str.split(';') if p.strip()]
@@ -835,6 +852,7 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
     return user_config
 
 def load_user_config_from_env() -> UserConfig:
+    swa_multi_group_env = os.getenv('FLEXKV_SWA_MULTI_GROUP')
     return UserConfig(
         cpu_cache_gb=int(os.getenv('FLEXKV_CPU_CACHE_GB', 16)),
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
@@ -845,6 +863,11 @@ def load_user_config_from_env() -> UserConfig:
         use_hugepage_tmp_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_TMP_BUFFER', 0))),
         hugepage_size_bytes=int(os.getenv('FLEXKV_HUGEPAGE_SIZE_BYTES', 2 * 1024 * 1024)),
         kv_cache_dtype=os.getenv('FLEXKV_KV_CACHE_DTYPE', None),
+        swa_multi_group=(
+            None
+            if swa_multi_group_env is None
+            else bool(int(swa_multi_group_env))
+        ),
     )
 
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:

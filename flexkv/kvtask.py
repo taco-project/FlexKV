@@ -833,7 +833,14 @@ class KVTaskEngine(KVTaskManager):
                                                                                   task_end_op_ids,
                                                                                   op_callback_dict,
                                                                                   layerwise_transfer,
-                                                                                  counter_id)
+                                                                                  counter_id,
+                                                                                  fuse_swa_into_layerwise=not bool(
+                                                                                      getattr(
+                                                                                          getattr(self.cache_config, "swa", None),
+                                                                                          "multi_group",
+                                                                                          False,
+                                                                                      )
+                                                                                  ))
         self.tasks[batch_id] = KVTask(
             task_id=batch_id,
             token_ids=np.concatenate([self.tasks[task_id].token_ids for task_id in task_ids]),

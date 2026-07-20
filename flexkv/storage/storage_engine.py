@@ -46,7 +46,8 @@ class StorageEngine:
     def __init__(self,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
-                 num_layers_per_pp_stage: int):
+                 num_layers_per_pp_stage: int,
+                 swa_layer_groups: Optional[List[LayerGroupSpec]] = None):
         """Initialize storage engine"""
         self._storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
         # SWA dedicated GPU pool handles, physically isolated from the main-KV
@@ -62,6 +63,17 @@ class StorageEngine:
         if self._model_config.layer_groups is not None:
             self._model_config.layer_groups = _resolve_layer_groups(
                 self._model_config.layer_groups, self._model_config.dtype
+            )
+        self._swa_layer_groups = _resolve_layer_groups(
+            swa_layer_groups, torch.uint8
+        )
+        if (
+            self._swa_layer_groups is not None
+            and GLOBAL_CONFIG_FROM_ENV.cpu_layout_type
+            != KVCacheLayoutType.BLOCKFIRST
+        ):
+            raise ValueError(
+                "SWA multi-group sidecars require FLEXKV_CPU_LAYOUT=BLOCKFIRST"
             )
 
         # For multi-group, the CPU/SSD/Remote buffer is sized in BYTES
@@ -150,6 +162,8 @@ class StorageEngine:
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
                     is_mla=True,
+                    layer_groups=self._swa_layer_groups,
+                    tp_size=self._model_config.tp_size,
                 )
                 self.allocate(
                     device_type=DeviceType.CPU,
@@ -178,6 +192,8 @@ class StorageEngine:
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
                     is_mla=True,
+                    layer_groups=self._swa_layer_groups,
+                    tp_size=self._model_config.tp_size,
                 )
                 self.allocate(
                     device_type=DeviceType.SSD,
@@ -206,6 +222,8 @@ class StorageEngine:
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
                     is_mla=True,
+                    layer_groups=self._swa_layer_groups,
+                    tp_size=self._model_config.tp_size,
                 )
                 swa_remote_path = self._cache_config.remote_cache_path
                 if isinstance(swa_remote_path, str):
