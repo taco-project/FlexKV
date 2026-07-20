@@ -68,40 +68,40 @@ def cudaHostUnregister(tensor: torch.Tensor) -> None:
         raise RuntimeError(f"cudaHostUnregister failed with error code {ret}")
 
 
-@dataclass
-class HostBufferHandle:
-    tensor: torch.Tensor
-    is_hugepage: bool = False
-    is_cuda_registered: bool = False
+# @dataclass
+# class HostBufferHandle:
+#     tensor: torch.Tensor
+#     is_hugepage: bool = False
+#     is_cuda_registered: bool = False
 
-    def __post_init__(self) -> None:
-        if self.is_cuda_registered and not self.is_hugepage:
-            raise ValueError("CUDA-registered host buffer must be HugePage-backed")
+#     def __post_init__(self) -> None:
+#         if self.is_cuda_registered and not self.is_hugepage:
+#             raise ValueError("CUDA-registered host buffer must be HugePage-backed")
 
-    @classmethod
-    def pinned(cls, tensor: torch.Tensor) -> HostBufferHandle:
-        return cls(tensor=tensor)
+#     @classmethod
+#     def pinned(cls, tensor: torch.Tensor) -> HostBufferHandle:
+#         return cls(tensor=tensor)
 
-    @classmethod
-    def hugepage(cls, tensor: torch.Tensor) -> HostBufferHandle:
-        return cls(tensor=tensor, is_hugepage=True, is_cuda_registered=True)
+#     @classmethod
+#     def hugepage(cls, tensor: torch.Tensor) -> HostBufferHandle:
+#         return cls(tensor=tensor, is_hugepage=True, is_cuda_registered=True)
 
-    def release(self) -> None:
-        if not self.is_hugepage:
-            return
+#     def release(self) -> None:
+#         if not self.is_hugepage:
+#             return
 
-        if self.is_cuda_registered:
-            try:
-                cudaHostUnregister(self.tensor)
-            except Exception as e:
-                flexkv_logger.warning(
-                    f"[host_buffer] release hugepage host buffer: cuda unregister failed ({e})"
-                )
-            self.is_cuda_registered = False
+#         if self.is_cuda_registered:
+#             try:
+#                 cudaHostUnregister(self.tensor)
+#             except Exception as e:
+#                 flexkv_logger.warning(
+#                     f"[host_buffer] release hugepage host buffer: cuda unregister failed ({e})"
+#                 )
+#             self.is_cuda_registered = False
 
-        free_hugepage_tensor(self.tensor)
-        flexkv_logger.info("[host_buffer] release hugepage host buffer")
-        self.is_hugepage = False
+#         free_hugepage_tensor(self.tensor)
+#         flexkv_logger.info("[host_buffer] release hugepage host buffer")
+#         self.is_hugepage = False
 
 
 def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Tensor:
