@@ -56,6 +56,9 @@ public:
 
   ~TPTransferThreadGroup();
 
+  void update_gpu_block_ptrs(
+      const std::vector<int64_t> &gpu_block_ptrs_flat);
+
   void tp_group_transfer(const torch::Tensor &gpu_block_id_tensor,
                          const torch::Tensor &cpu_block_id_tensor,
                          const int64_t cpu_kv_stride_in_bytes,

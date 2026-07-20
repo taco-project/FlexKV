@@ -137,6 +137,30 @@ TPTransferThreadGroup::TPTransferThreadGroup(
 
 }
 
+void TPTransferThreadGroup::update_gpu_block_ptrs(
+    const std::vector<int64_t> &gpu_block_ptrs_flat) {
+  const size_t expected =
+      static_cast<size_t>(num_gpus_) * num_tensors_per_gpu_;
+  if (gpu_block_ptrs_flat.size() != expected) {
+    throw std::invalid_argument("GPU pointer count does not match transfer group");
+  }
+  for (int i = 0; i < num_gpus_; ++i) {
+    cudaError_t err = cudaSetDevice(gpu_device_ids_[i]);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaSetDevice failed: ") +
+                               cudaGetErrorString(err));
+    }
+    err = cudaStreamSynchronize(streams_[i]);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaStreamSynchronize failed: ") +
+                               cudaGetErrorString(err));
+    }
+  }
+  for (size_t i = 0; i < expected; ++i) {
+    gpu_blocks_[i] = reinterpret_cast<void *>(gpu_block_ptrs_flat[i]);
+  }
+}
+
 TPTransferThreadGroup::~TPTransferThreadGroup() {
   const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
 

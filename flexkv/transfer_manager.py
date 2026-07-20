@@ -77,6 +77,14 @@ class TransferManager:
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
             self.context, zmq.SocketType.PULL, gpu_register_port, True)
+        self.gpu_control_port = f"{gpu_register_port}_control"
+        self.gpu_control_socket = get_zmq_socket(
+            self.context, zmq.SocketType.REP, self.gpu_control_port, True
+        )
+        self._gpu_suspended = False
+        self._pending_resume_registrations: Dict[
+            RegistrationKey, RegisterTPClientRequest
+        ] = {}
 
         self.transfer_engine: Optional[TransferEngine] = None
         self.storage_engine: Optional[StorageEngine] = None
@@ -136,6 +144,103 @@ class TransferManager:
             except Exception as e:
                 flexkv_logger.error(
                     f"Failed to register GPU worker {registration_key}: {e}")
+
+    def handle_gpu_control(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle synchronous sleep/wake mapping lifecycle requests."""
+        if self.transfer_engine is None or self.storage_engine is None:
+            raise RuntimeError("Transfer engine is not initialized")
+
+        request_type = request.get("type")
+        if request_type == "suspend_gpu":
+            if not self._gpu_suspended:
+                released = self.transfer_engine.suspend_gpu_mappings()
+                self._gpu_suspended = True
+                self._pending_resume_registrations.clear()
+                flexkv_logger.info(
+                    f"Suspended FlexKV GPU mappings: released={released}"
+                )
+            else:
+                released = 0
+            return {"ok": True, "released_mappings": released}
+
+        if request_type != "resume_gpu":
+            raise ValueError(f"Unknown GPU control request: {request_type}")
+        if not self._gpu_suspended:
+            raise RuntimeError("GPU mappings are not suspended")
+
+        registration = request.get("registration")
+        if not isinstance(registration, RegisterTPClientRequest):
+            raise TypeError("resume_gpu requires RegisterTPClientRequest")
+        if registration.registration_key not in self.all_gpu_blocks:
+            raise KeyError(
+                f"Unknown registration key {registration.registration_key}"
+            )
+        if (
+            registration.layer_groups is not None
+            or registration.handles_per_group is not None
+            or registration.swa_handles is not None
+        ):
+            raise NotImplementedError(
+                "GPU hot remap currently supports uniform main KV only"
+            )
+        self._pending_resume_registrations[
+            registration.registration_key
+        ] = registration
+
+        ready = (
+            len(self._pending_resume_registrations) == self.expected_gpus
+        )
+        imported = 0
+        if ready:
+            grouped_gpu_handles = {}
+            for registration_key in sorted(
+                self._pending_resume_registrations
+            ):
+                fresh = self._pending_resume_registrations[registration_key]
+                self.all_gpu_blocks[registration_key] = fresh.handles
+                self.all_gpu_layouts[registration_key] = fresh.gpu_layout
+                handle = self.storage_engine.get_storage_handle(
+                    DeviceType.GPU, fresh.device_id
+                )
+                handle.data = fresh.handles
+                handle.kv_layout = fresh.gpu_layout
+                worker_key = self.gpu_worker_key_mapping[registration_key]
+                grouped_gpu_handles.setdefault(worker_key, []).append(handle)
+            imported = self.transfer_engine.resume_gpu_mappings(
+                grouped_gpu_handles
+            )
+            self._pending_resume_registrations.clear()
+            self._gpu_suspended = False
+            flexkv_logger.info(
+                f"Resumed FlexKV GPU mappings: imported={imported}"
+            )
+
+        return {
+            "ok": True,
+            "ready": ready,
+            "registered": (
+                self.expected_gpus if ready
+                else len(self._pending_resume_registrations)
+            ),
+            "imported_mappings": imported,
+        }
+
+    def drain_gpu_control_requests(self) -> int:
+        """Drain all requests after a ZeroMQ FD edge notification."""
+        processed = 0
+        while True:
+            try:
+                request = self.gpu_control_socket.recv_pyobj(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            try:
+                response = self.handle_gpu_control(request)
+            except Exception as e:
+                flexkv_logger.exception("GPU mapping lifecycle request failed")
+                response = {"ok": False, "error": str(e)}
+            self.gpu_control_socket.send_pyobj(response)
+            processed += 1
+        return processed
 
     def _register_gpu_blocks_via_socket(self) -> None:
         try:
@@ -874,6 +979,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             # Also monitor completed_queue for finished ops (now it's mp.Queue with _reader)
             sel.register(transfer_manager.transfer_engine.completed_queue._reader,
                         selectors.EVENT_READ, data="finished_ops")
+            sel.register(transfer_manager.gpu_control_socket,
+                         selectors.EVENT_READ, data="gpu_control")
 
             flexkv_logger.info(
                 "TransferManager daemon process started with selector-based "
@@ -925,6 +1032,11 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         elif key.data == "finished_ops":
                             # Selector reports finished_ops queue has data
                             has_finished_ops = True
+
+                        elif key.data == "gpu_control":
+                            # ZeroMQ exposes an edge-triggered FD, so one event
+                            # must consume every request that is already queued.
+                            transfer_manager.drain_gpu_control_requests()
 
                     # Only collect finished_ops if selector reported data available
                     if has_finished_ops and not should_exit:

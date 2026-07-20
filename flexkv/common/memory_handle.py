@@ -171,12 +171,17 @@ if libcuda is not None:
     libcuda.cuMemRelease.restype = _CUresult
     libcuda.cuMemRelease.argtypes = [ctypes.c_void_p]
 
+# Imported VMM mappings are process-local. Keep the reserved base address and
+# size so a long-lived transfer worker can release the imported allocation
+# before vLLM tears down the exporting CuMemAllocator allocation for sleep.
+_IMPORTED_VMM_MAPPINGS: dict[int, tuple[int, int]] = {}
+
 
 # FDs returned by cuMemExportToShareableHandle stay valid only while the
 # exporting process holds them open. We stash them in a module-level list so
 # importers that arrive later (or restart) can still pidfd_getfd them.
-# List is intentionally simple (no eviction) — FlexKV registers a bounded
-# number of KV cache tensors at startup and never re-exports.
+# Entries are removed after FlexKV importers unmap for vLLM sleep; wake-up
+# exports fresh handles for the allocator's new physical allocation.
 _EXPORTED_VMM_FDS: list[int] = []
 
 # Linux 5.6+ syscalls used for cross-process FD passing without SCM_RIGHTS.
@@ -240,8 +245,7 @@ def _pidfd_getfd(pidfd: int, target_fd: int) -> int:
 # derived from its PID. Importers include the exporter PID and an
 # opaque FD key in the 64-byte VMM handle payload; on ``get_tensor`` they
 # connect to the UDS and receive the FD via SCM_RIGHTS. FDs stay registered
-# for the lifetime of the exporter process (KV cache tensors are permanent
-# from FlexKV's perspective) so there is no unregistration API to design.
+# until the connector confirms every FlexKV importer has unmapped before sleep.
 
 import socket
 import threading
@@ -401,6 +405,37 @@ def _check_cu(where: str, result: int) -> None:
     """Raise on non-CUDA_SUCCESS return codes from the driver API."""
     if result != CUDA_SUCCESS:
         raise RuntimeError(f"{where} failed with CUresult={result}")
+
+
+def release_vmm_tensor(tensor: torch.Tensor) -> bool:
+    """Release a VMM mapping created by ``TensorSharedHandle.get_tensor``.
+
+    The caller must drain transfers and synchronize all streams first. The
+    tensor becomes invalid immediately and must not be accessed again.
+    """
+    if libcuda is None:
+        return False
+
+    data_ptr = tensor.data_ptr()
+    mapping = _IMPORTED_VMM_MAPPINGS.get(data_ptr)
+    if mapping is None:
+        return False
+
+    base, allocation_size = mapping
+    res = libcuda.cuMemUnmap(
+        ctypes.c_ulonglong(base), ctypes.c_size_t(allocation_size)
+    )
+    _check_cu("cuMemUnmap", res)
+    res = libcuda.cuMemAddressFree(
+        ctypes.c_ulonglong(base), ctypes.c_size_t(allocation_size)
+    )
+    _check_cu("cuMemAddressFree", res)
+    del _IMPORTED_VMM_MAPPINGS[data_ptr]
+    flexkv_logger.debug(
+        f"Released imported VMM tensor: base=0x{base:x}, "
+        f"size={allocation_size}"
+    )
+    return True
 
 
 def _is_vmm_pointer(data_ptr: int) -> bool:
@@ -632,10 +667,9 @@ class TensorSharedHandle:
                 # cross-process we register the FD with a small
                 # SCM_RIGHTS-serving thread (see _vmm_fd_server_*) and
                 # ship (pid, key) as bytes; the importer connects to the
-                # UDS, sends the key, and receives the FD back. The
-                # exporter keeps its FD open for the lifetime of the
-                # process (see _EXPORTED_VMM_FDS below) so importers may
-                # arrive arbitrarily later.
+                # UDS, sends the key, and receives the FD back. The connector
+                # closes it only after the node manager confirms that every
+                # transfer-worker importer has unmapped it.
                 fd_out = ctypes.c_int(-1)
                 res = libcuda.cuMemExportToShareableHandle(
                     ctypes.byref(fd_out),
@@ -644,8 +678,11 @@ class TensorSharedHandle:
                     ctypes.c_ulonglong(0),
                 )
                 _check_cu("cuMemExportToShareableHandle(POSIX_FD)", res)
-                _EXPORTED_VMM_FDS.append(int(fd_out.value))
-                key = _vmm_fd_server_register(int(fd_out.value))
+                exported_fd = int(fd_out.value)
+                _EXPORTED_VMM_FDS.append(exported_fd)
+                key = _vmm_fd_server_register(exported_fd)
+                self._exported_vmm_fd = exported_fd
+                self._exported_vmm_fd_key = key
                 self.ipc_handle = _pack_vmm_fd(os.getpid(), key)
                 self.handle_type = "vmm_posix_fd"
             else:
@@ -800,6 +837,25 @@ class TensorSharedHandle:
             self.rebuild_func, self.rebuild_args, self.device
         )
 
+    def release_exported_vmm_handle(self) -> bool:
+        """Close this exporter-side POSIX FD after all importers unmap."""
+        fd = getattr(self, "_exported_vmm_fd", None)
+        key = getattr(self, "_exported_vmm_fd_key", None)
+        if fd is None:
+            return False
+        state = _VMM_FD_SERVER_STATE
+        with state["lock"]:
+            if key is not None and state["fd_by_key"].get(key) == fd:
+                del state["fd_by_key"][key]
+        try:
+            os.close(fd)
+        finally:
+            if fd in _EXPORTED_VMM_FDS:
+                _EXPORTED_VMM_FDS.remove(fd)
+            self._exported_vmm_fd = None
+            self._exported_vmm_fd_key = None
+        return True
+
     ## Import CUDA VMM allocation
     @staticmethod
     def _import_vmm_handle(
@@ -814,13 +870,8 @@ class TensorSharedHandle:
     ) -> torch.Tensor:
         """Rehydrate a VMM allocation exported via cuMemExportToShareableHandle.
 
-        The exporter side sent us just the 64-byte fabric handle. Here we
-        cuMemImportFromShareableHandle -> cuMemAddressReserve ->
-        cuMemMap -> cuMemSetAccess, then wrap the virtual address in a
-        zero-copy torch tensor. The imported allocation stays mapped for
-        the lifetime of the process; freeing it would invalidate every
-        tensor we handed out, and FlexKV's KVManager already owns the
-        registration lifetime.
+        The returned tensor owns no storage. Its process-local VMM mapping is
+        tracked until ``release_vmm_tensor`` is called before exporter sleep.
         """
         if libcuda is None:
             raise RuntimeError(
@@ -937,13 +988,38 @@ class TensorSharedHandle:
         libcuda.cuMemRelease(mem_handle)
 
         data_ptr = va.value + int(offset)
+        if data_ptr in _IMPORTED_VMM_MAPPINGS:
+            raise RuntimeError(
+                f"duplicate imported VMM tensor pointer 0x{data_ptr:x}"
+            )
+        _IMPORTED_VMM_MAPPINGS[data_ptr] = (
+            int(va.value), int(allocation_size)
+        )
         flexkv_logger.info(
             f"Imported VMM tensor: device={device}, base=0x{va.value:x}, "
             f"offset={offset}, size={allocation_size}"
         )
-        return TensorSharedHandle._create_tensor_from_cuda_ptr(
-            data_ptr, shape, dtype, device
-        )
+        try:
+            return TensorSharedHandle._create_tensor_from_cuda_ptr(
+                data_ptr, shape, dtype, device
+            )
+        except Exception:
+            _IMPORTED_VMM_MAPPINGS.pop(data_ptr, None)
+            _check_cu(
+                "cuMemUnmap",
+                libcuda.cuMemUnmap(
+                    ctypes.c_ulonglong(va.value),
+                    ctypes.c_size_t(allocation_size),
+                ),
+            )
+            _check_cu(
+                "cuMemAddressFree",
+                libcuda.cuMemAddressFree(
+                    ctypes.c_ulonglong(va.value),
+                    ctypes.c_size_t(allocation_size),
+                ),
+            )
+            raise
 
     ## Export tensor handle
     @staticmethod

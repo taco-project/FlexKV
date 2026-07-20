@@ -817,7 +817,9 @@ class FlexKVWorkerConnector:
         )
         logger.info("Finish init FlexKVWorkerConnector")
 
-    def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
+    def register_to_server(
+        self, kv_caches: dict[str, torch.Tensor], *, resume: bool = False
+    ):
         logger.info("Start register kv_caches")
 
         # Separate main KV caches from indexer caches by layer name.
@@ -895,6 +897,7 @@ class FlexKVWorkerConnector:
             self.tp_client.register_to_server(
                 kv_caches=gpu_blocks,
                 kv_layout=gpu_layout,
+                resume=resume,
             )
         else:
             indexer_buffers = list(indexer_kv_caches.values())
@@ -938,9 +941,19 @@ class FlexKVWorkerConnector:
                 layer_groups=layer_groups,
                 gpu_layouts=[gpu_layout, indexer_layout],
                 handles_per_group=[gpu_blocks, indexer_buffers],
+                resume=resume,
             )
 
         logger.info("Finish register kv_caches")
+        self._registered_kv_caches = dict(kv_caches)
+
+    def before_device_sleep(self) -> int:
+        return self.tp_client.suspend_gpu_mappings()
+
+    def after_device_wake(self) -> None:
+        if not hasattr(self, "_registered_kv_caches"):
+            raise RuntimeError("KV caches were not registered before wake")
+        self.register_to_server(self._registered_kv_caches, resume=True)
 
     def __del__(self):
         if hasattr(self, "remote_transfer_manager_process") and \
@@ -1088,6 +1101,14 @@ class FlexKVConnectorV1Impl:
             dictionary of layer names, kv cache
         """
         self.connector.register_to_server(kv_caches)
+
+    def before_device_sleep(self) -> None:
+        if self.role == KVConnectorRole.WORKER:
+            self.connector.before_device_sleep()
+
+    def after_device_wake(self) -> None:
+        if self.role == KVConnectorRole.WORKER:
+            self.connector.after_device_wake()
 
     # ==============================
     # Scheduler-side methods

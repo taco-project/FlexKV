@@ -815,6 +815,9 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("is_mla") = false,
            py::arg("ce_gather_threads") = 4,
            py::arg("ce_gather_nt") = true)
+      .def("update_gpu_block_ptrs",
+           &flexkv::TPTransferThreadGroup::update_gpu_block_ptrs,
+           py::arg("gpu_block_ptrs_flat"))
       .def("tp_group_transfer",
            &flexkv::TPTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),

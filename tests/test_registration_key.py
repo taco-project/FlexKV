@@ -1,5 +1,8 @@
 import sys
 import types
+from types import SimpleNamespace
+
+import zmq
 
 from flexkv.common.config import ModelConfig, RankInfo
 from flexkv.server.request import RegisterTPClientRequest
@@ -39,6 +42,82 @@ def _empty_transfer_manager() -> TransferManager:
     manager.swa_layer_groups = None
     manager.model_config = ModelConfig()
     return manager
+
+
+def test_sleep_wake_remaps_after_all_gpu_registrations():
+    manager = _empty_transfer_manager()
+    manager.expected_gpus = 2
+    manager._gpu_suspended = False
+    manager._pending_resume_registrations = {}
+    manager.all_gpu_blocks = {(0, 0): ["old0"], (0, 1): ["old1"]}
+    manager.all_gpu_layouts = {(0, 0): "layout0", (0, 1): "layout1"}
+    manager.gpu_worker_key_mapping = {(0, 0): "worker", (0, 1): "worker"}
+
+    gpu_handles = {
+        0: SimpleNamespace(data=["old0"], kv_layout="layout0"),
+        1: SimpleNamespace(data=["old1"], kv_layout="layout1"),
+    }
+    manager.storage_engine = SimpleNamespace(
+        get_storage_handle=lambda _device_type, device_id: gpu_handles[device_id]
+    )
+    calls = []
+    manager.transfer_engine = SimpleNamespace(
+        suspend_gpu_mappings=lambda: calls.append("suspend") or 4,
+        resume_gpu_mappings=lambda groups: calls.append(("resume", groups)) or 4,
+    )
+
+    suspended = manager.handle_gpu_control({"type": "suspend_gpu"})
+    assert suspended == {"ok": True, "released_mappings": 4}
+
+    first = _request(0, 0, 0)
+    first.handles = ["new0"]
+    second = _request(0, 1, 1)
+    second.handles = ["new1"]
+    partial = manager.handle_gpu_control(
+        {"type": "resume_gpu", "registration": first}
+    )
+    assert partial["ready"] is False
+    assert calls == ["suspend"]
+
+    complete = manager.handle_gpu_control(
+        {"type": "resume_gpu", "registration": second}
+    )
+    assert complete["ready"] is True
+    assert complete["imported_mappings"] == 4
+    assert manager._gpu_suspended is False
+    assert gpu_handles[0].data == ["new0"]
+    assert gpu_handles[1].data == ["new1"]
+    assert calls[1][0] == "resume"
+
+
+def test_gpu_control_edge_drains_all_queued_requests():
+    class FakeSocket:
+        def __init__(self, requests):
+            self.requests = list(requests)
+            self.responses = []
+
+        def recv_pyobj(self, _flags):
+            if not self.requests:
+                raise zmq.Again()
+            return self.requests.pop(0)
+
+        def send_pyobj(self, response):
+            self.responses.append(response)
+
+    manager = _empty_transfer_manager()
+    manager.gpu_control_socket = FakeSocket(
+        [{"worker": worker} for worker in range(8)]
+    )
+    manager.handle_gpu_control = lambda request: {
+        "ok": True,
+        "worker": request["worker"],
+    }
+
+    assert manager.drain_gpu_control_requests() == 8
+    assert [
+        response["worker"]
+        for response in manager.gpu_control_socket.responses
+    ] == list(range(8))
 
 
 def test_intra_client_id_flattens_pp_and_effective_tp_rank():

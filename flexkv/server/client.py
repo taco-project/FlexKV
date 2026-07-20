@@ -297,6 +297,13 @@ class KVTPClient:
         self.send_to_server = get_zmq_socket(
             context, zmq.SocketType.PUSH, gpu_register_port, False
         )
+        self.gpu_control_socket = get_zmq_socket(
+            context, zmq.SocketType.REQ,
+            f"{gpu_register_port}_control", False,
+        )
+        self.gpu_control_socket.setsockopt(zmq.RCVTIMEO, 120000)
+        self.gpu_control_socket.setsockopt(zmq.SNDTIMEO, 120000)
+        self._exported_handles: List[TensorSharedHandle] = []
 
         self.dp_client_id = dp_client_id
         self.pp_rank = pp_rank
@@ -336,6 +343,21 @@ class KVTPClient:
                 f"for task_id={task_id}"
             )
 
+    def suspend_gpu_mappings(self) -> int:
+        self.gpu_control_socket.send_pyobj({
+            "type": "suspend_gpu",
+            "registration_key": (self.dp_client_id, self.intra_client_id),
+        })
+        response = self.gpu_control_socket.recv_pyobj()
+        if not response.get("ok"):
+            raise RuntimeError(
+                f"FlexKV GPU unmap failed: {response.get('error')}"
+            )
+        for handle in self._exported_handles:
+            handle.release_exported_vmm_handle()
+        self._exported_handles = []
+        return int(response.get("released_mappings", 0))
+
     def register_to_server(
         self,
         kv_caches: List[torch.Tensor],
@@ -349,6 +371,7 @@ class KVTPClient:
         swa_layer_groups: Optional[List[LayerGroupSpec]] = None,
         swa_gpu_layouts: Optional[List[KVCacheLayout]] = None,
         swa_handles_per_group: Optional[List[List[torch.Tensor]]] = None,
+        resume: bool = False,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
@@ -426,8 +449,34 @@ class KVTPClient:
             swa_handles_per_group=swa_handles_per_group_shared,
         )
 
+        exported_handles = list(handles)
+        for group in handles_per_group_shared or []:
+            exported_handles.extend(group)
+        exported_handles.extend(swa_handles_shared or [])
+        for group in swa_handles_per_group_shared or []:
+            exported_handles.extend(group)
+
+        if resume:
+            self.gpu_control_socket.send_pyobj({
+                "type": "resume_gpu",
+                "registration": register_req,
+            })
+            response = self.gpu_control_socket.recv_pyobj()
+            if not response.get("ok"):
+                raise RuntimeError(
+                    f"FlexKV GPU remap failed: {response.get('error')}"
+                )
+            self._exported_handles = exported_handles
+            flexkv_logger.info(
+                f"KVTPClient {device_id}: post-wake registration accepted "
+                f"(ready={response.get('ready')}, "
+                f"registered={response.get('registered')})"
+            )
+            return
+
         try:
             self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
+            self._exported_handles = exported_handles
             flexkv_logger.info(
                 f"KVTPClient {device_id}: registration message sent "
                 f"(dp_client_id={self.dp_client_id}, pp_rank={self.pp_rank}, "
@@ -438,6 +487,7 @@ class KVTPClient:
                 f"KVTPClient {device_id}: zmq.Again when sending registration "
                 f"(send buffer full or no connection). Retrying with blocking send...")
             self.send_to_server.send_pyobj(register_req)
+            self._exported_handles = exported_handles
             flexkv_logger.info(f"KVTPClient {device_id}: registration message sent (blocking retry)")
 
 

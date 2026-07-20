@@ -21,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import multiprocessing as mp
 import os
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -67,6 +68,44 @@ def _fabric_supported(device_id: int = 0) -> bool:
         ctypes.byref(flag), ctypes.c_int(128), ctypes.c_int(device_id)
     ) if hasattr(libcuda, "cuDeviceGetAttribute") else 1
     return res == CUDA_SUCCESS and flag.value != 0
+
+
+def test_release_vmm_tensor_unmaps_and_frees_address(monkeypatch):
+    calls = []
+    fake_libcuda = SimpleNamespace(
+        cuMemUnmap=lambda base, size: calls.append(
+            ("unmap", base.value, size.value)
+        ) or CUDA_SUCCESS,
+        cuMemAddressFree=lambda base, size: calls.append(
+            ("free", base.value, size.value)
+        ) or CUDA_SUCCESS,
+    )
+    tensor = SimpleNamespace(data_ptr=lambda: 0x1200)
+    monkeypatch.setattr(memory_handle, "libcuda", fake_libcuda)
+    monkeypatch.setitem(
+        memory_handle._IMPORTED_VMM_MAPPINGS, 0x1200, (0x1000, 4096)
+    )
+
+    assert memory_handle.release_vmm_tensor(tensor) is True
+    assert calls == [("unmap", 0x1000, 4096), ("free", 0x1000, 4096)]
+    assert 0x1200 not in memory_handle._IMPORTED_VMM_MAPPINGS
+    assert memory_handle.release_vmm_tensor(tensor) is False
+
+
+def test_release_exported_vmm_handle_closes_fd(monkeypatch):
+    closed = []
+    handle = object.__new__(TensorSharedHandle)
+    handle._exported_vmm_fd = 51
+    handle._exported_vmm_fd_key = 7
+    monkeypatch.setitem(memory_handle._VMM_FD_SERVER_STATE["fd_by_key"], 7, 51)
+    memory_handle._EXPORTED_VMM_FDS.append(51)
+    monkeypatch.setattr(memory_handle.os, "close", closed.append)
+
+    assert handle.release_exported_vmm_handle() is True
+    assert closed == [51]
+    assert 7 not in memory_handle._VMM_FD_SERVER_STATE["fd_by_key"]
+    assert 51 not in memory_handle._EXPORTED_VMM_FDS
+    assert handle.release_exported_vmm_handle() is False
 
 
 # ---------------------------------------------------------------------------
