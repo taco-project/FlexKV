@@ -572,6 +572,11 @@ class SWAPoolConfig:
     num_remote_slots: int = 0          # Number of REMOTE SWA pool slots (0 = no REMOTE SWA tier)
     num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
     bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
+    # True when the SWA page also carries heterogeneous sidecar groups (for
+    # example DeepSeek-V4 attention/indexer compress states).  The flag keeps
+    # layerwise GET from fusing SWA into the legacy uniform-layout kernel; the
+    # dedicated multi-group SWA worker completes first instead.
+    multi_group: bool = False
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
     pin_memory: bool = True            # Use pinned memory for async DMA
 

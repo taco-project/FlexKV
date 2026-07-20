@@ -22,7 +22,7 @@ import sys
 
 from flexkv.common.transfer import TransferOpGraph, CompletedOp, WorkerKey
 from flexkv.common.config import (
-    CacheConfig, ModelConfig,
+    CacheConfig, LayerGroupSpec, ModelConfig,
     recompute_cache_block_counts,
 )
 from flexkv.common.debug import flexkv_logger
@@ -61,6 +61,13 @@ class TransferManager:
         # client provides swa_handles (DSv4 sliding-window-attention pool).
         self.all_swa_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}
         self.all_swa_gpu_layouts: Dict[int, KVCacheLayout] = {}
+        self.all_swa_gpu_layouts_per_group: Dict[
+            int, Optional[List[KVCacheLayout]]
+        ] = {}
+        self.all_swa_gpu_blocks_per_group: Dict[
+            int, Optional[List[List[TensorSharedHandle]]]
+        ] = {}
+        self.swa_layer_groups: Optional[List[LayerGroupSpec]] = None
 
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
@@ -92,9 +99,23 @@ class TransferManager:
                 if getattr(req, "swa_handles", None) is not None and req.swa_layout is not None:
                     self.all_swa_gpu_blocks[device_id] = req.swa_handles
                     self.all_swa_gpu_layouts[device_id] = req.swa_layout
+                    self.all_swa_gpu_layouts_per_group[device_id] = (
+                        req.swa_gpu_layouts
+                    )
+                    self.all_swa_gpu_blocks_per_group[device_id] = (
+                        req.swa_handles_per_group
+                    )
+                    if req.swa_layer_groups is not None:
+                        if self.swa_layer_groups is None:
+                            self.swa_layer_groups = req.swa_layer_groups
+                        elif self.swa_layer_groups != req.swa_layer_groups:
+                            raise ValueError(
+                                "SWA layer groups differ across GPU registrations"
+                            )
                     flexkv_logger.info(
                         f"GPU {device_id}: registered SWA handles "
-                        f"({len(req.swa_handles)} layers)"
+                        f"({len(req.swa_handles)} tensors, "
+                        f"groups={len(req.swa_layer_groups or [])})"
                     )
                 # Propagate layer_groups to model_config (first registration wins).
                 # token_size_in_bytes / num_cpu_blocks recompute downstream depends on this.
@@ -173,6 +194,7 @@ class TransferManager:
             self.model_config,
             self.cache_config,
             num_layers_per_pp_stage,
+            swa_layer_groups=self.swa_layer_groups,
         )
 
         # Register GPU blocks with their global device IDs
@@ -235,6 +257,11 @@ class TransferManager:
         # Group SWA GPU handles by WorkerKey, mirroring the main-KV grouping,
         # so the dedicated SWA worker map can be built per TP group.
         swa_gpu_handles: Optional[Dict[WorkerKey, List]] = None
+        swa_grouped_gpu_blocks_per_group: Optional[Dict[WorkerKey, List]] = None
+        swa_grouped_gpu_layouts_per_group: Optional[Dict[WorkerKey, List]] = None
+        if self.swa_layer_groups is not None:
+            swa_grouped_gpu_blocks_per_group = {}
+            swa_grouped_gpu_layouts_per_group = {}
         if self.storage_engine.has_storage_handle(DeviceType.CPU, is_swa=True):
             swa_gpu_handles = {}
             for device_id in sorted(self.all_swa_gpu_blocks.keys()):
@@ -244,6 +271,13 @@ class TransferManager:
                         swa_gpu_handles[worker_key] = []
                     swa_gpu_handles[worker_key].append(
                         self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_swa=True))
+                    if self.swa_layer_groups is not None:
+                        swa_grouped_gpu_blocks_per_group.setdefault(
+                            worker_key, []
+                        ).append(self.all_swa_gpu_blocks_per_group[device_id])
+                        swa_grouped_gpu_layouts_per_group.setdefault(
+                            worker_key, []
+                        ).append(self.all_swa_gpu_layouts_per_group[device_id])
 
         swa_cpu_handle =(
          self.storage_engine.get_storage_handle(DeviceType.CPU, is_swa=True)
@@ -274,6 +308,9 @@ class TransferManager:
             swa_cpu_handle=swa_cpu_handle,
             swa_ssd_handle=swa_ssd_handle,
             swa_remote_handle=swa_remote_handle,
+            swa_layer_groups=self.swa_layer_groups,
+            swa_gpu_blocks_per_group=swa_grouped_gpu_blocks_per_group,
+            swa_gpu_layouts_per_group=swa_grouped_gpu_layouts_per_group,
         )
         flexkv_logger.info(
             f"Initialized TransferEngine successfully, "

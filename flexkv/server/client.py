@@ -321,9 +321,30 @@ class KVTPClient:
         handles_per_group: Optional[List[List[torch.Tensor]]] = None,
         swa_caches: Optional[List[torch.Tensor]] = None,
         swa_layout: Optional[KVCacheLayout] = None,
+        swa_layer_groups: Optional[List[LayerGroupSpec]] = None,
+        swa_gpu_layouts: Optional[List[KVCacheLayout]] = None,
+        swa_handles_per_group: Optional[List[List[torch.Tensor]]] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
+        swa_group_fields = (
+            swa_layer_groups,
+            swa_gpu_layouts,
+            swa_handles_per_group,
+        )
+        if any(value is not None for value in swa_group_fields) and not all(
+            value is not None for value in swa_group_fields
+        ):
+            raise ValueError(
+                "swa_layer_groups, swa_gpu_layouts, and "
+                "swa_handles_per_group must be provided together"
+            )
+        if swa_layer_groups is not None and not (
+            len(swa_layer_groups)
+            == len(swa_gpu_layouts)
+            == len(swa_handles_per_group)
+        ):
+            raise ValueError("SWA multi-group registration length mismatch")
 
         # Use override_device_id if provided, otherwise use self.device_id
         device_id = override_device_id if override_device_id is not None else self.device_id
@@ -351,6 +372,18 @@ class KVTPClient:
                 raise ValueError("SWA blocks must be CUDA tensors")
             swa_handles_shared = [TensorSharedHandle(t, device_id) for t in swa_caches]
 
+        swa_handles_per_group_shared: Optional[
+            List[List[TensorSharedHandle]]
+        ] = None
+        if swa_handles_per_group is not None:
+            swa_handles_per_group_shared = []
+            for group_tensors in swa_handles_per_group:
+                if not group_tensors or not group_tensors[0].is_cuda:
+                    raise ValueError("SWA group blocks must be non-empty CUDA tensors")
+                swa_handles_per_group_shared.append(
+                    [TensorSharedHandle(t, device_id) for t in group_tensors]
+                )
+
         register_req = RegisterTPClientRequest(
             dp_client_id=self.dp_client_id,
             pp_rank=self.pp_rank,
@@ -362,6 +395,9 @@ class KVTPClient:
             handles_per_group=handles_per_group_shared,
             swa_handles=swa_handles_shared,
             swa_layout=swa_layout,
+            swa_layer_groups=swa_layer_groups,
+            swa_gpu_layouts=swa_gpu_layouts,
+            swa_handles_per_group=swa_handles_per_group_shared,
         )
 
         try:

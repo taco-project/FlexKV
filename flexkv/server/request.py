@@ -32,6 +32,12 @@ class RegisterTPClientRequest:
     # SWA transfer fileds
     swa_handles: Optional[List[TensorSharedHandle]] = None
     swa_layout: Optional[KVCacheLayout] = None
+    # Optional heterogeneous groups sharing the SWA page id space.  These are
+    # used by DSv4 to move SWA KV together with attention/indexer compress
+    # states, whose GPU page widths and dtypes differ from SWA KV.
+    swa_layer_groups: Optional[List[LayerGroupSpec]] = None
+    swa_gpu_layouts: Optional[List[KVCacheLayout]] = None
+    swa_handles_per_group: Optional[List[List[TensorSharedHandle]]] = None
 
 
 @dataclass

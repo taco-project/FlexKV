@@ -1263,17 +1263,25 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             raise ValueError(f"num_remote_blocks_per_file {self.num_remote_blocks_per_file} "
                              f"is not divisible by round_robin {self.round_robin}")
 
-        # For multi-group layouts, get_chunk_size() is not valid.
-        # CPURemoteTransferWorker uses LAYERFIRST which is single-group only,
-        # but guard for safety.
-        if cpu_kv_layout.layer_groups is not None:
+        self.has_multi_group = cpu_kv_layout.layer_groups is not None
+        if self.has_multi_group:
+            if (
+                cpu_kv_layout.type != KVCacheLayoutType.BLOCKFIRST
+                or remote_kv_layout.type != KVCacheLayoutType.BLOCKFIRST
+            ):
+                raise ValueError(
+                    "Multi-group CPU/remote transfer requires BLOCKFIRST layouts"
+                )
+            # A heterogeneous BLOCKFIRST block is already one byte-flat blob.
+            # Present it to the existing remote kernel as one MLA layer.
             self.block_size = cpu_kv_layout.get_block_stride()
+            self.num_layers = 1
         else:
             self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
 
-        self.is_mla = cpu_kv_layout.is_mla
-        self.kv_dim = cpu_kv_layout.kv_dim
+        self.is_mla = True if self.has_multi_group else cpu_kv_layout.is_mla
+        self.kv_dim = 1 if self.has_multi_group else cpu_kv_layout.kv_dim
 
         self.cpu_blocks = cpu_blocks
 
