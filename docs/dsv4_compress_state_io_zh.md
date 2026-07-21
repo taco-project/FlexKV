@@ -264,6 +264,8 @@ LayerwiseTransferOp
 
 `swa.multi_group=True` 时，SWA 池使用与 main-KV 同构的 `GroupParams + layer_members`；C4 层会等该层 state 写完再发 eventfd，无 state 的层只等 SWA KV + main。
 
+`swa_multi_layer` 控制上述融合路径，默认开启。显式设为 `false`（或通过环境变量设置 `FLEXKV_SWA_MULTI_LAYER=0`）时，main-KV 仍使用 layerwise restore，但 SWA/state 改由独立 H2D worker 搬运；主 layerwise op 会依赖该 worker 完成，因此不会提前暴露未恢复的 state。该开关不改变 `swa_multi_group` 是否注册 compress-state sidecar 的语义。
+
 非 layerwise GET 会等待整个 FlexKV task 完成后再把请求交还给 SGLang。
 
 ## 8. 关键约束与失败方式

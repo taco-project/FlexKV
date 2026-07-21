@@ -33,6 +33,7 @@ Or using JSON configuration:
 - `ssd_cache_dir`: Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `ssd_cache_dir: /data0/flexkv_ssd/;/data1/flexkv_ssd/` to improve bandwidth.
 - `enable_gds`: Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default.
 - `swa_multi_group`: DeepSeek-V4 SWA sidecar switch. When omitted or set to `true`, SWA KV is stored and restored together with the attention/indexer compress states. Set it explicitly to `false` to keep SWA KV I/O while skipping state registration and I/O.
+- `swa_multi_layer`: Controls whether layerwise restore fuses SWA/state H2D into the main layerwise worker. It defaults to `true`; set it to `false` to use the standalone SWA/state H2D predecessor path.
 
 To switch to SWA-only mode, add the following explicit setting:
 
@@ -55,6 +56,7 @@ If the `FLEXKV_CONFIG_PATH` environment variable is not set, configuration can b
 | `FLEXKV_SSD_CACHE_DIR` | str | "./flexkv_ssd" | Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `"/data0/flexkv_ssd/;/data1/flexkv_ssd/"` to improve bandwidth |
 | `FLEXKV_ENABLE_GDS` | bool | 0 | Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default, set to 1 to enable |
 | `FLEXKV_SWA_MULTI_GROUP` | bool | unset (auto-enabled) | For DeepSeek-V4, unset or `1` stores/restores SWA KV with attention/indexer compress states; `0` keeps SWA KV I/O only |
+| `FLEXKV_SWA_MULTI_LAYER` | bool | 1 | `1` fuses SWA/state H2D into layerwise restore; `0` uses the standalone SWA/state H2D predecessor worker |
 
 ---
 

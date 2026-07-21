@@ -690,6 +690,11 @@ class CacheConfig:
     # transfer type" in the transfer engine. Flip to True once the worker lands.
     enable_swa_transfer: bool = False
 
+    # Fuse SWA (including heterogeneous state sidecars) into the layerwise H2D
+    # worker.  When disabled, layerwise main-KV restore stays enabled while SWA
+    # uses its standalone H2D worker and completes before the main layerwise op.
+    swa_multi_layer: bool = True
+
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
@@ -805,6 +810,10 @@ class UserConfig:
     # path. None is intentionally distinct from False so old configs default
     # to the correctness-preserving state restore path.
     swa_multi_group: Optional[bool] = None
+    # Fuse SWA/state H2D into the main layerwise restore worker. Disable this to
+    # keep SWA/state on the standalone predecessor worker as a compatibility or
+    # debugging fallback.
+    swa_multi_layer: bool = True
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
@@ -820,6 +829,11 @@ class UserConfig:
             raise ValueError(
                 "swa_multi_group must be a boolean when configured, "
                 f"got {self.swa_multi_group!r}"
+            )
+        if not isinstance(self.swa_multi_layer, bool):
+            raise ValueError(
+                "swa_multi_layer must be a boolean, "
+                f"got {self.swa_multi_layer!r}"
             )
 
 def parse_path_list(path_str: str) -> List[str]:
@@ -868,6 +882,7 @@ def load_user_config_from_env() -> UserConfig:
             if swa_multi_group_env is None
             else bool(int(swa_multi_group_env))
         ),
+        swa_multi_layer=bool(int(os.getenv('FLEXKV_SWA_MULTI_LAYER', 1))),
     )
 
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
@@ -1032,6 +1047,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote
+    cache_config.swa_multi_layer = user_config.swa_multi_layer
 
     # Update derived flags after setting p2p and remote configs
     cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or

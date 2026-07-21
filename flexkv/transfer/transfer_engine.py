@@ -345,11 +345,11 @@ class TransferEngine:
     def _get_layerwise_swa_kwargs(self, worker_key: WorkerKey) -> dict:
         """SWA args for LayerwiseTransferWorker (uniform or multi-group).
 
-        Layerwise GET fuses main-KV + SWA/state into one LAYERWISE op, so both
-        layouts are wired into the layerwise worker rather than a standalone
-        SWA H2D worker.
+        With ``swa_multi_layer`` enabled, layerwise GET fuses main-KV +
+        SWA/state into one LAYERWISE op, so both layouts are wired into the
+        layerwise worker rather than a standalone SWA H2D worker.
         """
-        if not self._has_swa:
+        if not self._has_swa or not self.cache_config.swa_multi_layer:
             return {}
         swa_ssd_files = (
             self._swa_ssd_handle.get_file_list()
@@ -399,6 +399,9 @@ class TransferEngine:
 
         assert self._cpu_handle is not None
         _enable_layerwise = GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
+        _fuse_swa_into_layerwise = (
+            _enable_layerwise and self.cache_config.swa_multi_layer
+        )
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
         
@@ -700,10 +703,11 @@ class TransferEngine:
         # reuse this channel with heterogeneous multi-group worker arguments.
         if self._has_swa:
             self._swa_worker_map: Dict[TransferType, Dict[WorkerKey, WorkerHandle]] = {}
-            # Layerwise GET fuses SWA/state H2D into LAYERWISE (uniform via
-            # launch_swa_h2d_layer_, multi-group via launch_swa_mg_h2d_layer_).
-            # Standalone SWA H2D workers are only needed when layerwise is off.
-            if not _enable_layerwise:
+            # With swa_multi_layer enabled, layerwise GET fuses SWA/state H2D
+            # into LAYERWISE (uniform via launch_swa_h2d_layer_, multi-group via
+            # launch_swa_mg_h2d_layer_). Otherwise retain the standalone SWA
+            # H2D worker as a predecessor of the main layerwise op.
+            if not _fuse_swa_into_layerwise:
                 if self.model_config.effective_tp_size_per_node == 1:
                     self._swa_h2d_workers: Dict[WorkerKey, WorkerHandle] = {
                         worker_key: GPUCPUTransferWorker.create_worker(
@@ -894,7 +898,7 @@ class TransferEngine:
                 flexkv_logger.info("TransferEngine: swa GDS workers initialized")
             self._has_swa = True
             # Must mirror the create condition above.
-            if not _enable_layerwise:
+            if not _fuse_swa_into_layerwise:
                 flexkv_logger.info(
                     f"TransferEngine: swa workers initialized "
                     f"({len(self._swa_h2d_workers)} H2D + {len(self._swa_d2h_workers)} D2H)")
