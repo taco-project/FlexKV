@@ -341,6 +341,56 @@ class TransferEngine:
             ],
         )
 
+    def _get_layerwise_swa_kwargs(self, worker_key: WorkerKey) -> dict:
+        """SWA args for LayerwiseTransferWorker (uniform or multi-group).
+
+        Layerwise GET fuses main-KV + SWA/state into one LAYERWISE op, so both
+        layouts are wired into the layerwise worker rather than a standalone
+        SWA H2D worker.
+        """
+        if not self._has_swa:
+            return {}
+        swa_ssd_files = (
+            self._swa_ssd_handle.get_file_list()
+            if self._swa_ssd_handle is not None else None)
+        swa_ssd_kv_layout = (
+            self._swa_ssd_handle.kv_layout
+            if self._swa_ssd_handle is not None else None)
+        swa_num_blocks_per_file = (
+            self._swa_ssd_handle.num_blocks_per_file
+            if self._swa_ssd_handle is not None else 0)
+
+        if self._swa_layer_groups is not None:
+            mg = self._get_swa_multi_group_kwargs_tp(worker_key)
+            if not mg:
+                return {}
+            return dict(
+                swa_cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
+                swa_cpu_kv_layout=self._swa_cpu_handle.kv_layout,
+                swa_ssd_files=swa_ssd_files,
+                swa_ssd_kv_layout=swa_ssd_kv_layout,
+                swa_num_blocks_per_file=swa_num_blocks_per_file,
+                swa_layer_groups=mg["layer_groups"],
+                swa_gpu_blocks_per_group=mg["gpu_blocks_per_group"],
+                swa_gpu_layouts_per_group=mg["gpu_layouts_per_group"],
+            )
+
+        return dict(
+            swa_gpu_blocks=[
+                h.get_tensor_handle_list()
+                for h in self._swa_gpu_handles[worker_key]
+            ],
+            swa_cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
+            swa_gpu_kv_layouts=[
+                h.kv_layout for h in self._swa_gpu_handles[worker_key]
+            ],
+            swa_cpu_kv_layout=self._swa_cpu_handle.kv_layout,
+            swa_dtype=self._swa_gpu_handles[worker_key][0].dtype,
+            swa_ssd_files=swa_ssd_files,
+            swa_ssd_kv_layout=swa_ssd_kv_layout,
+            swa_num_blocks_per_file=swa_num_blocks_per_file,
+        )
+
     def _init_workers(self) -> None:
         if self._running:
             return
@@ -600,29 +650,8 @@ class TransferEngine:
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                    # ---- SWA pool wiring (single worker fused with main-KV) ----
-                    # Pass SWA handles when registered; otherwise None and the
-                    # worker stays in pure main-KV mode (has_swa=False inside).
-                    swa_gpu_blocks=(
-                        [h.get_tensor_handle_list() for h in self._swa_gpu_handles[worker_key]]
-                        if self._has_swa and self._swa_layer_groups is None else None),
-                    swa_cpu_blocks=(self._swa_cpu_handle.get_worker_tensor()
-                                    if self._has_swa and self._swa_layer_groups is None else None),
-                    swa_gpu_kv_layouts=([h.kv_layout for h in self._swa_gpu_handles[worker_key]]
-                                        if self._has_swa and self._swa_layer_groups is None else None),
-                    swa_cpu_kv_layout=(self._swa_cpu_handle.kv_layout
-                                       if self._has_swa and self._swa_layer_groups is None else None),
-                    swa_dtype=(self._swa_gpu_handles[worker_key][0].dtype
-                               if self._has_swa and self._swa_layer_groups is None else None),
-                    swa_ssd_files=(self._swa_ssd_handle.get_file_list()
-                                   if self._has_swa and self._swa_layer_groups is None
-                                   and self._swa_ssd_handle is not None else None),
-                    swa_ssd_kv_layout=(self._swa_ssd_handle.kv_layout
-                                       if self._has_swa and self._swa_layer_groups is None
-                                       and self._swa_ssd_handle is not None else None),
-                    swa_num_blocks_per_file=(self._swa_ssd_handle.num_blocks_per_file
-                                             if self._has_swa and self._swa_layer_groups is None
-                                             and self._swa_ssd_handle is not None else 0),
+                    # Fuse main-KV + uniform/multi-group SWA into one LAYERWISE op.
+                    **self._get_layerwise_swa_kwargs(worker_key),
                     **self._get_multi_group_kwargs_tp(worker_key),
                 )
                 self.layerwise_workers[worker_key] = worker
@@ -670,7 +699,10 @@ class TransferEngine:
         # reuse this channel with heterogeneous multi-group worker arguments.
         if self._has_swa:
             self._swa_worker_map: Dict[TransferType, Dict[WorkerKey, WorkerHandle]] = {}
-            if not _enable_layerwise or self._swa_layer_groups is not None:
+            # Layerwise GET fuses SWA/state H2D into LAYERWISE (uniform via
+            # launch_swa_h2d_layer_, multi-group via launch_swa_mg_h2d_layer_).
+            # Standalone SWA H2D workers are only needed when layerwise is off.
+            if not _enable_layerwise:
                 if self.model_config.effective_tp_size_per_node == 1:
                     self._swa_h2d_workers: Dict[WorkerKey, WorkerHandle] = {
                         worker_key: GPUCPUTransferWorker.create_worker(
@@ -860,10 +892,11 @@ class TransferEngine:
                 self._swa_worker_map[TransferType.D2DISK] = self._swa_gds_workers
                 flexkv_logger.info("TransferEngine: swa GDS workers initialized")
             self._has_swa = True
-            if not _enable_layerwise or self._swa_layer_groups is not None:
+            # Must mirror the create condition above.
+            if not _enable_layerwise:
                 flexkv_logger.info(
-                f"TransferEngine: swa inline workers initialized "
-                f"({len(self._swa_h2d_workers)} H2D + {len(self._swa_d2h_workers)} D2H)")
+                    f"TransferEngine: swa workers initialized "
+                    f"({len(self._swa_h2d_workers)} H2D + {len(self._swa_d2h_workers)} D2H)")
             else:
                 flexkv_logger.info(
                     f"TransferEngine: swa inline workers initialized "
@@ -871,34 +904,45 @@ class TransferEngine:
 
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
+
+        def _wait_worker_ready(
+            worker: WorkerHandle,
+            transfer_type: TransferType,
+            worker_key: Optional[WorkerKey] = None,
+        ) -> None:
+            """Wait for ready_event, but fail fast if the process already died."""
+            label = (
+                f"{transfer_type.name} worker {worker.worker_id}"
+                + (f" key={worker_key}" if worker_key is not None else "")
+            )
+            while not worker.ready_event.wait(timeout=5.0):
+                if not worker.process.is_alive():
+                    raise RuntimeError(
+                        f"{label} died during init "
+                        f"(exitcode={worker.process.exitcode}); "
+                        f"see worker traceback above (often CUDA OOM from "
+                        f"wrong-device context on GPU0)"
+                    )
+                flexkv_logger.debug(f"still waiting for {label} to ready")
+            flexkv_logger.debug(f"{label} is ready")
+
         # Wait for all main KV workers to ready
         for transfer_type, worker in self._worker_map.items():
             if isinstance(worker, dict):
                 for wk, w in worker.items():
-                    flexkv_logger.debug(f"waiting for {transfer_type.name} worker {w.worker_id} to ready")
-                    w.ready_event.wait()
-                    flexkv_logger.debug(f"{transfer_type.name} worker {w.worker_id} is ready")
-
+                    _wait_worker_ready(w, transfer_type, wk)
             else:
-                flexkv_logger.debug(f"waiting for {transfer_type.name} worker {worker.worker_id} to ready")
-                worker.ready_event.wait()
-                flexkv_logger.debug(
-                    f"{transfer_type.name} worker {worker.worker_id} is ready"
-                )
+                _wait_worker_ready(worker, transfer_type)
 
         # Wait for all SWA dedicated workers to be ready
         if self._has_swa:
 
             for transfer_type, worker in self._swa_worker_map.items():
                 if isinstance(worker, dict):
-                    for w in worker.values():
-                        flexkv_logger.debug(f"waiting for {transfer_type.name} worker {w.worker_id} to ready")
-                        w.ready_event.wait()
-                        flexkv_logger.debug(f"{transfer_type.name} worker {w.worker_id} is ready")
+                    for wk, w in worker.items():
+                        _wait_worker_ready(w, transfer_type, wk)
                 else:
-                    flexkv_logger.debug(f"waiting for swa {transfer_type.name} worker {worker.worker_id} to ready")
-                    worker.ready_event.wait()
-                    flexkv_logger.debug(f"swa {transfer_type.name} worker {worker.worker_id} is ready")
+                    _wait_worker_ready(worker, transfer_type)
 
         # Startup assertions: verify layerwise mode worker map consistency
         if _enable_layerwise:

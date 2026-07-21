@@ -828,19 +828,18 @@ class KVTaskEngine(KVTaskManager):
                 task_end_op_ids.append(self.tasks[task_id].task_end_op_id)
                 callbacks.append(self.tasks[task_id].callback)
                 return_masks.append(self.tasks[task_id].return_mask)
-        batch_task_graph, task_end_op_id, op_callback_dict = merge_to_batch_graph(batch_id,
-                                                                                  transfer_graphs,
-                                                                                  task_end_op_ids,
-                                                                                  op_callback_dict,
-                                                                                  layerwise_transfer,
-                                                                                  counter_id,
-                                                                                  fuse_swa_into_layerwise=not bool(
-                                                                                      getattr(
-                                                                                          getattr(self.cache_config, "swa", None),
-                                                                                          "multi_group",
-                                                                                          False,
-                                                                                      )
-                                                                                  ))
+        # Always fuse SWA/state H2D into LAYERWISE when layerwise GET is on.
+        # Multi-group SWA (DSv4 + c4 state sidecars) is handled inside C++ by
+        # launch_swa_mg_h2d_layer_; do not keep standalone SWA H2D predecessors.
+        batch_task_graph, task_end_op_id, op_callback_dict = merge_to_batch_graph(
+            batch_id,
+            transfer_graphs,
+            task_end_op_ids,
+            op_callback_dict,
+            layerwise_transfer,
+            counter_id,
+            fuse_swa_into_layerwise=True,
+        )
         self.tasks[batch_id] = KVTask(
             task_id=batch_id,
             token_ids=np.concatenate([self.tasks[task_id].token_ids for task_id in task_ids]),

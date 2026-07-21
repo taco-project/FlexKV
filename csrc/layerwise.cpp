@@ -212,7 +212,7 @@ void LayerwiseTransferGroup::launch_swa_h2d_layer_(
     int64_t swa_h2d_cpu_layer_stride_in_bytes,
     int64_t swa_cpu_block_stride_in_bytes, int transfer_cta_num,
     bool use_ce_transfer) {
-  if (!has_swa_) {
+  if (!has_swa_ || has_swa_multi_group_) {
     return;
   }
   for (int i = 0; i < num_gpus_; ++i) {
@@ -252,6 +252,253 @@ void LayerwiseTransferGroup::launch_swa_h2d_layer_(
           /*is_mla=*/true, swa_gpu_block_strides_in_bytes_[i],
           /*sync=*/false, ce_config_);
       break;
+    }
+  }
+}
+
+namespace {
+
+void fill_group_params_from_arrays(
+    GroupParams &gp, int num_gpus, int gi,
+    const std::vector<std::vector<std::vector<torch::Tensor>>>
+        &gpu_blocks_per_group,
+    const std::vector<int> &group_num_layers,
+    const std::vector<int64_t> &group_cpu_offset_bytes,
+    const std::vector<int64_t> &group_ssd_offset_bytes,
+    const std::vector<int64_t> &group_cpu_layer_strides,
+    const std::vector<int64_t> &group_cpu_kv_strides,
+    const std::vector<int64_t> &group_ssd_layer_strides,
+    const std::vector<int64_t> &group_ssd_kv_strides,
+    const std::vector<int64_t> &group_chunk_sizes,
+    const std::vector<int64_t> &group_h2d_cpu_kv_strides,
+    const std::vector<int64_t> &group_h2d_cpu_layer_strides,
+    const std::vector<int64_t> &group_cpu_block_strides,
+    const std::vector<int64_t> &group_cpu_tp_strides,
+    const std::vector<int64_t> &group_gpu_kv_strides,
+    const std::vector<int64_t> &group_gpu_block_strides,
+    const std::vector<int64_t> &group_gpu_layer_strides,
+    const std::vector<int64_t> &group_gpu_chunk_sizes,
+    const char *ctx_name) {
+  gp.num_layers = group_num_layers[gi];
+  gp.cpu_offset_bytes = group_cpu_offset_bytes[gi];
+  gp.ssd_offset_bytes = group_ssd_offset_bytes[gi];
+  gp.cpu_layer_stride = group_cpu_layer_strides[gi];
+  gp.cpu_kv_stride = group_cpu_kv_strides[gi];
+  gp.ssd_layer_stride = group_ssd_layer_strides[gi];
+  gp.ssd_kv_stride = group_ssd_kv_strides[gi];
+  gp.chunk_size = group_chunk_sizes[gi];
+  gp.h2d_cpu_kv_stride = group_h2d_cpu_kv_strides[gi];
+  gp.h2d_cpu_layer_stride = group_h2d_cpu_layer_strides[gi];
+  gp.cpu_block_stride = group_cpu_block_strides[gi];
+  gp.cpu_tp_stride = group_cpu_tp_strides[gi];
+
+  gp.gpu_kv_strides.resize(num_gpus);
+  gp.gpu_block_strides.resize(num_gpus);
+  gp.gpu_layer_strides.resize(num_gpus);
+  gp.gpu_chunk_sizes.resize(num_gpus);
+  for (int d = 0; d < num_gpus; ++d) {
+    gp.gpu_kv_strides[d] = group_gpu_kv_strides[gi * num_gpus + d];
+    gp.gpu_block_strides[d] = group_gpu_block_strides[gi * num_gpus + d];
+    gp.gpu_layer_strides[d] = group_gpu_layer_strides[gi * num_gpus + d];
+    gp.gpu_chunk_sizes[d] = group_gpu_chunk_sizes[gi * num_gpus + d];
+  }
+
+  if (static_cast<int>(gpu_blocks_per_group[gi].size()) != num_gpus) {
+    throw std::runtime_error(std::string(ctx_name) +
+                             " gpu_blocks_per_group[" + std::to_string(gi) +
+                             "].size() != num_gpus");
+  }
+  // Retain Tensor objects so CUDA IPC mappings stay valid while this
+  // GroupParams is in use (see GroupParams::gpu_tensors).
+  gp.gpu_tensors = gpu_blocks_per_group[gi];
+  gp.num_tensors_per_gpu =
+      static_cast<int>(gp.gpu_tensors[0].size());
+  cudaMallocHost((void **)&gp.gpu_blocks_flat,
+                 num_gpus * gp.num_tensors_per_gpu * sizeof(void *));
+  for (int d = 0; d < num_gpus; ++d) {
+    if (static_cast<int>(gp.gpu_tensors[d].size()) !=
+        gp.num_tensors_per_gpu) {
+      throw std::runtime_error(
+          std::string(ctx_name) + " gpu_blocks_per_group[" +
+          std::to_string(gi) + "][" + std::to_string(d) +
+          "] tensor count mismatch");
+    }
+    for (int t = 0; t < gp.num_tensors_per_gpu; ++t) {
+      gp.gpu_blocks_flat[d * gp.num_tensors_per_gpu + t] =
+          gp.gpu_tensors[d][t].data_ptr();
+    }
+  }
+
+  if (gp.num_tensors_per_gpu == 1) {
+    gp.backend_type = BackendType::TRTLLM;
+  } else if (gp.num_tensors_per_gpu == gp.num_layers) {
+    gp.backend_type = BackendType::VLLM;
+  } else if (gp.num_tensors_per_gpu == gp.num_layers * 2) {
+    gp.backend_type = BackendType::SGLANG;
+  } else {
+    throw std::runtime_error(
+        std::string(ctx_name) + " group " + std::to_string(gi) +
+        " has unsupported tensors_per_gpu=" +
+        std::to_string(gp.num_tensors_per_gpu) +
+        " for num_layers=" + std::to_string(gp.num_layers));
+  }
+
+  gp.gpu_tensor_handlers.reserve(num_gpus);
+  for (int d = 0; d < num_gpus; ++d) {
+    int64_t **gpu_blocks_ptr = reinterpret_cast<int64_t **>(
+        gp.gpu_blocks_flat + d * gp.num_tensors_per_gpu);
+    gp.gpu_tensor_handlers.emplace_back(
+        gp.backend_type, gpu_blocks_ptr, gp.num_layers, gp.gpu_kv_strides[d],
+        gp.gpu_block_strides[d], gp.gpu_layer_strides[d]);
+  }
+}
+
+} // namespace
+
+void LayerwiseTransferGroup::init_swa_multi_group(
+    const std::vector<std::vector<std::vector<torch::Tensor>>>
+        &swa_gpu_blocks_per_group,
+    torch::Tensor swa_cpu_blocks,
+    std::map<int, std::vector<std::string>> swa_ssd_files,
+    const std::vector<std::vector<std::pair<int, int>>> &swa_layer_members,
+    const std::vector<int> &swa_group_num_layers,
+    const std::vector<int64_t> &swa_group_cpu_offset_bytes,
+    const std::vector<int64_t> &swa_group_ssd_offset_bytes,
+    const std::vector<int64_t> &swa_group_cpu_layer_strides,
+    const std::vector<int64_t> &swa_group_cpu_kv_strides,
+    const std::vector<int64_t> &swa_group_ssd_layer_strides,
+    const std::vector<int64_t> &swa_group_ssd_kv_strides,
+    const std::vector<int64_t> &swa_group_chunk_sizes,
+    const std::vector<int64_t> &swa_group_h2d_cpu_kv_strides,
+    const std::vector<int64_t> &swa_group_h2d_cpu_layer_strides,
+    const std::vector<int64_t> &swa_group_cpu_block_strides,
+    const std::vector<int64_t> &swa_group_cpu_tp_strides,
+    const std::vector<int64_t> &swa_group_gpu_kv_strides,
+    const std::vector<int64_t> &swa_group_gpu_block_strides,
+    const std::vector<int64_t> &swa_group_gpu_layer_strides,
+    const std::vector<int64_t> &swa_group_gpu_chunk_sizes, int iouring_entries,
+    int iouring_flags) {
+  if (has_swa_) {
+    throw std::runtime_error(
+        "[LayerwiseTransferGroup] init_swa_multi_group() called but SWA was "
+        "already initialized (uniform or multi-group)");
+  }
+  if (!swa_cpu_blocks.defined() || swa_cpu_blocks.numel() == 0) {
+    throw std::runtime_error(
+        "[LayerwiseTransferGroup] init_swa_multi_group() requires non-empty "
+        "swa_cpu_blocks");
+  }
+  if (static_cast<int>(swa_layer_members.size()) != num_original_layers_) {
+    throw std::runtime_error(
+        "[LayerwiseTransferGroup] swa_layer_members length " +
+        std::to_string(swa_layer_members.size()) +
+        " != num_original_layers " + std::to_string(num_original_layers_));
+  }
+
+  int num_groups = static_cast<int>(swa_group_num_layers.size());
+  if (static_cast<int>(swa_gpu_blocks_per_group.size()) != num_groups) {
+    throw std::runtime_error(
+        "[LayerwiseTransferGroup] swa_gpu_blocks_per_group size " +
+        std::to_string(swa_gpu_blocks_per_group.size()) +
+        " does not match num_groups " + std::to_string(num_groups));
+  }
+
+  swa_layer_members_ = swa_layer_members;
+  swa_groups_.resize(num_groups);
+  for (int gi = 0; gi < num_groups; ++gi) {
+    fill_group_params_from_arrays(
+        swa_groups_[gi], num_gpus_, gi, swa_gpu_blocks_per_group,
+        swa_group_num_layers, swa_group_cpu_offset_bytes,
+        swa_group_ssd_offset_bytes, swa_group_cpu_layer_strides,
+        swa_group_cpu_kv_strides, swa_group_ssd_layer_strides,
+        swa_group_ssd_kv_strides, swa_group_chunk_sizes,
+        swa_group_h2d_cpu_kv_strides, swa_group_h2d_cpu_layer_strides,
+        swa_group_cpu_block_strides, swa_group_cpu_tp_strides,
+        swa_group_gpu_kv_strides, swa_group_gpu_block_strides,
+        swa_group_gpu_layer_strides, swa_group_gpu_chunk_sizes,
+        "[LayerwiseTransferGroup SWA multi-group]");
+  }
+
+  swa_cpu_blocks_ = swa_cpu_blocks.data_ptr();
+  has_swa_ = true;
+  has_swa_multi_group_ = true;
+
+  swa_enable_ssd_ = !swa_ssd_files.empty();
+  if (swa_enable_ssd_) {
+    swa_ioctx_ = std::make_unique<SSDIOCTX>(
+        swa_ssd_files, swa_ssd_files.size(), iouring_entries, iouring_flags);
+  }
+}
+
+int LayerwiseTransferGroup::swa_slots_for_orig_(int orig_layer,
+                                               bool swa_active) const {
+  if (!swa_active) {
+    return 0;
+  }
+  if (has_swa_multi_group_) {
+    return static_cast<int>(swa_layer_members_[orig_layer].size());
+  }
+  return 1;
+}
+
+void LayerwiseTransferGroup::launch_swa_mg_h2d_layer_(
+    int orig_layer, int num_blocks, int64_t *swa_gpu_block_ids,
+    int64_t *swa_cpu_block_ids, int transfer_cta_num, bool use_ce_transfer,
+    bool is_mla, const std::string &mla_d2h_mode) {
+  std::cout<< "launch_swa_mg_h2d_layer_ called" << std::endl;
+  if (!has_swa_multi_group_) {
+    return;
+  }
+  const auto &members = swa_layer_members_[orig_layer];
+  std::string mode = mla_d2h_mode;
+  for (const auto &member : members) {
+    int gi = member.first;
+    int local_id = member.second;
+    const GroupParams &gp = swa_groups_[gi];
+    for (int d = 0; d < num_gpus_; ++d) {
+      cudaSetDevice(gpu_device_ids_[d]);
+      int64_t cpu_startoff_inside_chunks = d * gp.cpu_tp_stride;
+      if (is_mla) {
+        cpu_startoff_inside_chunks =
+            mode == "all_write" ? d * num_blocks * gp.cpu_block_stride : 0;
+      }
+      int64_t gpu_startoff_inside_chunks = 0;
+      int64_t chunk_size = gp.gpu_chunk_sizes[d];
+      void *cpu_ptr_for_group =
+          static_cast<char *>(swa_cpu_blocks_) + gp.cpu_offset_bytes;
+
+      switch (gp.backend_type) {
+      case BackendType::VLLM:
+        flexkv::transfer_kv_blocks<BackendType::VLLM>(
+            num_blocks, local_id, 1, swa_gpu_block_ids,
+            gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
+            swa_cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
+            gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+            cpu_startoff_inside_chunks, chunk_size, streams_[d],
+            transfer_cta_num, true, use_ce_transfer, is_mla,
+            gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
+        break;
+      case BackendType::TRTLLM:
+        flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+            num_blocks, local_id, 1, swa_gpu_block_ids,
+            gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
+            swa_cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
+            gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+            cpu_startoff_inside_chunks, chunk_size, streams_[d],
+            transfer_cta_num, true, use_ce_transfer, is_mla,
+            gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
+        break;
+      case BackendType::SGLANG:
+        flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+            num_blocks, local_id, 1, swa_gpu_block_ids,
+            gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
+            swa_cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
+            gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+            cpu_startoff_inside_chunks, chunk_size, streams_[d],
+            transfer_cta_num, true, use_ce_transfer, is_mla,
+            gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
+        break;
+      }
     }
   }
 }
@@ -504,12 +751,15 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
           "[LayerwiseTransferGroup multi-group] gpu_blocks_per_group[" +
           std::to_string(gi) + "].size() != num_gpus");
     }
+    // Retain Tensor objects so CUDA IPC mappings stay valid (C++ only
+    // caches data_ptr() in gpu_blocks_flat).
+    gp.gpu_tensors = gpu_blocks_per_group[gi];
     gp.num_tensors_per_gpu =
-        static_cast<int>(gpu_blocks_per_group[gi][0].size());
+        static_cast<int>(gp.gpu_tensors[0].size());
     cudaMallocHost((void **)&gp.gpu_blocks_flat,
                    num_gpus * gp.num_tensors_per_gpu * sizeof(void *));
     for (int d = 0; d < num_gpus; ++d) {
-      if (static_cast<int>(gpu_blocks_per_group[gi][d].size()) !=
+      if (static_cast<int>(gp.gpu_tensors[d].size()) !=
           gp.num_tensors_per_gpu) {
         throw std::runtime_error(
             "[LayerwiseTransferGroup multi-group] gpu_blocks_per_group[" +
@@ -518,7 +768,7 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
       }
       for (int t = 0; t < gp.num_tensors_per_gpu; ++t) {
         gp.gpu_blocks_flat[d * gp.num_tensors_per_gpu + t] =
-            gpu_blocks_per_group[gi][d][t].data_ptr();
+            gp.gpu_tensors[d][t].data_ptr();
       }
     }
 
@@ -618,6 +868,12 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
     cudaFreeHost(gpu_blocks_);
   }
   for (auto &gp : groups_) {
+    if (gp.gpu_blocks_flat != nullptr) {
+      cudaFreeHost(gp.gpu_blocks_flat);
+      gp.gpu_blocks_flat = nullptr;
+    }
+  }
+  for (auto &gp : swa_groups_) {
     if (gp.gpu_blocks_flat != nullptr) {
       cudaFreeHost(gp.gpu_blocks_flat);
       gp.gpu_blocks_flat = nullptr;
@@ -1118,28 +1374,50 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     nvtxRangePop();
   }
 
-  // Step 0b: SWA SSD -> CPU (uniform per-layer layout, independent ioctx).
+  // Step 0b: SWA SSD -> CPU.
+  // Uniform SWA uses per-layer LAYERFIRST I/O; multi-group SWA/state uses an
+  // opaque BLOCKFIRST byte-flat block (same as main Step 0a).
   if (has_swa_ && swa_enable_ssd_ && swa_disk2h_src.numel() > 0) {
-    torch::Tensor swa_all_layer_ids = torch::arange(
-        0, num_original_layers_, torch::TensorOptions().dtype(torch::kInt32));
-    transfer_kv_blocks_ssd(
-        *swa_ioctx_, swa_all_layer_ids,
-        reinterpret_cast<int64_t>(swa_cpu_blocks_), swa_disk2h_src,
-        swa_disk2h_dst, swa_cpu_layer_stride_in_bytes,
-        swa_cpu_kv_stride_in_bytes, swa_ssd_layer_stride_in_bytes,
-        swa_ssd_kv_stride_in_bytes, swa_cpu_chunk_size_in_bytes,
-        swa_cpu_block_stride_in_bytes,
-        true, swa_num_blocks_per_file, round_robin, num_threads_per_device,
-        /*is_mla=*/true);
+    if (has_swa_multi_group_) {
+      const int64_t swa_block_stride = swa_groups_[0].cpu_block_stride;
+      torch::Tensor one_layer_id =
+          torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32));
+      transfer_kv_blocks_ssd(
+          *swa_ioctx_, one_layer_id,
+          reinterpret_cast<int64_t>(swa_cpu_blocks_), swa_disk2h_src,
+          swa_disk2h_dst,
+          /*cpu_layer_stride_in_bytes=*/swa_block_stride,
+          /*cpu_kv_stride_in_bytes=*/0,
+          /*ssd_layer_stride_in_bytes=*/swa_block_stride,
+          /*ssd_kv_stride_in_bytes=*/0,
+          /*chunk_size_in_bytes=*/swa_block_stride,
+          /*block_stride_in_bytes=*/swa_block_stride,
+          /*is_read=*/true, swa_num_blocks_per_file, round_robin,
+          num_threads_per_device, /*is_mla=*/true);
+    } else {
+      torch::Tensor swa_all_layer_ids = torch::arange(
+          0, num_original_layers_,
+          torch::TensorOptions().dtype(torch::kInt32));
+      transfer_kv_blocks_ssd(
+          *swa_ioctx_, swa_all_layer_ids,
+          reinterpret_cast<int64_t>(swa_cpu_blocks_), swa_disk2h_src,
+          swa_disk2h_dst, swa_cpu_layer_stride_in_bytes,
+          swa_cpu_kv_stride_in_bytes, swa_ssd_layer_stride_in_bytes,
+          swa_ssd_kv_stride_in_bytes, swa_cpu_chunk_size_in_bytes,
+          swa_cpu_block_stride_in_bytes, true, swa_num_blocks_per_file,
+          round_robin, num_threads_per_device, /*is_mla=*/true);
+    }
   }
 
-  // Empty-member layers: immediate eventfd only when SWA is not active for
-  // this transfer (otherwise SWA H2D + callback will post the fd).
+  // Empty-member layers: immediate eventfd only when neither main nor SWA
+  // has work for this original layer.
   if (enable_eventfd_ && num_counters_ > 0 && !layer_eventfds_.empty()) {
     int offset = current_counter_id_ * tp_size_ * num_layers_;
     int *eventfds_ptr = layer_eventfds_.data() + offset;
     for (int orig = 0; orig < num_original_layers_; ++orig) {
-      if (!layer_members_[orig].empty() || swa_active) {
+      const bool has_swa_work =
+          swa_slots_for_orig_(orig, swa_active) > 0;
+      if (!layer_members_[orig].empty() || has_swa_work) {
         continue;
       }
       for (int tp_rank = 0; tp_rank < tp_size_; ++tp_rank) {
@@ -1156,7 +1434,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   std::vector<int> work_origs;
   work_origs.reserve(num_original_layers_);
   for (int orig = 0; orig < num_original_layers_; ++orig) {
-    if (!layer_members_[orig].empty() || swa_active) {
+    if (!layer_members_[orig].empty() ||
+        swa_slots_for_orig_(orig, swa_active) > 0) {
       work_origs.push_back(orig);
     }
   }
@@ -1244,11 +1523,16 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     }
 
     if (swa_active) {
-      launch_swa_h2d_layer_(orig, 1, swa_num_blocks, swa_gpu_block_ids,
-                            swa_cpu_block_ids, swa_h2d_cpu_kv_stride_in_bytes,
-                            swa_h2d_cpu_layer_stride_in_bytes,
-                            swa_cpu_block_stride_in_bytes, transfer_cta_num,
-                            use_ce_transfer);
+      if (has_swa_multi_group_) {
+        launch_swa_mg_h2d_layer_(orig, swa_num_blocks, swa_gpu_block_ids,
+                                 swa_cpu_block_ids, transfer_cta_num,
+                                 use_ce_transfer, /*is_mla=*/true, mode);
+      } else {
+        launch_swa_h2d_layer_(
+            orig, 1, swa_num_blocks, swa_gpu_block_ids, swa_cpu_block_ids,
+            swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
+            swa_cpu_block_stride_in_bytes, transfer_cta_num, use_ce_transfer);
+      }
     }
 
     if (notify_mode_ == NotifyMode::POLLING) {
@@ -1266,7 +1550,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
         is_last_active ? nullptr : &h2d_range_ids[next_orig];
 
     if (notify_mode_ == NotifyMode::HOSTFUNC) {
-      int slots_per_gpu = members_this_layer + (swa_active ? 1 : 0);
+      int swa_slots = swa_slots_for_orig_(orig, swa_active);
+      int slots_per_gpu = members_this_layer + swa_slots;
       layer_done_callback(/*start_layer=*/orig, /*layers_this_batch=*/1,
                           /*expected_count=*/slots_per_gpu * num_gpus_,
                           &h2d_range_ids[orig], is_last_active, next_name,

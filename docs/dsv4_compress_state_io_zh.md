@@ -238,21 +238,19 @@ H2D worker 按注册时的 group byte offset，从一个 Host page block 中分�
 
 ### 7.1 Layerwise GET 的依赖
 
-旧的 layerwise 路径会把 uniform SWA 搬运融合进 main-KV layerwise kernel。heterogeneous state 无法使用这个单一 layout，所以 `swa.multi_group=True` 时改为：
+Layerwise 路径把 main-KV 与 SWA/state 全部 fuse 进同一个 `LayerwiseTransferOp`：
 
 ```text
-SWA/state DISK2H
-        │
-        ▼
-SWA/state H2D（独立 multi-group worker）
-        │
-        ▼
-main-KV LayerwiseTransferOp
-        │
-        └─ per-layer ready event
+LayerwiseTransferOp
+  ├─ main-KV DISK2H（如需要，opaque multi-group block）
+  ├─ SWA/state DISK2H（如需要，opaque multi-group block）
+  └─ per original layer:
+       ├─ main-KV H2D（各 layer group members）
+       ├─ SWA KV / attn state / indexer state H2D（各 SWA group members）
+       └─ per-layer ready eventfd
 ```
 
-main layerwise op 显式依赖完整的 SWA/state H2D。这样第一层 ready event 也不会在 state 恢复前触发，DSA 不会看到半恢复或 stale 的 score。
+`swa.multi_group=True` 时，SWA 池使用与 main-KV 同构的 `GroupParams + layer_members`；C4 层会等该层 state 写完再发 eventfd，无 state 的层只等 SWA KV + main。
 
 非 layerwise GET 会等待整个 FlexKV task 完成后再把请求交还给 SGLang。
 

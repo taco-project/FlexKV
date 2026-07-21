@@ -63,8 +63,8 @@ def test_swa_state_sidecars_share_one_byte_flat_host_block() -> None:
     assert layout.kv_shape == torch.Size([7, expected_block_bytes])
 
 
-def test_layerwise_waits_for_heterogeneous_swa_state_h2d() -> None:
-    """No layer event may fire before the state sidecar H2D is complete."""
+def test_layerwise_fuses_heterogeneous_swa_state_h2d() -> None:
+    """Layerwise GET packs main-KV + SWA/state into one LAYERWISE op."""
     graph = TransferOpGraph()
     main_h2d = TransferOp(
         graph_id=graph.graph_id,
@@ -89,7 +89,7 @@ def test_layerwise_waits_for_heterogeneous_swa_state_h2d() -> None:
         op_callback_dict={},
         layerwise_transfer=True,
         counter_id=2,
-        fuse_swa_into_layerwise=False,
+        fuse_swa_into_layerwise=True,
     )
 
     layerwise_ops = [
@@ -101,7 +101,11 @@ def test_layerwise_waits_for_heterogeneous_swa_state_h2d() -> None:
         if op.transfer_type == TransferType.H2D and op.is_swa
     ]
     assert len(layerwise_ops) == 1
-    assert len(standalone_swa) == 1
-    assert standalone_swa[0].op_id in layerwise_ops[0].predecessors
-    assert layerwise_ops[0].swa_src_block_ids_h2d.size == 0
+    assert len(standalone_swa) == 0
+    assert np.array_equal(
+        layerwise_ops[0].swa_src_block_ids_h2d, np.array([31], dtype=np.int64)
+    )
+    assert np.array_equal(
+        layerwise_ops[0].swa_dst_block_ids_h2d, np.array([41], dtype=np.int64)
+    )
     assert task_end == layerwise_ops[0].op_id

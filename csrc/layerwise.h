@@ -46,10 +46,14 @@ struct GroupParams {
   std::vector<int64_t> gpu_chunk_sizes;
 
   // GPU tensor pointers (cudaMallocHost'd, num_gpus_ * num_tensors_per_gpu)
-  void **gpu_blocks_flat;
-  int num_tensors_per_gpu;
-  BackendType backend_type;
+  void **gpu_blocks_flat = nullptr;
+  int num_tensors_per_gpu = 0;
+  BackendType backend_type = BackendType::VLLM;
   std::vector<GTensorHandler> gpu_tensor_handlers;
+  // Keep imported CUDA IPC / shared tensors alive for the lifetime of this
+  // group. ``gpu_blocks_flat`` only caches ``data_ptr()``; dropping the
+  // Tensor objects closes the IPC mapping and leaves dangling device pointers.
+  std::vector<std::vector<torch::Tensor>> gpu_tensors;
 };
 
 class LayerwiseTransferGroup {
@@ -199,6 +203,35 @@ public:
       const std::string &mla_d2h_mode = "sharded",
       const std::string &notify_mode = "hostfunc");
 
+  // Bind heterogeneous SWA/state sidecars (SWA KV + compress states) onto the
+  // same LayerwiseTransferGroup.  Mutually exclusive with the uniform
+  // ``init_swa_sidecar_`` path.  Call after construction when
+  // ``swa.multi_group`` is enabled so GET fuses main-KV + SWA/state into one
+  // LAYERWISE op.
+  void init_swa_multi_group(
+      const std::vector<std::vector<std::vector<torch::Tensor>>>
+          &swa_gpu_blocks_per_group,
+      torch::Tensor swa_cpu_blocks,
+      std::map<int, std::vector<std::string>> swa_ssd_files,
+      const std::vector<std::vector<std::pair<int, int>>> &swa_layer_members,
+      const std::vector<int> &swa_group_num_layers,
+      const std::vector<int64_t> &swa_group_cpu_offset_bytes,
+      const std::vector<int64_t> &swa_group_ssd_offset_bytes,
+      const std::vector<int64_t> &swa_group_cpu_layer_strides,
+      const std::vector<int64_t> &swa_group_cpu_kv_strides,
+      const std::vector<int64_t> &swa_group_ssd_layer_strides,
+      const std::vector<int64_t> &swa_group_ssd_kv_strides,
+      const std::vector<int64_t> &swa_group_chunk_sizes,
+      const std::vector<int64_t> &swa_group_h2d_cpu_kv_strides,
+      const std::vector<int64_t> &swa_group_h2d_cpu_layer_strides,
+      const std::vector<int64_t> &swa_group_cpu_block_strides,
+      const std::vector<int64_t> &swa_group_cpu_tp_strides,
+      const std::vector<int64_t> &swa_group_gpu_kv_strides,
+      const std::vector<int64_t> &swa_group_gpu_block_strides,
+      const std::vector<int64_t> &swa_group_gpu_layer_strides,
+      const std::vector<int64_t> &swa_group_gpu_chunk_sizes,
+      int iouring_entries = 512, int iouring_flags = 0);
+
 private:
   int num_gpus_;
   // Single-group GPU pointer table (multi-group: nullptr; per-group tables
@@ -223,8 +256,10 @@ private:
   bool enable_ssd_;
   std::unique_ptr<SSDIOCTX> ioctx_;
 
-  // ---- SWA dedicated pool state (sidecar; single- and multi-group) ----
+  // ---- SWA dedicated pool state (sidecar; uniform OR multi-group) ----
   bool has_swa_ = false;
+  bool has_swa_multi_group_ = false;
+  // Uniform SWA (legacy LAYERFIRST single layout)
   void **swa_gpu_blocks_ = nullptr;    // flat [num_gpus * num_tensors_per_gpu]
   void *swa_cpu_blocks_ = nullptr;
   int swa_num_tensors_per_gpu_ = 0;
@@ -236,6 +271,9 @@ private:
   BackendType swa_backend_type_;
   bool swa_enable_ssd_ = false;
   std::unique_ptr<SSDIOCTX> swa_ioctx_;
+  // Heterogeneous SWA/state multi-group (BLOCKFIRST byte-flat host block)
+  std::vector<GroupParams> swa_groups_;
+  std::vector<std::vector<std::pair<int, int>>> swa_layer_members_;
 
   // Layer eventfds for notification
   // Shape: [num_counters, tp_size, num_layers]
@@ -257,7 +295,8 @@ private:
 
   // Single-group: ``expected_count = num_gpus_``.
   // Multi-group: ``expected_count = slots_per_gpu * num_gpus_`` where
-  // ``slots_per_gpu = members_this_layer + (swa_active ? 1 : 0)``.
+  // ``slots_per_gpu = main_members + swa_slots`` (uniform SWA: 0/1;
+  // SWA multi-group: ``swa_layer_members_[orig].size()``).
   void layer_done_callback(int start_layer, int layers_this_batch,
                            int expected_count,
                            nvtxRangeId_t *current_range_id_ptr,
@@ -283,6 +322,14 @@ private:
       int64_t swa_h2d_cpu_layer_stride_in_bytes,
       int64_t swa_cpu_block_stride_in_bytes, int transfer_cta_num,
       bool use_ce_transfer);
+
+  // Per-original-layer H2D for heterogeneous SWA/state groups.
+  void launch_swa_mg_h2d_layer_(
+      int orig_layer, int num_blocks, int64_t *swa_gpu_block_ids,
+      int64_t *swa_cpu_block_ids, int transfer_cta_num, bool use_ce_transfer,
+      bool is_mla, const std::string &mla_d2h_mode);
+
+  int swa_slots_for_orig_(int orig_layer, bool swa_active) const;
 
   // ===== Event polling notification (#199) =====
   // Used when notify_mode == "polling".

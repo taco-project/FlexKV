@@ -20,7 +20,12 @@ from flexkv.common.transfer import WorkerKey
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp
-from flexkv.transfer.worker import TransferWorkerBase, cudaHostRegister
+from flexkv.transfer.worker import (
+    TransferWorkerBase,
+    cudaHostRegister,
+    ensure_cuda_device,
+    import_tensor_handles,
+)
 
 
 def build_layerwise_eventfd_socket_path(
@@ -94,6 +99,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  swa_ssd_files:  Optional[Dict[int, List[str]]] = None,
                  swa_ssd_kv_layout:  Optional[KVCacheLayout] = None,
                  swa_num_blocks_per_file: int = 0,
+                 # Heterogeneous SWA/state sidecars (mutually exclusive with
+                 # uniform swa_gpu_blocks / swa_gpu_kv_layouts above).
+                 swa_layer_groups: Optional[List[LayerGroupSpec]] = None,
+                 swa_gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]] = None,
+                 swa_gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None,
                  ) -> None:
         flexkv_logger.debug(
             f"[LayerwiseWorker] __init__ started: worker_id={worker_id}, "
@@ -104,12 +114,15 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size, f"len(gpu_blocks) = {len(gpu_blocks)}, tp_group_size = {tp_group_size}"
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
+        # Bind CUDA device before any CUDA API (host-register / IPC import).
+        # Under DP each LayerwiseWorker owns one GPU; without this every worker
+        # would create a default context on GPU0 and starve it.
+        if gpu_blocks and gpu_blocks[0]:
+            ensure_cuda_device(gpu_blocks[0][0].device)
+        self._pin_op_buffer()
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
-            blocks_in_one_gpu = []
-            for handle in handles_in_one_gpu:
-                blocks_in_one_gpu.append(handle.get_tensor())
-            imported_gpu_blocks.append(blocks_in_one_gpu)
+            imported_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type (uint8 in multi-group)
         self.is_mla = gpu_kv_layouts[0].is_mla
@@ -171,18 +184,46 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         flexkv_logger.debug("[LayerwiseWorker] CPU memory pinned successfully")
         self.cpu_blocks = cpu_blocks
 
-        self.has_swa = swa_gpu_blocks is not None and swa_cpu_blocks is not None
-        if self.has_swa:
+        self.has_swa_multi_group = (
+            swa_layer_groups is not None
+            and swa_gpu_blocks_per_group is not None
+            and swa_gpu_layouts_per_group is not None
+            and swa_cpu_blocks is not None
+        )
+        if self.has_swa_multi_group and swa_gpu_blocks is not None:
+            raise ValueError(
+                "[LayerwiseWorker] pass either uniform swa_gpu_blocks or "
+                "swa_layer_groups/swa_gpu_blocks_per_group, not both"
+            )
+
+        self.has_swa = (
+            (swa_gpu_blocks is not None and swa_cpu_blocks is not None)
+            or self.has_swa_multi_group
+        )
+        self._swa_layer_groups = swa_layer_groups
+        self._swa_gpu_blocks_per_group = swa_gpu_blocks_per_group
+        self._swa_gpu_layouts_per_group = swa_gpu_layouts_per_group
+
+        if self.has_swa_multi_group:
+            assert swa_cpu_blocks is not None
+            swa_cpu_blocks = materialize_worker_tensor(swa_cpu_blocks)
+            cudaHostRegister(swa_cpu_blocks)
+            flexkv_logger.info(
+                "[LayerwiseWorker] SWA multi-group CPU memory pinned successfully")
+            self.swa_cpu_blocks = swa_cpu_blocks
+            self._swa_cpu_kv_layout = swa_cpu_kv_layout
+            self._swa_ssd_files = swa_ssd_files if swa_ssd_files is not None else {}
+            self._swa_ssd_kv_layout = swa_ssd_kv_layout
+            self._swa_num_blocks_per_file = swa_num_blocks_per_file
+            self._swa_enable_ssd = len(self._swa_ssd_files) > 0
+        elif self.has_swa:
             assert swa_gpu_blocks is not None
             assert len(swa_gpu_blocks) == self.num_gpus, (
                 f"len(swa_gpu_blocks)={len(swa_gpu_blocks)} != num_gpus={self.num_gpus}"
             )
             imported_swa_gpu_blocks: List[List[torch.Tensor]] = []
             for handles_in_one_gpu in swa_gpu_blocks:
-                blocks_in_one_gpu = []
-                for handle in handles_in_one_gpu:
-                    blocks_in_one_gpu.append(handle.get_tensor())
-                imported_swa_gpu_blocks.append(blocks_in_one_gpu)
+                imported_swa_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
             self.swa_gpu_blocks = imported_swa_gpu_blocks
             swa_cpu_blocks = materialize_worker_tensor(swa_cpu_blocks)
             cudaHostRegister(swa_cpu_blocks)
@@ -205,7 +246,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         else:
             self._swa_enable_ssd = False
 
-        if self.has_swa:
+        if self.has_swa and not self.has_swa_multi_group:
             self._init_swa_strides()
 
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
@@ -248,6 +289,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 layer_eventfds_tensor=layer_eventfds_tensor,
                 tp_group_size=tp_group_size,
             )
+
+        if self.has_swa_multi_group:
+            self._bind_swa_multi_group(tp_group_size)
 
         flexkv_logger.info(f"[LayerwiseWorker] __init__ completed successfully, worker_id={worker_id}")
 
@@ -305,7 +349,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             f"swa_ssd={self._swa_enable_ssd}, multi_group={self.has_multi_group}")
 
     def _swa_init_kwargs(self) -> Dict[str, Any]:
-        if not self.has_swa:
+        # Heterogeneous SWA/state is bound via init_swa_multi_group() after the
+        # LayerwiseTransferGroup is constructed; do not pass uniform sidecar args.
+        if not self.has_swa or self.has_swa_multi_group:
             return {"has_swa": False}
         return dict(
             has_swa=True,
@@ -345,6 +391,25 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 swa_ssd_kv_stride_in_bytes=0,
                 swa_num_blocks_per_file=0,
             )
+        # Multi-group SWA/state reads strides from GroupParams at init time;
+        # only block ids matter for the transfer call.
+        if self.has_swa_multi_group:
+            return dict(
+                swa_h2d_src=swa_src_h2d if swa_src_h2d is not None else empty,
+                swa_h2d_dst=swa_dst_h2d if swa_dst_h2d is not None else empty,
+                swa_disk2h_src=swa_src_disk2h if swa_src_disk2h is not None else empty,
+                swa_disk2h_dst=swa_dst_disk2h if swa_dst_disk2h is not None else empty,
+                swa_cpu_kv_stride_in_bytes=0,
+                swa_cpu_layer_stride_in_bytes=0,
+                swa_cpu_block_stride_in_bytes=0,
+                swa_cpu_chunk_size_in_bytes=0,
+                swa_h2d_cpu_kv_stride_in_bytes=0,
+                swa_h2d_cpu_layer_stride_in_bytes=0,
+                swa_cpu_tp_stride_in_bytes=0,
+                swa_ssd_layer_stride_in_bytes=0,
+                swa_ssd_kv_stride_in_bytes=0,
+                swa_num_blocks_per_file=self._swa_num_blocks_per_file,
+            )
         return dict(
             swa_h2d_src=swa_src_h2d if swa_src_h2d is not None else empty,
             swa_h2d_dst=swa_dst_h2d if swa_dst_h2d is not None else empty,
@@ -360,6 +425,168 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             swa_ssd_layer_stride_in_bytes=self.swa_ssd_layer_stride_in_bytes,
             swa_ssd_kv_stride_in_bytes=self.swa_ssd_kv_stride_in_bytes,
             swa_num_blocks_per_file=self._swa_num_blocks_per_file,
+        )
+
+    def _compute_multi_group_tables(
+        self,
+        layer_groups: List[LayerGroupSpec],
+        gpu_blocks_per_group: List[List[List[TensorSharedHandle]]],
+        gpu_layouts_per_group: List[List[KVCacheLayout]],
+        cpu_kv_layout: KVCacheLayout,
+        tp_group_size: int,
+    ) -> Dict[str, Any]:
+        """Build stride/offset tables + imported GPU tensors for one multi-group pool."""
+        if cpu_kv_layout.type != KVCacheLayoutType.BLOCKFIRST:
+            raise ValueError(
+                "[LayerwiseWorker multi-group] only BLOCKFIRST CPU layout is "
+                f"supported, got {cpu_kv_layout.type}"
+            )
+        kv_dim = self.kv_dim
+        tpb = cpu_kv_layout.tokens_per_block
+        num_original_layers = self.num_layers
+        layer_member_map = build_layer_member_map(layer_groups, num_original_layers)
+        layer_members = [list(m) for m in layer_member_map.members]
+
+        cpu_block_stride = cpu_kv_layout.get_block_stride()
+        cpu_tp_stride = cpu_block_stride // tp_group_size
+
+        group_num_layers: List[int] = []
+        group_cpu_offset_bytes: List[int] = []
+        group_ssd_offset_bytes: List[int] = []
+        group_cpu_layer_strides: List[int] = []
+        group_cpu_kv_strides: List[int] = []
+        group_ssd_layer_strides: List[int] = []
+        group_ssd_kv_strides: List[int] = []
+        group_chunk_sizes: List[int] = []
+        group_h2d_cpu_kv_strides: List[int] = []
+        group_h2d_cpu_layer_strides: List[int] = []
+        group_cpu_block_strides: List[int] = []
+        group_cpu_tp_strides: List[int] = []
+        group_gpu_kv_strides: List[int] = []
+        group_gpu_block_strides: List[int] = []
+        group_gpu_layer_strides: List[int] = []
+        group_gpu_chunk_sizes: List[int] = []
+        gpu_blocks_per_group_tensors: List[List[List[torch.Tensor]]] = []
+
+        offset_bytes = 0
+        for gi, g in enumerate(layer_groups):
+            dtype_size_g = (g.dtype or self.dtype).itemsize
+            tpb_g = tpb // g.compress_ratio
+            chunk_elements = tpb_g * g.num_kv_heads * g.head_size
+            chunk_size_bytes = chunk_elements * dtype_size_g
+            layer_stride_bytes = kv_dim * chunk_size_bytes
+            kv_stride_bytes = chunk_size_bytes
+
+            group_num_layers.append(g.num_layers)
+            group_cpu_offset_bytes.append(offset_bytes)
+            group_ssd_offset_bytes.append(offset_bytes)
+            group_cpu_layer_strides.append(layer_stride_bytes)
+            group_cpu_kv_strides.append(kv_stride_bytes)
+            group_ssd_layer_strides.append(layer_stride_bytes)
+            group_ssd_kv_strides.append(kv_stride_bytes)
+            group_chunk_sizes.append(chunk_size_bytes)
+            group_h2d_cpu_kv_strides.append(kv_stride_bytes)
+            group_h2d_cpu_layer_strides.append(layer_stride_bytes)
+            group_cpu_block_strides.append(cpu_block_stride)
+            group_cpu_tp_strides.append(cpu_tp_stride)
+
+            group_blocks_per_device = gpu_blocks_per_group[gi]
+            group_layouts_per_device = gpu_layouts_per_group[gi]
+            if len(group_blocks_per_device) != self.num_gpus:
+                raise ValueError(
+                    f"[LayerwiseWorker multi-group] gpu_blocks_per_group[{gi}] "
+                    f"has {len(group_blocks_per_device)} devices, expected "
+                    f"{self.num_gpus}"
+                )
+
+            imported_group_blocks: List[List[torch.Tensor]] = []
+            for handles_for_device in group_blocks_per_device:
+                imported_group_blocks.append(import_tensor_handles(handles_for_device))
+            gpu_blocks_per_group_tensors.append(imported_group_blocks)
+
+            for layout in group_layouts_per_device:
+                group_gpu_kv_strides.append(layout.get_kv_stride() * dtype_size_g)
+                group_gpu_block_strides.append(layout.get_block_stride() * dtype_size_g)
+                group_gpu_layer_strides.append(layout.get_layer_stride() * dtype_size_g)
+                group_gpu_chunk_sizes.append(layout.get_chunk_size() * dtype_size_g)
+
+            offset_bytes += g.num_layers * layer_stride_bytes
+
+        return dict(
+            layer_members=layer_members,
+            group_num_layers=group_num_layers,
+            group_cpu_offset_bytes=group_cpu_offset_bytes,
+            group_ssd_offset_bytes=group_ssd_offset_bytes,
+            group_cpu_layer_strides=group_cpu_layer_strides,
+            group_cpu_kv_strides=group_cpu_kv_strides,
+            group_ssd_layer_strides=group_ssd_layer_strides,
+            group_ssd_kv_strides=group_ssd_kv_strides,
+            group_chunk_sizes=group_chunk_sizes,
+            group_h2d_cpu_kv_strides=group_h2d_cpu_kv_strides,
+            group_h2d_cpu_layer_strides=group_h2d_cpu_layer_strides,
+            group_cpu_block_strides=group_cpu_block_strides,
+            group_cpu_tp_strides=group_cpu_tp_strides,
+            group_gpu_kv_strides=group_gpu_kv_strides,
+            group_gpu_block_strides=group_gpu_block_strides,
+            group_gpu_layer_strides=group_gpu_layer_strides,
+            group_gpu_chunk_sizes=group_gpu_chunk_sizes,
+            gpu_blocks_per_group_tensors=gpu_blocks_per_group_tensors,
+            cpu_block_stride=cpu_block_stride,
+            cpu_tp_stride=cpu_tp_stride,
+        )
+
+    def _bind_swa_multi_group(self, tp_group_size: int) -> None:
+        """Attach heterogeneous SWA/state groups onto the C++ transfer group."""
+        if not self.has_multi_group:
+            raise ValueError(
+                "[LayerwiseWorker] SWA/state multi-group requires main-KV "
+                "multi-group (layerwise_transfer_multi_group path)"
+            )
+        assert self._swa_layer_groups is not None
+        assert self._swa_gpu_blocks_per_group is not None
+        assert self._swa_gpu_layouts_per_group is not None
+        assert self._swa_cpu_kv_layout is not None
+
+        tables = self._compute_multi_group_tables(
+            layer_groups=self._swa_layer_groups,
+            gpu_blocks_per_group=self._swa_gpu_blocks_per_group,
+            gpu_layouts_per_group=self._swa_gpu_layouts_per_group,
+            cpu_kv_layout=self._swa_cpu_kv_layout,
+            tp_group_size=tp_group_size,
+        )
+        # Same IPC lifetime rule as main multi-group: C++ stores raw
+        # data_ptr only, so Python must retain the imported tensors.
+        self.swa_gpu_blocks_per_group_tensors = tables[
+            "gpu_blocks_per_group_tensors"
+        ]
+        flexkv_logger.info(
+            f"[LayerwiseWorker] Binding SWA multi-group: "
+            f"{len(self._swa_layer_groups)} groups, "
+            f"block_stride={tables['cpu_block_stride']}"
+        )
+        self.layerwise_transfer_group.init_swa_multi_group(
+            swa_gpu_blocks_per_group=self.swa_gpu_blocks_per_group_tensors,
+            swa_cpu_blocks=self.swa_cpu_blocks,
+            swa_ssd_files=self._swa_ssd_files,
+            swa_layer_members=tables["layer_members"],
+            swa_group_num_layers=tables["group_num_layers"],
+            swa_group_cpu_offset_bytes=tables["group_cpu_offset_bytes"],
+            swa_group_ssd_offset_bytes=tables["group_ssd_offset_bytes"],
+            swa_group_cpu_layer_strides=tables["group_cpu_layer_strides"],
+            swa_group_cpu_kv_strides=tables["group_cpu_kv_strides"],
+            swa_group_ssd_layer_strides=tables["group_ssd_layer_strides"],
+            swa_group_ssd_kv_strides=tables["group_ssd_kv_strides"],
+            swa_group_chunk_sizes=tables["group_chunk_sizes"],
+            swa_group_h2d_cpu_kv_strides=tables["group_h2d_cpu_kv_strides"],
+            swa_group_h2d_cpu_layer_strides=tables["group_h2d_cpu_layer_strides"],
+            swa_group_cpu_block_strides=tables["group_cpu_block_strides"],
+            swa_group_cpu_tp_strides=tables["group_cpu_tp_strides"],
+            swa_group_gpu_kv_strides=tables["group_gpu_kv_strides"],
+            swa_group_gpu_block_strides=tables["group_gpu_block_strides"],
+            swa_group_gpu_layer_strides=tables["group_gpu_layer_strides"],
+            swa_group_gpu_chunk_sizes=tables["group_gpu_chunk_sizes"],
+            iouring_entries=GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+            iouring_flags=GLOBAL_CONFIG_FROM_ENV.iouring_flags,
         )
 
     # ------------------------------------------------------------------
@@ -454,139 +681,59 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         per ``g.num_kv_heads * g.head_size * dtype_size_g`` (per-token). The
         SSD layout mirrors the CPU layout.
         """
-        if cpu_kv_layout.type != KVCacheLayoutType.BLOCKFIRST:
-            raise ValueError(
-                "[LayerwiseWorker multi-group] only BLOCKFIRST CPU layout is "
-                f"supported, got {cpu_kv_layout.type}"
-            )
         if self.enable_ssd and ssd_kv_layout.type != KVCacheLayoutType.BLOCKFIRST:
             raise ValueError(
                 "[LayerwiseWorker multi-group] only BLOCKFIRST SSD layout is "
                 f"supported, got {ssd_kv_layout.type}"
             )
 
-        kv_dim = self.kv_dim
-        tpb = cpu_kv_layout.tokens_per_block
-        num_original_layers = self.num_layers
+        tables = self._compute_multi_group_tables(
+            layer_groups=layer_groups,
+            gpu_blocks_per_group=gpu_blocks_per_group,
+            gpu_layouts_per_group=gpu_layouts_per_group,
+            cpu_kv_layout=cpu_kv_layout,
+            tp_group_size=tp_group_size,
+        )
 
-        # Dense mapping: original layer id -> [(group_idx, local_layer_id), ...]
-        layer_member_map = build_layer_member_map(layer_groups, num_original_layers)
-        layer_members = [list(m) for m in layer_member_map.members]
-
-        # Block-stride is identical for CPU and SSD in multi-group BLOCKFIRST
-        # (kv_shape[1] = bytes_per_block, already accounts for tp_size and per-group dtypes).
-        cpu_block_stride = cpu_kv_layout.get_block_stride()
-        cpu_tp_stride = cpu_block_stride // tp_group_size
-
-        group_num_layers: List[int] = []
-        group_cpu_offset_bytes: List[int] = []
-        group_ssd_offset_bytes: List[int] = []
-        group_cpu_layer_strides: List[int] = []
-        group_cpu_kv_strides: List[int] = []
-        group_ssd_layer_strides: List[int] = []
-        group_ssd_kv_strides: List[int] = []
-        group_chunk_sizes: List[int] = []
-        group_h2d_cpu_kv_strides: List[int] = []
-        group_h2d_cpu_layer_strides: List[int] = []
-        group_cpu_block_strides: List[int] = []
-        group_cpu_tp_strides: List[int] = []
-        group_gpu_kv_strides: List[int] = []
-        group_gpu_block_strides: List[int] = []
-        group_gpu_layer_strides: List[int] = []
-        group_gpu_chunk_sizes: List[int] = []
-
-        gpu_blocks_per_group_tensors: List[List[List[torch.Tensor]]] = []
-
-        offset_bytes = 0
-        for gi, g in enumerate(layer_groups):
-            dtype_size_g = g.dtype.itemsize
-            # Compressed groups shrink the per-block token count by compress_ratio;
-            # the GPU tensor sglang allocates is already at the same shrunk shape,
-            # so chunk_elements (= bytes that travel for one (layer, K-or-V) on the
-            # CPU side per block) matches GPU exactly.
-            tpb_g = tpb // g.compress_ratio
-            chunk_elements = tpb_g * g.num_kv_heads * g.head_size
-            chunk_size_bytes = chunk_elements * dtype_size_g
-            layer_stride_bytes = kv_dim * chunk_size_bytes
-            kv_stride_bytes = chunk_size_bytes
-
-            group_num_layers.append(g.num_layers)
-            group_cpu_offset_bytes.append(offset_bytes)
-            group_ssd_offset_bytes.append(offset_bytes)  # CPU and SSD share layout
-            group_cpu_layer_strides.append(layer_stride_bytes)
-            group_cpu_kv_strides.append(kv_stride_bytes)
-            group_ssd_layer_strides.append(layer_stride_bytes)
-            group_ssd_kv_strides.append(kv_stride_bytes)
-            group_chunk_sizes.append(chunk_size_bytes)
-            # In BLOCKFIRST + TP-divided layout, each rank reads only its own
-            # head shard. The kv/layer strides for H2D are the per-group, per-token
-            # widths — they're identical to the SSD->CPU strides because the
-            # per-rank chunk is laid out the same way internally.
-            group_h2d_cpu_kv_strides.append(kv_stride_bytes)
-            group_h2d_cpu_layer_strides.append(layer_stride_bytes)
-            group_cpu_block_strides.append(cpu_block_stride)
-            group_cpu_tp_strides.append(cpu_tp_stride)
-
-            # Materialize GPU tensors for this group, per device
-            group_blocks_per_device = gpu_blocks_per_group[gi]
-            group_layouts_per_device = gpu_layouts_per_group[gi]
-            if len(group_blocks_per_device) != self.num_gpus:
-                raise ValueError(
-                    f"[LayerwiseWorker multi-group] gpu_blocks_per_group[{gi}] "
-                    f"has {len(group_blocks_per_device)} devices, expected "
-                    f"{self.num_gpus}"
-                )
-
-            imported_group_blocks: List[List[torch.Tensor]] = []
-            for d, handles_for_device in enumerate(group_blocks_per_device):
-                tensors_for_device = [h.get_tensor() for h in handles_for_device]
-                imported_group_blocks.append(tensors_for_device)
-            gpu_blocks_per_group_tensors.append(imported_group_blocks)
-
-            for d, layout in enumerate(group_layouts_per_device):
-                # Per-GPU GPU-side strides, in bytes (per-group dtype).
-                group_gpu_kv_strides.append(layout.get_kv_stride() * dtype_size_g)
-                group_gpu_block_strides.append(layout.get_block_stride() * dtype_size_g)
-                group_gpu_layer_strides.append(layout.get_layer_stride() * dtype_size_g)
-                group_gpu_chunk_sizes.append(layout.get_chunk_size() * dtype_size_g)
-
-            offset_bytes += g.num_layers * layer_stride_bytes
-
-        # Store for transfer_impl / logging
         self.layer_groups = layer_groups
-        self.group_cpu_block_stride = cpu_block_stride
-        self.layer_member_map = layer_member_map
+        self.group_cpu_block_stride = tables["cpu_block_stride"]
+        self.layer_member_map = build_layer_member_map(layer_groups, self.num_layers)
+        # Keep imported CUDA IPC tensors alive: C++ only stores data_ptr().
+        # Dropping these refs closes the IPC mapping and causes illegal
+        # memory access on the next H2D/D2H launch.
+        self.gpu_blocks_per_group_tensors = tables["gpu_blocks_per_group_tensors"]
 
         flexkv_logger.info(
             f"[LayerwiseWorker multi-group] {len(layer_groups)} groups, "
-            f"num_original_layers={num_original_layers}, "
-            f"block_stride={cpu_block_stride}, tp_stride={cpu_tp_stride}"
+            f"num_original_layers={self.num_layers}, "
+            f"block_stride={tables['cpu_block_stride']}, "
+            f"tp_stride={tables['cpu_tp_stride']}"
         )
 
         flexkv_logger.debug("[LayerwiseWorker] Creating LayerwiseTransferGroup (multi-group)...")
         self.layerwise_transfer_group = LayerwiseTransferGroup(
             num_gpus=self.num_gpus,
-            gpu_blocks_per_group=gpu_blocks_per_group_tensors,
+            gpu_blocks_per_group=self.gpu_blocks_per_group_tensors,
             cpu_blocks=cpu_blocks,
             ssd_files=ssd_files,
-            num_original_layers=num_original_layers,
-            layer_members=layer_members,
-            group_num_layers=group_num_layers,
-            group_cpu_offset_bytes=group_cpu_offset_bytes,
-            group_ssd_offset_bytes=group_ssd_offset_bytes,
-            group_cpu_layer_strides=group_cpu_layer_strides,
-            group_cpu_kv_strides=group_cpu_kv_strides,
-            group_ssd_layer_strides=group_ssd_layer_strides,
-            group_ssd_kv_strides=group_ssd_kv_strides,
-            group_chunk_sizes=group_chunk_sizes,
-            group_h2d_cpu_kv_strides=group_h2d_cpu_kv_strides,
-            group_h2d_cpu_layer_strides=group_h2d_cpu_layer_strides,
-            group_cpu_block_strides=group_cpu_block_strides,
-            group_cpu_tp_strides=group_cpu_tp_strides,
-            group_gpu_kv_strides=group_gpu_kv_strides,
-            group_gpu_block_strides=group_gpu_block_strides,
-            group_gpu_layer_strides=group_gpu_layer_strides,
-            group_gpu_chunk_sizes=group_gpu_chunk_sizes,
+            num_original_layers=self.num_layers,
+            layer_members=tables["layer_members"],
+            group_num_layers=tables["group_num_layers"],
+            group_cpu_offset_bytes=tables["group_cpu_offset_bytes"],
+            group_ssd_offset_bytes=tables["group_ssd_offset_bytes"],
+            group_cpu_layer_strides=tables["group_cpu_layer_strides"],
+            group_cpu_kv_strides=tables["group_cpu_kv_strides"],
+            group_ssd_layer_strides=tables["group_ssd_layer_strides"],
+            group_ssd_kv_strides=tables["group_ssd_kv_strides"],
+            group_chunk_sizes=tables["group_chunk_sizes"],
+            group_h2d_cpu_kv_strides=tables["group_h2d_cpu_kv_strides"],
+            group_h2d_cpu_layer_strides=tables["group_h2d_cpu_layer_strides"],
+            group_cpu_block_strides=tables["group_cpu_block_strides"],
+            group_cpu_tp_strides=tables["group_cpu_tp_strides"],
+            group_gpu_kv_strides=tables["group_gpu_kv_strides"],
+            group_gpu_block_strides=tables["group_gpu_block_strides"],
+            group_gpu_layer_strides=tables["group_gpu_layer_strides"],
+            group_gpu_chunk_sizes=tables["group_gpu_chunk_sizes"],
             iouring_entries=GLOBAL_CONFIG_FROM_ENV.iouring_entries,
             iouring_flags=GLOBAL_CONFIG_FROM_ENV.iouring_flags,
             layer_eventfds_tensor=layer_eventfds_tensor,
