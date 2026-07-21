@@ -573,9 +573,9 @@ class SWAPoolConfig:
     num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
     bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
     # True when the SWA page also carries heterogeneous sidecar groups (for
-    # example DeepSeek-V4 attention/indexer compress states).  The flag keeps
-    # layerwise GET from fusing SWA into the legacy uniform-layout kernel; the
-    # dedicated multi-group SWA worker completes first instead.
+    # example DeepSeek-V4 attention/indexer compress states).  Layerwise GET
+    # still fuses SWA/state H2D into LAYERWISE via launch_swa_mg_h2d_layer_;
+    # this flag drives multi-group layout / registration, not the fuse choice.
     multi_group: bool = False
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
     pin_memory: bool = True            # Use pinned memory for async DMA

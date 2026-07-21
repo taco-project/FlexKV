@@ -32,6 +32,13 @@ Or using JSON configuration:
 - `ssd_cache_gb`: SSD cache layer capacity in GB. Recommended to be greater than `cpu_cache_gb` and a multiple of `FLEXKV_MAX_FILE_SIZE_GB`. Set to 0 if only using CPU cache (SSD cache will not be enabled).
 - `ssd_cache_dir`: Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `ssd_cache_dir: /data0/flexkv_ssd/;/data1/flexkv_ssd/` to improve bandwidth.
 - `enable_gds`: Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default.
+- `swa_multi_group`: DeepSeek-V4 SWA sidecar switch. When omitted or set to `true`, SWA KV is stored and restored together with the attention/indexer compress states. Set it explicitly to `false` to keep SWA KV I/O while skipping state registration and I/O.
+
+To switch to SWA-only mode, add the following explicit setting:
+
+```yml
+swa_multi_group: false
+```
 
 ---
 
@@ -47,6 +54,7 @@ If the `FLEXKV_CONFIG_PATH` environment variable is not set, configuration can b
 | `FLEXKV_SSD_CACHE_GB` | int | 0 | SSD cache layer capacity in GB. Recommended to be greater than `FLEXKV_CPU_CACHE_GB` and a multiple of `FLEXKV_MAX_FILE_SIZE_GB`. Set to 0 if only using CPU cache (SSD cache will not be enabled) |
 | `FLEXKV_SSD_CACHE_DIR` | str | "./flexkv_ssd" | Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `"/data0/flexkv_ssd/;/data1/flexkv_ssd/"` to improve bandwidth |
 | `FLEXKV_ENABLE_GDS` | bool | 0 | Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default, set to 1 to enable |
+| `FLEXKV_SWA_MULTI_GROUP` | bool | unset (auto-enabled) | For DeepSeek-V4, unset or `1` stores/restores SWA KV with attention/indexer compress states; `0` keeps SWA KV I/O only |
 
 ---
 

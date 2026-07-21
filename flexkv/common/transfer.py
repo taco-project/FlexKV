@@ -569,9 +569,11 @@ def merge_to_batch_graph(batch_id: int,
         task_end_op_ids: List of end op IDs for each task (one per graph)
         op_callback_dict: Dict mapping old op_id -> callback
         layerwise_transfer: Whether to merge the graphs into a layerwise transfer op
-        fuse_swa_into_layerwise: Use the legacy uniform SWA path inside the
-            layerwise kernel. Heterogeneous SWA/state sidecars set this false;
-            their dedicated worker must finish before layerwise main-KV starts.
+        fuse_swa_into_layerwise: When True (default / production), SWA/state
+            H2D block ids are carried on the fused LAYERWISE op (uniform SWA
+            via launch_swa_h2d_layer_, multi-group via launch_swa_mg_h2d_layer_).
+            When False, SWA/state ops stay as standalone predecessors
+            (legacy heterogeneous fallback for non-fused debugging).
 
     Returns:
         (merged_graph, batch_end_op_id, new_op_callback_dict)
@@ -666,9 +668,9 @@ def merge_to_batch_graph(batch_id: int,
         if ops_by_type[TransferType.D2H] or ops_by_type[TransferType.H2DISK]:
             raise ValueError("Layerwise SWA sidecar merge only supports GET tasks")
 
-        # Keep heterogeneous SWA/state pages on the dedicated multi-group
-        # worker.  Make the main layerwise op depend on their H2D completion so
-        # its first per-layer eventfd cannot expose stale compress state.
+        # Keep SWA/state as standalone predecessors only when the caller
+        # explicitly disables fusion (debug / legacy fallback). Production
+        # always uses the fused LAYERWISE path below.
         merged_swa_disk2h_op = _merge_ops(
             swa_disk2h_ops,
             TransferType.DISK2H,
