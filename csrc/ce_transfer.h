@@ -27,6 +27,10 @@ struct CETransferConfig {
   bool is_blockfirst = false;
   // model uses MLA (kv_dim=1)
   bool is_mla = false;
+  // parallel CPU gather/scatter threads; 0=disable
+  int gather_threads = 4;
+  // NT store (AVX-512/AVX2 streaming store) for scatter/gather
+  bool gather_nt = true;
 };
 enum class CEPath : int {
   PER_BLOCK = -1,       // baseline (path_opt_enabled == false)
@@ -151,7 +155,8 @@ void scatter_to_cpu(const void *staging_buf, int64_t *cpu_ptr_int64,
                     int64_t cpu_startoff_inside_chunks_int64,
                     int64_t chunk_size_in_bytes, int layer_idx, int kv_idx,
                     int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
-                    int start_layer_id, bool cpu_phys_contig);
+                    int start_layer_id, bool cpu_phys_contig,
+                    int gather_threads, bool gather_nt);
 
 void gather_from_cpu(void *staging_buf, const int64_t *cpu_ptr_int64,
                      const int64_t *cpu_block_ids, int num_blocks,
@@ -159,6 +164,7 @@ void gather_from_cpu(void *staging_buf, const int64_t *cpu_ptr_int64,
                      int64_t cpu_startoff_inside_chunks_int64,
                      int64_t chunk_size_in_bytes, int layer_idx, int kv_idx,
                      int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
-                     int start_layer_id, bool cpu_phys_contig);
+                     int start_layer_id, bool cpu_phys_contig,
+                     int gather_threads, bool gather_nt);
 
 } // namespace flexkv

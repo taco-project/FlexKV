@@ -651,11 +651,13 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             GLOBAL_CONFIG_FROM_ENV.iouring_entries,
             GLOBAL_CONFIG_FROM_ENV.iouring_flags,
             layer_eventfds_tensor, tp_group_size,
-            ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
-            ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
+            ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+            ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
             ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
             is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
             is_mla=self.is_mla,
+            ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
+            ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             **self._swa_init_kwargs(),
         )
 
@@ -738,11 +740,13 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             iouring_flags=GLOBAL_CONFIG_FROM_ENV.iouring_flags,
             layer_eventfds_tensor=layer_eventfds_tensor,
             tp_size=tp_group_size,
-            ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
-            ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
+            ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+            ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
             ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
             is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
             is_mla=self.is_mla,
+            ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
+            ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             **self._swa_init_kwargs(),
         )
 

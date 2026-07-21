@@ -743,9 +743,11 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_num_cta_h2d=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_H2D', 4)),
     transfer_num_cta_d2h=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_D2H', 4)),
 
-    transfer_segment_threshold=int(os.getenv('FLEXKV_TRANSFER_SEGMENT_THRESHOLD', 8)),
-    transfer_path_opt=bool(int(os.getenv('FLEXKV_TRANSFER_PATH_OPT', 1))),
+    ce_segment_threshold=int(os.getenv('FLEXKV_CE_SEGMENT_THRESHOLD', 8)),
+    ce_path_opt=bool(int(os.getenv('FLEXKV_CE_PATH_OPT', 1))),
     enable_ce_memcpy2d=bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', 1))),
+    ce_gather_threads=int(os.getenv('FLEXKV_CE_GATHER_THREADS', 4)),
+    ce_gather_nt=bool(int(os.getenv('FLEXKV_CE_GATHER_NT', 1))),
 
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),
