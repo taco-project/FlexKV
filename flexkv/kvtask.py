@@ -828,9 +828,9 @@ class KVTaskEngine(KVTaskManager):
                 task_end_op_ids.append(self.tasks[task_id].task_end_op_id)
                 callbacks.append(self.tasks[task_id].callback)
                 return_masks.append(self.tasks[task_id].return_mask)
-        # Always fuse SWA/state H2D into LAYERWISE when layerwise GET is on.
-        # Multi-group SWA (DSv4 + c4 state sidecars) is handled inside C++ by
-        # launch_swa_mg_h2d_layer_; do not keep standalone SWA H2D predecessors.
+        # Multi-group SWA (DSv4 + c4 state sidecars) can run inside C++ via
+        # launch_swa_mg_h2d_layer_.  Keep the standalone predecessor path
+        # available behind swa_multi_layer for compatibility and debugging.
         batch_task_graph, task_end_op_id, op_callback_dict = merge_to_batch_graph(
             batch_id,
             transfer_graphs,
@@ -838,7 +838,7 @@ class KVTaskEngine(KVTaskManager):
             op_callback_dict,
             layerwise_transfer,
             counter_id,
-            fuse_swa_into_layerwise=True,
+            fuse_swa_into_layerwise=self.cache_config.swa_multi_layer,
         )
         self.tasks[batch_id] = KVTask(
             task_id=batch_id,
