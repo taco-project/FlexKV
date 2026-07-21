@@ -287,11 +287,30 @@ class TransferWorkerBase(ABC):
             else f"transfer data size: {transfer_size / (1024 * 1024 * 1024)} GB "
         )
         flexkv_logger.info(
-            f"{transfer_op.transfer_type.name} transfer request: {transfer_op.transfer_op_id} finished "
+            f"[FlexKV-IO] direction={self._io_direction(transfer_op.transfer_type)} "
+            f"path={self._io_path(transfer_op.transfer_type)} phase=complete "
+            f"request_id={transfer_op.transfer_op_id} "
+            f"graph_id={transfer_op.transfer_graph_id} bytes={transfer_size} "
+            f"{transfer_op.transfer_type.name} transfer request: "
+            f"{transfer_op.transfer_op_id} finished "
             f"{size_text}"
             f"transfer time: {end_time - start_time:.4f} s "
             f"transfer bandwidth: {transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
         )
+
+    @staticmethod
+    def _io_direction(transfer_type: TransferType) -> str:
+        if transfer_type in (TransferType.H2D, TransferType.LAYERWISE):
+            return "H2D"
+        if transfer_type == TransferType.D2H:
+            return "D2H"
+        return transfer_type.name
+
+    @staticmethod
+    def _io_path(transfer_type: TransferType) -> str:
+        if transfer_type == TransferType.LAYERWISE:
+            return "layerwise"
+        return "bulk"
 
     @abstractmethod
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
