@@ -124,26 +124,32 @@ class StorageEngine:
             )
 
         if self._cache_config.enable_remote:
-            if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
-                raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
-            self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
-                num_layer=num_layers_per_pp_stage,
-                num_block=self._cache_config.num_remote_blocks,
-                tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads_per_node,
-                head_size=self._model_config.head_size,
-                is_mla=self._model_config.use_mla,
-                layer_groups=self._model_config.layer_groups,
-                tp_size=self._model_config.tp_size,
-            )
-            self.allocate(
-                device_type=DeviceType.REMOTE,
-                layout=self._remote_layout,
-                dtype=buffer_dtype,
-                file_path=self._cache_config.remote_cache_path,
-                remote_config_custom = self._cache_config.remote_config_custom
-            )
+            if self._cache_config.use_mooncake_store_backend:
+                flexkv_logger.info(
+                    "[StorageEngine] mooncake-store backend: hot CPU buffer will be "
+                    "registered directly (no separate contributed region)."
+                )
+            else:
+                if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
+                    raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
+                self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
+                    type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                    num_layer=num_layers_per_pp_stage,
+                    num_block=self._cache_config.num_remote_blocks,
+                    tokens_per_block=self._cache_config.tokens_per_block,
+                    num_head=self._model_config.num_kv_heads_per_node,
+                    head_size=self._model_config.head_size,
+                    is_mla=self._model_config.use_mla,
+                    layer_groups=self._model_config.layer_groups,
+                    tp_size=self._model_config.tp_size,
+                )
+                self.allocate(
+                    device_type=DeviceType.REMOTE,
+                    layout=self._remote_layout,
+                    dtype=buffer_dtype,
+                    file_path=self._cache_config.remote_cache_path,
+                    remote_config_custom = self._cache_config.remote_config_custom
+                )
 
         # SWA pool allocate
         self._swa_cpu_layout: Optional[KVCacheLayout] = None
@@ -207,40 +213,46 @@ class StorageEngine:
                 )
 
             if self._cache_config.enable_remote and swa_cfg.num_remote_slots > 0:
-                if self._swa_cpu_layout is None:
-                    raise ValueError("SWA REMOTE tier requires the SWA CPU tier")
-                if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._swa_cpu_layout.type:
-                    raise ValueError(
-                        f"SWA Remote layout type must match SWA CPU layout type: "
-                        f"{self._swa_cpu_layout.type}"
+                if self._cache_config.use_mooncake_store_backend:
+                    flexkv_logger.info(
+                        "[StorageEngine] mooncake-store backend: hot SWA CPU buffer will be "
+                        "registered directly (no separate contributed region)."
                     )
-                self._swa_remote_layout = KVCacheLayout(
-                    type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
-                    num_layer=swa_cfg.num_swa_layers,
-                    num_block=swa_cfg.num_remote_slots,
-                    tokens_per_block=swa_tokens_per_block,
-                    num_head=1,
-                    head_size=swa_cfg.bytes_per_token_per_layer,
-                    is_mla=True,
-                    layer_groups=self._swa_layer_groups,
-                    tp_size=self._model_config.tp_size,
-                )
-                swa_remote_path = self._cache_config.remote_cache_path
-                if isinstance(swa_remote_path, str):
-                    swa_remote_path = swa_remote_path + "_swa"
-                elif isinstance(swa_remote_path, list):
-                    swa_remote_path = [path + "_swa" for path in swa_remote_path]
+                else:
+                    if self._swa_cpu_layout is None:
+                        raise ValueError("SWA REMOTE tier requires the SWA CPU tier")
+                    if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._swa_cpu_layout.type:
+                        raise ValueError(
+                            f"SWA Remote layout type must match SWA CPU layout type: "
+                            f"{self._swa_cpu_layout.type}"
+                        )
+                    self._swa_remote_layout = KVCacheLayout(
+                        type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                        num_layer=swa_cfg.num_swa_layers,
+                        num_block=swa_cfg.num_remote_slots,
+                        tokens_per_block=swa_tokens_per_block,
+                        num_head=1,
+                        head_size=swa_cfg.bytes_per_token_per_layer,
+                        is_mla=True,
+                        layer_groups=self._swa_layer_groups,
+                        tp_size=self._model_config.tp_size,
+                    )
+                    swa_remote_path = self._cache_config.remote_cache_path
+                    if isinstance(swa_remote_path, str):
+                        swa_remote_path = swa_remote_path + "_swa"
+                    elif isinstance(swa_remote_path, list):
+                        swa_remote_path = [path + "_swa" for path in swa_remote_path]
 
-                self.allocate(
-                    device_type=DeviceType.REMOTE,
-                    layout=self._swa_remote_layout,
-                    dtype=torch.uint8,
-                    device_id=0,
-                    raw_data=None,
-                    is_swa=True,
-                    file_path=swa_remote_path,
-                    remote_config_custom=self._cache_config.remote_config_custom,
-                )
+                    self.allocate(
+                        device_type=DeviceType.REMOTE,
+                        layout=self._swa_remote_layout,
+                        dtype=torch.uint8,
+                        device_id=0,
+                        raw_data=None,
+                        is_swa=True,
+                        file_path=swa_remote_path,
+                        remote_config_custom=self._cache_config.remote_config_custom,
+                    )
 
 
     def register_gpu_blocks(self,

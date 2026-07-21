@@ -675,6 +675,15 @@ class CacheConfig:
     # Mooncake transfer engine config path (serialized via pickle to survive spawn subprocesses)
     mooncake_config_path: Optional[str] = None
 
+    # Mooncake-store distributed KV cache backend (key-addressed; ≠ Transfer Engine P2P)
+    use_mooncake_store_backend: bool = False
+    mooncake_store_config_path: Optional[str] = None
+    mooncake_store_pp_rank: int = 0
+    mooncake_store_pp_size: int = 1
+    mooncake_store_node_layer_start: int = 0
+    mooncake_store_node_layer_end: int = 0
+    mooncake_store_total_layers: int = 0
+
     # Stored for deferred recomputation when layer_groups become known
     _user_cpu_cache_gb: float = 0
     _user_ssd_cache_gb: float = 0
@@ -698,7 +707,16 @@ class CacheConfig:
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
-        self.enable_remote = self.enable_3rd_remote
+        self.use_mooncake_store_backend = self.use_mooncake_store_backend or bool(
+            int(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', '0')))
+        if self.use_mooncake_store_backend and self.mooncake_store_config_path is None:
+            self.mooncake_store_config_path = os.getenv(
+                'FLEXKV_MOONCAKE_STORE_CONFIG_PATH', None)
+            if self.mooncake_store_config_path is None:
+                raise ValueError(
+                    "Mooncake store config path not found; set "
+                    "mooncake_store_config_path or FLEXKV_MOONCAKE_STORE_CONFIG_PATH")
+        self.enable_remote = self.enable_3rd_remote or self.use_mooncake_store_backend
 
     def __str__(self) -> str:
         return (
@@ -725,6 +743,9 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     cpp_metrics_port=int(os.getenv('FLEXKV_CPP_METRICS_PORT', 8081)),
     ## Port for Python metrics HTTP server (default: 8080)
     py_metrics_port=int(os.getenv('FLEXKV_PY_METRICS_PORT', 8080)),
+
+    use_mooncake_store_backend=bool(int(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', 0))),
+    mooncake_store_config_path=os.getenv('FLEXKV_MOONCAKE_STORE_CONFIG_PATH', None),
 
     # Server-client mode configuration
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
@@ -794,6 +815,13 @@ class UserConfig:
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
+    use_mooncake_store_backend: bool = False
+    mooncake_store_config_path: Optional[str] = None
+    mooncake_store_pp_rank: int = 0
+    mooncake_store_pp_size: int = 1
+    mooncake_store_node_layer_start: int = 0
+    mooncake_store_node_layer_end: int = 0
+    mooncake_store_total_layers: int = 0
 
     # distributed zmq configs
     local_zmq_ip: Optional[str] = None
@@ -876,6 +904,8 @@ def load_user_config_from_env() -> UserConfig:
         use_hugepage_cpu_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_CPU_BUFFER', 0))),
         use_hugepage_tmp_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_TMP_BUFFER', 0))),
         hugepage_size_bytes=int(os.getenv('FLEXKV_HUGEPAGE_SIZE_BYTES', 2 * 1024 * 1024)),
+        use_mooncake_store_backend=bool(int(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', 0))),
+        mooncake_store_config_path=os.getenv('FLEXKV_MOONCAKE_STORE_CONFIG_PATH', None),
         kv_cache_dtype=os.getenv('FLEXKV_KV_CACHE_DTYPE', None),
         swa_multi_group=(
             None
@@ -1047,13 +1077,22 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote
+    cache_config.use_mooncake_store_backend = user_config.use_mooncake_store_backend
+    cache_config.mooncake_store_config_path = user_config.mooncake_store_config_path
+    cache_config.mooncake_store_pp_rank = int(rank_info.pp_rank)
+    cache_config.mooncake_store_pp_size = int(rank_info.model_config.pp_size)
+    cache_config.mooncake_store_total_layers = int(rank_info.model_config.num_layers)
+    if int(rank_info.model_config.nnodes) == 1:
+        cache_config.mooncake_store_node_layer_start = 0
+        cache_config.mooncake_store_node_layer_end = int(rank_info.model_config.num_layers)
     cache_config.swa_multi_layer = user_config.swa_multi_layer
 
     # Update derived flags after setting p2p and remote configs
     cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or
                                       cache_config.enable_p2p_ssd or
                                       cache_config.enable_3rd_remote)
-    cache_config.enable_remote = cache_config.enable_3rd_remote
+    cache_config.enable_remote = (cache_config.enable_3rd_remote or
+                                  cache_config.use_mooncake_store_backend)
 
     if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
         cache_config.num_ssd_blocks = \
@@ -1063,7 +1102,8 @@ def update_default_config_from_user_config(rank_info: RankInfo,
 
     if not cache_config.enable_cpu:
         raise ValueError("enable_cpu must be True")
-    if cache_config.enable_remote and not cache_config.enable_ssd:
+    if (cache_config.enable_remote and not cache_config.enable_ssd
+            and not cache_config.use_mooncake_store_backend):
         raise ValueError("enable_ssd must be True if enable_remote is True")
     if not cache_config.enable_cpu and not cache_config.enable_gds:
         raise ValueError("enable_gds must be True if enable_cpu is False")
@@ -1074,7 +1114,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
             "enable_kv_sharing and enable_gds cannot be used at the same time"
         )
 
-    if cache_config.enable_remote:
+    if cache_config.enable_remote and not cache_config.use_mooncake_store_backend:
         if cache_config.remote_cache_path is None:
             if cache_config.remote_file_prefix is None:
                 raise ValueError(

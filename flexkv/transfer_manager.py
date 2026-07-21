@@ -249,9 +249,10 @@ class TransferManager:
             if self.cache_config.enable_cpu else None
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
             if self.cache_config.enable_ssd else None
+        use_mooncake_store = self.cache_config.use_mooncake_store_backend
         remote_handle = (
             self.storage_engine.get_storage_handle(DeviceType.REMOTE) \
-            if self.cache_config.enable_remote \
+            if self.cache_config.enable_remote and not use_mooncake_store \
             else None
         )
         # Group SWA GPU handles by WorkerKey, mirroring the main-KV grouping,

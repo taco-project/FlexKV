@@ -7,6 +7,9 @@ import numpy as np
 class MatchResultAccel:
     num_ready_matched_blocks: int = 0
     num_matched_blocks: int = 0
+    # Mooncake-store only: main KV longest prefix (may exceed num_matched_blocks
+    # when SWA joint hit is shorter). PUT uses this to skip existing KV keys.
+    kv_matched_blocks: int = 0
     last_ready_node: Optional['CRadixNode'] = None
     last_node: Optional['CRadixNode'] = None
     last_node_matched_length: int = 0
