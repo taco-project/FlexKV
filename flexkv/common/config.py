@@ -573,9 +573,7 @@ class SWAPoolConfig:
     num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
     bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
     # True when the SWA page also carries heterogeneous sidecar groups (for
-    # example DeepSeek-V4 attention/indexer compress states).  Layerwise GET
-    # still fuses SWA/state H2D into LAYERWISE via launch_swa_mg_h2d_layer_;
-    # this flag drives multi-group layout / registration, not the fuse choice.
+    # example DeepSeek-V4 attention/indexer compress states).
     multi_group: bool = False
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
     pin_memory: bool = True            # Use pinned memory for async DMA
@@ -699,14 +697,10 @@ class CacheConfig:
     # transfer type" in the transfer engine. Flip to True once the worker lands.
     enable_swa_transfer: bool = False
 
-    # Fuse SWA (including heterogeneous state sidecars) into the layerwise H2D
-    # worker.  When disabled, layerwise main-KV restore stays enabled while SWA
-    # uses its standalone H2D worker and completes before the main layerwise op.
-    swa_multi_layer: bool = True
-
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
+        self.enable_remote = self.enable_3rd_remote or self.use_mooncake_store_backend
         self.use_mooncake_store_backend = self.use_mooncake_store_backend or bool(
             int(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', '0')))
         if self.use_mooncake_store_backend and self.mooncake_store_config_path is None:
@@ -716,7 +710,6 @@ class CacheConfig:
                 raise ValueError(
                     "Mooncake store config path not found; set "
                     "mooncake_store_config_path or FLEXKV_MOONCAKE_STORE_CONFIG_PATH")
-        self.enable_remote = self.enable_3rd_remote or self.use_mooncake_store_backend
 
     def __str__(self) -> str:
         return (
@@ -838,10 +831,6 @@ class UserConfig:
     # path. None is intentionally distinct from False so old configs default
     # to the correctness-preserving state restore path.
     swa_multi_group: Optional[bool] = None
-    # Fuse SWA/state H2D into the main layerwise restore worker. Disable this to
-    # keep SWA/state on the standalone predecessor worker as a compatibility or
-    # debugging fallback.
-    swa_multi_layer: bool = True
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
@@ -857,11 +846,6 @@ class UserConfig:
             raise ValueError(
                 "swa_multi_group must be a boolean when configured, "
                 f"got {self.swa_multi_group!r}"
-            )
-        if not isinstance(self.swa_multi_layer, bool):
-            raise ValueError(
-                "swa_multi_layer must be a boolean, "
-                f"got {self.swa_multi_layer!r}"
             )
 
 def parse_path_list(path_str: str) -> List[str]:
@@ -912,7 +896,6 @@ def load_user_config_from_env() -> UserConfig:
             if swa_multi_group_env is None
             else bool(int(swa_multi_group_env))
         ),
-        swa_multi_layer=bool(int(os.getenv('FLEXKV_SWA_MULTI_LAYER', 1))),
     )
 
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
@@ -1085,8 +1068,6 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     if int(rank_info.model_config.nnodes) == 1:
         cache_config.mooncake_store_node_layer_start = 0
         cache_config.mooncake_store_node_layer_end = int(rank_info.model_config.num_layers)
-    cache_config.swa_multi_layer = user_config.swa_multi_layer
-
     # Update derived flags after setting p2p and remote configs
     cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or
                                       cache_config.enable_p2p_ssd or
@@ -1102,9 +1083,8 @@ def update_default_config_from_user_config(rank_info: RankInfo,
 
     if not cache_config.enable_cpu:
         raise ValueError("enable_cpu must be True")
-    if (cache_config.enable_remote and not cache_config.enable_ssd
-            and not cache_config.use_mooncake_store_backend):
-        raise ValueError("enable_ssd must be True if enable_remote is True")
+    # SSD and REMOTE are peer cold tiers under CPU (H2DISK vs H2REMOTE);
+    # enabling remote does not require a local SSD mid-tier.
     if not cache_config.enable_cpu and not cache_config.enable_gds:
         raise ValueError("enable_gds must be True if enable_cpu is False")
     if cache_config.enable_gds and not cache_config.enable_ssd:

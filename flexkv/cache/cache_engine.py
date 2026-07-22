@@ -870,7 +870,16 @@ class GlobalCacheEngine:
             )
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
-        return_mask[block_start_idx* self.tokens_per_block:
+        if temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
+            prefetch_blocks = 0
+            for op in transfer_graph._op_map.values():
+                if op.transfer_type == TransferType.REMOTE2H:
+                    prefetch_blocks += len(op.src_block_ids)
+            if prefetch_blocks > 0:
+                return_mask[block_start_idx * self.tokens_per_block:
+                            (block_start_idx + prefetch_blocks) * self.tokens_per_block] = True
+        else:        
+            return_mask[block_start_idx* self.tokens_per_block:
                     (block_start_idx + plan.num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 
         # if layer_num // layer_granularity != 1:
@@ -1608,6 +1617,8 @@ class GlobalCacheEngine:
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
             fragment2_num_blocks = 0
+            
+        # NOTE: to avoid full kv repeating write in mooncake store.
         if self.use_mooncake_store_backend:
             kv_hit = int(getattr(remote_matched_result, "kv_matched_blocks", 0)
                          or remote_matched_result.num_matched_blocks)
@@ -1765,7 +1776,7 @@ class GlobalCacheEngine:
             if remote_swa_slot >= 0:
                 remote_slot_ids = np.array([remote_swa_slot], dtype=np.int64)
             elif put_remote_via_mooncake:
-                remote_slot_ids = np.array([0], dtype=np.int64)
+                remote_slot_ids = np.array([0], dtype=np.int64) # slot 0 will not be used in mooncake store backend.
             else:
                 remote_slot_ids = empty
             swa_ops = self.swa_op_constructor.build_put_chain(
@@ -2243,6 +2254,7 @@ class GlobalCacheEngine:
             return None
 
         is_mooncake_source = source.is_mooncake
+        # Mooncake-store will skip pin_swa_node for remote source.
         if not is_mooncake_source:
             source.engine._pin_swa_node(source.node)
 

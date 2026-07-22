@@ -679,7 +679,6 @@ def merge_to_batch_graph(batch_id: int,
                          op_callback_dict: Dict[int, Callable],
                          layerwise_transfer: bool = False,
                          counter_id: int = 0,
-                         fuse_swa_into_layerwise: bool = True,
                          ) -> Tuple[TransferOpGraph, int, Dict[int, Callable]]:
     """
     Merge multiple TransferOpGraphs into a single batch graph.
@@ -687,7 +686,8 @@ def merge_to_batch_graph(batch_id: int,
     Supported patterns:
       GET: DISK2H / REMOTE2H (optional) -> H2D
       PUT: D2H -> H2DISK / H2REMOTE (optional)
-      layerwise GET: fused LAYERWISE (+ REMOTE2H predecessors when present)
+      layerwise GET: fused LAYERWISE (+ REMOTE2H predecessors when present);
+          SWA local lanes always fold into LAYERWISE when layerwise is on.
 
     Args:
         batch_id: ID for the new batch graph
@@ -695,9 +695,6 @@ def merge_to_batch_graph(batch_id: int,
         task_end_op_ids: List of end op IDs for each task (one per graph)
         op_callback_dict: Dict mapping old op_id -> callback
         layerwise_transfer: Whether to merge the graphs into a layerwise transfer op
-        fuse_swa_into_layerwise: When True (default / production), SWA/state
-            H2D block ids are carried on the fused LAYERWISE op.
-            When False, SWA/state ops stay as standalone predecessors.
 
     Returns:
         (merged_graph, batch_end_op_id, new_op_callback_dict)
@@ -748,12 +745,12 @@ def merge_to_batch_graph(batch_id: int,
                         op_callback_dict[op.op_id])
 
     new_op_callback_dict: Dict[int, Callable] = {}
-    # Layerwise fuses local DISK2H/H2D into LAYERWISE; those per-op callbacks
-    # land in a throwaway dict. REMOTE2H callbacks stay on new_op_callback_dict
-    # so they are not lost when remotes are LAYERWISE predecessors.
-    layerwise_tmp_callback_dict: Dict[int, Callable] = {}
-    local_get_cb_dict = (layerwise_tmp_callback_dict if layerwise_transfer
-                         else new_op_callback_dict)
+    # Layerwise folds local DISK2H/H2D into LAYERWISE: merge those ops with a
+    # throwaway callback dict (block ids only), then reattach callbacks onto
+    # LAYERWISE. REMOTE2H stays on new_op_callback_dict as a predecessor.
+    layerwise_local_cb_dict: Dict[int, Callable] = {}
+    local_cb_dict = (layerwise_local_cb_dict if layerwise_transfer
+                     else new_op_callback_dict)
 
     has_get = _bucket_has(TransferType.H2D, TransferType.DISK2H, TransferType.REMOTE2H,
                           ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
@@ -770,16 +767,15 @@ def merge_to_batch_graph(batch_id: int,
     dp_client_id = _pick_dp_client_id(
         ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
 
-    if has_get and layerwise_transfer and not fuse_swa_into_layerwise:
-        # Legacy / debug: SWA stays as standalone predecessors of LAYERWISE.
+    if has_get:
         merged_disk2h_op = _merge_ops(
             ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
             merged_graph, callbacks_by_type[TransferType.DISK2H],
-            local_get_cb_dict)
+            local_cb_dict)
         merged_h2d_op = _merge_ops(
             ops_by_type[TransferType.H2D], TransferType.H2D,
             merged_graph, callbacks_by_type[TransferType.H2D],
-            local_get_cb_dict)
+            local_cb_dict)
         merged_remote2h_op = _merge_ops(
             ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
             merged_graph, callbacks_by_type[TransferType.REMOTE2H],
@@ -787,209 +783,102 @@ def merge_to_batch_graph(batch_id: int,
         merged_swa_disk2h_op = _merge_swa_ops(
             swa_ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
             merged_graph, swa_callbacks_by_type[TransferType.DISK2H],
-            new_op_callback_dict)
+            local_cb_dict)
         merged_swa_h2d_op = _merge_swa_ops(
             swa_ops_by_type[TransferType.H2D], TransferType.H2D,
             merged_graph, swa_callbacks_by_type[TransferType.H2D],
-            new_op_callback_dict)
+            local_cb_dict)
         merged_swa_remote2h_op = _merge_swa_ops(
             swa_ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
             merged_graph, swa_callbacks_by_type[TransferType.REMOTE2H],
             new_op_callback_dict)
+        if layerwise_transfer:
+            for op in (merged_remote2h_op, merged_swa_remote2h_op):
+                if op is not None:
+                    merged_graph.add_transfer_op(op)
 
-        for op in (merged_swa_disk2h_op, merged_swa_h2d_op,
-                   merged_remote2h_op, merged_swa_remote2h_op):
-            if op is not None:
-                merged_graph.add_transfer_op(op)
-        if merged_swa_disk2h_op is not None and merged_swa_h2d_op is not None:
-            merged_graph.add_dependency(
-                merged_swa_h2d_op.op_id, merged_swa_disk2h_op.op_id)
-        if merged_swa_remote2h_op is not None and merged_swa_h2d_op is not None:
-            merged_graph.add_dependency(
-                merged_swa_h2d_op.op_id, merged_swa_remote2h_op.op_id)
+            assert merged_h2d_op is not None or merged_swa_h2d_op is not None, \
+                "layerwise GET requires an H2D (main or SWA)"
 
-        layerwise_transfer_op = None
-        if merged_h2d_op is not None:
             layerwise_transfer_op = LayerwiseTransferOp(
                 graph_id=merged_graph.graph_id,
-                src_block_ids_h2d=merged_h2d_op.src_block_ids,
-                dst_block_ids_h2d=merged_h2d_op.dst_block_ids,
-                src_block_ids_disk2h=(
-                    merged_disk2h_op.src_block_ids
+                src_block_ids_h2d=merged_h2d_op.src_block_ids if merged_h2d_op is not None
+                    else np.array([], dtype=np.int64),
+                dst_block_ids_h2d=merged_h2d_op.dst_block_ids if merged_h2d_op is not None
+                    else np.array([], dtype=np.int64),
+                src_block_ids_disk2h=merged_disk2h_op.src_block_ids
                     if merged_disk2h_op is not None
-                    else np.array([], dtype=np.int64)
-                ),
-                dst_block_ids_disk2h=(
-                    merged_disk2h_op.dst_block_ids
+                    else np.array([], dtype=np.int64),
+                dst_block_ids_disk2h=merged_disk2h_op.dst_block_ids
                     if merged_disk2h_op is not None
-                    else np.array([], dtype=np.int64)
-                ),
-                dp_client_id=merged_h2d_op.dp_client_id,
+                    else np.array([], dtype=np.int64),
+                swa_src_block_ids_h2d=merged_swa_h2d_op.src_block_ids
+                    if merged_swa_h2d_op is not None
+                    else np.array([], dtype=np.int64),
+                swa_dst_block_ids_h2d=merged_swa_h2d_op.dst_block_ids
+                    if merged_swa_h2d_op is not None
+                    else np.array([], dtype=np.int64),
+                swa_src_block_ids_disk2h=merged_swa_disk2h_op.src_block_ids
+                    if merged_swa_disk2h_op is not None
+                    else np.array([], dtype=np.int64),
+                swa_dst_block_ids_disk2h=merged_swa_disk2h_op.dst_block_ids
+                    if merged_swa_disk2h_op is not None
+                    else np.array([], dtype=np.int64),
+                dp_client_id=dp_client_id,
                 counter_id=counter_id,
             )
             merged_graph.add_transfer_op(layerwise_transfer_op)
-            if merged_swa_h2d_op is not None:
-                merged_graph.add_dependency(
-                    layerwise_transfer_op.op_id, merged_swa_h2d_op.op_id)
+
             if merged_remote2h_op is not None:
                 merged_graph.add_dependency(
                     layerwise_transfer_op.op_id, merged_remote2h_op.op_id)
-            _attach_combined_callback(
-                layerwise_transfer_op,
-                callbacks_by_type[TransferType.DISK2H]
-                + callbacks_by_type[TransferType.H2D],
-                new_op_callback_dict,
-            )
-
-        terminal_ids = [
-            op.op_id
-            for op in (layerwise_transfer_op, merged_swa_h2d_op)
-            if op is not None
-            and not (
-                op is merged_swa_h2d_op and layerwise_transfer_op is not None
-            )
-        ]
-        terminal_op = layerwise_transfer_op or merged_swa_h2d_op
-        dp_client_id = terminal_op.dp_client_id if terminal_op is not None else 0
-        batch_end_op_id = _add_batch_sink(merged_graph, terminal_ids, dp_client_id)
-
-    elif has_get and layerwise_transfer:
-        # Production fused LAYERWISE: SWA local lanes fold into LAYERWISE;
-        # REMOTE2H (main + SWA) stay standalone predecessors.
-        merged_disk2h_op = _merge_ops(
-            ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
-            merged_graph, callbacks_by_type[TransferType.DISK2H],
-            local_get_cb_dict)
-        merged_h2d_op = _merge_ops(
-            ops_by_type[TransferType.H2D], TransferType.H2D,
-            merged_graph, callbacks_by_type[TransferType.H2D],
-            local_get_cb_dict)
-        merged_swa_disk2h_op = _merge_swa_ops(
-            swa_ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
-            merged_graph, swa_callbacks_by_type[TransferType.DISK2H],
-            local_get_cb_dict)
-        merged_swa_h2d_op = _merge_swa_ops(
-            swa_ops_by_type[TransferType.H2D], TransferType.H2D,
-            merged_graph, swa_callbacks_by_type[TransferType.H2D],
-            local_get_cb_dict)
-        # Register remote callbacks on the real dict (not the layerwise tmp).
-        merged_remote2h_op = _merge_ops(
-            ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
-            merged_graph, callbacks_by_type[TransferType.REMOTE2H],
-            new_op_callback_dict)
-        merged_swa_remote2h_op = _merge_swa_ops(
-            swa_ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
-            merged_graph, swa_callbacks_by_type[TransferType.REMOTE2H],
-            new_op_callback_dict)
-
-        for op in (merged_remote2h_op, merged_swa_remote2h_op):
-            if op is not None:
-                merged_graph.add_transfer_op(op)
-
-        assert merged_h2d_op is not None or merged_swa_h2d_op is not None, \
-            "layerwise GET requires an H2D (main or SWA)"
-
-        layerwise_transfer_op = LayerwiseTransferOp(
-            graph_id=merged_graph.graph_id,
-            src_block_ids_h2d=merged_h2d_op.src_block_ids if merged_h2d_op is not None
-                else np.array([], dtype=np.int64),
-            dst_block_ids_h2d=merged_h2d_op.dst_block_ids if merged_h2d_op is not None
-                else np.array([], dtype=np.int64),
-            src_block_ids_disk2h=merged_disk2h_op.src_block_ids
-                if merged_disk2h_op is not None
-                else np.array([], dtype=np.int64),
-            dst_block_ids_disk2h=merged_disk2h_op.dst_block_ids
-                if merged_disk2h_op is not None
-                else np.array([], dtype=np.int64),
-            swa_src_block_ids_h2d=merged_swa_h2d_op.src_block_ids
-                if merged_swa_h2d_op is not None
-                else np.array([], dtype=np.int64),
-            swa_dst_block_ids_h2d=merged_swa_h2d_op.dst_block_ids
-                if merged_swa_h2d_op is not None
-                else np.array([], dtype=np.int64),
-            swa_src_block_ids_disk2h=merged_swa_disk2h_op.src_block_ids
-                if merged_swa_disk2h_op is not None
-                else np.array([], dtype=np.int64),
-            swa_dst_block_ids_disk2h=merged_swa_disk2h_op.dst_block_ids
-                if merged_swa_disk2h_op is not None
-                else np.array([], dtype=np.int64),
-            dp_client_id=dp_client_id,
-            counter_id=counter_id,
-        )
-        merged_graph.add_transfer_op(layerwise_transfer_op)
-
-        if merged_remote2h_op is not None:
-            merged_graph.add_dependency(
-                layerwise_transfer_op.op_id, merged_remote2h_op.op_id)
-        if merged_swa_remote2h_op is not None:
-            merged_graph.add_dependency(
-                layerwise_transfer_op.op_id, merged_swa_remote2h_op.op_id)
-
-        layerwise_callbacks: List[Callable] = []
-        layerwise_callbacks.extend(callbacks_by_type[TransferType.DISK2H])
-        layerwise_callbacks.extend(callbacks_by_type[TransferType.H2D])
-        layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.DISK2H])
-        layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.H2D])
-        _attach_combined_callback(
-            layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
-        batch_end_op_id = layerwise_transfer_op.op_id
-
-    elif has_get:
-        merged_disk2h_op = _merge_ops(
-            ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
-            merged_graph, callbacks_by_type[TransferType.DISK2H],
-            new_op_callback_dict)
-        merged_h2d_op = _merge_ops(
-            ops_by_type[TransferType.H2D], TransferType.H2D,
-            merged_graph, callbacks_by_type[TransferType.H2D],
-            new_op_callback_dict)
-        merged_remote2h_op = _merge_ops(
-            ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
-            merged_graph, callbacks_by_type[TransferType.REMOTE2H],
-            new_op_callback_dict)
-        merged_swa_disk2h_op = _merge_swa_ops(
-            swa_ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
-            merged_graph, swa_callbacks_by_type[TransferType.DISK2H],
-            new_op_callback_dict)
-        merged_swa_h2d_op = _merge_swa_ops(
-            swa_ops_by_type[TransferType.H2D], TransferType.H2D,
-            merged_graph, swa_callbacks_by_type[TransferType.H2D],
-            new_op_callback_dict)
-        merged_swa_remote2h_op = _merge_swa_ops(
-            swa_ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
-            merged_graph, swa_callbacks_by_type[TransferType.REMOTE2H],
-            new_op_callback_dict)
-
-        for op in (merged_disk2h_op, merged_h2d_op, merged_remote2h_op,
-                   merged_swa_disk2h_op, merged_swa_h2d_op, merged_swa_remote2h_op):
-            if op is not None:
-                merged_graph.add_transfer_op(op)
-
-        if merged_h2d_op is not None:
-            if merged_disk2h_op is not None:
-                merged_graph.add_dependency(merged_h2d_op.op_id, merged_disk2h_op.op_id)
-            if merged_remote2h_op is not None:
-                merged_graph.add_dependency(merged_h2d_op.op_id, merged_remote2h_op.op_id)
-        if merged_swa_h2d_op is not None:
-            if merged_swa_disk2h_op is not None:
-                merged_graph.add_dependency(
-                    merged_swa_h2d_op.op_id, merged_swa_disk2h_op.op_id)
             if merged_swa_remote2h_op is not None:
                 merged_graph.add_dependency(
-                    merged_swa_h2d_op.op_id, merged_swa_remote2h_op.op_id)
+                    layerwise_transfer_op.op_id, merged_swa_remote2h_op.op_id)
 
-        get_sinks: List[int] = []
-        if merged_h2d_op is not None:
-            get_sinks.append(merged_h2d_op.op_id)
-        if merged_swa_h2d_op is not None:
-            get_sinks.append(merged_swa_h2d_op.op_id)
-        if not get_sinks:
-            for op in (merged_remote2h_op, merged_swa_remote2h_op,
-                       merged_disk2h_op, merged_swa_disk2h_op):
+            layerwise_callbacks: List[Callable] = []
+            layerwise_callbacks.extend(callbacks_by_type[TransferType.DISK2H])
+            layerwise_callbacks.extend(callbacks_by_type[TransferType.H2D])
+            layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.DISK2H])
+            layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.H2D])
+            _attach_combined_callback(
+                layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
+            batch_end_op_id = layerwise_transfer_op.op_id
+        else:
+            for op in (merged_disk2h_op, merged_h2d_op, merged_remote2h_op,
+                       merged_swa_disk2h_op, merged_swa_h2d_op,
+                       merged_swa_remote2h_op):
                 if op is not None:
-                    get_sinks.append(op.op_id)
-                    break
-        batch_end_op_id = _add_batch_sink(merged_graph, get_sinks, dp_client_id)
+                    merged_graph.add_transfer_op(op)
+
+            if merged_h2d_op is not None:
+                if merged_disk2h_op is not None:
+                    merged_graph.add_dependency(
+                        merged_h2d_op.op_id, merged_disk2h_op.op_id)
+                if merged_remote2h_op is not None:
+                    merged_graph.add_dependency(
+                        merged_h2d_op.op_id, merged_remote2h_op.op_id)
+            if merged_swa_h2d_op is not None:
+                if merged_swa_disk2h_op is not None:
+                    merged_graph.add_dependency(
+                        merged_swa_h2d_op.op_id, merged_swa_disk2h_op.op_id)
+                if merged_swa_remote2h_op is not None:
+                    merged_graph.add_dependency(
+                        merged_swa_h2d_op.op_id, merged_swa_remote2h_op.op_id)
+
+            get_sinks: List[int] = []
+            if merged_h2d_op is not None:
+                get_sinks.append(merged_h2d_op.op_id)
+            if merged_swa_h2d_op is not None:
+                get_sinks.append(merged_swa_h2d_op.op_id)
+            if not get_sinks:
+                for op in (merged_remote2h_op, merged_swa_remote2h_op,
+                           merged_disk2h_op, merged_swa_disk2h_op):
+                    if op is not None:
+                        get_sinks.append(op.op_id)
+                        break
+            batch_end_op_id = _add_batch_sink(
+                merged_graph, get_sinks, dp_client_id)
 
     elif has_put:
         merged_d2h_op = _merge_ops(

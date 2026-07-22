@@ -255,12 +255,14 @@ class KVManager:
             token_ids = token_ids.numpy()
         if self.server_client_mode:
             task_id = self.dp_client.prefetch_async(token_ids, namespace=namespace)
+            return task_id, 0
         else:
-            task_id = self.kv_task_engine.prefetch_async(
+            task_id, actual_prefetch_tokens = self.kv_task_engine.prefetch_async(
                 token_ids,
                 namespace=namespace,
             )
-        return task_id
+            flexkv_logger.info(f"[FlexKV] prefetch: task_id={task_id}, actual_prefetch_tokens={actual_prefetch_tokens}")
+        return task_id, actual_prefetch_tokens
 
     def launch(self,
                task_ids: Union[int, List[int]],
