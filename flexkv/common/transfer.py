@@ -695,9 +695,21 @@ def merge_to_batch_graph(batch_id: int,
         task_end_op_ids: List of end op IDs for each task (one per graph)
         op_callback_dict: Dict mapping old op_id -> callback
         layerwise_transfer: Whether to merge the graphs into a layerwise transfer op
+        fuse_swa_into_layerwise: When True (default / production), SWA/state
+            H2D block ids are carried on the fused LAYERWISE op (uniform SWA
+            via launch_swa_h2d_layer_, multi-group via launch_swa_mg_h2d_layer_).
+            When False, SWA/state ops stay as standalone predecessors
+            (legacy heterogeneous fallback for non-fused debugging).
 
     Returns:
         (merged_graph, batch_end_op_id, new_op_callback_dict)
+
+    The input task-end ids belong to graphs that are discarded during fusion;
+    they are retained in the API for caller compatibility.  The merged graph
+    rebuilds its completion contract from its supported shape:
+      GET: full H2D + SWA H2D
+      PUT: full D2H + SWA D2H
+      layerwise GET: the fused LAYERWISE op
     """
     if not transfer_graphs:
         empty_graph = TransferOpGraph()
@@ -727,6 +739,23 @@ def merge_to_batch_graph(batch_id: int,
     for graph in transfer_graphs:
         for op_id, op in graph._op_map.items():
             if op.transfer_type == TransferType.VIRTUAL:
+                continue
+            if getattr(op, "is_swa", False):
+                if op.transfer_type == TransferType.H2D:
+                    swa_h2d_ops.append(op)
+                elif op.transfer_type == TransferType.DISK2H:
+                    swa_disk2h_ops.append(op)
+                elif op.transfer_type == TransferType.D2H:
+                    swa_d2h_ops.append(op)
+                elif op.transfer_type == TransferType.H2DISK:
+                    swa_h2disk_ops.append(op)
+                else:
+                    raise NotImplementedError(
+                        f"Batch merge does not support SWA transfer type: {op.transfer_type}."
+                    )
+                if op.op_id in op_callback_dict:
+                    swa_callbacks_by_type[op.transfer_type].append(
+                        op_callback_dict[op.op_id])
                 continue
             if op.transfer_type not in supported_types:
                 raise NotImplementedError(

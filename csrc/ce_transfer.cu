@@ -14,6 +14,14 @@
 #include <utility>
 #include <unordered_map>
 #include <array>
+#include <algorithm>
+#include <condition_variable>
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "monitoring/metrics_manager.h"
 
@@ -298,22 +306,235 @@ void ce_transfer_segment_direct(
 
 // ---- Ping-pong: D2H double-buffer (SEGMENT_SCATTER, GATHER_SCATTER); not in direct paths ----
 
-// ---- scatter_to_cpu: staging -> strided CPU (merge when LAYERFIRST) ----
+// ---- Parallel CPU gather/scatter with NT store ----
+namespace {
+
+enum class CopyImpl { SCALAR, AVX2, AVX512 };
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define FLEXKV_X86 1
+#else
+#define FLEXKV_X86 0
+#endif
+
+#if FLEXKV_X86
+__attribute__((target("avx512f"))) void nt_copy_avx512(char *d,
+                                                          const char *s,
+                                                          size_t n) {
+  size_t i = 0;
+  size_t head =
+      static_cast<size_t>((64 - (reinterpret_cast<uintptr_t>(d) & 63)) & 63);
+  if (head > n)
+    head = n;
+  if (head) {
+    std::memcpy(d, s, head);
+    i = head;
+  }
+  for (; i + 64 <= n; i += 64) {
+    __m512i v = _mm512_loadu_si512(reinterpret_cast<const void *>(s + i));
+    _mm512_stream_si512(reinterpret_cast<__m512i *>(d + i), v);
+  }
+  if (i < n)
+    std::memcpy(d + i, s + i, n - i);
+}
+
+__attribute__((target("avx2"))) void nt_copy_avx2(char *d, const char *s,
+                                                     size_t n) {
+  size_t i = 0;
+  size_t head =
+      static_cast<size_t>((32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31);
+  if (head > n)
+    head = n;
+  if (head) {
+    std::memcpy(d, s, head);
+    i = head;
+  }
+  for (; i + 32 <= n; i += 32) {
+    __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + i));
+    _mm256_stream_si256(reinterpret_cast<__m256i *>(d + i), v);
+  }
+  if (i < n)
+    std::memcpy(d + i, s + i, n - i);
+}
+#endif
+
+CopyImpl pick_copy_impl(bool nt_enabled) {
+#if FLEXKV_X86
+  if (!nt_enabled)
+    return CopyImpl::SCALAR;
+  if (__builtin_cpu_supports("avx512f"))
+    return CopyImpl::AVX512;
+  if (__builtin_cpu_supports("avx2"))
+    return CopyImpl::AVX2;
+  return CopyImpl::SCALAR;
+#else
+  (void)nt_enabled;
+  return CopyImpl::SCALAR;
+#endif
+}
+
+inline void nt_copy_block(char *d, const char *s, size_t n, CopyImpl impl) {
+#if FLEXKV_X86
+  switch (impl) {
+  case CopyImpl::AVX512:
+    nt_copy_avx512(d, s, n);
+    return;
+  case CopyImpl::AVX2:
+    nt_copy_avx2(d, s, n);
+    return;
+  default:
+    std::memcpy(d, s, n);
+    return;
+  }
+#else
+  (void)impl;
+  std::memcpy(d, s, n);
+#endif
+}
+
+inline void sfence_if_nt(CopyImpl impl) {
+#if FLEXKV_X86
+  if (impl != CopyImpl::SCALAR)
+    _mm_sfence();
+#else
+  (void)impl;
+#endif
+}
+
+// Persistent per-GPU-thread CPU thread pool. Caller participates as one worker;
+// (N-1) background threads handle the rest. cv-based wakeup (not busy-spin).
+// thread_local: each GPU dispatch thread gets its own pool — zero cross-GPU contention.
+class CopyPool {
+public:
+  // thread_local: each GPU dispatch thread gets its own pool. No cross-GPU contention.
+  // threads param only used on first init; thread_local persists afterwards.
+  static CopyPool &instance(int threads) {
+    thread_local CopyPool p(threads);
+    return p;
+  }
+  int worker_count() const { return static_cast<int>(workers_.size()); }
+  void run(int total, const std::function<void(int, int)> &body) {
+    const int nw = static_cast<int>(workers_.size());
+    const int participants = nw + 1;
+    const int chunk = (total + participants - 1) / participants;
+    for (int w = 0; w < nw; ++w) {
+      const int start = (w + 1) * chunk;
+      const int end = std::min(start + chunk, total);
+      if (start >= total) {
+        workers_[w]->mark_done();
+        continue;
+      }
+      workers_[w]->submit(&body, start, end);
+    }
+    const int main_end = std::min(chunk, total);
+    if (main_end > 0)
+      body(0, main_end);
+    for (int w = 0; w < nw; ++w)
+      workers_[w]->wait();
+  }
+
+private:
+  struct Worker {
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cv;
+    std::condition_variable done_cv;
+    const std::function<void(int, int)> *fn = nullptr;
+    int start = 0, end = 0;
+    bool has_job = false;
+    bool done = true;
+    bool stop = false;
+    Worker() { th = std::thread([this] { loop(); }); }
+    ~Worker() {
+      {
+        std::lock_guard<std::mutex> lk(m);
+        stop = true;
+      }
+      cv.notify_one();
+      if (th.joinable())
+        th.join();
+    }
+    void submit(const std::function<void(int, int)> *f, int s, int e) {
+      {
+        std::lock_guard<std::mutex> lk(m);
+        fn = f;
+        start = s;
+        end = e;
+        has_job = true;
+        done = false;
+      }
+      cv.notify_one();
+    }
+    void mark_done() {
+      std::lock_guard<std::mutex> lk(m);
+      done = true;
+    }
+    void wait() {
+      std::unique_lock<std::mutex> lk(m);
+      done_cv.wait(lk, [this] { return done; });
+    }
+    void loop() {
+      for (;;) {
+        const std::function<void(int, int)> *f = nullptr;
+        int s = 0, e = 0;
+        {
+          std::unique_lock<std::mutex> lk(m);
+          cv.wait(lk, [this] { return has_job || stop; });
+          if (stop && !has_job)
+            return;
+          f = fn;
+          s = start;
+          e = end;
+          has_job = false;
+        }
+        try {
+          (*f)(s, e);
+        } catch (...) {
+        }
+        {
+          std::lock_guard<std::mutex> lk(m);
+          done = true;
+        }
+        done_cv.notify_one();
+      }
+    }
+  };
+  std::vector<std::unique_ptr<Worker>> workers_;
+  explicit CopyPool(int total_threads) {
+    for (int i = 0; i < total_threads - 1; ++i)
+      workers_.push_back(std::make_unique<Worker>());
+  }
+};
+
+constexpr int kPrefetchDist = 16;
+
+} // namespace
+
+// ============================================================================
+// scatter_to_cpu: staging buf → strided CPU dst.
+//   LAYERFIRST (cpu_phys_contig): merge consecutive block_ids into one copy.
+//   BLOCKFIRST: per-block parallel scatter with NT stores via thread pool.
+// ============================================================================
 void scatter_to_cpu(const void *staging_buf, int64_t *cpu_ptr_int64,
                     int64_t *cpu_block_ids, int num_blocks,
                     int64_t cpu_block_stride_int64,
                     int64_t cpu_startoff_inside_chunks_int64,
                     int64_t chunk_size_in_bytes, int layer_idx, int kv_idx,
                     int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
-                    int start_layer_id, bool cpu_phys_contig) {
+                    int start_layer_id, bool cpu_phys_contig,
+                    int gather_threads, bool gather_nt) {
   int64_t *cpu_base = cpu_ptr_int64 +
       (layer_idx + start_layer_id) * cpu_layer_stride_int64 +
       kv_idx * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-  int64_t k = 0;
-  while (k < num_blocks) {
-    int64_t run_start = k;
-    if (cpu_phys_contig) {
-      // LAYERFIRST: consecutive block_ids are physically adjacent -- merge.
+  const char *src = static_cast<const char *>(staging_buf);
+
+  if (cpu_phys_contig) {
+    // LAYERFIRST: merge consecutive block_ids into one copy. NT store avoids cache pollution.
+    const CopyImpl impl = pick_copy_impl(gather_nt);
+    int64_t k = 0;
+    while (k < num_blocks) {
+      int64_t run_start = k;
       while (k + 1 < num_blocks &&
              cpu_block_ids[k + 1] == cpu_block_ids[k] + 1) {
         ++k;
@@ -321,38 +542,61 @@ void scatter_to_cpu(const void *staging_buf, int64_t *cpu_ptr_int64,
       int64_t nr_blocks = k - run_start + 1;
       int64_t cb = cpu_block_ids[run_start];
       int64_t run_bytes = nr_blocks * chunk_size_in_bytes;
-      memcpy(cpu_base + cb * cpu_block_stride_int64,
-             (const char *)staging_buf +
-                 (int64_t)run_start * chunk_size_in_bytes,
-             run_bytes);
-    } else {
-      // BLOCKFIRST: each block is at a strided position -- scatter individually.
-      int64_t cb = cpu_block_ids[k];
-      memcpy(cpu_base + cb * cpu_block_stride_int64,
-             (const char *)staging_buf +
-                 (int64_t)k * chunk_size_in_bytes,
-             chunk_size_in_bytes);
+      nt_copy_block((char *)(cpu_base + cb * cpu_block_stride_int64),
+                  src + (int64_t)run_start * chunk_size_in_bytes,
+                  (size_t)run_bytes, impl);
+      ++k;
     }
-    ++k;
+    sfence_if_nt(impl);
+    return;
+  }
+
+  // BLOCKFIRST: per-block parallel NT scatter.
+  const CopyImpl impl = pick_copy_impl(gather_nt);
+  auto body = [&](int begin, int end) {
+    for (int kk = begin; kk < end; ++kk) {
+      if (kk + kPrefetchDist < end)
+        __builtin_prefetch(
+            cpu_base + cpu_block_ids[kk + kPrefetchDist] * cpu_block_stride_int64,
+            1 /*write*/, 0 /*non-temporal*/);
+      int64_t cb = cpu_block_ids[kk];
+      nt_copy_block((char *)(cpu_base + cb * cpu_block_stride_int64),
+                  src + (int64_t)kk * chunk_size_in_bytes,
+                  (size_t)chunk_size_in_bytes, impl);
+    }
+    sfence_if_nt(impl);
+  };
+  if (gather_threads <= 0 || num_blocks < 8 ||
+      CopyPool::instance(gather_threads).worker_count() == 0) {
+    body(0, num_blocks);
+  } else {
+    CopyPool::instance(gather_threads).run(num_blocks, body);
   }
 }
 
-// ---- gather_from_cpu: strided CPU -> staging (H2D, merge when LAYERFIRST) ----
+// ============================================================================
+// gather_from_cpu: strided CPU src → contiguous staging buf.
+//   H2D counterpart of scatter_to_cpu. Same LAYERFIRST/BLOCKFIRST logic.
+// ============================================================================
 void gather_from_cpu(void *staging_buf, const int64_t *cpu_ptr_int64,
                      const int64_t *cpu_block_ids, int num_blocks,
                      int64_t cpu_block_stride_int64,
                      int64_t cpu_startoff_inside_chunks_int64,
                      int64_t chunk_size_in_bytes, int layer_idx, int kv_idx,
                      int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
-                     int start_layer_id, bool cpu_phys_contig) {
+                     int start_layer_id, bool cpu_phys_contig,
+                     int gather_threads, bool gather_nt) {
   const int64_t *cpu_base = cpu_ptr_int64 +
       (layer_idx + start_layer_id) * cpu_layer_stride_int64 +
       kv_idx * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-  int64_t k = 0;
-  while (k < num_blocks) {
-    int64_t run_start = k;
-    if (cpu_phys_contig) {
-      // LAYERFIRST: consecutive block_ids are physically adjacent -- merge.
+  char *dst = static_cast<char *>(staging_buf);
+
+  if (cpu_phys_contig) {
+    // LAYERFIRST: merge consecutive block_ids into one copy. NT store on staging buf.
+    const CopyImpl impl = pick_copy_impl(gather_nt);
+    int64_t k = 0;
+    while (k < num_blocks) {
+      int64_t run_start = k;
       while (k + 1 < num_blocks &&
              cpu_block_ids[k + 1] == cpu_block_ids[k] + 1) {
         ++k;
@@ -360,19 +604,35 @@ void gather_from_cpu(void *staging_buf, const int64_t *cpu_ptr_int64,
       int64_t nr_blocks = k - run_start + 1;
       int64_t cb = cpu_block_ids[run_start];
       int64_t run_bytes = nr_blocks * chunk_size_in_bytes;
-      memcpy((char *)staging_buf +
-                 (int64_t)run_start * chunk_size_in_bytes,
-             cpu_base + cb * cpu_block_stride_int64,
-             run_bytes);
-    } else {
-      // BLOCKFIRST: each block is at a strided position -- gather individually.
-      int64_t cb = cpu_block_ids[k];
-      memcpy((char *)staging_buf +
-                 (int64_t)k * chunk_size_in_bytes,
-             cpu_base + cb * cpu_block_stride_int64,
-             chunk_size_in_bytes);
+      nt_copy_block(dst + (int64_t)run_start * chunk_size_in_bytes,
+                  (const char *)(cpu_base + cb * cpu_block_stride_int64),
+                  (size_t)run_bytes, impl);
+      ++k;
     }
-    ++k;
+    sfence_if_nt(impl);
+    return;
+  }
+
+  // BLOCKFIRST: per-block parallel NT gather.
+  const CopyImpl impl = pick_copy_impl(gather_nt);
+  auto body = [&](int begin, int end) {
+    for (int kk = begin; kk < end; ++kk) {
+      if (kk + kPrefetchDist < end)
+        __builtin_prefetch(
+            cpu_base + cpu_block_ids[kk + kPrefetchDist] * cpu_block_stride_int64,
+            0 /*read*/, 0 /*non-temporal*/);
+      int64_t cb = cpu_block_ids[kk];
+      nt_copy_block(dst + (int64_t)kk * chunk_size_in_bytes,
+                  (const char *)(cpu_base + cb * cpu_block_stride_int64),
+                  (size_t)chunk_size_in_bytes, impl);
+    }
+    sfence_if_nt(impl);
+  };
+  if (gather_threads <= 0 || num_blocks < 8 ||
+      CopyPool::instance(gather_threads).worker_count() == 0) {
+    body(0, num_blocks);
+  } else {
+    CopyPool::instance(gather_threads).run(num_blocks, body);
   }
 }
 
@@ -484,7 +744,8 @@ void ce_transfer_segment_scatter(
                          cpu_startoff_inside_chunks_int64,
                          chunk_size_in_bytes, pi, pj,
                          cpu_kv_stride_int64, cpu_layer_stride_int64,
-                         start_layer_id, ce_analysis.cpu_phys_contig);
+                         start_layer_id, ce_analysis.cpu_phys_contig,
+                         ce_config.gather_threads, ce_config.gather_nt);
         }
       } else {
         cudaStreamSynchronize(stream);
@@ -495,7 +756,8 @@ void ce_transfer_segment_scatter(
                        cpu_startoff_inside_chunks_int64,
                        chunk_size_in_bytes, i, j,
                        cpu_kv_stride_int64, cpu_layer_stride_int64,
-                       start_layer_id, ce_analysis.cpu_phys_contig);
+                       start_layer_id, ce_analysis.cpu_phys_contig,
+                       ce_config.gather_threads, ce_config.gather_nt);
       }
     } else {
       // ---- H2D: gather all -> H2D all -> drain (no ping-pong) ----
@@ -505,7 +767,8 @@ void ce_transfer_segment_scatter(
                       cpu_startoff_inside_chunks_int64,
                       chunk_size_in_bytes, i, j,
                       cpu_kv_stride_int64, cpu_layer_stride_int64,
-                      start_layer_id, ce_analysis.cpu_phys_contig);
+                      start_layer_id, ce_analysis.cpu_phys_contig,
+                      ce_config.gather_threads, ce_config.gather_nt);
       // H2D segments from staging
       int64_t off = 0;
       for (const auto &seg : ce_analysis.segments) {
@@ -538,7 +801,8 @@ void ce_transfer_segment_scatter(
                    cpu_startoff_inside_chunks_int64,
                    chunk_size_in_bytes, li, lj,
                    cpu_kv_stride_int64, cpu_layer_stride_int64,
-                   start_layer_id, ce_analysis.cpu_phys_contig);
+                   start_layer_id, ce_analysis.cpu_phys_contig,
+                   ce_config.gather_threads, ce_config.gather_nt);
   }
   // Events cached, not destroyed (all work already synced).
 }
@@ -808,7 +1072,8 @@ void ce_transfer_gather_scatter(
                          cpu_startoff_inside_chunks_int64,
                          chunk_size_in_bytes, pi, pj,
                          cpu_kv_stride_int64, cpu_layer_stride_int64,
-                         start_layer_id, ce_analysis.cpu_phys_contig);
+                         start_layer_id, ce_analysis.cpu_phys_contig,
+                         ce_config.gather_threads, ce_config.gather_nt);
         }
       } else if (need_host_buf) {
         cudaStreamSynchronize(stream);
@@ -819,7 +1084,8 @@ void ce_transfer_gather_scatter(
                        cpu_startoff_inside_chunks_int64,
                        chunk_size_in_bytes, i, j,
                        cpu_kv_stride_int64, cpu_layer_stride_int64,
-                       start_layer_id, ce_analysis.cpu_phys_contig);
+                       start_layer_id, ce_analysis.cpu_phys_contig,
+                       ce_config.gather_threads, ce_config.gather_nt);
       }
     } else {
       // ---- H2D ----
@@ -840,7 +1106,8 @@ void ce_transfer_gather_scatter(
                         cpu_startoff_inside_chunks_int64,
                         chunk_size_in_bytes, i, j,
                         cpu_kv_stride_int64, cpu_layer_stride_int64,
-                        start_layer_id, ce_analysis.cpu_phys_contig);
+                        start_layer_id, ce_analysis.cpu_phys_contig,
+                        ce_config.gather_threads, ce_config.gather_nt);
         h2d_src = host_buf[idx];
       }
 
@@ -884,7 +1151,8 @@ void ce_transfer_gather_scatter(
                    cpu_startoff_inside_chunks_int64,
                    chunk_size_in_bytes, li, lj,
                    cpu_kv_stride_int64, cpu_layer_stride_int64,
-                   start_layer_id, ce_analysis.cpu_phys_contig);
+                   start_layer_id, ce_analysis.cpu_phys_contig,
+                   ce_config.gather_threads, ce_config.gather_nt);
   }
 
   // Drain last H2D

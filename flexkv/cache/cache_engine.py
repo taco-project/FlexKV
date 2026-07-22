@@ -1668,7 +1668,10 @@ class GlobalCacheEngine:
         cpu_swa_slot = -1
         ssd_swa_slot = -1
         remote_swa_slot = -1
+<<<<<<< HEAD
         mooncake_swa_tail_hash: Optional[str] = None
+=======
+>>>>>>> main
 
         if self.swa_op_constructor.enabled:
             cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
@@ -2192,9 +2195,13 @@ class GlobalCacheEngine:
                 # request mask may stop earlier. A snapshot for a deeper trailing
                 # window cannot serve this request window; try another tier.
                 continue
+<<<<<<< HEAD
 
             if not self._is_mooncake_swa_tier(device_type):
                 assert match_result.last_swa_node is not None
+=======
+            assert match_result.last_swa_node is not None
+>>>>>>> main
             candidates.append((swa_hit, device_type, match_result))
 
         for usable_end, device_type, match_result in sorted(

@@ -288,11 +288,30 @@ class TransferWorkerBase(ABC):
             else f"transfer data size: {transfer_size / (1024 * 1024 * 1024)} GB "
         )
         flexkv_logger.info(
-            f"{transfer_op.transfer_type.name} transfer request: {transfer_op.transfer_op_id} finished "
+            f"[FlexKV-IO] direction={self._io_direction(transfer_op.transfer_type)} "
+            f"path={self._io_path(transfer_op.transfer_type)} phase=complete "
+            f"request_id={transfer_op.transfer_op_id} "
+            f"graph_id={transfer_op.transfer_graph_id} bytes={transfer_size} "
+            f"{transfer_op.transfer_type.name} transfer request: "
+            f"{transfer_op.transfer_op_id} finished "
             f"{size_text}"
             f"transfer time: {end_time - start_time:.4f} s "
             f"transfer bandwidth: {transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
         )
+
+    @staticmethod
+    def _io_direction(transfer_type: TransferType) -> str:
+        if transfer_type in (TransferType.H2D, TransferType.LAYERWISE):
+            return "H2D"
+        if transfer_type == TransferType.D2H:
+            return "D2H"
+        return transfer_type.name
+
+    @staticmethod
+    def _io_path(transfer_type: TransferType) -> str:
+        if transfer_type == TransferType.LAYERWISE:
+            return "layerwise"
+        return "bulk"
 
     @abstractmethod
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -488,8 +507,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
-        self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
-        self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
+        self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.ce_path_opt
+        self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold
         self.ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
 
         self._compressor = compressor or NullCompressionStrategy()
@@ -844,11 +863,13 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 self.gpu_layer_strides_in_bytes,
                 self.gpu_chunk_sizes_in_bytes,
                 gpu_device_ids,
-                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
-                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
+                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
                 ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
                 is_blockfirst=self.cpu_is_blockfirst,
                 is_mla=self.is_mla,
+                ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
+                ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             )
 
         self._compressor = compressor or NullCompressionStrategy()
@@ -959,8 +980,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 gpu_layer_strides,
                 gpu_chunk_sizes,
                 gpu_device_ids,
-                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
-                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
+                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
                 ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
                 is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
                 is_mla=self.is_mla,

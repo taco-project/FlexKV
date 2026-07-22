@@ -67,41 +67,15 @@ def cudaHostUnregister(tensor: torch.Tensor) -> None:
     if ret != 0:
         raise RuntimeError(f"cudaHostUnregister failed with error code {ret}")
 
-
-# @dataclass
-# class HostBufferHandle:
-#     tensor: torch.Tensor
-#     is_hugepage: bool = False
-#     is_cuda_registered: bool = False
-
-#     def __post_init__(self) -> None:
-#         if self.is_cuda_registered and not self.is_hugepage:
-#             raise ValueError("CUDA-registered host buffer must be HugePage-backed")
-
-#     @classmethod
-#     def pinned(cls, tensor: torch.Tensor) -> HostBufferHandle:
-#         return cls(tensor=tensor)
-
-#     @classmethod
-#     def hugepage(cls, tensor: torch.Tensor) -> HostBufferHandle:
-#         return cls(tensor=tensor, is_hugepage=True, is_cuda_registered=True)
-
-#     def release(self) -> None:
-#         if not self.is_hugepage:
-#             return
-
-#         if self.is_cuda_registered:
-#             try:
-#                 cudaHostUnregister(self.tensor)
-#             except Exception as e:
-#                 flexkv_logger.warning(
-#                     f"[host_buffer] release hugepage host buffer: cuda unregister failed ({e})"
-#                 )
-#             self.is_cuda_registered = False
-
-#         free_hugepage_tensor(self.tensor)
-#         flexkv_logger.info("[host_buffer] release hugepage host buffer")
-#         self.is_hugepage = False
+    buf_type = ctypes.c_uint8 * num_bytes
+    raw = buf_type.from_address(host_ptr.value)
+    np_arr = np.frombuffer(raw, dtype=np.uint8, count=num_bytes)
+    tensor = (
+        torch.frombuffer(np_arr, dtype=torch.uint8, count=num_bytes)
+        .view(dtype)[:num_elements]
+    )
+    weakref.finalize(tensor, lambda p=host_ptr: cudart.cudaFreeHost(p))
+    return tensor
 
 
 def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Tensor:

@@ -445,7 +445,7 @@ void LayerwiseTransferGroup::launch_swa_mg_h2d_layer_(
     int orig_layer, int num_blocks, int64_t *swa_gpu_block_ids,
     int64_t *swa_cpu_block_ids, int transfer_cta_num, bool use_ce_transfer,
     bool is_mla, const std::string &mla_d2h_mode) {
-   if (!has_swa_multi_group_) {
+  if (!has_swa_multi_group_) {
     return;
   }
   const auto &members = swa_layer_members_[orig_layer];

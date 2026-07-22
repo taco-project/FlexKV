@@ -400,6 +400,9 @@ class TransferEngine:
 
         assert self._cpu_handle is not None
         _enable_layerwise = GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
+        _fuse_swa_into_layerwise = (
+            _enable_layerwise and self.cache_config.swa_multi_layer
+        )
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
         

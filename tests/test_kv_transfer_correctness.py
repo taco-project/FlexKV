@@ -284,6 +284,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_segment_threshold=None,
                   ce_path_opt=None,
                   ce_enable_memcpy2d=None,
+                  ce_gather_threads=None,
+                  ce_gather_nt=None,
                   is_blockfirst=None,
                   is_mla=None):
     """Create TPTransferThreadGroup with strides from KVCacheLayout.
@@ -295,11 +297,15 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
     CE config defaults from GLOBAL_CONFIG_FROM_ENV (same as production).
     """
     if ce_segment_threshold is None:
-        ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
+        ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold
     if ce_path_opt is None:
-        ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
+        ce_path_opt = GLOBAL_CONFIG_FROM_ENV.ce_path_opt
     if ce_enable_memcpy2d is None:
         ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
+    if ce_gather_threads is None:
+        ce_gather_threads = GLOBAL_CONFIG_FROM_ENV.ce_gather_threads
+    if ce_gather_nt is None:
+        ce_gather_nt = GLOBAL_CONFIG_FROM_ENV.ce_gather_nt
     if is_blockfirst is None:
         is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
     if is_mla is None:
@@ -325,6 +331,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
         ce_enable_memcpy2d=ce_enable_memcpy2d,
+        ce_gather_threads=ce_gather_threads,
+        ce_gather_nt=ce_gather_nt,
         is_blockfirst=is_blockfirst,
         is_mla=is_mla,
     )
@@ -334,6 +342,8 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
                          ce_segment_threshold=None,
                          ce_path_opt=None,
                          ce_enable_memcpy2d=None,
+                         ce_gather_threads=None,
+                         ce_gather_nt=None,
                          is_blockfirst=None,
                          is_mla=None,
                          layer_eventfds_tensor=None):
@@ -347,11 +357,15 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
     CE config defaults from GLOBAL_CONFIG_FROM_ENV (same as production).
     """
     if ce_segment_threshold is None:
-        ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
+        ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold
     if ce_path_opt is None:
-        ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
+        ce_path_opt = GLOBAL_CONFIG_FROM_ENV.ce_path_opt
     if ce_enable_memcpy2d is None:
         ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
+    if ce_gather_threads is None:
+        ce_gather_threads = GLOBAL_CONFIG_FROM_ENV.ce_gather_threads
+    if ce_gather_nt is None:
+        ce_gather_nt = GLOBAL_CONFIG_FROM_ENV.ce_gather_nt
     if is_blockfirst is None:
         is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
     if is_mla is None:
@@ -389,6 +403,8 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
         ce_enable_memcpy2d=ce_enable_memcpy2d,
+        ce_gather_threads=ce_gather_threads,
+        ce_gather_nt=ce_gather_nt,
         is_blockfirst=is_blockfirst,
         is_mla=is_mla,
     )
@@ -401,7 +417,9 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                            ce_segment_threshold=None,
                            notify_mode="hostfunc", layer_granularity=None,
                            is_blockfirst=None,
-                           enable_memcpy2d=None):
+                           enable_memcpy2d=None,
+                           ce_gather_threads=None,
+                           ce_gather_nt=None):
     """Run a single CE H2D via LayerwiseTransferGroup, reading `cpu_kv` back
     into `all_gpu` with block-id list `ids`.
 
@@ -418,6 +436,8 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                                     gpu_layout, num_layers,
                                     ce_path_opt=ce_path_opt,
                                     ce_segment_threshold=ce_segment_threshold,
+                                    ce_gather_threads=ce_gather_threads,
+                                    ce_gather_nt=ce_gather_nt,
                                     is_blockfirst=is_blockfirst,
                                     ce_enable_memcpy2d=enable_memcpy2d)
     empty_ids = torch.empty(0, dtype=torch.int64).pin_memory()
@@ -1540,6 +1560,222 @@ def test_ce_strategy_coverage():
     # Verify it is exercised by the swept space.
     assert "GATHER_DIRECT" in strategies, \
         "no swept case exercises GATHER_DIRECT strategy"
+
+
+# NT store and gather multi-thread correctness tests
+#
+# gather_threads controls parallel CPU gather/scatter (CopyPool thread_local):
+#   0 = disable (single-thread fallback), 1/4/8 = thread count
+# gather_nt controls non-temporal (streaming) stores (AVX-512/AVX2):
+#   True = use NT stores, False = regular stores
+# Both are correctness-transparent optimizations on the CE path.
+
+GATHER_NT_MODE_CONFIGS = [
+    pytest.param((4, 8, 16, 1, 512), True, "sharded", id="mla_sharded"),
+    pytest.param((4, 8, 16, 1, 512), True, "all_write", id="mla_all_write"),
+    pytest.param((4, 8, 16, 1, 512), True, "rank0_only", id="mla_rank0_only"),
+    pytest.param((4, 8, 16, 8, 128), False, "sharded", id="mha"),
+]
+
+GATHER_THREADS_VALUES = [0, 1, 4, 8]
+GATHER_NT_VALUES = [True, False]
+
+
+@pytest.mark.parametrize("data_config,is_mla,mode", GATHER_NT_MODE_CONFIGS)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("gather_threads", GATHER_THREADS_VALUES,
+                         ids=["gt0", "gt1", "gt4", "gt8"])
+@pytest.mark.parametrize("gather_nt", GATHER_NT_VALUES,
+                         ids=["nt_on", "nt_off"])
+def test_gather_nt_roundtrip(data_config, is_mla, cpu_layout_name, mode,
+                             gather_threads, gather_nt):
+    """CE gather threads and NT store round-trip correctness.
+
+    Sweeps gather_threads (0=disable, 1, 4, 8) and gather_nt (on/off)
+    to verify parallel CPU gather/scatter and non-temporal stores produce
+    correct results across MLA modes and CPU layouts.
+    """
+    skip_if_engine_unsupported(use_ce=True)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    num_gpus = NUM_GPUS
+
+    gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, is_mla, num_gpus)
+
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
+                               heads_per_rank, head_dim, kv_dim, g)
+               for g in range(num_gpus)]
+
+    if is_mla:
+        fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb,
+                 heads_per_rank, head_dim, kv_dim)
+        for g in range(1, num_gpus):
+            for l in range(num_layers):
+                all_gpu[g][l].copy_(all_gpu[0][l])
+    else:
+        for g in range(num_gpus):
+            fill_gpu(all_gpu[g], g, num_layers, num_blocks, tpb,
+                     heads_per_rank, head_dim, kv_dim)
+    sync_all(num_gpus)
+
+    (total_cpu_blocks, cpu_stride_kv, cpu_stride_layer,
+     cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
+        cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+    cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_cpu_blocks)
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
+                       gpu_layout, num_layers,
+                       is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
+                       ce_gather_threads=gather_threads,
+                       ce_gather_nt=gather_nt)
+
+    ids = block_ids(num_blocks)
+    gpu_block_ids = ids
+    cpu_block_ids = ids
+
+    # D2H
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=gpu_block_ids, cpu_block_id_tensor=cpu_block_ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
+        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
+        mla_d2h_mode=mode,
+    )
+    sync_all(num_gpus)
+
+    # Clear GPUs
+    for g in range(num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].zero_()
+    sync_all(num_gpus)
+
+    # H2D
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=gpu_block_ids, cpu_block_id_tensor=cpu_block_ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=True,
+        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
+        mla_d2h_mode=mode,
+    )
+    sync_all(num_gpus)
+
+    # Verify round-trip data integrity
+    expected_gpu = 0 if is_mla else None
+    for g in range(num_gpus):
+        src_g = expected_gpu if expected_gpu is not None else g
+        for layer in [0, num_layers - 1]:
+            for block in [0, num_blocks - 1]:
+                for kv in range(kv_dim):
+                    for hd_idx in [0, head_dim - 1]:
+                        exp = expected_val(src_g, layer, block, 0, hd_idx, kv)
+                        act = all_gpu[g][layer][kv, block, 0, 0, hd_idx].item()
+                        assert abs(act - exp) < 1e-3, \
+                            "gather/NT round-trip mismatch: gt={} nt={} " \
+                            "layout={} gpu={} layer={} block={} kv={} hd={}: " \
+                            "expected={:.6f} got={:.6f}".format(
+                                gather_threads, gather_nt, cpu_layout_name,
+                                g, layer, block, kv, hd_idx, exp, act)
+
+    del tp
+
+
+@pytest.mark.parametrize("data_config,is_mla,mode", GATHER_NT_MODE_CONFIGS)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("gather_threads", GATHER_THREADS_VALUES,
+                         ids=["gt0", "gt1", "gt4", "gt8"])
+@pytest.mark.parametrize("gather_nt", GATHER_NT_VALUES,
+                         ids=["nt_on", "nt_off"])
+def test_gather_nt_layerwise_h2d(data_config, is_mla, cpu_layout_name, mode,
+                                 gather_threads, gather_nt):
+    """CE gather threads and NT store correctness for layerwise H2D.
+
+    TP-group CE D2H prepares CPU, LayerwiseTransferGroup CE H2D reads back
+    with swept gather_threads and gather_nt settings.
+    """
+    skip_if_engine_unsupported(use_ce=True)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    num_gpus = NUM_GPUS
+
+    gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, is_mla, num_gpus)
+
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
+                               heads_per_rank, head_dim, kv_dim, g)
+               for g in range(num_gpus)]
+    if is_mla:
+        fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb,
+                 heads_per_rank, head_dim, kv_dim)
+        for g in range(1, num_gpus):
+            for l in range(num_layers):
+                all_gpu[g][l].copy_(all_gpu[0][l])
+    else:
+        for g in range(num_gpus):
+            fill_gpu(all_gpu[g], g, num_layers, num_blocks, tpb,
+                     heads_per_rank, head_dim, kv_dim)
+    sync_all(num_gpus)
+
+    (total_blocks, cpu_stride_kv, cpu_stride_layer,
+     cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
+        cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+    cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks)
+    ids = block_ids(num_blocks)
+    chunk_size = gpu_layout.get_chunk_size() * ES
+
+    # D2H via TP-group (default config)
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
+                       gpu_layout, num_layers,
+                       is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
+        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
+        mla_d2h_mode=mode,
+    )
+    sync_all(num_gpus)
+    del tp
+
+    for g in range(num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].zero_()
+    sync_all(num_gpus)
+
+    # H2D via layerwise with swept gather_threads and gather_nt
+    layerwise_h2d_readback(
+        all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
+        cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
+        chunk_size, is_mla, mode,
+        is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
+        ce_gather_threads=gather_threads,
+        ce_gather_nt=gather_nt)
+
+    expected_gpu = 0 if is_mla else None
+    for g in range(num_gpus):
+        src_g = expected_gpu if expected_gpu is not None else g
+        for layer in [0, num_layers - 1]:
+            for block in [0, num_blocks - 1]:
+                for kv in range(kv_dim):
+                    for hd_idx in [0, head_dim - 1]:
+                        exp = expected_val(src_g, layer, block, 0, hd_idx, kv)
+                        act = all_gpu[g][layer][kv, block, 0, 0, hd_idx].item()
+                        assert abs(act - exp) < 1e-3, \
+                            "gather/NT layerwise H2D mismatch: gt={} nt={} " \
+                            "layout={} gpu={} layer={} block={} kv={} hd={}: " \
+                            "expected={:.6f} got={:.6f}".format(
+                                gather_threads, gather_nt, cpu_layout_name,
+                                g, layer, block, kv, hd_idx, exp, act)
 
 
 if __name__ == "__main__":
