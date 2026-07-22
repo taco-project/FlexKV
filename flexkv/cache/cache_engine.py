@@ -1297,19 +1297,24 @@ class GlobalCacheEngine:
         op_gds_transfer = None
         fragment2_cpu_blocks = None
 
-        #allocated new cpu blocks for this request
-        allocated_cpu_block_num = fragment2_num_blocks
-        # NOTE: When matched_pos is "remote", we ALWAYS need to allocate local CPU blocks
-        # to receive the data, regardless of whether we insert to local index or not
+        # Allocate CPU blocks only for paths that actually stage data through
+        # host memory. GDS moves fragment2 directly from SSD to GPU.
+        allocated_cpu_block_num = 0 if enable_gds else fragment2_num_blocks
+        # Remote CPU hits still need local CPU blocks for PEERH2H staging,
+        # regardless of whether those blocks are inserted into the local index.
         if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
             allocated_cpu_block_num += fragment1_num_blocks
-        nvtx.push_range(f"take {allocated_cpu_block_num} cpu blocks", color="green")
-        allocated_cpu_blocks = self.cpu_cache_engine.take(
-            num_required_blocks=allocated_cpu_block_num,
-            protected_node=cpu_matched_result.last_node,
-            strict=False
-        )
-        nvtx.pop_range()
+        if allocated_cpu_block_num > 0:
+            nvtx.push_range(f"take {allocated_cpu_block_num} cpu blocks", color="green")
+            allocated_cpu_blocks = self.cpu_cache_engine.take(
+                num_required_blocks=allocated_cpu_block_num,
+                protected_node=cpu_matched_result.last_node,
+                strict=False
+            )
+            nvtx.pop_range()
+        else:
+            # take(0) may still trigger proactive eviction at high utilization.
+            allocated_cpu_blocks = np.empty(0, dtype=np.int64)
         # NOTE: not enough space to allocate, skip the request
         # there might be a better way to handle this
         if len(allocated_cpu_blocks) < allocated_cpu_block_num:
@@ -1326,7 +1331,7 @@ class GlobalCacheEngine:
             total_query_blocks = block_mask_end - block_mask_start
             # CPU hit blocks (directly from CPU cache)
             self._metrics_collector.record_cache_hit("cpu", fragment1_num_blocks)
-            # SSD hit blocks (blocks loaded from SSD to CPU)
+            # SSD hit blocks (loaded directly to GPU with GDS, otherwise via CPU)
             self._metrics_collector.record_cache_hit("ssd", fragment2_num_blocks)
             # Miss blocks (not in any cache)
             miss_blocks = total_query_blocks - fragment12_num_blocks
