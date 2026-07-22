@@ -73,12 +73,15 @@ class KVTask:
     # the SWA counterpart to slot_mapping. None when the request has no SWA ops.
     swa_slot_mapping: Optional[np.ndarray] = None
 
+    # True after wait()/try_wait() has produced a response for this task.
+    request_returned: bool = False
+
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
 
     def shed_heavy_resources(self) -> None:
-        # Drop heavy fields once the task terminates. Keeps status / return_mask
-        # so wait() can still report the result; only when the user observes it (wait/try_wait) or cancels it.
+        # Keep status and return_mask so a task whose response has not been
+        # returned can still be observed by wait().
         self.graph = None
         self.token_ids = None
         self.slot_mapping = None
@@ -439,8 +442,6 @@ class KVTaskManager:
         return task.graph
 
     def _release_task(self, task_id: int) -> None:
-        """Remove the task record entirely. Called when the user observes (wait/try_wait)
-        or cancels the task. """
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]
@@ -462,6 +463,8 @@ class KVTaskManager:
         task.task_end_op_finished = True
         self.graph_to_task.pop(task.graph.graph_id, None)
         task.shed_heavy_resources()
+        if task.request_returned:
+            self._release_task(task_id)
 
     def _process_empty_graph(self, task_id: int) -> None:
         task = self.tasks[task_id]
@@ -588,12 +591,14 @@ class KVTaskEngine(KVTaskManager):
                     )
                     break
                 elif self.check_completed(task_id, completely=completely):
+                    task = self.tasks[task_id]
                     return_responses[task_id] = KVResponse(
-                        status=convert_to_response_status(self.tasks[task_id].status),
+                        status=convert_to_response_status(task.status),
                         task_id=task_id,
-                        return_mask=self.tasks[task_id].return_mask
+                        return_mask=task.return_mask
                     )
-                    if self.tasks[task_id].is_completed():
+                    task.request_returned = True
+                    if task.is_completed():
                         self._release_task(task_id)
                     break
                 elif only_return_finished:
