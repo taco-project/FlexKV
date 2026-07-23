@@ -3444,9 +3444,13 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
 
     def _transfer_impl(self, cpu_ptrs, block_sizes, keys, transfer_type: TransferType) -> None:
         if transfer_type == TransferType.H2REMOTE:
-            self.mooncake_client.batch_put(keys, cpu_ptrs, block_sizes)
+            put_results = self.mooncake_client.batch_put(keys, cpu_ptrs, block_sizes)
+            if not all(put_results):
+                flexkv_logger.error(f"Mooncake-store batch put partially failed: {put_results}")
         elif transfer_type == TransferType.REMOTE2H:
-            self.mooncake_client.batch_get(keys, cpu_ptrs, block_sizes)
+            get_results = self.mooncake_client.batch_get(keys, cpu_ptrs, block_sizes)
+            if not all(get_results):
+                flexkv_logger.error(f"Mooncake-store batch get partially failed: {get_results}")
         else:
             raise ValueError(
                 f"MooncakeStoreTransferWorker only supports H2REMOTE/REMOTE2H, got {transfer_type}")

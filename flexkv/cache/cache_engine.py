@@ -871,14 +871,17 @@ class GlobalCacheEngine:
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         if temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
+            # Prefetch return_mask covers full-KV tokens only. SWA REMOTE2H ops
+            # (is_swa=True) live in a separate slot space and must not be summed
+            # into prefetch_blocks, or the mask over-extends by SWA slot count.
             prefetch_blocks = 0
             for op in transfer_graph._op_map.values():
-                if op.transfer_type == TransferType.REMOTE2H:
+                if op.transfer_type == TransferType.REMOTE2H and not op.is_swa:
                     prefetch_blocks += len(op.src_block_ids)
             if prefetch_blocks > 0:
                 return_mask[block_start_idx * self.tokens_per_block:
                             (block_start_idx + prefetch_blocks) * self.tokens_per_block] = True
-        else:        
+        else:
             return_mask[block_start_idx* self.tokens_per_block:
                     (block_start_idx + plan.num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 

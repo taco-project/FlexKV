@@ -740,23 +740,6 @@ def merge_to_batch_graph(batch_id: int,
         for op_id, op in graph._op_map.items():
             if op.transfer_type == TransferType.VIRTUAL:
                 continue
-            if getattr(op, "is_swa", False):
-                if op.transfer_type == TransferType.H2D:
-                    swa_h2d_ops.append(op)
-                elif op.transfer_type == TransferType.DISK2H:
-                    swa_disk2h_ops.append(op)
-                elif op.transfer_type == TransferType.D2H:
-                    swa_d2h_ops.append(op)
-                elif op.transfer_type == TransferType.H2DISK:
-                    swa_h2disk_ops.append(op)
-                else:
-                    raise NotImplementedError(
-                        f"Batch merge does not support SWA transfer type: {op.transfer_type}."
-                    )
-                if op.op_id in op_callback_dict:
-                    swa_callbacks_by_type[op.transfer_type].append(
-                        op_callback_dict[op.op_id])
-                continue
             if op.transfer_type not in supported_types:
                 raise NotImplementedError(
                     f"Batch merge does not support transfer type: {op.transfer_type}. "
@@ -901,11 +884,14 @@ def merge_to_batch_graph(batch_id: int,
             if merged_swa_h2d_op is not None:
                 get_sinks.append(merged_swa_h2d_op.op_id)
             if not get_sinks:
+                # No GPU sink (e.g. prefetch / CPU-only): every independent
+                # full-KV and SWA leaf must be a terminal. Taking only the first
+                # would mark the batch done while another REMOTE2H/DISK2H lane
+                # is still in flight.
                 for op in (merged_remote2h_op, merged_swa_remote2h_op,
                            merged_disk2h_op, merged_swa_disk2h_op):
                     if op is not None:
                         get_sinks.append(op.op_id)
-                        break
             batch_end_op_id = _add_batch_sink(
                 merged_graph, get_sinks, dp_client_id)
 
@@ -959,11 +945,12 @@ def merge_to_batch_graph(batch_id: int,
         if merged_swa_d2h_op is not None:
             put_sinks.append(merged_swa_d2h_op.op_id)
         if not put_sinks:
+            # No D2H sink: wait for every independent full-KV / SWA leaf
+            # (H2DISK and/or H2REMOTE). 
             for op in (merged_h2disk_op, merged_swa_h2disk_op,
                        merged_h2remote_op, merged_swa_h2remote_op):
                 if op is not None:
                     put_sinks.append(op.op_id)
-                    break
         batch_end_op_id = _add_batch_sink(merged_graph, put_sinks, dp_client_id)
 
     else:
