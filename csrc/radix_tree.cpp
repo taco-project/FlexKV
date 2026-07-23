@@ -257,6 +257,62 @@ std::deque<int64_t> *CRadixNode::shrink_simple(int length) {
   return shrink_blocks;
 }
 
+void CRadixTreeIndex::validate_insert_target(
+    CRadixNode *last_node, torch::Tensor &block_hashes, int num_blocks,
+    int num_matched_blocks, int last_node_matched_length) {
+  static constexpr const char *stale_match_error =
+      "radix insert conflict: stale match result; rematch before retrying";
+
+  if (last_node == nullptr || last_node->get_index() != this ||
+      num_matched_blocks < 0 ||
+      num_matched_blocks >= num_blocks) {
+    throw std::runtime_error(stale_match_error);
+  }
+
+  const int node_size = last_node->size();
+  auto *block_hashes_ptr = block_hashes.data_ptr<int64_t>();
+  if (is_root(last_node)) {
+    if (last_node_matched_length != 0 || num_matched_blocks != 0) {
+      throw std::runtime_error(stale_match_error);
+    }
+  } else {
+    CRadixNode *parent = last_node->get_parent();
+    const HashType head_hash = last_node->get_head_hash();
+    if (parent == nullptr || !parent->lookup_child(head_hash) ||
+        parent->get_child(head_hash) != last_node ||
+        last_node_matched_length <= 0 ||
+        last_node_matched_length > node_size) {
+      throw std::runtime_error(stale_match_error);
+    }
+
+    const int matched_start =
+        num_matched_blocks - last_node_matched_length;
+    if (matched_start < 0) {
+      throw std::runtime_error(stale_match_error);
+    }
+    for (int i = 0; i < last_node_matched_length; ++i) {
+      if (last_node->get_hash(i) !=
+          HashType(block_hashes_ptr[matched_start + i])) {
+        throw std::runtime_error(stale_match_error);
+      }
+    }
+  }
+
+  const HashType target_hash =
+      HashType(block_hashes_ptr[num_matched_blocks]);
+  if (last_node_matched_length < node_size) {
+    // A valid partial match diverges at the split point. Equality means the
+    // supplied match result no longer describes this node.
+    if (last_node->get_hash(last_node_matched_length) == target_hash) {
+      throw std::runtime_error(stale_match_error);
+    }
+  } else if (last_node->lookup_child(target_hash)) {
+    throw std::runtime_error(
+        "radix insert conflict: target child already exists; "
+        "rematch before retrying");
+  }
+}
+
 CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
                                     torch::Tensor &block_hashes, int num_blocks,
                                     int num_insert_blocks, bool ready,
@@ -278,12 +334,16 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
   }
 
   assert(last_node != nullptr);
-  assert(last_node_matched_length != 0 || is_root(last_node));
   assert(physical_block_ids.size() == num_insert_blocks - num_matched_blocks);
 
   if (num_matched_blocks >= num_insert_blocks) {
     return nullptr;
   }
+
+  // This must run before allocating/splitting/removing leaves: on conflict the
+  // tree is unchanged and the caller retains every supplied physical block.
+  validate_insert_target(last_node, block_hashes, num_blocks,
+                         num_matched_blocks, last_node_matched_length);
 
   auto new_node = new CRadixNode(this, ready, 0);
   auto &new_block_hashes = new_node->get_block_hashes();
@@ -574,6 +634,9 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
   auto last_ready_node = root;
   auto prefix_blocks_num = 0;
   auto ready_prefix_blocks_num = 0;
+  // Readiness is a contiguous-prefix property. Once a matched node is unready,
+  // a ready descendant must not be counted until that ancestor becomes ready.
+  bool ready_prefix_open = true;
   auto last_node_matched_length = 0;
   // SWA (node-mount): deepest fully-matched ready node carrying a live SWA
   // slot.
@@ -613,7 +676,7 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
           break;
         }
       }
-      if (current_node->is_ready()) {
+      if (ready_prefix_open && current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += matched_length;
         // SWA hit only when the WHOLE node matched (its trailing page is
@@ -622,6 +685,8 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
           last_swa_node = current_node;
           swa_hit_blocks = ready_prefix_blocks_num;
         }
+      } else if (matched_length > 0) {
+        ready_prefix_open = false;
       }
       last_node_matched_length = matched_length;
       prefix_blocks_num += matched_length;
@@ -637,7 +702,7 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
     if (child_hash_opt.has_value() &&
         current_node->lookup_child(child_hash_opt.value())) {
       child_hash = child_hash_opt.value();
-      if (current_node->is_ready()) {
+      if (ready_prefix_open && current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += current_node->size();
         // Whole node matched (we are descending into a child): expose its SWA.
@@ -645,6 +710,8 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
           last_swa_node = current_node;
           swa_hit_blocks = ready_prefix_blocks_num;
         }
+      } else if (current_node->size() > 0) {
+        ready_prefix_open = false;
       }
       prefix_blocks_num += current_node->size();
       auto &pbs = current_node->get_physical_blocks();
@@ -683,7 +750,7 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
         matched_length = 0;
       }
 
-      if (current_node->is_ready()) {
+      if (ready_prefix_open && current_node->is_ready()) {
         last_ready_node = current_node;
         ready_prefix_blocks_num += matched_length;
         // Only a full node match exposes the trailing page's SWA.
@@ -691,6 +758,8 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
           last_swa_node = current_node;
           swa_hit_blocks = ready_prefix_blocks_num;
         }
+      } else if (matched_length > 0) {
+        ready_prefix_open = false;
       }
 
       last_node_matched_length = matched_length;

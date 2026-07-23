@@ -117,12 +117,18 @@ CRadixNode *LocalRadixTree::insert(torch::Tensor &physical_block_ids,
   }
 
   assert(last_node != nullptr);
-  assert(last_node_matched_length != 0 || is_root(last_node));
   assert(physical_block_ids.size() == num_insert_blocks - num_matched_blocks);
 
   if (num_matched_blocks >= num_insert_blocks) {
     return nullptr;
   }
+
+  // Keep stale-match handling identical to the base radix tree. This check is
+  // deliberately before split/LeaseMeta allocation/current_block_count changes;
+  // a rejected insert leaves both the tree and caller-owned physical blocks
+  // untouched.
+  validate_insert_target(last_node, block_hashes, num_blocks,
+                         num_matched_blocks, last_node_matched_length);
 
   // Handle split if the last node only partially matched
   if (last_node_matched_length < last_node->size()) {

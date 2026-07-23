@@ -163,6 +163,21 @@ def test_deferred_insert_rematches_after_concurrent_save_split():
     assert engine.mempool.num_used_blocks == 7
 
 
+def test_deferred_insert_recycles_staging_rejected_by_radix_guard():
+    engine = _engine()
+    sequence = _sequence([1, 2])
+    pending = _pending(engine, sequence, (True, True), 0, 2)
+    staged = pending.physical_blocks.copy()
+    engine.insert = Mock(side_effect=RuntimeError(
+        "radix insert conflict: target child already exists; "
+        "rematch before retrying"))
+
+    _manager(engine)._commit_deferred_insert(pending)
+
+    assert engine.mempool._free_mask[staged].all()
+    assert engine.mempool.num_used_blocks == 0
+
+
 def test_callback_cleans_up_old_anchor_when_deferred_commit_fails():
     manager = object.__new__(GlobalCacheEngine)
     manager._cache_tree_lock = threading.RLock()
