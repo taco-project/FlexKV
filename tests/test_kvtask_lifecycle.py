@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests: KVTask state machine + SWA load-lock lifecycle at the engine level.
+"""Unit tests for KVTask lifecycle, transfer results, and SWA load locks.
 
-Two concerns, both cheap (no TransferManager subprocess, no GPU):
+The control-plane cases cover:
 
 1. The ``KVTask`` dataclass state machine: status transitions, is_completed,
    early-response cleanup, ``swa_slot_mapping``, and shed_heavy_resources.
 
-2. The SWA load-lock lifecycle on ``GlobalCacheEngine``: a GET pins the matched
+2. Per-block transfer-result aggregation and partial-load failure handling.
+
+3. The SWA load-lock lifecycle on ``GlobalCacheEngine``: a GET pins the matched
    CPU SWA node while building the GET plan, and the SWA H2D completion callback
    releases it (``_swa_release_load_lock``), leaving the
    node cached (dec_swa_lock_ref, NOT dec_swa_lock_only). This documents that
@@ -15,15 +17,28 @@ Two concerns, both cheap (no TransferManager subprocess, no GPU):
    in get()/put(), both released via the op/transfer callbacks) — so a fresh
    GET after a completed GET re-locks cleanly with no residual pin.
 
-Requires flexkv.c_ext for concern 2 (production CacheEngineAccel); concern 1 is
-pure Python.
+The SWA engine cases require ``flexkv.c_ext``; none starts a TransferManager
+subprocess or requires a GPU.
 """
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
 from flexkv.common.request import KVResponseStatus
-from flexkv.kvtask import KVTask, KVTaskEngine, TaskType, TaskStatus
+from flexkv.common.transfer import (
+    CompletedOp,
+    CompletionAwareCallback,
+    TransferType,
+)
+from flexkv.kvtask import (
+    KVTask,
+    KVTaskEngine,
+    KVTaskManager,
+    TaskStatus,
+    TaskType,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -169,6 +184,129 @@ def test_completed_task_remains_observable_until_first_response():
     np.testing.assert_array_equal(response.return_mask, return_mask)
     assert task.request_returned is True
     assert task.task_id not in engine.tasks
+
+
+class _CompletedOpsHandle:
+    def __init__(self, completed_ops):
+        self.completed_ops = completed_ops
+
+    def wait(self, _timeout):
+        return self.completed_ops
+
+    def shutdown(self):
+        pass
+
+
+def test_multi_handle_block_results_are_combined_with_and():
+    """A block is reusable only when every transfer handle succeeded."""
+    graph_id, op_id = 41, 73
+    manager = object.__new__(KVTaskManager)
+    manager.transfer_handles = [
+        _CompletedOpsHandle([CompletedOp(
+            graph_id=graph_id,
+            op_id=op_id,
+            num_blocks=3,
+            block_results=(True, True, False),
+        )]),
+        _CompletedOpsHandle([CompletedOp(
+            graph_id=graph_id,
+            op_id=op_id,
+            num_blocks=3,
+            block_results=(True, False, True),
+        )]),
+    ]
+    manager.required_completed_count = 2
+    manager.uncompleted_ops = {}
+    manager.uncompleted_op_results = {}
+    manager.uncompleted_graphs = {}
+
+    assert manager._get_completed_ops(timeout=0) == [CompletedOp(
+        graph_id=graph_id,
+        op_id=op_id,
+        num_blocks=3,
+        block_results=(True, False, False),
+    )]
+    assert manager.uncompleted_ops == {}
+    assert manager.uncompleted_op_results == {}
+
+
+@pytest.mark.parametrize("second_results", [None, (True, True)])
+def test_multi_handle_invalid_block_results_fail_closed(second_results):
+    graph_id, op_id = 43, 76
+    manager = object.__new__(KVTaskManager)
+    manager.transfer_handles = [
+        _CompletedOpsHandle([CompletedOp(
+            graph_id=graph_id,
+            op_id=op_id,
+            num_blocks=3,
+            block_results=(True, True, True),
+        )]),
+        _CompletedOpsHandle([CompletedOp(
+            graph_id=graph_id,
+            op_id=op_id,
+            num_blocks=3,
+            block_results=second_results,
+        )]),
+    ]
+    manager.required_completed_count = 2
+    manager.uncompleted_ops = {}
+    manager.uncompleted_op_results = {}
+    manager.uncompleted_graphs = {}
+
+    assert manager._get_completed_ops(timeout=0) == [CompletedOp(
+        graph_id=graph_id,
+        op_id=op_id,
+        num_blocks=3,
+        block_results=(False, False, False),
+    )]
+
+
+def test_partial_remote2h_does_not_return_early_success():
+    graph_id, op_id, task_end_op_id = 42, 74, 75
+    completion = CompletedOp(
+        graph_id=graph_id,
+        op_id=op_id,
+        transfer_type=TransferType.REMOTE2H.value,
+        num_blocks=3,
+        block_results=(True, False, False),
+    )
+    seen = []
+    task = _make_task(
+        status=TaskStatus.RUNNING,
+        task_end_op_id=task_end_op_id,
+        graph=SimpleNamespace(graph_id=graph_id, num_ops=2, _op_map={}),
+        op_callback_dict={
+            op_id: CompletionAwareCallback(lambda result: seen.append(result))
+        },
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager._get_completed_ops = lambda _timeout: [completion]
+
+    manager._update_tasks(timeout=0)
+
+    assert task.transfer_failed is True
+    assert task.task_end_op_finished is False
+    assert seen == [completion]
+    assert manager.check_completed(task.task_id) is False
+
+    manager._get_completed_ops = lambda _timeout: [CompletedOp(
+        graph_id=graph_id,
+        op_id=task_end_op_id,
+        transfer_type=TransferType.H2D.value,
+    )]
+    manager._update_tasks(timeout=0)
+
+    assert task.task_end_op_finished is True
+    assert manager.check_completed(task.task_id) is False
+
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp.completed_graph(graph_id)
+    ]
+    manager._update_tasks(timeout=0)
+
+    assert task.status == TaskStatus.FAILED
 
 
 # --- M15/M16: SWA-aware get's core arithmetic (pure, mirrors kvtask logic) --- #

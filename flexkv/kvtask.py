@@ -2,7 +2,7 @@ import time
 from typing import Dict, Optional, List, Union, Tuple
 import threading
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 import multiprocessing as mp
 import copy
@@ -13,7 +13,14 @@ import numpy as np
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.block import hash_token
-from flexkv.common.transfer import TransferOpGraph, merge_to_batch_graph, get_nvtx_default_color, CompletedOp
+from flexkv.common.transfer import (
+    CompletedOp,
+    TransferOpGraph,
+    TransferType,
+    get_nvtx_default_color,
+    invoke_op_callback,
+    merge_to_batch_graph,
+)
 from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import (
     GlobalCacheEngine,
@@ -68,6 +75,7 @@ class KVTask:
     return_mask: Union[np.ndarray, list[np.ndarray]]
     callback: Optional[Union[Callable, List[Callable]]]
     op_callback_dict: Dict[int, Callable]
+    transfer_failed: bool = False
 
     # SWA GPU slot_mapping (SWA-pool token index space), bound LATE at launch —
     # the SWA counterpart to slot_mapping. None when the request has no SWA ops.
@@ -183,6 +191,7 @@ class KVTaskManager:
         self.graph_to_task: Dict[int, int] = {}
 
         self.uncompleted_ops: Dict[int, int] = {}  # op_id -> completed_count
+        self.uncompleted_op_results: Dict[int, CompletedOp] = {}
         self.uncompleted_graphs: Dict[int, int] = {}  # graph_id -> completed_count
         self.required_completed_count: int = len(self.transfer_handles)
 
@@ -353,6 +362,29 @@ class KVTaskManager:
                 continue
             task_id = self.graph_to_task[completed_op.graph_id]
             task = self.tasks[task_id]
+            # A failed pull invalidates the current request and must trigger
+            # fallback. Mooncake uploads retain the existing asynchronous PUT
+            # completion contract (the task-end D2H may precede H2REMOTE).
+            graph_op = getattr(task.graph, "_op_map", {}).get(
+                completed_op.op_id)
+            is_remote_load = (
+                completed_op.transfer_type == TransferType.REMOTE2H.value
+                or (graph_op is not None
+                    and graph_op.transfer_type == TransferType.REMOTE2H)
+            )
+            expects_block_results = (
+                graph_op is not None
+                and (graph_op.mooncake_store_block_hashes is not None
+                     or graph_op.mooncake_store_swa_block_hashes is not None)
+            )
+            missing_results = (
+                completed_op.block_results is None and expects_block_results)
+            failed_blocks = (
+                completed_op.block_results is not None
+                and not all(completed_op.block_results)
+            )
+            if is_remote_load and (missing_results or failed_blocks):
+                task.transfer_failed = True
             # Record transfer metrics for completed ops (post-completion statistics)
             # All three counters (ops_total, blocks_total, bytes_total) are updated
             # here after transfer completion, providing accurate post-transfer metrics.
@@ -375,7 +407,17 @@ class KVTaskManager:
                 self.tasks[task_id].task_end_op_finished = True
             has_callback = completed_op.op_id in task.op_callback_dict
             if has_callback:
-                task.op_callback_dict[completed_op.op_id]()
+                try:
+                    invoke_op_callback(
+                        task.op_callback_dict[completed_op.op_id], completed_op)
+                except Exception:
+                    task.transfer_failed = True
+                    flexkv_logger.error(
+                        "Transfer op callback failed: "
+                        f"graph_id={completed_op.graph_id}, "
+                        f"op_id={completed_op.op_id}",
+                        exc_info=True,
+                    )
 
     def _cancel_task(self, task_id: int) -> None:
         if task_id not in self.tasks:
@@ -389,6 +431,11 @@ class KVTaskManager:
         task = self.tasks[task_id]
         self._process_empty_graph(task_id)
         if completely:
+            return task.is_completed()
+        # A partial-capable backend may finish the data-path sink after already
+        # reporting failed blocks. Wait for graph completion so cleanup runs and
+        # the caller observes FAILED instead of an early RUNNING-as-success result.
+        if task.transfer_failed:
             return task.is_completed()
         # For tasks with callback (e.g., PUT tasks that need to call insert_and_publish),
         # we must wait until _mark_completed is called (i.e., is_completed() returns True)
@@ -456,12 +503,21 @@ class KVTaskManager:
         if task.is_completed():
             return
         if task.callback:
-            if isinstance(task.callback, list):
-                for callback in task.callback:
+            callbacks = (
+                task.callback if isinstance(task.callback, list)
+                else [task.callback]
+            )
+            for callback in callbacks:
+                try:
                     callback()
-            else:
-                task.callback()
-        task.status = TaskStatus.COMPLETED
+                except Exception:
+                    task.transfer_failed = True
+                    flexkv_logger.error(
+                        f"Transfer graph callback failed for task_id={task_id}",
+                        exc_info=True,
+                    )
+        task.status = (
+            TaskStatus.FAILED if task.transfer_failed else TaskStatus.COMPLETED)
         task.task_end_op_finished = True
         self.graph_to_task.pop(task.graph.graph_id, None)
         task.shed_heavy_resources()
@@ -489,12 +545,71 @@ class KVTaskManager:
                         self.uncompleted_graphs[completed_op.graph_id] = completed_count
                 else:
                     completed_count = self.uncompleted_ops.get(completed_op.op_id, 0) + 1
+                    aggregate = self._merge_completed_op(
+                        self.uncompleted_op_results.get(completed_op.op_id),
+                        completed_op,
+                    )
                     if completed_count == self.required_completed_count:
-                        results.append(completed_op)
+                        results.append(aggregate)
                         self.uncompleted_ops.pop(completed_op.op_id, None)
+                        self.uncompleted_op_results.pop(completed_op.op_id, None)
                     else:
                         self.uncompleted_ops[completed_op.op_id] = completed_count
+                        self.uncompleted_op_results[completed_op.op_id] = aggregate
         return results
+
+    @staticmethod
+    def _merge_completed_op(
+        current: Optional[CompletedOp],
+        incoming: CompletedOp,
+    ) -> CompletedOp:
+        """Combine multi-handle outcomes; a block succeeds only everywhere."""
+        if current is None:
+            if incoming.block_results is None:
+                return incoming
+            expected_blocks = incoming.num_blocks or len(incoming.block_results)
+            block_results = (
+                tuple(bool(result) for result in incoming.block_results)
+                if len(incoming.block_results) == expected_blocks
+                else (False,) * expected_blocks
+            )
+            return replace(
+                incoming,
+                num_blocks=expected_blocks,
+                block_results=block_results,
+            )
+
+        block_results = None
+        if (current.block_results is not None
+                or incoming.block_results is not None):
+            # Once one handle reports a bitmap, every handle must report the
+            # same width. Missing or malformed data is a fail-closed result.
+            expected_blocks = max(
+                current.num_blocks,
+                incoming.num_blocks,
+                len(current.block_results or ()),
+                len(incoming.block_results or ()),
+            )
+
+            def normalize(results: Optional[Tuple[bool, ...]]) -> Tuple[bool, ...]:
+                if results is None or len(results) != expected_blocks:
+                    return (False,) * expected_blocks
+                return tuple(bool(result) for result in results)
+
+            left = normalize(current.block_results)
+            right = normalize(incoming.block_results)
+            block_results = tuple(a and b for a, b in zip(left, right))
+        return replace(
+            current,
+            transfer_type=current.transfer_type or incoming.transfer_type,
+            num_blocks=max(
+                current.num_blocks,
+                incoming.num_blocks,
+                len(block_results or ()),
+            ),
+            num_bytes=max(current.num_bytes, incoming.num_bytes),
+            block_results=block_results,
+        )
 
 class KVTaskEngine(KVTaskManager):
     def __init__(self,
