@@ -537,6 +537,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         )
 
         self.group_transfer_params: list = []
+        # Keep the imported CUDA-IPC tensors alive for the worker's lifetime.
+        # _get_layer_ptrs() below records only their raw data_ptr()s; if the
+        # tensors themselves were allowed to go out of scope, PyTorch would
+        # release the underlying CUDA IPC mapping and the stored pointers would
+        # dangle, so the per-group transfer would read/write freed device
+        # memory (observed as the indexer group silently restoring zeros).
+        self._multi_group_gpu_blocks_keepalive: list = []
         cpu_offset_bytes = 0  # byte offset of this group within a CPU block
 
         for gi, (g, gpu_layout) in enumerate(zip(layer_groups, gpu_layouts_per_group)):
@@ -545,6 +552,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
             # Resolve GPU tensors for this group
             group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+            self._multi_group_gpu_blocks_keepalive.append(group_gpu_blocks)
             group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
 
             # Compressed groups: GPU tensor's tokens dim equals tpb_g, not tpb.
@@ -903,6 +911,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         )
 
         self.tp_group_transfer_groups: list = []
+        # Keep imported CUDA-IPC tensors alive for the worker's lifetime:
+        # TPTransferThreadGroup below stores only their raw data_ptr()s, so if
+        # the tensors were dropped PyTorch would release the IPC mapping and the
+        # pointers would dangle (mirrors GPUCPUTransferWorker._init_multi_group
+        # and LayerwiseWorker._init_multi_group).
+        self._multi_group_gpu_blocks_keepalive: list = []
         cpu_offset_bytes = 0
 
         for gi, g in enumerate(layer_groups):
@@ -917,6 +931,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             imported_group_blocks = []
             for handles_in_one_gpu in group_gpu_blocks_per_gpu:
                 imported_group_blocks.append(import_tensor_handles(handles_in_one_gpu))
+            self._multi_group_gpu_blocks_keepalive.append(imported_group_blocks)
 
             # Build flat pointer list for this group
             gpu_block_ptrs_flat = [
@@ -1634,6 +1649,10 @@ class GDSTransferWorker(TransferWorkerBase):
         self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride()
 
         self.group_gds_params: list = []
+        # Keep imported CUDA-IPC tensors alive: _get_layer_ptrs() records only
+        # raw data_ptr()s below, so dropping the tensors would free the IPC
+        # mapping and dangle the stored pointers.
+        self._multi_group_gpu_blocks_keepalive: list = []
         ssd_offset_bytes = 0
 
         for gi, g in enumerate(layer_groups):
@@ -1669,6 +1688,7 @@ class GDSTransferWorker(TransferWorkerBase):
             # GPU pointers for this group
             if gpu_blocks_per_group is not None:
                 group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+                self._multi_group_gpu_blocks_keepalive.append(group_gpu_blocks)
                 group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
             else:
                 group_gpu_ptrs = self.gpu_layer_ptrs
@@ -1956,6 +1976,10 @@ class tpGDSTransferWorker(TransferWorkerBase):
         self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride()
 
         self.group_tp_gds_params: list = []
+        # Keep imported CUDA-IPC tensors alive: only data_ptr()s are recorded
+        # below, so dropping the tensors would free the IPC mapping and dangle
+        # the stored pointers.
+        self._multi_group_gpu_blocks_keepalive: list = []
         ssd_offset_bytes = 0
 
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
@@ -1985,6 +2009,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
                     grp_layout = gpu_layouts_per_group[gi][gpu_idx]
                     grp_handles = gpu_blocks_per_group[gi][gpu_idx]
                     grp_tensors = [h.get_tensor() for h in grp_handles]
+                    self._multi_group_gpu_blocks_keepalive.append(grp_tensors)
 
                     gpu_strides = self._get_gpu_strides_from_tensor(
                         grp_tensors[0], tpb_g, dtype_size_g, self.is_mla,
