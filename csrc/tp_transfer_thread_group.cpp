@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "tp_transfer_thread_group.h"
+#include "logging.h"
 #include "transfer.cuh"
 #ifdef FLEXKV_ENABLE_NVCOMP
 #include "compression/ans/nvcomp_ans_tp.h"
@@ -196,8 +197,10 @@ void TPTransferThreadGroup::tp_group_transfer(
   std::string mode = mla_d2h_mode;
   if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
       && mode != "layer_parallel" && mode != "rank_rotate") {
-    fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'sharded'\n",
-            mode.c_str());
+    FLEXKV_LOG_WARNING(
+        "operation=transfer_config action=fallback status=degraded "
+        "field=mla_d2h_mode value=\"%s\" fallback=sharded",
+        mode.c_str());
     mode = "sharded";
   }
 

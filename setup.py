@@ -217,6 +217,13 @@ def get_version():
 build_dir = "build"
 os.makedirs(build_dir, exist_ok=True)
 
+spdlog_include_dir = os.path.abspath("third_party/spdlog/include")
+if not os.path.isdir(spdlog_include_dir):
+    raise RuntimeError(
+        "third_party/spdlog is missing; run "
+        "git submodule update --init third_party/spdlog"
+    )
+
 # Check if we're in debug mode using environment variable
 debug = os.environ.get("FLEXKV_DEBUG") == "1"
 if debug:
@@ -233,6 +240,7 @@ enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 # Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
     "csrc/bindings.cpp",
+    "csrc/logging.cpp",
     "csrc/transfer.cu",  # Skip CUDA file for now
     "csrc/ce_transfer.cu",
     "csrc/hash.cpp",
@@ -245,6 +253,7 @@ cpp_sources = [
 ]
 
 hpp_sources = [
+    "csrc/logging.h",
     "csrc/cache_utils.h",
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
@@ -284,6 +293,7 @@ if enable_metrics:
 include_dirs = [
     os.path.abspath(os.path.join(build_dir, "include")),
     os.path.abspath("csrc"),
+    spdlog_include_dir,
 ]
 
 # Add rpath to find libraries at runtime

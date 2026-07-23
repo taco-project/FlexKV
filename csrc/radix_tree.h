@@ -1,7 +1,6 @@
 #pragma once
 #include <errno.h>
 #include <execinfo.h>
-#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -13,6 +12,7 @@
 #include "cache_utils.h"
 #include "dist/lease_meta_mempool.h" // for flexkv::LeaseMeta
 #include "eviction_strategy.h"
+#include "logging.h"
 
 namespace flexkv {
 
@@ -381,7 +381,10 @@ public:
     if (swa_lru_tail != nullptr) { delete swa_lru_tail; swa_lru_tail = nullptr; }
 
     if (node_count) {
-      std::cerr << "CRadix Node count" << node_count << std::endl;
+      FLEXKV_LOG_WARNING(
+          "operation=radix_tree_shutdown action=complete status=degraded "
+          "remaining_nodes=%d",
+          node_count);
     }
   }
 

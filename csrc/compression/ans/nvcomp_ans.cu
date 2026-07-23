@@ -4,11 +4,11 @@
  */
 #include "compression/ans/nvcomp_ans.cuh"
 #include "compression/common/staging_transfer.cuh"
+#include "logging.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <algorithm>
-#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -18,8 +18,9 @@ namespace flexkv {
   do {                                                                     \
     nvcompStatus_t _s = (call);                                            \
     if (_s != nvcompSuccess) {                                             \
-      fprintf(stderr, "[nvcomp] error %d at %s:%d\n", (int)_s, __FILE__,   \
-              __LINE__);                                                   \
+      FLEXKV_LOG_ERROR(                                                    \
+          "operation=nvcomp action=complete status=failed error_code=%d", \
+          static_cast<int>(_s));                                           \
       throw std::runtime_error("nvcomp ANS error");                        \
     }                                                                      \
   } while (0)
@@ -28,8 +29,10 @@ namespace flexkv {
   do {                                                                     \
     cudaError_t _e = (call);                                               \
     if (_e != cudaSuccess) {                                               \
-      fprintf(stderr, "[nvcomp] CUDA error: %s at %s:%d\n",                \
-              cudaGetErrorString(_e), __FILE__, __LINE__);                 \
+      FLEXKV_LOG_ERROR(                                                    \
+          "operation=nvcomp_cuda action=complete status=failed "           \
+          "error=\"%s\"",                                                \
+          cudaGetErrorString(_e));                                         \
       throw std::runtime_error(cudaGetErrorString(_e));                    \
     }                                                                      \
   } while (0)

@@ -1,5 +1,6 @@
 #include "gds_manager.h"
 #include "layout_transform.cuh"
+#include "logging.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
@@ -653,9 +654,11 @@ void transfer_kv_blocks_gds(
     }
 
     if (verbose) {
-        std::cerr << "GDS: Allocated GPU buffer of " << total_buffer_size 
-                  << " bytes (" << num_slots << " slots x " 
-                  << ssd_block_stride_in_bytes << " bytes/slot)" << std::endl;
+        FLEXKV_LOG_DEBUG(
+            "operation=gds_buffer action=allocate status=success "
+            "buffer_bytes=%ld slots=%d slot_bytes=%ld",
+            static_cast<long>(total_buffer_size), num_slots,
+            static_cast<long>(ssd_block_stride_in_bytes));
     }
     
     // Create per-slot CUDA streams and mutexes
@@ -760,14 +763,6 @@ void transfer_kv_blocks_gds(
                     gds_manager.write(filename.c_str(), buffer_slot_ptr, gpu_buffer_size_in_bytes, ssd_block_offset);
                 }
                 
-                if (verbose) {
-                    std::cerr << "GDS: " << (is_read ? "Read" : "Write")
-                              << " SSD: " << ssd_block_id
-                              << " GPU: " << gpu_block_id
-                              << " Slot: " << slot_id
-                              << " Device: " << device_id
-                              << std::endl;
-                }
             }));
         }
     }
@@ -787,6 +782,14 @@ void transfer_kv_blocks_gds(
     }
     cudaFree(d_gpu_block_ids);
     cudaFree(buffer_ptr);
+
+    if (verbose) {
+        FLEXKV_LOG_DEBUG(
+            "operation=gds_transfer action=complete status=success "
+            "direction=%s blocks=%ld devices=%d worker_threads=%d",
+            is_read ? "SSD2D" : "D2SSD", static_cast<long>(num_transfers),
+            num_devices, num_worker_threads);
+    }
     
     gds_manager.synchronize();
 }

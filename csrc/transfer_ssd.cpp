@@ -1,6 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
-#include <cstdio>
+#include <cstring>
 #include <torch/extension.h>
 #include <unistd.h>
 #include <vector>
@@ -198,11 +198,16 @@ static void _transfer_single_thread_impl(
                                 ssd_k_block_offset);
       }
       
-      if (bytes_transfer == -1){
-        perror("pread failed");
-      }
-
       if (bytes_transfer != chunk_size_in_bytes) {
+        const int error = bytes_transfer < 0 ? errno : 0;
+        FLEXKV_LOG_ERROR(
+            "operation=ssd_transfer action=complete status=failed "
+            "direction=%s kv=K expected_bytes=%ld transferred_bytes=%ld "
+            "errno=%d error=\"%s\"",
+            is_read ? "SSD2H" : "H2SSD",
+            static_cast<long>(chunk_size_in_bytes),
+            static_cast<long>(bytes_transfer), error,
+            error == 0 ? "short_io" : std::strerror(error));
         throw std::runtime_error("Failed to transfer K block");
       }
 
@@ -218,6 +223,15 @@ static void _transfer_single_thread_impl(
                                 ssd_v_block_offset);
       }
       if (bytes_transfer != chunk_size_in_bytes) {
+        const int error = bytes_transfer < 0 ? errno : 0;
+        FLEXKV_LOG_ERROR(
+            "operation=ssd_transfer action=complete status=failed "
+            "direction=%s kv=V expected_bytes=%ld transferred_bytes=%ld "
+            "errno=%d error=\"%s\"",
+            is_read ? "SSD2H" : "H2SSD",
+            static_cast<long>(chunk_size_in_bytes),
+            static_cast<long>(bytes_transfer), error,
+            error == 0 ? "short_io" : std::strerror(error));
         throw std::runtime_error("Failed to transfer V block");
       }
 
