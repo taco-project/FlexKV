@@ -1,8 +1,9 @@
+import logging
 import time
 from typing import Dict, Optional, List, Union, Tuple
 import threading
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 import multiprocessing as mp
 import copy
@@ -72,6 +73,7 @@ class KVTask:
     # SWA GPU slot_mapping (SWA-pool token index space), bound LATE at launch —
     # the SWA counterpart to slot_mapping. None when the request has no SWA ops.
     swa_slot_mapping: Optional[np.ndarray] = None
+    created_ns: int = field(default_factory=time.perf_counter_ns)
 
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
@@ -207,6 +209,57 @@ class KVTaskManager:
             self.remote_process.close()
             self.remote_process = None
 
+    @staticmethod
+    def _operation_name(task_type: TaskType) -> str:
+        if task_type in (TaskType.GET, TaskType.BATCH_GET):
+            return "get"
+        if task_type in (TaskType.PUT, TaskType.BATCH_PUT):
+            return "put"
+        return "prefetch"
+
+    def _log_task_created(self, task: KVTask) -> None:
+        if not flexkv_logger.is_enabled_for(logging.DEBUG):
+            return
+        graph_id = task.graph.graph_id if task.graph is not None else -1
+        tokens = len(task.token_ids) if task.token_ids is not None else 0
+        flexkv_logger.debug(
+            "[FlexKV-IO] operation=%s action=create status=%s blocks=%d "
+            "flexkv_task_id=%d graph_id=%d tokens=%d graph_ops=%d",
+            self._operation_name(task.task_type),
+            task.status.value,
+            tokens // self.cache_config.tokens_per_block,
+            task.task_id,
+            graph_id,
+            tokens,
+            task.graph.num_ops if task.graph is not None else 0,
+        )
+
+    def _log_task_terminal(self, task: KVTask, status: TaskStatus) -> None:
+        graph_ops = task.graph.num_ops if task.graph is not None else 0
+        if status == TaskStatus.COMPLETED:
+            level = logging.INFO if graph_ops else logging.DEBUG
+        else:
+            level = logging.WARNING
+        if not flexkv_logger.is_enabled_for(level):
+            return
+        graph_id = task.graph.graph_id if task.graph is not None else -1
+        duration_s = (time.perf_counter_ns() - task.created_ns) / 1e9
+        if level == logging.INFO:
+            log = flexkv_logger.info
+        elif level == logging.DEBUG:
+            log = flexkv_logger.debug
+        else:
+            log = flexkv_logger.warning
+        log(
+            "[FlexKV-IO] operation=%s action=complete status=%s "
+            "flexkv_task_id=%d graph_id=%d task_time=%.4fs",
+            self._operation_name(task.task_type),
+            convert_to_response_status(status).value,
+            task.task_id,
+            graph_id,
+            duration_s,
+        )
+
     def create_get_task(self,
                         task_id: int,
                         token_ids: np.ndarray,
@@ -244,6 +297,7 @@ class KVTaskManager:
             op_callback_dict=op_callback_dict)
 
         self.graph_to_task[graph.graph_id] = task_id
+        self._log_task_created(self.tasks[task_id])
 
     def create_put_task(self,
                         task_id: int,
@@ -277,6 +331,7 @@ class KVTaskManager:
             callback=callback,
             op_callback_dict=op_callback_dict)
         self.graph_to_task[graph.graph_id] = task_id
+        self._log_task_created(self.tasks[task_id])
 
     def create_prefetch_task(self,
                             task_id: int,
@@ -316,6 +371,7 @@ class KVTaskManager:
         self.prefetch_tasks[self._gen_prefetch_key(token_ids, namespace)] = task_id
 
         self.graph_to_task[graph.graph_id] = task_id
+        self._log_task_created(self.tasks[task_id])
 
     def _launch_task(self, task_id: int) -> None:
         transfer_graph = self.check_task_ready(task_id)
@@ -378,6 +434,7 @@ class KVTaskManager:
         task = self.tasks[task_id]
         if not task.is_completed():
             task.status = TaskStatus.CANCELLED
+            self._log_task_terminal(task, TaskStatus.CANCELLED)
         self._release_task(task_id)
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
@@ -436,6 +493,14 @@ class KVTaskManager:
         if task.status != TaskStatus.READY:
             raise ValueError(f"Task {task_id} status is {task.status}, cannot launch")
         task.status = TaskStatus.RUNNING
+        if flexkv_logger.is_enabled_for(logging.DEBUG):
+            flexkv_logger.debug(
+                "[FlexKV-IO] operation=%s action=launch status=running "
+                "flexkv_task_id=%d graph_id=%d",
+                self._operation_name(task.task_type),
+                task.task_id,
+                task.graph.graph_id,
+            )
         return task.graph
 
     def _release_task(self, task_id: int) -> None:
@@ -460,6 +525,7 @@ class KVTaskManager:
                 task.callback()
         task.status = TaskStatus.COMPLETED
         task.task_end_op_finished = True
+        self._log_task_terminal(task, TaskStatus.COMPLETED)
         self.graph_to_task.pop(task.graph.graph_id, None)
         task.shed_heavy_resources()
 
@@ -855,6 +921,20 @@ class KVTaskEngine(KVTaskManager):
             op_callback_dict=op_callback_dict,
         )
         self.graph_to_task[batch_task_graph.graph_id] = batch_id
+        if flexkv_logger.is_enabled_for(logging.INFO):
+            operation = self._operation_name(batch_task_type)
+            flexkv_logger.info(
+                "[FlexKV-IO] operation=%s action=merge status=ready direction=%s "
+                "child_task_ids=%s flexkv_batch_task_id=%d graph_id=%d "
+                "transfer_mode=%s graph_ops=%d",
+                operation,
+                "H2D" if operation == "get" else "D2H",
+                ",".join(str(task_id) for task_id in task_ids),
+                batch_id,
+                batch_task_graph.graph_id,
+                "layerwise" if layerwise_transfer else "no-layerwise",
+                batch_task_graph.num_ops,
+            )
         for task_id in task_ids:
             child_task = self.tasks[task_id]
             if child_task.graph is not None:

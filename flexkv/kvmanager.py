@@ -26,7 +26,7 @@ from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
 from flexkv.integration.dynamo.collector import KVEventCollector
-from flexkv.common.debug import flexkv_logger
+from flexkv.common.debug import eviction_log_aggregator, flexkv_logger
 from flexkv.cache.redis_meta import RedisMeta
 
 
@@ -38,8 +38,14 @@ class KVManager:
                  server_recv_port: str = "",
                  gpu_register_port: str = "",
                  event_collector: Optional[KVEventCollector] = None):
-        flexkv_logger.info(f"{model_config = }")
-        flexkv_logger.info(f"{cache_config = }")
+        # Use the curated ``__str__`` summaries. Dataclass repr includes
+        # credential-bearing fields such as ``redis_password``.
+        flexkv_logger.info(
+            "[FlexKV-CONFIG] operation=config action=load status=success "
+            "component=kv_manager model_config=%s cache_config=%s",
+            model_config,
+            cache_config,
+        )
         self.model_config = model_config
         self.cache_config = cache_config
 
@@ -129,6 +135,7 @@ class KVManager:
             return self.kv_task_engine.is_ready()
 
     def shutdown(self) -> None:
+        eviction_log_aggregator.flush()
         if self.server_client_mode:
             self.dp_client.shutdown()
             # Wait for the server process to exit after sending shutdown request

@@ -11,6 +11,7 @@ from flexkv.cache.radix_remote import LocalRadixTree, DistributedRadixTree
 from flexkv.cache.redis_meta import RedisMetaChannel as _PyRedisMetaChannel
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.block import SequenceMeta
+from flexkv.common.debug import eviction_log_aggregator
 #if TYPE_CHECKING:
 from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import DeviceType
@@ -455,6 +456,8 @@ class HierarchyLRCacheEngine:
             )
 
             if evict_block_num > 0:
+                free_before = self.mempool.num_free_blocks
+                start_ns = time.perf_counter_ns()
                 target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
                 # evict() resizes target_blocks in-place to the actual freed count
                 # (may EXCEED evict_block_num when the I2 tombstone cascade frees
@@ -464,6 +467,25 @@ class HierarchyLRCacheEngine:
                     target_blocks.resize_(num_evicted)
                 evicted_np = target_blocks.numpy()
                 self.mempool.recycle_blocks(evicted_np)
+                free_after = self.mempool.num_free_blocks
+                eviction_log_aggregator.record(
+                    tier=self.device_type.name.lower(),
+                    scope="full",
+                    reason=(
+                        "capacity"
+                        if num_required_blocks > free_before
+                        else "threshold"
+                    ),
+                    requested_blocks=num_required_blocks,
+                    required_blocks=evict_block_num,
+                    evicted_blocks=num_evicted,
+                    free_blocks_before=free_before,
+                    free_blocks_after=free_after,
+                    total_blocks=self.mempool.num_total_blocks,
+                    duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
+                    target_met=free_after
+                    >= max(num_required_blocks, target_free_blocks),
+                )
 
             if protected_node is not None:
                 self.local_index.unlock(protected_node)

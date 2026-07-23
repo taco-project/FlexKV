@@ -2,10 +2,13 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import inspect
+from collections import defaultdict
+from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -51,6 +54,9 @@ class FlexkvLogger:
         self.logger.setLevel(log_level)
         self.enabled = log_level != (logging.CRITICAL + 1)
 
+    def is_enabled_for(self, level: int) -> bool:
+        return self.enabled and self.logger.isEnabledFor(level)
+
     def _get_caller_info(self, skip: int = 2):
         frame = inspect.currentframe()
         try:
@@ -86,26 +92,184 @@ class FlexkvLogger:
         self.logger.handle(record)
 
     def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
-        if self.enabled and self.logger.isEnabledFor(logging.DEBUG):
+        if self.is_enabled_for(logging.DEBUG):
             self._log(logging.DEBUG, msg, args, kwargs)
 
     def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
-        if self.enabled and self.logger.isEnabledFor(logging.INFO):
+        if self.is_enabled_for(logging.INFO):
             self._log(logging.INFO, msg, args, kwargs)
 
     def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
-        if self.enabled and self.logger.isEnabledFor(logging.WARNING):
+        if self.is_enabled_for(logging.WARNING):
             self._log(logging.WARNING, msg, args, kwargs)
 
     def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
-        if self.enabled and self.logger.isEnabledFor(logging.ERROR):
+        if self.is_enabled_for(logging.ERROR):
             self._log(logging.ERROR, msg, args, kwargs)
 
     def critical(self, msg: str, *args: Any, **kwargs: Any) -> None:
-        if self.enabled and self.logger.isEnabledFor(logging.CRITICAL):
+        if self.is_enabled_for(logging.CRITICAL):
             self._log(logging.CRITICAL, msg, args, kwargs)
 
 flexkv_logger = FlexkvLogger(os.getenv("FLEXKV_LOG_LEVEL", "INFO"))
+
+
+@dataclass
+class _EvictionWindow:
+    batches: int = 0
+    requested_blocks: int = 0
+    required_blocks: int = 0
+    evicted_blocks: int = 0
+    duration_ms: float = 0.0
+    target_miss_batches: int = 0
+    free_blocks_min: Optional[int] = None
+    free_blocks_last: int = 0
+    total_blocks: int = 0
+
+
+class EvictionLogAggregator:
+    """Rate-limit eviction INFO logs while preserving per-batch diagnostics.
+
+    Metrics remain the source of truth for every eviction. Each batch is
+    available at DEBUG, failures to make enough space are emitted immediately
+    at WARNING, and routine activity is summarized at INFO once per window.
+    """
+
+    def __init__(
+        self,
+        interval_s: Optional[float] = None,
+        logger: FlexkvLogger = flexkv_logger,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if interval_s is None:
+            try:
+                interval_s = float(
+                    os.getenv("FLEXKV_EVICTION_LOG_INTERVAL_S", "10")
+                )
+            except ValueError:
+                interval_s = 10.0
+        self.interval_s = max(0.1, float(interval_s))
+        self.logger = logger
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._window_started = self.clock()
+        self._windows: Dict[Tuple[str, str, str], _EvictionWindow] = defaultdict(
+            _EvictionWindow
+        )
+
+    def record(
+        self,
+        *,
+        tier: str,
+        scope: str,
+        reason: str,
+        requested_blocks: int,
+        required_blocks: int,
+        evicted_blocks: int,
+        free_blocks_before: int,
+        free_blocks_after: int,
+        total_blocks: int,
+        duration_ms: float,
+        sample_block_hashes: Optional[List[str]] = None,
+        target_met: bool,
+    ) -> None:
+        batch_level = logging.DEBUG if target_met else logging.WARNING
+        if self.logger.is_enabled_for(batch_level):
+            fields = (
+                "[FlexKV-EVICTION] operation=eviction action=batch status=%s "
+                "tier=%s scope=%s reason=%s requested_blocks=%d "
+                "required_blocks=%d evicted_blocks=%d free_blocks_before=%d "
+                "free_blocks_after=%d pool_total_blocks=%d target_met=%s "
+                "sample_block_hashes=%s eviction_time=%.4fs"
+            )
+            args = (
+                "success" if target_met else "target_miss",
+                tier,
+                scope,
+                reason,
+                requested_blocks,
+                required_blocks,
+                evicted_blocks,
+                free_blocks_before,
+                free_blocks_after,
+                total_blocks,
+                str(target_met).lower(),
+                ",".join((sample_block_hashes or [])[:3]) or "-",
+                duration_ms / 1000,
+            )
+            log = self.logger.debug if target_met else self.logger.warning
+            log(fields, *args)
+
+        if not self.logger.is_enabled_for(logging.INFO):
+            return
+
+        summaries = []
+        now = self.clock()
+        with self._lock:
+            window = self._windows[(tier, scope, reason)]
+            window.batches += 1
+            window.requested_blocks += requested_blocks
+            window.required_blocks += required_blocks
+            window.evicted_blocks += evicted_blocks
+            window.duration_ms += duration_ms
+            window.target_miss_batches += int(not target_met)
+            window.free_blocks_min = (
+                free_blocks_after
+                if window.free_blocks_min is None
+                else min(window.free_blocks_min, free_blocks_after)
+            )
+            window.free_blocks_last = free_blocks_after
+            window.total_blocks = total_blocks
+            if now - self._window_started >= self.interval_s:
+                summaries = list(self._windows.items())
+                elapsed = now - self._window_started
+                self._windows.clear()
+                self._window_started = now
+            else:
+                elapsed = 0.0
+        self._emit_summaries(summaries, elapsed)
+
+    def flush(self) -> None:
+        """Emit the current partial window, primarily for shutdown and tests."""
+        now = self.clock()
+        with self._lock:
+            summaries = list(self._windows.items())
+            elapsed = max(0.0, now - self._window_started)
+            self._windows.clear()
+            self._window_started = now
+        self._emit_summaries(summaries, elapsed)
+
+    def _emit_summaries(
+        self,
+        summaries: List[Tuple[Tuple[str, str, str], _EvictionWindow]],
+        elapsed: float,
+    ) -> None:
+        for (tier, scope, reason), window in summaries:
+            self.logger.info(
+                "[FlexKV-EVICTION] operation=eviction action=summary status=%s "
+                "tier=%s scope=%s reason=%s window=%.3fs "
+                "batches=%d requested_blocks=%d required_blocks=%d "
+                "evicted_blocks=%d target_miss_batches=%d "
+                "free_blocks_min=%d free_blocks_last=%d "
+                "pool_total_blocks=%d eviction_time=%.4fs",
+                "success" if window.target_miss_batches == 0 else "degraded",
+                tier,
+                scope,
+                reason,
+                elapsed,
+                window.batches,
+                window.requested_blocks,
+                window.required_blocks,
+                window.evicted_blocks,
+                window.target_miss_batches,
+                window.free_blocks_min or 0,
+                window.free_blocks_last,
+                window.total_blocks,
+                window.duration_ms / 1000,
+            )
+
+
+eviction_log_aggregator = EvictionLogAggregator()
 
 
 def format_process_exit(exitcode: Optional[int]) -> str:
