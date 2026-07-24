@@ -543,15 +543,15 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     layer_eventfds_.assign(fds_ptr, fds_ptr + total_fds);
 
     FLEXKV_LOG_INFO(
-        "operation=layerwise_init action=complete status=success "
-        "transfer_mode=layerwise eventfd=true tp_size=%d counters=%d "
+        "operation=layerwise_init act=complete status=success "
+        "mode=layerwise eventfd=true tp_size=%d counters=%d "
         "layers=%d total_fds=%d",
         tp_size_, num_counters_, num_layers_, total_fds);
   } else {
     num_counters_ = 0;
     FLEXKV_LOG_INFO(
-        "operation=layerwise_init action=complete status=success "
-        "transfer_mode=layerwise eventfd=false tp_size=%d layers=%d",
+        "operation=layerwise_init act=complete status=success "
+        "mode=layerwise eventfd=false tp_size=%d layers=%d",
         tp_size_, num_layers_);
   }
 
@@ -1117,7 +1117,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
   if (is_mla && mla_mode != "sharded" && mla_mode != "all_write" &&
       mla_mode != "rank0_only") {
     FLEXKV_LOG_WARNING(
-        "operation=layerwise_config action=fallback status=degraded "
+        "operation=layerwise_config act=fallback status=degraded "
         "field=mla_d2h_mode value=\"%s\" fallback=sharded",
         mla_mode.c_str());
     mla_mode = "sharded";
@@ -1272,10 +1272,9 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const double total_bandwidth_gbps =
         total_time_s > 0.0 ? total_size_gb / total_time_s : 0.0;
     FLEXKV_LOG_DEBUG(
-        "operation=layerwise_transfer action=complete status=success "
-        "direction=H2D blocks=%d transfer_mode=layerwise "
-        "transfer_data_size=%.6fGB transfer_time=%.4fs "
-        "transfer_bandwidth=%.2fGB/s",
+        "operation=layerwise_transfer act=complete status=success "
+        "direction=H2D blocks=%d mode=layerwise "
+        "data_size=%.6fGB transfer_time=%.4fs bandwidth=%.2fGB/s",
         num_blocks, total_size_gb, total_time_s, total_bandwidth_gbps);
 
     cudaSetDevice(gpu_device_ids_[0]);
@@ -1327,7 +1326,7 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   if (is_mla && mode != "sharded" && mode != "all_write" &&
       mode != "rank0_only") {
     FLEXKV_LOG_WARNING(
-        "operation=layerwise_config action=fallback status=degraded "
+        "operation=layerwise_config act=fallback status=degraded "
         "field=mla_d2h_mode value=\"%s\" fallback=sharded",
         mode.c_str());
     mode = "sharded";

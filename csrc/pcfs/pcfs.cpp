@@ -16,7 +16,7 @@ bool flexkv::Pcfs::init() {
   fsctx = hifs_init(fsid.c_str(), port, ip.c_str(), false, nullptr);
   if (!fsctx) {
     FLEXKV_LOG_ERROR(
-        "operation=pcfs_init action=complete status=failed fsid=\"%s\" "
+        "operation=pcfs_init act=complete status=failed fsid=\"%s\" "
         "ip=\"%s\" port=%u",
         fsid.c_str(), ip.c_str(), port);
     return false;
@@ -60,7 +60,7 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
     snprintf(crreq.name, sizeof(crreq.name), "%s", filename.c_str());
     if (hifs_create(fsctx, &crreq, &crreply) != 0 || crreply.error != 0) {
       FLEXKV_LOG_ERROR(
-          "operation=pcfs_file_create action=complete status=failed "
+          "operation=pcfs_file_create act=complete status=failed "
           "parent_node_id=%lu path=\"%s\" error_code=%d",
           parent_nodeid, crreq.name, crreply.error);
       return 0;
@@ -77,7 +77,7 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
     if (hifs_open(fsctx, &open_req, &open_reply) != 0 ||
         open_reply.error != 0) {
       FLEXKV_LOG_ERROR(
-          "operation=pcfs_file_open action=complete status=failed "
+          "operation=pcfs_file_open act=complete status=failed "
           "parent_node_id=%lu path=\"%s\" error_code=%d",
           parent_nodeid, filename.c_str(), open_reply.error);
       return 0;
@@ -92,7 +92,7 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
     if (hifs_truncate(fsctx, &truncate_req, &truncate_reply) != 0 ||
         truncate_reply.error != 0) {
       FLEXKV_LOG_ERROR(
-          "operation=pcfs_file_truncate action=complete status=failed "
+          "operation=pcfs_file_truncate act=complete status=failed "
           "parent_node_id=%lu path=\"%s\" size=%lu error_code=%d",
           parent_nodeid, filename.c_str(), file_size, truncate_reply.error);
       return 0;
@@ -103,7 +103,7 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
     uint64_t exist_file_size = lkreply.attr.size;
     if (exist_file_size < file_size) {
       FLEXKV_LOG_ERROR(
-          "operation=pcfs_file_validate action=complete status=failed "
+          "operation=pcfs_file_validate act=complete status=failed "
           "parent_node_id=%lu path=\"%s\" existing_size=%lu required_size=%lu",
           parent_nodeid, filename.c_str(), exist_file_size, file_size);
       return 0;
@@ -119,7 +119,7 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
     if (hifs_open(fsctx, &open_req, &open_reply) != 0 ||
         open_reply.error != 0) {
       FLEXKV_LOG_ERROR(
-          "operation=pcfs_file_open action=complete status=failed "
+          "operation=pcfs_file_open act=complete status=failed "
           "parent_node_id=%lu path=\"%s\" error_code=%d",
           parent_nodeid, filename.c_str(), open_reply.error);
       return 0;

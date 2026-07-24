@@ -176,7 +176,7 @@ class EvictionLogAggregator:
         batch_level = logging.DEBUG if target_met else logging.WARNING
         if self.logger.is_enabled_for(batch_level):
             fields = (
-                "[FlexKV-EVICTION] operation=eviction action=batch status=%s "
+                "[FlexKV-EVICTION] operation=eviction act=batch status=%s "
                 "tier=%s scope=%s reason=%s requested_blocks=%d "
                 "required_blocks=%d evicted_blocks=%d free_blocks_before=%d "
                 "free_blocks_after=%d pool_total_blocks=%d target_met=%s "
@@ -246,7 +246,7 @@ class EvictionLogAggregator:
     ) -> None:
         for (tier, scope, reason), window in summaries:
             self.logger.info(
-                "[FlexKV-EVICTION] operation=eviction action=summary status=%s "
+                "[FlexKV-EVICTION] operation=eviction act=summary status=%s "
                 "tier=%s scope=%s reason=%s window=%.3fs "
                 "batches=%d requested_blocks=%d required_blocks=%d "
                 "evicted_blocks=%d target_miss_batches=%d "

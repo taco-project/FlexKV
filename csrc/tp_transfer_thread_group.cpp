@@ -198,7 +198,7 @@ void TPTransferThreadGroup::tp_group_transfer(
   if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
       && mode != "layer_parallel" && mode != "rank_rotate") {
     FLEXKV_LOG_WARNING(
-        "operation=transfer_config action=fallback status=degraded "
+        "operation=transfer_config act=fallback status=degraded "
         "field=mla_d2h_mode value=\"%s\" fallback=sharded",
         mode.c_str());
     mode = "sharded";

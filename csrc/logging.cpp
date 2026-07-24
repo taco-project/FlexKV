@@ -160,9 +160,9 @@ void Logf(Level level, const char *file, int line, const char *format,
       EmergencyWrite(buffer);
     }
   } catch (const std::exception &error) {
-    EmergencyWrite("operation=logging action=emit status=failed", error.what());
+    EmergencyWrite("operation=logging act=emit status=failed", error.what());
   } catch (...) {
-    EmergencyWrite("operation=logging action=emit status=failed error=unknown");
+    EmergencyWrite("operation=logging act=emit status=failed error=unknown");
   }
 }
 

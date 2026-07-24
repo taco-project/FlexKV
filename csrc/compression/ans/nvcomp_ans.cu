@@ -19,7 +19,7 @@ namespace flexkv {
     nvcompStatus_t _s = (call);                                            \
     if (_s != nvcompSuccess) {                                             \
       FLEXKV_LOG_ERROR(                                                    \
-          "operation=nvcomp action=complete status=failed error_code=%d", \
+          "operation=nvcomp act=complete status=failed error_code=%d",    \
           static_cast<int>(_s));                                           \
       throw std::runtime_error("nvcomp ANS error");                        \
     }                                                                      \
@@ -30,7 +30,7 @@ namespace flexkv {
     cudaError_t _e = (call);                                               \
     if (_e != cudaSuccess) {                                               \
       FLEXKV_LOG_ERROR(                                                    \
-          "operation=nvcomp_cuda action=complete status=failed "           \
+          "operation=nvcomp_cuda act=complete status=failed "              \
           "error=\"%s\"",                                                \
           cudaGetErrorString(_e));                                         \
       throw std::runtime_error(cudaGetErrorString(_e));                    \

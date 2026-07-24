@@ -30,7 +30,7 @@ void MetricsManager::Configure(bool enabled, int port) {
     // Protect against duplicate configuration
     if (configured_) {
         FLEXKV_LOG_DEBUG(
-            "operation=metrics_config action=configure status=skipped "
+            "operation=metrics_config act=configure status=skipped "
             "reason=already_configured");
         return;
     }
@@ -40,12 +40,12 @@ void MetricsManager::Configure(bool enabled, int port) {
     
     if (enabled_) {
         FLEXKV_LOG_INFO(
-            "operation=metrics_config action=configure status=success "
+            "operation=metrics_config act=configure status=success "
             "enabled=true port=%d",
             port_);
     } else {
         FLEXKV_LOG_DEBUG(
-            "operation=metrics_config action=configure status=success "
+            "operation=metrics_config act=configure status=success "
             "enabled=false");
     }
 }
@@ -86,7 +86,7 @@ bool MetricsManager::Initialize(const std::string& bind_address) {
 
     if (!enabled_) {
         FLEXKV_LOG_DEBUG(
-            "operation=metrics_init action=complete status=skipped "
+            "operation=metrics_init act=complete status=skipped "
             "reason=disabled");
         return false;
     }
@@ -113,14 +113,14 @@ bool MetricsManager::Initialize(const std::string& bind_address) {
 
         running_.store(true);
         FLEXKV_LOG_INFO(
-            "operation=metrics_init action=complete status=success "
+            "operation=metrics_init act=complete status=success "
             "endpoint=\"http://%s/metrics\"",
             bind_address.c_str());
         return true;
 
     } catch (const std::exception& e) {
         FLEXKV_LOG_ERROR(
-            "operation=metrics_init action=complete status=failed error=\"%s\"",
+            "operation=metrics_init act=complete status=failed error=\"%s\"",
             e.what());
         registry_.reset();
         exposer_.reset();
@@ -147,7 +147,7 @@ void MetricsManager::Shutdown() {
     registry_.reset();
 
     FLEXKV_LOG_DEBUG(
-        "operation=metrics_shutdown action=complete status=success");
+        "operation=metrics_shutdown act=complete status=success");
 #endif
 }
 

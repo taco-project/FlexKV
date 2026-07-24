@@ -382,7 +382,7 @@ public:
 
     if (node_count) {
       FLEXKV_LOG_WARNING(
-          "operation=radix_tree_shutdown action=complete status=degraded "
+          "operation=radix_tree_shutdown act=complete status=degraded "
           "remaining_nodes=%d",
           node_count);
     }

@@ -53,7 +53,7 @@ def test_eviction_logging_keeps_batches_at_debug_and_aggregates_info():
     levels = [level for level, _ in logger.records]
     assert levels == ["debug", "debug", "info"]
     summary = logger.records[-1][1]
-    assert "operation=eviction action=summary status=success" in summary
+    assert "operation=eviction act=summary status=success" in summary
     assert "schema_version" not in summary
     assert "batches=2" in summary
     assert "evicted_blocks=6" in summary
@@ -70,6 +70,6 @@ def test_eviction_target_miss_warns_immediately():
 
     assert [level for level, _ in logger.records] == ["warning"]
     warning = logger.records[-1][1]
-    assert "operation=eviction action=batch status=target_miss" in warning
+    assert "operation=eviction act=batch status=target_miss" in warning
     assert "target_met=false" in warning
     assert "eviction_time=0.0013s" in warning

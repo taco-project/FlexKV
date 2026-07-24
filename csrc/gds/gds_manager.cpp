@@ -655,7 +655,7 @@ void transfer_kv_blocks_gds(
 
     if (verbose) {
         FLEXKV_LOG_DEBUG(
-            "operation=gds_buffer action=allocate status=success "
+            "operation=gds_buffer act=allocate status=success "
             "buffer_bytes=%ld slots=%d slot_bytes=%ld",
             static_cast<long>(total_buffer_size), num_slots,
             static_cast<long>(ssd_block_stride_in_bytes));
@@ -785,7 +785,7 @@ void transfer_kv_blocks_gds(
 
     if (verbose) {
         FLEXKV_LOG_DEBUG(
-            "operation=gds_transfer action=complete status=success "
+            "operation=gds_transfer act=complete status=success "
             "direction=%s blocks=%ld devices=%d worker_threads=%d",
             is_read ? "SSD2D" : "D2SSD", static_cast<long>(num_transfers),
             num_devices, num_worker_threads);

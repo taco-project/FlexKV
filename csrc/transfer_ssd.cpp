@@ -201,7 +201,7 @@ static void _transfer_single_thread_impl(
       if (bytes_transfer != chunk_size_in_bytes) {
         const int error = bytes_transfer < 0 ? errno : 0;
         FLEXKV_LOG_ERROR(
-            "operation=ssd_transfer action=complete status=failed "
+            "operation=ssd_transfer act=complete status=failed "
             "direction=%s kv=K expected_bytes=%ld transferred_bytes=%ld "
             "errno=%d error=\"%s\"",
             is_read ? "SSD2H" : "H2SSD",
@@ -225,7 +225,7 @@ static void _transfer_single_thread_impl(
       if (bytes_transfer != chunk_size_in_bytes) {
         const int error = bytes_transfer < 0 ? errno : 0;
         FLEXKV_LOG_ERROR(
-            "operation=ssd_transfer action=complete status=failed "
+            "operation=ssd_transfer act=complete status=failed "
             "direction=%s kv=V expected_bytes=%ld transferred_bytes=%ld "
             "errno=%d error=\"%s\"",
             is_read ? "SSD2H" : "H2SSD",

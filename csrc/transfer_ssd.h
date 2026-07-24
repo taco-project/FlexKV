@@ -37,7 +37,7 @@ public:
         entries = _entries;
       } else {
         FLEXKV_LOG_ERROR(
-            "operation=io_uring_init action=complete status=failed "
+            "operation=io_uring_init act=complete status=failed "
             "entries=%d flags=%d errno=%d",
             _entries, flags, errno);
       }
@@ -54,7 +54,7 @@ public:
     write_ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4);
 
     FLEXKV_LOG_DEBUG(
-        "operation=io_uring_priority action=configure status=success "
+        "operation=io_uring_priority act=configure status=success "
         "rt_ioprio=%s",
         rt_supported ? "supported" : "unsupported fallback=best_effort");
   }
@@ -163,14 +163,14 @@ public:
           total_cqe_err || total_over_limit ? "degraded" : "success";
       if (total_cqe_err || total_over_limit) {
         FLEXKV_LOG_WARNING(
-            "operation=io_uring action=summary status=%s entries=%d "
+            "operation=io_uring act=summary status=%s entries=%d "
             "inflight=%d prepared=%d submitted=%lu completed=%lu "
             "over_limit=%lu cqe_errors=%lu",
             status, entries, inflight, prepared, total_submitted,
             total_completed, total_over_limit, total_cqe_err);
       } else {
         FLEXKV_LOG_DEBUG(
-            "operation=io_uring action=summary status=%s entries=%d "
+            "operation=io_uring act=summary status=%s entries=%d "
             "inflight=%d prepared=%d submitted=%lu completed=%lu "
             "over_limit=%lu cqe_errors=%lu",
             status, entries, inflight, prepared, total_submitted,
@@ -238,7 +238,7 @@ public:
 
         if (fd_buffer_io < 0 || fd_direct_io < 0) {
           FLEXKV_LOG_ERROR(
-              "operation=ssd_file_open action=complete status=failed "
+              "operation=ssd_file_open act=complete status=failed "
               "path=\"%s\" buffered_fd=%d direct_fd=%d errno=%d",
               ssd_files[i][j].c_str(), fd_buffer_io, fd_direct_io, errno);
           throw std::runtime_error("Failed to open file");

@@ -299,11 +299,11 @@ class TransferWorkerBase(ABC):
             and uncompressed_size != transfer_size
         ):
             flexkv_logger.info(
-                "[FlexKV-IO] operation=transfer action=complete status=success "
-                "direction=%s blocks=%d op_id=%d graph_id=%d transfer_mode=%s "
+                "[FlexKV-IO] operation=transfer act=complete status=success "
+                "direction=%s blocks=%d op_id=%d graph_id=%d mode=%s "
                 "compressed_size=%.6gGB original_size=%.6gGB "
                 "compression_ratio=%.2fx transfer_time=%.4fs "
-                "transfer_bandwidth=%.2fGB/s",
+                "bandwidth=%.2fGB/s",
                 direction,
                 blocks,
                 transfer_op.transfer_op_id,
@@ -317,10 +317,9 @@ class TransferWorkerBase(ABC):
             )
         else:
             flexkv_logger.info(
-                "[FlexKV-IO] operation=transfer action=complete status=success "
-                "direction=%s blocks=%d op_id=%d graph_id=%d transfer_mode=%s "
-                "transfer_data_size=%.6gGB transfer_time=%.4fs "
-                "transfer_bandwidth=%.2fGB/s",
+                "[FlexKV-IO] operation=transfer act=complete status=success "
+                "direction=%s blocks=%d op_id=%d graph_id=%d mode=%s "
+                "data_size=%.6gGB transfer_time=%.4fs bandwidth=%.2fGB/s",
                 direction,
                 blocks,
                 transfer_op.transfer_op_id,
@@ -376,9 +375,9 @@ class TransferWorkerBase(ABC):
                                 else op.valid_block_num
                             )
                             flexkv_logger.error(
-                                "[FlexKV-IO] operation=transfer action=complete "
+                                "[FlexKV-IO] operation=transfer act=complete "
                                 "status=failed direction=%s blocks=%d op_id=%d "
-                                "graph_id=%d transfer_mode=%s transfer_time=%.4fs "
+                                "graph_id=%d mode=%s transfer_time=%.4fs "
                                 "error=%r",
                                 direction,
                                 blocks,

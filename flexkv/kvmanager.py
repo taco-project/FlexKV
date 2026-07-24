@@ -41,7 +41,7 @@ class KVManager:
         # Use the curated ``__str__`` summaries. Dataclass repr includes
         # credential-bearing fields such as ``redis_password``.
         flexkv_logger.info(
-            "[FlexKV-CONFIG] operation=config action=load status=success "
+            "[FlexKV-CONFIG] operation=config act=load status=success "
             "component=kv_manager model_config=%s cache_config=%s",
             model_config,
             cache_config,

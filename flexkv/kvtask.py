@@ -223,7 +223,7 @@ class KVTaskManager:
         graph_id = task.graph.graph_id if task.graph is not None else -1
         tokens = len(task.token_ids) if task.token_ids is not None else 0
         flexkv_logger.debug(
-            "[FlexKV-IO] operation=%s action=create status=%s blocks=%d "
+            "[FlexKV-IO] operation=%s act=create status=%s blocks=%d "
             "flexkv_task_id=%d graph_id=%d tokens=%d graph_ops=%d",
             self._operation_name(task.task_type),
             task.status.value,
@@ -251,7 +251,7 @@ class KVTaskManager:
         else:
             log = flexkv_logger.warning
         log(
-            "[FlexKV-IO] operation=%s action=complete status=%s "
+            "[FlexKV-IO] operation=%s act=complete status=%s "
             "flexkv_task_id=%d graph_id=%d task_time=%.4fs",
             self._operation_name(task.task_type),
             convert_to_response_status(status).value,
@@ -495,7 +495,7 @@ class KVTaskManager:
         task.status = TaskStatus.RUNNING
         if flexkv_logger.is_enabled_for(logging.DEBUG):
             flexkv_logger.debug(
-                "[FlexKV-IO] operation=%s action=launch status=running "
+                "[FlexKV-IO] operation=%s act=launch status=running "
                 "flexkv_task_id=%d graph_id=%d",
                 self._operation_name(task.task_type),
                 task.task_id,
@@ -924,9 +924,9 @@ class KVTaskEngine(KVTaskManager):
         if flexkv_logger.is_enabled_for(logging.INFO):
             operation = self._operation_name(batch_task_type)
             flexkv_logger.info(
-                "[FlexKV-IO] operation=%s action=merge status=ready direction=%s "
+                "[FlexKV-IO] operation=%s act=merge status=ready direction=%s "
                 "child_task_ids=%s flexkv_batch_task_id=%d graph_id=%d "
-                "transfer_mode=%s graph_ops=%d",
+                "mode=%s graph_ops=%d",
                 operation,
                 "H2D" if operation == "get" else "D2H",
                 ",".join(str(task_id) for task_id in task_ids),
