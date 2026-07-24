@@ -305,27 +305,12 @@ def install_worker_crash_diagnostics(worker_class_name: str, worker_id: int) -> 
     """Best-effort crash breadcrumbs inside FlexKV transfer worker subprocesses."""
     import faulthandler
 
-    flexkv_logger.info(
-        "[FlexKV-SEGV-DEBUG] install_worker_crash_diagnostics: "
-        f"class={worker_class_name}, worker_id={worker_id}, pid={os.getpid()}"
-    )
     try:
         faulthandler.enable(all_threads=True, file=sys.stderr)
-    except Exception as e:
-        flexkv_logger.warning(
-            f"[FlexKV-SEGV-DEBUG] faulthandler.enable failed pid={os.getpid()}: {e}"
-        )
+    except Exception:
+        pass
 
     def _fatal_signal_handler(signum: int, frame: Any) -> None:
-        try:
-            sig_name = signal.Signals(signum).name
-        except ValueError:
-            sig_name = f"SIG{signum}"
-        flexkv_logger.critical(
-            "[FlexKV-SEGV-DEBUG] worker fatal signal: "
-            f"class={worker_class_name}, worker_id={worker_id}, pid={os.getpid()}, "
-            f"signum={signum} ({sig_name})"
-        )
         try:
             faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
         except Exception:
