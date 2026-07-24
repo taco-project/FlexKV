@@ -277,6 +277,33 @@ class TestBatchEndOpIdVirtualSink:
         (m_r2h,) = _find_ops(merged, transfer_type=TransferType.REMOTE2H)
         assert end == m_r2h.op_id
 
+    def test_prefetch_main_and_swa_remote2h_virtual_sink(self):
+        # Prefetch with both full-KV and SWA REMOTE2H (no H2D): batch end must
+        # wait for BOTH leaves, not just the first one found.
+        r2h = _mk_op(TransferType.REMOTE2H, [0], [0], kv_hashes=["h"])
+        swa_r2h = _mk_op(TransferType.REMOTE2H, [0], [0], is_swa=True, swa_hashes=["t"])
+        merged, end, _ = merge_to_batch_graph(
+            1, [_graph_of([r2h, swa_r2h])], [-1], {})
+        (sink,) = _find_virtual(merged)
+        assert end == sink.op_id
+        (m_r2h,) = _find_ops(merged, transfer_type=TransferType.REMOTE2H, is_swa=False)
+        (m_swa_r2h,) = _find_ops(merged, transfer_type=TransferType.REMOTE2H, is_swa=True)
+        assert m_r2h.op_id in sink.predecessors
+        assert m_swa_r2h.op_id in sink.predecessors
+
+    def test_put_no_d2h_h2disk_and_h2remote_virtual_sink(self):
+        # Degenerate PUT without D2H: both leaf lanes must be terminals.
+        h2disk = _mk_op(TransferType.H2DISK, [0], [0])
+        h2remote = _mk_op(TransferType.H2REMOTE, [0], [0], kv_hashes=["h"])
+        merged, end, _ = merge_to_batch_graph(
+            1, [_graph_of([h2disk, h2remote])], [-1], {})
+        (sink,) = _find_virtual(merged)
+        assert end == sink.op_id
+        (m_disk,) = _find_ops(merged, transfer_type=TransferType.H2DISK)
+        (m_remote,) = _find_ops(merged, transfer_type=TransferType.H2REMOTE)
+        assert m_disk.op_id in sink.predecessors
+        assert m_remote.op_id in sink.predecessors
+
 
 # --------------------------------------------------------------------------
 # Layerwise + mooncake coexistence

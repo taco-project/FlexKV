@@ -697,7 +697,7 @@ class MooncakeStoreCacheEngine:
     def insert_and_publish(self, node: Any) -> bool:
         return True
 
-    # TAKE is skipped as the real index is managed by simm itself
+    # TAKE is skipped as the real index is managed by Mooncake-store itself
     def take(
         self,
         num_required_blocks: int,
