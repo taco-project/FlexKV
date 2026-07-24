@@ -25,6 +25,11 @@
 #include "tp_transfer_thread_group.h"
 #include "transfer.cuh"
 #include "transfer_ssd.h"
+
+#ifndef FLEXKV_GIT_COMMIT
+#define FLEXKV_GIT_COMMIT "unknown"
+#endif
+
 #ifdef FLEXKV_ENABLE_P2P
 #include "dist/block_meta.h"
 #include "dist/distributed_radix_tree.h"
@@ -415,6 +420,8 @@ bool create_gds_file_binding(GDSManager &manager, const std::string &filename,
 #endif
 
 PYBIND11_MODULE(c_ext, m) {
+  m.attr("__git_commit__") = FLEXKV_GIT_COMMIT;
+
   // Metrics configuration function - allows Python to configure C++ metrics
   m.def(
       "configure_cpp_metrics",

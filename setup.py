@@ -214,6 +214,28 @@ def get_version():
     except Exception:
         return "0.0.0+unknown"
 
+
+def get_git_commit():
+    commit = os.environ.get("FLEXKV_GIT_COMMIT") or os.environ.get("GITHUB_SHA")
+    if not commit:
+        import subprocess
+        try:
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                stderr=subprocess.PIPE,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            ).decode().strip()
+        except Exception:
+            return "unknown"
+
+    commit = commit.strip().lower()
+    if not commit or any(char not in "0123456789abcdef" for char in commit):
+        return "unknown"
+    return commit[:12]
+
+
+build_git_commit = get_git_commit()
+
 build_dir = "build"
 os.makedirs(build_dir, exist_ok=True)
 
@@ -287,7 +309,11 @@ if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
     os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
 print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
 
-extra_compile_args = ["-std=c++17", "-O3"]
+extra_compile_args = [
+    "-std=c++17",
+    "-O3",
+    f'-DFLEXKV_GIT_COMMIT=\\"{build_git_commit}\\"',
+]
 if enable_metrics:
     extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
 include_dirs = [

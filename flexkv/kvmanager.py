@@ -21,6 +21,7 @@ import time
 import numpy as np
 import torch
 
+from flexkv import c_ext
 from flexkv.server.client import KVDPClient
 from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
@@ -42,7 +43,8 @@ class KVManager:
         # credential-bearing fields such as ``redis_password``.
         flexkv_logger.info(
             "[FlexKV-CONFIG] operation=config act=load status=success "
-            "component=kv_manager model_config=%s cache_config=%s",
+            "component=kv_manager commit=%s model_config=%s cache_config=%s",
+            getattr(c_ext, "__git_commit__", "unknown"),
             model_config,
             cache_config,
         )
