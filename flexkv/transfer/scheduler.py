@@ -13,6 +13,13 @@ class TransferScheduler:
         """Add a new transfer graph to the scheduler"""
         self._transfer_graphs[graph.graph_id] = graph
 
+    def fail_graph(self, graph_id: int) -> None:
+        """Drop a graph whose transfer failed: none of its remaining ops may be
+        dispatched. Ops of this graph already running on workers are allowed to
+        drain; schedule() already ignores finished ops whose graph is gone.
+        Idempotent, and a no-op for graphs that already completed."""
+        self._transfer_graphs.pop(graph_id, None)
+
     def schedule(self,
                 finished_ops: List[TransferOp]
                ) -> Tuple[List[int], List[TransferOp]]:

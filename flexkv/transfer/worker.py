@@ -351,8 +351,18 @@ class TransferWorkerBase(ABC):
                             flexkv_logger.error(f"Error launching transfer: {e}\n"
                                         f"Failed transfer op: {op}")
                         if transfer_status:
-                            ## only put the op when transfer success
                             self.finished_ops_queue.put(op.transfer_op_id)
+                        else:
+                            # Report the failure instead of dropping it. A
+                            # silently dropped op leaves its graph incomplete
+                            # forever: the task times out with no cleanup and
+                            # every resource its plan holds (locked nodes,
+                            # unready index nodes, staging blocks) leaks. The
+                            # scheduler turns this message into a graph-level
+                            # failure and the task layer rolls the plan back.
+                            # A bare int still means success, so the queue
+                            # stays compatible with any other producer.
+                            self.finished_ops_queue.put((op.transfer_op_id, False))
                     if should_shutdown:
                         if hasattr(self, "shutdown") and callable(self.shutdown):
                             try:
@@ -1928,7 +1938,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
             # SSD layout calculations
             self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
             self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-            self.ssd_tp_stride_in_bytes = self.ssd_block_stride_in_bytes // self.tp_group_size if not self.is_mla else self.ssd_block_stride_in_bytes
+            self.ssd_tp_stride_in_bytes = (self.ssd_block_stride_in_bytes // self.tp_group_size
+                                           if not self.is_mla else self.ssd_block_stride_in_bytes)
 
             # Resolve pointers in Python
             gpu_block_ptrs_flat = [
@@ -2033,16 +2044,16 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 gpu_kv_strides = []
                 gpu_block_strides = []
                 gpu_layer_strides = []
-                for i, l in enumerate(gpu_kv_layouts):
+                for i, layout in enumerate(gpu_kv_layouts):
                     gpu_strides = self._get_gpu_strides_from_tensor(
                         self.gpu_blocks[i][0], tpb_g, dtype_size_g, self.is_mla,
                     ) if len(self.gpu_blocks[i]) > 1 else None
                     if gpu_strides is not None:
                         kv_s, blk_s, layer_s = gpu_strides
                     else:
-                        kv_s = l.get_kv_stride() * dtype_size_g
-                        blk_s = l.get_block_stride() * dtype_size_g
-                        layer_s = l.get_layer_stride() * dtype_size_g
+                        kv_s = layout.get_kv_stride() * dtype_size_g
+                        blk_s = layout.get_block_stride() * dtype_size_g
+                        layer_s = layout.get_layer_stride() * dtype_size_g
                     gpu_kv_strides.append(kv_s)
                     gpu_block_strides.append(blk_s)
                     gpu_layer_strides.append(layer_s)
@@ -2204,7 +2215,8 @@ class NixlTransferWorker(TransferWorkerBase):
         be = normalize_nixl_file_plugin_name(str(nixl_backend).upper())
         if be not in NIXL_GPU_FILE_BACKENDS and be not in NIXL_CPU_FILE_BACKENDS:
             raise ValueError(
-                f"nixl_backend must be one of {sorted(NIXL_GPU_FILE_BACKENDS | NIXL_CPU_FILE_BACKENDS)}, got {nixl_backend}"
+                f"nixl_backend must be one of "
+                f"{sorted(NIXL_GPU_FILE_BACKENDS | NIXL_CPU_FILE_BACKENDS)}, got {nixl_backend}"
             )
         if be in NIXL_GPU_FILE_BACKENDS and gpu_blocks is None:
             raise ValueError("GDS_MT requires gpu_blocks")

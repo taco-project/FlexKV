@@ -18,7 +18,7 @@ import time
 import multiprocessing as mp
 import selectors
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import contextlib
 import nvtx
@@ -201,6 +201,20 @@ class TransferEngine:
         # pending_count and the parent finalizes when count hits 0.
         self._child_id_to_child: Dict[int, TransferOp] = {}
         self._child_to_parent_op_id: Dict[int, int] = {}
+
+        # Failure propagation. A worker reports a failed transfer op as
+        # (op_id, False) on finished_ops_queue instead of silently dropping
+        # it (which used to leave the graph incomplete forever, its task
+        # timing out with every plan resource leaked). The graph of a failed
+        # op stops dispatching immediately, its remaining in-flight ops are
+        # allowed to drain, and once none are outstanding a graph-level
+        # failure message is emitted so the task layer can roll the plan
+        # back. Draining first means late sibling completions still run
+        # their op callbacks against index nodes that are still mounted.
+        self._failed_graph_ids: Set[int] = set()
+        # Ops with at least one failed replica: must be discarded, not
+        # finalized, when their pending_count drains to zero.
+        self._failed_parent_op_ids: Set[int] = set()
 
     def _get_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
         """Get multi-group kwargs for TP=1 workers (GPUCPU / GDS)."""
@@ -704,7 +718,8 @@ class TransferEngine:
                 ssd_kv_layout = self._ssd_handle.kv_layout if self._ssd_handle else None,
                 ssd_files = self._ssd_handle.get_file_list() if self._ssd_handle else None,
                 num_blocks_per_file = self._ssd_handle.num_blocks_per_file if self._ssd_handle else 0,
-                mooncake_config_path = getattr(self.cache_config, 'mooncake_config_path', None) or os.environ.get("MOONCAKE_CONFIG_PATH"),
+                mooncake_config_path = (getattr(self.cache_config, 'mooncake_config_path', None)
+                                        or os.environ.get("MOONCAKE_CONFIG_PATH")),
             )
             # NOTE: now peerH2H and peerSSD2H op use the same worker
             if self.cache_config.enable_p2p_cpu:
@@ -1058,6 +1073,14 @@ class TransferEngine:
                         while True:
                             try:
                                 op_id = self.finished_ops_queue.get_nowait()
+                                # A bare int means success; a (op_id, False)
+                                # tuple is a worker-reported transfer failure.
+                                op_succeeded = True
+                                if isinstance(op_id, tuple):
+                                    op_id, op_succeeded = op_id
+                                if not op_succeeded:
+                                    self._handle_failed_op(op_id)
+                                    continue
                                 if op_id in self._child_to_parent_op_id:
                                     # Replica op (LAYERWISE PP fan-out): decrement parent's
                                     # pending_count and finalize parent when all replicas done.
@@ -1069,7 +1092,12 @@ class TransferEngine:
                                     parent_op = self.op_id_to_op[parent_op_id]
                                     parent_op.pending_count -= 1
                                     if parent_op.pending_count == 0:
-                                        self._finalize_op(parent_op, finished_ops)
+                                        # A sibling replica of this op may have
+                                        # failed; the op then must not complete.
+                                        if parent_op_id in self._failed_parent_op_ids:
+                                            self._discard_failed_op(parent_op)
+                                        else:
+                                            self._finalize_op(parent_op, finished_ops)
                                     flexkv_logger.debug(
                                         f"[TransferEngine] child op {op_id} completed, "
                                         f"parent op {parent_op_id} pending_count={parent_op.pending_count}")
@@ -1077,7 +1105,10 @@ class TransferEngine:
                                     op = self.op_id_to_op[op_id]
                                     op.pending_count -= 1
                                     if op.pending_count == 0:
-                                        self._finalize_op(op, finished_ops)
+                                        if op_id in self._failed_parent_op_ids:
+                                            self._discard_failed_op(op)
+                                        else:
+                                            self._finalize_op(op, finished_ops)
                             except queue.Empty:
                                 break
                         nvtx.end_range(nvtx_r2)
@@ -1120,6 +1151,11 @@ class TransferEngine:
                         self.completed_queue.put(CompletedOp.completed_graph(graph_id))
                 nvtx.end_range(nvtx_r3)
 
+                # Outside the dispatch block: a tick may consist solely of a
+                # failure report, with no finished op and no new graph.
+                if self._failed_graph_ids:
+                    self._emit_drained_graph_failures()
+
             except Exception as e:
                 flexkv_logger.error(
                     f"Error in scheduler loop: {type(e).__name__}: {e!r} "
@@ -1136,6 +1172,71 @@ class TransferEngine:
         # Cleanup
         sel.close()
         flexkv_logger.info("TransferEngine scheduler loop stopped")
+
+    def _handle_failed_op(self, op_id: int) -> None:
+        """A worker reported a failed transfer for ``op_id``.
+
+        Bookkeeping mirrors the completion path (replica maps, pending
+        counts, pin buffer, nvtx) so nothing leaks, but the op never reaches
+        finished_ops (its successors must not run) and its graph is marked
+        failed: the scheduler stops dispatching the graph's remaining ops,
+        and once every already-dispatched op of the graph has drained the
+        loop emits a graph-level failure to the task layer.
+        """
+        graph_id = None
+        if op_id in self._child_to_parent_op_id:
+            parent_op_id = self._child_to_parent_op_id.pop(op_id)
+            child_op = self._child_id_to_child.pop(op_id)
+            free_op_from_buffer(child_op, self.pin_buffer)
+            if op_id in self.op_id_to_nvtx_range:
+                nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
+            parent_op = self.op_id_to_op.get(parent_op_id)
+            if parent_op is not None:
+                graph_id = parent_op.graph_id
+                parent_op.pending_count -= 1
+                self._failed_parent_op_ids.add(parent_op_id)
+                if parent_op.pending_count == 0:
+                    self._discard_failed_op(parent_op)
+        else:
+            op = self.op_id_to_op.get(op_id)
+            if op is not None:
+                graph_id = op.graph_id
+                op.pending_count -= 1
+                if op.pending_count == 0:
+                    self._discard_failed_op(op)
+                else:
+                    self._failed_parent_op_ids.add(op_id)
+        if graph_id is not None:
+            flexkv_logger.error(
+                f"[TransferEngine] transfer op {op_id} of graph {graph_id} "
+                f"failed; failing the graph and draining its in-flight ops")
+            self._failed_graph_ids.add(graph_id)
+            self.scheduler.fail_graph(graph_id)
+
+    def _discard_failed_op(self, op: TransferOp) -> None:
+        """Release a fully-drained op that must not complete (it failed, or a
+        replica of it did): same pin-buffer rule and cleanup as _finalize_op,
+        minus the completion message and successor scheduling."""
+        if getattr(op, "is_swa", False):
+            resolved_worker = self._swa_worker_map.get(op.transfer_type)
+        else:
+            resolved_worker = self._worker_map.get(op.transfer_type)
+        if resolved_worker is not None and not isinstance(resolved_worker, dict):
+            free_op_from_buffer(op, self.pin_buffer)
+        if op.op_id in self.op_id_to_nvtx_range:
+            nvtx.end_range(self.op_id_to_nvtx_range.pop(op.op_id))
+        self.op_id_to_op.pop(op.op_id, None)
+        self._failed_parent_op_ids.discard(op.op_id)
+
+    def _emit_drained_graph_failures(self) -> None:
+        """Report each failed graph to the task layer once its dispatched ops
+        have all drained, so the task's rollback never races an in-flight op's
+        completion callback."""
+        for graph_id in list(self._failed_graph_ids):
+            if any(op.graph_id == graph_id for op in self.op_id_to_op.values()):
+                continue
+            self.completed_queue.put(CompletedOp.failed_graph(graph_id))
+            self._failed_graph_ids.discard(graph_id)
 
     def _finalize_op(self, op: TransferOp, finished_ops: List[TransferOp]) -> None:
         """Finalize a completed op: release pin buffer, notify upper layer, and clean up.
@@ -1183,7 +1284,7 @@ class TransferEngine:
         After flattening, a single int fully identifies the DP slice —
         PP siblings are the worker_keys that share it across pp_rank.
         """
-        return [wk for wk in worker_map.keys() if wk.dp_client_id == dp_client_id]
+        return [wk for wk in worker_map if wk.dp_client_id == dp_client_id]
 
     def _assign_layerwise_op_to_workers(self, op: TransferOp) -> None:
         """Fan-out a LAYERWISE op symmetrically to every local PP-stage

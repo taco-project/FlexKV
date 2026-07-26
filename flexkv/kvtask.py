@@ -353,6 +353,9 @@ class KVTaskManager:
                 continue
             task_id = self.graph_to_task[completed_op.graph_id]
             task = self.tasks[task_id]
+            if completed_op.is_graph_failed():
+                self._fail_task(task_id)
+                continue
             # Record transfer metrics for completed ops (post-completion statistics)
             # All three counters (ops_total, blocks_total, bytes_total) are updated
             # here after transfer completion, providing accurate post-transfer metrics.
@@ -376,6 +379,32 @@ class KVTaskManager:
             has_callback = completed_op.op_id in task.op_callback_dict
             if has_callback:
                 task.op_callback_dict[completed_op.op_id]()
+
+    def _fail_task(self, task_id: int) -> None:
+        """A transfer op of this task's graph failed and the graph has fully
+        drained. Roll the plan back instead of completing it: ops that did
+        finish already ran their callbacks (their nodes are ready and their
+        data is valid, so abort keeps them), while nodes whose transfer never
+        ran are still unready and get removed with their blocks recycled.
+        The task terminates as FAILED so wait() reports the failure instead
+        of a misleading TIMEOUT."""
+        task = self.tasks[task_id]
+        if task.is_completed():
+            return
+        flexkv_logger.error(f"[KVTaskEngine] task {task_id} FAILED: a transfer "
+                            f"op of graph {task.graph.graph_id} failed")
+        callbacks = task.callback if isinstance(task.callback, list) \
+            else [task.callback]
+        for callback in callbacks:
+            abort = getattr(callback, "abort", None)
+            if abort is not None:
+                abort()
+        task.status = TaskStatus.FAILED
+        task.task_end_op_finished = True
+        self.graph_to_task.pop(task.graph.graph_id, None)
+        task.shed_heavy_resources()
+        if task.request_returned:
+            self._release_task(task_id)
 
     def _cancel_task(self, task_id: int) -> None:
         if task_id not in self.tasks:
@@ -496,7 +525,12 @@ class KVTaskManager:
         for transfer_handle in self.transfer_handles:
             completed_ops = transfer_handle.wait(timeout)
             for completed_op in completed_ops:
-                if completed_op.is_graph_completed():
+                if completed_op.is_graph_failed():
+                    # A failure is reported once, by the engine that owns the
+                    # graph; it must not enter the per-op dedup below, whose
+                    # op_id == -1 key would collide across failed graphs.
+                    results.append(completed_op)
+                elif completed_op.is_graph_completed():
                     completed_count = self.uncompleted_graphs.get(completed_op.graph_id, 0) + 1
                     if completed_count == self.required_completed_count:
                         results.append(completed_op)

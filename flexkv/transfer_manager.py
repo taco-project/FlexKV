@@ -480,7 +480,8 @@ class TransferManagerOnRemote(TransferManager):
                                     if task_end_op_id != -1 and completed_op.op_id == task_end_op_id:
                                         end_op = CompletedOp(graph_id=completed_op.graph_id, op_id=task_end_op_id)
                                         self.result_socket.send_pyobj(end_op)
-                                    if completed_op.is_graph_completed():
+                                    if (completed_op.is_graph_completed()
+                                            or completed_op.is_graph_failed()):
                                         self.result_socket.send_pyobj(completed_op)
                                         del self._active_graphs[completed_op.graph_id]
 
@@ -842,7 +843,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             sel.register(transfer_manager.transfer_engine.completed_queue._reader,
                         selectors.EVENT_READ, data="finished_ops")
 
-            flexkv_logger.info("TransferManager daemon process started with selector-based event monitoring (command + finished_ops)")
+            flexkv_logger.info("TransferManager daemon process started with "
+                               "selector-based event monitoring (command + finished_ops)")
 
             while True:
                 try:
@@ -856,7 +858,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     for key, mask in events:
                         if key.data == "command":
                             # New command available
-                            inner_range = nvtx.start_range(message="TransferManagerInter.process_worker.req", color="red")
+                            inner_range = nvtx.start_range(
+                                message="TransferManagerInter.process_worker.req", color="red")
                             request = command_conn.recv()
                             request_type = request.get('type')
                             if request_type == 'submit':
@@ -873,7 +876,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
 
                     # Only collect finished_ops if selector reported data available
                     if has_finished_ops:
-                        inner_range = nvtx.start_range(message="TransferManagerInter.process_worker.results", color="red")
+                        inner_range = nvtx.start_range(
+                            message="TransferManagerInter.process_worker.results", color="red")
                         try:
                             # Directly get from completed_queue without timeout to avoid poll
                             finished_ops = []
