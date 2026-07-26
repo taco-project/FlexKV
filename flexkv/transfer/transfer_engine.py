@@ -196,6 +196,12 @@ class TransferEngine:
             layerwise_enabled=GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer,
         )
 
+        # Metrics: this engine usually runs in the TransferManager subprocess,
+        # so the collector takes the "worker" role automatically (no HTTP port
+        # bind; aggregated via PROMETHEUS_MULTIPROC_DIR when set).
+        from flexkv.metrics.collector import init_global_collector
+        self._metrics_collector = init_global_collector()
+
         # Used for LAYERWISE PP fan-out: a parent op spawns one replica per PP
         # sibling worker; each replica's completion decrements the parent's
         # pending_count and the parent finalizes when count hits 0.
@@ -967,10 +973,19 @@ class TransferEngine:
             flexkv_logger.debug(f"{label} is ready")
 
         # Wait for all main KV workers to ready
+        layerwise_expected = len(self._worker_map.get(TransferType.LAYERWISE, {}))
+        layerwise_ready = 0
+        if layerwise_expected > 0 and self._metrics_collector is not None:
+            self._metrics_collector.update_layerwise_workers(0, layerwise_expected)
         for transfer_type, worker in self._worker_map.items():
             if isinstance(worker, dict):
                 for wk, w in worker.items():
                     _wait_worker_ready(w, transfer_type, wk)
+                    if transfer_type == TransferType.LAYERWISE:
+                        layerwise_ready += 1
+                        if self._metrics_collector is not None:
+                            self._metrics_collector.update_layerwise_workers(
+                                layerwise_ready, layerwise_expected)
             else:
                 _wait_worker_ready(worker, transfer_type)
 
@@ -1169,6 +1184,7 @@ class TransferEngine:
             transfer_type=transfer_type_str,
             num_blocks=num_blocks,
             num_bytes=num_bytes,
+            is_swa=getattr(op, "is_swa", False),
         ))
         finished_ops.append(op)
         del self.op_id_to_op[op.op_id]
@@ -1318,7 +1334,17 @@ class TransferEngine:
             raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
 
         if op.transfer_type == TransferType.LAYERWISE:
-            self._assign_layerwise_op_to_workers(op)
+            collector = self._metrics_collector
+            t0 = time.monotonic() if (collector is not None and collector.enabled) else 0.0
+            status = "ok"
+            try:
+                self._assign_layerwise_op_to_workers(op)
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                if collector is not None and collector.enabled:
+                    collector.record_layerwise_submit(status, time.monotonic() - t0)
             return
 
         worker = self._worker_map[op.transfer_type]
