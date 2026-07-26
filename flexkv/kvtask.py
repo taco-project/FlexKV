@@ -549,6 +549,10 @@ class KVTaskManager:
                             # A failed handle never finalizes some of the
                             # graph's ops, so their N-way per-op counters can
                             # never complete: purge them rather than leak.
+                            # Safe because each handle's terminal message
+                            # follows all its per-op messages (per-handle
+                            # FIFO), so nothing can arrive for this graph
+                            # after the Nth terminal and resurrect a counter.
                             stale = [key for key in self.uncompleted_ops
                                      if key[0] == graph_id]
                             for key in stale:

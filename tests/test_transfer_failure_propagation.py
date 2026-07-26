@@ -377,6 +377,11 @@ class _FakeHandle:
         out, self.pending = self.pending, []
         return out
 
+    def shutdown(self):
+        # KVTaskManager.__del__ shuts handles down; without this the GC-time
+        # AttributeError surfaces as a PytestUnraisableExceptionWarning.
+        pass
+
 
 def _make_multi_handle_manager(num_handles):
     manager = KVTaskManager.__new__(KVTaskManager)
