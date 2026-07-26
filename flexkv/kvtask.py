@@ -382,6 +382,22 @@ class KVTaskManager:
             return
         task = self.tasks[task_id]
         if not task.is_completed():
+            # A task whose graph never launched still holds everything its
+            # plan acquired at create time: locked radix nodes, CPU staging
+            # blocks, and is_ready=False index nodes that only a completion
+            # callback could publish. Dropping the task without aborting leaks
+            # all of it -- the staging blocks become unreachable (mempool
+            # exhaustion) and the unready nodes are permanently unevictable
+            # holes that also shadow future puts of the same prefix. Abort
+            # rolls those back; RUNNING tasks keep the old behavior (their
+            # graph is in flight and completion callbacks will still fire).
+            if task.status in (TaskStatus.UNREADY, TaskStatus.READY):
+                callbacks = task.callback if isinstance(task.callback, list) \
+                    else [task.callback]
+                for callback in callbacks:
+                    abort = getattr(callback, "abort", None)
+                    if abort is not None:
+                        abort()
             task.status = TaskStatus.CANCELLED
         self._release_task(task_id)
 
