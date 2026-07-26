@@ -30,6 +30,7 @@ from flexkv.common.transfer import (
 )
 from flexkv.kvtask import KVTaskManager, TaskStatus, convert_to_response_status
 from flexkv.transfer.scheduler import TransferScheduler
+from flexkv.transfer.transfer_engine import TransferEngine
 
 pytestmark = pytest.mark.unit
 
@@ -147,15 +148,11 @@ class _EngineHarness:
         self.completed_queue = Queue()
         self.scheduler = TransferScheduler()
 
-    _handle_failed_op = __import__(
-        "flexkv.transfer.transfer_engine", fromlist=["TransferEngine"]
-    ).TransferEngine._handle_failed_op
-    _discard_failed_op = __import__(
-        "flexkv.transfer.transfer_engine", fromlist=["TransferEngine"]
-    ).TransferEngine._discard_failed_op
-    _emit_drained_graph_failures = __import__(
-        "flexkv.transfer.transfer_engine", fromlist=["TransferEngine"]
-    ).TransferEngine._emit_drained_graph_failures
+    _handle_failed_op = TransferEngine._handle_failed_op
+    _discard_failed_op = TransferEngine._discard_failed_op
+    _finalize_or_discard = TransferEngine._finalize_or_discard
+    _emit_drained_graph_failures = TransferEngine._emit_drained_graph_failures
+    _op_buffer_registered_here = TransferEngine._op_buffer_registered_here
 
 
 def test_failed_op_fails_graph_and_emits_after_drain():
@@ -208,12 +205,15 @@ def test_failed_replica_discards_parent_when_replicas_drain():
     assert parent.op_id in engine._failed_parent_op_ids
     assert graph.graph_id in engine._failed_graph_ids
 
-    # remaining replica completes: the parent must be DISCARDED, not finalized
+    # remaining replica completes: the loop's routing helper must DISCARD the
+    # parent, not finalize it (finalize would emit a completion message).
     parent.pending_count -= 1
     assert parent.pending_count == 0
-    engine._discard_failed_op(parent)
+    engine._finalize_or_discard(parent, finished_ops=[])
     assert parent.op_id not in engine.op_id_to_op
     assert parent.op_id not in engine._failed_parent_op_ids
+    assert engine.completed_queue.empty(), \
+        "a discarded op must not produce a completion message"
 
     engine._emit_drained_graph_failures()
     assert engine.completed_queue.get_nowait().is_graph_failed()

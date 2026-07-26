@@ -202,15 +202,9 @@ class TransferEngine:
         self._child_id_to_child: Dict[int, TransferOp] = {}
         self._child_to_parent_op_id: Dict[int, int] = {}
 
-        # Failure propagation. A worker reports a failed transfer op as
-        # (op_id, False) on finished_ops_queue instead of silently dropping
-        # it (which used to leave the graph incomplete forever, its task
-        # timing out with every plan resource leaked). The graph of a failed
-        # op stops dispatching immediately, its remaining in-flight ops are
-        # allowed to drain, and once none are outstanding a graph-level
-        # failure message is emitted so the task layer can roll the plan
-        # back. Draining first means late sibling completions still run
-        # their op callbacks against index nodes that are still mounted.
+        # Failure propagation state; see _handle_failed_op for the flow.
+        # Graphs with a failed op, awaiting drain of their in-flight ops
+        # before the graph-level failure message is emitted.
         self._failed_graph_ids: Set[int] = set()
         # Ops with at least one failed replica: must be discarded, not
         # finalized, when their pending_count drains to zero.
@@ -1092,12 +1086,7 @@ class TransferEngine:
                                     parent_op = self.op_id_to_op[parent_op_id]
                                     parent_op.pending_count -= 1
                                     if parent_op.pending_count == 0:
-                                        # A sibling replica of this op may have
-                                        # failed; the op then must not complete.
-                                        if parent_op_id in self._failed_parent_op_ids:
-                                            self._discard_failed_op(parent_op)
-                                        else:
-                                            self._finalize_op(parent_op, finished_ops)
+                                        self._finalize_or_discard(parent_op, finished_ops)
                                     flexkv_logger.debug(
                                         f"[TransferEngine] child op {op_id} completed, "
                                         f"parent op {parent_op_id} pending_count={parent_op.pending_count}")
@@ -1105,10 +1094,7 @@ class TransferEngine:
                                     op = self.op_id_to_op[op_id]
                                     op.pending_count -= 1
                                     if op.pending_count == 0:
-                                        if op_id in self._failed_parent_op_ids:
-                                            self._discard_failed_op(op)
-                                        else:
-                                            self._finalize_op(op, finished_ops)
+                                        self._finalize_or_discard(op, finished_ops)
                             except queue.Empty:
                                 break
                         nvtx.end_range(nvtx_r2)
@@ -1139,11 +1125,7 @@ class TransferEngine:
                             # dict-keyed entries (H2D/D2H), each replica is
                             # registered inside _assign_op_to_worker /
                             # _assign_swa_op_to_worker per PP sibling.
-                            if getattr(op, "is_swa", False):
-                                resolved_worker = self._swa_worker_map.get(op.transfer_type)
-                            else:
-                                resolved_worker = self._worker_map.get(op.transfer_type)
-                            if resolved_worker is not None and not isinstance(resolved_worker, dict):
+                            if self._op_buffer_registered_here(op):
                                 register_op_to_buffer(op, self.pin_buffer)
                             self._assign_op_to_worker(op)
                     # Handle completed graphs
@@ -1172,6 +1154,26 @@ class TransferEngine:
         # Cleanup
         sel.close()
         flexkv_logger.info("TransferEngine scheduler loop stopped")
+
+    def _op_buffer_registered_here(self, op: TransferOp) -> bool:
+        """The 'unified rule' shared by dispatch, _finalize_op and
+        _discard_failed_op: a parent op's pin buffer is registered (and thus
+        freed) at this level only when its worker_map entry resolves to a
+        single worker. Dict-keyed entries (PP fan-out) register and free each
+        replica individually."""
+        if getattr(op, "is_swa", False):
+            resolved_worker = self._swa_worker_map.get(op.transfer_type)
+        else:
+            resolved_worker = self._worker_map.get(op.transfer_type)
+        return resolved_worker is not None and not isinstance(resolved_worker, dict)
+
+    def _finalize_or_discard(self, op: TransferOp, finished_ops: List[TransferOp]) -> None:
+        """Route a fully-drained op: discard if any replica of it failed,
+        finalize (completion message + successor scheduling) otherwise."""
+        if op.op_id in self._failed_parent_op_ids:
+            self._discard_failed_op(op)
+        else:
+            self._finalize_op(op, finished_ops)
 
     def _handle_failed_op(self, op_id: int) -> None:
         """A worker reported a failed transfer for ``op_id``.
@@ -1202,10 +1204,9 @@ class TransferEngine:
             if op is not None:
                 graph_id = op.graph_id
                 op.pending_count -= 1
+                self._failed_parent_op_ids.add(op_id)
                 if op.pending_count == 0:
                     self._discard_failed_op(op)
-                else:
-                    self._failed_parent_op_ids.add(op_id)
         if graph_id is not None:
             flexkv_logger.error(
                 f"[TransferEngine] transfer op {op_id} of graph {graph_id} "
@@ -1217,11 +1218,7 @@ class TransferEngine:
         """Release a fully-drained op that must not complete (it failed, or a
         replica of it did): same pin-buffer rule and cleanup as _finalize_op,
         minus the completion message and successor scheduling."""
-        if getattr(op, "is_swa", False):
-            resolved_worker = self._swa_worker_map.get(op.transfer_type)
-        else:
-            resolved_worker = self._worker_map.get(op.transfer_type)
-        if resolved_worker is not None and not isinstance(resolved_worker, dict):
+        if self._op_buffer_registered_here(op):
             free_op_from_buffer(op, self.pin_buffer)
         if op.op_id in self.op_id_to_nvtx_range:
             nvtx.end_range(self.op_id_to_nvtx_range.pop(op.op_id))
@@ -1248,11 +1245,7 @@ class TransferEngine:
         # was registered upstream (single-worker path). For dict-keyed (PP fan-out)
         # entries the parent was never registered; each replica was registered and
         # freed individually in the scheduler's child completion path.
-        if getattr(op, "is_swa", False):
-            resolved_worker = self._swa_worker_map.get(op.transfer_type)
-        else:
-            resolved_worker = self._worker_map.get(op.transfer_type)
-        if resolved_worker is not None and not isinstance(resolved_worker, dict):
+        if self._op_buffer_registered_here(op):
             free_op_from_buffer(op, self.pin_buffer)
         # Compute transfer metrics for this completed op.
         # Use layer_groups-aware token size so overlapping main/indexer groups

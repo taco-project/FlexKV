@@ -380,6 +380,18 @@ class KVTaskManager:
             if has_callback:
                 task.op_callback_dict[completed_op.op_id]()
 
+    @staticmethod
+    def _abort_task_plans(task: "KVTask") -> None:
+        """Run the abort path of every plan handle the task carries (a batch
+        task carries one per merged sub-task). Handles predating the abort API
+        are skipped."""
+        callbacks = task.callback if isinstance(task.callback, list) \
+            else [task.callback]
+        for callback in callbacks:
+            abort = getattr(callback, "abort", None)
+            if abort is not None:
+                abort()
+
     def _fail_task(self, task_id: int) -> None:
         """A transfer op of this task's graph failed and the graph has fully
         drained. Roll the plan back instead of completing it: ops that did
@@ -393,12 +405,7 @@ class KVTaskManager:
             return
         flexkv_logger.error(f"[KVTaskEngine] task {task_id} FAILED: a transfer "
                             f"op of graph {task.graph.graph_id} failed")
-        callbacks = task.callback if isinstance(task.callback, list) \
-            else [task.callback]
-        for callback in callbacks:
-            abort = getattr(callback, "abort", None)
-            if abort is not None:
-                abort()
+        self._abort_task_plans(task)
         task.status = TaskStatus.FAILED
         task.task_end_op_finished = True
         self.graph_to_task.pop(task.graph.graph_id, None)
@@ -421,12 +428,7 @@ class KVTaskManager:
             # rolls those back; RUNNING tasks keep the old behavior (their
             # graph is in flight and completion callbacks will still fire).
             if task.status in (TaskStatus.UNREADY, TaskStatus.READY):
-                callbacks = task.callback if isinstance(task.callback, list) \
-                    else [task.callback]
-                for callback in callbacks:
-                    abort = getattr(callback, "abort", None)
-                    if abort is not None:
-                        abort()
+                self._abort_task_plans(task)
             task.status = TaskStatus.CANCELLED
         self._release_task(task_id)
 

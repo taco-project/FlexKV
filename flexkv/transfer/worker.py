@@ -353,15 +353,11 @@ class TransferWorkerBase(ABC):
                         if transfer_status:
                             self.finished_ops_queue.put(op.transfer_op_id)
                         else:
-                            # Report the failure instead of dropping it. A
-                            # silently dropped op leaves its graph incomplete
-                            # forever: the task times out with no cleanup and
-                            # every resource its plan holds (locked nodes,
-                            # unready index nodes, staging blocks) leaks. The
-                            # scheduler turns this message into a graph-level
-                            # failure and the task layer rolls the plan back.
-                            # A bare int still means success, so the queue
-                            # stays compatible with any other producer.
+                            # Report the failure instead of dropping it: a
+                            # dropped op leaves its graph incomplete forever
+                            # and leaks every resource its plan holds. A bare
+                            # int still means success, so the queue format
+                            # stays compatible.
                             self.finished_ops_queue.put((op.transfer_op_id, False))
                     if should_shutdown:
                         if hasattr(self, "shutdown") and callable(self.shutdown):
