@@ -182,8 +182,11 @@ class KVTaskManager:
 
         self.graph_to_task: Dict[int, int] = {}
 
-        self.uncompleted_ops: Dict[int, int] = {}  # op_id -> completed_count
-        self.uncompleted_graphs: Dict[int, int] = {}  # graph_id -> completed_count
+        # (graph_id, op_id) -> completed_count; graph-keyed so a failed
+        # graph's stale per-op counters can be purged.
+        self.uncompleted_ops: Dict[Tuple[int, int], int] = {}
+        # graph_id -> (terminal_count, any_failed) across the N handles.
+        self.uncompleted_graphs: Dict[int, Tuple[int, bool]] = {}
         self.required_completed_count: int = len(self.transfer_handles)
 
         self.task_id_counter = 0
@@ -400,6 +403,8 @@ class KVTaskManager:
         ran are still unready and get removed with their blocks recycled.
         The task terminates as FAILED so wait() reports the failure instead
         of a misleading TIMEOUT."""
+        if task_id not in self.tasks:
+            return
         task = self.tasks[task_id]
         if task.is_completed():
             return
@@ -527,25 +532,40 @@ class KVTaskManager:
         for transfer_handle in self.transfer_handles:
             completed_ops = transfer_handle.wait(timeout)
             for completed_op in completed_ops:
-                if completed_op.is_graph_failed():
-                    # A failure is reported once, by the engine that owns the
-                    # graph; it must not enter the per-op dedup below, whose
-                    # op_id == -1 key would collide across failed graphs.
-                    results.append(completed_op)
-                elif completed_op.is_graph_completed():
-                    completed_count = self.uncompleted_graphs.get(completed_op.graph_id, 0) + 1
-                    if completed_count == self.required_completed_count:
-                        results.append(completed_op)
-                        self.uncompleted_graphs.pop(completed_op.graph_id, None)
+                if completed_op.op_id == -1:
+                    # Graph-level terminal message, completed OR failed. Every
+                    # handle received the same graph, so the task terminates
+                    # only after all of them have reported a terminal state --
+                    # aborting on the first failure would recycle plan blocks
+                    # a sibling engine is still writing into. Any failure
+                    # among the N outcomes fails the graph.
+                    graph_id = completed_op.graph_id
+                    count, failed = self.uncompleted_graphs.get(graph_id, (0, False))
+                    count += 1
+                    failed = failed or completed_op.is_graph_failed()
+                    if count == self.required_completed_count:
+                        self.uncompleted_graphs.pop(graph_id, None)
+                        if failed:
+                            # A failed handle never finalizes some of the
+                            # graph's ops, so their N-way per-op counters can
+                            # never complete: purge them rather than leak.
+                            stale = [key for key in self.uncompleted_ops
+                                     if key[0] == graph_id]
+                            for key in stale:
+                                self.uncompleted_ops.pop(key, None)
+                            results.append(CompletedOp.failed_graph(graph_id))
+                        else:
+                            results.append(completed_op)
                     else:
-                        self.uncompleted_graphs[completed_op.graph_id] = completed_count
+                        self.uncompleted_graphs[graph_id] = (count, failed)
                 else:
-                    completed_count = self.uncompleted_ops.get(completed_op.op_id, 0) + 1
+                    op_key = (completed_op.graph_id, completed_op.op_id)
+                    completed_count = self.uncompleted_ops.get(op_key, 0) + 1
                     if completed_count == self.required_completed_count:
                         results.append(completed_op)
-                        self.uncompleted_ops.pop(completed_op.op_id, None)
+                        self.uncompleted_ops.pop(op_key, None)
                     else:
-                        self.uncompleted_ops[completed_op.op_id] = completed_count
+                        self.uncompleted_ops[op_key] = completed_count
         return results
 
 class KVTaskEngine(KVTaskManager):

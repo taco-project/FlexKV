@@ -363,3 +363,77 @@ def test_fail_task_is_idempotent_and_mutex_with_completion(global_engine):
 
     assert cpu.mempool.num_free_blocks == free_after_fail
     assert task.status == TaskStatus.FAILED
+
+
+# --------------------------------------------------------------------------
+# Multi-handle terminal aggregation (nnodes > 1 / trtllm-remote deployments)
+# --------------------------------------------------------------------------
+
+class _FakeHandle:
+    def __init__(self):
+        self.pending = []
+
+    def wait(self, timeout=None):
+        out, self.pending = self.pending, []
+        return out
+
+
+def _make_multi_handle_manager(num_handles):
+    manager = KVTaskManager.__new__(KVTaskManager)
+    manager.transfer_handles = [_FakeHandle() for _ in range(num_handles)]
+    manager.required_completed_count = num_handles
+    manager.uncompleted_ops = {}
+    manager.uncompleted_graphs = {}
+    return manager
+
+
+def test_multi_handle_failure_waits_for_every_handle():
+    """The same graph is submitted to every handle; terminating on the first
+    handle's failure would recycle plan blocks a sibling engine is still
+    writing into. The graph may only terminate once ALL handles report a
+    terminal state, and any failure among them fails the graph."""
+    manager = _make_multi_handle_manager(2)
+    handle_a, handle_b = manager.transfer_handles
+
+    handle_a.pending = [CompletedOp.failed_graph(5)]
+    assert manager._get_completed_ops() == []          # b still in flight
+    assert manager.uncompleted_graphs == {5: (1, True)}
+
+    handle_b.pending = [CompletedOp.completed_graph(5)]
+    results = manager._get_completed_ops()
+    assert len(results) == 1
+    assert results[0].is_graph_failed()                # any failure fails it
+    assert manager.uncompleted_graphs == {}
+
+
+def test_multi_handle_failure_purges_stale_op_counters():
+    """A failed handle never finalizes some of the graph's ops, so their
+    N-way per-op counters could never complete; graph termination must purge
+    them instead of leaking them forever."""
+    manager = _make_multi_handle_manager(2)
+    handle_a, handle_b = manager.transfer_handles
+
+    # op 7 of graph 5 finalized on handle_a only; handle_a then fails.
+    handle_a.pending = [CompletedOp(graph_id=5, op_id=7),
+                        CompletedOp.failed_graph(5)]
+    assert manager._get_completed_ops() == []
+    assert manager.uncompleted_ops == {(5, 7): 1}
+
+    handle_b.pending = [CompletedOp.failed_graph(5)]
+    results = manager._get_completed_ops()
+    assert len(results) == 1 and results[0].is_graph_failed()
+    assert manager.uncompleted_ops == {}, "stale per-op counters must be purged"
+    # an unrelated graph's op counter must survive the purge
+    handle_a.pending = [CompletedOp(graph_id=6, op_id=9)]
+    manager._get_completed_ops()
+    assert manager.uncompleted_ops == {(6, 9): 1}
+
+
+def test_single_handle_failure_terminates_immediately():
+    """required_completed_count == 1 (the default deployment): a failure
+    message terminates the graph in the same call, exactly as before."""
+    manager = _make_multi_handle_manager(1)
+    manager.transfer_handles[0].pending = [CompletedOp.failed_graph(3)]
+    results = manager._get_completed_ops()
+    assert len(results) == 1 and results[0].is_graph_failed()
+    assert manager.uncompleted_graphs == {}
