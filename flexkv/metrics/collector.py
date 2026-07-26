@@ -17,13 +17,14 @@ from typing import Dict, Optional
 
 # Optional import for prometheus_client
 try:
-    from prometheus_client import Counter, Gauge, Histogram
+    from prometheus_client import Counter, Gauge, Histogram, REGISTRY as DEFAULT_REGISTRY
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
     Counter = None
     Gauge = None
     Histogram = None
+    DEFAULT_REGISTRY = None
 
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
@@ -159,7 +160,10 @@ class FlexKVMetricsCollector:
         """
         if role is None:
             role = _detect_process_role()
-        self._registry = registry
+        # NOTE: prometheus_client skips registration entirely when a metric is
+        # constructed with registry=None, so fall back to the default REGISTRY
+        # explicitly (None only means "caller did not inject one").
+        self._registry = registry if registry is not None else DEFAULT_REGISTRY
 
         # Check if metrics should be enabled (controlled by env var and prometheus availability)
         should_enable = PROMETHEUS_AVAILABLE and _should_enable_metrics()

@@ -225,3 +225,36 @@ class TestDisabledPath:
         engine._free_swa_slot(0)
         assert engine._evict_swa_slots(1) == 1
         engine._drain_unmounted_swa_slots()
+
+
+class TestDefaultRegistry:
+    """Regression: without an injected registry, metrics must register into the
+    process default REGISTRY (prometheus_client skips registration when a
+    metric is constructed with registry=None)."""
+
+    @staticmethod
+    def _unregister_all_flexkv(registry):
+        # Other tests (e.g. GlobalCacheEngine with metrics on) may have
+        # populated the default REGISTRY; clear flexkv entries so this test
+        # is order-independent. Uses the private name map (test-only).
+        for name in list(getattr(registry, "_names_to_collectors", {})):
+            if name.startswith("flexkv_py_"):
+                try:
+                    registry.unregister(registry._names_to_collectors[name])
+                except Exception:
+                    pass
+
+    def test_metrics_land_in_default_registry(self, monkeypatch):
+        from prometheus_client import REGISTRY
+
+        self._unregister_all_flexkv(REGISTRY)
+        try:
+            monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "enable_metrics", True)
+            c = FlexKVMetricsCollector(role="worker")  # no registry injected
+            assert c._registry is REGISTRY
+            c.record_swa_query("hit")
+            assert REGISTRY.get_sample_value(
+                "flexkv_py_swa_query_total", {"result": "hit"}) >= 1
+        finally:
+            self._unregister_all_flexkv(REGISTRY)
+

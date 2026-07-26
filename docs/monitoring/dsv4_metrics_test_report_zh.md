@@ -19,6 +19,7 @@
 | 5 | 实机部署（sglang + DSV4-Flash tp4） | 真实推理请求 + `/metrics` 抓取 | 服务稳定，SWA/传输指标实时变化 |
 | 6 | 引擎级命中路径 | kvtask 测试 + multiproc 聚合 | 命中类指标准确触发（`cache_query{full}`、`cache_match{ready=true}`、`swa_query{hit}`） |
 | 7 | 关闭路径零副作用 | 单测 disabled 用例 + 关闭态全量回归 | 所有 `record_*` 为 no-op，行为与改造前一致 |
+| 8 | 单进程端点输出 | 独立进程起 8080 + curl | 修复后全部 13 个新指标准确输出（见第 8 节） |
 
 ---
 
@@ -160,6 +161,34 @@ flexkv_py_allocated_blocks_total {'device': 'cpu'} = 16.0
 
 - 单测 `TestDisabledPath`：metrics 关闭时全部 `record_*`（含 Histogram `observe`）为 no-op 且不抛异常；
 - 关闭态全量回归（见第 2 节）与改造前基线一致。
+
+## 8. 单进程端点输出（含一次实测暴露问题的修复记录）
+
+验证中单进程模式（未设 `PROMETHEUS_MULTIPROC_DIR`）曾暴露问题：8080 端点无任何 `flexkv_py_*` 输出。根因：collector 支持 registry 注入的实现将 `registry=None` 显式传给指标构造函数，而 prometheus_client 在**显式** `registry=None` 时完全跳过注册（与"不传该参数默认注册到全局 REGISTRY"语义不同）。此前未暴露的原因：单测均注入独立 registry；多进程模式数值写 mmap 文件、`MultiProcessCollector` 直接读文件聚合，不依赖注册。
+
+修复（commit `fix(metrics)`）：未注入 registry 时回退到 prometheus 默认 `REGISTRY`；新增回归用例 `TestDefaultRegistry::test_metrics_land_in_default_registry`（覆盖默认 REGISTRY 路径，且通过前后清理做到与套件执行顺序无关）。
+
+修复后单进程独立验证：
+
+```
+$ FLEXKV_ENABLE_METRICS=1 python <standalone_server_script> &
+$ curl -s http://127.0.0.1:8080/metrics | grep ^flexkv_py_
+
+flexkv_py_cache_match_blocks_total{device="cpu",ready="true"} 20.0
+flexkv_py_cache_match_blocks_total{device="cpu",ready="false"} 3.0
+flexkv_py_cache_query_total{result="full"} 1.0
+flexkv_py_layerwise_submit_seconds_count 1.0
+flexkv_py_layerwise_submit_seconds_sum 0.004
+flexkv_py_layerwise_submit_total{status="ok"} 1.0
+flexkv_py_swa_evicted_slots_total{device="cpu",reason="pool_full"} 2.0
+flexkv_py_swa_hit_blocks_total 12.0
+flexkv_py_swa_query_total{result="hit"} 1.0
+flexkv_py_swa_slot_total{device="cpu"} 256.0
+flexkv_py_swa_slot_used{device="cpu"} 1.0
+...（13 个新指标全部正常输出，含 0 值 label 组合）
+```
+
+修复后测试：单测 14/14 通过（新增 1 例回归），metrics 开启回归 218 通过。
 
 ---
 
