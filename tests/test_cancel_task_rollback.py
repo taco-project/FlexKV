@@ -185,15 +185,15 @@ def _run_put(engine, tokens, request_id, complete=True):
         for op_callback in op_callbacks.values():
             op_callback()
         callback()
-    return mask_out, callback
+    return mask_out, callback, op_callbacks
 
 
 def _run_get(engine, tokens, request_id):
     mask = np.ones_like(tokens, dtype=bool)
     slot_mapping = np.arange(tokens.size, dtype=np.int64)
-    _graph, mask_out, callback, _op_callbacks, _end = engine.get(
+    _graph, mask_out, callback, op_callbacks, _end = engine.get(
         request_id, tokens, mask, slot_mapping, dp_client_id=0)
-    return mask_out, callback
+    return mask_out, callback, op_callbacks
 
 
 def _seed_ssd_resident_data(engine, num_seqs=6, churn=10):
@@ -219,7 +219,7 @@ def test_aborted_get_restores_cpu_pool(global_engine):
     unready_before = cpu.index.total_unready_blocks()
     aborted = 0
     for i, tokens in enumerate(seqs * 8):
-        mask_out, callback = _run_get(engine, tokens, request_id=1000 + i)
+        mask_out, callback, _ops = _run_get(engine, tokens, request_id=1000 + i)
         if mask_out.any():
             callback.abort()   # what _cancel_task now does pre-launch
             aborted += 1
@@ -228,8 +228,8 @@ def test_aborted_get_restores_cpu_pool(global_engine):
     assert cpu.mempool.num_free_blocks == free_before
     assert cpu.index.total_unready_blocks() == unready_before
     # the pool is usable: a fresh put both allocates and completes
-    mask_out, _ = _run_put(engine, _tokens(TPB // 2, seed=9000),
-                           request_id=2000)
+    mask_out, _cb, _ops = _run_put(engine, _tokens(TPB // 2, seed=9000),
+                                   request_id=2000)
     assert mask_out.any()
 
 
@@ -241,7 +241,7 @@ def test_aborted_put_restores_both_tiers(global_engine):
     ssd_free = ssd.mempool.num_free_blocks
 
     tokens = _tokens(TPB // 2, seed=42)
-    _mask, callback = _run_put(engine, tokens, request_id=1, complete=False)
+    _mask, callback, _ops = _run_put(engine, tokens, request_id=1, complete=False)
     assert cpu.mempool.num_free_blocks < cpu_free  # plan holds blocks
 
     callback.abort()
@@ -251,7 +251,7 @@ def test_aborted_put_restores_both_tiers(global_engine):
     assert cpu.index.total_unready_blocks() == 0
     assert ssd.index.total_unready_blocks() == 0
     # the prefix was rolled back, so the same put succeeds afterwards
-    mask_out, _ = _run_put(engine, tokens, request_id=2)
+    mask_out, _cb, _ops = _run_put(engine, tokens, request_id=2)
     assert mask_out.any()
 
 
@@ -260,7 +260,7 @@ def test_completed_then_cancelled_plan_does_not_double_release(global_engine):
     cpu = engine.cpu_cache_engine
     tokens = _tokens(TPB // 2, seed=77)
 
-    _mask, callback = _run_put(engine, tokens, request_id=1, complete=True)
+    _mask, callback, _ops = _run_put(engine, tokens, request_id=1, complete=True)
     free_after_complete = cpu.mempool.num_free_blocks
 
     callback.abort()   # late cancel racing completion: must be a no-op
@@ -326,3 +326,76 @@ def test_cancel_task_leaves_running_tasks_alone(global_engine):
         op_callback()
     callback()
     assert cpu.index.total_ready_blocks() > 0
+
+
+# --------------------------------------------------------------------------
+# Raced plans: cancel one while an overlapping plan is pending
+# --------------------------------------------------------------------------
+
+def test_cancel_with_pending_extension_leaves_bounded_hole(global_engine):
+    """The documented residual case, pinned so it is not overstated.
+
+    Put B (prefix + extension) arrives while put A (prefix) is pending; B
+    skips A's blocks because A's unready insert claims them, so A's content
+    is never written by anyone. Cancelling A then backs off the rollback
+    (A's node gained B's child and is no longer a leaf) and the prefix stays
+    an unready hole -- semantically forced, since marking it ready would
+    publish blocks whose transfer never ran. What the fix guarantees here is
+    strictly-no-worse than before: the hole is the same size as upstream's,
+    bounded by A's node, and unlike upstream it is no longer locked.
+    """
+    engine = global_engine
+    cpu = engine.cpu_cache_engine
+    prefix = _tokens(4, seed=61)
+    extension = np.concatenate([prefix, _tokens(2, seed=62)])
+
+    mask_a, callback_a, _ops_a = _run_put(engine, prefix, request_id=1,
+                                          complete=False)
+    assert mask_a.any()
+    _mask_b, callback_b, ops_b = _run_put(engine, extension, request_id=2,
+                                          complete=False)
+
+    callback_a.abort()
+    # B saw A's pending insert and skipped the prefix; complete it normally.
+    for op_callback in ops_b.values():
+        op_callback()
+    callback_b()
+
+    # A's node was extended by B, so the rollback must have backed off: the
+    # hole is exactly A's insert (4 blocks per tier), bounded and no larger.
+    # Upstream leaves the same 4-block hole PLUS a leaked lock on it; here
+    # nothing may stay locked once both plans are resolved.
+    assert cpu.index.total_unready_blocks() == 4
+
+    if hasattr(cpu.index, "root_node"):  # python index exposes the tree
+        stack = [cpu.index.root_node]
+        while stack:
+            node = stack.pop()
+            assert node.lock_cnt == 0, "no plan may leave a lock behind"
+            stack.extend(node.children.values())
+
+
+def test_cancel_get_with_racing_put_leaves_no_residue(global_engine):
+    """A staging GET is cancelled while a put of the same prefix is pending;
+    the put saw the unready staging node and skipped, so after the abort and
+    the put's completion nothing unready may remain and late abort/complete
+    calls on the cancelled handle must be inert."""
+    engine = global_engine
+    seqs = _seed_ssd_resident_data(engine)
+    target = seqs[0]
+
+    mask_get, callback_get, _get_ops = _run_get(engine, target, request_id=900)
+    if not mask_get.any():
+        pytest.skip("scenario needs an SSD-staging GET plan")
+    _mask, callback_put, put_ops = _run_put(engine, target, request_id=901,
+                                            complete=False)
+
+    callback_get.abort()
+    for op_callback in put_ops.values():
+        op_callback()
+    callback_put()
+
+    assert engine.cpu_cache_engine.index.total_unready_blocks() == 0
+    assert engine.ssd_cache_engine.index.total_unready_blocks() == 0
+    callback_get.abort()   # late duplicate: inert
+    callback_get()         # late complete on aborted handle: inert
