@@ -1733,7 +1733,9 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             raise ValueError(f"num_remote_blocks_per_file {self.num_remote_blocks_per_file} "
                              f"is not divisible by round_robin {self.round_robin}")
 
-        self.has_multi_group = cpu_kv_layout.layer_groups is not None
+        self.has_multi_group = (
+            getattr(cpu_kv_layout, "layer_groups", None) is not None
+        )
         if self.has_multi_group:
             if (
                 cpu_kv_layout.type != KVCacheLayoutType.BLOCKFIRST
@@ -2927,7 +2929,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self.num_cpu_blocks = cpu_kv_layout.num_block
         # For multi-group layouts, get_chunk_size() is invalid;
         # use get_block_stride() which works for both single and multi-group BLOCKFIRST.
-        if cpu_kv_layout.layer_groups is not None:
+        if getattr(cpu_kv_layout, "layer_groups", None) is not None:
             self.block_size = cpu_kv_layout.get_block_stride()
         else:
             self.block_size = cpu_kv_layout.get_chunk_size()
