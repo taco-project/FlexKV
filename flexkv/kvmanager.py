@@ -129,6 +129,7 @@ class KVManager:
             return self.kv_task_engine.is_ready()
 
     def shutdown(self) -> None:
+        flexkv_logger.info("[FLEXKV] KVManager.shutdown begin.")
         if self.server_client_mode:
             self.dp_client.shutdown()
             # Wait for the server process to exit after sending shutdown request
@@ -143,6 +144,7 @@ class KVManager:
                 "MPS is enabled. To stop MPS daemon manually, run: "
                 "'echo quit | nvidia-cuda-mps-control'"
             )
+        flexkv_logger.info("[FLEXKV] KVManager.shutdown done.")
 
     def get_async(self,
                   token_ids: Union[torch.Tensor, np.ndarray],

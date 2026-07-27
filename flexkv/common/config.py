@@ -795,6 +795,19 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     mla_d2h_mode=os.getenv('FLEXKV_MLA_D2H_MODE', 'sharded'),
 
     layerwise_notify_mode=os.getenv('FLEXKV_LAYERWISE_NOTIFY_MODE', 'hostfunc'),
+
+    # Graceful shutdown timeout hierarchy (each layer waits for the next inner
+    # layer plus a small buffer to avoid mid-unpin SIGKILL):
+    #   sglang tokenizer wait   (SGLANG_SCHEDULER_SHUTDOWN_WAIT_S)  = 1200s
+    #     > TM parent-side wait (FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S) = 900s
+    #       > per-worker wait   (FLEXKV_WORKER_SHUTDOWN_TIMEOUT_S)  = 600s
+    # If you tune one, keep the ordering: worker < TM < scheduler-wait.
+    worker_shutdown_timeout_s=float(os.getenv('FLEXKV_WORKER_SHUTDOWN_TIMEOUT_S', 600)),
+    # Parent wait for TransferManager subprocess after sending shutdown command.
+    # Must cover parallel worker unregister + a buffer over per-worker timeout.
+    transfer_manager_shutdown_timeout_s=float(
+        os.getenv('FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S', 900)
+    ),
 )
 
 @dataclass
