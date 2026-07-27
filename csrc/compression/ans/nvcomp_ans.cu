@@ -63,16 +63,38 @@ void ans_ctx_create(ANSTransferContext* ctx, size_t max_num_chunks,
   ctx->max_chunk_size = max_chunk_size;
 
   try {
-    // data_type: 0 = FLOAT16 (bf16/fp16), 1 = UCHAR/UINT8 (fp8)
+    // data_type: 0 = FLOAT16, 1 = UCHAR byte stream,
+    //            2 = native FP8 E4M3 (nvCOMP >= 5.3).
 #if FLEXKV_NVCOMP_MAJOR >= 5
     ctx->compress_opts = nvcompBatchedANSCompressDefaultOpts;
     ctx->decompress_opts = nvcompBatchedANSDecompressDefaultOpts;
-    ctx->compress_opts.data_type =
-        (data_type == 0) ? NVCOMP_TYPE_FLOAT16 : NVCOMP_TYPE_UCHAR;
+    if (data_type == 0) {
+      ctx->compress_opts.data_type = NVCOMP_TYPE_FLOAT16;
+    } else if (data_type == 1) {
+      ctx->compress_opts.data_type = NVCOMP_TYPE_UCHAR;
+    } else if (data_type == 2) {
+#if FLEXKV_NVCOMP_MAJOR > 5 || \
+    (FLEXKV_NVCOMP_MAJOR == 5 && defined(NVCOMP_VER_MINOR) && \
+     NVCOMP_VER_MINOR >= 3)
+      ctx->compress_opts.data_type = NVCOMP_TYPE_FLOAT8_E4M3;
+#else
+      throw std::invalid_argument(
+          "ANS native FP8 E4M3 mode requires nvCOMP >= 5.3");
+#endif
+    } else {
+      throw std::invalid_argument("ANS data_type must be 0, 1, or 2");
+    }
 #else
     ctx->compress_opts = nvcompBatchedANSDefaultOpts;
     ctx->decompress_opts = nvcompBatchedANSDefaultOpts;
-    ctx->compress_opts.data_type = (data_type == 0) ? float16 : uint8;
+    if (data_type == 0) {
+      ctx->compress_opts.data_type = float16;
+    } else if (data_type == 1) {
+      ctx->compress_opts.data_type = uint8;
+    } else {
+      throw std::invalid_argument(
+          "ANS native FP8 E4M3 mode requires nvCOMP >= 5.3");
+    }
 #endif
 
     const size_t max_total = max_num_chunks * max_chunk_size;

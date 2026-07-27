@@ -19,7 +19,7 @@ except ImportError:
 AVAILABLE = _NVCOMP_AVAILABLE
 SUPPORTED_DTYPES = (
     torch.bfloat16, torch.float16,
-    torch.float8_e4m3fn, torch.float8_e5m2,
+    torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8,
 )
 
 MIN_CHUNK_BYTES = 4096
@@ -32,13 +32,20 @@ SSD_PACKED_IO_ALIGN = 512
 def check_dtype(dtype) -> None:
     if dtype not in SUPPORTED_DTYPES:
         raise RuntimeError(
-            f"nvcomp only supports bf16/fp16/fp8, got {dtype}")
+            f"nvcomp only supports bf16/fp16/fp8/uint8, got {dtype}")
 
 
 def data_type(dtype) -> int:
-    """nvcomp ANS data type: 0 = FLOAT16 (bf16/fp16), 1 = UCHAR (fp8)."""
+    """Map torch dtype to nvCOMP ANS symbol type.
+
+    0 = FLOAT16, 1 = UCHAR, 2 = native FLOAT8_E4M3 (nvCOMP >= 5.3).
+    """
     check_dtype(dtype)
-    return 0 if dtype.itemsize == 2 else 1
+    if dtype.itemsize == 2:
+        return 0
+    if dtype == torch.float8_e4m3fn:
+        return 2
+    return 1
 
 
 def check_engine_nvcomp_enable(
