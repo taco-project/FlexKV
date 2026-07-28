@@ -933,6 +933,9 @@ PYBIND11_MODULE(c_ext, m) {
                &flexkv::CRadixTreeIndex::evict),
            py::arg("evicted_blocks"), py::arg("evicted_block_hashes"),
            py::arg("num_evicted"), py::call_guard<py::gil_scoped_release>())
+      .def("remove_unready_leaf",
+           &flexkv::CRadixTreeIndex::remove_unready_leaf, py::arg("node"),
+           py::arg("freed_blocks"), py::call_guard<py::gil_scoped_release>())
       .def("total_cached_blocks", &flexkv::CRadixTreeIndex::total_cached_blocks)
       .def("total_unready_blocks",
            &flexkv::CRadixTreeIndex::total_unready_blocks)
