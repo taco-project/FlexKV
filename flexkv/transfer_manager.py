@@ -331,6 +331,10 @@ class TransferManager:
     def start(self) -> None:
         self.transfer_engine.start()
 
+    def set_cuda_profiler(self, enable: bool) -> None:
+        if hasattr(self, "transfer_engine"):
+            self.transfer_engine.set_cuda_profiler(enable)
+
     def shutdown(self) -> None:
         if hasattr(self, 'transfer_engine'):
             self.transfer_engine.shutdown()
@@ -727,6 +731,10 @@ class TransferManagerHandleBase(ABC):
     def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         pass
 
+    def set_cuda_profiler(self, enable: bool) -> None:
+        """Optional: broadcast cudaProfilerStart/Stop to transfer workers."""
+        return
+
     @abstractmethod
     def shutdown(self) -> None:
         pass
@@ -756,6 +764,9 @@ class TransferManagerIntraProcessHandle(TransferManagerHandleBase):
 
     def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         return self.transfer_manager.wait(timeout)
+
+    def set_cuda_profiler(self, enable: bool) -> None:
+        self.transfer_manager.set_cuda_profiler(enable)
 
     def shutdown(self) -> None:
         self.transfer_manager.shutdown()
@@ -897,6 +908,10 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                                 transfer_manager.submit(request['transfer_graph'])
                             elif request_type == 'submit_batch':
                                 transfer_manager.submit_batch(request['transfer_graphs'])
+                            elif request_type == 'cuda_profiler':
+                                transfer_manager.set_cuda_profiler(
+                                    bool(request.get('enable', False))
+                                )
                             elif request_type == 'shutdown':
                                 flexkv_logger.info(
                                     "TransferManager received shutdown command; "
@@ -1011,6 +1026,17 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             pass
 
         return finished_ops
+
+    def set_cuda_profiler(self, enable: bool) -> None:
+        try:
+            self.command_parent_conn.send({
+                'type': 'cuda_profiler',
+                'enable': bool(enable),
+            })
+        except (BrokenPipeError, OSError, EOFError) as e:
+            flexkv_logger.warning(
+                f"Failed to send TransferManager cuda_profiler command: {e}"
+            )
 
     def shutdown(self) -> None:
         if self.process is None:
@@ -1299,6 +1325,9 @@ class TransferManagerHandle:
 
     def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         return self._handle.wait(timeout)
+
+    def set_cuda_profiler(self, enable: bool) -> None:
+        self._handle.set_cuda_profiler(enable)
 
     def shutdown(self) -> None:
         self._handle.shutdown()

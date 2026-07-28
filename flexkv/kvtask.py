@@ -212,6 +212,17 @@ class KVTaskManager:
             self.remote_process.close()
             self.remote_process = None
 
+    def set_cuda_profiler(self, enable: bool) -> None:
+        if not hasattr(self, "transfer_handles") or self.transfer_handles is None:
+            return
+        for transfer_handle in self.transfer_handles:
+            try:
+                transfer_handle.set_cuda_profiler(enable)
+            except Exception as e:
+                flexkv_logger.warning(
+                    f"KVTaskEngine.set_cuda_profiler({enable}) failed: {e}"
+                )
+
     def create_get_task(self,
                         task_id: int,
                         token_ids: np.ndarray,

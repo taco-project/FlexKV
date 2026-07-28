@@ -77,7 +77,11 @@ from flexkv.transfer.compression.common.strategy import (
     CompressionStrategy,
     NullCompressionStrategy,
 )
-from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
+from flexkv.transfer.worker_op import (
+    WorkerControlMsg,
+    WorkerTransferOp,
+    WorkerLayerwiseTransferOp,
+)
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.external.mooncake_store_keys import PoolKind, build_key
@@ -457,6 +461,16 @@ class TransferWorkerBase(ABC):
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         pass
 
+    def _handle_control_msg(self, msg: WorkerControlMsg) -> None:
+        if msg.kind == "cuda_profiler_start":
+            _worker_cuda_profiler_start(self.worker_id)
+        elif msg.kind == "cuda_profiler_stop":
+            _worker_cuda_profiler_stop(self.worker_id)
+        else:
+            flexkv_logger.warning(
+                f"[worker {self.worker_id}] unknown control msg kind={msg.kind!r}"
+            )
+
     def run(self) -> None:
         """Main loop for the worker process.
 
@@ -472,6 +486,9 @@ class TransferWorkerBase(ABC):
                 op = self.transfer_conn.recv()
                 if op is None:
                     return
+                if isinstance(op, WorkerControlMsg):
+                    self._handle_control_msg(op)
+                    continue
 
                 batch_ops = [op]
                 shutdown_after_batch = False
@@ -480,6 +497,9 @@ class TransferWorkerBase(ABC):
                     if op is None:
                         shutdown_after_batch = True
                         break
+                    if isinstance(op, WorkerControlMsg):
+                        self._handle_control_msg(op)
+                        continue
                     batch_ops.append(op)
 
                 for op in batch_ops:
@@ -509,6 +529,40 @@ class TransferWorkerBase(ABC):
             except Exception as e:
                 flexkv_logger.error(f"Error in worker run loop: {e}")
 
+
+def _worker_cuda_profiler_start(worker_id: int) -> None:
+    """Begin Nsight capture window inside this transfer worker process."""
+    try:
+        if not torch.cuda.is_available():
+            flexkv_logger.warning(
+                f"[worker {worker_id}] cudaProfilerStart skipped: CUDA unavailable"
+            )
+            return
+        torch.cuda.cudart().cudaProfilerStart()
+        msg = f"[worker {worker_id}] cudaProfilerStart"
+        flexkv_logger.info(msg)
+        print(f"[FLEXKV] {msg}", flush=True)
+    except Exception as e:
+        flexkv_logger.warning(
+            f"[worker {worker_id}] cudaProfilerStart failed: {e}"
+        )
+
+
+def _worker_cuda_profiler_stop(worker_id: int) -> None:
+    """End Nsight capture window inside this transfer worker process."""
+    try:
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.cudart().cudaProfilerStop()
+        msg = f"[worker {worker_id}] cudaProfilerStop"
+        flexkv_logger.info(msg)
+        print(f"[FLEXKV] {msg}", flush=True)
+    except Exception as e:
+        flexkv_logger.warning(
+            f"[worker {worker_id}] cudaProfilerStop failed: {e}"
+        )
+
+
 class WorkerHandle:
     """handle for worker process"""
     def __init__(self, worker_id: int, transfer_conn: Connection, process: mp.Process, ready_event: Any):
@@ -523,6 +577,17 @@ class WorkerHandle:
         else:
             worker_op = WorkerTransferOp(op)
         self.transfer_conn.send(worker_op)
+
+    def set_cuda_profiler(self, enable: bool) -> None:
+        """Ask the worker process to cudaProfilerStart/Stop (Nsight range)."""
+        kind = "cuda_profiler_start" if enable else "cuda_profiler_stop"
+        try:
+            self.transfer_conn.send(WorkerControlMsg(kind=kind))
+        except (BrokenPipeError, OSError, EOFError) as e:
+            flexkv_logger.warning(
+                f"[WorkerHandle] worker {self.worker_id} set_cuda_profiler"
+                f"({enable}) failed: {e}"
+            )
 
     def shutdown(self) -> None:
         try:
@@ -941,7 +1006,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.cpu_tensor = cpu_blocks
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        self._register_host_tensor(cpu_blocks, "tp_cpu_kv_pool")
+        self._register_host_tensor(cpu_blocks, "cpu_kv_pool")
 
         self.num_layers = gpu_kv_layouts[0].num_layer
 

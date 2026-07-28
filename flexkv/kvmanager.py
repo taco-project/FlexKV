@@ -146,6 +146,16 @@ class KVManager:
             )
         flexkv_logger.info("[FLEXKV] KVManager.shutdown done.")
 
+    def set_cuda_profiler(self, enable: bool) -> None:
+        """Propagate Nsight cudaProfilerStart/Stop to FlexKV transfer workers."""
+        if self.server_client_mode:
+            flexkv_logger.warning(
+                "KVManager.set_cuda_profiler is not supported in server_client_mode"
+            )
+            return
+        if self.kv_task_engine is not None:
+            self.kv_task_engine.set_cuda_profiler(enable)
+
     def get_async(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   slot_mapping: Union[torch.Tensor, np.ndarray],

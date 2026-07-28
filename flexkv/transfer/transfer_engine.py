@@ -1046,6 +1046,21 @@ class TransferEngine:
                 handles.append(worker)
         return handles
 
+    def set_cuda_profiler(self, enable: bool) -> None:
+        """Broadcast cudaProfilerStart/Stop to all transfer worker processes."""
+        handles = self._collect_worker_handles()
+        flexkv_logger.info(
+            f"TransferEngine.set_cuda_profiler(enable={enable}): "
+            f"notifying {len(handles)} worker(s)"
+        )
+        for handle in handles:
+            try:
+                handle.set_cuda_profiler(enable)
+            except Exception as e:
+                flexkv_logger.warning(
+                    f"set_cuda_profiler on worker {handle.worker_id} failed: {e}"
+                )
+
     def _shutdown_worker_handles(self, handles: List[WorkerHandle]) -> None:
         """Stop worker processes in parallel (send sentinel + join/unregister)."""
         if not handles:

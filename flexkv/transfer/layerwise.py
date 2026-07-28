@@ -6,6 +6,7 @@ from torch.multiprocessing import Queue as MPQueue
 from multiprocessing.connection import Connection
 from typing import List, Any, Dict, Union, Optional, Tuple
 
+import nvtx
 import torch
 
 from flexkv.c_ext import LayerwiseTransferGroup
@@ -906,6 +907,39 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                       swa_src_block_ids_disk2h: Optional[torch.Tensor] = None,
                       swa_dst_block_ids_disk2h: Optional[torch.Tensor] = None,
                       **kwargs: Any) -> None:
+        path = "MG" if self.has_multi_group else "SG"
+        nvtx.push_range(
+            f"FlexKV.Layerwise::py.transfer_impl({path}) "
+            f"h2d_blocks={len(src_block_ids_h2d)} counter={counter_id}",
+            color="blue",
+        )
+        try:
+            self._transfer_impl_body(
+                src_block_ids_h2d,
+                dst_block_ids_h2d,
+                src_block_ids_disk2h,
+                dst_block_ids_disk2h,
+                counter_id,
+                swa_src_block_ids_h2d,
+                swa_dst_block_ids_h2d,
+                swa_src_block_ids_disk2h,
+                swa_dst_block_ids_disk2h,
+            )
+        finally:
+            nvtx.pop_range()
+
+    def _transfer_impl_body(
+        self,
+        src_block_ids_h2d: torch.Tensor,
+        dst_block_ids_h2d: torch.Tensor,
+        src_block_ids_disk2h: Optional[torch.Tensor],
+        dst_block_ids_disk2h: Optional[torch.Tensor],
+        counter_id: int,
+        swa_src_block_ids_h2d: Optional[torch.Tensor],
+        swa_dst_block_ids_h2d: Optional[torch.Tensor],
+        swa_src_block_ids_disk2h: Optional[torch.Tensor],
+        swa_dst_block_ids_disk2h: Optional[torch.Tensor],
+    ) -> None:
         assert src_block_ids_h2d.dtype == torch.int64
         assert dst_block_ids_h2d.dtype == torch.int64
         assert len(src_block_ids_h2d) == len(dst_block_ids_h2d)
@@ -946,78 +980,113 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             else torch.empty(0, dtype=torch.int64)
 
         if self.has_multi_group:
-            self.layerwise_transfer_group.layerwise_transfer_multi_group(
-                ssd_block_ids=ssd_block_ids,
-                cpu_block_ids_d2h=cpu_block_ids_d2h,
-                num_blocks_per_file=self.num_blocks_per_file,
-                round_robin=self.round_robin,
-                num_threads_per_device=32,
-                gpu_block_id_tensor=dst_block_ids_h2d,
-                cpu_block_id_tensor=src_block_ids_h2d,
-                transfer_cta_num=self.h2d_cta_num,
-                use_ce_transfer=self.use_ce_transfer_h2d,
-                is_mla=self.is_mla,
-                counter_id=counter_id,
+            nvtx.push_range(
+                f"FlexKV.Layerwise::py.cpp_multi_group "
+                f"blocks={len(src_block_ids_h2d)} "
+                f"ssd={int(ssd_block_ids.numel())} "
+                f"swa_h2d={int(swa_src_block_ids_h2d.numel()) if swa_has_h2d else 0}",
+                color="cyan",
+            )
+            try:
+                self.layerwise_transfer_group.layerwise_transfer_multi_group(
+                    ssd_block_ids=ssd_block_ids,
+                    cpu_block_ids_d2h=cpu_block_ids_d2h,
+                    num_blocks_per_file=self.num_blocks_per_file,
+                    round_robin=self.round_robin,
+                    num_threads_per_device=32,
+                    gpu_block_id_tensor=dst_block_ids_h2d,
+                    cpu_block_id_tensor=src_block_ids_h2d,
+                    transfer_cta_num=self.h2d_cta_num,
+                    use_ce_transfer=self.use_ce_transfer_h2d,
+                    is_mla=self.is_mla,
+                    counter_id=counter_id,
+                    mla_d2h_mode=self.mla_d2h_mode,
+                    notify_mode=self.layerwise_notify_mode,
+                    **swa_kwargs,
+                )
+            finally:
+                nvtx.pop_range()
+            return
+
+        nvtx.push_range(
+            f"FlexKV.Layerwise::py.cpp_single_group "
+            f"blocks={len(src_block_ids_h2d)} layers={self.num_layers} "
+            f"ssd={int(ssd_block_ids.numel())}",
+            color="cyan",
+        )
+        try:
+            self.layerwise_transfer_group.layerwise_transfer(
+                ssd_block_ids,
+                cpu_block_ids_d2h,
+                self.ssd_layer_stride_in_bytes,
+                self.ssd_kv_stride_in_bytes,
+                self.num_blocks_per_file,
+                self.round_robin,
+                32,  # num_threads_per_device
+                dst_block_ids_h2d,
+                src_block_ids_h2d,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.cpu_chunk_size_in_bytes,
+                self.h2d_cpu_kv_stride_in_bytes,
+                self.h2d_cpu_layer_stride_in_bytes,
+                self.cpu_tp_stride_in_bytes,
+                self.h2d_cta_num,
+                self.use_ce_transfer_h2d,
+                self.num_layers,
+                1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
+                self.is_mla,
+                counter_id,
                 mla_d2h_mode=self.mla_d2h_mode,
                 notify_mode=self.layerwise_notify_mode,
                 **swa_kwargs,
             )
-            return
-
-        self.layerwise_transfer_group.layerwise_transfer(
-            ssd_block_ids,
-            cpu_block_ids_d2h,
-            self.ssd_layer_stride_in_bytes,
-            self.ssd_kv_stride_in_bytes,
-            self.num_blocks_per_file,
-            self.round_robin,
-            32,  # num_threads_per_device
-            dst_block_ids_h2d,
-            src_block_ids_h2d,
-            self.cpu_kv_stride_in_bytes,
-            self.cpu_layer_stride_in_bytes,
-            self.cpu_block_stride_in_bytes,
-            self.cpu_chunk_size_in_bytes,
-            self.h2d_cpu_kv_stride_in_bytes,
-            self.h2d_cpu_layer_stride_in_bytes,
-            self.cpu_tp_stride_in_bytes,
-            self.h2d_cta_num,
-            self.use_ce_transfer_h2d,
-            self.num_layers,
-            1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
-            self.is_mla,
-            counter_id,
-            mla_d2h_mode=self.mla_d2h_mode,
-            notify_mode=self.layerwise_notify_mode,
-            **swa_kwargs,
-        )
+        finally:
+            nvtx.pop_range()
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
-        src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
-        dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
+        nvtx.push_range(
+            f"FlexKV.Layerwise::py.launch_transfer "
+            f"op={transfer_op.transfer_op_id} graph={transfer_op.transfer_graph_id} "
+            f"counter={transfer_op.counter_id}",
+            color="blue",
+        )
+        try:
+            return self._launch_transfer_body(transfer_op)
+        finally:
+            nvtx.pop_range()
 
-        if transfer_op.src_block_ids_disk2h.size > 0:
-            src_block_ids_disk2h = torch.from_numpy(transfer_op.src_block_ids_disk2h).to(dtype=torch.int64)
-            dst_block_ids_disk2h = torch.from_numpy(transfer_op.dst_block_ids_disk2h).to(dtype=torch.int64)
-        else:
-            src_block_ids_disk2h = None
-            dst_block_ids_disk2h = None
+    def _launch_transfer_body(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
+        nvtx.push_range("FlexKV.Layerwise::py.prep_tensors", color="orange")
+        try:
+            src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
+            dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
 
-        # SWA ids: empty np arrays -> None (so _transfer_impl can short-circuit cleanly).
-        if transfer_op.swa_src_block_ids_h2d.size > 0:
-            swa_src_h2d = torch.from_numpy(transfer_op.swa_src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
-            swa_dst_h2d = torch.from_numpy(transfer_op.swa_dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
-        else:
-            swa_src_h2d = None
-            swa_dst_h2d = None
-        if transfer_op.swa_src_block_ids_disk2h.size > 0:
-            swa_src_disk2h = torch.from_numpy(transfer_op.swa_src_block_ids_disk2h).to(dtype=torch.int64)
-            swa_dst_disk2h = torch.from_numpy(transfer_op.swa_dst_block_ids_disk2h).to(dtype=torch.int64)
-        else:
-            swa_src_disk2h = None
-            swa_dst_disk2h = None
+            if transfer_op.src_block_ids_disk2h.size > 0:
+                src_block_ids_disk2h = torch.from_numpy(transfer_op.src_block_ids_disk2h).to(dtype=torch.int64)
+                dst_block_ids_disk2h = torch.from_numpy(transfer_op.dst_block_ids_disk2h).to(dtype=torch.int64)
+            else:
+                src_block_ids_disk2h = None
+                dst_block_ids_disk2h = None
 
-        num_h2d_blocks = len(src_block_ids_h2d)
+            # SWA ids: empty np arrays -> None (so _transfer_impl can short-circuit cleanly).
+            if transfer_op.swa_src_block_ids_h2d.size > 0:
+                swa_src_h2d = torch.from_numpy(transfer_op.swa_src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
+                swa_dst_h2d = torch.from_numpy(transfer_op.swa_dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
+            else:
+                swa_src_h2d = None
+                swa_dst_h2d = None
+            if transfer_op.swa_src_block_ids_disk2h.size > 0:
+                swa_src_disk2h = torch.from_numpy(transfer_op.swa_src_block_ids_disk2h).to(dtype=torch.int64)
+                swa_dst_disk2h = torch.from_numpy(transfer_op.swa_dst_block_ids_disk2h).to(dtype=torch.int64)
+            else:
+                swa_src_disk2h = None
+                swa_dst_disk2h = None
+
+            num_h2d_blocks = len(src_block_ids_h2d)
+        finally:
+            nvtx.pop_range()
 
         start_time = time.time()
         self._transfer_impl(

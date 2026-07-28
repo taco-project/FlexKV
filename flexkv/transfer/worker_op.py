@@ -6,6 +6,17 @@ import numpy as np
 from flexkv.common.transfer import TransferOp, TransferType, LayerwiseTransferOp
 
 
+@dataclass(frozen=True)
+class WorkerControlMsg:
+    """Out-of-band control for TransferWorker (not a transfer op).
+
+    Used to align Nsight ``--capture-range=cudaProfilerApi`` with SGLang
+    ``/start_profile`` (activities includes ``CUDA_PROFILER``).
+    """
+
+    kind: str  # "cuda_profiler_start" | "cuda_profiler_stop"
+
+
 @dataclass
 class WorkerTransferOp:
     transfer_op_id: int
