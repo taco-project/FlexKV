@@ -96,7 +96,7 @@ def start_metrics_server(port: Optional[int] = None) -> bool:
             return True
         
         try:
-            from prometheus_client import start_http_server, REGISTRY
+            from prometheus_client import start_http_server, REGISTRY  # noqa: F401
         except ImportError:
             raise RuntimeError(
                 "[FlexKV PyMetrics] prometheus_client not installed but metrics server requested. "
@@ -107,10 +107,24 @@ def start_metrics_server(port: Optional[int] = None) -> bool:
             port = get_metrics_port()
         
         try:
-            # Start server with default registry (single process mode)
-            # Always bind to localhost (127.0.0.1) for security
-            start_http_server(port, addr=BIND_ADDRESS, registry=REGISTRY)
-            
+            # Multiprocess mode: when PROMETHEUS_MULTIPROC_DIR is set, worker
+            # subprocesses write metric files into that dir and we expose an
+            # aggregating registry. Otherwise keep the single-process default.
+            import os
+            if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+                from prometheus_client import CollectorRegistry, start_http_server
+                from prometheus_client.multiprocess import MultiProcessCollector
+                registry = CollectorRegistry()
+                MultiProcessCollector(registry)
+                start_http_server(port, addr=BIND_ADDRESS, registry=registry)
+                print(
+                    f"[FlexKV PyMetrics] multiprocess mode: aggregating "
+                    f"{os.environ['PROMETHEUS_MULTIPROC_DIR']}"
+                )
+            else:
+                from prometheus_client import start_http_server, REGISTRY
+                start_http_server(port, addr=BIND_ADDRESS, registry=REGISTRY)
+
             _server_started = True
             print(
                 f"[FlexKV PyMetrics] Initialized successfully, exposing metrics at http://{BIND_ADDRESS}:{port}/metrics"

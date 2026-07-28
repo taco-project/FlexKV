@@ -222,10 +222,20 @@ class CacheEngineAccel:
         """Initialize the SWA host pool for node-mounted SWA on this engine."""
         from flexkv.swa.swa_host_pool import SWAHostPool
         self.swa_pool = SWAHostPool(swa_config)
+        self._record_swa_slot_stats()
 
     @property
     def swa_enabled(self) -> bool:
         return self.swa_pool is not None
+
+    def _swa_device_label(self) -> str:
+        return DEVICE_TYPE[self.device_type].lower()
+
+    def _record_swa_slot_stats(self) -> None:
+        """Push current SWA pool usage to metrics (no-op when disabled)."""
+        if self._metrics_collector is not None and self.swa_pool is not None:
+            self._metrics_collector.update_swa_slot_stats(
+                self._swa_device_label(), self.swa_pool.num_used, self.swa_pool.num_slots)
 
     def _alloc_swa_slot(self, protected_node=None) -> int:
         """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
@@ -233,6 +243,7 @@ class CacheEngineAccel:
             return -1
         slot = self.swa_pool.allocate()
         if slot is not None:
+            self._record_swa_slot_stats()
             return slot
         # can not allocate SWA slot, evict SWA-LRU once
         if protected_node is not None:
@@ -243,18 +254,30 @@ class CacheEngineAccel:
             if protected_node is not None:
                 self.unlock(protected_node)
         slot = self.swa_pool.allocate()
-        return slot if slot is not None else -1
+        if slot is None:
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_swa_slot_alloc_failed(self._swa_device_label())
+            return -1
+        self._record_swa_slot_stats()
+        return slot
 
     def _free_swa_slot(self, slot: int) -> None:
         """Return one detached SWA slot to this tier's pool."""
         self.swa_pool.free(int(slot))
+        self._record_swa_slot_stats()
 
     def _drain_unmounted_swa_slots(self) -> None:
         """Return slots detached by radix-tree structural changes to the pool."""
         if self.swa_pool is None:
             return
-        for slot in self.index.drain_freed_swa_slots():
-            self._free_swa_slot(slot)
+        drained = list(self.index.drain_freed_swa_slots())
+        for slot in drained:
+            self.swa_pool.free(int(slot))
+        if drained:
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_swa_evicted(
+                    self._swa_device_label(), "cascade", len(drained))
+            self._record_swa_slot_stats()
 
     def _pin_swa_node(self, node) -> None:
         self.index.lock(node)
@@ -270,6 +293,9 @@ class CacheEngineAccel:
             return 0
         evicted_full = torch.zeros(0, dtype=torch.int64)
         num_freed = self.index.evict_swa(evicted_full, num_swa_evicted)
+        if num_freed > 0 and self._metrics_collector is not None:
+            self._metrics_collector.record_swa_evicted(
+                self._swa_device_label(), "pool_full", num_freed)
         if evicted_full.numel() > 0:
             self.mempool.recycle_blocks(evicted_full.numpy())
         self._drain_unmounted_swa_slots()
@@ -502,11 +528,21 @@ class CacheEngine:
         """Initialize the SWA host pool for node-mounted SWA on this engine."""
         from flexkv.swa.swa_host_pool import SWAHostPool
         self.swa_pool = SWAHostPool(swa_config)
+        self._record_swa_slot_stats()
 
     @property
     def swa_enabled(self) -> bool:
         return self.tier_swa_config is not None and self.tier_swa_config.enabled \
                and self.swa_pool is not None
+
+    def _swa_device_label(self) -> str:
+        return DEVICE_TYPE[self.device_type].lower()
+
+    def _record_swa_slot_stats(self) -> None:
+        """Push current SWA pool usage to metrics (no-op when disabled)."""
+        if self._metrics_collector is not None and self.swa_pool is not None:
+            self._metrics_collector.update_swa_slot_stats(
+                self._swa_device_label(), self.swa_pool.num_used, self.swa_pool.num_slots)
 
     def _alloc_swa_slot(self, protected_node=None) -> int:
         """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
@@ -514,6 +550,7 @@ class CacheEngine:
             return -1
         slot = self.swa_pool.allocate()
         if slot is not None:
+            self._record_swa_slot_stats()
             return slot
         if protected_node is not None:
             self.lock_node(protected_node)
@@ -523,18 +560,30 @@ class CacheEngine:
             if protected_node is not None:
                 self.unlock(protected_node)
         slot = self.swa_pool.allocate()
-        return slot if slot is not None else -1
+        if slot is None:
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_swa_slot_alloc_failed(self._swa_device_label())
+            return -1
+        self._record_swa_slot_stats()
+        return slot
 
     def _free_swa_slot(self, slot: int) -> None:
         """Return one detached SWA slot to this tier's pool."""
         self.swa_pool.free(int(slot))
+        self._record_swa_slot_stats()
 
     def _drain_unmounted_swa_slots(self) -> None:
         """Return slots detached by radix-tree structural changes to the pool."""
         if self.swa_pool is None:
             return
-        for slot in self.index.drain_freed_swa_slots():
-            self._free_swa_slot(slot)
+        drained = list(self.index.drain_freed_swa_slots())
+        for slot in drained:
+            self.swa_pool.free(int(slot))
+        if drained:
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_swa_evicted(
+                    self._swa_device_label(), "cascade", len(drained))
+            self._record_swa_slot_stats()
 
     def _pin_swa_node(self, node) -> None:
         self.index.lock(node)
@@ -549,6 +598,9 @@ class CacheEngine:
         if self.swa_pool is None:
             return 0
         evicted_full, num_freed = self.index.evict_swa(num_swa_evicted)
+        if num_freed > 0 and self._metrics_collector is not None:
+            self._metrics_collector.record_swa_evicted(
+                self._swa_device_label(), "pool_full", num_freed)
         if evicted_full.size > 0:
             self.mempool.recycle_blocks(evicted_full)
         self._drain_unmounted_swa_slots()
@@ -1135,6 +1187,7 @@ class GlobalCacheEngine:
                 total_query_blocks = block_mask_end - block_mask_start
                 if total_query_blocks > 0:
                     self._metrics_collector.record_cache_miss(total_query_blocks)
+                    self._metrics_collector.record_cache_query("miss")
             return self._empty_get_return(request_id)
         assert fragment123_num_blocks <= len(gpu_block_ids)
 
@@ -1202,6 +1255,15 @@ class GlobalCacheEngine:
             self._metrics_collector.record_cache_hit("ssd", fragment2_num_blocks)
             # Remote hit blocks (blocks loaded from remote)
             self._metrics_collector.record_cache_hit("remote", fragment3_num_blocks)
+            # Query result over the requested window + per-tier readiness split
+            query_result = "full" if fragment123_num_blocks >= total_query_blocks else "partial"
+            self._metrics_collector.record_cache_query(query_result)
+            for _dev, _res in (("cpu", cpu_matched_result),
+                               ("ssd", ssd_matched_result),
+                               ("remote", remote_matched_result)):
+                _matched = max(0, min(_res.num_matched_blocks, block_mask_end) - block_mask_start)
+                _ready = max(0, min(_res.num_ready_matched_blocks, block_mask_end) - block_mask_start)
+                self._metrics_collector.record_cache_match_blocks(_dev, _ready, _matched - _ready)
             # Miss blocks (not in any cache)
             miss_blocks = total_query_blocks - fragment123_num_blocks
             if miss_blocks > 0:
@@ -1404,6 +1466,7 @@ class GlobalCacheEngine:
                 total_query_blocks = block_mask_end - block_mask_start
                 if total_query_blocks > 0:
                     self._metrics_collector.record_cache_miss(total_query_blocks)
+                    self._metrics_collector.record_cache_query("miss")
             nvtx.end_range(nvtx_range)
             return self._empty_get_return(request_id)
         assert fragment12_num_blocks <= len(gpu_block_ids)
@@ -1460,6 +1523,14 @@ class GlobalCacheEngine:
             self._metrics_collector.record_cache_hit("cpu", fragment1_num_blocks)
             # SSD hit blocks (loaded directly to GPU with GDS, otherwise via CPU)
             self._metrics_collector.record_cache_hit("ssd", fragment2_num_blocks)
+            # Query result over the requested window + per-tier readiness split
+            query_result = "full" if fragment12_num_blocks >= total_query_blocks else "partial"
+            self._metrics_collector.record_cache_query(query_result)
+            for _dev, _res in (("cpu", cpu_matched_result),
+                               ("ssd", ssd_matched_result)):
+                _matched = max(0, min(_res.num_matched_blocks, block_mask_end) - block_mask_start)
+                _ready = max(0, min(_res.num_ready_matched_blocks, block_mask_end) - block_mask_start)
+                self._metrics_collector.record_cache_match_blocks(_dev, _ready, _matched - _ready)
             # Miss blocks (not in any cache)
             miss_blocks = total_query_blocks - fragment12_num_blocks
             if miss_blocks > 0:
@@ -2361,6 +2432,9 @@ class GlobalCacheEngine:
                     "mooncake SWA source selection requires sequence_meta "
                     "for the tail hash")
                 tail_hash = str(sequence_meta.block_hashes[usable_end - 1])
+                if self._metrics_collector is not None:
+                    self._metrics_collector.record_swa_query("hit")
+                    self._metrics_collector.record_swa_hit_blocks(usable_end - block_mask_start)
                 return usable_end, SWAReadSource(
                     hit_blocks=usable_end,
                     device_type=device_type,
@@ -2371,6 +2445,9 @@ class GlobalCacheEngine:
             source_slot = int(source_node.swa_host_slot)
             assert source_slot >= 0
 
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_swa_query("hit")
+                self._metrics_collector.record_swa_hit_blocks(usable_end - block_mask_start)
             return usable_end, SWAReadSource(
                 hit_blocks=usable_end,
                 host_slot=source_slot,
@@ -2379,6 +2456,8 @@ class GlobalCacheEngine:
                 engine=engine,
             )
 
+        if self._metrics_collector is not None:
+            self._metrics_collector.record_swa_query("miss")
         return block_mask_start, SWAReadSource()
 
     def _reserve_swa_read_source(

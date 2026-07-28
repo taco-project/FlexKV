@@ -13,6 +13,7 @@ FlexKV integrates a [Prometheus](https://prometheus.io/)-based runtime metrics m
 | `FLEXKV_ENABLE_METRICS` | `0` | Enable metrics collection (set to `1` to enable, disabled by default) |
 | `FLEXKV_PY_METRICS_PORT` | `8080` | Python metrics HTTP server port |
 | `FLEXKV_CPP_METRICS_PORT` | `8081` | C++ metrics HTTP server port |
+| `PROMETHEUS_MULTIPROC_DIR` | - | Optional. Directory for `prometheus_client` multiprocess aggregation. Set it (before process start) to export metrics recorded in spawned subprocesses — currently the layerwise startup/submit metrics recorded in the TransferManager process. Metrics recorded in the main process (cache/SWA/transfer/pool) are exported without it. |
 
 ### 1.2 Configuration
 
@@ -45,6 +46,38 @@ Python metrics are recorded by `GlobalCacheEngine` in `cache_engine.py` and coll
 | `flexkv_py_evicted_blocks_total` | Counter | `device` | Total number of evicted blocks |
 | `flexkv_py_allocated_blocks_total` | Counter | `device` | Total number of allocated blocks |
 | `flexkv_py_allocation_failures_total` | Counter | `mode` | Number of allocation failures |
+
+#### DSV4 Metrics (SWA / Cache Query / Layerwise)
+
+Metrics for DeepSeek-V4-style deployments: sliding-window attention (SWA) cache, per-tier match readiness, and layerwise transfer startup/dispatch. Recorded by `GlobalCacheEngine` (main process) and `TransferEngine` (TransferManager subprocess; layerwise metrics require `PROMETHEUS_MULTIPROC_DIR` to be aggregated into the HTTP endpoint).
+
+**SWA:**
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `flexkv_py_swa_query_total` | Counter | `result` (`hit`/`miss`) | SWA-aware GET queries by result |
+| `flexkv_py_swa_hit_blocks_total` | Counter | - | Blocks served from an SWA read source on hits |
+| `flexkv_py_swa_slot_used` | Gauge | `device` | SWA host-pool slots currently in use, per tier |
+| `flexkv_py_swa_slot_total` | Gauge | `device` | SWA host-pool total slots, per tier |
+| `flexkv_py_swa_slot_alloc_failed_total` | Counter | `device` | SWA slot allocation failures (pool still full after one eviction retry) |
+| `flexkv_py_swa_evicted_slots_total` | Counter | `device`, `reason` (`pool_full`/`cascade`) | SWA slots freed: `pool_full` = SWA-LRU eviction under pool pressure; `cascade` = detached by radix-tree structural changes |
+| `flexkv_py_swa_transfer_bytes_total` | Counter | `operation` | Bytes transferred by SWA (`is_swa`) ops after completion |
+
+**Cache query / readiness:**
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `flexkv_py_cache_query_total` | Counter | `result` (`full`/`partial`/`miss`) | GET queries by coverage of the queried window |
+| `flexkv_py_cache_match_blocks_total` | Counter | `device`, `ready` (`true`/`false`) | Blocks matched in the radix tree per tier, split by data readiness. `ready=true` is immediately reusable ("effective reuse"); `ready=false` is matched but still in flight |
+
+**Layerwise:**
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `flexkv_py_layerwise_workers_ready` | Gauge | - | Layerwise workers that finished initialization (eventfd handshake) |
+| `flexkv_py_layerwise_workers_expected` | Gauge | - | Layerwise workers expected at startup |
+| `flexkv_py_layerwise_submit_seconds` | Histogram | - | Time to fan out a LAYERWISE op to all sibling workers (successful fan-outs only) |
+| `flexkv_py_layerwise_submit_total` | Counter | `status` (`ok`/`error`) | LAYERWISE op fan-out count by status |
 
 ---
 

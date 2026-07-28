@@ -13,6 +13,7 @@ FlexKV 集成了基于 [Prometheus](https://prometheus.io/) 的运行时指标�
 | `FLEXKV_ENABLE_METRICS` | `0` | 启用指标收集（设为 `1` 启用，默认禁用） |
 | `FLEXKV_PY_METRICS_PORT` | `8080` | Python 指标 HTTP 服务端口 |
 | `FLEXKV_CPP_METRICS_PORT` | `8081` | C++ 指标 HTTP 服务端口 |
+| `PROMETHEUS_MULTIPROC_DIR` | - | 可选。`prometheus_client` 多进程聚合目录。在进程启动前设置后，可汇聚 spawn 子进程中记录的指标（目前是 TransferManager 进程中的 layerwise 启动/提交指标）。主进程指标（缓存/SWA/传输/内存池）不依赖此变量 |
 
 ### 1.2 配置方式
 
@@ -45,6 +46,38 @@ Python 指标由 `GlobalCacheEngine` 在 `cache_engine.py` 中记录，通过 `F
 | `flexkv_py_evicted_blocks_total` | Counter | `device` | 驱逐的 blocks 总数 |
 | `flexkv_py_allocated_blocks_total` | Counter | `device` | 分配的 blocks 总数 |
 | `flexkv_py_allocation_failures_total` | Counter | `mode` | 资源分配失败次数 |
+
+#### DSV4 指标（SWA / 缓存查询 / Layerwise）
+
+面向 DeepSeek-V4 形态部署的指标：滑动窗口注意力（SWA）缓存、分层匹配就绪状态、layerwise 传输启动/派发。由 `GlobalCacheEngine`（主进程）和 `TransferEngine`（TransferManager 子进程；layerwise 指标需设置 `PROMETHEUS_MULTIPROC_DIR` 才会汇聚到 HTTP 端点）记录。
+
+**SWA：**
+
+| 指标名称 | 类型 | 标签 | 描述 |
+|---|---|---|---|
+| `flexkv_py_swa_query_total` | Counter | `result`（`hit`/`miss`） | SWA 感知 GET 查询次数，按结果分类 |
+| `flexkv_py_swa_hit_blocks_total` | Counter | - | SWA 读源命中服务的 blocks 总数 |
+| `flexkv_py_swa_slot_used` | Gauge | `device` | SWA host-pool 已用 slot 数（按层级） |
+| `flexkv_py_swa_slot_total` | Gauge | `device` | SWA host-pool 总 slot 数（按层级） |
+| `flexkv_py_swa_slot_alloc_failed_total` | Counter | `device` | SWA slot 分配失败次数（淘汰重试后池仍满） |
+| `flexkv_py_swa_evicted_slots_total` | Counter | `device`, `reason`（`pool_full`/`cascade`） | SWA slot 释放数：`pool_full` = 池满触发 SWA-LRU 淘汰；`cascade` = radix 树结构变化级联释放 |
+| `flexkv_py_swa_transfer_bytes_total` | Counter | `operation` | SWA（`is_swa`）op 完成后统计的传输字节数 |
+
+**缓存查询 / 就绪状态：**
+
+| 指标名称 | 类型 | 标签 | 描述 |
+|---|---|---|---|
+| `flexkv_py_cache_query_total` | Counter | `result`（`full`/`partial`/`miss`） | GET 查询按查询窗口覆盖度分类的次数 |
+| `flexkv_py_cache_match_blocks_total` | Counter | `device`, `ready`（`true`/`false`） | radix 树命中的 blocks 按层级与数据就绪状态拆分。`ready=true` 即可直接复用量（有效复用）；`ready=false` 为已匹配但仍在传输中 |
+
+**Layerwise：**
+
+| 指标名称 | 类型 | 标签 | 描述 |
+|---|---|---|---|
+| `flexkv_py_layerwise_workers_ready` | Gauge | - | 已完成初始化（eventfd 握手）的 layerwise worker 数 |
+| `flexkv_py_layerwise_workers_expected` | Gauge | - | 启动时预期的 layerwise worker 数 |
+| `flexkv_py_layerwise_submit_seconds` | Histogram | - | 将 LAYERWISE op 扇出到全部 sibling worker 的耗时（仅统计成功扇出） |
+| `flexkv_py_layerwise_submit_total` | Counter | `status`（`ok`/`error`） | LAYERWISE op 扇出次数（按状态） |
 
 ---
 

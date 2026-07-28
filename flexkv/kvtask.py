@@ -368,6 +368,7 @@ class KVTaskManager:
                     completed_op.num_blocks,
                     completed_op.num_bytes,
                     operation,
+                    is_swa=completed_op.is_swa,
                 )
             if completed_op.is_graph_completed():
                 self._mark_completed(task_id)

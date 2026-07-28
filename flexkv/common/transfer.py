@@ -24,6 +24,8 @@ class CompletedOp:
     transfer_type: Optional[str] = None
     num_blocks: int = 0
     num_bytes: int = 0
+    # True when this op moved SWA KV (separate slot-id space); used only for metrics.
+    is_swa: bool = False
 
     def is_graph_completed(self) -> bool:
         return self.op_id == -1
