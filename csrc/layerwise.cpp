@@ -7,6 +7,9 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+// Per-GPU pinned workers: cudaSetDevice once at thread start (see
+// docs/layerwise_gpu_pinned_thread_pool_zh.md).
+
 namespace flexkv {
 
 // ===== Event polling notification (#199) =====
@@ -47,7 +50,7 @@ void LayerwiseTransferGroup::event_polling_loop() {
 
     bool all_done = true;
     for (int g = 0; g < num_gpus_ && all_done; ++g) {
-      cudaSetDevice(gpu_device_ids_[g]);
+      // cudaEventQuery does not require cudaSetDevice; avoid hot-path churn.
       cudaError_t err = cudaEventQuery(batch.per_gpu_events[g]);
       if (err == cudaErrorNotReady) {
         all_done = false;
@@ -71,14 +74,84 @@ void LayerwiseTransferGroup::stop_polling_() {
   if (poll_thread_.joinable()) {
     poll_thread_.join();
   }
-  for (auto &batch : poll_batches_) {
-    for (int d = 0; d < static_cast<int>(batch.per_gpu_events.size()); ++d) {
-      cudaSetDevice(gpu_device_ids_[d]);
-      cudaEventDestroy(batch.per_gpu_events[d]);
+  if (!poll_batches_.empty() && !gpu_workers_.empty()) {
+    std::vector<std::future<void>> futs;
+    futs.reserve(poll_batches_.size() * static_cast<size_t>(num_gpus_));
+    for (auto &batch : poll_batches_) {
+      for (int d = 0; d < static_cast<int>(batch.per_gpu_events.size()); ++d) {
+        cudaEvent_t ev = batch.per_gpu_events[d];
+        futs.push_back(enqueue_for_gpu_(d, [ev]() { cudaEventDestroy(ev); }));
+      }
+    }
+    for (auto &f : futs) {
+      f.get();
+    }
+  } else {
+    for (auto &batch : poll_batches_) {
+      for (int d = 0; d < static_cast<int>(batch.per_gpu_events.size()); ++d) {
+        cudaSetDevice(gpu_device_ids_[d]);
+        cudaEventDestroy(batch.per_gpu_events[d]);
+      }
     }
   }
   poll_batches_.clear();
   poll_next_batch_.store(0, std::memory_order_release);
+}
+
+void LayerwiseTransferGroup::start_gpu_pool_() {
+  gpu_pool_stop_.store(false, std::memory_order_release);
+  gpu_queues_.resize(num_gpus_);
+  gpu_mtxs_ = std::vector<std::mutex>(num_gpus_);
+  gpu_cvs_ = std::vector<std::condition_variable>(num_gpus_);
+  gpu_workers_.clear();
+  gpu_workers_.reserve(num_gpus_);
+  for (int i = 0; i < num_gpus_; ++i) {
+    gpu_workers_.emplace_back([this, i]() {
+      cudaSetDevice(gpu_device_ids_[i]); // once per worker lifetime
+      while (true) {
+        GpuTask task;
+        {
+          std::unique_lock<std::mutex> lk(gpu_mtxs_[i]);
+          gpu_cvs_[i].wait(lk, [&] {
+            return gpu_pool_stop_.load(std::memory_order_acquire) ||
+                   !gpu_queues_[i].empty();
+          });
+          if (gpu_pool_stop_.load(std::memory_order_acquire) &&
+              gpu_queues_[i].empty()) {
+            return;
+          }
+          task = std::move(gpu_queues_[i].front());
+          gpu_queues_[i].pop();
+        }
+        task();
+      }
+    });
+  }
+}
+
+void LayerwiseTransferGroup::stop_gpu_pool_() {
+  gpu_pool_stop_.store(true, std::memory_order_release);
+  for (auto &cv : gpu_cvs_) {
+    cv.notify_all();
+  }
+  for (auto &t : gpu_workers_) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+  gpu_workers_.clear();
+}
+
+std::future<void> LayerwiseTransferGroup::enqueue_for_gpu_(int gpu_idx,
+                                                          GpuTask task) {
+  auto pkg = std::make_shared<std::packaged_task<void()>>(std::move(task));
+  auto fut = pkg->get_future();
+  {
+    std::lock_guard<std::mutex> lk(gpu_mtxs_[gpu_idx]);
+    gpu_queues_[gpu_idx].emplace([pkg] { (*pkg)(); });
+  }
+  gpu_cvs_[gpu_idx].notify_one();
+  return fut;
 }
 
 struct LayerCallbackData {
@@ -205,8 +278,8 @@ void LayerwiseTransferGroup::init_swa_sidecar_(
   }
 }
 
-void LayerwiseTransferGroup::launch_swa_h2d_layer_(
-    int start_layer, int layers_this_batch, int num_blocks,
+void LayerwiseTransferGroup::launch_swa_h2d_on_gpu_(
+    int gpu_idx, int start_layer, int layers_this_batch, int num_blocks,
     int64_t *swa_gpu_block_ids, int64_t *swa_cpu_block_ids,
     int64_t swa_h2d_cpu_kv_stride_in_bytes,
     int64_t swa_h2d_cpu_layer_stride_in_bytes,
@@ -215,44 +288,42 @@ void LayerwiseTransferGroup::launch_swa_h2d_layer_(
   if (!has_swa_ || has_swa_multi_group_) {
     return;
   }
-  for (int i = 0; i < num_gpus_; ++i) {
-    cudaSetDevice(gpu_device_ids_[i]);
-    int64_t swa_chunk_size = swa_gpu_chunk_sizes_in_bytes_[i];
-    switch (swa_backend_type_) {
-    case BackendType::VLLM:
-      flexkv::transfer_kv_blocks<BackendType::VLLM>(
-          num_blocks, start_layer, layers_this_batch, swa_gpu_block_ids,
-          swa_gpu_tensor_handlers_[i],
-          /*gpu_startoff=*/0, swa_cpu_block_ids, swa_cpu_blocks_,
-          swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
-          swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
-          streams_[i], transfer_cta_num, true, use_ce_transfer,
-          /*is_mla=*/true, swa_gpu_block_strides_in_bytes_[i],
-          /*sync=*/false, ce_config_);
-      break;
-    case BackendType::TRTLLM:
-      flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
-          num_blocks, start_layer, layers_this_batch, swa_gpu_block_ids,
-          swa_gpu_tensor_handlers_[i],
-          /*gpu_startoff=*/0, swa_cpu_block_ids, swa_cpu_blocks_,
-          swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
-          swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
-          streams_[i], transfer_cta_num, true, use_ce_transfer,
-          /*is_mla=*/true, swa_gpu_block_strides_in_bytes_[i],
-          /*sync=*/false, ce_config_);
-      break;
-    case BackendType::SGLANG:
-      flexkv::transfer_kv_blocks<BackendType::SGLANG>(
-          num_blocks, start_layer, layers_this_batch, swa_gpu_block_ids,
-          swa_gpu_tensor_handlers_[i],
-          /*gpu_startoff=*/0, swa_cpu_block_ids, swa_cpu_blocks_,
-          swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
-          swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
-          streams_[i], transfer_cta_num, true, use_ce_transfer,
-          /*is_mla=*/true, swa_gpu_block_strides_in_bytes_[i],
-          /*sync=*/false, ce_config_);
-      break;
-    }
+  const int i = gpu_idx;
+  int64_t swa_chunk_size = swa_gpu_chunk_sizes_in_bytes_[i];
+  switch (swa_backend_type_) {
+  case BackendType::VLLM:
+    flexkv::transfer_kv_blocks<BackendType::VLLM>(
+        num_blocks, start_layer, layers_this_batch, swa_gpu_block_ids,
+        swa_gpu_tensor_handlers_[i],
+        /*gpu_startoff=*/0, swa_cpu_block_ids, swa_cpu_blocks_,
+        swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
+        swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
+        streams_[i], transfer_cta_num, true, use_ce_transfer,
+        /*is_mla=*/true, swa_gpu_block_strides_in_bytes_[i],
+        /*sync=*/false, ce_config_);
+    break;
+  case BackendType::TRTLLM:
+    flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+        num_blocks, start_layer, layers_this_batch, swa_gpu_block_ids,
+        swa_gpu_tensor_handlers_[i],
+        /*gpu_startoff=*/0, swa_cpu_block_ids, swa_cpu_blocks_,
+        swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
+        swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
+        streams_[i], transfer_cta_num, true, use_ce_transfer,
+        /*is_mla=*/true, swa_gpu_block_strides_in_bytes_[i],
+        /*sync=*/false, ce_config_);
+    break;
+  case BackendType::SGLANG:
+    flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+        num_blocks, start_layer, layers_this_batch, swa_gpu_block_ids,
+        swa_gpu_tensor_handlers_[i],
+        /*gpu_startoff=*/0, swa_cpu_block_ids, swa_cpu_blocks_,
+        swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
+        swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
+        streams_[i], transfer_cta_num, true, use_ce_transfer,
+        /*is_mla=*/true, swa_gpu_block_strides_in_bytes_[i],
+        /*sync=*/false, ce_config_);
+    break;
   }
 }
 
@@ -441,63 +512,58 @@ int LayerwiseTransferGroup::swa_slots_for_orig_(int orig_layer,
   return 1;
 }
 
-void LayerwiseTransferGroup::launch_swa_mg_h2d_layer_(
-    int orig_layer, int num_blocks, int64_t *swa_gpu_block_ids,
+void LayerwiseTransferGroup::launch_swa_mg_h2d_on_gpu_(
+    int gpu_idx, int orig_layer, int num_blocks, int64_t *swa_gpu_block_ids,
     int64_t *swa_cpu_block_ids, int transfer_cta_num, bool use_ce_transfer,
     bool is_mla, const std::string &mla_d2h_mode) {
   if (!has_swa_multi_group_) {
     return;
   }
+  const int d = gpu_idx;
   const auto &members = swa_layer_members_[orig_layer];
   std::string mode = mla_d2h_mode;
   for (const auto &member : members) {
     int gi = member.first;
     int local_id = member.second;
     const GroupParams &gp = swa_groups_[gi];
-    for (int d = 0; d < num_gpus_; ++d) {
-      cudaSetDevice(gpu_device_ids_[d]);
-      int64_t cpu_startoff_inside_chunks = d * gp.cpu_tp_stride;
-      if (is_mla) {
-        cpu_startoff_inside_chunks =
-            mode == "all_write" ? d * num_blocks * gp.cpu_block_stride : 0;
-      }
-      int64_t gpu_startoff_inside_chunks = 0;
-      int64_t chunk_size = gp.gpu_chunk_sizes[d];
-      void *cpu_ptr_for_group =
-          static_cast<char *>(swa_cpu_blocks_) + gp.cpu_offset_bytes;
+    int64_t cpu_startoff_inside_chunks = d * gp.cpu_tp_stride;
+    if (is_mla) {
+      cpu_startoff_inside_chunks =
+          mode == "all_write" ? d * num_blocks * gp.cpu_block_stride : 0;
+    }
+    int64_t gpu_startoff_inside_chunks = 0;
+    int64_t chunk_size = gp.gpu_chunk_sizes[d];
+    void *cpu_ptr_for_group =
+        static_cast<char *>(swa_cpu_blocks_) + gp.cpu_offset_bytes;
 
-      switch (gp.backend_type) {
-      case BackendType::VLLM:
-        flexkv::transfer_kv_blocks<BackendType::VLLM>(
-            num_blocks, local_id, 1, swa_gpu_block_ids,
-            gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
-            swa_cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
-            gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
-            cpu_startoff_inside_chunks, chunk_size, streams_[d],
-            transfer_cta_num, true, use_ce_transfer, is_mla,
-            gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
-        break;
-      case BackendType::TRTLLM:
-        flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
-            num_blocks, local_id, 1, swa_gpu_block_ids,
-            gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
-            swa_cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
-            gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
-            cpu_startoff_inside_chunks, chunk_size, streams_[d],
-            transfer_cta_num, true, use_ce_transfer, is_mla,
-            gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
-        break;
-      case BackendType::SGLANG:
-        flexkv::transfer_kv_blocks<BackendType::SGLANG>(
-            num_blocks, local_id, 1, swa_gpu_block_ids,
-            gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
-            swa_cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
-            gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
-            cpu_startoff_inside_chunks, chunk_size, streams_[d],
-            transfer_cta_num, true, use_ce_transfer, is_mla,
-            gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
-        break;
-      }
+    switch (gp.backend_type) {
+    case BackendType::VLLM:
+      flexkv::transfer_kv_blocks<BackendType::VLLM>(
+          num_blocks, local_id, 1, swa_gpu_block_ids, gp.gpu_tensor_handlers[d],
+          gpu_startoff_inside_chunks, swa_cpu_block_ids, cpu_ptr_for_group,
+          gp.h2d_cpu_kv_stride, gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+          cpu_startoff_inside_chunks, chunk_size, streams_[d], transfer_cta_num,
+          true, use_ce_transfer, is_mla, gp.gpu_block_strides[d],
+          /*sync=*/false, ce_config_);
+      break;
+    case BackendType::TRTLLM:
+      flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+          num_blocks, local_id, 1, swa_gpu_block_ids, gp.gpu_tensor_handlers[d],
+          gpu_startoff_inside_chunks, swa_cpu_block_ids, cpu_ptr_for_group,
+          gp.h2d_cpu_kv_stride, gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+          cpu_startoff_inside_chunks, chunk_size, streams_[d], transfer_cta_num,
+          true, use_ce_transfer, is_mla, gp.gpu_block_strides[d],
+          /*sync=*/false, ce_config_);
+      break;
+    case BackendType::SGLANG:
+      flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+          num_blocks, local_id, 1, swa_gpu_block_ids, gp.gpu_tensor_handlers[d],
+          gpu_startoff_inside_chunks, swa_cpu_block_ids, cpu_ptr_for_group,
+          gp.h2d_cpu_kv_stride, gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+          cpu_startoff_inside_chunks, chunk_size, streams_[d], transfer_cta_num,
+          true, use_ce_transfer, is_mla, gp.gpu_block_strides[d],
+          /*sync=*/false, ce_config_);
+      break;
     }
   }
 }
@@ -636,6 +702,8 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
                     swa_gpu_kv_strides_tensor, swa_gpu_block_strides_tensor,
                     swa_gpu_layer_strides_tensor, swa_gpu_chunk_sizes_tensor,
                     num_layers, iouring_entries, iouring_flags);
+
+  start_gpu_pool_();
 }
 
 LayerwiseTransferGroup::LayerwiseTransferGroup(
@@ -828,6 +896,8 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
                     swa_gpu_kv_strides_tensor, swa_gpu_block_strides_tensor,
                     swa_gpu_layer_strides_tensor, swa_gpu_chunk_sizes_tensor,
                     num_original_layers, iouring_entries, iouring_flags);
+
+  start_gpu_pool_();
 }
 
 LayerwiseTransferGroup::~LayerwiseTransferGroup() {
@@ -840,19 +910,37 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
     if (poll_thread_.joinable()) {
       poll_thread_.join();
     }
-    // Sync streams: async polling path returns without sync.
-    for (int i = 0; i < num_gpus_; ++i) {
-      cudaSetDevice(gpu_device_ids_[i]);
-      cudaStreamSynchronize(streams_[i]);
-    }
-    // Destroy poll batch events (deferred from layerwise_transfer)
-    for (int b = 0; b < (int)poll_batches_.size(); ++b) {
-      for (int g = 0; g < num_gpus_; ++g) {
-        cudaSetDevice(gpu_device_ids_[g]);
-        cudaEventDestroy(poll_batches_[b].per_gpu_events[g]);
+    // Sync streams via pinned workers (device already bound).
+    {
+      std::vector<std::future<void>> futs;
+      futs.reserve(num_gpus_);
+      for (int i = 0; i < num_gpus_; ++i) {
+        futs.push_back(enqueue_for_gpu_(i, [this, i]() {
+          cudaStreamSynchronize(streams_[i]);
+        }));
+      }
+      for (auto &f : futs) {
+        f.get();
       }
     }
+    // Destroy poll batch events on pinned workers.
+    {
+      std::vector<std::future<void>> futs;
+      for (int b = 0; b < (int)poll_batches_.size(); ++b) {
+        for (int g = 0; g < num_gpus_; ++g) {
+          cudaEvent_t ev = poll_batches_[b].per_gpu_events[g];
+          futs.push_back(
+              enqueue_for_gpu_(g, [ev]() { cudaEventDestroy(ev); }));
+        }
+      }
+      for (auto &f : futs) {
+        f.get();
+      }
+    }
+    poll_batches_.clear();
   }
+
+  stop_gpu_pool_();
 
   // Save/restore device: a leaked current-device makes the device-keyed
   // ping-pong event cache in ce_transfer.cu hit the wrong GPU → segfault.
@@ -911,26 +999,36 @@ void LayerwiseTransferGroup::layer_done_callback(
     eventfds_ptr = layer_eventfds_.data() + offset;
   }
 
+  std::vector<std::future<void>> futs;
+  futs.reserve(static_cast<size_t>(callbacks_per_gpu) * num_gpus_);
   for (int rep = 0; rep < callbacks_per_gpu; ++rep) {
     for (int i = 0; i < num_gpus_; ++i) {
-      LayerCallbackData *data = new LayerCallbackData{start_layer,
-                                                      layers_this_batch,
-                                                      expected_count,
-                                                      counter,
-                                                      enable_eventfd_,
-                                                      tp_size_,
-                                                      num_layers_,
-                                                      eventfds_ptr,
-                                                      current_range_id_ptr,
-                                                      is_last_batch,
-                                                      {0},
-                                                      next_range_id_ptr};
-      if (next_range_name != nullptr) {
-        snprintf(data->next_range_name, sizeof(data->next_range_name), "%s",
-                 next_range_name);
-      }
-      cudaLaunchHostFunc(streams_[i], layer_done_host_callback, data);
+      futs.push_back(enqueue_for_gpu_(
+          i, [this, i, start_layer, layers_this_batch, expected_count, counter,
+              eventfds_ptr, current_range_id_ptr, is_last_batch, next_range_name,
+              next_range_id_ptr]() {
+            LayerCallbackData *data = new LayerCallbackData{start_layer,
+                                                            layers_this_batch,
+                                                            expected_count,
+                                                            counter,
+                                                            enable_eventfd_,
+                                                            tp_size_,
+                                                            num_layers_,
+                                                            eventfds_ptr,
+                                                            current_range_id_ptr,
+                                                            is_last_batch,
+                                                            {0},
+                                                            next_range_id_ptr};
+            if (next_range_name != nullptr) {
+              snprintf(data->next_range_name, sizeof(data->next_range_name),
+                       "%s", next_range_name);
+            }
+            cudaLaunchHostFunc(streams_[i], layer_done_host_callback, data);
+          }));
     }
+  }
+  for (auto &f : futs) {
+    f.get();
   }
 }
 
@@ -1004,6 +1102,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
   if (notify_mode_ == NotifyMode::POLLING && num_batches > 0) {
     poll_batches_.clear();
     poll_batches_.resize(num_batches);
+    std::vector<std::future<void>> poll_create_futs;
+    poll_create_futs.reserve(static_cast<size_t>(num_batches) * num_gpus_);
     for (int b = 0; b < num_batches; ++b) {
       poll_batches_[b].start_layer = b * layer_granularity;
       poll_batches_[b].layers_this_batch =
@@ -1011,15 +1111,24 @@ void LayerwiseTransferGroup::layerwise_transfer(
       poll_batches_[b].per_gpu_events.resize(num_gpus_);
       poll_batches_[b].notified = false;
       for (int g = 0; g < num_gpus_; ++g) {
-        cudaSetDevice(gpu_device_ids_[g]);
-        cudaEventCreateWithFlags(&poll_batches_[b].per_gpu_events[g],
-                                 cudaEventDisableTiming);
+        poll_create_futs.push_back(enqueue_for_gpu_(g, [this, b, g]() {
+          cudaEventCreateWithFlags(&poll_batches_[b].per_gpu_events[g],
+                                   cudaEventDisableTiming);
+        }));
       }
+    }
+    for (auto &f : poll_create_futs) {
+      f.get();
     }
   }
 
-  // Record start event
-  cudaEventRecord(timing_events[0], streams_[0]);
+  // Record start event on GPU 0 via pinned worker
+  {
+    auto fut = enqueue_for_gpu_(0, [this, &timing_events]() {
+      cudaEventRecord(timing_events[0], streams_[0]);
+    });
+    fut.get();
+  }
 
   // Allocate storage for NVTX range IDs (one per batch)
   std::vector<nvtxRangeId_t> h2d_range_ids(num_batches, 0);
@@ -1122,92 +1231,92 @@ void LayerwiseTransferGroup::layerwise_transfer(
     batch_start_layers[batch_idx] = start_layer;
     batch_layers_count[batch_idx] = layers_this_batch;
 
-    // Step 1: CPU -> GPU transfer
-    // NVTX range for this batch was already started (by main thread for first
-    // batch, or by previous batch's callback for subsequent batches)
-
-    for (int i = 0; i < num_gpus_; ++i) {
-      cudaSetDevice(gpu_device_ids_[i]);
-      int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
-      int64_t gpu_startoff_inside_chunks = 0;
-      int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
-
-      // Handle MLA D2H mode for H2D transfer (#192, inlined logic).
-      if (is_mla) {
-        if (mla_mode == "sharded") {
-          cpu_startoff_inside_chunks = 0;
-          gpu_startoff_inside_chunks = 0;
-        } else if (mla_mode == "all_write") {
-          // Each rank's complete KV occupies num_blocks blocks on CPU.
-          // Use cpu_block_stride (not gpu_chunk_size) because BLOCKFIRST's
-          // block_stride includes all layers+kv_dims, while LAYERFIRST's
-          // block_stride == chunk_size (same result).
-          cpu_startoff_inside_chunks =
-              i * num_blocks * cpu_block_stride_in_bytes;
-          gpu_startoff_inside_chunks = 0;
-        } else if (mla_mode == "rank0_only") {
-          cpu_startoff_inside_chunks = 0;
-          gpu_startoff_inside_chunks = 0;
-        }
-      }
-
-      switch (backend_type_) {
-      case BackendType::VLLM:
-        flexkv::transfer_kv_blocks<BackendType::VLLM>(
-            num_blocks, start_layer, layers_this_batch, gpu_block_ids,
-            gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
-            cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
-            cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
-            use_ce_transfer, is_mla, gpu_block_strides_in_bytes_[i],
-            /*sync=*/false, ce_config_);
-        break;
-      case BackendType::TRTLLM:
-        flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
-            num_blocks, start_layer, layers_this_batch, gpu_block_ids,
-            gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
-            cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
-            cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
-            use_ce_transfer, is_mla, gpu_block_strides_in_bytes_[i],
-            /*sync=*/false, ce_config_);
-        break;
-      case BackendType::SGLANG:
-        flexkv::transfer_kv_blocks<BackendType::SGLANG>(
-            num_blocks, start_layer, layers_this_batch, gpu_block_ids,
-            gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
-            cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
-            cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
-            use_ce_transfer, is_mla, gpu_block_strides_in_bytes_[i],
-            /*sync=*/false, ce_config_);
-        break;
-      }
-    }
-
-    if (swa_active) {
-      launch_swa_h2d_layer_(start_layer, layers_this_batch, swa_num_blocks,
-                            swa_gpu_block_ids, swa_cpu_block_ids,
-                            swa_h2d_cpu_kv_stride_in_bytes,
-                            swa_h2d_cpu_layer_stride_in_bytes,
-                            swa_cpu_block_stride_in_bytes, transfer_cta_num,
-                            use_ce_transfer);
-    }
-
-    // Record event after this batch on GPU 0
-    cudaSetDevice(gpu_device_ids_[0]);
-    cudaEventRecord(timing_events[batch_idx + 1], streams_[0]);
-
-    if (notify_mode_ == NotifyMode::POLLING) {
-      // Record per-GPU events for the polling thread. Recorded after both the
-      // main-KV and (optional) SWA H2D transfers on each stream, so completion
-      // of the event implies completion of both for this batch.
+    // Step 1: CPU -> GPU transfer on per-GPU pinned workers (no SetDevice).
+    {
+      std::vector<std::future<void>> futs;
+      futs.reserve(num_gpus_);
       for (int i = 0; i < num_gpus_; ++i) {
-        cudaSetDevice(gpu_device_ids_[i]);
-        cudaEventRecord(poll_batches_[batch_idx].per_gpu_events[i],
-                        streams_[i]);
+        futs.push_back(enqueue_for_gpu_(i, [=]() {
+          int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
+          int64_t gpu_startoff_inside_chunks = 0;
+          int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
+
+          if (is_mla) {
+            if (mla_mode == "sharded") {
+              cpu_startoff_inside_chunks = 0;
+              gpu_startoff_inside_chunks = 0;
+            } else if (mla_mode == "all_write") {
+              cpu_startoff_inside_chunks =
+                  i * num_blocks * cpu_block_stride_in_bytes;
+              gpu_startoff_inside_chunks = 0;
+            } else if (mla_mode == "rank0_only") {
+              cpu_startoff_inside_chunks = 0;
+              gpu_startoff_inside_chunks = 0;
+            }
+          }
+
+          switch (backend_type_) {
+          case BackendType::VLLM:
+            flexkv::transfer_kv_blocks<BackendType::VLLM>(
+                num_blocks, start_layer, layers_this_batch, gpu_block_ids,
+                gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
+                cpu_block_ids, cpu_ptr, h2d_cpu_kv_stride_in_bytes,
+                h2d_cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+                cpu_startoff_inside_chunks, chunk_size, streams_[i],
+                transfer_cta_num, /*is_host_to_device=*/true, use_ce_transfer,
+                is_mla, gpu_block_strides_in_bytes_[i], /*sync=*/false,
+                ce_config_);
+            break;
+          case BackendType::TRTLLM:
+            flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+                num_blocks, start_layer, layers_this_batch, gpu_block_ids,
+                gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
+                cpu_block_ids, cpu_ptr, h2d_cpu_kv_stride_in_bytes,
+                h2d_cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+                cpu_startoff_inside_chunks, chunk_size, streams_[i],
+                transfer_cta_num, /*is_host_to_device=*/true, use_ce_transfer,
+                is_mla, gpu_block_strides_in_bytes_[i], /*sync=*/false,
+                ce_config_);
+            break;
+          case BackendType::SGLANG:
+            flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+                num_blocks, start_layer, layers_this_batch, gpu_block_ids,
+                gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
+                cpu_block_ids, cpu_ptr, h2d_cpu_kv_stride_in_bytes,
+                h2d_cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+                cpu_startoff_inside_chunks, chunk_size, streams_[i],
+                transfer_cta_num, /*is_host_to_device=*/true, use_ce_transfer,
+                is_mla, gpu_block_strides_in_bytes_[i], /*sync=*/false,
+                ce_config_);
+            break;
+          }
+
+          if (swa_active) {
+            launch_swa_h2d_on_gpu_(
+                i, start_layer, layers_this_batch, swa_num_blocks,
+                swa_gpu_block_ids, swa_cpu_block_ids,
+                swa_h2d_cpu_kv_stride_in_bytes,
+                swa_h2d_cpu_layer_stride_in_bytes,
+                swa_cpu_block_stride_in_bytes, transfer_cta_num,
+                use_ce_transfer);
+          }
+
+          if (i == 0) {
+            cudaEventRecord(timing_events[batch_idx + 1], streams_[0]);
+          }
+
+          if (notify_mode_ == NotifyMode::POLLING) {
+            cudaEventRecord(poll_batches_[batch_idx].per_gpu_events[i],
+                            streams_[i]);
+          }
+        }));
       }
-    } else {
+      for (auto &f : futs) {
+        f.get();
+      }
+    }
+
+    if (notify_mode_ != NotifyMode::POLLING) {
       // NVTX: current range ends in callback, next range starts in callback
       bool is_last_batch = (batch_idx == num_batches - 1);
       const char *next_name =
@@ -1231,13 +1340,20 @@ void LayerwiseTransferGroup::layerwise_transfer(
     poll_thread_ =
         std::thread(&LayerwiseTransferGroup::event_polling_loop, this);
   } else {
+    std::vector<std::future<void>> sync_futs;
+    sync_futs.reserve(num_gpus_);
     for (int i = 0; i < num_gpus_; ++i) {
-      cudaError_t err = cudaStreamSynchronize(streams_[i]);
-      if (err != cudaSuccess) {
-        throw std::runtime_error("layerwise_transfer failed on GPU " +
-                                 std::to_string(i) + ": " +
-                                 cudaGetErrorString(err));
-      }
+      sync_futs.push_back(enqueue_for_gpu_(i, [this, i]() {
+        cudaError_t err = cudaStreamSynchronize(streams_[i]);
+        if (err != cudaSuccess) {
+          throw std::runtime_error("layerwise_transfer failed on GPU " +
+                                   std::to_string(i) + ": " +
+                                   cudaGetErrorString(err));
+        }
+      }));
+    }
+    for (auto &f : sync_futs) {
+      f.get();
     }
   }
 
@@ -1441,15 +1557,22 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
 
   if (notify_mode_ == NotifyMode::POLLING) {
     poll_batches_.resize(work_origs.size());
+    std::vector<std::future<void>> poll_create_futs;
+    poll_create_futs.reserve(work_origs.size() * static_cast<size_t>(num_gpus_));
     for (size_t ai = 0; ai < work_origs.size(); ++ai) {
       poll_batches_[ai].start_layer = work_origs[ai];
       poll_batches_[ai].layers_this_batch = 1;
       poll_batches_[ai].per_gpu_events.resize(num_gpus_);
+      poll_batches_[ai].notified = false;
       for (int d = 0; d < num_gpus_; ++d) {
-        cudaSetDevice(gpu_device_ids_[d]);
-        cudaEventCreateWithFlags(&poll_batches_[ai].per_gpu_events[d],
-                                 cudaEventDisableTiming);
+        poll_create_futs.push_back(enqueue_for_gpu_(d, [this, ai, d]() {
+          cudaEventCreateWithFlags(&poll_batches_[ai].per_gpu_events[d],
+                                   cudaEventDisableTiming);
+        }));
       }
+    }
+    for (auto &f : poll_create_futs) {
+      f.get();
     }
   }
 
@@ -1471,75 +1594,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     int orig = work_origs[ai];
     const auto &members = layer_members_[orig];
     int members_this_layer = static_cast<int>(members.size());
-
-    for (const auto &member : members) {
-      int gi = member.first;
-      int local_id = member.second;
-      const GroupParams &gp = groups_[gi];
-
-      for (int d = 0; d < num_gpus_; ++d) {
-        cudaSetDevice(gpu_device_ids_[d]);
-        int64_t cpu_startoff_inside_chunks = d * gp.cpu_tp_stride;
-        if (is_mla) {
-          cpu_startoff_inside_chunks =
-              mode == "all_write" ? d * num_blocks * gp.cpu_block_stride : 0;
-        }
-        int64_t gpu_startoff_inside_chunks = 0;
-        int64_t chunk_size = gp.gpu_chunk_sizes[d];
-        void *cpu_ptr_for_group =
-            static_cast<char *>(cpu_blocks_) + gp.cpu_offset_bytes;
-
-        switch (gp.backend_type) {
-        case BackendType::VLLM:
-          flexkv::transfer_kv_blocks<BackendType::VLLM>(
-              num_blocks, local_id, 1, gpu_block_ids, gp.gpu_tensor_handlers[d],
-              gpu_startoff_inside_chunks, cpu_block_ids, cpu_ptr_for_group,
-              gp.h2d_cpu_kv_stride, gp.h2d_cpu_layer_stride,
-              gp.cpu_block_stride, cpu_startoff_inside_chunks, chunk_size,
-              streams_[d], transfer_cta_num, true, use_ce_transfer, is_mla,
-              gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
-          break;
-        case BackendType::TRTLLM:
-          flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
-              num_blocks, local_id, 1, gpu_block_ids, gp.gpu_tensor_handlers[d],
-              gpu_startoff_inside_chunks, cpu_block_ids, cpu_ptr_for_group,
-              gp.h2d_cpu_kv_stride, gp.h2d_cpu_layer_stride,
-              gp.cpu_block_stride, cpu_startoff_inside_chunks, chunk_size,
-              streams_[d], transfer_cta_num, true, use_ce_transfer, is_mla,
-              gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
-          break;
-        case BackendType::SGLANG:
-          flexkv::transfer_kv_blocks<BackendType::SGLANG>(
-              num_blocks, local_id, 1, gpu_block_ids, gp.gpu_tensor_handlers[d],
-              gpu_startoff_inside_chunks, cpu_block_ids, cpu_ptr_for_group,
-              gp.h2d_cpu_kv_stride, gp.h2d_cpu_layer_stride,
-              gp.cpu_block_stride, cpu_startoff_inside_chunks, chunk_size,
-              streams_[d], transfer_cta_num, true, use_ce_transfer, is_mla,
-              gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
-          break;
-        }
-      }
-    }
-
-    if (swa_active) {
-      if (has_swa_multi_group_) {
-        launch_swa_mg_h2d_layer_(orig, swa_num_blocks, swa_gpu_block_ids,
-                                 swa_cpu_block_ids, transfer_cta_num,
-                                 use_ce_transfer, /*is_mla=*/true, mode);
-      } else {
-        launch_swa_h2d_layer_(
-            orig, 1, swa_num_blocks, swa_gpu_block_ids, swa_cpu_block_ids,
-            swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
-            swa_cpu_block_stride_in_bytes, transfer_cta_num, use_ce_transfer);
-      }
-    }
-
-    if (notify_mode_ == NotifyMode::POLLING) {
-      for (int d = 0; d < num_gpus_; ++d) {
-        cudaSetDevice(gpu_device_ids_[d]);
-        cudaEventRecord(poll_batches_[ai].per_gpu_events[d], streams_[d]);
-      }
-    }
+    int swa_slots = swa_slots_for_orig_(orig, swa_active);
+    int slots_per_gpu = members_this_layer + swa_slots;
 
     bool is_last_active = (ai + 1 == work_origs.size());
     int next_orig = is_last_active ? -1 : work_origs[ai + 1];
@@ -1548,14 +1604,114 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     nvtxRangeId_t *next_id_ptr =
         is_last_active ? nullptr : &h2d_range_ids[next_orig];
 
+    std::atomic<int> *hostfunc_counter = nullptr;
+    int *eventfds_ptr = nullptr;
+    int expected_count = 0;
     if (notify_mode_ == NotifyMode::HOSTFUNC) {
-      int swa_slots = swa_slots_for_orig_(orig, swa_active);
-      int slots_per_gpu = members_this_layer + swa_slots;
-      layer_done_callback(/*start_layer=*/orig, /*layers_this_batch=*/1,
-                          /*expected_count=*/slots_per_gpu * num_gpus_,
-                          &h2d_range_ids[orig], is_last_active, next_name,
-                          next_id_ptr,
-                          /*callbacks_per_gpu=*/slots_per_gpu);
+      hostfunc_counter = new std::atomic<int>(0);
+      expected_count = slots_per_gpu * num_gpus_;
+      if (enable_eventfd_ && num_counters_ > 0) {
+        int offset = current_counter_id_ * tp_size_ * num_layers_;
+        eventfds_ptr = layer_eventfds_.data() + offset;
+      }
+    }
+
+    std::vector<std::future<void>> futs;
+    futs.reserve(num_gpus_);
+    for (int d = 0; d < num_gpus_; ++d) {
+      futs.push_back(enqueue_for_gpu_(d, [=, &members, &h2d_range_ids]() {
+        for (const auto &member : members) {
+          int gi = member.first;
+          int local_id = member.second;
+          const GroupParams &gp = groups_[gi];
+
+          int64_t cpu_startoff_inside_chunks = d * gp.cpu_tp_stride;
+          if (is_mla) {
+            cpu_startoff_inside_chunks =
+                mode == "all_write" ? d * num_blocks * gp.cpu_block_stride : 0;
+          }
+          int64_t gpu_startoff_inside_chunks = 0;
+          int64_t chunk_size = gp.gpu_chunk_sizes[d];
+          void *cpu_ptr_for_group =
+              static_cast<char *>(cpu_blocks_) + gp.cpu_offset_bytes;
+
+          switch (gp.backend_type) {
+          case BackendType::VLLM:
+            flexkv::transfer_kv_blocks<BackendType::VLLM>(
+                num_blocks, local_id, 1, gpu_block_ids,
+                gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
+                cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
+                gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+                cpu_startoff_inside_chunks, chunk_size, streams_[d],
+                transfer_cta_num, true, use_ce_transfer, is_mla,
+                gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
+            break;
+          case BackendType::TRTLLM:
+            flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+                num_blocks, local_id, 1, gpu_block_ids,
+                gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
+                cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
+                gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+                cpu_startoff_inside_chunks, chunk_size, streams_[d],
+                transfer_cta_num, true, use_ce_transfer, is_mla,
+                gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
+            break;
+          case BackendType::SGLANG:
+            flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+                num_blocks, local_id, 1, gpu_block_ids,
+                gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
+                cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
+                gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+                cpu_startoff_inside_chunks, chunk_size, streams_[d],
+                transfer_cta_num, true, use_ce_transfer, is_mla,
+                gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
+            break;
+          }
+        }
+
+        if (swa_active) {
+          if (has_swa_multi_group_) {
+            launch_swa_mg_h2d_on_gpu_(d, orig, swa_num_blocks, swa_gpu_block_ids,
+                                      swa_cpu_block_ids, transfer_cta_num,
+                                      use_ce_transfer, /*is_mla=*/true, mode);
+          } else {
+            launch_swa_h2d_on_gpu_(
+                d, orig, 1, swa_num_blocks, swa_gpu_block_ids, swa_cpu_block_ids,
+                swa_h2d_cpu_kv_stride_in_bytes,
+                swa_h2d_cpu_layer_stride_in_bytes,
+                swa_cpu_block_stride_in_bytes, transfer_cta_num,
+                use_ce_transfer);
+          }
+        }
+
+        if (notify_mode_ == NotifyMode::POLLING) {
+          cudaEventRecord(poll_batches_[ai].per_gpu_events[d], streams_[d]);
+        } else {
+          for (int rep = 0; rep < slots_per_gpu; ++rep) {
+            LayerCallbackData *data =
+                new LayerCallbackData{/*start_layer=*/orig,
+                                      /*layers_this_batch=*/1,
+                                      expected_count,
+                                      hostfunc_counter,
+                                      enable_eventfd_,
+                                      tp_size_,
+                                      num_layers_,
+                                      eventfds_ptr,
+                                      &h2d_range_ids[orig],
+                                      is_last_active,
+                                      {0},
+                                      next_id_ptr};
+            if (next_name != nullptr) {
+              snprintf(data->next_range_name, sizeof(data->next_range_name),
+                       "%s", next_name);
+            }
+            cudaLaunchHostFunc(streams_[d], layer_done_host_callback, data);
+          }
+        }
+      }));
+    }
+    for (auto &f : futs) {
+      f.get();
     }
   }
 
@@ -1565,13 +1721,20 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     poll_thread_ =
         std::thread(&LayerwiseTransferGroup::event_polling_loop, this);
   } else {
+    std::vector<std::future<void>> sync_futs;
+    sync_futs.reserve(num_gpus_);
     for (int d = 0; d < num_gpus_; ++d) {
-      cudaError_t err = cudaStreamSynchronize(streams_[d]);
-      if (err != cudaSuccess) {
-        throw std::runtime_error(
-            "layerwise_transfer_multi_group failed on GPU " +
-            std::to_string(d) + ": " + cudaGetErrorString(err));
-      }
+      sync_futs.push_back(enqueue_for_gpu_(d, [this, d]() {
+        cudaError_t err = cudaStreamSynchronize(streams_[d]);
+        if (err != cudaSuccess) {
+          throw std::runtime_error(
+              "layerwise_transfer_multi_group failed on GPU " +
+              std::to_string(d) + ": " + cudaGetErrorString(err));
+        }
+      }));
+    }
+    for (auto &f : sync_futs) {
+      f.get();
     }
   }
 }
