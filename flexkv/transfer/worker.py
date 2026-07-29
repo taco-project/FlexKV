@@ -480,27 +480,36 @@ class TransferWorkerBase(ABC):
                     if op is None:
                         shutdown_after_batch = True
                         break
-                    batch_ops.append(op)
-
-                for op in batch_ops:
-                    transfer_status = False
-                    try:
-                        nvtx.push_range(
-                            f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
-                            f"graph_id: {op.transfer_graph_id}",
-                            color=get_nvtx_range_color(op.transfer_graph_id),
-                        )
-                        transfer_status = self.launch_transfer(op)
-                        nvtx.pop_range()
-                    except Exception as e:
-                        flexkv_logger.error(
-                            f"Error launching transfer: {e}\nFailed transfer op: {op}"
-                        )
-                    if transfer_status:
-                        self.finished_ops_queue.put(op.transfer_op_id)
-
-                if shutdown_after_batch:
-                    return
+                    batch_ops = [op]
+                    for op in batch_ops:
+                        transfer_status = False
+                        try:
+                            nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
+                                                f"graph_id: {op.transfer_graph_id}",
+                                                color=get_nvtx_range_color(op.transfer_graph_id))
+                            transfer_status = self.launch_transfer(op)
+                            nvtx.pop_range()
+                        except Exception as e:
+                            flexkv_logger.error(f"Error launching transfer: {e}\n"
+                                        f"Failed transfer op: {op}")
+                        if transfer_status:
+                            self.finished_ops_queue.put(op.transfer_op_id)
+                        else:
+                            # Report the failure instead of dropping it: a
+                            # dropped op leaves its graph incomplete forever
+                            # and leaks every resource its plan holds. A bare
+                            # int still means success, so the queue format
+                            # stays compatible.
+                            self.finished_ops_queue.put((op.transfer_op_id, False))
+                    if shutdown_after_batch:
+                        if hasattr(self, "shutdown") and callable(self.shutdown):
+                            try:
+                                self.shutdown()
+                            except Exception as e:
+                                flexkv_logger.error(f"Error when shut down worker: {e}")
+                        break
+                else:
+                    continue
             except EOFError:
                 flexkv_logger.warning(
                     f"[worker {self.worker_id}] transfer pipe EOF; exiting run loop"
@@ -2082,7 +2091,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
             # SSD layout calculations
             self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
             self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-            self.ssd_tp_stride_in_bytes = self.ssd_block_stride_in_bytes // self.tp_group_size if not self.is_mla else self.ssd_block_stride_in_bytes
+            self.ssd_tp_stride_in_bytes = (self.ssd_block_stride_in_bytes // self.tp_group_size
+                                           if not self.is_mla else self.ssd_block_stride_in_bytes)
 
             # Resolve pointers in Python
             gpu_block_ptrs_flat = [
@@ -2187,16 +2197,16 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 gpu_kv_strides = []
                 gpu_block_strides = []
                 gpu_layer_strides = []
-                for i, l in enumerate(gpu_kv_layouts):
+                for i, layout in enumerate(gpu_kv_layouts):
                     gpu_strides = self._get_gpu_strides_from_tensor(
                         self.gpu_blocks[i][0], tpb_g, dtype_size_g, self.is_mla,
                     ) if len(self.gpu_blocks[i]) > 1 else None
                     if gpu_strides is not None:
                         kv_s, blk_s, layer_s = gpu_strides
                     else:
-                        kv_s = l.get_kv_stride() * dtype_size_g
-                        blk_s = l.get_block_stride() * dtype_size_g
-                        layer_s = l.get_layer_stride() * dtype_size_g
+                        kv_s = layout.get_kv_stride() * dtype_size_g
+                        blk_s = layout.get_block_stride() * dtype_size_g
+                        layer_s = layout.get_layer_stride() * dtype_size_g
                     gpu_kv_strides.append(kv_s)
                     gpu_block_strides.append(blk_s)
                     gpu_layer_strides.append(layer_s)
@@ -2358,7 +2368,8 @@ class NixlTransferWorker(TransferWorkerBase):
         be = normalize_nixl_file_plugin_name(str(nixl_backend).upper())
         if be not in NIXL_GPU_FILE_BACKENDS and be not in NIXL_CPU_FILE_BACKENDS:
             raise ValueError(
-                f"nixl_backend must be one of {sorted(NIXL_GPU_FILE_BACKENDS | NIXL_CPU_FILE_BACKENDS)}, got {nixl_backend}"
+                f"nixl_backend must be one of "
+                f"{sorted(NIXL_GPU_FILE_BACKENDS | NIXL_CPU_FILE_BACKENDS)}, got {nixl_backend}"
             )
         if be in NIXL_GPU_FILE_BACKENDS and gpu_blocks is None:
             raise ValueError("GDS_MT requires gpu_blocks")

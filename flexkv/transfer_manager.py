@@ -480,7 +480,8 @@ class TransferManagerOnRemote(TransferManager):
                                     if task_end_op_id != -1 and completed_op.op_id == task_end_op_id:
                                         end_op = CompletedOp(graph_id=completed_op.graph_id, op_id=task_end_op_id)
                                         self.result_socket.send_pyobj(end_op)
-                                    if completed_op.is_graph_completed():
+                                    if (completed_op.is_graph_completed()
+                                            or completed_op.is_graph_failed()):
                                         self.result_socket.send_pyobj(completed_op)
                                         del self._active_graphs[completed_op.graph_id]
 
