@@ -17,6 +17,8 @@ class WorkerTransferOp:
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
     src_block_node_ids: Optional[np.ndarray]
+    mooncake_store_block_hashes: Optional[np.ndarray] = None
+    mooncake_store_swa_block_hashes: Optional[list] = None
 
     def __init__(self, transfer_op: TransferOp):
         self.transfer_op_id = transfer_op.op_id
@@ -27,8 +29,15 @@ class WorkerTransferOp:
         self.valid_block_num = transfer_op.valid_block_num
         # Always preserve optional src_block_node_ids from TransferOp
         self.src_block_node_ids = transfer_op.src_block_node_ids
+        self.mooncake_store_block_hashes = transfer_op.mooncake_store_block_hashes
+        self.mooncake_store_swa_block_hashes = transfer_op.mooncake_store_swa_block_hashes
 
         if self.src_slot_id == -1 or self.dst_slot_id == -1:
+            self.src_block_ids = transfer_op.src_block_ids
+            self.dst_block_ids = transfer_op.dst_block_ids
+        elif (transfer_op.mooncake_store_block_hashes is not None
+              or transfer_op.mooncake_store_swa_block_hashes is not None):
+            # Mooncake ops need block ids even when slot ids are set.
             self.src_block_ids = transfer_op.src_block_ids
             self.dst_block_ids = transfer_op.dst_block_ids
         else:

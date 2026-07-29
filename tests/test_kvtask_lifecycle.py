@@ -5,7 +5,7 @@
 Two concerns, both cheap (no TransferManager subprocess, no GPU):
 
 1. The ``KVTask`` dataclass state machine: status transitions, is_completed,
-   the new ``swa_slot_mapping`` field, and shed_heavy_resources.
+   early-response cleanup, ``swa_slot_mapping``, and shed_heavy_resources.
 
 2. The SWA load-lock lifecycle on ``GlobalCacheEngine``: a GET pins the matched
    CPU SWA node while building the GET plan, and the SWA H2D completion callback
@@ -22,7 +22,8 @@ import numpy as np
 import pytest
 import torch
 
-from flexkv.kvtask import KVTask, TaskType, TaskStatus
+from flexkv.common.request import KVResponseStatus
+from flexkv.kvtask import KVTask, KVTaskEngine, TaskType, TaskStatus
 
 pytestmark = pytest.mark.unit
 
@@ -45,10 +46,26 @@ def _make_task(**over):
     return KVTask(**base)
 
 
+class _FakeGraph:
+    def __init__(self, graph_id=10, num_ops=2):
+        self.graph_id = graph_id
+        self.num_ops = num_ops
+
+
+def _make_task_engine(task):
+    engine = KVTaskEngine.__new__(KVTaskEngine)
+    engine.tasks = {task.task_id: task}
+    engine.graph_to_task = {task.graph.graph_id: task.task_id}
+    # Completion is driven explicitly by each test.
+    engine._update_tasks = lambda timeout=0: None
+    return engine
+
+
 def test_task_defaults_and_swa_field():
     t = _make_task()
     assert t.status == TaskStatus.UNREADY
     assert t.swa_slot_mapping is None          # new field defaults None
+    assert t.request_returned is False
     assert not t.is_completed()
 
 
@@ -80,6 +97,78 @@ def test_shed_heavy_resources_keeps_status():
     # status/return_mask survive so wait() can still report
     assert t.status == TaskStatus.COMPLETED
     assert t.return_mask is not None
+
+
+def test_early_return_marks_request_returned_and_keeps_running_task():
+    graph = _FakeGraph()
+    return_mask = np.array([True, False], dtype=np.bool_)
+    task = _make_task(
+        status=TaskStatus.RUNNING,
+        task_end_op_finished=True,
+        graph=graph,
+        return_mask=return_mask,
+    )
+    engine = _make_task_engine(task)
+
+    response = engine._wait_impl(
+        [task.task_id], timeout=0, completely=False
+    )[task.task_id]
+
+    assert response.status == KVResponseStatus.SUCCESS
+    np.testing.assert_array_equal(response.return_mask, return_mask)
+    assert task.request_returned is True
+    assert engine.tasks[task.task_id] is task
+    assert engine.graph_to_task[graph.graph_id] == task.task_id
+
+
+def test_graph_completion_releases_task_after_early_return():
+    graph = _FakeGraph()
+    task = _make_task(
+        status=TaskStatus.RUNNING,
+        task_end_op_finished=True,
+        graph=graph,
+        request_returned=True,
+    )
+    engine = _make_task_engine(task)
+    callback_calls = []
+
+    def callback():
+        assert task.task_id in engine.tasks
+        callback_calls.append("completed")
+
+    task.callback = callback
+    engine._mark_completed(task.task_id)
+
+    assert callback_calls == ["completed"]
+    assert task.status == TaskStatus.COMPLETED
+    assert task.task_end_op_finished is True
+    assert task.graph is None
+    assert task.task_id not in engine.tasks
+    assert graph.graph_id not in engine.graph_to_task
+
+
+def test_completed_task_remains_observable_until_first_response():
+    graph = _FakeGraph()
+    return_mask = np.array([True, True], dtype=np.bool_)
+    task = _make_task(
+        status=TaskStatus.RUNNING,
+        graph=graph,
+        return_mask=return_mask,
+    )
+    engine = _make_task_engine(task)
+
+    engine._mark_completed(task.task_id)
+    assert task.task_id in engine.tasks
+    assert task.request_returned is False
+    assert graph.graph_id not in engine.graph_to_task
+
+    response = engine._wait_impl(
+        [task.task_id], timeout=0, completely=True
+    )[task.task_id]
+    assert response.status == KVResponseStatus.SUCCESS
+    np.testing.assert_array_equal(response.return_mask, return_mask)
+    assert task.request_returned is True
+    assert task.task_id not in engine.tasks
 
 
 # --- M15/M16: SWA-aware get's core arithmetic (pure, mirrors kvtask logic) --- #

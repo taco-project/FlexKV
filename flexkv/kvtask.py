@@ -75,12 +75,15 @@ class KVTask:
     swa_slot_mapping: Optional[np.ndarray] = None
     created_ns: int = field(default_factory=time.perf_counter_ns)
 
+    # True after wait()/try_wait() has produced a response for this task.
+    request_returned: bool = False
+
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
 
     def shed_heavy_resources(self) -> None:
-        # Drop heavy fields once the task terminates. Keeps status / return_mask
-        # so wait() can still report the result; only when the user observes it (wait/try_wait) or cancels it.
+        # Keep status and return_mask so a task whose response has not been
+        # returned can still be observed by wait().
         self.graph = None
         self.token_ids = None
         self.slot_mapping = None
@@ -107,8 +110,10 @@ class KVTaskManager:
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
-        if cache_config.enable_remote and not cache_config.enable_ssd:
-            raise ValueError("enable_ssd must be True if enable_remote is True")
+        # Mooncake store is a remote backend that does not require local SSD.
+        # Keep this aligned with CacheConfig validation in common/config.py.
+        if (cache_config.enable_remote and not cache_config.enable_cpu):
+            raise ValueError("enable_cpu must be True if enable_remote is True")
         if not cache_config.enable_cpu and not cache_config.enable_gds:
             raise ValueError("enable_gds must be True if enable_cpu is False")
         if cache_config.enable_gds and not cache_config.enable_ssd:
@@ -179,8 +184,11 @@ class KVTaskManager:
 
         self.graph_to_task: Dict[int, int] = {}
 
-        self.uncompleted_ops: Dict[int, int] = {}  # op_id -> completed_count
-        self.uncompleted_graphs: Dict[int, int] = {}  # graph_id -> completed_count
+        # (graph_id, op_id) -> completed_count; graph-keyed so a failed
+        # graph's stale per-op counters can be purged.
+        self.uncompleted_ops: Dict[Tuple[int, int], int] = {}
+        # graph_id -> (terminal_count, any_failed) across the N handles.
+        self.uncompleted_graphs: Dict[int, Tuple[int, bool]] = {}
         self.required_completed_count: int = len(self.transfer_handles)
 
         self.task_id_counter = 0
@@ -404,6 +412,9 @@ class KVTaskManager:
                 continue
             task_id = self.graph_to_task[completed_op.graph_id]
             task = self.tasks[task_id]
+            if completed_op.is_graph_failed():
+                self._fail_task(task_id)
+                continue
             # Record transfer metrics for completed ops (post-completion statistics)
             # All three counters (ops_total, blocks_total, bytes_total) are updated
             # here after transfer completion, providing accurate post-transfer metrics.
@@ -428,11 +439,57 @@ class KVTaskManager:
             if has_callback:
                 task.op_callback_dict[completed_op.op_id]()
 
+    @staticmethod
+    def _abort_task_plans(task: "KVTask") -> None:
+        """Run the abort path of every plan handle the task carries (a batch
+        task carries one per merged sub-task). Handles predating the abort API
+        are skipped."""
+        callbacks = task.callback if isinstance(task.callback, list) \
+            else [task.callback]
+        for callback in callbacks:
+            abort = getattr(callback, "abort", None)
+            if abort is not None:
+                abort()
+
+    def _fail_task(self, task_id: int) -> None:
+        """A transfer op of this task's graph failed and the graph has fully
+        drained. Roll the plan back instead of completing it: ops that did
+        finish already ran their callbacks (their nodes are ready and their
+        data is valid, so abort keeps them), while nodes whose transfer never
+        ran are still unready and get removed with their blocks recycled.
+        The task terminates as FAILED so wait() reports the failure instead
+        of a misleading TIMEOUT."""
+        if task_id not in self.tasks:
+            return
+        task = self.tasks[task_id]
+        if task.is_completed():
+            return
+        flexkv_logger.error(f"[KVTaskEngine] task {task_id} FAILED: a transfer "
+                            f"op of graph {task.graph.graph_id} failed")
+        self._abort_task_plans(task)
+        task.status = TaskStatus.FAILED
+        task.task_end_op_finished = True
+        self.graph_to_task.pop(task.graph.graph_id, None)
+        task.shed_heavy_resources()
+        if task.request_returned:
+            self._release_task(task_id)
+
     def _cancel_task(self, task_id: int) -> None:
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]
         if not task.is_completed():
+            # A task whose graph never launched still holds everything its
+            # plan acquired at create time: locked radix nodes, CPU staging
+            # blocks, and is_ready=False index nodes that only a completion
+            # callback could publish. Dropping the task without aborting leaks
+            # all of it -- the staging blocks become unreachable (mempool
+            # exhaustion) and the unready nodes are permanently unevictable
+            # holes that also shadow future puts of the same prefix. Abort
+            # rolls those back; RUNNING tasks keep the old behavior (their
+            # graph is in flight and completion callbacks will still fire).
+            if task.status in (TaskStatus.UNREADY, TaskStatus.READY):
+                self._abort_task_plans(task)
             task.status = TaskStatus.CANCELLED
             self._log_task_terminal(task, TaskStatus.CANCELLED)
         self._release_task(task_id)
@@ -504,8 +561,6 @@ class KVTaskManager:
         return task.graph
 
     def _release_task(self, task_id: int) -> None:
-        """Remove the task record entirely. Called when the user observes (wait/try_wait)
-        or cancels the task. """
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]
@@ -528,6 +583,8 @@ class KVTaskManager:
         self._log_task_terminal(task, TaskStatus.COMPLETED)
         self.graph_to_task.pop(task.graph.graph_id, None)
         task.shed_heavy_resources()
+        if task.request_returned:
+            self._release_task(task_id)
 
     def _process_empty_graph(self, task_id: int) -> None:
         task = self.tasks[task_id]
@@ -541,20 +598,44 @@ class KVTaskManager:
         for transfer_handle in self.transfer_handles:
             completed_ops = transfer_handle.wait(timeout)
             for completed_op in completed_ops:
-                if completed_op.is_graph_completed():
-                    completed_count = self.uncompleted_graphs.get(completed_op.graph_id, 0) + 1
-                    if completed_count == self.required_completed_count:
-                        results.append(completed_op)
-                        self.uncompleted_graphs.pop(completed_op.graph_id, None)
+                if completed_op.op_id == -1:
+                    # Graph-level terminal message, completed OR failed. Every
+                    # handle received the same graph, so the task terminates
+                    # only after all of them have reported a terminal state --
+                    # aborting on the first failure would recycle plan blocks
+                    # a sibling engine is still writing into. Any failure
+                    # among the N outcomes fails the graph.
+                    graph_id = completed_op.graph_id
+                    count, failed = self.uncompleted_graphs.get(graph_id, (0, False))
+                    count += 1
+                    failed = failed or completed_op.is_graph_failed()
+                    if count == self.required_completed_count:
+                        self.uncompleted_graphs.pop(graph_id, None)
+                        if failed:
+                            # A failed handle never finalizes some of the
+                            # graph's ops, so their N-way per-op counters can
+                            # never complete: purge them rather than leak.
+                            # Safe because each handle's terminal message
+                            # follows all its per-op messages (per-handle
+                            # FIFO), so nothing can arrive for this graph
+                            # after the Nth terminal and resurrect a counter.
+                            stale = [key for key in self.uncompleted_ops
+                                     if key[0] == graph_id]
+                            for key in stale:
+                                self.uncompleted_ops.pop(key, None)
+                            results.append(CompletedOp.failed_graph(graph_id))
+                        else:
+                            results.append(completed_op)
                     else:
-                        self.uncompleted_graphs[completed_op.graph_id] = completed_count
+                        self.uncompleted_graphs[graph_id] = (count, failed)
                 else:
-                    completed_count = self.uncompleted_ops.get(completed_op.op_id, 0) + 1
+                    op_key = (completed_op.graph_id, completed_op.op_id)
+                    completed_count = self.uncompleted_ops.get(op_key, 0) + 1
                     if completed_count == self.required_completed_count:
                         results.append(completed_op)
-                        self.uncompleted_ops.pop(completed_op.op_id, None)
+                        self.uncompleted_ops.pop(op_key, None)
                     else:
-                        self.uncompleted_ops[completed_op.op_id] = completed_count
+                        self.uncompleted_ops[op_key] = completed_count
         return results
 
 class KVTaskEngine(KVTaskManager):
@@ -654,12 +735,14 @@ class KVTaskEngine(KVTaskManager):
                     )
                     break
                 elif self.check_completed(task_id, completely=completely):
+                    task = self.tasks[task_id]
                     return_responses[task_id] = KVResponse(
-                        status=convert_to_response_status(self.tasks[task_id].status),
+                        status=convert_to_response_status(task.status),
                         task_id=task_id,
-                        return_mask=self.tasks[task_id].return_mask
+                        return_mask=task.return_mask
                     )
-                    if self.tasks[task_id].is_completed():
+                    task.request_returned = True
+                    if task.is_completed():
                         self._release_task(task_id)
                     break
                 elif only_return_finished:
@@ -853,13 +936,19 @@ class KVTaskEngine(KVTaskManager):
                        token_ids: np.ndarray,
                        dp_client_id: int = 0,
                        task_id: int = -1,
-                       namespace: Optional[List[str]] = None) -> int:
+                       namespace: Optional[List[str]] = None) -> Tuple[int, int]:
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
         self.create_prefetch_task(task_id, token_ids, dp_client_id=dp_client_id, namespace=namespace)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
+        task = self.tasks[task_id]
+        actual_prefetch_tokens = 0
+        if task is not None and task.return_mask is not None:
+            actual_prefetch_tokens = int(np.sum(task.return_mask))
+        else:
+            flexkv_logger.warning(f"prefetch task {task_id} returned None")
         # trace prefetch async request
         self.tracer.trace_request(
             request_type="PREFETCH_ASYNC",
@@ -870,7 +959,7 @@ class KVTaskEngine(KVTaskManager):
             dp_client_id=dp_client_id
         )
         self._launch_task(task_id)
-        return task_id
+        return task_id, actual_prefetch_tokens
 
     def merge_to_batch_kvtask(self,
                               batch_id: int,
@@ -894,9 +983,9 @@ class KVTaskEngine(KVTaskManager):
                 task_end_op_ids.append(self.tasks[task_id].task_end_op_id)
                 callbacks.append(self.tasks[task_id].callback)
                 return_masks.append(self.tasks[task_id].return_mask)
-        # Multi-group SWA (DSv4 + c4 state sidecars) can run inside C++ via
-        # launch_swa_mg_h2d_layer_.  Keep the standalone predecessor path
-        # available behind swa_multi_layer for compatibility and debugging.
+        # When layerwise is on, SWA (+ optional C4 state sidecars) always folds
+        # into the fused LAYERWISE op via launch_swa_h2d_layer_ /
+        # launch_swa_mg_h2d_layer_.
         batch_task_graph, task_end_op_id, op_callback_dict = merge_to_batch_graph(
             batch_id,
             transfer_graphs,
@@ -904,7 +993,6 @@ class KVTaskEngine(KVTaskManager):
             op_callback_dict,
             layerwise_transfer,
             counter_id,
-            fuse_swa_into_layerwise=self.cache_config.swa_multi_layer,
         )
         self.tasks[batch_id] = KVTask(
             task_id=batch_id,

@@ -2,6 +2,7 @@ import contextlib
 import logging
 import os
 import copy
+import signal
 
 import torch.multiprocessing as mp
 import threading
@@ -42,6 +43,7 @@ from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_te
 from flexkv.transfer.host_buffer import (
     allocate_host_buffer,
     cudaHostRegister,
+    safe_cuda_host_unregister,
 )
 
 
@@ -79,6 +81,7 @@ from flexkv.transfer.compression.common.strategy import (
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
+from flexkv.external.mooncake_store_keys import PoolKind, build_key
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.transfer.utils import (
@@ -112,6 +115,15 @@ class TransferWorkerBase(ABC):
     _worker_id_counter = 0
     _worker_id_lock = threading.Lock()
 
+    def __new__(cls, *args: Any, **kwargs: Any):
+        # Allocate first so ``_worker_process`` can always hold a reference and
+        # call shutdown() even when ``__init__`` fails mid-way after some pins.
+        obj = super().__new__(cls)
+        obj._host_registered = []
+        obj._shutdown_done = False
+        obj._op_buffer_pinned = False
+        return obj
+
     def __init__(self,
                  worker_id: int,
                  transfer_conn: Connection,  # receive end of pipe
@@ -123,6 +135,19 @@ class TransferWorkerBase(ABC):
 
         self.op_buffer_tensor = op_buffer_tensor
         self._op_buffer_pinned = False
+        # (tensor, label) pairs registered via _register_host_tensor / _pin_op_buffer.
+        self._host_registered: List[Tuple[torch.Tensor, str]] = []
+        self._shutdown_done = False
+
+    def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
+        """cudaHostRegister and track for paired unregister in shutdown()."""
+        size_gb = tensor.numel() * tensor.element_size() / (1024 ** 3)
+        flexkv_logger.info(
+            f"[worker {self.worker_id}] cudaHostRegister {label or 'host'}: "
+            f"ptr=0x{tensor.data_ptr():x} size={size_gb:.3f} GiB"
+        )
+        cudaHostRegister(tensor)
+        self._host_registered.append((tensor, label or "host"))
 
     def _pin_op_buffer(self) -> None:
         """Pin the shared op buffer after the worker has bound its CUDA device.
@@ -131,8 +156,79 @@ class TransferWorkerBase(ABC):
         or every worker creates a default CUDA context on GPU0.
         """
         if not self._op_buffer_pinned:
-            cudaHostRegister(self.op_buffer_tensor)
+            self._register_host_tensor(self.op_buffer_tensor, "op_buffer")
             self._op_buffer_pinned = True
+
+    def shutdown(self) -> None:
+        """Unregister all host tensors pinned by this worker. Idempotent.
+
+        Safe to call after a partially-failed ``__init__`` (only unregisters
+        whatever was tracked in ``_host_registered``).
+        """
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        registered = getattr(self, "_host_registered", None) or []
+        worker_id = getattr(self, "worker_id", "-1")
+        msg = (
+            f"[worker {worker_id}] shutdown: unregistering "
+            f"{len(registered)} host region(s)"
+        )
+        flexkv_logger.info(msg)
+        # Drain in-flight CUDA work before unpinning host memory that
+        # DMA / kernels may still be touching.
+        #
+        # torch.cuda.synchronize() releases the GIL and blocks in the driver;
+        # if the GPU is wedged (hung kernel, TDR, faulty NVLink) it can hang
+        # forever. We run it in a daemon thread with a bounded join so a
+        # wedged GPU cannot prevent cudaHostUnregister from firing — the
+        # kernel behind the DMA is already dead, so proceeding with unpin
+        # is the correct action; the sentinel thread dies with the process.
+        self._drain_cuda_bounded(worker_id, timeout_s=30.0)
+        # Unregister in reverse order of registration.
+        while registered:
+            tensor, label = registered.pop()
+            safe_cuda_host_unregister(tensor, label=f"worker={worker_id} {label}")
+        self._op_buffer_pinned = False
+        self._host_registered = registered
+
+    @staticmethod
+    def _drain_cuda_bounded(worker_id: Any, timeout_s: float) -> None:
+        """Best-effort torch.cuda.synchronize() with a wall-clock cap.
+
+        Returns whether the sync actually completed. Failure / timeout is
+        logged but not raised — unpin must proceed either way.
+        """
+        if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+            return
+        done = threading.Event()
+        err: List[BaseException] = []
+
+        def _run() -> None:
+            try:
+                torch.cuda.synchronize()
+            except BaseException as e:  # noqa: BLE001
+                err.append(e)
+            finally:
+                done.set()
+
+        t = threading.Thread(
+            target=_run,
+            name=f"flexkv-worker-{worker_id}-cuda-drain",
+            daemon=True,
+        )
+        t.start()
+        if not done.wait(timeout=timeout_s):
+            flexkv_logger.warning(
+                f"[worker {worker_id}] cuda synchronize did not finish in "
+                f"{timeout_s:.0f}s (GPU likely wedged); proceeding with unpin"
+            )
+            return
+        if err:
+            flexkv_logger.warning(
+                f"[worker {worker_id}] cuda synchronize before unpin failed: "
+                f"{err[0]!r}"
+            )
 
     @classmethod
     def _get_worker_id(cls) -> int:
@@ -227,10 +323,55 @@ class TransferWorkerBase(ABC):
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
                         op_buffer_tensor: torch.Tensor, ready_event: Any, *args: Any, **kwargs: Any) -> None:
         # Note: MPI initialization prevention is handled by create_safe_process
-        # Environment variables are set before this function is called
-        worker = cls(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs)
-        ready_event.set()
-        worker.run()
+        # Environment variables are set before this function is called.
+        #
+        # Use ``__new__`` + ``__init__`` (not ``cls(...)``) so we keep a live
+        # reference if ``__init__`` raises after partial cudaHostRegister; the
+        # ``finally`` block can still unpin. ``run()`` only exits the loop —
+        # this finally owns shutdown().
+        worker: Optional["TransferWorkerBase"] = None
+
+        def _on_sigterm(signum: int, frame: Any) -> None:
+            # Raise SystemExit so the ``finally`` below still runs shutdown().
+            flexkv_logger.warning(
+                f"[worker {worker_id}] received signal {signum}; exiting for graceful cleanup"
+            )
+            raise SystemExit(0)
+
+        try:
+            # Ignore Ctrl+C (SIGINT): the foreground process group receives it
+            # together with sglang/tee. Workers must only unpin when the parent
+            # sends a shutdown sentinel / SIGTERM, otherwise they race and get
+            # SIGKILL mid-unregister, leaking pinned CPU buffers.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        except Exception as e:
+            flexkv_logger.warning(
+                f"[worker {worker_id}] failed to install shutdown signal handlers: {e}"
+            )
+
+
+        try:
+            worker = cls.__new__(cls)
+            worker.__init__(
+                worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs
+            )
+            ready_event.set()
+            worker.run()
+        except Exception as e:
+            # Init / run failure: log then re-raise so process exitcode != 0.
+            # SIGTERM → SystemExit is BaseException and bypasses this handler,
+            # still hitting ``finally`` for unpin.
+            flexkv_logger.error(
+                f"[worker {worker_id}] exited with error during init/run: {e}"
+            )
+            raise
+        finally:
+            if worker is not None:
+                try:
+                    worker.shutdown()
+                except Exception as e:
+                    flexkv_logger.error(f"[worker {worker_id}] final shutdown error: {e}")
 
     @abstractmethod
     def _transfer_impl(
@@ -335,27 +476,29 @@ class TransferWorkerBase(ABC):
         pass
 
     def run(self) -> None:
-        """main loop for worker process"""
-        should_shutdown = False
+        """Main loop for the worker process.
+
+        Exit paths (``None`` sentinel, pipe EOF, or return) do not unregister
+        themselves — ``_worker_process`` owns a single ``shutdown()`` in its
+        ``finally`` block so cleanup is not duplicated.
+        """
         while True:
             try:
-                if self.transfer_conn.poll(timeout=0.0001):  # check if data available
+                if not self.transfer_conn.poll(timeout=0.0001):
+                    continue
+
+                op = self.transfer_conn.recv()
+                if op is None:
+                    return
+
+                batch_ops = [op]
+                shutdown_after_batch = False
+                while self.transfer_conn.poll(timeout=0):
                     op = self.transfer_conn.recv()
                     if op is None:
-                        # shut down zmq listening server of peer2cpuTransferWorker
-                        if hasattr(self, "shutdown") and callable(self.shutdown):
-                            try:
-                                self.shutdown()
-                            except Exception as e:
-                                flexkv_logger.error(f"Error when shut down worker: {e}")
+                        shutdown_after_batch = True
                         break
                     batch_ops = [op]
-                    while self.transfer_conn.poll(timeout=0):
-                        op = self.transfer_conn.recv()
-                        if op is None:
-                            should_shutdown = True
-                            break
-                        batch_ops.append(op)
                     for op in batch_ops:
                         transfer_status = False
                         transfer_start_ns = time.perf_counter_ns()
@@ -392,9 +535,15 @@ class TransferWorkerBase(ABC):
                             if nvtx_pushed:
                                 nvtx.pop_range()
                         if transfer_status:
-                            ## only put the op when transfer success
                             self.finished_ops_queue.put(op.transfer_op_id)
-                    if should_shutdown:
+                        else:
+                            # Report the failure instead of dropping it: a
+                            # dropped op leaves its graph incomplete forever
+                            # and leaks every resource its plan holds. A bare
+                            # int still means success, so the queue format
+                            # stays compatible.
+                            self.finished_ops_queue.put((op.transfer_op_id, False))
+                    if shutdown_after_batch:
                         if hasattr(self, "shutdown") and callable(self.shutdown):
                             try:
                                 self.shutdown()
@@ -404,11 +553,12 @@ class TransferWorkerBase(ABC):
                 else:
                     continue
             except EOFError:
-                # Connection closed
-                break
+                flexkv_logger.warning(
+                    f"[worker {self.worker_id}] transfer pipe EOF; exiting run loop"
+                )
+                return
             except Exception as e:
                 flexkv_logger.error(f"Error in worker run loop: {e}")
-                continue
 
 class WorkerHandle:
     """handle for worker process"""
@@ -428,19 +578,33 @@ class WorkerHandle:
     def shutdown(self) -> None:
         try:
             self.transfer_conn.send(None)
-            self.transfer_conn.close()
-        except (BrokenPipeError, OSError):
-            pass  # Pipe already closed
-        # set timeout to 5 seconds
-        self.process.join(timeout=5)
+        except (BrokenPipeError, OSError, EOFError):
+            pass  # Pipe already closed / peer gone
+
+        timeout = float(GLOBAL_CONFIG_FROM_ENV.worker_shutdown_timeout_s)
+        self.process.join(timeout=timeout)
         if self.process.is_alive():
-            print("force terminate the worker process")
+            flexkv_logger.warning(
+                f"[WorkerHandle] worker {self.worker_id} still alive after "
+                f"{timeout:.0f}s graceful shutdown; force terminate"
+            )
             self.process.terminate()
-            self.process.join()
+            self.process.join(timeout=30)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join()
+
+        try:
+            self.transfer_conn.close()
+        except Exception:
+            pass
 
     def __del__(self) -> None:
-        if self.process.is_alive():
-            self.shutdown()
+        try:
+            if getattr(self, "process", None) is not None and self.process.is_alive():
+                self.shutdown()
+        except Exception:
+            pass
 
 class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non-tp and non-dp case
     def __init__(self,
@@ -470,7 +634,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         # Register CPU tensors with CUDA
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        cudaHostRegister(cpu_blocks)
+        self._register_host_tensor(cpu_blocks, "cpu_kv_pool")
         self.gpu_blocks = import_tensor_handles(gpu_blocks)
         # Get pointers first
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
@@ -578,6 +742,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         )
 
         self.group_transfer_params: list = []
+        # Keep the imported CUDA-IPC tensors alive for the worker's lifetime.
+        # _get_layer_ptrs() below records only their raw data_ptr()s; if the
+        # tensors themselves were allowed to go out of scope, PyTorch would
+        # release the underlying CUDA IPC mapping and the stored pointers would
+        # dangle, so the per-group transfer would read/write freed device
+        # memory (observed as the indexer group silently restoring zeros).
+        self._multi_group_gpu_blocks_keepalive: list = []
         cpu_offset_bytes = 0  # byte offset of this group within a CPU block
 
         for gi, (g, gpu_layout) in enumerate(zip(layer_groups, gpu_layouts_per_group)):
@@ -586,6 +757,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
             # Resolve GPU tensors for this group
             group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+            self._multi_group_gpu_blocks_keepalive.append(group_gpu_blocks)
             group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
 
             # Compressed groups: GPU tensor's tokens dim equals tpb_g, not tpb.
@@ -820,7 +992,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.cpu_tensor = cpu_blocks
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        cudaHostRegister(cpu_blocks)
+        self._register_host_tensor(cpu_blocks, "tp_cpu_kv_pool")
 
         self.num_layers = gpu_kv_layouts[0].num_layer
 
@@ -944,6 +1116,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         )
 
         self.tp_group_transfer_groups: list = []
+        # Keep imported CUDA-IPC tensors alive for the worker's lifetime:
+        # TPTransferThreadGroup below stores only their raw data_ptr()s, so if
+        # the tensors were dropped PyTorch would release the IPC mapping and the
+        # pointers would dangle (mirrors GPUCPUTransferWorker._init_multi_group
+        # and LayerwiseWorker._init_multi_group).
+        self._multi_group_gpu_blocks_keepalive: list = []
         cpu_offset_bytes = 0
 
         for gi, g in enumerate(layer_groups):
@@ -958,6 +1136,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             imported_group_blocks = []
             for handles_in_one_gpu in group_gpu_blocks_per_gpu:
                 imported_group_blocks.append(import_tensor_handles(handles_in_one_gpu))
+            self._multi_group_gpu_blocks_keepalive.append(imported_group_blocks)
 
             # Build flat pointer list for this group
             gpu_block_ptrs_flat = [
@@ -1675,6 +1854,10 @@ class GDSTransferWorker(TransferWorkerBase):
         self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride()
 
         self.group_gds_params: list = []
+        # Keep imported CUDA-IPC tensors alive: _get_layer_ptrs() records only
+        # raw data_ptr()s below, so dropping the tensors would free the IPC
+        # mapping and dangle the stored pointers.
+        self._multi_group_gpu_blocks_keepalive: list = []
         ssd_offset_bytes = 0
 
         for gi, g in enumerate(layer_groups):
@@ -1710,6 +1893,7 @@ class GDSTransferWorker(TransferWorkerBase):
             # GPU pointers for this group
             if gpu_blocks_per_group is not None:
                 group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+                self._multi_group_gpu_blocks_keepalive.append(group_gpu_blocks)
                 group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
             else:
                 group_gpu_ptrs = self.gpu_layer_ptrs
@@ -1949,7 +2133,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
             # SSD layout calculations
             self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
             self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-            self.ssd_tp_stride_in_bytes = self.ssd_block_stride_in_bytes // self.tp_group_size if not self.is_mla else self.ssd_block_stride_in_bytes
+            self.ssd_tp_stride_in_bytes = (self.ssd_block_stride_in_bytes // self.tp_group_size
+                                           if not self.is_mla else self.ssd_block_stride_in_bytes)
 
             # Resolve pointers in Python
             gpu_block_ptrs_flat = [
@@ -1997,6 +2182,10 @@ class tpGDSTransferWorker(TransferWorkerBase):
         self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride()
 
         self.group_tp_gds_params: list = []
+        # Keep imported CUDA-IPC tensors alive: only data_ptr()s are recorded
+        # below, so dropping the tensors would free the IPC mapping and dangle
+        # the stored pointers.
+        self._multi_group_gpu_blocks_keepalive: list = []
         ssd_offset_bytes = 0
 
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
@@ -2026,6 +2215,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
                     grp_layout = gpu_layouts_per_group[gi][gpu_idx]
                     grp_handles = gpu_blocks_per_group[gi][gpu_idx]
                     grp_tensors = [h.get_tensor() for h in grp_handles]
+                    self._multi_group_gpu_blocks_keepalive.append(grp_tensors)
 
                     gpu_strides = self._get_gpu_strides_from_tensor(
                         grp_tensors[0], tpb_g, dtype_size_g, self.is_mla,
@@ -2049,16 +2239,16 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 gpu_kv_strides = []
                 gpu_block_strides = []
                 gpu_layer_strides = []
-                for i, l in enumerate(gpu_kv_layouts):
+                for i, layout in enumerate(gpu_kv_layouts):
                     gpu_strides = self._get_gpu_strides_from_tensor(
                         self.gpu_blocks[i][0], tpb_g, dtype_size_g, self.is_mla,
                     ) if len(self.gpu_blocks[i]) > 1 else None
                     if gpu_strides is not None:
                         kv_s, blk_s, layer_s = gpu_strides
                     else:
-                        kv_s = l.get_kv_stride() * dtype_size_g
-                        blk_s = l.get_block_stride() * dtype_size_g
-                        layer_s = l.get_layer_stride() * dtype_size_g
+                        kv_s = layout.get_kv_stride() * dtype_size_g
+                        blk_s = layout.get_block_stride() * dtype_size_g
+                        layer_s = layout.get_layer_stride() * dtype_size_g
                     gpu_kv_strides.append(kv_s)
                     gpu_block_strides.append(blk_s)
                     gpu_layer_strides.append(layer_s)
@@ -2220,7 +2410,8 @@ class NixlTransferWorker(TransferWorkerBase):
         be = normalize_nixl_file_plugin_name(str(nixl_backend).upper())
         if be not in NIXL_GPU_FILE_BACKENDS and be not in NIXL_CPU_FILE_BACKENDS:
             raise ValueError(
-                f"nixl_backend must be one of {sorted(NIXL_GPU_FILE_BACKENDS | NIXL_CPU_FILE_BACKENDS)}, got {nixl_backend}"
+                f"nixl_backend must be one of "
+                f"{sorted(NIXL_GPU_FILE_BACKENDS | NIXL_CPU_FILE_BACKENDS)}, got {nixl_backend}"
             )
         if be in NIXL_GPU_FILE_BACKENDS and gpu_blocks is None:
             raise ValueError("GDS_MT requires gpu_blocks")
@@ -2315,7 +2506,7 @@ class NixlTransferWorker(TransferWorkerBase):
                 f"NixlTransferWorker ({be}): pinning CPU pool "
                 f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GiB"
             )
-            cudaHostRegister(cpu_blocks)  # type: ignore[arg-type]
+            self._register_host_tensor(cpu_blocks, "nixl_cpu_pool")  # type: ignore[arg-type]
             if cpu_kv_layout.type != ssd_kv_layout.type:
                 raise ValueError(
                     "CPU and SSD KV layout types must match for NIXL FILE transfer"
@@ -2728,17 +2919,52 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             return old_value
 
     def shutdown(self):
-        self.zmq_server.shutdown()
-        self.zmq_client.shutdown()
-        # unregist buffer in mooncake engine
-        self.mooncake_transfer_engine.unregist_buffer(self.cpu_blocks.data_ptr())
-        if self.cache_config.enable_p2p_ssd:
-            self.mooncake_transfer_engine.unregist_buffer(self.tmp_cpu_buffer.data_ptr())
-            # Release CUDA pinning & HugePage mapping, if any.
-            if hasattr(self, "_tmp_cpu_buffer_handle"):
-                self._tmp_cpu_buffer_handle.release()
-        # unregist node info from redis server
-        self.unregist_node_meta()
+        """Best-effort cleanup; tolerant of partially-failed ``__init__``."""
+        try:
+            zmq_server = getattr(self, "zmq_server", None)
+            if zmq_server is not None:
+                zmq_server.shutdown()
+            zmq_client = getattr(self, "zmq_client", None)
+            if zmq_client is not None:
+                zmq_client.shutdown()
+            engine = getattr(self, "mooncake_transfer_engine", None)
+            cpu_blocks = getattr(self, "cpu_blocks", None)
+            if engine is not None and cpu_blocks is not None:
+                try:
+                    engine.unregist_buffer(cpu_blocks.data_ptr())
+                except Exception as e:
+                    flexkv_logger.warning(
+                        f"PEER2CPUTransferWorker unregist cpu buffer failed: {e}"
+                    )
+                cache_config = getattr(self, "cache_config", None)
+                if cache_config is not None and getattr(cache_config, "enable_p2p_ssd", False):
+                    tmp_buf = getattr(self, "tmp_cpu_buffer", None)
+                    if tmp_buf is not None:
+                        try:
+                            engine.unregist_buffer(tmp_buf.data_ptr())
+                        except Exception as e:
+                            flexkv_logger.warning(
+                                f"PEER2CPUTransferWorker unregist tmp buffer failed: {e}"
+                            )
+                    tmp_handle = getattr(self, "_tmp_cpu_buffer_handle", None)
+                    if tmp_handle is not None:
+                        try:
+                            tmp_handle.release()
+                        except Exception as e:
+                            flexkv_logger.warning(
+                                f"PEER2CPUTransferWorker release tmp handle failed: {e}"
+                            )
+            if getattr(self, "redis_meta_client", None) is not None:
+                try:
+                    self.unregist_node_meta()
+                except Exception as e:
+                    flexkv_logger.warning(
+                        f"PEER2CPUTransferWorker unregist_node_meta failed: {e}"
+                    )
+        except Exception as e:
+            flexkv_logger.error(f"PEER2CPUTransferWorker shutdown error: {e}")
+        finally:
+            super().shutdown()
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         task_info_list = self.op_parser(transfer_op)
@@ -3420,3 +3646,172 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.info(f"Fetched node {node_id} meta from Redis.")
 
         return self.node_metas[node_id]
+
+class MooncakeStoreTransferWorker(TransferWorkerBase):
+    """Mooncake-store remote KV I/O worker (main KV and SWA pools)."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        cpu_blocks: Union[List[torch.Tensor], torch.Tensor],
+        cpu_kv_layout: "KVCacheLayout",
+        dtype: torch.dtype,
+        cache_config: "CacheConfig",
+        pool_kind: PoolKind = PoolKind.KV,
+        override_global_segment_size: Optional[int] = None,
+    ) -> None:
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self.pp_rank = int(getattr(cache_config, 'mooncake_store_pp_rank', 0) or 0)
+        self.pp_size = int(getattr(cache_config, 'mooncake_store_pp_size', 1) or 1)
+        self.node_layer_start = int(getattr(cache_config, 'mooncake_store_node_layer_start', 0) or 0)
+        self.node_layer_end = int(getattr(cache_config, 'mooncake_store_node_layer_end', 0) or 0)
+        self.total_layers = int(getattr(cache_config, 'mooncake_store_total_layers', 0) or 0)
+        self.pool_kind = pool_kind
+
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
+        self._register_host_tensor(cpu_blocks, "mooncake_store_cpu_pool")
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+        self.num_layers: int = cpu_kv_layout.num_layer
+        self.num_cpu_blocks: int = cpu_kv_layout.num_block
+        self.dtype = dtype
+        self.cpu_kv_layout = cpu_kv_layout
+        assert self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
+        self.is_mla: bool = cpu_kv_layout.is_mla
+        self.kv_dim = 2 if not self.is_mla else 1
+        self.cpu_blocks = cpu_blocks
+        self.cache_config = cache_config
+        self._cpu_buffer = cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks
+        # Opaque whole-block I/O: multi-group CPU layout is byte-flat
+        # ([num_block, bytes_per_block]); get_chunk_size() is invalid there.
+        self.block_size_bytes = self._block_size_bytes(cpu_kv_layout, dtype)
+
+        from flexkv.external.mooncake_store_utils import MooncakeStoreClient, MooncakeStoreConfig
+        store_config = MooncakeStoreConfig.from_file(
+            self.cache_config,
+            override_global_segment_size=override_global_segment_size,
+        )
+        self.mooncake_client = MooncakeStoreClient(store_config)
+        self.mooncake_client.register_buffer(self._cpu_buffer)
+
+    def shutdown(self) -> None:
+        """Best-effort cleanup; tolerant of partially-failed ``__init__``."""
+        try:
+            client = getattr(self, "mooncake_client", None)
+            buf = getattr(self, "_cpu_buffer", None)
+            if client is not None and buf is not None:
+                try:
+                    client.unregister_buffer(buf)
+                except Exception as e:
+                    flexkv_logger.error(
+                        f"[MooncakeStoreTransferWorker] unregister_buffer failed: {e}"
+                    )
+        finally:
+            super().shutdown()
+
+    @staticmethod
+    def _block_size_bytes(cpu_kv_layout: "KVCacheLayout", dtype: torch.dtype) -> int:
+        """Bytes per CPU block for mooncake put/get addressing.
+
+        Multi-group BLOCKFIRST stores ``bytes_per_block`` directly in
+        ``kv_shape[1]`` (via ``get_block_stride()``) — do not multiply by
+        ``dtype.itemsize``. Single-group layouts still use element count ×
+        itemsize.
+        """
+        if cpu_kv_layout.layer_groups is not None:
+            return int(cpu_kv_layout.get_block_stride())
+        return int(cpu_kv_layout.get_elements_per_block() * dtype.itemsize)
+
+    def _transfer_impl(self, cpu_ptrs, block_sizes, keys, transfer_type: TransferType) -> None:
+        if transfer_type == TransferType.H2REMOTE:
+            put_results = self.mooncake_client.batch_put(keys, cpu_ptrs, block_sizes)
+            if not all(put_results):
+                flexkv_logger.error(f"Mooncake-store batch put partially failed: {put_results}")
+        elif transfer_type == TransferType.REMOTE2H:
+            get_results = self.mooncake_client.batch_get(keys, cpu_ptrs, block_sizes)
+            if not all(get_results):
+                flexkv_logger.error(f"Mooncake-store batch get partially failed: {get_results}")
+        else:
+            raise ValueError(
+                f"MooncakeStoreTransferWorker only supports H2REMOTE/REMOTE2H, got {transfer_type}")
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        if self.pool_kind == PoolKind.SWA:
+            cpu_ptrs, block_sizes, keys = self._preprocess_swa(transfer_op)
+        else:
+            cpu_ptrs, block_sizes, keys = self._preprocess_kv(transfer_op)
+        start_time = time.time()
+        self._transfer_impl(cpu_ptrs, block_sizes, keys, transfer_op.transfer_type)
+        end_time = time.time()
+        transfer_size = sum(block_sizes)
+        self._log_transfer_performance(transfer_op, transfer_size, start_time, end_time)
+        return True
+
+    def _preprocess_kv(self, transfer_op: WorkerTransferOp):
+        cpu_block_ids = (
+            transfer_op.dst_block_ids
+            if transfer_op.transfer_type == TransferType.REMOTE2H
+            else transfer_op.src_block_ids
+        )
+        assert transfer_op.mooncake_store_block_hashes is not None
+        block_size_bytes = self.block_size_bytes
+        base_ptr = self._cpu_buffer.data_ptr()
+        cpu_ptrs, block_sizes, keys = [], [], []
+        for i, blk_id in enumerate(cpu_block_ids):
+            key = build_key(
+                transfer_op.mooncake_store_block_hashes[i],
+                PoolKind.KV,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                node_layer_start=self.node_layer_start,
+                node_layer_end=self.node_layer_end,
+                total_layers=self.total_layers,
+            )
+            cpu_ptrs.append(base_ptr + int(blk_id) * block_size_bytes)
+            block_sizes.append(block_size_bytes)
+            keys.append(key)
+        return cpu_ptrs, block_sizes, keys
+
+    def _preprocess_swa(self, transfer_op: WorkerTransferOp):
+        """Build (cpu_ptrs, sizes, keys) for the SWA mooncake lane.
+
+        Each request contributes one (CPU slot id, tail_hash) pair; after batch
+        merging, ``cpu_block_ids`` and ``mooncake_store_swa_block_hashes`` both
+        hold N entries in the same order (one key per slot).
+        """
+        tail_hashes = transfer_op.mooncake_store_swa_block_hashes
+        if tail_hashes is None:
+            raise ValueError(
+                "SWA mooncake transfer requires mooncake_store_swa_block_hashes")
+        cpu_block_ids = (
+            transfer_op.dst_block_ids
+            if transfer_op.transfer_type == TransferType.REMOTE2H
+            else transfer_op.src_block_ids
+        )
+        if len(tail_hashes) != len(cpu_block_ids):
+            raise ValueError(
+                "SWA mooncake transfer requires len(swa_block_hashes) == "
+                f"len(cpu_block_ids): got {len(tail_hashes)} vs {len(cpu_block_ids)}")
+        block_size_bytes = self.block_size_bytes
+        base_ptr = self._cpu_buffer.data_ptr()
+        cpu_ptrs: List[int] = []
+        block_sizes: List[int] = []
+        keys: List[str] = []
+        for i, blk_id in enumerate(cpu_block_ids):
+            cpu_ptrs.append(base_ptr + int(blk_id) * block_size_bytes)
+            block_sizes.append(block_size_bytes)
+            keys.append(build_key(
+                str(tail_hashes[i]),
+                PoolKind.SWA,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                node_layer_start=self.node_layer_start,
+                node_layer_end=self.node_layer_end,
+                total_layers=self.total_layers,
+            ))
+        return cpu_ptrs, block_sizes, keys
+
+    def _postprocess(self, transfer_op: WorkerTransferOp) -> None:
+        pass

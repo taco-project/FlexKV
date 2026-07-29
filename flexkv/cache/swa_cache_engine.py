@@ -50,7 +50,7 @@ plane's responsibility.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 
@@ -104,7 +104,8 @@ class SWAOpConstructor:
                      transfer_type: TransferType,
                      src_slot_ids: np.ndarray,
                      dst_slot_ids: np.ndarray,
-                     dp_client_id: int = 0) -> Optional[int]:
+                     dp_client_id: int = 0,
+                     mooncake_tail_hashes: Optional[List[str]] = None) -> Optional[int]:
         """Add one peer SWA transfer op (``is_swa=True``) to ``graph``; return op_id.
 
         ``transfer_type`` is a STANDARD type (H2D / D2H / DISK2H / H2DISK /
@@ -120,6 +121,12 @@ class SWAOpConstructor:
         dst = np.asarray(dst_slot_ids, dtype=np.int64)
         if src.size == 0 or dst.size == 0:
             return None
+        is_remote = transfer_type in (TransferType.H2REMOTE, TransferType.REMOTE2H)
+        tail_hashes = (
+            [str(h) for h in mooncake_tail_hashes]
+            if (is_remote and mooncake_tail_hashes)
+            else None
+        )
         op = TransferOp(
             graph_id=graph.graph_id,
             transfer_type=transfer_type,
@@ -127,6 +134,7 @@ class SWAOpConstructor:
             dst_block_ids=dst,
             dp_client_id=dp_client_id,
             is_swa=True,
+            mooncake_store_swa_block_hashes=tail_hashes,
         )
         graph.add_transfer_op(op)
         return op.op_id
@@ -137,7 +145,8 @@ class SWAOpConstructor:
                         cpu_slot_ids: np.ndarray,
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
-                        dp_client_id: int = 0) -> Optional[int]:
+                        dp_client_id: int = 0,
+                        mooncake_tail_hashes: Optional[List[str]] = None) -> Optional[int]:
         """Build the GET-side SWA load chain into ``graph``; return the terminal
         SWA ``H2D`` op_id (to be appended to the graph's finished_ops_ids so it
         joins the VIRTUAL barrier alongside the full-KV H2D).
@@ -147,6 +156,9 @@ class SWAOpConstructor:
         bytes are sourced from SSD / REMOTE. (CPU-resident SWA needs no staging
         op, like a CPU full-KV hit.) All ops carry ``is_swa=True``. Returns None
         when disabled / empty.
+
+        ``mooncake_tail_hashes``: mooncake-store REMOTE tier is key-addressed;
+        the tail hash of the hit block is carried on the SWA ``REMOTE2H`` op.
         """
         assert gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
         h2d_id = self.build_swa_op(
@@ -166,6 +178,7 @@ class SWAOpConstructor:
             remote2h_id = self.build_swa_op(
                 graph, TransferType.REMOTE2H, remote_slot_ids, cpu_slot_ids,
                 dp_client_id=dp_client_id,
+                mooncake_tail_hashes=mooncake_tail_hashes,
             )
             if remote2h_id is not None:
                 graph.add_dependency(h2d_id, remote2h_id)
@@ -178,7 +191,9 @@ class SWAOpConstructor:
                         ssd_slot_ids: Optional[np.ndarray] = None,
                         remote_slot_ids: Optional[np.ndarray] = None,
                         dp_client_id: int = 0,
-                        return_op_ids: bool = False) -> Union[Optional[int], SWAPutChainOpIds]:
+                        return_op_ids: bool = False,
+                        mooncake_tail_hashes: Optional[List[str]] = None
+                        ) -> Union[Optional[int], SWAPutChainOpIds]:
         """Build the PUT-side SWA store chain into ``graph``; return the SWA
         ``D2H`` op_id (to be appended to the graph's finished_ops_ids).
 
@@ -187,6 +202,9 @@ class SWAOpConstructor:
         ops depend on the SWA ``D2H`` but are fire-and-forget (NOT reported),
         exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2REMOTE``. All ops
         carry ``is_swa=True``. Returns None when disabled / empty.
+
+        ``mooncake_tail_hashes``: for the key-addressed mooncake-store REMOTE
+        tier, the sequence tail hash keys the SWA snapshot on ``H2REMOTE``.
         """
         assert gpu_slot_ids.size == cpu_slot_ids.size, "GPU and CPU SWA slot ids must have the same size"
         d2h_id = self.build_swa_op(
@@ -208,6 +226,7 @@ class SWAOpConstructor:
             h2remote_id = self.build_swa_op(
                 graph, TransferType.H2REMOTE, cpu_slot_ids, remote_slot_ids,
                 dp_client_id=dp_client_id,
+                mooncake_tail_hashes=mooncake_tail_hashes,
             )
             if h2remote_id is not None:
                 graph.add_dependency(h2remote_id, d2h_id)

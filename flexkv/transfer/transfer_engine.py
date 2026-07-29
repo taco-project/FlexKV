@@ -18,7 +18,7 @@ import time
 import multiprocessing as mp
 import selectors
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import contextlib
 import nvtx
@@ -40,7 +40,9 @@ from flexkv.transfer.worker import (
     tpGDSTransferWorker,
     NixlTransferWorker,
     PEER2CPUTransferWorker,
+    MooncakeStoreTransferWorker,
 )
+from flexkv.external.mooncake_store_keys import PoolKind
 from flexkv.transfer.compression import build_compressors
 from flexkv.transfer.layerwise import (
     LayerwiseTransferWorker,
@@ -88,6 +90,42 @@ def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
         pin_buffer.free_slot(op.src_slot_id)
     if op.dst_slot_id != -1:
         pin_buffer.free_slot(op.dst_slot_id)
+
+
+def _te_bounded_cuda_sync(timeout_s: float) -> None:
+    """torch.cuda.synchronize() with a wall-clock cap.
+
+    Runs the sync in a daemon thread so a wedged GPU cannot prevent
+    TransferEngine.shutdown from returning. Failure / timeout is logged
+    but not raised — this is called from the shutdown finally.
+    """
+    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+        return
+    done = threading.Event()
+    err: List[BaseException] = []
+
+    def _run() -> None:
+        try:
+            torch.cuda.synchronize()
+        except BaseException as e:  # noqa: BLE001
+            err.append(e)
+        finally:
+            done.set()
+
+    t = threading.Thread(
+        target=_run, name="flexkv-te-cuda-drain", daemon=True,
+    )
+    t.start()
+    if not done.wait(timeout=timeout_s):
+        flexkv_logger.warning(
+            f"TransferEngine.shutdown: cuda synchronize did not finish in "
+            f"{timeout_s:.0f}s (GPU likely wedged); continuing"
+        )
+        return
+    if err:
+        flexkv_logger.warning(
+            f"TransferEngine.shutdown: cuda synchronize failed: {err[0]!r}"
+        )
 
 class TransferEngine:
     def __init__(self,
@@ -199,6 +237,14 @@ class TransferEngine:
         # pending_count and the parent finalizes when count hits 0.
         self._child_id_to_child: Dict[int, TransferOp] = {}
         self._child_to_parent_op_id: Dict[int, int] = {}
+
+        # Failure propagation state; see _handle_failed_op for the flow.
+        # Graphs with a failed op, awaiting drain of their in-flight ops
+        # before the graph-level failure message is emitted.
+        self._failed_graph_ids: Set[int] = set()
+        # Ops with at least one failed replica: must be discarded, not
+        # finalized, when their pending_count drains to zero.
+        self._failed_parent_op_ids: Set[int] = set()
 
     def _get_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
         """Get multi-group kwargs for TP=1 workers (GPUCPU / GDS)."""
@@ -345,11 +391,10 @@ class TransferEngine:
     def _get_layerwise_swa_kwargs(self, worker_key: WorkerKey) -> dict:
         """SWA args for LayerwiseTransferWorker (uniform or multi-group).
 
-        With ``swa_multi_layer`` enabled, layerwise GET fuses main-KV +
-        SWA/state into one LAYERWISE op, so both layouts are wired into the
-        layerwise worker rather than a standalone SWA H2D worker.
+        When SWA is enabled, layerwise GET always binds SWA (and any C4 state
+        sidecars) into the LAYERWISE worker rather than a standalone H2D worker.
         """
-        if not self._has_swa or not self.cache_config.swa_multi_layer:
+        if not self._has_swa:
             return {}
         swa_ssd_files = (
             self._swa_ssd_handle.get_file_list()
@@ -398,10 +443,9 @@ class TransferEngine:
         self._worker_map: Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]] = {}
 
         assert self._cpu_handle is not None
+        # When layerwise is on, SWA/state H2D is always fused into the LAYERWISE
+        # worker (no standalone swa_multi_layer switch).
         _enable_layerwise = GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
-        _fuse_swa_into_layerwise = (
-            _enable_layerwise and self.cache_config.swa_multi_layer
-        )
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
         
@@ -558,6 +602,22 @@ class TransferEngine:
             )
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
+        elif (getattr(self.cache_config, 'use_mooncake_store_backend', False)
+              and self._cpu_handle is not None):
+            self.mooncake_store_worker: WorkerHandle = MooncakeStoreTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
+                cache_config=self.cache_config,
+                pool_kind=PoolKind.KV,
+            )
+            self._worker_map[TransferType.H2REMOTE] = self.mooncake_store_worker
+            self._worker_map[TransferType.REMOTE2H] = self.mooncake_store_worker
+            flexkv_logger.info(
+                "[TransferEngine] mooncake-store workers created for H2REMOTE/REMOTE2H")
         if self.cache_config.enable_gds:
             assert self._ssd_handle is not None
             if self.cache_config.enable_nixl:
@@ -687,7 +747,8 @@ class TransferEngine:
                 ssd_kv_layout = self._ssd_handle.kv_layout if self._ssd_handle else None,
                 ssd_files = self._ssd_handle.get_file_list() if self._ssd_handle else None,
                 num_blocks_per_file = self._ssd_handle.num_blocks_per_file if self._ssd_handle else 0,
-                mooncake_config_path = getattr(self.cache_config, 'mooncake_config_path', None) or os.environ.get("MOONCAKE_CONFIG_PATH"),
+                mooncake_config_path = (getattr(self.cache_config, 'mooncake_config_path', None)
+                                        or os.environ.get("MOONCAKE_CONFIG_PATH")),
             )
             # NOTE: now peerH2H and peerSSD2H op use the same worker
             if self.cache_config.enable_p2p_cpu:
@@ -703,11 +764,11 @@ class TransferEngine:
         # reuse this channel with heterogeneous multi-group worker arguments.
         if self._has_swa:
             self._swa_worker_map: Dict[TransferType, Dict[WorkerKey, WorkerHandle]] = {}
-            # With swa_multi_layer enabled, layerwise GET fuses SWA/state H2D
-            # into LAYERWISE (uniform via launch_swa_h2d_layer_, multi-group via
-            # launch_swa_mg_h2d_layer_). Otherwise retain the standalone SWA
-            # H2D worker as a predecessor of the main layerwise op.
-            if not _fuse_swa_into_layerwise:
+            # When layerwise is on, SWA H2D always runs inside LAYERWISE
+            # (uniform via launch_swa_h2d_layer_, multi-group via
+            # launch_swa_mg_h2d_layer_). Standalone SWA H2D workers are only
+            # created when layerwise transfer is disabled.
+            if not _enable_layerwise:
                 if self.model_config.effective_tp_size_per_node == 1:
                     self._swa_h2d_workers: Dict[WorkerKey, WorkerHandle] = {
                         worker_key: GPUCPUTransferWorker.create_worker(
@@ -828,8 +889,26 @@ class TransferEngine:
                 flexkv_logger.info("TransferEngine: swa CPU<->SSD workers initialized")
 
 
-            # ---- SWA CPU<->Remote workers (single CPURemoteTransferWorker per dir) ----
-            if self._swa_remote_handle is not None and self._swa_cpu_handle is not None:
+            # ---- SWA CPU<->Remote workers -----------------------------------
+            if (getattr(self.cache_config, 'use_mooncake_store_backend', False)
+                    and self._swa_cpu_handle is not None):
+                self.swa_mooncake_store_worker: WorkerHandle = (
+                    MooncakeStoreTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
+                        cpu_kv_layout=self._swa_cpu_handle.kv_layout,
+                        dtype=self._swa_cpu_handle.dtype,
+                        cache_config=self.cache_config,
+                        pool_kind=PoolKind.SWA,
+                        override_global_segment_size=0,
+                    ))
+                self._swa_worker_map[TransferType.REMOTE2H] = self.swa_mooncake_store_worker
+                self._swa_worker_map[TransferType.H2REMOTE] = self.swa_mooncake_store_worker
+                flexkv_logger.info(
+                    "TransferEngine: swa mooncake-store workers initialized")
+            elif self._swa_remote_handle is not None and self._swa_cpu_handle is not None:
                 self.swa_remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
@@ -898,7 +977,7 @@ class TransferEngine:
                 flexkv_logger.info("TransferEngine: swa GDS workers initialized")
             self._has_swa = True
             # Must mirror the create condition above.
-            if not _fuse_swa_into_layerwise:
+            if not _enable_layerwise:
                 flexkv_logger.info(
                     f"TransferEngine: swa workers initialized "
                     f"({len(self._swa_h2d_workers)} H2D + {len(self._swa_d2h_workers)} D2H)")
@@ -941,7 +1020,6 @@ class TransferEngine:
 
         # Wait for all SWA dedicated workers to be ready
         if self._has_swa:
-
             for transfer_type, worker in self._swa_worker_map.items():
                 if isinstance(worker, dict):
                     for wk, w in worker.items():
@@ -963,8 +1041,73 @@ class TransferEngine:
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
         self._scheduler_thread.start()
 
+    def _collect_worker_handles(self) -> List[WorkerHandle]:
+        handles: List[WorkerHandle] = []
+        for worker in getattr(self, "_worker_map", {}).values():
+            if isinstance(worker, dict):
+                handles.extend(worker.values())
+            else:
+                handles.append(worker)
+        for worker in getattr(self, "_swa_worker_map", {}).values():
+            if isinstance(worker, dict):
+                handles.extend(worker.values())
+            else:
+                handles.append(worker)
+        return handles
+
+    def _shutdown_worker_handles(self, handles: List[WorkerHandle]) -> None:
+        """Stop worker processes in parallel (send sentinel + join/unregister)."""
+        if not handles:
+            return
+        flexkv_logger.info(
+            f"TransferEngine: stopping {len(handles)} worker(s) in parallel"
+        )
+
+        def _shutdown_one(handle: WorkerHandle) -> None:
+            try:
+                handle.shutdown()
+            except Exception as e:
+                flexkv_logger.error(
+                    f"Error shutting down worker {handle.worker_id}: {e}"
+                )
+
+        threads = [
+            threading.Thread(
+                target=_shutdown_one,
+                args=(h,),
+                name=f"flexkv-worker-shutdown-{h.worker_id}",
+            )
+            for h in handles
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    def _rollback_init_workers(self, err: BaseException) -> None:
+        """Best-effort cleanup when spawn/ready fails before engine is running."""
+        handles = self._collect_worker_handles()
+        if not handles:
+            return
+        flexkv_logger.error(
+            f"TransferEngine init failed ({err}); "
+            f"rolling back {len(handles)} already-created worker(s)"
+        )
+        self._shutdown_worker_handles(handles)
+        self._worker_map = {}
+        if hasattr(self, "_swa_worker_map"):
+            self._swa_worker_map = {}
+
     def start(self) -> None:
-        self._init_workers()
+        try:
+            self._init_workers()
+        except Exception as e:
+            # Covers: mid-spawn exception, ready timeout/death, startup asserts.
+            # Child-side __init__ failure also unpins inside the worker process;
+            # this rolls back sibling workers that already became ready.
+            if not self._running:
+                self._rollback_init_workers(e)
+            raise
 
     def _scheduler_loop(self) -> None:
         """Event-driven scheduler loop using selectors (ZERO LATENCY with shutdown pipe)"""
@@ -1023,6 +1166,14 @@ class TransferEngine:
                         while True:
                             try:
                                 op_id = self.finished_ops_queue.get_nowait()
+                                # A bare int means success; a (op_id, False)
+                                # tuple is a worker-reported transfer failure.
+                                op_succeeded = True
+                                if isinstance(op_id, tuple):
+                                    op_id, op_succeeded = op_id
+                                if not op_succeeded:
+                                    self._handle_failed_op(op_id)
+                                    continue
                                 if op_id in self._child_to_parent_op_id:
                                     # Replica op (LAYERWISE PP fan-out): decrement parent's
                                     # pending_count and finalize parent when all replicas done.
@@ -1034,7 +1185,7 @@ class TransferEngine:
                                     parent_op = self.op_id_to_op[parent_op_id]
                                     parent_op.pending_count -= 1
                                     if parent_op.pending_count == 0:
-                                        self._finalize_op(parent_op, finished_ops)
+                                        self._finalize_or_discard(parent_op, finished_ops)
                                     flexkv_logger.debug(
                                         f"[TransferEngine] child op {op_id} completed, "
                                         f"parent op {parent_op_id} pending_count={parent_op.pending_count}")
@@ -1042,7 +1193,7 @@ class TransferEngine:
                                     op = self.op_id_to_op[op_id]
                                     op.pending_count -= 1
                                     if op.pending_count == 0:
-                                        self._finalize_op(op, finished_ops)
+                                        self._finalize_or_discard(op, finished_ops)
                             except queue.Empty:
                                 break
                         nvtx.end_range(nvtx_r2)
@@ -1073,17 +1224,18 @@ class TransferEngine:
                             # dict-keyed entries (H2D/D2H), each replica is
                             # registered inside _assign_op_to_worker /
                             # _assign_swa_op_to_worker per PP sibling.
-                            if getattr(op, "is_swa", False):
-                                resolved_worker = self._swa_worker_map.get(op.transfer_type)
-                            else:
-                                resolved_worker = self._worker_map.get(op.transfer_type)
-                            if resolved_worker is not None and not isinstance(resolved_worker, dict):
+                            if self._op_buffer_registered_here(op):
                                 register_op_to_buffer(op, self.pin_buffer)
                             self._assign_op_to_worker(op)
                     # Handle completed graphs
                     for graph_id in completed_graph_ids:
                         self.completed_queue.put(CompletedOp.completed_graph(graph_id))
                 nvtx.end_range(nvtx_r3)
+
+                # Outside the dispatch block: a tick may consist solely of a
+                # failure report, with no finished op and no new graph.
+                if self._failed_graph_ids:
+                    self._emit_drained_graph_failures()
 
             except Exception as e:
                 flexkv_logger.error(
@@ -1102,6 +1254,86 @@ class TransferEngine:
         sel.close()
         flexkv_logger.info("TransferEngine scheduler loop stopped")
 
+    def _op_buffer_registered_here(self, op: TransferOp) -> bool:
+        """The 'unified rule' shared by dispatch, _finalize_op and
+        _discard_failed_op: a parent op's pin buffer is registered (and thus
+        freed) at this level only when its worker_map entry resolves to a
+        single worker. Dict-keyed entries (PP fan-out) register and free each
+        replica individually."""
+        if getattr(op, "is_swa", False):
+            resolved_worker = self._swa_worker_map.get(op.transfer_type)
+        else:
+            resolved_worker = self._worker_map.get(op.transfer_type)
+        return resolved_worker is not None and not isinstance(resolved_worker, dict)
+
+    def _finalize_or_discard(self, op: TransferOp, finished_ops: List[TransferOp]) -> None:
+        """Route a fully-drained op: discard if any replica of it failed,
+        finalize (completion message + successor scheduling) otherwise."""
+        if op.op_id in self._failed_parent_op_ids:
+            self._discard_failed_op(op)
+        else:
+            self._finalize_op(op, finished_ops)
+
+    def _handle_failed_op(self, op_id: int) -> None:
+        """A worker reported a failed transfer for ``op_id``.
+
+        Bookkeeping mirrors the completion path (replica maps, pending
+        counts, pin buffer, nvtx) so nothing leaks, but the op never reaches
+        finished_ops (its successors must not run) and its graph is marked
+        failed: the scheduler stops dispatching the graph's remaining ops,
+        and once every already-dispatched op of the graph has drained the
+        loop emits a graph-level failure to the task layer.
+        """
+        graph_id = None
+        if op_id in self._child_to_parent_op_id:
+            parent_op_id = self._child_to_parent_op_id.pop(op_id)
+            child_op = self._child_id_to_child.pop(op_id)
+            free_op_from_buffer(child_op, self.pin_buffer)
+            if op_id in self.op_id_to_nvtx_range:
+                nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
+            parent_op = self.op_id_to_op.get(parent_op_id)
+            if parent_op is not None:
+                graph_id = parent_op.graph_id
+                parent_op.pending_count -= 1
+                self._failed_parent_op_ids.add(parent_op_id)
+                if parent_op.pending_count == 0:
+                    self._discard_failed_op(parent_op)
+        else:
+            op = self.op_id_to_op.get(op_id)
+            if op is not None:
+                graph_id = op.graph_id
+                op.pending_count -= 1
+                self._failed_parent_op_ids.add(op_id)
+                if op.pending_count == 0:
+                    self._discard_failed_op(op)
+        if graph_id is not None:
+            flexkv_logger.error(
+                f"[TransferEngine] transfer op {op_id} of graph {graph_id} "
+                f"failed; failing the graph and draining its in-flight ops")
+            self._failed_graph_ids.add(graph_id)
+            self.scheduler.fail_graph(graph_id)
+
+    def _discard_failed_op(self, op: TransferOp) -> None:
+        """Release a fully-drained op that must not complete (it failed, or a
+        replica of it did): same pin-buffer rule and cleanup as _finalize_op,
+        minus the completion message and successor scheduling."""
+        if self._op_buffer_registered_here(op):
+            free_op_from_buffer(op, self.pin_buffer)
+        if op.op_id in self.op_id_to_nvtx_range:
+            nvtx.end_range(self.op_id_to_nvtx_range.pop(op.op_id))
+        self.op_id_to_op.pop(op.op_id, None)
+        self._failed_parent_op_ids.discard(op.op_id)
+
+    def _emit_drained_graph_failures(self) -> None:
+        """Report each failed graph to the task layer once its dispatched ops
+        have all drained, so the task's rollback never races an in-flight op's
+        completion callback."""
+        for graph_id in list(self._failed_graph_ids):
+            if any(op.graph_id == graph_id for op in self.op_id_to_op.values()):
+                continue
+            self.completed_queue.put(CompletedOp.failed_graph(graph_id))
+            self._failed_graph_ids.discard(graph_id)
+
     def _finalize_op(self, op: TransferOp, finished_ops: List[TransferOp]) -> None:
         """Finalize a completed op: release pin buffer, notify upper layer, and clean up.
 
@@ -1112,11 +1344,7 @@ class TransferEngine:
         # was registered upstream (single-worker path). For dict-keyed (PP fan-out)
         # entries the parent was never registered; each replica was registered and
         # freed individually in the scheduler's child completion path.
-        if getattr(op, "is_swa", False):
-            resolved_worker = self._swa_worker_map.get(op.transfer_type)
-        else:
-            resolved_worker = self._worker_map.get(op.transfer_type)
-        if resolved_worker is not None and not isinstance(resolved_worker, dict):
+        if self._op_buffer_registered_here(op):
             free_op_from_buffer(op, self.pin_buffer)
         # Compute transfer metrics for this completed op.
         # Use layer_groups-aware token size so overlapping main/indexer groups
@@ -1148,7 +1376,7 @@ class TransferEngine:
         After flattening, a single int fully identifies the DP slice —
         PP siblings are the worker_keys that share it across pp_rank.
         """
-        return [wk for wk in worker_map.keys() if wk.dp_client_id == dp_client_id]
+        return [wk for wk in worker_map if wk.dp_client_id == dp_client_id]
 
     def _assign_layerwise_op_to_workers(self, op: TransferOp) -> None:
         """Fan-out a LAYERWISE op symmetrically to every local PP-stage
@@ -1234,6 +1462,9 @@ class TransferEngine:
                     dst_block_ids=op.dst_block_ids.copy(),
                     dp_client_id=op.dp_client_id,
                     is_swa=True,
+                    mooncake_store_swa_block_hashes=(
+                        list(op.mooncake_store_swa_block_hashes)
+                        if op.mooncake_store_swa_block_hashes is not None else None),
                 )
                 register_op_to_buffer(replica, self.pin_buffer)
                 self._child_id_to_child[replica.op_id] = replica
@@ -1299,6 +1530,9 @@ class TransferEngine:
                     src_block_ids=op.src_block_ids.copy(),
                     dst_block_ids=op.dst_block_ids.copy(),
                     dp_client_id=op.dp_client_id,
+                    mooncake_store_block_hashes=(
+                        op.mooncake_store_block_hashes.copy()
+                        if op.mooncake_store_block_hashes is not None else None),
                 )
                 register_op_to_buffer(replica, self.pin_buffer)
                 self._child_id_to_child[replica.op_id] = replica
@@ -1332,29 +1566,31 @@ class TransferEngine:
         nvtx.end_range(nvtx_range)
 
     def get_completed_graphs_and_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
-        """Get IDs of all completed transfer graphs at current moment
+        """Drain completed ops, blocking up to ``timeout`` for the first one.
 
-        Args:
-            timeout: Optional timeout for the first graph retrieval
-
-        Returns:
-            List of CompletedOp objects. Empty list if no graphs are completed.
+        The old early-return-on-empty ignored ``timeout`` and busy-spun the
+        result thread at 100% CPU, starving the scheduler loop under high QPS.
         """
         completed_ops: List[CompletedOp] = []
 
-        if self.completed_queue.empty():
+        try:
+            if timeout is None or timeout <= 0:
+                # Non-blocking drain.
+                if self.completed_queue.empty():
+                    return completed_ops
+                first_op = self.completed_queue.get_nowait()
+            else:
+                first_op = self.completed_queue.get(timeout=timeout)
+            completed_ops.append(first_op)
+        except queue.Empty:
             return completed_ops
 
-        try:
-            first_op = self.completed_queue.get(timeout=timeout)
-            completed_ops.append(first_op)
-
-            while not self.completed_queue.empty():
-                completed_op = self.completed_queue.get_nowait()
-                completed_ops.append(completed_op)
-
-        except queue.Empty:
-            pass
+        # Drain whatever else is immediately available.
+        while not self.completed_queue.empty():
+            try:
+                completed_ops.append(self.completed_queue.get_nowait())
+            except queue.Empty:
+                break
 
         return completed_ops
 
@@ -1385,20 +1621,9 @@ class TransferEngine:
                 else:
                     flexkv_logger.debug(f"Shutdown pipes already closed: {e}")
 
-            # shutdown main KV workers
-            for worker in self._worker_map.values():
-                if isinstance(worker, dict):
-                    for w in worker.values():
-                        w.shutdown()
-                else:
-                    worker.shutdown()
-            # shutdown SWA dedicated workers
-            for worker in getattr(self, "_swa_worker_map", {}).values():
-                if isinstance(worker, dict):
-                    for w in worker.values():
-                        w.shutdown()
-                else:
-                    worker.shutdown()
+            # Shutdown all workers in parallel so large cudaHostUnregister
+            # work overlaps across processes instead of stacking timeouts.
+            self._shutdown_worker_handles(self._collect_worker_handles())
         except Exception as e:
             flexkv_logger.error(f"Error during shutdown: {e}")
         finally:
@@ -1407,4 +1632,7 @@ class TransferEngine:
                     self.finished_ops_queue.get_nowait()
 
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            # Bounded sync: a wedged GPU here would keep the TM process alive
+            # past shutdown, forcing the parent-side SIGTERM/SIGKILL. Workers
+            # have already unpinned; TM does not itself hold CPU pin refs.
+            _te_bounded_cuda_sync(timeout_s=15.0) # hardcode for now

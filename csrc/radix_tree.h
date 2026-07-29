@@ -636,6 +636,15 @@ public:
   virtual int evict(torch::Tensor &evicted_blocks, int num_evicted);
   virtual int evict(torch::Tensor &evicted_blocks,
                     torch::Tensor &evicted_block_hashes, int num_evicted);
+  // Roll back a not-yet-ready inserted leaf whose completion callback will
+  // never run (planned transfer aborted before launch). Removes the node only
+  // when unambiguously safe (still an unready, unlocked, SWA-unlocked leaf)
+  // and publishes its physical blocks into freed_blocks (resized; possibly
+  // plus a tombstone-leaf cascade, mirroring evict()). Returns the number of
+  // freed blocks; 0 when the node was left in place. Mirrors
+  // flexkv/cache/radixtree.py::remove_unready_leaf (the executable spec).
+  virtual int remove_unready_leaf(CRadixNode *node,
+                                  torch::Tensor &freed_blocks);
   virtual std::shared_ptr<CMatchResult>
   match_prefix(torch::Tensor &block_hashes, int num_blocks,
                bool update_cache_info = true);

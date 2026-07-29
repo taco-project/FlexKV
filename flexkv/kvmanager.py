@@ -137,6 +137,7 @@ class KVManager:
             return self.kv_task_engine.is_ready()
 
     def shutdown(self) -> None:
+        flexkv_logger.info("[FLEXKV] KVManager.shutdown begin.")
         eviction_log_aggregator.flush()
         if self.server_client_mode:
             self.dp_client.shutdown()
@@ -152,6 +153,7 @@ class KVManager:
                 "MPS is enabled. To stop MPS daemon manually, run: "
                 "'echo quit | nvidia-cuda-mps-control'"
             )
+        flexkv_logger.info("[FLEXKV] KVManager.shutdown done.")
 
     def get_async(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
@@ -264,12 +266,14 @@ class KVManager:
             token_ids = token_ids.numpy()
         if self.server_client_mode:
             task_id = self.dp_client.prefetch_async(token_ids, namespace=namespace)
+            return task_id, 0
         else:
-            task_id = self.kv_task_engine.prefetch_async(
+            task_id, actual_prefetch_tokens = self.kv_task_engine.prefetch_async(
                 token_ids,
                 namespace=namespace,
             )
-        return task_id
+            flexkv_logger.info(f"[FlexKV] prefetch: task_id={task_id}, actual_prefetch_tokens={actual_prefetch_tokens}")
+        return task_id, actual_prefetch_tokens
 
     def launch(self,
                task_ids: Union[int, List[int]],
@@ -316,7 +320,7 @@ class KVManager:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         if self.server_client_mode:
-            self.dp_client.cancel_tasks(task_ids)
+            self.dp_client.cancel_task(task_ids)
         else:
             self.kv_task_engine.cancel_tasks(task_ids)
 
