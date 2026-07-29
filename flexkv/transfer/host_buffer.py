@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ctypes
+import os
+import time
 import weakref
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import torch
@@ -48,25 +50,72 @@ CUDA_HOST_ALLOC_PORTABLE = 0x01
 CUDA_HOST_ALLOC_MAPPED = 0x02
 
 
+_FLEXKV_CUDAHOST_REGISTER_PORTABLE = 1  # cudaHostRegisterPortable
+_FLEXKV_CUDAHOST_CHUNK_SAFETY_MARGIN_BYTES = 4 * 1024  # 4 KiB cushion for CUDA internal alignment
+
+
+def _get_cudahost_chunk_bytes() -> int:
+    chunk_gb = float(os.getenv("FLEXKV_CUDAHOST_CHUNK_SIZE_GB", "0"))
+    if chunk_gb <= 0:
+        return 0  # no chunking
+    chunk = int(chunk_gb * (1024 ** 3)) - _FLEXKV_CUDAHOST_CHUNK_SAFETY_MARGIN_BYTES
+    # Round down to 4 KiB page boundary
+    return chunk & ~0xFFF
+
+
 def cudaHostRegister(tensor: torch.Tensor) -> None:
+    """Register a CPU tensor with CUDA, optionally in chunks of FLEXKV_CUDAHOST_CHUNK_SIZE_GB.
+
+    Chunked registration keeps each cudaHostRegister call under the configured size,
+    which avoids failures on very large buffers. When the chunk size is 0 (default)
+    the whole tensor is registered in a single call.
+    """
     cudart = _get_cudart()
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
+    ptr_base = tensor.data_ptr()
+    total_size = tensor.numel() * tensor.element_size()
     flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED
-    ret = cudart.cudaHostRegister(
-        ctypes.c_void_p(ptr), ctypes.c_size_t(size), ctypes.c_uint(flags)
-    )
-    if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+    chunk_size = _get_cudahost_chunk_bytes()
+
+    if chunk_size == 0 or total_size <= chunk_size:
+        ret = cudart.cudaHostRegister(
+            ctypes.c_void_p(ptr_base), ctypes.c_size_t(total_size), ctypes.c_uint(flags)
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+        return
+
+    for offset in range(0, total_size, chunk_size):
+        size = min(chunk_size, total_size - offset)
+        ret = cudart.cudaHostRegister(
+            ctypes.c_void_p(ptr_base + offset), ctypes.c_size_t(size), ctypes.c_uint(flags)
+        )
+        if ret != 0:
+            # Roll back already-registered chunks so we don't leak registrations.
+            for done in range(0, offset, chunk_size):
+                cudart.cudaHostUnregister(ctypes.c_void_p(ptr_base + done))
+            raise RuntimeError(
+                f"cudaHostRegister failed at offset={offset} bytes with error code {ret}"
+            )
 
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
+    """Unregister a CPU tensor from CUDA, matching the chunked register layout."""
     cudart = _get_cudart()
-    ptr = tensor.data_ptr()
-    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
-    if ret != 0:
-        raise RuntimeError(f"cudaHostUnregister failed with error code {ret}")
+    ptr_base = tensor.data_ptr()
+    total_size = tensor.numel() * tensor.element_size()
+    chunk_size = _get_cudahost_chunk_bytes()
 
+    if chunk_size == 0 or total_size <= chunk_size:
+        cudart.cudaHostUnregister(ctypes.c_void_p(ptr_base))
+        return
+
+    for offset in range(0, total_size, chunk_size):
+        ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr_base + offset))
+        if ret != 0:
+            flexkv_logger.warning(
+                f"cudaHostUnregister failed at offset={offset} bytes, "
+                f"error code {ret} (ignored)"
+            )
 
 def safe_cuda_host_unregister(tensor: torch.Tensor, label: str = "") -> None:
     """Best-effort unregister; never raises (idempotent shutdown helper)."""
