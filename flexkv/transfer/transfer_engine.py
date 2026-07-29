@@ -1566,29 +1566,31 @@ class TransferEngine:
         nvtx.end_range(nvtx_range)
 
     def get_completed_graphs_and_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
-        """Get IDs of all completed transfer graphs at current moment
+        """Drain completed ops, blocking up to ``timeout`` for the first one.
 
-        Args:
-            timeout: Optional timeout for the first graph retrieval
-
-        Returns:
-            List of CompletedOp objects. Empty list if no graphs are completed.
+        The old early-return-on-empty ignored ``timeout`` and busy-spun the
+        result thread at 100% CPU, starving the scheduler loop under high QPS.
         """
         completed_ops: List[CompletedOp] = []
 
-        if self.completed_queue.empty():
+        try:
+            if timeout is None or timeout <= 0:
+                # Non-blocking drain.
+                if self.completed_queue.empty():
+                    return completed_ops
+                first_op = self.completed_queue.get_nowait()
+            else:
+                first_op = self.completed_queue.get(timeout=timeout)
+            completed_ops.append(first_op)
+        except queue.Empty:
             return completed_ops
 
-        try:
-            first_op = self.completed_queue.get(timeout=timeout)
-            completed_ops.append(first_op)
-
-            while not self.completed_queue.empty():
-                completed_op = self.completed_queue.get_nowait()
-                completed_ops.append(completed_op)
-
-        except queue.Empty:
-            pass
+        # Drain whatever else is immediately available.
+        while not self.completed_queue.empty():
+            try:
+                completed_ops.append(self.completed_queue.get_nowait())
+            except queue.Empty:
+                break
 
         return completed_ops
 

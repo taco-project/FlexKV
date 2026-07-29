@@ -722,15 +722,12 @@ def merge_to_batch_graph(batch_id: int,
       layerwise GET: the fused LAYERWISE op
     """
     if not transfer_graphs:
-        empty_graph = TransferOpGraph()
-        empty_graph.set_graph_id(batch_id)
-        return empty_graph, -1, {}
+        return TransferOpGraph(), -1, {}
     if len(transfer_graphs) != len(task_end_op_ids):
         raise ValueError(
             "transfer_graphs and task_end_op_ids must have the same length")
 
     merged_graph = TransferOpGraph()
-    merged_graph.set_graph_id(batch_id)
 
     ops_by_type: Dict[TransferType, List[TransferOp]] = {}
     callbacks_by_type: Dict[TransferType, List[Callable]] = {}
