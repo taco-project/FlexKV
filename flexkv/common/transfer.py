@@ -24,9 +24,16 @@ class CompletedOp:
     transfer_type: Optional[str] = None
     num_blocks: int = 0
     num_bytes: int = 0
+    # True on the graph-level message that reports the graph terminated because
+    # one of its ops failed. Defaults False so the message stays pickle- and
+    # constructor-compatible with existing producers/consumers.
+    failed: bool = False
 
     def is_graph_completed(self) -> bool:
-        return self.op_id == -1
+        return self.op_id == -1 and not self.failed
+
+    def is_graph_failed(self) -> bool:
+        return self.op_id == -1 and self.failed
 
     def to_tuple(self) -> Tuple[int, int]:
         return (self.graph_id, self.op_id)
@@ -38,6 +45,10 @@ class CompletedOp:
     @classmethod
     def completed_graph(cls, graph_id: int) -> 'CompletedOp':
         return cls(graph_id=graph_id, op_id=-1)
+
+    @classmethod
+    def failed_graph(cls, graph_id: int) -> 'CompletedOp':
+        return cls(graph_id=graph_id, op_id=-1, failed=True)
 
 
 class DeviceType(IntEnum):
@@ -326,9 +337,8 @@ class TransferOpGraph:
             # Optional SWA launch-time binding path: if caller passes
             # swa_gpu_blocks, fill SWA ops from that array; otherwise preserve
             # graph-built SWA ids.
-            if getattr(op, "is_swa", False):
-                if swa_gpu_blocks is None:
-                    continue
+            if getattr(op, "is_swa", False) and swa_gpu_blocks is None:
+                continue
             transfer_type = op.transfer_type
             if getattr(op, "is_swa", False):
                 count = op.dst_block_ids.size if transfer_type.name.endswith("2D") \
