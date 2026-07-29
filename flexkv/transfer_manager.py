@@ -23,7 +23,7 @@ import sys
 from flexkv.common.transfer import TransferOpGraph, CompletedOp, WorkerKey
 from flexkv.common.config import (
     CacheConfig, LayerGroupSpec, ModelConfig,
-    recompute_cache_block_counts,
+    recompute_cache_block_counts, GLOBAL_CONFIG_FROM_ENV,
 )
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
@@ -825,6 +825,24 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                 except ChildProcessError:
                     break
         signal.signal(signal.SIGCHLD, _reap_children)
+
+        # Ignore Ctrl+C (SIGINT): process-group SIGINT would race with parent
+        # kill_process_tree(SIGKILL). Only SIGTERM / {'type':'shutdown'} should
+        # trigger paired worker unregister. SIGKILL cannot be handled.
+        def _on_sigterm(signum, frame):
+            flexkv_logger.warning(
+                f"TransferManager process received signal {signum}; exiting for graceful cleanup"
+            )
+            raise SystemExit(0)
+
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        except Exception as e:
+            flexkv_logger.warning(
+                f"Failed to install TransferManager shutdown signal handlers: {e}"
+            )
+
         try:
             flexkv_logger.debug(f"_process_worker started, pid={os.getpid()}, "
                                f"gpu_register_port={gpu_register_port}")
@@ -843,13 +861,16 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             sel.register(transfer_manager.transfer_engine.completed_queue._reader,
                         selectors.EVENT_READ, data="finished_ops")
 
-            flexkv_logger.info("TransferManager daemon process started with "
-                               "selector-based event monitoring (command + finished_ops)")
+            flexkv_logger.info(
+                "TransferManager daemon process started with selector-based "
+                "event monitoring (command + finished_ops)"
+            )
 
-            while True:
+            should_exit = False
+            while not should_exit:
                 try:
-                    # Event-driven: wait for command OR finished_ops (ZERO LATENCY!)
-                    # Complete blocking with NO TIMEOUT - shutdown via terminate()
+                    # Event-driven: wait for command OR finished_ops.
+                    # Graceful exit via {'type': 'shutdown'} command (or SIGTERM→SystemExit).
                     events = sel.select(timeout=None)
 
                     # Process all events
@@ -858,14 +879,31 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     for key, mask in events:
                         if key.data == "command":
                             # New command available
-                            inner_range = nvtx.start_range(
-                                message="TransferManagerInter.process_worker.req", color="red")
-                            request = command_conn.recv()
+                            inner_range = nvtx.start_range(message="TransferManagerInter.process_worker.req", color="red")
+                            try:
+                                request = command_conn.recv()
+                            except (EOFError, BrokenPipeError, ConnectionResetError) as e:
+                                # Parent (scheduler) died without sending shutdown.
+                                # Break out and let finally run transfer_manager.shutdown()
+                                # so workers get paired cudaHostUnregister.
+                                flexkv_logger.warning(
+                                    f"TransferManager command pipe closed ({e!r}); "
+                                    "parent likely crashed. Exiting for graceful cleanup."
+                                )
+                                should_exit = True
+                                nvtx.end_range(inner_range)
+                                break
                             request_type = request.get('type')
                             if request_type == 'submit':
                                 transfer_manager.submit(request['transfer_graph'])
                             elif request_type == 'submit_batch':
                                 transfer_manager.submit_batch(request['transfer_graphs'])
+                            elif request_type == 'shutdown':
+                                flexkv_logger.info(
+                                    "TransferManager received shutdown command; "
+                                    "leaving event loop for graceful cleanup"
+                                )
+                                should_exit = True
                             else:
                                 flexkv_logger.error(f"Unrecognized request type: {request_type}")
                             nvtx.end_range(inner_range)
@@ -875,9 +913,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                             has_finished_ops = True
 
                     # Only collect finished_ops if selector reported data available
-                    if has_finished_ops:
-                        inner_range = nvtx.start_range(
-                            message="TransferManagerInter.process_worker.results", color="red")
+                    if has_finished_ops and not should_exit:
+                        inner_range = nvtx.start_range(message="TransferManagerInter.process_worker.results", color="red")
                         try:
                             # Directly get from completed_queue without timeout to avoid poll
                             finished_ops = []
@@ -894,6 +931,14 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                             flexkv_logger.error(f"Error collecting finished ops: {e}")
                         nvtx.end_range(inner_range)
 
+                except (EOFError, BrokenPipeError, ConnectionResetError) as e:
+                    # Fallback: any IPC-broken exception bubbling up here also
+                    # means the parent is gone — exit for graceful cleanup.
+                    flexkv_logger.warning(
+                        f"TransferManager IPC error ({e!r}); "
+                        "parent likely crashed. Exiting for graceful cleanup."
+                    )
+                    should_exit = True
                 except Exception as e:
                     flexkv_logger.error(f"Error in transfer manager process: {e}")
 
@@ -910,12 +955,20 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             # Gracefully shut down transfer engine and its worker subprocesses
             if 'transfer_manager' in locals():
                 try:
+                    flexkv_logger.info("TransferManager process: shutting down transfer engine")
                     transfer_manager.shutdown()
                 except Exception as e:
                     flexkv_logger.error(f"Error shutting down transfer manager: {e}")
 
-            command_conn.close()
-            result_conn.close()
+            try:
+                command_conn.close()
+            except Exception:
+                pass
+            try:
+                result_conn.close()
+            except Exception:
+                pass
+            flexkv_logger.info("TransferManager process cleanup complete")
 
     def start(self) -> None:
         os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
@@ -961,18 +1014,54 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         return finished_ops
 
     def shutdown(self) -> None:
-        if self.process is not None:
-            self.process.terminate()
-            self.process.join(timeout=5.0)
-            if self.process.is_alive():
-                self.process.kill()
-                self.process.join()
+        if self.process is None:
+            return
 
-        self.command_parent_conn.close()
-        self.result_parent_conn.close()
+        if self.process.is_alive():
+            try:
+                flexkv_logger.info(
+                    "Sending graceful shutdown command to TransferManager subprocess "
+                    f"(pid={self.process.pid})"
+                )
+                self.command_parent_conn.send({'type': 'shutdown'})
+            except (BrokenPipeError, OSError, EOFError) as e:
+                flexkv_logger.warning(
+                    f"Failed to send TransferManager shutdown command: {e}; "
+                    "falling back to terminate"
+                )
+                self.process.terminate()
+
+            timeout = float(GLOBAL_CONFIG_FROM_ENV.transfer_manager_shutdown_timeout_s)
+            self.process.join(timeout=timeout)
+            if self.process.is_alive():
+                flexkv_logger.warning(
+                    f"TransferManager still alive after {timeout:.0f}s graceful wait; "
+                    "terminating"
+                )
+                self.process.terminate()
+                self.process.join(timeout=30)
+                if self.process.is_alive():
+                    flexkv_logger.warning(
+                        "TransferManager still alive after terminate; killing"
+                    )
+                    self.process.kill()
+                    self.process.join()
+
+        try:
+            self.command_parent_conn.close()
+        except Exception:
+            pass
+        try:
+            self.result_parent_conn.close()
+        except Exception:
+            pass
+        self.process = None
 
     def __del__(self):
-        self.shutdown()
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
 
 class TransferManagerMultiNodeHandle(TransferManagerHandleBase):

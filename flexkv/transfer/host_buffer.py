@@ -68,6 +68,30 @@ def cudaHostUnregister(tensor: torch.Tensor) -> None:
         raise RuntimeError(f"cudaHostUnregister failed with error code {ret}")
 
 
+def safe_cuda_host_unregister(tensor: torch.Tensor, label: str = "") -> None:
+    """Best-effort unregister; never raises (idempotent shutdown helper)."""
+    suffix = f" ({label})" if label else ""
+    try:
+        size_gb = tensor.numel() * tensor.element_size() / (1024 ** 3)
+        ptr = int(tensor.data_ptr())
+        # Print before/after so test.log still sees progress even if logger
+        # handlers are torn down mid-unpin.
+        flexkv_logger.info(
+            f"[host_buffer] cudaHostUnregister begin {suffix}: "
+            f"ptr=0x{ptr:x} size={size_gb:.3f} GiB",
+        )
+        cudaHostUnregister(tensor)
+        msg = (
+            f"[host_buffer] cudaHostUnregister ok {suffix}: "
+            f"ptr=0x{ptr:x} size={size_gb:.3f} GiB"
+        )
+        flexkv_logger.info(msg)
+    except Exception as e:
+        msg = f"[host_buffer] cudaHostUnregister failed{suffix}: {e}"
+        flexkv_logger.warning(msg)
+
+
+
 @dataclass
 class HostBufferHandle:
     tensor: torch.Tensor

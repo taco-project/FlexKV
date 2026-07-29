@@ -91,6 +91,42 @@ def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
     if op.dst_slot_id != -1:
         pin_buffer.free_slot(op.dst_slot_id)
 
+
+def _te_bounded_cuda_sync(timeout_s: float) -> None:
+    """torch.cuda.synchronize() with a wall-clock cap.
+
+    Runs the sync in a daemon thread so a wedged GPU cannot prevent
+    TransferEngine.shutdown from returning. Failure / timeout is logged
+    but not raised — this is called from the shutdown finally.
+    """
+    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+        return
+    done = threading.Event()
+    err: List[BaseException] = []
+
+    def _run() -> None:
+        try:
+            torch.cuda.synchronize()
+        except BaseException as e:  # noqa: BLE001
+            err.append(e)
+        finally:
+            done.set()
+
+    t = threading.Thread(
+        target=_run, name="flexkv-te-cuda-drain", daemon=True,
+    )
+    t.start()
+    if not done.wait(timeout=timeout_s):
+        flexkv_logger.warning(
+            f"TransferEngine.shutdown: cuda synchronize did not finish in "
+            f"{timeout_s:.0f}s (GPU likely wedged); continuing"
+        )
+        return
+    if err:
+        flexkv_logger.warning(
+            f"TransferEngine.shutdown: cuda synchronize failed: {err[0]!r}"
+        )
+
 class TransferEngine:
     def __init__(self,
         gpu_handles: Dict[WorkerKey, List[StorageHandle]],
@@ -407,10 +443,9 @@ class TransferEngine:
         self._worker_map: Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]] = {}
 
         assert self._cpu_handle is not None
+        # When layerwise is on, SWA/state H2D is always fused into the LAYERWISE
+        # worker (no standalone swa_multi_layer switch).
         _enable_layerwise = GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
-        _fuse_swa_into_layerwise = (
-            _enable_layerwise and self.cache_config.swa_multi_layer
-        )
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
         
@@ -985,7 +1020,6 @@ class TransferEngine:
 
         # Wait for all SWA dedicated workers to be ready
         if self._has_swa:
-
             for transfer_type, worker in self._swa_worker_map.items():
                 if isinstance(worker, dict):
                     for wk, w in worker.items():
@@ -1007,8 +1041,73 @@ class TransferEngine:
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
         self._scheduler_thread.start()
 
+    def _collect_worker_handles(self) -> List[WorkerHandle]:
+        handles: List[WorkerHandle] = []
+        for worker in getattr(self, "_worker_map", {}).values():
+            if isinstance(worker, dict):
+                handles.extend(worker.values())
+            else:
+                handles.append(worker)
+        for worker in getattr(self, "_swa_worker_map", {}).values():
+            if isinstance(worker, dict):
+                handles.extend(worker.values())
+            else:
+                handles.append(worker)
+        return handles
+
+    def _shutdown_worker_handles(self, handles: List[WorkerHandle]) -> None:
+        """Stop worker processes in parallel (send sentinel + join/unregister)."""
+        if not handles:
+            return
+        flexkv_logger.info(
+            f"TransferEngine: stopping {len(handles)} worker(s) in parallel"
+        )
+
+        def _shutdown_one(handle: WorkerHandle) -> None:
+            try:
+                handle.shutdown()
+            except Exception as e:
+                flexkv_logger.error(
+                    f"Error shutting down worker {handle.worker_id}: {e}"
+                )
+
+        threads = [
+            threading.Thread(
+                target=_shutdown_one,
+                args=(h,),
+                name=f"flexkv-worker-shutdown-{h.worker_id}",
+            )
+            for h in handles
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    def _rollback_init_workers(self, err: BaseException) -> None:
+        """Best-effort cleanup when spawn/ready fails before engine is running."""
+        handles = self._collect_worker_handles()
+        if not handles:
+            return
+        flexkv_logger.error(
+            f"TransferEngine init failed ({err}); "
+            f"rolling back {len(handles)} already-created worker(s)"
+        )
+        self._shutdown_worker_handles(handles)
+        self._worker_map = {}
+        if hasattr(self, "_swa_worker_map"):
+            self._swa_worker_map = {}
+
     def start(self) -> None:
-        self._init_workers()
+        try:
+            self._init_workers()
+        except Exception as e:
+            # Covers: mid-spawn exception, ready timeout/death, startup asserts.
+            # Child-side __init__ failure also unpins inside the worker process;
+            # this rolls back sibling workers that already became ready.
+            if not self._running:
+                self._rollback_init_workers(e)
+            raise
 
     def _scheduler_loop(self) -> None:
         """Event-driven scheduler loop using selectors (ZERO LATENCY with shutdown pipe)"""
@@ -1520,20 +1619,9 @@ class TransferEngine:
                 else:
                     flexkv_logger.debug(f"Shutdown pipes already closed: {e}")
 
-            # shutdown main KV workers
-            for worker in self._worker_map.values():
-                if isinstance(worker, dict):
-                    for w in worker.values():
-                        w.shutdown()
-                else:
-                    worker.shutdown()
-            # shutdown SWA dedicated workers
-            for worker in getattr(self, "_swa_worker_map", {}).values():
-                if isinstance(worker, dict):
-                    for w in worker.values():
-                        w.shutdown()
-                else:
-                    worker.shutdown()
+            # Shutdown all workers in parallel so large cudaHostUnregister
+            # work overlaps across processes instead of stacking timeouts.
+            self._shutdown_worker_handles(self._collect_worker_handles())
         except Exception as e:
             flexkv_logger.error(f"Error during shutdown: {e}")
         finally:
@@ -1542,4 +1630,7 @@ class TransferEngine:
                     self.finished_ops_queue.get_nowait()
 
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            # Bounded sync: a wedged GPU here would keep the TM process alive
+            # past shutdown, forcing the parent-side SIGTERM/SIGKILL. Workers
+            # have already unpinned; TM does not itself hold CPU pin refs.
+            _te_bounded_cuda_sync(timeout_s=15.0) # hardcode for now

@@ -1,6 +1,7 @@
 import contextlib
 import os
 import copy
+import signal
 
 import torch.multiprocessing as mp
 import threading
@@ -41,6 +42,7 @@ from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_te
 from flexkv.transfer.host_buffer import (
     allocate_host_buffer,
     cudaHostRegister,
+    safe_cuda_host_unregister,
 )
 
 
@@ -112,6 +114,15 @@ class TransferWorkerBase(ABC):
     _worker_id_counter = 0
     _worker_id_lock = threading.Lock()
 
+    def __new__(cls, *args: Any, **kwargs: Any):
+        # Allocate first so ``_worker_process`` can always hold a reference and
+        # call shutdown() even when ``__init__`` fails mid-way after some pins.
+        obj = super().__new__(cls)
+        obj._host_registered = []
+        obj._shutdown_done = False
+        obj._op_buffer_pinned = False
+        return obj
+
     def __init__(self,
                  worker_id: int,
                  transfer_conn: Connection,  # receive end of pipe
@@ -123,6 +134,19 @@ class TransferWorkerBase(ABC):
 
         self.op_buffer_tensor = op_buffer_tensor
         self._op_buffer_pinned = False
+        # (tensor, label) pairs registered via _register_host_tensor / _pin_op_buffer.
+        self._host_registered: List[Tuple[torch.Tensor, str]] = []
+        self._shutdown_done = False
+
+    def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
+        """cudaHostRegister and track for paired unregister in shutdown()."""
+        size_gb = tensor.numel() * tensor.element_size() / (1024 ** 3)
+        flexkv_logger.info(
+            f"[worker {self.worker_id}] cudaHostRegister {label or 'host'}: "
+            f"ptr=0x{tensor.data_ptr():x} size={size_gb:.3f} GiB"
+        )
+        cudaHostRegister(tensor)
+        self._host_registered.append((tensor, label or "host"))
 
     def _pin_op_buffer(self) -> None:
         """Pin the shared op buffer after the worker has bound its CUDA device.
@@ -131,8 +155,79 @@ class TransferWorkerBase(ABC):
         or every worker creates a default CUDA context on GPU0.
         """
         if not self._op_buffer_pinned:
-            cudaHostRegister(self.op_buffer_tensor)
+            self._register_host_tensor(self.op_buffer_tensor, "op_buffer")
             self._op_buffer_pinned = True
+
+    def shutdown(self) -> None:
+        """Unregister all host tensors pinned by this worker. Idempotent.
+
+        Safe to call after a partially-failed ``__init__`` (only unregisters
+        whatever was tracked in ``_host_registered``).
+        """
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        registered = getattr(self, "_host_registered", None) or []
+        worker_id = getattr(self, "worker_id", "-1")
+        msg = (
+            f"[worker {worker_id}] shutdown: unregistering "
+            f"{len(registered)} host region(s)"
+        )
+        flexkv_logger.info(msg)
+        # Drain in-flight CUDA work before unpinning host memory that
+        # DMA / kernels may still be touching.
+        #
+        # torch.cuda.synchronize() releases the GIL and blocks in the driver;
+        # if the GPU is wedged (hung kernel, TDR, faulty NVLink) it can hang
+        # forever. We run it in a daemon thread with a bounded join so a
+        # wedged GPU cannot prevent cudaHostUnregister from firing — the
+        # kernel behind the DMA is already dead, so proceeding with unpin
+        # is the correct action; the sentinel thread dies with the process.
+        self._drain_cuda_bounded(worker_id, timeout_s=30.0)
+        # Unregister in reverse order of registration.
+        while registered:
+            tensor, label = registered.pop()
+            safe_cuda_host_unregister(tensor, label=f"worker={worker_id} {label}")
+        self._op_buffer_pinned = False
+        self._host_registered = registered
+
+    @staticmethod
+    def _drain_cuda_bounded(worker_id: Any, timeout_s: float) -> None:
+        """Best-effort torch.cuda.synchronize() with a wall-clock cap.
+
+        Returns whether the sync actually completed. Failure / timeout is
+        logged but not raised — unpin must proceed either way.
+        """
+        if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+            return
+        done = threading.Event()
+        err: List[BaseException] = []
+
+        def _run() -> None:
+            try:
+                torch.cuda.synchronize()
+            except BaseException as e:  # noqa: BLE001
+                err.append(e)
+            finally:
+                done.set()
+
+        t = threading.Thread(
+            target=_run,
+            name=f"flexkv-worker-{worker_id}-cuda-drain",
+            daemon=True,
+        )
+        t.start()
+        if not done.wait(timeout=timeout_s):
+            flexkv_logger.warning(
+                f"[worker {worker_id}] cuda synchronize did not finish in "
+                f"{timeout_s:.0f}s (GPU likely wedged); proceeding with unpin"
+            )
+            return
+        if err:
+            flexkv_logger.warning(
+                f"[worker {worker_id}] cuda synchronize before unpin failed: "
+                f"{err[0]!r}"
+            )
 
     @classmethod
     def _get_worker_id(cls) -> int:
@@ -227,10 +322,55 @@ class TransferWorkerBase(ABC):
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
                         op_buffer_tensor: torch.Tensor, ready_event: Any, *args: Any, **kwargs: Any) -> None:
         # Note: MPI initialization prevention is handled by create_safe_process
-        # Environment variables are set before this function is called
-        worker = cls(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs)
-        ready_event.set()
-        worker.run()
+        # Environment variables are set before this function is called.
+        #
+        # Use ``__new__`` + ``__init__`` (not ``cls(...)``) so we keep a live
+        # reference if ``__init__`` raises after partial cudaHostRegister; the
+        # ``finally`` block can still unpin. ``run()`` only exits the loop —
+        # this finally owns shutdown().
+        worker: Optional["TransferWorkerBase"] = None
+
+        def _on_sigterm(signum: int, frame: Any) -> None:
+            # Raise SystemExit so the ``finally`` below still runs shutdown().
+            flexkv_logger.warning(
+                f"[worker {worker_id}] received signal {signum}; exiting for graceful cleanup"
+            )
+            raise SystemExit(0)
+
+        try:
+            # Ignore Ctrl+C (SIGINT): the foreground process group receives it
+            # together with sglang/tee. Workers must only unpin when the parent
+            # sends a shutdown sentinel / SIGTERM, otherwise they race and get
+            # SIGKILL mid-unregister, leaking pinned CPU buffers.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        except Exception as e:
+            flexkv_logger.warning(
+                f"[worker {worker_id}] failed to install shutdown signal handlers: {e}"
+            )
+
+
+        try:
+            worker = cls.__new__(cls)
+            worker.__init__(
+                worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs
+            )
+            ready_event.set()
+            worker.run()
+        except Exception as e:
+            # Init / run failure: log then re-raise so process exitcode != 0.
+            # SIGTERM → SystemExit is BaseException and bypasses this handler,
+            # still hitting ``finally`` for unpin.
+            flexkv_logger.error(
+                f"[worker {worker_id}] exited with error during init/run: {e}"
+            )
+            raise
+        finally:
+            if worker is not None:
+                try:
+                    worker.shutdown()
+                except Exception as e:
+                    flexkv_logger.error(f"[worker {worker_id}] final shutdown error: {e}")
 
     @abstractmethod
     def _transfer_impl(
@@ -318,27 +458,29 @@ class TransferWorkerBase(ABC):
         pass
 
     def run(self) -> None:
-        """main loop for worker process"""
-        should_shutdown = False
+        """Main loop for the worker process.
+
+        Exit paths (``None`` sentinel, pipe EOF, or return) do not unregister
+        themselves — ``_worker_process`` owns a single ``shutdown()`` in its
+        ``finally`` block so cleanup is not duplicated.
+        """
         while True:
             try:
-                if self.transfer_conn.poll(timeout=0.0001):  # check if data available
+                if not self.transfer_conn.poll(timeout=0.0001):
+                    continue
+
+                op = self.transfer_conn.recv()
+                if op is None:
+                    return
+
+                batch_ops = [op]
+                shutdown_after_batch = False
+                while self.transfer_conn.poll(timeout=0):
                     op = self.transfer_conn.recv()
                     if op is None:
-                        # shut down zmq listening server of peer2cpuTransferWorker
-                        if hasattr(self, "shutdown") and callable(self.shutdown):
-                            try:
-                                self.shutdown()
-                            except Exception as e:
-                                flexkv_logger.error(f"Error when shut down worker: {e}")
+                        shutdown_after_batch = True
                         break
                     batch_ops = [op]
-                    while self.transfer_conn.poll(timeout=0):
-                        op = self.transfer_conn.recv()
-                        if op is None:
-                            should_shutdown = True
-                            break
-                        batch_ops.append(op)
                     for op in batch_ops:
                         transfer_status = False
                         try:
@@ -359,7 +501,7 @@ class TransferWorkerBase(ABC):
                             # int still means success, so the queue format
                             # stays compatible.
                             self.finished_ops_queue.put((op.transfer_op_id, False))
-                    if should_shutdown:
+                    if shutdown_after_batch:
                         if hasattr(self, "shutdown") and callable(self.shutdown):
                             try:
                                 self.shutdown()
@@ -369,11 +511,12 @@ class TransferWorkerBase(ABC):
                 else:
                     continue
             except EOFError:
-                # Connection closed
-                break
+                flexkv_logger.warning(
+                    f"[worker {self.worker_id}] transfer pipe EOF; exiting run loop"
+                )
+                return
             except Exception as e:
                 flexkv_logger.error(f"Error in worker run loop: {e}")
-                continue
 
 class WorkerHandle:
     """handle for worker process"""
@@ -393,19 +536,33 @@ class WorkerHandle:
     def shutdown(self) -> None:
         try:
             self.transfer_conn.send(None)
-            self.transfer_conn.close()
-        except (BrokenPipeError, OSError):
-            pass  # Pipe already closed
-        # set timeout to 5 seconds
-        self.process.join(timeout=5)
+        except (BrokenPipeError, OSError, EOFError):
+            pass  # Pipe already closed / peer gone
+
+        timeout = float(GLOBAL_CONFIG_FROM_ENV.worker_shutdown_timeout_s)
+        self.process.join(timeout=timeout)
         if self.process.is_alive():
-            print("force terminate the worker process")
+            flexkv_logger.warning(
+                f"[WorkerHandle] worker {self.worker_id} still alive after "
+                f"{timeout:.0f}s graceful shutdown; force terminate"
+            )
             self.process.terminate()
-            self.process.join()
+            self.process.join(timeout=30)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join()
+
+        try:
+            self.transfer_conn.close()
+        except Exception:
+            pass
 
     def __del__(self) -> None:
-        if self.process.is_alive():
-            self.shutdown()
+        try:
+            if getattr(self, "process", None) is not None and self.process.is_alive():
+                self.shutdown()
+        except Exception:
+            pass
 
 class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non-tp and non-dp case
     def __init__(self,
@@ -435,7 +592,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         # Register CPU tensors with CUDA
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        cudaHostRegister(cpu_blocks)
+        self._register_host_tensor(cpu_blocks, "cpu_kv_pool")
         self.gpu_blocks = import_tensor_handles(gpu_blocks)
         # Get pointers first
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
@@ -793,7 +950,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.cpu_tensor = cpu_blocks
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        cudaHostRegister(cpu_blocks)
+        self._register_host_tensor(cpu_blocks, "tp_cpu_kv_pool")
 
         self.num_layers = gpu_kv_layouts[0].num_layer
 
@@ -2307,7 +2464,7 @@ class NixlTransferWorker(TransferWorkerBase):
                 f"NixlTransferWorker ({be}): pinning CPU pool "
                 f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GiB"
             )
-            cudaHostRegister(cpu_blocks)  # type: ignore[arg-type]
+            self._register_host_tensor(cpu_blocks, "nixl_cpu_pool")  # type: ignore[arg-type]
             if cpu_kv_layout.type != ssd_kv_layout.type:
                 raise ValueError(
                     "CPU and SSD KV layout types must match for NIXL FILE transfer"
@@ -2720,17 +2877,52 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             return old_value
 
     def shutdown(self):
-        self.zmq_server.shutdown()
-        self.zmq_client.shutdown()
-        # unregist buffer in mooncake engine
-        self.mooncake_transfer_engine.unregist_buffer(self.cpu_blocks.data_ptr())
-        if self.cache_config.enable_p2p_ssd:
-            self.mooncake_transfer_engine.unregist_buffer(self.tmp_cpu_buffer.data_ptr())
-            # Release CUDA pinning & HugePage mapping, if any.
-            if hasattr(self, "_tmp_cpu_buffer_handle"):
-                self._tmp_cpu_buffer_handle.release()
-        # unregist node info from redis server
-        self.unregist_node_meta()
+        """Best-effort cleanup; tolerant of partially-failed ``__init__``."""
+        try:
+            zmq_server = getattr(self, "zmq_server", None)
+            if zmq_server is not None:
+                zmq_server.shutdown()
+            zmq_client = getattr(self, "zmq_client", None)
+            if zmq_client is not None:
+                zmq_client.shutdown()
+            engine = getattr(self, "mooncake_transfer_engine", None)
+            cpu_blocks = getattr(self, "cpu_blocks", None)
+            if engine is not None and cpu_blocks is not None:
+                try:
+                    engine.unregist_buffer(cpu_blocks.data_ptr())
+                except Exception as e:
+                    flexkv_logger.warning(
+                        f"PEER2CPUTransferWorker unregist cpu buffer failed: {e}"
+                    )
+                cache_config = getattr(self, "cache_config", None)
+                if cache_config is not None and getattr(cache_config, "enable_p2p_ssd", False):
+                    tmp_buf = getattr(self, "tmp_cpu_buffer", None)
+                    if tmp_buf is not None:
+                        try:
+                            engine.unregist_buffer(tmp_buf.data_ptr())
+                        except Exception as e:
+                            flexkv_logger.warning(
+                                f"PEER2CPUTransferWorker unregist tmp buffer failed: {e}"
+                            )
+                    tmp_handle = getattr(self, "_tmp_cpu_buffer_handle", None)
+                    if tmp_handle is not None:
+                        try:
+                            tmp_handle.release()
+                        except Exception as e:
+                            flexkv_logger.warning(
+                                f"PEER2CPUTransferWorker release tmp handle failed: {e}"
+                            )
+            if getattr(self, "redis_meta_client", None) is not None:
+                try:
+                    self.unregist_node_meta()
+                except Exception as e:
+                    flexkv_logger.warning(
+                        f"PEER2CPUTransferWorker unregist_node_meta failed: {e}"
+                    )
+        except Exception as e:
+            flexkv_logger.error(f"PEER2CPUTransferWorker shutdown error: {e}")
+        finally:
+            super().shutdown()
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         task_info_list = self.op_parser(transfer_op)
@@ -3438,7 +3630,7 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         self.pool_kind = pool_kind
 
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
-        cudaHostRegister(cpu_blocks)
+        self._register_host_tensor(cpu_blocks, "mooncake_store_cpu_pool")
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.num_layers: int = cpu_kv_layout.num_layer
         self.num_cpu_blocks: int = cpu_kv_layout.num_block
@@ -3461,6 +3653,21 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         )
         self.mooncake_client = MooncakeStoreClient(store_config)
         self.mooncake_client.register_buffer(self._cpu_buffer)
+
+    def shutdown(self) -> None:
+        """Best-effort cleanup; tolerant of partially-failed ``__init__``."""
+        try:
+            client = getattr(self, "mooncake_client", None)
+            buf = getattr(self, "_cpu_buffer", None)
+            if client is not None and buf is not None:
+                try:
+                    client.unregister_buffer(buf)
+                except Exception as e:
+                    flexkv_logger.error(
+                        f"[MooncakeStoreTransferWorker] unregister_buffer failed: {e}"
+                    )
+        finally:
+            super().shutdown()
 
     @staticmethod
     def _block_size_bytes(cpu_kv_layout: "KVCacheLayout", dtype: torch.dtype) -> int:
