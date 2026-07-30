@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <vector>
 
+#include "logging.h"
+
 #ifndef IOPRIO_CLASS_SHIFT
 #define IOPRIO_CLASS_SHIFT 13
 #define IOPRIO_PRIO_MASK ((1UL << IOPRIO_CLASS_SHIFT) - 1)
@@ -34,9 +36,10 @@ public:
       if (!io_uring_queue_init(_entries, &ring, flags)) {
         entries = _entries;
       } else {
-        fprintf(stderr,
-                "IOUring(%p) init failed, entries(%d), flags(%d), errno(%d)\n",
-                this, _entries, flags, errno);
+        FLEXKV_LOG_ERROR(
+            "operation=io_uring_init act=complete status=failed "
+            "entries=%d flags=%d errno=%d",
+            _entries, flags, errno);
       }
     }
 
@@ -50,8 +53,10 @@ public:
     }
     write_ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4);
 
-    fprintf(stdout, "IOUring(%p) : RT ioprio %s\n", this,
-            rt_supported ? "supported" : "not supported, using BE");
+    FLEXKV_LOG_DEBUG(
+        "operation=io_uring_priority act=configure status=success "
+        "rt_ioprio=%s",
+        rt_supported ? "supported" : "unsupported fallback=best_effort");
   }
 
   ~IOUring() {
@@ -154,12 +159,23 @@ public:
 
   void dump(int force) {
     if (force || total_cqe_err || total_over_limit) {
-      fprintf(
-          stdout,
-          "IOUring(%p) : entries = %d, inflight = %d, prepared = %d, "
-          "submitted = %lu, completed = %lu, over_limit = %lu, cqe_err = %lu\n",
-          this, entries, inflight, prepared, total_submitted, total_completed,
-          total_over_limit, total_cqe_err);
+      const char *status =
+          total_cqe_err || total_over_limit ? "degraded" : "success";
+      if (total_cqe_err || total_over_limit) {
+        FLEXKV_LOG_WARNING(
+            "operation=io_uring act=summary status=%s entries=%d "
+            "inflight=%d prepared=%d submitted=%lu completed=%lu "
+            "over_limit=%lu cqe_errors=%lu",
+            status, entries, inflight, prepared, total_submitted,
+            total_completed, total_over_limit, total_cqe_err);
+      } else {
+        FLEXKV_LOG_DEBUG(
+            "operation=io_uring act=summary status=%s entries=%d "
+            "inflight=%d prepared=%d submitted=%lu completed=%lu "
+            "over_limit=%lu cqe_errors=%lu",
+            status, entries, inflight, prepared, total_submitted,
+            total_completed, total_over_limit, total_cqe_err);
+      }
     }
   }
 
@@ -221,8 +237,10 @@ public:
         fd_direct_io = open(ssd_files[i][j].c_str(), O_RDWR | O_DIRECT);
 
         if (fd_buffer_io < 0 || fd_direct_io < 0) {
-          std::cerr << "open file failed, path = " << ssd_files[i][j]
-                    << std::endl;
+          FLEXKV_LOG_ERROR(
+              "operation=ssd_file_open act=complete status=failed "
+              "path=\"%s\" buffered_fd=%d direct_fd=%d errno=%d",
+              ssd_files[i][j].c_str(), fd_buffer_io, fd_direct_io, errno);
           throw std::runtime_error("Failed to open file");
         } else {
           posix_fadvise(fd_buffer_io, 0, 0, POSIX_FADV_SEQUENTIAL);

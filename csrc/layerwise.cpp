@@ -1,4 +1,5 @@
 #include "layerwise.h"
+#include "logging.h"
 #include <atomic>
 #include <cstdio>
 #include <fcntl.h>
@@ -541,12 +542,17 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     int32_t *fds_ptr = layer_eventfds_tensor.data_ptr<int32_t>();
     layer_eventfds_.assign(fds_ptr, fds_ptr + total_fds);
 
-    printf("[LayerwiseTransferGroup] Initialized with eventfds: "
-           "tp_size=%d, num_counters=%d, num_layers=%d, total_fds=%d\n",
-           tp_size_, num_counters_, num_layers_, total_fds);
+    FLEXKV_LOG_INFO(
+        "operation=layerwise_init act=complete status=success "
+        "mode=layerwise eventfd=true tp_size=%d counters=%d "
+        "layers=%d total_fds=%d",
+        tp_size_, num_counters_, num_layers_, total_fds);
   } else {
     num_counters_ = 0;
-    printf("[LayerwiseTransferGroup] Initialized without eventfds\n");
+    FLEXKV_LOG_INFO(
+        "operation=layerwise_init act=complete status=success "
+        "mode=layerwise eventfd=false tp_size=%d layers=%d",
+        tp_size_, num_layers_);
   }
 
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
@@ -989,15 +995,18 @@ void LayerwiseTransferGroup::layerwise_transfer(
       static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
   void *cpu_ptr = cpu_blocks_;
 
-  // Create CUDA events for timing each layer batch (on GPU 0)
   int num_batches = (num_layers + layer_granularity - 1) / layer_granularity;
-  std::vector<cudaEvent_t> timing_events(num_batches + 1); // +1 for start event
-  std::vector<int> batch_start_layers(num_batches);
-  std::vector<int> batch_layers_count(num_batches);
+  const bool log_timing =
+      notify_mode_ != NotifyMode::POLLING &&
+      logging::IsEnabled(logging::Level::Debug);
+  std::vector<cudaEvent_t> timing_events(log_timing ? num_batches + 1 : 0);
+  std::vector<int> batch_layers_count(log_timing ? num_batches : 0);
 
   cudaSetDevice(gpu_device_ids_[0]);
-  for (int i = 0; i <= num_batches; ++i) {
-    cudaEventCreate(&timing_events[i]);
+  if (log_timing) {
+    for (int i = 0; i <= num_batches; ++i) {
+      cudaEventCreate(&timing_events[i]);
+    }
   }
 
   // Prepare poll batches for event-based notification (#199)
@@ -1018,8 +1027,9 @@ void LayerwiseTransferGroup::layerwise_transfer(
     }
   }
 
-  // Record start event
-  cudaEventRecord(timing_events[0], streams_[0]);
+  if (log_timing) {
+    cudaEventRecord(timing_events[0], streams_[0]);
+  }
 
   // Allocate storage for NVTX range IDs (one per batch)
   std::vector<nvtxRangeId_t> h2d_range_ids(num_batches, 0);
@@ -1106,10 +1116,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
   std::string mla_mode = mla_d2h_mode;
   if (is_mla && mla_mode != "sharded" && mla_mode != "all_write" &&
       mla_mode != "rank0_only") {
-    fprintf(stderr,
-            "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default "
-            "'sharded'\n",
-            mla_mode.c_str());
+    FLEXKV_LOG_WARNING(
+        "operation=layerwise_config act=fallback status=degraded "
+        "field=mla_d2h_mode value=\"%s\" fallback=sharded",
+        mla_mode.c_str());
     mla_mode = "sharded";
   }
 
@@ -1119,8 +1129,9 @@ void LayerwiseTransferGroup::layerwise_transfer(
     int layers_this_batch =
         std::min(layer_granularity, num_layers - start_layer);
 
-    batch_start_layers[batch_idx] = start_layer;
-    batch_layers_count[batch_idx] = layers_this_batch;
+    if (log_timing) {
+      batch_layers_count[batch_idx] = layers_this_batch;
+    }
 
     // Step 1: CPU -> GPU transfer
     // NVTX range for this batch was already started (by main thread for first
@@ -1194,9 +1205,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
                             use_ce_transfer);
     }
 
-    // Record event after this batch on GPU 0
-    cudaSetDevice(gpu_device_ids_[0]);
-    cudaEventRecord(timing_events[batch_idx + 1], streams_[0]);
+    if (log_timing) {
+      cudaSetDevice(gpu_device_ids_[0]);
+      cudaEventRecord(timing_events[batch_idx + 1], streams_[0]);
+    }
 
     if (notify_mode_ == NotifyMode::POLLING) {
       // Record per-GPU events for the polling thread. Recorded after both the
@@ -1241,52 +1253,34 @@ void LayerwiseTransferGroup::layerwise_transfer(
     }
   }
 
-  // Calculate and print timing for each layer batch
-  // chunk_size per GPU * num_gpus * 2 (K+V) * layers_this_batch * num_blocks
-  // fprintf(stderr, "\n[LayerwiseTransfer] CPU->GPU Transfer Timing
-  // (num_blocks=%d):\n", num_blocks);
-  float total_time_ms = 0.0f;
-  int64_t total_bytes = 0;
-
-  for (int i = 0; i < num_batches; ++i) {
-    float elapsed_ms = 0.0f;
-    cudaEventElapsedTime(&elapsed_ms, timing_events[i], timing_events[i + 1]);
-
-    // Calculate bytes transferred for this batch
-    // For each GPU: chunk_size * 2 (K+V) * layers * num_blocks
-    int64_t bytes_this_batch = 0;
-    for (int g = 0; g < num_gpus_; ++g) {
-      bytes_this_batch +=
-          gpu_chunk_sizes_in_bytes_[g] * 2 * batch_layers_count[i] * num_blocks;
+  if (log_timing) {
+    float total_time_ms = 0.0f;
+    int64_t total_bytes = 0;
+    for (int i = 0; i < num_batches; ++i) {
+      float elapsed_ms = 0.0f;
+      cudaEventElapsedTime(&elapsed_ms, timing_events[i],
+                           timing_events[i + 1]);
+      for (int g = 0; g < num_gpus_; ++g) {
+        total_bytes += gpu_chunk_sizes_in_bytes_[g] * 2 *
+                       batch_layers_count[i] * num_blocks;
+      }
+      total_time_ms += elapsed_ms;
     }
+    const double total_size_gb =
+        total_bytes / (1024.0 * 1024.0 * 1024.0);
+    const double total_time_s = total_time_ms / 1000.0;
+    const double total_bandwidth_gbps =
+        total_time_s > 0.0 ? total_size_gb / total_time_s : 0.0;
+    FLEXKV_LOG_DEBUG(
+        "operation=layerwise_transfer act=complete status=success "
+        "direction=H2D blocks=%d mode=layerwise "
+        "data_size=%.6fGB transfer_time=%.4fs bandwidth=%.2fGB/s",
+        num_blocks, total_size_gb, total_time_s, total_bandwidth_gbps);
 
-    double bandwidth_gbps =
-        (bytes_this_batch / (1024.0 * 1024.0 * 1024.0)) / (elapsed_ms / 1000.0);
-
-    // fprintf(stderr, "  Layers [%d, %d): time=%.3f ms, size=%.2f MB,
-    // bandwidth=%.2f GB/s\n",
-    //         batch_start_layers[i],
-    //         batch_start_layers[i] + batch_layers_count[i],
-    //         elapsed_ms,
-    //         bytes_this_batch / (1024.0 * 1024.0),
-    //         bandwidth_gbps);
-
-    total_time_ms += elapsed_ms;
-    total_bytes += bytes_this_batch;
-  }
-
-  double total_bandwidth_gbps =
-      (total_bytes / (1024.0 * 1024.0 * 1024.0)) / (total_time_ms / 1000.0);
-  // fprintf(stderr, "  Total: time=%.3f ms, size=%.2f MB, avg_bandwidth=%.2f
-  // GB/s\n\n",
-  //         total_time_ms, total_bytes / (1024.0 * 1024.0),
-  //         total_bandwidth_gbps);
-  // fflush(stderr);
-
-  // Cleanup timing events
-  cudaSetDevice(gpu_device_ids_[0]);
-  for (int i = 0; i <= num_batches; ++i) {
-    cudaEventDestroy(timing_events[i]);
+    cudaSetDevice(gpu_device_ids_[0]);
+    for (int i = 0; i <= num_batches; ++i) {
+      cudaEventDestroy(timing_events[i]);
+    }
   }
 }
 
@@ -1331,9 +1325,10 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   std::string mode = mla_d2h_mode;
   if (is_mla && mode != "sharded" && mode != "all_write" &&
       mode != "rank0_only") {
-    fprintf(stderr,
-            "[FlexKV] Invalid mla_d2h_mode='%s'; using 'sharded'\n",
-            mode.c_str());
+    FLEXKV_LOG_WARNING(
+        "operation=layerwise_config act=fallback status=degraded "
+        "field=mla_d2h_mode value=\"%s\" fallback=sharded",
+        mode.c_str());
     mode = "sharded";
   }
 
