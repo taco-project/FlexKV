@@ -55,6 +55,7 @@ If the `FLEXKV_CONFIG_PATH` environment variable is not set, configuration can b
 | `FLEXKV_SSD_CACHE_GB` | int | 0 | SSD cache layer capacity in GB. Recommended to be greater than `FLEXKV_CPU_CACHE_GB` and a multiple of `FLEXKV_MAX_FILE_SIZE_GB`. Set to 0 if only using CPU cache (SSD cache will not be enabled) |
 | `FLEXKV_SSD_CACHE_DIR` | str | "./flexkv_ssd" | Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `"/data0/flexkv_ssd/;/data1/flexkv_ssd/"` to improve bandwidth |
 | `FLEXKV_ENABLE_GDS` | bool | 0 | Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default, set to 1 to enable |
+| `FLEXKV_CUDAHOST_CHUNK_SIZE_GB` | float | 0 | Chunk size in GB used when calling `cudaHostRegister` on a HugePage host buffer. Default `0` registers the whole buffer in a single call; a value greater than 0 registers (and correspondingly unregisters) the buffer in chunks of this size, which avoids one-shot registration failures on very large buffers. The chunk size is rounded down to a 4 KiB page boundary with a small alignment margin reserved |
 | `FLEXKV_SWA_MULTI_GROUP` | bool | unset (auto-enabled) | For DeepSeek-V4, unset or `1` stores/restores SWA KV with attention/indexer compress states; `0` keeps SWA KV I/O only |
 | `FLEXKV_SWA_MULTI_LAYER` | bool | 1 | `1` fuses SWA/state H2D into layerwise restore; `0` uses the standalone SWA/state H2D predecessor worker |
 

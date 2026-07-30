@@ -805,4 +805,37 @@ CRadixTreeIndex::match_prefix(torch::Tensor &block_hashes, int num_blocks,
       last_swa_node, swa_hit_blocks);
 }
 
+// Roll back a not-yet-ready inserted leaf (planned transfer aborted before
+// launch). Only removes the node when unambiguously safe: it must still be an
+// unready, unlocked, SWA-unlocked leaf. If another request split it or
+// inserted below it in the create-to-cancel window, it is left in place
+// (pre-existing behavior) rather than risk detaching blocks another plan
+// references. Mirrors flexkv/cache/radixtree.py::remove_unready_leaf.
+int CRadixTreeIndex::remove_unready_leaf(CRadixNode *node,
+                                         torch::Tensor &freed_blocks) {
+  if (node == nullptr || is_root(node) || node->is_ready() ||
+      node->get_lock_cnt() > 0 || node->get_swa_lock_ref() > 0 ||
+      !node->is_leaf()) {
+    freed_blocks.resize_({0});
+    return 0;
+  }
+  std::vector<int64_t> freed;
+  auto parent = detach_leaf_collect(node, freed, nullptr);
+  if (swa_enabled_) {
+    // I2 cascade, exactly as evict() does after a leaf deletion.
+    cascade_delete_tombstone_leaves(parent, freed, nullptr);
+  } else if (parent != nullptr && parent->is_leaf() && !is_root(parent)) {
+    add_leaf(parent);
+  }
+  int n = static_cast<int>(freed.size());
+  freed_blocks.resize_({n});
+  if (n > 0) {
+    auto *out = freed_blocks.data_ptr<int64_t>();
+    for (int i = 0; i < n; ++i) {
+      out[i] = freed[i];
+    }
+  }
+  return n;
+}
+
 } //  namespace flexkv

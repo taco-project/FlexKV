@@ -210,7 +210,9 @@ class RadixNode:
         # freed_swa_slots + the SWA-LRU (this node has no back-ref to the tree).
 
 class RadixTreeIndex:
-    def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000, hit_reward_seconds: int = 0, eviction_policy: str = "lru", protected_threshold: int = 2):
+    def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000,
+                 hit_reward_seconds: int = 0, eviction_policy: str = "lru",
+                 protected_threshold: int = 2):
         self.root_node: RadixNode = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                               physical_blocks=np.array([], dtype=np.int64),
                                               is_ready=True,
@@ -686,6 +688,42 @@ class RadixTreeIndex:
                     evicted_full_blocks = np.concatenate([evicted_full_blocks, freed_full])
         return evicted_full_blocks, num_swa_freed
 
+    def remove_unready_leaf(self, node: Optional[RadixNode]) -> np.ndarray:
+        """Roll back a not-yet-ready inserted leaf, returning its blocks.
+
+        Used when a planned transfer is aborted before launch: the node was
+        inserted with ``is_ready=False`` and its completion callback (which
+        would have marked it ready) will never run. Left alone it can never be
+        evicted (``in_use`` is true for unready nodes) and it shadows future
+        puts of the same prefix, so the blocks and the prefix are both lost.
+
+        Only removes the node when doing so is unambiguously safe: it must
+        still be an unready, unlocked, SWA-unlocked leaf. If another request
+        split it or inserted below it in the create-to-cancel window, the node
+        is left in place (pre-existing behavior) rather than risk detaching
+        blocks another plan references. Returns the physical blocks to recycle
+        (empty when nothing was removed).
+        """
+        if (node is None or node.is_root() or node.is_ready
+                or node.lock_cnt > 0 or node.swa_lock_ref > 0
+                or not node.is_leaf()):
+            return np.array([], dtype=np.int64)
+        parent = node.parent
+        assert parent is not None
+        parent.children.pop(node.head_hash(), None)
+        self.leaf_nodes.pop(node.head_hash(), None)
+        self.record_freed_swa_slot(node)
+        freed = node.physical_blocks
+        node.parent = None
+        if parent.is_leaf() and not parent.is_root():
+            self.leaf_nodes[parent.head_hash()] = parent
+        if self._swa_enabled:
+            cascade_blocks, _hashes, _survivor = \
+                self._iteratively_delete_tombstone_leaf(parent)
+            if cascade_blocks.size:
+                freed = np.concatenate([freed, cascade_blocks])
+        return freed
+
     def _iteratively_delete_tombstone_leaf(
             self, node: RadixNode) -> Tuple[np.ndarray, np.ndarray, Optional[RadixNode]]:
         """Delete ``node`` and its ancestors while they are tombstone leaves with
@@ -768,11 +806,10 @@ class RadixTreeIndex:
         cur = swa_boundary
         assert cur.swa_lock_ref > 0, "dec_swa_lock_only on an unlocked SWA node"
         cur.swa_lock_ref -= 1
-        if cur.swa_lock_ref == 0 and cur.has_swa():
-            if cur.is_leaf():
-                # Leaf: free SWA now (Full stays until the full lock drops).
-                self.record_freed_swa_slot(cur)
-            # internal: keep SWA, stays evictable on the SWA-LRU
+        if cur.swa_lock_ref == 0 and cur.has_swa() and cur.is_leaf():
+            # Leaf: free SWA now (Full stays until the full lock drops).
+            # An internal node keeps its SWA, staying evictable on the SWA-LRU.
+            self.record_freed_swa_slot(cur)
 
 
     def _get_eviction_priority(self, node: RadixNode):

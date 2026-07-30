@@ -22,7 +22,6 @@ from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_te
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp
 from flexkv.transfer.worker import (
     TransferWorkerBase,
-    cudaHostRegister,
     ensure_cuda_device,
     import_tensor_handles,
 )
@@ -180,7 +179,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         # initialize CPU storage
         flexkv_logger.info(f"[LayerwiseWorker] Pinning CPU Memory: "
                            f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        cudaHostRegister(cpu_blocks)
+        self._register_host_tensor(cpu_blocks, "layerwise_cpu_kv_pool")
         flexkv_logger.debug("[LayerwiseWorker] CPU memory pinned successfully")
         self.cpu_blocks = cpu_blocks
 
@@ -207,7 +206,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         if self.has_swa_multi_group:
             assert swa_cpu_blocks is not None
             swa_cpu_blocks = materialize_worker_tensor(swa_cpu_blocks)
-            cudaHostRegister(swa_cpu_blocks)
+            self._register_host_tensor(swa_cpu_blocks, "layerwise_swa_cpu_pool")
             flexkv_logger.info(
                 "[LayerwiseWorker] SWA multi-group CPU memory pinned successfully")
             self.swa_cpu_blocks = swa_cpu_blocks
@@ -226,7 +225,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 imported_swa_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
             self.swa_gpu_blocks = imported_swa_gpu_blocks
             swa_cpu_blocks = materialize_worker_tensor(swa_cpu_blocks)
-            cudaHostRegister(swa_cpu_blocks)
+            self._register_host_tensor(swa_cpu_blocks, "layerwise_swa_cpu_pool")
             flexkv_logger.info("[LayerwiseWorker] SWA CPU memory pinned successfully")
             self.swa_cpu_blocks = swa_cpu_blocks
             self.swa_num_layers = swa_cpu_kv_layout.num_layer

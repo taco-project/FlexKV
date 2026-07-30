@@ -27,9 +27,16 @@ class CompletedOp:
     # Per-block completion status for backends that can partially succeed.
     # ``None`` preserves the all-or-nothing contract of existing workers.
     block_results: Optional[Tuple[bool, ...]] = None
+    # True on the graph-level message that reports the graph terminated because
+    # one of its ops failed. Defaults False so the message stays pickle- and
+    # constructor-compatible with existing producers/consumers.
+    failed: bool = False
 
     def is_graph_completed(self) -> bool:
-        return self.op_id == -1
+        return self.op_id == -1 and not self.failed
+
+    def is_graph_failed(self) -> bool:
+        return self.op_id == -1 and self.failed
 
     def slice_blocks(self, offset: int, count: int) -> 'CompletedOp':
         """Return this completion restricted to one pre-merge op span."""
@@ -56,6 +63,10 @@ class CompletedOp:
     @classmethod
     def completed_graph(cls, graph_id: int) -> 'CompletedOp':
         return cls(graph_id=graph_id, op_id=-1)
+
+    @classmethod
+    def failed_graph(cls, graph_id: int) -> 'CompletedOp':
+        return cls(graph_id=graph_id, op_id=-1, failed=True)
 
 
 @dataclass(frozen=True)
@@ -365,9 +376,8 @@ class TransferOpGraph:
             # Optional SWA launch-time binding path: if caller passes
             # swa_gpu_blocks, fill SWA ops from that array; otherwise preserve
             # graph-built SWA ids.
-            if getattr(op, "is_swa", False):
-                if swa_gpu_blocks is None:
-                    continue
+            if getattr(op, "is_swa", False) and swa_gpu_blocks is None:
+                continue
             transfer_type = op.transfer_type
             if getattr(op, "is_swa", False):
                 count = op.dst_block_ids.size if transfer_type.name.endswith("2D") \
@@ -782,15 +792,12 @@ def merge_to_batch_graph(batch_id: int,
       layerwise GET: the fused LAYERWISE op
     """
     if not transfer_graphs:
-        empty_graph = TransferOpGraph()
-        empty_graph.set_graph_id(batch_id)
-        return empty_graph, -1, {}
+        return TransferOpGraph(), -1, {}
     if len(transfer_graphs) != len(task_end_op_ids):
         raise ValueError(
             "transfer_graphs and task_end_op_ids must have the same length")
 
     merged_graph = TransferOpGraph()
-    merged_graph.set_graph_id(batch_id)
 
     ops_by_type: Dict[TransferType, List[TransferOp]] = {}
     callbacks_by_type: Dict[TransferType, List[Tuple[TransferOp, Callable]]] = {}

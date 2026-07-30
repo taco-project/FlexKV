@@ -190,9 +190,12 @@ class KVTaskManager:
 
         self.graph_to_task: Dict[int, int] = {}
 
-        self.uncompleted_ops: Dict[int, int] = {}  # op_id -> completed_count
-        self.uncompleted_op_results: Dict[int, CompletedOp] = {}
-        self.uncompleted_graphs: Dict[int, int] = {}  # graph_id -> completed_count
+        # (graph_id, op_id) -> completed_count; graph-keyed so a failed
+        # graph's stale per-op counters can be purged.
+        self.uncompleted_ops: Dict[Tuple[int, int], int] = {}
+        self.uncompleted_op_results: Dict[Tuple[int, int], CompletedOp] = {}
+        # graph_id -> (terminal_count, any_failed) across the N handles.
+        self.uncompleted_graphs: Dict[int, Tuple[int, bool]] = {}
         self.required_completed_count: int = len(self.transfer_handles)
 
         self.task_id_counter = 0
@@ -362,6 +365,9 @@ class KVTaskManager:
                 continue
             task_id = self.graph_to_task[completed_op.graph_id]
             task = self.tasks[task_id]
+            if completed_op.is_graph_failed():
+                self._fail_task(task_id)
+                continue
             # A failed pull invalidates the current request and must trigger
             # fallback. Mooncake uploads retain the existing asynchronous PUT
             # completion contract (the task-end D2H may precede H2REMOTE).
@@ -419,11 +425,57 @@ class KVTaskManager:
                         exc_info=True,
                     )
 
+    @staticmethod
+    def _abort_task_plans(task: "KVTask") -> None:
+        """Run the abort path of every plan handle the task carries (a batch
+        task carries one per merged sub-task). Handles predating the abort API
+        are skipped."""
+        callbacks = task.callback if isinstance(task.callback, list) \
+            else [task.callback]
+        for callback in callbacks:
+            abort = getattr(callback, "abort", None)
+            if abort is not None:
+                abort()
+
+    def _fail_task(self, task_id: int) -> None:
+        """A transfer op of this task's graph failed and the graph has fully
+        drained. Roll the plan back instead of completing it: ops that did
+        finish already ran their callbacks (their nodes are ready and their
+        data is valid, so abort keeps them), while nodes whose transfer never
+        ran are still unready and get removed with their blocks recycled.
+        The task terminates as FAILED so wait() reports the failure instead
+        of a misleading TIMEOUT."""
+        if task_id not in self.tasks:
+            return
+        task = self.tasks[task_id]
+        if task.is_completed():
+            return
+        flexkv_logger.error(f"[KVTaskEngine] task {task_id} FAILED: a transfer "
+                            f"op of graph {task.graph.graph_id} failed")
+        self._abort_task_plans(task)
+        task.status = TaskStatus.FAILED
+        task.task_end_op_finished = True
+        self.graph_to_task.pop(task.graph.graph_id, None)
+        task.shed_heavy_resources()
+        if task.request_returned:
+            self._release_task(task_id)
+
     def _cancel_task(self, task_id: int) -> None:
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]
         if not task.is_completed():
+            # A task whose graph never launched still holds everything its
+            # plan acquired at create time: locked radix nodes, CPU staging
+            # blocks, and is_ready=False index nodes that only a completion
+            # callback could publish. Dropping the task without aborting leaks
+            # all of it -- the staging blocks become unreachable (mempool
+            # exhaustion) and the unready nodes are permanently unevictable
+            # holes that also shadow future puts of the same prefix. Abort
+            # rolls those back; RUNNING tasks keep the old behavior (their
+            # graph is in flight and completion callbacks will still fire).
+            if task.status in (TaskStatus.UNREADY, TaskStatus.READY):
+                self._abort_task_plans(task)
             task.status = TaskStatus.CANCELLED
         self._release_task(task_id)
 
@@ -533,29 +585,58 @@ class KVTaskManager:
 
     def _get_completed_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         results = []
+        # Keep lightweight test/fallback managers created with ``__new__``
+        # compatible with the pre-bitmap state shape.
+        if not hasattr(self, "uncompleted_op_results"):
+            self.uncompleted_op_results = {}
         for transfer_handle in self.transfer_handles:
             completed_ops = transfer_handle.wait(timeout)
             for completed_op in completed_ops:
-                if completed_op.is_graph_completed():
-                    completed_count = self.uncompleted_graphs.get(completed_op.graph_id, 0) + 1
-                    if completed_count == self.required_completed_count:
-                        results.append(completed_op)
-                        self.uncompleted_graphs.pop(completed_op.graph_id, None)
+                if completed_op.op_id == -1:
+                    # Graph-level terminal message, completed OR failed. Every
+                    # handle received the same graph, so the task terminates
+                    # only after all of them have reported a terminal state --
+                    # aborting on the first failure would recycle plan blocks
+                    # a sibling engine is still writing into. Any failure
+                    # among the N outcomes fails the graph.
+                    graph_id = completed_op.graph_id
+                    count, failed = self.uncompleted_graphs.get(graph_id, (0, False))
+                    count += 1
+                    failed = failed or completed_op.is_graph_failed()
+                    if count == self.required_completed_count:
+                        self.uncompleted_graphs.pop(graph_id, None)
+                        if failed:
+                            # A failed handle never finalizes some of the
+                            # graph's ops, so their N-way per-op counters can
+                            # never complete: purge them rather than leak.
+                            # Safe because each handle's terminal message
+                            # follows all its per-op messages (per-handle
+                            # FIFO), so nothing can arrive for this graph
+                            # after the Nth terminal and resurrect a counter.
+                            stale = [key for key in self.uncompleted_ops
+                                     if key[0] == graph_id]
+                            for key in stale:
+                                self.uncompleted_ops.pop(key, None)
+                                self.uncompleted_op_results.pop(key, None)
+                            results.append(CompletedOp.failed_graph(graph_id))
+                        else:
+                            results.append(completed_op)
                     else:
-                        self.uncompleted_graphs[completed_op.graph_id] = completed_count
+                        self.uncompleted_graphs[graph_id] = (count, failed)
                 else:
-                    completed_count = self.uncompleted_ops.get(completed_op.op_id, 0) + 1
+                    op_key = (completed_op.graph_id, completed_op.op_id)
+                    completed_count = self.uncompleted_ops.get(op_key, 0) + 1
                     aggregate = self._merge_completed_op(
-                        self.uncompleted_op_results.get(completed_op.op_id),
+                        self.uncompleted_op_results.get(op_key),
                         completed_op,
                     )
                     if completed_count == self.required_completed_count:
                         results.append(aggregate)
-                        self.uncompleted_ops.pop(completed_op.op_id, None)
-                        self.uncompleted_op_results.pop(completed_op.op_id, None)
+                        self.uncompleted_ops.pop(op_key, None)
+                        self.uncompleted_op_results.pop(op_key, None)
                     else:
-                        self.uncompleted_ops[completed_op.op_id] = completed_count
-                        self.uncompleted_op_results[completed_op.op_id] = aggregate
+                        self.uncompleted_ops[op_key] = completed_count
+                        self.uncompleted_op_results[op_key] = aggregate
         return results
 
     @staticmethod
