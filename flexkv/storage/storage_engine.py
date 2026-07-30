@@ -91,7 +91,7 @@ class StorageEngine:
                 tokens_per_block=self._cache_config.tokens_per_block,
                 num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
-                is_mla=self._model_config.use_mla,
+                is_mla=self._model_config.is_layout_mla(),
                 layer_groups=self._model_config.layer_groups,
                 tp_size=self._model_config.tp_size,
             )
@@ -111,7 +111,7 @@ class StorageEngine:
                 tokens_per_block=self._cache_config.tokens_per_block,
                 num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
-                is_mla=self._model_config.use_mla,
+                is_mla=self._model_config.is_layout_mla(),
                 layer_groups=self._model_config.layer_groups,
                 tp_size=self._model_config.tp_size,
             )
@@ -139,7 +139,7 @@ class StorageEngine:
                     tokens_per_block=self._cache_config.tokens_per_block,
                     num_head=self._model_config.num_kv_heads_per_node,
                     head_size=self._model_config.head_size,
-                    is_mla=self._model_config.use_mla,
+                    is_mla=self._model_config.is_layout_mla(),
                     layer_groups=self._model_config.layer_groups,
                     tp_size=self._model_config.tp_size,
                 )

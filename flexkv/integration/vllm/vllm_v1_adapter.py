@@ -764,7 +764,7 @@ class FlexKVWorkerConnector:
             tokens_per_block=block_size,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=self.flexkv_config.model_config.use_mla,
+            is_mla=self.flexkv_config.model_config.is_layout_mla(),
         )
 
         if not indexer_kv_caches:

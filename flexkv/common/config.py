@@ -109,7 +109,17 @@ class ModelConfig:
     num_layers: int = 1
     num_kv_heads: int = 1
     head_size: int = 1
+    # Attention-arch flag (DeepSeek MLA vs MHA). Used for head-parameter
+    # derivation and as the default for layout/share axes below.
     use_mla: bool = False
+    # Physical KV layout: True => kv_dim=1 (one packed stream per slot).
+    # None inherits ``use_mla`` (see ``is_layout_mla``).
+    layout_is_mla: Optional[bool] = None
+    # Whether CP ranks share the same *logical KV content* (classic MLA).
+    # Does NOT change process identity: ``effective_tp_rank`` always includes
+    # ``cp_rank``. Used for copy/capacity semantics (e.g. MLA D2H all_write).
+    # None inherits ``use_mla``. DSv4: False + ``layout_is_mla=True``.
+    share_kv_across_cp: Optional[bool] = None
     dtype: torch.dtype = torch.bfloat16
 
     # ------------------------------------------------------------------
@@ -356,6 +366,25 @@ class ModelConfig:
         """Per-node counterpart of :pyattr:`effective_tp_size`."""
         return self.tp_size_per_node * self.cp_size_per_node
 
+    def is_layout_mla(self) -> bool:
+        """Physical layout uses a single packed KV stream (``kv_dim=1``).
+
+        Falls back to ``use_mla`` when ``layout_is_mla`` is unset.
+        """
+        return self.use_mla if self.layout_is_mla is None else bool(self.layout_is_mla)
+
+    def is_kv_shared_across_cp(self) -> bool:
+        """Whether CP ranks share the same logical KV content.
+
+        Falls back to ``use_mla`` when ``share_kv_across_cp`` is unset.
+        Does not affect ``effective_tp_rank`` identity (approach 1).
+        """
+        return (
+            self.use_mla
+            if self.share_kv_across_cp is None
+            else bool(self.share_kv_across_cp)
+        )
+
     @property
     def num_kv_heads_per_node(self) -> int:
         """Number of KV heads visible to a single node."""
@@ -365,8 +394,8 @@ class ModelConfig:
 
     @property
     def kv_dim(self) -> int:
-        """KV dimension: 1 for MLA (no head split), 2 for standard (head split)."""
-        return 1 if self.use_mla else 2
+        """KV dimension from physical layout: 1 packed stream, else K/V=2."""
+        return 1 if self.is_layout_mla() else 2
 
     @property
     def bytes_per_token_per_layer(self) -> int:
@@ -381,7 +410,7 @@ class ModelConfig:
     @property
     def token_size_in_bytes(self) -> int:
         """Whole-model per-token KV footprint (bytes) across all layers/groups."""
-        kv_dim = 1 if self.use_mla else 2
+        kv_dim = self.kv_dim
         if self.layer_groups:
             # layer_groups store per-GPU num_kv_heads; multiply by tp_size
             # to get full-model per-token size (matching CPU/SSD block sizing).
@@ -407,6 +436,8 @@ class ModelConfig:
         return (
             f"ModelConfig(num_layers={self.num_layers}, num_kv_heads={self.num_kv_heads}"
             f", head_size={self.head_size}, use_mla={self.use_mla}"
+            f", layout_is_mla={self.is_layout_mla()}"
+            f", share_kv_across_cp={self.is_kv_shared_across_cp()}"
             f", dtype={self.dtype}"
             f", tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}"
             f", cp_size={self.cp_size}"
@@ -970,7 +1001,7 @@ def recompute_cache_block_counts(
     block_size_in_bytes = block_size_in_bytes_for_cache(
         model_config, cache_config)
     capacity_divisor = 1
-    if (model_config.use_mla
+    if (model_config.is_kv_shared_across_cp()
             and GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode == "all_write"):
         capacity_divisor = max(
             1, model_config.effective_tp_size_per_node)
@@ -1035,7 +1066,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     model_config = rank_info.model_config
     mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
     capacity_divisor = 1
-    if model_config.use_mla and mla_d2h_mode == "all_write":
+    if model_config.is_kv_shared_across_cp() and mla_d2h_mode == "all_write":
         num_gpus_per_node = model_config.effective_tp_size_per_node
         if num_gpus_per_node > 1:
             capacity_divisor = num_gpus_per_node

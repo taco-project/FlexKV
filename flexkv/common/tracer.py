@@ -105,6 +105,8 @@ class FlexKVTracer:
             "num_kv_heads": model_config.num_kv_heads,
             "head_size": model_config.head_size,
             "use_mla": model_config.use_mla,
+            "layout_is_mla": model_config.is_layout_mla(),
+            "share_kv_across_cp": model_config.is_kv_shared_across_cp(),
             "dtype": str(model_config.dtype),
             "tp_size": model_config.tp_size,
             "dp_size": model_config.dp_size,

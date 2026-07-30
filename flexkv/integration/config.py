@@ -371,7 +371,6 @@ class FlexKVConfig:
 
         from sglang.srt.configs.model_config import AttentionArch
         use_mla = getattr(sglang_config, "attention_arch", None) == AttentionArch.MLA
-
         if use_mla:
             kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
             qk_rope_head_dim = int(getattr(sglang_config, "qk_rope_head_dim", 0))
@@ -421,6 +420,18 @@ class FlexKVConfig:
                 )
 
         self.model_config.use_mla = use_mla
+
+        # Approach 1: identity always includes cp_rank; layout/share are separate.
+        # Set DSv4 axes before GB->blocks so kv_dim uses layout_is_mla.
+        is_dsv4 = bool(getattr(sglang_config, "is_deepseek_v4_arch", False))
+        if is_dsv4:
+            self.model_config.layout_is_mla = True
+            self.model_config.share_kv_across_cp = False
+            logger.info(
+                "[FlexKV sglang] DSv4 axes: layout_is_mla=True, "
+                "share_kv_across_cp=False "
+                f"(attention use_mla={self.model_config.use_mla})"
+            )
 
         # Fill FlexKV parallel config.
         #
@@ -492,7 +503,7 @@ class FlexKVConfig:
         # in DeepSeekV4SingleKVPool. Without this config, cache_config.swa
         # stays None -> the cache engine never builds an SWA pool -> a SWA-aware
         # get finds no SWA, so SWA KV is never matched/reused for this all-SWA model.
-        is_dsv4 = bool(getattr(sglang_config, "is_deepseek_v4_arch", False))
+        # (layout_is_mla / share_kv_across_cp already set above for DSv4.)
         if is_dsv4:
             swa_page_size = self.cache_config.tokens_per_block
             # bytes_per_token_per_layer MUST match the GPU SWA buffer's *padded*
