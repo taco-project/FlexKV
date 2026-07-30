@@ -283,8 +283,8 @@ if [ "$ENABLE_METRICS" -eq 1 ]; then
     info "Metrics enabled: initializing all submodules (including prometheus-cpp)..."
     git submodule update --init --recursive
 else
-    info "Metrics disabled: initializing only xxHash submodule..."
-    git submodule update --init --recursive third_party/xxHash
+    info "Metrics disabled: initializing required xxHash and spdlog submodules..."
+    git submodule update --init --recursive third_party/xxHash third_party/spdlog
 fi
 success "Git submodules initialized."
 

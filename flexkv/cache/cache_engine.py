@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import threading
 import time
 from functools import partial
@@ -30,7 +31,7 @@ from flexkv.cache.redis_meta import RedisMeta, dist_available
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.swa_cache_engine import SWAOpConstructor
-from flexkv.common.block import SequenceMeta
+from flexkv.common.block import SequenceMeta, format_block_hash
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig
 from flexkv.common.transfer import (
     DeviceType,
@@ -39,7 +40,11 @@ from flexkv.common.transfer import (
     TransferType,
     add_virtual_op_for_multiple_finished_ops,
 )
-from flexkv.common.debug import flexkv_logger, summarize_id_tensor
+from flexkv.common.debug import (
+    eviction_log_aggregator,
+    flexkv_logger,
+    summarize_id_tensor,
+)
 from flexkv.common.type import MatchResultAccel
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics import FlexKVMetricsCollector, init_global_collector, get_global_collector
@@ -268,11 +273,27 @@ class CacheEngineAccel:
         """Evict node-mounted SWA slots through the C++ radix tree."""
         if self.swa_pool is None:
             return 0
+        free_before = self.swa_pool.num_free
+        start_ns = time.perf_counter_ns()
         evicted_full = torch.zeros(0, dtype=torch.int64)
         num_freed = self.index.evict_swa(evicted_full, num_swa_evicted)
         if evicted_full.numel() > 0:
             self.mempool.recycle_blocks(evicted_full.numpy())
         self._drain_unmounted_swa_slots()
+        free_after = self.swa_pool.num_free
+        eviction_log_aggregator.record(
+            tier=DEVICE_TYPE[self.device_type].lower(),
+            scope="swa",
+            reason="capacity",
+            requested_blocks=num_swa_evicted,
+            required_blocks=num_swa_evicted,
+            evicted_blocks=num_freed,
+            free_blocks_before=free_before,
+            free_blocks_after=free_after,
+            total_blocks=self.swa_pool.num_slots,
+            duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
+            target_met=num_freed >= num_swa_evicted,
+        )
         return num_freed
 
     def reset(self) -> None:
@@ -383,6 +404,8 @@ class CacheEngineAccel:
             )
 
             if evict_block_num > 0:
+                free_before = self.mempool.num_free_blocks
+                start_ns = time.perf_counter_ns()
                 target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
                 evicted_block_hashes = torch.zeros(evict_block_num, dtype=torch.int64)
                 # evict() resizes both tensors in-place to the actual freed count
@@ -411,6 +434,35 @@ class CacheEngineAccel:
                         block_hashes=evicted_block_hashes.numpy(),
                         medium=DEVICE_TYPE[self.device_type]
                     )
+                free_after = self.mempool.num_free_blocks
+                target_met = free_after >= max(
+                    num_required_blocks, target_free_blocks
+                )
+                sample_block_hashes = None
+                batch_level = logging.DEBUG if target_met else logging.WARNING
+                if flexkv_logger.is_enabled_for(batch_level):
+                    sample_block_hashes = [
+                        format_block_hash(value)
+                        for value in evicted_block_hashes[:3].tolist()
+                    ]
+                eviction_log_aggregator.record(
+                    tier=DEVICE_TYPE[self.device_type].lower(),
+                    scope="full",
+                    reason=(
+                        "capacity"
+                        if num_required_blocks > free_before
+                        else "threshold"
+                    ),
+                    requested_blocks=num_required_blocks,
+                    required_blocks=evict_block_num,
+                    evicted_blocks=num_evicted,
+                    free_blocks_before=free_before,
+                    free_blocks_after=free_after,
+                    total_blocks=self.mempool.num_total_blocks,
+                    duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
+                    sample_block_hashes=sample_block_hashes,
+                    target_met=target_met,
+                )
             if protected_node is not None:
                 self.index.unlock(protected_node)
 
@@ -548,10 +600,26 @@ class CacheEngine:
         """Evict node-mounted SWA slots through the Python radix tree."""
         if self.swa_pool is None:
             return 0
+        free_before = self.swa_pool.num_free
+        start_ns = time.perf_counter_ns()
         evicted_full, num_freed = self.index.evict_swa(num_swa_evicted)
         if evicted_full.size > 0:
             self.mempool.recycle_blocks(evicted_full)
         self._drain_unmounted_swa_slots()
+        free_after = self.swa_pool.num_free
+        eviction_log_aggregator.record(
+            tier=DEVICE_TYPE[self.device_type].lower(),
+            scope="swa",
+            reason="capacity",
+            requested_blocks=num_swa_evicted,
+            required_blocks=num_swa_evicted,
+            evicted_blocks=num_freed,
+            free_blocks_before=free_before,
+            free_blocks_after=free_after,
+            total_blocks=self.swa_pool.num_slots,
+            duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
+            target_met=num_freed >= num_swa_evicted,
+        )
         return num_freed
 
     def reset(self) -> None:
@@ -620,6 +688,8 @@ class CacheEngine:
                 int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0
             )
             if evict_block_num > 0:
+                free_before = self.mempool.num_free_blocks
+                start_ns = time.perf_counter_ns()
                 evicted_blocks, evicted_block_hashes = self.index.evict(evict_block_num)
                 self.mempool.recycle_blocks(evicted_blocks)
 
@@ -633,6 +703,35 @@ class CacheEngine:
                 if self.event_collector is not None:
                     self.event_collector.publish_removed(block_hashes=evicted_block_hashes,
                                                          medium=DEVICE_TYPE[self.device_type])
+                free_after = self.mempool.num_free_blocks
+                target_met = free_after >= max(
+                    num_required_blocks, target_free_blocks
+                )
+                sample_block_hashes = None
+                batch_level = logging.DEBUG if target_met else logging.WARNING
+                if flexkv_logger.is_enabled_for(batch_level):
+                    sample_block_hashes = [
+                        format_block_hash(value)
+                        for value in evicted_block_hashes[:3].tolist()
+                    ]
+                eviction_log_aggregator.record(
+                    tier=DEVICE_TYPE[self.device_type].lower(),
+                    scope="full",
+                    reason=(
+                        "capacity"
+                        if num_required_blocks > free_before
+                        else "threshold"
+                    ),
+                    requested_blocks=num_required_blocks,
+                    required_blocks=evict_block_num,
+                    evicted_blocks=len(evicted_blocks),
+                    free_blocks_before=free_before,
+                    free_blocks_after=free_after,
+                    total_blocks=self.mempool.num_total_blocks,
+                    duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
+                    sample_block_hashes=sample_block_hashes,
+                    target_met=target_met,
+                )
             if protected_node is not None:
                 self.index.unlock(protected_node)
 
@@ -1726,7 +1825,7 @@ class GlobalCacheEngine:
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
             fragment2_num_blocks = 0
-            
+
         # NOTE: to avoid full kv repeating write in mooncake store.
         if self.use_mooncake_store_backend:
             kv_hit = int(getattr(remote_matched_result, "kv_matched_blocks", 0)

@@ -66,6 +66,19 @@ target_include_directories(xxhash PUBLIC
 
 install(FILES ${XXHASH_HEADERS} DESTINATION include)
 
+# ==================== Native Logging ====================
+if(NOT IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/third_party/spdlog/include")
+    message(FATAL_ERROR
+        "third_party/spdlog is missing; run git submodule update --init third_party/spdlog")
+endif()
+
+add_library(flexkv_logging STATIC csrc/logging.cpp)
+set_target_properties(flexkv_logging PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(flexkv_logging PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/spdlog/include
+)
+
 # ==================== prometheus-cpp Library ====================
 # Step 1: Auto-detect default from directory existence
 if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prometheus-cpp")
@@ -152,6 +165,7 @@ if(FLEXKV_ENABLE_MONITORING)
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/prometheus-cpp/pull/include
     )
     target_link_libraries(flexkv_monitoring PUBLIC
+        flexkv_logging
         prometheus-cpp::pull
         prometheus-cpp::core
     )

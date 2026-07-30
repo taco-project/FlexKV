@@ -1,7 +1,7 @@
 // Pcfs.cpp
 #include "pcfs.h"
+#include "logging.h"
 #include <fcntl.h>
-#define INIT_IO_SIZE (1024 * 1024)
 #define MAX_PCFS_LINK_NUM 64 // read + write <= 128, pcfs limits
 
 flexkv::Pcfs::Pcfs(const std::string &fsid, uint32_t port,
@@ -15,8 +15,10 @@ flexkv::Pcfs::~Pcfs() { destroy(); }
 bool flexkv::Pcfs::init() {
   fsctx = hifs_init(fsid.c_str(), port, ip.c_str(), false, nullptr);
   if (!fsctx) {
-    fprintf(stderr, "HIFS初始化失败 (fsid=%s, ip=%s)\n", fsid.c_str(),
-            ip.c_str());
+    FLEXKV_LOG_ERROR(
+        "operation=pcfs_init act=complete status=failed fsid=\"%s\" "
+        "ip=\"%s\" port=%u",
+        fsid.c_str(), ip.c_str(), port);
     return false;
   }
   return true;
@@ -57,8 +59,10 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
     crreq.unique = 1000;
     snprintf(crreq.name, sizeof(crreq.name), "%s", filename.c_str());
     if (hifs_create(fsctx, &crreq, &crreply) != 0 || crreply.error != 0) {
-      fprintf(stderr, "embedded create file data pnodeid:%lu file %s fail\n",
-              parent_nodeid, crreq.name);
+      FLEXKV_LOG_ERROR(
+          "operation=pcfs_file_create act=complete status=failed "
+          "parent_node_id=%lu path=\"%s\" error_code=%d",
+          parent_nodeid, crreq.name, crreply.error);
       return 0;
     }
     file_nodeid = crreply.nodeid;
@@ -72,8 +76,10 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
 
     if (hifs_open(fsctx, &open_req, &open_reply) != 0 ||
         open_reply.error != 0) {
-      fprintf(stderr, "embedded open file data pnodeid:%lu file %s fail\n",
-              parent_nodeid, filename.c_str());
+      FLEXKV_LOG_ERROR(
+          "operation=pcfs_file_open act=complete status=failed "
+          "parent_node_id=%lu path=\"%s\" error_code=%d",
+          parent_nodeid, filename.c_str(), open_reply.error);
       return 0;
     }
     hifs_truncate_req_t truncate_req = {0};
@@ -85,45 +91,21 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
     truncate_req.size = file_size;
     if (hifs_truncate(fsctx, &truncate_req, &truncate_reply) != 0 ||
         truncate_reply.error != 0) {
-      fprintf(
-          stderr,
-          "embedded truncate file data pnodeid:%lu file %s to size %lu fail\n",
-          parent_nodeid, filename.c_str(), file_size);
+      FLEXKV_LOG_ERROR(
+          "operation=pcfs_file_truncate act=complete status=failed "
+          "parent_node_id=%lu path=\"%s\" size=%lu error_code=%d",
+          parent_nodeid, filename.c_str(), file_size, truncate_reply.error);
       return 0;
     }
 
-    // init with 0x00
-    // char *buffer = static_cast<char*>(malloc(INIT_IO_SIZE));
-    // if (!buffer) {
-    //     return false;
-    // }
-    // memset(buffer, 0, INIT_IO_SIZE);
-
-    // size_t remaining = file_size;
-    // size_t offset = 0;
-    // for (offset = 0; remaining > 0; offset += INIT_IO_SIZE) {
-    //     size_t write_size = (remaining > INIT_IO_SIZE) ? INIT_IO_SIZE :
-    //     remaining; hifs_write_req_t wrreq = {0}; hifs_write_reply_t wrreply =
-    //     {0}; wrreq.fh = open_reply.fh; wrreq.offset = offset; wrreq.size =
-    //     write_size; wrreq.buf = buffer; wrreq.uid = 0; wrreq.gid = 0;
-    //     wrreq.unique= 1000;
-    //     if (hifs_write(fsctx, &wrreq, &wrreply) != 0 || wrreply.error != 0) {
-    //         fprintf(stderr, "embedded write file data pnodeid:%lu file %s
-    //         fail\n", open_reply.fh, filename.c_str()); free(buffer); return
-    //         0;
-    //     }
-
-    //     remaining -= write_size;
-    // }
-    // free(buffer);
   } else {
     // return 0 if the size is smaller than file_size
     uint64_t exist_file_size = lkreply.attr.size;
     if (exist_file_size < file_size) {
-      fprintf(
-          stderr,
-          "file exists and its size smaller than allocate: %lu file %s fail\n",
-          parent_nodeid, filename.c_str());
+      FLEXKV_LOG_ERROR(
+          "operation=pcfs_file_validate act=complete status=failed "
+          "parent_node_id=%lu path=\"%s\" existing_size=%lu required_size=%lu",
+          parent_nodeid, filename.c_str(), exist_file_size, file_size);
       return 0;
     }
     hifs_open_req_t open_req = {0};
@@ -136,8 +118,10 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
 
     if (hifs_open(fsctx, &open_req, &open_reply) != 0 ||
         open_reply.error != 0) {
-      fprintf(stderr, "embedded open file data pnodeid:%lu file %s fail\n",
-              parent_nodeid, filename.c_str());
+      FLEXKV_LOG_ERROR(
+          "operation=pcfs_file_open act=complete status=failed "
+          "parent_node_id=%lu path=\"%s\" error_code=%d",
+          parent_nodeid, filename.c_str(), open_reply.error);
       return 0;
     }
   }
