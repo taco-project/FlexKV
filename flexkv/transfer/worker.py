@@ -79,6 +79,8 @@ from flexkv.transfer.compression.common.strategy import (
     NullCompressionStrategy,
 )
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
+from flexkv.transfer import trace
+trace.configure(GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace)
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.external.mooncake_store_keys import PoolKind, build_key
@@ -490,6 +492,7 @@ class TransferWorkerBase(ABC):
                 op = self.transfer_conn.recv()
                 if op is None:
                     return
+                op._received_ns = time.perf_counter_ns()
 
                 batch_ops = [op]
                 shutdown_after_batch = False
@@ -498,60 +501,75 @@ class TransferWorkerBase(ABC):
                     if op is None:
                         shutdown_after_batch = True
                         break
-                    batch_ops = [op]
-                    for op in batch_ops:
-                        transfer_status = False
-                        transfer_start_ns = time.perf_counter_ns()
-                        nvtx_pushed = False
+                    op._received_ns = time.perf_counter_ns()
+                    batch_ops.append(op)
+                for op in batch_ops:
+                    transfer_status = False
+                    transfer_start_ns = time.perf_counter_ns()
+                    nvtx_pushed = False
+                    try:
+                        nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
+                                            f"graph_id: {op.transfer_graph_id}",
+                                            color=get_nvtx_range_color(op.transfer_graph_id))
+                        nvtx_pushed = True
+                        transfer_status = self.launch_transfer(op)
+                    except Exception as e:
+                        is_layerwise = op.transfer_type == TransferType.LAYERWISE
+                        direction = "H2D" if is_layerwise else op.transfer_type.value
+                        blocks = (
+                            len(op.src_block_ids_h2d)
+                            if is_layerwise
+                            else op.valid_block_num
+                        )
+                        flexkv_logger.error(
+                            "[FlexKV-IO] operation=transfer act=complete "
+                            "status=failed direction=%s blocks=%d op_id=%d "
+                            "graph_id=%d mode=%s transfer_time=%.4fs "
+                            "error=%r",
+                            direction,
+                            blocks,
+                            op.transfer_op_id,
+                            op.transfer_graph_id,
+                            "layerwise" if is_layerwise else "no-layerwise",
+                            (time.perf_counter_ns() - transfer_start_ns) / 1e9,
+                            str(e),
+                            exc_info=True,
+                        )
+                    finally:
+                        if nvtx_pushed:
+                            nvtx.pop_range()
+                    launched_ns = time.perf_counter_ns()
+                    is_h2d = (op.transfer_type == TransferType.H2D
+                              or op.transfer_type == TransferType.LAYERWISE)
+                    metrics = trace.build_worker_metrics(
+                        op,
+                        getattr(op, "prof_submitted_ns", 0),
+                        getattr(op, "_received_ns", launched_ns),
+                        transfer_start_ns,
+                        launched_ns,
+                        self.worker_id,
+                        getattr(self, "_bytes_per_block", 0),
+                        getattr(self, "is_mla", False),
+                        is_h2d,
+                    )
+                    if transfer_status:
+                        self.finished_ops_queue.put(
+                            (op.transfer_op_id, True, metrics))
+                    else:
+                        # Report the failure instead of dropping it: a
+                        # dropped op leaves its graph incomplete forever
+                        # and leaks every resource its plan holds. A bare
+                        # int still means success, so the queue format
+                        # stays compatible.
+                        self.finished_ops_queue.put(
+                            (op.transfer_op_id, False, None))
+                if shutdown_after_batch:
+                    if hasattr(self, "shutdown") and callable(self.shutdown):
                         try:
-                            nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
-                                                f"graph_id: {op.transfer_graph_id}",
-                                                color=get_nvtx_range_color(op.transfer_graph_id))
-                            nvtx_pushed = True
-                            transfer_status = self.launch_transfer(op)
+                            self.shutdown()
                         except Exception as e:
-                            is_layerwise = op.transfer_type == TransferType.LAYERWISE
-                            direction = "H2D" if is_layerwise else op.transfer_type.value
-                            blocks = (
-                                len(op.src_block_ids_h2d)
-                                if is_layerwise
-                                else op.valid_block_num
-                            )
-                            flexkv_logger.error(
-                                "[FlexKV-IO] operation=transfer act=complete "
-                                "status=failed direction=%s blocks=%d op_id=%d "
-                                "graph_id=%d mode=%s transfer_time=%.4fs "
-                                "error=%r",
-                                direction,
-                                blocks,
-                                op.transfer_op_id,
-                                op.transfer_graph_id,
-                                "layerwise" if is_layerwise else "no-layerwise",
-                                (time.perf_counter_ns() - transfer_start_ns) / 1e9,
-                                str(e),
-                                exc_info=True,
-                            )
-                        finally:
-                            if nvtx_pushed:
-                                nvtx.pop_range()
-                        if transfer_status:
-                            self.finished_ops_queue.put(op.transfer_op_id)
-                        else:
-                            # Report the failure instead of dropping it: a
-                            # dropped op leaves its graph incomplete forever
-                            # and leaks every resource its plan holds. A bare
-                            # int still means success, so the queue format
-                            # stays compatible.
-                            self.finished_ops_queue.put((op.transfer_op_id, False))
-                    if shutdown_after_batch:
-                        if hasattr(self, "shutdown") and callable(self.shutdown):
-                            try:
-                                self.shutdown()
-                            except Exception as e:
-                                flexkv_logger.error(f"Error when shut down worker: {e}")
-                        break
-                else:
-                    continue
+                            flexkv_logger.error(f"Error when shut down worker: {e}")
+                    break
             except EOFError:
                 flexkv_logger.warning(
                     f"[worker {self.worker_id}] transfer pipe EOF; exiting run loop"
@@ -573,6 +591,11 @@ class WorkerHandle:
             worker_op = WorkerLayerwiseTransferOp(op)
         else:
             worker_op = WorkerTransferOp(op)
+        if trace._TRACE_ON:
+            submitted_ns = time.perf_counter_ns()
+            worker_op.prof_submitted_ns = submitted_ns
+            trace.set_submit_ns(op.op_id, submitted_ns)
+            trace.inc_inflight()
         self.transfer_conn.send(worker_op)
 
     def shutdown(self) -> None:
@@ -628,13 +651,16 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  gpu_layouts_per_group: Optional[List[KVCacheLayout]] = None) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+
         # Bind CUDA device BEFORE host-register / IPC import / Stream creation.
         ensure_cuda_device(gpu_device_id)
+
         self._pin_op_buffer()
         # Register CPU tensors with CUDA
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         self._register_host_tensor(cpu_blocks, "cpu_kv_pool")
+
         self.gpu_blocks = import_tensor_handles(gpu_blocks)
         # Get pointers first
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
@@ -664,6 +690,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
             # a chunk can be located by layer_id * layer_stride + kv_id * kv_stride + block_id * block_stride
             self.chunk_size_in_bytes = gpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+            # Bytes per KV block (all layers); used by transfer tracing for bw.
+            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
 
             # Compute GPU strides from actual tensor to handle different attention
             # backend layouts (flash_attn: [2,N,B,H,D], triton: [N,2,B,H,D]).
@@ -881,6 +909,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     -1,  # ce_force_path
                     self.ce_enable_memcpy2d,
                     self.cpu_is_blockfirst,
+                    enable_transfer_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
                 )
         else:
             # Uniform transfer: single call (whole-model)
@@ -909,6 +938,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 -1,  # ce_force_path
                 self.ce_enable_memcpy2d,
                 self.cpu_is_blockfirst,
+                enable_transfer_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -1043,6 +1073,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
             self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
             self.chunk_size_in_bytes = self.cpu_chunk_size_in_bytes
+            # Bytes per KV block (all layers); used by transfer tracing for bw.
+            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
             # tp has effect on the layout of the cpu tensor
             # the tp dim should always be right after the block dim
             # on both blockfirst layout and layerfirst layout
@@ -1378,6 +1410,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
             self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
             self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+            # Bytes per KV block (all layers); used by transfer tracing for bw.
+            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
 
         try:
             self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), GLOBAL_CONFIG_FROM_ENV.iouring_entries,
@@ -1588,6 +1622,8 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         self.cpu_block_stride_in_bytes = self.block_size * self.dtype.itemsize
 
         self.chunk_size_in_bytes = self.block_size * self.dtype.itemsize
+        # Bytes per KV block (all layers); used by transfer tracing for bw.
+        self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
         # 144115188075855883 only use int not c_types.u_int64
         if not remote_config_custom:
             raise RuntimeError("remote_config_custom is not provided")
@@ -1801,6 +1837,8 @@ class GDSTransferWorker(TransferWorkerBase):
             # GPU layout calculations — compute strides from actual tensor to handle
             # different attention backend layouts (flash_attn vs triton/flashinfer).
             self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
+            # Bytes per KV block (all layers); used by transfer tracing for bw.
+            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
             gpu_strides = self._get_gpu_strides_from_tensor(
                 self.gpu_blocks[0], gpu_kv_layout.tokens_per_block,
                 self.dtype.itemsize, self.is_mla,
@@ -2103,7 +2141,10 @@ class tpGDSTransferWorker(TransferWorkerBase):
         else:
             ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
             self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
+            self.chunk_size_in_bytes = self.ssd_chunk_size_in_bytes
             self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+            # Bytes per KV block (all layers); used by transfer tracing for bw.
+            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
             if not self.is_mla:
                 ssd_kv_layout_per_file = ssd_kv_layout_per_file.div_head(self.tp_group_size)
 
@@ -2441,6 +2482,7 @@ class NixlTransferWorker(TransferWorkerBase):
 
         self.num_layers = gpu_kv_layout.num_layer
         self.is_mla = gpu_kv_layout.is_mla
+        self.kv_dim = gpu_kv_layout.kv_dim
 
         # SSD / file-side layout (same for every NIXL FILE backend).
         ssd_pf = ssd_kv_layout.div_block(self.num_files, padding=True)
@@ -2516,6 +2558,9 @@ class NixlTransferWorker(TransferWorkerBase):
                 raise RuntimeError("NIXL: prepare_all_ssd_files failed")
             if not self._session.prepare_dram_cpu(self.cpu_blocks):
                 raise RuntimeError("NIXL: prepare_dram_cpu failed")
+
+        # Bytes per KV block (all layers); used by transfer tracing for bw.
+        self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
 
     def _transfer_impl(
         self,
@@ -2730,6 +2775,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         self.is_mla = cpu_kv_layout.is_mla
         self.kv_dim = cpu_kv_layout.kv_dim
+        # Bytes per KV block (all layers); used by transfer tracing for bw.
+        self._bytes_per_block = self.block_size * self.dtype.itemsize * self.num_layers * self.kv_dim
 
         self.cpu_blocks = cpu_blocks  ## shared memory
         self.cache_config = cache_config
@@ -3687,6 +3734,8 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         # Opaque whole-block I/O: multi-group CPU layout is byte-flat
         # ([num_block, bytes_per_block]); get_chunk_size() is invalid there.
         self.block_size_bytes = self._block_size_bytes(cpu_kv_layout, dtype)
+        # Bytes per KV block (all layers); used by transfer tracing for bw.
+        self._bytes_per_block = self.block_size_bytes
 
         from flexkv.external.mooncake_store_utils import MooncakeStoreClient, MooncakeStoreConfig
         store_config = MooncakeStoreConfig.from_file(

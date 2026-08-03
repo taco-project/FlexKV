@@ -172,7 +172,8 @@ public:
       const int swa_num_blocks_per_file = 0,
       // ---- MLA D2H mode (#192) + polling notification (#199) ----
       const std::string &mla_d2h_mode = "sharded",
-      const std::string &notify_mode = "hostfunc");
+      const std::string &notify_mode = "hostfunc",
+      const bool enable_trace = false);
 
   // Multi-group layerwise transfer: SSD->CPU per group, CPU->GPU per original
   // layer (expanding the CSR to fire one transfer kernel per group member).
@@ -201,7 +202,8 @@ public:
       const int64_t swa_ssd_kv_stride_in_bytes = 0,
       const int swa_num_blocks_per_file = 0,
       const std::string &mla_d2h_mode = "sharded",
-      const std::string &notify_mode = "hostfunc");
+      const std::string &notify_mode = "hostfunc",
+      const bool enable_trace = false);
 
   // Bind heterogeneous SWA/state sidecars (SWA KV + compress states) onto the
   // same LayerwiseTransferGroup.  Mutually exclusive with the uniform

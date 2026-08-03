@@ -968,7 +968,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t swa_ssd_layer_stride_in_bytes,
     const int64_t swa_ssd_kv_stride_in_bytes,
     const int swa_num_blocks_per_file, const std::string &mla_d2h_mode,
-    const std::string &notify_mode) {
+    const std::string &notify_mode, const bool enable_trace) {
 
   if (has_multi_group_) {
     throw std::runtime_error(
@@ -1253,6 +1253,29 @@ void LayerwiseTransferGroup::layerwise_transfer(
     }
   }
 
+  if (enable_trace && log_timing) {
+    cudaSetDevice(gpu_device_ids_[0]);
+    for (int i = 0; i < num_batches; ++i) {
+      // event-level sync
+      cudaEventSynchronize(timing_events[i + 1]);
+      float sync_ms = 0.0f;
+      cudaEventElapsedTime(&sync_ms, timing_events[i], timing_events[i + 1]);
+      int layers_this_batch = batch_layers_count[i];
+      int64_t h2d_bytes = 0;
+      for (int g = 0; g < num_gpus_; ++g) {
+        h2d_bytes +=
+            gpu_chunk_sizes_in_bytes_[g] * 2 * layers_this_batch * num_blocks;
+      }
+      double data_mb = h2d_bytes / (1024.0 * 1024.0);
+      double bw_mbs = (sync_ms > 0.0f) ? data_mb / (sync_ms / 1000.0) : 0.0;
+      int sl = i * layer_granularity;
+      FLEXKV_LOG_INFO(
+          "[XFER] type=layerwise_h2d layer_range=[%d,%d) blocks=%d "
+          "data=%.2fMB sync_ms=%.3f bw=%.0fMB/s",
+          sl, sl + layers_this_batch, num_blocks, data_mb, sync_ms, bw_mbs);
+    }
+  }
+
   if (log_timing) {
     float total_time_ms = 0.0f;
     int64_t total_bytes = 0;
@@ -1302,7 +1325,7 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     const int64_t swa_ssd_layer_stride_in_bytes,
     const int64_t swa_ssd_kv_stride_in_bytes,
     const int swa_num_blocks_per_file, const std::string &mla_d2h_mode,
-    const std::string &notify_mode) {
+    const std::string &notify_mode, const bool enable_trace) {
   (void)swa_cpu_tp_stride_in_bytes;
 
   if (!has_multi_group_) {
@@ -1462,10 +1485,38 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     h2d_range_ids[first] = nvtxRangeStartA(h2d_range_names[first].c_str());
   }
 
+  const bool mg_trace = enable_trace &&
+                        notify_mode_ != NotifyMode::POLLING &&
+                        logging::IsEnabled(logging::Level::Debug) &&
+                        !work_origs.empty();
+  std::vector<std::vector<cudaEvent_t>> trace_begin_events(
+      mg_trace ? work_origs.size() : 0,
+      std::vector<cudaEvent_t>(mg_trace ? num_gpus_ : 0));
+  std::vector<std::vector<cudaEvent_t>> trace_end_events(
+      mg_trace ? work_origs.size() : 0,
+      std::vector<cudaEvent_t>(mg_trace ? num_gpus_ : 0));
+  std::vector<int64_t> data_bytes_per_orig(work_origs.size(), 0);
+  if (mg_trace) {
+    for (size_t ai = 0; ai < work_origs.size(); ++ai) {
+      for (int d = 0; d < num_gpus_; ++d) {
+        cudaSetDevice(gpu_device_ids_[d]);
+        cudaEventCreate(&trace_begin_events[ai][d]);
+        cudaEventCreate(&trace_end_events[ai][d]);
+      }
+    }
+  }
+
   for (size_t ai = 0; ai < work_origs.size(); ++ai) {
     int orig = work_origs[ai];
     const auto &members = layer_members_[orig];
     int members_this_layer = static_cast<int>(members.size());
+
+    if (mg_trace) {
+      for (int d = 0; d < num_gpus_; ++d) {
+        cudaSetDevice(gpu_device_ids_[d]);
+        cudaEventRecord(trace_begin_events[ai][d], streams_[d]);
+      }
+    }
 
     for (const auto &member : members) {
       int gi = member.first;
@@ -1514,6 +1565,21 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
           break;
         }
       }
+    }
+
+    if (mg_trace) {
+      for (int d = 0; d < num_gpus_; ++d) {
+        cudaSetDevice(gpu_device_ids_[d]);
+        cudaEventRecord(trace_end_events[ai][d], streams_[d]);
+      }
+      int64_t per_orig_bytes = 0;
+      for (const auto &m : members) {
+        const GroupParams &gp = groups_[m.first];
+        for (int d = 0; d < num_gpus_; ++d) {
+          per_orig_bytes += gp.gpu_chunk_sizes[d] * 2 * num_blocks;
+        }
+      }
+      data_bytes_per_orig[ai] = per_orig_bytes;
     }
 
     if (swa_active) {
@@ -1566,6 +1632,39 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
         throw std::runtime_error(
             "layerwise_transfer_multi_group failed on GPU " +
             std::to_string(d) + ": " + cudaGetErrorString(err));
+      }
+    }
+    if (mg_trace) {
+      for (size_t ai = 0; ai < work_origs.size(); ++ai) {
+        int orig = work_origs[ai];
+        float max_ms = 0.0f;
+        for (int d = 0; d < num_gpus_; ++d) {
+          cudaEventSynchronize(trace_end_events[ai][d]);
+          float ms = 0.0f;
+          cudaEventElapsedTime(&ms, trace_begin_events[ai][d],
+                               trace_end_events[ai][d]);
+          if (ms > max_ms) {
+            max_ms = ms;
+          }
+        }
+        double data_mb = data_bytes_per_orig[ai] / (1024.0 * 1024.0);
+        double bw_mbs = (max_ms > 0.0f) ? data_mb / (max_ms / 1000.0) : 0.0;
+        FLEXKV_LOG_INFO(
+            "[XFER] type=layerwise_mg_h2d orig=%d members=%zu gpus=%d "
+            "sync_ms=%.3f data=%.2fMB bw=%.0fMB/s",
+            orig, layer_members_[orig].size(), num_gpus_, max_ms, data_mb,
+            bw_mbs);
+      }
+    }
+  }
+
+  // destroy trace timing events
+  if (mg_trace) {
+    for (size_t ai = 0; ai < work_origs.size(); ++ai) {
+      for (int d = 0; d < num_gpus_; ++d) {
+        cudaSetDevice(gpu_device_ids_[d]);
+        cudaEventDestroy(trace_begin_events[ai][d]);
+        cudaEventDestroy(trace_end_events[ai][d]);
       }
     }
   }

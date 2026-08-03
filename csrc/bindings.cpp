@@ -64,7 +64,8 @@ void transfer_kv_blocks_binding(
     bool ce_path_opt = false,
     int ce_segment_threshold = 8, int ce_force_path = -1,
     bool ce_enable_memcpy2d = false, bool is_blockfirst = false,
-    int ce_gather_threads = 4, bool ce_gather_nt = true) {
+    int ce_gather_threads = 4, bool ce_gather_nt = true,
+    bool enable_transfer_trace = false) {
   int num_blocks = gpu_block_id_tensor.numel();
 
   int64_t *gpu_block_ids =
@@ -117,7 +118,7 @@ void transfer_kv_blocks_binding(
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
         use_ce_transfer, is_mla,
-        gpu_block_stride_in_bytes, sync, ce_config);
+        gpu_block_stride_in_bytes, sync, ce_config, enable_transfer_trace);
     break;
   case flexkv::BackendType::TRTLLM:
     flexkv::transfer_kv_blocks<flexkv::BackendType::TRTLLM>(
@@ -127,7 +128,7 @@ void transfer_kv_blocks_binding(
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
         use_ce_transfer, is_mla,
-        gpu_block_stride_in_bytes, sync, ce_config);
+        gpu_block_stride_in_bytes, sync, ce_config, enable_transfer_trace);
     break;
   case flexkv::BackendType::SGLANG:
     flexkv::transfer_kv_blocks<flexkv::BackendType::SGLANG>(
@@ -137,7 +138,7 @@ void transfer_kv_blocks_binding(
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
         use_ce_transfer, is_mla,
-        gpu_block_stride_in_bytes, sync, ce_config);
+        gpu_block_stride_in_bytes, sync, ce_config, enable_transfer_trace);
     break;
   }
 
@@ -447,7 +448,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("ce_enable_memcpy2d") = false,
         py::arg("is_blockfirst") = false,
         py::arg("ce_gather_threads") = 4,
-        py::arg("ce_gather_nt") = true);
+        py::arg("ce_gather_nt") = true,
+        py::arg("enable_transfer_trace") = false);
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory", py::arg("ioctx"),
         py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),
@@ -676,7 +678,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("swa_ssd_kv_stride_in_bytes") = 0,
            py::arg("swa_num_blocks_per_file") = 0,
            py::arg("mla_d2h_mode") = "sharded",
-           py::arg("notify_mode") = "hostfunc")
+           py::arg("notify_mode") = "hostfunc",
+           py::arg("enable_trace") = false)
       .def("layerwise_transfer_multi_group",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer_multi_group,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -700,7 +703,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("swa_ssd_kv_stride_in_bytes") = 0,
            py::arg("swa_num_blocks_per_file") = 0,
            py::arg("mla_d2h_mode") = "sharded",
-           py::arg("notify_mode") = "hostfunc");
+           py::arg("notify_mode") = "hostfunc",
+           py::arg("enable_trace") = false);
 
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
