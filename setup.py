@@ -1,3 +1,4 @@
+import importlib.metadata
 import importlib.util
 import os
 import shutil
@@ -133,12 +134,59 @@ def _probe_nvcomp_root(root, source):
     return None
 
 
+def _cuda_major():
+    """Return the CUDA major version used by PyTorch, when available."""
+    try:
+        import torch
+        if torch.version.cuda:
+            return int(torch.version.cuda.split(".", 1)[0])
+    except (ImportError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _pip_nvcomp_roots(cuda_major):
+    """Yield nvCOMP roots installed by either supported NVIDIA wheel."""
+    supported_majors = (cuda_major,) if cuda_major in (12, 13) else (13, 12)
+    seen = set()
+
+    # The standalone C++ wheels can be namespace packages, for which
+    # find_spec("nvidia.nvcomp").origin is None. CUDA 13 wheels use
+    # nvidia/libnvcomp while older wheels may use nvidia/nvcomp.
+    for major in supported_majors:
+        for dist_name in (
+                f"nvidia-libnvcomp-cu{major}",
+                f"nvidia-nvcomp-cu{major}"):
+            try:
+                dist = importlib.metadata.distribution(dist_name)
+            except importlib.metadata.PackageNotFoundError:
+                continue
+            for package_dir in ("nvidia/libnvcomp", "nvidia/nvcomp"):
+                root = Path(dist.locate_file(package_dir))
+                if root not in seen:
+                    seen.add(root)
+                    yield root, f"pip {dist_name} ({root})"
+
+    if cuda_major not in (12, 13):
+        # Retain compatibility with older wheels that expose an importable
+        # module but may not have one of the current distribution names.
+        spec = importlib.util.find_spec("nvidia.nvcomp")
+        if spec:
+            roots = list(spec.submodule_search_locations or ())
+            if spec.origin:
+                roots.append(os.path.dirname(spec.origin))
+            for root in map(Path, roots):
+                if root not in seen:
+                    seen.add(root)
+                    yield root, f"pip nvidia.nvcomp ({root})"
+
+
 def _find_nvcomp(nvcomp_root):
     """Locate public nvcomp headers and library.
 
     Probing priority:
       1. NVCOMP_ROOT (error if set but not usable; no silent fallback).
-      2. pip-installed nvidia-nvcomp-cu12 (via importlib.find_spec).
+      2. CUDA-matched nvidia-libnvcomp-cu{12,13} / nvidia-nvcomp-cu{12,13}.
       3. System /usr.
     """
     if nvcomp_root:
@@ -152,13 +200,9 @@ def _find_nvcomp(nvcomp_root):
             )
         return result
 
-    spec = importlib.util.find_spec("nvidia.nvcomp")
-    if spec and spec.origin:
-        pip_root = os.path.dirname(spec.origin)
-        result = _probe_nvcomp_root(
-            pip_root,
-            f"pip nvidia-nvcomp-cu12 ({pip_root})",
-        )
+    cuda_major = _cuda_major()
+    for pip_root, source in _pip_nvcomp_roots(cuda_major):
+        result = _probe_nvcomp_root(pip_root, source)
         if result:
             return result
 
@@ -166,11 +210,13 @@ def _find_nvcomp(nvcomp_root):
     if result:
         return result
 
+    cuda_suffix = str(cuda_major) if cuda_major in (12, 13) else "{12|13}"
     raise ValueError(
-        "nvcomp not found. Install via one of:\n"
-        "  pip install nvidia-nvcomp-cu12==4.2.0.14   (recommended)\n"
-        "  a system/distro nvcomp package\n"
-        "Or set NVCOMP_ROOT=/path/to/nvcomp manually."
+        "nvcomp not found. Install the package matching this CUDA toolkit:\n"
+        f"  pip install nvidia-libnvcomp-cu{cuda_suffix}   (C++ library)\n"
+        f"  pip install nvidia-nvcomp-cu{cuda_suffix}      (Python API + C++ library)\n"
+        "Or install a system/distro package, or set "
+        "NVCOMP_ROOT=/path/to/nvcomp manually."
     )
 
 
