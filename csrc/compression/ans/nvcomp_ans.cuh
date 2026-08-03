@@ -7,6 +7,7 @@
 #include "transfer.cuh"
 
 #include "nvcomp/ans.h"
+#include "nvcomp/version.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,22 @@
 #include <vector>
 
 namespace flexkv {
+
+#if defined(NVCOMP_VER_MAJOR)
+#define FLEXKV_NVCOMP_MAJOR NVCOMP_VER_MAJOR
+#elif defined(NVCOMP_MAJOR_VERSION)
+#define FLEXKV_NVCOMP_MAJOR NVCOMP_MAJOR_VERSION
+#else
+#error "Unable to determine the nvCOMP major version"
+#endif
+
+#if FLEXKV_NVCOMP_MAJOR >= 5
+using ANSCompressOpts = nvcompBatchedANSCompressOpts_t;
+using ANSDecompressOpts = nvcompBatchedANSDecompressOpts_t;
+#else
+using ANSCompressOpts = nvcompBatchedANSOpts_t;
+using ANSDecompressOpts = nvcompBatchedANSOpts_t;
+#endif
 
 struct ANSTransferContext {
   ANSTransferContext() = default;
@@ -31,7 +48,8 @@ struct ANSTransferContext {
   size_t comp_temp_bytes = 0;
   size_t decomp_temp_bytes = 0;
 
-  nvcompBatchedANSOpts_t opts{};
+  ANSCompressOpts compress_opts{};
+  ANSDecompressOpts decompress_opts{};
 
   // GPU buffers -- compression (D2H: compress on GPU, then copy payload to CPU)
   void* d_comp_temp = nullptr;
