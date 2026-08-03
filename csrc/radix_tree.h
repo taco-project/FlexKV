@@ -340,6 +340,15 @@ protected:
                                               std::vector<int64_t> &out_blocks,
                                               std::vector<int64_t> *out_hashes);
 
+  // Validate a caller-supplied match anchor before any split, allocation, or
+  // child-map mutation. A conflict raises std::runtime_error; ownership of the
+  // supplied physical blocks remains with the caller so it can rematch/retry or
+  // recycle them. LocalRadixTree reuses the same guard in its insert override.
+  void validate_insert_target(CRadixNode *last_node,
+                              torch::Tensor &block_hashes, int num_blocks,
+                              int num_matched_blocks,
+                              int last_node_matched_length);
+
 public:
   CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000,
                   int hit_reward_seconds = 0,

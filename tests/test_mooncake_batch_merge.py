@@ -19,6 +19,8 @@ import numpy as np
 import pytest
 
 from flexkv.common.transfer import (
+    CompletedOp,
+    CompletionAwareCallback,
     TransferOp,
     TransferOpGraph,
     TransferType,
@@ -223,6 +225,54 @@ class TestBatchMergeMooncakeDependencies:
         (m_d2h,) = _find_ops(merged, transfer_type=TransferType.D2H, is_swa=True)
         (m_h2r,) = _find_ops(merged, transfer_type=TransferType.H2REMOTE, is_swa=True)
         assert m_d2h.op_id in m_h2r.predecessors
+
+    def test_remote2h_completion_is_sliced_by_original_op_span(self):
+        """A merged Mooncake result must not be broadcast to every request.
+
+        The middle failure belongs only to request A. Request B's later blocks
+        remain independently successful and must reach B's callback unchanged.
+        """
+        op_a = _mk_op(
+            TransferType.REMOTE2H,
+            [0, 1],
+            [10, 11],
+            kv_hashes=["a0", "a1"],
+        )
+        op_b = _mk_op(
+            TransferType.REMOTE2H,
+            [2, 3, 4],
+            [12, 13, 14],
+            kv_hashes=["b0", "b1", "b2"],
+        )
+        seen = {}
+
+        def capture(name):
+            return CompletionAwareCallback(
+                lambda completed: seen.__setitem__(name, completed.block_results)
+            )
+
+        merged, _, callbacks = merge_to_batch_graph(
+            99,
+            [_one_op_graph(op_a), _one_op_graph(op_b)],
+            [-1, -1],
+            {
+                op_a.op_id: capture("a"),
+                op_b.op_id: capture("b"),
+            },
+        )
+        (merged_remote2h,) = _find_ops(
+            merged, transfer_type=TransferType.REMOTE2H)
+        callbacks[merged_remote2h.op_id](CompletedOp(
+            graph_id=merged.graph_id,
+            op_id=merged_remote2h.op_id,
+            num_blocks=5,
+            block_results=(True, False, True, True, True),
+        ))
+
+        assert seen == {
+            "a": (True, False),
+            "b": (True, True, True),
+        }
 
 
 class TestBatchEndOpIdVirtualSink:

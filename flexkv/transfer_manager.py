@@ -477,9 +477,12 @@ class TransferManagerOnRemote(TransferManager):
                                 if completed_op.graph_id in self._active_graphs:
                                     task_end_op_id = self._active_graphs[completed_op.graph_id]
 
-                                    if task_end_op_id != -1 and completed_op.op_id == task_end_op_id:
-                                        end_op = CompletedOp(graph_id=completed_op.graph_id, op_id=task_end_op_id)
-                                        self.result_socket.send_pyobj(end_op)
+                                    if (completed_op.block_results is not None
+                                            or (task_end_op_id != -1
+                                                and completed_op.op_id == task_end_op_id)):
+                                        # Preserve backend-specific completion details
+                                        # (notably Mooncake per-block results).
+                                        self.result_socket.send_pyobj(completed_op)
                                     if (completed_op.is_graph_completed()
                                             or completed_op.is_graph_failed()):
                                         self.result_socket.send_pyobj(completed_op)
