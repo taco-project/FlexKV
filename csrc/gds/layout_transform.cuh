@@ -32,9 +32,8 @@ void launch_layout_transform_kernel(
     int64_t* gpu_block_ids,
     int num_blocks,
     int num_layers,
-    bool is_mla,
+    bool single_kv_region,
     bool buffer_to_target,
     cudaStream_t stream);
 
 } // namespace flexkv
-

@@ -611,7 +611,7 @@ void transfer_kv_blocks_gds(
     int64_t total_layers,
     bool is_read,
     bool verbose,
-    bool is_mla
+    bool single_kv_region
 ) {
     const int num_transfers = ssd_block_ids.size(0);
     
@@ -737,7 +737,7 @@ void transfer_kv_blocks_gds(
                         d_my_block_id,
                         1,  // num_blocks
                         num_layers,
-                        is_mla,
+                        single_kv_region,
                         true,
                         slot_stream
                     );
@@ -754,7 +754,7 @@ void transfer_kv_blocks_gds(
                         d_my_block_id,
                         1,  // num_blocks
                         num_layers,
-                        is_mla,
+                        single_kv_region,
                         false,
                         slot_stream
                     );

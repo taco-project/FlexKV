@@ -124,6 +124,7 @@ class FlexKVReplayEngine:
             num_kv_heads=model_config_data['num_kv_heads'],
             head_size=8,#model_config_data['head_size'], # for local test
             use_mla=model_config_data['use_mla'],
+            packed_kv=model_config_data.get('packed_kv', False),
             dtype=dtype,
             tp_size=1,#model_config_data['tp_size'], # for local test
             dp_size=1,#model_config_data['dp_size'], # for local test
@@ -199,7 +200,7 @@ class FlexKVReplayEngine:
 
             for layer_id in range(self.model_config.num_layers):
                 # Create KV cache tensor: [2, num_blocks, tokens_per_block, num_heads, head_size]
-                kv_dim = 2 if not self.model_config.use_mla else 1
+                kv_dim = self.model_config.kv_dim
                 kv_tensor = torch.zeros(  # Use zeros instead of random for reproducibility
                     size=(kv_dim, self.gpu_blocks_num, self.cache_config.tokens_per_block,
                           self.model_config.num_kv_heads // self.model_config.tp_size,
@@ -264,7 +265,8 @@ class FlexKVReplayEngine:
                 tokens_per_block=self.cache_config.tokens_per_block,
                 num_head=self.model_config.num_kv_heads // self.model_config.tp_size,
                 head_size=self.model_config.head_size,
-                is_mla=self.model_config.use_mla
+                is_mla=self.model_config.use_mla,
+                packed_kv=self.model_config.packed_kv,
             )
 
         # Create KVTaskEngine with gpu_register_port

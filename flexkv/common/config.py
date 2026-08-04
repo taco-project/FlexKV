@@ -110,6 +110,9 @@ class ModelConfig:
     num_kv_heads: int = 1
     head_size: int = 1
     use_mla: bool = False
+    # Packed layouts remove the separate K/V dimension.  Backends may encode
+    # K/V in the content width or in additional physical head slots.
+    packed_kv: bool = False
     dtype: torch.dtype = torch.bfloat16
 
     # ------------------------------------------------------------------
@@ -365,8 +368,12 @@ class ModelConfig:
 
     @property
     def kv_dim(self) -> int:
-        """KV dimension: 1 for MLA (no head split), 2 for standard (head split)."""
-        return 1 if self.use_mla else 2
+        """Number of KV regions: 1 when K and V share one, else 2.
+
+        MLA's latent KV has no separate V, and a packed layout keeps V inside
+        ``head_size``; both therefore report a single region.
+        """
+        return 1 if self.use_mla or self.packed_kv else 2
 
     @property
     def bytes_per_token_per_layer(self) -> int:
@@ -381,7 +388,7 @@ class ModelConfig:
     @property
     def token_size_in_bytes(self) -> int:
         """Whole-model per-token KV footprint (bytes) across all layers/groups."""
-        kv_dim = 1 if self.use_mla else 2
+        kv_dim = self.kv_dim
         if self.layer_groups:
             # layer_groups store per-GPU num_kv_heads; multiply by tp_size
             # to get full-model per-token size (matching CPU/SSD block sizing).
@@ -407,6 +414,7 @@ class ModelConfig:
         return (
             f"ModelConfig(num_layers={self.num_layers}, num_kv_heads={self.num_kv_heads}"
             f", head_size={self.head_size}, use_mla={self.use_mla}"
+            f", packed_kv={self.packed_kv}"
             f", dtype={self.dtype}"
             f", tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}"
             f", cp_size={self.cp_size}"

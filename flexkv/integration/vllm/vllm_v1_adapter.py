@@ -27,6 +27,41 @@ from vllm.distributed.parallel_state import get_tp_group
 try:
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 
+    class _FlexKVConnectorStats(KVConnectorStats):
+        """Serializable vLLM stats snapshot for the FlexKV scheduler side."""
+
+        _RATIO_KEYS = {"get_gpu_match_ratio", "get_flexkv_match_ratio"}
+
+        def reset(self):
+            for key in self.data:
+                self.data[key] = 0
+
+        def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
+            if other.is_empty():
+                return self
+            for key, value in other.data.items():
+                if key not in self._RATIO_KEYS:
+                    self.data[key] = self.data.get(key, 0) + value
+            query_tokens = self.data.get("num_get_query_tokens", 0)
+            self.data["get_gpu_match_ratio"] = (
+                self.data.get("num_gpu_matched_tokens", 0) / query_tokens
+                if query_tokens else 0.0
+            )
+            self.data["get_flexkv_match_ratio"] = (
+                self.data.get("num_flexkv_matched_tokens", 0) / query_tokens
+                if query_tokens else 0.0
+            )
+            return self
+
+        def reduce(self) -> dict[str, int | float]:
+            return dict(self.data)
+
+        def is_empty(self) -> bool:
+            return not any(
+                value for key, value in self.data.items()
+                if key not in self._RATIO_KEYS
+            )
+
     class _FlexKVWorkerSentinelStats(KVConnectorStats):
         """Sentinel stats returned from the worker side so that
         KVConnectorOutput.is_empty() returns False.  The scheduler
@@ -47,6 +82,7 @@ try:
 
 except ImportError:
     KVConnectorStats = None  # type: ignore[misc,assignment]
+    _FlexKVConnectorStats = None  # type: ignore[misc,assignment]
     _FlexKVWorkerSentinelStats = None  # type: ignore[misc,assignment]
 
 # KVConnectorOutput: available since v0.10.1
@@ -73,6 +109,39 @@ if TYPE_CHECKING:
 
 
 logger = flexkv_logger
+
+
+def _assert_token_major(kv_cache: torch.Tensor, token_dim: int,
+                        head_dim: int) -> None:
+    """Reject a KV cache whose heads outrank its tokens in memory.
+
+    A cache has the same logical shape under both of vLLM's cache layouts;
+    only the strides differ.  NHD stores it token-major, which is the order
+    FlexKV's workers assume, while HND stores it head-major.  Since the
+    workers derive addresses from KVCacheLayout's shape-implied strides and
+    never read ``tensor.stride()``, an HND cache would be read at the wrong
+    offsets and silently corrupt KV, so refuse it here.
+
+    Either extent being 1 makes the two layouts byte-identical, so those are
+    accepted -- a rank of a GQA model with one KV head is the common case.
+
+    Args:
+        kv_cache (torch.Tensor): one layer's KV cache.
+        token_dim (int): index of the tokens-per-block dimension.
+        head_dim (int): index of the KV-heads dimension.
+
+    Raises:
+        ValueError: if the cache is head-major (HND) rather than token-major.
+    """
+    if kv_cache.shape[head_dim] == 1 or kv_cache.shape[token_dim] == 1:
+        return
+    strides = kv_cache.stride()
+    if strides[head_dim] > strides[token_dim]:
+        raise ValueError(
+            "KV cache is head-major (HND); FlexKV addresses KV token-major. "
+            "Leave VLLM_KV_CACHE_LAYOUT unset to get the NHD default. "
+            f"shape={tuple(kv_cache.shape)} stride={strides}"
+        )
 
 
 @dataclass
@@ -739,9 +808,29 @@ class FlexKVWorkerConnector:
             block_size = gpu_blocks[0].shape[1]
             num_kv_heads = 1
             head_size = gpu_blocks[0].shape[2]
+        elif gpu_blocks[0].ndim == 4:
+            # Packed vLLM caches have no separate K/V axis. Regular backends
+            # use (num_blocks, H, block_size, 2 * D), while FlashInfer NVFP4
+            # uses (num_blocks, 2 * H, block_size, Dpacked). Preserve the
+            # backend's physical head count and width in both cases.
+            if not self.flexkv_config.model_config.packed_kv:
+                raise ValueError(
+                    "received a packed 4D vLLM KV cache but packed_kv is not "
+                    f"set: shape={tuple(gpu_blocks[0].shape)}")
+            _assert_token_major(gpu_blocks[0], token_dim=2, head_dim=1)
+            # packed_kv makes kv_dim 1, so LAYERFIRST's kv dim degenerates to
+            # extent 1 and its shape-implied strides reduce to the tensor's
+            # own block/token/head/content order, exactly as they do for MLA.
+            gpu_layout_type = KVCacheLayoutType.LAYERFIRST
+            num_blocks = gpu_blocks[0].shape[0]
+            num_kv_heads = gpu_blocks[0].shape[1]
+            block_size = gpu_blocks[0].shape[2]
+            head_size = gpu_blocks[0].shape[3]
         else:
             assert gpu_blocks[0].ndim == 5, (
-                f"expect kv cached tensor has 5 dim but get shape={gpu_blocks[0].shape}.")
+                f"expect kv cached tensor has 4 or 5 dim "
+                f"but get shape={gpu_blocks[0].shape}.")
+            _assert_token_major(gpu_blocks[0], token_dim=2, head_dim=3)
             # Detect GPU layout from the kv dim position (which holds size 2):
             #   vLLM <= 0.21: (kv=2, num_blocks, ...)  -> LAYERFIRST
             #   vLLM >= 0.23: (num_blocks, kv=2, ...)  -> LAYERBLOCK
@@ -765,6 +854,7 @@ class FlexKVWorkerConnector:
             num_head=num_kv_heads,
             head_size=head_size,
             is_mla=self.flexkv_config.model_config.use_mla,
+            packed_kv=self.flexkv_config.model_config.packed_kv,
         )
 
         if not indexer_kv_caches:
@@ -1108,7 +1198,7 @@ class FlexKVConnectorV1Impl:
             "get_gpu_match_ratio": stats.get_gpu_match_ratio,
             "get_flexkv_match_ratio": stats.get_flexkv_match_ratio,
         }
-        return KVConnectorStats(data=data)
+        return _FlexKVConnectorStats(data=data)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         if self.role == KVConnectorRole.SCHEDULER:

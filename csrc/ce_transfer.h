@@ -25,7 +25,8 @@ struct CETransferConfig {
   bool enable_memcpy2d = false;
   // CPU layout: BLOCKFIRST vs LAYERFIRST
   bool is_blockfirst = false;
-  // model uses MLA (kv_dim=1)
+  // True MLA model; controls the MLA-only partial BLOCKFIRST D2H path.
+  // Packed MHA also has one KV region but must leave this false.
   bool is_mla = false;
   // parallel CPU gather/scatter threads; 0=disable
   int gather_threads = 4;

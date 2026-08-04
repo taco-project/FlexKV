@@ -125,7 +125,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type (uint8 in multi-group)
         self.is_mla = gpu_kv_layouts[0].is_mla
-        self.kv_dim = 1 if self.is_mla else 2
+        self.single_kv_region = gpu_kv_layouts[0].single_kv_region
+        self.packed_kv = gpu_kv_layouts[0].packed_kv
+        self.kv_dim = gpu_kv_layouts[0].kv_dim
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
@@ -961,6 +963,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 transfer_cta_num=self.h2d_cta_num,
                 use_ce_transfer=self.use_ce_transfer_h2d,
                 is_mla=self.is_mla,
+                packed_kv=self.packed_kv,
                 counter_id=counter_id,
                 mla_d2h_mode=self.mla_d2h_mode,
                 notify_mode=self.layerwise_notify_mode,
@@ -991,6 +994,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.num_layers,
             1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
             self.is_mla,
+            self.packed_kv,
             counter_id,
             mla_d2h_mode=self.mla_d2h_mode,
             notify_mode=self.layerwise_notify_mode,

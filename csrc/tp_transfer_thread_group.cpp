@@ -182,7 +182,14 @@ void TPTransferThreadGroup::tp_group_transfer(
     const bool is_host_to_device, const bool use_ce_transfer,
     const int layer_id, const int layer_granularity, const bool is_mla,
     const std::string &mla_d2h_mode,
-    const int designated_rank) {
+    const int designated_rank,
+    const bool packed_kv) {
+
+  // Number of KV regions the copy kernels stride over.  MLA's latent KV has no
+  // separate V and a packed layout keeps V inside head_size, so both report a
+  // single region.  Everything else below keeps reading is_mla, which also
+  // decides the TP head split and the MLA-only D2H modes.
+  const bool single_kv_region = is_mla || packed_kv;
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -307,8 +314,9 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla,
-              gpu_block_strides_in_bytes_[i], true, ce_config_);
+              transfer_num_cta, is_host_to_device, use_ce_transfer,
+              single_kv_region, gpu_block_strides_in_bytes_[i], true,
+              ce_config_);
           break;
         case BackendType::TRTLLM:
           flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
@@ -317,8 +325,9 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla,
-              gpu_block_strides_in_bytes_[i], true, ce_config_);
+              transfer_num_cta, is_host_to_device, use_ce_transfer,
+              single_kv_region, gpu_block_strides_in_bytes_[i], true,
+              ce_config_);
           break;
         case BackendType::SGLANG:
           flexkv::transfer_kv_blocks<BackendType::SGLANG>(
@@ -327,8 +336,9 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla,
-              gpu_block_strides_in_bytes_[i], true, ce_config_);
+              transfer_num_cta, is_host_to_device, use_ce_transfer,
+              single_kv_region, gpu_block_strides_in_bytes_[i], true,
+              ce_config_);
           break;
         }
 

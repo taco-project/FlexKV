@@ -549,7 +549,7 @@ class TransferWorkerBase(ABC):
                         launched_ns,
                         self.worker_id,
                         getattr(self, "_bytes_per_block", 0),
-                        getattr(self, "is_mla", False),
+                        getattr(self, "single_kv_region", False),
                         is_h2d,
                     )
                     if transfer_status:
@@ -670,6 +670,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         self.dtype = dtype
         self.is_mla = gpu_kv_layout.is_mla
+        self.single_kv_region = gpu_kv_layout.single_kv_region
         self.kv_dim = gpu_kv_layout.kv_dim
         self.cpu_is_blockfirst = (
             cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
@@ -755,7 +756,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         layer_groups: List[LayerGroupSpec],
     ) -> None:
         """Initialize per-group transfer parameters for models with mixed KV shapes."""
-        kv_dim = 1 if self.is_mla else 2
+        kv_dim = self.kv_dim
         tpb = cpu_kv_layout.tokens_per_block
         cpu_layout_type = cpu_kv_layout.type
         num_cpu_blocks = cpu_kv_layout.num_block
@@ -830,6 +831,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 'cpu_kv_stride': cpu_kv_stride,
                 'cpu_offset_bytes': cpu_offset_bytes,
                 'num_layers': g.num_layers,
+                'is_mla': gpu_layout.is_mla,
             })
 
             # Advance CPU byte offset for next group.
@@ -901,7 +903,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     transfer_num_cta,
                     transfer_type == TransferType.H2D,
                     use_ce_transfer,
-                    self.is_mla,
+                    self.single_kv_region,
                     self.gpu_block_type_,
                     True,  # sync
                     self.ce_path_opt,
@@ -910,6 +912,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     self.ce_enable_memcpy2d,
                     self.cpu_is_blockfirst,
                     enable_transfer_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
+                    ce_is_mla=gp['is_mla'],
                 )
         else:
             # Uniform transfer: single call (whole-model)
@@ -930,7 +933,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 transfer_num_cta,
                 transfer_type == TransferType.H2D,
                 use_ce_transfer,
-                self.is_mla,
+                self.single_kv_region,
                 self.gpu_block_type_,
                 True,  # sync
                 self.ce_path_opt,
@@ -939,6 +942,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 self.ce_enable_memcpy2d,
                 self.cpu_is_blockfirst,
                 enable_transfer_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
+                ce_is_mla=self.is_mla,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -1014,6 +1018,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
         self.is_mla = gpu_kv_layouts[0].is_mla
+        self.single_kv_region = gpu_kv_layouts[0].single_kv_region
+        self.packed_kv = gpu_kv_layouts[0].packed_kv
         self.kv_dim = gpu_kv_layouts[0].kv_dim
 
         self.num_gpus = len(self.gpu_blocks)
@@ -1135,7 +1141,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         sizes (e.g. bf16 main + uint8 indexer) interleave correctly within a
         block.
         """
-        kv_dim = 1 if self.is_mla else 2
+        kv_dim = self.kv_dim
         tpb = cpu_kv_layout.tokens_per_block
         cpu_layout_type = cpu_kv_layout.type
         num_cpu_blocks = cpu_kv_layout.num_block
@@ -1312,6 +1318,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                     0,                 # start_layer_id (always 0 within group)
                     gp['num_layers'],  # all layers in this group
                     self.is_mla,
+                    packed_kv=self.packed_kv,
                 )
         else:
             self.tp_transfer_thread_group.tp_group_transfer(
@@ -1328,6 +1335,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 self.num_layers,    # layer_granularity = all layers
                 self.is_mla,
                 self.mla_d2h_mode,  # Pass MLA D2H mode to C++ (#192)
+                packed_kv=self.packed_kv,
             )
 
 
@@ -1392,6 +1400,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
 
         self.is_mla = cpu_kv_layout.is_mla
+        self.single_kv_region = cpu_kv_layout.single_kv_region
         self.kv_dim = cpu_kv_layout.kv_dim
         self.cpu_layout_type = cpu_kv_layout.type
         self.has_multi_group = layer_groups is not None
@@ -1471,7 +1480,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             # CPU and SSD share an identical per-block byte layout in multi-group
             # mode, so each block can be transferred as one opaque blob — no
             # per-group / per-tp_rank loop needed. num_layers=1,
-            # layer_stride=chunk_size=block_stride, is_mla=True (skip V) make
+            # layer_stride=chunk_size=block_stride, single_kv_region=True makes
             # the kernel issue exactly one pread/pwrite of block_stride bytes
             # per block, sidestepping the sub-4KiB chunk hazard for highly
             # compressed groups (e.g. DSv4 indexer at compress_ratio=128).
@@ -1492,7 +1501,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 num_blocks_per_file=self.num_blocks_per_file,
                 round_robin=self.round_robin,
                 num_threads_per_device=32,
-                is_mla=True,
+                single_kv_region=True,
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
         else:
@@ -1514,7 +1523,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 num_blocks_per_file=self.num_blocks_per_file,
                 round_robin=self.round_robin,
                 num_threads_per_device=32,
-                is_mla=self.is_mla,
+                single_kv_region=self.single_kv_region,
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
 
@@ -1599,7 +1608,9 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
 
-        self.is_mla = True if self.has_multi_group else cpu_kv_layout.is_mla
+        self.single_kv_region = (
+            True if self.has_multi_group else cpu_kv_layout.single_kv_region
+        )
         self.kv_dim = 1 if self.has_multi_group else cpu_kv_layout.kv_dim
 
         self.cpu_blocks = cpu_blocks
@@ -1729,7 +1740,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
                 cfs_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
                 block_size_in_bytes=self.chunk_size_in_bytes,
                 total_layers=self.num_layers,
-                is_mla=self.is_mla,
+                single_kv_region=self.single_kv_region,
                 num_threads_per_file=32,
             )
         else:
@@ -1752,7 +1763,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
                 num_remote_blocks_per_file=self.num_remote_blocks_per_file,
                 use_mmap=False,  # TODO: fix bug when use mmap
                 num_threads_per_file=32,
-                is_mla=self.is_mla,
+                single_kv_region=self.single_kv_region,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -1822,6 +1833,7 @@ class GDSTransferWorker(TransferWorkerBase):
 
         self.dtype = dtype
         self.is_mla = gpu_kv_layout.is_mla
+        self.single_kv_region = gpu_kv_layout.single_kv_region
         self.kv_dim = gpu_kv_layout.kv_dim
         self.has_multi_group = layer_groups is not None
 
@@ -1886,7 +1898,7 @@ class GDSTransferWorker(TransferWorkerBase):
         use g.dtype.itemsize so groups with different element sizes (e.g.
         bf16 main + uint8 indexer) interleave correctly within a block.
         """
-        kv_dim = 1 if self.is_mla else 2
+        kv_dim = self.kv_dim
         tpb = ssd_kv_layout.tokens_per_block
 
         # Multi-group BLOCKFIRST: get_block_stride() returns bytes_per_block
@@ -2010,7 +2022,7 @@ class GDSTransferWorker(TransferWorkerBase):
                         gp['num_layers'],
                         is_read,
                         False,
-                        self.is_mla,
+                        self.single_kv_region,
                         self.gpu_block_type_,
                         self.gpu_device_id,
                     )
@@ -2035,7 +2047,7 @@ class GDSTransferWorker(TransferWorkerBase):
                     self.num_layers,
                     is_read,
                     False,
-                    self.is_mla,
+                    self.single_kv_region,
                     self.gpu_block_type_,
                     self.gpu_device_id,
                 )
@@ -2127,6 +2139,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
 
         self.dtype = dtype
         self.is_mla = gpu_kv_layouts[0].is_mla
+        self.single_kv_region = gpu_kv_layouts[0].single_kv_region
+        self.packed_kv = gpu_kv_layouts[0].packed_kv
         self.kv_dim = gpu_kv_layouts[0].kv_dim
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
@@ -2217,7 +2231,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
         use g.dtype.itemsize so groups with different element sizes (e.g.
         bf16 main + uint8 indexer) interleave correctly within a block.
         """
-        kv_dim = 1 if self.is_mla else 2
+        kv_dim = self.kv_dim
         tpb = ssd_kv_layout.tokens_per_block
 
         # Multi-group BLOCKFIRST: get_block_stride() returns bytes_per_block
@@ -2377,6 +2391,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
                     0,  # layer_id always 0 for per-group
                     gp['num_layers'],
                     self.is_mla,
+                    packed_kv=self.packed_kv,
                 )
         else:
             self.tp_gds_transfer_thread_group.tp_group_transfer(
@@ -2391,6 +2406,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 0,
                 self.num_layers,
                 self.is_mla,
+                packed_kv=self.packed_kv,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -2468,9 +2484,11 @@ class NixlTransferWorker(TransferWorkerBase):
         if (
             gpu_kv_layout.num_layer != cpu_kv_layout.num_layer
             or gpu_kv_layout.is_mla != cpu_kv_layout.is_mla
+            or gpu_kv_layout.packed_kv != cpu_kv_layout.packed_kv
         ):
             raise ValueError(
-                "gpu_kv_layout and cpu_kv_layout must match on num_layer and is_mla"
+                "gpu_kv_layout and cpu_kv_layout must match on num_layer, "
+                "is_mla and packed_kv"
             )
 
         self.nixl_backend = be
@@ -2483,7 +2501,7 @@ class NixlTransferWorker(TransferWorkerBase):
         self.dtype = dtype
 
         self.num_layers = gpu_kv_layout.num_layer
-        self.is_mla = gpu_kv_layout.is_mla
+        self.single_kv_region = gpu_kv_layout.single_kv_region
         self.kv_dim = gpu_kv_layout.kv_dim
 
         # SSD / file-side layout (same for every NIXL FILE backend).
@@ -2609,7 +2627,7 @@ class NixlTransferWorker(TransferWorkerBase):
         if n == 0:
             return
 
-        kv_dim = 1 if self.is_mla else 2
+        kv_dim = self.kv_dim
         layer_end = layer_id + layer_granularity
 
         file_paths: List[str] = []
@@ -2637,7 +2655,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.ssd_layer_stride_in_bytes,
                             self.ssd_kv_stride_in_bytes,
                             self.ssd_block_stride_in_bytes,
-                            self.is_mla,
+                            self.single_kv_region,
                         )
                         gview = gpu_chunk_u8_view(
                             self.gpu_blocks,
@@ -2650,7 +2668,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.gpu_block_stride_in_bytes,
                             self.gpu_layer_stride_in_bytes,
                             self.chunk_size_in_bytes,
-                            self.is_mla,
+                            self.single_kv_region,
                         )
                         gpu_tensors.append(gview)
                         file_paths.append(path)
@@ -2685,7 +2703,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.mem_layer_stride_in_bytes,
                             self.mem_kv_stride_in_bytes,
                             self.mem_block_stride_in_bytes,
-                            self.is_mla,
+                            self.single_kv_region,
                         )
                         sob = ssd_chunk_byte_offset_in_file(
                             lid,
@@ -2694,7 +2712,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.ssd_layer_stride_in_bytes,
                             self.ssd_kv_stride_in_bytes,
                             self.ssd_block_stride_in_bytes,
-                            self.is_mla,
+                            self.single_kv_region,
                         )
                         dram_ptr_len.append((base + cob, self.chunk_size_in_bytes))
                         file_paths.append(path)
@@ -2733,7 +2751,7 @@ class NixlTransferWorker(TransferWorkerBase):
                 lg,
             )
             end_time = time.time()
-            kv_dim = 2 if not self.is_mla else 1
+            kv_dim = self.kv_dim
             transfer_size = (
                 self.chunk_size_in_bytes * lg * transfer_op.valid_block_num * kv_dim
             )
@@ -2775,7 +2793,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self.cpu_kv_layout = cpu_kv_layout
         self.remote_kv_layout = remote_kv_layout
 
-        self.is_mla = cpu_kv_layout.is_mla
+        self.single_kv_region = cpu_kv_layout.single_kv_region
         self.kv_dim = cpu_kv_layout.kv_dim
         # Bytes per KV block (all layers); used by transfer tracing for bw.
         self._bytes_per_block = self.block_size * self.dtype.itemsize * self.num_layers * self.kv_dim
@@ -2860,15 +2878,18 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             assert ssd_kv_layout is not None, "Invalid ssd kv layout!"
             ## init the cpu buffer for ssd to cpu copy
             # NOTE: now we allocate 500 blocks for test
+            # Keyword args on purpose: packed_kv sits before _kv_shape in the
+            # dataclass, so a positional list would land kv_shape in packed_kv.
             self.tmp_cpu_buffer_layout = KVCacheLayout(
-                self.cpu_kv_layout.type,
-                self.cpu_kv_layout.num_layer,
-                self.cache_config.num_tmp_cpu_blocks,
-                self.cpu_kv_layout.tokens_per_block,
-                self.cpu_kv_layout.num_head,
-                self.cpu_kv_layout.head_size,
-                self.cpu_kv_layout.is_mla,
-                self.cpu_kv_layout.kv_shape,
+                type=self.cpu_kv_layout.type,
+                num_layer=self.cpu_kv_layout.num_layer,
+                num_block=self.cache_config.num_tmp_cpu_blocks,
+                tokens_per_block=self.cpu_kv_layout.tokens_per_block,
+                num_head=self.cpu_kv_layout.num_head,
+                head_size=self.cpu_kv_layout.head_size,
+                is_mla=self.cpu_kv_layout.is_mla,
+                packed_kv=self.cpu_kv_layout.packed_kv,
+                _kv_shape=self.cpu_kv_layout.kv_shape,
             )
             # Allocate the temporary SSD->CPU staging buffer.
             #
@@ -3456,7 +3477,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 num_blocks_per_file=self.num_blocks_per_file,
                 round_robin=self.round_robin,
                 num_threads_per_device=32,
-                is_mla=self.is_mla,
+                single_kv_region=self.single_kv_region,
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
         except Exception as e:
@@ -3729,8 +3750,8 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         self.dtype = dtype
         self.cpu_kv_layout = cpu_kv_layout
         assert self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
-        self.is_mla: bool = cpu_kv_layout.is_mla
-        self.kv_dim = 2 if not self.is_mla else 1
+        self.single_kv_region: bool = cpu_kv_layout.single_kv_region
+        self.kv_dim = cpu_kv_layout.kv_dim
         self.cpu_blocks = cpu_blocks
         self.cache_config = cache_config
         self._cpu_buffer = cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks

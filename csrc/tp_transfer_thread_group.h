@@ -67,7 +67,13 @@ public:
                          const bool use_ce_transfer, const int layer_id,
                          const int layer_granularity, const bool is_mla,
                          const std::string &mla_d2h_mode = "sharded",
-                         const int designated_rank = 0);
+                         const int designated_rank = 0,
+                         // vLLM >= PR #44455 packs K and V into the content
+                         // dim, so head_size covers both and there is one KV
+                         // region to stride over instead of two.  Distinct
+                         // from is_mla, which additionally means "TP
+                         // replicates the heads"; packed MHA splits them.
+                         const bool packed_kv = false);
 
 #ifdef FLEXKV_ENABLE_NVCOMP
 

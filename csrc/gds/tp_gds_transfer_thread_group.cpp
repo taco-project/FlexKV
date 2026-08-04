@@ -170,8 +170,14 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
     const int64_t num_blocks_per_file,
     const bool is_read,
     const int layer_id,
-    const int layer_granularity, 
-    const bool is_mla) {
+    const int layer_granularity,
+    const bool is_mla,
+    const bool packed_kv) {
+
+  // See TPTransferThreadGroup::tp_group_transfer: the GDS kernels take this as
+  // a pure KV-region count, while the per-rank SSD offset below still keys off
+  // is_mla (packed MHA splits heads across ranks, MLA replicates them).
+  const bool single_kv_region = is_mla || packed_kv;
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -202,7 +208,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
                 ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
-                is_read, false, is_mla
+                is_read, false, single_kv_region
             );
             break;
           case BackendType::TRTLLM:
@@ -211,7 +217,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
                 ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
-                is_read, false, is_mla
+                is_read, false, single_kv_region
             );
             break;
           case BackendType::SGLANG:
@@ -220,7 +226,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
                 ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
-                is_read, false, is_mla
+                is_read, false, single_kv_region
             );
             break;
         }
