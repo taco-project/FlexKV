@@ -520,8 +520,8 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     torch::Tensor swa_gpu_block_strides_tensor,
     torch::Tensor swa_gpu_layer_strides_tensor,
     torch::Tensor swa_gpu_chunk_sizes_tensor,
-    CETransferConfig ce_config)
-    : ce_config_(ce_config) {
+    bool ssd_io_opt, CETransferConfig ce_config)
+    : ce_config_(ce_config), ssd_io_opt_(ssd_io_opt) {
 
   num_gpus_ = num_gpus;
   num_layers_ = num_layers;
@@ -676,8 +676,8 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     torch::Tensor swa_gpu_block_strides_tensor,
     torch::Tensor swa_gpu_layer_strides_tensor,
     torch::Tensor swa_gpu_chunk_sizes_tensor,
-    CETransferConfig ce_config)
-    : ce_config_(ce_config) {
+    bool ssd_io_opt, CETransferConfig ce_config)
+    : ce_config_(ce_config), ssd_io_opt_(ssd_io_opt) {
 
   num_gpus_ = num_gpus;
   num_layers_ = num_original_layers;
@@ -1079,7 +1079,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
         ssd_kv_stride_in_bytes, cpu_chunk_size_in_bytes,
         cpu_block_stride_in_bytes,
         true, // is_read: SSD -> CPU
-        num_blocks_per_file, round_robin, num_threads_per_device, is_mla);
+        num_blocks_per_file, round_robin, num_threads_per_device, is_mla,
+        /*ssd_io_opt=*/ssd_io_opt_);
 
     nvtxRangePop();
   }
@@ -1107,7 +1108,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
         swa_cpu_block_stride_in_bytes,
         true, // is_read: SSD -> CPU
         swa_num_blocks_per_file, round_robin, num_threads_per_device,
-        /*is_mla=*/true);
+        /*is_mla=*/true, /*ssd_io_opt=*/ssd_io_opt_);
   }
 
   // Validate mla_d2h_mode (#192) once before the per-batch loop. The mode only
@@ -1387,7 +1388,7 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
         /*chunk_size_in_bytes=*/block_stride,
         /*block_stride_in_bytes=*/block_stride,
         /*is_read=*/true, num_blocks_per_file, round_robin,
-        num_threads_per_device, /*is_mla=*/true);
+        num_threads_per_device, /*is_mla=*/true, /*ssd_io_opt=*/ssd_io_opt_);
     nvtxRangePop();
   }
 
@@ -1410,7 +1411,7 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
           /*chunk_size_in_bytes=*/swa_block_stride,
           /*block_stride_in_bytes=*/swa_block_stride,
           /*is_read=*/true, swa_num_blocks_per_file, round_robin,
-          num_threads_per_device, /*is_mla=*/true);
+          num_threads_per_device, /*is_mla=*/true, /*ssd_io_opt=*/ssd_io_opt_);
     } else {
       torch::Tensor swa_all_layer_ids = torch::arange(
           0, num_original_layers_,
@@ -1422,7 +1423,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
           swa_cpu_kv_stride_in_bytes, swa_ssd_layer_stride_in_bytes,
           swa_ssd_kv_stride_in_bytes, swa_cpu_chunk_size_in_bytes,
           swa_cpu_block_stride_in_bytes, true, swa_num_blocks_per_file,
-          round_robin, num_threads_per_device, /*is_mla=*/true);
+          round_robin, num_threads_per_device, /*is_mla=*/true,
+          /*ssd_io_opt=*/ssd_io_opt_);
     }
   }
 

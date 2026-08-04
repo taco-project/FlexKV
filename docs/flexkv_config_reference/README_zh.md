@@ -137,7 +137,7 @@ swa_multi_group: false
 | `FLEXKV_MAX_FILE_SIZE_GB` | float | -1 | 单个 SSD 文件的最大大小，-1表示不限 |
 | `FLEXKV_IOURING_ENTRIES` | int | 512 | io_uring 队列深度，推荐设为 `512` 以提升并发 IO 性能 |
 | `FLEXKV_IOURING_FLAGS` | int | 0 | io_uring 标志位，默认为 0|
-
+| `FLEXKV_SSD_IO_OPT` | bool | 1 | SSD↔CPU 传输的 I/O 优化总开关（默认开启）。开启后系统会自动把多次零散的小 I/O 合并成更少的大 I/O，减少系统调用开销、提升传输效率；设为 `0` 则退回最基础的一对一传输（功能正确但更慢） |
 
 
 ---

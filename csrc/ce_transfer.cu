@@ -71,12 +71,16 @@ CEAnalysis analyze_ce_transfer(
 CEPath choose_path(const CEAnalysis &ce_analysis, const CETransferConfig &ce_config,
                    int64_t chunk_size_in_bytes,
                    bool is_host_to_device, bool is_full_block) {
-  // GATHER_DIRECT: BF + !cpu_phys_contig + gpu contiguous
-  // bfirst+MLA+D2H+!full_block -> SEGMENT_SCATTER
+  // BF + !cpu_phys_contig + GPU contig
   if (ce_config.is_blockfirst && !ce_analysis.cpu_phys_contig && ce_analysis.gpu_phys_contig) {
-    // D2H only
-    if (!is_host_to_device && ce_config.is_mla && !is_full_block)
-      return CEPath::SEGMENT_SCATTER;  // bfirst MLA layer_parallel D2H
+    if (!is_host_to_device && ce_config.is_mla) {
+      if (ce_analysis.num_segments > ce_config.segment_threshold)
+        return (chunk_size_in_bytes > 0 && chunk_size_in_bytes % sizeof(int64_t) != 0)
+                   ? CEPath::SEGMENT_SCATTER
+                   : CEPath::GATHER_SCATTER;
+      if (!is_full_block)
+        return CEPath::SEGMENT_SCATTER;
+    }
     return CEPath::GATHER_DIRECT;
   }
 

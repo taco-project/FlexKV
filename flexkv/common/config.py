@@ -759,6 +759,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     ce_segment_threshold=int(os.getenv('FLEXKV_CE_SEGMENT_THRESHOLD', 8)),
     ce_path_opt=bool(int(os.getenv('FLEXKV_CE_PATH_OPT', 1))),
+    ssd_io_opt=bool(int(os.getenv('FLEXKV_SSD_IO_OPT', 1))),
+
     enable_ce_memcpy2d=bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', 1))),
     ce_gather_threads=int(os.getenv('FLEXKV_CE_GATHER_THREADS', 4)),
     ce_gather_nt=bool(int(os.getenv('FLEXKV_CE_GATHER_NT', 1))),

@@ -79,7 +79,7 @@ public:
       torch::Tensor swa_gpu_block_strides_tensor = torch::Tensor(),
       torch::Tensor swa_gpu_layer_strides_tensor = torch::Tensor(),
       torch::Tensor swa_gpu_chunk_sizes_tensor = torch::Tensor(),
-      CETransferConfig ce_config = CETransferConfig{});
+      bool ssd_io_opt = true, CETransferConfig ce_config = CETransferConfig{});
 
   // Multi-group constructor. ``gpu_blocks_per_group[gi][d]`` is the GPU-side
   // tensor list for group ``gi`` on device ``d``. ``layer_members`` encodes
@@ -128,7 +128,7 @@ public:
       torch::Tensor swa_gpu_block_strides_tensor = torch::Tensor(),
       torch::Tensor swa_gpu_layer_strides_tensor = torch::Tensor(),
       torch::Tensor swa_gpu_chunk_sizes_tensor = torch::Tensor(),
-      CETransferConfig ce_config = CETransferConfig{});
+      bool ssd_io_opt = true, CETransferConfig ce_config = CETransferConfig{});
 
   ~LayerwiseTransferGroup();
 
@@ -286,6 +286,7 @@ private:
   std::vector<int> layer_eventfds_; // Flat array
   int current_counter_id_; // Current counter set index for this transfer
   CETransferConfig ce_config_;
+  bool ssd_io_opt_ = true;
 
   // ---- Multi-group state ----
   bool has_multi_group_;

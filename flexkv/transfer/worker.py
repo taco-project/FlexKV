@@ -1493,6 +1493,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 round_robin=self.round_robin,
                 num_threads_per_device=32,
                 is_mla=True,
+                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
         else:
             layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
@@ -1514,6 +1515,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 round_robin=self.round_robin,
                 num_threads_per_device=32,
                 is_mla=self.is_mla,
+                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -3455,6 +3457,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 round_robin=self.round_robin,
                 num_threads_per_device=32,
                 is_mla=self.is_mla,
+                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
         except Exception as e:
             flexkv_logger.error(f"Copy data from ssd to cpu failed: {e}")

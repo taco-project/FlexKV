@@ -3,6 +3,7 @@
 #include <liburing.h>
 #include <linux/ioprio.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <torch/extension.h>
 #include <unistd.h>
 #include <vector>
@@ -157,6 +158,33 @@ public:
     return 0;
   }
 
+  // Vectored I/O: readv/writev from a single offset into multiple buffers
+  int prep_readv(int fd, const struct iovec *iovs, int iovcnt, uint64_t offset) {
+    if (prepare()) {
+      total_over_limit++;
+      return -1;
+    }
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) return -1;
+    io_uring_prep_readv(sqe, fd, iovs, iovcnt, offset);
+    sqe->ioprio = read_ioprio;
+    prepared++;
+    return 0;
+  }
+
+  int prep_writev(int fd, const struct iovec *iovs, int iovcnt, uint64_t offset) {
+    if (prepare()) {
+      total_over_limit++;
+      return -1;
+    }
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) return -1;
+    io_uring_prep_writev(sqe, fd, iovs, iovcnt, offset);
+    sqe->ioprio = write_ioprio;
+    prepared++;
+    return 0;
+  }
+
   void dump(int force) {
     if (force || total_cqe_err || total_over_limit) {
       const char *status =
@@ -301,6 +329,7 @@ void transfer_kv_blocks_ssd(
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_kv_stride_in_bytes, int64_t chunk_size_in_bytes,
     int64_t block_stride_in_bytes, bool is_read, int num_blocks_per_file,
-    int round_robin = 1, int num_threads_per_device = 16, bool is_mla = false);
+    int round_robin = 1, int num_threads_per_device = 16, bool is_mla = false,
+    bool ssd_io_opt = true);
 
 } // namespace flexkv

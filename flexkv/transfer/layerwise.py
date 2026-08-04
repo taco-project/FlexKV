@@ -659,6 +659,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             is_mla=self.is_mla,
             ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
             ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
+            ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             **self._swa_init_kwargs(),
         )
 
@@ -748,6 +749,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             is_mla=self.is_mla,
             ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
             ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
+            ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             **self._swa_init_kwargs(),
         )
 
