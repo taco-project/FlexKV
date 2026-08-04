@@ -289,6 +289,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 tp_group_size=tp_group_size,
             )
 
+        self._bytes_per_block = getattr(self, "cpu_chunk_size_in_bytes", 0) * self.num_layers * self.kv_dim
+
         if self.has_swa_multi_group:
             self._bind_swa_multi_group(tp_group_size)
 
@@ -960,6 +962,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 counter_id=counter_id,
                 mla_d2h_mode=self.mla_d2h_mode,
                 notify_mode=self.layerwise_notify_mode,
+                enable_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
                 **swa_kwargs,
             )
             return
@@ -989,6 +992,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             counter_id,
             mla_d2h_mode=self.mla_d2h_mode,
             notify_mode=self.layerwise_notify_mode,
+            enable_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
             **swa_kwargs,
         )
 

@@ -30,6 +30,7 @@ from flexkv.common.storage import StorageHandle
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp, WorkerKey
 from flexkv.common.transfer import get_nvtx_range_color
 from flexkv.transfer.scheduler import TransferScheduler
+from flexkv.transfer import trace
 from flexkv.transfer.worker import (
     WorkerHandle,
     CPUSSDDiskTransferWorker,
@@ -1165,13 +1166,22 @@ class TransferEngine:
                         # Get all available ops in one go to reduce system calls
                         while True:
                             try:
-                                op_id = self.finished_ops_queue.get_nowait()
-                                # A bare int means success; a (op_id, False)
-                                # tuple is a worker-reported transfer failure.
+                                payload = self.finished_ops_queue.get_nowait()
+                                # Payload: int (legacy) | (op_id, ok) |
+                                #          (op_id, ok, metrics_dict from worker).
                                 op_succeeded = True
-                                if isinstance(op_id, tuple):
-                                    op_id, op_succeeded = op_id
+                                metrics = None
+                                if isinstance(payload, tuple):
+                                    if len(payload) >= 3:
+                                        op_id, op_succeeded, metrics = payload[0], payload[1], payload[2]
+                                    else:
+                                        op_id, op_succeeded = payload
+                                else:
+                                    op_id = payload
                                 if not op_succeeded:
+                                    # Keep trace state consistent even on failure.
+                                    trace.dec_inflight()
+                                    trace.consume_submit_ns(op_id)
                                     self._handle_failed_op(op_id)
                                     continue
                                 if op_id in self._child_to_parent_op_id:
@@ -1182,6 +1192,7 @@ class TransferEngine:
                                     free_op_from_buffer(child_op, self.pin_buffer)
                                     if op_id in self.op_id_to_nvtx_range:
                                         nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
+                                    self._emit_xfer_trace(op_id, metrics)
                                     parent_op = self.op_id_to_op[parent_op_id]
                                     parent_op.pending_count -= 1
                                     if parent_op.pending_count == 0:
@@ -1192,6 +1203,7 @@ class TransferEngine:
                                 else:
                                     op = self.op_id_to_op[op_id]
                                     op.pending_count -= 1
+                                    self._emit_xfer_trace(op_id, metrics)
                                     if op.pending_count == 0:
                                         self._finalize_or_discard(op, finished_ops)
                             except queue.Empty:
@@ -1273,6 +1285,18 @@ class TransferEngine:
             self._discard_failed_op(op)
         else:
             self._finalize_op(op, finished_ops)
+
+    def _emit_xfer_trace(self, op_id: int, metrics) -> None:
+        """Print one ``[XFER]`` line for a completed op (transfer tracing).
+
+        Combines the worker-computed timing metrics with the scheduler-side
+        e2e (submit -> detect) and current backlog. All trace.* calls no-op
+        when ``FLEXKV_TRANSFER_TRACE`` is unset, so this is safe to call
+        unconditionally on every finished op.
+        """
+        e2e_ms = trace.consume_submit_ns(op_id)
+        trace.dec_inflight()
+        trace.record_xfer(op_id, metrics, e2e_ms)
 
     def _handle_failed_op(self, op_id: int) -> None:
         """A worker reported a failed transfer for ``op_id``.

@@ -33,6 +33,7 @@ void transfer_kv_blocks(
     int64_t chunk_size_in_bytes, cudaStream_t stream, int transfer_num_cta,
     bool is_host_to_device, bool use_ce_transfer, bool is_mla,
     int64_t gpu_block_stride_in_bytes = 0,
-    bool sync = true, const CETransferConfig &ce_config = CETransferConfig{});
+    bool sync = true, const CETransferConfig &ce_config = CETransferConfig{},
+    bool enable_trace = false);
 
 } // namespace flexkv

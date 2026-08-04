@@ -19,6 +19,7 @@ class WorkerTransferOp:
     src_block_node_ids: Optional[np.ndarray]
     mooncake_store_block_hashes: Optional[np.ndarray] = None
     mooncake_store_swa_block_hashes: Optional[list] = None
+    prof_submitted_ns: int = 0
 
     def __init__(self, transfer_op: TransferOp):
         self.transfer_op_id = transfer_op.op_id
@@ -61,6 +62,7 @@ class WorkerLayerwiseTransferOp:
     swa_src_block_ids_disk2h: np.ndarray
     swa_dst_block_ids_disk2h: np.ndarray
     counter_id: int  # Counter set index for triple buffering eventfd notification
+    prof_submitted_ns: int = 0
 
     def __init__(self, transfer_op: LayerwiseTransferOp):
         self.transfer_op_id = transfer_op.op_id

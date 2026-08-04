@@ -17,9 +17,12 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <chrono>
+
 #include "monitoring/metrics_manager.h"
 #include "transfer.cuh"
 #include "ce_transfer.h"
+#include "logging.h"
 
 namespace flexkv {
 
@@ -168,7 +171,7 @@ void transfer_kv_blocks(
     cudaStream_t stream, int transfer_num_cta, bool is_host_to_device,
     bool use_ce_transfer, bool is_mla,
     int64_t gpu_block_stride_in_bytes, bool sync,
-    const CETransferConfig &ce_config) {
+    const CETransferConfig &ce_config, bool enable_trace) {
 
   int block_size = 1024;
   int block_count = transfer_num_cta;
@@ -298,7 +301,16 @@ void transfer_kv_blocks(
     }
   }
   if (sync) {
+    auto sync_t0 = std::chrono::steady_clock::now();
     cudaStreamSynchronize(stream);
+    if (enable_trace) {
+      auto sync_t1 = std::chrono::steady_clock::now();
+      double sync_ms =
+          std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count();
+      FLEXKV_LOG_INFO(
+          "[XFER] type=%s blocks=%d sync_ms=%.3f",
+          is_host_to_device ? "H2D" : "D2H", num_blocks, sync_ms);
+    }
   }
 }
 
@@ -306,16 +318,16 @@ void transfer_kv_blocks(
 template void transfer_kv_blocks<BackendType::VLLM>(
     int, int, int, int64_t *, GTensorHandler, int64_t, int64_t *, void *,
     int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool,
-    bool, int64_t, bool, const CETransferConfig &);
+    bool, int64_t, bool, const CETransferConfig &, bool);
 
 template void transfer_kv_blocks<BackendType::TRTLLM>(
     int, int, int, int64_t *, GTensorHandler, int64_t, int64_t *, void *,
     int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool,
-    bool, int64_t, bool, const CETransferConfig &);
+    bool, int64_t, bool, const CETransferConfig &, bool);
 
 template void transfer_kv_blocks<BackendType::SGLANG>(
     int, int, int, int64_t *, GTensorHandler, int64_t, int64_t *, void *,
     int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t, int, bool, bool,
-    bool, int64_t, bool, const CETransferConfig &);
+    bool, int64_t, bool, const CETransferConfig &, bool);
 
 } // namespace flexkv
