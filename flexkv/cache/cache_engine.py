@@ -19,7 +19,7 @@ import time
 from functools import partial, wraps
 from queue import Queue
 from typing import List, Tuple, Optional, Dict, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import nvtx
@@ -840,6 +840,24 @@ DEFAULT_CACHE_STRATEGY = CacheStrategy()
 
 CPUONLY_CACHE_STRATEGY = CacheStrategy(ignore_gpu=False, ignore_ssd=True, ignore_remote=True, ignore_gds=True)
 
+
+def resolve_get_cache_strategy(
+        use_mooncake_store_backend: bool,
+        temp_cache_strategy: CacheStrategy) -> CacheStrategy:
+    """Apply mooncake prefetch/compute split to a GET CacheStrategy.
+
+    Prefetch tasks set ``ignore_gpu=True`` and may pull REMOTE2H.
+    Compute retrieve (GPU-bound GET) must stay on local CPU/SSD when mooncake
+    is enabled — remote misses become CPU misses / recompute, never an
+    in-graph REMOTE2H.
+    """
+    if (use_mooncake_store_backend
+            and not temp_cache_strategy.ignore_gpu
+            and not temp_cache_strategy.ignore_remote):
+        return replace(temp_cache_strategy, ignore_remote=True)
+    return temp_cache_strategy
+
+
 class GlobalCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None,
                  event_collector: Optional[KVEventCollector] = None):
@@ -854,6 +872,13 @@ class GlobalCacheEngine:
         self.ssd_cache_engine = None
         self.remote_cache_engine = None
         self.use_mooncake_store_backend = cache_config.use_mooncake_store_backend
+        if self.use_mooncake_store_backend:
+            # Product rule (M0): mooncake REMOTE2H runs in prefetch only;
+            # compute retrieve matches local ready tiers and does H2D.
+            flexkv_logger.info(
+                "Mooncake store enabled: REMOTE2H is prefetch-only; "
+                "compute GET forces ignore_remote=True"
+            )
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
         if cache_config.enable_kv_sharing:
@@ -1078,6 +1103,9 @@ class GlobalCacheEngine:
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
                                      tokens_per_block=self.cache_config.tokens_per_block,
                                      namespace=namespace)
+
+        temp_cache_strategy = resolve_get_cache_strategy(
+            self.use_mooncake_store_backend, temp_cache_strategy)
 
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             # from this entrance, we will also handle the case of peer_cpu and peer_ssd
