@@ -1221,7 +1221,38 @@ PYBIND11_MODULE(c_ext, m) {
             std::deque<int64_t> dq(hashes.begin(), hashes.end());
             return ch.delete_blockmeta_batch(node_id, &dq, batch_size);
           },
-          py::arg("node_id"), py::arg("hashes"), py::arg("batch_size") = 200);
+          py::arg("node_id"), py::arg("hashes"), py::arg("batch_size") = 200)
+      .def("delete_node_blocks", &flexkv::RedisMetaChannel::delete_node_blocks,
+           py::arg("node_id"), py::arg("batch_size") = 200)
+      .def("has_any_block_keys", [](flexkv::RedisMetaChannel &ch) {
+        bool has_keys = false;
+        if (!ch.has_any_block_keys(has_keys)) {
+          throw std::runtime_error("Failed to scan Redis block metadata");
+        }
+        return has_keys;
+      })
+      .def("begin_reset_barrier", [](flexkv::RedisMetaChannel &ch,
+                                      uint64_t ttl_ms) {
+        uint64_t epoch = 0;
+        if (!ch.begin_reset_barrier(ttl_ms, epoch)) {
+          throw std::runtime_error("Failed to begin Redis reset barrier");
+        }
+        return epoch;
+      }, py::arg("ttl_ms"))
+      .def("mark_reset_barrier_arrival",
+           &flexkv::RedisMetaChannel::mark_reset_barrier_arrival,
+           py::arg("epoch"), py::arg("ttl_ms"))
+      .def("is_reset_barrier_ready", [](flexkv::RedisMetaChannel &ch,
+                                         uint64_t epoch) {
+        bool ready = false;
+        if (!ch.is_reset_barrier_ready(epoch, ready)) {
+          throw std::runtime_error("Failed to inspect Redis reset barrier");
+        }
+        return ready;
+      }, py::arg("epoch"))
+      .def("finish_reset_barrier",
+           &flexkv::RedisMetaChannel::finish_reset_barrier,
+           py::arg("epoch"));
 
   py::class_<flexkv::LocalRadixTree, flexkv::CRadixTreeIndex>(m,
                                                               "LocalRadixTree")
@@ -1267,7 +1298,8 @@ PYBIND11_MODULE(c_ext, m) {
       .def("total_ready_blocks", &flexkv::LocalRadixTree::total_ready_blocks)
       .def("total_cached_blocks", &flexkv::LocalRadixTree::total_cached_blocks)
       .def("total_node_num", &flexkv::LocalRadixTree::total_node_num)
-      .def("reset", &flexkv::LocalRadixTree::reset)
+      .def("reset", &flexkv::LocalRadixTree::reset,
+           py::call_guard<py::gil_scoped_release>())
       .def("is_root", &flexkv::LocalRadixTree::is_root, py::arg("node"))
       .def("remove_node", &flexkv::LocalRadixTree::remove_node, py::arg("node"))
       .def("remove_leaf", &flexkv::LocalRadixTree::remove_leaf, py::arg("node"))
@@ -1278,6 +1310,9 @@ PYBIND11_MODULE(c_ext, m) {
       .def("is_empty", &flexkv::LocalRadixTree::is_empty)
       .def("inc_node_count", &flexkv::LocalRadixTree::inc_node_count)
       .def("dec_node_count", &flexkv::LocalRadixTree::dec_node_count)
+      .def("lease_pool_capacity", &flexkv::LocalRadixTree::lease_pool_capacity)
+      .def("lease_pool_free_size", &flexkv::LocalRadixTree::lease_pool_free_size)
+      .def("pending_queue_size", &flexkv::LocalRadixTree::pending_queue_size)
       .def("set_ready", &flexkv::LocalRadixTree::set_ready, py::arg("node"),
            py::arg("ready"), py::arg("ready_length") = -1);
   m.attr("LocalRadixTree")
@@ -1294,6 +1329,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("lease_renew_ms") = 5000, py::arg("hit_reward_seconds") = 0)
       .def("start", &flexkv::DistributedRadixTree::start, py::arg("channel"))
       .def("stop", &flexkv::DistributedRadixTree::stop)
+      .def("reset", &flexkv::DistributedRadixTree::reset,
+           py::call_guard<py::gil_scoped_release>())
       .def("remote_tree_refresh",
            &flexkv::DistributedRadixTree::remote_tree_refresh,
            py::return_value_policy::reference)

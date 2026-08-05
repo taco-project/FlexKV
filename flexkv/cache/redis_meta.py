@@ -135,6 +135,26 @@ class RedisMetaChannel:
         """batch delete block metadata for specified node"""
         return self._c.delete_blockmeta_batch(int(node_id), list(int(h) for h in hashes), int(batch_size))
 
+    def delete_node_blocks(self, node_id: int, batch_size: int = 200) -> bool:
+        """Delete all block metadata for this storage layer and node."""
+        return bool(self._c.delete_node_blocks(int(node_id), int(batch_size)))
+
+    def has_any_block_keys(self) -> bool:
+        """Return whether this storage layer still has any block advertisements."""
+        return bool(self._c.has_any_block_keys())
+
+    def begin_reset_barrier(self, ttl_ms: int) -> int:
+        return int(self._c.begin_reset_barrier(int(ttl_ms)))
+
+    def mark_reset_barrier_arrival(self, epoch: int, ttl_ms: int) -> bool:
+        return bool(self._c.mark_reset_barrier_arrival(int(epoch), int(ttl_ms)))
+
+    def is_reset_barrier_ready(self, epoch: int) -> bool:
+        return bool(self._c.is_reset_barrier_ready(int(epoch)))
+
+    def finish_reset_barrier(self, epoch: int) -> bool:
+        return bool(self._c.finish_reset_barrier(int(epoch)))
+
 class RedisNodeInfo:
     """Redis node information management class implemented in Python"""
 

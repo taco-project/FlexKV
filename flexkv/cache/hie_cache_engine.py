@@ -39,7 +39,9 @@ class HierarchyLRCacheEngine:
                  evict_start_threshold: float = 1.0,
                  hit_reward_seconds: int = 0,
                  eviction_policy: str = "lru",
-                 meta: Optional[RedisMeta] = None) -> None:
+                 meta: Optional[RedisMeta] = None,
+                 reset_barrier_timeout_ms: int = 60000,
+                 reset_barrier_poll_ms: int = 50) -> None:
         if num_total_blocks <= 0:
             raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
@@ -92,6 +94,12 @@ class HierarchyLRCacheEngine:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
+        self.reset_barrier_timeout_ms = int(reset_barrier_timeout_ms)
+        self.reset_barrier_poll_ms = int(reset_barrier_poll_ms)
+        if self.reset_barrier_timeout_ms <= 0:
+            raise ValueError("reset_barrier_timeout_ms must be positive")
+        if self.reset_barrier_poll_ms <= 0:
+            raise ValueError("reset_barrier_poll_ms must be positive")
 
         # cumulative statistics: for analyzing distributed KV reuse benefits
         self._stats_total_queried_tokens = 0       # total tokens queried
@@ -167,8 +175,52 @@ class HierarchyLRCacheEngine:
         self.remote_index.stop()
 
     def reset(self) -> None:
+        restart_local_index = self.local_index.started
+        restart_remote_index = self.remote_index.started
+        barrier_ttl_ms = max(self.reset_barrier_timeout_ms * 2, 1000)
+        self.local_index.stop()
+        self.remote_index.stop()
+        reset_epoch = self.local_ch.begin_reset_barrier(barrier_ttl_ms)
+
         self.local_index.reset()
+        self.remote_index.reset()
+        if not self.local_ch.mark_reset_barrier_arrival(
+            reset_epoch, barrier_ttl_ms
+        ):
+            raise RuntimeError(
+                f"Failed to mark reset barrier arrival for device type: {self.device_type}"
+            )
+        self._wait_for_global_block_cleanup(reset_epoch)
+        if not self.local_ch.finish_reset_barrier(reset_epoch):
+            raise RuntimeError(
+                f"Failed to finish reset barrier for device type: {self.device_type}"
+            )
         self.mempool.reset()
+
+        if restart_remote_index and not self.remote_index.start(self.remote_ch):
+            raise RuntimeError(
+                f"Failed to restart distributed radix tree for device type: {self.device_type}"
+            )
+        if restart_local_index and not self.local_index.start(self.local_ch):
+            if restart_remote_index:
+                self.remote_index.stop()
+            raise RuntimeError(
+                f"Failed to restart local radix tree for device type: {self.device_type}"
+            )
+
+    def _wait_for_global_block_cleanup(self, reset_epoch: int) -> None:
+        deadline = time.monotonic() + self.reset_barrier_timeout_ms / 1000.0
+        while True:
+            barrier_ready = self.local_ch.is_reset_barrier_ready(reset_epoch)
+            has_block_keys = self.local_ch.has_any_block_keys()
+            if barrier_ready and not has_block_keys:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Timed out waiting for all nodes to enter reset and remove Redis block metadata "
+                    f"for device type: {self.device_type}; physical blocks were not reset"
+                )
+            time.sleep(self.reset_barrier_poll_ms / 1000.0)
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
         """Match a sequence against the cache index.
@@ -584,6 +636,8 @@ class HierarchyLRCacheEngine:
             remote_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
             local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
             eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
+            reset_barrier_timeout_ms=int(GLOBAL_CONFIG_FROM_ENV.reset_barrier_timeout_ms),
+            reset_barrier_poll_ms=int(GLOBAL_CONFIG_FROM_ENV.reset_barrier_poll_ms),
             meta=meta,
         )
 
@@ -625,6 +679,8 @@ class HierarchyLRCacheEngine:
                 evict_start_threshold=float(GLOBAL_CONFIG_FROM_ENV.evict_start_threshold),
                 hit_reward_seconds=int(GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds),
                 eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
+                reset_barrier_timeout_ms=int(GLOBAL_CONFIG_FROM_ENV.reset_barrier_timeout_ms),
+                reset_barrier_poll_ms=int(GLOBAL_CONFIG_FROM_ENV.reset_barrier_poll_ms),
                 meta=meta,
             )
             raise ValueError("Invalid device type: {cache_config.device_type}")
