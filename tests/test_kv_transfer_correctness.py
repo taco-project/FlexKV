@@ -346,6 +346,7 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
                          ce_gather_nt=None,
                          is_blockfirst=None,
                          is_mla=None,
+                         ssd_io_opt=None,
                          layer_eventfds_tensor=None):
     """Create LayerwiseTransferGroup for H2D-only testing (no SSD).
 
@@ -355,6 +356,7 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
     tensor to exercise the notify-mode path (upstream #199).
 
     CE config defaults from GLOBAL_CONFIG_FROM_ENV (same as production).
+    ssd_io_opt defaults from GLOBAL_CONFIG_FROM_ENV.ssd_io_opt (same as production).
     """
     if ce_segment_threshold is None:
         ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold
@@ -370,6 +372,8 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
         is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
     if is_mla is None:
         is_mla = gpu_layout.is_mla
+    if ssd_io_opt is None:
+        ssd_io_opt = GLOBAL_CONFIG_FROM_ENV.ssd_io_opt
     if layer_eventfds_tensor is None:
         layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
     def strides_tensor(getter):
@@ -407,6 +411,7 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_gather_nt=ce_gather_nt,
         is_blockfirst=is_blockfirst,
         is_mla=is_mla,
+        ssd_io_opt=ssd_io_opt,
     )
 
 
@@ -1776,6 +1781,577 @@ def test_gather_nt_layerwise_h2d(data_config, is_mla, cpu_layout_name, mode,
                             "expected={:.6f} got={:.6f}".format(
                                 gather_threads, gather_nt, cpu_layout_name,
                                 g, layer, block, kv, hd_idx, exp, act)
+
+
+# ---------------------------------------------------------------------------
+# SSD transfer correctness tests (non-compressed path: transfer_kv_blocks_ssd)
+# ---------------------------------------------------------------------------
+# CPU → SSD → CPU roundtrip: fill, write, clear, read, verify byte equality.
+# Covers LAYERFIRST/BLOCKFIRST × MLA/MHA × multi-layer × 1/4 threads.
+
+try:
+    from flexkv.c_ext import SSDIOCTX, transfer_kv_blocks_ssd as _ssd_xfer_fn
+    _SSD_AVAILABLE = True
+except ImportError:
+    _SSD_AVAILABLE = False
+
+
+SSD_SKIP_REASON = "c_ext not built or SSD support disabled"
+
+# Small sizes: SSD I/O is slow, only verifying correctness.
+SSD_SIZES = [
+    pytest.param((4, 8, 16, 1, 512), id="mla-mini"),
+    pytest.param((16, 16, 16, 1, 512), id="mla-multi-layer"),
+    pytest.param((4, 8, 16, 8, 128), id="mha-mini"),
+    pytest.param((16, 16, 16, 8, 128), id="mha-multi-layer"),
+    pytest.param((2, 4, 1, 1, 512), id="mla-edge"),
+    pytest.param((2, 4, 1, 8, 128), id="mha-edge"),
+]
+
+SSD_THREADS = [1, 4]
+
+
+def _ssd_file_path(tmpdir, dev_id=0, file_id=0):
+    """Create a temp SSD file and return its path."""
+    import os
+    dev_dir = os.path.join(tmpdir, f"dev{dev_id}")
+    os.makedirs(dev_dir, exist_ok=True)
+    return os.path.join(dev_dir, f"ssd_cache_{dev_id}_{file_id}.bin")
+
+
+def _setup_ssd_file(layout, num_blocks_per_file, tmpdir):
+    """Pre-allocate SSD file sized for the layout."""
+    import os
+    file_size = layout.get_total_elements() * ES
+
+    fpath = _ssd_file_path(tmpdir, 0, 0)
+    with open(fpath, "wb+") as f:
+        os.truncate(f.fileno(), file_size)
+        os.fsync(f.fileno())
+    return {0: [fpath]}
+
+
+def _fill_cpu_kv(cpu_tensor, layout, num_layers, num_blocks, tpb, num_heads,
+                 head_dim, kv_dim, seed=42):
+    """Fill CPU KV buffer with layout-independent deterministic pattern."""
+    total_elems = cpu_tensor.numel()
+    flat = torch.arange(total_elems, dtype=torch.int32) % 9973
+    cpu_tensor[:] = flat.view(cpu_tensor.shape).to(DTYPE)
+
+
+def _ssd_roundtrip_verify(cpu_orig, cpu_readback, layout, num_layers,
+                          num_blocks, tpb, num_heads, head_dim, kv_dim,
+                          label=""):
+    """Verify byte-level equality after SSD roundtrip."""
+    orig_bytes = cpu_orig.view(torch.uint8).reshape(-1)
+    read_bytes = cpu_readback.view(torch.uint8).reshape(-1)
+    assert torch.equal(orig_bytes, read_bytes), \
+        f"SSD roundtrip data mismatch ({label}): " \
+        f"{(orig_bytes != read_bytes).sum().item()} / {orig_bytes.numel()} bytes differ"
+
+
+@pytest.mark.parametrize("data_config", SSD_SIZES)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("num_threads", SSD_THREADS, ids=["t1", "t4"])
+@pytest.mark.parametrize("ssd_io_opt", [False, True], ids=["baseline", "optimized"])
+@pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
+def test_ssd_transfer_roundtrip(data_config, cpu_layout_name, num_threads,
+                                ssd_io_opt, iouring_entries, tmp_path):
+    """SSD roundtrip: CPU → SSD → CPU with byte-level verification. Covers thread/io_uring engines (iouring_entries=0/512).
+
+    Covers LAYERFIRST/BLOCKFIRST × MLA/MHA × multi-layer × 1/4 threads ×
+    FLEXKV_SSD_IO_OPT (baseline=off=basic fragmented I/O, optimized=on=bf/lf opt).
+    SSD layout matches CPU layout. Both modes must be byte-identical to source.
+    """
+    if not _SSD_AVAILABLE:
+        pytest.skip(SSD_SKIP_REASON)
+
+    import shutil
+    import tempfile
+
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    is_mla = (num_heads == 1)
+    kv_dim = 1 if is_mla else 2
+
+    # Build CPU/SSD layout (same type, same as production)
+    layout = KVCacheLayout(
+        type=KVCacheLayoutType[cpu_layout_name.upper()],
+        num_layer=num_layers, num_block=num_blocks,
+        tokens_per_block=tpb, num_head=num_heads,
+        head_size=head_dim, is_mla=is_mla)
+
+    chunk_size = layout.get_chunk_size()
+    block_stride = layout.get_block_stride()
+    kv_stride = layout.get_kv_stride()
+    layer_stride = layout.get_layer_stride()
+
+    # Create CPU buffer
+    cpu_kv = torch.zeros(tuple(layout.kv_shape), dtype=DTYPE).pin_memory()
+    _fill_cpu_kv(cpu_kv, layout, num_layers, num_blocks, tpb,
+                 num_heads, head_dim, kv_dim)
+
+    # Snapshot original for comparison
+    cpu_orig = cpu_kv.clone()
+
+    # Setup SSD file
+    tmpdir = str(tmp_path)
+    ssd_files = _setup_ssd_file(layout, num_blocks, tmpdir)
+
+    # Block IDs (identity mapping)
+    block_ids = torch.arange(num_blocks, dtype=torch.int64).pin_memory()
+    layer_ids = torch.arange(num_layers, dtype=torch.int32).pin_memory()
+
+    chunk_bytes = chunk_size * ES
+    block_stride_bytes = block_stride * ES
+    kv_stride_bytes = kv_stride * ES
+    layer_stride_bytes = layer_stride * ES
+
+    ioctx = SSDIOCTX(ssd_files, 1, iouring_entries, 0)  # 1 device, no io_uring
+
+    # Write: CPU → SSD
+    _ssd_xfer_fn(
+        ioctx=ioctx,
+        cpu_layer_id_list=layer_ids,
+        cpu_tensor_ptr=cpu_kv.data_ptr(),
+        ssd_block_ids=block_ids,
+        cpu_block_ids=block_ids,
+        cpu_layer_stride_in_bytes=layer_stride_bytes,
+        cpu_kv_stride_in_bytes=kv_stride_bytes,
+        ssd_layer_stride_in_bytes=layer_stride_bytes,
+        ssd_kv_stride_in_bytes=kv_stride_bytes,
+        chunk_size_in_bytes=chunk_bytes,
+        block_stride_in_bytes=block_stride_bytes,
+        is_read=False,
+        num_blocks_per_file=num_blocks,
+        round_robin=1,
+        num_threads_per_device=num_threads,
+        is_mla=is_mla,
+        ssd_io_opt=ssd_io_opt,
+    )
+
+    # Clear CPU buffer
+    cpu_kv.zero_()
+
+    # Read: SSD → CPU
+    _ssd_xfer_fn(
+        ioctx=ioctx,
+        cpu_layer_id_list=layer_ids,
+        cpu_tensor_ptr=cpu_kv.data_ptr(),
+        ssd_block_ids=block_ids,
+        cpu_block_ids=block_ids,
+        cpu_layer_stride_in_bytes=layer_stride_bytes,
+        cpu_kv_stride_in_bytes=kv_stride_bytes,
+        ssd_layer_stride_in_bytes=layer_stride_bytes,
+        ssd_kv_stride_in_bytes=kv_stride_bytes,
+        chunk_size_in_bytes=chunk_bytes,
+        block_stride_in_bytes=block_stride_bytes,
+        is_read=True,
+        num_blocks_per_file=num_blocks,
+        round_robin=1,
+        num_threads_per_device=num_threads,
+        is_mla=is_mla,
+        ssd_io_opt=ssd_io_opt,
+    )
+
+    # Verify
+    label = (f"layout={cpu_layout_name} mla={is_mla} layers={num_layers} "
+             f"blocks={num_blocks} threads={num_threads}")
+    _ssd_roundtrip_verify(cpu_orig, cpu_kv, layout, num_layers, num_blocks,
+                          tpb, num_heads, head_dim, kv_dim, label=label)
+
+    del ioctx
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("data_config", [pytest.param((4, 8, 16, 1, 512), id="mla-mini"),
+                                         pytest.param((4, 8, 16, 8, 128), id="mha-mini")])
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("num_threads", [1, 4], ids=["t1", "t4"])
+@pytest.mark.parametrize("ssd_io_opt", [False, True], ids=["baseline", "optimized"])
+@pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
+def test_ssd_transfer_partial_blocks(data_config, cpu_layout_name, num_threads,
+                                     ssd_io_opt, iouring_entries, tmp_path):
+    """SSD roundtrip with non-contiguous block IDs: write [0,2,4,6] → read into [1,3,5,7]. Covers thread/io_uring engines (iouring_entries=0/512).
+
+    Exercises block-id remapping and fragmented layer-first I/O path.
+    Covers FLEXKV_SSD_IO_OPT (baseline=off=basic fragmented I/O, optimized=on=bf/lf opt).
+    """
+    if not _SSD_AVAILABLE:
+        pytest.skip(SSD_SKIP_REASON)
+
+    import shutil
+
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    is_mla = (num_heads == 1)
+    kv_dim = 1 if is_mla else 2
+
+    layout = KVCacheLayout(
+        type=KVCacheLayoutType[cpu_layout_name.upper()],
+        num_layer=num_layers, num_block=num_blocks,
+        tokens_per_block=tpb, num_head=num_heads,
+        head_size=head_dim, is_mla=is_mla)
+
+    chunk_size = layout.get_chunk_size()
+    block_stride = layout.get_block_stride()
+    kv_stride = layout.get_kv_stride()
+    layer_stride = layout.get_layer_stride()
+
+    cpu_kv = torch.zeros(tuple(layout.kv_shape), dtype=DTYPE).pin_memory()
+    _fill_cpu_kv(cpu_kv, layout, num_layers, num_blocks, tpb,
+                 num_heads, head_dim, kv_dim)
+    cpu_orig = cpu_kv.clone()
+
+    tmpdir = str(tmp_path)
+    ssd_files = _setup_ssd_file(layout, num_blocks, tmpdir)
+
+    # Write even blocks to SSD
+    write_ssd_ids = torch.tensor([0, 2, 4, 6], dtype=torch.int64).pin_memory()
+    write_cpu_ids = torch.tensor([0, 2, 4, 6], dtype=torch.int64).pin_memory()
+    layer_ids = torch.arange(num_layers, dtype=torch.int32).pin_memory()
+
+    chunk_bytes = chunk_size * ES
+    block_stride_bytes = block_stride * ES
+    kv_stride_bytes = kv_stride * ES
+    layer_stride_bytes = layer_stride * ES
+
+    ioctx = SSDIOCTX(ssd_files, 1, iouring_entries, 0)
+
+    _ssd_xfer_fn(
+        ioctx=ioctx,
+        cpu_layer_id_list=layer_ids,
+        cpu_tensor_ptr=cpu_kv.data_ptr(),
+        ssd_block_ids=write_ssd_ids,
+        cpu_block_ids=write_cpu_ids,
+        cpu_layer_stride_in_bytes=layer_stride_bytes,
+        cpu_kv_stride_in_bytes=kv_stride_bytes,
+        ssd_layer_stride_in_bytes=layer_stride_bytes,
+        ssd_kv_stride_in_bytes=kv_stride_bytes,
+        chunk_size_in_bytes=chunk_bytes,
+        block_stride_in_bytes=block_stride_bytes,
+        is_read=False,
+        num_blocks_per_file=num_blocks,
+        round_robin=1,
+        num_threads_per_device=num_threads,
+        is_mla=is_mla,
+        ssd_io_opt=ssd_io_opt,
+    )
+
+    # Clear the written CPU blocks
+    for bid in [0, 2, 4, 6]:
+        # Zero out the block in the CPU buffer
+        if layout.type == KVCacheLayoutType.LAYERFIRST:
+            cpu_kv[:, :, bid] = 0
+        else:
+            cpu_kv[bid] = 0
+
+    # Read back into ODD CPU slots
+    read_ssd_ids = torch.tensor([0, 2, 4, 6], dtype=torch.int64).pin_memory()
+    read_cpu_ids = torch.tensor([1, 3, 5, 7], dtype=torch.int64).pin_memory()
+
+    _ssd_xfer_fn(
+        ioctx=ioctx,
+        cpu_layer_id_list=layer_ids,
+        cpu_tensor_ptr=cpu_kv.data_ptr(),
+        ssd_block_ids=read_ssd_ids,
+        cpu_block_ids=read_cpu_ids,
+        cpu_layer_stride_in_bytes=layer_stride_bytes,
+        cpu_kv_stride_in_bytes=kv_stride_bytes,
+        ssd_layer_stride_in_bytes=layer_stride_bytes,
+        ssd_kv_stride_in_bytes=kv_stride_bytes,
+        chunk_size_in_bytes=chunk_bytes,
+        block_stride_in_bytes=block_stride_bytes,
+        is_read=True,
+        num_blocks_per_file=num_blocks,
+        round_robin=1,
+        num_threads_per_device=num_threads,
+        is_mla=is_mla,
+        ssd_io_opt=ssd_io_opt,
+    )
+
+    # Verify: blocks 1,3,5,7 should now contain the original data from
+    # blocks 0,2,4,6 respectively.
+    for src_bid, dst_bid in zip([0, 2, 4, 6], [1, 3, 5, 7]):
+        if layout.type == KVCacheLayoutType.LAYERFIRST:
+            for layer in range(num_layers):
+                for kv in range(kv_dim):
+                    orig_block = cpu_orig[layer, kv, src_bid]
+                    read_block = cpu_kv[layer, kv, dst_bid]
+                    assert torch.equal(orig_block, read_block), \
+                        f"SSD partial roundtrip mismatch: src={src_bid} dst={dst_bid} " \
+                        f"layer={layer} kv={kv} layout={cpu_layout_name}"
+        else:
+            orig_block = cpu_orig[src_bid]
+            read_block = cpu_kv[dst_bid]
+            assert torch.equal(orig_block, read_block), \
+                f"SSD partial roundtrip mismatch: src={src_bid} dst={dst_bid} " \
+                f"layout={cpu_layout_name}"
+
+    del ioctx
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Incremental (partial layer range) transfers: path validation
+# ---------------------------------------------------------------------------
+
+def _ssd_layer_view(cpu_kv, layout, layer_id):
+    """All blocks of one layer, for either CPU layout."""
+    if layout.type == KVCacheLayoutType.LAYERFIRST:
+        # kv_shape = [layer, kv, block, tpb, head, head_size]
+        return cpu_kv[layer_id]
+    # BLOCKFIRST kv_shape = [block, layer, kv, tpb, head, head_size]
+    return cpu_kv[:, layer_id]
+
+
+def _ssd_block_layer_view(cpu_kv, layout, block_id, layer_id):
+    """One (block, layer) cell (all K/V halves), for either CPU layout."""
+    if layout.type == KVCacheLayoutType.LAYERFIRST:
+        return cpu_kv[layer_id, :, block_id]
+    return cpu_kv[block_id, layer_id]
+
+
+# ---------------------------------------------------------------------------
+# FLEXKV_SSD_IO_OPT: opt/baseline equivalence + layerwise SSD disk2h coverage
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("data_config", [pytest.param((4, 8, 16, 1, 512), id="mla-mini"),
+                                         pytest.param((16, 16, 16, 1, 512), id="mla-multi"),
+                                         pytest.param((4, 8, 16, 8, 128), id="mha-mini"),
+                                         pytest.param((16, 16, 16, 8, 128), id="mha-multi")])
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("num_threads", [1, 4], ids=["t1", "t4"])
+@pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
+def test_ssd_io_opt_on_off_byte_identical(data_config, cpu_layout_name, num_threads,
+                                          iouring_entries, tmp_path):
+    """FLEXKV_SSD_IO_OPT ON vs OFF must produce byte-identical SSD roundtrips. Covers thread/io_uring engines (iouring_entries=0/512).
+
+    The optimization only changes the I/O strategy (bf one-shot vs lf
+    layer-major vs basic fragmented), never the bytes transferred. This guards
+    against the opt path silently diverging from the baseline.
+    """
+    if not _SSD_AVAILABLE:
+        pytest.skip(SSD_SKIP_REASON)
+    import shutil
+
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    is_mla = (num_heads == 1)
+    kv_dim = 1 if is_mla else 2
+
+    layout = KVCacheLayout(
+        type=KVCacheLayoutType[cpu_layout_name.upper()],
+        num_layer=num_layers, num_block=num_blocks,
+        tokens_per_block=tpb, num_head=num_heads,
+        head_size=head_dim, is_mla=is_mla)
+    chunk_bytes = layout.get_chunk_size() * ES
+    block_stride_bytes = layout.get_block_stride() * ES
+    kv_stride_bytes = layout.get_kv_stride() * ES
+    layer_stride_bytes = layout.get_layer_stride() * ES
+
+    block_ids = torch.arange(num_blocks, dtype=torch.int64).pin_memory()
+    layer_ids = torch.arange(num_layers, dtype=torch.int32).pin_memory()
+
+    def _run(opt):
+        cpu_kv = torch.zeros(tuple(layout.kv_shape), dtype=DTYPE).pin_memory()
+        _fill_cpu_kv(cpu_kv, layout, num_layers, num_blocks, tpb,
+                     num_heads, head_dim, kv_dim)
+        orig = cpu_kv.clone()
+        sub = str(tmp_path / ("opt_on" if opt else "opt_off"))
+        ssd_files = _setup_ssd_file(layout, num_blocks, sub)
+        ioctx = SSDIOCTX(ssd_files, 1, iouring_entries, 0)
+        try:
+            _ssd_xfer_fn(ioctx=ioctx, cpu_layer_id_list=layer_ids,
+                         cpu_tensor_ptr=cpu_kv.data_ptr(),
+                         ssd_block_ids=block_ids, cpu_block_ids=block_ids,
+                         cpu_layer_stride_in_bytes=layer_stride_bytes,
+                         cpu_kv_stride_in_bytes=kv_stride_bytes,
+                         ssd_layer_stride_in_bytes=layer_stride_bytes,
+                         ssd_kv_stride_in_bytes=kv_stride_bytes,
+                         chunk_size_in_bytes=chunk_bytes,
+                         block_stride_in_bytes=block_stride_bytes,
+                         is_read=False, num_blocks_per_file=num_blocks,
+                         round_robin=1, num_threads_per_device=num_threads,
+                         is_mla=is_mla, ssd_io_opt=opt)
+            cpu_kv.zero_()
+            _ssd_xfer_fn(ioctx=ioctx, cpu_layer_id_list=layer_ids,
+                         cpu_tensor_ptr=cpu_kv.data_ptr(),
+                         ssd_block_ids=block_ids, cpu_block_ids=block_ids,
+                         cpu_layer_stride_in_bytes=layer_stride_bytes,
+                         cpu_kv_stride_in_bytes=kv_stride_bytes,
+                         ssd_layer_stride_in_bytes=layer_stride_bytes,
+                         ssd_kv_stride_in_bytes=kv_stride_bytes,
+                         chunk_size_in_bytes=chunk_bytes,
+                         block_stride_in_bytes=block_stride_bytes,
+                         is_read=True, num_blocks_per_file=num_blocks,
+                         round_robin=1, num_threads_per_device=num_threads,
+                         is_mla=is_mla, ssd_io_opt=opt)
+        finally:
+            del ioctx
+            shutil.rmtree(sub, ignore_errors=True)
+        return orig, cpu_kv
+
+    orig_on, read_on = _run(True)
+    orig_off, read_off = _run(False)
+    _ssd_roundtrip_verify(orig_on, read_on, layout, num_layers, num_blocks,
+                          tpb, num_heads, head_dim, kv_dim, label="on")
+    _ssd_roundtrip_verify(orig_off, read_off, layout, num_layers, num_blocks,
+                          tpb, num_heads, head_dim, kv_dim, label="off")
+    on_bytes = read_on.view(torch.uint8).reshape(-1)
+    off_bytes = read_off.view(torch.uint8).reshape(-1)
+    assert torch.equal(on_bytes, off_bytes), \
+        f"SSD opt ON vs OFF diverge: {(on_bytes != off_bytes).sum().item()} " \
+        f"bytes differ (layout={cpu_layout_name} mla={is_mla} threads={num_threads})"
+
+
+@pytest.mark.parametrize("data_config", [pytest.param((4, 8, 16, 1, 512), id="mla-mini"),
+                                         pytest.param((16, 16, 16, 1, 512), id="mla-multi")])
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("ssd_io_opt", [False, True], ids=["baseline", "optimized"])
+@pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
+def test_ssd_transfer_layerwise_disk2h(data_config, cpu_layout_name, ssd_io_opt,
+                                       iouring_entries, tmp_path):
+    """Layerwise SSD disk2h: SSD -> CPU (staging) -> GPU via LayerwiseTransferGroup. Covers thread/io_uring engines (iouring_entries=0/512).
+
+    Mirrors production LayerwiseWorker single-group wiring: ssd_files set and
+    ssd_io_opt threaded into the C++ SSD read (Step 0 of layerwise_transfer). The
+    SSD read writes the KV into the CPU staging buffer, then the CE H2D loop
+    copies CPU -> GPU. Verifies the CPU staging buffer recovers the original
+    source for both opt/baseline (the direct output of the SSD path).
+
+    MLA-only + sharded: all ranks hold identical data, so the SSD read's full
+    CPU layout is consistent with the H2D sharded offset (0). This is the path
+    the user flagged as needing coverage for the FLEXKV_SSD_IO_OPT switch.
+    """
+    if not _SSD_AVAILABLE:
+        pytest.skip(SSD_SKIP_REASON)
+    import shutil
+
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    assert num_heads == 1, "layerwise SSD disk2h test is MLA-only (sharded)"
+    num_gpus = NUM_GPUS
+    is_mla = True
+    kv_dim = 1
+
+    gpu_layout, cpu_layout, cpu_layout_tp, _, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, is_mla, num_gpus)
+
+    (total_blocks, cpu_stride_kv, cpu_stride_layer,
+     cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
+        cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+        num_heads, head_dim, tpb, is_mla, "sharded", num_gpus)
+    cpu_chunk_bytes = cpu_layout.get_chunk_size() * ES
+
+    # CPU staging buffer (source). Fill with deterministic pattern.
+    cpu_kv = torch.zeros(tuple(cpu_layout.kv_shape), dtype=DTYPE).pin_memory()
+    _fill_cpu_kv(cpu_kv, cpu_layout, num_layers, num_blocks, tpb,
+                 num_heads, head_dim, kv_dim)
+    cpu_orig = cpu_kv.clone()
+
+    # GPU tensors (zeroed; H2D writes into them).
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
+                                heads_per_rank, head_dim, kv_dim, g)
+               for g in range(num_gpus)]
+    sync_all(num_gpus)
+
+    def _gstride(getter):
+        return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
+    gpu_kv_strides = _gstride(gpu_layout.get_kv_stride)
+    gpu_block_strides = _gstride(gpu_layout.get_block_stride)
+    gpu_layer_strides = _gstride(gpu_layout.get_layer_stride)
+    gpu_chunk_sizes = _gstride(gpu_layout.get_chunk_size)
+
+    # SSD layout mirrors CPU layout (1 file holds all blocks).
+    ssd_layer_bytes = cpu_layout.get_layer_stride() * ES
+    ssd_kv_bytes = cpu_layout.get_kv_stride() * ES
+
+    tmpdir = str(tmp_path)
+    ssd_files = _setup_ssd_file(cpu_layout, num_blocks, tmpdir)
+    ioctx = SSDIOCTX(ssd_files, 1, iouring_entries, 0)
+
+    # Populate SSD from the CPU source (CPU -> SSD) using the same strides the
+    # layerwise SSD read will use to pull it back.
+    block_ids = torch.arange(num_blocks, dtype=torch.int64).pin_memory()
+    layer_ids = torch.arange(num_layers, dtype=torch.int32).pin_memory()
+    _ssd_xfer_fn(ioctx=ioctx, cpu_layer_id_list=layer_ids,
+                 cpu_tensor_ptr=cpu_kv.data_ptr(),
+                 ssd_block_ids=block_ids, cpu_block_ids=block_ids,
+                 cpu_layer_stride_in_bytes=cpu_stride_layer,
+                 cpu_kv_stride_in_bytes=cpu_stride_kv,
+                 ssd_layer_stride_in_bytes=ssd_layer_bytes,
+                 ssd_kv_stride_in_bytes=ssd_kv_bytes,
+                 chunk_size_in_bytes=cpu_chunk_bytes,
+                 block_stride_in_bytes=cpu_stride_block,
+                 is_read=False, num_blocks_per_file=num_blocks,
+                 round_robin=1, num_threads_per_device=32,
+                 is_mla=is_mla, ssd_io_opt=ssd_io_opt)
+    cpu_kv.zero_()
+
+    group = LayerwiseTransferGroup(
+        num_gpus=num_gpus, gpu_blocks=all_gpu, cpu_blocks=cpu_kv,
+        ssd_files=ssd_files, num_layers=num_layers,
+        gpu_kv_strides_tensor=gpu_kv_strides,
+        gpu_block_strides_tensor=gpu_block_strides,
+        gpu_layer_strides_tensor=gpu_layer_strides,
+        gpu_chunk_sizes_tensor=gpu_chunk_sizes,
+        iouring_entries=0, iouring_flags=0,
+        layer_eventfds_tensor=torch.empty(0, dtype=torch.int32),
+        tp_size=num_gpus, has_swa=False,
+        swa_gpu_blocks=[], swa_cpu_blocks=torch.empty(0),
+        swa_ssd_files={},
+        swa_gpu_kv_strides_tensor=torch.empty(0),
+        swa_gpu_block_strides_tensor=torch.empty(0),
+        swa_gpu_layer_strides_tensor=torch.empty(0),
+        swa_gpu_chunk_sizes_tensor=torch.empty(0),
+        ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+        ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+        ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+        is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
+        is_mla=is_mla,
+        ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
+        ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
+        ssd_io_opt=ssd_io_opt,
+    )
+
+    # SSD -> CPU -> GPU. Positional args mirror LayerwiseWorker.layerwise_transfer.
+    group.layerwise_transfer(
+        block_ids,        # ssd_block_ids (src disk2h)
+        block_ids,        # cpu_block_ids_d2h (dst disk2h)
+        ssd_layer_bytes,  # ssd_layer_stride_in_bytes
+        ssd_kv_bytes,     # ssd_kv_stride_in_bytes
+        num_blocks,       # num_blocks_per_file
+        1,                # round_robin
+        32,               # num_threads_per_device
+        block_ids,        # gpu_block_id_tensor (dst h2d)
+        block_ids,        # cpu_block_id_tensor (src h2d)
+        cpu_stride_kv,    # cpu_kv_stride_in_bytes
+        cpu_stride_layer,  # cpu_layer_stride_in_bytes
+        cpu_stride_block,  # cpu_block_stride_in_bytes
+        cpu_chunk_bytes,   # cpu_chunk_size_in_bytes
+        cpu_stride_kv,    # h2d_cpu_kv_stride_in_bytes
+        cpu_stride_layer,  # h2d_cpu_layer_stride_in_bytes
+        cpu_stride_tp,    # cpu_tp_stride_in_bytes
+        4,                # transfer_cta_num
+        True,             # use_ce_transfer
+        num_layers,
+        1,                # layer_granularity
+        is_mla,
+        0,                # counter_id
+        mla_d2h_mode="sharded",
+        notify_mode="hostfunc",
+    )
+    sync_all(num_gpus)
+
+    # The SSD read wrote the staging buffer; H2D only read from it. So the CPU
+    # staging buffer must equal the original source for both opt/baseline.
+    orig_bytes = cpu_orig.view(torch.uint8).reshape(-1)
+    read_bytes = cpu_kv.view(torch.uint8).reshape(-1)
+    assert torch.equal(orig_bytes, read_bytes), \
+        f"layerwise SSD disk2h mismatch (layout={cpu_layout_name} " \
+        f"ssd_io_opt={ssd_io_opt}): " \
+        f"{(orig_bytes != read_bytes).sum().item()} / {orig_bytes.numel()} bytes differ"
+
+    del ioctx, group
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

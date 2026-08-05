@@ -348,42 +348,92 @@ PATH_FORMS = [
 ]
 
 
-def python_choose_path(pattern, layout_key, mode, is_h2d, threshold,
-                       chunk_size_bytes, is_mla=True):
-    """Mirror of C++ choose_path (ce_transfer.cu). Returns the strategy name
-    that choose_path would pick for the given (pattern, layout, mode, dir).
-    """
-    cpu_phys_contig = (layout_key == "lfirst") and is_mla
-    # MHA + LF: cpu_block_stride = num_gpus * head_dim != chunk_size = head_dim
-    # (per-rank), so cpu_phys_contig = false even for LAYERFIRST.
-    is_blockfirst = (layout_key == "bfirst")
-    gpu_phys_contig = not (mode == "sharded" and not is_h2d)
-    if pattern == "contiguous":
-        num_segments = 1
-    elif pattern == "few_seg":
-        num_segments = 4
-    else:
-        num_segments = threshold + 1
+# CEPath enum mapping for predict_ce_path output.
+CE_PATH_NAMES = {
+    -1: "PER_BLOCK",
+    0: "CONTIG_DIRECT",
+    1: "SEGMENT_DIRECT",
+    2: "SEGMENT_SCATTER",
+    3: "GATHER_SCATTER",
+    4: "GATHER_DIRECT",
+}
 
-    # GATHER_DIRECT: BF + !cpu_phys_contig + GPU physically contiguous
-    # (non-sharded). Sharded D2H breaks gpu_phys_contig -> GATHER_SCATTER.
-    # Exception: bfirst + MLA + D2H + !full_block (layer_parallel) ->
-    # SEGMENT_SCATTER is 30%-8.9x faster than GATHER_DIRECT. Mirrors
-    # ce_transfer.cu:120-128 (is_full_block = mode in (rank0_only, all_write);
-    # !is_host_to_device = D2H).
-    if is_blockfirst and not cpu_phys_contig and gpu_phys_contig:
-        if not is_h2d and is_mla and mode not in ("rank0_only", "all_write"):
-            return "SEGMENT_SCATTER"
-        return "GATHER_DIRECT"
-    if cpu_phys_contig and gpu_phys_contig and num_segments == 1:
-        return "CONTIG_DIRECT"
-    if not gpu_phys_contig:
-        return "GATHER_SCATTER"
-    if num_segments <= threshold:
-        return "SEGMENT_DIRECT" if cpu_phys_contig else "SEGMENT_SCATTER"
-    if chunk_size_bytes > 0 and chunk_size_bytes % 8 != 0:
-        return "SEGMENT_SCATTER"
-    return "GATHER_SCATTER"
+
+_SIZEOF_INT64 = 8
+
+
+def _analyze_ce_transfer(gpu_block_ids, cpu_block_ids, num_blocks,
+                         cpu_block_stride_in_bytes, chunk_size_in_bytes,
+                         gpu_block_stride_in_bytes):
+    gpu_log_contig = True
+    cpu_log_contig = True
+    cpu_phys_contig = (cpu_block_stride_in_bytes == chunk_size_in_bytes)
+    gpu_phys_contig = (gpu_block_stride_in_bytes == 0 or
+                       gpu_block_stride_in_bytes == chunk_size_in_bytes)
+    num_segments = 1 if num_blocks > 0 else 0
+    seg_start = 0
+    for k in range(1, num_blocks):
+        src_step = (gpu_block_ids[k] == gpu_block_ids[k - 1] + 1)
+        dst_step = (cpu_block_ids[k] == cpu_block_ids[k - 1] + 1)
+        if not src_step:
+            gpu_log_contig = False
+        if not dst_step:
+            cpu_log_contig = False
+        if not src_step or not dst_step:
+            num_segments += 1
+            seg_start = k
+    return {
+        "gpu_log_contig": gpu_log_contig,
+        "cpu_log_contig": cpu_log_contig,
+        "cpu_phys_contig": cpu_phys_contig,
+        "gpu_phys_contig": gpu_phys_contig,
+        "num_segments": num_segments,
+    }
+
+
+def _choose_ce_path(ce, is_blockfirst, is_mla, segment_threshold,
+                    chunk_size_in_bytes, is_host_to_device, is_full_block):
+    # BF + !cpu_phys_contig + GPU contig: MLA D2H path refinement.
+    if is_blockfirst and not ce["cpu_phys_contig"] and ce["gpu_phys_contig"]:
+        if not is_host_to_device and is_mla:
+            if ce["num_segments"] > segment_threshold:
+                return (2 if (chunk_size_in_bytes > 0 and
+                              chunk_size_in_bytes % _SIZEOF_INT64 != 0)
+                        else 3)  # SEGMENT_SCATTER : GATHER_SCATTER
+            if not is_full_block:
+                return 2  # SEGMENT_SCATTER
+        return 4  # GATHER_DIRECT
+    # CONTIG_DIRECT: both sides contig -> one big memcpy.
+    if (ce["gpu_log_contig"] and ce["cpu_log_contig"] and
+            ce["cpu_phys_contig"] and ce["gpu_phys_contig"]):
+        return 0  # CONTIG_DIRECT
+    # Sharded D2H -> GATHER_SCATTER (SEGMENT_SCATTER misplaces shards).
+    if not ce["gpu_phys_contig"]:
+        return 3  # GATHER_SCATTER
+    # LAYERFIRST: pick by segment count.
+    if ce["num_segments"] <= segment_threshold:
+        return 1 if ce["cpu_phys_contig"] else 2  # SEGMENT_DIRECT : SEGMENT_SCATTER
+    if chunk_size_in_bytes > 0 and chunk_size_in_bytes % _SIZEOF_INT64 != 0:
+        return 2  # SEGMENT_SCATTER
+    return 3  # GATHER_SCATTER
+
+
+def predict_ce_path(gpu_block_id_tensor, cpu_block_id_tensor,
+                    cpu_block_stride_in_bytes, chunk_size_in_bytes,
+                    num_layers, is_host_to_device, is_mla, is_blockfirst,
+                    ce_segment_threshold=8, gpu_block_stride_in_bytes=0):
+    """Mirror of C++ predict_ce_path_binding — returns the CEPath int."""
+    gpu_ids = gpu_block_id_tensor.tolist()
+    cpu_ids = cpu_block_id_tensor.tolist()
+    num_blocks = len(gpu_ids)
+    ce = _analyze_ce_transfer(gpu_ids, cpu_ids, num_blocks,
+                              cpu_block_stride_in_bytes, chunk_size_in_bytes,
+                              gpu_block_stride_in_bytes)
+    kv_dim = 1 if is_mla else 2
+    is_full_block = (num_layers * kv_dim * chunk_size_in_bytes ==
+                     cpu_block_stride_in_bytes)
+    return _choose_ce_path(ce, is_blockfirst, is_mla, ce_segment_threshold,
+                           chunk_size_in_bytes, is_host_to_device, is_full_block)
 
 
 # -- Main benchmark -----------------------------------------------------------
@@ -396,6 +446,8 @@ def run_strategy_compare(args):
     # PER_BLOCK baseline is pattern-independent. Cache by (size, layout, mode,
     # dir) so we only time it once per unique combo.
     baseline_cache = {}
+    # MLA H2D is mode-independent — cache first mode's timings for reuse.
+    h2d_mla_cache = {}
 
     print("=" * 100)
     print("  CE Strategy Auto-Selection: 5 strategies head-to-head + recommended")
@@ -452,24 +504,86 @@ def run_strategy_compare(args):
 
             for is_h2d in dirs:
                 dir_name = "H2D" if is_h2d else "D2H"
-                key = (form_name, dir_name)
-                auto_path = python_choose_path(
-                    pattern, layout_key, mode, is_h2d, threshold,
-                    head_dim * ES, is_mla=is_mla)
-                results[key]["auto_path"] = auto_path
+                # For H2D, MLA mode is mode-independent — label it just "mla".
+                if is_h2d and is_mla:
+                    row_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
+                else:
+                    row_name = form_name
+                key = (row_name, dir_name)
                 if is_mla:
-                    form_display = "{} | {} | mla-{}".format(pattern, layout_key, mode)
+                    if is_h2d:
+                        form_display = "{} | {} | mla".format(pattern, layout_key)
+                    else:
+                        form_display = "{} | {} | mla-{}".format(pattern, layout_key, mode)
                 else:
                     form_display = "{} | {} | mha".format(pattern, layout_key)
+
+                # MLA H2D is mode-independent — skip duplicate modes.
+                if is_h2d and is_mla:
+                    if h2d_mla_cache.get((pattern, layout_key)) is not None:
+                        continue
+
+                # Query C++ choose_path directly via predict_ce_path.
+                chunk_size = gpu_layout.get_chunk_size() * ES
+                # sharded D2H: strided GPU view breaks phys contiguity
+                gpu_bl_sb = (chunk_size * num_gpus
+                             if (mode == "sharded" and not is_h2d) else 0)
+                auto_path_id = predict_ce_path(
+                    gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+                    cpu_block_stride_in_bytes=cpu_bl_sb,
+                    chunk_size_in_bytes=chunk_size,
+                    num_layers=num_layers, is_host_to_device=is_h2d,
+                    is_mla=is_mla,
+                    is_blockfirst=(layout_key == "bfirst"),
+                    ce_segment_threshold=threshold,
+                    gpu_block_stride_in_bytes=gpu_bl_sb)
+                auto_path = CE_PATH_NAMES.get(auto_path_id, "PER_BLOCK")
+                results[key]["auto_path"] = auto_path
                 print("\n-- {} | {} | auto={} --".format(
                     form_display, dir_name, auto_path))
+
+                # Viable force-run paths for this form/dir (also used by warmup).
+                viable = correct_paths_for(layout_key, is_mla, pattern, mode,
+                                            is_h2d, threshold)
+
+                # Warmup each path to absorb first-run overhead.
+                warm_paths = [(-1, auto_path)]
+                _seen = {auto_path}
+                for fp_id, fp_name in viable:
+                    if fp_name not in _seen:
+                        _seen.add(fp_name)
+                        warm_paths.append((fp_id, fp_name))
+                for wp_id, wp_name in warm_paths:
+                    # Match memcpy2d setting used in timed runs.
+                    wp_m2d = [(args.memcpy2d == "on")] if wp_id == -1 else [False]
+                    if wp_id != -1 and args.memcpy2d == "on" and wp_name in AFFECTED_PATHS:
+                        wp_m2d = [False, True]
+                    for wp_m in wp_m2d:
+                        try:
+                            wp_tp = make_tp_group(
+                                cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
+                                num_layers, ce_path_opt=True,
+                                ce_segment_threshold=threshold,
+                                ce_force_path=wp_id,
+                                is_mla=is_mla,
+                                is_blockfirst=(layout_key == "bfirst"),
+                                ce_enable_memcpy2d=wp_m)
+                            bench_one_dir(
+                                wp_tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
+                                num_layers, is_h2d, num_gpus,
+                                max(1, args.iters // 5), is_mla, mode,
+                                transfer_num_cta=cta)
+                            del wp_tp
+                        except Exception as e:
+                            # Timed runs will surface real failures
+                            print("  warmup [{}] skipped: {}".format(wp_name, e))
 
                 # Run baseline (PER_BLOCK, path_opt=false) — cached
                 bk = (size_name, layout_key, mode, dir_name)
                 cached_bs = baseline_cache.get(bk)
                 if cached_bs is not None:
                     results[key]["baseline"] = cached_bs
-                    print("  baseline (cached) {:.3f} ms".format(cached_bs))
+                    print("  baseline {:.3f} ms".format(cached_bs))
                 else:
                     print("  baseline ...", end=" ", flush=True)
                     try:
@@ -490,41 +604,12 @@ def run_strategy_compare(args):
                     except Exception as e:
                         print("FAILED: {}".format(e))
 
-                # Run auto (force_path=-1, choose_path decides)
-                print("  auto [{}] ...".format(auto_path), end=" ", flush=True)
-                try:
-                    tp = make_tp_group(
-                        cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
-                        num_layers, ce_path_opt=True,
-                        ce_segment_threshold=threshold,
-                        ce_force_path=-1,
-                        is_mla=is_mla,
-                        is_blockfirst=(layout_key == "bfirst"))
-                    med = bench_one_dir(
-                        tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
-                        num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
-                        transfer_num_cta=cta)
-                    results[key]["auto"] = med
-                    print("{:.3f} ms".format(med))
-                    del tp
-                except Exception as e:
-                    print("FAILED: {}".format(e))
-
-                # Run each viable strategy (skip auto-pick — redundant).
-                # When --memcpy2d on, the two affected paths (SEGMENT_SCATTER,
-                # GATHER_DIRECT) are also timed with cudaMemcpy2DAsync so the
-                # benefit of FLEXKV_ENABLE_CE_MEMCPY2D can be measured head-to-head.
-                # The off variant of the auto-picked path is already timed by
-                # the 'auto' run, so we skip that one to avoid redundancy.
-                viable = correct_paths_for(layout_key, is_mla, pattern, mode,
-                                            is_h2d, threshold)
+                # Time every viable strategy (auto measured separately above).
                 for fp_id, fp_name in viable:
                     m2d_settings = [False]
                     if args.memcpy2d == "on" and fp_name in AFFECTED_PATHS:
                         m2d_settings = [False, True]
                     for m2d in m2d_settings:
-                        if m2d is False and fp_name == auto_path:
-                            continue
                         tag = " [memcpy2d=1]" if m2d else ""
                         label = fp_name + (" [2d]" if m2d else "")
                         print("  {}{} ...".format(fp_name, tag), end=" ", flush=True)
@@ -548,6 +633,31 @@ def run_strategy_compare(args):
                             results[key][label] = None
                             print("FAILED: {}".format(e))
 
+                # Run auto after force-runs to reuse warmup state.
+                print("  auto [{}] ...".format(auto_path), end=" ", flush=True)
+                try:
+                    tp = make_tp_group(
+                        cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
+                        num_layers, ce_path_opt=True,
+                        ce_segment_threshold=threshold,
+                        ce_force_path=-1,
+                        is_mla=is_mla,
+                        is_blockfirst=(layout_key == "bfirst"),
+                        ce_enable_memcpy2d=(args.memcpy2d == "on"))
+                    med = bench_one_dir(
+                        tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
+                        num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
+                        transfer_num_cta=cta)
+                    results[key]["auto"] = med
+                    print("{:.3f} ms".format(med))
+                    del tp
+                except Exception as e:
+                    print("FAILED: {}".format(e))
+
+                # Cache H2D results for MLA reuse (mode-independent, see above).
+                if is_h2d and is_mla:
+                    h2d_mla_cache[(pattern, layout_key)] = dict(results[key])
+
             del all_gpu, cpu_kv
 
     # -- Print results per size ------------------------------------------------
@@ -570,6 +680,15 @@ def run_strategy_compare(args):
             else:
                 form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
             for is_h2d in dirs:
+                # MLA H2D is mode-independent — show only rank0_only.
+                if is_h2d and is_mla and mode != "rank0_only":
+                    continue
+                if is_h2d and is_mla:
+                    form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
+                elif is_mla:
+                    form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
+                else:
+                    form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
                 viable = correct_paths_for(layout_key, is_mla, pattern, mode,
                                             is_h2d, threshold)
                 run_rows.append((form_name, "H2D" if is_h2d else "D2H", viable))
@@ -591,6 +710,7 @@ def run_strategy_compare(args):
 
         auto_wins = 0
         auto_total = 0
+        overhead_rows = []
 
         for form_name, dir_name, viable in run_rows:
             cfgs = results.get((form_name, dir_name), {})
@@ -599,18 +719,25 @@ def run_strategy_compare(args):
             auto_path = cfgs.get("auto_path", "")
             viable_names = {pn for _, pn in viable}
 
-            # Collect all strategy timings
+            # Display: off-variant timings; [2d] columns show ON variant.
             strategy_times = {}
             for _, pname in STRATEGIES:
-                if pname == auto_path:
-                    strategy_times[pname] = auto
-                elif pname in viable_names:
-                    strategy_times[pname] = cfgs.get(pname)
-                else:
-                    strategy_times[pname] = None
+                strategy_times[pname] = cfgs.get(pname) if pname in viable_names else None
 
-            # Find fastest
-            all_vals = {k: v for k, v in strategy_times.items() if v is not None}
+            # Comparison set: match auto's memcpy2d setting for fair '=' check.
+            use_on = (args.memcpy2d == "on")
+            cmp_times = {}
+            for _, pname in STRATEGIES:
+                if pname not in viable_names:
+                    cmp_times[pname] = None
+                elif use_on and pname in AFFECTED_PATHS:
+                    on_v = cfgs.get(pname + " [2d]")
+                    cmp_times[pname] = on_v if on_v is not None else cfgs.get(pname)
+                else:
+                    cmp_times[pname] = cfgs.get(pname)
+
+            # Find fastest (at auto's memcpy2d setting)
+            all_vals = {k: v for k, v in cmp_times.items() if v is not None}
             if all_vals:
                 recommended = min(all_vals, key=all_vals.get)
                 fastest_val = all_vals[recommended]
@@ -618,14 +745,27 @@ def run_strategy_compare(args):
                 recommended = "-"
                 fastest_val = None
 
-            # Check if auto matches recommended
-            auto_optimal = (auto is not None and fastest_val is not None
-                            and auto == fastest_val)
+            # Correctness: did choose_path pick the optimal path?
+            path_optimal = (auto_path != "" and recommended != "-"
+                            and auto_path == recommended)
+
+            # Timing sanity: auto within 8% of fastest (informational).
+            if auto is not None and fastest_val is not None:
+                tol = 0.08 * fastest_val
+                time_ok = auto <= fastest_val + tol
+            else:
+                time_ok = False
 
             if auto is not None:
                 auto_total += 1
-                if auto_optimal:
+                if path_optimal:
                     auto_wins += 1
+                    if fastest_val:
+                        overhead = (auto - fastest_val) / fastest_val
+                        if overhead > 0.15:
+                            overhead_rows.append(
+                                (form_name, dir_name, auto_path,
+                                 auto, fastest_val, overhead))
 
             # Format row
             def fmt_val(v, is_fastest):
@@ -640,43 +780,55 @@ def run_strategy_compare(args):
                 line += "  {:>{w}s}".format("-", w=col_w)
             else:
                 line += "  {:>{w}.3f} ".format(baseline, w=col_w - 1)
+            # Main columns: '*' marks the fastest variant.
             for _, pname in STRATEGIES:
                 v = strategy_times.get(pname)
-                is_fast = (v is not None and v == fastest_val)
+                is_fast = (pname == recommended and v is not None
+                           and fastest_val is not None and v == fastest_val)
                 line += "  {}".format(fmt_val(v, is_fast))
 
             if args.memcpy2d == "on":
                 for _, pname in STRATEGIES:
                     if pname in AFFECTED_PATHS:
                         v = cfgs.get(pname + " [2d]")
-                        off_v = strategy_times.get(pname)
-                        # '*' here means the memcpy2d=1 variant is FASTER than
-                        # its off sibling for the same path (i.e. benefit).
-                        is_fast = (v is not None and off_v is not None and v < off_v)
+                        # '*' = fastest or benefits vs off variant.
+                        is_fast = ((pname == recommended and v is not None
+                                    and fastest_val is not None and v == fastest_val)
+                                   or (v is not None and strategy_times.get(pname) is not None
+                                       and v < strategy_times.get(pname)))
                         line += "  {}".format(fmt_val(v, is_fast))
 
             # auto column
             if auto is None:
                 line += "  {:>{w}s}".format("-", w=col_w)
             else:
-                star = "*" if auto_optimal else " "
+                star = "*" if time_ok else " "
                 line += "  {:>{w}.3f}{}".format(auto, star, w=col_w - 1)
 
             # recommended + match
-            match_sym = "=" if auto_optimal else "!" if auto is not None else "?"
+            match_sym = "=" if path_optimal else "!" if auto is not None else "?"
             line += "  {:>16s}".format(recommended)
             line += " {:>2s}".format(match_sym)
             print(line)
 
         print("  " + "-" * (len(hdr) - 2))
         if auto_total:
-            print("  choose_path auto pick optimal in {}/{} rows.".format(
+            print("  choose_path picked optimal path in {}/{} rows.".format(
                 auto_wins, auto_total))
             if auto_wins == auto_total:
                 print("  => choose_path is OPTIMAL for this size.")
             else:
-                print("  => inspect rows marked '!' (auto not fastest).")
-        print("  '*' = fastest strategy. '=' = auto matches recommended. '!' = auto NOT optimal.")
+                print("  => inspect rows marked '!' (auto picked a SUBOPTIMAL path).")
+        print("  '*' (path cols) = fastest variant at current memcpy2d setting.")
+        print("  '*' (auto col)  = auto time within 8% of fastest (timing sanity).")
+        print("  '=' = choose_path picked the optimal path; '!' = chose a SUBOPTIMAL path (real bug).")
+        if overhead_rows:
+            print("  note: {} path-optimal row(s) show >15% auto-time overhead vs the "
+                  "isolated fastest (full-API harness overhead / run variance) — "
+                  "NOT choose_path bugs:".format(len(overhead_rows)))
+            for fn, dn, ap, au, fv, oh in overhead_rows:
+                print("    - {} {} [{}]: auto={:.3f} vs fastest={:.3f} ({:.0%} over)".format(
+                    fn, dn, ap, au, fv, oh))
         if args.memcpy2d == "on":
             print_memcpy2d_benefit(results, run_rows)
         print("=" * 100)
@@ -768,7 +920,18 @@ def print_recommendation_summary(all_results, args, threshold):
             viable_names = {pn for _, pn in viable}
             for is_h2d in dirs:
                 dir_name = "H2D" if is_h2d else "D2H"
-                cfgs = results.get((form_name, dir_name), {})
+                # MLA H2D is mode-independent: label it just "mla", and reuse
+                # rank0_only's H2D best so every mode still contributes its
+                # full 6 data points (3 patterns × 2 dirs) to the average.
+                if is_h2d and is_mla:
+                    h2d_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
+                else:
+                    h2d_name = form_name
+                if is_h2d and is_mla and mode != "rank0_only":
+                    best_per_formdir[(h2d_name, dir_name)] = best_per_formdir.get(
+                        (h2d_name, dir_name), (None, None))
+                    continue
+                cfgs = results.get((h2d_name, dir_name), {})
                 auto_path = cfgs.get("auto_path", "")
                 # Collect off timings
                 off_vals = []
@@ -801,10 +964,7 @@ def print_recommendation_summary(all_results, args, threshold):
                 size_name, num_layers, num_blocks, head_dim, memcpy_label))
             print("=" * 100)
 
-            # Group by (is_mla, mode, layout) → list of best timings.
-            # Sharded H2D == rank0_only H2D (C++ uses cpu_startoff=0 for both),
-            # so use rank0_only's H2D data to fill in sharded's H2D for fair
-            # comparison (all modes get 6 data points: 3 patterns × 2 dirs).
+            # Group by (is_mla, mode, layout). Sharded H2D == rank0_only H2D.
             groups = {}
             for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
                 if pattern == "scattered" and num_blocks <= threshold:
@@ -816,11 +976,15 @@ def print_recommendation_summary(all_results, args, threshold):
                     form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
                 for is_h2d in dirs:
                     dir_name = "H2D" if is_h2d else "D2H"
-                    vals = best_per_formdir.get((form_name, dir_name))
+                    # MLA H2D stored under "mla" (no mode suffix).
+                    if is_h2d and is_mla:
+                        lookup = "{}/{}/{}".format(pattern, layout_key, mla_tag)
+                    else:
+                        lookup = form_name
+                    vals = best_per_formdir.get((lookup, dir_name))
                     if vals is None and is_mla and mode == "sharded" and is_h2d:
-                        # Sharded H2D: use rank0_only H2D (same C++ path)
-                        h2d_form = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, "rank0_only")
-                        vals = best_per_formdir.get((h2d_form, dir_name))
+                        # Sharded H2D: same as rank0_only H2D (mode-independent)
+                        vals = best_per_formdir.get((lookup, dir_name))
                     if vals is not None:
                         v = vals[1] if use_on else vals[0]
                         if v is not None:

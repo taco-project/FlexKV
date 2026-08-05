@@ -155,7 +155,8 @@ void transfer_kv_blocks_ssd_binding(
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_kv_stride_in_bytes, int64_t chunk_size_in_bytes,
     int64_t block_stride_in_bytes, bool is_read, int num_blocks_per_file,
-    int round_robin = 1, int num_threads_per_device = 8, bool is_mla = false) {
+    int round_robin = 1, int num_threads_per_device = 8, bool is_mla = false,
+    bool ssd_io_opt = true) {
   TORCH_CHECK(ssd_block_ids.dtype() == torch::kInt64,
               "ssd_block_ids must be int64");
   TORCH_CHECK(cpu_block_ids.dtype() == torch::kInt64,
@@ -166,7 +167,7 @@ void transfer_kv_blocks_ssd_binding(
       cpu_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
       ssd_layer_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size_in_bytes,
       block_stride_in_bytes, is_read, num_blocks_per_file, round_robin,
-      num_threads_per_device, is_mla);
+      num_threads_per_device, is_mla, ssd_io_opt);
 }
 
 #ifdef FLEXKV_ENABLE_CFS
@@ -459,7 +460,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("chunk_size_in_bytes"), py::arg("block_stride_in_bytes"),
         py::arg("is_read"), py::arg("num_blocks_per_file"),
         py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
-        py::arg("is_mla") = false);
+        py::arg("is_mla") = false, py::arg("ssd_io_opt") = true);
   py::class_<flexkv::LayerwiseTransferGroup>(m, "LayerwiseTransferGroup")
       .def(py::init([](int num_gpus,
                        const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
@@ -486,7 +487,7 @@ PYBIND11_MODULE(c_ext, m) {
                        bool is_blockfirst,
                        bool is_mla,
                        int ce_gather_threads,
-                       bool ce_gather_nt) {
+                       bool ce_gather_nt, bool ssd_io_opt) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
             cfg.path_opt_enabled = ce_path_opt;
@@ -504,7 +505,7 @@ PYBIND11_MODULE(c_ext, m) {
                  tp_size, has_swa, swa_gpu_blocks, swa_cpu_blocks,
                  swa_ssd_files, swa_gpu_kv_strides_tensor,
                  swa_gpu_block_strides_tensor, swa_gpu_layer_strides_tensor,
-                 swa_gpu_chunk_sizes_tensor, cfg);
+                 swa_gpu_chunk_sizes_tensor, ssd_io_opt, cfg);
            }),
            py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("cpu_blocks"),
            py::arg("ssd_files"), py::arg("num_layers"),
@@ -531,7 +532,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("is_blockfirst") = false,
            py::arg("is_mla") = false,
            py::arg("ce_gather_threads") = 4,
-           py::arg("ce_gather_nt") = true)
+           py::arg("ce_gather_nt") = true, py::arg("ssd_io_opt") = true)
       .def(py::init([](
           int num_gpus,
           const std::vector<std::vector<std::vector<torch::Tensor>>>
@@ -567,7 +568,7 @@ PYBIND11_MODULE(c_ext, m) {
           torch::Tensor swa_gpu_chunk_sizes_tensor,
           int64_t ce_segment_threshold, bool ce_path_opt, int ce_force_path,
           bool ce_enable_memcpy2d, bool is_blockfirst, bool is_mla,
-          int ce_gather_threads, bool ce_gather_nt) {
+          int ce_gather_threads, bool ce_gather_nt, bool ssd_io_opt) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
             cfg.path_opt_enabled = ce_path_opt;
@@ -591,7 +592,7 @@ PYBIND11_MODULE(c_ext, m) {
                 layer_eventfds_tensor, tp_size, has_swa, swa_gpu_blocks,
                 swa_cpu_blocks, swa_ssd_files, swa_gpu_kv_strides_tensor,
                 swa_gpu_block_strides_tensor, swa_gpu_layer_strides_tensor,
-                swa_gpu_chunk_sizes_tensor, cfg);
+                swa_gpu_chunk_sizes_tensor, ssd_io_opt, cfg);
           }),
           py::arg("num_gpus"), py::arg("gpu_blocks_per_group"),
           py::arg("cpu_blocks"), py::arg("ssd_files"),
@@ -624,7 +625,7 @@ PYBIND11_MODULE(c_ext, m) {
           py::arg("is_blockfirst") = false,
           py::arg("is_mla") = false,
           py::arg("ce_gather_threads") = 4,
-          py::arg("ce_gather_nt") = true)
+          py::arg("ce_gather_nt") = true, py::arg("ssd_io_opt") = true)
       .def("init_swa_multi_group",
            &flexkv::LayerwiseTransferGroup::init_swa_multi_group,
            py::arg("swa_gpu_blocks_per_group"), py::arg("swa_cpu_blocks"),
