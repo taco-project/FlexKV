@@ -284,9 +284,12 @@ class FlexKVConfig:
             instance_id=instance_id,
             pp_start_layer=pp_start_layer,
             pp_end_layer=pp_end_layer,
-            # vLLM sets LOCAL_RANK env var (= rank % gpus_per_node) before
-            # launching each worker process.  Use it directly as the
-            # authoritative physical device index.
+            # LOCAL_RANK is only set for launchers that export it (e.g. ray or
+            # torchrun).  The mp executor passes local_rank to the worker as a
+            # constructor kwarg and does NOT export it, so this is -1 there and
+            # RankInfo.__post_init__ falls back to deriving it from tp_rank.
+            # FlexKVConnectorV1Impl overrides it with get_world_group().local_rank
+            # on the worker side; do not rely on this value being correct.
             local_rank=int(os.environ.get('LOCAL_RANK', -1)),
         )
 
