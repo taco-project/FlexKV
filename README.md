@@ -164,6 +164,13 @@ FlexKV natively integrates a Prometheus-based runtime monitoring framework that 
 
 For the full list of supported metrics, environment variable configuration, deployment guide for the monitoring stack (Prometheus + Grafana), see [docs/monitoring/README_en.md](docs/monitoring/README_en.md).
 
+## Continuous Integration
+
+Pull requests and protected-branch pushes build the release wheel and run the
+CPU unit-test tier on GitHub Actions. See the
+[CI guide](docs/ci/README_en.md) for the runner configuration, test scope,
+reference duration, local reproduction steps, and artifact-upload policy.
+
 ## Branching Strategy
 
 The branch management strategy of this project is as follows:

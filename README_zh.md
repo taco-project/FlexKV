@@ -161,6 +161,12 @@ FlexKV 原生集成了基于 Prometheus 的运行时监控框架，覆盖 Python
 
 完整的指标列表、环境变量配置、监控栈（Prometheus + Grafana）部署指南，请参阅 [docs/monitoring/README_zh.md](docs/monitoring/README_zh.md)。
 
+## 持续集成
+
+Pull Request 和受保护分支 push 会在 GitHub Actions 中构建 release wheel，并运行 CPU
+单元测试。Runner 配置、测试范围、参考耗时、本地复现步骤和产物上传规则详见
+[CI 文档](docs/ci/README_zh.md)。
+
 ## 分支策略
 
 本项目的分支管理策略如下：

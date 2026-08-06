@@ -17,6 +17,7 @@ Targeting SGLang:
 ### Documentation
 
 - Replace the legacy SGLang patch workflow with version-specific English and Chinese integration instructions
+- Add English and Chinese CI guides covering the runner, release-wheel build, CPU unit-test scope, reference timing, local reproduction, and COS upload policy
 
 ## [1.2.0] - 2025-11-25
 ### Feature
