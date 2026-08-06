@@ -783,6 +783,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     ce_segment_threshold=int(os.getenv('FLEXKV_CE_SEGMENT_THRESHOLD', 8)),
     ce_path_opt=bool(int(os.getenv('FLEXKV_CE_PATH_OPT', 1))),
+    ssd_io_opt=bool(int(os.getenv('FLEXKV_SSD_IO_OPT', 1))),
+
     enable_ce_memcpy2d=bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', 1))),
     ce_gather_threads=int(os.getenv('FLEXKV_CE_GATHER_THREADS', 4)),
     ce_gather_nt=bool(int(os.getenv('FLEXKV_CE_GATHER_NT', 1))),
@@ -805,6 +807,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     trace_max_file_size_mb=int(os.getenv('FLEXKV_TRACE_MAX_FILE_SIZE_MB', 100)),
     trace_max_files=int(os.getenv('FLEXKV_TRACE_MAX_FILES', 5)),
     trace_flush_interval_ms=int(os.getenv('FLEXKV_TRACE_FLUSH_INTERVAL_MS', 1000)),
+
+    enable_transfer_trace=bool(int(os.getenv('FLEXKV_TRANSFER_TRACE', 0))),
 
     lt_pool_initial_capacity=int(os.getenv('FLEXKV_LT_POOL_INITIAL_CAPACITY', 10000000)),
     refresh_batch_size=int(os.getenv('FLEXKV_REFRESH_BATCH_SIZE', 256)),

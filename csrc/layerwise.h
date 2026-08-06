@@ -79,7 +79,7 @@ public:
       torch::Tensor swa_gpu_block_strides_tensor = torch::Tensor(),
       torch::Tensor swa_gpu_layer_strides_tensor = torch::Tensor(),
       torch::Tensor swa_gpu_chunk_sizes_tensor = torch::Tensor(),
-      CETransferConfig ce_config = CETransferConfig{});
+      bool ssd_io_opt = true, CETransferConfig ce_config = CETransferConfig{});
 
   // Multi-group constructor. ``gpu_blocks_per_group[gi][d]`` is the GPU-side
   // tensor list for group ``gi`` on device ``d``. ``layer_members`` encodes
@@ -128,7 +128,7 @@ public:
       torch::Tensor swa_gpu_block_strides_tensor = torch::Tensor(),
       torch::Tensor swa_gpu_layer_strides_tensor = torch::Tensor(),
       torch::Tensor swa_gpu_chunk_sizes_tensor = torch::Tensor(),
-      CETransferConfig ce_config = CETransferConfig{});
+      bool ssd_io_opt = true, CETransferConfig ce_config = CETransferConfig{});
 
   ~LayerwiseTransferGroup();
 
@@ -172,7 +172,8 @@ public:
       const int swa_num_blocks_per_file = 0,
       // ---- MLA D2H mode (#192) + polling notification (#199) ----
       const std::string &mla_d2h_mode = "sharded",
-      const std::string &notify_mode = "hostfunc");
+      const std::string &notify_mode = "hostfunc",
+      const bool enable_trace = false);
 
   // Multi-group layerwise transfer: SSD->CPU per group, CPU->GPU per original
   // layer (expanding the CSR to fire one transfer kernel per group member).
@@ -201,7 +202,8 @@ public:
       const int64_t swa_ssd_kv_stride_in_bytes = 0,
       const int swa_num_blocks_per_file = 0,
       const std::string &mla_d2h_mode = "sharded",
-      const std::string &notify_mode = "hostfunc");
+      const std::string &notify_mode = "hostfunc",
+      const bool enable_trace = false);
 
   // Bind heterogeneous SWA/state sidecars (SWA KV + compress states) onto the
   // same LayerwiseTransferGroup.  Mutually exclusive with the uniform
@@ -284,6 +286,7 @@ private:
   std::vector<int> layer_eventfds_; // Flat array
   int current_counter_id_; // Current counter set index for this transfer
   CETransferConfig ce_config_;
+  bool ssd_io_opt_ = true;
 
   // ---- Multi-group state ----
   bool has_multi_group_;

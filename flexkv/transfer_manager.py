@@ -82,7 +82,17 @@ class TransferManager:
         device_id = req.device_id
 
         if device_id in self.all_gpu_blocks:
-            flexkv_logger.error(f"GPU {device_id} has already registered.")
+            # A duplicate device_id means the framework adapter handed us the
+            # same id for two different workers.  Registration can then never
+            # reach expected_gpus, so _register_gpu_blocks_via_socket spins
+            # forever printing "Still waiting for GPU registrations: k/N".
+            # Say so explicitly instead of leaving an unexplained hang.
+            flexkv_logger.error(
+                f"GPU {device_id} has already registered. Duplicate device_id "
+                f"from a different worker: registration cannot reach "
+                f"{self.expected_gpus}/{self.expected_gpus} and init will hang. "
+                f"Check that the framework adapter passes a per-worker-unique "
+                f"device_id (registered so far: {sorted(self.all_gpu_blocks)}).")
         else:
             try:
                 self.all_gpu_blocks[device_id] = req.handles
