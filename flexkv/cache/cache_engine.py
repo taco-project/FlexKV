@@ -94,6 +94,13 @@ class DeferredCacheInsert:
     successful remote prefix is valid.  PUT staging has already completed all
     of its graph consumers when this record is committed, so ``None`` means the
     complete staged range is valid.
+
+    ``swa_anchor_block`` / ``swa_load_result`` support joint Full+SWA prefetch:
+    the SWA snapshot is a single-block window keyed at position
+    ``swa_anchor_block`` (i.e. J-1 for a joint match of length J). At commit
+    time the joint guard mounts the SWA slot ONLY when the Full commit reaches
+    ``swa_anchor_block+1`` AND the SWA REMOTE2H reported success; otherwise the
+    slot is freed and only the Full prefix is published to the tree.
     """
 
     device_type: DeviceType
@@ -105,6 +112,8 @@ class DeferredCacheInsert:
     load_result: Optional[MooncakeLoadResult] = None
     swa_slot: int = -1
     publish_to_peer: bool = False
+    swa_anchor_block: int = -1
+    swa_load_result: Optional[MooncakeLoadResult] = None
 
 
 @dataclass
@@ -1140,16 +1149,23 @@ class GlobalCacheEngine:
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         if temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
-            # Prefetch return_mask covers full-KV tokens only. SWA REMOTE2H ops
-            # (is_swa=True) live in a separate slot space and must not be summed
-            # into prefetch_blocks, or the mask over-extends by SWA slot count.
+            # Prefetch return_mask covers Full REMOTE2H tokens only (A: planned
+            # remote pull). SWA REMOTE2H ops live in a separate slot space and
+            # must not be summed into prefetch_blocks. Place the True span at
+            # the remote fragment start (f12), not block_start_idx — otherwise
+            # a non-zero CPU/SSD prefix shifts the mask onto local blocks.
             prefetch_blocks = 0
             for op in transfer_graph._op_map.values():
                 if op.transfer_type == TransferType.REMOTE2H and not op.is_swa:
                     prefetch_blocks += len(op.src_block_ids)
             if prefetch_blocks > 0:
-                return_mask[block_start_idx * self.tokens_per_block:
-                            (block_start_idx + prefetch_blocks) * self.tokens_per_block] = True
+                remote_start_block = block_start_idx
+                for pending in plan.deferred_inserts:
+                    if pending.device_type == DeviceType.CPU:
+                        remote_start_block = pending.remote_start_block
+                        break
+                return_mask[remote_start_block * self.tokens_per_block:
+                            (remote_start_block + prefetch_blocks) * self.tokens_per_block] = True
         else:
             return_mask[block_start_idx* self.tokens_per_block:
                     (block_start_idx + plan.num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
@@ -1289,6 +1305,7 @@ class GlobalCacheEngine:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
         transfer_graph = TransferOpGraph()
         swa_reservation: Optional[SWAReadReservation] = None
+        swa_read_source: SWAReadSource = SWAReadSource()
         if swa_aware:
             block_mask_end, swa_read_source = self._select_swa_read_source(
                 block_mask_start,
@@ -1306,7 +1323,11 @@ class GlobalCacheEngine:
             if enable_gpu:
                 swa_reservation = self._reserve_swa_read_source(
                     transfer_graph, swa_read_source, protected_cpu_node, dp_client_id)
-            if swa_read_source.found and swa_reservation is None:
+            # Compute path: SWA reservation failure -> no Full-only restore.
+            # Prefetch path (not enable_gpu): reservation is intentionally
+            # skipped; the SWA REMOTE2H is planned later in the joint block,
+            # and the commit-time guard enforces the tree invariant.
+            if enable_gpu and swa_read_source.found and swa_reservation is None:
                 block_mask_end = block_mask_start
             if (enable_gpu and swa_read_source.found and swa_reservation is None
                     and self._metrics_collector is not None):
@@ -1507,6 +1528,51 @@ class GlobalCacheEngine:
         num_gpu_blocks_to_transfer = len(fragment123_gpu_blocks) if enable_gpu else 0
         op_callback_dict = {}
         deferred_inserts: List[DeferredCacheInsert] = []
+
+        # construct the SWA op for joint prefetch
+        joint_prefetch_swa_slot = -1
+        joint_prefetch_swa_anchor = -1
+        joint_prefetch_swa_load_result: Optional[MooncakeLoadResult] = None
+        if (defer_mooncake_commit
+                and swa_aware
+                and not enable_gpu
+                and swa_reservation is None
+                and swa_read_source.found
+                and swa_read_source.is_mooncake
+                and self.swa_op_constructor.enabled):
+            joint_prefetch_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
+                protected_node=cpu_matched_result.last_ready_node)
+            if joint_prefetch_swa_slot >= 0:
+                joint_prefetch_swa_anchor = swa_read_source.hit_blocks - 1
+                swa_op_id = self.swa_op_constructor.build_swa_op(
+                    transfer_graph,
+                    TransferType.REMOTE2H,
+                    src_slot_ids=np.array([0], dtype=np.int64),
+                    dst_slot_ids=np.array(
+                        [joint_prefetch_swa_slot], dtype=np.int64),
+                    dp_client_id=dp_client_id,
+                    mooncake_tail_hashes=[swa_read_source.mooncake_tail_hash],
+                )
+                if swa_op_id is None:
+                    # SWA transfer gated off after all; return the slot.
+                    self.cpu_cache_engine._free_swa_slot(joint_prefetch_swa_slot)
+                    joint_prefetch_swa_slot = -1
+                    joint_prefetch_swa_anchor = -1
+                else:
+                    joint_prefetch_swa_load_result = MooncakeLoadResult()
+                    op_callback_dict[swa_op_id] = CompletionAwareCallback(
+                        joint_prefetch_swa_load_result.record)
+                    # Report the SWA REMOTE2H as a finished op so the graph
+                    # cannot complete before its mask lands on the pending.
+                    finished_ops_ids.append(swa_op_id)
+            else:
+                flexkv_logger.warning(
+                    "[FlexKV-SWA] Joint prefetch SWA slot allocation failed; "
+                    f"falling back to Full-only prefetch, request_id={request_id}"
+                )
+                if self._metrics_collector is not None:
+                    self._metrics_collector.record_joint_prefetch_swa_slot_alloc_failure()
+
         if defer_mooncake_commit:
             assert op_remote2h is not None
             load_result = MooncakeLoadResult()
@@ -1522,6 +1588,9 @@ class GlobalCacheEngine:
                 remote_start_block=remote_start_block,
                 requested_end_block=requested_end_block,
                 load_result=load_result,
+                swa_slot=joint_prefetch_swa_slot,
+                swa_anchor_block=joint_prefetch_swa_anchor,
+                swa_load_result=joint_prefetch_swa_load_result,
             ))
             if write_ssd_blocks_from_remote:
                 deferred_inserts.append(DeferredCacheInsert(
@@ -1533,6 +1602,13 @@ class GlobalCacheEngine:
                     requested_end_block=requested_end_block,
                     load_result=load_result,
                 ))
+        elif joint_prefetch_swa_slot >= 0:
+            # SWA op was planned but Full mooncake path was skipped
+            # (defer_mooncake_commit False): no CPU pending will consume the
+            # slot, so free it and drop the op-side callback wiring rather
+            # than leak a slot into an untracked graph.
+            self.cpu_cache_engine._free_swa_slot(joint_prefetch_swa_slot)
+            joint_prefetch_swa_slot = -1
         if swa_reservation is not None:
             assert num_gpu_blocks_to_transfer > 0
             finished_ops_ids.append(swa_reservation.h2d_id)
@@ -1590,6 +1666,7 @@ class GlobalCacheEngine:
 
         transfer_graph = TransferOpGraph()
         swa_reservation: Optional[SWAReadReservation] = None
+        swa_read_source: SWAReadSource = SWAReadSource()
         if swa_aware:
             block_mask_end, swa_read_source = self._select_swa_read_source(
                 block_mask_start,
@@ -1606,7 +1683,12 @@ class GlobalCacheEngine:
             if enable_gpu:
                 swa_reservation = self._reserve_swa_read_source(
                     transfer_graph, swa_read_source, protected_cpu_node, dp_client_id)
-            if swa_read_source.found and swa_reservation is None:
+            # Align with _get_impl_global: only refuse Full-only restore when
+            # compute needs GPU SWA but reservation failed. Prefetch
+            # (not enable_gpu) leaves Full intact; SWA is staged separately.
+            # (When no SWA source exists, _select_swa_read_source already
+            # returned block_mask_end == block_mask_start.)
+            if enable_gpu and swa_read_source.found and swa_reservation is None:
                 block_mask_end = block_mask_start
             if (enable_gpu and swa_read_source.found and swa_reservation is None
                     and self._metrics_collector is not None):
@@ -2591,6 +2673,24 @@ class GlobalCacheEngine:
         else:
             successful_remote = pending.load_result.successful_prefix(remote_blocks)
             publish_end = pending.remote_start_block + successful_remote
+
+        # Joint Full+SWA prefetch guard: SWA is mounted ONLY when Full commit
+        # reaches the SWA anchor AND the SWA op reported success. On any partial
+        # (Full short of the anchor, SWA REMOTE2H failed, or SWA result missing)
+        # we free the SWA slot and fall through to publish only the Full prefix.
+        # This preserves the tree invariant "node has SWA => Full is ready up to
+        # this node" (SWA-I1) at prefetch-commit time.
+        if pending.swa_slot >= 0 and pending.swa_anchor_block >= 0:
+            swa_covered = publish_end >= (pending.swa_anchor_block + 1)
+            swa_ok = (
+                pending.swa_load_result is not None
+                and pending.swa_load_result.block_results is not None
+                and len(pending.swa_load_result.block_results) > 0
+                and all(pending.swa_load_result.block_results)
+            )
+            if not (swa_covered and swa_ok):
+                engine._free_swa_slot(pending.swa_slot)
+                pending = replace(pending, swa_slot=-1)
 
         # Hierarchical engines must rematch their local tree. match() may choose
         # a distributed peer node, which is not a valid insertion anchor here.

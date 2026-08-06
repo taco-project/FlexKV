@@ -86,6 +86,18 @@ class KVTask:
     # True after wait()/try_wait() has produced a response for this task.
     request_returned: bool = False
 
+    # Prefetch mooncake outcomes captured from CompletedOp (not from
+    # task.graph ops — transfer engines may mutate a deepcopy).
+    # ``prefetch_full_block_results`` drives return_mask at finalize (A:
+    # how many Full REMOTE2H tokens this prefetch newly pulled). SWA bitmaps
+    # + ``prefetch_has_swa_remote`` feed the joint outcome METRIC only —
+    # SWA lives in a separate slot space and is not summed into return_mask.
+    prefetch_full_block_results: Optional[Tuple[bool, ...]] = None
+    prefetch_swa_block_results: Optional[Tuple[bool, ...]] = None
+    prefetch_has_swa_remote: bool = False
+    prefetch_namespace: Optional[List[str]] = None
+    prefetch_swa_aware: bool = False
+
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
 
@@ -107,6 +119,17 @@ TASK_STATUS_TO_RESPONSE_STATUS = {
 
 def convert_to_response_status(task_status: TaskStatus) -> KVResponseStatus:
     return TASK_STATUS_TO_RESPONSE_STATUS[task_status]
+
+
+def _longest_success_prefix(block_results: Tuple[bool, ...]) -> int:
+    """Longest contiguous True prefix of per-block transfer results."""
+    prefix = 0
+    for succeeded in block_results:
+        if not succeeded:
+            break
+        prefix += 1
+    return prefix
+
 
 class KVTaskManager:
     def __init__(self,
@@ -355,6 +378,7 @@ class KVTaskManager:
                             token_ids: np.ndarray,
                             dp_client_id: int,
                             namespace: Optional[List[str]] = None,
+                            swa_aware: bool = False,
                             ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
@@ -370,7 +394,12 @@ class KVTaskManager:
             slot_mapping=fake_slot_mapping,
             dp_client_id=dp_client_id,
             temp_cache_strategy=temp_cache_strategy,
-            namespace=namespace)
+            namespace=namespace,
+            swa_aware=swa_aware)
+        prefetch_has_swa_remote = any(
+            op.transfer_type == TransferType.REMOTE2H and getattr(op, "is_swa", False)
+            for op in graph._op_map.values()
+        )
         self.tasks[task_id] = KVTask(
             task_id=task_id,
             task_type=TaskType.PREFETCH,
@@ -383,7 +412,10 @@ class KVTaskManager:
             graph=graph,
             return_mask=return_mask,
             callback=callback,
-            op_callback_dict=op_callback_dict)
+            op_callback_dict=op_callback_dict,
+            prefetch_has_swa_remote=prefetch_has_swa_remote,
+            prefetch_namespace=namespace,
+            prefetch_swa_aware=swa_aware)
 
         self.prefetch_tasks[self._gen_prefetch_key(token_ids, namespace)] = task_id
 
@@ -429,6 +461,7 @@ class KVTaskManager:
             # completion contract (the task-end D2H may precede H2REMOTE).
             graph_op = getattr(task.graph, "_op_map", {}).get(
                 completed_op.op_id)
+            is_swa_op = graph_op is not None and getattr(graph_op, "is_swa", False)
             is_remote_load = (
                 completed_op.transfer_type == TransferType.REMOTE2H.value
                 or (graph_op is not None
@@ -438,15 +471,42 @@ class KVTaskManager:
                 graph_op is not None
                 and (graph_op.mooncake_store_block_hashes is not None
                      or graph_op.mooncake_store_swa_block_hashes is not None)
-            )
+            ) ## only mooncake store related ops expect block results now
             missing_results = (
                 completed_op.block_results is None and expects_block_results)
             failed_blocks = (
                 completed_op.block_results is not None
                 and not all(completed_op.block_results)
             )
-            if is_remote_load and (missing_results or failed_blocks):
-                task.transfer_failed = True
+            # REMOTE2H policy + mooncake bitmap snapshot (CompletionOp itself;
+            # do not rely on TransferOp.block_results on task.graph — engines
+            # may mutate a submitted deepcopy).
+            if is_remote_load:
+                if is_swa_op:
+                    # Joint prefetch: SWA partial/missing MUST NOT fail the task.
+                    # Commit-time joint guard uses the bitmap with Full's mask.
+                    if task.task_type == TaskType.PREFETCH:
+                        task.prefetch_has_swa_remote = True
+                        if completed_op.block_results is not None:
+                            task.prefetch_swa_block_results = tuple(
+                                bool(x) for x in completed_op.block_results)
+                else:
+                    if missing_results:
+                        task.transfer_failed = True
+                    elif failed_blocks:
+                        # Prefetch: L==0 fails eagerly; L>0 waits for graph
+                        # completion so joint SWA can still shape commit.
+                        if task.task_type == TaskType.PREFETCH:
+                            assert completed_op.block_results is not None
+                            if _longest_success_prefix(
+                                    tuple(completed_op.block_results)) == 0:
+                                task.transfer_failed = True
+                        else:
+                            task.transfer_failed = True
+                    if (task.task_type == TaskType.PREFETCH
+                            and completed_op.block_results is not None):
+                        task.prefetch_full_block_results = tuple(
+                            bool(x) for x in completed_op.block_results)
             # Record transfer metrics for completed ops (post-completion statistics)
             # All three counters (ops_total, blocks_total, bytes_total) are updated
             # here after transfer completion, providing accurate post-transfer metrics.
@@ -463,10 +523,6 @@ class KVTaskManager:
                     completed_op.num_bytes,
                     operation,
                 )
-            if completed_op.is_graph_completed():
-                self._mark_completed(task_id)
-            elif completed_op.op_id == task.task_end_op_id:
-                self.tasks[task_id].task_end_op_finished = True
             has_callback = completed_op.op_id in task.op_callback_dict
             if has_callback:
                 try:
@@ -480,6 +536,85 @@ class KVTaskManager:
                         f"op_id={completed_op.op_id}",
                         exc_info=True,
                     )
+            if completed_op.is_graph_completed():
+                # _mark_completed runs deferred commit first, then (for
+                # prefetch) finalizes return_mask from the Full REMOTE2H
+                # success bitmap — report "how much remote this task pulled".
+                self._mark_completed(task_id)
+            elif completed_op.op_id == task.task_end_op_id:
+                self.tasks[task_id].task_end_op_finished = True
+
+    def _narrow_return_mask_to_prefix_blocks(
+            self, task: "KVTask", num_success_blocks: int) -> None:
+        """Rewrite prefetch return_mask to the first ``num_success_blocks``.
+
+        Prefetch builds a contiguous True span for planned REMOTE2H blocks.
+        After partial mooncake success, only ``[:L]`` is published/usable.
+        """
+        mask = task.return_mask
+        if mask is None or isinstance(mask, list):
+            return
+        if num_success_blocks <= 0:
+            task.return_mask = np.zeros_like(mask, dtype=np.bool_)
+            return
+        true_idx = np.flatnonzero(mask)
+        if true_idx.size == 0:
+            return
+        start = int(true_idx[0])
+        orig_end = int(true_idx[-1]) + 1
+        tpb = self.cache_config.tokens_per_block
+        end = min(start + num_success_blocks * tpb, orig_end, mask.shape[0])
+        new_mask = np.zeros_like(mask, dtype=np.bool_)
+        new_mask[start:end] = True
+        task.return_mask = new_mask
+
+    def _finalize_prefetch_return_mask(self, task: "KVTask") -> None:
+        """Report how many Full REMOTE2H tokens this prefetch newly pulled (A).
+
+        ``sum(return_mask)`` is the storage/L3 accounting number consumed by
+        sglang as ``storage_hit_length``. It must NOT include a pre-existing
+        CPU prefix (f1) or DISK2H — only the longest success prefix of this
+        task's Full mooncake REMOTE2H. Joint SWA success/failure is classified
+        separately in the outcome metric; SWA slots are never summed here.
+
+        Plan-time ``return_mask`` already spans the planned Full REMOTE2H
+        interval; this method truncates that span to ``L`` blocks. Opaque
+        backends that never supply ``block_results`` leave the plan-time mask
+        unchanged (legacy all-or-nothing).
+        """
+        full_results = task.prefetch_full_block_results
+        if full_results is not None:
+            full_success_len = _longest_success_prefix(full_results)
+            self._narrow_return_mask_to_prefix_blocks(task, full_success_len)
+        else:
+            full_success_len = None
+
+        # Joint / full-only outcome metric (mooncake bitmaps).
+        if full_results is None:
+            return
+
+        assert full_success_len is not None
+        if not task.prefetch_has_swa_remote:
+            outcome = "full_only"
+        else:
+            planned_full_len = len(full_results)
+            swa_results = task.prefetch_swa_block_results
+            swa_ok = (
+                swa_results is not None
+                and len(swa_results) > 0
+                and all(swa_results)
+            )
+            if full_success_len == 0:
+                outcome = "all_failed"
+            elif full_success_len == planned_full_len and swa_ok:
+                outcome = "full_and_swa"
+            elif full_success_len == planned_full_len and not swa_ok:
+                outcome = "full_only_swa_lost"
+            else:
+                outcome = "partial_full"
+        metrics_collector = get_global_collector()
+        if metrics_collector is not None:
+            metrics_collector.record_joint_prefetch_outcome(outcome)
 
     @staticmethod
     def _abort_task_plans(task: "KVTask") -> None:
@@ -539,6 +674,12 @@ class KVTaskManager:
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
         task = self.tasks[task_id]
         self._process_empty_graph(task_id)
+        # Prefetch must wait for the graph terminal only. Joint Full+SWA graphs
+        # may mark an early task_end (e.g. SWA REMOTE2H) while Full is still
+        # in flight; SUCCESS before _finalize_prefetch_return_mask /
+        # deferred commit would advertise a planned mask that is not yet ready.
+        if task.task_type == TaskType.PREFETCH:
+            completely = True
         if completely:
             return task.is_completed()
         # A partial-capable backend may finish the data-path sink after already
@@ -633,6 +774,11 @@ class KVTaskManager:
                         f"Transfer graph callback failed for task_id={task_id}",
                         exc_info=True,
                     )
+        # Deferred commit (tree mount) has just run. Finalize return_mask from
+        # the Full REMOTE2H success bitmap (how much remote this task pulled).
+        # On fail we still finalize so outcome metrics (e.g. all_failed) land.
+        if task.task_type == TaskType.PREFETCH:
+            self._finalize_prefetch_return_mask(task)
         task.status = (
             TaskStatus.FAILED if task.transfer_failed else TaskStatus.COMPLETED)
         task.task_end_op_finished = True
@@ -1056,19 +1202,25 @@ class KVTaskEngine(KVTaskManager):
                        token_ids: np.ndarray,
                        dp_client_id: int = 0,
                        task_id: int = -1,
-                       namespace: Optional[List[str]] = None) -> Tuple[int, int]:
+                       namespace: Optional[List[str]] = None,
+                       swa_aware: bool = False) -> int:
+        """Launch a prefetch task; return its task_id.
+
+        The launch call is fire-and-forget: it publishes the plan and hands the
+        graph to the transfer engine. Progress and usable-token accounting are
+        polled later via ``try_wait``/``wait`` — ``KVResponse.return_mask`` is
+        rewritten in ``_finalize_prefetch_return_mask`` to the Full REMOTE2H
+        success prefix (tokens newly pulled from remote this request). Callers
+        that want that count should read ``sum(return_mask)`` on the response,
+        not any launch-time value. Compute H2D length still comes from a
+        subsequent local ``get_match`` against the CPU tree.
+        """
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
-        self.create_prefetch_task(task_id, token_ids, dp_client_id=dp_client_id, namespace=namespace)
+        self.create_prefetch_task(task_id, token_ids, dp_client_id=dp_client_id, namespace=namespace, swa_aware=swa_aware)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
-        task = self.tasks[task_id]
-        actual_prefetch_tokens = 0
-        if task is not None and task.return_mask is not None:
-            actual_prefetch_tokens = int(np.sum(task.return_mask))
-        else:
-            flexkv_logger.warning(f"prefetch task {task_id} returned None")
         # trace prefetch async request
         self.tracer.trace_request(
             request_type="PREFETCH_ASYNC",
@@ -1079,7 +1231,7 @@ class KVTaskEngine(KVTaskManager):
             dp_client_id=dp_client_id
         )
         self._launch_task(task_id)
-        return task_id, actual_prefetch_tokens
+        return task_id
 
     def merge_to_batch_kvtask(self,
                               batch_id: int,

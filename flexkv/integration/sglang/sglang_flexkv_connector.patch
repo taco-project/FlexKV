@@ -2446,10 +2446,25 @@ index 000000000..3c6ceb9b4
 +        self._load_fkv_tids: List[int] = []
 +        # rid -> flexkv_task_id (prefetch in flight)
 +        self._ongoing_prefetches: Dict[str, int] = {}
++        # rid -> tokens actually loaded and mounted on the local CPU tree at
++        # graph_completed. Populated by check_prefetch_progress (from KVResponse
++        # return_mask, kept in sync across the TP group via scatter) and drained
++        # by pop_prefetch_loaded_tokens once the scheduler consumes it. This is
++        # the "used bytes" side of "load what transferred, use what loaded".
++        self._prefetch_loaded_tokens: Dict[str, int] = {}
 +        self._prefetch_enabled = bool(
 +            cache_config.enable_ssd
 +            or cache_config.enable_remote
 +            or cache_config.enable_kv_sharing
++        )
++        # Joint Full+SWA prefetch: plan a SWA REMOTE2H alongside the Full one so
++        # the SWA snapshot lands on the local CPU SWA pool. Gated by the SWA
++        # transfer data-plane being wired up (cache_config.enable_swa_transfer);
++        # without it SWA ops are no-ops in the graph builder and swa_aware=True
++        # would just be an empty planning branch.
++        self._prefetch_swa_aware = bool(
++            self._prefetch_enabled
++            and getattr(cache_config, "enable_swa_transfer", False)
 +        )
 +
 +        if self._sync_ctx.is_sync_leader:
@@ -2818,8 +2833,10 @@ index 000000000..3c6ceb9b4
 +            token_ids_np = np.array(token_ids, dtype=np.int64)
 +            prefetch_task_id = self.kv_manager.prefetch_async(
 +                token_ids=token_ids_np,
++                swa_aware=self._prefetch_swa_aware,
 +            )
-+            logger.debug(f"[FlexKV] prefetch: launched task_id={prefetch_task_id}")
++            logger.debug(f"[FlexKV] prefetch: launched task_id={prefetch_task_id}, "
++                         f"swa_aware={self._prefetch_swa_aware}")
 +
 +        if self._sync_ctx.needs_sync:
 +            data = self._sync_ctx.scatter(
@@ -2839,10 +2856,12 @@ index 000000000..3c6ceb9b4
 +            return True
 +
 +        is_completed = False
++        loaded_tokens = 0
 +        if self._sync_ctx.is_sync_leader:
 +            completed = self.kv_manager.try_wait(task_ids=[prefetch_task_id])
 +            if prefetch_task_id in completed:
-+                status = completed[prefetch_task_id].status
++                response = completed[prefetch_task_id]
++                status = response.status
 +                if status != KVResponseStatus.SUCCESS:
 +                    logger.warning(
 +                        "[FlexKV] prefetch task %d for rid=%s finished with status=%s",
@@ -2850,25 +2869,47 @@ index 000000000..3c6ceb9b4
 +                        rid,
 +                        status,
 +                    )
++                else:
++                    # KVTaskManager._finalize_prefetch_return_mask has rewritten
++                    # return_mask to the actually usable prefix (joint guard for
++                    # swa_aware, Full success prefix for non-swa). sum() gives the
++                    # exact number of tokens now mounted on the local CPU tree.
++                    mask = response.return_mask
++                    if mask is not None:
++                        loaded_tokens = int(mask.sum())
 +                is_completed = True
 +
 +        if self._sync_ctx.needs_sync:
 +            data = self._sync_ctx.scatter(
-+                {"is_completed": is_completed, "loaded_tokens": 0},
++                {"is_completed": is_completed, "loaded_tokens": loaded_tokens},
 +            )
 +            is_completed = data["is_completed"]
++            loaded_tokens = data["loaded_tokens"]
 +
 +        if is_completed:
 +            self._ongoing_prefetches.pop(rid, None)
++            # Record the loaded-tokens count for pop_prefetch_loaded_tokens.
++            # Both leader and non-leader ranks agree on the value via scatter,
++            # so the scheduler can call the pop from any TP rank.
++            self._prefetch_loaded_tokens[rid] = loaded_tokens
 +        return is_completed
 +
 +    def pop_prefetch_loaded_tokens(self, rid: str) -> int:
-+        # TODO: Implement this
-+        return 0
++        """Return and clear the tokens loaded by the last prefetch for ``rid``.
++
++        Returns 0 when no prefetch is registered for ``rid`` (either never
++        prefetched, or already popped, or prefetch was cancelled). See the
++        FlexKV M1 contract: this counter is the number of tokens the scheduler
++        may skip over during compute retrieve without an explicit rematch.
++        """
++        return self._prefetch_loaded_tokens.pop(rid, 0)
 +
 +    def cancel_prefetch(self, rid: str) -> None:
 +        self._pending_loads.pop(rid, None)
 +        prefetch_task_id = self._ongoing_prefetches.pop(rid, -1)
++        # Cancelled prefetches never publish tokens; drop any stale entry that
++        # a racing check_prefetch_progress might have recorded so pop_* returns 0.
++        self._prefetch_loaded_tokens.pop(rid, None)
 +        if self._sync_ctx.is_sync_leader and prefetch_task_id >= 0:
 +            # Flexkv not support cancel prefetch task yet
 +            pass
@@ -2888,6 +2929,7 @@ index 000000000..3c6ceb9b4
 +                self.kv_manager.cancel(pending_tids)
 +        self._pending_loads.clear()
 +        self._ongoing_prefetches.clear()
++        self._prefetch_loaded_tokens.clear()
 +        self._ongoing_loads.clear()
 +        self._completed_loads.clear()
 +        self._load_fkv_tids.clear()

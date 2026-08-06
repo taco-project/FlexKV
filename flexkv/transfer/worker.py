@@ -115,6 +115,119 @@ except ImportError:
     transfer_kv_blocks_remote = None
     shared_transfer_kv_blocks_remote_read = None
 
+
+# ---------------------------------------------------------------------------
+# Mooncake fault injection (opt-in, off by default).
+#
+# Purpose: exercise the "publish what actually transferred" pipeline
+# (DeferredCacheInsert joint guard + _finalize_prefetch_return_mask) end-to-end
+# without waiting for real network flakes. The hook lives at the ONLY point
+# per-block booleans are produced (batch_get / batch_put); every downstream
+# stage — CompletedOp.block_results, MooncakeLoadResult, commit-time prefix
+# math, return_mask narrowing, outcome metric — is exercised identically.
+#
+# Environment variables (all optional):
+#
+#   FLEXKV_MOONCAKE_FAULT_MODE
+#       "none"       — passthrough (default)
+#       "tail_fail"  — first (N - K) True, last K False; K from FLEXKV_MOONCAKE_FAULT_TAIL_N
+#                      (default 1). Models the "connection dies near end of batch"
+#                      shape and exercises the "0 < L_full < J" partial branch.
+#       "first_ok"   — same as tail_fail with TAIL_N=len-1: exactly one True at
+#                      the head. Fast way to hit "L_full = 1".
+#       "random"     — each block independently fails with probability
+#                      FLEXKV_MOONCAKE_FAULT_RANDOM_RATIO (default 0.3). The
+#                      first False collapses the "success prefix" — good for
+#                      soak-style variation with a fixed seed.
+#       "full_fail"  — all False. Triggers all_failed / task-level FAILED.
+#
+#   FLEXKV_MOONCAKE_FAULT_PROB
+#       Per-call probability the fault applies (default 1.0). <1.0 lets some
+#       batches pass through untouched so partial and full mix.
+#
+#   FLEXKV_MOONCAKE_FAULT_OP
+#       "both" (default) / "get" / "put" — restrict fault to one direction.
+#       Useful for isolating GET-side commit tests from PUT-side tests.
+#
+#   FLEXKV_MOONCAKE_FAULT_SEED
+#       Optional int; when set, seeds the fault RNG for reproducible runs.
+#
+# The hook only fires when FLEXKV_MOONCAKE_FAULT_MODE is set and non-empty and
+# not "none", so a bare-env production run is byte-for-byte the same as
+# without this patch.
+# ---------------------------------------------------------------------------
+
+_FAULT_RNG: Optional[np.random.Generator] = None
+
+
+def _get_fault_rng() -> np.random.Generator:
+    global _FAULT_RNG
+    if _FAULT_RNG is None:
+        seed_env = os.environ.get("FLEXKV_MOONCAKE_FAULT_SEED", "")
+        seed = int(seed_env) if seed_env else None
+        _FAULT_RNG = np.random.default_rng(seed)
+    return _FAULT_RNG
+
+
+def _inject_mooncake_fault(results: List[bool],
+                           transfer_type: "TransferType") -> List[bool]:
+    """Optionally replace ``results`` with a partial-failure pattern.
+
+    See module-level doc for the environment variables. No-op unless
+    ``FLEXKV_MOONCAKE_FAULT_MODE`` is set to something other than ``none``.
+    """
+    mode = os.environ.get("FLEXKV_MOONCAKE_FAULT_MODE", "").strip().lower()
+    if not mode or mode == "none":
+        return results
+
+    op_filter = os.environ.get("FLEXKV_MOONCAKE_FAULT_OP", "get").strip().lower()
+    if op_filter == "get" and transfer_type != TransferType.REMOTE2H:
+        return results
+    if op_filter == "put" and transfer_type != TransferType.H2REMOTE:
+        return results
+
+    n = len(results)
+    if n == 0:
+        return results
+
+    try:
+        prob = float(os.environ.get("FLEXKV_MOONCAKE_FAULT_PROB", "1.0"))
+    except ValueError:
+        prob = 1.0
+    if prob < 1.0 and _get_fault_rng().random() >= prob:
+        return results
+
+    if mode == "full_fail":
+        injected = [False] * n
+    elif mode == "first_ok":
+        injected = [True] + [False] * (n - 1)
+    elif mode == "tail_fail":
+        try:
+            tail_n = int(os.environ.get("FLEXKV_MOONCAKE_FAULT_TAIL_N", "1"))
+        except ValueError:
+            tail_n = 1
+        tail_n = max(1, min(n, tail_n))
+        injected = [True] * (n - tail_n) + [False] * tail_n
+    elif mode == "random":
+        try:
+            ratio = float(os.environ.get("FLEXKV_MOONCAKE_FAULT_RANDOM_RATIO", "0.3"))
+        except ValueError:
+            ratio = 0.3
+        ratio = max(0.0, min(1.0, ratio))
+        rng = _get_fault_rng()
+        injected = [rng.random() >= ratio for _ in range(n)]
+    else:
+        flexkv_logger.warning(
+            f"[Mooncake-Fault] unknown mode '{mode}'; passthrough")
+        return results
+
+    flexkv_logger.warning(
+        f"[Mooncake-Fault] mode={mode} op={transfer_type.name} "
+        f"injected={sum(injected)}/{n} true "
+        f"(orig={sum(bool(r) for r in results)}/{n})")
+    return injected
+
+
 class TransferWorkerBase(ABC):
     _worker_id_counter = 0
     _worker_id_lock = threading.Lock()
@@ -3739,11 +3852,13 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
                        transfer_type: TransferType) -> List[bool]:
         if transfer_type == TransferType.H2REMOTE:
             put_results = self.mooncake_client.batch_put(keys, cpu_ptrs, block_sizes)
+            put_results = _inject_mooncake_fault(put_results, transfer_type)
             if not all(put_results):
                 flexkv_logger.error(f"Mooncake-store batch put partially failed: {put_results}")
             return put_results
         elif transfer_type == TransferType.REMOTE2H:
             get_results = self.mooncake_client.batch_get(keys, cpu_ptrs, block_sizes)
+            get_results = _inject_mooncake_fault(get_results, transfer_type)
             if not all(get_results):
                 flexkv_logger.error(f"Mooncake-store batch get partially failed: {get_results}")
             return get_results

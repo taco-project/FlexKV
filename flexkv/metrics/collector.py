@@ -212,13 +212,43 @@ class FlexKVMetricsCollector:
             documentation="Total number of evicted blocks by device",
             labelnames=["device"],
         )
-        
         self.allocated_blocks_total = Counter(
             name="flexkv_py_allocated_blocks_total",
             documentation="Total number of allocated blocks by device",
             labelnames=["device"],
         )
-        
+
+        # Joint Full+SWA prefetch outcome (mooncake). One increment per prefetch
+        # task at graph_completed. Outcome buckets (see _finalize_prefetch_return_mask):
+        #   full_and_swa       — Full covers J AND SWA op OK (SWA mounted on tree)
+        #   full_only_swa_lost — Full covers J but SWA op failed (Full[:J] on tree,
+        #                        no SWA; subsequent swa_aware GET misses SWA)
+        #   partial_full       — Full L<J (regardless of SWA)
+        #   all_failed         — Full L==0
+        #   full_only          — non-swa prefetch (no SWA op in graph)
+        # return_mask / storage_hit_length reports Full REMOTE2H success tokens
+        # only (A), independent of these buckets.
+        self.joint_prefetch_outcomes_total = Counter(
+            name="flexkv_py_joint_prefetch_outcomes_total",
+            documentation=(
+                "Joint Full+SWA prefetch outcomes by bucket "
+                "(full_and_swa / full_only_swa_lost / partial_full / all_failed / full_only)"
+            ),
+            labelnames=["outcome"],
+        )
+
+        # Joint prefetch CPU SWA slot allocation failures (mooncake). Incremented
+        # when _alloc_swa_slot returned -1 during plan-time joint prefetch build:
+        # the task then falls back to Full-only prefetch, which will not restore
+        # SWA on a subsequent swa_aware GET. Persistent non-zero => tune num_slots
+        # or SWA eviction pressure.
+        self.joint_prefetch_swa_slot_alloc_failed_total = Counter(
+            name="flexkv_py_joint_prefetch_swa_slot_alloc_failed_total",
+            documentation=(
+                "Joint prefetch CPU SWA slot allocation failures at plan time"
+            ),
+        )
+
         logger.info("[FlexKV PyMetrics] Prometheus metrics collector initialized")
     
     def _init_dummy_metrics(self):
@@ -244,6 +274,8 @@ class FlexKVMetricsCollector:
         self.mempool_free_blocks = dummy
         self.evicted_blocks_total = dummy
         self.allocated_blocks_total = dummy
+        self.joint_prefetch_outcomes_total = dummy
+        self.joint_prefetch_swa_slot_alloc_failed_total = dummy
     
 
     
@@ -342,7 +374,29 @@ class FlexKVMetricsCollector:
         if not self.enabled or num_blocks <= 0:
             return
         self.allocated_blocks_total.labels(device=device).inc(num_blocks)
-    
+
+    def record_joint_prefetch_outcome(self, outcome: str) -> None:
+        """Record one joint Full+SWA prefetch outcome bucket.
+
+        Args:
+            outcome: one of ``full_and_swa`` / ``full_only_swa_lost`` /
+                ``partial_full`` / ``all_failed`` / ``full_only``.
+                See ``KVTaskManager._finalize_prefetch_return_mask`` for the
+                exact classification. Called once per prefetch task at
+                graph_completed.
+        """
+        if not self.enabled:
+            return
+        self.joint_prefetch_outcomes_total.labels(outcome=outcome).inc(1)
+
+    def record_joint_prefetch_swa_slot_alloc_failure(self) -> None:
+        """Record one CPU SWA slot allocation failure at plan-time joint prefetch
+        build. Persistent non-zero indicates SWA host pool pressure and forces the
+        request to fall back to Full-only prefetch."""
+        if not self.enabled:
+            return
+        self.joint_prefetch_swa_slot_alloc_failed_total.inc(1)
+
 # Global collector instance
 _global_collector: Optional[FlexKVMetricsCollector] = None
 
