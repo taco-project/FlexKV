@@ -715,9 +715,12 @@ class CacheConfig:
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
-        self.enable_remote = self.enable_3rd_remote or self.use_mooncake_store_backend
+        # Resolve mooncake flag from env BEFORE deriving enable_remote;
+        # otherwise FLEXKV_USE_MOONCAKE_STORE_BACKEND=1 leaves enable_remote
+        # False and trips the check below (FlexKVConfig default_factory path).
         self.use_mooncake_store_backend = self.use_mooncake_store_backend or bool(
             int(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', '0')))
+        self.enable_remote = self.enable_3rd_remote or self.use_mooncake_store_backend
         if self.use_mooncake_store_backend and self.mooncake_store_config_path is None:
             self.mooncake_store_config_path = os.getenv(
                 'FLEXKV_MOONCAKE_STORE_CONFIG_PATH', None)

@@ -86,6 +86,7 @@ from flexkv.transfer.worker_op import (
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.external.mooncake_store_keys import PoolKind, build_key
+from flexkv.external.mooncake_fault_inject import inject_mooncake_fault, is_mooncake_fault_inject_enabled
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.transfer.utils import (
@@ -114,118 +115,6 @@ try:
 except ImportError:
     transfer_kv_blocks_remote = None
     shared_transfer_kv_blocks_remote_read = None
-
-
-# ---------------------------------------------------------------------------
-# Mooncake fault injection (opt-in, off by default).
-#
-# Purpose: exercise the "publish what actually transferred" pipeline
-# (DeferredCacheInsert joint guard + _finalize_prefetch_return_mask) end-to-end
-# without waiting for real network flakes. The hook lives at the ONLY point
-# per-block booleans are produced (batch_get / batch_put); every downstream
-# stage — CompletedOp.block_results, MooncakeLoadResult, commit-time prefix
-# math, return_mask narrowing, outcome metric — is exercised identically.
-#
-# Environment variables (all optional):
-#
-#   FLEXKV_MOONCAKE_FAULT_MODE
-#       "none"       — passthrough (default)
-#       "tail_fail"  — first (N - K) True, last K False; K from FLEXKV_MOONCAKE_FAULT_TAIL_N
-#                      (default 1). Models the "connection dies near end of batch"
-#                      shape and exercises the "0 < L_full < J" partial branch.
-#       "first_ok"   — same as tail_fail with TAIL_N=len-1: exactly one True at
-#                      the head. Fast way to hit "L_full = 1".
-#       "random"     — each block independently fails with probability
-#                      FLEXKV_MOONCAKE_FAULT_RANDOM_RATIO (default 0.3). The
-#                      first False collapses the "success prefix" — good for
-#                      soak-style variation with a fixed seed.
-#       "full_fail"  — all False. Triggers all_failed / task-level FAILED.
-#
-#   FLEXKV_MOONCAKE_FAULT_PROB
-#       Per-call probability the fault applies (default 1.0). <1.0 lets some
-#       batches pass through untouched so partial and full mix.
-#
-#   FLEXKV_MOONCAKE_FAULT_OP
-#       "both" (default) / "get" / "put" — restrict fault to one direction.
-#       Useful for isolating GET-side commit tests from PUT-side tests.
-#
-#   FLEXKV_MOONCAKE_FAULT_SEED
-#       Optional int; when set, seeds the fault RNG for reproducible runs.
-#
-# The hook only fires when FLEXKV_MOONCAKE_FAULT_MODE is set and non-empty and
-# not "none", so a bare-env production run is byte-for-byte the same as
-# without this patch.
-# ---------------------------------------------------------------------------
-
-_FAULT_RNG: Optional[np.random.Generator] = None
-
-
-def _get_fault_rng() -> np.random.Generator:
-    global _FAULT_RNG
-    if _FAULT_RNG is None:
-        seed_env = os.environ.get("FLEXKV_MOONCAKE_FAULT_SEED", "")
-        seed = int(seed_env) if seed_env else None
-        _FAULT_RNG = np.random.default_rng(seed)
-    return _FAULT_RNG
-
-
-def _inject_mooncake_fault(results: List[bool],
-                           transfer_type: "TransferType") -> List[bool]:
-    """Optionally replace ``results`` with a partial-failure pattern.
-
-    See module-level doc for the environment variables. No-op unless
-    ``FLEXKV_MOONCAKE_FAULT_MODE`` is set to something other than ``none``.
-    """
-    mode = os.environ.get("FLEXKV_MOONCAKE_FAULT_MODE", "").strip().lower()
-    if not mode or mode == "none":
-        return results
-
-    op_filter = os.environ.get("FLEXKV_MOONCAKE_FAULT_OP", "get").strip().lower()
-    if op_filter == "get" and transfer_type != TransferType.REMOTE2H:
-        return results
-    if op_filter == "put" and transfer_type != TransferType.H2REMOTE:
-        return results
-
-    n = len(results)
-    if n == 0:
-        return results
-
-    try:
-        prob = float(os.environ.get("FLEXKV_MOONCAKE_FAULT_PROB", "1.0"))
-    except ValueError:
-        prob = 1.0
-    if prob < 1.0 and _get_fault_rng().random() >= prob:
-        return results
-
-    if mode == "full_fail":
-        injected = [False] * n
-    elif mode == "first_ok":
-        injected = [True] + [False] * (n - 1)
-    elif mode == "tail_fail":
-        try:
-            tail_n = int(os.environ.get("FLEXKV_MOONCAKE_FAULT_TAIL_N", "1"))
-        except ValueError:
-            tail_n = 1
-        tail_n = max(1, min(n, tail_n))
-        injected = [True] * (n - tail_n) + [False] * tail_n
-    elif mode == "random":
-        try:
-            ratio = float(os.environ.get("FLEXKV_MOONCAKE_FAULT_RANDOM_RATIO", "0.3"))
-        except ValueError:
-            ratio = 0.3
-        ratio = max(0.0, min(1.0, ratio))
-        rng = _get_fault_rng()
-        injected = [rng.random() >= ratio for _ in range(n)]
-    else:
-        flexkv_logger.warning(
-            f"[Mooncake-Fault] unknown mode '{mode}'; passthrough")
-        return results
-
-    flexkv_logger.warning(
-        f"[Mooncake-Fault] mode={mode} op={transfer_type.name} "
-        f"injected={sum(injected)}/{n} true "
-        f"(orig={sum(bool(r) for r in results)}/{n})")
-    return injected
 
 
 class TransferWorkerBase(ABC):
@@ -610,6 +499,11 @@ class TransferWorkerBase(ABC):
                 if op is None:
                     return
 
+                # Drain any already-queued ops into one batch, then process.
+                # The for-loop MUST sit outside the drain while: a single-op
+                # submit leaves poll() False immediately, and a while-else
+                # continue would otherwise drop the first op forever (which
+                # stalls D2H → H2REMOTE and leaves mooncake PutStart=0).
                 batch_ops = [op]
                 shutdown_after_batch = False
                 while self.transfer_conn.poll(timeout=0):
@@ -617,65 +511,79 @@ class TransferWorkerBase(ABC):
                     if op is None:
                         shutdown_after_batch = True
                         break
-                    batch_ops = [op]
-                    for op in batch_ops:
-                        transfer_status = False
-                        transfer_start_ns = time.perf_counter_ns()
-                        nvtx_pushed = False
+                    batch_ops.append(op)
+
+                for op in batch_ops:
+                    transfer_status = False
+                    transfer_start_ns = time.perf_counter_ns()
+                    nvtx_pushed = False
+                    try:
+                        if op.transfer_type in (
+                            TransferType.H2REMOTE,
+                            TransferType.REMOTE2H,
+                            TransferType.D2H,
+                            TransferType.H2D,
+                        ):
+                            flexkv_logger.info(
+                                f"[FlexKV-MC-XFER] worker launch "
+                                f"{op.transfer_type.name} "
+                                f"op_id={op.transfer_op_id} "
+                                f"graph_id={op.transfer_graph_id} "
+                                f"worker_id={self.worker_id} "
+                                f"blocks={op.valid_block_num}"
+                            )
+                        nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
+                                            f"graph_id: {op.transfer_graph_id}",
+                                            color=get_nvtx_range_color(op.transfer_graph_id))
+                        nvtx_pushed = True
+                        transfer_status = self.launch_transfer(op)
+                    except Exception as e:
+                        is_layerwise = op.transfer_type == TransferType.LAYERWISE
+                        direction = "H2D" if is_layerwise else op.transfer_type.value
+                        blocks = (
+                            len(op.src_block_ids_h2d)
+                            if is_layerwise
+                            else op.valid_block_num
+                        )
+                        flexkv_logger.error(
+                            "[FlexKV-IO] operation=transfer act=complete "
+                            "status=failed direction=%s blocks=%d op_id=%d "
+                            "graph_id=%d mode=%s transfer_time=%.4fs "
+                            "error=%r",
+                            direction,
+                            blocks,
+                            op.transfer_op_id,
+                            op.transfer_graph_id,
+                            "layerwise" if is_layerwise else "no-layerwise",
+                            (time.perf_counter_ns() - transfer_start_ns) / 1e9,
+                            str(e),
+                            exc_info=True,
+                        )
+                    finally:
+                        if nvtx_pushed:
+                            nvtx.pop_range()
+                    if isinstance(transfer_status, WorkerTransferResult):
+                        # Partial-capable backends report completion even when
+                        # zero blocks succeeded, so the graph can clean up and
+                        # the caller can fall back instead of hanging forever.
+                        self.finished_ops_queue.put(transfer_status)
+                    elif transfer_status:
+                        self.finished_ops_queue.put(op.transfer_op_id)
+                    else:
+                        # Report the failure instead of dropping it: a
+                        # dropped op leaves its graph incomplete forever
+                        # and leaks every resource its plan holds. A bare
+                        # int still means success, so the queue format
+                        # stays compatible.
+                        self.finished_ops_queue.put((op.transfer_op_id, False))
+
+                if shutdown_after_batch:
+                    if hasattr(self, "shutdown") and callable(self.shutdown):
                         try:
-                            nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
-                                                f"graph_id: {op.transfer_graph_id}",
-                                                color=get_nvtx_range_color(op.transfer_graph_id))
-                            nvtx_pushed = True
-                            transfer_status = self.launch_transfer(op)
+                            self.shutdown()
                         except Exception as e:
-                            is_layerwise = op.transfer_type == TransferType.LAYERWISE
-                            direction = "H2D" if is_layerwise else op.transfer_type.value
-                            blocks = (
-                                len(op.src_block_ids_h2d)
-                                if is_layerwise
-                                else op.valid_block_num
-                            )
-                            flexkv_logger.error(
-                                "[FlexKV-IO] operation=transfer act=complete "
-                                "status=failed direction=%s blocks=%d op_id=%d "
-                                "graph_id=%d mode=%s transfer_time=%.4fs "
-                                "error=%r",
-                                direction,
-                                blocks,
-                                op.transfer_op_id,
-                                op.transfer_graph_id,
-                                "layerwise" if is_layerwise else "no-layerwise",
-                                (time.perf_counter_ns() - transfer_start_ns) / 1e9,
-                                str(e),
-                                exc_info=True,
-                            )
-                        finally:
-                            if nvtx_pushed:
-                                nvtx.pop_range()
-                        if isinstance(transfer_status, WorkerTransferResult):
-                            # Partial-capable backends report completion even when
-                            # zero blocks succeeded, so the graph can clean up and
-                            # the caller can fall back instead of hanging forever.
-                            self.finished_ops_queue.put(transfer_status)
-                        elif transfer_status:
-                            self.finished_ops_queue.put(op.transfer_op_id)
-                        else:
-                            # Report the failure instead of dropping it: a
-                            # dropped op leaves its graph incomplete forever
-                            # and leaks every resource its plan holds. A bare
-                            # int still means success, so the queue format
-                            # stays compatible.
-                            self.finished_ops_queue.put((op.transfer_op_id, False))
-                    if shutdown_after_batch:
-                        if hasattr(self, "shutdown") and callable(self.shutdown):
-                            try:
-                                self.shutdown()
-                            except Exception as e:
-                                flexkv_logger.error(f"Error when shut down worker: {e}")
-                        break
-                else:
-                    continue
+                            flexkv_logger.error(f"Error when shut down worker: {e}")
+                    break
             except EOFError:
                 flexkv_logger.warning(
                     f"[worker {self.worker_id}] transfer pipe EOF; exiting run loop"
@@ -3852,15 +3760,19 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
                        transfer_type: TransferType) -> List[bool]:
         if transfer_type == TransferType.H2REMOTE:
             put_results = self.mooncake_client.batch_put(keys, cpu_ptrs, block_sizes)
-            put_results = _inject_mooncake_fault(put_results, transfer_type)
             if not all(put_results):
-                flexkv_logger.error(f"Mooncake-store batch put partially failed: {put_results}")
+                flexkv_logger.warning(f"Mooncake-store batch put partially failed: {put_results}")
             return put_results
         elif transfer_type == TransferType.REMOTE2H:
             get_results = self.mooncake_client.batch_get(keys, cpu_ptrs, block_sizes)
-            get_results = _inject_mooncake_fault(get_results, transfer_type)
+
+            if is_mooncake_fault_inject_enabled():
+                get_results = inject_mooncake_fault(get_results, transfer_type)
+                flexkv_logger.info(f"Mooncake-store batch get results after fault injection: {get_results}")
+
             if not all(get_results):
-                flexkv_logger.error(f"Mooncake-store batch get partially failed: {get_results}")
+                flexkv_logger.warning(
+                    f"Mooncake-store batch get partially failed: {get_results}")
             return get_results
         else:
             raise ValueError(

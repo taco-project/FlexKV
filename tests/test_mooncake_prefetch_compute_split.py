@@ -152,6 +152,21 @@ def test_cache_config_mooncake_enables_remote(tmp_path, monkeypatch):
     assert cfg.enable_remote is True
 
 
+def test_cache_config_enable_remote_from_mooncake_env(tmp_path, monkeypatch):
+    """Env-only mooncake enable must also flip enable_remote (ordering bug)."""
+    from flexkv.common.config import CacheConfig
+
+    cfg_path = tmp_path / "mooncake.json"
+    cfg_path.write_text("{}")
+    monkeypatch.setenv("FLEXKV_USE_MOONCAKE_STORE_BACKEND", "1")
+    monkeypatch.setenv("FLEXKV_MOONCAKE_STORE_CONFIG_PATH", str(cfg_path))
+
+    # Default CacheConfig() path used by FlexKVConfig.field(default_factory=...)
+    cfg = CacheConfig()
+    assert cfg.use_mooncake_store_backend is True
+    assert cfg.enable_remote is True
+
+
 def test_assert_mooncake_prefetch_ready_rejects_without_prefetch():
     cache_config = SimpleNamespace(use_mooncake_store_backend=True)
     with pytest.raises(RuntimeError, match="requires prefetch"):

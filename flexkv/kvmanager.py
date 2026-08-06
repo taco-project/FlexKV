@@ -287,7 +287,6 @@ class KVManager:
                 namespace=namespace,
                 swa_aware=swa_aware,
             )
-            flexkv_logger.info(f"[FlexKV] prefetch: task_id={task_id}")
         return task_id
 
     def launch(self,
