@@ -512,6 +512,19 @@ setup(
             build_temp=os.path.join(build_dir, "temp"),  # Temporary build files
         )
     },
+    # Register a vLLM general plugin so FlexKV's compatibility shim
+    # (currently: injecting `build_prom_metrics` into vLLM's stock
+    # FlexKVConnectorV1 so PD-disaggregated MultiConnector deployments do
+    # not crash on the Prometheus-registry assertion) is loaded
+    # automatically in every vLLM process at startup.  See
+    # flexkv/integration/vllm/plugin.py for what the plugin does and why
+    # an import-time monkey patch alone is insufficient.  Users only need
+    # `pip install flexkv` — no manual import or launch-script changes.
+    entry_points={
+        "vllm.general_plugins": [
+            "flexkv_register = flexkv.integration.vllm.plugin:register",
+        ],
+    },
     #python_requires=">=3.8",
     python_requires=">=3.6",
 )
