@@ -836,18 +836,33 @@ class FlexKVConnectorV1Impl:
             # Track scheduled requests to detect preemptions in build_connector_meta
             self.previous_scheduled_req_ids: set[str] = set()
         elif role == KVConnectorRole.WORKER:
-            # vllm's ParallelConfig has no ``tensor_parallel_rank`` field, so
-            # the value read in post_init_from_vllm_config is always 0 on every
-            # worker.  Override it here using the initialized TP group rank so
-            # each worker registers a distinct device_id with FlexKV.
+            # Neither rank is knowable from the config on the worker side:
+            #   * vllm's ParallelConfig has no ``tensor_parallel_rank`` field, so
+            #     the tp_rank read in post_init_from_vllm_config is always 0.
+            #   * the mp executor passes ``local_rank`` to the worker as a kwarg
+            #     and never exports LOCAL_RANK, so the
+            #     ``int(os.environ.get('LOCAL_RANK', -1))`` in
+            #     integration/config.py yields -1 and RankInfo.__post_init__
+            #     derives local_rank from tp_rank=0 -> 0.
+            # local_rank is what becomes device_id, so leaving it at 0 makes
+            # every worker register the same device_id and GPU registration
+            # never reaches expected_gpus.  Recover both from the initialized
+            # process groups.  local_rank must be set explicitly:
+            # dataclasses.replace re-runs __post_init__, but by then local_rank
+            # is 0 (not < 0) so it is never re-derived.
             try:
                 import dataclasses
-                from vllm.distributed.parallel_state import get_tp_group
+                from vllm.distributed.parallel_state import (get_tp_group,
+                                                             get_world_group)
                 rank_info = dataclasses.replace(
-                    rank_info, tp_rank=get_tp_group().rank_in_group)
+                    rank_info,
+                    tp_rank=get_tp_group().rank_in_group,
+                    local_rank=get_world_group().local_rank)
             except Exception as _e:
-                logger.warning(
-                    f"FlexKV: could not derive tp_rank from vllm TP group: {_e}")
+                logger.error(
+                    f"FlexKV: could not derive ranks from vllm process groups: "
+                    f"{_e}. device_id will collide across workers and GPU "
+                    f"registration will hang at 1/N.")
             self.connector = FlexKVWorkerConnector(flexkv_config, rank_info)
         else:
             raise ValueError(f"Unrecognized KVConnectorRole: {role}.")
