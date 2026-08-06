@@ -358,7 +358,7 @@ print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
 extra_compile_args = [
     "-std=c++17",
     "-O3",
-    f'-DFLEXKV_GIT_COMMIT=\\"{build_git_commit}\\"',
+    f'-DFLEXKV_GIT_COMMIT="{build_git_commit}"',
 ]
 if enable_metrics:
     extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
