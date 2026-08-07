@@ -86,6 +86,33 @@ class MooncakeLoadResult:
         return prefix
 
 
+@dataclass
+class DeferredPublishResult:
+    """CPU radix publication outcome for a deferred Mooncake load.
+
+    Transfer ``block_results`` alone are not enough for prefetch
+    ``return_mask``: rematch/insert may discard staging even when REMOTE2H
+    succeeded. Task finalize takes
+    ``min(transfer_prefix, published_remote_blocks)``.
+    """
+
+    published_remote_blocks: Optional[int] = None
+    failed: bool = False
+    reason: str = ""
+
+    def record(
+            self,
+            published_remote_blocks: int,
+            reason: str = "ok",
+            failed: bool = False) -> None:
+        self.published_remote_blocks = int(published_remote_blocks)
+        self.reason = reason
+        self.failed = bool(failed)
+
+    def record_failure(self, reason: str = "error") -> None:
+        self.record(0, reason=reason, failed=True)
+
+
 @dataclass(frozen=True)
 class DeferredCacheInsert:
     """Detached tier blocks published by the graph-completion callback.
@@ -101,6 +128,10 @@ class DeferredCacheInsert:
     time the joint guard mounts the SWA slot ONLY when the Full commit reaches
     ``swa_anchor_block+1`` AND the SWA REMOTE2H reported success; otherwise the
     slot is freed and only the Full prefix is published to the tree.
+
+    ``publish_result`` (CPU Mooncake loads) is filled by
+    ``_commit_deferred_insert`` / ``_transfer_callback`` so prefetch finalize
+    can report the mounted prefix rather than transfer-only success.
     """
 
     device_type: DeviceType
@@ -114,6 +145,7 @@ class DeferredCacheInsert:
     publish_to_peer: bool = False
     swa_anchor_block: int = -1
     swa_load_result: Optional[MooncakeLoadResult] = None
+    publish_result: Optional[DeferredPublishResult] = None
 
 
 @dataclass
@@ -1576,6 +1608,9 @@ class GlobalCacheEngine:
         if defer_mooncake_commit:
             assert op_remote2h is not None
             load_result = MooncakeLoadResult()
+            # CPU publication drives prefetch return_mask; SSD commit is
+            # independent and must not overwrite this tracker.
+            publish_result = DeferredPublishResult()
             op_callback_dict[op_remote2h.op_id] = CompletionAwareCallback(
                 load_result.record)
             remote_start_block = block_mask_start + fragment12_num_blocks
@@ -1591,6 +1626,7 @@ class GlobalCacheEngine:
                 swa_slot=joint_prefetch_swa_slot,
                 swa_anchor_block=joint_prefetch_swa_anchor,
                 swa_load_result=joint_prefetch_swa_load_result,
+                publish_result=publish_result,
             ))
             if write_ssd_blocks_from_remote:
                 deferred_inserts.append(DeferredCacheInsert(
@@ -2650,8 +2686,29 @@ class GlobalCacheEngine:
         engine.index.set_swa(node, int(pending.swa_slot))
         engine._drain_unmounted_swa_slots()
 
+    @staticmethod
+    def _record_deferred_publish(
+            pending: DeferredCacheInsert,
+            published_end_block: int,
+            reason: str,
+            failed: bool = False) -> None:
+        """Report how many remote blocks became matchable after commit."""
+        publish_result = pending.publish_result
+        if publish_result is None:
+            return
+        published_remote = max(
+            0, int(published_end_block) - int(pending.remote_start_block))
+        publish_result.record(
+            published_remote, reason=reason, failed=failed)
+
     def _commit_deferred_insert(self, pending: DeferredCacheInsert):
-        """Fresh-rematch and atomically publish one valid staging prefix."""
+        """Fresh-rematch and atomically publish one valid staging prefix.
+
+        When ``pending.publish_result`` is set (CPU Mooncake loads), every
+        normal return path records the published remote-block count so
+        prefetch finalize can clamp ``return_mask`` to what the radix tree
+        actually mounts — not only what REMOTE2H transferred.
+        """
         engine = self.cache_engines[pending.device_type]
         physical_blocks = np.asarray(pending.physical_blocks, dtype=np.int64)
         staged_blocks = pending.requested_end_block - pending.staged_start_block
@@ -2666,6 +2723,8 @@ class GlobalCacheEngine:
                 f"{pending.requested_end_block}), "
                 f"remote_start={pending.remote_start_block}, "
                 f"physical_blocks={len(physical_blocks)}")
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "invalid_range", failed=True)
             return None
 
         if pending.load_result is None:
@@ -2704,6 +2763,8 @@ class GlobalCacheEngine:
         except Exception:
             # No radix mutation has started, so all staging is still ours.
             self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "rematch_error", failed=True)
             raise
         current_blocks = int(current_match.num_matched_blocks)
         ready_blocks = int(current_match.num_ready_matched_blocks)
@@ -2713,6 +2774,8 @@ class GlobalCacheEngine:
         if (current_blocks != ready_blocks
                 or current_blocks < pending.staged_start_block):
             self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "rematch_stale")
             return None
 
         if current_blocks >= publish_end:
@@ -2725,11 +2788,16 @@ class GlobalCacheEngine:
                 else:
                     self._publish_pending_swa_slot(
                         engine, pending, boundary_node)
+            # Tree already covers the transferred prefix — still usable.
+            self._record_deferred_publish(
+                pending, publish_end, "already_covered")
             return boundary_node
 
         successful_staged_blocks = publish_end - pending.staged_start_block
         if successful_staged_blocks <= 0:
             self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "zero_prefix")
             return None
 
         skipped_blocks = current_blocks - pending.staged_start_block
@@ -2750,14 +2818,22 @@ class GlobalCacheEngine:
             # after mutation, so keep those fail-closed.
             if not str(error).startswith("radix insert conflict:"):
                 self._release_pending_swa_slot(engine, pending)
+                self._record_deferred_publish(
+                    pending, pending.remote_start_block, "insert_error", failed=True)
                 raise
             self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "insert_conflict")
             return None
         except Exception:
             self._release_pending_swa_slot(engine, pending)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "insert_error", failed=True)
             raise
         if node is None:
             self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "insert_none")
             return None
 
         unused_blocks = np.concatenate((
@@ -2775,6 +2851,8 @@ class GlobalCacheEngine:
             # Inserted blocks now belong to the unready tree node and must not
             # be recycled, but the detached SWA slot is still ours.
             self._release_pending_swa_slot(engine, pending)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "set_ready_error", failed=True)
             raise
 
         if pending.swa_slot >= 0:
@@ -2785,6 +2863,7 @@ class GlobalCacheEngine:
 
         if pending.publish_to_peer:
             engine.local_index.insert_and_publish(node)
+        self._record_deferred_publish(pending, publish_end, "ok")
         return node
 
     @_synchronized_cache_tree
@@ -2802,6 +2881,12 @@ class GlobalCacheEngine:
                     # The commit helper recycles blocks on every known pre-insert
                     # rejection; an unexpected post-insert exception has uncertain
                     # ownership and must not return those blocks to the mempool.
+                    # Commit paths that raise after recording leave publish_result
+                    # set; unrecorded failures still need a zero publish report.
+                    publish_result = getattr(pending, "publish_result", None)
+                    if (publish_result is not None
+                            and publish_result.published_remote_blocks is None):
+                        publish_result.record_failure("callback_error")
                     flexkv_logger.error(
                         "Deferred cache publication failed: "
                         f"device={pending.device_type.name}",

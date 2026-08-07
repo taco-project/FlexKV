@@ -7,8 +7,9 @@ Exercise the "publish what actually transferred" pipeline
 end-to-end without waiting for real network flakes. Call this at the only
 point where per-block booleans are produced (``batch_get`` / ``batch_put``);
 every downstream stage — ``CompletedOp.block_results``, ``MooncakeLoadResult``,
-commit-time prefix math, return_mask narrowing, outcome metric — sees the
-same injected bitmap.
+commit-time prefix math, return_mask narrowing (including the joint Full+SWA
+gate that reports 0 unless both succeed), outcome metric — sees the same
+injected bitmap.
 
 Environment variables (all optional)
 ------------------------------------

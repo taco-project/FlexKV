@@ -473,13 +473,12 @@ def test_prefetch_joint_full_and_swa_narrow_to_j():
     assert int(np.sum(task.return_mask)) == J * tpb
 
 
-def test_prefetch_joint_full_ok_swa_fail_publishes_full_only():
-    """Joint prefetch: Full complete but SWA fail.
+def test_prefetch_joint_full_ok_swa_fail_reports_zero_mask():
+    """Joint prefetch: Full complete but SWA fail → report 0 to callers.
 
-    return_mask reports Full REMOTE2H success (A) = J*tpb even when SWA is
-    lost. Tree still mounts Full[:J] and frees the SWA slot; swa_aware compute
-    miss is enforced later in _get_impl_local. Metric bucket
-    'full_only_swa_lost' preserves the tuning signal.
+    Tree may still mount Full[:J] and free the SWA slot, but swa_aware GET
+    cannot reuse the joint prefix, so storage_hit_length must be 0. Metric
+    bucket 'full_only_swa_lost' still records the Full-only mount case.
     """
     graph_id, full_op_id, swa_op_id = 61, 92, 93
     tpb = 2
@@ -538,15 +537,15 @@ def test_prefetch_joint_full_ok_swa_fail_publishes_full_only():
     manager._update_tasks(timeout=0)
 
     assert task.transfer_failed is False
-    assert int(np.sum(task.return_mask)) == J * tpb
+    assert task.prefetch_has_swa_remote is True
+    assert int(np.sum(task.return_mask)) == 0
 
 
-def test_prefetch_joint_partial_full_publishes_l_full():
-    """Joint prefetch: Full partial (L<J). return_mask = L*tpb (remote A)."""
+def test_prefetch_joint_partial_full_reports_zero_mask():
+    """Joint prefetch: Full partial (L<J) → report 0 (SWA cannot mount)."""
     graph_id, full_op_id, swa_op_id = 62, 94, 95
     tpb = 2
     J = 3
-    L = 2
     return_mask = np.ones(J * tpb, dtype=np.bool_)
     full_op = SimpleNamespace(
         transfer_type=TransferType.REMOTE2H,
@@ -601,7 +600,8 @@ def test_prefetch_joint_partial_full_publishes_l_full():
     manager._update_tasks(timeout=0)
 
     assert task.transfer_failed is False
-    assert int(np.sum(task.return_mask)) == L * tpb
+    assert task.prefetch_has_swa_remote is True
+    assert int(np.sum(task.return_mask)) == 0
 
 
 def test_prefetch_zero_success_prefix_still_fails():
@@ -803,21 +803,21 @@ def _prefetch_task_with_ops(*, graph_id, full_op_id, swa_op_id, tpb, J,
     ), full_op, swa_op
 
 
-# return_mask tokens come from Full REMOTE2H L (A); outcome bucket is orthogonal.
+# return_mask tokens: joint requires Full+SWA both OK; else 0. Outcome orthogonal.
 @pytest.mark.parametrize(
     "full_mask,swa_mask,expected_outcome,expected_tokens",
     [
         ((True,  True,  True),  (True,),  "full_and_swa",       6),
-        ((True,  True,  True),  (False,), "full_only_swa_lost", 6),
-        ((True,  True,  False), (True,),  "partial_full",       4),
-        ((True,  True,  False), (False,), "partial_full",       4),
+        ((True,  True,  True),  (False,), "full_only_swa_lost", 0),
+        ((True,  True,  False), (True,),  "partial_full",       0),
+        ((True,  True,  False), (False,), "partial_full",       0),
         ((False, False, False), (True,),  "all_failed",         0),
     ],
 )
 def test_joint_prefetch_outcome_metric_counts(
         full_mask, swa_mask, expected_outcome, expected_tokens,
         monkeypatch):
-    """G3: finalize emits outcome bucket; return_mask = Full REMOTE L * tpb."""
+    """G3: outcome bucket from mount; return_mask gated on Full+SWA both OK."""
     recorder = _RecordingCollector()
     monkeypatch.setattr(
         "flexkv.kvtask.get_global_collector", lambda: recorder)
@@ -905,6 +905,123 @@ def test_narrow_return_mask_helper():
         task.return_mask,
         np.array([False, False, True, True, False, False, False]),
     )
+
+
+def test_prefetch_finalize_clamps_mask_to_deferred_publish():
+    """Transfer success + commit discard must not report a non-zero mask."""
+    from flexkv.cache.cache_engine import DeferredPublishResult
+    from flexkv.common.transfer import DeviceType
+
+    graph_id, op_id = 80, 240
+    tpb = 2
+    graph_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1", "h2"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+    publish_result = DeferredPublishResult()
+    publish_result.record(0, reason="insert_conflict")
+    pending = SimpleNamespace(
+        device_type=DeviceType.CPU,
+        publish_result=publish_result,
+    )
+
+    class _Callback:
+        def __init__(self):
+            self.keywords = {"deferred_inserts": [pending]}
+
+        def __call__(self):
+            return None
+
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=op_id,
+        token_ids=np.arange(3 * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=1, _op_map={op_id: graph_op}
+        ),
+        return_mask=np.ones(3 * tpb, dtype=np.bool_),
+        callback=_Callback(),
+        op_callback_dict={},
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=3, block_results=(True, True, True)),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    assert task.prefetch_full_block_results == (True, True, True)
+    assert int(np.sum(task.return_mask)) == 0
+    assert task.status == TaskStatus.COMPLETED
+
+
+def test_prefetch_finalize_clamps_to_shorter_publish_prefix():
+    """Published prefix shorter than transfer prefix wins."""
+    from flexkv.cache.cache_engine import DeferredPublishResult
+    from flexkv.common.transfer import DeviceType
+
+    graph_id, op_id = 81, 241
+    tpb = 2
+    graph_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1", "h2"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+    publish_result = DeferredPublishResult()
+    publish_result.record(1, reason="ok")
+    pending = SimpleNamespace(
+        device_type=DeviceType.CPU,
+        publish_result=publish_result,
+    )
+
+    class _Callback:
+        def __init__(self):
+            self.keywords = {"deferred_inserts": [pending]}
+
+        def __call__(self):
+            return None
+
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=op_id,
+        token_ids=np.arange(3 * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=1, _op_map={op_id: graph_op}
+        ),
+        return_mask=np.ones(3 * tpb, dtype=np.bool_),
+        callback=_Callback(),
+        op_callback_dict={},
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=3, block_results=(True, True, False)),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    # transfer L=2, publish=1 → report 1 block
+    assert int(np.sum(task.return_mask)) == 1 * tpb
 
 
 # --- M15/M16: SWA-aware get's core arithmetic (pure, mirrors kvtask logic) --- #

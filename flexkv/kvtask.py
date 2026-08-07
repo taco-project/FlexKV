@@ -16,6 +16,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.block import hash_token
 from flexkv.common.transfer import (
     CompletedOp,
+    DeviceType,
     TransferOpGraph,
     TransferType,
     get_nvtx_default_color,
@@ -88,9 +89,10 @@ class KVTask:
 
     # Prefetch mooncake outcomes captured from CompletedOp (not from
     # task.graph ops — transfer engines may mutate a deepcopy).
-    # ``prefetch_full_block_results`` drives return_mask at finalize (A:
-    # how many Full REMOTE2H tokens this prefetch newly pulled). SWA bitmaps
-    # + ``prefetch_has_swa_remote`` feed the joint outcome METRIC only —
+    # Finalize return_mask (A) is the Full REMOTE2H success prefix clamped by
+    # deferred publish; for joint SWA prefetch it is further gated so only
+    # Full+SWA both succeeding reports a non-zero mask (else 0). SWA bitmaps
+    # + ``prefetch_has_swa_remote`` also feed the joint outcome METRIC —
     # SWA lives in a separate slot space and is not summed into return_mask.
     prefetch_full_block_results: Optional[Tuple[bool, ...]] = None
     prefetch_swa_block_results: Optional[Tuple[bool, ...]] = None
@@ -568,32 +570,103 @@ class KVTaskManager:
         new_mask[start:end] = True
         task.return_mask = new_mask
 
+    @staticmethod
+    def _prefetch_published_remote_blocks(task: "KVTask") -> Optional[int]:
+        """CPU deferred-publish remote block count after graph callback.
+
+        Returns ``None`` when this task has no deferred-publish tracker
+        (non-mooncake / legacy path). Returns ``0`` when commit discarded
+        or failed to mount anything matchable.
+        """
+        callbacks = task.callback
+        if callbacks is None:
+            return None
+        if not isinstance(callbacks, list):
+            callbacks = [callbacks]
+        saw_tracker = False
+        published: Optional[int] = None
+        for callback in callbacks:
+            keywords = getattr(callback, "keywords", None) or {}
+            for pending in keywords.get("deferred_inserts") or []:
+                if getattr(pending, "device_type", None) != DeviceType.CPU:
+                    continue
+                publish_result = getattr(pending, "publish_result", None)
+                if publish_result is None:
+                    continue
+                saw_tracker = True
+                blocks = publish_result.published_remote_blocks
+                if blocks is None or publish_result.failed:
+                    blocks = 0
+                published = (
+                    int(blocks) if published is None
+                    else min(published, int(blocks)))
+        if not saw_tracker:
+            return None
+        return 0 if published is None else published
+
     def _finalize_prefetch_return_mask(self, task: "KVTask") -> None:
-        """Report how many Full REMOTE2H tokens this prefetch newly pulled (A).
+        """Report reusable Full REMOTE2H tokens for this prefetch (A).
 
         ``sum(return_mask)`` is the storage/L3 accounting number consumed by
         sglang as ``storage_hit_length``. It must NOT include a pre-existing
-        CPU prefix (f1) or DISK2H — only the longest success prefix of this
-        task's Full mooncake REMOTE2H. Joint SWA success/failure is classified
-        separately in the outcome metric; SWA slots are never summed here.
+        CPU prefix (f1) or DISK2H.
 
-        Plan-time ``return_mask`` already spans the planned Full REMOTE2H
-        interval; this method truncates that span to ``L`` blocks. Opaque
-        backends that never supply ``block_results`` leave the plan-time mask
-        unchanged (legacy all-or-nothing).
+        Base length is the longest success prefix of this task's Full mooncake
+        REMOTE2H, clamped by CPU deferred-publish length so transfer-success /
+        commit-discard cannot over-report.
+
+        Joint Full+SWA prefetch (``prefetch_has_swa_remote``): subsequent
+        ``swa_aware`` GET uses ``min(full, swa)`` and commit only mounts SWA
+        when Full covers the whole planned span. Reporting therefore requires
+        **both** Full transfer/publish complete (L == planned) **and** SWA
+        transfer success; otherwise the mask is cleared to 0 even if Full
+        alone was mounted. SWA tokens are never summed into the mask.
+
+        Opaque backends without ``block_results`` leave the plan-time mask
+        unchanged when there is no SWA remote op.
         """
         full_results = task.prefetch_full_block_results
         if full_results is not None:
-            full_success_len = _longest_success_prefix(full_results)
-            self._narrow_return_mask_to_prefix_blocks(task, full_success_len)
+            mounted_full_len = _longest_success_prefix(full_results)
         else:
-            full_success_len = None
+            mounted_full_len = None
+
+        published_remote = self._prefetch_published_remote_blocks(task)
+        if published_remote is not None:
+            if mounted_full_len is None:
+                mounted_full_len = published_remote
+            else:
+                mounted_full_len = min(mounted_full_len, published_remote)
+
+        # Length reported to callers (may be zeroed by the joint SWA gate).
+        report_len = mounted_full_len
+        if task.prefetch_has_swa_remote:
+            swa_results = task.prefetch_swa_block_results
+            swa_ok = (
+                swa_results is not None
+                and len(swa_results) > 0
+                and all(swa_results)
+            )
+            if full_results is None:
+                # Joint path without Full bitmaps cannot prove both succeeded.
+                report_len = 0
+            else:
+                planned_full_len = len(full_results)
+                if (report_len is None
+                        or report_len != planned_full_len
+                        or not swa_ok):
+                    report_len = 0
+
+        if report_len is not None:
+            self._narrow_return_mask_to_prefix_blocks(task, report_len)
 
         # Joint / full-only outcome metric (mooncake bitmaps).
+        # Classified from mounted Full length + SWA bitmap — not from the
+        # caller-facing report_len gate — so full_only_swa_lost remains visible.
         if full_results is None:
             return
 
-        assert full_success_len is not None
+        assert mounted_full_len is not None
         if not task.prefetch_has_swa_remote:
             outcome = "full_only"
         else:
@@ -604,11 +677,11 @@ class KVTaskManager:
                 and len(swa_results) > 0
                 and all(swa_results)
             )
-            if full_success_len == 0:
+            if mounted_full_len == 0:
                 outcome = "all_failed"
-            elif full_success_len == planned_full_len and swa_ok:
+            elif mounted_full_len == planned_full_len and swa_ok:
                 outcome = "full_and_swa"
-            elif full_success_len == planned_full_len and not swa_ok:
+            elif mounted_full_len == planned_full_len and not swa_ok:
                 outcome = "full_only_swa_lost"
             else:
                 outcome = "partial_full"
@@ -1209,11 +1282,12 @@ class KVTaskEngine(KVTaskManager):
         The launch call is fire-and-forget: it publishes the plan and hands the
         graph to the transfer engine. Progress and usable-token accounting are
         polled later via ``try_wait``/``wait`` — ``KVResponse.return_mask`` is
-        rewritten in ``_finalize_prefetch_return_mask`` to the Full REMOTE2H
-        success prefix (tokens newly pulled from remote this request). Callers
-        that want that count should read ``sum(return_mask)`` on the response,
-        not any launch-time value. Compute H2D length still comes from a
-        subsequent local ``get_match`` against the CPU tree.
+        rewritten in ``_finalize_prefetch_return_mask`` to the reusable Full
+        REMOTE2H length (clamped by deferred publish; for joint SWA only when
+        Full+SWA both succeed, else 0). Callers that want that count should
+        read ``sum(return_mask)`` on the response, not any launch-time value.
+        Compute H2D length still comes from a subsequent local ``get_match``
+        against the CPU tree.
         """
         if task_id == -1:
             task_id = self._gen_task_id()

@@ -226,8 +226,9 @@ class FlexKVMetricsCollector:
         #   partial_full       — Full L<J (regardless of SWA)
         #   all_failed         — Full L==0
         #   full_only          — non-swa prefetch (no SWA op in graph)
-        # return_mask / storage_hit_length reports Full REMOTE2H success tokens
-        # only (A), independent of these buckets.
+        # return_mask / storage_hit_length: Full REMOTE2H success tokens when
+        # non-joint; for joint Full+SWA only when both succeed (else 0).
+        # Independent of outcome buckets except that gate.
         self.joint_prefetch_outcomes_total = Counter(
             name="flexkv_py_joint_prefetch_outcomes_total",
             documentation=(

@@ -13,11 +13,13 @@ pytest.importorskip("flexkv.c_ext")
 from flexkv.cache.cache_engine import (
     CacheEngine,
     DeferredCacheInsert,
+    DeferredPublishResult,
     GlobalCacheEngine,
     MooncakeLoadResult,
 )
 from flexkv.common.block import SequenceMeta
 from flexkv.common.transfer import DeviceType
+from dataclasses import replace
 
 
 pytestmark = pytest.mark.unit
@@ -176,6 +178,68 @@ def test_deferred_insert_recycles_staging_rejected_by_radix_guard():
 
     assert engine.mempool._free_mask[staged].all()
     assert engine.mempool.num_used_blocks == 0
+
+
+def test_deferred_insert_records_publish_result_on_success():
+    engine = _engine()
+    sequence = _sequence([1, 2, 3, 4])
+    publish_result = DeferredPublishResult()
+    pending = _pending(
+        engine, sequence, (True, True, True, True), 0, 4)
+    pending = replace(pending, publish_result=publish_result)
+
+    _manager(engine)._commit_deferred_insert(pending)
+
+    assert publish_result.published_remote_blocks == 4
+    assert publish_result.failed is False
+    assert publish_result.reason == "ok"
+
+
+def test_deferred_insert_records_zero_publish_on_conflict():
+    engine = _engine()
+    sequence = _sequence([1, 2, 3])
+    publish_result = DeferredPublishResult()
+    pending = _pending(engine, sequence, (True, True, True), 0, 3)
+    pending = replace(pending, publish_result=publish_result)
+    staged = pending.physical_blocks.copy()
+    engine.insert = Mock(side_effect=RuntimeError(
+        "radix insert conflict: target child already exists; "
+        "rematch before retrying"))
+
+    node = _manager(engine)._commit_deferred_insert(pending)
+
+    assert node is None
+    assert publish_result.published_remote_blocks == 0
+    assert publish_result.failed is False
+    assert publish_result.reason == "insert_conflict"
+    assert engine.mempool._free_mask[staged].all()
+
+
+def test_callback_records_publish_failure_when_commit_raises():
+    manager = object.__new__(GlobalCacheEngine)
+    manager._cache_tree_lock = threading.RLock()
+    manager._commit_deferred_insert = Mock(
+        side_effect=RuntimeError("injected commit failure"))
+    manager.cpu_cache_engine = SimpleNamespace(
+        unlock=Mock(),
+        set_ready=Mock(),
+        recycle=Mock(),
+    )
+    publish_result = DeferredPublishResult()
+    pending = SimpleNamespace(
+        device_type=DeviceType.CPU,
+        publish_result=publish_result,
+    )
+
+    manager._transfer_callback(
+        node_to_unlock={DeviceType.CPU: (object(), 0)},
+        buffer_to_free=None,
+        deferred_inserts=[pending],
+    )
+
+    assert publish_result.published_remote_blocks == 0
+    assert publish_result.failed is True
+    assert publish_result.reason == "callback_error"
 
 
 def test_callback_cleans_up_old_anchor_when_deferred_commit_fails():
