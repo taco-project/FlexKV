@@ -9,7 +9,12 @@ import torch
 import multiprocessing as mp
 from multiprocessing import Process, Pipe
 
-from flexkv.common.config import ModelConfig, CacheConfig, RankInfo, LayerGroupSpec
+from flexkv.common.config import (
+    ModelConfig,
+    CacheConfig,
+    RankInfo,
+    LayerGroupSpec,
+)
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
 from flexkv.kvtask import KVTaskEngine
@@ -24,7 +29,10 @@ from flexkv.common.debug import flexkv_logger
 from common_utils import (
     DEFAULT_MODEL_CONFIG, DEFAULT_CACHE_CONFIG, DEFAULT_TEST_CONFIG,
     generate_request_pair, block_ids_2_slot_mapping,
-    skip_if_insufficient_gpus,create_gpu_kv_layout, GPUKVCacheVerifier
+    skip_if_insufficient_gpus, create_gpu_kv_layout, GPUKVCacheVerifier,
+    GPU_LAYOUT_LAYERFIRST, GPU_LAYOUT_BLOCKFIRST, GPU_LAYOUT_SGLANG,
+    GPU_LAYOUT_VLLM_LAYERBLOCK, GPU_LAYOUT_VLLM_PACKED,
+    GPU_LAYOUT_VLLM_MLA,
 )
 
 
@@ -60,20 +68,56 @@ def run_tp_client(dp_client_id,
 
         # Create GPU blocks for this tp_rank in the tp_client process
         gpu_blocks_for_tp = []
-        if gpu_layout_type == 0:
+        if gpu_layout_type in (
+            GPU_LAYOUT_LAYERFIRST,
+            GPU_LAYOUT_VLLM_LAYERBLOCK,
+        ):
             for _ in range(model_config.num_layers):
                 gpu_blocks_for_tp.append(
                     torch.empty(size=tuple(gpu_kv_layout.kv_shape[1:]), dtype=model_config.dtype).cuda(device_id)
                 )
-        elif gpu_layout_type == 1:
+        elif gpu_layout_type == GPU_LAYOUT_BLOCKFIRST:
             gpu_blocks_for_tp.append(
                 torch.empty(size=tuple(gpu_kv_layout.kv_shape[:]), dtype=model_config.dtype).cuda(device_id)
             )
-        elif gpu_layout_type == 2:
+        elif gpu_layout_type == GPU_LAYOUT_SGLANG:
             kv_dim = model_config.kv_dim
             for _ in range(model_config.num_layers * kv_dim):
                 gpu_blocks_for_tp.append(
                     torch.empty(size=tuple(gpu_kv_layout.kv_shape[2:]), dtype=model_config.dtype).cuda(device_id)
+                )
+        elif gpu_layout_type == GPU_LAYOUT_VLLM_PACKED:
+            for _ in range(model_config.num_layers):
+                physical = torch.empty(
+                    size=(
+                        gpu_kv_layout.num_block,
+                        gpu_kv_layout.tokens_per_block,
+                        gpu_kv_layout.num_head,
+                        gpu_kv_layout.head_size,
+                    ),
+                    dtype=model_config.dtype,
+                    device=f"cuda:{device_id}",
+                )
+                packed = physical.permute(0, 2, 1, 3)
+                assert not packed.is_contiguous()
+                assert packed.stride(0) == gpu_kv_layout.get_block_stride()
+                assert packed.stride(1) == gpu_kv_layout.head_size
+                assert packed.stride(2) == (
+                    gpu_kv_layout.num_head * gpu_kv_layout.head_size
+                )
+                gpu_blocks_for_tp.append(packed)
+        elif gpu_layout_type == GPU_LAYOUT_VLLM_MLA:
+            for _ in range(model_config.num_layers):
+                gpu_blocks_for_tp.append(
+                    torch.empty(
+                        size=(
+                            gpu_kv_layout.num_block,
+                            gpu_kv_layout.tokens_per_block,
+                            gpu_kv_layout.head_size,
+                        ),
+                        dtype=model_config.dtype,
+                        device=f"cuda:{device_id}",
+                    )
                 )
         else:
             raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
@@ -114,37 +158,89 @@ def shutdown_tp_client(tp_client_processes):
         {"tp_size": 1, "dp_size": 1},
         {"tp_size": 2, "dp_size": 2},
         {"dtype": torch.float32},
-        {"use_mla": True},
-        {"tp_size": 4, "dp_size": 1, "use_mla": True},
+        {"num_kv_heads": 1, "use_mla": True},
+        {"num_kv_heads": 1, "tp_size": 4, "dp_size": 1, "use_mla": True},
         {"tp_size": 4, "dp_size": 1},
-        # fp8 端到端流程覆盖（仅在当前 PyTorch 支持 float8_e4m3fn 且 CUDA 具备 mul 等算子时启用）
+        pytest.param(
+            {
+                "num_kv_heads": 4,
+                "head_size": 36,
+                "dtype": torch.uint8,
+            },
+            id="nvfp4",
+        ),
         pytest.param(
             {"dtype": torch.float8_e4m3fn},
             marks=pytest.mark.skipif(
                 _fp8_cuda_ops_unavailable(),
-                reason="fp8 dtype or CUDA ops (e.g. mul_cuda) not available in this PyTorch build",
+                reason=(
+                    "fp8 dtype or CUDA ops (e.g. mul_cuda) not available "
+                    "in this PyTorch build"
+                ),
             ),
         ),
     ],
     indirect=True,
 )
 @pytest.mark.parametrize("cache_config", [
-    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
-    {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 256, 'num_ssd_blocks': 2048},
+    {"enable_cpu": True, "enable_ssd": False, "num_cpu_blocks": 1024},
+    {
+        "enable_cpu": True,
+        "enable_ssd": True,
+        "num_cpu_blocks": 256,
+        "num_ssd_blocks": 2048,
+    },
     # GDS test configs
     # {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': True, \
     #     'enable_remote': False, 'num_cpu_blocks':256, 'num_ssd_blocks': 1024},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
-    {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
-    {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4, 'namespace': ['test_namespace']},
+    {
+        "num_gpu_blocks": 512,
+        "requests_per_block": 16,
+        "initial_write_ratio": 0.4,
+    },
+    {
+        "num_gpu_blocks": 512,
+        "requests_per_block": 16,
+        "initial_write_ratio": 0.4,
+        "namespace": ["test_namespace"],
+    },
 ], indirect=True)
 @pytest.mark.parametrize("gpu_layout_type", [
-    0,
-    1,
-    2,
+    GPU_LAYOUT_LAYERFIRST,
+    GPU_LAYOUT_BLOCKFIRST,
+    GPU_LAYOUT_SGLANG,
+    GPU_LAYOUT_VLLM_LAYERBLOCK,
+    GPU_LAYOUT_VLLM_PACKED,
+    GPU_LAYOUT_VLLM_MLA,
+], ids=[
+    "layerfirst",
+    "blockfirst",
+    "sglang",
+    "vllm-layerblock",
+    "vllm-packed-4d",
+    "vllm-mla-3d",
 ])
-def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type, request):
+def test_kvmanager(
+    model_config,
+    cache_config,
+    test_config,
+    gpu_layout_type,
+    request,
+):
+    if model_config.use_mla and gpu_layout_type != GPU_LAYOUT_VLLM_MLA:
+        pytest.skip("vLLM MLA uses its dedicated 3D KV cache layout")
+    if not model_config.use_mla and gpu_layout_type == GPU_LAYOUT_VLLM_MLA:
+        pytest.skip("the vLLM MLA layout only applies to MLA models")
+
+    model_config.packed_kv = gpu_layout_type == GPU_LAYOUT_VLLM_PACKED
+    if model_config.packed_kv:
+        if model_config.dtype == torch.uint8: # nvfp4
+            model_config.num_kv_heads *= 2
+        else:
+            model_config.head_size *= 2
+
     tp_size = model_config.tp_size
     dp_size = model_config.dp_size
 

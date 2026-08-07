@@ -818,9 +818,11 @@ class FlexKVWorkerConnector:
                     "received a packed 4D vLLM KV cache but packed_kv is not "
                     f"set: shape={tuple(gpu_blocks[0].shape)}")
             _assert_token_major(gpu_blocks[0], token_dim=2, head_dim=1)
-            # packed_kv makes kv_dim 1, so LAYERFIRST's kv dim degenerates to
-            # extent 1 and its shape-implied strides reduce to the tensor's
-            # own block/token/head/content order, exactly as they do for MLA.
+            # packed_kv makes kv_dim 1. LAYERFIRST [L, 1, B, T, H, D]
+            # and LAYERBLOCK [L, B, 1, T, H, D] then have identical layer,
+            # block, and chunk strides; only the unused kv_stride differs.
+            # Use LAYERFIRST as the canonical single-region representation,
+            # matching MLA and the packed tensor's physical NHD order.
             gpu_layout_type = KVCacheLayoutType.LAYERFIRST
             num_blocks = gpu_blocks[0].shape[0]
             num_kv_heads = gpu_blocks[0].shape[1]

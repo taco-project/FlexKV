@@ -303,17 +303,19 @@ class FlexKVConfig:
         from vllm.distributed.kv_transfer.kv_connector.utils import (
             get_current_attn_backend,
         )
+        from vllm.config import set_current_vllm_config
 
         requested_num_heads_per_rank = vllm_config.model_config.get_num_kv_heads(vllm_config.parallel_config)
         requested_head_size = vllm_config.model_config.get_head_size()
 
-        cache_shape = get_current_attn_backend(vllm_config).get_kv_cache_shape(
-            1,
-            self.cache_config.tokens_per_block,
-            requested_num_heads_per_rank,
-            requested_head_size,
-            vllm_kv_cache_dtype,
-        )
+        with set_current_vllm_config(vllm_config): # for old vllm
+            cache_shape = get_current_attn_backend(vllm_config).get_kv_cache_shape(
+                1,
+                self.cache_config.tokens_per_block,
+                requested_num_heads_per_rank,
+                requested_head_size,
+                vllm_kv_cache_dtype,
+            )
 
         if self.model_config.use_mla:
             if len(cache_shape) != 3:
