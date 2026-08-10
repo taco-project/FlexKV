@@ -500,15 +500,9 @@ class RankInfo:
     def effective_tp_rank(self) -> int:
         """Effective tp-rank in the *data-plane* segmentation space.
 
-        For MLA models, every CP rank holds the same KV pages (the MLA latent
-        is not split along the sequence axis from a KV perspective), so
-        ``cp_rank`` must NOT participate in slice indexing — otherwise a CP rank
-        would write to a non-existent CPU slice and corrupt block accounting.
-        For non-MLA models, CP shards along the sequence dimension and each
-        ``(cp_rank, tp_rank)`` pair owns a unique slice.
+        Each ``(cp_rank, tp_rank)`` pair owns a unique slice in the combined
+        CP×TP segmentation space.
         """
-        if self.model_config.use_mla:
-            return self.tp_rank
         return self.cp_rank * max(1, self.model_config.tp_size) + self.tp_rank
 
     @property
@@ -785,6 +779,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     slru_protected_threshold=int(os.getenv('FLEXKV_SLRU_PROTECTED_THRESHOLD', 2)),
 
     enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
+
+    enable_collective_sync=bool(int(os.getenv('FLEXKV_ENABLE_COLLECTIVE_SYNC', 1))),
 
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),
@@ -1220,6 +1216,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
             else:
                 raise ValueError(f"Unknown config name: {global_attr_name} in config file, "
                                  f"available config names: {global_config_attrs}")
+
 
 @dataclass
 class MooncakeTransferEngineConfig:
