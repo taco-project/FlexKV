@@ -49,6 +49,10 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 - 添加 vLLM 适配的启动脚本 ([#47](https://github.com/taco-project/FlexKV/pull/47))
 - 支持 vLLM+FlexKV 的 TP16 ([#59](https://github.com/taco-project/FlexKV/pull/59))
 
+针对 SGLang:
+- SGLang `v0.5.16` 及以上版本已原生内置 FlexKV backend，无需再应用 patch（[sglang#29701](https://github.com/sgl-project/sglang/pull/29701)）
+- 支持 DeepSeek-V4 异构 C4/C128/indexer KV group、FullKV + SWA 双缓存、compress-state sidecar 和逐层恢复（[#225](https://github.com/taco-project/FlexKV/pull/225)）。在配套的 SGLang 适配合入前，请使用 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 并固定到 [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac)。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)
+
 针对 TensorRT-LLM
 - 在 TensorRT-LLM 上支持使用 FlexKV ([#48](https://github.com/taco-project/FlexKV/pull/48))
 - 支持 TensorRT-LLM+FlexKV 的 TP16 ([#53](https://github.com/taco-project/FlexKV/pull/53))
@@ -156,6 +160,12 @@ FlexKV 支持分布式 KVCache 复用，实现多节点间的高效共享。
 FlexKV 原生集成了基于 Prometheus 的运行时监控框架，覆盖 Python 和 C++ 两层关键路径。采用**零侵入**设计——只需设置环境变量 `FLEXKV_ENABLE_METRICS=1`，即可自动收集缓存命中/未命中、内存池状态、数据传输等核心指标，并通过标准 HTTP 端点暴露给 Prometheus 采集和 Grafana 可视化。
 
 完整的指标列表、环境变量配置、监控栈（Prometheus + Grafana）部署指南，请参阅 [docs/monitoring/README_zh.md](docs/monitoring/README_zh.md)。
+
+## 持续集成
+
+Pull Request 和受保护分支 push 会在 GitHub Actions 中构建 release wheel，并运行 CPU
+单元测试。Runner 配置、测试范围、参考耗时、本地复现步骤和产物上传规则详见
+[CI 文档](docs/ci/README_zh.md)。
 
 ## 分支策略
 

@@ -51,6 +51,10 @@ Targeting vLLM:
 - Add launch scripts for vLLM adaption ([#47](https://github.com/taco-project/FlexKV/pull/47))
 - Support TP16 for vLLM+FlexKV ([#59](https://github.com/taco-project/FlexKV/pull/59))
 
+Targeting SGLang:
+- The native FlexKV backend is available in upstream SGLang `v0.5.16` and later; no patch is required ([sglang#29701](https://github.com/sgl-project/sglang/pull/29701))
+- Support DeepSeek-V4 heterogeneous C4/C128/indexer KV groups, FullKV + SWA dual caches, compress-state sidecars, and layerwise restore ([#225](https://github.com/taco-project/FlexKV/pull/225)). Until the matching SGLang adaptation is merged, use [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) pinned to [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac). See the [SGLang integration guide](flexkv/integration/sglang/README.md)
+
 Targeting TensorRT-LLM
 - Support using FlexKV on TensorRT-LLM ([#48](https://github.com/taco-project/FlexKV/pull/48))
 - Support TP16 for TensorRT-LLM+FlexKV ([#53](https://github.com/taco-project/FlexKV/pull/53))
@@ -159,6 +163,13 @@ Key features include:
 FlexKV natively integrates a Prometheus-based runtime monitoring framework that covers key paths in both the Python and C++ layers. It is designed to be **zero-intrusion** — simply set the environment variable `FLEXKV_ENABLE_METRICS=1` to automatically collect core metrics such as cache hit/miss, memory pool status, and data transfer statistics, which are then exposed via standard HTTP endpoints for Prometheus scraping and Grafana visualization.
 
 For the full list of supported metrics, environment variable configuration, deployment guide for the monitoring stack (Prometheus + Grafana), see [docs/monitoring/README_en.md](docs/monitoring/README_en.md).
+
+## Continuous Integration
+
+Pull requests and protected-branch pushes build the release wheel and run the
+CPU unit-test tier on GitHub Actions. See the
+[CI guide](docs/ci/README_en.md) for the runner configuration, test scope,
+reference duration, local reproduction steps, and artifact-upload policy.
 
 ## Branching Strategy
 

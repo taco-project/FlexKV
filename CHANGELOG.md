@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Feature
+
+Targeting SGLang:
+- The native FlexKV backend is available in upstream SGLang `v0.5.16` and later; no patch is required ([sglang#29701](https://github.com/sgl-project/sglang/pull/29701))
+- Add DeepSeek-V4 support for heterogeneous C4/C128/indexer KV groups, FullKV + SWA dual caches, attention/indexer compress-state sidecars, and layerwise restore ([#225](https://github.com/taco-project/FlexKV/pull/225))
+- The matching DeepSeek-V4 SGLang adaptation is not merged yet. Use [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) pinned to [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac) until it is merged
+
+### Documentation
+
+- Replace the legacy SGLang patch workflow with version-specific English and Chinese integration instructions
+- Add English and Chinese CI guides covering the runner, release-wheel build, CPU unit-test scope, reference timing, local reproduction, and COS upload policy
+
 ## [1.2.0] - 2025-11-25
 ### Feature
 Universal:
@@ -75,4 +87,3 @@ Targeting TensorRT-LLM:
 ### Init
 - init version
 - add license
-
