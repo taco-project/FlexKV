@@ -75,6 +75,21 @@ python -m sglang.launch_server \
 SGLang 官方的
 [`flexkv/README.md`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/flexkv/README.md)。
 
+## 集成边界
+
+FlexKV connector 的核心逻辑（`FlexKVComm` 和 `FlexKVConnector`）位于本目录：
+
+| 文件 | 职责 |
+|------|------|
+| `comm.py` | 3-axis（PP × CP × TP）跨 rank 通信层 |
+| `connector.py` | `FlexKVConnector`，封装 `KVManager` 供 SGLang 调用 |
+
+SGLang 侧的 `storage/flexkv/__init__.py` 通过 `importlib` 从 `flexkv.integration.sglang.connector`
+动态加载 connector，后续 FlexKV 逻辑改动通常只需更新 FlexKV 仓库。
+
+设置环境变量 `FLEXKV_ENABLE_COLLECTIVE_SYNC=0` 可禁用跨 rank 同步（scatter/barrier/all_reduce），
+在不使用 Pipeline Parallelism (PP) 的部署中关闭可减少同步开销、提升性能。
+
 ## 关于本目录中的 patch
 
 `sglang_flexkv_connector.patch` 仅作为 FlexKV 尚未合入 SGLang 主干前的历史参考保留。

@@ -187,3 +187,13 @@ swa_multi_group: false
 | `FLEXKV_EVICT_RATIO` | float | 0.05 | cpu，ssd一次evict主动淘汰比例（0.0 = 只淘汰最小的必要的block数）。建议保持 `0.05`，即每一次淘汰5%的最久未使用的block |
 | `FLEXKV_EVICT_START_THRESHOLD` | float | 0.7 | 触发主动淘汰的内存利用率阈值。当缓存利用率达到该比例时，FlexKV 开始主动淘汰节点。例如 `0.7` 表示缓存占用达到 70% 时即开始淘汰。设为 `1.0` 则仅在缓存满时才淘汰 |
 | `FLEXKV_HIT_REWARD_SECONDS` | int | 0 | 每次缓存命中时向节点的有效访问时间叠加的额外秒数，为 LRU 增加频率感知能力。设为 `0`（默认值）时为标准 LRU 行为。设为正数时，频繁命中的节点会累积额外的保护时间，使其更难被驱逐。详见[驱逐策略指南](../eviction_policy/README_zh.md) |
+
+---
+
+### SGLang 集成
+
+> 注：以下配置仅在使用 SGLang 集成（`flexkv.integration.sglang.connector`）时生效。
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `FLEXKV_ENABLE_COLLECTIVE_SYNC` | bool | 1 | 是否启用跨 rank 集合同步（scatter/barrier/all_reduce）。该同步主要用于 Pipeline Parallelism (PP) 场景下各 stage 间的协调。在不使用 PP 的部署中可设为 0 关闭以减少同步开销、提升性能 |

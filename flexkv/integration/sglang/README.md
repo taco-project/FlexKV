@@ -80,6 +80,24 @@ The equivalent explicit backend option is
 [`flexkv/README.md`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/flexkv/README.md)
 for detailed configuration and validation instructions.
 
+## Integration boundary
+
+The core FlexKV connector logic (`FlexKVComm` and `FlexKVConnector`) lives in
+this directory:
+
+| File | Description |
+|------|-------------|
+| `comm.py` | 3-axis (PP × CP × TP) cross-rank communication layer |
+| `connector.py` | `FlexKVConnector` wrapping `KVManager` for SGLang |
+
+SGLang's `storage/flexkv/__init__.py` dynamically loads the connector from
+`flexkv.integration.sglang.connector` via `importlib`, so future FlexKV logic
+changes typically only require updating the FlexKV repo.
+
+Set `FLEXKV_ENABLE_COLLECTIVE_SYNC=0` to disable cross-rank sync
+(scatter/barrier/all_reduce). In deployments without Pipeline Parallelism (PP),
+disabling it reduces sync overhead and improves performance.
+
 ## About the patch in this directory
 
 `sglang_flexkv_connector.patch` is retained only as a legacy reference for the
