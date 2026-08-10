@@ -59,13 +59,16 @@ void transfer_kv_blocks_binding(
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_block_stride_in_bytes,
     int64_t chunk_size_in_bytes, int start_layer_id, int num_layers,
     int transfer_num_cta = 4, bool is_host_to_device = true,
-    bool use_ce_transfer = false, bool is_mla = false, int gpu_block_type = 0,
+    bool use_ce_transfer = false, bool single_kv_region = false,
+    int gpu_block_type = 0,
     bool sync = true,
     bool ce_path_opt = false,
     int ce_segment_threshold = 8, int ce_force_path = -1,
     bool ce_enable_memcpy2d = false, bool is_blockfirst = false,
     int ce_gather_threads = 4, bool ce_gather_nt = true,
-    bool enable_transfer_trace = false) {
+    bool enable_transfer_trace = false, bool ce_is_mla = false) {
+  TORCH_CHECK(!ce_is_mla || single_kv_region,
+              "ce_is_mla=True requires single_kv_region=True");
   int num_blocks = gpu_block_id_tensor.numel();
 
   int64_t *gpu_block_ids =
@@ -98,7 +101,8 @@ void transfer_kv_blocks_binding(
   ce_config.force_path = ce_force_path;
   ce_config.enable_memcpy2d = ce_enable_memcpy2d;
   ce_config.is_blockfirst = is_blockfirst;
-  ce_config.is_mla = is_mla;
+  // CE MLA path selection is distinct from the kernel's KV-region count.
+  ce_config.is_mla = ce_is_mla;
   ce_config.gather_threads = ce_gather_threads;
   ce_config.gather_nt = ce_gather_nt;
 
@@ -117,7 +121,7 @@ void transfer_kv_blocks_binding(
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
-        use_ce_transfer, is_mla,
+        use_ce_transfer, single_kv_region,
         gpu_block_stride_in_bytes, sync, ce_config, enable_transfer_trace);
     break;
   case flexkv::BackendType::TRTLLM:
@@ -127,7 +131,7 @@ void transfer_kv_blocks_binding(
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
-        use_ce_transfer, is_mla,
+        use_ce_transfer, single_kv_region,
         gpu_block_stride_in_bytes, sync, ce_config, enable_transfer_trace);
     break;
   case flexkv::BackendType::SGLANG:
@@ -137,7 +141,7 @@ void transfer_kv_blocks_binding(
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
-        use_ce_transfer, is_mla,
+        use_ce_transfer, single_kv_region,
         gpu_block_stride_in_bytes, sync, ce_config, enable_transfer_trace);
     break;
   }
@@ -155,8 +159,8 @@ void transfer_kv_blocks_ssd_binding(
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_kv_stride_in_bytes, int64_t chunk_size_in_bytes,
     int64_t block_stride_in_bytes, bool is_read, int num_blocks_per_file,
-    int round_robin = 1, int num_threads_per_device = 8, bool is_mla = false,
-    bool ssd_io_opt = true) {
+    int round_robin = 1, int num_threads_per_device = 8,
+    bool single_kv_region = false, bool ssd_io_opt = true) {
   TORCH_CHECK(ssd_block_ids.dtype() == torch::kInt64,
               "ssd_block_ids must be int64");
   TORCH_CHECK(cpu_block_ids.dtype() == torch::kInt64,
@@ -167,7 +171,7 @@ void transfer_kv_blocks_ssd_binding(
       cpu_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
       ssd_layer_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size_in_bytes,
       block_stride_in_bytes, is_read, num_blocks_per_file, round_robin,
-      num_threads_per_device, is_mla, ssd_io_opt);
+      num_threads_per_device, single_kv_region, ssd_io_opt);
 }
 
 #ifdef FLEXKV_ENABLE_CFS
@@ -180,7 +184,7 @@ void transfer_kv_blocks_remote(
     int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
     int partition_block_type, int round_robin,
     int64_t num_remote_blocks_per_file, bool use_mmap = false,
-    int num_threads_per_file = 8, bool is_mla = false) {
+    int num_threads_per_file = 8, bool single_kv_region = false) {
   TORCH_CHECK(remote_block_ids.dtype() == torch::kInt64,
               "remote_block_ids must be int64");
   TORCH_CHECK(cpu_block_ids.dtype() == torch::kInt64,
@@ -195,7 +199,7 @@ void transfer_kv_blocks_remote(
       remote_layer_stride_in_bytes, remote_block_stride_in_bytes,
       remote_kv_stride_in_bytes, block_size_in_bytes, total_layers, is_read,
       partition_block_type, round_robin, num_remote_blocks_per_file, use_mmap,
-      num_threads_per_file, is_mla);
+      num_threads_per_file, single_kv_region);
 }
 
 void shared_transfer_kv_blocks_remote_read_binding(
@@ -205,7 +209,8 @@ void shared_transfer_kv_blocks_remote_read_binding(
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
     int64_t cfs_layer_stride_in_bytes, int64_t cfs_block_stride_in_bytes,
     int64_t cfs_kv_stride_in_bytes, int64_t block_size_in_bytes,
-    int64_t total_layers, bool is_mla = false, int num_threads_per_file = 8) {
+    int64_t total_layers, bool single_kv_region = false,
+    int num_threads_per_file = 8) {
 
   // convert file_nodeids
   std::vector<std::uint64_t> file_nodeids;
@@ -239,7 +244,7 @@ void shared_transfer_kv_blocks_remote_read_binding(
       cpu_layer_id_list, cpu_tensor_ptr, cpu_layer_stride_in_bytes,
       cpu_kv_stride_in_bytes, cfs_layer_stride_in_bytes,
       cfs_block_stride_in_bytes, cfs_kv_stride_in_bytes, block_size_in_bytes,
-      total_layers, is_mla, num_threads_per_file);
+      total_layers, single_kv_region, num_threads_per_file);
 }
 #endif
 
@@ -253,7 +258,8 @@ void transfer_kv_blocks_gds_binding(
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t ssd_copy_off_inside_chunks,
     int num_blocks_per_file, int64_t total_layers, bool is_read,
-    bool verbose = false, bool is_mla = false, int gpu_block_type = 0,
+    bool verbose = false, bool single_kv_region = false,
+    int gpu_block_type = 0,
     int gpu_device_id = 0) {
   TORCH_CHECK(gpu_layer_ptrs_tensor.dtype() == torch::kInt64,
               "gpu_layer_ptrs must be int64");
@@ -291,7 +297,7 @@ void transfer_kv_blocks_gds_binding(
         ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes,
         ssd_kv_stride_in_bytes, block_size_in_bytes, ssd_copy_off_inside_chunks,
         ssd_block_stride_in_bytes, gpu_device_id, num_blocks_per_file,
-        total_layers, is_read, verbose, is_mla);
+        total_layers, is_read, verbose, single_kv_region);
     break;
   case flexkv::BackendType::TRTLLM:
     flexkv::transfer_kv_blocks_gds<flexkv::BackendType::TRTLLM>(
@@ -299,7 +305,7 @@ void transfer_kv_blocks_gds_binding(
         ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes,
         ssd_kv_stride_in_bytes, block_size_in_bytes, ssd_copy_off_inside_chunks,
         ssd_block_stride_in_bytes, gpu_device_id, num_blocks_per_file,
-        total_layers, is_read, verbose, is_mla);
+        total_layers, is_read, verbose, single_kv_region);
     break;
   case flexkv::BackendType::SGLANG:
     flexkv::transfer_kv_blocks_gds<flexkv::BackendType::SGLANG>(
@@ -307,7 +313,7 @@ void transfer_kv_blocks_gds_binding(
         ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes,
         ssd_kv_stride_in_bytes, block_size_in_bytes, ssd_copy_off_inside_chunks,
         ssd_block_stride_in_bytes, gpu_device_id, num_blocks_per_file,
-        total_layers, is_read, verbose, is_mla);
+        total_layers, is_read, verbose, single_kv_region);
     break;
   }
 }
@@ -442,7 +448,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("cpu_block_stride_in_bytes"), py::arg("chunk_size_in_bytes"),
         py::arg("start_layer_id"), py::arg("num_layers"),
         py::arg("transfer_num_cta") = 4, py::arg("is_host_to_device") = true,
-        py::arg("use_ce_transfer") = false, py::arg("is_mla") = false,
+        py::arg("use_ce_transfer") = false,
+        py::arg("single_kv_region") = false,
         py::arg("gpu_block_type") = 0, py::arg("sync") = true,
         py::arg("ce_path_opt") = false,
         py::arg("ce_segment_threshold") = 8, py::arg("ce_force_path") = -1,
@@ -450,7 +457,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("is_blockfirst") = false,
         py::arg("ce_gather_threads") = 4,
         py::arg("ce_gather_nt") = true,
-        py::arg("enable_transfer_trace") = false);
+        py::arg("enable_transfer_trace") = false,
+        py::arg("ce_is_mla") = false);
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory", py::arg("ioctx"),
         py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),
@@ -460,7 +468,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("chunk_size_in_bytes"), py::arg("block_stride_in_bytes"),
         py::arg("is_read"), py::arg("num_blocks_per_file"),
         py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
-        py::arg("is_mla") = false, py::arg("ssd_io_opt") = true);
+        py::arg("single_kv_region") = false,
+        py::arg("ssd_io_opt") = true);
   py::class_<flexkv::LayerwiseTransferGroup>(m, "LayerwiseTransferGroup")
       .def(py::init([](int num_gpus,
                        const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
@@ -663,6 +672,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_cta_num"),
            py::arg("use_ce_transfer"), py::arg("num_layers"),
            py::arg("layer_granularity"), py::arg("is_mla"),
+           py::arg("packed_kv") = false,
            py::arg("counter_id") = 0,
            py::arg("swa_h2d_src") = torch::empty({0}),
            py::arg("swa_h2d_dst") = torch::empty({0}),
@@ -688,6 +698,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("num_threads_per_device"), py::arg("gpu_block_id_tensor"),
            py::arg("cpu_block_id_tensor"), py::arg("transfer_cta_num"),
            py::arg("use_ce_transfer"), py::arg("is_mla"),
+           py::arg("packed_kv") = false,
            py::arg("counter_id") = 0,
            py::arg("swa_h2d_src") = torch::empty({0}),
            py::arg("swa_h2d_dst") = torch::empty({0}),
@@ -720,7 +731,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("total_layers"), py::arg("is_read"),
         py::arg("partition_block_type"), py::arg("round_robin"),
         py::arg("num_remote_blocks_per_file"), py::arg("use_mmap") = false,
-        py::arg("num_threads_per_file") = 16, py::arg("is_mla") = false);
+        py::arg("num_threads_per_file") = 16,
+        py::arg("single_kv_region") = false);
 #endif
 #ifdef FLEXKV_ENABLE_GDS
   m.def(
@@ -734,7 +746,8 @@ PYBIND11_MODULE(c_ext, m) {
       py::arg("ssd_block_stride_in_bytes"), py::arg("ssd_kv_stride_in_bytes"),
       py::arg("block_size_in_bytes"), py::arg("ssd_copy_off_inside_chunks"),
       py::arg("num_blocks_per_file"), py::arg("total_layers"),
-      py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false,
+      py::arg("is_read"), py::arg("verbose") = false,
+      py::arg("single_kv_region") = false,
       py::arg("gpu_block_type") = 0, py::arg("gpu_device_id") = 0);
 #endif
   m.def("get_hash_size", &flexkv::get_hash_size,
@@ -812,7 +825,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("is_mla"), py::arg("mla_d2h_mode") = "sharded",
-           py::arg("designated_rank") = 0);
+           py::arg("designated_rank") = 0, py::arg("packed_kv") = false);
 #ifdef FLEXKV_ENABLE_NVCOMP
   // nvcomp ANS variant: tp_group_transfer_ans() lazily initializes from the
   // constructor config and returns total compressed bytes across ranks.
@@ -856,7 +869,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ssd_block_stride_in_bytes"),
            py::arg("ssd_tp_stride_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"),
-           py::arg("layer_granularity"), py::arg("is_mla"));
+           py::arg("layer_granularity"), py::arg("is_mla"),
+           py::arg("packed_kv") = false);
 #endif
 
   // Add Hasher class binding
@@ -906,7 +920,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("cpu_kv_stride_in_bytes"), py::arg("cfs_layer_stride_in_bytes"),
         py::arg("cfs_block_stride_in_bytes"), py::arg("cfs_kv_stride_in_bytes"),
         py::arg("block_size_in_bytes"), py::arg("total_layers"),
-        py::arg("is_mla") = false, py::arg("num_threads_per_file") = 8);
+        py::arg("single_kv_region") = false,
+        py::arg("num_threads_per_file") = 8);
 #endif
 
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")

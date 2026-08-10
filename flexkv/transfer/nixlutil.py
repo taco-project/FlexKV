@@ -392,9 +392,9 @@ def kv_chunk_byte_offset_in_block(
     layer_stride_b: int,
     kv_stride_b: int,
     block_stride_b: int,
-    is_mla: bool,
+    single_kv_region: bool,
 ) -> int:
-    if is_mla:
+    if single_kv_region:
         return mem_block_id * block_stride_b + layer_id * layer_stride_b
     return (
         mem_block_id * block_stride_b
@@ -410,9 +410,9 @@ def ssd_chunk_byte_offset_in_file(
     ssd_layer_stride_b: int,
     ssd_kv_stride_b: int,
     block_stride_b: int,
-    is_mla: bool,
+    single_kv_region: bool,
 ) -> int:
-    if is_mla:
+    if single_kv_region:
         return block_in_file * block_stride_b + layer_id * ssd_layer_stride_b
     return (
         block_in_file * block_stride_b
@@ -432,9 +432,9 @@ def gpu_chunk_u8_view(
     gpu_block_stride_b: int,
     gpu_layer_stride_b: int,
     chunk_size_b: int,
-    is_mla: bool,
+    single_kv_region: bool,
 ) -> torch.Tensor:
-    if is_mla:
+    if single_kv_region:
         kv_idx = 0
     if gpu_block_type == 0:
         t = gpu_blocks[layer_id]
@@ -452,8 +452,18 @@ def gpu_chunk_u8_view(
     else:
         raise ValueError(f"Invalid gpu_block_type {gpu_block_type}")
 
-    if off + chunk_size_b > t.numel() * t.element_size():
+    byte_tensor = t.view(torch.uint8)
+    storage_offset_b = byte_tensor.storage_offset()
+    storage_size_b = t.untyped_storage().nbytes()
+    if storage_offset_b + off + chunk_size_b > storage_size_b:
         raise ValueError("GPU chunk slice out of bounds for NIXL transfer")
 
-    flat = t.view(torch.uint8).reshape(-1)
-    return flat[off : off + chunk_size_b]
+    # Packed NHD tensors are logical permutations of a token-major allocation.
+    # reshape(-1) would materialize a contiguous copy for those non-contiguous
+    # tensors, so NIXL would transfer a temporary buffer instead of the KV cache.
+    # Address the contiguous physical storage directly while preserving aliasing.
+    return byte_tensor.as_strided(
+        size=(chunk_size_b,),
+        stride=(1,),
+        storage_offset=storage_offset_b + off,
+    )

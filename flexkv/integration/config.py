@@ -38,26 +38,21 @@ def nvfp4_kv_cache_full_dim(head_size: int) -> int:
 
 def _warn_nvfp4_unsupported_framework(dtype_str: Optional[str], framework: str) -> None:
     """Warn if NVFP4 KV cache is requested from a framework whose FlexKV adapter
-    has not yet implemented the nvfp4 packed-layout ``head_size`` fold.
+    has not yet implemented physical KV layout discovery.
 
-    Only the vLLM adapter (``post_init_from_vllm_config``) folds the packed width
-    ``head_size//2 + head_size//16`` into ``head_size`` so the CPU/SSD mirror
-    matches the framework's packed GPU tensor byte-for-byte. Without that fold the
-    CPU mirror is sized for the *logical* head_size and offload/reload would be
-    byte-misaligned. Until each framework's packed nvfp4 layout is verified we
-    only warn here rather than silently produce a corrupt mirror.
+    The vLLM adapter asks the selected attention backend for its actual cache
+    shape and mirrors the returned physical head count and width.  Until each
+    framework exposes and verifies equivalent layout metadata, only warn here
+    rather than silently produce a byte-misaligned CPU mirror.
     """
     if not _is_nvfp4_dtype_str(dtype_str):
         return
-    # TODO(nvfp4): implement + verify the nvfp4 packed head_size fold for the
-    # {framework} adapter (mirror post_init_from_vllm_config: guard non-MLA,
-    # set model_config.head_size = nvfp4_kv_cache_full_dim(head_size)). Confirm
-    # the framework stores nvfp4 KV as a single packed uint8 tensor with the same
-    # (head_size//2 + head_size//16) last-dim layout as vLLM before enabling.
+    # TODO(nvfp4): query and verify the framework's actual physical KV cache
+    # shape, then populate ModelConfig.num_kv_heads/head_size from that shape.
     logger.warning(
         f"[FlexKV {framework}] kv_cache_dtype='{dtype_str}' (NVFP4) requested, but "
-        f"the {framework} FlexKV adapter does NOT yet apply the nvfp4 packed "
-        f"head_size fold. The CPU/SSD mirror may be byte-misaligned with the "
+        f"the {framework} FlexKV adapter does NOT yet discover the physical "
+        f"KV cache shape. The CPU/SSD mirror may be byte-misaligned with the "
         f"packed GPU tensor -> offload/reload correctness is NOT guaranteed. "
         f"NVFP4 is currently verified only through the vLLM adapter. "
         f"See TODO(nvfp4) in flexkv/integration/config.py."
@@ -210,40 +205,12 @@ class FlexKVConfig:
         self.cache_config.tokens_per_block = vllm_config.cache_config.block_size
 
         self.model_config.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
-        self.model_config.head_size = vllm_config.model_config.get_head_size()
         vllm_kv_cache_dtype = getattr(vllm_config.cache_config, 'cache_dtype', 'auto')
         self._resolve_dtype(
             framework_dtype_str=vllm_kv_cache_dtype if isinstance(vllm_kv_cache_dtype, str) else None,
             fallback_dtype=getattr(vllm_config.model_config, 'dtype', torch.bfloat16),
         )
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
-        # NVFP4: vLLM stores the packed fp4 data + fp8 block scales in a single
-        # uint8 tensor whose per-head last dim is head_size//2 + head_size//16.
-        # _resolve_dtype has already mapped nvfp4 -> uint8; here we fold the
-        # packed width into head_size so the CPU/SSD mirror matches vLLM's packed
-        # GPU tensor byte-for-byte. The effective dtype string follows the same
-        # user-first-else-framework priority _resolve_dtype uses.
-        effective_dtype_str = (
-            self.user_config.kv_cache_dtype
-            if self.user_config.kv_cache_dtype is not None
-            else (vllm_kv_cache_dtype if isinstance(vllm_kv_cache_dtype, str) else None)
-        )
-        if _is_nvfp4_dtype_str(effective_dtype_str) and not self.model_config.use_mla:
-            logical_head_size = self.model_config.head_size
-            packed_head_size = nvfp4_kv_cache_full_dim(logical_head_size)
-            self.model_config.head_size = packed_head_size
-            logger.info(
-                f"[FlexKV vllm] NVFP4 KV cache detected: folding packed layout "
-                f"into head_size (logical={logical_head_size} -> "
-                f"packed={packed_head_size}, dtype=uint8)"
-            )
-        elif _is_nvfp4_dtype_str(effective_dtype_str) and self.model_config.use_mla:
-            logger.warning(
-                "[FlexKV vllm] kv_cache_dtype='nvfp4' requested for an MLA "
-                "model. vLLM MLA backends do NOT support nvfp4 KV cache now; "
-                "skipping the nvfp4 head_size fold. If vLLM rejects this "
-                "config, use fp8/fp8_ds_mla for MLA instead."
-            )
         self.model_config.tp_size = int(parallel_config.tensor_parallel_size)
         self.model_config.dp_size = int(parallel_config.data_parallel_size)
         self.model_config.pp_size = int(parallel_config.pipeline_parallel_size)
@@ -253,6 +220,20 @@ class FlexKVConfig:
         self.model_config.attn_cp_size = self.model_config.cp_size
         self.model_config.nnodes = max(1, int(getattr(parallel_config, 'nnodes', 1)))
 
+        effective_dtype_str = (
+            self.user_config.kv_cache_dtype
+            if self.user_config.kv_cache_dtype is not None
+            else (vllm_kv_cache_dtype if isinstance(vllm_kv_cache_dtype, str) else None)
+        )
+        if self.model_config.use_mla and _is_nvfp4_dtype_str(effective_dtype_str):
+            logger.warning(
+                "[FlexKV vllm] kv_cache_dtype='nvfp4' requested for an MLA "
+                "model. vLLM MLA backends do NOT support nvfp4 KV cache now; "
+                "if vLLM rejects this config, use fp8/fp8_ds_mla for MLA "
+                "instead."
+            )
+        self._configure_kv_layout_from_vllm_backend(
+            vllm_config, vllm_kv_cache_dtype)
 
         if self.model_config.pp_size > 1:
             from vllm.distributed.utils import get_pp_indices as vllm_get_pp_indices
@@ -262,11 +243,6 @@ class FlexKVConfig:
         else:
             pp_start_layer = 0
             pp_end_layer = self.model_config.num_layers
-        if self.model_config.use_mla:
-            self.model_config.num_kv_heads = 1
-        else:
-            self.model_config.num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
-
         self.model_config.instance_num = int(GLOBAL_CONFIG_FROM_ENV.instance_num)
         instance_id = int(GLOBAL_CONFIG_FROM_ENV.instance_id)
 
@@ -302,6 +278,92 @@ class FlexKVConfig:
         # Freeze model_config — no further mutations allowed
         self.model_config.freeze()
         return rank_info
+
+    def _configure_kv_layout_from_vllm_backend(
+        self,
+        vllm_config: "VllmConfig",
+        vllm_kv_cache_dtype: str,
+    ) -> None:
+        """Populate FlexKV's storage layout from vLLM's physical cache shape.
+
+        The backend reports the tensor shape for one TP rank.  FlexKV preserves
+        its physical head count and width, then scales non-MLA head counts by TP
+        so the CPU/SSD layout contains one contiguous slice for every rank.  MLA
+        heads are replicated and remain a single implicit head.  This handles
+        MLA 3D caches, packed 4D caches, and legacy split-K/V 5D caches,
+        including replicated GQA heads and FlashInfer's NVFP4 ``2 * H`` axis.
+
+        Args:
+            vllm_config (VllmConfig): the vLLM config to read the backend from.
+            vllm_kv_cache_dtype (str): vLLM's ``cache_config.cache_dtype``.
+
+        Raises:
+            ValueError: if the backend returns an unsupported cache shape.
+        """
+        from vllm.distributed.kv_transfer.kv_connector.utils import (
+            get_current_attn_backend,
+        )
+        from vllm.config import set_current_vllm_config
+
+        requested_num_heads_per_rank = vllm_config.model_config.get_num_kv_heads(vllm_config.parallel_config)
+        requested_head_size = vllm_config.model_config.get_head_size()
+
+        with set_current_vllm_config(vllm_config): # for old vllm
+            cache_shape = get_current_attn_backend(vllm_config).get_kv_cache_shape(
+                1,
+                self.cache_config.tokens_per_block,
+                requested_num_heads_per_rank,
+                requested_head_size,
+                vllm_kv_cache_dtype,
+            )
+
+        if self.model_config.use_mla:
+            if len(cache_shape) != 3:
+                raise ValueError(
+                    "Unsupported MLA vLLM KV cache shape: expected 3 "
+                    f"dimensions, got shape={cache_shape}"
+                )
+            physical_num_heads_per_rank = 1
+            physical_head_size = cache_shape[2]
+            packed_kv = False
+        else:
+            if len(cache_shape) == 4:
+                # Standard packed K/V: (num_blocks, num_kv_heads, block_size, 2 * head_size).
+                # FlashInfer NVFP4: (num_blocks, 2 * num_kv_heads, block_size, packed_head_size).
+                # packed_head_size = head_size // 2 + head_size // 16.
+                physical_num_heads_per_rank = cache_shape[1]
+                physical_head_size = cache_shape[3]
+                packed_kv = True
+            elif len(cache_shape) == 5:
+                # Standard split K/V: the K/V axis is dimension 0 or 1 and the
+                # last dimension is head_size. NVFP4 uses the same layout type,
+                # but the last dimension is packed_head_size.
+                if cache_shape[0] != 2 and cache_shape[1] != 2: # for LAYERFIRST or LAYERBLOCK
+                    raise ValueError(
+                        "Unsupported split-K/V vLLM cache shape: expected a "
+                        f"K/V axis of size 2, got shape={cache_shape}"
+                    )
+                physical_num_heads_per_rank = cache_shape[3]
+                physical_head_size = cache_shape[4]
+                packed_kv = False
+            else:
+                raise ValueError(
+                    "Unsupported non-MLA vLLM KV cache shape: expected 4 or 5 "
+                    f"dimensions, got shape={cache_shape}"
+                )
+
+        self.model_config.num_kv_heads = physical_num_heads_per_rank
+        if not self.model_config.use_mla:
+            self.model_config.num_kv_heads *= self.model_config.tp_size
+        self.model_config.head_size = physical_head_size
+        self.model_config.packed_kv = packed_kv
+        logger.info(
+            f"[FlexKV vllm] physical KV layout from backend: "
+            f"shape={cache_shape}, "
+            f"num_kv_heads_per_rank={physical_num_heads_per_rank}, "
+            f"total_storage_heads={self.model_config.num_kv_heads}, "
+            f"head_size={physical_head_size}, packed_kv={packed_kv}"
+        )
 
     def post_init_from_sglang_config(
         self,

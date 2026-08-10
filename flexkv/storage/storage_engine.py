@@ -92,6 +92,7 @@ class StorageEngine:
                 num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla,
+                packed_kv=self._model_config.packed_kv,
                 layer_groups=self._model_config.layer_groups,
                 tp_size=self._model_config.tp_size,
             )
@@ -112,6 +113,7 @@ class StorageEngine:
                 num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla,
+                packed_kv=self._model_config.packed_kv,
                 layer_groups=self._model_config.layer_groups,
                 tp_size=self._model_config.tp_size,
             )
@@ -140,6 +142,7 @@ class StorageEngine:
                     num_head=self._model_config.num_kv_heads_per_node,
                     head_size=self._model_config.head_size,
                     is_mla=self._model_config.use_mla,
+                    packed_kv=self._model_config.packed_kv,
                     layer_groups=self._model_config.layer_groups,
                     tp_size=self._model_config.tp_size,
                 )

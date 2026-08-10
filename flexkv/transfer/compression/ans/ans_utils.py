@@ -69,6 +69,17 @@ def check_engine_nvcomp_enable(
         for gpu_handle in tp_gpu_handles
     ]
 
+    # TODO(nvcomp-guard): the packed 4D KV layout is not supported yet. The ANS
+    # kernels take a single is_mla that means both "one KV region" and "the
+    # per-rank size table is canonical", and a packed layout wants only the
+    # former, so neither value addresses it correctly.
+    if cpu_handle is not None and cpu_handle.kv_layout.packed_kv:
+        flexkv_logger.warning(
+            "[nvcomp-fallback] FLEXKV_ENABLE_NVCOMP=1 but the KV cache uses "
+            "the packed 4D layout, which the ANS kernels cannot address yet; "
+            "disabling nvcomp.")
+        return False
+
     # TODO(nvcomp-guard): layerwise transfer is not supported yet
     if layerwise_enabled:
         flexkv_logger.warning(
@@ -191,7 +202,9 @@ def allocate_engine_size_tables(
 ]:
     layout = cpu_handle.kv_layout
     num_layers = layout.num_layer
-    kv_dim = 1 if layout.is_mla else 2
+    # Read the region count off the layout rather than recomputing it from
+    # is_mla, so the table always matches what the kernels stride over.
+    kv_dim = layout.kv_dim
     tp_size = model_config.effective_tp_size_per_node
     canonical = (tp_size == 1 or layout.is_mla)
 

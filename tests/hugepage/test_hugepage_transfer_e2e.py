@@ -149,7 +149,7 @@ def test_hugepage_ssd_to_gpu_roundtrip() -> None:
             num_blocks_per_file=num_blocks_per_file,
             round_robin=1,
             num_threads_per_device=1,
-            is_mla=False,
+            single_kv_region=False,
         )
 
         buf_np = np.frombuffer(

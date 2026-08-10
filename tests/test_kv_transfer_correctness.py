@@ -1925,7 +1925,7 @@ def test_ssd_transfer_roundtrip(data_config, cpu_layout_name, num_threads,
         num_blocks_per_file=num_blocks,
         round_robin=1,
         num_threads_per_device=num_threads,
-        is_mla=is_mla,
+        single_kv_region=is_mla,
         ssd_io_opt=ssd_io_opt,
     )
 
@@ -1949,7 +1949,7 @@ def test_ssd_transfer_roundtrip(data_config, cpu_layout_name, num_threads,
         num_blocks_per_file=num_blocks,
         round_robin=1,
         num_threads_per_device=num_threads,
-        is_mla=is_mla,
+        single_kv_region=is_mla,
         ssd_io_opt=ssd_io_opt,
     )
 
@@ -2032,7 +2032,7 @@ def test_ssd_transfer_partial_blocks(data_config, cpu_layout_name, num_threads,
         num_blocks_per_file=num_blocks,
         round_robin=1,
         num_threads_per_device=num_threads,
-        is_mla=is_mla,
+        single_kv_region=is_mla,
         ssd_io_opt=ssd_io_opt,
     )
 
@@ -2064,7 +2064,7 @@ def test_ssd_transfer_partial_blocks(data_config, cpu_layout_name, num_threads,
         num_blocks_per_file=num_blocks,
         round_robin=1,
         num_threads_per_device=num_threads,
-        is_mla=is_mla,
+        single_kv_region=is_mla,
         ssd_io_opt=ssd_io_opt,
     )
 
@@ -2170,7 +2170,7 @@ def test_ssd_io_opt_on_off_byte_identical(data_config, cpu_layout_name, num_thre
                          block_stride_in_bytes=block_stride_bytes,
                          is_read=False, num_blocks_per_file=num_blocks,
                          round_robin=1, num_threads_per_device=num_threads,
-                         is_mla=is_mla, ssd_io_opt=opt)
+                         single_kv_region=is_mla, ssd_io_opt=opt)
             cpu_kv.zero_()
             _ssd_xfer_fn(ioctx=ioctx, cpu_layer_id_list=layer_ids,
                          cpu_tensor_ptr=cpu_kv.data_ptr(),
@@ -2183,7 +2183,7 @@ def test_ssd_io_opt_on_off_byte_identical(data_config, cpu_layout_name, num_thre
                          block_stride_in_bytes=block_stride_bytes,
                          is_read=True, num_blocks_per_file=num_blocks,
                          round_robin=1, num_threads_per_device=num_threads,
-                         is_mla=is_mla, ssd_io_opt=opt)
+                         single_kv_region=is_mla, ssd_io_opt=opt)
         finally:
             del ioctx
             shutil.rmtree(sub, ignore_errors=True)
@@ -2283,7 +2283,7 @@ def test_ssd_transfer_layerwise_disk2h(data_config, cpu_layout_name, ssd_io_opt,
                  block_stride_in_bytes=cpu_stride_block,
                  is_read=False, num_blocks_per_file=num_blocks,
                  round_robin=1, num_threads_per_device=32,
-                 is_mla=is_mla, ssd_io_opt=ssd_io_opt)
+                 single_kv_region=is_mla, ssd_io_opt=ssd_io_opt)
     cpu_kv.zero_()
 
     group = LayerwiseTransferGroup(

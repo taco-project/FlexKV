@@ -154,7 +154,8 @@ public:
       const int64_t h2d_cpu_layer_stride_in_bytes,
       const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
       const bool use_ce_transfer, const int num_layers,
-      const int layer_granularity, const bool is_mla, const int counter_id = 0,
+      const int layer_granularity, const bool is_mla,
+      const bool packed_kv = false, const int counter_id = 0,
       // ---- SWA per-call ids + strides (fused into same layer loop) ----
       const torch::Tensor &swa_h2d_src = torch::Tensor(),
       const torch::Tensor &swa_h2d_dst = torch::Tensor(),
@@ -185,7 +186,8 @@ public:
       const int round_robin, const int num_threads_per_device,
       const torch::Tensor &gpu_block_id_tensor,
       const torch::Tensor &cpu_block_id_tensor, const int transfer_cta_num,
-      const bool use_ce_transfer, const bool is_mla, const int counter_id = 0,
+      const bool use_ce_transfer, const bool is_mla,
+      const bool packed_kv = false, const int counter_id = 0,
       // ---- SWA per-call ids + strides (fused into same per-orig loop) ----
       const torch::Tensor &swa_h2d_src = torch::Tensor(),
       const torch::Tensor &swa_h2d_dst = torch::Tensor(),

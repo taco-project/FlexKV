@@ -317,7 +317,7 @@ namespace flexkv {
  * @param total_layers Total number of layers
  * @param is_read true for SSD->GPU, false for GPU->SSD
  * @param verbose Enable verbose logging
- * @param is_mla Whether using MLA
+ * @param single_kv_region Whether K and V share one content region
  */
 template<BackendType Type>
 void transfer_kv_blocks_gds(
@@ -337,7 +337,7 @@ void transfer_kv_blocks_gds(
     int64_t total_layers,
     bool is_read,
     bool verbose = false,
-    bool is_mla = false
+    bool single_kv_region = false
 );
 
 } // namespace flexkv

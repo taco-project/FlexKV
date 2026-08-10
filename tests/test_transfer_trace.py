@@ -66,7 +66,7 @@ def test_build_worker_metrics_timing(monkeypatch):
         launched_ns=8_000_000,    # +5 ms xfer
         worker_id=2,
         bytes_per_block=4096,
-        is_mla=True,
+        single_kv_region=True,
         is_h2d=True,
     )
     assert m["ipc_ms"] == pytest.approx(1.0)
@@ -76,7 +76,7 @@ def test_build_worker_metrics_timing(monkeypatch):
     assert m["nb"] == 10
     assert m["bytes"] == 4096 * 10
     assert m["is_h2d"] is True
-    assert m["is_mla"] is True
+    assert m["single_kv_region"] is True
     assert m["graph_id"] == 7
     assert m["worker_id"] == 2
 
@@ -103,7 +103,8 @@ def test_record_xfer_and_summary(monkeypatch):
             _FakeOp(valid_block_num=4, type_name="D2H"),
             submitted_ns=0, received_ns=500_000, launch_ns=1_500_000,
             launched_ns=6_500_000,
-            worker_id=0, bytes_per_block=1024, is_mla=False, is_h2d=False)
+            worker_id=0, bytes_per_block=1024,
+            single_kv_region=False, is_h2d=False)
         trace.record_xfer(100, metrics, e2e_ms=7.0)
     finally:
         target.removeHandler(cap)
@@ -113,6 +114,7 @@ def test_record_xfer_and_summary(monkeypatch):
     assert "[XFER] op=100" in lines
     assert "type=D2H" in lines
     assert "bytes=4096" in lines
+    assert "single_kv_region=0" in lines
     assert "backlog=1" in lines   # inflight not yet decremented at print time
     # Summary should have flushed (window forced stale).
     assert "[XFER-SUMMARY]" in lines

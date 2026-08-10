@@ -47,9 +47,10 @@ __global__ void transfer_kv_blocks_kernel_8b(
     GTensorHandler gpu_handler, int64_t gpu_startoff_inside_chunks,
     int64_t *cpu_block_ids, int64_t *cpu_ptr, int64_t cpu_kv_stride,
     int64_t cpu_layer_stride, int64_t cpu_block_stride,
-    int64_t cpu_startoff_inside_chunks, int64_t copy_size, bool is_mla,
+    int64_t cpu_startoff_inside_chunks, int64_t copy_size,
+    bool single_kv_region,
     bool is_host_to_device) {
-  int kv_dim = is_mla ? 1 : 2;
+  int kv_dim = single_kv_region ? 1 : 2;
   int num_chunks = num_layers * kv_dim * num_blocks;
 
   int warp_id = threadIdx.x / 32;
@@ -98,9 +99,10 @@ __global__ void transfer_kv_blocks_kernel(
     GTensorHandler gpu_handler, int64_t gpu_startoff_inside_chunks,
     int64_t *cpu_block_ids, int64_t *cpu_ptr, int64_t cpu_kv_stride,
     int64_t cpu_layer_stride, int64_t cpu_block_stride,
-    int64_t cpu_startoff_inside_chunks, int64_t copy_size, bool is_mla,
+    int64_t cpu_startoff_inside_chunks, int64_t copy_size,
+    bool single_kv_region,
     bool is_host_to_device) {
-  int kv_dim = is_mla ? 1 : 2;
+  int kv_dim = single_kv_region ? 1 : 2;
   // Fold kv_dim into an inner loop so each warp iteration processes all KV
   // slots of one (layer, block). For non-MLA this halves the outer iteration
   // count, amortizing setup cost (division, block_ids fetch, layer_idx and
@@ -169,7 +171,7 @@ void transfer_kv_blocks(
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_block_stride_in_bytes,
     int64_t cpu_startoff_inside_chunks, int64_t chunk_size_in_bytes,
     cudaStream_t stream, int transfer_num_cta, bool is_host_to_device,
-    bool use_ce_transfer, bool is_mla,
+    bool use_ce_transfer, bool single_kv_region,
     int64_t gpu_block_stride_in_bytes, bool sync,
     const CETransferConfig &ce_config, bool enable_trace) {
 
@@ -191,7 +193,7 @@ void transfer_kv_blocks(
 
   // CE transfer mode
   if (use_ce_transfer) {
-    int kv_dim = is_mla ? 1 : 2;
+    int kv_dim = single_kv_region ? 1 : 2;
 
     // Analyze block-id contiguity
     CEAnalysis analysis = analyze_ce_transfer(
@@ -290,14 +292,14 @@ void transfer_kv_blocks(
           gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
           cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
           cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-          chunk_size_in_int64, is_mla, is_host_to_device);
+          chunk_size_in_int64, single_kv_region, is_host_to_device);
     } else {
       transfer_kv_blocks_kernel_8b<Type><<<gridDim, blockDim, 0, stream>>>(
           num_blocks, start_layer_id, num_layers, gpu_block_ids,
           gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
           cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
           cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-          chunk_size_in_int64, is_mla, is_host_to_device);
+          chunk_size_in_int64, single_kv_region, is_host_to_device);
     }
   }
   if (sync) {

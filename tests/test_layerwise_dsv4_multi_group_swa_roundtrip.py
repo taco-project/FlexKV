@@ -312,6 +312,7 @@ def _d2h_main_group(
         True,
         True,
         0,
+        ce_is_mla=gpu_layout.is_mla,
     )
 
 
@@ -344,6 +345,7 @@ def _d2h_swa(
         True,
         True,
         0,
+        ce_is_mla=swa_layout.is_mla,
     )
 
 
