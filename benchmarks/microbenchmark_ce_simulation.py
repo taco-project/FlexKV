@@ -77,17 +77,17 @@ LAYOUTS = {
     "bfirst": KVCacheLayoutType.BLOCKFIRST,
 }
 
-# (label, is_mla, mode)
-# MHA: non-MLA, mode ignored.
-# MLA: all 4 D2H modes (sharded / rank0_only / layer_parallel / rank_rotate).
+# (label, kv_dim, num_kv_heads, mode)
+# MHA: kv_dim=2, num_kv_heads=num_gpus (mode ignored).
+# MLA: kv_dim=1, num_kv_heads=1, all 4 D2H modes (sharded / rank0_only / layer_parallel / rank_rotate).
 # CPU tensor total blocks = num_blocks * num_gpus ONLY for all_write (handled in
 # cpu_strides_for_strategy); the 4 modes below all use num_blocks, correct as-is.
 STRATEGIES = [
-    ("MHA",               False, "sharded"),
-    ("MLA-sharded",        True, "sharded"),
-    ("MLA-rank0_only",     True, "rank0_only"),
-    ("MLA-layer_parallel", True, "layer_parallel"),
-    ("MLA-rank_rotate",    True, "rank_rotate"),
+    ("MHA",                2, 8, "sharded"),
+    ("MLA-sharded",        1, 1, "sharded"),
+    ("MLA-rank0_only",     1, 1, "rank0_only"),
+    ("MLA-layer_parallel", 1, 1, "layer_parallel"),
+    ("MLA-rank_rotate",    1, 1, "rank_rotate"),
 ]
 
 CE_CONFIGS = [
@@ -99,32 +99,32 @@ CE_CONFIGS = [
 
 # Helpers (mirrors microbenchmark_ce_strategy.py)
 
-def make_layouts(num_layers, num_blocks, head_dim, cpu_layout_type, is_mla, num_gpus):
-    num_head = 1 if is_mla else num_gpus
+def make_layouts(num_layers, num_blocks, head_dim, cpu_layout_type, kv_dim, num_kv_heads, num_gpus):
+    num_head = 1 if num_kv_heads == 1 else num_gpus
     heads_per_rank = 1
     gpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=1, num_head=heads_per_rank,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     cpu_layout = KVCacheLayout(
         type=cpu_layout_type,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=1, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     return gpu_layout, cpu_layout
 
 
 def cpu_strides_for_strategy(cpu_layout, num_layers, num_blocks, head_dim,
-                             is_mla, mode, num_gpus):
-    total = num_blocks * num_gpus if (is_mla and mode == "all_write") else num_blocks
-    num_head = 1 if is_mla else num_gpus
+                             kv_dim, num_kv_heads, mode, num_gpus):
+    total = num_blocks * num_gpus if (num_kv_heads == 1 and mode == "all_write") else num_blocks
+    num_head = 1 if num_kv_heads == 1 else num_gpus
     layout_for_kv_stride = KVCacheLayout(
         type=cpu_layout.type,
         num_layer=num_layers, num_block=total,
         tokens_per_block=1, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
-    if not is_mla and cpu_layout.type == KVCacheLayoutType.BLOCKFIRST:
+        head_size=head_dim, kv_dim=kv_dim)
+    if num_kv_heads > 1 and cpu_layout.type == KVCacheLayoutType.BLOCKFIRST:
         layout_for_kv_stride = layout_for_kv_stride.div_head(num_gpus)
     kv_sb = layout_for_kv_stride.get_kv_stride() * ES
     layer_sb = layout_for_kv_stride.get_layer_stride() * ES
@@ -140,19 +140,19 @@ def make_gpu_tensors(num_layers, kv_dim, num_blocks, heads_per_rank, head_dim, d
     return [full[i] for i in range(num_layers)]
 
 
-def make_cpu_tensor(cpu_layout, num_layers, total_blocks, head_dim, is_mla, num_gpus):
-    num_head = 1 if is_mla else num_gpus
+def make_cpu_tensor(cpu_layout, num_layers, total_blocks, head_dim, kv_dim, num_kv_heads, num_gpus):
+    num_head = 1 if num_kv_heads == 1 else num_gpus
     layout = KVCacheLayout(
         type=cpu_layout.type,
         num_layer=num_layers, num_block=total_blocks,
         tokens_per_block=1, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     return torch.empty(tuple(layout.kv_shape), dtype=DTYPE, pin_memory=True)
 
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True, ce_segment_threshold=8,
-                  is_mla=False, is_blockfirst=False,
+                  kv_dim=2, is_blockfirst=False,
                   ce_enable_memcpy2d=None):
     # Default to the global CE memcpy2d setting (FLEXKV_ENABLE_CE_MEMCPY2D,
     # default ON since the env rename). Pass explicitly to override, e.g.
@@ -175,7 +175,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         enable_nvcomp=False,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
         is_blockfirst=is_blockfirst,
         ce_enable_memcpy2d=ce_enable_memcpy2d)
 
@@ -295,8 +295,8 @@ class TorchRNG:
 # Benchmark core: time one direction with wall-clock timer
 
 def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
-                  num_layers, is_h2d, num_gpus, iters, is_mla, mode,
-                  use_ce, transfer_num_cta=16):
+                  num_layers, is_h2d, num_gpus, iters, kv_dim, num_kv_heads,
+                  mode, use_ce, transfer_num_cta=16):
     """Time ONE direction over `iters`, return median wall-clock ms."""
 
     def do_transfer():
@@ -306,7 +306,8 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
             cpu_block_stride_in_bytes=cpu_bl_sb, cpu_tp_stride_in_bytes=cpu_tp_sb,
             transfer_num_cta=transfer_num_cta, is_host_to_device=is_h2d,
             use_ce_transfer=use_ce, layer_id=0, layer_granularity=num_layers,
-            is_mla=is_mla, mla_d2h_mode=mode)
+            kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+            kv_shared_across_ranks_mode=mode)
 
     for _ in range(WARMUP_ITERS):
         do_transfer()
@@ -403,26 +404,26 @@ def run_simulation(args):
         ))
 
         for layout_name in args.layouts:
-            for strat_label, is_mla, mode in STRATEGIES:
+            for strat_label, kv_dim, strat_num_kv_heads, mode in STRATEGIES:
                 combo = "{}|{}|{}".format(size_name, layout_name, strat_label)
                 cpu_layout_type = LAYOUTS[layout_name]
-                kv_dim = 1 if is_mla else 2
+                num_kv_heads = num_gpus if strat_num_kv_heads == 0 else strat_num_kv_heads
                 heads_per_rank = 1
 
                 print("\n  === {} ===".format(combo))
 
                 # Pre-allocate GPU/CPU tensors at pool_size (max batch).
                 gpu_layout, cpu_layout = make_layouts(
-                    num_layers, pool_size, head_dim, cpu_layout_type, is_mla, num_gpus)
+                    num_layers, pool_size, head_dim, cpu_layout_type, kv_dim, num_kv_heads, num_gpus)
                 cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb, total_blocks = \
                     cpu_strides_for_strategy(cpu_layout, num_layers, pool_size,
-                                             head_dim, is_mla, mode, num_gpus)
+                                             head_dim, kv_dim, num_kv_heads, mode, num_gpus)
 
                 all_gpu = [make_gpu_tensors(num_layers, kv_dim, pool_size,
                                             heads_per_rank, head_dim, g)
                            for g in range(num_gpus)]
                 cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks,
-                                        head_dim, is_mla, num_gpus)
+                                        head_dim, kv_dim, num_kv_heads, num_gpus)
 
                 round_meta[combo] = []
 
@@ -436,18 +437,18 @@ def run_simulation(args):
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                             num_layers, ce_path_opt=path_opt,
                             ce_segment_threshold=threshold,
-                            is_mla=is_mla,
+                            kv_dim=kv_dim,
                             is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST))
 
                         try:
                             d2h_ms = bench_one_dir(
                                 tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                                 num_layers, False, num_gpus, ITERS_PER_ROUND,
-                                is_mla, mode, use_ce=use_ce, transfer_num_cta=cta)
+                                kv_dim, num_kv_heads, mode, use_ce=use_ce, transfer_num_cta=cta)
                             h2d_ms = bench_one_dir(
                                 tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                                 num_layers, True, num_gpus, ITERS_PER_ROUND,
-                                is_mla, mode, use_ce=use_ce, transfer_num_cta=cta)
+                                kv_dim, num_kv_heads, mode, use_ce=use_ce, transfer_num_cta=cta)
                             round_times[cfg_label] = {"d2h": d2h_ms, "h2d": h2d_ms,
                                                       "rt": d2h_ms + h2d_ms}
                         except Exception as e:

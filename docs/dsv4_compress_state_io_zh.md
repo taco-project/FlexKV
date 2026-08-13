@@ -9,6 +9,8 @@ DeepSeek-V4 的 DSA attention 除了读取 C4 KV 和 C4 indexer KV，还会读�
 
 原来的 FlexKV 只存取 KV buffer。请求 restore 时，KV 会从 Host 恢复到 GPU，但上述 state 仍可能保留旧值或空值，导致 DSA 使用“正确 KV + 错误 score”。
 
+> **存储 vs 计算**：DeepSeek-V4 的 KV cache **存储**采用 MLA 式布局（`kv_dim=1`，K/V 合一的 `kv_buffer`，`num_kv_heads=1`，跨 TP rank 共享），但其 attention **计算**是 MHA 而非 MLA。FlexKV 按**存储布局**判定 `kv_dim`（依据 `qk_nope_head_dim`），与计算路径无关。
+
 本实现补齐这两组 state 的完整数据通路：
 
 ```text

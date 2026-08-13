@@ -332,14 +332,13 @@ size_t transfer_kv_blocks_ans_comp(
     int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_block_stride_in_bytes,
     int64_t chunk_size_in_bytes,
-    bool is_mla,
+    int kv_dim,
     uint32_t* cpu_size_table_base,
     int64_t cpu_size_table_block_stride,
     int64_t cpu_size_table_layer_stride,
     cudaStream_t stream) {
   require_initialized_ans_ctx(ctx, "transfer_kv_blocks_ans_comp");
 
-  const int kv_dim = is_mla ? 1 : 2;
   const int total_chunks = num_layers * kv_dim * num_blocks;
   const int batch_cap = static_cast<int>(ctx->max_num_chunks);
   const int num_batches = (total_chunks + batch_cap - 1) / batch_cap;
@@ -437,14 +436,13 @@ size_t transfer_kv_blocks_ans_decomp(
     int64_t cpu_layer_stride_in_bytes,
     int64_t cpu_block_stride_in_bytes,
     int64_t chunk_size_in_bytes,
-    bool is_mla,
+    int kv_dim,
     uint32_t* cpu_size_table_base,
     int64_t cpu_size_table_block_stride,
     int64_t cpu_size_table_layer_stride,
     cudaStream_t stream) {
   require_initialized_ans_ctx(ctx, "transfer_kv_blocks_ans_decomp");
 
-  const int kv_dim = is_mla ? 1 : 2;
   const int total_chunks = num_layers * kv_dim * num_blocks;
   const int batch_cap = static_cast<int>(ctx->max_num_chunks);
   const int num_batches = (total_chunks + batch_cap - 1) / batch_cap;
@@ -523,11 +521,11 @@ size_t transfer_kv_blocks_ans_decomp(
 #define ANS_INSTANTIATE(Type)                                               \
   template size_t transfer_kv_blocks_ans_comp<Type>(                         \
       ANSTransferContext*, int, int, int, int64_t*, GTensorHandler, int64_t*, \
-      void*, int64_t, int64_t, int64_t, int64_t, bool, uint32_t*, int64_t,    \
+      void*, int64_t, int64_t, int64_t, int64_t, int, uint32_t*, int64_t,    \
       int64_t, cudaStream_t);                                                \
   template size_t transfer_kv_blocks_ans_decomp<Type>(                       \
       ANSTransferContext*, int, int, int, int64_t*, GTensorHandler, int64_t*, \
-      void*, int64_t, int64_t, int64_t, int64_t, bool, uint32_t*, int64_t,    \
+      void*, int64_t, int64_t, int64_t, int64_t, int, uint32_t*, int64_t,    \
       int64_t, cudaStream_t);
 
 ANS_INSTANTIATE(BackendType::VLLM)

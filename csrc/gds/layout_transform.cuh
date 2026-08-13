@@ -32,7 +32,7 @@ void launch_layout_transform_kernel(
     int64_t* gpu_block_ids,
     int num_blocks,
     int num_layers,
-    bool single_kv_region,
+    int kv_dim,
     bool buffer_to_target,
     cudaStream_t stream);
 

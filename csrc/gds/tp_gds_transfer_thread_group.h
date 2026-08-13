@@ -46,11 +46,8 @@ public:
       const bool is_read,  // true for SSD->GPU, false for GPU->SSD
       const int layer_id,
       const int layer_granularity,
-      const bool is_mla,
-      // vLLM >= PR #44455 packs K and V into the content dim: head_size covers
-      // both, leaving one KV region to stride over instead of two.  Distinct
-      // from is_mla, which also means "TP replicates the heads".
-      const bool packed_kv = false);
+      const int kv_dim,
+      const int num_kv_heads = 1);
 
 private:
   using Task = std::function<void()>;

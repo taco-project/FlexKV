@@ -392,9 +392,9 @@ def kv_chunk_byte_offset_in_block(
     layer_stride_b: int,
     kv_stride_b: int,
     block_stride_b: int,
-    single_kv_region: bool,
+    kv_dim: int,
 ) -> int:
-    if single_kv_region:
+    if kv_dim == 1:
         return mem_block_id * block_stride_b + layer_id * layer_stride_b
     return (
         mem_block_id * block_stride_b
@@ -410,9 +410,9 @@ def ssd_chunk_byte_offset_in_file(
     ssd_layer_stride_b: int,
     ssd_kv_stride_b: int,
     block_stride_b: int,
-    single_kv_region: bool,
+    kv_dim: int,
 ) -> int:
-    if single_kv_region:
+    if kv_dim == 1:
         return block_in_file * block_stride_b + layer_id * ssd_layer_stride_b
     return (
         block_in_file * block_stride_b
@@ -432,9 +432,9 @@ def gpu_chunk_u8_view(
     gpu_block_stride_b: int,
     gpu_layer_stride_b: int,
     chunk_size_b: int,
-    single_kv_region: bool,
+    kv_dim: int,
 ) -> torch.Tensor:
-    if single_kv_region:
+    if kv_dim == 1:
         kv_idx = 0
     if gpu_block_type == 0:
         t = gpu_blocks[layer_id]

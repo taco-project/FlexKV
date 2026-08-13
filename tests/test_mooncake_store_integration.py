@@ -5,7 +5,7 @@ Tests for FlexKV + mooncake-store integration:
   * MooncakeStoreClient: batch_put / batch_get / batch_exists round-trip
   * MooncakeStoreCacheEngine.match():
       - single-pool (KV-only) longest-prefix semantics
-      - multi-pool (KV + indexer) joint-existence intersection
+      - joint-hit with the SWA pool (KV prefix + largest SWA snapshot)
   * End-to-end: put-with-pattern -> match -> get -> verify data
 
 Requires
@@ -36,7 +36,7 @@ import numpy as np
 # Skip the entire module if the mooncake-store SDK is not installed.
 pytest.importorskip("mooncake.store", reason="mooncake-store SDK not installed")
 
-from flexkv.common.config import CacheConfig, IndexerCacheConfig
+from flexkv.common.config import CacheConfig, SWAPoolConfig
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.block import SequenceMeta
 from flexkv.external.mooncake_store_keys import PoolKind, build_key
@@ -54,10 +54,13 @@ def _config_path() -> str:
     return os.environ.get("FLEXKV_MOONCAKE_STORE_CONFIG_PATH", "")
 
 
-def _make_cache_config(*, with_indexer: bool = False) -> CacheConfig:
-    """Build a minimal CacheConfig that targets mooncake-store."""
-    indexer = IndexerCacheConfig() if with_indexer else None
-    return CacheConfig(
+def _make_cache_config(swa: bool = False) -> CacheConfig:
+    """Build a minimal CacheConfig that targets mooncake-store.
+
+    When ``swa=True`` the SWA remote pool is enabled, arming
+    ``MooncakeStoreCacheEngine`` joint-hit matching.
+    """
+    cfg = CacheConfig(
         tokens_per_block=16,
         enable_cpu=True,
         enable_ssd=False,
@@ -66,8 +69,10 @@ def _make_cache_config(*, with_indexer: bool = False) -> CacheConfig:
         mooncake_store_config_path=_config_path(),
         num_cpu_blocks=64,
         num_remote_blocks=128,
-        indexer=indexer,
     )
+    if swa:
+        cfg.swa = SWAPoolConfig(enabled=True)
+    return cfg
 
 
 def _make_blockfirst_layout(num_blocks=16, num_layers=1, tokens_per_block=16):
@@ -78,7 +83,8 @@ def _make_blockfirst_layout(num_blocks=16, num_layers=1, tokens_per_block=16):
         tokens_per_block=tokens_per_block,
         num_head=2,
         head_size=64,
-        is_mla=True,
+        kv_dim=1,
+        num_kv_heads=1,
     )
 
 
@@ -229,7 +235,7 @@ def test_match_kv_only_full_hit(mooncake_client, buffer_and_keys):
     )
     assert all(put_ok)
 
-    cache_config = _make_cache_config(with_indexer=False)
+    cache_config = _make_cache_config()
     engine = MooncakeStoreCacheEngine(cache_config)
 
     result = engine.match(seq)
@@ -266,7 +272,7 @@ def test_match_kv_only_partial_prefix(mooncake_client, buffer_and_keys):
     )
     assert all(put_ok)
 
-    cache_config = _make_cache_config(with_indexer=False)
+    cache_config = _make_cache_config()
     engine = MooncakeStoreCacheEngine(cache_config)
 
     result = engine.match(seq)
@@ -277,12 +283,19 @@ def test_match_kv_only_partial_prefix(mooncake_client, buffer_and_keys):
     mooncake_client.unregister_buffer(buffer)
 
 # ---------------------------------------------------------------------------
-# Layer 3: MooncakeStoreCacheEngine.match() — multi-pool (KV + indexer)
+# Layer 2b: MooncakeStoreCacheEngine.match() — KV + SWA joint hit
 # ---------------------------------------------------------------------------
+#
+# Semantics (_joint_match_length): joint_matched is the LARGEST L in
+# [1, kv_matched] such that SWA(hash[L-1]) exists — a right-to-left scan,
+# NOT an intersection prefix. SWA snapshots accumulate historically, so a
+# hit at an inner position is valid as long as the full-KV prefix up to it
+# is present. With SWA enabled but no snapshot, joint hit is 0 even when KV
+# is fully present.
 
 @pytest.mark.mooncake
-def test_match_kv_indexer_joint_full_hit(mooncake_client, buffer_and_keys):
-    """When KV and indexer are BOTH published, match() returns num_blocks."""
+def test_match_swa_joint_full_hit(mooncake_client, buffer_and_keys):
+    """KV + SWA both present at every block -> joint hit == num_blocks."""
     from flexkv.external.mooncake_store_utils import MooncakeStoreCacheEngine
 
     buffer, layout, ptrs, sizes = buffer_and_keys
@@ -296,27 +309,28 @@ def test_match_kv_indexer_joint_full_hit(mooncake_client, buffer_and_keys):
     seq = SequenceMeta(token_ids=token_ids, tokens_per_block=tokens_per_block)
 
     kv_keys = [build_key(seq.block_hashes[i], PoolKind.KV) for i in range(num_blocks)]
-    idx_keys = [build_key(seq.block_hashes[i], PoolKind.INDEXER) for i in range(num_blocks)]
-
-    # We re-use the same buffer slots for both pools; the test only cares
-    # about key-existence, not block content.
+    swa_keys = [build_key(seq.block_hashes[i], PoolKind.SWA) for i in range(num_blocks)]
     assert all(mooncake_client.batch_put(kv_keys, ptrs, sizes))
-    assert all(mooncake_client.batch_put(idx_keys, ptrs, sizes))
+    assert all(mooncake_client.batch_put(swa_keys, ptrs, sizes))
 
-    cache_config = _make_cache_config(with_indexer=True)
-    engine = MooncakeStoreCacheEngine(cache_config)
-    assert len(engine.hit_pool_specs) == 2  # KV + indexer
+    engine = MooncakeStoreCacheEngine(_make_cache_config(swa=True))
+    assert engine.swa_enabled
 
     result = engine.match(seq)
-    assert result.num_matched_blocks == num_blocks, (
-        f"joint hit should return {num_blocks}, got {result.num_matched_blocks}"
-    )
+    assert result.kv_matched_blocks == num_blocks
+    assert result.num_matched_blocks == num_blocks
+    assert result.swa_hit_blocks == num_blocks
 
     mooncake_client.unregister_buffer(buffer)
 
+
 @pytest.mark.mooncake
-def test_match_kv_indexer_joint_indexer_missing(mooncake_client, buffer_and_keys):
-    """KV-hit but indexer-miss must NOT count as a hit (prefix truncates)."""
+def test_match_swa_joint_swa_at_inner_position(mooncake_client, buffer_and_keys):
+    """SWA only at an inner block -> joint hit is that position (largest L).
+
+    kv_matched == 4 (all KV present); SWA published only at block index 2,
+    so the largest L in [1..4] with SWA(hash[L-1]) present is L == 3.
+    """
     from flexkv.external.mooncake_store_utils import MooncakeStoreCacheEngine
 
     buffer, layout, ptrs, sizes = buffer_and_keys
@@ -330,32 +344,26 @@ def test_match_kv_indexer_joint_indexer_missing(mooncake_client, buffer_and_keys
     seq = SequenceMeta(token_ids=token_ids, tokens_per_block=tokens_per_block)
 
     kv_keys = [build_key(seq.block_hashes[i], PoolKind.KV) for i in range(num_blocks)]
-    idx_keys = [build_key(seq.block_hashes[i], PoolKind.INDEXER) for i in range(num_blocks)]
-
-    # Publish ALL KV keys, but only the FIRST 2 indexer keys.
     assert all(mooncake_client.batch_put(kv_keys, ptrs, sizes))
-    publish_idx = 2
-    assert all(
-        mooncake_client.batch_put(
-            idx_keys[:publish_idx], ptrs[:publish_idx], sizes[:publish_idx]
-        )
-    )
 
-    cache_config = _make_cache_config(with_indexer=True)
-    engine = MooncakeStoreCacheEngine(cache_config)
+    swa_pos = 2  # 0-indexed; corresponds to L == 3
+    swa_keys = [build_key(seq.block_hashes[swa_pos], PoolKind.SWA)]
+    assert all(mooncake_client.batch_put(
+        swa_keys, [ptrs[swa_pos]], [sizes[swa_pos]]))
+
+    engine = MooncakeStoreCacheEngine(_make_cache_config(swa=True))
 
     result = engine.match(seq)
-    # Joint-AND prefix must stop at the first indexer miss.
-    assert result.num_matched_blocks == publish_idx, (
-        f"joint match must truncate at first indexer miss; "
-        f"expected {publish_idx}, got {result.num_matched_blocks}"
-    )
+    assert result.kv_matched_blocks == num_blocks
+    assert result.num_matched_blocks == swa_pos + 1
+    assert result.swa_hit_blocks == swa_pos + 1
 
     mooncake_client.unregister_buffer(buffer)
 
+
 @pytest.mark.mooncake
-def test_match_kv_indexer_joint_kv_missing(mooncake_client, buffer_and_keys):
-    """Symmetric: KV-miss but indexer-hit also truncates."""
+def test_match_swa_joint_swa_missing(mooncake_client, buffer_and_keys):
+    """KV present everywhere but no SWA snapshot -> joint hit == 0."""
     from flexkv.external.mooncake_store_utils import MooncakeStoreCacheEngine
 
     buffer, layout, ptrs, sizes = buffer_and_keys
@@ -369,30 +377,63 @@ def test_match_kv_indexer_joint_kv_missing(mooncake_client, buffer_and_keys):
     seq = SequenceMeta(token_ids=token_ids, tokens_per_block=tokens_per_block)
 
     kv_keys = [build_key(seq.block_hashes[i], PoolKind.KV) for i in range(num_blocks)]
-    idx_keys = [build_key(seq.block_hashes[i], PoolKind.INDEXER) for i in range(num_blocks)]
+    assert all(mooncake_client.batch_put(kv_keys, ptrs, sizes))
+    # Publish no SWA keys.
 
-    # Publish only the first KV key, but ALL indexer keys.
-    publish_kv = 1
-    assert all(
-        mooncake_client.batch_put(
-            kv_keys[:publish_kv], ptrs[:publish_kv], sizes[:publish_kv]
-        )
-    )
-    assert all(mooncake_client.batch_put(idx_keys, ptrs, sizes))
-
-    cache_config = _make_cache_config(with_indexer=True)
-    engine = MooncakeStoreCacheEngine(cache_config)
+    engine = MooncakeStoreCacheEngine(_make_cache_config(swa=True))
 
     result = engine.match(seq)
-    assert result.num_matched_blocks == publish_kv, (
-        f"joint match must truncate at first KV miss; "
-        f"expected {publish_kv}, got {result.num_matched_blocks}"
+    assert result.kv_matched_blocks == num_blocks
+    assert result.num_matched_blocks == 0
+    assert result.swa_hit_blocks == 0
+
+    mooncake_client.unregister_buffer(buffer)
+
+
+@pytest.mark.mooncake
+def test_match_swa_joint_kv_prefix_caps_joint(mooncake_client, buffer_and_keys):
+    """KV prefix shorter than a later SWA snapshot -> joint capped by KV prefix.
+
+    KV published for the first 2 blocks (kv_matched == 2). SWA published at
+    block index 1 (inside the prefix) and index 3 (beyond it). The joint
+    scan only covers [1..2], so the unreachable SWA at index 3 is ignored
+    and joint hit == 2 (SWA at index 1 -> L == 2).
+    """
+    from flexkv.external.mooncake_store_utils import MooncakeStoreCacheEngine
+
+    buffer, layout, ptrs, sizes = buffer_and_keys
+    mooncake_client.register_buffer(buffer)
+
+    tokens_per_block = layout.tokens_per_block
+    num_blocks = layout.num_block  # 4
+    token_ids = np.random.randint(
+        0, 1_000_000, size=num_blocks * tokens_per_block, dtype=np.int64
     )
+    seq = SequenceMeta(token_ids=token_ids, tokens_per_block=tokens_per_block)
+
+    publish_kv = 2
+    kv_keys = [build_key(seq.block_hashes[i], PoolKind.KV) for i in range(num_blocks)]
+    assert all(mooncake_client.batch_put(
+        kv_keys[:publish_kv], ptrs[:publish_kv], sizes[:publish_kv]))
+
+    swa_keys = [
+        build_key(seq.block_hashes[1], PoolKind.SWA),
+        build_key(seq.block_hashes[3], PoolKind.SWA),
+    ]
+    assert all(mooncake_client.batch_put(
+        swa_keys, [ptrs[1], ptrs[3]], [sizes[1], sizes[3]]))
+
+    engine = MooncakeStoreCacheEngine(_make_cache_config(swa=True))
+
+    result = engine.match(seq)
+    assert result.kv_matched_blocks == publish_kv
+    assert result.num_matched_blocks == 2  # SWA at index 1 -> L == 2
+    assert result.swa_hit_blocks == 2
 
     mooncake_client.unregister_buffer(buffer)
 
 # ---------------------------------------------------------------------------
-# Layer 4: end-to-end (put pattern -> match -> get -> verify content)
+# Layer 3: end-to-end (put pattern -> match -> get -> verify content)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.mooncake
@@ -420,7 +461,7 @@ def test_mooncake_e2e_kv_only(mooncake_client, buffer_and_keys):
     kv_keys = [build_key(seq.block_hashes[i], PoolKind.KV) for i in range(num_blocks)]
     assert all(mooncake_client.batch_put(kv_keys, ptrs, sizes))
 
-    cache_config = _make_cache_config(with_indexer=False)
+    cache_config = _make_cache_config()
     engine = MooncakeStoreCacheEngine(cache_config)
 
     result = engine.match(seq)
@@ -436,42 +477,8 @@ def test_mooncake_e2e_kv_only(mooncake_client, buffer_and_keys):
 
     mooncake_client.unregister_buffer(buffer)
 
-# ---------------------------------------------------------------------------
-# Layer 5: PoolSpec/CacheConfig wiring sanity (no cluster needed)
-# ---------------------------------------------------------------------------
-
-def test_enable_pool_specs_kv_only_when_indexer_none():
-    """Without indexer, only the KV pool is active."""
-    cfg = CacheConfig(
-        tokens_per_block=16,
-        enable_remote=True,
-        use_mooncake_store_backend=True,
-        mooncake_store_config_path="/tmp/dummy.json",  # not loaded here
-        indexer=None,
-    )
-    specs = cfg.enable_pool_specs()
-    kinds = [s.kind for s in specs]
-    assert kinds == [PoolKind.KV]
-
-
-def test_enable_pool_specs_includes_indexer_when_configured():
-    """Configuring an IndexerCacheConfig must add the INDEXER pool."""
-    cfg = CacheConfig(
-        tokens_per_block=16,
-        enable_remote=True,
-        use_mooncake_store_backend=True,
-        mooncake_store_config_path="/tmp/dummy.json",
-        indexer=IndexerCacheConfig(),
-    )
-    specs = cfg.enable_pool_specs()
-    kinds = [s.kind for s in specs]
-    assert kinds == [PoolKind.KV, PoolKind.INDEXER]
-    assert all(s.required_for_hit for s in specs), (
-        "all current pools must participate in joint-hit"
-    )
-
 
 def test_build_key_format_matches_worker_contract():
     """Centralised key builder must produce '<hash>_<suffix>' literally."""
     assert build_key(123, PoolKind.KV) == "123_FlexKV"
-    assert build_key("abc", PoolKind.INDEXER) == "abc_FlexKV_indexer"
+    assert build_key("abc", PoolKind.SWA) == "abc_FlexKV_swa"

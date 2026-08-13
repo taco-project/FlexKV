@@ -29,7 +29,7 @@ def test_gpu_chunk_u8_view_aliases_noncontiguous_physical_storage():
         gpu_block_stride_b=block_stride_b,
         gpu_layer_stride_b=logical.numel() * logical.element_size(),
         chunk_size_b=block_stride_b,
-        single_kv_region=True,
+        kv_dim=1,
     )
 
     assert view.untyped_storage().data_ptr() == logical.untyped_storage().data_ptr()
@@ -55,5 +55,5 @@ def test_gpu_chunk_u8_view_rejects_storage_overrun():
             gpu_block_stride_b=tensor.numel() * tensor.element_size(),
             gpu_layer_stride_b=tensor.numel() * tensor.element_size(),
             chunk_size_b=1,
-            single_kv_region=True,
+            kv_dim=1,
         )

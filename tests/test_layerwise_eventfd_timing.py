@@ -196,7 +196,6 @@ def _build_fixture_with_eventfds(
         layer_eventfds_tensor=eventfds_tensor,
         tp_size=1,
         is_blockfirst=True,
-        is_mla=True,
         **swa_ctor,
     )
 
@@ -279,7 +278,8 @@ def _run_h2d(
         cpu_block_id_tensor=cpu_src,
         transfer_cta_num=4,
         use_ce_transfer=True,
-        is_mla=True,
+        kv_dim=1,
+        num_kv_heads=1,
         counter_id=0,
         **swa_kwargs,
     )

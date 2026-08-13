@@ -1879,12 +1879,22 @@ class FlexKVConnector:
         assert len(kv_caches) > 0
         if self._is_dsv4:
             self._register_dsv4_to_server(kv_caches)
-            return
+        else:
+            self._register_standard_to_server(kv_caches, indexer_buffers)
+
+    def _register_standard_to_server(
+        self,
+        kv_caches: List[torch.Tensor],
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+    ) -> None:
         assert (
             kv_caches[0].ndim == 3
         ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
 
-        is_mla = self.model_config.use_mla
+        # kv_dim from ModelConfig (MLA→1, non-MLA plain MHA→2). num_kv_heads is
+        # the per-rank physical head count read from the GPU tensor (same value
+        # used for num_head); for MLA the tensor's head axis is 1.
+        kv_dim = self.model_config.kv_dim
         num_blocks, num_kv_heads, head_size = kv_caches[0].shape
 
         gpu_layout = KVCacheLayout(
@@ -1894,7 +1904,8 @@ class FlexKVConnector:
             tokens_per_block=self.page_size,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=is_mla,
+            kv_dim=kv_dim,
+            num_kv_heads=num_kv_heads,
         )
 
         indexer_layout = None
@@ -1911,7 +1922,9 @@ class FlexKVConnector:
                 tokens_per_block=1,
                 num_head=1,
                 head_size=indexer_tensor.shape[1],
-                is_mla=True,
+                # Indexer: single-region single-head sidecar (kv_dim=1, num_kv_heads=1).
+                kv_dim=1,
+                num_kv_heads=1,
             )
 
         if indexer_buffers and indexer_layout is not None:
@@ -1980,7 +1993,8 @@ class FlexKVConnector:
                     tokens_per_block=sub_page_size,
                     num_head=1,
                     head_size=head_size,
-                    is_mla=True,
+                    kv_dim=self.model_config.kv_dim,
+                    num_kv_heads=self.model_config.num_kv_heads,
                 )
             )
             handles_per_group.append(list(buffers))
@@ -2002,7 +2016,8 @@ class FlexKVConnector:
             tokens_per_block=first_layout.tokens_per_block,
             num_head=first_layout.num_head,
             head_size=first_layout.head_size,
-            is_mla=first_layout.is_mla,
+            kv_dim=first_layout.kv_dim,
+            num_kv_heads=first_layout.num_kv_heads,
         )
 
         swa_caches = None
@@ -2027,7 +2042,9 @@ class FlexKVConnector:
                 tokens_per_block=sub_page_size,
                 num_head=1,
                 head_size=head_size,
-                is_mla=True,
+                # SWA: single-region single-head sidecar (kv_dim=1, num_kv_heads=1).
+                kv_dim=1,
+                num_kv_heads=1,
             )
             swa_caches = list(swa_buffers)
 
@@ -2064,7 +2081,9 @@ class FlexKVConnector:
                         tokens_per_block=ring_size,
                         num_head=1,
                         head_size=int(state_group["head_size"]),
-                        is_mla=True,
+                        # State sidecar: single-region single-head (kv_dim=1, num_kv_heads=1).
+                        kv_dim=1,
+                        num_kv_heads=1,
                     )
                     swa_layer_groups.append(
                         LayerGroupSpec(

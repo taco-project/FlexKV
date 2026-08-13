@@ -562,17 +562,19 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         # Use physical device ID for registration
         correct_device_id = physical_device_id
         
-        if self.flexkv_config.model_config.use_mla:
+        # TRT-LLM MLA ⟺ ModelConfig.kv_dim == 1 (set in post_init_from_trt_config).
+        if self.flexkv_config.model_config.kv_dim == 1:
             assert kv_cache_tensor.ndim == 4, (f"expect kv cached tensor has 4 dim but get shape={kv_cache_tensor.shape}")
 
         num_blocks = kv_cache_tensor.shape[0]
         num_layers = kv_cache_tensor.shape[1]
         kv_dim = kv_cache_tensor.shape[2]
         block_size = self.flexkv_config.cache_config.tokens_per_block
-        num_kv_heads = 1 if self.flexkv_config.model_config.use_mla else self.flexkv_config.model_config.num_kv_heads
+        # num_kv_heads from ModelConfig: 1 for MLA (shared), H for plain MHA.
+        num_kv_heads = self.flexkv_config.model_config.num_kv_heads
         head_size = self.flexkv_config.model_config.head_size
-        if self.flexkv_config.model_config.use_mla:
-            assert kv_dim == 1, (f"expect kv_dim eqals to 1 when using MLA but get kv_dim={kv_dim}")
+        if self.flexkv_config.model_config.kv_dim == 1:
+            assert kv_dim == 1, (f"expect kv_dim equals to 1 when using MLA but get kv_dim={kv_dim}")
         
         gpu_blocks = [kv_cache_tensor] # convert to list for flexkv register 
  
@@ -583,7 +585,8 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             tokens_per_block=block_size,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=self.flexkv_config.model_config.use_mla,
+            kv_dim=kv_dim,
+            num_kv_heads=num_kv_heads,
         )
         flexkv_logger.info(f"gpu_layout: {gpu_layout}")
         # Use correct device_id from tensor's actual device

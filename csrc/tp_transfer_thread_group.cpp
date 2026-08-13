@@ -178,18 +178,12 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_kv_stride_in_bytes,
     const int64_t cpu_layer_stride_in_bytes,
     const int64_t cpu_block_stride_in_bytes,
-    const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
+    const int64_t cpu_tp_stride_in_bytes,     const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
-    const int layer_id, const int layer_granularity, const bool is_mla,
-    const std::string &mla_d2h_mode,
-    const int designated_rank,
-    const bool packed_kv) {
-
-  // Number of KV regions the copy kernels stride over.  MLA's latent KV has no
-  // separate V and a packed layout keeps V inside head_size, so both report a
-  // single region.  Everything else below keeps reading is_mla, which also
-  // decides the TP head split and the MLA-only D2H modes.
-  const bool single_kv_region = is_mla || packed_kv;
+    const int layer_id, const int layer_granularity, const int kv_dim,
+    const int num_kv_heads,
+    const std::string &kv_shared_across_ranks_mode,
+    const int designated_rank) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -200,13 +194,13 @@ void TPTransferThreadGroup::tp_group_transfer(
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
-  // Validate mla_d2h_mode parameter (only meaningful for MLA)
-  std::string mode = mla_d2h_mode;
-  if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
+  // Validate kv_shared_across_ranks_mode parameter (only meaningful for shared KV)
+  std::string mode = kv_shared_across_ranks_mode;
+  if (num_kv_heads == 1 && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
       && mode != "layer_parallel" && mode != "rank_rotate") {
     FLEXKV_LOG_WARNING(
         "operation=transfer_config act=fallback status=degraded "
-        "field=mla_d2h_mode value=\"%s\" fallback=sharded",
+        "field=kv_shared_across_ranks_mode value=\"%s\" fallback=sharded",
         mode.c_str());
     mode = "sharded";
   }
@@ -215,11 +209,11 @@ void TPTransferThreadGroup::tp_group_transfer(
   // the per-rank transfer size and the stride between ranks. If chunk_size
   // is not divisible by num_gpus_, the integer division drops trailing bytes,
   // leaving a hole in the assembled KV on CPU.
-  // All ranks share the same chunk_size (MLA = identical KV), so check [0] once.
-  if (is_mla && !is_host_to_device && mode == "sharded" && num_gpus_ > 1) {
+  // All ranks share the same chunk_size (num_kv_heads==1 = identical KV), so check [0] once.
+  if (num_kv_heads == 1 && !is_host_to_device && mode == "sharded" && num_gpus_ > 1) {
     if (gpu_chunk_sizes_in_bytes_[0] % num_gpus_ != 0) {
       throw std::runtime_error(
-          "sharded MLA D2H mode requires gpu_chunk_size divisible by "
+          "sharded kv_shared_across_ranks D2H mode requires gpu_chunk_size divisible by "
           "num_gpus, but chunk_size=" +
           std::to_string(gpu_chunk_sizes_in_bytes_[0]) + " and num_gpus=" +
           std::to_string(num_gpus_) + ". Use 'all_write' or 'rank0_only' "
@@ -230,14 +224,14 @@ void TPTransferThreadGroup::tp_group_transfer(
 
   // rank_rotate: resolve designated rank from round-robin counter, treat as rank0_only.
   int eff_designated_rank = designated_rank;
-  if (is_mla && !is_host_to_device && mode == "rank_rotate") {
+  if (num_kv_heads == 1 && !is_host_to_device && mode == "rank_rotate") {
     eff_designated_rank = rotate_counter_;
     rotate_counter_ = (rotate_counter_ + 1) % num_gpus_;
   }
 
   for (int i = 0; i < num_gpus_; ++i) {
     // For rank0_only / rank_rotate mode in D2H: only the designated rank performs transfer
-    if (is_mla && !is_host_to_device && (mode == "rank0_only" || mode == "rank_rotate")
+    if (num_kv_heads == 1 && !is_host_to_device && (mode == "rank0_only" || mode == "rank_rotate")
         && i != eff_designated_rank) {
       // Skip D2H transfer for non-designated GPUs
       futures.emplace_back(enqueue_for_gpu(i, [i]() {
@@ -247,7 +241,7 @@ void TPTransferThreadGroup::tp_group_transfer(
     }
 
     // round_robin D2H: skip ranks with 0 layers (layer_granularity < num_gpus_)
-    if (is_mla && !is_host_to_device && mode == "layer_parallel") {
+    if (num_kv_heads == 1 && !is_host_to_device && mode == "layer_parallel") {
       int L_rotate = layer_granularity, N_rotate = num_gpus_;
       int layers_per_rank_rotate = L_rotate / N_rotate;
       int remainder_rotate = L_rotate % N_rotate;
@@ -272,8 +266,7 @@ void TPTransferThreadGroup::tp_group_transfer(
         int64_t gpu_startoff_inside_chunks = 0;
         int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
 
-        // per-rank offset (default 0/0/full from init above)
-        if (!is_mla) {
+        if (num_kv_heads > 1) {
           cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
         } else if (mode == "sharded" && !is_host_to_device) {
           // sharded D2H: per-rank shard
@@ -289,7 +282,7 @@ void TPTransferThreadGroup::tp_group_transfer(
         // Effective layer range: round_robin assigns subset; else full (layer_id, layer_granularity).
         int eff_start_layer = layer_id;
         int eff_num_layers = layer_granularity;
-        if (is_mla && !is_host_to_device && mode == "layer_parallel") {
+        if (num_kv_heads == 1 && !is_host_to_device && mode == "layer_parallel") {
           int L_rotate = layer_granularity, N_rotate = num_gpus_;
           int layers_per_rank_rotate = L_rotate / N_rotate;
           int remainder_rotate = L_rotate % N_rotate;
@@ -315,7 +308,7 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
               transfer_num_cta, is_host_to_device, use_ce_transfer,
-              single_kv_region, gpu_block_strides_in_bytes_[i], true,
+              kv_dim, gpu_block_strides_in_bytes_[i], true,
               ce_config_);
           break;
         case BackendType::TRTLLM:
@@ -326,7 +319,7 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
               transfer_num_cta, is_host_to_device, use_ce_transfer,
-              single_kv_region, gpu_block_strides_in_bytes_[i], true,
+              kv_dim, gpu_block_strides_in_bytes_[i], true,
               ce_config_);
           break;
         case BackendType::SGLANG:
@@ -337,7 +330,7 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
               transfer_num_cta, is_host_to_device, use_ce_transfer,
-              single_kv_region, gpu_block_strides_in_bytes_[i], true,
+              kv_dim, gpu_block_strides_in_bytes_[i], true,
               ce_config_);
           break;
         }

@@ -78,7 +78,7 @@ def block_bytes(pool, block):
 def make_layout(num_blocks):
     return KVCacheLayout(type=KVCacheLayoutType.LAYERFIRST, num_layer=NUM_LAYERS,
                          num_block=num_blocks, tokens_per_block=TOKENS_PER_BLOCK,
-                         num_head=1, head_size=BYTES_PER_TOKEN_PER_LAYER, is_mla=True)
+                         num_head=1, head_size=BYTES_PER_TOKEN_PER_LAYER, kv_dim=1, num_kv_heads=1)
 
 
 def wait_for_op(te, op_ids, timeout_s=30.0):
@@ -116,7 +116,7 @@ def _run(transfer_engines) -> int:
 
     # ---- config: engine mempool and TransferEngine CPU pool share num_cpu_blocks
     model_config = ModelConfig(num_layers=NUM_LAYERS, num_kv_heads=1,
-                               head_size=BYTES_PER_TOKEN_PER_LAYER, use_mla=True,
+                               head_size=BYTES_PER_TOKEN_PER_LAYER, kv_dim=1,
                                dtype=torch.uint8, tp_size=1, pp_size=1, dp_size=1,
                                cp_size=1)
     cache_config = CacheConfig(

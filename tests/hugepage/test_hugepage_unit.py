@@ -92,7 +92,8 @@ def test_hugepage_allocator_fallback() -> None:
         tokens_per_block=16,
         num_head=8,
         head_size=128,
-        is_mla=False,
+        kv_dim=2,
+        num_kv_heads=8,
     )
     dtype = torch.bfloat16
     page_size = 1024 * 1024 * 1024
@@ -166,7 +167,7 @@ def test_storage_engine_cpu_cache_uses_hugepage_when_enabled() -> None:
         num_layers=1,
         num_kv_heads=1,
         head_size=128,
-        use_mla=False,
+        kv_dim=2,
         dtype=torch.bfloat16,
     )
     cache_config = CacheConfig(
@@ -197,7 +198,7 @@ def test_storage_engine_cpu_cache_falls_back_when_hugepage_unavailable(monkeypat
         num_layers=1,
         num_kv_heads=1,
         head_size=128,
-        use_mla=False,
+        kv_dim=2,
         dtype=torch.bfloat16,
     )
     cache_config = CacheConfig(

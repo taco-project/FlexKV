@@ -27,7 +27,7 @@ def test_update_default_config_from_user_config_applies_hugepage_flags() -> None
         num_layers=1,
         num_kv_heads=1,
         head_size=128,
-        use_mla=False,
+        kv_dim=2,
     )
     cache_config = CacheConfig()
     user_config = UserConfig(

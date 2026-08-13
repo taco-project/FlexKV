@@ -498,13 +498,14 @@ if __name__ == "__main__":
         tokens_per_block=tokens_per_block,
         num_head=num_kv_heads//tp_size,
         head_size=head_size,
-        is_mla=False
+        kv_dim=2,
+        num_kv_heads=num_kv_heads,
     )
 
     model_config = ModelConfig(num_layers=num_layers,
                                 num_kv_heads=num_kv_heads,
                                 head_size=head_size,
-                                use_mla=False,
+                                kv_dim=2,
                                 tp_size=tp_size,
                                 dtype=torch.float16)
 

@@ -71,7 +71,8 @@ def _make_gpu_layout(g: LayerGroupSpec, num_blocks: int, tpb: int) -> KVCacheLay
         tokens_per_block=tpb_g,
         num_head=g.num_kv_heads,
         head_size=g.head_size,
-        is_mla=(g.num_kv_heads == 1),
+        kv_dim=(1 if g.num_kv_heads == 1 else 2),
+        num_kv_heads=g.num_kv_heads,
     )
 
 
@@ -88,7 +89,8 @@ def _make_multi_group_cpu_layout(
         tokens_per_block=tpb,
         num_head=1,
         head_size=MAIN_HEAD_SIZE,
-        is_mla=True,
+        kv_dim=1,
+        num_kv_heads=1,
         layer_groups=list(layer_groups),
         tp_size=1,
     )
@@ -102,7 +104,8 @@ def _make_swa_layout(num_layers: int, num_blocks: int, tpb: int) -> KVCacheLayou
         tokens_per_block=tpb,
         num_head=1,
         head_size=SWA_BYTES_PER_TOKEN,
-        is_mla=True,
+        kv_dim=1,
+        num_kv_heads=1,
     )
 
 
@@ -113,7 +116,7 @@ def _compute_multi_group_strides(
     tp_size: int = 1,
 ) -> Dict[str, object]:
     """Mirror flexkv.transfer.layerwise.LayerwiseWorker._init_multi_group strides."""
-    kv_dim = 1 if cpu_kv_layout.is_mla else 2
+    kv_dim = cpu_kv_layout.kv_dim
     tpb = cpu_kv_layout.tokens_per_block
     num_original_layers = cpu_kv_layout.num_layer
 
@@ -347,7 +350,6 @@ def _build_fixture(
         layer_eventfds_tensor=empty_eventfds,
         tp_size=1,
         is_blockfirst=True,
-        is_mla=True,
     )
 
     swa_layout = _make_swa_layout(
@@ -443,7 +445,8 @@ def _run_h2d(
         cpu_block_id_tensor=cpu_src,
         transfer_cta_num=4,
         use_ce_transfer=True,
-        is_mla=True,
+        kv_dim=1,
+        num_kv_heads=1,
         counter_id=0,
         **swa_kwargs,
     )

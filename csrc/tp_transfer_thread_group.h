@@ -65,15 +65,10 @@ public:
                          const int transfer_num_cta,
                          const bool is_host_to_device,
                          const bool use_ce_transfer, const int layer_id,
-                         const int layer_granularity, const bool is_mla,
-                         const std::string &mla_d2h_mode = "sharded",
-                         const int designated_rank = 0,
-                         // vLLM >= PR #44455 packs K and V into the content
-                         // dim, so head_size covers both and there is one KV
-                         // region to stride over instead of two.  Distinct
-                         // from is_mla, which additionally means "TP
-                         // replicates the heads"; packed MHA splits them.
-                         const bool packed_kv = false);
+                         const int layer_granularity, const int kv_dim,
+                         const int num_kv_heads,
+                         const std::string &kv_shared_across_ranks_mode = "sharded",
+                         const int designated_rank = 0);
 
 #ifdef FLEXKV_ENABLE_NVCOMP
 
@@ -90,7 +85,8 @@ public:
                                const int transfer_num_cta,
                                const bool is_host_to_device,
                                const bool use_ce_transfer, const int layer_id,
-                               const int layer_granularity, const bool is_mla,
+                               const int layer_granularity, const int kv_dim,
+                               const int num_kv_heads,
                                const int64_t cpu_size_table_tp_ptr,
                                const int64_t cpu_size_table_tp_rank_stride,
                                const int64_t cpu_size_table_block_stride,

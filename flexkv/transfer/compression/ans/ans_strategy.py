@@ -42,7 +42,7 @@ class NvcompGpuCpuStrategy(CompressionStrategy):
         self._ans_ctx = ans_utils.create_ans_context(
             chunk_size_bytes=worker.chunk_size_in_bytes,
             dtype=worker.dtype,
-            is_mla=worker.is_mla,
+            kv_dim=worker.kv_dim,
             log_prefix="[nvcomp]",
         )
 
@@ -91,7 +91,7 @@ class NvcompGpuCpuStrategy(CompressionStrategy):
                         worker.cpu_layer_stride_in_bytes,
                         worker.cpu_block_stride_in_bytes,
                         worker.chunk_size_in_bytes, 0, worker.num_layers,
-                        worker.is_mla, worker.gpu_block_type_,
+                        worker.kv_dim, worker.gpu_block_type_,
                         self._table_ptr, self._table_block_stride,
                         self._table_layer_stride)
                 finally:
@@ -110,7 +110,7 @@ class NvcompGpuCpuStrategy(CompressionStrategy):
                         worker.cpu_layer_stride_in_bytes,
                         worker.cpu_block_stride_in_bytes,
                         worker.chunk_size_in_bytes, 0, worker.num_layers,
-                        worker.is_mla, worker.gpu_block_type_,
+                        worker.kv_dim, worker.gpu_block_type_,
                         self._table_ptr, self._table_block_stride,
                         self._table_layer_stride)
                 finally:
@@ -145,7 +145,7 @@ class NvcompGpuCpuTpStrategy(CompressionStrategy):
             self._cpu_size_table_tp,
             "[tpGPUCPUTransferWorker] cpu_size_table_tp",
             register=True,
-            expected_dims=(3,) if worker.is_mla else (4,),
+            expected_dims=(3,) if worker.num_kv_heads == 1 else (4,),
         )
         worker.tp_transfer_thread_group.init_nvcomp(batch_size, data_type)
 
@@ -201,7 +201,7 @@ class NvcompGpuCpuTpStrategy(CompressionStrategy):
                 use_ce_transfer,
                 0,
                 worker.num_layers,
-                worker.is_mla,
+                worker.kv_dim,
                 self._table_ptr,
                 self._table_rank_stride,
                 self._table_block_stride,
@@ -229,7 +229,7 @@ class NvcompCpuSsdStrategy(CompressionStrategy):
 
     def attach(self, worker) -> None:
         (self._write_threads,
-         self._read_threads) = ans_utils.ssd_packed_threads(worker.is_mla)
+         self._read_threads) = ans_utils.ssd_packed_threads(worker.num_kv_heads == 1)
 
         selected_cpu = (self._cpu_size_table_tp
                         if self._cpu_size_table_tp is not None
@@ -308,8 +308,8 @@ class NvcompCpuSsdStrategy(CompressionStrategy):
             if transfer_type == TransferType.DISK2H
             else self._write_threads
         )
-        use_ranked_table = self._cpu_size_table_tp is not None and not worker.is_mla
-        use_canonical_rank0_table = self._cpu_size_table_tp is not None and worker.is_mla
+        use_ranked_table = self._cpu_size_table_tp is not None and worker.num_kv_heads > 1
+        use_canonical_rank0_table = self._cpu_size_table_tp is not None and worker.num_kv_heads == 1
 
         if use_ranked_table:
             if worker.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
@@ -339,7 +339,7 @@ class NvcompCpuSsdStrategy(CompressionStrategy):
                 "ssd_size_table_rank_stride": self._ssd_table_rank_stride_tp,
                 "ssd_size_table_block_stride": self._ssd_table_block_stride_tp,
                 "ssd_size_table_layer_stride": self._ssd_table_layer_stride_tp,
-                "is_mla": False,
+                "kv_dim": worker.kv_dim,
                 "tp_size": self._tp_size,
                 "cpu_tp_rank_stride_in_bytes": cpu_tp_rank_stride,
             }
@@ -372,7 +372,7 @@ class NvcompCpuSsdStrategy(CompressionStrategy):
             "ssd_size_table_rank_stride": 0,
             "ssd_size_table_block_stride": ssd_block_stride,
             "ssd_size_table_layer_stride": ssd_layer_stride_tbl,
-            "is_mla": worker.is_mla,
+            "kv_dim": worker.kv_dim,
             "tp_size": 1,
             "cpu_tp_rank_stride_in_bytes": 0,
         }
