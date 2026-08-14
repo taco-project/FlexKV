@@ -301,6 +301,9 @@ protected:
   int node_count;
   int hit_reward_seconds;
   std::unique_ptr<IEvictionStrategy> strategy_;
+  // StreamingLLM: number of leading blocks (attention sinks) protected from
+  // eviction. 0 disables the protection.
+  int sink_block_count_ = 0;
 
   // SWA slots that were freed because their node was deleted/invalidated by a
   // structural change (split / merge / evict). The Python side drains this and
@@ -353,12 +356,14 @@ public:
   CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000,
                   int hit_reward_seconds = 0,
                   EvictionPolicy eviction_policy = EvictionPolicy::LRU,
-                  int protected_threshold = 2) {
+                  int protected_threshold = 2,
+                  int sink_block_count = 0) {
     this->tokens_per_block = tokens_per_block;
     this->max_num_blocks = max_num_blocks;
     this->node_count = 0;
     this->hit_reward_seconds = hit_reward_seconds;
     this->strategy_ = create_eviction_strategy(eviction_policy, protected_threshold);
+    this->sink_block_count_ = sink_block_count;
 
     root = new CRadixNode(this, true, 0);
     node_list.push_back(root);
@@ -371,6 +376,26 @@ public:
     swa_lru_tail = new CRadixNode(this, true, 0);
     swa_lru_head->set_swa_lru_next(swa_lru_tail);
     swa_lru_tail->set_swa_lru_prev(swa_lru_head);
+  }
+
+
+  // Compute the total number of blocks preceding *node* (sum of sizes of all
+  // ancestors).  Used by StreamingLLM sink-token protection.
+  int get_block_offset_from_root(CRadixNode *node) const {
+    int offset = 0;
+    CRadixNode *cur = node->get_parent();
+    while (cur != nullptr && !is_root(cur)) {
+      offset += cur->size();
+      cur = cur->get_parent();
+    }
+    return offset;
+  }
+
+  // True if *node* falls within the first sink_block_count_ blocks and should
+  // be protected from eviction (StreamingLLM attention sinks).
+  bool is_sink_block(CRadixNode *node) const {
+    if (sink_block_count_ <= 0) return false;
+    return get_block_offset_from_root(node) < sink_block_count_;
   }
 
   const IEvictionStrategy *get_strategy() const { return strategy_.get(); }

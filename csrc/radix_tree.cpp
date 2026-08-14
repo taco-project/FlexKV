@@ -457,7 +457,9 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks,
   std::vector<CRadixNode *> candidates;
   candidates.reserve(leaf_list.size());
   for (auto node : leaf_list) {
-    if (node->evictable()) {
+    // StreamingLLM: skip attention-sink blocks (first sink_block_count_ blocks
+    // from the root) — they are always attended to and must never be evicted.
+    if (node->evictable() && !is_sink_block(node)) {
       candidates.push_back(node);
     }
   }

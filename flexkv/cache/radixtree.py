@@ -212,7 +212,7 @@ class RadixNode:
 class RadixTreeIndex:
     def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000,
                  hit_reward_seconds: int = 0, eviction_policy: str = "lru",
-                 protected_threshold: int = 2):
+                 protected_threshold: int = 2, sink_block_count: int = 0):
         self.root_node: RadixNode = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                               physical_blocks=np.array([], dtype=np.int64),
                                               is_ready=True,
@@ -228,6 +228,9 @@ class RadixTreeIndex:
         self.hit_reward_seconds = hit_reward_seconds
         self.eviction_policy = eviction_policy
         self.protected_threshold = protected_threshold
+        # StreamingLLM: protect the first N blocks (attention sinks) from eviction.
+        # Sink tokens always receive high attention scores and should never be evicted.
+        self.sink_block_count = sink_block_count
 
         # ===== SWA-only LRU (intrusive doubly-linked list w/ sentinels) =====
         # head side = MRU, tail side = LRU. Nodes carrying a live SWA slot are on
@@ -592,6 +595,12 @@ class RadixTreeIndex:
         candidates = []
         for node in self.leaf_nodes.values():
             if node.evictable():
+                # StreamingLLM: skip attention-sink blocks (first sink_block_count
+                # blocks from the root) — they are always attended to and must
+                # never be evicted.
+                if self.sink_block_count > 0 and \
+                        self._get_block_offset_from_root(node) < self.sink_block_count:
+                    continue
                 priority = self._get_eviction_priority(node)
                 candidates.append((priority, node))
         heapq.heapify(candidates)
@@ -812,11 +821,36 @@ class RadixTreeIndex:
             self.record_freed_swa_slot(cur)
 
 
+
+    def _get_block_offset_from_root(self, node: RadixNode) -> int:
+        """Compute the total number of blocks preceding *node* (i.e. the sum of
+        sizes of all ancestors).  Nodes whose offset is below
+        ``sink_block_count`` are treated as attention sinks and protected from
+        eviction (StreamingLLM)."""
+        offset = 0
+        cur = node.parent
+        while cur is not None and not cur.is_root():
+            offset += cur.size()
+            cur = cur.parent
+        return offset
+
     def _get_eviction_priority(self, node: RadixNode):
         """Get the eviction priority for a node based on the configured policy.
 
         Lower priority values are evicted first (min-heap).
+
+        Nodes within the first ``sink_block_count`` blocks from the root are
+        treated as attention sinks (StreamingLLM) and given maximum priority so
+        they are never evicted.
         """
+        # StreamingLLM: protect attention sinks (first N blocks) from eviction.
+        if self.sink_block_count > 0:
+            offset = self._get_block_offset_from_root(node)
+            if offset < self.sink_block_count:
+                # Return a value larger than any real priority so the node is
+                # never selected for eviction (min-heap: larger = evicted later).
+                return float('inf')
+
         if self.eviction_policy == "lru":
             return node.grace_time
         elif self.eviction_policy == "lfu":

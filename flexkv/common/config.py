@@ -624,6 +624,9 @@ class SWAPoolConfig:
 class CacheConfig:
     tokens_per_block: int = 16
     eviction_policy: str = "lru"
+    # StreamingLLM: number of leading blocks (attention sinks) protected from
+    # eviction. 0 disables the protection.
+    sink_block_count: int = 0
     enable_cpu: bool = True
     enable_ssd: bool = False
     enable_gds: bool = False # Requires enable_ssd=True
@@ -797,6 +800,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
     eviction_policy=os.getenv('FLEXKV_EVICTION_POLICY', 'lru'),
     slru_protected_threshold=int(os.getenv('FLEXKV_SLRU_PROTECTED_THRESHOLD', 2)),
+    sink_block_count=int(os.getenv('FLEXKV_SINK_BLOCK_COUNT', 0)),
 
     enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
 

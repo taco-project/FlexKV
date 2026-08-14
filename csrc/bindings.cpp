@@ -930,16 +930,17 @@ PYBIND11_MODULE(c_ext, m) {
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
       .def(py::init([](int tokens_per_block, unsigned int max_num_blocks,
                        int hit_reward_seconds, std::string eviction_policy,
-                       int protected_threshold) {
+                       int protected_threshold, int sink_block_count) {
              auto policy = flexkv::parse_eviction_policy(eviction_policy);
              return new flexkv::CRadixTreeIndex(
                  tokens_per_block, max_num_blocks, hit_reward_seconds, policy,
-                 protected_threshold);
+                 protected_threshold, sink_block_count);
            }),
            py::arg("tokens_per_block"), py::arg("max_num_blocks") = 1000000,
            py::arg("hit_reward_seconds") = 0,
            py::arg("eviction_policy") = "lru",
-           py::arg("protected_threshold") = 2)
+           py::arg("protected_threshold") = 2,
+           py::arg("sink_block_count") = 0)
       .def("is_empty", &flexkv::CRadixTreeIndex::is_empty)
       .def("reset", &flexkv::CRadixTreeIndex::reset)
       .def("lock", &flexkv::CRadixTreeIndex::lock, py::arg("node"))
