@@ -507,15 +507,17 @@ class FlexKVSchedulerConnector:
         request: "Request",
         block_ids: list[int],
     ) -> bool:
-        """
+        """Handle a vLLM request before its KV cache blocks are freed.
+
         Args:
-            request: Request to put.
-            blocks: All block_ids of the request.
+            request: The vLLM scheduler request being finalized.
+            block_ids: IDs of all GPU KV cache blocks owned by the request.
 
         Returns:
-            bool: whether thire is unfinished task for this request.
+            True if a FlexKV transfer still needs the request's blocks and
+            vLLM must defer freeing them; False if the blocks can be freed.
         """
-        # Task not finished, can't free blocks
+        # An existing FlexKV task still owns these blocks, so keep them alive.
         if request.request_id in self.req_id_to_task_dict:
             return True
 
@@ -525,9 +527,8 @@ class FlexKVSchedulerConnector:
             finish_reason == FinishReason.ABORT
             and bool(getattr(request, "offload_kv_on_finish", False))
         )
-        if not request.is_finished() or not (
-            normal_finish or requested_abort_offload
-        ):
+        should_put = request.is_finished() and (normal_finish or requested_abort_offload)
+        if not should_put:
             return False
 
         if self.maybe_skip_put and os.path.exists('/tmp/flexkv_skip_put'):
