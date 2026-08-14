@@ -455,13 +455,24 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks,
   // Optimization: Batch build the priority queue to reduce overhead from O(N
   // log N) to O(N)
   std::vector<CRadixNode *> candidates;
+  std::vector<CRadixNode *> sink_candidates;
   candidates.reserve(leaf_list.size());
   for (auto node : leaf_list) {
-    // StreamingLLM: skip attention-sink blocks (first sink_block_count_ blocks
-    // from the root) — they are always attended to and must never be evicted.
-    if (node->evictable() && !is_sink_block(node)) {
+    if (!node->evictable())
+      continue;
+    // StreamingLLM: protect attention-sink blocks (first sink_block_count_
+    // blocks from the root). They are always attended to and should be evicted
+    // only as a last resort when no non-sink block is available.
+    if (is_sink_block(node)) {
+      sink_candidates.push_back(node);
+    } else {
       candidates.push_back(node);
     }
+  }
+  // Fallback: if every evictable leaf is a sink block, we must still make
+  // progress, so allow evicting the lowest-priority sink block.
+  if (candidates.empty()) {
+    candidates = std::move(sink_candidates);
   }
 
   std::priority_queue<CRadixNode *, std::vector<CRadixNode *>,

@@ -593,16 +593,24 @@ class RadixTreeIndex:
 
     def evict(self, num_evicted: int) -> Tuple[np.ndarray, np.ndarray]:
         candidates = []
+        sink_candidates = []
         for node in self.leaf_nodes.values():
-            if node.evictable():
-                # StreamingLLM: skip attention-sink blocks (first sink_block_count
-                # blocks from the root) — they are always attended to and must
-                # never be evicted.
-                if self.sink_block_count > 0 and \
-                        self._get_block_offset_from_root(node) < self.sink_block_count:
-                    continue
-                priority = self._get_eviction_priority(node)
+            if not node.evictable():
+                continue
+            # StreamingLLM: protect attention-sink blocks (first sink_block_count
+            # blocks from the root). They are always attended to and should be
+            # evicted only as a last resort when no non-sink block is available.
+            is_sink = (self.sink_block_count > 0 and
+                       self._get_block_offset_from_root(node) < self.sink_block_count)
+            priority = self._get_eviction_priority(node)
+            if is_sink:
+                sink_candidates.append((priority, node))
+            else:
                 candidates.append((priority, node))
+        # Fallback: if every evictable leaf is a sink block, we must still make
+        # progress, so allow evicting the lowest-priority sink block.
+        if not candidates:
+            candidates = sink_candidates
         heapq.heapify(candidates)
         evicted_blocks = np.array([], dtype=np.int64)
         evicted_block_hashes = np.array([], dtype=np.int64)

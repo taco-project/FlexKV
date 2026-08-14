@@ -939,8 +939,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("tokens_per_block"), py::arg("max_num_blocks") = 1000000,
            py::arg("hit_reward_seconds") = 0,
            py::arg("eviction_policy") = "lru",
-           py::arg("protected_threshold") = 2,
-           py::arg("sink_block_count") = 0)
+           py::arg("protected_threshold") = 2, py::arg("sink_block_count") = 0)
       .def("is_empty", &flexkv::CRadixTreeIndex::is_empty)
       .def("reset", &flexkv::CRadixTreeIndex::reset)
       .def("lock", &flexkv::CRadixTreeIndex::lock, py::arg("node"))
@@ -964,9 +963,9 @@ PYBIND11_MODULE(c_ext, m) {
                &flexkv::CRadixTreeIndex::evict),
            py::arg("evicted_blocks"), py::arg("evicted_block_hashes"),
            py::arg("num_evicted"), py::call_guard<py::gil_scoped_release>())
-      .def("remove_unready_leaf",
-           &flexkv::CRadixTreeIndex::remove_unready_leaf, py::arg("node"),
-           py::arg("freed_blocks"), py::call_guard<py::gil_scoped_release>())
+      .def("remove_unready_leaf", &flexkv::CRadixTreeIndex::remove_unready_leaf,
+           py::arg("node"), py::arg("freed_blocks"),
+           py::call_guard<py::gil_scoped_release>())
       .def("total_cached_blocks", &flexkv::CRadixTreeIndex::total_cached_blocks)
       .def("total_unready_blocks",
            &flexkv::CRadixTreeIndex::total_unready_blocks)

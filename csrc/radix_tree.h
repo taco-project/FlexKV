@@ -356,8 +356,7 @@ public:
   CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000,
                   int hit_reward_seconds = 0,
                   EvictionPolicy eviction_policy = EvictionPolicy::LRU,
-                  int protected_threshold = 2,
-                  int sink_block_count = 0) {
+                  int protected_threshold = 2, int sink_block_count = 0) {
     this->tokens_per_block = tokens_per_block;
     this->max_num_blocks = max_num_blocks;
     this->node_count = 0;
@@ -378,7 +377,6 @@ public:
     swa_lru_tail->set_swa_lru_prev(swa_lru_head);
   }
 
-
   // Compute the total number of blocks preceding *node* (sum of sizes of all
   // ancestors).  Used by StreamingLLM sink-token protection.
   int get_block_offset_from_root(CRadixNode *node) const {
@@ -394,7 +392,8 @@ public:
   // True if *node* falls within the first sink_block_count_ blocks and should
   // be protected from eviction (StreamingLLM attention sinks).
   bool is_sink_block(CRadixNode *node) const {
-    if (sink_block_count_ <= 0) return false;
+    if (sink_block_count_ <= 0)
+      return false;
     return get_block_offset_from_root(node) < sink_block_count_;
   }
 
