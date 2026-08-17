@@ -121,9 +121,9 @@ def assert_compressed_slots_equal(
     pytest.param(torch.float8_e4m3fn, id="fp8"),
 ])
 @pytest.mark.parametrize("tp_size", [pytest.param(1, id="tp_1")])
-@pytest.mark.parametrize("is_mla", [
-    pytest.param(False, id="mha"),
-    pytest.param(True, id="mla"),
+@pytest.mark.parametrize("kv_dim, num_kv_heads", [
+    pytest.param(2, 8, id="mha"),
+    pytest.param(1, 1, id="mla"),
 ])
 @pytest.mark.parametrize("chunk_size_per_device", [
     pytest.param(8 * 1024, id="cpd_8KB"),
@@ -132,17 +132,17 @@ def assert_compressed_slots_equal(
     pytest.param(18 * 1024, id="cpd_18KB"),  # MLA
 ])
 def test_ssd_roundtrip_non_tp(
-    cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_device,
+    cpu_layout_name, dtype, tp_size, kv_dim, num_kv_heads, chunk_size_per_device,
     num_layers=4, transfer_blocks=2,
 ):
     if not NVCOMP_AVAILABLE:
         pytest.skip("nvcomp not available")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    if is_mla != (chunk_size_per_device == 18 * 1024):
+    if (kv_dim == 1) != (chunk_size_per_device == 18 * 1024):
         pytest.skip("18KB is MLA-only; 8/16/32KB are MHA-only")
 
-    case = resolve_case(chunk_size_per_device, tp_size, is_mla, dtype)
+    case = resolve_case(chunk_size_per_device, tp_size, kv_dim, num_kv_heads, dtype)
     num_heads, head_size = case["num_head"], case["head_dim"]
     tokens_per_block, kv_dim = case["tokens_per_block"], case["kv_dim"]
     elem = dtype.itemsize
@@ -158,7 +158,8 @@ def test_ssd_roundtrip_non_tp(
         tokens_per_block=tokens_per_block,
         num_head=num_heads,
         head_size=head_size,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
+        num_kv_heads=num_kv_heads,
     )
     cpu_layout = KVCacheLayout(
         type=layout_type,
@@ -167,7 +168,8 @@ def test_ssd_roundtrip_non_tp(
         tokens_per_block=tokens_per_block,
         num_head=num_heads,
         head_size=head_size,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
+        num_kv_heads=num_kv_heads,
     )
     ssd_layout = KVCacheLayout(
         type=layout_type,
@@ -176,7 +178,8 @@ def test_ssd_roundtrip_non_tp(
         tokens_per_block=tokens_per_block,
         num_head=num_heads,
         head_size=head_size,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
+        num_kv_heads=num_kv_heads,
     )
 
     shape_per_layer = (
@@ -232,7 +235,7 @@ def test_ssd_roundtrip_non_tp(
                 chunk_bytes,
                 0,
                 num_layers,
-                is_mla,
+                kv_dim,
                 0,
                 cpu_size_table.data_ptr(),
                 cpu_size_table.stride(0),
@@ -266,7 +269,7 @@ def test_ssd_roundtrip_non_tp(
             num_blocks_per_file=num_blocks_per_file,
             layout_type=cpu_layout.type.value,
             total_layers=num_layers,
-            is_mla=is_mla,
+            kv_dim=kv_dim,
             cpu_size_table_ptr=cpu_size_table.data_ptr(),
             cpu_size_table_block_stride=cpu_size_table.stride(0),
             cpu_size_table_layer_stride=cpu_size_table.stride(1),
@@ -296,7 +299,7 @@ def test_ssd_roundtrip_non_tp(
             num_blocks_per_file=num_blocks_per_file,
             layout_type=cpu_layout.type.value,
             total_layers=num_layers,
-            is_mla=is_mla,
+            kv_dim=kv_dim,
             cpu_size_table_ptr=cpu_size_table.data_ptr(),
             cpu_size_table_block_stride=cpu_size_table.stride(0),
             cpu_size_table_layer_stride=cpu_size_table.stride(1),
@@ -337,9 +340,9 @@ def test_ssd_roundtrip_non_tp(
     pytest.param(4, id="tp_4"),
     pytest.param(8, id="tp_8"),
 ])
-@pytest.mark.parametrize("is_mla", [
-    pytest.param(False, id="mha"),
-    pytest.param(True, id="mla"),
+@pytest.mark.parametrize("kv_dim, num_kv_heads", [
+    pytest.param(2, 8, id="mha"),
+    pytest.param(1, 1, id="mla"),
 ])
 @pytest.mark.parametrize("chunk_size_per_device", [
     pytest.param(8 * 1024, id="cpd_8KB"),
@@ -348,7 +351,7 @@ def test_ssd_roundtrip_non_tp(
     pytest.param(18 * 1024, id="cpd_18KB"),  # MLA
 ])
 def test_ssd_roundtrip_tp(
-    cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_device,
+    cpu_layout_name, dtype, tp_size, kv_dim, num_kv_heads, chunk_size_per_device,
     num_layers=4, transfer_blocks=2,
 ):
     if not NVCOMP_AVAILABLE:
@@ -357,10 +360,10 @@ def test_ssd_roundtrip_tp(
         pytest.skip("CUDA is not available")
     if torch.cuda.device_count() < tp_size:
         pytest.skip(f"tp_size={tp_size} needs {tp_size} GPUs")
-    if is_mla != (chunk_size_per_device == 18 * 1024):
+    if (kv_dim == 1) != (chunk_size_per_device == 18 * 1024):
         pytest.skip("18KB is MLA-only; 8/16/32KB are MHA-only")
 
-    case = resolve_case(chunk_size_per_device, tp_size, is_mla, dtype)
+    case = resolve_case(chunk_size_per_device, tp_size, kv_dim, num_kv_heads, dtype)
     num_heads, head_size = case["num_head"], case["head_dim"]
     tokens_per_block, kv_dim = case["tokens_per_block"], case["kv_dim"]
     elem = dtype.itemsize
@@ -368,7 +371,7 @@ def test_ssd_roundtrip_tp(
 
     num_cpu_blocks = transfer_blocks * 2
     num_ssd_blocks = transfer_blocks
-    heads_per_rank = num_heads if is_mla else num_heads // tp_size
+    heads_per_rank = num_heads if num_kv_heads == 1 else num_heads // tp_size
 
     gpu_full_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
@@ -377,9 +380,10 @@ def test_ssd_roundtrip_tp(
         tokens_per_block=tokens_per_block,
         num_head=num_heads,
         head_size=head_size,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
+        num_kv_heads=num_kv_heads,
     )
-    gpu_rank_layout = gpu_full_layout if is_mla else gpu_full_layout.div_head(tp_size)
+    gpu_rank_layout = gpu_full_layout if num_kv_heads == 1 else gpu_full_layout.div_head(tp_size)
     cpu_layout = KVCacheLayout(
         type=layout_type,
         num_layer=num_layers,
@@ -387,7 +391,8 @@ def test_ssd_roundtrip_tp(
         tokens_per_block=tokens_per_block,
         num_head=num_heads,
         head_size=head_size,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
+        num_kv_heads=num_kv_heads,
     )
     ssd_layout = KVCacheLayout(
         type=layout_type,
@@ -396,13 +401,14 @@ def test_ssd_roundtrip_tp(
         tokens_per_block=tokens_per_block,
         num_head=num_heads,
         head_size=head_size,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
+        num_kv_heads=num_kv_heads,
     )
 
     shape_per_layer = (
         kv_dim, transfer_blocks, tokens_per_block, heads_per_rank, head_size)
     all_gpu = []
-    if is_mla:
+    if num_kv_heads == 1:
         base_cache = make_gpu_cache(
             (num_layers,) + shape_per_layer, dtype, DEVICE).cpu()
         for rank in range(tp_size):
@@ -415,7 +421,7 @@ def test_ssd_roundtrip_tp(
             all_gpu.append([cache[layer] for layer in range(num_layers)])
 
     cpu_cache = torch.zeros(tuple(cpu_layout.kv_shape), dtype=dtype).pin_memory()
-    if is_mla:
+    if num_kv_heads == 1:
         cpu_size_table = torch.zeros(
             (num_cpu_blocks, num_layers, kv_dim), dtype=torch.uint32).pin_memory()
         ssd_size_table = torch.zeros(
@@ -468,7 +474,7 @@ def test_ssd_roundtrip_tp(
         data_type,
     )
 
-    if cpu_layout.type == KVCacheLayoutType.BLOCKFIRST and not is_mla:
+    if cpu_layout.type == KVCacheLayoutType.BLOCKFIRST and num_kv_heads > 1:
         cpu_stride_layout = cpu_layout.div_head(tp_size)
     else:
         cpu_stride_layout = cpu_layout
@@ -477,7 +483,7 @@ def test_ssd_roundtrip_tp(
     cpu_block_stride = cpu_layout.get_block_stride() * elem
     cpu_tp_stride = cpu_block_stride // tp_size
 
-    if is_mla:
+    if num_kv_heads == 1:
         st_args = (
             cpu_size_table.data_ptr(),
             0,
@@ -507,27 +513,27 @@ def test_ssd_roundtrip_tp(
             False,
             0,
             num_layers,
-            is_mla,
+            kv_dim,
             *st_args,
         )
         for rank in range(tp_size):
             torch.cuda.synchronize(rank)
-        if is_mla:
+        if num_kv_heads == 1:
             assert (cpu_size_table.to(torch.int64)[write_cpu_ids] > 0).all()
         else:
             assert (cpu_size_table_tp.to(torch.int64)[:, write_cpu_ids] > 0).all()
         expected_payloads = snapshot_compressed_slots(
             cpu_cache,
-            cpu_size_table if is_mla else cpu_size_table_tp,
+            cpu_size_table if num_kv_heads == 1 else cpu_size_table_tp,
             write_cpu_ids,
-            ranks=[0] if is_mla else list(range(tp_size)),
-            table_ranked=not is_mla,
+            ranks=[0] if num_kv_heads == 1 else list(range(tp_size)),
+            table_ranked=num_kv_heads > 1,
             num_layers=num_layers,
             kv_dim=kv_dim,
             block_stride=cpu_block_stride,
             layer_stride=cpu_layer_stride,
             kv_stride=cpu_kv_stride,
-            rank_stride=0 if is_mla else cpu_tp_stride)
+            rank_stride=0 if num_kv_heads == 1 else cpu_tp_stride)
 
         h2disk_bytes = transfer_kv_blocks_ssd_packed(
             ioctx=ioctx,
@@ -543,20 +549,20 @@ def test_ssd_roundtrip_tp(
             num_blocks_per_file=num_blocks_per_file,
             layout_type=cpu_layout.type.value,
             total_layers=num_layers,
-            is_mla=is_mla,
-            cpu_size_table_ptr=(cpu_size_table if is_mla else cpu_size_table_tp).data_ptr(),
-            cpu_size_table_block_stride=(cpu_size_table if is_mla else cpu_size_table_tp).stride(0 if is_mla else 1),
-            cpu_size_table_layer_stride=(cpu_size_table if is_mla else cpu_size_table_tp).stride(1 if is_mla else 2),
-            ssd_size_table_ptr=(ssd_size_table if is_mla else ssd_size_table_tp).data_ptr(),
-            ssd_size_table_block_stride=(ssd_size_table if is_mla else ssd_size_table_tp).stride(0 if is_mla else 1),
-            ssd_size_table_layer_stride=(ssd_size_table if is_mla else ssd_size_table_tp).stride(1 if is_mla else 2),
-            tp_size=1 if is_mla else tp_size,
-            cpu_tp_rank_stride_in_bytes=0 if is_mla else cpu_tp_stride,
-            cpu_size_table_rank_stride=0 if is_mla else cpu_size_table_tp.stride(0),
-            ssd_size_table_rank_stride=0 if is_mla else ssd_size_table_tp.stride(0),
+            kv_dim=kv_dim,
+            cpu_size_table_ptr=(cpu_size_table if num_kv_heads == 1 else cpu_size_table_tp).data_ptr(),
+            cpu_size_table_block_stride=(cpu_size_table if num_kv_heads == 1 else cpu_size_table_tp).stride(0 if num_kv_heads == 1 else 1),
+            cpu_size_table_layer_stride=(cpu_size_table if num_kv_heads == 1 else cpu_size_table_tp).stride(1 if num_kv_heads == 1 else 2),
+            ssd_size_table_ptr=(ssd_size_table if num_kv_heads == 1 else ssd_size_table_tp).data_ptr(),
+            ssd_size_table_block_stride=(ssd_size_table if num_kv_heads == 1 else ssd_size_table_tp).stride(0 if num_kv_heads == 1 else 1),
+            ssd_size_table_layer_stride=(ssd_size_table if num_kv_heads == 1 else ssd_size_table_tp).stride(1 if num_kv_heads == 1 else 2),
+            tp_size=1 if num_kv_heads == 1 else tp_size,
+            cpu_tp_rank_stride_in_bytes=0 if num_kv_heads == 1 else cpu_tp_stride,
+            cpu_size_table_rank_stride=0 if num_kv_heads == 1 else cpu_size_table_tp.stride(0),
+            ssd_size_table_rank_stride=0 if num_kv_heads == 1 else ssd_size_table_tp.stride(0),
         )
 
-        if is_mla:
+        if num_kv_heads == 1:
             assert h2disk_bytes == int(ssd_size_table.to(torch.int64)[ssd_block_ids].sum().item())
             assert torch.equal(
                 cpu_size_table.to(torch.int64)[write_cpu_ids],
@@ -586,20 +592,20 @@ def test_ssd_roundtrip_tp(
             num_blocks_per_file=num_blocks_per_file,
             layout_type=cpu_layout.type.value,
             total_layers=num_layers,
-            is_mla=is_mla,
-            cpu_size_table_ptr=(cpu_size_table if is_mla else cpu_size_table_tp).data_ptr(),
-            cpu_size_table_block_stride=(cpu_size_table if is_mla else cpu_size_table_tp).stride(0 if is_mla else 1),
-            cpu_size_table_layer_stride=(cpu_size_table if is_mla else cpu_size_table_tp).stride(1 if is_mla else 2),
-            ssd_size_table_ptr=(ssd_size_table if is_mla else ssd_size_table_tp).data_ptr(),
-            ssd_size_table_block_stride=(ssd_size_table if is_mla else ssd_size_table_tp).stride(0 if is_mla else 1),
-            ssd_size_table_layer_stride=(ssd_size_table if is_mla else ssd_size_table_tp).stride(1 if is_mla else 2),
-            tp_size=1 if is_mla else tp_size,
-            cpu_tp_rank_stride_in_bytes=0 if is_mla else cpu_tp_stride,
-            cpu_size_table_rank_stride=0 if is_mla else cpu_size_table_tp.stride(0),
-            ssd_size_table_rank_stride=0 if is_mla else ssd_size_table_tp.stride(0),
+            kv_dim=kv_dim,
+            cpu_size_table_ptr=(cpu_size_table if num_kv_heads == 1 else cpu_size_table_tp).data_ptr(),
+            cpu_size_table_block_stride=(cpu_size_table if num_kv_heads == 1 else cpu_size_table_tp).stride(0 if num_kv_heads == 1 else 1),
+            cpu_size_table_layer_stride=(cpu_size_table if num_kv_heads == 1 else cpu_size_table_tp).stride(1 if num_kv_heads == 1 else 2),
+            ssd_size_table_ptr=(ssd_size_table if num_kv_heads == 1 else ssd_size_table_tp).data_ptr(),
+            ssd_size_table_block_stride=(ssd_size_table if num_kv_heads == 1 else ssd_size_table_tp).stride(0 if num_kv_heads == 1 else 1),
+            ssd_size_table_layer_stride=(ssd_size_table if num_kv_heads == 1 else ssd_size_table_tp).stride(1 if num_kv_heads == 1 else 2),
+            tp_size=1 if num_kv_heads == 1 else tp_size,
+            cpu_tp_rank_stride_in_bytes=0 if num_kv_heads == 1 else cpu_tp_stride,
+            cpu_size_table_rank_stride=0 if num_kv_heads == 1 else cpu_size_table_tp.stride(0),
+            ssd_size_table_rank_stride=0 if num_kv_heads == 1 else ssd_size_table_tp.stride(0),
         )
         assert disk2h_bytes == h2disk_bytes
-        if is_mla:
+        if num_kv_heads == 1:
             assert torch.equal(
                 cpu_size_table.to(torch.int64)[read_cpu_ids],
                 ssd_size_table.to(torch.int64)[ssd_block_ids],
@@ -613,17 +619,17 @@ def test_ssd_roundtrip_tp(
             assert (cpu_size_table_tp.to(torch.int64)[:, write_cpu_ids] == 0).all()
         assert_compressed_slots_equal(
             cpu_cache,
-            cpu_size_table if is_mla else cpu_size_table_tp,
+            cpu_size_table if num_kv_heads == 1 else cpu_size_table_tp,
             read_cpu_ids,
             expected_payloads,
-            ranks=[0] if is_mla else list(range(tp_size)),
-            table_ranked=not is_mla,
+            ranks=[0] if num_kv_heads == 1 else list(range(tp_size)),
+            table_ranked=num_kv_heads > 1,
             num_layers=num_layers,
             kv_dim=kv_dim,
             block_stride=cpu_block_stride,
             layer_stride=cpu_layer_stride,
             kv_stride=cpu_kv_stride,
-            rank_stride=0 if is_mla else cpu_tp_stride)
+            rank_stride=0 if num_kv_heads == 1 else cpu_tp_stride)
     finally:
         del tg
         shutil.rmtree(tmpdir, ignore_errors=True)

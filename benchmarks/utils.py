@@ -109,7 +109,7 @@ def load_config(config_path: str) -> Tuple[ModelConfig, CacheConfig]:
         model_config.num_kv_heads = config["num_kv_heads"]
         model_config.head_size = config["head_size"]
         model_config.dtype = eval(f"torch.{config['dtype']}")
-        model_config.use_mla = config["use_mla"]
+        model_config.kv_dim = config.get("kv_dim", 2)
         model_config.tp_size = config["tp_size"]
         model_config.dp_size = config["dp_size"]
         cache_config.tokens_per_block = config["tokens_per_block"]

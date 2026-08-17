@@ -58,7 +58,7 @@ static void transfer_blocks_impl(
     int64_t cpu_layer_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes,
-    int num_files_per_device, bool is_read, bool single_kv_region,
+    int num_files_per_device, bool is_read, int kv_dim,
     bool ssd_io_opt, bool enable_block_first_transfer, IOCallable &do_io,
     IOVecCallable &do_iov) {
   if (end_block <= start_block) return;
@@ -101,7 +101,7 @@ static void transfer_blocks_impl(
     int ssd_bid = ssd_block_ids_in_device[start_block];
     int fd = fd_list[ssd_bid % num_files_per_device];
     ssd_bid /= num_files_per_device;
-    int num_kv = single_kv_region ? 1 : 2;
+    int num_kv = kv_dim;
     for (int lid = start_layer; lid < end_layer; lid++) {
       for (int kv = 0; kv < num_kv; kv++) {
         void *cpu_ptr = reinterpret_cast<char *>(cpu_tensor_ptr) +
@@ -152,7 +152,7 @@ static void transfer_blocks_impl(
       }
     }
 
-    int num_kv = single_kv_region ? 1 : 2;
+    int num_kv = kv_dim;
     std::vector<struct iovec> iovs;
 
     for (int lid = start_layer; lid < end_layer; lid++) {
@@ -220,7 +220,7 @@ static void transfer_blocks_impl(
         throw std::runtime_error("Failed to transfer K block");
       }
 
-      if (single_kv_region) {
+      if (kv_dim == 1) {
         continue;
       }
       bytes_transfer = 0;
@@ -318,7 +318,7 @@ void transfer_kv_blocks_ssd(
     int64_t ssd_kv_stride_in_bytes,    // in single file
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes, bool is_read,
     int num_blocks_per_file, int round_robin, int num_threads_per_device,
-    bool single_kv_region, bool ssd_io_opt) {
+    int kv_dim, bool ssd_io_opt) {
   const int num_devices = ioctx.get_num_devices();
   const int num_files_per_device = ioctx.get_num_files_per_device();
 
@@ -346,7 +346,7 @@ void transfer_kv_blocks_ssd(
                 is_4k_aligned(chunk_size_in_bytes) &&
                 is_4k_aligned(cpu_layer_stride_in_bytes) &&
                 is_4k_aligned(ssd_layer_stride_in_bytes) &&
-                (single_kv_region ||
+                (kv_dim == 1 ||
                  (is_4k_aligned(cpu_kv_stride_in_bytes) &&
                   is_4k_aligned(ssd_kv_stride_in_bytes)));
   }
@@ -443,7 +443,7 @@ void transfer_kv_blocks_ssd(
               cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
               cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
               chunk_size_in_bytes, block_stride_in_bytes, num_files_per_device,
-              is_read, single_kv_region, ssd_io_opt,
+              is_read, kv_dim, ssd_io_opt,
               enable_block_first_transfer, do_io, do_iov);
           iouring.submit();  // flush SQEs
           continue;
@@ -457,7 +457,7 @@ void transfer_kv_blocks_ssd(
              cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
              cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
              chunk_size_in_bytes, block_stride_in_bytes, num_files_per_device,
-             is_read, single_kv_region, ssd_io_opt,
+             is_read, kv_dim, ssd_io_opt,
              enable_block_first_transfer,
              prom = std::move(prom)]() mutable {
               try {
@@ -481,7 +481,7 @@ void transfer_kv_blocks_ssd(
                     ssd_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
                     ssd_kv_stride_in_bytes, chunk_size_in_bytes,
                     block_stride_in_bytes, num_files_per_device, is_read,
-                    single_kv_region, ssd_io_opt,
+                    kv_dim, ssd_io_opt,
                     enable_block_first_transfer, do_io, do_iov);
                 prom.set_value(nullptr);
               } catch (...) {

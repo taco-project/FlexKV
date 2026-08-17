@@ -40,7 +40,7 @@ def run_tp_client(dp_client_id, tp_rank, gpu_register_port, model_config, cache_
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
 
     # Create GPU blocks for this tp_rank in the tp_client process

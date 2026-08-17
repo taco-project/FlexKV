@@ -25,7 +25,7 @@ void register_common_compression_bindings(py::module_& m) {
            int64_t cpu_size_table_layer_stride, int64_t ssd_size_table_ptr,
            int64_t ssd_size_table_block_stride,
            int64_t ssd_size_table_layer_stride, int round_robin,
-           int num_threads_per_device, bool is_mla, int tp_size,
+           int num_threads_per_device, int kv_dim, int tp_size,
            int64_t cpu_tp_rank_stride_in_bytes,
            int64_t cpu_size_table_rank_stride,
            int64_t ssd_size_table_rank_stride) {
@@ -34,7 +34,7 @@ void register_common_compression_bindings(py::module_& m) {
               cpu_block_ids, cpu_layer_stride_in_bytes,
               cpu_kv_stride_in_bytes, chunk_size_in_bytes,
               block_stride_in_bytes, is_read, num_blocks_per_file,
-              round_robin, num_threads_per_device, is_mla, layout_type,
+              round_robin, num_threads_per_device, kv_dim, layout_type,
               total_layers, reinterpret_cast<uint32_t*>(cpu_size_table_ptr),
               cpu_size_table_block_stride, cpu_size_table_layer_stride,
               reinterpret_cast<uint32_t*>(ssd_size_table_ptr),
@@ -56,7 +56,7 @@ void register_common_compression_bindings(py::module_& m) {
         py::arg("ssd_size_table_ptr"),
         py::arg("ssd_size_table_block_stride"),
         py::arg("ssd_size_table_layer_stride"), py::arg("round_robin") = 1,
-        py::arg("num_threads_per_device") = 16, py::arg("is_mla") = false,
+        py::arg("num_threads_per_device") = 16, py::arg("kv_dim") = 2,
         py::arg("tp_size") = 1, py::arg("cpu_tp_rank_stride_in_bytes") = 0,
         py::arg("cpu_size_table_rank_stride") = 0,
         py::arg("ssd_size_table_rank_stride") = 0);

@@ -197,6 +197,7 @@ def test_tensor_from_tensor_pytorch_ipc():
 def test_tensor_from_tensor_direct_ipc():
     """Test method 2: Construction from torch.Tensor (forced direct CUDA IPC)"""
     mp.set_start_method("spawn", force=True)
+    torch.cuda.empty_cache()  # release cached blocks so IPC base ptrs are fresh
 
     device_id = 0
     # Create original tensor
@@ -243,6 +244,7 @@ def test_tensor_from_tensor_direct_ipc():
 def test_tensor_from_bytes():
     """Test method 3: Construction from bytes (IPC handle)"""
     mp.set_start_method("spawn", force=True)
+    torch.cuda.empty_cache()  # release cached blocks so IPC base ptrs are fresh
 
     device_id = 0
     # First create a tensor and export IPC handle

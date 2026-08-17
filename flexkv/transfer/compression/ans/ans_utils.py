@@ -70,10 +70,10 @@ def check_engine_nvcomp_enable(
     ]
 
     # TODO(nvcomp-guard): the packed 4D KV layout is not supported yet. The ANS
-    # kernels take a single is_mla that means both "one KV region" and "the
+    # kernels take a single kv_dim that means both "one KV region" and "the
     # per-rank size table is canonical", and a packed layout wants only the
     # former, so neither value addresses it correctly.
-    if cpu_handle is not None and cpu_handle.kv_layout.packed_kv:
+    if cpu_handle is not None and cpu_handle.kv_layout.kv_dim == 1 and cpu_handle.kv_layout.num_kv_heads > 1:
         flexkv_logger.warning(
             "[nvcomp-fallback] FLEXKV_ENABLE_NVCOMP=1 but the KV cache uses "
             "the packed 4D layout, which the ANS kernels cannot address yet; "
@@ -203,10 +203,10 @@ def allocate_engine_size_tables(
     layout = cpu_handle.kv_layout
     num_layers = layout.num_layer
     # Read the region count off the layout rather than recomputing it from
-    # is_mla, so the table always matches what the kernels stride over.
+    # the legacy flag, so the table always matches what the kernels stride over.
     kv_dim = layout.kv_dim
     tp_size = model_config.effective_tp_size_per_node
-    canonical = (tp_size == 1 or layout.is_mla)
+    canonical = (tp_size == 1 or layout.num_kv_heads == 1)
 
     cpu_table = allocate_size_table(
         num_blocks=cache_config.num_cpu_blocks,
@@ -239,12 +239,12 @@ def allocate_engine_size_tables(
     return None, cpu_table, None, ssd_table
 
 
-def ssd_packed_threads(is_mla: bool) -> Tuple[int, int]:
+def ssd_packed_threads(kv_shared: bool) -> Tuple[int, int]:
     """(write_threads, read_threads) for the nvcomp SSD packed path.
 
     Per-direction env (FLEXKV_NVCOMP_SSD_PACKED_WRITE_THREADS / _READ_THREADS)
-    overrides the is_mla default. MLA reads/writes the replicated canonical
-    chunk, so it benefits from more threads than head-sharded MHA.
+    overrides the default. KV shared across ranks reads/writes the replicated
+    canonical chunk, so it benefits from more threads than head-sharded MHA.
     """
     default_write = 16
     default_read = 8
@@ -271,7 +271,7 @@ def create_ans_context(
     *,
     chunk_size_bytes: int,
     dtype: torch.dtype,
-    is_mla: bool,
+    kv_dim: int,
     log_prefix: str,
 ) -> Any:
     if chunk_size_bytes < RATIO_PLATEAU_BYTES:
@@ -281,7 +281,6 @@ def create_ans_context(
             "compression ratio may be low. Consider increasing "
             "tokens_per_block.")
 
-    kv_dim = 1 if is_mla else 2
     ans_data_type = data_type(dtype)
     batch_size, batch_size_source = get_nvcomp_batch_size(
         chunk_size_bytes, data_type=ans_data_type)

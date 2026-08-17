@@ -109,10 +109,7 @@ class ModelConfig:
     num_layers: int = 1
     num_kv_heads: int = 1
     head_size: int = 1
-    use_mla: bool = False
-    # Packed layouts remove the separate K/V dimension.  Backends may encode
-    # K/V in the content width or in additional physical head slots.
-    packed_kv: bool = False
+    kv_dim: int = 2
     dtype: torch.dtype = torch.bfloat16
 
     # ------------------------------------------------------------------
@@ -362,18 +359,9 @@ class ModelConfig:
     @property
     def num_kv_heads_per_node(self) -> int:
         """Number of KV heads visible to a single node."""
-        if self.use_mla:
+        if self.num_kv_heads == 1:
             return self.num_kv_heads
         return self.num_kv_heads * self.tp_size_per_node // max(1, self.tp_size)
-
-    @property
-    def kv_dim(self) -> int:
-        """Number of KV regions: 1 when K and V share one, else 2.
-
-        MLA's latent KV has no separate V, and a packed layout keeps V inside
-        ``head_size``; both therefore report a single region.
-        """
-        return 1 if self.use_mla or self.packed_kv else 2
 
     @property
     def bytes_per_token_per_layer(self) -> int:
@@ -413,8 +401,7 @@ class ModelConfig:
         )
         return (
             f"ModelConfig(num_layers={self.num_layers}, num_kv_heads={self.num_kv_heads}"
-            f", head_size={self.head_size}, use_mla={self.use_mla}"
-            f", packed_kv={self.packed_kv}"
+            f", head_size={self.head_size}, kv_dim={self.kv_dim}"
             f", dtype={self.dtype}"
             f", tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}"
             f", cp_size={self.cp_size}"
@@ -811,7 +798,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     nvcomp_batch_size=int(os.getenv('FLEXKV_NVCOMP_BATCH_SIZE', '0')),  # 0 = auto
 
-    mla_d2h_mode=os.getenv('FLEXKV_MLA_D2H_MODE', 'sharded'),
+    kv_shared_across_ranks_mode=os.getenv('FLEXKV_KV_SHARED_ACROSS_RANKS_MODE', 'sharded'),
 
     layerwise_notify_mode=os.getenv('FLEXKV_LAYERWISE_NOTIFY_MODE', 'hostfunc'),
 
@@ -989,8 +976,8 @@ def recompute_cache_block_counts(
     block_size_in_bytes = block_size_in_bytes_for_cache(
         model_config, cache_config)
     capacity_divisor = 1
-    if (model_config.use_mla
-            and GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode == "all_write"):
+    if (model_config.num_kv_heads == 1
+            and GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode == "all_write"):
         capacity_divisor = max(
             1, model_config.effective_tp_size_per_node)
 
@@ -1052,14 +1039,14 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     # This mirrors the C++ offset logic in tp_transfer_thread_group.cpp where
     # GPU i writes to cpu_startoff = i * chunk_size, requiring N slots per logical block.
     model_config = rank_info.model_config
-    mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
+    kv_shared_across_ranks_mode = GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode
     capacity_divisor = 1
-    if model_config.use_mla and mla_d2h_mode == "all_write":
+    if model_config.num_kv_heads == 1 and kv_shared_across_ranks_mode == "all_write":
         num_gpus_per_node = model_config.effective_tp_size_per_node
         if num_gpus_per_node > 1:
             capacity_divisor = num_gpus_per_node
             flexkv_logger.info(
-                f"[config] MLA all_write mode: logical cpu/ssd capacity "
+                f"[config] KV shared across ranks all_write mode: logical cpu/ssd capacity "
                 f"÷{num_gpus_per_node} (each block occupies {num_gpus_per_node}× "
                 f"physical space, total memory budget unchanged)"
             )

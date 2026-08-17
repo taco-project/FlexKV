@@ -95,7 +95,7 @@ def build_worker_metrics(
     launched_ns: int,
     worker_id: int,
     bytes_per_block: int,
-    single_kv_region: bool,
+    kv_dim: int,
     is_h2d: bool,
 ) -> Optional[dict]:
     """Worker-side: ipc / wait / xfer + op metadata. None when off.
@@ -123,7 +123,7 @@ def build_worker_metrics(
         "graph_id": getattr(op, "transfer_graph_id", -1),
         "worker_id": worker_id,
         "is_h2d": bool(is_h2d),
-        "single_kv_region": bool(single_kv_region),
+        "kv_dim": int(kv_dim),
         "bytes": int(bytes_per_block) * int(nb),
         "ipc_ms": ipc_ms,
         "wait_ms": wait_ms,
@@ -141,7 +141,7 @@ def record_xfer(op_id: int, metrics: Optional[dict], e2e_ms: float) -> None:
     bw = (bytes_ / (xfer_ms / 1000.0) / 1e6) if (bytes_ > 0 and xfer_ms > 0) else 0.0
 
     flexkv_logger.info(
-        "[XFER] op=%d type=%s nb=%d bytes=%d h2d=%d single_kv_region=%d "
+        "[XFER] op=%d type=%s nb=%d bytes=%d h2d=%d kv_dim=%d "
         "ipc=%.3fms wait=%.3fms xfer=%.3fms e2e=%.3fms bw=%.0fMB/s "
         "worker=%d graph=%d backlog=%d",
         op_id,
@@ -149,7 +149,7 @@ def record_xfer(op_id: int, metrics: Optional[dict], e2e_ms: float) -> None:
         metrics["nb"],
         bytes_,
         int(metrics["is_h2d"]),
-        int(metrics["single_kv_region"]),
+        int(metrics["kv_dim"]),
         metrics["ipc_ms"],
         metrics["wait_ms"],
         xfer_ms,

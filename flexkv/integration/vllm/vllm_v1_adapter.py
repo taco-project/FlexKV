@@ -832,40 +832,49 @@ class FlexKVWorkerConnector:
             else:
                 main_kv_caches[layer_name] = tensor
 
-        # Build main KV cache layout
+        # Build main KV cache layout.
+        #
+        # kv_dim / num_kv_heads are derived from the physical GPU tensor shape
+        # (the ground truth at registration time). The ModelConfig values set
+        # during post_init (from the framework's predicted cache_shape) are used
+        # only as a cross-check.
+        #   3D tensor      -> MLA       : kv_dim=1, num_kv_heads=1
+        #   4D tensor      -> packed MHA: kv_dim=1, num_kv_heads=H (per-rank)
+        #   5D tensor      -> plain MHA : kv_dim=2, num_kv_heads=H (per-rank)
         gpu_blocks = list(main_kv_caches.values())
         num_layer = len(main_kv_caches)
-        if self.flexkv_config.model_config.use_mla:
-            assert gpu_blocks[0].ndim == 3, (
-                f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
+        if gpu_blocks[0].ndim == 3:
             gpu_layout_type = KVCacheLayoutType.LAYERFIRST
             num_blocks = gpu_blocks[0].shape[0]
             block_size = gpu_blocks[0].shape[1]
             num_kv_heads = 1
             head_size = gpu_blocks[0].shape[2]
+            kv_dim = 1
         elif gpu_blocks[0].ndim == 4:
             # Packed vLLM caches have no separate K/V axis. Regular backends
             # use (num_blocks, H, block_size, 2 * D), while FlashInfer NVFP4
             # uses (num_blocks, 2 * H, block_size, Dpacked). Preserve the
             # backend's physical head count and width in both cases.
-            if not self.flexkv_config.model_config.packed_kv:
+            if self.flexkv_config.model_config.kv_dim != 1:
                 raise ValueError(
-                    "received a packed 4D vLLM KV cache but packed_kv is not "
-                    f"set: shape={tuple(gpu_blocks[0].shape)}")
+                    "received a packed 4D vLLM KV cache but model_config.kv_dim "
+                    f"is not 1: kv_dim={self.flexkv_config.model_config.kv_dim}, "
+                    f"shape={tuple(gpu_blocks[0].shape)}")
             _assert_token_major(gpu_blocks[0], token_dim=2, head_dim=1)
-            # packed_kv makes kv_dim 1. LAYERFIRST [L, 1, B, T, H, D]
-            # and LAYERBLOCK [L, B, 1, T, H, D] then have identical layer,
-            # block, and chunk strides; only the unused kv_stride differs.
-            # Use LAYERFIRST as the canonical single-region representation,
-            # matching MLA and the packed tensor's physical NHD order.
+            # LAYERFIRST [L, 1, B, T, H, D] and LAYERBLOCK [L, B, 1, T, H, D]
+            # then have identical layer, block, and chunk strides; only the
+            # unused kv_stride differs. Use LAYERFIRST as the canonical
+            # single-region representation, matching MLA and the packed
+            # tensor's physical NHD order.
             gpu_layout_type = KVCacheLayoutType.LAYERFIRST
             num_blocks = gpu_blocks[0].shape[0]
             num_kv_heads = gpu_blocks[0].shape[1]
             block_size = gpu_blocks[0].shape[2]
             head_size = gpu_blocks[0].shape[3]
+            kv_dim = 1
         else:
             assert gpu_blocks[0].ndim == 5, (
-                f"expect kv cached tensor has 4 or 5 dim "
+                f"expect kv cached tensor has 3, 4 or 5 dim "
                 f"but get shape={gpu_blocks[0].shape}.")
             _assert_token_major(gpu_blocks[0], token_dim=2, head_dim=3)
             # Detect GPU layout from the kv dim position (which holds size 2):
@@ -883,6 +892,7 @@ class FlexKVWorkerConnector:
             block_size = gpu_blocks[0].shape[2]
             num_kv_heads = gpu_blocks[0].shape[3]
             head_size = gpu_blocks[0].shape[4]
+            kv_dim = 2
         gpu_layout = KVCacheLayout(
             type=gpu_layout_type,
             num_layer=num_layer,
@@ -890,8 +900,8 @@ class FlexKVWorkerConnector:
             tokens_per_block=block_size,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=self.flexkv_config.model_config.use_mla,
-            packed_kv=self.flexkv_config.model_config.packed_kv,
+            kv_dim=kv_dim,
+            num_kv_heads=num_kv_heads,
         )
 
         if not indexer_kv_caches:
@@ -912,7 +922,10 @@ class FlexKVWorkerConnector:
                 tokens_per_block=first_indexer_buffer.shape[1],
                 num_head=1,
                 head_size=first_indexer_buffer.shape[2],
-                is_mla=True,
+                # Indexer is a single-region single-head sidecar (kv_dim=1,
+                # num_kv_heads=1), like MLA/SWA.
+                kv_dim=1,
+                num_kv_heads=1,
             )
 
             layer_groups = [

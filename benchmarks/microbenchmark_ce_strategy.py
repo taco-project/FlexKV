@@ -79,40 +79,40 @@ STRAT_LAYOUTS = {
 
 
 def make_layouts_strat(num_layers, num_blocks, head_dim, cpu_layout_type,
-                       is_mla, num_gpus):
+                       kv_dim, num_kv_heads, num_gpus):
     """GPU (LAYERFIRST, per-rank heads) and CPU (cpu_layout_type) layouts.
 
-    MLA: kv_dim=1, head=1 (all ranks identical).
-    MHA: kv_dim=2, head=num_gpus (each rank gets 1 head).
+    MLA (kv_dim=1, num_kv_heads=1): head=1 (all ranks identical).
+    MHA (kv_dim=2, num_kv_heads>1): head=num_gpus (each rank gets 1 head).
     """
-    num_head = 1 if is_mla else num_gpus
+    num_head = 1 if num_kv_heads == 1 else num_gpus
     heads_per_rank = 1
     gpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=1, num_head=heads_per_rank,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     cpu_layout = KVCacheLayout(
         type=cpu_layout_type,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=1, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     return gpu_layout, cpu_layout
 
 
 def cpu_strides_for_strategy(cpu_layout, num_layers, num_blocks, head_dim,
-                             is_mla, mode, num_gpus):
+                             kv_dim, num_kv_heads, mode, num_gpus):
     """Return (cpu_kv_sb, cpu_layer_sb, cpu_block_sb, cpu_tp_sb, total_blocks)."""
     total = num_blocks
-    num_head = 1 if is_mla else num_gpus
+    num_head = 1 if num_kv_heads == 1 else num_gpus
 
     layout_for_kv_stride = KVCacheLayout(
         type=cpu_layout.type,
         num_layer=num_layers, num_block=total,
         tokens_per_block=1, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
 
-    if not is_mla and cpu_layout.type == KVCacheLayoutType.BLOCKFIRST:
+    if num_kv_heads > 1 and cpu_layout.type == KVCacheLayoutType.BLOCKFIRST:
         layout_for_kv_stride = layout_for_kv_stride.div_head(num_gpus)
 
     kv_sb = layout_for_kv_stride.get_kv_stride() * ES
@@ -132,20 +132,20 @@ def make_gpu_tensors_strat(num_layers, kv_dim, num_blocks, heads_per_rank,
 
 
 def make_cpu_tensor_strat(cpu_layout, num_layers, total_blocks, head_dim,
-                          is_mla, num_gpus):
-    num_head = 1 if is_mla else num_gpus
+                          kv_dim, num_kv_heads, num_gpus):
+    num_head = 1 if num_kv_heads == 1 else num_gpus
     layout = KVCacheLayout(
         type=cpu_layout.type,
         num_layer=num_layers, num_block=total_blocks,
         tokens_per_block=1, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     return torch.empty(tuple(layout.kv_shape), dtype=DTYPE, pin_memory=True)
 
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True,
                   ce_segment_threshold=8, ce_force_path=-1,
-                  is_mla=False, is_blockfirst=False,
+                  kv_dim=2, is_blockfirst=False,
                   ce_enable_memcpy2d=False):
     """TPTransferThreadGroup with CE config passed per-construction."""
     gpu_ptrs = []
@@ -165,7 +165,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
         ce_force_path=ce_force_path,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
         is_blockfirst=is_blockfirst,
         ce_enable_memcpy2d=ce_enable_memcpy2d)
 
@@ -202,8 +202,8 @@ def make_block_id_pattern(kind, num_blocks):
 # -- Benchmark core -----------------------------------------------------------
 
 def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
-                  num_layers, is_h2d, num_gpus, iters, is_mla, mode,
-                  transfer_num_cta=16):
+                  num_layers, is_h2d, num_gpus, iters, kv_dim, num_kv_heads,
+                  mode, transfer_num_cta=16):
     """Time ONE direction (H2D or D2H) over `iters`, return median wall-clock ms."""
 
     def do_transfer():
@@ -213,7 +213,8 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
             cpu_block_stride_in_bytes=cpu_bl_sb, cpu_tp_stride_in_bytes=cpu_tp_sb,
             transfer_num_cta=transfer_num_cta, is_host_to_device=is_h2d,
             use_ce_transfer=True, layer_id=0, layer_granularity=num_layers,
-            is_mla=is_mla, mla_d2h_mode=mode)
+            kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+            kv_shared_across_ranks_mode=mode)
 
     for _ in range(WARMUP_ITERS):
         do_transfer()
@@ -276,7 +277,7 @@ STR_ABBR_2D = {
 # - GATHER_SCATTER: LF + MLA (non-sharded OR sharded via strided from_blob)
 #   (BF segfault; MHA segfault)
 # - GATHER_DIRECT: BF only (LF segfault — from_blob with BF stride assumption)
-def correct_paths_for(layout_key, is_mla, pattern, mode, is_h2d, threshold):
+def correct_paths_for(layout_key, kv_dim, pattern, mode, is_h2d, threshold):
     """Return the (path_id, name) list of strategies that are DATA-CORRECT for
     a form. Mirrors the hard constraints each CEPath imposes (see csrc/ce_transfer.h):
 
@@ -286,11 +287,11 @@ def correct_paths_for(layout_key, is_mla, pattern, mode, is_h2d, threshold):
       GATHER_SCATTER(3):  ALWAYS correct — GPU gather + CPU scatter, any layout / sharded
       GATHER_DIRECT(4):   BF (!cpu_phys_contig) & gpu_phys_contig (non-sharded)
 
-    cpu_phys_contig = (layout==lfirst) and is_mla.
+    cpu_phys_contig = (layout==lfirst) and (kv_dim == 1).
     gpu_phys_contig = !(mode==sharded and direction==D2H); sharded only breaks D2H.
     Computed rather than hand-listed so it can never drift from the C++ rules.
     """
-    cpu_phys_contig = (layout_key == "lfirst") and is_mla
+    cpu_phys_contig = (layout_key == "lfirst") and (kv_dim == 1)
     gpu_phys_contig = not (mode == "sharded" and not is_h2d)
     if pattern == "contiguous":
         num_segments = 1
@@ -316,35 +317,37 @@ def correct_paths_for(layout_key, is_mla, pattern, mode, is_h2d, threshold):
 
 # Full matrix ordered by: model → mode → layout → continuity.
 # This groups H2D+D2H for the same (model × mode × layout × continuity) together.
+# Third element is kv_dim: 1=MLA (K/V combined, single shared head),
+#                          2=MHA  (K/V separate, per-rank heads).
 PATH_FORMS = [
-    # --- MLA + rank0_only ---
-    ("contiguous", "lfirst", True,  "rank0_only",     [True, False]),
-    ("contiguous", "bfirst", True,  "rank0_only",     [True, False]),
-    ("few_seg",    "lfirst", True,  "rank0_only",     [True, False]),
-    ("few_seg",    "bfirst", True,  "rank0_only",     [True, False]),
-    ("scattered",  "lfirst", True,  "rank0_only",     [True, False]),
-    ("scattered",  "bfirst", True,  "rank0_only",     [True, False]),
-    # --- MLA + layer_parallel ---
-    ("contiguous", "lfirst", True,  "layer_parallel", [True, False]),
-    ("contiguous", "bfirst", True,  "layer_parallel", [True, False]),
-    ("few_seg",    "lfirst", True,  "layer_parallel", [True, False]),
-    ("few_seg",    "bfirst", True,  "layer_parallel", [True, False]),
-    ("scattered",  "lfirst", True,  "layer_parallel", [True, False]),
-    ("scattered",  "bfirst", True,  "layer_parallel", [True, False]),
-    # --- MLA + sharded (D2H only) ---
-    ("contiguous", "lfirst", True,  "sharded",        [False]),
-    ("contiguous", "bfirst", True,  "sharded",        [False]),
-    ("few_seg",    "lfirst", True,  "sharded",        [False]),
-    ("few_seg",    "bfirst", True,  "sharded",        [False]),
-    ("scattered",  "lfirst", True,  "sharded",        [False]),
-    ("scattered",  "bfirst", True,  "sharded",        [False]),
-    # --- MHA (H2D + D2H, mode is don't-care) ---
-    ("contiguous", "lfirst", False, "rank0_only",     [True, False]),
-    ("contiguous", "bfirst", False, "rank0_only",     [True, False]),
-    ("few_seg",    "lfirst", False, "rank0_only",     [True, False]),
-    ("few_seg",    "bfirst", False, "rank0_only",     [True, False]),
-    ("scattered",  "lfirst", False, "rank0_only",     [True, False]),
-    ("scattered",  "bfirst", False, "rank0_only",     [True, False]),
+    # --- MLA (kv_dim=1) + rank0_only ---
+    ("contiguous", "lfirst", 1,  "rank0_only",     [True, False]),
+    ("contiguous", "bfirst", 1,  "rank0_only",     [True, False]),
+    ("few_seg",    "lfirst", 1,  "rank0_only",     [True, False]),
+    ("few_seg",    "bfirst", 1,  "rank0_only",     [True, False]),
+    ("scattered",  "lfirst", 1,  "rank0_only",     [True, False]),
+    ("scattered",  "bfirst", 1,  "rank0_only",     [True, False]),
+    # --- MLA (kv_dim=1) + layer_parallel ---
+    ("contiguous", "lfirst", 1,  "layer_parallel", [True, False]),
+    ("contiguous", "bfirst", 1,  "layer_parallel", [True, False]),
+    ("few_seg",    "lfirst", 1,  "layer_parallel", [True, False]),
+    ("few_seg",    "bfirst", 1,  "layer_parallel", [True, False]),
+    ("scattered",  "lfirst", 1,  "layer_parallel", [True, False]),
+    ("scattered",  "bfirst", 1,  "layer_parallel", [True, False]),
+    # --- MLA (kv_dim=1) + sharded (D2H only) ---
+    ("contiguous", "lfirst", 1,  "sharded",        [False]),
+    ("contiguous", "bfirst", 1,  "sharded",        [False]),
+    ("few_seg",    "lfirst", 1,  "sharded",        [False]),
+    ("few_seg",    "bfirst", 1,  "sharded",        [False]),
+    ("scattered",  "lfirst", 1,  "sharded",        [False]),
+    ("scattered",  "bfirst", 1,  "sharded",        [False]),
+    # --- MHA (kv_dim=2, H2D + D2H, mode is don't-care) ---
+    ("contiguous", "lfirst", 2, "rank0_only",     [True, False]),
+    ("contiguous", "bfirst", 2, "rank0_only",     [True, False]),
+    ("few_seg",    "lfirst", 2, "rank0_only",     [True, False]),
+    ("few_seg",    "bfirst", 2, "rank0_only",     [True, False]),
+    ("scattered",  "lfirst", 2, "rank0_only",     [True, False]),
+    ("scattered",  "bfirst", 2, "rank0_only",     [True, False]),
 ]
 
 
@@ -391,11 +394,11 @@ def _analyze_ce_transfer(gpu_block_ids, cpu_block_ids, num_blocks,
     }
 
 
-def _choose_ce_path(ce, is_blockfirst, is_mla, segment_threshold,
+def _choose_ce_path(ce, is_blockfirst, kv_dim, segment_threshold,
                     chunk_size_in_bytes, is_host_to_device, is_full_block):
     # BF + !cpu_phys_contig + GPU contig: MLA D2H path refinement.
     if is_blockfirst and not ce["cpu_phys_contig"] and ce["gpu_phys_contig"]:
-        if not is_host_to_device and is_mla:
+        if not is_host_to_device and kv_dim == 1:
             if ce["num_segments"] > segment_threshold:
                 return (2 if (chunk_size_in_bytes > 0 and
                               chunk_size_in_bytes % _SIZEOF_INT64 != 0)
@@ -420,7 +423,7 @@ def _choose_ce_path(ce, is_blockfirst, is_mla, segment_threshold,
 
 def predict_ce_path(gpu_block_id_tensor, cpu_block_id_tensor,
                     cpu_block_stride_in_bytes, chunk_size_in_bytes,
-                    num_layers, is_host_to_device, is_mla, is_blockfirst,
+                    num_layers, is_host_to_device, kv_dim, is_blockfirst,
                     ce_segment_threshold=8, gpu_block_stride_in_bytes=0):
     """Mirror of C++ predict_ce_path_binding — returns the CEPath int."""
     gpu_ids = gpu_block_id_tensor.tolist()
@@ -429,10 +432,9 @@ def predict_ce_path(gpu_block_id_tensor, cpu_block_id_tensor,
     ce = _analyze_ce_transfer(gpu_ids, cpu_ids, num_blocks,
                               cpu_block_stride_in_bytes, chunk_size_in_bytes,
                               gpu_block_stride_in_bytes)
-    kv_dim = 1 if is_mla else 2
     is_full_block = (num_layers * kv_dim * chunk_size_in_bytes ==
                      cpu_block_stride_in_bytes)
-    return _choose_ce_path(ce, is_blockfirst, is_mla, ce_segment_threshold,
+    return _choose_ce_path(ce, is_blockfirst, kv_dim, ce_segment_threshold,
                            chunk_size_in_bytes, is_host_to_device, is_full_block)
 
 
@@ -475,10 +477,10 @@ def run_strategy_compare(args):
         results = all_results[size_name]
         heads_per_rank = 1
 
-        for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
-            mla_tag = "mla" if is_mla else "mha"
+        for pattern, layout_key, kv_dim, mode, dirs in PATH_FORMS:
+            mla_tag = "mla" if kv_dim == 1 else "mha"
             # MHA mode is don't-care — don't show it in the form name.
-            if is_mla:
+            if kv_dim == 1:
                 form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
             else:
                 form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
@@ -486,31 +488,31 @@ def run_strategy_compare(args):
                 print("  SKIP {} (num_blocks={} <= threshold={})".format(
                     form_name, num_blocks, threshold))
                 continue
-            kv_dim = 1 if is_mla else 2
+            num_kv_heads = 1 if kv_dim == 1 else num_gpus
             cpu_layout_type = STRAT_LAYOUTS[layout_key]
 
             gpu_layout, cpu_layout = make_layouts_strat(
-                num_layers, num_blocks, head_dim, cpu_layout_type, is_mla, num_gpus)
+                num_layers, num_blocks, head_dim, cpu_layout_type, kv_dim, num_kv_heads, num_gpus)
             cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb, total_blocks = \
                 cpu_strides_for_strategy(cpu_layout, num_layers, num_blocks,
-                                         head_dim, is_mla, mode, num_gpus)
+                                         head_dim, kv_dim, num_kv_heads, mode, num_gpus)
 
             all_gpu = [make_gpu_tensors_strat(num_layers, kv_dim, num_blocks,
                                               heads_per_rank, head_dim, g)
                        for g in range(num_gpus)]
             cpu_kv = make_cpu_tensor_strat(cpu_layout, num_layers, total_blocks,
-                                           head_dim, is_mla, num_gpus)
+                                           head_dim, kv_dim, num_kv_heads, num_gpus)
             ids = make_block_id_pattern(pattern, num_blocks)
 
             for is_h2d in dirs:
                 dir_name = "H2D" if is_h2d else "D2H"
                 # For H2D, MLA mode is mode-independent — label it just "mla".
-                if is_h2d and is_mla:
+                if is_h2d and kv_dim == 1:
                     row_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
                 else:
                     row_name = form_name
                 key = (row_name, dir_name)
-                if is_mla:
+                if kv_dim == 1:
                     if is_h2d:
                         form_display = "{} | {} | mla".format(pattern, layout_key)
                     else:
@@ -519,7 +521,7 @@ def run_strategy_compare(args):
                     form_display = "{} | {} | mha".format(pattern, layout_key)
 
                 # MLA H2D is mode-independent — skip duplicate modes.
-                if is_h2d and is_mla:
+                if is_h2d and kv_dim == 1:
                     if h2d_mla_cache.get((pattern, layout_key)) is not None:
                         continue
 
@@ -533,7 +535,7 @@ def run_strategy_compare(args):
                     cpu_block_stride_in_bytes=cpu_bl_sb,
                     chunk_size_in_bytes=chunk_size,
                     num_layers=num_layers, is_host_to_device=is_h2d,
-                    is_mla=is_mla,
+                    kv_dim=kv_dim,
                     is_blockfirst=(layout_key == "bfirst"),
                     ce_segment_threshold=threshold,
                     gpu_block_stride_in_bytes=gpu_bl_sb)
@@ -543,7 +545,7 @@ def run_strategy_compare(args):
                     form_display, dir_name, auto_path))
 
                 # Viable force-run paths for this form/dir (also used by warmup).
-                viable = correct_paths_for(layout_key, is_mla, pattern, mode,
+                viable = correct_paths_for(layout_key, kv_dim, pattern, mode,
                                             is_h2d, threshold)
 
                 # Warmup each path to absorb first-run overhead.
@@ -565,13 +567,13 @@ def run_strategy_compare(args):
                                 num_layers, ce_path_opt=True,
                                 ce_segment_threshold=threshold,
                                 ce_force_path=wp_id,
-                                is_mla=is_mla,
+                                kv_dim=kv_dim,
                                 is_blockfirst=(layout_key == "bfirst"),
                                 ce_enable_memcpy2d=wp_m)
                             bench_one_dir(
                                 wp_tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                                 num_layers, is_h2d, num_gpus,
-                                max(1, args.iters // 5), is_mla, mode,
+                                max(1, args.iters // 5), kv_dim, num_kv_heads, mode,
                                 transfer_num_cta=cta)
                             del wp_tp
                         except Exception as e:
@@ -591,11 +593,11 @@ def run_strategy_compare(args):
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                             num_layers, ce_path_opt=False,
                             ce_segment_threshold=threshold,
-                            is_mla=is_mla,
+                            kv_dim=kv_dim,
                             is_blockfirst=(layout_key == "bfirst"))
                         med = bench_one_dir(
                             tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
-                            num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
+                            num_layers, is_h2d, num_gpus, args.iters, kv_dim, num_kv_heads, mode,
                             transfer_num_cta=cta)
                         results[key]["baseline"] = med
                         baseline_cache[bk] = med
@@ -619,12 +621,12 @@ def run_strategy_compare(args):
                                 num_layers, ce_path_opt=True,
                                 ce_segment_threshold=threshold,
                                 ce_force_path=fp_id,
-                                is_mla=is_mla,
+                                kv_dim=kv_dim,
                                 is_blockfirst=(layout_key == "bfirst"),
                                 ce_enable_memcpy2d=m2d)
                             med = bench_one_dir(
                                 tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
-                                num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
+                                num_layers, is_h2d, num_gpus, args.iters, kv_dim, num_kv_heads, mode,
                                 transfer_num_cta=cta)
                             results[key][label] = med
                             print("{:.3f} ms".format(med))
@@ -641,12 +643,12 @@ def run_strategy_compare(args):
                         num_layers, ce_path_opt=True,
                         ce_segment_threshold=threshold,
                         ce_force_path=-1,
-                        is_mla=is_mla,
+                        kv_dim=kv_dim,
                         is_blockfirst=(layout_key == "bfirst"),
                         ce_enable_memcpy2d=(args.memcpy2d == "on"))
                     med = bench_one_dir(
                         tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
-                        num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
+                        num_layers, is_h2d, num_gpus, args.iters, kv_dim, num_kv_heads, mode,
                         transfer_num_cta=cta)
                     results[key]["auto"] = med
                     print("{:.3f} ms".format(med))
@@ -655,7 +657,7 @@ def run_strategy_compare(args):
                     print("FAILED: {}".format(e))
 
                 # Cache H2D results for MLA reuse (mode-independent, see above).
-                if is_h2d and is_mla:
+                if is_h2d and kv_dim == 1:
                     h2d_mla_cache[(pattern, layout_key)] = dict(results[key])
 
             del all_gpu, cpu_kv
@@ -671,25 +673,25 @@ def run_strategy_compare(args):
 
         # Build the list of (form_name, dir_name) rows actually run.
         run_rows = []
-        for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
+        for pattern, layout_key, kv_dim, mode, dirs in PATH_FORMS:
             if pattern == "scattered" and num_blocks <= threshold:
                 continue
-            mla_tag = "mla" if is_mla else "mha"
-            if is_mla:
+            mla_tag = "mla" if kv_dim == 1 else "mha"
+            if kv_dim == 1:
                 form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
             else:
                 form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
             for is_h2d in dirs:
                 # MLA H2D is mode-independent — show only rank0_only.
-                if is_h2d and is_mla and mode != "rank0_only":
+                if is_h2d and kv_dim == 1 and mode != "rank0_only":
                     continue
-                if is_h2d and is_mla:
+                if is_h2d and kv_dim == 1:
                     form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
-                elif is_mla:
+                elif kv_dim == 1:
                     form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
                 else:
                     form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
-                viable = correct_paths_for(layout_key, is_mla, pattern, mode,
+                viable = correct_paths_for(layout_key, kv_dim, pattern, mode,
                                             is_h2d, threshold)
                 run_rows.append((form_name, "H2D" if is_h2d else "D2H", viable))
 
@@ -907,15 +909,15 @@ def print_recommendation_summary(all_results, args, threshold):
         # best_on  = min of all timings including [2d] variants (scattered guard:
         #            [2d] variants excluded for scattered since guard falls through).
         best_per_formdir = {}  # (form_name, dir_name) → (best_off, best_on)
-        for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
+        for pattern, layout_key, kv_dim, mode, dirs in PATH_FORMS:
             if pattern == "scattered" and num_blocks <= threshold:
                 continue
-            mla_tag = "mla" if is_mla else "mha"
-            if is_mla:
+            mla_tag = "mla" if kv_dim == 1 else "mha"
+            if kv_dim == 1:
                 form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
             else:
                 form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
-            viable = correct_paths_for(layout_key, is_mla, pattern, mode,
+            viable = correct_paths_for(layout_key, kv_dim, pattern, mode,
                                         True, threshold)  # H2D viable (superset)
             viable_names = {pn for _, pn in viable}
             for is_h2d in dirs:
@@ -923,11 +925,11 @@ def print_recommendation_summary(all_results, args, threshold):
                 # MLA H2D is mode-independent: label it just "mla", and reuse
                 # rank0_only's H2D best so every mode still contributes its
                 # full 6 data points (3 patterns × 2 dirs) to the average.
-                if is_h2d and is_mla:
+                if is_h2d and kv_dim == 1:
                     h2d_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
                 else:
                     h2d_name = form_name
-                if is_h2d and is_mla and mode != "rank0_only":
+                if is_h2d and kv_dim == 1 and mode != "rank0_only":
                     best_per_formdir[(h2d_name, dir_name)] = best_per_formdir.get(
                         (h2d_name, dir_name), (None, None))
                     continue
@@ -964,31 +966,31 @@ def print_recommendation_summary(all_results, args, threshold):
                 size_name, num_layers, num_blocks, head_dim, memcpy_label))
             print("=" * 100)
 
-            # Group by (is_mla, mode, layout). Sharded H2D == rank0_only H2D.
+            # Group by (kv_dim, mode, layout). Sharded H2D == rank0_only H2D.
             groups = {}
-            for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
+            for pattern, layout_key, kv_dim, mode, dirs in PATH_FORMS:
                 if pattern == "scattered" and num_blocks <= threshold:
                     continue
-                mla_tag = "mla" if is_mla else "mha"
-                if is_mla:
+                mla_tag = "mla" if kv_dim == 1 else "mha"
+                if kv_dim == 1:
                     form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
                 else:
                     form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
                 for is_h2d in dirs:
                     dir_name = "H2D" if is_h2d else "D2H"
                     # MLA H2D stored under "mla" (no mode suffix).
-                    if is_h2d and is_mla:
+                    if is_h2d and kv_dim == 1:
                         lookup = "{}/{}/{}".format(pattern, layout_key, mla_tag)
                     else:
                         lookup = form_name
                     vals = best_per_formdir.get((lookup, dir_name))
-                    if vals is None and is_mla and mode == "sharded" and is_h2d:
+                    if vals is None and kv_dim == 1 and mode == "sharded" and is_h2d:
                         # Sharded H2D: same as rank0_only H2D (mode-independent)
                         vals = best_per_formdir.get((lookup, dir_name))
                     if vals is not None:
                         v = vals[1] if use_on else vals[0]
                         if v is not None:
-                            key = (is_mla, mode, layout_key)
+                            key = (kv_dim, mode, layout_key)
                             groups.setdefault(key, []).append(v)
 
             avgs = {}
@@ -1003,14 +1005,14 @@ def print_recommendation_summary(all_results, args, threshold):
             mla_best_val = float('inf')
             for mode in mla_modes:
                 for layout_key in ["lfirst", "bfirst"]:
-                    v = avgs.get((True, mode, layout_key))
+                    v = avgs.get((1, mode, layout_key))
                     if v is not None and v < mla_best_val:
                         mla_best_val = v
                         mla_best = (mode, layout_key)
             for mode in mla_modes:
                 row = "  {:>16s}".format(mode)
                 for layout_key in ["lfirst", "bfirst"]:
-                    v = avgs.get((True, mode, layout_key))
+                    v = avgs.get((1, mode, layout_key))
                     if v is not None:
                         star = " *" if (mode, layout_key) == mla_best else "  "
                         row += "  {:>9.3f}{}".format(v, star)
@@ -1025,12 +1027,12 @@ def print_recommendation_summary(all_results, args, threshold):
             mha_best = None
             mha_best_val = float('inf')
             for layout_key in ["lfirst", "bfirst"]:
-                v = avgs.get((False, "rank0_only", layout_key))
+                v = avgs.get((2, "rank0_only", layout_key))
                 if v is not None and v < mha_best_val:
                     mha_best_val = v
                     mha_best = layout_key
             for layout_key in ["lfirst", "bfirst"]:
-                v = avgs.get((False, "rank0_only", layout_key))
+                v = avgs.get((2, "rank0_only", layout_key))
                 if v is not None:
                     star = " *" if layout_key == mha_best else ""
                     print("    {:>8s}  avg={:.3f} ms{}".format(layout_key, v, star))

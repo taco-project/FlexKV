@@ -152,10 +152,10 @@ public:
       const int64_t cpu_chunk_size_in_bytes,
       const int64_t h2d_cpu_kv_stride_in_bytes,
       const int64_t h2d_cpu_layer_stride_in_bytes,
-      const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
+      const int64_t cpu_tp_stride_in_bytes,       const int transfer_cta_num,
       const bool use_ce_transfer, const int num_layers,
-      const int layer_granularity, const bool is_mla,
-      const bool packed_kv = false, const int counter_id = 0,
+      const int layer_granularity, const int kv_dim,
+      const int num_kv_heads, const int counter_id = 0,
       // ---- SWA per-call ids + strides (fused into same layer loop) ----
       const torch::Tensor &swa_h2d_src = torch::Tensor(),
       const torch::Tensor &swa_h2d_dst = torch::Tensor(),
@@ -171,8 +171,8 @@ public:
       const int64_t swa_ssd_layer_stride_in_bytes = 0,
       const int64_t swa_ssd_kv_stride_in_bytes = 0,
       const int swa_num_blocks_per_file = 0,
-      // ---- MLA D2H mode (#192) + polling notification (#199) ----
-      const std::string &mla_d2h_mode = "sharded",
+      // ---- kv_shared_across_ranks_mode mode (#192) + polling notification (#199) ----
+      const std::string &kv_shared_across_ranks_mode = "sharded",
       const std::string &notify_mode = "hostfunc",
       const bool enable_trace = false);
 
@@ -185,9 +185,9 @@ public:
       const torch::Tensor &cpu_block_ids_d2h, const int num_blocks_per_file,
       const int round_robin, const int num_threads_per_device,
       const torch::Tensor &gpu_block_id_tensor,
-      const torch::Tensor &cpu_block_id_tensor, const int transfer_cta_num,
-      const bool use_ce_transfer, const bool is_mla,
-      const bool packed_kv = false, const int counter_id = 0,
+      const torch::Tensor &cpu_block_id_tensor,       const int transfer_cta_num,
+      const bool use_ce_transfer, const int kv_dim,
+      const int num_kv_heads, const int counter_id = 0,
       // ---- SWA per-call ids + strides (fused into same per-orig loop) ----
       const torch::Tensor &swa_h2d_src = torch::Tensor(),
       const torch::Tensor &swa_h2d_dst = torch::Tensor(),
@@ -203,7 +203,7 @@ public:
       const int64_t swa_ssd_layer_stride_in_bytes = 0,
       const int64_t swa_ssd_kv_stride_in_bytes = 0,
       const int swa_num_blocks_per_file = 0,
-      const std::string &mla_d2h_mode = "sharded",
+      const std::string &kv_shared_across_ranks_mode = "sharded",
       const std::string &notify_mode = "hostfunc",
       const bool enable_trace = false);
 
@@ -332,7 +332,8 @@ private:
   void launch_swa_mg_h2d_layer_(
       int orig_layer, int num_blocks, int64_t *swa_gpu_block_ids,
       int64_t *swa_cpu_block_ids, int transfer_cta_num, bool use_ce_transfer,
-      bool is_mla, const std::string &mla_d2h_mode);
+      int kv_dim, int num_kv_heads,
+      const std::string &kv_shared_across_ranks_mode);
 
   int swa_slots_for_orig_(int orig_layer, bool swa_active) const;
 

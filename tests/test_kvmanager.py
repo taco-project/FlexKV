@@ -159,14 +159,15 @@ def shutdown_tp_client(tp_client_processes):
         {"tp_size": 1, "dp_size": 1},
         {"tp_size": 2, "dp_size": 2},
         {"dtype": torch.float32},
-        {"num_kv_heads": 1, "use_mla": True},
-        {"num_kv_heads": 1, "tp_size": 4, "dp_size": 1, "use_mla": True},
+        {"num_kv_heads": 1, "kv_dim": 1},
+        {"num_kv_heads": 1, "tp_size": 4, "dp_size": 1, "kv_dim": 1},
         {"tp_size": 4, "dp_size": 1},
         pytest.param(
             {
                 "num_kv_heads": 4,
                 "head_size": 36,
                 "dtype": torch.uint8,
+                "kv_dim": 2,
             },
             id="nvfp4",
         ),
@@ -210,16 +211,10 @@ def shutdown_tp_client(tp_client_processes):
 ], indirect=True)
 @pytest.mark.parametrize("gpu_layout_type", [
     GPU_LAYOUT_LAYERFIRST,
-    GPU_LAYOUT_BLOCKFIRST,
-    GPU_LAYOUT_SGLANG,
-    GPU_LAYOUT_VLLM_LAYERBLOCK,
     GPU_LAYOUT_VLLM_PACKED,
     GPU_LAYOUT_VLLM_MLA,
 ], ids=[
     "layerfirst",
-    "blockfirst",
-    "sglang",
-    "vllm-layerblock",
     "vllm-packed-4d",
     "vllm-mla-3d",
 ])
@@ -230,13 +225,13 @@ def test_kvmanager(
     gpu_layout_type,
     request,
 ):
-    if model_config.use_mla and gpu_layout_type != GPU_LAYOUT_VLLM_MLA:
+    if model_config.kv_dim == 1 and gpu_layout_type != GPU_LAYOUT_VLLM_MLA:
         pytest.skip("vLLM MLA uses its dedicated 3D KV cache layout")
-    if not model_config.use_mla and gpu_layout_type == GPU_LAYOUT_VLLM_MLA:
+    if model_config.kv_dim != 1 and gpu_layout_type == GPU_LAYOUT_VLLM_MLA:
         pytest.skip("the vLLM MLA layout only applies to MLA models")
 
-    model_config.packed_kv = gpu_layout_type == GPU_LAYOUT_VLLM_PACKED
-    if model_config.packed_kv:
+    if gpu_layout_type == GPU_LAYOUT_VLLM_PACKED:
+        model_config.kv_dim = 1
         if model_config.dtype == torch.uint8: # nvfp4
             model_config.num_kv_heads *= 2
         else:
@@ -570,7 +565,7 @@ def test_kvmanager(
     # so it runs even if the assertion or an earlier step fails.
 
     # Only verify data in direct mode
-    # verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers, use_mla)
+    # verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers)
     if total_cache_miss == 0:
         return
     elif total_cache_miss > 0:
@@ -777,7 +772,8 @@ def run_tp_client_with_indexer(dp_client_id,
             tokens_per_block=indexer_tokens_per_block,
             num_head=indexer_group.num_kv_heads,
             head_size=indexer_group.head_size,
-            is_mla=True,
+            kv_dim=1,
+            num_kv_heads=1,
         )
 
         # Unified registration: main + indexer go through one register_to_server
@@ -966,7 +962,8 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
             tokens_per_block=indexer_gpu_tpb,
             num_head=indexer_cfg.num_kv_heads,
             head_size=indexer_cfg.head_size,
-            is_mla=True,
+            kv_dim=1,
+            num_kv_heads=1,
         )
         indexer_kv_verifier = GPUIndexerCacheVerifier(
             shared_indexer_blocks=all_indexer_blocks,
@@ -1138,9 +1135,11 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
 @pytest.mark.parametrize(
     "model_config",
     [
-        # DSv4 form: main attention is MLA (kv_dim=1), indexer is also MLA-style
-        # (single tensor per layer with num_kv_heads=1, head_size=64, uint8).
-        {"tp_size": 1, "dp_size": 1, "use_mla": True},
+        # DSv4 form: KV cache storage is MLA-style (kv_dim=1, combined
+        # kv_buffer, num_kv_heads=1); attention computation is MHA, not MLA.
+        # Indexer is also MLA-style storage (single tensor per layer,
+        # num_kv_heads=1, head_size=64, uint8).
+        {"tp_size": 1, "dp_size": 1, "kv_dim": 1},
     ],    indirect=True,
 )
 @pytest.mark.parametrize("cache_config", [
@@ -1277,7 +1276,7 @@ def _mock_sglang_eventfd_client(socket_path: str,
     "model_config",
     [
         # DSv4 form (see test_kvmanager_with_indexer).
-        {"tp_size": 1, "dp_size": 1, "use_mla": True},
+        {"tp_size": 1, "dp_size": 1, "kv_dim": 1},
     ],    indirect=True,
 )
 @pytest.mark.parametrize("cache_config", [

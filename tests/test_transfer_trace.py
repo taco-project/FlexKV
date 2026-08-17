@@ -66,7 +66,7 @@ def test_build_worker_metrics_timing(monkeypatch):
         launched_ns=8_000_000,    # +5 ms xfer
         worker_id=2,
         bytes_per_block=4096,
-        single_kv_region=True,
+        kv_dim=1,
         is_h2d=True,
     )
     assert m["ipc_ms"] == pytest.approx(1.0)
@@ -76,13 +76,16 @@ def test_build_worker_metrics_timing(monkeypatch):
     assert m["nb"] == 10
     assert m["bytes"] == 4096 * 10
     assert m["is_h2d"] is True
-    assert m["single_kv_region"] is True
+    assert m["kv_dim"] == 1
     assert m["graph_id"] == 7
     assert m["worker_id"] == 2
 
 
 def test_record_xfer_and_summary(monkeypatch):
     trace = _reload_with_env(monkeypatch, "1")
+    # Ensure the FlexKV logger is enabled (other test modules may have called
+    # set_level("OFF") on the shared singleton).
+    trace.flexkv_logger.set_level("INFO")
     # Force the summary window stale so the flush triggers within this test.
     with trace._sum_lock:
         trace._win_start = trace._win_start - trace._SUMMARY_INTERVAL_S - 1
@@ -104,7 +107,7 @@ def test_record_xfer_and_summary(monkeypatch):
             submitted_ns=0, received_ns=500_000, launch_ns=1_500_000,
             launched_ns=6_500_000,
             worker_id=0, bytes_per_block=1024,
-            single_kv_region=False, is_h2d=False)
+            kv_dim=2, is_h2d=False)
         trace.record_xfer(100, metrics, e2e_ms=7.0)
     finally:
         target.removeHandler(cap)
@@ -114,7 +117,7 @@ def test_record_xfer_and_summary(monkeypatch):
     assert "[XFER] op=100" in lines
     assert "type=D2H" in lines
     assert "bytes=4096" in lines
-    assert "single_kv_region=0" in lines
+    assert "kv_dim=2" in lines
     assert "backlog=1" in lines   # inflight not yet decremented at print time
     # Summary should have flushed (window forced stale).
     assert "[XFER-SUMMARY]" in lines

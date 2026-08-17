@@ -73,7 +73,7 @@ CEPath choose_path(const CEAnalysis &ce_analysis, const CETransferConfig &ce_con
                    bool is_host_to_device, bool is_full_block) {
   // BF + !cpu_phys_contig + GPU contig
   if (ce_config.is_blockfirst && !ce_analysis.cpu_phys_contig && ce_analysis.gpu_phys_contig) {
-    if (!is_host_to_device && ce_config.is_mla) {
+    if (!is_host_to_device && ce_config.num_kv_heads == 1) {
       if (ce_analysis.num_segments > ce_config.segment_threshold)
         return (chunk_size_in_bytes > 0 && chunk_size_in_bytes % sizeof(int64_t) != 0)
                    ? CEPath::SEGMENT_SCATTER

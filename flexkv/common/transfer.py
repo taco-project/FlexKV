@@ -777,11 +777,14 @@ def merge_to_batch_graph(batch_id: int,
                           ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
 
     if layerwise_transfer:
-        assert has_get, "layerwise batch must contain GET ops"
-        assert not has_put, "layerwise batch must not mix PUT ops"
+        if not has_get:
+            raise ValueError("layerwise batch must contain GET ops")
+        if has_put:
+            raise ValueError("layerwise batch must not mix PUT ops")
     else:
-        assert not (has_get and has_put), \
-            "batch merge does not support mixed GET/PUT ops in the same batch"
+        if has_get and has_put:
+            raise ValueError(
+                "batch merge cannot mix GET and PUT ops in the same batch")
 
     dp_client_id = _pick_dp_client_id(
         ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)

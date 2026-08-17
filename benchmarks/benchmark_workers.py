@@ -83,7 +83,7 @@ def create_cpu_gpu_worker(
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
     if gpu_layout_type == 0 or gpu_layout_type == 2:
         layout_type = KVCacheLayoutType.LAYERFIRST
@@ -108,9 +108,9 @@ def create_cpu_gpu_worker(
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
-    gpu_layout = gpu_layout.div_head(model_config.tp_size) if not model_config.use_mla else gpu_layout
+    gpu_layout = gpu_layout.div_head(model_config.tp_size) if model_config.num_kv_heads > 1 else gpu_layout
     cpu_handle = CPUAllocator.allocate(
         layout=cpu_layout,
         dtype=model_config.dtype,
@@ -180,7 +180,7 @@ def create_cpu_ssd_worker(
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla
+        kv_dim=model_config.kv_dim
     )
     ssd_layout = KVCacheLayout(
         type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
@@ -189,7 +189,7 @@ def create_cpu_ssd_worker(
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla
+        kv_dim=model_config.kv_dim
     )
     cpu_handle = CPUAllocator.allocate(
         layout=cpu_layout,
@@ -256,7 +256,7 @@ def create_gpu_ssd_worker(
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
     ssd_layout = KVCacheLayout(
         type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
@@ -265,9 +265,9 @@ def create_gpu_ssd_worker(
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
-    gpu_layout = gpu_layout.div_head(model_config.tp_size) if not model_config.use_mla else gpu_layout
+    gpu_layout = gpu_layout.div_head(model_config.tp_size) if model_config.num_kv_heads > 1 else gpu_layout
 
     gpu_handles = []
     for tp_id in range(model_config.tp_size):
@@ -342,7 +342,7 @@ def create_layerwise_worker(
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
     if gpu_layout_type == 0 or gpu_layout_type == 2:
         layout_type = KVCacheLayoutType.LAYERFIRST
@@ -367,9 +367,9 @@ def create_layerwise_worker(
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
-    gpu_layout = gpu_layout.div_head(model_config.tp_size) if not model_config.use_mla else gpu_layout
+    gpu_layout = gpu_layout.div_head(model_config.tp_size) if model_config.num_kv_heads > 1 else gpu_layout
     cpu_handle = CPUAllocator.allocate(
         layout=cpu_layout,
         dtype=model_config.dtype,

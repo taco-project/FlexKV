@@ -193,7 +193,7 @@ class TestFinalizeOpMethod(unittest.TestCase):
         engine.pin_buffer = MagicMock()
         engine.cache_config = MagicMock()
         engine.cache_config.tokens_per_block = 16
-        engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1)
+        engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1, kv_dim=1)
         engine.rank_info = RankInfo(model_config=engine.model_config)
         # ``TransferEngine.__init__`` caches the per-pp-stage layer
         # count from the first GPU handle; we bypass __init__ via
@@ -282,7 +282,7 @@ class TestLayerwiseWorkerDispatch(unittest.TestCase):
         engine.pin_buffer = MagicMock()
         engine.cache_config = MagicMock()
         engine.cache_config.tokens_per_block = 16
-        engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1)
+        engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1, kv_dim=1)
         engine.rank_info = RankInfo(model_config=engine.model_config)
 
         layerwise_worker = MagicMock()
@@ -380,7 +380,7 @@ class TestWorkerKeyRouting(unittest.TestCase):
         engine.pin_buffer = MagicMock()
         engine.cache_config = MagicMock()
         engine.cache_config.tokens_per_block = 16
-        engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1)
+        engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1, kv_dim=1)
         engine.rank_info = RankInfo(model_config=engine.model_config)
         engine._child_id_to_child = {}
         engine._child_to_parent_op_id = {}
@@ -547,7 +547,7 @@ class TestPendingCountBookkeepingMatrix(unittest.TestCase):
         engine.pin_buffer = MagicMock()
         engine.cache_config = MagicMock()
         engine.cache_config.tokens_per_block = 16
-        engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1)
+        engine.model_config = ModelConfig(num_layers=2, num_kv_heads=1, head_size=1, kv_dim=1)
         # Synthesize N overlapping groups, as used by main KV + indexer.
         engine.model_config.layer_groups = [
             LayerGroupSpec(

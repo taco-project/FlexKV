@@ -257,7 +257,7 @@ class TransferWorkerBase(ABC):
         tensor: torch.Tensor,
         tokens_per_block: int,
         dtype_size: int,
-        is_mla: bool,
+        kv_dim: int,
     ) -> tuple:
         """Compute (kv_stride, block_stride, layer_stride) in bytes from a GPU
         KV cache tensor's actual memory layout.
@@ -268,7 +268,7 @@ class TransferWorkerBase(ABC):
 
         Returns (gpu_kv_stride_bytes, gpu_block_stride_bytes, gpu_layer_stride_bytes).
         """
-        if is_mla or tensor.ndim != 5:
+        if kv_dim == 1 or tensor.ndim != 5:
             return None  # caller should fall back to layout-based strides
 
         # Last 2 dims are always (num_kv_heads, head_size).
@@ -583,7 +583,7 @@ class TransferWorkerBase(ABC):
                         launched_ns,
                         self.worker_id,
                         getattr(self, "_bytes_per_block", 0),
-                        getattr(self, "single_kv_region", False),
+                        getattr(self, "kv_dim", 2),
                         is_h2d,
                     )
                     if transfer_status:
@@ -728,9 +728,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.cpu_tensor = cpu_blocks
 
         self.dtype = dtype
-        self.is_mla = gpu_kv_layout.is_mla
-        self.single_kv_region = gpu_kv_layout.single_kv_region
         self.kv_dim = gpu_kv_layout.kv_dim
+        self.num_kv_heads = gpu_kv_layout.num_kv_heads
         self.cpu_is_blockfirst = (
             cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
         )
@@ -757,7 +756,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             # backend layouts (flash_attn: [2,N,B,H,D], triton: [N,2,B,H,D]).
             gpu_strides = self._get_gpu_strides_from_tensor(
                 self.gpu_blocks[0], gpu_kv_layout.tokens_per_block,
-                self.dtype.itemsize, self.is_mla,
+                self.dtype.itemsize, self.kv_dim,
             ) if len(self.gpu_blocks) > 1 else None
             if gpu_strides is not None:
                 self.gpu_kv_stride_in_bytes = gpu_strides[0]
@@ -856,7 +855,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             # attention backend layouts (flash_attn vs triton/flashinfer).
             gpu_chunk_size = chunk_elements * dtype_size_g
             t0 = group_gpu_blocks[0]
-            gpu_strides = self._get_gpu_strides_from_tensor(t0, tpb_g, dtype_size_g, self.is_mla)
+            gpu_strides = self._get_gpu_strides_from_tensor(t0, tpb_g, dtype_size_g, self.kv_dim)
             if gpu_strides is not None:
                 gpu_kv_stride, gpu_block_stride, gpu_layer_stride = gpu_strides
             else:
@@ -890,7 +889,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 'cpu_kv_stride': cpu_kv_stride,
                 'cpu_offset_bytes': cpu_offset_bytes,
                 'num_layers': g.num_layers,
-                'is_mla': gpu_layout.is_mla,
+                'kv_dim': gpu_layout.kv_dim,
             })
 
             # Advance CPU byte offset for next group.
@@ -997,7 +996,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     transfer_num_cta,
                     transfer_type == TransferType.H2D,
                     use_ce_transfer,
-                    self.single_kv_region,
+                    self.kv_dim,
+                    self.num_kv_heads,
                     self.gpu_block_type_,
                     True,  # sync
                     self.ce_path_opt,
@@ -1006,7 +1006,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     self.ce_enable_memcpy2d,
                     self.cpu_is_blockfirst,
                     enable_transfer_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
-                    ce_is_mla=gp['is_mla'],
                 )
         else:
             # Uniform transfer: single call (whole-model)
@@ -1027,7 +1026,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 transfer_num_cta,
                 transfer_type == TransferType.H2D,
                 use_ce_transfer,
-                self.single_kv_region,
+                self.kv_dim,
+                self.num_kv_heads,
                 self.gpu_block_type_,
                 True,  # sync
                 self.ce_path_opt,
@@ -1036,7 +1036,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 self.ce_enable_memcpy2d,
                 self.cpu_is_blockfirst,
                 enable_transfer_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
-                ce_is_mla=self.is_mla,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -1112,10 +1111,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self._gpu_block_counts = [len(handles) for handles in gpu_blocks]
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
-        self.is_mla = gpu_kv_layouts[0].is_mla
-        self.single_kv_region = gpu_kv_layouts[0].single_kv_region
-        self.packed_kv = gpu_kv_layouts[0].packed_kv
         self.kv_dim = gpu_kv_layouts[0].kv_dim
+        self.num_kv_heads = gpu_kv_layouts[0].num_kv_heads
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
@@ -1132,9 +1129,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
-        # Read MLA D2H mode from global config
-        self.mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
-        flexkv_logger.debug(f"[tpGPUCPUTransferWorker] mla_d2h_mode={self.mla_d2h_mode}")
+        # Read KV shared across ranks D2H mode from global config
+        self.kv_shared_across_ranks_mode = GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode
+        flexkv_logger.debug(f"[tpGPUCPUTransferWorker] kv_shared_across_ranks_mode={self.kv_shared_across_ranks_mode}")
 
         if layer_groups is not None and gpu_blocks_per_group is not None and gpu_layouts_per_group is not None:
             self._init_tp_multi_group(
@@ -1155,7 +1152,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.gpu_layer_strides_in_bytes = []
             for i, gpu_kv_layout in enumerate(gpu_kv_layouts):
                 gpu_strides = self._get_gpu_strides_from_tensor(
-                    self.gpu_blocks[i][0], tpb, dtype_sz, self.is_mla,
+                    self.gpu_blocks[i][0], tpb, dtype_sz, self.kv_dim,
                 ) if len(self.gpu_blocks[i]) > 1 else None
                 if gpu_strides is not None:
                     kv_s, blk_s, layer_s = gpu_strides
@@ -1179,7 +1176,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             # tp has effect on the layout of the cpu tensor
             # the tp dim should always be right after the block dim
             # on both blockfirst layout and layerfirst layout
-            if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and not self.is_mla:
+            if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and self.num_kv_heads > 1:
                 cpu_kv_layout = cpu_kv_layout.div_head(self.tp_group_size)
 
             self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
@@ -1209,11 +1206,11 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 self.gpu_layer_strides_in_bytes,
                 self.gpu_chunk_sizes_in_bytes,
                 gpu_device_ids,
-                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
-                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
-                ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
-                is_blockfirst=self.cpu_is_blockfirst,
-                is_mla=self.is_mla,
+                GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+                GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+                GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+                self.cpu_is_blockfirst,
+                self.num_kv_heads,
                 ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
                 ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             )
@@ -1292,7 +1289,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             gpu_chunk_sizes = []
             for i, layout in enumerate(group_gpu_layouts):
                 gpu_strides = self._get_gpu_strides_from_tensor(
-                    imported_group_blocks[i][0], tpb_g, dtype_size_g, self.is_mla,
+                    imported_group_blocks[i][0], tpb_g, dtype_size_g, self.kv_dim,
                 ) if len(imported_group_blocks[i]) > 1 else None
                 if gpu_strides is not None:
                     kv_s, blk_s, layer_s = gpu_strides
@@ -1333,11 +1330,11 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 gpu_layer_strides,
                 gpu_chunk_sizes,
                 gpu_device_ids,
-                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
-                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
-                ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
-                is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
-                is_mla=self.is_mla,
+                GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+                GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+                GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+                (cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
+                self.num_kv_heads,
             )
 
             self.tp_group_transfer_groups.append({
@@ -1459,8 +1456,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                     use_ce_transfer,
                     0,                 # start_layer_id (always 0 within group)
                     gp['num_layers'],  # all layers in this group
-                    self.is_mla,
-                    packed_kv=self.packed_kv,
+                    self.kv_dim,
+                    self.num_kv_heads,
+                    self.kv_shared_across_ranks_mode,
                 )
         else:
             self.tp_transfer_thread_group.tp_group_transfer(
@@ -1475,9 +1473,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 use_ce_transfer,
                 0,                  # start_layer_id (whole-model)
                 self.num_layers,    # layer_granularity = all layers
-                self.is_mla,
-                self.mla_d2h_mode,  # Pass MLA D2H mode to C++ (#192)
-                packed_kv=self.packed_kv,
+                self.kv_dim,
+                self.num_kv_heads,
+                self.kv_shared_across_ranks_mode,
             )
 
 
@@ -1541,9 +1539,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.cpu_blocks = cpu_blocks
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
 
-        self.is_mla = cpu_kv_layout.is_mla
-        self.single_kv_region = cpu_kv_layout.single_kv_region
         self.kv_dim = cpu_kv_layout.kv_dim
+        self.num_kv_heads = cpu_kv_layout.num_kv_heads
         self.cpu_layout_type = cpu_kv_layout.type
         self.has_multi_group = layer_groups is not None
 
@@ -1622,50 +1619,50 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             # CPU and SSD share an identical per-block byte layout in multi-group
             # mode, so each block can be transferred as one opaque blob — no
             # per-group / per-tp_rank loop needed. num_layers=1,
-            # layer_stride=chunk_size=block_stride, single_kv_region=True makes
+            # layer_stride=chunk_size=block_stride, one KV region makes
             # the kernel issue exactly one pread/pwrite of block_stride bytes
             # per block, sidestepping the sub-4KiB chunk hazard for highly
             # compressed groups (e.g. DSv4 indexer at compress_ratio=128).
             one_layer_id = torch.tensor([0], dtype=torch.int32)
             transfer_kv_blocks_ssd(
-                ioctx=self.ioctx,
-                cpu_layer_id_list=one_layer_id,
-                cpu_tensor_ptr=cpu_base_ptr,
-                ssd_block_ids=ssd_block_id_list,
-                cpu_block_ids=cpu_block_id_list,
-                cpu_layer_stride_in_bytes=self.block_stride_in_bytes,
-                cpu_kv_stride_in_bytes=0,
-                ssd_layer_stride_in_bytes=self.block_stride_in_bytes,
-                ssd_kv_stride_in_bytes=0,
-                chunk_size_in_bytes=self.block_stride_in_bytes,
-                block_stride_in_bytes=self.block_stride_in_bytes,
-                is_read=is_read,
-                num_blocks_per_file=self.num_blocks_per_file,
-                round_robin=self.round_robin,
-                num_threads_per_device=32,
-                single_kv_region=True,
+                self.ioctx,
+                one_layer_id,
+                cpu_base_ptr,
+                ssd_block_id_list,
+                cpu_block_id_list,
+                self.block_stride_in_bytes,
+                0,
+                self.block_stride_in_bytes,
+                0,
+                self.block_stride_in_bytes,
+                self.block_stride_in_bytes,
+                is_read,
+                self.num_blocks_per_file,
+                self.round_robin,
+                32,
+                True,
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
         else:
             layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
 
             transfer_kv_blocks_ssd(
-                ioctx=self.ioctx,
-                cpu_layer_id_list=layer_id_list,
-                cpu_tensor_ptr=cpu_base_ptr,
-                ssd_block_ids=ssd_block_id_list,
-                cpu_block_ids=cpu_block_id_list,
-                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-                ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
-                ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
-                chunk_size_in_bytes=self.chunk_size_in_bytes,
-                block_stride_in_bytes=self.block_stride_in_bytes,
-                is_read=is_read,
-                num_blocks_per_file=self.num_blocks_per_file,
-                round_robin=self.round_robin,
-                num_threads_per_device=32,
-                single_kv_region=self.single_kv_region,
+                self.ioctx,
+                layer_id_list,
+                cpu_base_ptr,
+                ssd_block_id_list,
+                cpu_block_id_list,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_kv_stride_in_bytes,
+                self.ssd_layer_stride_in_bytes,
+                self.ssd_kv_stride_in_bytes,
+                self.chunk_size_in_bytes,
+                self.block_stride_in_bytes,
+                is_read,
+                self.num_blocks_per_file,
+                self.round_robin,
+                32,
+                self.kv_dim,
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
 
@@ -1752,10 +1749,8 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
 
-        self.single_kv_region = (
-            True if self.has_multi_group else cpu_kv_layout.single_kv_region
-        )
         self.kv_dim = 1 if self.has_multi_group else cpu_kv_layout.kv_dim
+        self.num_kv_heads = cpu_kv_layout.num_kv_heads
 
         self.cpu_blocks = cpu_blocks
 
@@ -1872,42 +1867,42 @@ class CPURemoteTransferWorker(TransferWorkerBase):
 
             # Use the new shared transfer function
             shared_transfer_kv_blocks_remote_read(
-                file_nodeid_list=file_nodeids_list,
-                cfs_blocks_partition_list=cfs_blocks_partition,
-                cpu_blocks_partition_list=cpu_blocks_partition,
-                cpu_layer_id_list=layer_id_list,
-                cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
-                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-                cfs_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
-                cfs_block_stride_in_bytes=self.remote_block_stride_in_bytes,
-                cfs_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
-                block_size_in_bytes=self.chunk_size_in_bytes,
-                total_layers=self.num_layers,
-                single_kv_region=self.single_kv_region,
+                file_nodeids_list,
+                cfs_blocks_partition,
+                cpu_blocks_partition,
+                layer_id_list,
+                self.cpu_layer_ptrs[0].item(),
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_kv_stride_in_bytes,
+                self.remote_layer_stride_in_bytes_per_file,
+                self.remote_block_stride_in_bytes,
+                self.remote_kv_stride_in_bytes_per_file,
+                self.chunk_size_in_bytes,
+                self.num_layers,
+                self.kv_dim,
                 num_threads_per_file=32,
             )
         else:
             transfer_kv_blocks_remote(
-                file_nodeid_list=self.file_nodeid_list,
-                cpu_layer_id_list=layer_id_list,
-                cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
-                remote_block_ids=remote_block_id_list,
-                cpu_block_ids=cpu_block_id_list,
-                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-                remote_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
-                remote_block_stride_in_bytes=self.remote_block_stride_in_bytes,
-                remote_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
-                block_size_in_bytes=self.chunk_size_in_bytes,
-                total_layers=self.num_layers,
-                is_read=(transfer_type == TransferType.REMOTE2H),
-                partition_block_type=PartitionBlockType.SEQUENTIAL.value, # use sequential
-                round_robin=self.round_robin,
-                num_remote_blocks_per_file=self.num_remote_blocks_per_file,
-                use_mmap=False,  # TODO: fix bug when use mmap
-                num_threads_per_file=32,
-                single_kv_region=self.single_kv_region,
+                self.file_nodeid_list,
+                layer_id_list,
+                self.cpu_layer_ptrs[0].item(),
+                remote_block_id_list,
+                cpu_block_id_list,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_kv_stride_in_bytes,
+                self.remote_layer_stride_in_bytes_per_file,
+                self.remote_block_stride_in_bytes,
+                self.remote_kv_stride_in_bytes_per_file,
+                self.chunk_size_in_bytes,
+                self.num_layers,
+                (transfer_type == TransferType.REMOTE2H),
+                PartitionBlockType.SEQUENTIAL.value,
+                self.round_robin,
+                self.num_remote_blocks_per_file,
+                False,
+                32,
+                self.kv_dim,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -1976,9 +1971,8 @@ class GDSTransferWorker(TransferWorkerBase):
                                f"{self.gds_manager.get_last_error()}")
 
         self.dtype = dtype
-        self.is_mla = gpu_kv_layout.is_mla
-        self.single_kv_region = gpu_kv_layout.single_kv_region
         self.kv_dim = gpu_kv_layout.kv_dim
+        self.num_kv_heads = gpu_kv_layout.num_kv_heads
         self.has_multi_group = layer_groups is not None
 
         # Layout information
@@ -1999,7 +1993,7 @@ class GDSTransferWorker(TransferWorkerBase):
             self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
             gpu_strides = self._get_gpu_strides_from_tensor(
                 self.gpu_blocks[0], gpu_kv_layout.tokens_per_block,
-                self.dtype.itemsize, self.is_mla,
+                self.dtype.itemsize, self.kv_dim,
             ) if len(self.gpu_blocks) > 1 else None
             if gpu_strides is not None:
                 self.gpu_kv_stride_in_bytes = gpu_strides[0]
@@ -2071,7 +2065,7 @@ class GDSTransferWorker(TransferWorkerBase):
                 gpu_layout = gpu_layouts_per_group[gi]
                 group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
                 gpu_strides = self._get_gpu_strides_from_tensor(
-                    group_gpu_blocks[0], tpb_g, dtype_size_g, self.is_mla,
+                    group_gpu_blocks[0], tpb_g, dtype_size_g, self.kv_dim,
                 ) if len(group_gpu_blocks) > 1 else None
                 if gpu_strides is not None:
                     gpu_kv_stride, gpu_block_stride, gpu_layer_stride = gpu_strides
@@ -2166,7 +2160,7 @@ class GDSTransferWorker(TransferWorkerBase):
                         gp['num_layers'],
                         is_read,
                         False,
-                        self.single_kv_region,
+                        self.kv_dim,
                         self.gpu_block_type_,
                         self.gpu_device_id,
                     )
@@ -2191,7 +2185,7 @@ class GDSTransferWorker(TransferWorkerBase):
                     self.num_layers,
                     is_read,
                     False,
-                    self.single_kv_region,
+                    self.kv_dim,
                     self.gpu_block_type_,
                     self.gpu_device_id,
                 )
@@ -2282,10 +2276,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
         self.num_files = sum(len(file_list) for file_list in ssd_files.values())
 
         self.dtype = dtype
-        self.is_mla = gpu_kv_layouts[0].is_mla
-        self.single_kv_region = gpu_kv_layouts[0].single_kv_region
-        self.packed_kv = gpu_kv_layouts[0].packed_kv
         self.kv_dim = gpu_kv_layouts[0].kv_dim
+        self.num_kv_heads = gpu_kv_layouts[0].num_kv_heads
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
         self.has_multi_group = layer_groups is not None
@@ -2305,7 +2297,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
             # Bytes per KV block (all layers); used by transfer tracing for bw.
             self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
-            if not self.is_mla:
+            if self.num_kv_heads > 1:
                 ssd_kv_layout_per_file = ssd_kv_layout_per_file.div_head(self.tp_group_size)
 
             # GPU layout calculations — compute strides from actual tensor to handle
@@ -2318,7 +2310,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             self.gpu_layer_strides_in_bytes = []
             for i, gpu_kv_layout in enumerate(gpu_kv_layouts):
                 gpu_strides = self._get_gpu_strides_from_tensor(
-                    self.gpu_blocks[i][0], tpb, dtype_sz, self.is_mla,
+                    self.gpu_blocks[i][0], tpb, dtype_sz, self.kv_dim,
                 ) if len(self.gpu_blocks[i]) > 1 else None
                 if gpu_strides is not None:
                     kv_s, blk_s, layer_s = gpu_strides
@@ -2335,7 +2327,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
             self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
             self.ssd_tp_stride_in_bytes = (self.ssd_block_stride_in_bytes // self.tp_group_size
-                                           if not self.is_mla else self.ssd_block_stride_in_bytes)
+                                           if self.num_kv_heads > 1 else self.ssd_block_stride_in_bytes)
 
             # Resolve pointers in Python
             gpu_block_ptrs_flat = [
@@ -2400,7 +2392,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             ssd_layer_stride = kv_dim * chunk_elements * dtype_size_g
             ssd_kv_stride = chunk_elements * dtype_size_g
             # TP stride for SSD: partition the block across TP ranks
-            ssd_tp_stride = self.ssd_block_stride_in_bytes // self.tp_group_size if not self.is_mla \
+            ssd_tp_stride = self.ssd_block_stride_in_bytes // self.tp_group_size if self.num_kv_heads > 1 \
                 else self.ssd_block_stride_in_bytes
 
             # Per-group GPU strides and pointers
@@ -2419,7 +2411,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
                     self._multi_group_gpu_blocks_keepalive.append(grp_tensors)
 
                     gpu_strides = self._get_gpu_strides_from_tensor(
-                        grp_tensors[0], tpb_g, dtype_size_g, self.is_mla,
+                        grp_tensors[0], tpb_g, dtype_size_g, self.kv_dim,
                     ) if len(grp_tensors) > 1 else None
                     if gpu_strides is not None:
                         kv_s, blk_s, layer_s = gpu_strides
@@ -2442,7 +2434,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 gpu_layer_strides = []
                 for i, layout in enumerate(gpu_kv_layouts):
                     gpu_strides = self._get_gpu_strides_from_tensor(
-                        self.gpu_blocks[i][0], tpb_g, dtype_size_g, self.is_mla,
+                        self.gpu_blocks[i][0], tpb_g, dtype_size_g, self.kv_dim,
                     ) if len(self.gpu_blocks[i]) > 1 else None
                     if gpu_strides is not None:
                         kv_s, blk_s, layer_s = gpu_strides
@@ -2534,8 +2526,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
                     is_read,
                     0,  # layer_id always 0 for per-group
                     gp['num_layers'],
-                    self.is_mla,
-                    packed_kv=self.packed_kv,
+                    self.kv_dim,
+                    self.num_kv_heads,
                 )
         else:
             self.tp_gds_transfer_thread_group.tp_group_transfer(
@@ -2549,8 +2541,8 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 is_read,
                 0,
                 self.num_layers,
-                self.is_mla,
-                packed_kv=self.packed_kv,
+                self.kv_dim,
+                self.num_kv_heads,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -2627,12 +2619,12 @@ class NixlTransferWorker(TransferWorkerBase):
         self._pin_op_buffer()
         if (
             gpu_kv_layout.num_layer != cpu_kv_layout.num_layer
-            or gpu_kv_layout.is_mla != cpu_kv_layout.is_mla
-            or gpu_kv_layout.packed_kv != cpu_kv_layout.packed_kv
+            or gpu_kv_layout.kv_dim != cpu_kv_layout.kv_dim
+            or gpu_kv_layout.num_kv_heads != cpu_kv_layout.num_kv_heads
         ):
             raise ValueError(
                 "gpu_kv_layout and cpu_kv_layout must match on num_layer, "
-                "is_mla and packed_kv"
+                "kv_dim and num_kv_heads"
             )
 
         self.nixl_backend = be
@@ -2645,8 +2637,8 @@ class NixlTransferWorker(TransferWorkerBase):
         self.dtype = dtype
 
         self.num_layers = gpu_kv_layout.num_layer
-        self.single_kv_region = gpu_kv_layout.single_kv_region
         self.kv_dim = gpu_kv_layout.kv_dim
+        self.num_kv_heads = gpu_kv_layout.num_kv_heads
 
         # SSD / file-side layout (same for every NIXL FILE backend).
         ssd_pf = ssd_kv_layout.div_block(self.num_files, padding=True)
@@ -2799,7 +2791,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.ssd_layer_stride_in_bytes,
                             self.ssd_kv_stride_in_bytes,
                             self.ssd_block_stride_in_bytes,
-                            self.single_kv_region,
+                            self.kv_dim,
                         )
                         gview = gpu_chunk_u8_view(
                             self.gpu_blocks,
@@ -2812,7 +2804,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.gpu_block_stride_in_bytes,
                             self.gpu_layer_stride_in_bytes,
                             self.chunk_size_in_bytes,
-                            self.single_kv_region,
+                            self.kv_dim,
                         )
                         gpu_tensors.append(gview)
                         file_paths.append(path)
@@ -2847,7 +2839,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.mem_layer_stride_in_bytes,
                             self.mem_kv_stride_in_bytes,
                             self.mem_block_stride_in_bytes,
-                            self.single_kv_region,
+                            self.kv_dim,
                         )
                         sob = ssd_chunk_byte_offset_in_file(
                             lid,
@@ -2856,7 +2848,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.ssd_layer_stride_in_bytes,
                             self.ssd_kv_stride_in_bytes,
                             self.ssd_block_stride_in_bytes,
-                            self.single_kv_region,
+                            self.kv_dim,
                         )
                         dram_ptr_len.append((base + cob, self.chunk_size_in_bytes))
                         file_paths.append(path)
@@ -2937,8 +2929,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self.cpu_kv_layout = cpu_kv_layout
         self.remote_kv_layout = remote_kv_layout
 
-        self.single_kv_region = cpu_kv_layout.single_kv_region
         self.kv_dim = cpu_kv_layout.kv_dim
+        self.num_kv_heads = cpu_kv_layout.num_kv_heads
         # Bytes per KV block (all layers); used by transfer tracing for bw.
         self._bytes_per_block = self.block_size * self.dtype.itemsize * self.num_layers * self.kv_dim
 
@@ -3022,8 +3014,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             assert ssd_kv_layout is not None, "Invalid ssd kv layout!"
             ## init the cpu buffer for ssd to cpu copy
             # NOTE: now we allocate 500 blocks for test
-            # Keyword args on purpose: packed_kv sits before _kv_shape in the
-            # dataclass, so a positional list would land kv_shape in packed_kv.
             self.tmp_cpu_buffer_layout = KVCacheLayout(
                 type=self.cpu_kv_layout.type,
                 num_layer=self.cpu_kv_layout.num_layer,
@@ -3031,8 +3021,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 tokens_per_block=self.cpu_kv_layout.tokens_per_block,
                 num_head=self.cpu_kv_layout.num_head,
                 head_size=self.cpu_kv_layout.head_size,
-                is_mla=self.cpu_kv_layout.is_mla,
-                packed_kv=self.cpu_kv_layout.packed_kv,
+                kv_dim=self.cpu_kv_layout.kv_dim,
+                num_kv_heads=self.cpu_kv_layout.num_kv_heads,
                 _kv_shape=self.cpu_kv_layout.kv_shape,
             )
             # Allocate the temporary SSD->CPU staging buffer.
@@ -3606,22 +3596,22 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         flexkv_logger.info(f"copy ssd blocks:{ssd_block_id_list} to cpu blocks: {cpu_block_id_list}" )
         try:
             transfer_kv_blocks_ssd(
-                ioctx=self.ioctx,
-                cpu_layer_id_list=layer_id_list,
-                cpu_tensor_ptr=self.tmp_cpu_buffer.data_ptr(),  ## copy ssd data to tmp cpu buffer
-                ssd_block_ids=ssd_block_id_list,
-                cpu_block_ids=cpu_block_id_list,
-                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-                ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
-                ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
-                chunk_size_in_bytes=self.chunk_size_in_bytes,
-                block_stride_in_bytes=self.block_stride_in_bytes,
-                is_read=True,
-                num_blocks_per_file=self.num_blocks_per_file,
-                round_robin=self.round_robin,
-                num_threads_per_device=32,
-                single_kv_region=self.single_kv_region,
+                self.ioctx,
+                layer_id_list,
+                self.tmp_cpu_buffer.data_ptr(),  ## copy ssd data to tmp cpu buffer
+                ssd_block_id_list,
+                cpu_block_id_list,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_kv_stride_in_bytes,
+                self.ssd_layer_stride_in_bytes,
+                self.ssd_kv_stride_in_bytes,
+                self.chunk_size_in_bytes,
+                self.block_stride_in_bytes,
+                True,
+                self.num_blocks_per_file,
+                self.round_robin,
+                32,
+                self.kv_dim,
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
         except Exception as e:
@@ -3894,8 +3884,8 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         self.dtype = dtype
         self.cpu_kv_layout = cpu_kv_layout
         assert self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
-        self.single_kv_region: bool = cpu_kv_layout.single_kv_region
         self.kv_dim = cpu_kv_layout.kv_dim
+        self.num_kv_heads = cpu_kv_layout.num_kv_heads
         self.cpu_blocks = cpu_blocks
         self.cache_config = cache_config
         self._cpu_buffer = cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks

@@ -21,7 +21,7 @@ def test_recompute_matches_heterogeneous_layout_block_size() -> None:
         num_layers=62,
         num_kv_heads=8,
         head_size=128,
-        use_mla=True,
+        kv_dim=1,
         tp_size=8,
         dtype=torch.bfloat16,
     )
@@ -66,7 +66,7 @@ def test_recompute_matches_heterogeneous_layout_block_size() -> None:
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
         layer_groups=model_config.layer_groups,
         tp_size=model_config.tp_size,
     )

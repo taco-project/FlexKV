@@ -49,7 +49,8 @@ def _make_swa_layout(num_layers: int, num_blocks: int, tpb: int) -> KVCacheLayou
         tokens_per_block=tpb,
         num_head=1,
         head_size=SWA_BYTES_PER_TOKEN,
-        is_mla=True,
+        kv_dim=1,
+        num_kv_heads=1,
     )
 
 
@@ -261,7 +262,6 @@ def _build_dsv4_fixture(layer_groups: List[LayerGroupSpec]) -> MultiGroupFixture
         swa_gpu_layer_strides_tensor=swa_strides["swa_gpu_layer_strides_tensor"],
         swa_gpu_chunk_sizes_tensor=swa_strides["swa_gpu_chunk_sizes_tensor"],
         is_blockfirst=True,
-        is_mla=True,
     )
 
     return MultiGroupFixture(
@@ -310,9 +310,8 @@ def _d2h_main_group(
         4,
         False,  # D2H
         True,
-        True,
+        gpu_layout.kv_dim,
         0,
-        ce_is_mla=gpu_layout.is_mla,
     )
 
 
@@ -343,9 +342,8 @@ def _d2h_swa(
         4,
         False,
         True,
-        True,
+        swa_layout.kv_dim,
         0,
-        ce_is_mla=swa_layout.is_mla,
     )
 
 
@@ -363,7 +361,8 @@ def _layerwise_h2d_main_and_swa(fx: MultiGroupFixture, cpu_src: int, gpu_dst: in
         cpu_block_id_tensor=torch.tensor([cpu_src], dtype=torch.int64),
         transfer_cta_num=4,
         use_ce_transfer=True,
-        is_mla=True,
+        kv_dim=1,
+        num_kv_heads=1,
         counter_id=0,
         swa_h2d_src=torch.tensor([swa_cpu_src], dtype=torch.int64),
         swa_h2d_dst=torch.tensor([swa_gpu_dst], dtype=torch.int64),

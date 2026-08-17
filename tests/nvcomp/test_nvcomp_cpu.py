@@ -26,35 +26,38 @@ device = "cuda:0"
 @pytest.mark.parametrize("cpu_layout_name", [pytest.param("BLOCKFIRST", id="bfirst"), pytest.param("LAYERFIRST", id="lfirst")])
 @pytest.mark.parametrize("dtype", [pytest.param(torch.bfloat16, id="bf16"), pytest.param(torch.float8_e4m3fn, id="fp8"),])
 @pytest.mark.parametrize("tp_size", [pytest.param(1, id="tp_1")])
-@pytest.mark.parametrize("is_mla", [pytest.param(False, id="mha"), pytest.param(True, id="mla")])
+@pytest.mark.parametrize("kv_dim, num_kv_heads", [
+    pytest.param(2, 8, id="mha"),
+    pytest.param(1, 1, id="mla"),
+])
 @pytest.mark.parametrize("chunk_size_per_device", [
     pytest.param(8 * 1024, id="cpd_8KB"),
     pytest.param(16 * 1024, id="cpd_16KB"),
     pytest.param(32 * 1024, id="cpd_32KB"),
     pytest.param(18 * 1024, id="cpd_18KB"), # MLA
 ])
-def test_roundtrip(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_device,
+def test_roundtrip(cpu_layout_name, dtype, tp_size, kv_dim, num_kv_heads, chunk_size_per_device,
                    num_layers=4, num_blocks=2):
     if not NVCOMP_AVAILABLE:
         pytest.skip("nvcomp not available")
-    if is_mla != (chunk_size_per_device == 18 * 1024):
+    if (kv_dim == 1) != (chunk_size_per_device == 18 * 1024):
         pytest.skip("18KB is MLA-only; 8/16/32KB are MHA-only")
 
-    case = resolve_case(chunk_size_per_device, tp_size, is_mla, dtype)
+    case = resolve_case(chunk_size_per_device, tp_size, kv_dim, num_kv_heads, dtype)
 
     transfer_stream = torch.cuda.Stream()
 
     num_heads, head_size = case["num_head"], case["head_dim"]
     tokens_per_block, kv_dim = case["tokens_per_block"], case["kv_dim"]
     print(f"\n{'='*60}")
-    print(f"    {"MLA" if is_mla else "MHA"} roundtrip test: layout={cpu_layout_name},chunk_size_per_device={case['chunk_bytes']}, layers={num_layers}, blocks={num_blocks}, kv_dim={kv_dim}, "
+    print(f"    {"MLA" if kv_dim == 1 else "MHA"} roundtrip test: layout={cpu_layout_name},chunk_size_per_device={case['chunk_bytes']}, layers={num_layers}, blocks={num_blocks}, kv_dim={kv_dim}, "
           f"tokens_per_block={tokens_per_block}, num_heads={num_heads}, head_size={head_size}, "
           f"dtype={dtype}, tp_size={tp_size}")
     
 
     gpu_blocks, cpu_blocks = make_kv_cache(
         num_layers, num_blocks, tokens_per_block, num_heads, head_size,
-        dtype, device, cpu_layout_name, is_mla)
+        dtype, device, cpu_layout_name, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
     # int64 pointer table, pinned (C++ reads it as an array of GPU pointers).
     gpu_ptrs = torch.tensor(
         [b.data_ptr() for b in gpu_blocks], dtype=torch.int64).pin_memory()
@@ -62,7 +65,7 @@ def test_roundtrip(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_devic
      gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
      cpu_kv_stride, cpu_layer_stride, cpu_block_stride) = compute_strides(
         num_layers, num_blocks, tokens_per_block, num_heads, head_size,
-        dtype, cpu_layout_name, is_mla)
+        dtype, cpu_layout_name, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
     assert chunk_size == case["chunk_bytes"]
 
     block_ids = torch.arange(num_blocks, dtype=torch.int64).pin_memory()
@@ -86,7 +89,7 @@ def test_roundtrip(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_devic
             gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
             block_ids, cpu_blocks,
             cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
-            chunk_size, 0, num_layers, is_mla, 0,
+            chunk_size, 0, num_layers, kv_dim, 0,
             st_ptr, st_block_stride, st_layer_stride)
     transfer_stream.synchronize()
     
@@ -112,7 +115,7 @@ def test_roundtrip(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_devic
             gpu_kv_stride, gpu_block_stride, gpu_layer_stride,
             block_ids, cpu_blocks,
             cpu_kv_stride, cpu_layer_stride, cpu_block_stride,
-            chunk_size, 0, num_layers, is_mla, 0,
+            chunk_size, 0, num_layers, kv_dim, 0,
             st_ptr, st_block_stride, st_layer_stride)
     transfer_stream.synchronize()
     assert h2d_bytes == expected_bytes
@@ -126,24 +129,27 @@ def test_roundtrip(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_devic
 @pytest.mark.parametrize("cpu_layout_name", [pytest.param("BLOCKFIRST", id="bfirst"), pytest.param("LAYERFIRST", id="lfirst")])
 @pytest.mark.parametrize("dtype", [pytest.param(torch.bfloat16, id="bf16"), pytest.param(torch.float8_e4m3fn, id="fp8"),])
 @pytest.mark.parametrize("tp_size", [pytest.param(2, id="tp_2"), pytest.param(4, id="tp_4"), pytest.param(8, id="tp_8")])
-@pytest.mark.parametrize("is_mla", [pytest.param(False, id="mha"), pytest.param(True, id="mla")])
+@pytest.mark.parametrize("kv_dim, num_kv_heads", [
+    pytest.param(2, 8, id="mha"),
+    pytest.param(1, 1, id="mla"),
+])
 @pytest.mark.parametrize("chunk_size_per_device", [
     pytest.param(8 * 1024, id="cpd_8KB"),
     pytest.param(16 * 1024, id="cpd_16KB"),
     pytest.param(32 * 1024, id="cpd_32KB"),
     pytest.param(18 * 1024, id="cpd_18KB"), # MLA
 ])
-def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_device,
+def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, kv_dim, num_kv_heads, chunk_size_per_device,
                            num_layers=4, num_blocks=2):
     if not NVCOMP_AVAILABLE:
         pytest.skip("nvcomp not available")
-    if is_mla != (chunk_size_per_device == 18 * 1024):
+    if (kv_dim == 1) != (chunk_size_per_device == 18 * 1024):
         pytest.skip("18KB is MLA-only; 8/16/32KB are MHA-only")
     if torch.cuda.device_count() < tp_size:
         pytest.skip(f"tp_size={tp_size} needs {tp_size} GPUs, "
                     f"have {torch.cuda.device_count()}")
 
-    case = resolve_case(chunk_size_per_device, tp_size, is_mla, dtype)
+    case = resolve_case(chunk_size_per_device, tp_size, kv_dim, num_kv_heads, dtype)
     num_head, head_dim = case["num_head"], case["head_dim"]
     tokens_per_block, kv_dim = case["tokens_per_block"], case["kv_dim"]
     elem = dtype.itemsize
@@ -151,7 +157,7 @@ def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_de
     data_type = ans_utils.data_type(dtype)
 
     print(f"\n{'='*60}")
-    print(f"    {"MLA" if is_mla else "MHA"} TP roundtrip: layout={cpu_layout_name}, chunk_size_per_device={chunk_size_per_device}, "
+    print(f"    {"MLA" if kv_dim == 1 else "MHA"} TP roundtrip: layout={cpu_layout_name}, chunk_size_per_device={chunk_size_per_device}, "
           f"tp_size={tp_size}, layers={num_layers}, blocks={num_blocks}, kv_dim={kv_dim}, "
           f"tokens_per_block={tokens_per_block}, num_heads={num_head}, head_size={head_dim}, dtype={dtype}")
 
@@ -159,10 +165,10 @@ def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_de
     # replicates the KV so every rank starts with *identical* data -- required
     # because D2H compresses each block from its owner rank (cpu_block_id % tp)
     # into one canonical copy and H2D fans that copy back to all ranks.
-    heads_per_gpu = num_head if is_mla else num_head // tp_size
+    heads_per_gpu = num_head if num_kv_heads == 1 else num_head // tp_size
     shape_per_layer = (kv_dim, num_blocks, tokens_per_block, heads_per_gpu, head_dim)
     all_gpu = []
-    if is_mla:
+    if num_kv_heads == 1:
         # Stage through host so replication is bit-exact on every device
         # (device-to-device copies can silently fail across NVLink islands).
         base = make_gpu_cache((num_layers,) + shape_per_layer, dtype, "cuda:0").cpu()
@@ -179,22 +185,22 @@ def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_de
     cpu_layout = KVCacheLayout(
         type=layout_type, num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=tokens_per_block, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
     cpu = torch.zeros(tuple(cpu_layout.kv_shape), dtype=dtype).pin_memory()
 
     # Per-rank GPU strides (LAYERFIRST; MHA divides heads across ranks).
     gpu_per_rank = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST, num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=tokens_per_block, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
-    if not is_mla:
+        head_size=head_dim, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
+    if num_kv_heads > 1:
         gpu_per_rank = gpu_per_rank.div_head(tp_size)
     per_rank_chunk = gpu_per_rank.get_chunk_size() * elem
     assert per_rank_chunk == case["chunk_bytes"]
 
     # CPU strides: BLOCKFIRST MHA needs the in-chunk head subview (div_head);
     # LAYERFIRST and MLA keep chunks contiguous so no division.
-    if not is_mla and layout_type == KVCacheLayoutType.BLOCKFIRST:
+    if num_kv_heads > 1 and layout_type == KVCacheLayoutType.BLOCKFIRST:
         cpu_stride_layout = cpu_layout.div_head(tp_size)
     else:
         cpu_stride_layout = cpu_layout
@@ -205,7 +211,7 @@ def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_de
 
     # External size table. MHA: per-rank [tp, blocks, layers, kv]. MLA: canonical
     # (KV replicated) [blocks, layers, 1] with rank_stride=0.
-    if is_mla:
+    if num_kv_heads == 1:
         size_table = torch.zeros(
             (num_blocks, num_layers, 1), dtype=torch.uint32).pin_memory()
         st_args = (size_table.data_ptr(), 0,
@@ -241,7 +247,7 @@ def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_de
         tg.tp_group_transfer_ans(
             block_ids, block_ids,
             cpu_kv_stride, cpu_layer_stride, cpu_block_stride, cpu_tp_stride,
-            transfer_num_cta, False, False, layer_id, num_layers, is_mla, *st_args)
+            transfer_num_cta, False, False, layer_id, num_layers, kv_dim, *st_args)
         for g in range(tp_size):
             torch.cuda.synchronize(g)
 
@@ -263,7 +269,7 @@ def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, is_mla, chunk_size_per_de
         tg.tp_group_transfer_ans(
             block_ids, block_ids,
             cpu_kv_stride, cpu_layer_stride, cpu_block_stride, cpu_tp_stride,
-            transfer_num_cta, True, False, layer_id, num_layers, is_mla, *st_args)
+            transfer_num_cta, True, False, layer_id, num_layers, kv_dim, *st_args)
         for g in range(tp_size):
             torch.cuda.synchronize(g)
 
@@ -295,11 +301,11 @@ def test_nvcomp_engine_rejects_too_small_chunks(monkeypatch):
     gpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST, num_layer=num_layers,
         num_block=1, tokens_per_block=tokens_per_block,
-        num_head=heads_per_rank, head_size=head_size, is_mla=False)
+        num_head=heads_per_rank, head_size=head_size, kv_dim=2, num_kv_heads=num_heads)
     cpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.BLOCKFIRST, num_layer=num_layers,
         num_block=num_blocks, tokens_per_block=tokens_per_block,
-        num_head=heads_per_rank, head_size=head_size, is_mla=False)
+        num_head=heads_per_rank, head_size=head_size, kv_dim=2, num_kv_heads=num_heads)
     gpu_handle = StorageHandle(
         AccessHandleType.TENSOR, [torch.empty((1,), dtype=dtype)],
         gpu_layout, dtype, gpu_device_id=0)
@@ -312,7 +318,7 @@ def test_nvcomp_engine_rejects_too_small_chunks(monkeypatch):
         {0: [gpu_handle]},
         ModelConfig(num_layers=num_layers, num_kv_heads=num_heads,
                     head_size=head_size, dtype=dtype, tp_size=tp_size,
-                    dp_size=1),
+                    dp_size=1, kv_dim=2),
         CacheConfig(tokens_per_block=tokens_per_block, enable_cpu=True,
                     num_cpu_blocks=num_blocks),
         cpu_handle=cpu_handle)
@@ -320,4 +326,3 @@ def test_nvcomp_engine_rejects_too_small_chunks(monkeypatch):
     assert isinstance(engine._compressors["gpu_cpu"], NullCompressionStrategy)
     assert isinstance(engine._compressors["gpu_cpu_tp"], NullCompressionStrategy)
     assert isinstance(engine._compressors["cpu_ssd"], NullCompressionStrategy)
-
