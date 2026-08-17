@@ -694,9 +694,9 @@ def merge_to_batch_graph(batch_id: int,
     Merge multiple TransferOpGraphs into a single batch graph.
 
     Supported patterns:
-      GET: DISK2H / REMOTE2H (optional) -> H2D
-      PUT: D2H -> H2DISK / H2REMOTE (optional)
-      layerwise GET: fused LAYERWISE (+ REMOTE2H predecessors when present);
+      GET: DISK2H / REMOTE2H (optional) -> H2D; DISK2D (GDS, independent)
+      PUT: D2H -> H2DISK / H2REMOTE (optional); D2DISK (GDS, independent)
+      layerwise GET: fused LAYERWISE (+ REMOTE2H / DISK2D predecessors when present);
           SWA local lanes always fold into LAYERWISE when layerwise is on.
 
     Args:
@@ -735,7 +735,8 @@ def merge_to_batch_graph(batch_id: int,
     swa_callbacks_by_type: Dict[TransferType, List[Callable]] = {}
     supported_types = {TransferType.DISK2H, TransferType.H2D,
                        TransferType.D2H, TransferType.H2DISK,
-                       TransferType.H2REMOTE, TransferType.REMOTE2H}
+                       TransferType.H2REMOTE, TransferType.REMOTE2H,
+                       TransferType.DISK2D, TransferType.D2DISK}
 
     for tt in supported_types:
         ops_by_type[tt] = []
@@ -750,7 +751,7 @@ def merge_to_batch_graph(batch_id: int,
             if op.transfer_type not in supported_types:
                 raise NotImplementedError(
                     f"Batch merge does not support transfer type: {op.transfer_type}. "
-                    f"Only DISK2H, H2D, D2H, H2DISK, REMOTE2H, and H2REMOTE are supported."
+                    f"Supported: DISK2H, H2D, D2H, H2DISK, REMOTE2H, H2REMOTE, DISK2D, D2DISK."
                 )
             if getattr(op, "is_swa", False):
                 swa_ops_by_type[op.transfer_type].append(op)
@@ -772,8 +773,10 @@ def merge_to_batch_graph(batch_id: int,
                      else new_op_callback_dict)
 
     has_get = _bucket_has(TransferType.H2D, TransferType.DISK2H, TransferType.REMOTE2H,
+                          TransferType.DISK2D,
                           ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
     has_put = _bucket_has(TransferType.D2H, TransferType.H2DISK, TransferType.H2REMOTE,
+                          TransferType.D2DISK,
                           ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
 
     if layerwise_transfer:
@@ -814,13 +817,19 @@ def merge_to_batch_graph(batch_id: int,
             swa_ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
             merged_graph, swa_callbacks_by_type[TransferType.REMOTE2H],
             new_op_callback_dict)
+        merged_disk2d_op = _merge_ops(
+            ops_by_type[TransferType.DISK2D], TransferType.DISK2D,
+            merged_graph, callbacks_by_type[TransferType.DISK2D],
+            new_op_callback_dict)
         if layerwise_transfer:
-            for op in (merged_remote2h_op, merged_swa_remote2h_op):
+            for op in (merged_remote2h_op, merged_swa_remote2h_op,
+                       merged_disk2d_op):
                 if op is not None:
                     merged_graph.add_transfer_op(op)
 
-            assert merged_h2d_op is not None or merged_swa_h2d_op is not None, \
-                "layerwise GET requires an H2D (main or SWA)"
+            assert (merged_h2d_op is not None or merged_swa_h2d_op is not None
+                    or merged_disk2d_op is not None), \
+                "layerwise GET requires an H2D (main or SWA) or DISK2D"
 
             layerwise_transfer_op = LayerwiseTransferOp(
                 graph_id=merged_graph.graph_id,
@@ -865,11 +874,15 @@ def merge_to_batch_graph(batch_id: int,
             layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.H2D])
             _attach_combined_callback(
                 layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
-            batch_end_op_id = layerwise_transfer_op.op_id
+            layerwise_sinks: List[int] = [layerwise_transfer_op.op_id]
+            if merged_disk2d_op is not None:
+                layerwise_sinks.append(merged_disk2d_op.op_id)
+            batch_end_op_id = _add_batch_sink(
+                merged_graph, layerwise_sinks, dp_client_id)
         else:
             for op in (merged_disk2h_op, merged_h2d_op, merged_remote2h_op,
                        merged_swa_disk2h_op, merged_swa_h2d_op,
-                       merged_swa_remote2h_op):
+                       merged_swa_remote2h_op, merged_disk2d_op):
                 if op is not None:
                     merged_graph.add_transfer_op(op)
 
@@ -893,11 +906,9 @@ def merge_to_batch_graph(batch_id: int,
                 get_sinks.append(merged_h2d_op.op_id)
             if merged_swa_h2d_op is not None:
                 get_sinks.append(merged_swa_h2d_op.op_id)
+            if merged_disk2d_op is not None:
+                get_sinks.append(merged_disk2d_op.op_id)
             if not get_sinks:
-                # No GPU sink (e.g. prefetch / CPU-only): every independent
-                # full-KV and SWA leaf must be a terminal. Taking only the first
-                # would mark the batch done while another REMOTE2H/DISK2H lane
-                # is still in flight.
                 for op in (merged_remote2h_op, merged_swa_remote2h_op,
                            merged_disk2h_op, merged_swa_disk2h_op):
                     if op is not None:
@@ -918,6 +929,10 @@ def merge_to_batch_graph(batch_id: int,
             ops_by_type[TransferType.H2REMOTE], TransferType.H2REMOTE,
             merged_graph, callbacks_by_type[TransferType.H2REMOTE],
             new_op_callback_dict)
+        merged_d2disk_op = _merge_ops(
+            ops_by_type[TransferType.D2DISK], TransferType.D2DISK,
+            merged_graph, callbacks_by_type[TransferType.D2DISK],
+            new_op_callback_dict)
         merged_swa_d2h_op = _merge_swa_ops(
             swa_ops_by_type[TransferType.D2H], TransferType.D2H,
             merged_graph, swa_callbacks_by_type[TransferType.D2H],
@@ -932,7 +947,8 @@ def merge_to_batch_graph(batch_id: int,
             new_op_callback_dict)
 
         for op in (merged_d2h_op, merged_swa_d2h_op, merged_h2disk_op,
-                   merged_swa_h2disk_op, merged_h2remote_op, merged_swa_h2remote_op):
+                   merged_swa_h2disk_op, merged_h2remote_op, merged_swa_h2remote_op,
+                   merged_d2disk_op):
             if op is not None:
                 merged_graph.add_transfer_op(op)
 
@@ -954,9 +970,9 @@ def merge_to_batch_graph(batch_id: int,
             put_sinks.append(merged_d2h_op.op_id)
         if merged_swa_d2h_op is not None:
             put_sinks.append(merged_swa_d2h_op.op_id)
+        if merged_d2disk_op is not None:
+            put_sinks.append(merged_d2disk_op.op_id)
         if not put_sinks:
-            # No D2H sink: wait for every independent full-KV / SWA leaf
-            # (H2DISK and/or H2REMOTE). 
             for op in (merged_h2disk_op, merged_swa_h2disk_op,
                        merged_h2remote_op, merged_swa_h2remote_op):
                 if op is not None:
