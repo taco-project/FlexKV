@@ -85,6 +85,13 @@ class TransferManager:
         self._pending_resume_registrations: Dict[
             RegistrationKey, RegisterTPClientRequest
         ] = {}
+        # The REP socket above is bound unconditionally, so *every* deployment
+        # mode has to service it -- an unserved REP endpoint turns a
+        # suspend/resume call into a silent 120s RCVTIMEO stall on the client.
+        # The subprocess mode drives it from its selector loop; the other two
+        # modes use the listener thread below.
+        self._gpu_control_shutdown = threading.Event()
+        self._gpu_control_thread: Optional[threading.Thread] = None
 
         self.transfer_engine: Optional[TransferEngine] = None
         self.storage_engine: Optional[StorageEngine] = None
@@ -95,8 +102,20 @@ class TransferManager:
         registration_key = req.registration_key
 
         if registration_key in self.all_gpu_blocks:
+            # A duplicate (dp_client_id, intra_client_id) means the framework
+            # adapter handed us the same logical identity for two different
+            # workers -- typically because it never passes intra_client_id and
+            # every TP rank collapses onto ...0. Registration can then never
+            # reach expected_gpus, so _register_gpu_blocks_via_socket spins
+            # forever printing "Still waiting for GPU registrations: k/N".
+            # Say so explicitly instead of leaving an unexplained hang.
             flexkv_logger.error(
-                f"GPU worker {registration_key} has already registered.")
+                f"GPU worker {registration_key} has already registered. "
+                f"A duplicate registration key from a different worker means "
+                f"registration can never complete and init will hang. Check "
+                f"that the framework adapter passes a per-worker-unique "
+                f"intra_client_id (registered so far: "
+                f"{sorted(self.all_gpu_blocks)}).")
         else:
             try:
                 self.all_gpu_blocks[registration_key] = req.handles
@@ -241,6 +260,59 @@ class TransferManager:
             self.gpu_control_socket.send_pyobj(response)
             processed += 1
         return processed
+
+    def start_gpu_control_listener(self) -> None:
+        """Serve the GPU control REP socket from a dedicated thread.
+
+        For the subprocess mode the selector loop in
+        ``TransferManagerInterProcessHandle._process_worker`` already drains
+        this socket, so it must not call this.  Thread mode and remote mode
+        have no such loop: without this thread the bound REP endpoint accepts
+        connections and then never answers, so a vLLM sleep/wake call blocks
+        for the client's full 120s RCVTIMEO and then fails.
+        """
+        if self._gpu_control_thread is not None:
+            return
+        self._gpu_control_shutdown.clear()
+        self._gpu_control_thread = threading.Thread(
+            target=self._gpu_control_listener,
+            name="flexkv-gpu-control",
+            daemon=True,
+        )
+        self._gpu_control_thread.start()
+
+    def _gpu_control_listener(self) -> None:
+        poller = zmq.Poller()
+        poller.register(self.gpu_control_socket, zmq.POLLIN)
+        try:
+            while not self._gpu_control_shutdown.is_set():
+                try:
+                    # Milliseconds -- zmq.Poller, unlike socket RCVTIMEO, does
+                    # not take seconds.
+                    if not poller.poll(timeout=100):
+                        continue
+                    self.drain_gpu_control_requests()
+                except zmq.ZMQError:
+                    # Context terminated during shutdown.
+                    break
+                except Exception:
+                    if not self._gpu_control_shutdown.is_set():
+                        flexkv_logger.exception(
+                            "GPU control listener failed; retrying"
+                        )
+                        time.sleep(0.01)
+        finally:
+            try:
+                poller.unregister(self.gpu_control_socket)
+            except Exception:
+                pass
+
+    def stop_gpu_control_listener(self) -> None:
+        self._gpu_control_shutdown.set()
+        thread = self._gpu_control_thread
+        self._gpu_control_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
 
     def _register_gpu_blocks_via_socket(self) -> None:
         try:
@@ -536,6 +608,9 @@ class TransferManagerOnRemote(TransferManager):
         poller = zmq.Poller()
         poller.register(self.command_socket, zmq.POLLIN)
         poller.register(self.query_socket, zmq.POLLIN)
+        # Inherited from TransferManager.__init__, which binds it
+        # unconditionally. Nothing else in this process serves it.
+        poller.register(self.gpu_control_socket, zmq.POLLIN)
 
         while not self._shutdown_flag:
             try:
@@ -572,6 +647,9 @@ class TransferManagerOnRemote(TransferManager):
                             flexkv_logger.warning(f"Unexpected command message type: {type(message)}")
                     except zmq.Again:
                         pass
+
+                if self.gpu_control_socket in socks:
+                    self.drain_gpu_control_requests()
 
                 if self.query_socket in socks:
                     try:
@@ -614,6 +692,7 @@ class TransferManagerOnRemote(TransferManager):
 
         poller.unregister(self.command_socket)
         poller.unregister(self.query_socket)
+        poller.unregister(self.gpu_control_socket)
 
     def _handle_set_slot_mapping(self, task_id: int, slot_mapping: np.ndarray) -> None:
         """Handle set_slot_mapping message from FlexKVConnector.
@@ -863,6 +942,9 @@ class TransferManagerIntraProcessHandle(TransferManagerHandleBase):
     def start(self) -> None:
         self.transfer_manager.initialize_transfer_engine()
         self.transfer_manager.start()
+        # No selector loop here (that is the subprocess mode), so the bound GPU
+        # control REP socket needs its own listener.
+        self.transfer_manager.start_gpu_control_listener()
         self._is_ready = True
 
     def is_ready(self) -> bool:
@@ -878,6 +960,7 @@ class TransferManagerIntraProcessHandle(TransferManagerHandleBase):
         return self.transfer_manager.wait(timeout)
 
     def shutdown(self) -> None:
+        self.transfer_manager.stop_gpu_control_listener()
         self.transfer_manager.shutdown()
 
 

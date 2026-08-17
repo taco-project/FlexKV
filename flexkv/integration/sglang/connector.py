@@ -256,6 +256,7 @@ class FlexKVConnector:
             self.flexkv_config.gpu_register_port,
             dp_client_id=self.rank_info.dp_client_id,
             pp_rank=self.rank_info.pp_rank,
+            intra_client_id=self.rank_info.intra_client_id,
             device_id=self.rank_info.local_rank,
         )
         self._register_with_retry(kv_caches, indexer_buffers)

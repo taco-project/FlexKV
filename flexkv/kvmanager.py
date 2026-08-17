@@ -335,7 +335,7 @@ class KVManager:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         if self.server_client_mode:
-            self.dp_client.cancel_task(task_ids)
+            self.dp_client.cancel_tasks(task_ids)
         else:
             self.kv_task_engine.cancel_tasks(task_ids)
 

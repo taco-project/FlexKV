@@ -203,7 +203,8 @@ def run_tp_client(dp_client_id, tp_rank, gpu_register_port, model_config, cache_
     in the main process (not in a KVServer subprocess).
     """
     device_id = tp_rank + dp_client_id * model_config.tp_size
-    tp_client = KVTPClient(gpu_register_port, dp_client_id, device_id)
+    tp_client = KVTPClient(gpu_register_port, dp_client_id, device_id,
+                           intra_client_id=tp_rank)
 
     gpu_kv_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
