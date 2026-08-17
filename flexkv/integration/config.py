@@ -411,10 +411,10 @@ class FlexKVConfig:
             dp_rank: logical DP shard index for this worker.
                 - plain DP (``enable_dp_attention=False``): the regular
                   ``dp_rank`` passed to the scheduler process (0, 1, …).
-                - DP Attention (``enable_dp_attention=True``): the
-                  ``attn_dp_rank`` derived from ``tp_rank`` via
-                  ``compute_dp_attention_world_info`` (already converted
-                  by the sglang scheduler before calling this method).
+                - DP Attention (``enable_dp_attention=True``): auto-derived
+                  from ``tp_rank`` via the same decomposition sglang uses
+                  in ``compute_dp_attention_world_info``.  The caller may
+                  pass ``None`` or 0; it will be overridden.
                 In both cases this value is stored directly as
                 ``RankInfo.dp_rank`` and ``ModelConfig.dp_size`` is set
                 to the true ``sglang_dp_size`` so that
@@ -443,6 +443,12 @@ class FlexKVConfig:
         attn_tp_size = max(1, sglang_tp_size // (attn_dp_size * attn_cp_size))
         # attn_tp_rank: derived from physical tp_rank
         attn_tp_rank = int(tp_rank) % attn_tp_size
+
+        if enable_dp_attention:
+            # sglang's _flexkv_factory passes dp_rank=None (the factory does
+            # not carry dp_rank on TreeCacheBuildContext).  Derive it from
+            # tp_rank using the same formula as compute_dp_attention_world_info.
+            dp_rank = int(tp_rank) // (attn_tp_size * attn_cp_size)
 
         # cache config: use page_size as tokens_per_block so that FlexKV's
         # CPU radix tree manages blocks at page granularity, ensuring that
