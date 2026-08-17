@@ -62,6 +62,7 @@ def run_tp_client(dp_client_id,
         device_id = tp_rank + dp_client_id * model_config.tp_size
         tp_client = KVTPClient(server_recv_port,
                                dp_client_id=dp_client_id, pp_rank=0,
+                               intra_client_id=tp_rank,
                                device_id=device_id)
 
         gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
@@ -784,6 +785,7 @@ def run_tp_client_with_indexer(dp_client_id,
         tp_client = KVTPClient(
             gpu_register_port=server_recv_port + "_gpu_register",
             dp_client_id=dp_client_id, pp_rank=0,
+            intra_client_id=tp_rank,
             device_id=device_id,
         )
         tp_client.register_to_server(

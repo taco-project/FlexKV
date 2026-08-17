@@ -413,6 +413,7 @@ if [ "$ENABLE_P2P" -eq 1 ]; then
         -DUSE_ETCD=OFF \
         -DUSE_CUDA=ON \
         -DWITH_STORE=OFF \
+        -DWITH_STORE_RUST=OFF \
         -DWITH_P2P_STORE=OFF \
         -DWITH_EP=OFF \
         -DWITH_METRICS=OFF \

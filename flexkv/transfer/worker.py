@@ -32,7 +32,7 @@ except ImportError:
     TPGDSTransferThreadGroup = None
 
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.memory_handle import TensorSharedHandle, release_vmm_tensor
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
 from flexkv.common.transfer import get_nvtx_range_color, LayerwiseTransferOp
@@ -477,6 +477,35 @@ class TransferWorkerBase(ABC):
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         pass
 
+    def _handle_control(self, command: str, payload: Any) -> Any:
+        handler = getattr(self, f"_control_{command}", None)
+        if handler is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support control {command}"
+            )
+        return handler(payload)
+
+    def _reply_control(self, op: Dict[str, Any]) -> None:
+        request_id = op["request_id"]
+        try:
+            reply = {
+                "type": "control_ack",
+                "request_id": request_id,
+                "result": self._handle_control(
+                    op["command"], op.get("payload")
+                ),
+            }
+        except Exception as exc:
+            flexkv_logger.exception(
+                f"Worker control {op.get('command')} failed"
+            )
+            reply = {
+                "type": "control_ack",
+                "request_id": request_id,
+                "error": str(exc),
+            }
+        self.transfer_conn.send(reply)
+
     def run(self) -> None:
         """Main loop for the worker process.
 
@@ -492,7 +521,8 @@ class TransferWorkerBase(ABC):
                 op = self.transfer_conn.recv()
                 if op is None:
                     return
-                op._received_ns = time.perf_counter_ns()
+                if not isinstance(op, dict):
+                    op._received_ns = time.perf_counter_ns()
 
                 batch_ops = [op]
                 shutdown_after_batch = False
@@ -501,9 +531,13 @@ class TransferWorkerBase(ABC):
                     if op is None:
                         shutdown_after_batch = True
                         break
-                    op._received_ns = time.perf_counter_ns()
+                    if not isinstance(op, dict):
+                        op._received_ns = time.perf_counter_ns()
                     batch_ops.append(op)
                 for op in batch_ops:
+                    if isinstance(op, dict) and op.get("type") == "control":
+                        self._reply_control(op)
+                        continue
                     transfer_status = False
                     transfer_start_ns = time.perf_counter_ns()
                     nvtx_pushed = False
@@ -598,6 +632,29 @@ class WorkerHandle:
             trace.inc_inflight()
         self.transfer_conn.send(worker_op)
 
+    def control(
+        self, command: str, payload: Any = None, timeout: float = 120.0
+    ) -> Any:
+        request_id = f"{self.worker_id}:{time.monotonic_ns()}"
+        self.transfer_conn.send({
+            "type": "control",
+            "command": command,
+            "payload": payload,
+            "request_id": request_id,
+        })
+        if not self.transfer_conn.poll(timeout):
+            raise TimeoutError(
+                f"Worker {self.worker_id} timed out handling {command}"
+            )
+        reply = self.transfer_conn.recv()
+        if reply.get("request_id") != request_id:
+            raise RuntimeError(f"Unexpected worker control reply: {reply}")
+        if "error" in reply:
+            raise RuntimeError(
+                f"Worker {self.worker_id} {command} failed: {reply['error']}"
+            )
+        return reply.get("result")
+
     def shutdown(self) -> None:
         try:
             self.transfer_conn.send(None)
@@ -661,6 +718,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         self._register_host_tensor(cpu_blocks, "cpu_kv_pool")
 
+        self.gpu_device_id = gpu_device_id
+        self._gpu_block_count = len(gpu_blocks)
         self.gpu_blocks = import_tensor_handles(gpu_blocks)
         # Get pointers first
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
@@ -847,6 +906,41 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             f"total_block_bytes={total_block_bytes}"
         )
 
+    def _control_suspend_gpu(self, payload: Any) -> int:
+        if self.group_transfer_params is not None:
+            raise NotImplementedError(
+                "GPU hot remap does not support multi-group KV layouts"
+            )
+        if not self.gpu_blocks:
+            return 0
+        with torch.cuda.device(self.gpu_device_id):
+            torch.cuda.synchronize()
+        old_blocks = self.gpu_blocks
+        self.gpu_blocks = []
+        self.gpu_blocks_ptrs.zero_()
+        self.gpu_tensor_ptrs = self.gpu_blocks_ptrs
+        released = sum(release_vmm_tensor(tensor) for tensor in old_blocks)
+        if released != len(old_blocks):
+            raise RuntimeError(
+                f"Expected {len(old_blocks)} VMM mappings, released {released}"
+            )
+        return released
+
+    def _control_resume_gpu(
+        self, gpu_blocks: List[TensorSharedHandle]
+    ) -> int:
+        if self.gpu_blocks:
+            raise RuntimeError("GPU blocks are already registered")
+        if len(gpu_blocks) != self._gpu_block_count:
+            raise ValueError(
+                f"Expected {self._gpu_block_count} GPU blocks, "
+                f"got {len(gpu_blocks)}"
+            )
+        self.gpu_blocks = import_tensor_handles(gpu_blocks)
+        self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
+        self.gpu_tensor_ptrs = self.gpu_blocks_ptrs
+        return len(self.gpu_blocks)
+
     def _transfer_impl(
         self,
         src_block_ids: torch.Tensor,
@@ -1015,6 +1109,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
             imported_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
+        self._gpu_block_counts = [len(handles) for handles in gpu_blocks]
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
         self.is_mla = gpu_kv_layouts[0].is_mla
@@ -1269,6 +1364,53 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             f"total_block_bytes={total_block_bytes}"
         )
 
+
+    def _control_suspend_gpu(self, payload: Any) -> int:
+        if self.tp_group_transfer_groups is not None:
+            raise NotImplementedError(
+                "GPU hot remap does not support multi-group KV layouts"
+            )
+        if not self.gpu_blocks:
+            return 0
+        zero_ptrs = [0] * sum(self._gpu_block_counts)
+        self.tp_transfer_thread_group.update_gpu_block_ptrs(zero_ptrs)
+        old_blocks = self.gpu_blocks
+        self.gpu_blocks = []
+        released = sum(
+            release_vmm_tensor(tensor)
+            for blocks_in_one_gpu in old_blocks
+            for tensor in blocks_in_one_gpu
+        )
+        expected = sum(self._gpu_block_counts)
+        if released != expected:
+            raise RuntimeError(
+                f"Expected {expected} VMM mappings, released {released}"
+            )
+        return released
+
+    def _control_resume_gpu(
+        self, gpu_blocks: List[List[TensorSharedHandle]]
+    ) -> int:
+        if self.gpu_blocks:
+            raise RuntimeError("GPU blocks are already registered")
+        counts = [len(handles) for handles in gpu_blocks]
+        if counts != self._gpu_block_counts:
+            raise ValueError(
+                f"Expected GPU block counts {self._gpu_block_counts}, got {counts}"
+            )
+        imported_gpu_blocks = [
+            import_tensor_handles(handles) for handles in gpu_blocks
+        ]
+        gpu_block_ptrs_flat = [
+            tensor.data_ptr()
+            for blocks_in_one_gpu in imported_gpu_blocks
+            for tensor in blocks_in_one_gpu
+        ]
+        self.tp_transfer_thread_group.update_gpu_block_ptrs(
+            gpu_block_ptrs_flat
+        )
+        self.gpu_blocks = imported_gpu_blocks
+        return len(gpu_block_ptrs_flat)
 
     def _transfer_impl(self,
                        src_block_ids: torch.Tensor,
@@ -1591,7 +1733,9 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             raise ValueError(f"num_remote_blocks_per_file {self.num_remote_blocks_per_file} "
                              f"is not divisible by round_robin {self.round_robin}")
 
-        self.has_multi_group = cpu_kv_layout.layer_groups is not None
+        self.has_multi_group = (
+            getattr(cpu_kv_layout, "layer_groups", None) is not None
+        )
         if self.has_multi_group:
             if (
                 cpu_kv_layout.type != KVCacheLayoutType.BLOCKFIRST
@@ -2785,7 +2929,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self.num_cpu_blocks = cpu_kv_layout.num_block
         # For multi-group layouts, get_chunk_size() is invalid;
         # use get_block_stride() which works for both single and multi-group BLOCKFIRST.
-        if cpu_kv_layout.layer_groups is not None:
+        if getattr(cpu_kv_layout, "layer_groups", None) is not None:
             self.block_size = cpu_kv_layout.get_block_stride()
         else:
             self.block_size = cpu_kv_layout.get_chunk_size()

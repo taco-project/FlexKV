@@ -527,6 +527,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             flexkv_config.gpu_register_port,
             dp_client_id=rank_info.dp_client_id,
             pp_rank=rank_info.pp_rank,
+            intra_client_id=rank_info.intra_client_id,
             device_id=rank_info.local_rank,
         )
         flexkv_logger.info("Finish init FlexKVWorkerConnector")
@@ -644,4 +645,3 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         """Cleanup on deletion."""
         if hasattr(self, 'remote_process') and self.remote_process is not None:
             self.shutdown()
-

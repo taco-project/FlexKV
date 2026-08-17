@@ -22,6 +22,7 @@ from flexkv.transfer_manager import TransferManagerOnRemote
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata, KVConnectorRole)
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.v1.engine import FinishReason
 
 # KVConnectorStats: available since v0.11.0
 try:
@@ -284,6 +285,29 @@ class FlexKVSchedulerConnector:
         if self.collector is not None:
             self.collector.close()
 
+    def reset_cache(self) -> bool:
+        """Invalidate the FlexKV cache: drop the radix tree + mempool on every
+        tier, so KV computed against stale weights can no longer be matched.
+
+        Invoked from vLLM's scheduler via reset_prefix_cache(reset_connector=True)
+        after a weight update. Safety relies only on the radix tree being
+        cleared (get_match can no longer hit stale KV); in-flight transfers need
+        not be drained.
+
+        We also clear this connector's own per-request bookkeeping. These dicts
+        map vLLM request_id -> flexkv task_id for requests currently in flight;
+        after a reset those task_ids reference dropped cache, so we clear them to
+        avoid dangling references (they are normally empty at a reset boundary).
+        """
+        self.flexkv_manager.reset()
+        self.req_id_to_task_dict.clear()
+        self.get_tasks.clear()
+        self.put_tasks.clear()
+        self.tasks_to_launch.clear()
+        self.tasks_to_cancel.clear()
+        self.failed_block_ids.clear()
+        return True
+
     ####################
     #### Get Method ####
     ####################
@@ -483,20 +507,28 @@ class FlexKVSchedulerConnector:
         request: "Request",
         block_ids: list[int],
     ) -> bool:
-        """
+        """Handle a vLLM request before its KV cache blocks are freed.
+
         Args:
-            request: Request to put.
-            blocks: All block_ids of the request.
+            request: The vLLM scheduler request being finalized.
+            block_ids: IDs of all GPU KV cache blocks owned by the request.
 
         Returns:
-            bool: whether thire is unfinished task for this request.
+            True if a FlexKV transfer still needs the request's blocks and
+            vLLM must defer freeing them; False if the blocks can be freed.
         """
-        # Task not finished, can't free blocks
+        # An existing FlexKV task still owns these blocks, so keep them alive.
         if request.request_id in self.req_id_to_task_dict:
             return True
 
-        # Abnormal finished, don't put
-        if not (request.is_finished() and request.get_finished_reason() < 2):
+        finish_reason = request.get_finished_reason()
+        normal_finish = finish_reason in (FinishReason.STOP, FinishReason.LENGTH)
+        requested_abort_offload = (
+            finish_reason == FinishReason.ABORT
+            and bool(getattr(request, "offload_kv_on_finish", False))
+        )
+        should_put = request.is_finished() and (normal_finish or requested_abort_offload)
+        if not should_put:
             return False
 
         if self.maybe_skip_put and os.path.exists('/tmp/flexkv_skip_put'):
@@ -636,7 +668,7 @@ class FlexKVSchedulerConnector:
         if get_task_ids:
             launched_get_task_ids = self.flexkv_manager.launch(task_ids=get_task_ids,
                                        slot_mappings=get_slot_mappings,
-                                       as_batch=self.enable_batch)
+                                       as_batch=self.enable_batch and len(get_task_ids) > 1)
             if len(launched_get_task_ids) == 1 and len(get_tasks_to_launch) > 1:
                 self.get_tasks[launched_get_task_ids[0]] = get_tasks_to_launch
             elif len(launched_get_task_ids) == len(get_tasks_to_launch):
@@ -647,7 +679,7 @@ class FlexKVSchedulerConnector:
         if put_task_ids:
             launched_put_task_ids = self.flexkv_manager.launch(task_ids=put_task_ids,
                                        slot_mappings=put_slot_mappings,
-                                       as_batch=self.enable_batch)
+                                       as_batch=self.enable_batch and len(put_task_ids) > 1)
             if len(launched_put_task_ids) == 1 and len(put_tasks_to_launch) > 1:
                 self.put_tasks[launched_put_task_ids[0]] = put_tasks_to_launch
             elif len(launched_put_task_ids) == len(put_tasks_to_launch):
@@ -781,11 +813,14 @@ class FlexKVWorkerConnector:
             flexkv_config.gpu_register_port,
             dp_client_id=rank_info.dp_client_id,
             pp_rank=rank_info.pp_rank,
+            intra_client_id=rank_info.intra_client_id,
             device_id=rank_info.local_rank,
         )
         logger.info("Finish init FlexKVWorkerConnector")
 
-    def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
+    def register_to_server(
+        self, kv_caches: dict[str, torch.Tensor], *, resume: bool = False
+    ):
         logger.info("Start register kv_caches")
 
         # Separate main KV caches from indexer caches by layer name.
@@ -863,6 +898,7 @@ class FlexKVWorkerConnector:
             self.tp_client.register_to_server(
                 kv_caches=gpu_blocks,
                 kv_layout=gpu_layout,
+                resume=resume,
             )
         else:
             indexer_buffers = list(indexer_kv_caches.values())
@@ -906,9 +942,19 @@ class FlexKVWorkerConnector:
                 layer_groups=layer_groups,
                 gpu_layouts=[gpu_layout, indexer_layout],
                 handles_per_group=[gpu_blocks, indexer_buffers],
+                resume=resume,
             )
 
         logger.info("Finish register kv_caches")
+        self._registered_kv_caches = dict(kv_caches)
+
+    def before_device_sleep(self) -> int:
+        return self.tp_client.suspend_gpu_mappings()
+
+    def after_device_wake(self) -> None:
+        if not hasattr(self, "_registered_kv_caches"):
+            raise RuntimeError("KV caches were not registered before wake")
+        self.register_to_server(self._registered_kv_caches, resume=True)
 
     def __del__(self):
         if hasattr(self, "remote_transfer_manager_process") and \
@@ -962,6 +1008,14 @@ class FlexKVConnectorV1Impl:
     def shutdown(self):
         if self.role == KVConnectorRole.SCHEDULER:
             self.connector.shutdown()
+
+    def reset_cache(self) -> Optional[bool]:
+        """Reset the FlexKV cache. Only meaningful on the scheduler side
+        (vLLM invokes connector.reset_cache() from the scheduler process).
+        """
+        if self.role == KVConnectorRole.SCHEDULER:
+            return self.connector.reset_cache()
+        return None
 
     # ==============================
     # Worker-side methods
@@ -1048,6 +1102,14 @@ class FlexKVConnectorV1Impl:
             dictionary of layer names, kv cache
         """
         self.connector.register_to_server(kv_caches)
+
+    def before_device_sleep(self) -> None:
+        if self.role == KVConnectorRole.WORKER:
+            self.connector.before_device_sleep()
+
+    def after_device_wake(self) -> None:
+        if self.role == KVConnectorRole.WORKER:
+            self.connector.after_device_wake()
 
     # ==============================
     # Scheduler-side methods

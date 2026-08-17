@@ -506,6 +506,14 @@ class RankInfo:
         return self.cp_rank * max(1, self.model_config.tp_size) + self.tp_rank
 
     @property
+    def intra_client_id(self) -> int:
+        """Unique data-plane worker ID within one DP client."""
+        return (
+            self.pp_rank * self.model_config.effective_tp_size
+            + self.effective_tp_rank
+        )
+
+    @property
     def pp_size_per_node(self) -> int:
         """Number of PP stages co-located on a single node."""
         model_config = self.model_config
@@ -744,6 +752,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     # Server-client mode configuration
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
+    server_launch_mode=os.getenv('FLEXKV_SERVER_LAUNCH_MODE', 'embedded').lower(),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
@@ -797,6 +806,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     lease_ttl_ms=int(os.getenv('FLEXKV_LEASE_TTL_MS', 30000)),
     safety_ttl_ms=int(os.getenv('FLEXKV_SAFETY_TTL_MS', 100)),
     renew_lease_ms=int(os.getenv('FLEXKV_RENEW_LEASE_MS', 4000)),
+    reset_barrier_timeout_ms=int(os.getenv('FLEXKV_RESET_BARRIER_TIMEOUT_MS', 60000)),
+    reset_barrier_poll_ms=int(os.getenv('FLEXKV_RESET_BARRIER_POLL_MS', 50)),
 
     nvcomp_batch_size=int(os.getenv('FLEXKV_NVCOMP_BATCH_SIZE', '0')),  # 0 = auto
 
