@@ -256,9 +256,10 @@ class KVServer:
                 for key, val in os.environ.items():
                     if key.startswith("FLEXKV_") and key not in env:
                         env[key] = val
-            
-            # Remove CUDA_VISIBLE_DEVICES so server can see all GPUs
-            env.pop('CUDA_VISIBLE_DEVICES', None)
+
+            cvd = os.environ.get('CUDA_VISIBLE_DEVICES')
+            if cvd is not None and 'CUDA_VISIBLE_DEVICES' not in env:
+                env['CUDA_VISIBLE_DEVICES'] = cvd
 
             # Serialize arguments
             args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port))
