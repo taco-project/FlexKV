@@ -54,6 +54,29 @@ def test_store_start_tracks_task_on_nonleader_rank():
     )
 
 
+def test_prefetch_start_extracts_task_id_from_current_manager_result():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._prefetch_enabled = True
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.prefetch_async.return_value = (23, 256)
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=True,
+        needs_sync=False,
+    )
+    connector._ongoing_prefetches = {}
+    connector._prefetch_contexts = {}
+    context = SimpleNamespace(task_id=-1)
+    connector._new_op_context = MagicMock(return_value=context)
+    connector._log_cache_op = MagicMock()
+
+    task_id = connector.prefetch_async("request", [1, 2, 3])
+
+    assert task_id == 23
+    assert context.task_id == 23
+    assert connector._ongoing_prefetches == {"request": 23}
+    assert connector._prefetch_contexts == {"request": context}
+
+
 def test_store_completion_clears_nonleader_tracking():
     connector = _follower_connector(["request"])
     connector._sync_ctx.is_sync_leader = False

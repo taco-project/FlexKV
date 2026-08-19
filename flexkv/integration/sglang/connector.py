@@ -1267,8 +1267,19 @@ class FlexKVConnector:
         prefetch_error: Optional[Exception] = None
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
-                task_id = self.kv_manager.prefetch_async(
+                prefetch_result = self.kv_manager.prefetch_async(
                     token_ids=np.asarray(token_ids, dtype=np.int64)
+                )
+                # KVManager currently returns
+                # ``(task_id, actual_prefetch_tokens)`` even though older
+                # versions annotated this API as returning an int.  Accept
+                # both shapes so the SGLang connector remains compatible
+                # across FlexKV versions and never scatters a tuple as the
+                # task id.
+                task_id = (
+                    prefetch_result[0]
+                    if isinstance(prefetch_result, tuple)
+                    else prefetch_result
                 )
             except Exception as exc:  # noqa: BLE001
                 prefetch_error = exc
