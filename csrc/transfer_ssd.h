@@ -1,9 +1,9 @@
 #pragma once
 #include <errno.h>
 #include <liburing.h>
-#include <linux/ioprio.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <fcntl.h>
 #include <torch/extension.h>
 #include <unistd.h>
 #include <vector>
