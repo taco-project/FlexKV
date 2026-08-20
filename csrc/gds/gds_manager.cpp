@@ -685,13 +685,23 @@ void transfer_kv_blocks_gds(
     
     std::vector<std::future<void>> futures;
     futures.reserve(num_transfers);
-    
+
+    size_t max_block_partition = 0;
     for (int device_id = 0; device_id < num_devices; device_id++) {
         const std::vector<int>& gpu_blocks = gpu_blocks_partition[device_id];
-        const std::vector<int>& ssd_blocks = ssd_blocks_partition[device_id];
-        const std::vector<std::string>& file_list = gds_manager.get_file_paths(device_id);
-        
-        for (size_t j = 0; j < gpu_blocks.size(); j++) {
+        if (max_block_partition < gpu_blocks.size())
+            max_block_partition = gpu_blocks.size();
+    } 
+
+    for (size_t j = 0; j < max_block_partition; j++) {
+        for (int device_id = 0; device_id < num_devices; device_id++) {
+            const std::vector<int>& gpu_blocks = gpu_blocks_partition[device_id];
+            if (gpu_blocks.size() <= j)
+                continue;
+
+            const std::vector<int>& ssd_blocks = ssd_blocks_partition[device_id];
+            const std::vector<std::string>& file_list = gds_manager.get_file_paths(device_id);
+
             const int gpu_block_id = gpu_blocks[j];
             const int ssd_block_id = ssd_blocks[j];
             const int slot_id = (device_id * gpu_blocks.size() + j) % num_slots;
