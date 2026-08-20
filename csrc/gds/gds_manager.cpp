@@ -700,8 +700,6 @@ void transfer_kv_blocks_gds(
                 continue;
 
             const std::vector<int>& ssd_blocks = ssd_blocks_partition[device_id];
-            const std::vector<std::string>& file_list = gds_manager.get_file_paths(device_id);
-
             const int gpu_block_id = gpu_blocks[j];
             const int ssd_block_id = ssd_blocks[j];
             const int slot_id = (device_id * gpu_blocks.size() + j) % num_slots;
@@ -709,6 +707,7 @@ void transfer_kv_blocks_gds(
             futures.push_back(gds_manager.enqueue_task([&, device_id, gpu_block_id, ssd_block_id, slot_id, gpu_id]() {
                 // Set correct CUDA device for this worker thread
                 cudaSetDevice(gpu_id);
+                const std::vector<std::string>& file_list = gds_manager.get_file_paths(device_id);
                 
                 std::lock_guard<std::mutex> slot_lock(slot_mutexes[slot_id]);
                 // Sync stream to ensure previous kernel on this slot completed
