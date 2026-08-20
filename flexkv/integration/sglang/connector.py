@@ -34,7 +34,7 @@ import socket
 import struct
 import time
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -461,7 +461,7 @@ class FlexKVConnector:
 
     def lookup_kv(
         self,
-        token_ids: List[int],
+        token_ids: Sequence[int],
         token_mask: torch.Tensor,
         rid: Optional[str] = None,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
