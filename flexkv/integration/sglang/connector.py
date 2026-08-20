@@ -41,8 +41,6 @@ import torch
 
 from flexkv.integration.sglang.comm import (
     CMD_LAYERWISE,
-    CMD_PUT_META,
-    CMD_STORE_COMPLETE,
     FlexKVComm,
     FlexKVLayerDoneCounter,
     FlexKVScatterChannel,
@@ -995,11 +993,10 @@ class FlexKVConnector:
     ) -> int:
         """Schedule a write back from GPU into FlexKV.
 
-        On the sync leader this runs ``put_match`` to discover which
-        tokens are NOT yet in FlexKV's CPU cache (= the "unmatched"
-        slice), then ``launch`` on those. On non-leaders the unmatched
-        mask is received over the PP fan-out so cross-node PP can
-        forward its slot mappings.
+        The sync leader runs ``put_match`` and ``launch``. Its result is
+        fanned out to every PP/CP/TP rank so every rank retains ownership
+        of the source GPU slots until the store completes. A remote PP
+        stage leader also forwards its local slot mapping.
 
         Returns the FlexKV task id of the in-flight store, or -1 if
         nothing needed to be written.
@@ -1018,7 +1015,6 @@ class FlexKVConnector:
         if self.page_size > 1:
             aligned_len = (n // self.page_size) * self.page_size
             if aligned_len == 0:
-                self._send_pp_put_meta(-1, [])
                 self._log_cache_op(
                     context,
                     "complete",
@@ -1032,7 +1028,13 @@ class FlexKVConnector:
                 token_ids_np = token_ids_np[:aligned_len]
                 kv_indices = kv_indices[:aligned_len]
 
-        fkv_task_id = -1
+        store_start = {
+            "rid": rid,
+            "task_id": -1,
+            "active": False,
+            "unmatched_mask": [],
+            "error": "",
+        }
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             match_error: Optional[Exception] = None
             try:
@@ -1041,7 +1043,6 @@ class FlexKVConnector:
                 match_error = exc
                 res = None
             if res is None:
-                self._send_pp_put_meta(-1, [])
                 self._log_cache_op(
                     context,
                     "complete",
@@ -1051,90 +1052,115 @@ class FlexKVConnector:
                     reason="no_response" if match_error is None else None,
                     error=str(match_error) if match_error is not None else None,
                 )
-                return -1
-            fkv_task_id, unmatched_mask = res
-            context.task_id = fkv_task_id
-
-            self._send_pp_put_meta(fkv_task_id, unmatched_mask)
-
-            unmatched_count = int(unmatched_mask.sum())
-            if unmatched_count > 0:
-                filtered = kv_indices[unmatched_mask]
-                slot_mapping_cpu = self._to_cpu_int64(filtered)
-                swa_slot_mapping = self._build_swa_slot_mapping(filtered)
-                swa_slots = (
-                    0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
+            else:
+                fkv_task_id, unmatched_mask = res
+                mask_list = (
+                    unmatched_mask.tolist()
+                    if hasattr(unmatched_mask, "tolist")
+                    else list(unmatched_mask)
                 )
-                try:
-                    self.kv_manager.launch(
-                        task_ids=[fkv_task_id],
-                        slot_mappings=[slot_mapping_cpu],
-                        swa_slot_mappings=[swa_slot_mapping],
-                        as_batch=False,
-                        layerwise_transfer=False,
+                store_start.update(
+                    task_id=int(fkv_task_id), unmatched_mask=mask_list
+                )
+                context.task_id = int(fkv_task_id)
+                unmatched_count = int(sum(bool(item) for item in mask_list))
+                if unmatched_count > 0:
+                    filtered = kv_indices[unmatched_mask]
+                    slot_mapping_cpu = self._to_cpu_int64(filtered)
+                    swa_slot_mapping = self._build_swa_slot_mapping(filtered)
+                    swa_slots = (
+                        0
+                        if swa_slot_mapping is None
+                        else int(swa_slot_mapping.numel())
                     )
-                except Exception as exc:  # noqa: BLE001
+                    try:
+                        self.kv_manager.launch(
+                            task_ids=[fkv_task_id],
+                            slot_mappings=[slot_mapping_cpu],
+                            swa_slot_mappings=[swa_slot_mapping],
+                            as_batch=False,
+                            layerwise_transfer=False,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        store_start["error"] = str(exc)
+                        self._log_cache_op(
+                            context,
+                            "complete",
+                            "failed",
+                            direction="D2H",
+                            transfer_mode="no-layerwise",
+                            stage="launch",
+                            error=str(exc),
+                        )
+                    else:
+                        store_start["active"] = True
+                        self._log_cache_op(
+                            context,
+                            "launch",
+                            "running",
+                            direction="D2H",
+                            transfer_mode="no-layerwise",
+                            tokens=unmatched_count,
+                            slots=int(slot_mapping_cpu.numel()),
+                            swa_slots=swa_slots,
+                        )
+                else:
                     self._log_cache_op(
                         context,
                         "complete",
-                        "failed",
+                        "skipped",
                         direction="D2H",
-                        transfer_mode="no-layerwise",
-                        stage="launch",
-                        error=str(exc),
+                        reason="already_cached",
+                        tokens=0,
                     )
-                    raise
-                self._log_cache_op(
-                    context,
-                    "launch",
-                    "running",
-                    direction="D2H",
-                    transfer_mode="no-layerwise",
-                    tokens=unmatched_count,
-                    slots=int(slot_mapping_cpu.numel()),
-                    swa_slots=swa_slots,
-                )
-                self._inflight_stores[rid] = fkv_task_id
-                self._inflight_store_contexts[rid] = context
-                return fkv_task_id
-            self._log_cache_op(
-                context,
-                "complete",
-                "skipped",
-                direction="D2H",
-                reason="already_cached",
-                tokens=0,
+
+        if self._sync_ctx.needs_sync:
+            store_start = self._sync_ctx.scatter(
+                store_start,
+                channel=FlexKVScatterChannel.STORE_START,
             )
+        if store_start.get("rid") != rid:
+            raise RuntimeError(
+                "[FlexKV] store-start rid mismatch: "
+                f"local={rid!r}, leader={store_start.get('rid')!r}"
+            )
+        if store_start.get("error"):
+            raise RuntimeError(
+                f"[FlexKV] store launch failed: {store_start['error']}"
+            )
+        if not store_start.get("active"):
             return -1
 
-        # Non-leader path: receive the unmatched mask + maybe forward
-        # slot_mapping to the remote-side TransferManager.
-        if self._sync_ctx.is_pp_receiver:
-            payload = self._sync_ctx.scatter_pp(None)
-            if payload.get("cmd") != CMD_PUT_META:
-                raise RuntimeError(
-                    f"Tag mismatch: expected CMD_PUT_META, got {payload.get('cmd')}"
-                )
-            fkv_task_id = int(payload["fkv_task_id"])
-            mask_list = payload.get("unmatched_mask", [])
-            unmatched_mask = torch.tensor(mask_list, dtype=torch.bool)
-            if (
-                int(unmatched_mask.sum()) > 0
-                and fkv_task_id >= 0
-                and self._sync_ctx.should_send_slot_mapping_to_remote
-            ):
-                filtered = kv_indices[unmatched_mask]
-                slot_mapping_cpu = self._to_cpu_int64(filtered)
-                self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
-                self._inflight_stores[rid] = fkv_task_id
-                context.task_id = fkv_task_id
-                self._inflight_store_contexts[rid] = context
+        fkv_task_id = int(store_start["task_id"])
+        mask_list = store_start.get("unmatched_mask", [])
+        if fkv_task_id < 0 or len(mask_list) != len(kv_indices):
+            raise RuntimeError(
+                "[FlexKV] invalid store-start payload: "
+                f"task_id={fkv_task_id}, mask_len={len(mask_list)}, "
+                f"slot_len={len(kv_indices)}"
+            )
+
+        # Cross-node PP needs the local PP stage's physical slot mapping.
+        if self._sync_ctx.should_send_slot_mapping_to_remote:
+            unmatched_mask = torch.as_tensor(
+                mask_list, dtype=torch.bool, device=kv_indices.device
+            )
+            filtered = kv_indices[unmatched_mask]
+            self._send_slot_mapping_to_remote(
+                fkv_task_id, self._to_cpu_int64(filtered)
+            )
+
+        # This is deliberately done on every rank. SGLang uses the returned
+        # positive task id to keep radix-node locks (and GPU slots) alive.
+        context.task_id = fkv_task_id
+        self._inflight_stores[rid] = fkv_task_id
+        self._inflight_store_contexts[rid] = context
         return fkv_task_id
 
     def check_completed_stores(self) -> List[str]:
         """Return rids whose stores have completed since the last call."""
         completed_rids: List[str] = []
-        completed_dict: Dict[int, Any] = {}
+        completed_by_rid: Dict[str, Any] = {}
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             if self._inflight_stores:
@@ -1159,50 +1185,36 @@ class FlexKVConnector:
                     )
                     completed_dict = {}
                 for fk_tid, response in completed_dict.items():
+                    status = _status_value(response)
+                    if not _is_terminal_status(status):
+                        continue
                     rid = fk_to_rid[fk_tid]
                     completed_rids.append(rid)
-                    self._inflight_stores.pop(rid, None)
-                    context = self._pop_context(
-                        "_inflight_store_contexts", rid, "store", fk_tid
-                    )
-                    status = _status_value(response)
-                    self._log_cache_op(
-                        context,
-                        "complete",
-                        status,
-                        direction="D2H",
-                        transfer_mode="no-layerwise",
-                    )
-
-        if self._sync_ctx.is_pp_sender:
-            self._sync_ctx.scatter_pp(
-                {
-                    "cmd": CMD_STORE_COMPLETE,
-                    "completed_fk_ids": list(completed_dict),
-                }
-            )
-        elif self._sync_ctx.is_pp_receiver:
-            payload = self._sync_ctx.scatter_pp(None)
-            if payload.get("cmd") != CMD_STORE_COMPLETE:
-                raise RuntimeError(
-                    f"Tag mismatch: expected CMD_STORE_COMPLETE, got "
-                    f"{payload.get('cmd')}"
-                )
-            fk_ids = payload.get("completed_fk_ids", [])
-            if fk_ids and self._inflight_stores:
-                fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
-                for fk_tid in fk_ids:
-                    if fk_tid in fk_to_rid:
-                        rid = fk_to_rid[fk_tid]
-                        completed_rids.append(rid)
-                        self._inflight_stores.pop(rid, None)
-                        getattr(self, "_inflight_store_contexts", {}).pop(rid, None)
+                    completed_by_rid[rid] = response
 
         if self._sync_ctx.needs_sync:
             completed_rids = self._sync_ctx.scatter(
                 completed_rids,
                 channel=FlexKVScatterChannel.STORE_COMPLETION,
             )
+        for rid in completed_rids:
+            fk_tid = self._inflight_stores.pop(rid, None)
+            if fk_tid is None:
+                continue
+            if self._sync_ctx.is_sync_leader:
+                context = self._pop_context(
+                    "_inflight_store_contexts", rid, "store", fk_tid
+                )
+                response = completed_by_rid.get(rid)
+                self._log_cache_op(
+                    context,
+                    "complete",
+                    _status_value(response),
+                    direction="D2H",
+                    transfer_mode="no-layerwise",
+                )
+            else:
+                getattr(self, "_inflight_store_contexts", {}).pop(rid, None)
         return completed_rids
 
     def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
@@ -1455,28 +1467,58 @@ class FlexKVConnector:
         self._completed_layerwise.clear()
         self._launched_load_tids.clear()
         getattr(self, "_launched_load_contexts", {}).clear()
+        # Store completion protects source GPU slots. Followers must not
+        # return from reset and let SGLang free those slots before the leader
+        # has observed a terminal (completely drained) response.
+        store_reset_status = {"ok": True, "error": ""}
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            for rid, fk_tid in list(self._inflight_stores.items()):
-                if fk_tid >= 0:
-                    context = self._pop_context(
-                        "_inflight_store_contexts", rid, "store", fk_tid
-                    )
-                    error = None
-                    try:
-                        responses = self.kv_manager.wait([fk_tid], timeout=20.0) or {}
-                        status = _status_value(responses.get(fk_tid))
-                    except Exception as exc:  # noqa: BLE001
-                        status = "failed"
-                        error = str(exc)
-                    self._log_cache_op(
-                        context,
-                        "complete",
-                        status,
-                        direction="D2H",
-                        transfer_mode="no-layerwise",
-                        source="reset",
-                        error=error,
-                    )
+            inflight = list(self._inflight_stores.items())
+            task_ids = [fk_tid for _, fk_tid in inflight if fk_tid >= 0]
+            responses: Dict[int, Any] = {}
+            wait_error = ""
+            if task_ids:
+                try:
+                    responses = self.kv_manager.wait(
+                        task_ids, timeout=30.0, completely=True
+                    ) or {}
+                except Exception as exc:  # noqa: BLE001
+                    wait_error = str(exc)
+            unsafe = []
+            for rid, fk_tid in inflight:
+                if fk_tid < 0:
+                    continue
+                response = responses.get(fk_tid)
+                status = _status_value(response)
+                if response is None or not _is_terminal_status(status):
+                    unsafe.append(fk_tid)
+                context = self._pop_context(
+                    "_inflight_store_contexts", rid, "store", fk_tid
+                )
+                self._log_cache_op(
+                    context,
+                    "complete",
+                    status,
+                    direction="D2H",
+                    transfer_mode="no-layerwise",
+                    source="reset",
+                    error=wait_error or None,
+                )
+            if unsafe or wait_error:
+                store_reset_status = {
+                    "ok": False,
+                    "error": (
+                        "store tasks were not safely drained during reset: "
+                        f"task_ids={unsafe}, error={wait_error or 'missing response'}"
+                    ),
+                }
+        if self._sync_ctx.needs_sync:
+            store_reset_status = self._sync_ctx.scatter(
+                store_reset_status,
+                channel=FlexKVScatterChannel.STORE_RESET,
+                blocking=True,
+            )
+        if not store_reset_status["ok"]:
+            raise RuntimeError(f"[FlexKV] {store_reset_status['error']}")
         self._inflight_stores.clear()
         getattr(self, "_inflight_store_contexts", {}).clear()
         if self.layer_done_counter is not None:
@@ -2117,21 +2159,6 @@ class FlexKVConnector:
             len(layer_groups),
             bool(swa_buffers),
             len(self._dsv4_state_groups),
-        )
-
-    def _send_pp_put_meta(self, fkv_task_id: int, unmatched_mask) -> None:
-        if not self._sync_ctx.is_pp_active:
-            return
-        if hasattr(unmatched_mask, "tolist"):
-            mask_list = unmatched_mask.tolist()
-        else:
-            mask_list = list(unmatched_mask)
-        self._sync_ctx.scatter_pp(
-            {
-                "cmd": CMD_PUT_META,
-                "fkv_task_id": fkv_task_id,
-                "unmatched_mask": mask_list,
-            }
         )
 
     def _send_slot_mapping_to_remote(
