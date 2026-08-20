@@ -83,7 +83,8 @@ jobs:
 
           echo "Running ${#unit_test_files[@]} CPU unit test files against the built wheel."
           cd "$RUNNER_TEMP"
-          timeout 10m python -m pytest -q --maxfail=1 "${unit_test_files[@]}"
+          # Keep pytest's configured pythonpath from shadowing the installed wheel.
+          timeout 10m python -m pytest -q --maxfail=1 -o pythonpath= "${unit_test_files[@]}"
 
       - name: Get Date and Time
         if: github.event_name == 'push'

@@ -40,11 +40,7 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
-# PP-channel command tags (used by ``scatter_pp`` payloads). Sender and
-# receiver assert on these to catch protocol drift early.
-CMD_PUT_META = 2
 CMD_LAYERWISE = 3
-CMD_STORE_COMPLETE = 5
 
 
 class FlexKVScatterChannel(str, Enum):
@@ -56,6 +52,8 @@ class FlexKVScatterChannel(str, Enum):
     PREFETCH_START = "prefetch_start"
     PREFETCH_PROGRESS = "prefetch_progress"
     RESET = "reset"
+    STORE_START = "store_start"
+    STORE_RESET = "store_reset"
 
 
 _SCATTER_CHANNEL_OFFSETS = {
@@ -65,6 +63,8 @@ _SCATTER_CHANNEL_OFFSETS = {
     FlexKVScatterChannel.PREFETCH_START: 4,
     FlexKVScatterChannel.PREFETCH_PROGRESS: 5,
     FlexKVScatterChannel.RESET: 6,
+    FlexKVScatterChannel.STORE_START: 7,
+    FlexKVScatterChannel.STORE_RESET: 8,
 }
 _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.LOOKUP: dict,
@@ -73,6 +73,8 @@ _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.PREFETCH_START: dict,
     FlexKVScatterChannel.PREFETCH_PROGRESS: dict,
     FlexKVScatterChannel.RESET: dict,
+    FlexKVScatterChannel.STORE_START: dict,
+    FlexKVScatterChannel.STORE_RESET: dict,
 }
 
 
