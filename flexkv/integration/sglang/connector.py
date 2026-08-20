@@ -553,6 +553,30 @@ class FlexKVConnector:
         #   3. hit_length == 0 → no work to do; FlexKV already marked the
         #      empty graph COMPLETED inside get_match, cancel would warn.
         if hit_length > 0 and rid is not None and fkv_task_id >= 0:
+            # SGLang can call match_prefix more than once for the same request
+            # before init_load_back consumes the held lookup.  Replacing the
+            # rid entry without cancelling the old FlexKV task loses its only
+            # handle while that task still pins its matched CPU radix leaf.
+            # Under remote-hit pressure this leaked one leaf lock per duplicate
+            # lookup until every historical leaf became unevictable.
+            replaced_task_id = self._pending_lookups.pop(rid, -1)
+            replaced_context = self._pending_lookup_contexts.pop(rid, None)
+            if (
+                replaced_task_id >= 0
+                and replaced_task_id != fkv_task_id
+                and self._sync_ctx.is_sync_leader
+            ):
+                assert self.kv_manager is not None
+                self.kv_manager.cancel([replaced_task_id])
+            if replaced_context is not None:
+                replaced_context.operation = "load"
+                self._log_cache_op(
+                    replaced_context,
+                    "complete",
+                    "cancelled",
+                    reason="lookup_replaced",
+                    replacement_task_id=fkv_task_id,
+                )
             self._pending_lookups[rid] = fkv_task_id
             self._pending_lookup_contexts[rid] = context
         elif hit_length > 0 and fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
